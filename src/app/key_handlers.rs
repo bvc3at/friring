@@ -141,6 +141,17 @@ impl App {
             return;
         }
 
+        // The Claude Code activity view (transcript pane + its tree) captures
+        // navigation keys before the global lookup too — so plain `j`/`k`/`g`
+        // navigate rather than hitting the keybinding lookup or the PTY. Focus/
+        // quit chords fall through (see `cc_escape_chord`).
+        if self.handle_cc_activity_key(code, mods) {
+            return;
+        }
+        if self.handle_cc_activity_tree_key(code, mods) {
+            return;
+        }
+
         // Keybinding lookup, scoped to the focused pane: global actions plus
         // any scoped to the current context (file viewer, session list,
         // terminal). Some readline/shell chords (Ctrl+A/E/W/U/R/D/…) defer to
@@ -196,10 +207,13 @@ impl App {
             InputFocus::GlobalSearch => self.handle_global_search_key(code, mods),
             InputFocus::Terminal => self.handle_terminal_key(code, mods),
             InputFocus::FileViewer => self.handle_file_viewer_key(code, mods),
-            // The code-review view and its changed-files list capture input
-            // earlier (before the global keybinding lookup), so these arms are
-            // effectively unreachable.
-            InputFocus::CodeReview | InputFocus::ReviewFiles => {}
+            // The code-review view, its changed-files list, and the activity
+            // view (transcript + tree) capture input earlier (before the global
+            // keybinding lookup), so these arms are effectively unreachable.
+            InputFocus::CodeReview
+            | InputFocus::ReviewFiles
+            | InputFocus::CcActivity
+            | InputFocus::CcActivityTree => {}
         }
     }
 
@@ -531,25 +545,36 @@ impl App {
             // in and out of it like any other pane (it lives in the right column,
             // not the left-column circular list). `Esc` still drops straight back
             // to the session list.
-            SessionList | Terminal | FileViewer | TaskList | CodeReview | ReviewFiles => {
+            SessionList | Terminal | FileViewer | TaskList | CodeReview | ReviewFiles
+            | CcActivity | CcActivityTree => {
                 // Order mirrors the on-screen columns: central → tasks → files.
-                // The central pane is the code review when the active session has
-                // one open (persisted per session, like the shell view), else the
-                // terminal — so `Ctrl+L`/`Ctrl+H` move in and out of the review
-                // just like the terminal, and `Ctrl+H` to the session list keeps
-                // the review open.
+                // The central pane is a mutually-exclusive overlay when the active
+                // session has one open (persisted per session, like the shell
+                // view) — the code review or the activity view — else the
+                // terminal. So `Ctrl+L`/`Ctrl+H` move in and out of the overlay
+                // like the terminal, and `Ctrl+H` to the session list keeps it
+                // open.
                 let review = self.active_review().is_some();
-                let central = if review { CodeReview } else { Terminal };
+                let cc = self.active_cc_activity().is_some();
+                let central = if review {
+                    CodeReview
+                } else if cc {
+                    CcActivity
+                } else {
+                    Terminal
+                };
                 let mut ring = vec![SessionList, central];
                 if self.show_tasks_panel {
                     ring.push(TaskList);
                 }
-                // While a review is open the file-viewer column shows the
-                // changed-files list (forced visible, see `layout_for`), so its
-                // ring stop is `ReviewFiles`; otherwise it's the file viewer when
-                // that panel is toggled on.
+                // While an overlay is open the file-viewer column shows its nav
+                // list (forced visible, see `layout_for`): the review's
+                // changed-files list, or the activity view's tree; otherwise it's
+                // the file viewer when that panel is toggled on.
                 if review {
                     ring.push(ReviewFiles);
+                } else if cc {
+                    ring.push(CcActivityTree);
                 } else if self.show_file_viewer {
                     ring.push(FileViewer);
                 }
@@ -1112,6 +1137,11 @@ impl App {
                 "Code review",
                 Self::toggle_code_review,
             ),
+            Action::ToggleCcActivity => self.gated(
+                self.features.cc_activity,
+                "CC activity",
+                Self::toggle_cc_activity,
+            ),
             Action::OpenAutomations => self.gated(
                 self.features.automations,
                 "Automations",
@@ -1300,6 +1330,10 @@ impl App {
             | InputFocus::TaskEditor
             | InputFocus::CodeReview
             | InputFocus::ReviewFiles
+            // The activity panes capture Ctrl+D as half-page paging before the
+            // global lookup, so this is effectively unreachable for them.
+            | InputFocus::CcActivity
+            | InputFocus::CcActivityTree
             | InputFocus::GlobalSearch => false,
             InputFocus::Terminal => false, // forward to PTY
         }

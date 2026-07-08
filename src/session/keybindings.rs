@@ -37,6 +37,8 @@ pub enum Action {
     ToggleShell,
     /// Toggle the native code-review view for the active session.
     ToggleReview,
+    /// Toggle the Claude Code activity view (workflow/subagent transcripts).
+    ToggleCcActivity,
     ForkSession,
     RestartSession,
     UndoDelete,
@@ -137,6 +139,7 @@ impl Action {
             Action::StartSync,
             Action::ToggleShell,
             Action::ToggleReview,
+            Action::ToggleCcActivity,
             Action::ForkSession,
             Action::RestartSession,
             Action::UndoDelete,
@@ -202,6 +205,7 @@ impl Action {
             Action::StartSync => "Sync worktrees",
             Action::ToggleShell => "Toggle shell view",
             Action::ToggleReview => "Toggle code review",
+            Action::ToggleCcActivity => "Toggle CC activity",
             Action::ForkSession => "Fork session",
             Action::RestartSession => "Restart session",
             Action::UndoDelete => "Undo delete",
@@ -388,6 +392,11 @@ impl Action {
             // and toggles the review only from non-terminal panes. F7 is the
             // in-terminal escape hatch. Fully rebindable.
             Action::ToggleReview => vec![KeyChord::ctrl('x'), KeyChord::function(7)],
+            // F9 only: every free bare `Ctrl+<letter>` is taken or reserved as a
+            // test probe, and an F-key dispatches from any pane without a PTY
+            // collision (so it needs no `terminal_passthrough` entry). Fully
+            // rebindable — add a Ctrl chord in the F1 editor if you want one.
+            Action::ToggleCcActivity => vec![KeyChord::function(9)],
             Action::ForkSession => vec![KeyChord::ctrl('f')],
             Action::RestartSession => vec![KeyChord::ctrl('r')],
             Action::UndoDelete => vec![KeyChord::ctrl('z')],
@@ -548,6 +557,7 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
                 QuitApp,
                 ToggleShell,
                 ToggleReview,
+                ToggleCcActivity,
                 ToggleHelp,
                 ToggleInfoPanel,
                 ToggleFileViewer,
@@ -1325,6 +1335,7 @@ mod tests {
                 Action::OpenAutomations => 0,
                 Action::StartSync => 0,
                 Action::ToggleShell => 0,
+                Action::ToggleCcActivity => 0,
                 Action::ToggleReview => 0,
                 Action::ForkSession => 0,
                 Action::RestartSession => 0,
@@ -1381,7 +1392,7 @@ mod tests {
         }
         // The listed variants must equal Action::all().len(). If you add
         // a variant, update both `Action::all()` and the match above.
-        const EXPECTED: usize = 59;
+        const EXPECTED: usize = 60;
         assert_eq!(Action::all().len(), EXPECTED);
         for a in Action::all() {
             classify(*a);

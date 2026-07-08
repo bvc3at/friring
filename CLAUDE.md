@@ -1609,6 +1609,75 @@ code_review`.
   only), auto-revealing a horizontally-scrolled-off search match, and
   search-match highlight across a wrap-boundary seam.
 
+## Claude Code activity view (workflows + subagents)
+
+Thurbox surfaces what happens **inside** a running Claude Code session — the
+Task subagents and multi-agent workflows it spawns, and the actual transcript
+text (thinking / tool calls / tool output) of each — in a native central-pane
+view (the `Activity` tab; **F9**, rebindable `Action::ToggleCcActivity`), gated
+by `[features] cc_activity`. **Claude + local sessions only**: it reads the flat
+JSONL Claude Code writes under
+`~/.claude/projects/<slug>/<agent_session_id>/subagents/` (no hooks/DB/sockets);
+other agents and remote `ssh:`/`wsl:` sessions (whose `~/.claude` lives on the
+host) show an empty tree.
+
+- **Data source** (verified against Claude Code v2.1.201 — undocumented +
+  version-specific, so all parsing is isolated in `session::cc_activity` to make
+  a layout change a one-file fix, degrading to a partial tree rather than an
+  error): `subagents/agent-<id>.jsonl` (+ `.meta.json` `{agentType,
+  description}`) = a standalone Task subagent; `subagents/workflows/wf_<id>/` =
+  one workflow run with a `journal.jsonl` of `started`/`result` edges (no phase
+  events — it freezes mid-agent), one `agent-<id>.jsonl` per spawned agent, and a
+  sibling `workflows/wf_<id>.json` completion record (top-level `phases[]` +
+  `workflowProgress[]` grid, written **once** at completion). Transcript entries
+  are `assistant` (thinking / text / tool_use) and `user` (the prompt string, or
+  `tool_result` blocks).
+- **Two data homes** (mirrors how `agent_metrics`/`git_stats` and the
+  `code_reviews` map coexist): `SessionInfo.cc_activity: Option<CcActivity>` is a
+  lightweight **index** (workflows + agents + standalone subagents; ids,
+  agentType, label, state, mtimes — no transcript bodies), refreshed off the UI
+  thread ~1 s for every local session, mtime-signature-gated so an unchanged tree
+  skips the parse (`App::start_cc_refresh`/`poll_cc_refresh`/`collect_cc_activity`,
+  mirroring the metrics `BackgroundTask`; **never persisted** — a high-churn DB
+  field would bump `PRAGMA data_version`). `App::cc_activities:
+  HashMap<SessionId, CcActivityState>` is the **open-view** UI state (rows,
+  selection, scroll, wrap, folds), created on toggle and surviving session
+  switches. The **selected** agent's transcript is parsed **on demand** from its
+  `agent-<id>.jsonl` and re-read on growth for live-tail.
+- **Path resolution.** The dir is found by **scanning `projects/*/` for the
+  `<agent_session_id>/subagents` child** (`paths::claude_projects_dir`), not by
+  computing the slug — Claude Code's slug replaces `/` **and `.`** (and likely
+  all non-alnum) with `-`. `agent_session_id` is the value thurbox injects as
+  `THURBOX_SESSION_ID`; `$CLAUDE_CONFIG_DIR` is honored.
+- **Surface** (shaped like the code-review view). A **side tree** in the
+  file-viewer column (`InputFocus::CcActivityTree`, forced visible via
+  `layout_for`): workflows fold their agents (`Space`), standalone subagents list
+  at the end, active agents show the session-list spinner and finished ones a
+  state dot; selecting a node **auto-previews** its content. A **central
+  transcript pane** (`InputFocus::CcActivity`): assistant thinking (dim) / text /
+  foldable `tool_use` headers + `tool_result` bodies (`Enter` folds the selected
+  tool), or a workflow **overview** (phases + per-agent grid + logs from the
+  completion record). Keys mirror code review: `j`/`k` + arrows, PageUp/Down,
+  `Ctrl+D`/`U`, `g`/`G`, `w` wrap, `Left`/`Right` h-scroll, `Enter`/`l` from the
+  tree drops into the transcript, `h` back to the tree, `Esc`/`F9` close;
+  `Ctrl+L`/`Ctrl+H` cycle the ring (`SessionList → CcActivity → CcActivityTree`).
+  Mouse: click a tree node / transcript row, drag the scrollbar, wheel-scroll.
+  Mutually exclusive with the code-review overlay (opening one closes the other).
+- **Live-tail.** The ~1 s scan bumps `SessionInfo.cc_activity`; when the active
+  session's view is open (`App::on_cc_activity_updated`) it re-reads the open
+  transcript and **sticky-bottom follows** (jumps to the newest row only when the
+  selection already sits at the end, like terminal scrollback), then repaints via
+  `request_redraw` (the signature gate keeps idle ticks silent).
+- **Code shape.** Pure data + defensive parsers in `session::cc_activity` (arch
+  rule `ui ← session`); the off-thread fs scan + view state + key handlers in
+  `app::cc_activity`; the renderer in `ui::cc_activity` (reuses `focus_block` /
+  `scrollbar` / theme — no diff machinery).
+- **v1 follow-ups** (named, not silently dropped): markdown rendering of
+  thinking/text (v1 renders raw text through the wrap/h-scroll path),
+  find-in-transcript (`/`), async parse of very large transcripts, parsing the
+  workflow `scripts/*.js` for live phase names/labels (v1 shows the exact phase
+  grid only once the completion record lands), and remote (`ssh:`/`wsl:`) support.
+
 ## Demo Video
 
 The demo media is **generated**, not hand-recorded. A single
@@ -1768,9 +1837,10 @@ backend dependency stays visible at each call site.
   `[features] mouse` in settings.toml — disabled, mouse capture is
   never enabled and the terminal keeps native mouse behavior.
   `agent_picker_modal` drives the new-session flow.
-- **Central-pane tab strip.** The agent terminal, the per-session shell, and the
-  code-review view share the central pane, surfaced as a clickable tab strip
-  (`Agent · Review · F7 · Shell · F8`) painted on the pane's **top border** by
+- **Central-pane tab strip.** The agent terminal, the per-session shell, the
+  code-review view, and the Claude Code activity view share the central pane,
+  surfaced as a clickable tab strip
+  (`Agent · Review · F7 · Shell · F8 · Activity · F9`) painted on the pane's **top border** by
   `App::draw_central_tabs`, which renders each tab as a filled **pill button**
   (`ui::render_pill`, the standalone form of the footer's `render_button_bar`
   chips) so it reads as clickable exactly like the Help/Tasks/… footer pills —
@@ -1861,6 +1931,7 @@ Global keys use `Ctrl` + semantic Vim conventions:
 | `Ctrl+/` | Global search (sessions/tasks/automations/files) | **/** = search |
 | `Ctrl+T` / `F8` | Toggle shell pane | **T**erminal |
 | `Ctrl+X` / `F7` | Toggle native code-review view | Review |
+| `F9` | Toggle Claude Code activity view (workflows/subagents) | Activity |
 | `Ctrl+H` | Focus previous pane (cycle backward) | Vim: **h** = left |
 | `Ctrl+J` | Select next session | Vim: **j** = down |
 | `Ctrl+K` | Select previous session | Vim: **k** = up |

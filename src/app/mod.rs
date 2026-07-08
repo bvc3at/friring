@@ -1,6 +1,7 @@
 mod automation;
 mod automation_state;
 mod background;
+pub(crate) mod cc_activity;
 pub(crate) mod code_review;
 mod config_reload;
 mod helpers;
@@ -71,6 +72,11 @@ const DEFERRED_INPUT_DELAY_TICKS: u64 = 10;
 
 /// How often to refresh system metrics (in ticks). At ~10ms per tick, 100 ≈ 1 second.
 const METRICS_REFRESH_TICKS: u64 = 100;
+
+/// How often to scan each local session's Claude Code `subagents/` tree for the
+/// activity view (in ticks, ~1 s). The scan is stat-gated: an unchanged tree
+/// skips the JSONL parse, so idle sessions stay cheap.
+const CC_REFRESH_TICKS: u64 = 100;
 
 /// How often to refresh git stats for the active session (in ticks). Git stats
 /// shell out to `git`, so they run on a slower cadence than other metrics
@@ -417,6 +423,8 @@ pub(crate) enum ScrollTarget {
     RunHistory,
     /// The code-review view's diff scrollbar.
     CodeReview,
+    /// The activity view's transcript scrollbar — position is the selection.
+    CcActivity,
     /// The active modal's list scrollbar — position is the selection index.
     Modal,
 }
@@ -474,6 +482,11 @@ pub(crate) enum ClickAction {
     /// Select the review-target-picker entry at this index (clicked while the
     /// picker is open).
     ReviewTarget(usize),
+    /// Jump the activity tree to the node at this `state.tree` index (clicked in
+    /// the tree column).
+    CcActivityNode(usize),
+    /// Select the activity transcript row at this `state.rows` index.
+    CcActivityRow(usize),
     /// Select a central-pane view from the tab strip in the pane's top border
     /// (Agent / Shell / Review). Dispatched by `activate_click_target`.
     CentralTab(CentralTab),
@@ -506,6 +519,10 @@ enum ScrollPane {
     CodeReview,
     /// The changed-files list shown in the file-viewer column during a review.
     ReviewFiles,
+    /// The activity view's transcript (central pane).
+    CcActivity,
+    /// The activity view's tree shown in the file-viewer column.
+    CcActivityTree,
 }
 
 #[derive(Debug, Clone)]
@@ -546,6 +563,14 @@ pub enum InputFocus {
     /// viewer: `j`/`k` walk the files (the diff follows), `Enter` drops into the
     /// diff at the selected file, `r`/`R` toggle reviewed.
     ReviewFiles,
+    /// The Claude Code activity view (workflow/subagent transcripts) in the
+    /// central pane (toggled like the review). Captures keys for scrolling +
+    /// tool folding.
+    CcActivity,
+    /// The activity view's **tree** in the file-viewer column (workflows →
+    /// agents + standalone subagents). Focusable like `ReviewFiles`: `j`/`k`
+    /// browse (the transcript follows), `Enter`/`l` drops into the transcript.
+    CcActivityTree,
 }
 
 /// Which pane the terminal view is showing for a given session.
@@ -564,6 +589,8 @@ pub(crate) enum CentralTab {
     Agent,
     Shell,
     Review,
+    /// The Claude Code activity view (workflow/subagent transcripts).
+    CcActivity,
 }
 
 /// Holds a recently deleted session for undo (Ctrl+Z) support.
@@ -605,6 +632,10 @@ pub struct App {
     /// sessions and returning keeps the review open. The active session's entry
     /// (if any) is reached via [`Self::active_review`] / [`Self::active_review_mut`].
     pub(crate) code_reviews: std::collections::HashMap<SessionId, code_review::CodeReviewState>,
+    /// Open Claude Code activity views, keyed by session — persisted per session
+    /// like [`Self::code_reviews`], so switching sessions and returning keeps the
+    /// view open. Reached via [`Self::active_cc_activity`] / `_mut`.
+    pub(crate) cc_activities: std::collections::HashMap<SessionId, cc_activity::CcActivityState>,
     pub(crate) modal: modals::Modal,
     /// In-progress new-session wizard (also drives fork/restart re-spawns).
     pub(crate) new_session: new_session_state::NewSessionWizardState,
@@ -617,6 +648,14 @@ pub struct App {
     /// Background system-metrics refresh (also guards `sys` ownership so
     /// refreshes never overlap), polled each tick.
     metrics_refresh: background::BackgroundTask<MetricsRefresh>,
+    /// Background scan of each local session's Claude Code `subagents/` tree,
+    /// indexing workflows/subagents onto `SessionInfo.cc_activity`. Polled each
+    /// tick; gated on `[features] cc_activity`.
+    cc_refresh: background::BackgroundTask<cc_activity::CcRefresh>,
+    /// Per-session directory signature of the last CC-activity scan, so an
+    /// unchanged `subagents/` tree skips re-parsing. `None`/absent = never
+    /// scanned. Pure in-memory (the index is file-derived, never persisted).
+    cached_cc_signatures: std::collections::HashMap<SessionId, u64>,
     /// Background active-session git-stats refresh, polled each tick.
     git_stats: background::BackgroundTask<(SessionId, Option<crate::session::GitStats>)>,
     /// Cached update-check result, rendered as the header "update available"
@@ -920,12 +959,15 @@ impl App {
             show_file_viewer: false,
             file_viewer: crate::ui::file_viewer::FileViewerState::new(),
             code_reviews: std::collections::HashMap::new(),
+            cc_activities: std::collections::HashMap::new(),
             modal: modals::Modal::None,
             new_session: new_session_state::NewSessionWizardState::default(),
             sync_state,
             worktree_sync: sync_state::WorktreeSyncState::default(),
             metrics: metrics_state::MetricsState::new(),
             metrics_refresh: background::BackgroundTask::default(),
+            cc_refresh: background::BackgroundTask::default(),
+            cached_cc_signatures: std::collections::HashMap::new(),
             git_stats: background::BackgroundTask::default(),
             // Seed the badge from the cache (no network); refreshed on first
             // tick if the flag is on and the cache is stale.
@@ -2219,20 +2261,19 @@ impl App {
     pub(crate) fn select_central_tab(&mut self, tab: CentralTab) {
         match tab {
             CentralTab::Agent => {
-                if self.active_review().is_some() {
-                    self.close_code_review();
-                }
+                self.close_central_overlays();
                 self.show_agent_view();
                 self.focus_central_terminal();
             }
             CentralTab::Shell => {
-                if self.active_review().is_some() {
-                    self.close_code_review();
-                }
+                self.close_central_overlays();
                 self.show_shell_view();
                 self.focus_central_terminal();
             }
             CentralTab::Review => {
+                if self.active_cc_activity().is_some() {
+                    self.close_cc_activity();
+                }
                 if self.active_review().is_none() {
                     self.toggle_code_review();
                 }
@@ -2243,6 +2284,32 @@ impl App {
                     self.on_focus_changed();
                 }
             }
+            CentralTab::CcActivity => {
+                if self.active_cc_activity().is_none() {
+                    // `toggle_cc_activity` closes any open review first.
+                    self.toggle_cc_activity();
+                }
+                if self.active_cc_activity().is_some()
+                    && !matches!(
+                        self.focus,
+                        InputFocus::CcActivity | InputFocus::CcActivityTree
+                    )
+                {
+                    self.focus = InputFocus::CcActivityTree;
+                    self.on_focus_changed();
+                }
+            }
+        }
+    }
+
+    /// Close whichever central-pane overlay is open (review or activity view),
+    /// so switching to the Agent/Shell tab leaves a clean terminal.
+    fn close_central_overlays(&mut self) {
+        if self.active_review().is_some() {
+            self.close_code_review();
+        }
+        if self.active_cc_activity().is_some() {
+            self.close_cc_activity();
         }
     }
 
@@ -2259,6 +2326,8 @@ impl App {
     pub(crate) fn active_central_tab(&self) -> CentralTab {
         if self.active_review().is_some() {
             CentralTab::Review
+        } else if self.active_cc_activity().is_some() {
+            CentralTab::CcActivity
         } else if self.active_terminal_view() == TerminalView::Shell {
             CentralTab::Shell
         } else {
@@ -2615,6 +2684,18 @@ impl App {
                 self.cr_select_target(i);
                 true
             }
+            ClickAction::CcActivityNode(i) => {
+                // A click in the tree focuses it and jumps the selection (which
+                // previews that node's transcript in the central pane).
+                self.focus = InputFocus::CcActivityTree;
+                self.ca_jump_to_tree_row(i);
+                true
+            }
+            ClickAction::CcActivityRow(i) => {
+                self.focus = InputFocus::CcActivity;
+                self.ca_select_row(i);
+                true
+            }
             ClickAction::CentralTab(tab) => {
                 self.select_central_tab(tab);
                 true
@@ -2751,6 +2832,8 @@ impl App {
                 // + keyboard paths); the scroll offset follows on render.
                 self.cr_select_row(pos);
             }
+            // Also selection-primary (see `CodeReview`) — move the selection.
+            ScrollTarget::CcActivity => self.ca_select_row(pos),
             ScrollTarget::Modal => self.step_modal_selection_to(pos),
         }
     }
@@ -2861,6 +2944,8 @@ impl App {
             Some(ScrollPane::Automations) => self.move_automation_selection(step),
             Some(ScrollPane::CodeReview) => self.cr_move(step as isize),
             Some(ScrollPane::ReviewFiles) => self.cr_jump_file(!up),
+            Some(ScrollPane::CcActivity) => self.ca_move(step as isize),
+            Some(ScrollPane::CcActivityTree) => self.ca_tree_move(step as isize),
         }
     }
 
@@ -2886,9 +2971,13 @@ impl App {
         let hit = |r: Option<Rect>| r.map(|r| r.contains(pos)).unwrap_or(false);
 
         if hit(areas.file_viewer) {
-            // During a review this column hosts the changed-files list.
+            // During a review this column hosts the changed-files list; during an
+            // activity view it hosts the workflow/subagent tree.
             if self.active_review().is_some() {
                 return Some(ScrollPane::ReviewFiles);
+            }
+            if self.active_cc_activity().is_some() {
+                return Some(ScrollPane::CcActivityTree);
             }
             return Some(ScrollPane::FileViewer);
         }
@@ -2908,6 +2997,7 @@ impl App {
                 InputFocus::TaskList | InputFocus::TaskEditor => ScrollPane::TaskPreview,
                 InputFocus::AutomationRunHistory => ScrollPane::RunHistory,
                 InputFocus::CodeReview => ScrollPane::CodeReview,
+                InputFocus::CcActivity => ScrollPane::CcActivity,
                 _ => ScrollPane::Terminal,
             });
         }
@@ -3959,9 +4049,13 @@ impl App {
     fn tick_background_refreshes(&mut self) {
         self.poll_metrics_refresh();
         self.poll_git_stats();
+        self.poll_cc_refresh();
 
         if self.metrics.tick_count % METRICS_REFRESH_TICKS == 0 {
             self.start_metrics_refresh();
+        }
+        if self.features.cc_activity && self.metrics.tick_count % CC_REFRESH_TICKS == 0 {
+            self.start_cc_refresh();
         }
         if self.metrics.tick_count % GIT_REFRESH_TICKS == 0 {
             self.start_git_stats_refresh();
@@ -5633,9 +5727,12 @@ impl App {
             area,
             self.show_info_panel,
             self.show_tasks_panel,
-            // The review's changed-files list lives in the file-viewer column, so
-            // force that column present while a review is open.
-            self.show_file_viewer || self.active_review().is_some(),
+            // The review's changed-files list and the activity view's tree both
+            // live in the file-viewer column, so force that column present while
+            // either overlay is open.
+            self.show_file_viewer
+                || self.active_review().is_some()
+                || self.active_cc_activity().is_some(),
             self.global_search.active,
             self.features.automations,
             self.automation_ui.cached_automations.len(),
@@ -7467,6 +7564,7 @@ mod tests {
             info_panel: false,
             shell_pane: false,
             code_review: false,
+            cc_activity: false,
             mouse: true,
             notifications: false,
             soft_delete: true,
@@ -7504,6 +7602,12 @@ mod tests {
         app.handle_key(KeyCode::F(7), KeyModifiers::NONE);
         assert!(app.active_review().is_none());
         assert_ne!(app.focus, InputFocus::CodeReview);
+        assert!(app.status_message.take().unwrap().text.contains("disabled"));
+
+        // F9 (ToggleCcActivity) is gated by the cc_activity flag.
+        app.handle_key(KeyCode::F(9), KeyModifiers::NONE);
+        assert!(app.active_cc_activity().is_none());
+        assert_ne!(app.focus, InputFocus::CcActivity);
         assert!(app.status_message.take().unwrap().text.contains("disabled"));
     }
 
