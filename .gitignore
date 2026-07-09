@@ -50,6 +50,11 @@ _site/
 .claude/scheduled_tasks.lock
 .aider*
 
+# Fork (Friring): keep .claude local-only. Files upstream already tracks under
+# .claude/ (commands, the publish + ui-review skills) stay tracked; this only
+# ignores NEW local additions — session skills, settings.local.json, worktrees/.
+.claude/
+
 # Local orchestrator/agent worker workspaces (stray nested checkouts)
 thurbox/
 
