@@ -5,7 +5,7 @@ when working with code in this repository.
 
 ## Project
 
-Thurbox is a multi-session coding-agent TUI orchestrator built
+Friring is a multi-session coding-agent TUI orchestrator built
 with Rust. It runs multiple coding-agent CLI instances (Claude
 Code, Codex, Antigravity, opencode, aider, … — any CLI you
 define) inside persistent tmux sessions, rendered as terminal
@@ -13,12 +13,32 @@ panels via ratatui + tui-term. Sessions survive crashes/restarts
 because tmux keeps the processes alive.
 
 Each session picks **which agent** to run from a declarative
-registry (`~/.config/thurbox/agents.toml`). Thurbox is
+registry (`~/.config/thurbox/agents.toml`). Friring is
 agent-neutral: it knows nothing about any agent's model,
 permissions, prompts, or tools — only how to launch the CLI with
 the right `command + args`. Each agent uses its own default
 config (bake a model or other flags into the agent's `args` if
 you want them).
+
+## Fork (Friring)
+
+This repository is **Friring**, a personal fork of
+[Thurbox](https://github.com/Thurbeen/thurbox) (`Thurbeen/thurbox`). See
+[`FORK.md`](FORK.md) for the full story and the running list of divergences.
+
+Two rules matter when working here:
+
+- **Don't rename the plumbing.** The binary (`thurbox`/`thurbox-cli`), config
+  dirs (`~/.config/thurbox`), tmux socket (`-L thurbox`), `THURBOX_*` env vars,
+  and the crate name stay as-is — Friring is a branding layer over the upstream
+  binary, and renaming them would break drop-in compatibility and make every
+  upstream merge conflict-heavy. Only the project *name* in prose is rebranded
+  (this file + `README.md`); URLs, install, and packaging still point at
+  upstream on purpose.
+- **Log every divergence in [`FORK.md`](FORK.md).** Whenever a change makes this
+  fork behave differently from upstream (a new feature, a changed default, a
+  guarded workflow), add a bullet under its "Differences from upstream" section
+  in the *same* change. `FORK.md` is the single place that tracks what differs.
 
 ## Build & Development Commands
 
@@ -962,7 +982,7 @@ the persistent `App::automation_editor` state (kept in sync by
 
 ## Tasks (todo list)
 
-Thurbox has a **task list**: todo items (title + markdown description +
+Friring has a **task list**: todo items (title + markdown description +
 status). The whole TUI surface is gated by `[features] tasks` in
 settings.toml (disabled: F5/Ctrl+W toasts, no task search results; the
 CLI stays functional). A task can be **acted on by a coding agent** via a **trigger-time
@@ -1552,7 +1572,7 @@ when the target session is the one in focus (`suppress_for_active`).
 
 ## Code review (native, tuicr-like)
 
-Thurbox has a **built-in, natively-rendered** code-review view (no external
+Friring has a **built-in, natively-rendered** code-review view (no external
 binary, no nested TUI) — a tuicr-like GitHub-style continuous diff with
 classified comments and a review summary. It targets the active session's
 worktree (`<base>..HEAD`), which maps cleanly onto thurbox's model (every

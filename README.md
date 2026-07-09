@@ -1,11 +1,29 @@
-# Thurbox
+# Friring
 
 <div align="center">
-  <img src="./website/assets/logo.svg" alt="thurbox" width="340">
+  <img src="./website/assets/logo.svg" alt="friring" width="340">
 </div>
 
+> **Friring** is a personal, opinionated fork of
+> **[Thurbox](https://github.com/Thurbeen/thurbox)** by Thurbeen.
+>
+> **The name** — Thurbox's `thur-` reads as *Thursday*; Friring bumps it to
+> *Friday* (`fri-`), and a **ring** is a boxing arena. So it's an arena for
+> agents — or, read another way, *free agents in a safe ring*.
+>
+> **Why it exists** — to land some opinionated features on top of Thurbox.
+> Good ones may be offered back upstream over time, and upstream's own
+> improvements get merged down into this fork; the original commit history is
+> kept intact as a tribute to the upstream author.
+>
+> **Heads up** — every link, install command, badge, and doc below points at
+> the **original** Thurbox project, and that's intentional: Friring currently
+> builds and installs as the upstream `thurbox` binary and publishes no
+> releases or website of its own. See **[FORK.md](./FORK.md)** for the running
+> list of how this fork diverges from upstream.
+
 Run any coding-agent CLI in persistent terminal sessions.
-Thurbox is a multi-session TUI orchestrator that launches
+Friring is a multi-session TUI orchestrator that launches
 Claude Code, Codex, Antigravity, opencode, aider — or any agent
 you describe — inside persistent tmux panes that survive
 crashes, restarts, and reboots. Sessions, agents, and git
@@ -16,7 +34,7 @@ worktrees are first-class citizens.
 [![Website](https://img.shields.io/badge/Website-thurbox.thurbeen.eu-blue)](https://thurbox.thurbeen.eu/)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=Thurbeen_thurbox&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Thurbeen_thurbox)
 
-![Thurbox Demo](./docs/media/thurbox-demo.gif)
+![Friring Demo](./docs/media/thurbox-demo.gif)
 
 > **Note:** Thurbox is still **v0.x.x**. While we try hard to avoid
 > them, breaking changes may occasionally happen between releases
@@ -132,14 +150,14 @@ flake (`nix develop` / `direnv allow`) with `just` tasks and an isolated runtime
 sandbox (`scripts/dev/sandbox.sh`) — see
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
-## Why Thurbox
+## Why Friring
 
 Running a coding agent in several terminals gets you far — until
 you want to keep sessions alive across crashes, isolate them
-per-branch, or juggle different agents side-by-side. Thurbox
+per-branch, or juggle different agents side-by-side. Friring
 adds:
 
-- **Persistence** — sessions live in tmux and survive Thurbox
+- **Persistence** — sessions live in tmux and survive Friring
   crashes, restarts, and reboots. Reattach from any terminal with
   `tmux -L thurbox attach`.
 - **Parallelism** — many agents side-by-side, each on its own
@@ -159,11 +177,11 @@ worktree". They mostly differ on what's underneath: whether the session
 backend is **real tmux** or a re-implemented multiplexer, whether the UI is a
 lightweight **TUI** or an Electron/native app, whether they launch the
 **unmodified vendor CLI** or their own model, and whether one session can span
-several repos. Thurbox optimizes the boring-but-load-bearing end of that list.
+several repos. Friring optimizes the boring-but-load-bearing end of that list.
 
 | Tool | Interface | Session backend | Agents | Multi-repo session | Code review | Platforms | Remote / SSH | License |
 |------|-----------|-----------------|--------|--------------------|-------------|-----------|--------------|---------|
-| **Thurbox** | TUI | **Real tmux** (+ psmux on Windows) | **Any CLI** — data in `agents.toml` | **✓** (one session, many repos) | **✓** (native in-TUI diff) | Linux · macOS · Windows | **✓** (SSH hosts) | MIT |
+| **Friring** | TUI | **Real tmux** (+ psmux on Windows) | **Any CLI** — data in `agents.toml` | **✓** (one session, many repos) | **✓** (native in-TUI diff) | Linux · macOS · Windows | **✓** (SSH hosts) | MIT |
 | [GitHub Copilot App](https://github.com/github/app) | Desktop GUI | App-managed (worktrees + GitHub cloud envs) | Copilot (GitHub's agent) | ✗ | Agent Merge (PR review) | Linux · macOS · Windows | GitHub-hosted cloud envs | Proprietary (paid Copilot) |
 | [Conductor](https://www.conductor.build/) | Native GUI | App-managed PTY | Claude, Codex, Cursor | ✗ | Visual diff (GUI) | macOS only | Cloud Workspaces | Free (closed source) |
 | [Herdr](https://herdr.dev/) | TUI | **Own** multiplexer (Rust) | Claude, Codex + many (any CLI) | ✗ | ✗ | Linux · macOS | Runs on a remote box | AGPL-3.0 |
@@ -172,7 +190,7 @@ several repos. Thurbox optimizes the boring-but-load-bearing end of that list.
 | [Claude Squad](https://github.com/smtg-ai/claude-squad) | TUI | **Real tmux** | Claude, Codex, OpenCode, Aider, Amp | ✗ | Git diff view | Linux · macOS (no Windows) | ✗ | AGPL-3.0 |
 | [Cursor](https://cursor.com/) | IDE + cloud | App-managed (its **own** models) | Composer + frontier models | ✗ | IDE review | macOS · Windows · Linux | Cloud VMs + SSH | Proprietary (paid) |
 
-What makes Thurbox different (some of these are shared — the combination is the
+What makes Friring different (some of these are shared — the combination is the
 point):
 
 - **Real tmux, not a re-implemented multiplexer.** Sessions live in the same
@@ -182,18 +200,18 @@ point):
   Squad shares this.)
 - **A TUI, not an Electron app.** Tiny footprint; runs in a plain terminal,
   over SSH, on a headless server — no desktop, no GPU, no per-window browser.
-- **Launches the unmodified vendor CLI.** Thurbox knows nothing about the
+- **Launches the unmodified vendor CLI.** Friring knows nothing about the
   agent's model, prompts, or tools — it just runs `command + args` — so you get
   the newest agent features the day the CLI ships them, with no wrapper in the
   way (vs Cursor, which runs its own models).
 - **Any agent CLI as data** (`~/.config/thurbox/agents.toml`) — add your own with
-  no recompile; Thurbox is deliberately agent-neutral.
+  no recompile; Friring is deliberately agent-neutral.
 - **Multi-repo sessions.** One session can span several repos at once — each
   repo in its **own git worktree** on a shared branch, gathered into a
   per-session symlink workspace — not just one worktree per task. (Of the GUI
   tools above, the closest is Conductor's `/add-dir`, which links separate
   pre-made workspaces rather than spawning one session across repos; Cursor's
-  multi-root/cloud path is folders-in-one-window, not worktree-per-repo.) Thurbox
+  multi-root/cloud path is folders-in-one-window, not worktree-per-repo.) Friring
   also runs agents in **plain non-git directories** (and attaches them as-is with
   `--add-dir`); worktree-only tools like Claude Squad require a git repo.
 - **Mouse support in the terminal.** Clickable session rows, buttons, and
@@ -205,14 +223,14 @@ point):
   back to the agent to address. The click-to-review visual diff that used to be
   a GUI-only perk, without leaving the TUI.
 
-On top of that, Thurbox is the only entry here that is terminal-native **and**
+On top of that, Friring is the only entry here that is terminal-native **and**
 runs on Windows **and** over SSH, and it ships a full headless CLI
 (`thurbox-cli`) plus cron-like automations to drive and schedule fleets of
 agents with no GUI at all — now with its own native code-review view, so the
 click-to-review visual diff is no longer a GUI-only trade-off. The GUI tools
 still trade footprint and that scriptability for a gentler on-ramp — and the
 most polished of them, [GitHub's Copilot App](https://github.com/github/app),
-also ties you to a single vendor's agent and a paid subscription, where Thurbox
+also ties you to a single vendor's agent and a paid subscription, where Friring
 stays agent-neutral and runs whatever CLI you already pay for. Feature accuracy
 as of June 2026; check each project for the latest.
 
@@ -224,10 +242,10 @@ as of June 2026; check each project for the latest.
 > the axes that actually distinguish them and keep it roughly current. Treat it
 > as a map of the terrain, not a ranking.
 >
-> Thurbox itself evolves quickly to fit how people actually work, and that's the
+> Friring itself evolves quickly to fit how people actually work, and that's the
 > deeper point: AI has lowered the cost of building tooling so far that anyone can
 > rewrite a workflow into their own custom tool rather than wait for a vendor to
-> ship it. Thurbox leans into that — agents, hosts, themes, keybindings, and
+> ship it. Friring leans into that — agents, hosts, themes, keybindings, and
 > extensions are all **data you edit**, not code you fork — so the "right" tool is
 > increasingly the one you shape for yourself.
 
@@ -446,7 +464,7 @@ winget uninstall Thurbeen.thurbox  # winget (Windows)
 choco uninstall thurbox        # Chocolatey (Windows)
 ```
 
-Sessions outlive Thurbox in tmux, so stop them too:
+Sessions outlive Friring in tmux, so stop them too:
 
 ```bash
 tmux -L thurbox kill-server    # ends all running agent sessions
@@ -517,7 +535,7 @@ command = "codex"
 - **Mix agents** — run Claude Code on one repo and Codex on
   another in side-by-side sessions; each session remembers its own
   agent.
-- **Recover a crash** — if Thurbox dies, relaunch it: sessions
+- **Recover a crash** — if Friring dies, relaunch it: sessions
   resume from tmux. Prefer raw tmux? `tmux -L thurbox attach`.
 
 ### Recipe: provision a monorepo headless
@@ -588,7 +606,7 @@ cli session list
 ```
 
 The "custom MCP config" is just an **agent** that launches `claude`
-with a different `--mcp-config` file — Thurbox stays agent-neutral.
+with a different `--mcp-config` file — Friring stays agent-neutral.
 Define the three roles in `~/.config/thurbox/agents.toml`:
 
 ```toml
@@ -718,7 +736,7 @@ own in-file `/` text search is unrelated and still there.)
 
 ## Headless CLI (`thurbox-cli`)
 
-The `thurbox-cli` binary drives Thurbox without the TUI — useful
+The `thurbox-cli` binary drives Friring without the TUI — useful
 for scripting and automation. It shares the same SQLite database
 and `tmux -L thurbox` server as the TUI, so changes made by either
 appear live in the other (the TUI polls `PRAGMA data_version`).
@@ -895,7 +913,7 @@ thurbox-cli config show                  # print the effective resolved config
 
 ## Architecture
 
-Thurbox follows **The Elm Architecture** (TEA):
+Friring follows **The Elm Architecture** (TEA):
 `Event → Message → update(model, msg) → view(model) → Frame`.
 All state lives in a single `App` model. Sessions run via a
 `SessionBackend` trait backed by local tmux (`tmux -L thurbox`).
@@ -1020,6 +1038,9 @@ This project is licensed under the MIT License - see the
 
 ## Acknowledgments
 
+- **[Thurbox](https://github.com/Thurbeen/thurbox)** by Thurbeen — the
+  upstream project Friring is forked from; all the foundational work is
+  theirs (see [FORK.md](FORK.md) for what this fork changes)
 - [Ratatui](https://github.com/ratatui-org/ratatui) — TUI
   framework
 - [tui-term](https://github.com/a-kenji/tui-term) — terminal
