@@ -71,6 +71,105 @@ fn hooks_home() -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// The exact `--settings` value the hooks extension injects into `claude`
+/// (`<hooks_home>/claude.json`) — constructed identically to the manifest's
+/// `["--settings", "{home}/claude.json"]` after `{home}` substitution, so it
+/// **byte-matches** the flag the CC daemon captures and replays when it
+/// backgrounds a session. The Claude Code activity scan uses it to attribute a
+/// detached background worker back to this thurbox instance (see
+/// `app::cc_activity`).
+pub(crate) fn hooks_settings_path() -> Option<String> {
+    hooks_home().map(|h| format!("{h}/claude.json"))
+}
+
+/// Point a **local claude** launch at a **per-session** `--settings` file —
+/// `<hooks_home>/sessions/<agent_session_id>.json`, a symlink to the shared
+/// `claude.json` — instead of the shared file directly.
+///
+/// Why: when Claude Code backgrounds a session as a detached daemon worker it
+/// **replays** the origin session's `--settings` flag. A shared path can only be
+/// disambiguated back to a thurbox session by a cwd heuristic (ambiguous for two
+/// non-worktree sessions on one repo); a per-session path **names the exact
+/// session**, so the activity view (`app::cc_activity`) attributes the worker's
+/// workflow precisely. The symlink means zero content upkeep — it tracks the
+/// shared `claude.json` the heal pass keeps current.
+///
+/// Best-effort and inert when it can't apply: returns `args` unchanged for an
+/// agent that doesn't carry our shared hooks `--settings`, on a non-unix host
+/// (no symlinks; the CC daemon is unix-only anyway), or on any fs error — the
+/// scan then falls back to the shared-path + cwd match.
+pub(crate) fn rewrite_settings_for_session(
+    agent_session_id: &str,
+    args: Vec<String>,
+) -> Vec<String> {
+    let Some(shared) = hooks_settings_path() else {
+        return args;
+    };
+    // Only rewrite launches that actually carry our shared hooks --settings.
+    if !args_carry_settings(&args, &shared) {
+        return args;
+    }
+    let Some(per) = ensure_per_session_symlink(agent_session_id) else {
+        return args;
+    };
+    rewrite_settings_value(args, &shared, &per)
+}
+
+/// Whether `args` contains a `--settings` flag (split or `=`-joined form) whose
+/// value equals `shared`.
+fn args_carry_settings(args: &[String], shared: &str) -> bool {
+    let joined = format!("--settings={shared}");
+    args.iter().enumerate().any(|(i, a)| {
+        a == &joined || (a == "--settings" && args.get(i + 1).map(String::as_str) == Some(shared))
+    })
+}
+
+/// Create (idempotently) the per-session settings symlink
+/// `<hooks_home>/sessions/<id>.json → ../claude.json` and return its path.
+/// `None` on non-unix or any fs error (caller then keeps the shared path).
+fn ensure_per_session_symlink(agent_session_id: &str) -> Option<String> {
+    #[cfg(not(unix))]
+    {
+        let _ = agent_session_id;
+        None
+    }
+    #[cfg(unix)]
+    {
+        let dir = std::path::Path::new(&hooks_home()?).join("sessions");
+        std::fs::create_dir_all(&dir).ok()?;
+        let link = dir.join(format!("{agent_session_id}.json"));
+        // Reuse an existing entry (respawn/restore keep the same id); the target
+        // is relative so it resolves from the link's own dir regardless of cwd.
+        if std::fs::symlink_metadata(&link).is_err() {
+            std::os::unix::fs::symlink("../claude.json", &link).ok()?;
+        }
+        Some(link.to_string_lossy().into_owned())
+    }
+}
+
+/// Replace the value of the `--settings` flag that currently equals `shared`
+/// with `per` (both `--settings X` and `--settings=X` forms). Only the matching
+/// flag is touched, so a user's own unrelated `--settings` is left alone.
+fn rewrite_settings_value(mut args: Vec<String>, shared: &str, per: &str) -> Vec<String> {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--settings" {
+            if args.get(i + 1).map(String::as_str) == Some(shared) {
+                args[i + 1] = per.to_string();
+                break;
+            }
+            i += 2;
+            continue;
+        }
+        if args[i].strip_prefix("--settings=") == Some(shared) {
+            args[i] = format!("--settings={per}");
+            break;
+        }
+        i += 1;
+    }
+    args
+}
+
 /// Materialize the embedded hooks-extension assets into a stable local dir under
 /// the data directory and return it, so [`install_extension`] can treat it as a
 /// local source. Rewritten on every call so the assets track the binary.
@@ -354,5 +453,91 @@ mod tests {
         db.set_builtin_hooks_optout(true).unwrap();
         // With opt-out set, ensure is a no-op (no install attempted).
         assert!(ensure_builtin_hooks_extension(&db).is_empty());
+    }
+
+    // --- per-session --settings rewrite (Phase 2: exact daemon attribution) ---
+
+    #[test]
+    fn rewrite_settings_value_handles_both_forms_and_leaves_others() {
+        let per = "/h/sessions/ID.json";
+        // Split form.
+        let split = ["--session-id", "x", "--settings", "/h/claude.json"].map(String::from);
+        assert_eq!(
+            rewrite_settings_value(split.to_vec(), "/h/claude.json", per),
+            ["--session-id", "x", "--settings", per].map(String::from)
+        );
+        // `=`-joined form.
+        let joined = ["--settings=/h/claude.json", "/seed"].map(String::from);
+        assert_eq!(
+            rewrite_settings_value(joined.to_vec(), "/h/claude.json", per),
+            [format!("--settings={per}"), "/seed".into()]
+        );
+        // A user's unrelated --settings (different value) is untouched.
+        let other = ["--settings", "/user/own.json"].map(String::from);
+        assert_eq!(
+            rewrite_settings_value(other.to_vec(), "/h/claude.json", per),
+            other
+        );
+    }
+
+    #[test]
+    fn args_carry_settings_detects_shared_only() {
+        let shared = "/h/claude.json";
+        assert!(args_carry_settings(
+            &["--settings", shared].map(String::from),
+            shared
+        ));
+        assert!(args_carry_settings(
+            &[format!("--settings={shared}")],
+            shared
+        ));
+        assert!(!args_carry_settings(
+            &["--settings", "/other.json"].map(String::from),
+            shared
+        ));
+        assert!(!args_carry_settings(
+            &["--model", "opus"].map(String::from),
+            shared
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_settings_for_session_creates_symlink_and_repoints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let shared = hooks_settings_path().expect("shared path");
+        // Give the shared claude.json a real target so the symlink resolves.
+        let home = std::path::Path::new(&shared).parent().unwrap();
+        std::fs::create_dir_all(home).unwrap();
+        std::fs::write(&shared, "{}").unwrap();
+
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let args = vec![
+            "--session-id".into(),
+            sid.into(),
+            "--settings".into(),
+            shared.clone(),
+        ];
+        let out = rewrite_settings_for_session(sid, args);
+
+        let per = format!("{}/sessions/{sid}.json", home.display());
+        assert_eq!(out, vec!["--session-id", sid, "--settings", &per]);
+        // The symlink exists and resolves to the shared file.
+        let link = std::path::Path::new(&per);
+        assert!(std::fs::symlink_metadata(link).is_ok());
+        assert_eq!(std::fs::read_to_string(link).unwrap(), "{}");
+
+        // Idempotent: a second call reuses the same symlink and path.
+        let out2 = rewrite_settings_for_session(sid, vec!["--settings".into(), shared.clone()]);
+        assert_eq!(out2, vec!["--settings".to_string(), per]);
+    }
+
+    #[test]
+    fn rewrite_settings_for_session_noop_without_hook_arg() {
+        // An agent whose args don't carry our shared --settings is unchanged (no
+        // symlink created) — no TestPathGuard needed since it returns early.
+        let args = vec!["--model".to_string(), "opus".to_string()];
+        assert_eq!(rewrite_settings_for_session("some-id", args.clone()), args);
     }
 }

@@ -1,5 +1,6 @@
 pub mod agent_def;
 pub mod automation;
+pub mod cc_activity;
 pub mod extension_def;
 pub mod host_def;
 pub mod keybindings;
@@ -13,6 +14,10 @@ pub use agent_def::{AgentDef, AgentRegistry};
 pub use automation::{
     parse_hhmm, preset_to_cron, Automation, AutomationAction, AutomationRun, AutomationRunStatus,
     AutomationSchedule, ExtraRepo, SchedulePreset,
+};
+pub use cc_activity::{
+    CcActivity, CcAgent, CcAgentState, CcPhase, CcRunStatus, CcWorkflow, CcWorkflowSummary,
+    TranscriptBlock,
 };
 pub use extension_def::{
     AgentPatch, ConfigMerge, ExtensionAutomation, ExtensionDef, ExtensionFile, ExtensionSession,
@@ -245,6 +250,11 @@ pub struct SessionInfo {
     /// Latest OSC window title the agent emitted (live activity text),
     /// captured from the terminal and refreshed each tick. Agent-neutral.
     pub agent_activity: Option<String>,
+    /// Claude Code workflow + subagent activity index (Claude, local sessions
+    /// only), polled off-thread from `~/.claude/.../subagents/`. Drives the
+    /// activity view's tree; `None` until first scanned (or for non-claude /
+    /// remote sessions). Derived from on-disk JSONL, never persisted.
+    pub cc_activity: Option<CcActivity>,
     /// Message text from the agent's latest attention notification (OSC 9/777),
     /// shown as the status when `status == SessionStatus::Blocked`.
     pub notification: Option<String>,
@@ -279,6 +289,7 @@ impl SessionInfo {
             remote_host: None,
             agent_metrics: None,
             agent_activity: None,
+            cc_activity: None,
             notification: None,
             git_stats: None,
             repo_display_names: Vec::new(),

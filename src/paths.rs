@@ -291,28 +291,53 @@ pub fn keybindings_file() -> Option<PathBuf> {
     resolve(PathKind::KeybindingsFile)
 }
 
+/// Resolve the Claude Code config root:
+/// `config_dir_override` → `$CLAUDE_CONFIG_DIR` → `~/.claude`.
+fn claude_config_root(config_dir_override: Option<&Path>) -> Option<PathBuf> {
+    if let Some(p) = config_dir_override {
+        Some(p.to_path_buf())
+    } else if let Some(env) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(PathBuf::from(env))
+    } else {
+        home_dir().map(|h| h.join(".claude"))
+    }
+}
+
+/// The Claude Code `projects/` directory under the resolved config root. Each
+/// session lives at `projects/<slug>/<agent_session_id>{.jsonl,/}`, with its
+/// subagents/workflows under `projects/<slug>/<agent_session_id>/subagents/`.
+/// Root resolution: `config_dir_override` → `$CLAUDE_CONFIG_DIR` → `~/.claude`.
+pub fn claude_projects_dir(config_dir_override: Option<&Path>) -> Option<PathBuf> {
+    claude_config_root(config_dir_override).map(|r| r.join("projects"))
+}
+
+/// The Claude Code daemon roster (`<root>/daemon/roster.json`): the live registry
+/// of background/detached workers. Same root resolution as
+/// [`claude_projects_dir`]. Used by the activity scan to attribute a background
+/// worker's `subagents/` tree back to the thurbox session that launched it.
+pub fn claude_daemon_roster(config_dir_override: Option<&Path>) -> Option<PathBuf> {
+    claude_config_root(config_dir_override).map(|r| r.join("daemon").join("roster.json"))
+}
+
+/// The Claude Code jobs directory (`<root>/jobs`): per-background-job state
+/// (`<short>/state.json`) that **persists after a run settles**, carrying the
+/// live agent grid + status. Same root resolution as [`claude_projects_dir`].
+pub fn claude_jobs_dir(config_dir_override: Option<&Path>) -> Option<PathBuf> {
+    claude_config_root(config_dir_override).map(|r| r.join("jobs"))
+}
+
 /// Returns true if a Claude transcript file `<agent_session_id>.jsonl` exists
 /// under `<root>/projects/*/`.
 ///
-/// Root resolution: `config_dir_override` → `$CLAUDE_CONFIG_DIR` → `~/.claude`.
 /// Used by restart paths to decide between `--resume` (transcript exists) and
 /// `--session-id` (fresh start with same id).
 pub fn claude_transcript_exists(
     agent_session_id: &str,
     config_dir_override: Option<&Path>,
 ) -> bool {
-    let root = if let Some(p) = config_dir_override {
-        p.to_path_buf()
-    } else if let Some(env) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        PathBuf::from(env)
-    } else {
-        match home_dir() {
-            Some(h) => h.join(".claude"),
-            None => return false,
-        }
+    let Some(projects) = claude_projects_dir(config_dir_override) else {
+        return false;
     };
-
-    let projects = root.join("projects");
     let Ok(entries) = std::fs::read_dir(&projects) else {
         return false;
     };

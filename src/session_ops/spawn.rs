@@ -93,6 +93,15 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+    // Local claude: point the hooks `--settings` at a per-session symlink so a
+    // backgrounded (daemon) workflow is attributed to this exact session in the
+    // activity view (mirrors the TUI's `launch_provider_for`). Remote spawns
+    // already had their `--settings` remote-adapted above and aren't scanned.
+    if host.is_none() {
+        agent_def.args =
+            super::builtin_hooks::rewrite_settings_for_session(&agent_session_id, agent_def.args);
+    }
+
     // For a multi-repo session, launch the agent in a per-session symlink
     // workspace gathering every member dir (so each repo is a visible subdir,
     // agent-neutral). `info.cwd` keeps the *primary* repo. Single-repo sessions

@@ -66,6 +66,7 @@ impl App {
         // Keep the central-pane focus aligned with the active session's review
         // (it may have changed under us via a session switch) before laying out.
         self.sync_review_focus();
+        self.sync_cc_activity_focus();
 
         let areas = self.layout_for(frame.area());
 
@@ -533,6 +534,24 @@ impl App {
             self.record_click(fv_area, ClickAction::FocusPane(InputFocus::ReviewFiles));
             return;
         }
+        // Likewise, the activity view's tree owns this column while open.
+        if self.active_cc_activity().is_some() {
+            let level = if self.focus == InputFocus::CcActivityTree {
+                crate::ui::FocusLevel::Focused
+            } else {
+                crate::ui::FocusLevel::Active
+            };
+            let rows = self
+                .active_cc_activity()
+                .map(|ca| crate::ui::cc_activity::render_tree(frame, fv_area, ca, level));
+            if let Some(rows) = rows {
+                for h in rows {
+                    self.record_click(h.rect, ClickAction::CcActivityNode(h.index));
+                }
+            }
+            self.record_click(fv_area, ClickAction::FocusPane(InputFocus::CcActivityTree));
+            return;
+        }
         if let Some(session) = self.sessions.get(self.active_index) {
             if self.file_viewer.needs_rebuild_for(&session.info) {
                 self.file_viewer.rebuild_from_session(&session.info);
@@ -618,6 +637,8 @@ impl App {
         }
         if self.active_review().is_some() {
             self.render_code_review_pane(frame, terminal);
+        } else if self.active_cc_activity().is_some() {
+            self.render_cc_activity_pane(frame, terminal);
         } else {
             self.render_terminal_pane(frame, terminal);
         }
@@ -654,6 +675,27 @@ impl App {
         }
         self.record_click(terminal, ClickAction::FocusPane(InputFocus::CodeReview));
         self.record_scrollbar(hits.scrollbar, ScrollTarget::CodeReview);
+    }
+
+    /// Render the open activity view (transcript) into the central pane (dimmed
+    /// when not the focused pane) and record its click/scroll targets.
+    fn render_cc_activity_pane(&mut self, frame: &mut Frame, terminal: Rect) {
+        let level = if self.focus == InputFocus::CcActivity {
+            crate::ui::FocusLevel::Focused
+        } else {
+            crate::ui::FocusLevel::Active
+        };
+        let Some(hits) = self
+            .active_cc_activity_mut()
+            .map(|ca| crate::ui::cc_activity::render(frame, terminal, ca, level))
+        else {
+            return;
+        };
+        for h in hits.rows {
+            self.record_click(h.rect, ClickAction::CcActivityRow(h.index));
+        }
+        self.record_click(terminal, ClickAction::FocusPane(InputFocus::CcActivity));
+        self.record_scrollbar(hits.scrollbar, ScrollTarget::CcActivity);
     }
 
     /// Render the active session's terminal (or shell view) into the central
@@ -742,6 +784,13 @@ impl App {
                 Some(crate::session::Action::ToggleShell),
             ));
         }
+        if self.features.cc_activity {
+            specs.push((
+                CentralTab::CcActivity,
+                "Activity",
+                Some(crate::session::Action::ToggleCcActivity),
+            ));
+        }
         // With both Shell and Review gated off there's only the Agent pill left
         // — a tab strip you can't switch away from. Drop it entirely so a
         // single non-functional tab doesn't advertise views that are disabled.
@@ -812,6 +861,8 @@ impl App {
             InputFocus::GlobalSearch => "Search",
             InputFocus::CodeReview => "Review",
             InputFocus::ReviewFiles => "Changed files",
+            InputFocus::CcActivity => "Activity",
+            InputFocus::CcActivityTree => "Workflows",
         };
         status_bar::FooterState {
             session_count: self.sessions.len(),

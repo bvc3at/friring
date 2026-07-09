@@ -27,7 +27,7 @@ development checkout never touches your real setup.
 the TUI polls their mtime (~1/s) and applies edits with a confirmation
 toast — no restart. For `settings.toml` only the **feature flags that
 gate UI panels** (`tasks`, `file_viewer`, `info_panel`, `global_search`,
-`shell_pane`, `code_review`, `perf_hud`, `soft_delete`) apply live; the restart-only values stay
+`shell_pane`, `code_review`, `cc_activity`, `perf_hud`, `soft_delete`) apply live; the restart-only values stay
 published through a write-once global (so they can't drift mid-frame),
 and the reload toast says when a restart is needed. `hosts.toml` (SSH
 backends register at startup) and `themes.toml` need a restart.
@@ -193,6 +193,7 @@ global_search = true
 info_panel    = true
 shell_pane    = true
 code_review   = true
+cc_activity   = true
 perf_hud      = true
 mouse         = true
 notifications = true
@@ -213,7 +214,7 @@ Turn major TUI features off entirely. All default to `true` **except
 `version_check` and `auto_update`, which default to `false`** (both
 reach the network, so they are opt-in). The UI-panel flags
 (`tasks`, `file_viewer`, `info_panel`, `global_search`, `shell_pane`,
-`code_review`, `perf_hud`, `soft_delete`) apply **live** on save; the rest
+`code_review`, `cc_activity`, `perf_hud`, `soft_delete`) apply **live** on save; the rest
 (`automations`, `mouse`, `notifications`, `version_check`, `auto_update`)
 take effect on the next launch.
 A disabled feature's pane never renders, its keybinding shows
@@ -229,6 +230,7 @@ no results. Data is never touched, so re-enabling a flag is lossless.
 | `info_panel` | `true` | info panel column (`F2`) |
 | `shell_pane` | `true` | per-session shell toggle (`Ctrl+T`) |
 | `code_review` | `true` | native code-review view (diff + comments, `Ctrl+X`) |
+| `cc_activity` | `true` | Claude Code activity view: workflow/subagent transcripts (`F9`); Claude + local sessions only |
 | `perf_hud` | `true` | perf HUD overlay (`F12`): live perf counters + frame/tick timing (see `docs/PERFORMANCE.md`) |
 | `mouse` | `true` | mouse capture: clicks, wheel, drag-select, hover, scrollbars |
 | `notifications` | `true` | OS desktop notifications when a session needs attention |

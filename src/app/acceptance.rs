@@ -977,6 +977,127 @@ fn review_files_pane_navigates_and_opens_into_diff() {
     assert!(matches!(h.app.focus, InputFocus::CodeReview));
 }
 
+// ── CC activity view: workflow/subagent transcript ───────────────────────────
+
+#[test]
+fn cc_activity_view_opens_navigates_folds_and_closes() {
+    use crate::session::{CcActivity, CcAgent, CcAgentState, CcRunStatus, CcWorkflow};
+    let tmp = tempfile::tempdir().unwrap();
+    // A real transcript file so selecting the agent loads blocks.
+    let transcript = tmp.path().join("agent-a1.jsonl");
+    std::fs::write(
+        &transcript,
+        "{\"type\":\"user\",\"message\":{\"content\":\"do the thing\"}}\n\
+         {\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"on it\"}]}}\n",
+    )
+    .unwrap();
+    let agent = |id: &str, path: std::path::PathBuf, state| CcAgent {
+        agent_id: id.into(),
+        transcript_path: path,
+        agent_type: "workflow-subagent".into(),
+        description: None,
+        label: None,
+        phase_title: None,
+        state,
+        mtime_ns: 0,
+        size: 0,
+        tokens: None,
+        tool_calls: None,
+        last_tool: None,
+        model: None,
+    };
+    let activity = CcActivity {
+        workflows: vec![CcWorkflow {
+            run_id: "wf_x".into(),
+            name: Some("demo".into()),
+            dir: tmp.path().to_path_buf(),
+            status: CcRunStatus::Running,
+            phases: Vec::new(),
+            agents: vec![
+                agent("a1", transcript.clone(), CcAgentState::Active),
+                agent("a2", tmp.path().join("missing.jsonl"), CcAgentState::Done),
+            ],
+            summary: None,
+            tempo: None,
+            needs: None,
+        }],
+        subagents: vec![CcAgent {
+            agent_type: "Explore".into(),
+            ..agent("s1", tmp.path().join("agent-s1.jsonl"), CcAgentState::Done)
+        }],
+    };
+
+    let mut h = Harness::spawnable(1);
+    h.app.sessions[0].info.cc_activity = Some(activity);
+
+    // F9 opens the view, focused on the tree (workflow header + 2 agents + 1
+    // standalone subagent = 4 rows).
+    h.key(KeyCode::F(9), KeyModifiers::NONE);
+    assert_eq!(h.app.focus, InputFocus::CcActivityTree);
+    assert_eq!(h.app.active_cc_activity().unwrap().tree.len(), 4);
+
+    // Moving to the first workflow agent auto-previews its transcript; `Enter`
+    // drops into it to read (prompt + assistant text = 2 rows).
+    h.key(KeyCode::Char('j'), KeyModifiers::NONE);
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(h.app.focus, InputFocus::CcActivity);
+    assert_eq!(h.app.active_cc_activity().unwrap().rows.len(), 2);
+
+    // `/` opens find; typing filters to matching rows and jumps the selection.
+    // The transcript is [Prompt("do the thing"), Text("on it")].
+    h.key(KeyCode::Char('/'), KeyModifiers::NONE);
+    assert!(
+        h.app
+            .active_cc_activity()
+            .unwrap()
+            .search
+            .as_ref()
+            .unwrap()
+            .editing
+    );
+    for c in "thing".chars() {
+        h.key(KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    {
+        let ca = h.app.active_cc_activity().unwrap();
+        assert_eq!(ca.search.as_ref().unwrap().matches, vec![0]);
+        assert_eq!(ca.selected, 0, "selection jumped to the first match");
+    }
+    // Tab commits (keeps the highlight bar); Esc then clears it without closing.
+    h.key(KeyCode::Tab, KeyModifiers::NONE);
+    assert!(
+        !h.app
+            .active_cc_activity()
+            .unwrap()
+            .search
+            .as_ref()
+            .unwrap()
+            .editing
+    );
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(h.app.active_cc_activity().unwrap().search.is_none());
+    assert!(
+        h.app.active_cc_activity().is_some(),
+        "clearing the search keeps the view open"
+    );
+
+    // `h` steps back to the tree; folding the workflow hides its agents.
+    h.key(KeyCode::Char('h'), KeyModifiers::NONE);
+    assert_eq!(h.app.focus, InputFocus::CcActivityTree);
+    h.key(KeyCode::Home, KeyModifiers::NONE); // back onto the workflow header
+    h.key(KeyCode::Char(' '), KeyModifiers::NONE);
+    assert_eq!(
+        h.app.active_cc_activity().unwrap().tree.len(),
+        2,
+        "a folded workflow hides its 2 agents (header + the standalone subagent remain)"
+    );
+
+    // Esc closes and returns focus to the terminal.
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(h.app.active_cc_activity().is_none());
+    assert_eq!(h.app.focus, InputFocus::Terminal);
+}
+
 #[test]
 fn review_jump_to_file_anchors_header_to_top() {
     let mut h = Harness::standard(1);
@@ -1471,23 +1592,36 @@ async fn central_tab_strip_omits_feature_gated_tabs() {
             .collect()
     };
 
-    // Only one alternate view gated off → the strip stays (Agent + the other).
+    // Only one alternate view enabled → the strip stays (Agent + the other).
     h.app.features.shell_pane = false;
+    h.app.features.cc_activity = false;
     h.app.features.code_review = true;
     h.render();
     assert_eq!(
         collect_tabs(&h.app),
         vec![CentralTab::Agent, CentralTab::Review],
-        "Review survives when only Shell is gated off"
+        "Review survives when the other alternate views are gated off"
     );
 
-    // Both alternate views gated off → no tab strip at all.
+    // The activity view is likewise a gated central tab.
     h.app.features.shell_pane = false;
     h.app.features.code_review = false;
+    h.app.features.cc_activity = true;
+    h.render();
+    assert_eq!(
+        collect_tabs(&h.app),
+        vec![CentralTab::Agent, CentralTab::CcActivity],
+        "Activity survives when the other alternate views are gated off"
+    );
+
+    // All alternate views gated off → no tab strip at all.
+    h.app.features.shell_pane = false;
+    h.app.features.code_review = false;
+    h.app.features.cc_activity = false;
     h.render();
     assert!(
         collect_tabs(&h.app).is_empty(),
-        "the lone Agent tab is dropped when Shell and Review are both off"
+        "the lone Agent tab is dropped when Shell, Review, and Activity are all off"
     );
 }
 
@@ -2656,6 +2790,17 @@ fn assert_invariants(app: &App, ctx: &str) {
             app.features.automations,
             "[{ctx}] automations focus with the feature disabled"
         ),
+        InputFocus::CcActivity | InputFocus::CcActivityTree => {
+            assert!(
+                app.features.cc_activity,
+                "[{ctx}] activity focus with the feature disabled"
+            );
+            assert!(
+                app.active_cc_activity().is_some(),
+                "[{ctx}] focus {:?} but the active session has no open activity view",
+                app.focus
+            );
+        }
         InputFocus::SessionList | InputFocus::Terminal => {}
     }
 

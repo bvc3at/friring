@@ -47,6 +47,7 @@ config_version = 1
 # info_panel = true       # F2 info panel
 # shell_pane = true       # Ctrl+T per-session shell
 # code_review = true      # native code-review view (diff + comments)
+# cc_activity = true      # Claude Code workflow/subagent activity view (F9)
 # perf_hud = true         # F12 perf HUD overlay (live counters + timing)
 # mouse = true            # mouse capture: clicks, wheel, drag-select, hover
 # notifications = true    # OS desktop notifications when a session needs attention
@@ -233,6 +234,7 @@ pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
         set_table_bool(features, "info_panel", f.info_panel);
         set_table_bool(features, "shell_pane", f.shell_pane);
         set_table_bool(features, "code_review", f.code_review);
+        set_table_bool(features, "cc_activity", f.cc_activity);
         set_table_bool(features, "perf_hud", f.perf_hud);
         set_table_bool(features, "mouse", f.mouse);
         set_table_bool(features, "notifications", f.notifications);
