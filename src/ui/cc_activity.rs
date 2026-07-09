@@ -167,25 +167,36 @@ fn render_search_bar(frame: &mut Frame, area: Rect, state: &CcActivityState) {
     let Some(s) = &state.search else {
         return;
     };
-    let count = s.matches.len();
-    let current = s.matches.iter().filter(|&&i| i <= state.selected).count();
-    let pos = if count == 0 {
+    let total = s.matches.len();
+    // "current" is derived from the selection (like code review / the file
+    // viewer's `current_match_index`): the 1-based rank of the selected row
+    // among the matches, or 0 when the cursor isn't on a match. Blank on an
+    // empty query, "no matches" only once something's been typed.
+    let current = s
+        .matches
+        .iter()
+        .position(|&i| i == state.selected)
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let pos = if s.query.trim().is_empty() {
+        String::new()
+    } else if total == 0 {
         "no matches".to_string()
     } else {
-        format!("{current}/{count}")
+        format!("{current}/{total}")
     };
     let hint = if s.editing {
         "Enter/↓ next · ↑ prev · Tab done · Esc cancel"
     } else {
         "n/N next/prev · Esc clear"
     };
-    let spans = vec![
-        Span::styled(format!("/{}", s.query), accent()),
-        Span::raw("  "),
-        Span::styled(pos, dim()),
-        Span::raw("  "),
-        Span::styled(hint, dim()),
-    ];
+    let mut spans = vec![Span::styled(format!("/{}", s.query), accent())];
+    if !pos.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(pos, dim()));
+    }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(hint, dim()));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -442,7 +453,7 @@ pub(crate) fn render_tree(
         .zip(list_area.y..)
     {
         let selected = offset == state.tree_selected;
-        let line = tree_row_line(state, row, list_area.width as usize, selected);
+        let line = tree_row_line(state, row, selected);
         let rect = Rect::new(list_area.x, y, list_area.width, 1);
         frame.render_widget(Paragraph::new(line), rect);
         hitboxes.push(RowHitbox {
@@ -456,12 +467,7 @@ pub(crate) fn render_tree(
     hitboxes
 }
 
-fn tree_row_line(
-    state: &CcActivityState,
-    row: &CcTreeRow,
-    width: usize,
-    selected: bool,
-) -> Line<'static> {
+fn tree_row_line(state: &CcActivityState, row: &CcTreeRow, selected: bool) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = match row {
         CcTreeRow::Workflow(wi) => {
             let w = state.activity.workflows.get(*wi);
@@ -511,8 +517,6 @@ fn tree_row_line(
         },
         CcTreeRow::Info(s) => vec![Span::styled(s.clone(), dim())],
     };
-    // Clip to width.
-    let _ = width;
     if selected {
         for span in &mut spans {
             span.style = span.style.add_modifier(Modifier::REVERSED);
