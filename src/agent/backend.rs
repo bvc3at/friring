@@ -76,6 +76,10 @@ pub struct TermSignals {
     attention_at: Arc<AtomicU64>,
     /// Message text from the most recent OSC 9/777 notification, if any.
     notification: Arc<Mutex<Option<String>>>,
+    /// Generation counter bumped after every title/notification write, so the
+    /// per-tick status refresh can skip the mutex locks + String clones while
+    /// nothing changed (ADR-P10; see [`Session::sync_agent_meta`]).
+    meta_gen: Arc<AtomicU64>,
 }
 
 impl TermSignals {
@@ -84,6 +88,9 @@ impl TermSignals {
         if let Ok(mut guard) = self.title.lock() {
             *guard = (!s.is_empty()).then_some(s);
         }
+        // After the write, so a reader that observes the new generation also
+        // observes the new value.
+        self.meta_gen.fetch_add(1, Ordering::Release);
     }
 
     /// Mark an attention signal, optionally with notification message text.
@@ -94,6 +101,7 @@ impl TermSignals {
             if let Ok(mut guard) = self.notification.lock() {
                 *guard = (!msg.is_empty()).then_some(msg);
             }
+            self.meta_gen.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -191,8 +199,27 @@ pub trait SessionBackend: Send + Sync {
         cols: u16,
     ) -> Result<SpawnedSession>;
 
-    /// Reconnect to an existing session.
-    fn adopt(&self, backend_id: &str, rows: u16, cols: u16) -> Result<AdoptedSession>;
+    /// Reconnect to an existing session. `seed` is pre-captured scrollback
+    /// history to prepend to the live stream (see [`Self::capture_history`]);
+    /// `None` makes the backend capture it itself — the two paths produce the
+    /// same bytes, `Some` just lets restore overlap the captures (ADR-P9).
+    fn adopt(
+        &self,
+        backend_id: &str,
+        rows: u16,
+        cols: u16,
+        seed: Option<Vec<u8>>,
+    ) -> Result<AdoptedSession>;
+
+    /// Capture a session's scrollback history as terminal bytes suitable for
+    /// seeding a fresh parser, to pass into [`Self::adopt`]. An independent
+    /// subprocess per pane, safe to run concurrently across sessions — unlike
+    /// `adopt`'s control-mode connect, which is serialized. Default: no
+    /// history (backends without a capture facility adopt with an empty
+    /// scrollback, exactly as if the capture had failed).
+    fn capture_history(&self, _backend_id: &str) -> Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
 
     /// Discover existing sessions managed by this backend.
     fn discover(&self) -> Result<Vec<DiscoveredSession>>;
@@ -295,6 +322,7 @@ struct WiredState {
     last_title: Arc<Mutex<Option<String>>>,
     attention_at: Arc<AtomicU64>,
     notification: Arc<Mutex<Option<String>>>,
+    meta_gen: Arc<AtomicU64>,
 }
 
 /// A companion shell pane running alongside an agent session.
@@ -356,6 +384,12 @@ pub struct Session {
     attention_at: Arc<AtomicU64>,
     /// Message text from the latest OSC 9/777 notification, if any.
     notification: Arc<Mutex<Option<String>>>,
+    /// Shared with [`TermSignals::meta_gen`]: bumped by the reader thread on
+    /// every title/notification write.
+    meta_gen: Arc<AtomicU64>,
+    /// The generation last consumed by [`Self::sync_agent_meta`]. Starts at
+    /// `u64::MAX` so the first tick always syncs.
+    last_synced_meta_gen: u64,
     /// `now_millis()` of the last attention acknowledgement (set while the
     /// session is the active one). Attention is pending when
     /// `attention_at > attention_ack_at`.
@@ -363,6 +397,13 @@ pub struct Session {
     pub shell_pane: Option<ShellPane>,
     /// Session environment variables, passed to shell pane spawns.
     env: HashMap<String, String>,
+    /// True for a **placeholder** session: a persisted remote session whose host
+    /// is currently unreachable, so it has no live backend pane / reader / writer
+    /// (its `input_tx` is a dead channel and its `parser` holds a static "host
+    /// unreachable" notice). Rendered with `SessionStatus::Unreachable` and
+    /// replaced in place by the real adopted session once the host recovers. See
+    /// `App::start_remote_restore` / the remote retry loop.
+    placeholder: bool,
 }
 
 impl Session {
@@ -421,7 +462,10 @@ impl Session {
         ))
     }
 
-    /// Reconnect to an existing backend session.
+    /// Reconnect to an existing backend session. `seed` is optional
+    /// pre-captured scrollback (see [`SessionBackend::capture_history`]);
+    /// `None` = the backend captures it during the adopt.
+    #[allow(clippy::too_many_arguments)]
     pub fn adopt(
         name: String,
         rows: u16,
@@ -430,8 +474,9 @@ impl Session {
         backend: &Arc<dyn SessionBackend>,
         provider: &Arc<dyn AgentProvider>,
         env: HashMap<String, String>,
+        seed: Option<Vec<u8>>,
     ) -> Result<Self> {
-        let adopted = backend.adopt(backend_id, rows, cols)?;
+        let adopted = backend.adopt(backend_id, rows, cols, seed)?;
 
         debug!(
             backend_id = %backend_id,
@@ -466,6 +511,7 @@ impl Session {
         let last_title = Arc::new(Mutex::new(None));
         let attention_at = Arc::new(AtomicU64::new(0));
         let notification = Arc::new(Mutex::new(None));
+        let meta_gen = Arc::new(AtomicU64::new(0));
         let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
             rows,
             cols,
@@ -474,6 +520,7 @@ impl Session {
                 title: Arc::clone(&last_title),
                 attention_at: Arc::clone(&attention_at),
                 notification: Arc::clone(&notification),
+                meta_gen: Arc::clone(&meta_gen),
             },
         )));
 
@@ -498,6 +545,7 @@ impl Session {
             last_title,
             attention_at,
             notification,
+            meta_gen,
         };
         (state, io.backend_id)
     }
@@ -525,10 +573,88 @@ impl Session {
             last_title: state.last_title,
             attention_at: state.attention_at,
             notification: state.notification,
+            meta_gen: state.meta_gen,
+            last_synced_meta_gen: u64::MAX,
             attention_ack_at: 0,
             shell_pane: None,
             env,
+            placeholder: false,
         }
+    }
+
+    /// Build a **placeholder** session for a persisted remote session whose host
+    /// is currently unreachable. It carries no live backend pane: the reader /
+    /// writer loops are never spawned, `input_tx` is a dead channel (keystrokes
+    /// are silently dropped), and the `parser` is seeded with a static notice.
+    /// The row renders like any other (grouping/ordering/nesting all key off
+    /// `info`) but shows `SessionStatus::Unreachable` until the host recovers and
+    /// [`Self::adopt`] replaces it in place. `info.status` is forced to
+    /// `Unreachable` here regardless of the caller's value.
+    pub fn placeholder(
+        mut info: SessionInfo,
+        rows: u16,
+        cols: u16,
+        backend: &Arc<dyn SessionBackend>,
+        provider: &Arc<dyn AgentProvider>,
+        env: HashMap<String, String>,
+    ) -> Self {
+        info.status = crate::session::SessionStatus::Unreachable;
+        info.backend_id = None;
+
+        let last_title = Arc::new(Mutex::new(None));
+        let attention_at = Arc::new(AtomicU64::new(0));
+        let notification = Arc::new(Mutex::new(None));
+        let meta_gen = Arc::new(AtomicU64::new(0));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            rows.max(1),
+            cols.max(1),
+            crate::session::settings::global().scrollback_lines,
+            TermSignals {
+                title: Arc::clone(&last_title),
+                attention_at: Arc::clone(&attention_at),
+                notification: Arc::clone(&notification),
+                meta_gen: Arc::clone(&meta_gen),
+            },
+        )));
+        let host = info.remote_host.clone().unwrap_or_else(|| "?".into());
+        let notice = format!(
+            "\r\n  \u{2298} Remote host '{host}' unreachable \u{2014} retrying\u{2026}\r\n\r\n  \
+             This session will reconnect automatically when the host comes back.\r\n  \
+             Press restart to retry now, or delete to remove it.\r\n"
+        );
+        if let Ok(mut p) = parser.lock() {
+            p.process(notice.as_bytes());
+        }
+
+        // A dead input channel: the receiver is dropped immediately, so any
+        // keystroke `try_send` fails fast and the byte is discarded.
+        let (input_tx, _dead_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+
+        Self {
+            info,
+            parser,
+            input_tx,
+            backend_id: String::new(),
+            backend: Arc::clone(backend),
+            provider: Arc::clone(provider),
+            exited: Arc::new(AtomicBool::new(false)),
+            last_output_at: Arc::new(AtomicU64::new(0)),
+            last_title,
+            attention_at,
+            notification,
+            meta_gen,
+            last_synced_meta_gen: u64::MAX,
+            attention_ack_at: 0,
+            shell_pane: None,
+            env,
+            placeholder: true,
+        }
+    }
+
+    /// Whether this is a placeholder for an unreachable remote session (no live
+    /// backend pane). See [`Self::placeholder`].
+    pub fn is_placeholder(&self) -> bool {
+        self.placeholder
     }
 
     /// Blocking read loop feeding the vt100 parser. Runs on a
@@ -605,6 +731,19 @@ impl Session {
     }
 
     pub fn resize(&self, rows: u16, cols: u16) {
+        // A cramped layout (tiny terminal + open panels/strips) can compute a
+        // zero-row/col content area; vt100's `set_size` underflows on 0 and
+        // tmux rejects it, so clamp at this boundary for every path below.
+        let (rows, cols) = (rows.max(1), cols.max(1));
+        // A placeholder has no live pane; only resize its local notice buffer.
+        // Talking to the (possibly-down) backend here would issue a blocking
+        // ssh resize on the UI thread — the freeze we're avoiding.
+        if self.placeholder {
+            if let Ok(mut parser) = self.parser.lock() {
+                parser.screen_mut().set_size(rows, cols);
+            }
+            return;
+        }
         if let Err(e) = self.backend.resize(&self.backend_id, rows, cols) {
             tracing::warn!("Failed to resize session: {e}");
             return;
@@ -660,6 +799,33 @@ impl Session {
     /// Latest OSC window title the agent emitted, if any (live activity text).
     pub fn agent_title(&self) -> Option<String> {
         self.last_title.lock().ok().and_then(|t| t.clone())
+    }
+
+    /// Read the agent's title + notification **only when they changed** since
+    /// the last call: `None` means unchanged (reuse the previously-synced
+    /// values), `Some` carries the fresh pair. The reader thread bumps a
+    /// generation counter on every write (`TermSignals::meta_gen`), so the
+    /// ~100 Hz status refresh pays one atomic load per session instead of two
+    /// mutex locks + two `String` clones (ADR-P10). A generation observed
+    /// before its write completes only delays the sync by one ~10 ms tick —
+    /// the counter is bumped *after* the value write, never before.
+    pub fn sync_agent_meta(&mut self) -> Option<(Option<String>, Option<String>)> {
+        let gen = self.meta_gen.load(Ordering::Acquire);
+        if gen == self.last_synced_meta_gen {
+            return None;
+        }
+        self.last_synced_meta_gen = gen;
+        Some((self.agent_title(), self.notification()))
+    }
+
+    /// Simulate a reader-thread title/notification write for the ADR-P10
+    /// perf tests (mirrors [`Self::mark_exited_for_test`]).
+    #[cfg(test)]
+    pub(crate) fn bump_meta_gen_for_test(&self, title: &str) {
+        if let Ok(mut guard) = self.last_title.lock() {
+            *guard = Some(title.to_string());
+        }
+        self.meta_gen.fetch_add(1, Ordering::Release);
     }
 
     /// Whether the agent has signalled for attention (bell / OSC 9 / OSC 777)
@@ -769,6 +935,10 @@ impl Session {
 
     /// Kill/destroy the backend session (for Ctrl+X close).
     pub fn kill(&self) {
+        // A placeholder owns no live backend pane (see `placeholder`).
+        if self.placeholder {
+            return;
+        }
         self.kill_shell_pane();
         if let Err(e) = self.backend.kill(&self.backend_id) {
             tracing::warn!("Failed to kill session: {e}");
@@ -777,6 +947,11 @@ impl Session {
 
     /// Detach from the backend session without killing it (for Ctrl+Q quit).
     pub fn detach(self) {
+        // A placeholder owns no live backend pane — detaching would issue a
+        // blocking ssh call (possibly to a down host) for nothing.
+        if self.placeholder {
+            return;
+        }
         if let Some(shell) = &self.shell_pane {
             if let Err(e) = self.backend.detach(&shell.backend_id) {
                 tracing::warn!("Failed to detach shell pane: {e}");
@@ -837,7 +1012,7 @@ impl Session {
 
     /// Re-adopt an existing shell pane from a backend_id (for restore on restart).
     pub fn adopt_shell_pane(&mut self, backend_id: &str, rows: u16, cols: u16) -> Result<()> {
-        let adopted = self.backend.adopt(backend_id, rows, cols)?;
+        let adopted = self.backend.adopt(backend_id, rows, cols, None)?;
 
         let (state, bid) = Self::wire_up(
             rows,
@@ -886,13 +1061,25 @@ impl Session {
         provider: &Arc<dyn AgentProvider>,
     ) -> (Self, mpsc::Receiver<Vec<u8>>) {
         let (input_tx, input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+        // Wire TermSignals to the session's accessor cells exactly like
+        // `wire_up`, so bytes injected via `feed_output_for_test` drive
+        // `agent_title`/`needs_attention` the same way live PTY output does.
+        let last_title = Arc::new(Mutex::new(None));
+        let attention_at = Arc::new(AtomicU64::new(0));
+        let notification = Arc::new(Mutex::new(None));
+        let meta_gen = Arc::new(AtomicU64::new(0));
         let session = Self {
             info: SessionInfo::new(name.to_string()),
             parser: Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
                 24,
                 80,
                 0,
-                TermSignals::default(),
+                TermSignals {
+                    title: Arc::clone(&last_title),
+                    attention_at: Arc::clone(&attention_at),
+                    notification: Arc::clone(&notification),
+                    meta_gen: Arc::clone(&meta_gen),
+                },
             ))),
             input_tx,
             backend_id: String::new(),
@@ -900,14 +1087,34 @@ impl Session {
             provider: Arc::clone(provider),
             exited: Arc::new(AtomicBool::new(false)),
             last_output_at: Arc::new(AtomicU64::new(now_millis())),
-            last_title: Arc::new(Mutex::new(None)),
-            attention_at: Arc::new(AtomicU64::new(0)),
-            notification: Arc::new(Mutex::new(None)),
+            last_title,
+            attention_at,
+            notification,
+            meta_gen,
+            last_synced_meta_gen: u64::MAX,
             attention_ack_at: 0,
             shell_pane: None,
             env: HashMap::new(),
+            placeholder: false,
         };
         (session, input_rx)
+    }
+
+    /// Feed raw agent-output bytes into the session exactly as the reader loop
+    /// would: bump `last_output_at` and run the bytes through the vt100 parser
+    /// (firing `TermSignals` callbacks). This is the test seam for everything
+    /// downstream of PTY output — terminal rendering, the output-change redraw
+    /// detector, OSC title/bell signals, and buffer-content search.
+    #[cfg(test)]
+    pub fn feed_output_for_test(&self, bytes: &[u8]) {
+        // Strictly-increasing bump: two feeds within the same millisecond must
+        // still read as *new* output to `App::detect_output_redraw`'s signature.
+        let prev = self.last_output_at.load(Ordering::Relaxed);
+        self.last_output_at
+            .store(now_millis().max(prev + 1), Ordering::Relaxed);
+        if let Ok(mut p) = self.parser.lock() {
+            p.process(bytes);
+        }
     }
 }
 

@@ -1506,6 +1506,7 @@ pub enum SettingsField {
     FeatShellPane,
     FeatCodeReview,
     FeatCcActivity,
+    FeatPerfHud,
     FeatMouse,
     FeatNotifications,
     FeatSoftDelete,
@@ -1526,7 +1527,7 @@ pub enum SettingsField {
 impl SettingsField {
     /// Field nav order — also the render order (headers are interleaved by the
     /// renderer). Used by [`cycle_field`] and the scroll-windowing logic.
-    pub const ORDER: [SettingsField; 21] = [
+    pub const ORDER: [SettingsField; 22] = [
         SettingsField::FeatTasks,
         SettingsField::FeatAutomations,
         SettingsField::FeatFileViewer,
@@ -1535,6 +1536,7 @@ impl SettingsField {
         SettingsField::FeatShellPane,
         SettingsField::FeatCodeReview,
         SettingsField::FeatCcActivity,
+        SettingsField::FeatPerfHud,
         SettingsField::FeatMouse,
         SettingsField::FeatNotifications,
         SettingsField::FeatSoftDelete,
@@ -1577,6 +1579,11 @@ impl SettingsField {
                 "cc_activity",
                 "CC activity",
                 "Claude workflow/subagent transcript view",
+            ),
+            FeatPerfHud => (
+                "perf_hud",
+                "Perf HUD",
+                "Live perf counters + frame/tick timing overlay",
             ),
             FeatMouse => ("mouse", "Mouse", "Mouse: clicks, wheel, drag-select, hover"),
             FeatNotifications => (
@@ -1732,6 +1739,7 @@ impl SettingsModal {
             FeatShellPane => f.shell_pane = !f.shell_pane,
             FeatCodeReview => f.code_review = !f.code_review,
             FeatCcActivity => f.cc_activity = !f.cc_activity,
+            FeatPerfHud => f.perf_hud = !f.perf_hud,
             FeatMouse => f.mouse = !f.mouse,
             FeatNotifications => f.notifications = !f.notifications,
             FeatSoftDelete => f.soft_delete = !f.soft_delete,
@@ -1790,6 +1798,7 @@ impl SettingsModal {
             FeatShellPane => on(f.shell_pane),
             FeatCodeReview => on(f.code_review),
             FeatCcActivity => on(f.cc_activity),
+            FeatPerfHud => on(f.perf_hud),
             FeatMouse => on(f.mouse),
             FeatNotifications => on(f.notifications),
             FeatSoftDelete => on(f.soft_delete),
@@ -3207,7 +3216,7 @@ mod tests {
 
     #[test]
     fn settings_order_lists_every_field_once() {
-        assert_eq!(SettingsField::ORDER.len(), 21);
+        assert_eq!(SettingsField::ORDER.len(), 22);
         for f in SettingsField::ORDER {
             assert_eq!(
                 SettingsField::ORDER.iter().filter(|x| **x == f).count(),
@@ -3283,6 +3292,7 @@ mod tests {
             FeatShellPane,
             FeatCodeReview,
             FeatCcActivity,
+            FeatPerfHud,
             FeatSoftDelete,
         ] {
             assert!(!f.restart_required(), "{f:?} should be live");

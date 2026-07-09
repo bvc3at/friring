@@ -44,17 +44,20 @@ fn push_keyboard_enhancement() {
 /// does not, so both the shutdown path and the panic hook call this before
 /// leaving raw mode.
 fn pop_keyboard_enhancement() {
-    if KEYBOARD_ENHANCEMENT_PUSHED.load(Ordering::SeqCst) {
+    // `swap` so a second restore (guard drop after an explicit restore, or the
+    // panic hook racing the guard) can't pop a level we never pushed.
+    if KEYBOARD_ENHANCEMENT_PUSHED.swap(false, Ordering::SeqCst) {
         let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
     }
 }
 
 /// Undo every terminal mutation we made on startup, in reverse order: pop the
 /// kitty flags, disable bracketed paste + mouse capture, then leave the
-/// alternate screen / raw mode (`ratatui::restore()`). Idempotent enough that
-/// calling it twice (e.g. the panic hook *and* the unwinding `TerminalGuard`)
-/// is harmless. The single source of truth shared by the panic hook and the
-/// guard so the two restore paths can't drift.
+/// alternate screen / raw mode (`ratatui::restore()`). Idempotent, so the
+/// callers can safely overlap: the normal quit path calls it explicitly (before
+/// the slow session detach) *and* again via the `TerminalGuard` drop, and the
+/// panic hook may race that guard on unwind. The single source of truth shared
+/// by all three so the restore paths can't drift.
 fn restore_terminal() {
     pop_keyboard_enhancement();
     let _ = execute!(
@@ -122,7 +125,10 @@ async fn main() -> Result<()> {
     let t_phase = std::time::Instant::now();
     let db = open_database()?;
     startup.db_open_ms = t_phase.elapsed().as_millis();
+
+    let t_phase = std::time::Instant::now();
     activate_persisted_theme(&db);
+    startup.theme_activate_ms = t_phase.elapsed().as_millis();
 
     let t_phase = std::time::Instant::now();
 
@@ -176,7 +182,9 @@ async fn main() -> Result<()> {
     push_keyboard_enhancement();
     let size = terminal.size()?;
 
+    let t_phase = std::time::Instant::now();
     let mut app = App::new(size.height, size.width, backends, agents, db);
+    startup.app_new_ms = t_phase.elapsed().as_millis();
     app.set_hosts(hosts);
     if let Some(rx) = auto_update_rx {
         app.set_auto_update_receiver(rx);
@@ -191,13 +199,25 @@ async fn main() -> Result<()> {
     }
     startup.restore_ms = t_phase.elapsed().as_millis();
 
+    let t_phase = std::time::Instant::now();
     arm_automation_heartbeat();
+    startup.heartbeat_ms = t_phase.elapsed().as_millis();
+
+    // Hand the phase breakdown to the app so the published perf snapshot
+    // (`thurbox-cli perf`) can show boot cost alongside the runtime stats.
+    app.set_startup_phases(startup.as_json());
 
     let res = run_loop(&mut terminal, &mut app, process_start, startup).await;
 
+    // Restore the terminal *before* the (potentially slow) session detach:
+    // `shutdown()` detaches tmux/SSH sessions, and while it runs the event loop
+    // is no longer draining stdin. With mouse capture still on, any mouse motion
+    // in that window queues SGR reports (`ESC[<b;x;yM`) in the tty buffer that
+    // the shell then echoes as `51;82;30M`-style garbage once thurbox exits.
+    // `restore_terminal` is idempotent, so the `_terminal_guard` drop below (and
+    // early-error returns) still restore correctly.
+    restore_terminal();
     app.shutdown();
-    // `_terminal_guard` restores the terminal as it drops here (and on any early
-    // error return above).
     res
 }
 
@@ -395,11 +415,33 @@ struct StartupTimings {
     config_init_ms: u128,
     /// `Database::open` (schema migrations included).
     db_open_ms: u128,
+    /// `activate_persisted_theme`: the metadata read + custom-theme publish.
+    theme_activate_ms: u128,
     /// Extension self-heal + built-in hooks wiring + agents.toml reload.
     extension_heal_ms: u128,
+    /// `App::new` (keybindings JSON load, settings snapshot, channel setup).
+    app_new_ms: u128,
     /// `load_persisted_state_from_db` + `restore_sessions` (sequential local
     /// adopt; remote backends restore on background threads, off this phase).
     restore_ms: u128,
+    /// `arm_automation_heartbeat`: a synchronous tmux subprocess.
+    heartbeat_ms: u128,
+}
+
+impl StartupTimings {
+    /// The phase breakdown as JSON, mirroring the `startup` log line's fields
+    /// (sans `first_frame_ms`, which isn't known until the first paint).
+    fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "config_init_ms": self.config_init_ms as u64,
+            "db_open_ms": self.db_open_ms as u64,
+            "theme_activate_ms": self.theme_activate_ms as u64,
+            "extension_heal_ms": self.extension_heal_ms as u64,
+            "app_new_ms": self.app_new_ms as u64,
+            "restore_ms": self.restore_ms as u64,
+            "heartbeat_ms": self.heartbeat_ms as u64,
+        })
+    }
 }
 
 async fn run_loop(
@@ -420,16 +462,27 @@ async fn run_loop(
         // or the forced-redraw floor elapsed. The loop still spins every ≤10ms
         // (cheap: poll + output check + tick), but the expensive layout/vt100
         // render is skipped when idle — see App::should_redraw / docs/PERFORMANCE.md.
+        // Wall-clock timing is opt-in (THURBOX_PERF_LOG or the perf HUD): the
+        // cached-bool gate keeps the default hot loop free of Instant reads.
+        let timing = app.perf_timing_active();
+
         if app.should_redraw() {
+            let draw_start = timing.then(std::time::Instant::now);
             terminal.draw(|f| app.view(f))?;
+            if let Some(start) = draw_start {
+                app.record_frame_time(start.elapsed());
+            }
             app.mark_redrawn();
 
             if perf_log && !first_frame_logged {
                 tracing::info!(
                     config_init_ms = startup.config_init_ms as u64,
                     db_open_ms = startup.db_open_ms as u64,
+                    theme_activate_ms = startup.theme_activate_ms as u64,
                     extension_heal_ms = startup.extension_heal_ms as u64,
+                    app_new_ms = startup.app_new_ms as u64,
                     restore_ms = startup.restore_ms as u64,
+                    heartbeat_ms = startup.heartbeat_ms as u64,
                     first_frame_ms = process_start.elapsed().as_millis() as u64,
                     "startup"
                 );
@@ -441,14 +494,22 @@ async fn run_loop(
 
         if event::poll(Duration::from_millis(10))? {
             if let Some(msg) = event_to_message(event::read()?) {
+                let update_start = timing.then(std::time::Instant::now);
                 app.update(msg); // marks the UI dirty
+                if let Some(start) = update_start {
+                    app.record_update_time(start.elapsed());
+                }
             }
         }
 
         // Cheap, lock-free check for new agent output (marks dirty on change).
         app.detect_output_redraw();
 
+        let tick_start = timing.then(std::time::Instant::now);
         app.tick();
+        if let Some(start) = tick_start {
+            app.record_tick_time(start.elapsed());
+        }
 
         if app.should_quit() {
             break;

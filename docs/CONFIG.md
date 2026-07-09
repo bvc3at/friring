@@ -27,7 +27,7 @@ development checkout never touches your real setup.
 the TUI polls their mtime (~1/s) and applies edits with a confirmation
 toast — no restart. For `settings.toml` only the **feature flags that
 gate UI panels** (`tasks`, `file_viewer`, `info_panel`, `global_search`,
-`shell_pane`, `code_review`, `cc_activity`, `soft_delete`) apply live; the restart-only values stay
+`shell_pane`, `code_review`, `cc_activity`, `perf_hud`, `soft_delete`) apply live; the restart-only values stay
 published through a write-once global (so they can't drift mid-frame),
 and the reload toast says when a restart is needed. `hosts.toml` (SSH
 backends register at startup) and `themes.toml` need a restart.
@@ -194,8 +194,10 @@ info_panel    = true
 shell_pane    = true
 code_review   = true
 cc_activity   = true
+perf_hud      = true
 mouse         = true
 notifications = true
+soft_delete   = true
 version_check = false          # opt-in: makes a network call
 auto_update   = false          # opt-in: downloads + replaces binaries
 
@@ -212,7 +214,7 @@ Turn major TUI features off entirely. All default to `true` **except
 `version_check` and `auto_update`, which default to `false`** (both
 reach the network, so they are opt-in). The UI-panel flags
 (`tasks`, `file_viewer`, `info_panel`, `global_search`, `shell_pane`,
-`code_review`, `cc_activity`, `soft_delete`) apply **live** on save; the rest
+`code_review`, `cc_activity`, `perf_hud`, `soft_delete`) apply **live** on save; the rest
 (`automations`, `mouse`, `notifications`, `version_check`, `auto_update`)
 take effect on the next launch.
 A disabled feature's pane never renders, its keybinding shows
@@ -229,6 +231,7 @@ no results. Data is never touched, so re-enabling a flag is lossless.
 | `shell_pane` | `true` | per-session shell toggle (`Ctrl+T`) |
 | `code_review` | `true` | native code-review view (diff + comments, `Ctrl+X`) |
 | `cc_activity` | `true` | Claude Code activity view: workflow/subagent transcripts (`F9`); Claude + local sessions only |
+| `perf_hud` | `true` | perf HUD overlay (`F12`): live perf counters + frame/tick timing (see `docs/PERFORMANCE.md`) |
 | `mouse` | `true` | mouse capture: clicks, wheel, drag-select, hover, scrollbars |
 | `notifications` | `true` | OS desktop notifications when a session needs attention |
 | `soft_delete` | `true` | TUI `Ctrl+D` soft-deletes (Ctrl+Z undo); off = hard delete after a confirmation prompt |
@@ -374,8 +377,8 @@ no id. A finished turn shows `Done` (blue) — for the session you're watching t
 The hooks are wired up automatically by the built-in **hooks** extension
 (auto-activated on first run). Opt out with `thurbox-cli extension deactivate
 hooks`. The status colours are tunable theme keys (`status_working` /
-`status_blocked` / `status_done` / `status_idle` / `status_error` — see
-`themes.toml`).
+`status_blocked` / `status_done` / `status_idle` / `status_error` /
+`status_unreachable` — see `themes.toml`).
 
 The wiring is applied **only to agents thurbox launches** — it never edits your
 own global agent config (e.g. your personal `~/.claude/settings.json`). thurbox's
@@ -614,6 +617,7 @@ Live in the `metadata` table and apply immediately (no restart):
 | `editor_command` | `thurbox-cli editor set "<cmd>"` | what `Ctrl+O` runs |
 | `active_extensions` | `thurbox-cli extension activate/deactivate` | JSON array of active extensions to self-heal |
 | `builtin_hooks_optout` | `thurbox-cli extension deactivate hooks` | `1` when the user opted out of the auto-activated hooks extension |
+| `perf_snapshot` | the TUI, while perf timing is active (`THURBOX_PERF_LOG` or an open perf HUD) | JSON perf snapshot read by `thurbox-cli perf` (see `docs/PERFORMANCE.md`) |
 
 These are in the DB rather than a file because they are written
 concurrently by multiple thurbox processes (TUI, CLI, MCP) and picked
@@ -629,6 +633,7 @@ User-set (read by thurbox):
 | `VISUAL`, then `EDITOR` | `Ctrl+O` editor when `editor_command` is unset |
 | `SHELL` | the `Ctrl+T` companion shell pane (fallback `/bin/sh`). For a remote/WSL session the pane uses the **host's** `$SHELL` as an interactive login shell (the SSH-login environment), not the local one. |
 | `RUST_LOG` | log filter for `thurbox.log` |
+| `THURBOX_PERF_LOG` | opt-in performance logging: a one-shot `startup` phase breakdown at first paint, per-session `restore_adopt`/`adopt_split` lines, steady-state `perf_window` lines (~10 s cadence), and wall-clock frame/tick timing collection. Any value enables it. See `docs/PERFORMANCE.md`. |
 | `THURBOX_SOCKET` | overrides the **local** multiplexer socket name (default `thurbox`; dev builds `thurbox-dev`). For test/sandbox tooling: Unix scoping uses `TMUX_TMPDIR`, but psmux (Windows) resolves every `-L <name>` machine-wide, so this is the only way to fully scope an instance there. Remote hosts are unaffected (socket from `hosts.toml`). Empty = unset. |
 
 Set **by** thurbox into every spawned agent process (not user-set;

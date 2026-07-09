@@ -695,10 +695,7 @@ impl App {
 
     fn open_file_in_editor(&mut self, root: std::path::PathBuf, file: std::path::PathBuf) {
         let Some(editor) = super::helpers::resolve_editor_command(&self.db) else {
-            self.set_status(
-                super::StatusLevel::Error,
-                "No editor configured — set `editor_command` via MCP or $VISUAL / $EDITOR.",
-            );
+            self.set_error(super::EDITOR_NOT_CONFIGURED);
             return;
         };
         if let Err(e) = super::helpers::open_in_editor(&[root, file], &editor) {
@@ -721,6 +718,25 @@ impl App {
                 parser.screen_mut().set_scrollback(0);
             }
         });
+
+        // A placeholder (unreachable remote) has no live pane; swallow the
+        // keystroke and hint how to recover instead of silently dropping it.
+        if self
+            .sessions
+            .get(self.active_index)
+            .is_some_and(|s| s.is_placeholder())
+        {
+            let host = self
+                .sessions
+                .get(self.active_index)
+                .and_then(|s| s.info.remote_host.clone())
+                .unwrap_or_else(|| "?".into());
+            self.set_status(
+                super::StatusLevel::Info,
+                format!("Session unreachable — host '{host}' is offline (restart to retry)"),
+            );
+            return;
+        }
 
         if let Some(session) = self.sessions.get(self.active_index) {
             if let Some(bytes) = input::key_to_bytes(code, mods) {
@@ -1164,6 +1180,10 @@ impl App {
                 "Global search",
                 Self::open_global_search,
             ),
+            Action::TogglePerfHud => self.gated(self.features.perf_hud, "Perf HUD", |s| {
+                s.show_perf_hud = !s.show_perf_hud;
+                s.request_redraw();
+            }),
             _ => return None,
         };
         Some(consumed)

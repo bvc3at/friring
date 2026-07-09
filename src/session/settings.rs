@@ -79,6 +79,10 @@ pub struct FeatureFlags {
     /// Claude, local sessions only.
     #[serde(default = "default_true")]
     pub cc_activity: bool,
+    /// Perf HUD overlay (F12): live perf counters + frame/tick timing. Opening
+    /// it also turns on wall-clock timing collection (see docs/PERFORMANCE.md).
+    #[serde(default = "default_true")]
+    pub perf_hud: bool,
     /// Mouse support: terminal mouse capture plus all click/scroll/hover
     /// handling (click-to-select, drag selection, Ctrl+Click URLs,
     /// scrollbars). Disable to keep the terminal's native mouse behavior
@@ -201,6 +205,7 @@ impl Default for FeatureFlags {
             shell_pane: true,
             code_review: true,
             cc_activity: true,
+            perf_hud: true,
             mouse: true,
             notifications: true,
             soft_delete: true,
@@ -470,6 +475,7 @@ mod tests {
             shell_pane,
             code_review,
             cc_activity,
+            perf_hud,
             mouse,
             notifications,
             soft_delete,
@@ -488,6 +494,7 @@ mod tests {
             shell_pane,
             code_review,
             cc_activity,
+            perf_hud,
             mouse,
             notifications,
             soft_delete,
@@ -498,7 +505,7 @@ mod tests {
         // `live` flags gate UI panels read from `App.features` every frame, so
         // flipping one is NOT a restart-only difference; the rest are read once
         // at startup and MUST register as one.
-        let live: [fn(&mut FeatureFlags); 8] = [
+        let live: [fn(&mut FeatureFlags); 9] = [
             |f| f.tasks = !f.tasks,
             |f| f.file_viewer = !f.file_viewer,
             |f| f.global_search = !f.global_search,
@@ -506,6 +513,7 @@ mod tests {
             |f| f.shell_pane = !f.shell_pane,
             |f| f.code_review = !f.code_review,
             |f| f.cc_activity = !f.cc_activity,
+            |f| f.perf_hud = !f.perf_hud,
             |f| f.soft_delete = !f.soft_delete,
         ];
         let restart: [fn(&mut FeatureFlags); 5] = [

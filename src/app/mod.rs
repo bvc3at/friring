@@ -2,11 +2,12 @@ mod automation;
 mod automation_state;
 mod background;
 pub(crate) mod cc_activity;
+pub(crate) mod clock;
 pub(crate) mod code_review;
 mod config_reload;
 mod helpers;
 mod key_handlers;
-mod metrics_state;
+pub(crate) mod metrics_state;
 pub(crate) mod modals;
 mod new_session_state;
 mod notify_state;
@@ -62,6 +63,30 @@ const SPINNER_TICKS_PER_FRAME: u64 = 12;
 /// 250 ms ≈ 4 fps when idle, vs. the old unconditional ~100 fps. See
 /// `docs/PERFORMANCE.md`.
 const FORCE_REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Slow-op thresholds (ms): a named synchronous UI-thread operation at or
+/// above `RECORD` lands in the slow-op ring (HUD / perf-window line); at or
+/// above `WARN` it also gets a `tracing::warn!` — a visible stall (multiple
+/// dropped frames) worth a log entry even when nobody is watching the HUD.
+const SLOW_OP_RECORD_MS: u64 = 5;
+const SLOW_OP_WARN_MS: u64 = 100;
+
+/// Ticks (~10 ms each) per steady-state perf report window (~10 s): under
+/// `THURBOX_PERF_LOG` each window emits one `perf_window` log line (counter
+/// deltas + timing percentiles) and refreshes the published snapshot.
+/// Tick-based so tests can drive windows without a wall clock.
+const PERF_WINDOW_TICKS: u64 = 1_000;
+
+/// Ticks between perf-snapshot publishes while the perf HUD is open (~5 s).
+/// Snapshot writes bump other connections' `data_version`, so this stays
+/// coarse and only runs while someone is actually looking at perf data.
+const PERF_SNAPSHOT_TICKS: u64 = 500;
+
+/// Ticks (~10 ms each) between the status refresh's `PRAGMA data_version`
+/// reads (~100 ms). Bounds an external `session signal`'s worst-case display
+/// latency while cutting the per-tick rusqlite round-trip 10× (ADR-P10);
+/// own-connection writes bypass the throttle via cache invalidation.
+const HOOK_VERSION_CHECK_TICKS: u64 = 10;
 
 /// Prompt sent to Claude sessions when a worktree rebase has conflicts.
 const SYNC_CONFLICT_PROMPT: &str = "Please sync this worktree with main. Run: git fetch origin && git rebase origin/main -- if there are conflicts, resolve them and continue the rebase with git rebase --continue.";
@@ -129,21 +154,60 @@ struct PendingSessionSpawn {
     base_branch: Option<String>,
 }
 
-/// One remote backend's discovery result: its `backend_type` plus the windows
-/// its host reported. Sent once per backend by the restore threads.
-type RemoteDiscovery = (String, Vec<crate::agent::backend::DiscoveredSession>);
+/// One remote backend's discovery result: its `backend_type`, whether the host
+/// was **reachable** (its `ensure_ready` succeeded — distinguishes "host down"
+/// from "host up but no windows"), plus the windows it reported. Sent once per
+/// discovery attempt by the restore threads.
+type RemoteDiscovery = (String, bool, Vec<crate::agent::backend::DiscoveredSession>);
 
-/// In-flight background restore of remote-backed sessions. Startup readies +
-/// discovers only *local* backends synchronously; each remote (`ssh:`/`wsl:`)
-/// backend is readied on its own thread, because a single ssh connect can take
-/// tens of seconds (or minutes for a down host) and must never block the first
-/// frame. Each thread sends one [`RemoteDiscovery`] message; the backend's
-/// sessions wait in `pending` and are adopted on the main thread once it
-/// reports (in [`App::poll_remote_restore`]).
+/// How long to wait between retry sweeps for a still-unreachable remote backend.
+const REMOTE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Background restore + reconnect loop for remote-backed sessions. Startup
+/// readies + discovers only *local* backends synchronously; each remote
+/// (`ssh:`/`wsl:`) backend is readied on its own thread, because a single ssh
+/// connect can take seconds (fail-fast is bounded by
+/// [`crate::shell::SSH_HARDENING_OPTS`]) and must never block the first frame.
+///
+/// Every remote session is inserted as a **placeholder** row up front (see
+/// [`crate::agent::backend::Session::placeholder`]) so it always shows in the
+/// list, tagged `SessionStatus::Unreachable`. Each discovery thread sends one
+/// [`RemoteDiscovery`]; on success the placeholder is replaced in place by the
+/// real adopted session, and on failure it stays and the backend is retried
+/// every [`REMOTE_RETRY_INTERVAL`]. This struct lives as long as any backend
+/// still has placeholder rows awaiting adoption.
 struct RemoteRestore {
     rx: mpsc::Receiver<RemoteDiscovery>,
-    /// Sessions awaiting their backend's discovery, keyed by `backend_type`.
+    /// Kept so retry sweeps can re-spawn discovery threads on the same channel.
+    tx: mpsc::Sender<RemoteDiscovery>,
+    /// Sessions still awaiting adoption, keyed by `backend_type`.
     pending: HashMap<String, Vec<sync::SharedSession>>,
+    /// Backends with a discovery thread currently running (don't double-spawn).
+    inflight: std::collections::HashSet<String>,
+    /// When the next retry sweep for still-pending backends is due.
+    next_retry_at: std::time::Instant,
+    /// Backends already surfaced as unreachable via a toast (dedup so the retry
+    /// loop doesn't re-toast every sweep).
+    notified_unreachable: std::collections::HashSet<String>,
+    perf_log: bool,
+}
+
+impl RemoteRestore {
+    /// An empty restore with its own discovery channel and the first retry due
+    /// at `next_retry_at`. Callers fill `pending`/`inflight` and spawn discovery
+    /// threads on `tx`.
+    fn new(perf_log: bool, next_retry_at: std::time::Instant) -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            rx,
+            tx,
+            pending: HashMap::new(),
+            inflight: std::collections::HashSet::new(),
+            next_retry_at,
+            notified_unreachable: std::collections::HashSet::new(),
+            perf_log,
+        }
+    }
 }
 
 /// Continuation for a backgrounded worktree-creation: the wizard inputs needed
@@ -678,6 +742,9 @@ pub struct App {
     /// interactive new-session flow, polled each tick. Programmatic spawns
     /// stay synchronous.
     session_spawn: background::BackgroundTask<Result<Session, String>>,
+    /// Off-thread code-review diff build (open/retarget), applied by
+    /// [`Self::poll_review_build`]. See ADR-P8 in `docs/PERFORMANCE.md`.
+    review_build: background::BackgroundTask<code_review::ReviewBuildResult>,
     /// Continuation for a completed background spawn: the metadata + follow-up
     /// (task prompt) to apply once the session is live.
     pending_session_spawn: Option<PendingSessionSpawn>,
@@ -799,10 +866,24 @@ pub struct App {
     /// reused across frames until [`Self::session_order_signature`] changes,
     /// skipping the per-frame grouping/sort/nest work. See `render_left_panel`.
     cached_session_order: Option<(u64, crate::ui::project_list::SessionOrder)>,
+    /// `THURBOX_PERF_LOG` presence, read once at construction so the hot loop's
+    /// timing gate ([`Self::perf_timing_active`]) is a bool check, not an env
+    /// lookup per iteration.
+    perf_log_env: bool,
+    /// Whether the perf HUD overlay is visible (toggled by
+    /// `Action::TogglePerfHud`); also enables timing collection.
+    show_perf_hud: bool,
+    /// Counter values at the last `perf_window` report, so each window logs
+    /// deltas (the counters themselves stay cumulative for the tests/HUD).
+    perf_window_base: metrics_state::PerfCounters,
+    /// Startup phase breakdown handed over by `main` (the `startup` log line's
+    /// fields), included in the published perf snapshot so `thurbox-cli perf`
+    /// shows boot cost too.
+    startup_phases: Option<serde_json::Value>,
 }
 
 const EDITOR_NOT_CONFIGURED: &str =
-    "No editor configured — set `editor_command` via MCP or export $EDITOR/$VISUAL";
+    "No editor configured — run `thurbox-cli editor set <cmd>` or export $EDITOR/$VISUAL";
 
 /// Output-quiescence threshold that breaks a *stuck* `working` hook state.
 ///
@@ -980,6 +1061,7 @@ impl App {
             worktree_create: background::BackgroundTask::default(),
             pending_worktree_create: None,
             session_spawn: background::BackgroundTask::default(),
+            review_build: background::BackgroundTask::default(),
             pending_session_spawn: None,
             remote_restore: None,
             deferred_inputs: Vec::new(),
@@ -1015,9 +1097,13 @@ impl App {
             cached_hook_states: HashMap::new(),
             pending_remote_hook_events: Vec::new(),
             hook_states_version: None,
-            last_draw_at: std::time::Instant::now(),
+            last_draw_at: clock::now(),
             last_output_gen: 0,
             cached_session_order: None,
+            perf_log_env: std::env::var_os("THURBOX_PERF_LOG").is_some(),
+            show_perf_hud: false,
+            perf_window_base: metrics_state::PerfCounters::default(),
+            startup_phases: None,
         };
         app.report_config_warnings(config_warnings);
         app
@@ -1177,6 +1263,9 @@ impl App {
             if matches!(self.focus, InputFocus::CodeReview | InputFocus::ReviewFiles) {
                 self.focus = InputFocus::Terminal;
             }
+        }
+        if !self.features.perf_hud {
+            self.show_perf_hud = false;
         }
     }
 
@@ -1509,6 +1598,15 @@ impl App {
         let Some(session) = self.sessions.get(self.active_index) else {
             return;
         };
+        // A placeholder (unreachable remote) has no live pane to restart — a
+        // manual restart means "reconnect now", so kick an immediate retry sweep
+        // for its backend instead of the live-restart path.
+        if session.is_placeholder() {
+            let backend_type = session.backend_name().to_string();
+            self.retry_remote_backend_now(&backend_type);
+            self.set_status(StatusLevel::Info, "Retrying remote host…");
+            return;
+        }
         let Some(agent_session_id) = session.info.agent_session_id.clone() else {
             return;
         };
@@ -1700,6 +1798,33 @@ impl App {
 
         let session_id = session.info.id;
 
+        // A placeholder (unreachable remote) has no live pane / local resource to
+        // tear down — deleting it just removes the row (a hard delete would run
+        // blocking remote git/worktree ops against the down host). Always soft-
+        // delete it, regardless of the `soft_delete` feature flag.
+        if session.is_placeholder() {
+            if let Err(e) = self.db.soft_delete_session(session_id) {
+                error!("Failed to soft-delete session in DB: {e}");
+            }
+            let removed = self.sessions.remove(self.active_index);
+            let name = removed.info.name.clone();
+            self.session_terminal_views.remove(&session_id);
+            self.code_reviews.remove(&session_id);
+            self.sync_active_session_to_project();
+            self.finalize_pending_delete();
+            self.pending_delete = Some(PendingDelete {
+                session: removed,
+                session_id,
+                created_at: clock::now(),
+            });
+            self.set_status(
+                StatusLevel::Info,
+                format!("Deleted '{name}'. Ctrl+Z to undo"),
+            );
+            self.save_state();
+            return;
+        }
+
         // When soft-delete is disabled, a TUI delete is a destructive hard
         // delete (kills the tmux window, removes worktrees) with no Ctrl+Z
         // undo. Confirm before tearing anything down only when the session has
@@ -1739,7 +1864,7 @@ impl App {
         self.pending_delete = Some(PendingDelete {
             session: removed_session,
             session_id,
-            created_at: std::time::Instant::now(),
+            created_at: clock::now(),
         });
 
         self.set_status(
@@ -2402,12 +2527,19 @@ impl App {
         // consumed click stops here; session-list and terminal clicks fall
         // through so the same press still arms text selection.
         let pos = Position::new(x, y);
-        if let Some(action) = self
+        if let Some((action, rect)) = self
             .click_targets
             .iter()
             .find(|t| t.rect.contains(pos))
-            .map(|t| t.action)
+            .map(|t| (t.action, t.rect))
         {
+            // A diff-row click carries its column so a paired side-by-side row
+            // can steer a follow-up comment to the old/new side it hit.
+            if let ClickAction::ReviewRow(i) = action {
+                self.focus = InputFocus::CodeReview;
+                self.cr_click_row(i, x.saturating_sub(rect.x), rect.width);
+                return;
+            }
             if self.activate_click_target(action) {
                 return;
             }
@@ -3873,7 +4005,9 @@ impl App {
         if cols < 120 {
             self.show_info_panel = false;
             self.show_tasks_panel = false;
-            if self.focus == InputFocus::TaskList {
+            // Rescue the editor too, not just the list — otherwise focus stays
+            // on the hidden panel's editor, which keeps capturing every key.
+            if matches!(self.focus, InputFocus::TaskList | InputFocus::TaskEditor) {
                 self.focus = InputFocus::SessionList;
             }
         }
@@ -3890,11 +4024,27 @@ impl App {
     }
 
     pub fn tick(&mut self) {
+        self.tick_core();
+        self.tick_background();
+    }
+
+    /// The deterministic half of [`Self::tick`]: everything that only reads
+    /// state, polls already-running work, or writes through the in-process DB —
+    /// no Tokio task is ever spawned here. Split out so the acceptance harness
+    /// can drive the tick pipeline (status derivation, timer expiry, search
+    /// debounce, automation firing, external-change polling) hermetically and
+    /// without a runtime; `main`'s loop always runs both halves via `tick()`.
+    pub(crate) fn tick_core(&mut self) {
         self.metrics.tick_count = self.metrics.tick_count.wrapping_add(1);
 
         self.tick_global_search_content();
 
         self.refresh_session_statuses();
+
+        // Convert any live remote session whose host connection just dropped into
+        // an unreachable placeholder + queue it for reconnect (see the method
+        // doc for why `has_exited()` is the reliable host-loss signal here).
+        self.detect_lost_remote_sessions();
 
         // Poll for sync results from background worktree sync threads
         self.poll_sync_results();
@@ -3903,6 +4053,9 @@ impl App {
         // `Session::spawn`) so `Ctrl+N` never freezes the UI.
         self.poll_worktree_create();
         self.poll_session_spawn();
+
+        // Apply a finished off-thread code-review diff build (ADR-P8).
+        self.poll_review_build();
 
         // Adopt remote-backed sessions whose host discovery (started at
         // restore) has since completed.
@@ -3926,19 +4079,188 @@ impl App {
             self.refresh_automations();
             self.refresh_tasks();
         }
+    }
 
+    /// The spawning half of [`Self::tick`]: kicks off background refreshes
+    /// (sysinfo/git/usage shell-outs), the opt-in update check, and the
+    /// auto-updater — each lands on a Tokio task. Kept out of
+    /// [`Self::tick_core`] so tests driving the tick pipeline never touch the
+    /// network, the filesystem outside the harness tempdir, or a runtime.
+    fn tick_background(&mut self) {
         self.tick_background_refreshes();
 
         self.tick_version_check();
 
         self.poll_auto_update();
+
+        self.tick_perf_window();
     }
 
-    /// Snapshot of the deterministic render/tick performance counters. Used by
-    /// the perf regression tests. See [`metrics_state::PerfCounters`].
-    #[cfg(test)]
+    /// Steady-state perf reporting: once per window (under `THURBOX_PERF_LOG`)
+    /// log counter deltas + timing percentiles + the window's slow ops, then
+    /// reset the per-window timing state so each report stands alone. The
+    /// startup line at first paint is separate and unaffected. Both the window
+    /// report and an open HUD also refresh the published snapshot
+    /// (`thurbox-cli perf`); a default run publishes nothing.
+    fn tick_perf_window(&mut self) {
+        let tick = self.metrics.tick_count;
+        let window_due = self.perf_log_env && tick % PERF_WINDOW_TICKS == 0;
+        let snapshot_due = self.show_perf_hud && tick % PERF_SNAPSHOT_TICKS == 0;
+        if !window_due && !snapshot_due {
+            return;
+        }
+        // Publish before the window reset below so the snapshot carries this
+        // window's timing percentiles rather than an empty histogram.
+        self.publish_perf_snapshot();
+        if !window_due {
+            return;
+        }
+        let now = self.perf_counters();
+        let d = now.delta(&self.perf_window_base);
+        let timings = &self.metrics.timings;
+        let slow_ops = timings
+            .slow_ops
+            .iter_recent()
+            .map(|op| format!("{}={}ms", op.name, op.ms))
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::info!(
+            frames = d.frames_rendered,
+            redraws_requested = d.redraws_requested,
+            redraws_skipped = d.redraws_skipped,
+            status_refreshes = d.status_refreshes,
+            order_rebuilds = d.ordered_sessions_rebuilds,
+            hook_state_loads = d.hook_state_loads,
+            external_poll_checks = d.external_poll_checks,
+            external_poll_reloads = d.external_poll_reloads,
+            frame_p50_us = timings.frame.percentile_us(50),
+            frame_p95_us = timings.frame.percentile_us(95),
+            frame_max_us = timings.frame.max_us(),
+            tick_p50_us = timings.tick.percentile_us(50),
+            tick_p95_us = timings.tick.percentile_us(95),
+            tick_max_us = timings.tick.max_us(),
+            slow_ops = %slow_ops,
+            sessions = self.sessions.len(),
+            "perf_window"
+        );
+        self.perf_window_base = now;
+        self.metrics.timings.reset_window();
+    }
+
+    /// Startup phase durations from `main`, for the published snapshot.
+    pub fn set_startup_phases(&mut self, phases: serde_json::Value) {
+        self.startup_phases = phases.into();
+    }
+
+    /// Write the current counters + timing stats as a JSON blob into the
+    /// `metadata` table for `thurbox-cli perf`. Only called while perf timing
+    /// is active (see [`Self::tick_perf_window`]) — the write bumps other
+    /// thurbox connections' `data_version`, so it must never run on a
+    /// default-config idle instance. Best-effort: a failed write only warns.
+    fn publish_perf_snapshot(&self) {
+        let p = self.perf_counters();
+        let t = &self.metrics.timings;
+        let histo = |h: &metrics_state::DurationHistogram| {
+            serde_json::json!({
+                "p50_us": h.percentile_us(50),
+                "p95_us": h.percentile_us(95),
+                "max_us": h.max_us(),
+            })
+        };
+        let slow_ops: Vec<serde_json::Value> = t
+            .slow_ops
+            .iter_recent()
+            .map(|op| serde_json::json!({ "op": op.name, "ms": op.ms }))
+            .collect();
+        let captured_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let snapshot = serde_json::json!({
+            "pid": std::process::id(),
+            "captured_at": captured_at,
+            "session_count": self.sessions.len(),
+            "tick_count": self.metrics.tick_count,
+            "counters": {
+                "frames_rendered": p.frames_rendered,
+                "redraws_requested": p.redraws_requested,
+                "redraws_skipped": p.redraws_skipped,
+                "status_refreshes": p.status_refreshes,
+                "ordered_sessions_rebuilds": p.ordered_sessions_rebuilds,
+                "parser_locks_render": p.parser_locks_render,
+                "automation_entries_built": p.automation_entries_built,
+                "hook_state_loads": p.hook_state_loads,
+                "external_poll_checks": p.external_poll_checks,
+                "external_poll_reloads": p.external_poll_reloads,
+            },
+            "frame": histo(&t.frame),
+            "tick": histo(&t.tick),
+            "slow_ops": slow_ops,
+            "startup": self.startup_phases,
+        });
+        if let Err(e) = self.db.set_perf_snapshot(&snapshot.to_string()) {
+            warn!("failed to publish perf snapshot: {e}");
+        }
+    }
+
+    /// Snapshot of the deterministic render/tick performance counters. Read by
+    /// the perf regression tests, the perf HUD, the `perf_window` log line, and
+    /// the published snapshot. See [`metrics_state::PerfCounters`].
     pub(crate) fn perf_counters(&self) -> metrics_state::PerfCounters {
         self.metrics.perf
+    }
+
+    /// Whether wall-clock perf timing should be collected this iteration:
+    /// opted in via `THURBOX_PERF_LOG` or by opening the perf HUD. A cached
+    /// bool so the hot loop pays nothing when observability is off.
+    pub fn perf_timing_active(&self) -> bool {
+        self.perf_log_env || self.show_perf_hud
+    }
+
+    /// Record one `terminal.draw` duration (called from the render loop, only
+    /// while [`Self::perf_timing_active`]).
+    pub fn record_frame_time(&mut self, d: std::time::Duration) {
+        self.metrics.timings.frame.record(d);
+    }
+
+    /// Record one `App::tick` duration (called from the render loop, only
+    /// while [`Self::perf_timing_active`]).
+    pub fn record_tick_time(&mut self, d: std::time::Duration) {
+        self.metrics.timings.tick.record(d);
+    }
+
+    /// Record one `App::update` (input dispatch) duration; outliers land in
+    /// the slow-op ring so a stalling key handler is attributable.
+    pub fn record_update_time(&mut self, d: std::time::Duration) {
+        self.note_slow_op("input_dispatch", d.as_millis() as u64);
+    }
+
+    /// Record an already-measured operation duration: at or above
+    /// `SLOW_OP_RECORD_MS` it lands in the slow-op ring (HUD / perf-window
+    /// line); at or above `SLOW_OP_WARN_MS` it also gets a `warn!` in the log.
+    /// The single sink behind [`Self::time_op`] and the workers that time
+    /// themselves (e.g. the code-review build).
+    pub(crate) fn note_slow_op(&mut self, name: &'static str, ms: u64) {
+        if ms >= SLOW_OP_WARN_MS {
+            tracing::warn!(op = name, ms, "slow op");
+        }
+        if ms >= SLOW_OP_RECORD_MS {
+            self.metrics
+                .timings
+                .slow_ops
+                .push(metrics_state::SlowOp { name, ms });
+        }
+    }
+
+    /// Measure a named synchronous UI-thread operation. Call sites are rare,
+    /// user-triggered ops (never the per-tick hot path), so this measures
+    /// unconditionally: notable durations land in the slow-op ring and
+    /// stall-grade ones also get a `warn!` in the log.
+    pub(crate) fn time_op<T>(&mut self, name: &'static str, f: impl FnOnce(&mut Self) -> T) -> T {
+        let start = std::time::Instant::now();
+        let out = f(self);
+        self.note_slow_op(name, start.elapsed().as_millis() as u64);
+        out
     }
 
     /// Mark the UI dirty so the render loop paints on its next iteration.
@@ -3953,14 +4275,14 @@ impl App {
     /// elapsed (so time-driven UI — clock, metrics, cursor blink, quiet-session
     /// status transitions — still refreshes without an explicit dirty flag).
     pub fn should_redraw(&self) -> bool {
-        self.needs_redraw || self.last_draw_at.elapsed() >= FORCE_REDRAW_INTERVAL
+        self.needs_redraw || clock::elapsed_since(self.last_draw_at) >= FORCE_REDRAW_INTERVAL
     }
 
     /// Record that a frame was just painted: clear the dirty flag, reset the
     /// forced-redraw timer, and count the requested redraw.
     pub fn mark_redrawn(&mut self) {
         self.needs_redraw = false;
-        self.last_draw_at = std::time::Instant::now();
+        self.last_draw_at = clock::now();
         self.metrics.bump(|p| &mut p.redraws_requested);
     }
 
@@ -4036,14 +4358,14 @@ impl App {
     fn tick_expire_timers(&mut self) {
         // Finalize pending delete after undo timeout
         if let Some(ref pending) = self.pending_delete {
-            if pending.created_at.elapsed() >= UNDO_TIMEOUT {
+            if clock::elapsed_since(pending.created_at) >= UNDO_TIMEOUT {
                 self.finalize_pending_delete();
             }
         }
 
         // Auto-expire status messages so default project/session counts reappear
         if let Some(ref msg) = self.status_message {
-            if msg.created_at.elapsed() >= STATUS_MESSAGE_TIMEOUT {
+            if clock::elapsed_since(msg.created_at) >= STATUS_MESSAGE_TIMEOUT {
                 self.status_message = None;
             }
         }
@@ -4101,13 +4423,23 @@ impl App {
         // an *external* `session signal` bumps `data_version`, but our own
         // `seen_at` writes (below) do not — otherwise reuse the cached map. This
         // replaces a full sessions-table scan on every (~10 ms) tick with a
-        // cheap in-memory `PRAGMA data_version` read on idle ticks. See
-        // `docs/PERFORMANCE.md`.
-        let version = self.db.data_version().ok();
-        if self.hook_states_version.is_none() || version != self.hook_states_version {
-            self.metrics.bump(|p| &mut p.hook_state_loads);
-            self.cached_hook_states = self.db.load_hook_states().unwrap_or_default();
-            self.hook_states_version = version;
+        // cheap in-memory `PRAGMA data_version` read — itself throttled to
+        // every `HOOK_VERSION_CHECK_TICKS` ticks (~100 ms; still ~10 rusqlite
+        // round-trips/s saved), except when the cache was explicitly
+        // invalidated (a remote hook event / restart wrote on our own
+        // connection, which the pragma can't see — check immediately). Worst
+        // case an external signal shows ~100 ms late, under any perceptible
+        // threshold. See `docs/PERFORMANCE.md` (ADR-P6 + ADR-P10).
+        let version_check_due = self.hook_states_version.is_none()
+            || self.metrics.tick_count % HOOK_VERSION_CHECK_TICKS == 0;
+        if version_check_due {
+            self.metrics.bump(|p| &mut p.data_version_checks);
+            let version = self.db.data_version().ok();
+            if self.hook_states_version.is_none() || version != self.hook_states_version {
+                self.metrics.bump(|p| &mut p.hook_state_loads);
+                self.cached_hook_states = self.db.load_hook_states().unwrap_or_default();
+                self.hook_states_version = version;
+            }
         }
         // "Seen" writes are deferred past the &mut self.sessions borrow below.
         let mut seen_writes: Vec<(crate::session::SessionId, i64)> = Vec::new();
@@ -4130,11 +4462,13 @@ impl App {
         // Track whether any visible field changed so a quiet transition (no new
         // output, so the output detector won't catch it) still repaints promptly
         // instead of waiting for the forced-redraw floor.
-        let changed = Self::apply_session_status_fields(
+        let (changed, meta_syncs) = Self::apply_session_status_fields(
             &mut self.sessions,
             &self.cached_hook_states,
             &seen_writes,
         );
+        self.metrics.perf.agent_meta_syncs =
+            self.metrics.perf.agent_meta_syncs.wrapping_add(meta_syncs);
 
         // Persist the seen marks now that the sessions borrow is released, and
         // mirror them into the cache write-through: our own write doesn't move
@@ -4195,7 +4529,7 @@ impl App {
             .filter(|(_, events)| !events.is_empty())
             .collect();
         // Older pending retries first, so per-pane event order is preserved.
-        let now = std::time::Instant::now();
+        let now = clock::now();
         let mut queue = std::mem::take(&mut self.pending_remote_hook_events);
         for (backend_name, events) in batches {
             for (pane_id, state) in events {
@@ -4277,9 +4611,15 @@ impl App {
         sessions: &mut [Session],
         hooks: &HashMap<crate::session::SessionId, crate::storage::HookRow>,
         seen_writes: &[(crate::session::SessionId, i64)],
-    ) -> bool {
+    ) -> (bool, u64) {
         let mut changed = false;
+        let mut meta_syncs = 0u64;
         for session in sessions.iter_mut() {
+            // A placeholder (unreachable remote) has no live pane / hooks; keep
+            // its `Unreachable` status until the host recovers and it adopts.
+            if session.is_placeholder() {
+                continue;
+            }
             let id = session.info.id;
             // `just_seen`: the focus-leave check above queued this session's seen
             // mark this tick (the DB write lands after this loop), so reflect it
@@ -4291,24 +4631,27 @@ impl App {
                 just_seen,
                 session.millis_since_last_output(),
             );
-
-            // Live activity text from the agent-emitted OSC terminal title.
-            let new_activity = session.agent_title();
-            // Retain the agent's latest pushed notification (OSC 9/777) so the
-            // info panel can show it as a persistent "last signal".
-            let new_notification = session.notification();
-
-            if session.info.status != new_status
-                || session.info.agent_activity != new_activity
-                || session.info.notification != new_notification
-            {
+            if session.info.status != new_status {
                 changed = true;
             }
             session.info.status = new_status;
-            session.info.agent_activity = new_activity;
-            session.info.notification = new_notification;
+
+            // Live activity text (OSC title) + latest pushed notification
+            // (OSC 9/777): re-read only when the reader thread wrote something
+            // new — its generation counter gates the two mutex locks + String
+            // clones that otherwise ran per session per ~10 ms tick (ADR-P10).
+            if let Some((new_activity, new_notification)) = session.sync_agent_meta() {
+                meta_syncs += 1;
+                if session.info.agent_activity != new_activity
+                    || session.info.notification != new_notification
+                {
+                    changed = true;
+                }
+                session.info.agent_activity = new_activity;
+                session.info.notification = new_notification;
+            }
         }
-        changed
+        (changed, meta_syncs)
     }
 
     /// Advance the Working spinner from the (deterministic) tick counter, and
@@ -4339,7 +4682,7 @@ impl App {
             return;
         };
         let active_index = self.active_index;
-        let now = std::time::Instant::now();
+        let now = clock::now();
         for (idx, session) in self.sessions.iter().enumerate() {
             let id = session.info.id;
             let status = session.info.status;
@@ -4500,9 +4843,12 @@ impl App {
             return;
         };
 
+        // Skip a placeholder (unreachable remote): it has no live pane, and its
+        // dummy backend/empty id would trigger a pointless ssh round-trip.
         let active = self
             .sessions
             .get(self.active_index)
+            .filter(|s| !s.is_placeholder())
             .map(|s| s.backend_handle());
 
         let metrics_files: Vec<(SessionId, PathBuf)> = match crate::paths::metrics_directory() {
@@ -4845,6 +5191,7 @@ impl App {
             backend,
             &provider,
             HashMap::new(),
+            None,
         ) {
             Ok(mut adopted_session) => {
                 // Preserve the original session ID from shared state
@@ -5003,7 +5350,7 @@ impl App {
         self.status_message = Some(StatusMessage {
             text: text.into(),
             level,
-            created_at: std::time::Instant::now(),
+            created_at: clock::now(),
         });
     }
 
@@ -5026,6 +5373,13 @@ impl App {
         }
 
         for session in &self.sessions {
+            // Never persist a placeholder (unreachable remote): its row already
+            // exists in the DB, and its empty `backend_id`/`shell_backend_id`
+            // (and, for an unknown host, a fallback local `backend_type`) would
+            // clobber the real persisted values and break re-adoption.
+            if session.is_placeholder() {
+                continue;
+            }
             let shared_session = self.session_to_shared(session);
             if let Err(e) = self.db.upsert_session(&shared_session) {
                 error!("Failed to upsert session to DB: {e}");
@@ -5113,6 +5467,16 @@ impl App {
 
         let discovered_by_backend = self.discover_windows_by_backend(&local, perf_log);
 
+        // Prefetch every matched pane's scrollback capture in parallel before
+        // the sequential adopt loop: the captures are independent subprocesses,
+        // only the control-mode connect is serialized (ADR-P9).
+        let seeds = self.prefetch_capture_seeds(&local, &discovered_by_backend, perf_log);
+        self.metrics.perf.restore_seed_prefetches = self
+            .metrics
+            .perf
+            .restore_seed_prefetches
+            .wrapping_add(seeds.len() as u64);
+
         for shared in local {
             let discovered = discovered_by_backend
                 .get(&shared.backend_type)
@@ -5120,7 +5484,7 @@ impl App {
                 .unwrap_or_default();
             let adopt_start = perf_log.then(std::time::Instant::now);
             let name = perf_log.then(|| shared.name.clone());
-            self.restore_single_session(shared, &discovered);
+            self.restore_single_session(shared, &discovered, &seeds);
             if let (Some(start), Some(name)) = (adopt_start, name) {
                 tracing::info!(
                     session = %name,
@@ -5152,17 +5516,29 @@ impl App {
                 .push(shared);
         }
 
-        let (tx, rx) = mpsc::channel();
-        let mut pending: HashMap<String, Vec<sync::SharedSession>> = HashMap::new();
+        let mut restore = RemoteRestore::new(perf_log, clock::now() + REMOTE_RETRY_INTERVAL);
         for (backend_type, sessions) in grouped {
-            let Some(backend) = self.resolve_persisted_backend(&backend_type) else {
-                continue;
-            };
-            Self::spawn_remote_discovery(backend, backend_type.clone(), perf_log, tx.clone());
-            pending.insert(backend_type, sessions);
+            // Always show the session, even before (or without) a live host:
+            // insert a placeholder row up front so it never silently vanishes.
+            for shared in &sessions {
+                self.insert_remote_placeholder(shared);
+            }
+            // A backend we can resolve gets a discovery thread + retry tracking.
+            // An unknown host (no config) keeps its placeholder but can't be
+            // adopted, so it isn't queued for retries.
+            if let Some(backend) = self.resolve_persisted_backend(&backend_type) {
+                Self::spawn_remote_discovery(
+                    backend,
+                    backend_type.clone(),
+                    perf_log,
+                    restore.tx.clone(),
+                );
+                restore.inflight.insert(backend_type.clone());
+                restore.pending.insert(backend_type, sessions);
+            }
         }
-        if !pending.is_empty() {
-            self.remote_restore = Some(RemoteRestore { rx, pending });
+        if !restore.pending.is_empty() {
+            self.remote_restore = Some(restore);
         }
     }
 
@@ -5176,67 +5552,253 @@ impl App {
     ) {
         std::thread::spawn(move || {
             let start = std::time::Instant::now();
-            let discovered = Self::ready_and_discover(&backend);
+            let (reachable, discovered) = Self::ready_and_discover(&backend);
             if perf_log {
                 tracing::info!(
                     backend = %backend_type,
+                    reachable,
                     windows = discovered.len() as u64,
                     discover_ms = start.elapsed().as_millis() as u64,
                     "restore_discover"
                 );
             }
-            let _ = tx.send((backend_type, discovered));
+            let _ = tx.send((backend_type, reachable, discovered));
         });
     }
 
-    /// Drain finished remote-backend discoveries and adopt their sessions.
-    /// Adoption runs on the main thread but talks to the control-mode
-    /// connection the background thread already brought up, so the expensive
-    /// part (ssh connect + remote tmux ready) never blocks a frame.
-    fn poll_remote_restore(&mut self) {
-        let Some(state) = &mut self.remote_restore else {
-            return;
+    /// Build (but don't insert) a placeholder [`Session`] for a persisted remote
+    /// session — a row tagged `SessionStatus::Unreachable` with no live pane. See
+    /// [`crate::agent::backend::Session::placeholder`].
+    fn build_placeholder_session(&self, shared: &sync::SharedSession) -> Session {
+        let agent = if shared.agent.is_empty() {
+            DEFAULT_AGENT_NAME.to_string()
+        } else {
+            shared.agent.clone()
         };
+        // Dummy backend/provider: a placeholder never does I/O, but the fields
+        // must be populated. Fall back to the local default when the host is
+        // unknown (unconfigured) so the row can still render.
+        let backend = self
+            .resolve_persisted_backend(&shared.backend_type)
+            .unwrap_or_else(|| self.backends.default_backend().clone());
+        let provider = self.provider_for(&SessionConfig {
+            agent: agent.clone(),
+            ..SessionConfig::default()
+        });
+
+        let mut info = SessionInfo::new(shared.name.clone());
+        info.id = shared.id;
+        info.agent = agent;
+        info.agent_session_id = shared.agent_session_id.clone();
+        info.cwd = shared.cwd.clone();
+        info.additional_dirs = shared.additional_dirs.clone();
+        info.worktrees = shared.worktrees.iter().cloned().map(Into::into).collect();
+        info.parent_session_id = shared.parent_session_id;
+        info.display_order = shared.display_order;
+        info.remote_host = host_label_from_backend_type(&shared.backend_type);
+        resolve_repo_display_names(&mut info);
+
+        let (rows, cols) = self.content_area_size();
+        Session::placeholder(info, rows, cols, &backend, &provider, HashMap::new())
+    }
+
+    /// Insert a placeholder row for a persisted remote session whose host is not
+    /// yet (or no longer) reachable, so it always appears in the list tagged
+    /// `SessionStatus::Unreachable`. Idempotent: skips if a session with this id
+    /// already exists (a real adopted session or an earlier placeholder).
+    fn insert_remote_placeholder(&mut self, shared: &sync::SharedSession) {
+        if self.sessions.iter().any(|s| s.info.id == shared.id) {
+            return;
+        }
+        let session = self.build_placeholder_session(shared);
+        self.sessions.push(session);
+        self.request_redraw();
+    }
+
+    /// Detect **mid-session host loss**: a live (non-placeholder) remote session
+    /// whose control-mode connection has died. Because tmux runs with
+    /// `remain-on-exit=on`, a normal agent exit keeps its pane alive (no reader
+    /// EOF), so for a *remote* session `has_exited()` becoming true reliably means
+    /// the host/SSH connection dropped — not a clean agent exit. Such a session is
+    /// converted **in place** to an `Unreachable` placeholder and queued for the
+    /// reconnect retry loop, so it never looks like a normal idle session and
+    /// auto-adopts when the host returns.
+    fn detect_lost_remote_sessions(&mut self) {
+        let lost: Vec<usize> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                !s.is_placeholder()
+                    && s.has_exited()
+                    && crate::session::is_remote_backend(s.backend_name())
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if lost.is_empty() {
+            return;
+        }
+        for i in lost {
+            // Capture the persisted shape before swapping in the placeholder, so
+            // the reconnect keeps the real `backend_id` / worktrees / identity.
+            let shared = self.session_to_shared(&self.sessions[i]);
+            // Replace in place (same index) so the active selection is undisturbed.
+            self.sessions[i] = self.build_placeholder_session(&shared);
+            self.enqueue_remote_reconnect(shared);
+        }
+        self.set_error("Remote host connection lost — reconnecting…");
+        self.request_redraw();
+    }
+
+    /// Queue a remote session for the reconnect retry loop, creating the
+    /// `remote_restore` state if it isn't running (e.g. host lost after the
+    /// startup restore already finished). Sets the retry clock to now so the next
+    /// `poll_remote_restore` probes the host immediately. No-op for an unknown
+    /// (unconfigured) host — its placeholder simply stays until reconfigured.
+    fn enqueue_remote_reconnect(&mut self, shared: sync::SharedSession) {
+        let backend_type = shared.backend_type.clone();
+        if self.resolve_persisted_backend(&backend_type).is_none() {
+            return;
+        }
+        let now = clock::now();
+        if self.remote_restore.is_none() {
+            // Reconnect as soon as the next tick, not after the retry interval.
+            self.remote_restore = Some(RemoteRestore::new(false, now));
+        }
+        if let Some(s) = self.remote_restore.as_mut() {
+            let queue = s.pending.entry(backend_type).or_default();
+            if !queue.iter().any(|q| q.id == shared.id) {
+                queue.push(shared);
+            }
+            s.next_retry_at = now;
+        }
+    }
+
+    /// Drain finished remote-backend discoveries, adopt reachable ones (replacing
+    /// their placeholder rows in place), keep unreachable ones as placeholders,
+    /// and periodically retry the still-down backends. Adoption runs on the main
+    /// thread but talks to the control-mode connection the background thread
+    /// already brought up, and remote ssh is fail-fast
+    /// ([`crate::shell::SSH_HARDENING_OPTS`]), so it never blocks a frame. The
+    /// restore state is dropped only once every remote session has been adopted.
+    fn poll_remote_restore(&mut self) {
+        if self.remote_restore.is_none() {
+            return;
+        }
+
         let mut ready: Vec<RemoteDiscovery> = Vec::new();
-        let mut disconnected = false;
-        loop {
-            match state.rx.try_recv() {
-                Ok(msg) => ready.push(msg),
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
+        if let Some(state) = &self.remote_restore {
+            loop {
+                match state.rx.try_recv() {
+                    Ok(msg) => ready.push(msg),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    // The channel can't disconnect while `remote_restore` holds a
+                    // `tx`; treat it as "nothing more this tick".
+                    Err(mpsc::TryRecvError::Disconnected) => break,
                 }
             }
         }
 
-        self.adopt_remote_discoveries(ready);
+        // Each reported backend's discovery thread has finished.
+        if let Some(state) = &mut self.remote_restore {
+            for (backend_type, _, _) in &ready {
+                state.inflight.remove(backend_type);
+            }
+        }
 
-        let finished = disconnected
-            || self
-                .remote_restore
-                .as_ref()
-                .is_some_and(|s| s.pending.is_empty());
-        if finished {
-            if let Some(state) = self.remote_restore.take() {
-                for backend_type in state.pending.keys() {
-                    warn!(
-                        backend = %backend_type,
-                        "Remote restore ended without a discovery result"
-                    );
+        if !ready.is_empty() {
+            self.adopt_remote_discoveries(ready);
+        }
+
+        self.maybe_retry_remote_restore();
+
+        // Done once nothing is left to adopt (all placeholders replaced).
+        if self
+            .remote_restore
+            .as_ref()
+            .is_some_and(|s| s.pending.is_empty())
+        {
+            self.remote_restore = None;
+        }
+    }
+
+    /// Re-spawn discovery threads for still-pending (unreachable) backends once
+    /// [`REMOTE_RETRY_INTERVAL`] has elapsed, so a recovered host auto-adopts its
+    /// placeholder sessions without a restart.
+    fn maybe_retry_remote_restore(&mut self) {
+        let now = clock::now();
+        if !self
+            .remote_restore
+            .as_ref()
+            .is_some_and(|s| now >= s.next_retry_at)
+        {
+            return;
+        }
+        let to_retry: Vec<String> = match &self.remote_restore {
+            Some(s) => s
+                .pending
+                .keys()
+                .filter(|b| !s.inflight.contains(*b))
+                .cloned()
+                .collect(),
+            None => return,
+        };
+        for backend_type in to_retry {
+            if let Some(backend) = self.resolve_persisted_backend(&backend_type) {
+                let (tx, perf_log) = match &self.remote_restore {
+                    Some(s) => (s.tx.clone(), s.perf_log),
+                    None => return,
+                };
+                Self::spawn_remote_discovery(backend, backend_type.clone(), perf_log, tx);
+                if let Some(s) = self.remote_restore.as_mut() {
+                    s.inflight.insert(backend_type);
                 }
+            }
+        }
+        if let Some(s) = self.remote_restore.as_mut() {
+            s.next_retry_at = now + REMOTE_RETRY_INTERVAL;
+        }
+    }
+
+    /// Trigger an immediate retry sweep for a backend (used by the manual
+    /// restart of an unreachable placeholder) — resets the retry clock so the
+    /// next `poll_remote_restore` re-spawns discovery right away.
+    fn retry_remote_backend_now(&mut self, backend_type: &str) {
+        if let Some(s) = self.remote_restore.as_mut() {
+            if s.pending.contains_key(backend_type) {
+                s.next_retry_at = clock::now();
             }
         }
     }
 
-    /// Adopt every pending session whose backend just reported its windows.
+    /// Adopt every reachable backend's pending sessions, replacing their
+    /// placeholder rows in place; keep unreachable backends' placeholders and
+    /// toast the host once.
     fn adopt_remote_discoveries(&mut self, ready: Vec<RemoteDiscovery>) {
-        // Adopting makes each restored session active; a late-arriving host
-        // must not steal the user's current selection, so snapshot + restore it.
+        // Adoption reorders `self.sessions`; a late-arriving host must not steal
+        // the user's current selection, so snapshot + restore it by id.
         let prior_active = self.sessions.get(self.active_index).map(|s| s.info.id);
         let prior_focus = self.focus;
-        let before = self.sessions.len();
-        for (backend_type, discovered) in ready {
+        let mut restored = 0usize;
+        let mut unreachable_hosts: Vec<String> = Vec::new();
+
+        for (backend_type, reachable, discovered) in ready {
+            if !reachable {
+                let first_time = self
+                    .remote_restore
+                    .as_mut()
+                    .is_some_and(|s| s.notified_unreachable.insert(backend_type.clone()));
+                if first_time {
+                    if let Some(h) = host_label_from_backend_type(&backend_type) {
+                        unreachable_hosts.push(h);
+                    }
+                }
+                continue;
+            }
+            // Reachable again: allow a future drop to re-toast.
+            if let Some(s) = self.remote_restore.as_mut() {
+                s.notified_unreachable.remove(&backend_type);
+            }
             let Some(sessions) = self
                 .remote_restore
                 .as_mut()
@@ -5244,32 +5806,80 @@ impl App {
             else {
                 continue;
             };
+            let mut still_pending: Vec<sync::SharedSession> = Vec::new();
             for shared in sessions {
-                // Another path (e.g. the DB sync) may have adopted it meanwhile.
-                if self.sessions.iter().any(|s| s.info.id == shared.id) {
+                let id = shared.id;
+                let has_real = self
+                    .sessions
+                    .iter()
+                    .any(|s| s.info.id == id && !s.is_placeholder());
+                // Already adopted for real (e.g. via the DB sync) — just drop any
+                // leftover placeholder.
+                if has_real {
+                    self.remove_remote_placeholder(id);
                     continue;
                 }
-                self.restore_single_session(shared, &discovered);
+                // No placeholder left and no real session → the user deleted it
+                // while the host was down; don't resurrect it (drop from pending).
+                let has_placeholder = self
+                    .sessions
+                    .iter()
+                    .any(|s| s.info.id == id && s.is_placeholder());
+                if !has_placeholder {
+                    continue;
+                }
+                let retry_copy = shared.clone();
+                // Remote adoption keeps the inline capture (`seed: None` path)
+                // — the SSH control-mode round-trips dominate there anyway.
+                self.restore_single_session(shared, &discovered, &HashMap::new());
+                if self
+                    .sessions
+                    .iter()
+                    .any(|s| s.info.id == id && !s.is_placeholder())
+                {
+                    self.remove_remote_placeholder(id);
+                    restored += 1;
+                } else {
+                    // Adopt/respawn failed (host dropped again mid-adopt); keep
+                    // the placeholder and re-queue for the next retry.
+                    still_pending.push(retry_copy);
+                }
+            }
+            if !still_pending.is_empty() {
+                if let Some(s) = self.remote_restore.as_mut() {
+                    s.pending.insert(backend_type, still_pending);
+                }
             }
         }
-        // Count sessions actually added — an adopt/respawn that failed inside
-        // `restore_single_session` must not inflate the toast.
-        let adopted = self.sessions.len() - before;
-        if adopted == 0 {
-            return;
-        }
+
+        // Restore prior selection/focus (indices shifted during adoption).
         if let Some(id) = prior_active {
             if let Some(idx) = self.sessions.iter().position(|s| s.info.id == id) {
                 self.active_index = idx;
                 self.focus = prior_focus;
             }
         }
-        self.save_state();
-        self.set_status(
-            StatusLevel::Info,
-            format!("Restored {adopted} remote session(s)"),
-        );
-        self.request_redraw();
+
+        for host in &unreachable_hosts {
+            self.set_error(format!("Remote host '{host}' unavailable"));
+        }
+        if restored > 0 {
+            self.save_state();
+            self.set_status(
+                StatusLevel::Info,
+                format!("Restored {restored} remote session(s)"),
+            );
+        }
+        if restored > 0 || !unreachable_hosts.is_empty() {
+            self.request_redraw();
+        }
+    }
+
+    /// Remove the placeholder row for `id` (leaving a real adopted session with
+    /// the same id untouched). See [`Self::insert_remote_placeholder`].
+    fn remove_remote_placeholder(&mut self, id: SessionId) {
+        self.sessions
+            .retain(|s| !(s.info.id == id && s.is_placeholder()));
     }
 
     /// Discover existing backend windows once per distinct `backend_type`.
@@ -5317,38 +5927,109 @@ impl App {
         let Some(backend) = self.resolve_persisted_backend(backend_type) else {
             return Vec::new();
         };
-        Self::ready_and_discover(&backend)
+        // Local restore only cares about the windows; reachability is a
+        // remote-restore concern.
+        Self::ready_and_discover(&backend).1
     }
 
-    /// Ready a backend and list its windows, degrading to an empty list on
-    /// error (logged, never fatal). Associated (no `&self`) so the remote
+    /// Ready a backend and list its windows. Returns `(reachable, windows)`:
+    /// `reachable` is `false` when `ensure_ready` failed (host down / SSH auth /
+    /// network), which the remote restore uses to keep placeholder rows and
+    /// schedule a retry rather than treating an empty list as "no windows".
+    /// Errors are logged, never fatal. Associated (no `&self`) so the remote
     /// restore threads can run it off the UI thread.
     fn ready_and_discover(
         backend: &Arc<dyn SessionBackend>,
-    ) -> Vec<crate::agent::backend::DiscoveredSession> {
+    ) -> (bool, Vec<crate::agent::backend::DiscoveredSession>) {
         if let Err(e) = backend.ensure_ready() {
             warn!(
                 backend = backend.name(),
-                "Backend not ready during restore; skipping its sessions: {e}"
+                "Backend not ready during restore; keeping its sessions as unreachable: {e}"
             );
-            return Vec::new();
+            return (false, Vec::new());
         }
 
-        backend.discover().unwrap_or_else(|e| {
+        let windows = backend.discover().unwrap_or_else(|e| {
             warn!(
                 backend = backend.name(),
                 "Failed to discover sessions from backend: {e}"
             );
             Vec::new()
-        })
+        });
+        (true, windows)
     }
 
     /// Restore a single session synchronously (used during startup). The
     /// backend is selected from the session's persisted `backend_type`.
+    /// Capture every matched local pane's scrollback in parallel, keyed by
+    /// pane id, for [`Self::restore_single_session`] to pass into
+    /// [`Session::adopt`]. `tmux capture-pane` is an independent subprocess
+    /// per pane, so overlapping them shrinks the sequential restore's
+    /// `capture_ms` slice to ~0 (ADR-P9); the control-mode connect stays
+    /// sequential. Concurrency is bounded so a big restore doesn't fork one
+    /// subprocess per session at once. A failed capture is simply absent from
+    /// the map — the adopt falls back to its inline capture.
+    fn prefetch_capture_seeds(
+        &self,
+        local: &[sync::SharedSession],
+        discovered_by_backend: &HashMap<String, Vec<crate::agent::backend::DiscoveredSession>>,
+        perf_log: bool,
+    ) -> HashMap<String, Vec<u8>> {
+        const MAX_CONCURRENT_CAPTURES: usize = 8;
+
+        let mut jobs: Vec<(String, Arc<dyn SessionBackend>)> = Vec::new();
+        for shared in local {
+            let Some(discovered) = discovered_by_backend.get(&shared.backend_type) else {
+                continue;
+            };
+            let Some(disc) = Self::find_matching_discovered(shared, discovered) else {
+                continue;
+            };
+            let Some(backend) = self.resolve_persisted_backend(&shared.backend_type) else {
+                continue;
+            };
+            jobs.push((disc.backend_id.clone(), backend));
+        }
+        if jobs.is_empty() {
+            return HashMap::new();
+        }
+
+        let start = std::time::Instant::now();
+        let count = jobs.len();
+        let queue = std::sync::Mutex::new(jobs);
+        let results = std::sync::Mutex::new(HashMap::new());
+        let workers = MAX_CONCURRENT_CAPTURES.min(count);
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    let job = queue.lock().ok().and_then(|mut q| q.pop());
+                    let Some((pane, backend)) = job else { break };
+                    match backend.capture_history(&pane) {
+                        Ok(seed) => {
+                            if let Ok(mut r) = results.lock() {
+                                r.insert(pane, seed);
+                            }
+                        }
+                        Err(e) => warn!("Failed to prefetch history for pane {pane}: {e}"),
+                    }
+                });
+            }
+        });
+        if perf_log {
+            tracing::info!(
+                sessions = count as u64,
+                prefetch_ms = start.elapsed().as_millis() as u64,
+                "restore_capture_prefetch"
+            );
+        }
+        results.into_inner().unwrap_or_default()
+    }
+
     fn restore_single_session(
         &mut self,
         shared: sync::SharedSession,
         discovered: &[crate::agent::backend::DiscoveredSession],
+        seeds: &HashMap<String, Vec<u8>>,
     ) {
         let name = shared.name.clone();
 
@@ -5389,6 +6070,7 @@ impl App {
                 &backend,
                 &provider,
                 HashMap::new(),
+                seeds.get(&disc.backend_id).cloned(),
             ) {
                 Ok(session) => Some(session),
                 Err(e) => {
@@ -5776,6 +6458,16 @@ fn resolve_repo_display_names(info: &mut SessionInfo) {
             .collect();
 }
 
+/// The bare host name behind a remote `backend_type` (`ssh:<name>` /
+/// `wsl:<name>`), used to label a placeholder/unreachable session. `None` for a
+/// local backend.
+fn host_label_from_backend_type(backend_type: &str) -> Option<String> {
+    backend_type
+        .strip_prefix(crate::session::SSH_BACKEND_PREFIX)
+        .or_else(|| backend_type.strip_prefix(crate::session::WSL_BACKEND_PREFIX))
+        .map(str::to_string)
+}
+
 /// The `(display_name, directory)` pairs a session spans, in display order:
 /// worktree repos first (name from the original `repo_path`, dir = the checkout),
 /// then non-worktree `additional_dirs`; or the lone `cwd` repo when there are no
@@ -5896,6 +6588,7 @@ mod tests {
             _: &str,
             _: u16,
             _: u16,
+            _: Option<Vec<u8>>,
         ) -> anyhow::Result<crate::agent::backend::AdoptedSession> {
             anyhow::bail!("stub backend does not adopt")
         }
@@ -7572,6 +8265,7 @@ mod tests {
             shell_pane: false,
             code_review: false,
             cc_activity: false,
+            perf_hud: false,
             mouse: true,
             notifications: false,
             soft_delete: true,
@@ -10511,16 +11205,79 @@ mod tests {
         app.tick();
         assert_eq!(app.perf_counters().hook_state_loads, 1);
 
-        // A different connection commits → `data_version` moves.
+        // A different connection commits → `data_version` moves. The pragma
+        // read itself is throttled (ADR-P10), so tick past a full
+        // `HOOK_VERSION_CHECK_TICKS` window for the change to be observed.
         let db2 = Database::open(tmp.path()).unwrap();
         db2.set_session_counter(7).unwrap();
 
-        app.tick();
+        for _ in 0..HOOK_VERSION_CHECK_TICKS {
+            app.tick();
+        }
         assert_eq!(
             app.perf_counters().hook_state_loads,
             2,
             "an external commit must invalidate the cache exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn perf_data_version_read_is_throttled() {
+        // The status refresh's `PRAGMA data_version` runs on the throttle
+        // cadence (~100 ms), not per ~10 ms tick: 100 idle ticks = the forced
+        // first check + one per `HOOK_VERSION_CHECK_TICKS` window (ADR-P10).
+        let mut app = App::new(24, 80, stub_backend(), stub_agents(), test_db());
+        for _ in 0..100 {
+            app.tick();
+        }
+        let checks = app.perf_counters().data_version_checks;
+        assert!(
+            checks <= 100 / HOOK_VERSION_CHECK_TICKS + 1,
+            "expected ≤{} throttled checks over 100 ticks, got {checks}",
+            100 / HOOK_VERSION_CHECK_TICKS + 1
+        );
+        assert!(
+            checks >= 100 / HOOK_VERSION_CHECK_TICKS,
+            "still polls each window"
+        );
+    }
+
+    #[tokio::test]
+    async fn perf_agent_meta_cached_across_idle_ticks() {
+        // The agent title/notification mutexes are re-read only when the
+        // reader thread bumped the meta generation: one initial sync per
+        // session, then flat across idle ticks — not 2·N locks per tick
+        // (ADR-P10).
+        let mut app = app_with_sessions(2);
+        for _ in 0..50 {
+            app.tick();
+        }
+        assert_eq!(
+            app.perf_counters().agent_meta_syncs,
+            2,
+            "one initial sync per session, then cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn perf_agent_meta_resyncs_on_change() {
+        let mut app = app_with_sessions(1);
+        app.tick();
+        assert_eq!(app.perf_counters().agent_meta_syncs, 1);
+
+        // The reader thread writes a new title → next tick re-reads it.
+        app.sessions[0].bump_meta_gen_for_test("build: cargo");
+        app.tick();
+        assert_eq!(app.perf_counters().agent_meta_syncs, 2);
+        assert_eq!(
+            app.sessions[0].info.agent_activity.as_deref(),
+            Some("build: cargo"),
+            "the fresh title landed in the session info"
+        );
+
+        // And goes quiet again.
+        app.tick();
+        assert_eq!(app.perf_counters().agent_meta_syncs, 2);
     }
 
     #[test]
@@ -10757,6 +11514,247 @@ mod tests {
         assert!(msg.text.contains("branch exists"));
         assert!(!app.worktree_create.in_progress());
         assert!(app.pending_worktree_create.is_none());
+    }
+
+    /// ADR-P8: opening a review dispatches the git work to a background
+    /// worker; the toggle path itself must leave the diff empty (loading).
+    #[tokio::test]
+    async fn perf_review_open_never_builds_on_ui_thread() {
+        let mut app = app_with_sessions(1);
+        app.sessions[0].info.cwd = Some(std::env::temp_dir());
+
+        app.toggle_code_review();
+
+        assert_eq!(app.perf_counters().review_builds_dispatched, 1);
+        assert!(app.review_build.in_progress());
+        let cr = app.active_review().expect("the pane opens instantly");
+        assert!(cr.loading, "opens in the loading state");
+        assert!(cr.files.is_empty(), "no git work ran on the UI thread");
+        assert_eq!(app.focus, InputFocus::CodeReview);
+    }
+
+    /// The worker's result lands via the tick poll: loading clears, the rows
+    /// rebuild from the delivered files, and the applied counter bumps.
+    #[test]
+    fn perf_review_build_result_applied_via_poll() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let built = code_review::CodeReviewState::for_test(sid, 2);
+        let mut pending = code_review::CodeReviewState::for_test(sid, 0);
+        pending.loading = true;
+        let repos = built.repos.clone();
+        app.code_reviews.insert(sid, pending);
+
+        let tx = app.review_build.start();
+        tx.send(code_review::ReviewBuildResult {
+            session_id: sid,
+            elapsed_ms: 7,
+            kind: code_review::ReviewBuildKind::Open {
+                repos,
+                commits: Vec::new(),
+                target: code_review::ReviewTarget::Branch,
+                files: built.files.clone(),
+            },
+        })
+        .unwrap();
+        app.poll_review_build();
+
+        let cr = &app.code_reviews[&sid];
+        assert!(!cr.loading);
+        assert_eq!(cr.files.len(), 2);
+        assert!(!cr.rows.is_empty(), "rows rebuilt from the delivered diff");
+        assert_eq!(app.perf_counters().review_builds_applied, 1);
+        assert!(!app.review_build.in_progress());
+    }
+
+    /// A build whose review was closed before delivery is dropped without
+    /// panicking or resurrecting state.
+    #[test]
+    fn review_build_for_closed_review_is_dropped() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let tx = app.review_build.start();
+        tx.send(code_review::ReviewBuildResult {
+            session_id: sid,
+            elapsed_ms: 3,
+            kind: code_review::ReviewBuildKind::Retarget {
+                target: code_review::ReviewTarget::Working,
+                files: Vec::new(),
+            },
+        })
+        .unwrap();
+
+        app.poll_review_build();
+
+        assert!(app.code_reviews.is_empty(), "no state resurrected");
+        assert_eq!(app.perf_counters().review_builds_applied, 0);
+        assert!(!app.review_build.in_progress());
+    }
+
+    #[test]
+    fn note_slow_op_applies_record_threshold() {
+        let mut app = app_with_sessions(0);
+        app.note_slow_op("fast", SLOW_OP_RECORD_MS - 1);
+        assert!(
+            app.metrics.timings.slow_ops.iter_recent().next().is_none(),
+            "below the record threshold nothing lands in the ring"
+        );
+        app.note_slow_op("slow", SLOW_OP_RECORD_MS);
+        assert_eq!(
+            app.metrics
+                .timings
+                .slow_ops
+                .iter_recent()
+                .next()
+                .map(|o| o.name),
+            Some("slow")
+        );
+    }
+
+    /// The perf snapshot write bumps *other* connections' `data_version`
+    /// (forcing their shared-state reload), so a default-config idle instance
+    /// must never publish it — only THURBOX_PERF_LOG or an open HUD opts in
+    /// (ADR-P11).
+    #[tokio::test]
+    async fn perf_snapshot_published_only_while_timing_active() {
+        let mut app = app_with_sessions(0);
+        app.perf_log_env = false;
+        for _ in 0..=PERF_WINDOW_TICKS {
+            app.tick();
+        }
+        assert_eq!(
+            app.db.get_perf_snapshot().unwrap(),
+            None,
+            "no snapshot churn without opt-in"
+        );
+
+        app.show_perf_hud = true;
+        for _ in 0..=PERF_SNAPSHOT_TICKS {
+            app.tick();
+        }
+        assert!(
+            app.db.get_perf_snapshot().unwrap().is_some(),
+            "an open HUD publishes the snapshot"
+        );
+    }
+
+    /// Local backend that records capture/adopt interplay for the ADR-P9
+    /// restore-prefetch gate: `capture_history` counts calls and returns
+    /// recognizable bytes; `adopt` asserts it always receives a prefetched
+    /// seed (never `None`, which would mean an inline capture on the
+    /// sequential path).
+    struct RecordingCaptureBackend {
+        captures: std::sync::atomic::AtomicUsize,
+        seeded_adopts: std::sync::atomic::AtomicUsize,
+    }
+    impl RecordingCaptureBackend {
+        fn new() -> Self {
+            Self {
+                captures: std::sync::atomic::AtomicUsize::new(0),
+                seeded_adopts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+    impl SessionBackend for RecordingCaptureBackend {
+        fn name(&self) -> &str {
+            "capture-stub"
+        }
+        fn check_available(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn ensure_ready(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn spawn(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[String],
+            _: Option<&Path>,
+            _: &std::collections::HashMap<String, String>,
+            _: u16,
+            _: u16,
+        ) -> anyhow::Result<crate::agent::backend::SpawnedSession> {
+            anyhow::bail!("capture stub does not spawn")
+        }
+        fn adopt(
+            &self,
+            _: &str,
+            _: u16,
+            _: u16,
+            seed: Option<Vec<u8>>,
+        ) -> anyhow::Result<crate::agent::backend::AdoptedSession> {
+            assert!(
+                seed.is_some(),
+                "restore must pass the prefetched seed (ADR-P9), not capture inline"
+            );
+            self.seeded_adopts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::agent::backend::AdoptedSession {
+                output: Box::new(std::io::empty()),
+                input: Box::new(std::io::sink()),
+            })
+        }
+        fn capture_history(&self, backend_id: &str) -> anyhow::Result<Vec<u8>> {
+            self.captures
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(format!("history:{backend_id}").into_bytes())
+        }
+        fn discover(&self) -> anyhow::Result<Vec<crate::agent::backend::DiscoveredSession>> {
+            Ok(vec![
+                make_discovered("%1", "tb-one", true),
+                make_discovered("%2", "tb-two", true),
+            ])
+        }
+        fn resize(&self, _: &str, _: u16, _: u16) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn is_dead(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn kill(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn detach(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn pane_pid(&self, _: &str) -> anyhow::Result<Option<u32>> {
+            Ok(None)
+        }
+    }
+
+    /// ADR-P9: the local restore prefetches every matched pane's scrollback
+    /// capture in parallel and hands the seeds to the sequential adopt loop —
+    /// one `capture_history` per session, every `adopt` seeded, counter == N.
+    #[tokio::test]
+    async fn perf_restore_prefetches_capture_seeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_sessions(0);
+        let backend = Arc::new(RecordingCaptureBackend::new());
+        app.backends.register(backend.clone());
+
+        let mut one = make_shared_session("%1", "one");
+        one.backend_type = "capture-stub".to_string();
+        let mut two = make_shared_session("%2", "two");
+        two.backend_type = "capture-stub".to_string();
+
+        app.restore_sessions(vec![one, two], 2);
+
+        assert_eq!(
+            backend.captures.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one prefetched capture per matched pane"
+        );
+        assert_eq!(
+            backend
+                .seeded_adopts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "every adopt received its prefetched seed"
+        );
+        assert_eq!(app.perf_counters().restore_seed_prefetches, 2);
+        assert_eq!(app.sessions.len(), 2);
     }
 
     #[test]
@@ -11246,6 +12244,186 @@ mod tests {
             _: &str,
             _: u16,
             _: u16,
+            _: Option<Vec<u8>>,
+        ) -> anyhow::Result<crate::agent::backend::AdoptedSession> {
+            Ok(crate::agent::backend::AdoptedSession {
+                output: Box::new(std::io::empty()),
+                input: Box::new(std::io::sink()),
+            })
+        }
+        fn discover(&self) -> anyhow::Result<Vec<crate::agent::backend::DiscoveredSession>> {
+            Ok(vec![make_discovered("%9", "tb-remote-sess", true)])
+        }
+        fn resize(&self, _: &str, _: u16, _: u16) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn is_dead(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn kill(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn detach(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn pane_pid(&self, _: &str) -> anyhow::Result<Option<u32>> {
+            Ok(None)
+        }
+    }
+
+    /// Stub remote backend whose host is **down**: `ensure_ready` fails, so
+    /// discovery reports unreachable and its sessions stay as placeholders.
+    struct DownRemoteStubBackend;
+    impl SessionBackend for DownRemoteStubBackend {
+        fn name(&self) -> &str {
+            "ssh:down-host"
+        }
+        fn check_available(&self) -> anyhow::Result<()> {
+            anyhow::bail!("host down")
+        }
+        fn ensure_ready(&self) -> anyhow::Result<()> {
+            anyhow::bail!("ssh: connect to host down-host port 22: No route to host")
+        }
+        fn spawn(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[String],
+            _: Option<&Path>,
+            _: &std::collections::HashMap<String, String>,
+            _: u16,
+            _: u16,
+        ) -> anyhow::Result<crate::agent::backend::SpawnedSession> {
+            anyhow::bail!("host down")
+        }
+        fn adopt(
+            &self,
+            _: &str,
+            _: u16,
+            _: u16,
+            _: Option<Vec<u8>>,
+        ) -> anyhow::Result<crate::agent::backend::AdoptedSession> {
+            anyhow::bail!("host down")
+        }
+        fn discover(&self) -> anyhow::Result<Vec<crate::agent::backend::DiscoveredSession>> {
+            anyhow::bail!("host down")
+        }
+        fn resize(&self, _: &str, _: u16, _: u16) -> anyhow::Result<()> {
+            anyhow::bail!("host down")
+        }
+        fn is_dead(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn kill(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn detach(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn pane_pid(&self, _: &str) -> anyhow::Result<Option<u32>> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_session_on_down_host_stays_unreachable_and_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_sessions(0);
+        app.backends.register(Arc::new(DownRemoteStubBackend));
+
+        let mut shared = make_shared_session("%9", "remote-sess");
+        shared.backend_type = "ssh:down-host".to_string();
+        let id = shared.id;
+        // The real persisted row (as if written by a prior run).
+        app.db.upsert_session(&shared).unwrap();
+        app.restore_sessions(vec![shared], 1);
+
+        // Immediately visible as an unreachable placeholder.
+        assert_eq!(app.sessions.len(), 1);
+        assert!(app.sessions[0].is_placeholder());
+        assert_eq!(app.sessions[0].info.status, SessionStatus::Unreachable);
+
+        // Drain the discovery thread's "unreachable" report: the placeholder
+        // survives (not adopted) and stays queued for retry.
+        for _ in 0..500 {
+            app.poll_remote_restore();
+            if app
+                .remote_restore
+                .as_ref()
+                .is_some_and(|s| s.notified_unreachable.contains("ssh:down-host"))
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.sessions.len(), 1);
+        assert!(app.sessions[0].is_placeholder());
+        assert_eq!(app.sessions[0].info.id, id);
+        // Still pending → the retry loop will keep trying the host.
+        assert!(app
+            .remote_restore
+            .as_ref()
+            .is_some_and(|s| s.pending.contains_key("ssh:down-host")));
+
+        // Its persisted row must be untouched by the placeholder (save_state
+        // skips placeholders), so re-adoption after recovery still works.
+        app.save_state();
+        let persisted = app.db.list_active_sessions().unwrap();
+        let row = persisted.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(row.backend_type, "ssh:down-host");
+        assert_eq!(row.backend_id, "%9");
+    }
+
+    /// Stub remote backend that is **down at first, then recovers**:
+    /// `ensure_ready` fails until `ready_after` calls have been made, then
+    /// succeeds and discovers `%9`. Models a failing remote session that later
+    /// reconnects.
+    struct FlakyRemoteStubBackend {
+        calls: std::sync::atomic::AtomicUsize,
+        ready_after: usize,
+    }
+    impl FlakyRemoteStubBackend {
+        fn new(ready_after: usize) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                ready_after,
+            }
+        }
+    }
+    impl SessionBackend for FlakyRemoteStubBackend {
+        fn name(&self) -> &str {
+            "ssh:flaky-host"
+        }
+        fn check_available(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn ensure_ready(&self) -> anyhow::Result<()> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n >= self.ready_after {
+                Ok(())
+            } else {
+                anyhow::bail!("host down")
+            }
+        }
+        fn spawn(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[String],
+            _: Option<&Path>,
+            _: &std::collections::HashMap<String, String>,
+            _: u16,
+            _: u16,
+        ) -> anyhow::Result<crate::agent::backend::SpawnedSession> {
+            anyhow::bail!("flaky stub does not spawn")
+        }
+        fn adopt(
+            &self,
+            _: &str,
+            _: u16,
+            _: u16,
+            _: Option<Vec<u8>>,
         ) -> anyhow::Result<crate::agent::backend::AdoptedSession> {
             Ok(crate::agent::backend::AdoptedSession {
                 output: Box::new(std::io::empty()),
@@ -11273,6 +12451,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_remote_session_host_loss_becomes_unreachable_then_reconnects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_sessions(0);
+        let remote: Arc<dyn SessionBackend> = Arc::new(RemoteStubBackend);
+        app.backends.register(Arc::clone(&remote));
+
+        // A live, adopted remote session (non-placeholder).
+        let mut session = Session::stub("remote-sess", &remote, &stub_provider());
+        session.info.agent_session_id = Some("sess-uuid".to_string());
+        let id = session.info.id;
+        app.sessions.push(session);
+        app.active_index = 0;
+        assert!(!app.sessions[0].is_placeholder());
+        assert!(crate::session::is_remote_backend(
+            app.sessions[0].backend_name()
+        ));
+
+        // Simulate the SSH/host connection dropping mid-session (control-mode
+        // EOF → `exited`); with `remain-on-exit=on` this only happens on host
+        // loss, never a clean agent exit.
+        app.sessions[0].mark_exited_for_test();
+
+        // The per-tick detector converts it in place to an unreachable
+        // placeholder and queues it for reconnect.
+        app.detect_lost_remote_sessions();
+        assert!(app.sessions[0].is_placeholder());
+        assert_eq!(app.sessions[0].info.status, SessionStatus::Unreachable);
+        assert_eq!(app.sessions[0].info.id, id);
+        assert!(app
+            .remote_restore
+            .as_ref()
+            .is_some_and(|s| s.pending.contains_key("ssh:test-host")));
+
+        // The host is reachable again → reconnects and re-adopts in place.
+        drain_remote_restore(&mut app);
+        assert_eq!(app.sessions.len(), 1);
+        assert!(!app.sessions[0].is_placeholder());
+        assert_eq!(app.sessions[0].info.id, id);
+    }
+
+    #[tokio::test]
+    async fn failing_remote_session_recovers_and_adopts_on_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_sessions(0);
+        // Down for the first discovery, up on the retry.
+        app.backends
+            .register(Arc::new(FlakyRemoteStubBackend::new(1)));
+
+        let mut shared = make_shared_session("%9", "remote-sess");
+        shared.backend_type = "ssh:flaky-host".to_string();
+        let id = shared.id;
+        app.restore_sessions(vec![shared], 1);
+        assert!(app.sessions[0].is_placeholder());
+
+        // Phase 1: the first discovery finds the host down — the placeholder
+        // survives as unreachable and stays queued for retry.
+        let mut down_seen = false;
+        for _ in 0..500 {
+            app.poll_remote_restore();
+            if app
+                .remote_restore
+                .as_ref()
+                .is_some_and(|s| s.notified_unreachable.contains("ssh:flaky-host"))
+            {
+                down_seen = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(down_seen, "first discovery should report the host down");
+        assert!(app.sessions[0].is_placeholder());
+        assert_eq!(app.sessions[0].info.status, SessionStatus::Unreachable);
+        assert!(app
+            .remote_restore
+            .as_ref()
+            .is_some_and(|s| s.pending.contains_key("ssh:flaky-host")));
+
+        // Phase 2: force a retry sweep; the host is up now, so the placeholder is
+        // replaced in place by the real adopted session (same id, no duplicate).
+        app.retry_remote_backend_now("ssh:flaky-host");
+        drain_remote_restore(&mut app);
+        assert_eq!(app.sessions.len(), 1);
+        assert!(!app.sessions[0].is_placeholder());
+        assert_eq!(app.sessions[0].info.id, id);
+        assert_eq!(app.sessions[0].backend_name(), "ssh:flaky-host");
+    }
+
+    #[tokio::test]
+    async fn deleting_placeholder_is_not_resurrected_on_recovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_sessions(0);
+        app.backends.register(Arc::new(RemoteStubBackend));
+
+        let mut shared = make_shared_session("%9", "remote-sess");
+        shared.backend_type = "ssh:test-host".to_string();
+        let id = shared.id;
+        app.db.upsert_session(&shared).unwrap();
+        app.restore_sessions(vec![shared], 1);
+        assert!(app.sessions[0].is_placeholder());
+
+        // The user deletes the placeholder before the host is reached.
+        app.active_index = 0;
+        app.close_active_session();
+        assert!(app.sessions.is_empty());
+
+        // The host is reachable now; draining discovery must NOT resurrect the
+        // deleted session.
+        drain_remote_restore(&mut app);
+        assert!(app.sessions.iter().all(|s| s.info.id != id));
+    }
+
+    #[tokio::test]
     async fn remote_sessions_restore_in_background() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = crate::paths::TestPathGuard::new(tmp.path());
@@ -11285,32 +12578,43 @@ mod tests {
 
         app.restore_sessions(vec![shared], 1);
 
-        // The first frame must not wait on the remote host: nothing is adopted
-        // synchronously; discovery runs on a background thread.
-        assert!(app.sessions.is_empty());
+        // The first frame must not wait on the remote host: the session shows
+        // immediately as an unreachable placeholder, and the real adopt runs on
+        // a background thread.
+        assert_eq!(app.sessions.len(), 1);
+        assert!(app.sessions[0].is_placeholder());
+        assert_eq!(app.sessions[0].info.id, id);
+        assert_eq!(app.sessions[0].info.status, SessionStatus::Unreachable);
         assert!(app.remote_restore.is_some());
 
-        // Drain like tick() would until the discovery thread reports.
+        // Drain like tick() would until the discovery thread reports; the
+        // placeholder is replaced in place by the real adopted session.
         drain_remote_restore(&mut app);
         assert_eq!(app.sessions.len(), 1);
+        assert!(!app.sessions[0].is_placeholder());
         assert_eq!(app.sessions[0].info.id, id);
         assert_eq!(app.sessions[0].backend_name(), "ssh:test-host");
     }
 
     #[test]
-    fn remote_session_on_unknown_host_is_left_unadopted() {
+    fn remote_session_on_unknown_host_shows_unreachable_placeholder() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = crate::paths::TestPathGuard::new(tmp.path());
         let mut app = app_with_sessions(0);
 
         let mut shared = make_shared_session("%9", "remote-sess");
         shared.backend_type = "ssh:unknown-host".to_string();
+        let id = shared.id;
 
         app.restore_sessions(vec![shared], 1);
 
-        // Same contract as the old synchronous path: an unmanageable backend's
-        // sessions are left un-adopted, and nothing stays pending.
-        assert!(app.sessions.is_empty());
+        // An unmanageable backend (host not in config) can't be adopted, but the
+        // session must still appear — as an unreachable placeholder — rather than
+        // silently vanish. It isn't queued for retries (nothing to retry against).
+        assert_eq!(app.sessions.len(), 1);
+        assert!(app.sessions[0].is_placeholder());
+        assert_eq!(app.sessions[0].info.id, id);
+        assert_eq!(app.sessions[0].info.status, SessionStatus::Unreachable);
         assert!(app.remote_restore.is_none());
     }
 

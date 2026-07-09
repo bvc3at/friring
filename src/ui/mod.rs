@@ -16,6 +16,7 @@ pub mod info_panel;
 pub mod layout;
 pub mod links;
 pub mod markdown;
+pub mod perf_hud;
 pub mod project_list;
 pub mod repo_picker_modal;
 pub mod restore_sessions_modal;
@@ -397,6 +398,7 @@ pub fn status_color(status: SessionStatus) -> Color {
         SessionStatus::Done => Theme::status_done(),
         SessionStatus::Idle => Theme::status_idle(),
         SessionStatus::Error => Theme::status_error(),
+        SessionStatus::Unreachable => Theme::status_unreachable(),
     }
 }
 

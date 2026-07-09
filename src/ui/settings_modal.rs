@@ -77,6 +77,7 @@ const SECTIONS: [(&str, &[SettingsField]); 3] = [
             SettingsField::FeatShellPane,
             SettingsField::FeatCodeReview,
             SettingsField::FeatCcActivity,
+            SettingsField::FeatPerfHud,
             SettingsField::FeatMouse,
             SettingsField::FeatNotifications,
             SettingsField::FeatSoftDelete,

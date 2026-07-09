@@ -76,6 +76,10 @@ wall-clock-free `u64` counters bumped at the render/tick hot paths:
 | `automation_entries_built` | automations-pane entry list built |
 | `hook_state_loads` | `refresh_session_statuses` actually reloaded the persisted hook columns (`load_hook_states`) — gated on a `data_version` change (ADR-P6), so it stays flat while idle |
 | `external_poll_checks` / `external_poll_reloads` | `poll_external_changes` ran its cheap `PRAGMA data_version` check / found a change and did a full shared-state reload |
+| `review_builds_dispatched` / `review_builds_applied` | code-review diff builds handed to the background worker / applied back on the UI thread (ADR-P8) |
+| `restore_seed_prefetches` | restore history captures prefetched in parallel, one per matched pane (ADR-P9) |
+| `agent_meta_syncs` | a session's OSC title/notification actually re-read (gated on the reader thread's meta generation, ADR-P10) |
+| `data_version_checks` | the status refresh actually ran its `PRAGMA data_version` read (throttled ~10×/s, ADR-P10) |
 
 `hook_state_loads` is the regression gate for ADR-P6: it climbs once at startup
 and then only when an external `session signal` commits, instead of ~1 per tick.
@@ -170,10 +174,13 @@ won't pay off.
   `startup …` line to `~/.local/share/thurbox/thurbox.log` with a **phase
   breakdown** that sums to roughly `first_frame_ms` —
   `config_init_ms` (config-file loads + local backend ready), `db_open_ms`,
+  `theme_activate_ms` (persisted-theme lookup + custom-theme publish),
   `extension_heal_ms` (self-heal + built-in hooks wiring + agents reload),
+  `app_new_ms` (`App::new`: keybindings load, settings snapshot, channels),
   `restore_ms` (the synchronous local-session restore — remote backends restore
-  on background threads, off this phase; see ADR-P7), and `first_frame_ms`
-  (total to first paint).
+  on background threads, off this phase; see ADR-P7), `heartbeat_ms` (arming
+  the automation-heartbeat tmux window), and `first_frame_ms` (total to first
+  paint).
   When restore is the long pole, the same flag also emits per-backend
   `restore_discover` lines (`discover_ms`; for a remote backend the line comes
   from its background thread) and per-session `restore_adopt` lines
@@ -184,10 +191,13 @@ won't pay off.
   `adopt_split` line (in `TmuxBackend::adopt`) further breaks `adopt_ms` into
   `capture_ms` (the independent `tmux capture-pane` subprocess — the only part
   that could run in parallel across sessions) and `connect_ms` (the
-  control-mode attach). This split is the deciding measurement for parallelizing
-  restore: the control-mode connection is serialized by a single mutex held
-  across each command's full round-trip (`TmuxBackend::with_control`), so
-  `connect_ms` is inherently sequential and only `capture_ms` can be overlapped.
+  control-mode attach). This split was the deciding measurement for
+  parallelizing restore: the control-mode connection is serialized by a single
+  mutex held across each command's full round-trip
+  (`TmuxBackend::with_control`), so `connect_ms` is inherently sequential and
+  only `capture_ms` can be overlapped — which ADR-P9 now does (on the startup
+  restore path `capture_ms` reads ≈ 0 and a `restore_capture_prefetch` line
+  reports the overlapped batch).
   Off by default — never affects normal runs or the smoke test; the timing reads
   are gated on the flag so there is zero overhead otherwise.
 - **Binary size**: the non-gating `binary-size` CI job
@@ -300,12 +310,200 @@ already brought up and is cheap on the main thread.
 
 ---
 
+## ADR-P8: Build code-review diffs off the UI thread
+
+**Choice**: Opening the code-review view (`Ctrl+X`/`F7`) and switching its
+target used to run the whole git pipeline **synchronously in the key
+handler** — per repo: base resolution (`branch_exists` + `list_branches` +
+`default_branch`), the target-picker commit listing, and the diff itself,
+each a `git` subprocess and **each an ssh round-trip for a remote session**.
+Measured via the `code_review_build` slow op (ADR-P11): seconds of frozen UI
+on a remote host. Now `toggle_code_review` does only the cheap gather
+(session id, host, worktree list, label dedup), installs the review in a
+`loading` state — the pane opens instantly with a "Building diff…"
+placeholder — and hands the git work to a `spawn_blocking` worker
+(`build_review_open` / `build_review_retarget` in `src/app/code_review.rs`,
+via the shared `BackgroundTask` fire-and-poll shape). `App::poll_review_build`
+(a `tick` step) applies the result **by session id** into `App::code_reviews`,
+so a review closed (or switched away from) mid-build simply drops the result.
+One build runs at a time; a second open/retarget while one is in flight is
+refused with a toast.
+
+Gate: `review_builds_dispatched` / `review_builds_applied` +
+`perf_review_open_never_builds_on_ui_thread`,
+`perf_review_build_result_applied_via_poll`,
+`review_build_for_closed_review_is_dropped` (`src/app/mod.rs` tests).
+
+**Why**: this was the largest *interactive* stall in the app, and the inputs
+are all owned/cloneable data (`ReviewRepo`, `HostDef`, the target), so the
+work moves off-thread wholesale with the same pattern the codebase already
+uses for git stats and worktree creation.
+
+**Rejected**:
+
+- *Queueing a second build behind the in-flight one* — a rapid open→retarget
+  would apply two results in sequence for no benefit; the refuse-with-toast
+  is simpler and the loading state makes it obvious.
+- *An async-aware diff stream (progressive per-repo fill-in)* — more moving
+  parts for a build that is fast locally; revisit only if multi-repo remote
+  reviews prove slow *after* this change.
+
+---
+
+## ADR-P9: Prefetch restore's history captures in parallel
+
+**Choice**: The sequential local-session restore adopts one session at a time,
+and ADR-P5's `adopt_split` measurement shows each adopt is `capture_ms` (an
+independent `tmux capture-pane` subprocess) + `connect_ms` (the control-mode
+attach, serialized by the connection mutex — inherently sequential). Restore
+now runs all matched panes' captures **in parallel** up front
+(`App::prefetch_capture_seeds`, a bounded `std::thread::scope` fan-out capped
+at 8 concurrent subprocesses) and passes each seed into the adopt:
+`SessionBackend::adopt` takes `seed: Option<Vec<u8>>` (`None` = capture
+inline, exactly the old behavior — used by mid-run adopts, shell-pane
+re-adoption, and the remote restore path) and the new
+`SessionBackend::capture_history` exposes the capture as its own trait method.
+With N sessions the restore's capture cost drops from `N × capture_ms` to
+roughly one `capture_ms`; `adopt_split` now logs `capture_ms ≈ 0` on the
+startup path, and a `restore_capture_prefetch` line (`sessions`,
+`prefetch_ms`) reports the overlapped batch.
+
+Gate: `restore_seed_prefetches` (one per prefetched pane) +
+`perf_restore_prefetches_capture_seeds` (`src/app/mod.rs` tests — a recording
+backend asserts every adopt received a prefetched seed and the capture ran
+exactly once per session; count-based, no timing).
+
+**Why**: startup time is dominated by restore once a few sessions exist, and
+the capture half is the only slice that parallelizes without touching the
+control-mode serialization ADR-P5 documents.
+
+**Rejected**:
+
+- *Parallelizing whole adopts* — `connect_pane` shares one control-mode
+  connection guarded by a mutex held across each command round-trip; threads
+  would just queue on it.
+- *Unbounded capture fan-out* — a 50-session restore would fork 50
+  subprocesses at once; the cap keeps the burst bounded with the same
+  wall-clock win.
+
+---
+
+## ADR-P10: Cut the idle tick's per-session churn
+
+**Choice**: two reductions in `refresh_session_statuses`' ~100 Hz work, both
+gated by counters:
+
+- **Agent meta generation gate.** `apply_session_status_fields` called
+  `session.agent_title()` + `session.notification()` for every session every
+  tick — 2·N mutex locks and up to 2·N `String` clones at ~100 Hz, almost
+  always re-reading unchanged values. The reader thread's `TermSignals` now
+  bumps a shared `meta_gen` atomic **after** each title/notification write,
+  and `Session::sync_agent_meta` re-reads the mutexes only when the
+  generation moved (one relaxed/acquire atomic load per session per tick
+  otherwise). Status derivation itself still runs every tick, so
+  blocked/working/done latency is unchanged; a generation observed mid-write
+  only delays the text by one ~10 ms tick (the counter is bumped after the
+  value lands). Gate: `agent_meta_syncs` +
+  `perf_agent_meta_cached_across_idle_ticks` /
+  `perf_agent_meta_resyncs_on_change`.
+- **Throttled `data_version` read.** The ADR-P6 cache still ran its `PRAGMA
+  data_version` `query_row` every tick (~100 rusqlite round-trips/s). The
+  read now runs every `HOOK_VERSION_CHECK_TICKS` (10 ticks ≈ 100 ms) — except
+  when the cache was explicitly invalidated (a remote hook event or restart
+  wrote on our own connection, which the pragma can't see; those check
+  immediately). Worst case an external `session signal` displays ~100 ms
+  late instead of ~10 ms — far below the 250 ms coupling ADR-P6 rejected as
+  visible. Gate: `data_version_checks` +
+  `perf_data_version_read_is_throttled` (and
+  `perf_hook_states_reload_on_external_change` now ticks through a full
+  throttle window before asserting).
+
+**Why**: with the render loop demand-driven (ADR-P1) and the hook reload
+cached (ADR-P6), these two were the largest remaining per-tick costs, and
+both scale with session count. Neither changes any user-visible latency
+budget.
+
+**Rejected**:
+
+- *Sharing `poll_external_changes`' cursor for the hook check* — still the
+  ADR-P6 rejection: `has_external_changes` mutates the shared
+  `last_data_version`, so two consumers would steal each other's edges.
+- *Gating the whole status derivation on the generation* — the
+  output-quiescence `working → Idle` fallback and the spinner are
+  time-driven; they must run every tick regardless.
+- *Deferred follow-ups* (measure first via the new observability):
+  extension self-heal gating on a fingerprint (watch `extension_heal_ms`),
+  and an adaptive idle poll interval for the 100 Hz loop itself (idle CPU
+  was not a reported pain point; the tick is now cheap).
+
+---
+
+## ADR-P11: Runtime observability — timing histograms, slow ops, perf window
+
+**Choice**: The deterministic counters (ADR-P2) now have a **runtime
+observability layer** on top — wall-clock stats that are **display/logging
+only** and never CI-asserted (the counters remain the sole regression gate):
+
+- `App::perf_counters()` is a runtime accessor (previously `#[cfg(test)]`).
+- `MetricsState.timings` (`src/app/metrics_state.rs`) holds two hand-rolled
+  fixed-bucket `DurationHistogram`s — `terminal.draw` duration per painted
+  frame and `App::tick` duration per iteration — plus a 16-slot `SlowOps`
+  ring of named synchronous UI-thread operations (`SlowOp { name, ms, tick }`).
+  No new dependencies: the histogram is ~40 lines with power-of-two µs buckets
+  (250 µs → 1 s + overflow), good enough to answer "is a frame 1 ms or 30 ms".
+- **Gating**: the hot-loop `Instant` reads run only while
+  `App::perf_timing_active()` — `THURBOX_PERF_LOG` set (cached at
+  construction) or the perf HUD open — so a normal run pays a single cached
+  bool check per loop iteration, keeping ADR-P5's zero-overhead promise.
+- **Slow ops**: `App::time_op(name, f)` wraps rare, user-triggered synchronous
+  operations (the code-review build/retarget/reload, and `App::update` outliers
+  as `input_dispatch`). Always measured (call sites are not the hot path):
+  ≥ 5 ms lands in the ring, ≥ 100 ms also logs a `slow op` warning — so an
+  interactive stall is attributable even when nobody was watching.
+- **Steady-state reporting**: under `THURBOX_PERF_LOG`, every 1000 ticks
+  (~10 s) `App::tick_perf_window` logs one `perf_window` line — counter
+  **deltas** for the window (`PerfCounters::delta`), frame/tick p50/p95/max,
+  and the window's slow ops — then resets the per-window timing state. The
+  one-shot `startup` line is unchanged.
+- **The perf HUD** (`src/ui/perf_hud.rs`, F12, `[features] perf_hud`): a
+  floating, non-modal overlay with the same counters/percentiles/slow-ops,
+  refreshed by the existing 250 ms forced-redraw floor.
+- **External inspection**: while timing is active the TUI also publishes a
+  JSON snapshot (counters + percentiles + slow ops + the startup phases) into
+  the SQLite `metadata` table (`perf_snapshot` key, ~every 5–10 s), read by
+  **`thurbox-cli perf`** (`--json` for machine output). Publishing is gated on
+  timing being active because each write bumps *other* thurbox connections'
+  `data_version` (a full shared-state reload on their next poll) — an idle,
+  default-config instance must never churn that row.
+
+**Why**: the counters gate regressions in CI but were invisible in a live
+build, and they deliberately count rather than time — so a user-perceived
+stall ("opening review froze for 3 s") had no signal at all. The histograms
+and slow-op ring answer *how long*, the `perf_window` line answers *what is
+the app doing while idle*, and both stay out of CI so ADR-P2's no-flaky-timing
+rule holds.
+
+**Rejected**:
+
+- *Always-on timing* — two `Instant::now()` calls per ≤10 ms loop iteration is
+  cheap but not free, and observability nobody asked for shouldn't tax every
+  run; the opt-in gate costs one bool.
+- *A timing dependency (hdrhistogram etc.)* — same licensing/vetting cost
+  ADR-P5 rejected for criterion; the fixed-bucket histogram is sufficient.
+- *CI assertions on the new timings* — explicitly ruled out; ADR-P2 stands.
+
+---
+
 ## Quick reference
 
 | I want to… | Do this |
 | --- | --- |
 | Measure startup | `THURBOX_PERF_LOG=1 thurbox`, read the `startup` line in `thurbox.log` |
-| Break down startup time | Read the `startup` phase fields (`config_init_ms`/`db_open_ms`/`extension_heal_ms`/`restore_ms`) + the `restore_discover`/`restore_adopt` lines |
+| Break down startup time | Read the `startup` phase fields (`config_init_ms`/`db_open_ms`/`theme_activate_ms`/`extension_heal_ms`/`app_new_ms`/`restore_ms`/`heartbeat_ms`) + the `restore_discover`/`restore_adopt` lines |
+| Watch steady-state cost | `THURBOX_PERF_LOG=1 thurbox`, read the `perf_window` lines (~10 s cadence: counter deltas + frame/tick percentiles + slow ops) |
+| Attribute an interactive stall | Look for `slow op` warnings in `thurbox.log` (named op + ms), or the slow-op list in `perf_window` |
+| Watch perf live in the TUI | Press `F12` (perf HUD overlay; `[features] perf_hud`) |
+| Inspect a running TUI from outside | `thurbox-cli perf` (needs THURBOX_PERF_LOG or an open HUD in that TUI) |
 | Verify the status-hook cache (ADR-P6) | `cargo nextest run -E 'test(perf_hook_states)'`; `hook_state_loads` stays flat while idle, +1 per external `session signal` |
 | See binary size | Check the `Binary Size` CI job summary, or `cargo bloat --release --crates` |
 | Profile CPU | `cargo flamegraph --profile release-with-debug --bin thurbox` |

@@ -77,12 +77,30 @@ The TUI has two layers of end-to-end coverage:
   module). A `Harness` builds a real `App` on a no-op `StubBackend` +
   `Database::open_in_memory()` + a `TestPathGuard` tempdir (fully hermetic),
   feeds `AppMessage::KeyPress` events exactly as `main.rs`'s loop does, and
-  renders to a headless ratatui `TestBackend`. Stable screens (welcome state,
+  renders to a headless ratatui `TestBackend`. It also drives the loop's
+  **tick**: `App::tick` is split into a deterministic `tick_core` (status
+  derivation, timer expiry, search debounce, automation firing, external-change
+  polling — what `Harness::tick` runs, hermetic and runtime-free) and a
+  spawning `tick_background` (sysinfo/git/usage shell-outs, update checks —
+  `main` only). Wall-clock-gated behavior is fast-forwarded via
+  `Harness::advance` (the `app::clock` test clock — a thread-local offset every
+  UI-thread timer reads through), and agent output is injected per session via
+  `Harness::feed_output` (same vt100 + `TermSignals` path as the PTY reader),
+  so redraw detection, OSC title/bell signals, buffer-content search, and
+  terminal rendering are all testable. Stable screens (welcome state,
   F1 help, theme picker) are pinned with **`insta`** snapshots
   (`src/app/snapshots/`); dynamic flows (navigation, modals, panel toggles,
   quit) assert on `App` state instead, so live metrics/clock never make them
   flaky. Runs in the normal `cargo nextest --all` — no tmux/TTY needed. Update
   snapshots with `INSTA_UPDATE=always cargo test` (or `cargo insta review`).
+- **Invariant monkey test** (`monkey_random_events_uphold_invariants` in
+  `src/app/acceptance.rs`). Seeded pseudo-random event streams (keys, chords,
+  mouse, ticks, clock jumps, resizes, injected agent output) against the
+  harness, rendering after **every** step and checking `assert_invariants`
+  (selection indices in bounds, focus never on a hidden surface, panels never
+  outlive their feature flag). A failure prints the seed + step for exact
+  replay. When a "weird TUI behavior" reduces to a rule, add it to
+  `assert_invariants` and let the monkey hunt for a violating sequence.
 - **Black-box smoke test** (`scripts/dev/smoke/tui-smoke.sh`). Launches the real
   `thurbox` binary inside a throwaway tmux pane (isolated `HOME`/XDG/
   `TMUX_TMPDIR`, mirroring `scripts/demo/record.sh`), drives it with
@@ -122,11 +140,18 @@ covers time-driven UI (clock/metrics/cursor blink). Idle paints drop ~100 fps �
 keyed by a content signature (`App::session_order_signature`), rebuilt only when
 its grouping/nesting inputs change. The per-tick session-status read is likewise
 cached (`App::cached_hook_states`), reloaded only when `PRAGMA data_version`
-moves — so an idle `tick` no longer rescans the `sessions` table (ADR-P6). Launch
-with `THURBOX_PERF_LOG=1` to log a `startup` line (phase breakdown +
-`first_frame_ms`, plus `restore_discover`/`restore_adopt`/`adopt_split`) to
-`thurbox.log`. Full rationale + intentionally-skipped optimizations:
-`docs/PERFORMANCE.md`.
+moves — so an idle `tick` no longer rescans the `sessions` table (ADR-P6), with
+the `PRAGMA` itself throttled to ~100 ms and the per-session OSC title/
+notification re-read gated on a reader-thread generation counter (ADR-P10).
+Restore prefetches all history captures in parallel (ADR-P9) and code-review
+diffs build off the UI thread with a loading state (ADR-P8). **Observability**:
+`F12` toggles a live perf HUD (counters + frame/tick percentiles + slow ops;
+`[features] perf_hud`); launching with `THURBOX_PERF_LOG=1` logs a `startup`
+line (phase breakdown + `first_frame_ms`, plus `restore_discover`/
+`restore_adopt`/`adopt_split`/`restore_capture_prefetch`), steady-state
+`perf_window` lines (~10 s), and `slow op` warnings to `thurbox.log`; while
+either is active the TUI publishes a JSON snapshot read by `thurbox-cli perf`.
+Full rationale + intentionally-skipped optimizations: `docs/PERFORMANCE.md`.
 
 ### Windows test environment (VM)
 
@@ -338,7 +363,7 @@ Each release includes:
   - `thurbox-v{ver}-x86_64-unknown-linux-musl.tar.gz`
   - `thurbox-v{ver}-aarch64-apple-darwin.tar.gz`
   - `thurbox-v{ver}-x86_64-pc-windows-msvc.zip` (the Windows artifact
-    extracted by `install.ps1` / packaged by Chocolatey)
+    extracted by `install.ps1` / packaged by Chocolatey + winget)
 - `thurbox-v{ver}-checksums.txt` (SHA256 sums for verification)
 - Changelog with categorized commits
 
@@ -363,6 +388,17 @@ package channels (each gated on its secret, skipped on forks):
   community repo. Runs on `windows-latest`; needs the `CHOCOLATEY_API_KEY`
   secret. New versions go through community-repo moderation.
   Install: `choco install thurbox`. Windows x86_64 only.
+- **winget** (`publish-winget`): bumps `PackageVersion`/`InstallerUrl`/
+  `InstallerSha256`/`ReleaseNotesUrl` in the three manifests under
+  `packaging/winget/manifests/` (via `packaging/winget/bump-manifests.py`,
+  reading the release `checksums.txt`), then `wingetcreate submit`s the set as a
+  PR to `microsoft/winget-pkgs`. Runs on `windows-latest`; needs the
+  `WINGET_TOKEN` secret (a `public_repo` PAT owning a fork of
+  `microsoft/winget-pkgs`). New versions go through winget-pkgs PR
+  validation + review. The release zip is a `zip` installer with
+  `NestedInstallerType = portable` (PATH aliases `thurbox`/`thurbox-cli`, no
+  MSI). Install: `winget install Thurbeen.thurbox`. Windows x86_64 only (added
+  as a moderation-independent alternative to the Chocolatey channel).
 
 See `packaging/README.md` for the full packaging overview.
 
@@ -640,11 +676,17 @@ via `App::backend_for`).
   re-report must not resurrect an acknowledged `done`). Carve-outs: psmux
   remotes (no subscriptions; hooks stripped) and non-claude agents (their hook
   configs aren't materialized remotely) stay Idle-only.
-- **Caveats** (WSL inherits the SSH path): the headless `session delete --force`
-  teardown (`kill_window`/`git::remove_worktree`) is local-only — a `--force`
-  delete won't kill the in-distro window or remove the in-distro worktree (the
-  TUI's own teardown is backend-aware). `wsl.exe`'s exact arg-passing isn't
-  verified in CI (no WSL runner); the construction is unit-tested
+- **Remote teardown** (WSL inherits the SSH path): `session delete --force`
+  teardown is **backend-aware** — `teardown_runtime_resources` resolves the
+  session's `HostDef` from its `backend_type` and, for a remote session, kills
+  the pane via `kill_pane_remote(host, backend_id)` and removes each worktree
+  via `git::remove_worktree_on(Some(host), …)` (local sessions keep the
+  `kill_window`/`remove_worktree` + Windows pane-reap path). Best-effort: an
+  unreachable host or a missing `hosts.toml` entry is recorded in
+  `ForceDeleteReport.remote_teardown_error` (surfaced in the CLI JSON) and the
+  row is still soft-/force-deleted. Like local force-delete it removes the
+  worktree *directory* only, leaving the branch. `wsl.exe`'s exact arg-passing
+  isn't verified in CI (no WSL runner); the construction is unit-tested
   (`transport::tests::wsl_*`, `git_command_wsl_*`).
 - **Local e2e**: `scripts/dev/e2e/linux-container.sh up` spins a throwaway Podman
   container (sshd + tmux + git) and `… test` asserts a session lands on the
@@ -694,7 +736,9 @@ release — `--force` bypasses the up-to-date/dev-build guards; gated on
 `[features] auto_update`, off by default; the TUI also runs this silently on
 startup when the flag is on), `notify`
 (diagnose OS desktop notifications: prints the detected delivery backend
-and last error; `--test` fires a sample — see OS notifications below).
+and last error; `--test` fires a sample — see OS notifications below), `perf`
+(print the perf snapshot a running TUI publishes while `THURBOX_PERF_LOG`
+or its perf HUD is active — see `docs/PERFORMANCE.md`).
 Output is
 **human-readable by default** and switches to JSON automatically when stdout is
 piped (so `… | jq` keeps working); force a format with `--json` (compact),
@@ -1328,8 +1372,8 @@ global_search` in settings.toml; scopes whose feature is disabled
 ## Session status (hooks-driven)
 
 The session list shows, at a glance, which agents are blocked, working,
-or done. `SessionStatus` (`src/session/mod.rs`) has five states driven by
-**agent hooks**, not heuristics:
+or done. `SessionStatus` (`src/session/mod.rs`) has six states — five driven by
+**agent hooks**, not heuristics, plus `Unreachable` for a down remote host:
 
 | State | Colour | Glyph | Meaning |
 |-------|--------|-------|---------|
@@ -1338,6 +1382,32 @@ or done. `SessionStatus` (`src/session/mod.rs`) has five states driven by
 | `Done` | blue | `●` (filled) | a turn just finished; shown until you switch away |
 | `Idle` | green | `○` (hollow) | acknowledged (you moved off a Done), never active, or at rest |
 | `Error` | red | `✗` | reserved for a crashed agent — **not derived yet** (no exit-code signal; exited → `Idle`) |
+| `Unreachable` | muted grey | `⊘` | remote host down/offline; a **placeholder** row (no live pane) awaiting reconnect |
+
+**Unreachable / placeholder sessions.** A persisted **remote** session whose host
+is unreachable at restore (SSH down / auth failing / offline) is inserted as a
+`Session::placeholder` (`src/agent/backend.rs`) so it **always appears** in the
+list instead of silently vanishing, tagged `Unreachable`. A placeholder holds no
+live backend pane — its reader/writer loops are never spawned, keystrokes are
+dropped with a hint, and `resize`/`kill`/`detach`/`save_state` skip it (so it
+never issues a blocking ssh call on the UI thread nor clobbers the persisted
+row). The remote-restore loop (`App::poll_remote_restore` /
+`maybe_retry_remote_restore`) readies each remote backend off-thread, retries a
+down host every `REMOTE_RETRY_INTERVAL` (20 s) — or immediately on restart
+(`Ctrl+R`) — and, once the host recovers, replaces the placeholder **in place**
+with the adopted session (same `SessionId`, so the order signature is unchanged).
+
+The same treatment covers **mid-session host loss**: `App::detect_lost_remote_sessions`
+(per tick) spots a *live* remote session whose control-mode connection just died
+and converts it in place to an `Unreachable` placeholder + queues it for
+reconnect (`enqueue_remote_reconnect`). The reliable signal is `has_exited()`:
+because tmux runs with `remain-on-exit=on`, a clean agent exit keeps its pane
+alive (no reader EOF), so a remote session's reader hitting EOF means the host/SSH
+connection dropped, not a normal exit. So a running session whose host dies flips
+to `Unreachable` and auto-reconnects instead of silently going `Idle`.
+This composes with the fail-fast SSH hardening (`crate::shell::SSH_HARDENING_OPTS`
+= `BatchMode=yes` + `ConnectTimeout` + `ServerAlive*`), which stops a broken host
+from prompting for a password on the TUI's terminal or hanging the render loop.
 
 The live session list **animates** the `Working` spinner (`ui::SPINNER_FRAMES`,
 `App::spinner_frame` advanced from `tick_count`, ~8 fps, repaints forced only
@@ -1389,7 +1459,7 @@ frame; the static `icon()` is used in non-animated contexts (info panel).
   left untouched — the override is purely in the per-tick derivation, like
   exited → `Idle`.
 - **Rollup.** Repo groups roll up to their most-urgent member
-  (`Blocked > Error > Working > Done > Idle`), rendered as a colored dot on
+  (`Blocked > Error > Working > Done > Unreachable > Idle`), rendered as a colored dot on
   the group header (`ui::project_list::group_status` +
   `group_header_line`). Status only recolors — it **never** reorders rows
   (the order cache stays status-independent).
@@ -1508,10 +1578,20 @@ code_review`.
   (`App::handle_review_files_key`, captured before the global lookup like the diff
   pane). While open it owns the central pane; `Esc`/`Ctrl+X` (or `F7`) close it.
   Rendered by `ui::code_review`, reusing `scrollbar`/`focus_block`/
-  `render_button_bar`/theme. **Unified or side-by-side** diff layout, toggled with
-  `v` / the footer button (`side_by_side`). **Mouse-first** (no vim modal): click a
-  diff line to select/comment, click footer buttons, drag the scrollbar,
-  wheel-scroll. **tuicr nav keys**: `j`/`k` + arrows, PageUp/Down + `Ctrl+D`/`U`,
+  `render_button_bar`/theme. **Unified or true paired side-by-side** diff layout,
+  toggled with `v` / the footer button (`side_by_side`). Side-by-side is
+  GitHub-style paired: a deletion (left) and its aligned addition (right) share
+  **one** screen row (positional `del[k] ↔ add[k]` alignment via the pure
+  `session::review::pair_hunk`; unpaired remainders get a blank half-cell). The
+  pairing is a rendering concern only — `ReviewRow::Line` stays row-granular, so
+  a paired row is still one selectable unit and every `match` on it is unchanged;
+  the row build (`push_file_rows`) just emits one row per pair (the addition
+  folds into its deletion's row) when `side_by_side`. Which side a comment
+  attaches to is resolved at compose time (`CodeReviewState::selected_anchor`):
+  keyboard defaults to New (the addition), a mouse click uses the column it hit
+  (`App::cr_click_row` → `click_side`; left = Old, right = New). **Mouse-first**
+  (no vim modal): click a diff line to select/comment, click footer buttons, drag
+  the scrollbar, wheel-scroll. **tuicr nav keys**: `j`/`k` + arrows, PageUp/Down + `Ctrl+D`/`U`,
   `g`/`G`, `{`/`}` (or Tab) next/prev file, `[`/`]` next/prev hunk. Every footer
   button is labelled with its key (`Comment·c`, `Send→Agent·e`, `Find·/`, …) so
   the shortcuts are discoverable; the changed-files column shows a nav-key legend.
@@ -1521,15 +1601,19 @@ code_review`.
   (`CodeReviewState::h_scroll`, stepped by `App::cr_scroll_h`, clamped to the
   longest line). A **wrap toggle** (`w` / the `Wrap`/`NoWrap` footer pill,
   `CodeReviewState::wrap`, `App::cr_toggle_wrap`) soft-wraps long lines onto
-  extra screen rows instead. Both are transient (unified layout only; no-ops in
-  side-by-side, which resets `h_scroll`). The core invariant — **1 logical diff
+  extra screen rows instead. **Wrap works in both layouts** — a unified line
+  wraps its body; a paired side-by-side row wraps each half independently and the
+  taller half drives the visual-row count (the shorter half pads blank past its
+  last chunk). Horizontal scroll stays unified-only (side-by-side always pins
+  `h_scroll = 0`). The core invariant — **1 logical diff
   row = 1 selectable unit** — is preserved: selection, comment anchoring, click
   hitboxes, and the `selected`-primary scrollbar stay logical; wrapping only
   expands the *visual* rows in `render_rows`, and every visual sub-row carries
   its parent's logical index (so a click on a wrapped continuation selects the
   whole line, and compose anchors to the line's first visual row). Rendering:
-  `unified_diff_line` (h-scroll) / `unified_diff_line_wrapped` (wrap) both build
-  the windowed body via the shared `diff_body_spans`.
+  `unified_diff_line` (h-scroll) / `unified_diff_line_wrapped` (wrap) /
+  `paired_diff_line` (side-by-side, wrap-aware) — the wrapped-row counts are
+  mirrored by `visual_line_count` / `paired_visual_count` for the scroll walk.
 - **Find in diff (`/`).** A `/`-triggered find sub-mode (also the `Find·/` footer
   button, and `/` from the changed-files pane) searches every visible row's text
   — file paths, hunk headings, diff line bodies, comment bodies (case-insensitive
@@ -1600,13 +1684,19 @@ code_review`.
   `y` copies the review as markdown to the clipboard, and `e` (Send→Agent) pastes
   the compiled review into the session's agent as a prompt to address it — the
   review → agent → re-review loop, the orchestrator-native equivalent of submit.
+- **Async diff build.** Opening/retargeting a review runs its git pipeline
+  (base resolution, commit listing, the diffs — over SSH for a remote session)
+  on a background worker with a "Building diff…" loading state, applied by
+  `App::poll_review_build` per tick — the pane opens instantly (ADR-P8,
+  `docs/PERFORMANCE.md`).
 - **v1 follow-ups** (named, not silently dropped): range/multi-line comments,
-  *true* paired side-by-side (v1's side-by-side is split-column — one source line
-  per row, context on both sides, add/del on their own side), async diff build for
-  huge repos (v1 builds synchronously on toggle), grammar-aware syntax
+  token-level intra-line word diffs on a paired row (v1 aligns whole lines
+  positionally, not sub-line), grammar-aware syntax
   highlighting (v1's lexer is heuristic + language-agnostic), horizontal
-  scroll + wrap in the **side-by-side** layout (v1 supports them in unified
-  only), auto-revealing a horizontally-scrolled-off search match, and
+  scroll in the **side-by-side** layout (wrap now works there; paired rows still
+  pin `h_scroll = 0`), per-side search-match highlighting in
+  side-by-side (v1 navigates but doesn't substring-highlight paired rows),
+  auto-revealing a horizontally-scrolled-off search match, and
   search-match highlight across a wrap-boundary seam.
 
 ## Claude Code activity view (workflows + subagents)
@@ -1987,6 +2077,7 @@ Global keys use `Ctrl` + semantic Vim conventions:
 | `Ctrl+,` / `F6` | Settings panel (edit settings.toml) | **,** = preferences |
 | `Ctrl+B` / `F2` | Toggle info panel (visible at width >= 120) | Info **b**ox |
 | `Ctrl+E` / `F3` | Toggle file viewer | **E**xplore files |
+| `F12` | Toggle perf HUD (live counters + frame/tick timing) | Diagnostics |
 | `F1` / `Ctrl+G` | Keybindings help + interactive editor | Universal |
 
 List contexts use plain `j`/`k`/`Enter` for navigation.
