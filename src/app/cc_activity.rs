@@ -22,12 +22,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::session::cc_activity::{
-    parse_journal, parse_meta, parse_transcript, parse_workflow_completion, JournalEntry,
+    parse_job_state, parse_journal, parse_meta, parse_roster, parse_transcript,
+    parse_workflow_completion, CcFanEntry, CcJobState, CcPhase, CcWorkflowSummary, JournalEntry,
     TranscriptBlock, WorkflowCompletion,
 };
-use crate::session::{CcActivity, CcAgent, CcAgentState, CcRunStatus, CcWorkflow, SessionId};
+use crate::session::{
+    CcActivity, CcAgent, CcAgentState, CcRunStatus, CcWorkflow, SessionId, SessionInfo,
+};
 
-use super::{background, App, InputFocus};
+use super::{background, session_member_dirs, App, InputFocus};
 
 /// A standalone subagent (or a journal-less workflow agent) is treated as
 /// `Active` while its transcript was appended within this window, else `Done`.
@@ -42,12 +45,28 @@ pub(super) struct CcRefresh {
     updates: Vec<(SessionId, u64, Option<CcActivity>)>,
 }
 
+/// One session's scan input. Besides its own `agent_session_id`, a session may
+/// **own** additional `subagents/` trees written by **background/daemon
+/// workers** it launched (a detached workflow runs under the worker's own
+/// session id, not this session's). Those are attributed on the scan thread by
+/// matching the worker's replayed `--settings` path against this instance's
+/// hooks settings and its `cwd` against `candidate_dirs`.
+struct CcSessionInput {
+    id: SessionId,
+    own_id: String,
+    /// Normalized (trailing-slash-trimmed) launch dirs this session's agent
+    /// could have started in — the disambiguator for the worker `cwd` match.
+    candidate_dirs: Vec<String>,
+    prior_sig: Option<u64>,
+}
+
 impl App {
-    /// Kick off a background scan of every local session's `subagents/` tree.
-    /// Skips remote sessions (their `~/.claude` lives on the host) and sessions
-    /// without an agent conversation id. Non-claude local sessions simply
-    /// resolve to no directory (empty activity) — cheap, and it means
-    /// claude-based agents under custom names (flow/shepherd workers) are
+    /// Kick off a background scan of every local session's `subagents/` tree —
+    /// its own, plus any owned by background/daemon workers it launched (see
+    /// [`CcSessionInput`]). Skips remote sessions (their `~/.claude` lives on the
+    /// host) and sessions without an agent conversation id. Non-claude local
+    /// sessions simply resolve to no directory (empty activity) — cheap, and it
+    /// means claude-based agents under custom names (flow/shepherd workers) are
     /// covered without a name allowlist.
     pub(super) fn start_cc_refresh(&mut self) {
         if self.cc_refresh.in_progress() {
@@ -56,28 +75,67 @@ impl App {
         let Some(projects) = crate::paths::claude_projects_dir(None) else {
             return;
         };
-        let inputs: Vec<(SessionId, String, Option<u64>)> = self
+        let inputs: Vec<CcSessionInput> = self
             .sessions
             .iter()
             .filter_map(|s| {
                 if s.info.remote_host.is_some() {
                     return None;
                 }
-                let sid = s.info.agent_session_id.clone()?;
-                Some((
-                    s.info.id,
-                    sid,
-                    self.cached_cc_signatures.get(&s.info.id).copied(),
-                ))
+                let own_id = s.info.agent_session_id.clone()?;
+                Some(CcSessionInput {
+                    id: s.info.id,
+                    own_id,
+                    candidate_dirs: self.session_candidate_dirs(&s.info),
+                    prior_sig: self.cached_cc_signatures.get(&s.info.id).copied(),
+                })
             })
             .collect();
         if inputs.is_empty() {
             return;
         }
+        // Attribution inputs: the daemon roster + jobs dir, and this instance's
+        // hooks `--settings` path (the flag the daemon replays). All resolved on
+        // the UI thread; the reads happen off-thread in `collect_cc_activity`.
+        let roster = crate::paths::claude_daemon_roster(None);
+        let jobs_dir = crate::paths::claude_jobs_dir(None);
+        let hooks_settings = crate::session_ops::builtin_hooks::hooks_settings_path();
         let tx = self.cc_refresh.start();
         tokio::task::spawn_blocking(move || {
-            let _ = tx.send(collect_cc_activity(projects, inputs));
+            let _ = tx.send(collect_cc_activity(
+                projects,
+                roster,
+                jobs_dir,
+                hooks_settings,
+                inputs,
+            ));
         });
+    }
+
+    /// The set of launch dirs a session's agent could have started in, normalized
+    /// for the worker-`cwd` match: every member dir (worktree / additional dir /
+    /// primary cwd) plus the resolved process cwd (the symlink workspace for a
+    /// multi-repo session). Uniqued.
+    fn session_candidate_dirs(&self, info: &SessionInfo) -> Vec<String> {
+        let mut dirs: Vec<PathBuf> =
+            session_member_dirs(info.cwd.as_deref(), &info.worktrees, &info.additional_dirs)
+                .into_iter()
+                .map(|(_, p)| p)
+                .collect();
+        if let Some(cwd) = info.cwd.clone() {
+            dirs.push(cwd);
+        }
+        if let Some(pcwd) = self.session_process_cwd_existing(info) {
+            dirs.push(pcwd);
+        }
+        let mut out: Vec<String> = Vec::new();
+        for d in dirs {
+            let n = normalize_dir(&d.to_string_lossy());
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+        out
     }
 
     /// Apply a completed CC-activity scan: update the cached signatures and, for
@@ -109,16 +167,21 @@ impl App {
     }
 }
 
-/// Off-thread: scan each session's `subagents/` tree into a [`CcActivity`]
-/// index, skipping the parse when the directory signature is unchanged.
+/// Off-thread: scan each session's owned `subagents/` trees into one merged
+/// [`CcActivity`] index, skipping the parse when the combined signature is
+/// unchanged. "Owned" = the session's own conversation id plus any
+/// background/daemon worker it launched (attributed via [`attribute_workers`]).
 fn collect_cc_activity(
     projects: PathBuf,
-    inputs: Vec<(SessionId, String, Option<u64>)>,
+    roster_path: Option<PathBuf>,
+    jobs_dir: Option<PathBuf>,
+    hooks_settings: Option<String>,
+    inputs: Vec<CcSessionInput>,
 ) -> CcRefresh {
-    // List the project slug dirs once; each session's tree is one of their
-    // `<agent_session_id>/subagents` children. Scanning sidesteps Claude Code's
-    // slug rule (which replaces `/` *and* `.` — and likely all non-alnum — with
-    // `-`, so a computed slug is wrong for any dotted path).
+    // List the project slug dirs once; each owned tree is one of their
+    // `<session_id>/subagents` children. Scanning sidesteps Claude Code's slug
+    // rule (which replaces `/` *and* `.` — and likely all non-alnum — with `-`,
+    // so a computed slug is wrong for any dotted path).
     let project_dirs: Vec<PathBuf> = std::fs::read_dir(&projects)
         .into_iter()
         .flatten()
@@ -132,29 +195,53 @@ fn collect_cc_activity(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
 
+    // Load the daemon worker pool once (persistent jobs + live roster), then
+    // attribute each worker to at most one session by its replayed --settings +
+    // cwd. Cheap: a handful of small JSON files, read once per scan.
+    let jobs = load_jobs(jobs_dir.as_deref());
+    let workers = collect_workers(roster_path.as_deref(), &jobs);
+    let owners = attribute_workers(&workers, hooks_settings.as_deref(), &inputs);
+
     let mut updates = Vec::with_capacity(inputs.len());
-    for (id, sid, prior) in inputs {
-        match resolve_subagents_dir(&project_dirs, &sid) {
-            Some(dir) => {
-                let sig = dir_signature(&dir);
-                if Some(sig) == prior {
-                    updates.push((id, sig, None));
-                } else {
-                    updates.push((id, sig, Some(build_activity(&dir, now_ns))));
-                }
+    for (idx, input) in inputs.iter().enumerate() {
+        // Owned session ids: this session's own conversation id, plus every
+        // attributed worker's own session id.
+        let mut owned_ids: Vec<String> = vec![input.own_id.clone()];
+        for (wsid, owner_idx) in &owners {
+            if *owner_idx == idx && *wsid != input.own_id {
+                owned_ids.push(wsid.clone());
             }
+        }
+        // Resolve each owned id to its `subagents/` dir; a worker dir also
+        // carries its live job state (drives the overview + change signature).
+        let owned: Vec<(PathBuf, Option<CcJobState>)> = owned_ids
+            .iter()
+            .filter_map(|oid| {
+                resolve_subagents_dir(&project_dirs, oid).map(|dir| (dir, jobs.get(oid).cloned()))
+            })
+            .collect();
+
+        if owned.is_empty() {
             // No subagents tree (yet, or a non-claude session): clear any stale
             // activity, otherwise leave the field untouched.
-            None => match prior {
-                Some(p) if p != 0 => updates.push((id, 0, Some(CcActivity::default()))),
-                _ => updates.push((id, 0, None)),
-            },
+            match input.prior_sig {
+                Some(p) if p != 0 => updates.push((input.id, 0, Some(CcActivity::default()))),
+                _ => updates.push((input.id, 0, None)),
+            }
+            continue;
+        }
+
+        let sig = union_signature(&owned);
+        if Some(sig) == input.prior_sig {
+            updates.push((input.id, sig, None));
+        } else {
+            updates.push((input.id, sig, Some(build_union(&owned, now_ns))));
         }
     }
     CcRefresh { updates }
 }
 
-/// Find `<project>/<agent_session_id>/subagents` across the project slug dirs.
+/// Find `<project>/<session_id>/subagents` across the project slug dirs.
 fn resolve_subagents_dir(project_dirs: &[PathBuf], sid: &str) -> Option<PathBuf> {
     for p in project_dirs {
         let d = p.join(sid).join("subagents");
@@ -165,11 +252,176 @@ fn resolve_subagents_dir(project_dirs: &[PathBuf], sid: &str) -> Option<PathBuf>
     None
 }
 
+/// Read every `jobs/<short>/state.json` into a map keyed by the worker's own
+/// session id (the key to its `subagents/` dir). Persistent — a settled run
+/// stays attributable, so a finished background workflow is still shown.
+fn load_jobs(jobs_dir: Option<&Path>) -> HashMap<String, CcJobState> {
+    let mut out = HashMap::new();
+    let Some(dir) = jobs_dir else {
+        return out;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        if let Ok(s) = std::fs::read_to_string(e.path().join("state.json")) {
+            if let Some(job) = parse_job_state(&s) {
+                out.insert(job.session_id.clone(), job);
+            }
+        }
+    }
+    out
+}
+
+/// A background/daemon worker candidate for attribution: its own session id (the
+/// `subagents/` dir key) plus the replayed `--settings` path and `cwd` used to
+/// match it to a session.
+struct WorkerRef {
+    session_id: String,
+    settings_path: Option<String>,
+    cwd: Option<String>,
+}
+
+/// The worker pool: every persistent daemon job, plus any live roster worker not
+/// yet backed by a job file (freshly claimed, no `state.json` written).
+fn collect_workers(
+    roster_path: Option<&Path>,
+    jobs: &HashMap<String, CcJobState>,
+) -> Vec<WorkerRef> {
+    let mut out: Vec<WorkerRef> = jobs
+        .values()
+        .map(|j| WorkerRef {
+            session_id: j.session_id.clone(),
+            settings_path: j.settings_path.clone(),
+            cwd: j.cwd.clone(),
+        })
+        .collect();
+    if let Some(s) = roster_path.and_then(|p| std::fs::read_to_string(p).ok()) {
+        for w in parse_roster(&s) {
+            if !jobs.contains_key(&w.session_id) {
+                out.push(WorkerRef {
+                    session_id: w.session_id,
+                    settings_path: w.settings_path,
+                    cwd: w.cwd,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Attribute each worker to the thurbox session that launched it, by the
+/// `--settings` path the daemon replays. Two forms (both scoped to this
+/// instance's hooks dir):
+///
+/// - **Exact** (Phase 2): a per-session `<hooks_home>/sessions/<id>.json` names
+///   the session whose conversation id is `<id>` — cwd is irrelevant, so two
+///   non-worktree sessions on one repo are unambiguous.
+/// - **Legacy** (shared `<hooks_home>/claude.json`, pre-Phase-2 or non-unix):
+///   fall back to matching the worker's cwd against a session's candidate launch
+///   dirs, first session by input order.
+///
+/// A worker is owned by **at most one** session. Returns
+/// `worker_session_id → session_index`.
+fn attribute_workers(
+    workers: &[WorkerRef],
+    hooks_settings: Option<&str>,
+    inputs: &[CcSessionInput],
+) -> HashMap<String, usize> {
+    let mut owners = HashMap::new();
+    // No hooks settings → nothing to correlate a worker against.
+    let Some(shared) = hooks_settings.map(normalize_dir) else {
+        return owners;
+    };
+    // The per-session symlinks live at `<hooks_home>/sessions/<id>.json`.
+    let sessions_prefix = shared
+        .strip_suffix("/claude.json")
+        .map(|home| format!("{home}/sessions/"));
+
+    for w in workers {
+        let Some(wsettings) = w.settings_path.as_deref().map(normalize_dir) else {
+            continue;
+        };
+        // Exact match by the per-session path's `<id>` basename.
+        if let Some(id) = sessions_prefix
+            .as_deref()
+            .and_then(|p| wsettings.strip_prefix(p))
+            .and_then(|f| f.strip_suffix(".json"))
+        {
+            if let Some(idx) = inputs
+                .iter()
+                .position(|s| s.own_id.as_str() == id && s.own_id != w.session_id)
+            {
+                owners.entry(w.session_id.clone()).or_insert(idx);
+            }
+            // A per-session path is authoritative — never fall through to cwd.
+            continue;
+        }
+        // Legacy shared path: must be *our* shared claude.json, then match by cwd.
+        if wsettings != shared {
+            continue;
+        }
+        let Some(wcwd) = w.cwd.as_deref().map(normalize_dir) else {
+            continue;
+        };
+        let owner = inputs
+            .iter()
+            .position(|s| s.own_id != w.session_id && s.candidate_dirs.contains(&wcwd));
+        if let Some(idx) = owner {
+            owners.entry(w.session_id.clone()).or_insert(idx);
+        }
+    }
+    owners
+}
+
+/// Trim trailing path separators so `/repo` and `/repo/` compare equal (the
+/// daemon records `--add-dir /repo/` but the worker `cwd` as `/repo`).
+fn normalize_dir(s: &str) -> String {
+    let t = s.trim_end_matches('/');
+    if t.is_empty() {
+        s.to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// Combined change signature over a session's owned trees plus the live fields
+/// of any attributed daemon job — so a fan/tempo/needs change re-triggers a
+/// parse just like a transcript append does.
+fn union_signature(owned: &[(PathBuf, Option<CcJobState>)]) -> u64 {
+    let mut items: Vec<(String, u128, u64)> = Vec::new();
+    let mut job_states: Vec<&CcJobState> = Vec::new();
+    for (dir, job) in owned {
+        collect_dir_items(dir, &mut items);
+        if let Some(j) = job {
+            job_states.push(j);
+        }
+    }
+    items.sort();
+    job_states.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    let mut hasher = DefaultHasher::new();
+    items.hash(&mut hasher);
+    job_states.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Hash of the whole `subagents/` subtree (each file's path + mtime + len). A
 /// live JSONL append bumps mtime → the hash moves → the tree is re-parsed; an
-/// idle tree hashes identically and skips the parse.
+/// idle tree hashes identically and skips the parse. (The production path uses
+/// [`union_signature`], which folds several trees + job state; this single-tree
+/// form backs the change-detection unit test.)
+#[cfg(test)]
 fn dir_signature(root: &Path) -> u64 {
     let mut items: Vec<(String, u128, u64)> = Vec::new();
+    collect_dir_items(root, &mut items);
+    items.sort();
+    let mut hasher = DefaultHasher::new();
+    items.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Append every file's (path, mtime, len) under `root` to `items`.
+fn collect_dir_items(root: &Path, items: &mut Vec<(String, u128, u64)>) {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -190,17 +442,38 @@ fn dir_signature(root: &Path) -> u64 {
             }
         }
     }
-    items.sort();
-    let mut hasher = DefaultHasher::new();
-    items.hash(&mut hasher);
-    hasher.finish()
 }
 
-/// Build the activity index from a `subagents/` directory: standalone `Task`
-/// subagents (top-level `agent-*.jsonl`) plus each `workflows/wf_*/` run.
-fn build_activity(subagents: &Path, now_ns: u128) -> CcActivity {
+/// Merge a session's owned `subagents/` trees into one activity index. Each
+/// owned entry is a dir plus (for a background-worker dir) its live job state,
+/// which enriches an in-flight workflow before any completion record exists.
+fn build_union(owned: &[(PathBuf, Option<CcJobState>)], now_ns: u128) -> CcActivity {
     let mut act = CcActivity::default();
+    for (dir, job) in owned {
+        build_activity_into(&mut act, dir, job.as_ref(), now_ns);
+    }
+    // Most-recently-active first, in both lists.
+    act.subagents.sort_by_key(|a| std::cmp::Reverse(a.mtime_ns));
+    act.workflows
+        .sort_by_key(|w| std::cmp::Reverse(workflow_mtime(w)));
+    act
+}
 
+/// Single-tree convenience wrapper (an in-process session with no daemon job).
+#[cfg(test)]
+fn build_activity(subagents: &Path, now_ns: u128) -> CcActivity {
+    build_union(&[(subagents.to_path_buf(), None)], now_ns)
+}
+
+/// Index one `subagents/` directory into `act`: standalone `Task` subagents
+/// (top-level `agent-*.jsonl`) plus each `workflows/wf_*/` run. `job` is the
+/// live daemon state when this dir belongs to a background worker.
+fn build_activity_into(
+    act: &mut CcActivity,
+    subagents: &Path,
+    job: Option<&CcJobState>,
+    now_ns: u128,
+) {
     if let Ok(entries) = std::fs::read_dir(subagents) {
         for e in entries.flatten() {
             let path = e.path();
@@ -254,20 +527,25 @@ fn build_activity(subagents: &Path, now_ns: u128) -> CcActivity {
             else {
                 continue;
             };
-            if let Some(wf) = build_workflow(&wf_root, &path, run_id) {
+            if let Some(wf) = build_workflow(&wf_root, &path, run_id, job) {
                 act.workflows.push(wf);
             }
         }
     }
-
-    // Most-recently-active first, in both lists.
-    act.subagents.sort_by_key(|a| std::cmp::Reverse(a.mtime_ns));
-    act.workflows
-        .sort_by_key(|w| std::cmp::Reverse(workflow_mtime(w)));
-    act
 }
 
-fn build_workflow(wf_root: &Path, run_dir: &Path, run_id: String) -> Option<CcWorkflow> {
+/// Build one workflow run. When a completion record (`wf_<id>.json`) exists it is
+/// authoritative; otherwise, for a live **background/daemon** run, the job's
+/// `fan[]` grid enriches each agent (label / phase-group / done-fail-run state)
+/// by id and supplies a live summary (`tempo`/`needs`/`tokens`) — the record
+/// isn't written until the run settles. In-process runs with neither fall back
+/// to the `journal.jsonl` edges.
+fn build_workflow(
+    wf_root: &Path,
+    run_dir: &Path,
+    run_id: String,
+    job: Option<&CcJobState>,
+) -> Option<CcWorkflow> {
     let journal = std::fs::read_to_string(run_dir.join("journal.jsonl"))
         .map(|s| parse_journal(&s))
         .unwrap_or_default();
@@ -279,6 +557,11 @@ fn build_workflow(wf_root: &Path, run_dir: &Path, run_id: String) -> Option<CcWo
     } else {
         CcRunStatus::Running
     };
+    // The live fan grid only matters before a completion record lands.
+    let fan = completion
+        .is_none()
+        .then(|| job.map(|j| j.fan_by_id()))
+        .flatten();
 
     let mut agents = Vec::new();
     if let Ok(entries) = std::fs::read_dir(run_dir) {
@@ -295,14 +578,20 @@ fn build_workflow(wf_root: &Path, run_dir: &Path, run_id: String) -> Option<CcWo
             let (mtime_ns, size) = stat_file(&path);
             let meta = read_agent_meta(run_dir, &id);
             let progress = completion.as_ref().and_then(|c| c.agents.get(id.as_str()));
-            let state = workflow_agent_state(&journal, completion.as_ref(), &id);
+            let fan_entry = fan.as_ref().and_then(|f| f.get(id.as_str()).copied());
+            let state = workflow_agent_state(&journal, completion.as_ref(), fan_entry, &id);
             agents.push(CcAgent {
                 agent_id: id,
                 transcript_path: path,
                 agent_type: meta.agent_type,
                 description: meta.description,
-                label: progress.and_then(|p| p.label.clone()),
-                phase_title: progress.and_then(|p| p.phase_title.clone()),
+                // Completion label wins; else the live fan label (skip a blank).
+                label: progress
+                    .and_then(|p| p.label.clone())
+                    .or_else(|| fan_entry.map(|f| f.label.clone()).filter(|l| !l.is_empty())),
+                phase_title: progress
+                    .and_then(|p| p.phase_title.clone())
+                    .or_else(|| fan_entry.and_then(|f| f.group.clone())),
                 state,
                 mtime_ns,
                 size,
@@ -318,10 +607,30 @@ fn build_workflow(wf_root: &Path, run_dir: &Path, run_id: String) -> Option<CcWo
     }
     agents.sort_by_key(|a| a.mtime_ns); // spawn order
 
-    let (name, phases, summary) = match completion {
-        Some(c) => (c.workflow_name, c.phases, Some(c.summary)),
-        None => (None, Vec::new(), None),
+    let (name, mut phases, summary, tempo, needs) = match completion {
+        Some(c) => (c.workflow_name, c.phases, Some(c.summary), None, None),
+        // Live background run: synthesize a summary from the job's totals; the
+        // completion record's phase list isn't written yet.
+        None => match job {
+            Some(j) => (
+                None,
+                Vec::new(),
+                Some(CcWorkflowSummary {
+                    status: j.state.clone(),
+                    total_tokens: j.tokens,
+                    ..Default::default()
+                }),
+                j.tempo.clone(),
+                j.needs.clone(),
+            ),
+            None => (None, Vec::new(), None, None, None),
+        },
     };
+    // Derive phases from the agents' (fan-supplied) phase titles, first-seen
+    // order — the live substitute for a completion record's `phases[]`.
+    if phases.is_empty() {
+        phases = derive_phases(&agents);
+    }
     Some(CcWorkflow {
         run_id,
         name,
@@ -330,14 +639,18 @@ fn build_workflow(wf_root: &Path, run_dir: &Path, run_id: String) -> Option<CcWo
         phases,
         agents,
         summary,
+        tempo,
+        needs,
     })
 }
 
-/// A workflow agent's state: authoritative from the completion grid when the
-/// run has finished, else from the `journal.jsonl` `started`/`result` edges.
+/// A workflow agent's state, in precedence order: the completion grid when the
+/// run has finished, else a live daemon `fan[]` entry (failed → `Error`, has a
+/// `doneAt` → `Done`, else `Active`), else the `journal.jsonl` edges.
 fn workflow_agent_state(
     journal: &HashMap<String, JournalEntry>,
     completion: Option<&WorkflowCompletion>,
+    fan: Option<&CcFanEntry>,
     agent_id: &str,
 ) -> CcAgentState {
     if let Some(c) = completion {
@@ -346,11 +659,41 @@ fn workflow_agent_state(
             _ => CcAgentState::Done, // a completed run's agents are all terminal
         };
     }
+    if let Some(f) = fan {
+        return if f.failed {
+            CcAgentState::Error
+        } else if f.done {
+            CcAgentState::Done
+        } else {
+            CcAgentState::Active
+        };
+    }
     match journal.get(agent_id) {
         Some(j) if j.has_result => CcAgentState::Done,
         Some(j) if j.started => CcAgentState::Active,
         _ => CcAgentState::Done,
     }
+}
+
+/// Distinct phase titles across a workflow's agents, in first-seen order — the
+/// live substitute for a completion record's `phases[]` (a background run's
+/// record isn't written until it settles).
+fn derive_phases(agents: &[CcAgent]) -> Vec<CcPhase> {
+    let mut seen: Vec<String> = Vec::new();
+    for a in agents {
+        if let Some(t) = &a.phase_title {
+            if !seen.contains(t) {
+                seen.push(t.clone());
+            }
+        }
+    }
+    seen.into_iter()
+        .enumerate()
+        .map(|(i, title)| CcPhase {
+            index: i as u64 + 1,
+            title,
+        })
+        .collect()
 }
 
 /// Newest transcript mtime across a workflow's agents (for tree ordering).
@@ -439,6 +782,20 @@ impl CcRow {
     }
 }
 
+/// In-transcript text search (the `/`-triggered find sub-mode), mirroring the
+/// code-review view's find. Matches rows whose text — prose, tool names/inputs,
+/// tool output — contains the query (case-insensitive). While [`Self::editing`]
+/// every key edits the query (the selection jumps to the first match as you
+/// type); `Enter`/`↓`/`Ctrl+N` step to the next match, `↑`/`Ctrl+P` the previous,
+/// and `Tab` commits — after which the bar stays for highlighting and `n`/`N`
+/// step matches just like the file viewer.
+pub(crate) struct CcSearch {
+    pub query: String,
+    pub editing: bool,
+    /// Matching row indices (into [`CcActivityState::rows`]), in row order.
+    pub matches: Vec<usize>,
+}
+
 /// The open activity view for one session (persisted in `App::cc_activities`).
 pub(crate) struct CcActivityState {
     /// Snapshot of the session's activity index, refreshed from
@@ -466,6 +823,8 @@ pub(crate) struct CcActivityState {
     /// Sticky-bottom live-tail: keep the selection pinned to the newest row
     /// while it sits at the end (cleared once the user scrolls up).
     pub follow: bool,
+    /// The open find-in-transcript search, if any (see [`CcSearch`]).
+    pub search: Option<CcSearch>,
 }
 
 impl CcActivityState {
@@ -485,7 +844,59 @@ impl CcActivityState {
             wrap: false,
             collapsed_tools: HashSet::new(),
             follow: true,
+            search: None,
         }
+    }
+
+    /// The searchable text of a row: prose (`Text`), or a transcript block's
+    /// rendered text (prompt/thinking/text body, tool name + input, tool result).
+    /// Drives both `/` matching and the in-row highlight, so the two never
+    /// disagree about what a row "contains". `Info` rows (hints / overview
+    /// scaffolding) aren't searchable.
+    fn row_text(&self, row: &CcRow) -> Option<String> {
+        match row {
+            CcRow::Info(_) => None,
+            CcRow::Text(s) => Some(s.clone()),
+            CcRow::Block(bi) => self.blocks.get(*bi).map(block_search_text),
+        }
+    }
+
+    /// Row indices whose [`Self::row_text`] contains `query` case-insensitively.
+    /// Empty/whitespace query → no matches. Pure, so it is unit-testable.
+    fn search_matches(&self, query: &str) -> Vec<usize> {
+        let q = query.trim().to_lowercase();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        (0..self.rows.len())
+            .filter(|&i| {
+                self.row_text(&self.rows[i])
+                    .is_some_and(|t| t.to_lowercase().contains(&q))
+            })
+            .collect()
+    }
+
+    /// Recompute the open search's match set against the current [`Self::rows`]
+    /// (no-op when no search is open) — called after the query changes and after
+    /// the rows are rebuilt (live-tail), so `n`/`N` + the highlight stay anchored.
+    fn refresh_search_matches(&mut self) {
+        let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else {
+            return;
+        };
+        let matches = self.search_matches(&query);
+        if let Some(s) = self.search.as_mut() {
+            s.matches = matches;
+        }
+    }
+
+    /// The active (non-empty) search query, lowercased for the in-row highlight —
+    /// `None` unless a search is open with text, so the renderer highlights
+    /// exactly the rows [`Self::search_matches`] counted.
+    pub(crate) fn active_query(&self) -> Option<String> {
+        self.search
+            .as_ref()
+            .map(|s| s.query.trim().to_lowercase())
+            .filter(|q| !q.is_empty())
     }
 
     /// Rebuild [`Self::tree`] from the activity snapshot, honouring folds.
@@ -571,6 +982,18 @@ impl CcActivityState {
     }
 }
 
+/// The searchable text of a transcript block — matches what the renderer shows,
+/// so `/` find and the highlight agree.
+fn block_search_text(block: &TranscriptBlock) -> String {
+    match block {
+        TranscriptBlock::Prompt(s)
+        | TranscriptBlock::Thinking(s)
+        | TranscriptBlock::Text(s)
+        | TranscriptBlock::ToolResult { content: s, .. } => s.clone(),
+        TranscriptBlock::ToolUse { name, input } => format!("{name} {input}"),
+    }
+}
+
 /// A workflow overview rendered as a small synthetic transcript.
 fn overview_rows(w: &CcWorkflow) -> Vec<CcRow> {
     let mut rows = Vec::new();
@@ -598,6 +1021,13 @@ fn overview_rows(w: &CcWorkflow) -> Vec<CcRow> {
         if !line.trim().is_empty() {
             rows.push(CcRow::Text(line.trim_end().to_string()));
         }
+    }
+    // Live pace of a background/daemon run (blocked-on-approval, etc.).
+    if let Some(t) = &w.tempo {
+        rows.push(CcRow::Text(format!("Pace: {t}")));
+    }
+    if let Some(n) = &w.needs {
+        rows.push(CcRow::Text(format!("Waiting on: {n}")));
     }
     if !w.phases.is_empty() {
         rows.push(CcRow::Info(String::new()));
@@ -776,6 +1206,7 @@ impl App {
         if matches!(open, Some(CcNodeRef::WorkflowOverview(_))) {
             if let Some(ca) = self.active_cc_activity_mut() {
                 ca.rebuild_rows();
+                ca.refresh_search_matches();
             }
             return;
         }
@@ -796,6 +1227,7 @@ impl App {
             ca.blocks = blocks;
             ca.open_mtime = mtime;
             ca.rebuild_rows();
+            ca.refresh_search_matches();
             // Follow the newest row when pinned to the bottom; otherwise just
             // keep the selection in bounds after the rebuild.
             if (ca.follow && at_end) || ca.selected >= ca.rows.len() {
@@ -856,6 +1288,7 @@ impl App {
             ca.open_mtime = mtime;
             ca.collapsed_tools.clear();
             ca.rebuild_rows();
+            ca.refresh_search_matches();
             ca.selected = ca.first_selectable();
             ca.scroll = 0;
             ca.follow = true;
@@ -952,7 +1385,12 @@ impl App {
 
     fn ca_viewport(&self) -> usize {
         let (rows, _) = self.content_area_size();
-        (rows as usize).saturating_sub(3)
+        // Minus the block border/footer, and the search bar row when open.
+        let search = usize::from(
+            self.active_cc_activity()
+                .is_some_and(|ca| ca.search.is_some()),
+        );
+        (rows as usize).saturating_sub(3 + search)
     }
 
     pub(crate) fn ca_move(&mut self, delta: isize) {
@@ -1060,6 +1498,112 @@ impl App {
         }
     }
 
+    // ── Find in transcript (`/`) ─────────────────────────────────────────
+
+    /// Open the find-in-transcript search, capturing keystrokes into the query.
+    pub(crate) fn ca_start_search(&mut self) {
+        if let Some(ca) = self.active_cc_activity_mut() {
+            ca.search = Some(CcSearch {
+                query: String::new(),
+                editing: true,
+                matches: Vec::new(),
+            });
+        }
+    }
+
+    /// Close the search entirely (drops the query + highlights).
+    fn ca_close_search(&mut self) {
+        if let Some(ca) = self.active_cc_activity_mut() {
+            ca.search = None;
+        }
+    }
+
+    /// `Tab`: commit the query — stop editing but keep the search open so the
+    /// highlight stays and `n`/`N` step matches (an empty query just closes).
+    fn ca_commit_search(&mut self) {
+        let Some(ca) = self.active_cc_activity_mut() else {
+            return;
+        };
+        match ca.search.as_mut() {
+            Some(s) if s.query.trim().is_empty() => ca.search = None,
+            Some(s) => s.editing = false,
+            None => {}
+        }
+    }
+
+    /// Edit the query (append a char / backspace), refresh matches, and jump the
+    /// selection to the first match — the file viewer's incremental search.
+    fn ca_edit_search(&mut self, push: Option<char>) {
+        if let Some(ca) = self.active_cc_activity_mut() {
+            if let Some(s) = ca.search.as_mut() {
+                match push {
+                    Some(c) => s.query.push(c),
+                    None => {
+                        s.query.pop();
+                    }
+                }
+            }
+            ca.refresh_search_matches();
+            if let Some(&first) = ca.search.as_ref().and_then(|s| s.matches.first()) {
+                ca.selected = first;
+                ca.follow = ca.selected + 1 >= ca.rows.len();
+                ca.ensure_visible();
+            }
+        }
+    }
+
+    /// Step to the next/previous match (`n`/`N`, `Enter`/arrows while typing),
+    /// scanning from the current selection and wrapping — always relative to the
+    /// cursor, like the file viewer's `next_match`.
+    fn ca_search_step(&mut self, forward: bool) {
+        let Some(ca) = self.active_cc_activity_mut() else {
+            return;
+        };
+        let Some(s) = ca.search.as_ref() else {
+            return;
+        };
+        if s.matches.is_empty() {
+            return;
+        }
+        let next = if forward {
+            s.matches
+                .iter()
+                .find(|&&i| i > ca.selected)
+                .copied()
+                .or_else(|| s.matches.first().copied())
+        } else {
+            s.matches
+                .iter()
+                .rev()
+                .find(|&&i| i < ca.selected)
+                .copied()
+                .or_else(|| s.matches.last().copied())
+        };
+        if let Some(sel) = next {
+            ca.selected = sel;
+            ca.follow = ca.selected + 1 >= ca.rows.len();
+            ca.ensure_visible();
+        }
+    }
+
+    /// Key handling while the search query line is being typed (mirrors the file
+    /// viewer / code review): `Enter`/`↓`/`Ctrl+N` next, `↑`/`Ctrl+P` previous
+    /// (all stay in the input), `Tab` commits, `Esc` cancels, chars edit.
+    fn handle_cc_search_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        let ctrl = mods.contains(KeyModifiers::CONTROL);
+        match code {
+            KeyCode::Esc => self.ca_close_search(),
+            KeyCode::Enter | KeyCode::Down => self.ca_search_step(true),
+            KeyCode::Up => self.ca_search_step(false),
+            KeyCode::Tab => self.ca_commit_search(),
+            KeyCode::Char('n') if ctrl => self.ca_search_step(true),
+            KeyCode::Char('p') if ctrl => self.ca_search_step(false),
+            KeyCode::Backspace => self.ca_edit_search(None),
+            KeyCode::Char(c) if !ctrl => self.ca_edit_search(Some(c)),
+            _ => {}
+        }
+    }
+
     // ── Key capture (before the global keybinding lookup) ────────────────
 
     /// Global chords the activity panes let through so the user can always
@@ -1091,6 +1635,14 @@ impl App {
         if self.cc_escape_chord(code, mods) {
             return false;
         }
+        // While typing a search query, capture every (non-escape) key.
+        let searching = self
+            .active_cc_activity()
+            .is_some_and(|ca| ca.search.as_ref().is_some_and(|s| s.editing));
+        if searching {
+            self.handle_cc_search_key(code, mods);
+            return true;
+        }
         if mods.contains(KeyModifiers::CONTROL) {
             match code {
                 KeyCode::Char('d') => self.ca_page(true),
@@ -1103,7 +1655,19 @@ impl App {
             return true;
         }
         match code {
+            // Esc clears a committed search before closing the view, so a stray
+            // `/` is one keystroke to undo.
+            KeyCode::Esc
+                if self
+                    .active_cc_activity()
+                    .is_some_and(|ca| ca.search.is_some()) =>
+            {
+                self.ca_close_search()
+            }
             KeyCode::Esc => self.close_cc_activity(),
+            KeyCode::Char('/') => self.ca_start_search(),
+            KeyCode::Char('n') => self.ca_search_step(true),
+            KeyCode::Char('N') => self.ca_search_step(false),
             KeyCode::Down | KeyCode::Char('j') => self.ca_move(1),
             KeyCode::Up | KeyCode::Char('k') => self.ca_move(-1),
             KeyCode::PageDown => self.ca_page(true),
@@ -1287,5 +1851,239 @@ mod tests {
             .collect();
         assert_eq!(resolve_subagents_dir(&dirs, "sid-123"), Some(want));
         assert_eq!(resolve_subagents_dir(&dirs, "missing"), None);
+    }
+
+    /// Build a minimal on-disk `projects/` + `jobs/` layout for the union tests:
+    /// a foreground session with *no* tree of its own, and one daemon worker that
+    /// ran a live workflow, with a matching job `state.json`.
+    fn daemon_fixture(
+        root: &Path,
+        worker_id: &str,
+        settings: &str,
+        cwd: &str,
+    ) -> (PathBuf, PathBuf) {
+        let projects = root.join("projects");
+        let jobs = root.join("jobs");
+        let wf = projects
+            .join("-repo-w")
+            .join(worker_id)
+            .join("subagents/workflows/wf_run");
+        write(&wf.join("agent-a6d17521.jsonl"), "x\n");
+        write(
+            &wf.join("agent-a6d17521.meta.json"),
+            r#"{"agentType":"workflow-subagent"}"#,
+        );
+        // A running fan entry (no doneAt) blocked on an approval.
+        let state = format!(
+            r#"{{"sessionId":"{worker_id}","daemonShort":"95c38d32","state":"working",
+                "tempo":"blocked","needs":"approve Bash: ls","tokens":19030,"cwd":"{cwd}",
+                "backend":"daemon","respawnFlags":["--settings","{settings}","--add-dir","{cwd}/"],
+                "fan":[{{"id":"a6d17521","kind":"workflow","label":"review:correctness","group":"Review","startedAt":1}}]}}"#
+        );
+        write(&jobs.join("95c38d32/state.json"), &state);
+        (projects, jobs)
+    }
+
+    #[test]
+    fn collect_unions_daemon_worker_by_settings_and_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hooks = "/cfg/hooks/claude.json";
+        let repo = "/repo/thurbox";
+        let worker = "95c38d32-39d4-4102-82df-24602ac3a2a0";
+        let (projects, jobs) = daemon_fixture(tmp.path(), worker, hooks, repo);
+
+        // Foreground session owns no tree of its own (the real bug); the worker's
+        // cwd matches its candidate dir and the worker replays our hooks settings.
+        let input = CcSessionInput {
+            id: SessionId::default(),
+            own_id: "0e6bcb32-fore".into(),
+            candidate_dirs: vec![repo.into()],
+            prior_sig: None,
+        };
+        let refresh =
+            collect_cc_activity(projects, None, Some(jobs), Some(hooks.into()), vec![input]);
+
+        let (_, sig, act) = &refresh.updates[0];
+        assert_ne!(*sig, 0);
+        let act = act.as_ref().expect("worker workflow merged in");
+        assert_eq!(act.workflows.len(), 1, "daemon workflow attributed");
+        let w = &act.workflows[0];
+        assert_eq!(w.run_id, "wf_run");
+        assert_eq!(w.status, CcRunStatus::Running);
+        // Live enrichment straight from jobs/state.json (no completion record).
+        assert_eq!(w.tempo.as_deref(), Some("blocked"));
+        assert_eq!(w.needs.as_deref(), Some("approve Bash: ls"));
+        assert_eq!(w.summary.as_ref().and_then(|s| s.total_tokens), Some(19030));
+        let a = &w.agents[0];
+        assert_eq!(a.label.as_deref(), Some("review:correctness")); // fan label
+        assert_eq!(a.phase_title.as_deref(), Some("Review")); // fan group
+        assert_eq!(a.state, CcAgentState::Active); // running: no doneAt
+        assert_eq!(w.phases.len(), 1); // synthesized from the fan group
+        assert_eq!(w.phases[0].title, "Review");
+    }
+
+    #[test]
+    fn collect_skips_worker_with_foreign_settings_or_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let worker = "95c38d32-39d4-4102-82df-24602ac3a2a0";
+        let (projects, jobs) = daemon_fixture(
+            tmp.path(),
+            worker,
+            "/OTHER/hooks/claude.json",
+            "/repo/thurbox",
+        );
+
+        // Same session, but our hooks settings differ from the worker's replayed
+        // one → not attributed. (A different instance / a non-thurbox launch.)
+        let input = CcSessionInput {
+            id: SessionId::default(),
+            own_id: "0e6bcb32-fore".into(),
+            candidate_dirs: vec!["/repo/thurbox".into()],
+            prior_sig: None,
+        };
+        let refresh = collect_cc_activity(
+            projects.clone(),
+            None,
+            Some(jobs.clone()),
+            Some("/cfg/hooks/claude.json".into()),
+            vec![input],
+        );
+        // No owned tree at all → cleared/empty, not the worker's workflow.
+        assert!(
+            refresh.updates[0].2.is_none() || refresh.updates[0].2.as_ref().unwrap().is_empty()
+        );
+
+        // Settings match but the cwd is on a different repo → also not attributed.
+        let (projects2, jobs2) = daemon_fixture(
+            tmp.path().join("b").as_path(),
+            worker,
+            "/cfg/hooks/claude.json",
+            "/some/other/repo",
+        );
+        let input2 = CcSessionInput {
+            id: SessionId::default(),
+            own_id: "fore2".into(),
+            candidate_dirs: vec!["/repo/thurbox".into()],
+            prior_sig: None,
+        };
+        let refresh2 = collect_cc_activity(
+            projects2,
+            None,
+            Some(jobs2),
+            Some("/cfg/hooks/claude.json".into()),
+            vec![input2],
+        );
+        assert!(
+            refresh2.updates[0].2.is_none() || refresh2.updates[0].2.as_ref().unwrap().is_empty()
+        );
+    }
+
+    #[test]
+    fn attribute_workers_matches_first_session_only() {
+        // Two sessions on the same repo (the coarse non-worktree case): a matching
+        // worker is assigned to exactly one, deterministically the first.
+        let workers = vec![WorkerRef {
+            session_id: "w1".into(),
+            settings_path: Some("/h/claude.json".into()),
+            cwd: Some("/repo".into()),
+        }];
+        let inputs = vec![
+            CcSessionInput {
+                id: SessionId::default(),
+                own_id: "s0".into(),
+                candidate_dirs: vec!["/repo".into()],
+                prior_sig: None,
+            },
+            CcSessionInput {
+                id: SessionId::default(),
+                own_id: "s1".into(),
+                candidate_dirs: vec!["/repo".into()],
+                prior_sig: None,
+            },
+        ];
+        let owners = attribute_workers(&workers, Some("/h/claude.json"), &inputs);
+        assert_eq!(owners.get("w1"), Some(&0)); // first session wins, once
+                                                // No hooks settings → no attribution at all.
+        assert!(attribute_workers(&workers, None, &inputs).is_empty());
+    }
+
+    #[test]
+    fn attribute_workers_exact_by_per_session_path() {
+        // A per-session `--settings` path names the exact session — the cwd is
+        // irrelevant, so it beats the coarse heuristic even when a *different*
+        // session's cwd matches.
+        let workers = vec![WorkerRef {
+            session_id: "w1".into(),
+            settings_path: Some("/h/sessions/FORE-ID.json".into()),
+            cwd: Some("/some/unrelated/dir".into()),
+        }];
+        let inputs = vec![
+            CcSessionInput {
+                id: SessionId::default(),
+                own_id: "OTHER".into(),
+                candidate_dirs: vec!["/some/unrelated/dir".into()],
+                prior_sig: None,
+            },
+            CcSessionInput {
+                id: SessionId::default(),
+                own_id: "FORE-ID".into(),
+                candidate_dirs: vec![], // no cwd hint at all
+                prior_sig: None,
+            },
+        ];
+        let owners = attribute_workers(&workers, Some("/h/claude.json"), &inputs);
+        assert_eq!(owners.get("w1"), Some(&1)); // exact id wins over cwd
+                                                // A per-session path naming an absent session attributes to nobody (it is
+                                                // authoritative — no cwd fall-through to a wrong session).
+        let orphan = vec![WorkerRef {
+            session_id: "w2".into(),
+            settings_path: Some("/h/sessions/GONE.json".into()),
+            cwd: Some("/some/unrelated/dir".into()),
+        }];
+        assert!(attribute_workers(&orphan, Some("/h/claude.json"), &inputs).is_empty());
+    }
+
+    #[test]
+    fn normalize_dir_trims_trailing_slash() {
+        assert_eq!(normalize_dir("/repo/x/"), "/repo/x");
+        assert_eq!(normalize_dir("/repo/x"), "/repo/x");
+        assert_eq!(normalize_dir("/"), "/"); // never collapses to empty
+    }
+
+    #[test]
+    fn transcript_search_matches_blocks_case_insensitively() {
+        let mut ca = CcActivityState::new(CcActivity::default());
+        ca.open = Some(CcNodeRef::Subagent("x".into()));
+        ca.blocks = vec![
+            TranscriptBlock::Text("hello World".into()),
+            TranscriptBlock::Thinking("plan the WORLD".into()),
+            TranscriptBlock::ToolUse {
+                name: "Bash".into(),
+                input: "ls world".into(),
+            },
+            TranscriptBlock::ToolResult {
+                content: "nothing here".into(),
+                is_error: false,
+            },
+        ];
+        ca.rebuild_rows();
+        assert_eq!(ca.rows.len(), 4);
+        // Matches the text, thinking, and the tool-use input — not the result.
+        assert_eq!(ca.search_matches("world"), vec![0, 1, 2]);
+        // The tool name is searchable (block_search_text = "Bash ls world").
+        assert_eq!(ca.search_matches("bash"), vec![2]);
+        assert!(ca.search_matches("absent").is_empty());
+        assert!(ca.search_matches("   ").is_empty()); // whitespace → no matches
+
+        // refresh_search_matches populates the open search's set.
+        ca.search = Some(CcSearch {
+            query: "world".into(),
+            editing: false,
+            matches: Vec::new(),
+        });
+        ca.refresh_search_matches();
+        assert_eq!(ca.search.as_ref().unwrap().matches, vec![0, 1, 2]);
+        // Info rows (overview scaffolding) are not searchable.
+        assert_eq!(ca.row_text(&CcRow::Info("Phases".into())), None);
     }
 }

@@ -112,6 +112,13 @@ pub struct CcWorkflow {
     pub phases: Vec<CcPhase>,
     pub agents: Vec<CcAgent>,
     pub summary: Option<CcWorkflowSummary>,
+    /// Live pace of a **background/daemon** run (from `jobs/<short>/state.json`),
+    /// e.g. `blocked` while awaiting an approval. `None` for in-process runs and
+    /// for completed runs read from the completion record.
+    pub tempo: Option<String>,
+    /// What a `blocked` background run is waiting on (the approval prompt text),
+    /// if any.
+    pub needs: Option<String>,
 }
 
 /// The per-session activity index polled onto `SessionInfo.cc_activity`. It is
@@ -342,6 +349,187 @@ pub fn parse_workflow_completion(s: &str) -> Option<WorkflowCompletion> {
         }
     }
     Some(out)
+}
+
+// -------------------------------------------------------------------------
+// Background / daemon workers — attribution + live status.
+//
+// Claude Code can dispatch a whole session as a *detached* background worker
+// (the fleet/daemon path): a claimed spare process gets its **own** new session
+// id and writes its subagents/workflows under it — not under the launching
+// thurbox session's id. There is no parent→child lineage on disk, so a worker is
+// correlated back to the session that launched it via the one thing the daemon
+// **replays**: the `--settings <hooks>/claude.json` flag captured from the origin
+// session's CLI args (plus a cwd match). Two on-disk homes carry the state:
+//
+// - `~/.claude/daemon/roster.json` — the live worker registry (may prune settled
+//   workers), parsed by [`parse_roster`].
+// - `~/.claude/jobs/<short>/state.json` — per-job state that **persists after the
+//   run settles** (so a finished background workflow stays attributable) and
+//   carries the live `fan[]` agent grid, `tempo`, `needs`, and token total,
+//   parsed by [`parse_job_state`]. Its `fan[].id` matches the on-disk
+//   `agent-<id>.jsonl` under the run dir, so it enriches a live workflow before
+//   any completion record exists.
+//
+// Verified against Claude Code v2.1.201–2.1.204 (undocumented, version-specific).
+// -------------------------------------------------------------------------
+
+/// A background/daemon worker from `roster.json`: its own session id (the key to
+/// its `subagents/` dir), the replayed `--settings` path + `cwd` used to
+/// attribute it to a thurbox session, and the claim `source` (`slash`/`fleet`/
+/// `spare`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct CcWorker {
+    pub session_id: String,
+    pub short: String,
+    pub settings_path: Option<String>,
+    pub cwd: Option<String>,
+    pub source: Option<String>,
+}
+
+/// One agent cell of a daemon job's live `fan[]` grid.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct CcFanEntry {
+    /// Matches the on-disk `agent-<id>.jsonl` under the run dir.
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    /// Phase group (`Review`/`Verify`/…) — the live equivalent of a phase title.
+    pub group: Option<String>,
+    pub failed: bool,
+    /// Terminal (carries a `doneAt`), whether success or failure.
+    pub done: bool,
+}
+
+/// The subset of `jobs/<short>/state.json` the activity view needs: the worker's
+/// session id (its `subagents/` dir key), attribution fields (`settings_path`,
+/// `cwd`), the live status (`state`/`tempo`/`needs`/`tokens`), and the `fan[]`
+/// agent grid.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct CcJobState {
+    pub session_id: String,
+    pub daemon_short: Option<String>,
+    pub state: Option<String>,
+    pub tempo: Option<String>,
+    pub needs: Option<String>,
+    pub tokens: Option<u64>,
+    pub cwd: Option<String>,
+    pub settings_path: Option<String>,
+    pub fan: Vec<CcFanEntry>,
+}
+
+impl CcJobState {
+    /// Index the `fan[]` grid by agent id for per-agent enrichment lookups.
+    pub fn fan_by_id(&self) -> HashMap<&str, &CcFanEntry> {
+        self.fan.iter().map(|e| (e.id.as_str(), e)).collect()
+    }
+}
+
+/// Extract the value of a `--settings` flag from a launch-arg vector, handling
+/// both the split (`--settings`, `<path>`) and joined (`--settings=<path>`)
+/// forms. Returns the first occurrence.
+pub fn settings_from_args(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--settings" {
+            return it.next().cloned();
+        }
+        if let Some(v) = a.strip_prefix("--settings=") {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Parse `~/.claude/daemon/roster.json` into its workers. Each worker's
+/// `--settings` path is read from `dispatch.launch.args`,
+/// `dispatch.launch.flagArgs`, or `dispatch.respawnFlags` (whichever carries it).
+/// Defensive: unknown shapes yield an empty list rather than an error.
+pub fn parse_roster(s: &str) -> Vec<CcWorker> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+        return Vec::new();
+    };
+    let Some(workers) = v.get("workers").and_then(|w| w.as_object()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(workers.len());
+    for (short, w) in workers {
+        let Some(session_id) = str_field(w, "sessionId") else {
+            continue;
+        };
+        let dispatch = w.get("dispatch");
+        out.push(CcWorker {
+            session_id,
+            short: short.clone(),
+            settings_path: dispatch.and_then(worker_settings_path),
+            cwd: str_field(w, "cwd").or_else(|| dispatch.and_then(|d| str_field(d, "cwd"))),
+            source: dispatch.and_then(|d| str_field(d, "source")),
+        });
+    }
+    out
+}
+
+/// The `--settings` path a `dispatch` replays, checked across the arg vectors it
+/// can appear in (`launch.args` for a prompt spawn, `launch.flagArgs` for a
+/// resume, or the `respawnFlags` fallback).
+fn worker_settings_path(dispatch: &serde_json::Value) -> Option<String> {
+    let launch = dispatch.get("launch");
+    for key in ["args", "flagArgs"] {
+        if let Some(arr) = launch.and_then(|l| l.get(key)).and_then(|a| a.as_array()) {
+            if let Some(p) = settings_from_args(&string_vec(arr)) {
+                return Some(p);
+            }
+        }
+    }
+    dispatch
+        .get("respawnFlags")
+        .and_then(|a| a.as_array())
+        .and_then(|arr| settings_from_args(&string_vec(arr)))
+}
+
+fn string_vec(arr: &[serde_json::Value]) -> Vec<String> {
+    arr.iter()
+        .filter_map(|x| x.as_str().map(String::from))
+        .collect()
+}
+
+/// Parse a `jobs/<short>/state.json`. Missing/garbled input, or a record with no
+/// `sessionId`, yields `None`.
+pub fn parse_job_state(s: &str) -> Option<CcJobState> {
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    let session_id = str_field(&v, "sessionId")?;
+    let settings_path = v
+        .get("respawnFlags")
+        .and_then(|a| a.as_array())
+        .and_then(|arr| settings_from_args(&string_vec(arr)));
+    let fan = v
+        .get("fan")
+        .and_then(|f| f.as_array())
+        .map(|arr| arr.iter().filter_map(parse_fan_entry).collect())
+        .unwrap_or_default();
+    Some(CcJobState {
+        session_id,
+        daemon_short: str_field(&v, "daemonShort"),
+        state: str_field(&v, "state"),
+        tempo: str_field(&v, "tempo"),
+        needs: str_field(&v, "needs"),
+        tokens: u64_field(&v, "tokens"),
+        cwd: str_field(&v, "cwd"),
+        settings_path,
+        fan,
+    })
+}
+
+fn parse_fan_entry(v: &serde_json::Value) -> Option<CcFanEntry> {
+    let id = str_field(v, "id")?;
+    Some(CcFanEntry {
+        id,
+        kind: str_field(v, "kind").unwrap_or_default(),
+        label: str_field(v, "label").unwrap_or_default(),
+        group: str_field(v, "group"),
+        failed: v.get("failed").and_then(|x| x.as_bool()).unwrap_or(false),
+        done: v.get("doneAt").is_some_and(|x| !x.is_null()),
+    })
 }
 
 /// Parse an `agent-<id>.jsonl` transcript into the block stream the view
@@ -639,5 +827,136 @@ garbage line that is not json
         assert!(!act.is_empty());
         assert_eq!(act.agent_count(), 1);
         assert!(act.any_active());
+    }
+
+    #[test]
+    fn settings_from_args_both_forms() {
+        let split = [
+            "--session-id",
+            "x",
+            "--settings",
+            "/h/claude.json",
+            "--add-dir",
+            "/r",
+        ]
+        .map(String::from);
+        assert_eq!(
+            settings_from_args(&split).as_deref(),
+            Some("/h/claude.json")
+        );
+        let joined = ["--settings=/h/c.json", "/seed"].map(String::from);
+        assert_eq!(settings_from_args(&joined).as_deref(), Some("/h/c.json"));
+        let none = ["--model", "opus"].map(String::from);
+        assert_eq!(settings_from_args(&none), None);
+    }
+
+    #[test]
+    fn parse_roster_extracts_workers_and_settings() {
+        // Shape verified against Claude Code v2.1.204: `workers` keyed by short
+        // id; the `--settings` path lives in `dispatch.launch.args` (prompt) or
+        // `dispatch.launch.flagArgs` (resume), with `respawnFlags` as fallback.
+        let json = r#"{
+          "proto":1,
+          "workers":{
+            "95c38d32":{
+              "sessionId":"95c38d32-39d4-4102-82df-24602ac3a2a0",
+              "cwd":"/mnt/shared/projects/thurbox",
+              "dispatch":{
+                "source":"slash",
+                "cwd":"/mnt/shared/projects/thurbox",
+                "launch":{"mode":"prompt","args":[
+                  "--session-id","95c38d32-39d4-4102-82df-24602ac3a2a0",
+                  "--settings","/mnt/shared/projects/thurbox/target/dev-sandbox/default/thurbox-config/hooks/claude.json",
+                  "--add-dir","/mnt/shared/projects/thurbox/"]},
+                "respawnFlags":["--settings","/mnt/shared/projects/thurbox/target/dev-sandbox/default/thurbox-config/hooks/claude.json"]
+              }
+            },
+            "7492d0aa":{
+              "sessionId":"7492d0aa-a09b-4f52-b178-8fcb0c03b7ee",
+              "cwd":"/mnt/shared/projects/agterm",
+              "dispatch":{
+                "source":"fleet",
+                "launch":{"mode":"resume","flagArgs":["--effort","max","--model","claude-opus-4-8[1m]"]},
+                "respawnFlags":["--effort","max"]
+              }
+            }
+          }
+        }"#;
+        let workers = parse_roster(json);
+        assert_eq!(workers.len(), 2);
+        let tbx = workers
+            .iter()
+            .find(|w| w.short == "95c38d32")
+            .expect("thurbox worker");
+        assert_eq!(tbx.session_id, "95c38d32-39d4-4102-82df-24602ac3a2a0");
+        assert_eq!(tbx.source.as_deref(), Some("slash"));
+        assert_eq!(tbx.cwd.as_deref(), Some("/mnt/shared/projects/thurbox"));
+        assert_eq!(
+            tbx.settings_path.as_deref(),
+            Some("/mnt/shared/projects/thurbox/target/dev-sandbox/default/thurbox-config/hooks/claude.json")
+        );
+        // A worker launched outside thurbox carries no `--settings` (won't match).
+        let fleet = workers.iter().find(|w| w.short == "7492d0aa").unwrap();
+        assert_eq!(fleet.settings_path, None);
+        assert_eq!(fleet.source.as_deref(), Some("fleet"));
+    }
+
+    #[test]
+    fn parse_roster_is_defensive() {
+        assert!(parse_roster("not json").is_empty());
+        assert!(parse_roster("{}").is_empty());
+        assert!(parse_roster(r#"{"workers":{}}"#).is_empty());
+        // A worker with no sessionId is skipped, not fatal.
+        assert!(parse_roster(r#"{"workers":{"x":{"cwd":"/r"}}}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_job_state_reads_fan_grid_and_status() {
+        // Shape verified against v2.1.204: `fan[]` entries carry `id`
+        // (matching agent-<id>.jsonl), `label`, `group`, optional `doneAt`/
+        // `failed`; a running entry has no `doneAt`.
+        let json = r#"{
+          "state":"working",
+          "tempo":"blocked",
+          "needs":"approve Bash: ls -la",
+          "tokens":19030,
+          "cwd":"/mnt/shared/projects/thurbox",
+          "sessionId":"95c38d32-39d4-4102-82df-24602ac3a2a0",
+          "daemonShort":"95c38d32",
+          "backend":"daemon",
+          "respawnFlags":["--settings","/h/claude.json","--add-dir","/r"],
+          "fan":[
+            {"id":"a6d17521b393df437","kind":"workflow","label":"review:correctness","startedAt":1,"doneAt":2,"group":"Review"},
+            {"id":"aafa530d9d6c56ecc","kind":"workflow","label":"synthesize","startedAt":3,"doneAt":4,"failed":true,"group":"Synthesize"},
+            {"id":"arunning0000000","kind":"workflow","label":"verify:x","startedAt":5,"group":"Verify"}
+          ]
+        }"#;
+        let j = parse_job_state(json).expect("parses");
+        assert_eq!(j.session_id, "95c38d32-39d4-4102-82df-24602ac3a2a0");
+        assert_eq!(j.daemon_short.as_deref(), Some("95c38d32"));
+        assert_eq!(j.tempo.as_deref(), Some("blocked"));
+        assert_eq!(j.needs.as_deref(), Some("approve Bash: ls -la"));
+        assert_eq!(j.tokens, Some(19030));
+        assert_eq!(j.settings_path.as_deref(), Some("/h/claude.json"));
+        assert_eq!(j.fan.len(), 3);
+
+        let by_id = j.fan_by_id();
+        let done = by_id["a6d17521b393df437"];
+        assert!(done.done && !done.failed);
+        assert_eq!(done.group.as_deref(), Some("Review"));
+        let failed = by_id["aafa530d9d6c56ecc"];
+        assert!(failed.done && failed.failed);
+        let running = by_id["arunning0000000"];
+        assert!(!running.done && !running.failed); // no doneAt yet
+    }
+
+    #[test]
+    fn parse_job_state_is_defensive() {
+        assert_eq!(parse_job_state("nope"), None);
+        assert_eq!(parse_job_state("{}"), None); // no sessionId
+        let minimal = parse_job_state(r#"{"sessionId":"s"}"#).expect("minimal");
+        assert_eq!(minimal.session_id, "s");
+        assert!(minimal.fan.is_empty());
+        assert_eq!(minimal.settings_path, None);
     }
 }

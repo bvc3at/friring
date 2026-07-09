@@ -1257,6 +1257,13 @@ impl App {
         let mut def = self.agent_def_for(&config.agent);
         if let Some(h) = self.host_for_backend(config.backend.as_deref()) {
             def.args = crate::session_ops::spawn::adapt_agent_args_for_remote(h, def.args);
+        } else if let Some(sid) = config.agent_session_id.as_deref() {
+            // Local claude: point the hooks `--settings` at a per-session symlink
+            // so a backgrounded (daemon) workflow is attributed to this exact
+            // session in the activity view — not disambiguated by cwd. Shares the
+            // headless spawn's rewrite; a no-op for agents without the hook.
+            def.args =
+                crate::session_ops::builtin_hooks::rewrite_settings_for_session(sid, def.args);
         }
         Arc::new(GenericProvider::new(def))
     }

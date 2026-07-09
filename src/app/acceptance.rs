@@ -971,6 +971,8 @@ fn cc_activity_view_opens_navigates_folds_and_closes() {
                 agent("a2", tmp.path().join("missing.jsonl"), CcAgentState::Done),
             ],
             summary: None,
+            tempo: None,
+            needs: None,
         }],
         subagents: vec![CcAgent {
             agent_type: "Explore".into(),
@@ -993,6 +995,44 @@ fn cc_activity_view_opens_navigates_folds_and_closes() {
     h.key(KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(h.app.focus, InputFocus::CcActivity);
     assert_eq!(h.app.active_cc_activity().unwrap().rows.len(), 2);
+
+    // `/` opens find; typing filters to matching rows and jumps the selection.
+    // The transcript is [Prompt("do the thing"), Text("on it")].
+    h.key(KeyCode::Char('/'), KeyModifiers::NONE);
+    assert!(
+        h.app
+            .active_cc_activity()
+            .unwrap()
+            .search
+            .as_ref()
+            .unwrap()
+            .editing
+    );
+    for c in "thing".chars() {
+        h.key(KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    {
+        let ca = h.app.active_cc_activity().unwrap();
+        assert_eq!(ca.search.as_ref().unwrap().matches, vec![0]);
+        assert_eq!(ca.selected, 0, "selection jumped to the first match");
+    }
+    // Tab commits (keeps the highlight bar); Esc then clears it without closing.
+    h.key(KeyCode::Tab, KeyModifiers::NONE);
+    assert!(
+        !h.app
+            .active_cc_activity()
+            .unwrap()
+            .search
+            .as_ref()
+            .unwrap()
+            .editing
+    );
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(h.app.active_cc_activity().unwrap().search.is_none());
+    assert!(
+        h.app.active_cc_activity().is_some(),
+        "clearing the search keeps the view open"
+    );
 
     // `h` steps back to the tree; folding the workflow hides its agents.
     h.key(KeyCode::Char('h'), KeyModifiers::NONE);

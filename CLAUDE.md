@@ -1619,9 +1619,13 @@ by `[features] cc_activity`. **Claude + local sessions only**: it reads the flat
 JSONL Claude Code writes under
 `~/.claude/projects/<slug>/<agent_session_id>/subagents/` (no hooks/DB/sockets);
 other agents and remote `ssh:`/`wsl:` sessions (whose `~/.claude` lives on the
-host) show an empty tree.
+host) show an empty tree. It surfaces **both** in-process workflows/subagents
+**and** ones dispatched to a **detached background (daemon) worker** — the latter
+run under the worker's *own* session id, so they're attributed back to the
+launching thurbox session by the replayed `--settings` flag (see the
+daemon-worker bullet).
 
-- **Data source** (verified against Claude Code v2.1.201 — undocumented +
+- **Data source** (verified against Claude Code v2.1.201–2.1.204 — undocumented +
   version-specific, so all parsing is isolated in `session::cc_activity` to make
   a layout change a one-file fix, degrading to a partial tree rather than an
   error): `subagents/agent-<id>.jsonl` (+ `.meta.json` `{agentType,
@@ -1629,9 +1633,12 @@ host) show an empty tree.
   one workflow run with a `journal.jsonl` of `started`/`result` edges (no phase
   events — it freezes mid-agent), one `agent-<id>.jsonl` per spawned agent, and a
   sibling `workflows/wf_<id>.json` completion record (top-level `phases[]` +
-  `workflowProgress[]` grid, written **once** at completion). Transcript entries
-  are `assistant` (thinking / text / tool_use) and `user` (the prompt string, or
-  `tool_result` blocks).
+  `workflowProgress[]` grid, written **once** at completion). A **background**
+  run additionally has `~/.claude/jobs/<short>/state.json` (persists after the run
+  settles) with a live `fan[]` agent grid (`id` matches `agent-<id>.jsonl`) +
+  `tempo`/`needs`/`tokens`, and `~/.claude/daemon/roster.json` (the live worker
+  registry). Transcript entries are `assistant` (thinking / text / tool_use) and
+  `user` (the prompt string, or `tool_result` blocks).
 - **Two data homes** (mirrors how `agent_metrics`/`git_stats` and the
   `code_reviews` map coexist): `SessionInfo.cc_activity: Option<CcActivity>` is a
   lightweight **index** (workflows + agents + standalone subagents; ids,
@@ -1644,6 +1651,27 @@ host) show an empty tree.
   selection, scroll, wrap, folds), created on toggle and surviving session
   switches. The **selected** agent's transcript is parsed **on demand** from its
   `agent-<id>.jsonl` and re-read on growth for live-tail.
+- **Background/daemon-worker attribution.** Claude Code can dispatch a whole
+  session as a detached **daemon worker** (a claimed pre-forked spare gets its
+  *own* new session id and writes its workflows under it — there is no parent→
+  child lineage on disk). The scan **unions** each thurbox session's own tree with
+  any worker it launched: it reads `roster.json` + every `jobs/*/state.json` once
+  per scan and attributes a worker by the one thing the daemon **replays**, its
+  `--settings <hooks>/claude.json` flag. Two match forms (both scoped to this
+  instance's hooks dir, `attribute_workers`): **exact** — a **per-session** path
+  `<hooks_home>/sessions/<agent_session_id>.json` (a symlink thurbox launches
+  claude with, `builtin_hooks::rewrite_settings_for_session`, applied by the TUI
+  `launch_provider_for` + headless `spawn`) names the exact session; **legacy** —
+  the shared `claude.json` (pre-that / non-unix) falls back to a `cwd` match
+  against the session's launch dirs (`session_candidate_dirs`). A background
+  workflow with no completion record yet gets a **live overview** from
+  `jobs/state.json` (`fan[]` → per-agent label/phase-group/done-fail-run state,
+  `tempo`/`needs`/`tokens`), so a run blocked on approval shows *what* it's
+  waiting on. Owned-dir signatures fold the job state so a status change
+  live-tails. `CcWorker`/`CcJobState`/`CcFanEntry` + `parse_roster`/
+  `parse_job_state` are pure in `session::cc_activity`; the union +
+  `attribute_workers` live in `app::cc_activity`. (Remote sessions are still
+  skipped — worker files live on the host.)
 - **Path resolution.** The dir is found by **scanning `projects/*/` for the
   `<agent_session_id>/subagents` child** (`paths::claude_projects_dir`), not by
   computing the slug — Claude Code's slug replaces `/` **and `.`** (and likely
@@ -1657,12 +1685,16 @@ host) show an empty tree.
   transcript pane** (`InputFocus::CcActivity`): assistant thinking (dim) / text /
   foldable `tool_use` headers + `tool_result` bodies (`Enter` folds the selected
   tool), or a workflow **overview** (phases + per-agent grid + logs from the
-  completion record). Keys mirror code review: `j`/`k` + arrows, PageUp/Down,
-  `Ctrl+D`/`U`, `g`/`G`, `w` wrap, `Left`/`Right` h-scroll, `Enter`/`l` from the
-  tree drops into the transcript, `h` back to the tree, `Esc`/`F9` close;
-  `Ctrl+L`/`Ctrl+H` cycle the ring (`SessionList → CcActivity → CcActivityTree`).
-  Mouse: click a tree node / transcript row, drag the scrollbar, wheel-scroll.
-  Mutually exclusive with the code-review overlay (opening one closes the other).
+  completion record; a background run's overview also shows its live pace +
+  what it's blocked on). Keys mirror code review: `j`/`k` + arrows, PageUp/Down,
+  `Ctrl+D`/`U`, `g`/`G`, `w` wrap, `Left`/`Right` h-scroll, `/` **find-in-
+  transcript** (incremental, `Enter`/`n`/`N` step matches, `Tab` commits, `Esc`
+  clears then closes — mirrors the code-review / file-viewer find, matched
+  substrings highlighted in place), `Enter`/`l` from the tree drops into the
+  transcript, `h` back to the tree, `Esc`/`F9` close; `Ctrl+L`/`Ctrl+H` cycle the
+  ring (`SessionList → CcActivity → CcActivityTree`). Mouse: click a tree node /
+  transcript row, drag the scrollbar, wheel-scroll. Mutually exclusive with the
+  code-review overlay (opening one closes the other).
 - **Live-tail.** The ~1 s scan bumps `SessionInfo.cc_activity`; when the active
   session's view is open (`App::on_cc_activity_updated`) it re-reads the open
   transcript and **sticky-bottom follows** (jumps to the newest row only when the
@@ -1672,11 +1704,19 @@ host) show an empty tree.
   rule `ui ← session`); the off-thread fs scan + view state + key handlers in
   `app::cc_activity`; the renderer in `ui::cc_activity` (reuses `focus_block` /
   `scrollbar` / theme — no diff machinery).
-- **v1 follow-ups** (named, not silently dropped): markdown rendering of
-  thinking/text (v1 renders raw text through the wrap/h-scroll path),
-  find-in-transcript (`/`), async parse of very large transcripts, parsing the
-  workflow `scripts/*.js` for live phase names/labels (v1 shows the exact phase
-  grid only once the completion record lands), and remote (`ssh:`/`wsl:`) support.
+- **Follow-ups** (named, not silently dropped): markdown rendering of
+  thinking/text (still raw through the wrap/h-scroll path — `ui::markdown` isn't
+  width-aware, so it conflicts with the manual per-row wrap/h-scroll/highlight
+  engine); async parse of very large transcripts (v1 parses on-demand on the UI
+  thread); parsing the workflow `scripts/*.js` for live phase names/labels of an
+  **in-process** run (a background run already gets live phases from the
+  `jobs/state.json` `fan[]` groups); baking the session id into the per-session
+  hook commands so a background worker also reports `working`/`blocked`/`done`
+  **status** (the per-session `--settings` symlink shares `claude.json`, which
+  keys status off `$THURBOX_SESSION` — absent on a daemon worker); and remote
+  (`ssh:`/`wsl:`) support. **Done since v1:** background/daemon-worker
+  attribution + live overview, per-session `--settings` for exact attribution,
+  and find-in-transcript (`/`).
 
 ## Demo Video
 

@@ -311,6 +311,21 @@ pub fn claude_projects_dir(config_dir_override: Option<&Path>) -> Option<PathBuf
     claude_config_root(config_dir_override).map(|r| r.join("projects"))
 }
 
+/// The Claude Code daemon roster (`<root>/daemon/roster.json`): the live registry
+/// of background/detached workers. Same root resolution as
+/// [`claude_projects_dir`]. Used by the activity scan to attribute a background
+/// worker's `subagents/` tree back to the thurbox session that launched it.
+pub fn claude_daemon_roster(config_dir_override: Option<&Path>) -> Option<PathBuf> {
+    claude_config_root(config_dir_override).map(|r| r.join("daemon").join("roster.json"))
+}
+
+/// The Claude Code jobs directory (`<root>/jobs`): per-background-job state
+/// (`<short>/state.json`) that **persists after a run settles**, carrying the
+/// live agent grid + status. Same root resolution as [`claude_projects_dir`].
+pub fn claude_jobs_dir(config_dir_override: Option<&Path>) -> Option<PathBuf> {
+    claude_config_root(config_dir_override).map(|r| r.join("jobs"))
+}
+
 /// Returns true if a Claude transcript file `<agent_session_id>.jsonl` exists
 /// under `<root>/projects/*/`.
 ///
