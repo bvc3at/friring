@@ -116,9 +116,47 @@ resume_latest = false       # true = id-less "resume last session in cwd"
 
 `{id}` is substituted with the thurbox-generated session UUID. Groups
 are emitted only when their driving value exists; precedence is
-fork > resume > new-session. See the seeded file's comments and
-CLAUDE.md's *Agent Definitions* section for the `resume_latest`
-semantics.
+fork > resume > new-session. `args` is always passed. **No model is
+ever passed** — each agent uses its own default config, so bake
+`["--model", "opus"]` into `args` to pin one. A session stores only its
+**agent name**; there are no per-session model/permission/prompt/tool
+knobs. An agent that omits `resume_args` starts fresh on restart; the
+live tmux process is what carries its state across TUI restarts.
+
+**Session-id pinning vs. `resume_latest`.** thurbox generates the
+`agent_session_id` (a UUID), but only `claude` accepts it at creation
+(`--session-id {id}`), so only claude can resume or fork *by that exact
+id*. The other built-ins can't pin or report their id, so they set
+`resume_latest = true` with **id-less** resume/fork flags (no `{id}`
+token) and let the CLI resolve "the last session in *this* directory"
+itself:
+
+| Agent | `resume_latest` | resume flag |
+|-------|-----------------|-------------|
+| `claude` | `false` | `--resume {id}` (pins the exact id) |
+| `codex` | `true` | `resume --last` |
+| `opencode` | `true` | `--continue` |
+| `antigravity` | `true` | `--continue` (`agy`) |
+| `aider` | `true` | `--restore-chat-history` |
+| `copilot` | `true` | `--continue` |
+
+This works because restart reuses the session's cwd and a single-repo
+fork reuses the parent's cwd. `resume_latest` only changes *when* the
+resume group fires (`session_ops::resume_trigger_for`): for the id-less
+agents restart always triggers resume, while claude still defers to an
+on-disk transcript check. Caveats: an agent with no `fork_args`
+(`antigravity`, `aider`, `copilot` — none of these CLIs fork) starts
+fresh on `Ctrl+F`; and a multi-repo fork of a cwd-scoped agent lands in a
+fresh symlink workspace, so `--last`/`--continue` finds no parent session
+(a multi-repo *restart* still resumes — it reuses the same workspace dir).
+
+Internals: `session::AgentDef` / `session::AgentRegistry`
+(`session/agent_def.rs`, pure data + the arg-substitution logic) are the
+data types; `agent::agent_config::load_or_seed()` reads/seeds the TOML
+with `builtin_registry()` as the fallback; `agent::GenericProvider` wraps
+an `AgentDef` and implements the `AgentProvider` trait (`command()` +
+`build_args(&SessionConfig)`), picked per session by
+`App::provider_for(&config)`.
 
 The seeded file also ships two commented, copy-pasteable templates
 below the built-ins — **Add your own agent** (every field annotated)
@@ -133,6 +171,26 @@ distros**. Each `[[hosts]]` entry registers a session backend named
 `ssh:<name>` (default kind) or `wsl:<name>`. Seeded fully commented-out
 (fresh installs are local-only for SSH). Malformed file → zero
 configured hosts, error shown.
+
+```toml
+config_version = 1
+
+# An SSH host (the default kind):
+[[hosts]]
+name = "devbox"               # backend id "ssh:devbox"; what --host expects
+destination = "me@devbox"     # "user@host" or a ~/.ssh/config alias
+ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
+socket = "thurbox"            # host `tmux -L` socket   (default "thurbox")
+session = "thurbox"           # host tmux session name  (default "thurbox")
+worktrees_dir = "/home/me/.local/share/thurbox/worktrees"  # abs; optional
+multiplexer = "tmux"          # "psmux" for a Windows SSH host
+
+# A WSL distro (only to OVERRIDE auto-discovery, e.g. a custom worktrees_dir):
+[[hosts]]
+name = "ubuntu"               # → backend "wsl:ubuntu"
+kind = "wsl"                  # selects the WSL transport
+distro = "Ubuntu-22.04"       # the wsl.exe distro name (default = name)
+```
 
 | Field | Required | Default | Purpose |
 |-------|----------|---------|---------|
@@ -157,6 +215,133 @@ paths (a WSL distro's worktrees live in its own Linux filesystem, not on
 `/mnt/c`); the distro needs `tmux` >= 3.2 and `git`. Host changes
 require a restart (the registry is read once and each host's `$HOME` is
 cached for the process lifetime).
+
+### Transports and multiplexers
+
+`TmuxBackend` is transport-neutral (`agent::transport::TmuxTransport`);
+only the one-time process launch differs by host kind:
+
+| Kind | Launch prefix | Multiplexer |
+|------|---------------|-------------|
+| local | `<mux> -L thurbox …` | `tmux` (Linux/macOS) / `psmux` (Windows) — `DEFAULT_MUX` |
+| `ssh:<name>` | `ssh <dest> <mux> -L thurbox …` | the `multiplexer` field |
+| `wsl:<name>` | `wsl.exe -d <distro> tmux -L thurbox …` | `tmux`, inside the distro |
+
+Everything downstream of the launch is identical: the same POSIX quoting
+(`shell::posix_quote`) and the **byte-identical control-mode protocol**
+(`control_mode.rs`). `wsl.exe` forwards whitespace-free tokens to the
+in-distro shell exactly as `ssh` does; an arg *containing whitespace* is
+kept as one word, so a multi-word `sh -c` script goes through
+`wsl.exe --exec` instead (`shell::wsl_command` / `git::host_shell_c`).
+
+**psmux** is a native-Windows, drop-in tmux clone (ConPTY, no WSL) that
+speaks the **same control-mode wire protocol**, pane-id (`%N`), and `-L`
+socket model, so the backend is parameterized by binary name rather than
+forked. `DEFAULT_MUX` is `tmux` on Linux/macOS and `psmux` on Windows; a
+remote SSH host can also pin `multiplexer = "psmux"`. psmux has known
+**divergences** from tmux (verified against psmux 3.3.6, each branched on
+`TmuxTransport::uses_psmux()`; a WSL distro's own tmux is unaffected):
+
+- **`send-keys -H`** (hex byte injection) is not implemented, so
+  `send_keys_commands` re-encodes keystrokes from the primitives psmux
+  *does* support — `send-keys -l` literal runs plus
+  `Enter`/`Tab`/`Escape`/`BSpace`/`C-<letter>` key-names — reproducing
+  the same PTY byte stream (tmux keeps the byte-exact `-H` path). Literal
+  runs go out as `-l -N 1 "…"` (double-quoted, `\"`/`\\` escaped); the
+  `-N` flag makes psmux's send-coalescing decoder bail so a typed `'`
+  isn't mangled into `\` (`flush_psmux_literal` / `psmux_quote`).
+- **`new-window` trailing tokens are not joined** (psmux keeps only the
+  first, dropping the agent's args) and **`new-window -e` is ignored** (env
+  vars never reach the process). `TmuxBackend::psmux_window_powershell`
+  folds env + command into **one PowerShell token**
+  (`Set-Item Env:K 'v'; & 'claude' '--session-id' …`, run via
+  `powershell -NoLogo -Command` — hence PowerShell single-quoting
+  throughout, with backslash literal so `C:\` paths survive); control-mode
+  spawns (`psmux_window_command`) frame it in double quotes, and the
+  headless local `spawn_window` passes it as a single argv arg.
+
+The **local** socket name honours the `THURBOX_SOCKET` env override
+(`local_socket()`) — the only way to fully scope an instance on Windows,
+where every `-L <name>` resolves machine-wide (no `TMUX_TMPDIR`). Remote
+hosts take their socket from `hosts.toml`.
+
+### Backends, worktrees, and restore
+
+Each host registers a backend named `ssh:<name>` / `wsl:<name>`
+(`TmuxBackend::from_host`), registered **lazily** at startup from
+`host_config::load_all_with_warnings` — a down or slow host must not
+block the first frame, so `check_available` / `ensure_ready` are deferred
+to first use (`App::backend_for`). Loading unions the configured hosts
+with `discover_wsl_hosts()` (deduped; a configured entry wins). Data
+types: `session::HostDef` (`kind: HostKind {Ssh, Wsl}`) / `HostRegistry`
+live in `session/` (so both `agent` and `git` can use them), with
+backend-name helpers `is_ssh_backend` / `is_wsl_backend` /
+`is_remote_backend`.
+
+- **Selection.** `SessionConfig.backend` is `ssh:<host>` / `wsl:<distro>`
+  (or `None` = local). The TUI new-session flow shows a **host picker**
+  first (skipped when none are configured or discovered); the chosen host
+  runs git worktree creation + branch listing. Headless:
+  `thurbox-cli session create --host <name>`.
+- **Worktrees** run via the host launcher (`git::*_on(host, …)` →
+  `git::host_launcher` → `ssh …` / `wsl.exe …`) and live under the host's
+  `worktrees_dir` (else `$HOME/.local/share/thurbox/worktrees`, resolved
+  and cached per backend name — a WSL distro has no `destination`).
+- **Persistence/restore.** `backend_type` round-trips in SQLite; restore
+  discovers windows **per backend**, so off-local sessions re-adopt
+  against their own host. Remote backends are readied + discovered **in
+  the background** (one thread per host, drained by
+  `App::poll_remote_restore` each tick), so an unreachable host never
+  blocks the first frame — only local sessions restore synchronously
+  (ADR-P7, `docs/PERFORMANCE.md`).
+
+### Agent config, status, and teardown on a host
+
+- **Agent args.** Args that reference thurbox-managed config by a *local*
+  path (the hooks extension's `--settings <config>/hooks/claude.json`)
+  would kill a remote agent ("Settings file not found"), so
+  `session_ops::spawn::adapt_agent_args_for_remote` rewrites them per
+  host: on a **POSIX remote** the home-anchored path is translated to the
+  remote home, the file copied there, and the arg substituted; on a
+  **psmux host / non-POSIX config root / failed copy** the flag+path pair
+  is **stripped** so the agent launches clean. The local-path env hints
+  (`THURBOX_METRICS_DIR` / `THURBOX_CONFIG_DIR` / `THURBOX_DATA_DIR`) are
+  likewise skipped for remote spawns (`inject_thurbox_env`); only the
+  opaque identity vars travel.
+- **Session status** (hooks-driven, like local — see [Session
+  status](#session-status)). `thurbox-cli session signal` can't run from a
+  host (there is no CLI there, and it would write the host's own DB), so
+  the materialized hook file's commands are rewritten
+  (`builtin_hooks::rewrite_hook_signals_for_remote`) to set a tmux **pane
+  user option** instead: `tmux set-option -p @thurbox_state <s>` needs no
+  socket, pane id, or identity. The local TUI's control-mode connection
+  subscribes once per connection (`refresh-client -B
+  'thurbox-status:%*:#{@thurbox_state}'`, re-armed on reconnect in
+  `ControlMode::start`; tmux ≥ 3.2) and drains `%subscription-changed`
+  pushes (≤ 1/s) via `App::drain_remote_hook_events` into the same
+  `set_hook_state` columns local signals use — so Done→seen
+  acknowledgment, notifications, rollups, and the stuck-`working` fallback
+  are shared. Events are matched by **backend name + pane id** (ids
+  collide across hosts), allow-listed, and deduped. **Carve-outs:** psmux
+  remotes (no subscriptions; hooks stripped) and non-claude agents (hook
+  configs aren't materialized remotely) stay Idle-only.
+- **Teardown.** `session delete --force` is backend-aware:
+  `teardown_runtime_resources` resolves the session's `HostDef` from its
+  `backend_type` and, for a remote session, kills the pane
+  (`kill_pane_remote`) and removes each worktree
+  (`git::remove_worktree_on(Some(host), …)`). It deletes the worktree
+  *directory* only, leaving the branch; an unreachable host or a missing
+  `hosts.toml` entry is recorded in
+  `ForceDeleteReport.remote_teardown_error` (surfaced in the CLI JSON) and
+  the row is still soft-/force-deleted. `wsl.exe` arg construction is
+  unit-tested (`transport::tests::wsl_*`, `git_command_wsl_*`), not CI-run
+  (no WSL runner).
+
+For local testing, `scripts/dev/e2e/linux-container.sh up` spins a
+throwaway Podman container (sshd + tmux + git) and `… test` asserts a
+session lands on the `ssh:podman` backend without touching your real
+`~/.ssh` / `~/.config`. The remote-transport design rationale lives in
+ADR-13 (`ARCHITECTURE.md`).
 
 ## settings.toml
 
@@ -373,7 +558,10 @@ Each session's state (Blocked / Working / Done / Idle / Error) is driven by
 being closed; a hook fired headlessly is picked up via `PRAGMA data_version`.
 Identity comes from the injected `THURBOX_SESSION` env var, so a hook passes
 no id. A finished turn shows `Done` (blue) — for the session you're watching too
-— and becomes `Idle` once you switch focus off it.
+— and becomes `Idle` once you switch focus off it. Remote (`ssh:` /
+`wsl:`) sessions can't run the CLI, so their hooks report over a tmux
+pane user option delivered by control-mode instead, landing in the same
+columns — see [hosts.toml](#hoststoml).
 
 The hooks are wired up automatically by the built-in **hooks** extension
 (auto-activated on first run). Opt out with `thurbox-cli extension deactivate
@@ -406,10 +594,16 @@ per-agent detail: `extensions/hooks/README.md`.
 
 ## themes.toml
 
-User-defined themes, offered in the `Ctrl+Y` picker alongside the fifteen
-built-in presets and persisted by `name` like any preset. Each
-`[[themes]]` entry starts from a built-in `base` and overrides only the
-colours it names:
+User-defined themes, offered in the `Ctrl+Y` picker (alt `F4`, which
+avoids terminals that grab `Ctrl+Y` as DSUSP) alongside the **fifteen
+built-in presets** and persisted by `name` like any preset. The presets
+are eleven dark — **Default**, **Catppuccin Mocha**, **Tokyo Night**,
+**Gruvbox Dark**, **Doom**, **Nord**, **Dracula**, **One Dark**, **Rosé
+Pine Moon**, **Everforest**, **Kanagawa** — and four light — **Catppuccin
+Latte**, **Tokyo Night Day**, **Gruvbox Light**, **Solarized Light**; each
+is available as a `base` in its id form (e.g. the `catppuccin-mocha`
+below). Each `[[themes]]` entry starts from a built-in `base` and
+overrides only the colours it names:
 
 ```toml
 [[themes]]
@@ -427,6 +621,14 @@ overridable key — including the code-review diff colours `diff_added` /
 `diff_removed_bg` (the subtle full-row tint). Bad colours and built-in name
 collisions degrade to startup warnings (the base colour / the built-in stays in
 effect).
+
+Custom themes load through
+`agent::themes_config::load_or_seed_with_warnings`
+(`session::theme_config::CustomThemeDef` → `ThemeEntry`) and are published
+to the renderer by `ui::theme::set_custom_themes`. The active choice is
+persisted in SQLite (`metadata.active_theme`, see [SQLite-backed
+settings](#sqlite-backed-settings)); other thurbox processes pick up a
+change within one tick via `PRAGMA data_version` polling.
 
 ## keybindings.json
 
@@ -460,8 +662,8 @@ Maps `Action` names to one or more chord strings:
   action to a key that isn't a bare `Ctrl+<letter>` makes it work in the
   terminal too. Navigation/quit chords (`Ctrl+H/J/K/L`, `Ctrl+Q`, `Ctrl+N`) are
   **never** forwarded — they're how you leave the terminal.
-- Action names and defaults: see the table in CLAUDE.md / README, or
-  `src/session/keybindings.rs`.
+- Action names and defaults: see the keybindings table in
+  `docs/FEATURES.md` / README, or `src/session/keybindings.rs`.
 
 ## extensions/
 

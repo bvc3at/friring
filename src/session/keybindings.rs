@@ -6,8 +6,8 @@
 //! terminal scroll) fire only while their pane is focused — so single-letter
 //! keys like `j`/`k` can be rebound per-pane without stealing them from the
 //! terminal, which forwards everything to the PTY. Defaults reproduce the
-//! table in `CLAUDE.md`; users override via the F1 editor or by hand-editing
-//! `~/.config/thurbox/keybindings.json`.
+//! table in `docs/FEATURES.md`; users override via the F1 editor or by
+//! hand-editing `~/.config/thurbox/keybindings.json`.
 //!
 //! A few stateful keys remain literal in `key_handlers.rs` and are *not*
 //! rebindable: modal-internal selectors (j/k/Enter/Esc), the automations/tasks

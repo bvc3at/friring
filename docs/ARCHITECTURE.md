@@ -16,12 +16,114 @@ Every input has a traceable path from event to screen change.
 There's no hidden state scattered across components, which matters
 when multiple PTY sessions are producing concurrent output.
 
+**Event loop** (`run_loop` in `main.rs`): `tokio::main` loads the
+`AgentRegistry` (`agents.toml`, ADR-19), initializes the `BackendRegistry`
+(the local `local-tmux` backend plus one lazily-registered backend per
+`hosts.toml` host, ADR-13), opens the SQLite DB (ADR-8), initializes the
+terminal, then spawns/restores sessions before entering the loop. Each
+iteration draws a frame (demand-driven, so an idle screen is not
+repainted — `docs/PERFORMANCE.md` ADR-P1), polls crossterm events
+(~10 ms), converts each into an `AppMessage`
+(`KeyPress`/`Resize`/mouse/paste), applies it via
+`App::update` → `handle_key`/`handle_resize`, then runs `App::tick`
+(status derivation, timer expiry, background-task polling). On exit
+`App::shutdown` **detaches** sessions rather than killing them (tmux keeps
+them alive across restarts, ADR-2/ADR-12); the terminal is then restored.
+A panic hook restores the terminal first so a crash never strands the user
+in raw mode, and all logging is file-based since the TUI owns stdout
+(ADR-6).
+
 **Rejected**:
 
 - *Component-based (each panel owns state)* — leads to
   synchronization bugs when sessions interact.
 - *Ad-hoc event handlers* — untraceable control flow;
   hard to reason about as the app grows.
+
+---
+
+## Module responsibilities
+
+A per-module map of where each responsibility lives; where an ADR owns the
+design it is cross-referenced, not restated. The crate is layered around a
+pure `session` data core, with `agent` (side effects) and `ui` (rendering)
+between it and the `app` coordinator.
+
+- **`app/`** — the TEA Model + Update + View (ADR-1): the `App` struct
+  (all state), the `AppMessage` enum + `handle_key`/`handle_resize`
+  (Update), and `view` (render). Owns state and coordinates every side
+  effect; decomposed into per-domain sub-files under `src/app/` while the
+  spine stays on `App` (ADR-22).
+- **`agent/`** — the side-effect layer. `AgentProvider` /
+  `GenericProvider` build the launch argv from a declarative `AgentDef`
+  (ADR-19); `Session` wraps a `SessionBackend` (ADR-11) held in a
+  `BackendRegistry` keyed by name; `TmuxBackend` runs tmux over a
+  `TmuxTransport` (`transport.rs` — `Local`/`Ssh`/`Wsl`, ADR-12/ADR-13)
+  speaking control mode (`control_mode.rs`). Output is parsed into an
+  `Arc<Mutex<vt100::Parser>>` on a `spawn_blocking` reader; input is
+  written over an mpsc channel (ADR-3), translated from crossterm
+  `KeyCode` to xterm ANSI by `input.rs` (ADR-4).
+- **`session/`** — plain data types, the dependency sink (no
+  crate-internal references): `SessionId`, `SessionStatus`, `SessionInfo`
+  (carries the `agent` name), `SessionConfig` (agent/backend names, ids,
+  cwd, env), `AgentDef`/`AgentRegistry` (ADR-19), and `HostDef` /
+  `HostRegistry` / `HostKind` (ADR-13) — mostly `Display`/`Default` impls
+  plus the agent-arg substitution logic.
+- **`ui/`** — pure rendering functions, no side effects. `layout.rs`
+  computes the responsive panel areas (ADR-5); widgets include
+  `project_list` (its `compute_session_order` is the single comparator
+  shared with `App`'s `Ctrl+J/K` navigation — ordered by `display_order`,
+  grouped by repo, never by status; `move_in_order` is the pure reorder
+  behind `Shift+J/K`), `terminal_view`, `info_panel`, `status_bar`,
+  `repo_picker_modal`, `agent_picker_modal`; `selection.rs` drives
+  mouse-drag text selection and `links.rs` detects clickable URLs. Colors
+  are centralized in `theme.rs` (ADR-14).
+- **`cli/`** — `thurbox-cli` subcommand dispatch (headless session ops +
+  scheduling + the editor command), sharing the SQLite DB with the TUI but
+  never importing `app`/`ui` (ADR-15).
+
+**Mouse routing (per-frame click registry).** Mouse input is unified with
+the keyboard through one per-frame registry (`App::click_targets`,
+mirroring the `scrollbar_hits` registry): list/modal/button renderers
+return `ui::RowHitbox`es / `ui::ButtonHit`es, `App::view` records them as
+`ClickAction`s, and `handle_mouse_click` / `handle_modal_click` hit-test
+them. A modal-button click **replays the paired key** through the modal's
+own handler, so a click always follows the exact keyboard path. Clickable
+"pill" buttons (`ui::render_button_bar`) draw the status-bar footer
+(Help/Info/Files/Theme/Tasks/Settings/Quit — feature-gated, and dropped as
+a set when the footer is too narrow so the essential pills never fall off)
+plus every modal's action buttons (`ui::ModalButtons`). The `ClickAction`
+variants (`Global`, `ModalButton`, `ModalField`, `PaneField`, `RepoFocus`,
+`CentralTab`, …) select or toggle what was clicked — a Settings bool row
+toggles on click, scalar rows only select. The whole subsystem is gated by
+`[features] mouse`: disabled, mouse capture is never enabled and the
+terminal keeps native mouse behavior.
+
+**Central-pane tab strip.** The agent terminal, per-session shell, code
+review, and Claude Code activity view share the central pane, surfaced as
+a clickable tab strip painted on the pane's top border by
+`App::draw_central_tabs` (each tab a `ui::render_pill`; the active view is
+the accent-filled "primary" pill). `central_tab_cells` lays out the
+on-border hitboxes, recorded as
+`ClickAction::CentralTab(CentralTab::{Agent,Shell,Review})` **before** the
+pane's whole-rect focus fallback so a tab click wins; a click runs
+`App::select_central_tab`, which *selects* a view (distinct from the
+keyboard `Ctrl+T`/`Ctrl+X` *toggles*). Each tab shows its toggle's F-key
+hint, because a focused terminal passes `Ctrl+<letter>` chords through to
+the CLI while the F-key dispatches in every pane; Shell/Review tabs are
+feature-gated.
+
+**Enforcement.** `tests/architecture_rules.rs` is an **allowlist** (the
+dependency table itself lives in `AGENTS.md`): every module under `src/`
+must declare a `ModuleRules` entry naming the crate modules it may
+reference — in *any* form (`use`, `pub use`, brace groups,
+fully-qualified `crate::…` paths) — and a new module fails the test until
+its place is declared. `ui → app` is the deliberate TEA `view(model)`
+coupling (ui renders `app`-owned modal/status state but triggers no side
+effects); `session_ops` and `cli` may reach `crate::agent::…` via
+fully-qualified paths **only** (never `use`) so the headless→backend
+dependency stays visible at each call site. `app` is EXEMPT — the
+coordinator imports every layer (ADR-22).
 
 ---
 

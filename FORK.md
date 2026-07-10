@@ -32,7 +32,7 @@ layer over the upstream binary — it publishes no releases, packages, or websit
 of its own, so installing it installs upstream Thurbox. Keeping the functional
 identifiers identical also lets Friring stay drop-in compatible with an existing
 Thurbox install and easy to keep in sync with upstream. Only the human-facing
-project *name* is rebranded, in `README.md` and `CLAUDE.md`.
+project *name* is rebranded, in `README.md` and the agent brief (`AGENTS.md`).
 
 ## Differences from upstream
 
@@ -60,12 +60,58 @@ live-tailed while running, browsable when finished. Claude + local sessions only
 - **Find-in-transcript (`/`).** Incremental find with in-place match
   highlighting, mirroring the code-review / file-viewer find.
 
+Implementation notes (this is a fork-only feature, so its detail lives here
+rather than in `docs/FEATURES.md`):
+
+- **Two data homes.** `SessionInfo.cc_activity` is a lightweight **index**
+  (workflows + agents + standalone subagents; ids, agentType, state, mtimes — no
+  transcript bodies), refreshed off the UI thread ~1 s per local session,
+  mtime-signature-gated, and **never persisted** (a high-churn DB field would
+  bump `PRAGMA data_version`). `App::cc_activities` is the **open-view** UI state
+  (rows, selection, scroll, wrap, folds); the selected agent's transcript is
+  parsed **on demand** and re-read on growth for live-tail.
+- **Path resolution.** The dir is found by scanning `projects/*/` for the
+  `<agent_session_id>/subagents` child (`paths::claude_projects_dir`), not by
+  computing Claude Code's slug (which replaces `/`, `.`, and likely all non-alnum
+  with `-`). `agent_session_id` is what thurbox injects as `THURBOX_SESSION_ID`;
+  `$CLAUDE_CONFIG_DIR` is honored.
+- **Surface & keys.** A side tree in the file-viewer column
+  (`InputFocus::CcActivityTree`) folds workflows over their agents; a central
+  transcript pane (`InputFocus::CcActivity`) shows assistant thinking / text /
+  foldable `tool_use` + `tool_result`, or a workflow overview (phases + per-agent
+  grid + logs, plus a background run's live pace / what it's blocked on). Keys
+  mirror the code-review view (`j`/`k`, PageUp/Down, `Ctrl+D`/`U`, `g`/`G`, `w`
+  wrap, `Left`/`Right` h-scroll, `/` find). Mutually exclusive with the
+  code-review overlay.
+- **Code shape.** Pure data + defensive parsers in `session::cc_activity` (arch
+  rule `ui ← session`); the off-thread scan + view state + key handlers in
+  `app::cc_activity`; the renderer in `ui::cc_activity` (reuses `focus_block` /
+  `scrollbar` / theme). Parsing is isolated in one module because the Claude Code
+  on-disk layout is undocumented and version-specific (verified against v2.1.201–
+  2.1.204), degrading to a partial tree rather than an error.
+- **Follow-ups** (named, not silently dropped): markdown rendering of
+  thinking/text (blocked on `ui::markdown` not being width-aware); async parse of
+  very large transcripts; parsing an in-process run's workflow `scripts/*.js` for
+  live phase names; baking the session id into per-session hook commands so a
+  daemon worker also reports `working`/`blocked`/`done` **status**; and remote
+  (`ssh:`/`wsl:`) support. **Done since v1:** daemon-worker attribution + live
+  overview, per-session `--settings` for exact attribution, find-in-transcript.
+
 ### Documentation / branding
 
-- `README.md` and `CLAUDE.md` prose call the project **Friring** (the binary,
-  URLs, install commands, and packaging are unchanged and still say `thurbox`).
+- `README.md` and the agent guide prose call the project **Friring** (the
+  binary, URLs, install commands, and packaging are unchanged and still say
+  `thurbox`).
 - A fork notice at the top of `README.md` explains the fork, the name, and that
   all links intentionally point upstream.
+- **Agent-guide layout.** Upstream keeps one large `CLAUDE.md`. On the fork the
+  always-loaded brief is a lean **`AGENTS.md`** (root) with **`CLAUDE.md` a
+  symlink** to it, and the former monolith's detail was moved into on-demand
+  `docs/` topic files (two new ones added: `docs/CLI.md`, `docs/RELEASING.md`).
+  This keeps per-turn context small and makes the guide agent-neutral (Codex and
+  others read `AGENTS.md`). Thin path-scoped Claude Code rules live in
+  `.claude/rules/` (rust/shell/markdown/website), each loaded only when a
+  matching file is edited.
 
 ### CI / automation
 

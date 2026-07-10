@@ -76,8 +76,8 @@ STORAGE_DIR="$WORKDIR/storage"
 WIN_USER="Docker"
 WIN_PASS="admin"
 
-# Dev builds share the thurbox-dev tmux socket name (see CLAUDE.md / demo
-# isolation). psmux honours -L the same way, so the smoke test uses it too.
+# Dev builds share the thurbox-dev tmux socket name (see docs/DEVELOPMENT.md,
+# demo isolation). psmux honours -L the same way, so the smoke test uses it too.
 SOCKET="thurbox-dev"
 
 ssh_vm() {
