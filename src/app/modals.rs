@@ -1521,13 +1521,14 @@ pub enum SettingsField {
     ScrollbackLines,
     TwoPanelMinCols,
     ThreePanelMinCols,
+    InfoPanelPosition,
     AuditRetentionDays,
 }
 
 impl SettingsField {
     /// Field nav order — also the render order (headers are interleaved by the
     /// renderer). Used by [`cycle_field`] and the scroll-windowing logic.
-    pub const ORDER: [SettingsField; 22] = [
+    pub const ORDER: [SettingsField; 23] = [
         SettingsField::FeatTasks,
         SettingsField::FeatAutomations,
         SettingsField::FeatFileViewer,
@@ -1549,6 +1550,7 @@ impl SettingsField {
         SettingsField::ScrollbackLines,
         SettingsField::TwoPanelMinCols,
         SettingsField::ThreePanelMinCols,
+        SettingsField::InfoPanelPosition,
         SettingsField::AuditRetentionDays,
     ];
 
@@ -1637,6 +1639,11 @@ impl SettingsField {
                 "3-panel width",
                 "Min width (cols) to show the 3rd panel",
             ),
+            InfoPanelPosition => (
+                "info_panel_position",
+                "Info position",
+                "Info pane dock: under sessions or own column",
+            ),
             AuditRetentionDays => (
                 "audit_retention_days",
                 "Audit days",
@@ -1662,7 +1669,8 @@ impl SettingsField {
     }
 
     /// Whether the field holds a boolean (toggled with Space/Enter) vs. a
-    /// numeric scalar (stepped with ←/→).
+    /// stepped value (←/→): the numeric scalars plus the info-pane position,
+    /// which cycles its variants through the same stepper.
     pub fn is_scalar(self) -> bool {
         use SettingsField::*;
         matches!(
@@ -1671,6 +1679,7 @@ impl SettingsField {
                 | ScrollbackLines
                 | TwoPanelMinCols
                 | ThreePanelMinCols
+                | InfoPanelPosition
                 | AuditRetentionDays
         )
     }
@@ -1749,7 +1758,7 @@ impl SettingsModal {
             NotifSuppressForActive => n.suppress_for_active = !n.suppress_for_active,
             NotifSound => n.sound = !n.sound,
             NotifMinInterval | ScrollbackLines | TwoPanelMinCols | ThreePanelMinCols
-            | AuditRetentionDays => {}
+            | InfoPanelPosition | AuditRetentionDays => {}
         }
     }
 
@@ -1778,6 +1787,16 @@ impl SettingsModal {
             NotifMinInterval => {
                 d.notifications.min_interval_secs =
                     step_clamp(d.notifications.min_interval_secs as i64, delta, 5, 0, 3600) as u64;
+            }
+            InfoPanelPosition => {
+                // Cycle the position variants (wrapping) through the stepper.
+                let all = crate::session::settings::InfoPanelPosition::ALL;
+                let pos = all
+                    .iter()
+                    .position(|p| *p == d.info_panel_position)
+                    .unwrap_or(0);
+                let next = (pos as i32 + delta).rem_euclid(all.len() as i32) as usize;
+                d.info_panel_position = all[next];
             }
             _ => {}
         }
@@ -1811,6 +1830,7 @@ impl SettingsModal {
             ScrollbackLines => self.draft.scrollback_lines.to_string(),
             TwoPanelMinCols => self.draft.two_panel_min_cols.to_string(),
             ThreePanelMinCols => self.draft.three_panel_min_cols.to_string(),
+            InfoPanelPosition => self.draft.info_panel_position.as_str().to_string(),
             AuditRetentionDays => self.draft.audit_retention_days.to_string(),
         }
     }
@@ -3218,7 +3238,7 @@ mod tests {
 
     #[test]
     fn settings_order_lists_every_field_once() {
-        assert_eq!(SettingsField::ORDER.len(), 22);
+        assert_eq!(SettingsField::ORDER.len(), 23);
         for f in SettingsField::ORDER {
             assert_eq!(
                 SettingsField::ORDER.iter().filter(|x| **x == f).count(),
@@ -3296,6 +3316,7 @@ mod tests {
             FeatCcActivity,
             FeatPerfHud,
             FeatSoftDelete,
+            InfoPanelPosition,
         ] {
             assert!(!f.restart_required(), "{f:?} should be live");
         }

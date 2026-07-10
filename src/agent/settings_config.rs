@@ -34,6 +34,13 @@ config_version = 1
 # Days of audit-log history kept (pruned on startup).
 # audit_retention_days = 90
 
+# Where the F2 info pane docks. "auto" inlines it at the bottom of the
+# session column whenever the full session list and the full info content
+# fit, and falls back to its own column otherwise; "column" always uses the
+# dedicated column (the classic layout); "inline" always docks it under the
+# session list, squeezing the list if needed. Applies live on save/reload.
+# info_panel_position = "auto"
+
 # Feature flags: turn whole TUI features off. All default to true.
 # Disabling `automations` also stops the TUI firing schedules and arming
 # the tmux heartbeat on startup; explicit `thurbox-cli automation`
@@ -221,6 +228,7 @@ pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
     doc["two_panel_min_cols"] = value(i64::from(settings.two_panel_min_cols));
     doc["three_panel_min_cols"] = value(i64::from(settings.three_panel_min_cols));
     doc["audit_retention_days"] = value(settings.audit_retention_days as i64);
+    doc["info_panel_position"] = value(settings.info_panel_position.as_str());
 
     if !doc.contains_key("features") {
         doc["features"] = toml_edit::table();
@@ -291,6 +299,7 @@ mod tests {
             "two_panel_min_cols",
             "three_panel_min_cols",
             "audit_retention_days",
+            "info_panel_position",
             "[features]",
             "tasks",
             "automations",
@@ -385,6 +394,8 @@ mod tests {
         let (mut s, _) = load_or_seed_with_warnings();
         s.scrollback_lines = 4000;
         s.audit_retention_days = 7;
+        // Non-default so the round-trip check below would catch a dropped key.
+        s.info_panel_position = crate::session::settings::InfoPanelPosition::Inline;
         s.features.tasks = false;
         s.features.version_check = true;
         s.features.auto_update = true;

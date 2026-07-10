@@ -44,7 +44,51 @@ pub fn render_info_panel(
         .border_style(Style::default().fg(Theme::border_unfocused()));
 
     let inner_width = area.width.saturating_sub(2) as usize;
+    let lines = build_lines(info, metrics, automations, usage, parent_name, inner_width);
 
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+/// Nominal inner width used when measuring [`content_rows`]. The logical line
+/// count is width-independent (gauges are always two lines, separators one);
+/// width only affects wrapping, which the measure ignores — a wrapped tail may
+/// clip, exactly as it does in the column view.
+const MEASURE_WIDTH: usize = 24;
+
+/// Rows (incl. the two border rows) the panel needs to show its full content —
+/// sizes the inline dock and drives the `Auto` placement fit test
+/// (see [`crate::ui::layout::LayoutParams`]).
+pub fn content_rows(
+    info: &SessionInfo,
+    metrics: Option<&SystemMetrics>,
+    automations: &[AutomationEntry],
+    usage: Option<&crate::session::AgentUsage>,
+    parent_name: Option<&str>,
+) -> u16 {
+    let lines = build_lines(
+        info,
+        metrics,
+        automations,
+        usage,
+        parent_name,
+        MEASURE_WIDTH,
+    );
+    (lines.len() as u16).saturating_add(2)
+}
+
+/// Build the panel's content lines — the single source for both rendering and
+/// [`content_rows`], so the measured height can never drift from what renders.
+fn build_lines<'a>(
+    info: &'a SessionInfo,
+    metrics: Option<&SystemMetrics>,
+    automations: &'a [AutomationEntry],
+    usage: Option<&crate::session::AgentUsage>,
+    parent_name: Option<&str>,
+    inner_width: usize,
+) -> Vec<Line<'a>> {
     let mut lines = Vec::new();
 
     append_session_section(&mut lines, info, parent_name);
@@ -74,10 +118,7 @@ pub fn render_info_panel(
 
     append_automations_section(&mut lines, automations, inner_width);
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+    lines
 }
 
 /// Append the session header rows: name, status, agent, and the optional

@@ -690,7 +690,16 @@ pub struct App {
     /// the process-wide settings at construction so tests can flip flags
     /// without touching the first-writer-wins global.
     pub(crate) features: crate::session::settings::FeatureFlags,
+    /// Where the info panel docks (`info_panel_position`) — copied out of the
+    /// global like [`Self::features`] so the settings panel / live reload can
+    /// re-apply it without a restart.
+    pub(crate) info_panel_position: crate::session::settings::InfoPanelPosition,
     pub(crate) show_info_panel: bool,
+    /// Last content-area size pushed to the session PTYs. The `auto` info-pane
+    /// dock can move between the left column and its own column when content
+    /// changes (no resize event involved), so the tick compares against this
+    /// and re-pushes on drift.
+    last_content_size: Option<(u16, u16)>,
     /// Whether the tasks panel column is shown (toggled like the file viewer).
     pub(crate) show_tasks_panel: bool,
     pub(crate) show_file_viewer: bool,
@@ -1042,7 +1051,9 @@ impl App {
             terminal_cols: cols,
             session_counter,
             features: crate::session::settings::global().features,
+            info_panel_position: crate::session::settings::global().info_panel_position,
             show_info_panel: false,
+            last_content_size: None,
             show_tasks_panel: false,
             show_file_viewer: false,
             file_viewer: crate::ui::file_viewer::FileViewerState::new(),
@@ -1211,12 +1222,14 @@ impl App {
         self.toast_config_reload("settings.toml reloaded", &warnings);
     }
 
-    /// Apply the **live** portion of `settings` (the UI-panel feature flags read
-    /// from `App.features` each frame) and resize panes to match. The
-    /// restart-only values are intentionally left to the next launch. Shared by
-    /// the settings panel's save path and the live-reload poll.
+    /// Apply the **live** portion of `settings` (the UI-panel feature flags and
+    /// the info-pane position, both read from `App` state each frame) and
+    /// resize panes to match. The restart-only values are intentionally left to
+    /// the next launch. Shared by the settings panel's save path and the
+    /// live-reload poll.
     pub(crate) fn apply_live_settings(&mut self, settings: &crate::session::settings::Settings) {
         self.features = settings.features;
+        self.info_panel_position = settings.info_panel_position;
         self.enforce_feature_visibility();
         self.resize_sessions_to_content_area();
     }
@@ -2076,12 +2089,13 @@ impl App {
     }
 
     /// Open the Settings panel. The draft reflects the live source of truth:
-    /// `self.features` for the feature flags (so in-session changes show), and
-    /// `settings::global()` for the scalars + notifications (read once at
-    /// startup, never mutated in-process).
+    /// `self.features` / `self.info_panel_position` for the live-applied values
+    /// (so in-session changes show), and `settings::global()` for the scalars +
+    /// notifications (read once at startup, never mutated in-process).
     pub(crate) fn open_settings_panel(&mut self) {
         let draft = crate::session::settings::Settings {
             features: self.features,
+            info_panel_position: self.info_panel_position,
             ..crate::session::settings::global().clone()
         };
         self.modal = modals::Modal::Settings(modals::SettingsModal::new(draft));
@@ -4031,9 +4045,13 @@ impl App {
         self.terminal_rows = rows;
 
         // Collapse the optional right-side panels if the terminal gets too
-        // narrow (they only render at width >= 120 anyway).
+        // narrow (they only render at width >= 120 anyway). The info panel is
+        // exempt unless pinned to its column: with `auto`/`inline` it docks in
+        // the left column, which narrow terminals still show.
         if cols < 120 {
-            self.show_info_panel = false;
+            if self.info_panel_position == crate::session::settings::InfoPanelPosition::Column {
+                self.show_info_panel = false;
+            }
             self.show_tasks_panel = false;
             // Rescue the editor too, not just the list — otherwise focus stays
             // on the hidden panel's editor, which keeps capturing every key.
@@ -4048,8 +4066,20 @@ impl App {
     /// Push the current content-area `(rows, cols)` to every session — call after any layout change.
     pub(crate) fn resize_sessions_to_content_area(&mut self) {
         let (rows, cols) = self.content_area_size();
+        self.last_content_size = Some((rows, cols));
         for session in &self.sessions {
             session.resize(rows, cols);
+        }
+    }
+
+    /// Re-push PTY sizes when the computed content area drifted without a
+    /// resize event: the `auto` info-pane dock moves between the left column
+    /// and its own column as its inputs (info content, session/automation
+    /// counts) change, which shifts the terminal width mid-session. No-op —
+    /// no backend traffic — while the size is stable.
+    fn sync_content_size(&mut self) {
+        if self.last_content_size != Some(self.content_area_size()) {
+            self.resize_sessions_to_content_area();
         }
     }
 
@@ -4070,6 +4100,10 @@ impl App {
         self.tick_global_search_content();
 
         self.refresh_session_statuses();
+
+        // Catch layout drift the event loop can't see (the auto info-pane dock
+        // moving as content changes) and re-push PTY sizes.
+        self.sync_content_size();
 
         // Convert any live remote session whose host connection just dropped into
         // an unreachable placeholder + queue it for reconnect (see the method
@@ -6445,24 +6479,54 @@ impl App {
     /// and feature flags — the single funnel into `layout::compute_layout`,
     /// so the view, mouse routing, and content sizing can never disagree.
     pub(crate) fn layout_for(&self, area: Rect) -> layout::PanelAreas {
+        use crate::session::settings::InfoPanelPosition;
+        // The measured row counts only steer the inline/auto info dock, so
+        // skip the (line-building) measure when the position can't inline.
+        let measure = self.show_info_panel && self.info_panel_position != InfoPanelPosition::Column;
         layout::compute_layout(
             area,
-            self.show_info_panel,
-            self.show_tasks_panel,
-            // The review's changed-files list and the activity view's tree both
-            // live in the file-viewer column, so force that column present while
-            // either overlay is open.
-            self.show_file_viewer
-                || self.active_review().is_some()
-                || self.active_cc_activity().is_some(),
-            self.global_search.active,
-            self.features.automations,
-            self.automation_ui.cached_automations.len(),
-            // Carve the transient status row whenever there's a message to show
-            // (a status/error toast or the live sync spinner) — must match what
-            // `render_status_message_row` renders so the row is never empty.
-            self.worktree_sync.in_progress || self.status_message.is_some(),
+            &layout::LayoutParams {
+                show_info_panel: self.show_info_panel,
+                info_position: self.info_panel_position,
+                info_rows: if measure { self.info_panel_rows() } else { 0 },
+                session_rows: if measure { self.session_list_rows() } else { 0 },
+                show_tasks_panel: self.show_tasks_panel,
+                // The review's changed-files list and the activity view's tree both
+                // live in the file-viewer column, so force that column present while
+                // either overlay is open.
+                show_file_viewer: self.show_file_viewer
+                    || self.active_review().is_some()
+                    || self.active_cc_activity().is_some(),
+                show_global_search: self.global_search.active,
+                show_automations_pane: self.features.automations,
+                automation_count: self.automation_ui.cached_automations.len(),
+                // Carve the transient status row whenever there's a message to show
+                // (a status/error toast or the live sync spinner) — must match what
+                // `render_status_message_row` renders so the row is never empty.
+                show_status_row: self.worktree_sync.in_progress || self.status_message.is_some(),
+            },
         )
+    }
+
+    /// Rows (incl. borders) the session list needs to show every row — one per
+    /// session plus one per repo-group header. Reuses the cached order when its
+    /// signature is fresh; on a change frame (`layout_for` runs before
+    /// `render_left_panel` refreshes the cache) it recomputes without storing.
+    fn session_list_rows(&self) -> u16 {
+        let header_count = match &self.cached_session_order {
+            Some((sig, order)) if *sig == self.session_order_signature() => {
+                order.headers.iter().flatten().count()
+            }
+            _ => {
+                let infos: Vec<&SessionInfo> = self.sessions.iter().map(|s| &s.info).collect();
+                crate::ui::project_list::compute_session_order(&infos)
+                    .headers
+                    .iter()
+                    .flatten()
+                    .count()
+            }
+        };
+        (self.sessions.len() + header_count).max(1) as u16 + 2
     }
 
     /// The layout for the whole terminal screen (mouse hit-testing, sizing).
@@ -8435,6 +8499,9 @@ mod tests {
     #[test]
     fn f2_toggle_resizes_session_parser() {
         let mut app = app_with_sessions(1);
+        // Pin the classic column dock — `auto` would inline at this size and
+        // deliberately leave the terminal width alone.
+        app.info_panel_position = crate::session::settings::InfoPanelPosition::Column;
         app.update(AppMessage::Resize(160, 40));
         let before = session_parser_size(&app, 0);
 
@@ -8444,6 +8511,97 @@ mod tests {
         assert!(
             after.1 < before.1,
             "terminal width must shrink when info panel opens: before={before:?}, after={after:?}",
+        );
+    }
+
+    #[test]
+    fn f2_auto_position_inlines_under_sessions_when_it_fits() {
+        // Default `auto`: at 160×40 the left column holds the full session
+        // list plus the full info content, so F2 docks the pane inline and the
+        // terminal keeps its width instead of losing the dedicated column.
+        let mut app = app_with_sessions(1);
+        app.update(AppMessage::Resize(160, 40));
+        let before = session_parser_size(&app, 0);
+
+        app.handle_key(KeyCode::F(2), KeyModifiers::NONE);
+        assert!(app.show_info_panel);
+        assert_eq!(
+            session_parser_size(&app, 0),
+            before,
+            "inline dock must not carve a column off the terminal"
+        );
+
+        let areas = app.screen_layout();
+        let sessions = areas.left_panel.unwrap();
+        let info = areas.info_panel.expect("info pane inlined");
+        assert_eq!(info.x, sessions.x, "docked in the left column");
+        assert!(info.y > sessions.y, "docked below the session list");
+    }
+
+    #[test]
+    fn narrow_resize_collapses_info_panel_only_when_pinned_to_column() {
+        let mut app = app_with_sessions(1);
+        app.update(AppMessage::Resize(160, 40));
+        app.handle_key(KeyCode::F(2), KeyModifiers::NONE);
+        assert!(app.show_info_panel);
+
+        // `auto`: the pane lives in the left column, which narrow terminals
+        // still show — the toggle survives dropping below 120 cols.
+        app.update(AppMessage::Resize(100, 40));
+        assert!(app.show_info_panel, "auto dock survives < 120 cols");
+
+        // `column`: the dedicated column can't render below 120 → collapse.
+        app.info_panel_position = crate::session::settings::InfoPanelPosition::Column;
+        app.update(AppMessage::Resize(90, 40));
+        assert!(!app.show_info_panel);
+    }
+
+    #[test]
+    fn apply_live_settings_updates_info_panel_position() {
+        let mut app = app_with_sessions(0);
+        let mut settings = crate::session::settings::Settings::default();
+        settings.info_panel_position = crate::session::settings::InfoPanelPosition::Inline;
+        app.apply_live_settings(&settings);
+        assert_eq!(
+            app.info_panel_position,
+            crate::session::settings::InfoPanelPosition::Inline
+        );
+    }
+
+    #[test]
+    fn auto_dock_flip_repushes_pty_sizes_via_tick_drift_check() {
+        // Growing info content can flip the `auto` dock inline → column with
+        // no resize event; the tick's drift check must re-push PTY sizes.
+        let mut app = app_with_sessions(1);
+        app.update(AppMessage::Resize(160, 40));
+        app.handle_key(KeyCode::F(2), KeyModifiers::NONE);
+        let inline_width = session_parser_size(&app, 0).1;
+
+        // 30 scheduled automations blow the info content (one row each) past
+        // the left column's height → the pane falls back to the column.
+        let now = crate::sync::current_time_millis();
+        app.automation_ui.cached_automations = (0..30)
+            .map(|i| crate::session::Automation {
+                id: i,
+                name: format!("auto-{i}"),
+                enabled: true,
+                schedule: crate::session::AutomationSchedule::Once { at: 0 },
+                timezone: None,
+                action: crate::session::AutomationAction::Send {
+                    session_id: SessionId::default(),
+                },
+                prompt: "p".into(),
+                created_at: 0,
+                updated_at: 0,
+                last_run_at: None,
+                next_run_at: Some(now + 3_600_000),
+            })
+            .collect();
+
+        app.sync_content_size();
+        assert!(
+            session_parser_size(&app, 0).1 < inline_width,
+            "flip to the column must shrink the pushed PTY width"
         );
     }
 

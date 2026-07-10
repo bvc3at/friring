@@ -39,6 +39,14 @@ struct CentralTabCell {
     active: bool,
 }
 
+/// Owned info-panel inputs (built per frame by `App::info_panel_data`): the
+/// feature-gated upcoming-automation entries and the resolved parent-session
+/// name.
+struct InfoPanelData {
+    automations: Vec<info_panel::AutomationEntry>,
+    parent_name: Option<String>,
+}
+
 /// The rect to paint a hover tint over, given a click target's hitbox.
 ///
 /// A session row's hitbox spans a prepended repo-group header line plus the
@@ -383,7 +391,9 @@ impl App {
         );
     }
 
-    /// Render the info panel for the active session (when present).
+    /// Render the info panel for the active session (when present) — either
+    /// the dedicated column or the inline dock under the session list; the
+    /// content is identical (`layout_for` picked the rect).
     fn render_info_panel(&self, frame: &mut Frame, info_area: Option<Rect>) {
         let Some(info_area) = info_area else {
             return;
@@ -391,13 +401,28 @@ impl App {
         let Some(info) = self.sessions.get(self.active_index).map(|s| &s.info) else {
             return;
         };
+        let data = self.info_panel_data(info);
+        info_panel::render_info_panel(
+            frame,
+            info_area,
+            info,
+            Some(&self.metrics.system_metrics),
+            &data.automations,
+            self.usage.get(&info.agent),
+            data.parent_name.as_deref(),
+        );
+    }
+
+    /// The owned info-panel inputs shared by rendering and measuring
+    /// ([`Self::info_panel_rows`]), so the measured height can't drift from
+    /// what renders.
+    fn info_panel_data(&self, info: &SessionInfo) -> InfoPanelData {
         let now = crate::sync::current_time_millis();
-        let agent_usage = self.usage.get(&info.agent);
         // Skip the upcoming-automations section entirely when the feature is
         // off: the TUI won't fire those schedules, so advertising their
         // countdowns here (the cache is loaded from the DB regardless) would
         // surface a disabled feature. Mirrors the footer badge being zeroed.
-        let automation_entries: Vec<info_panel::AutomationEntry> = self
+        let automations: Vec<info_panel::AutomationEntry> = self
             .automation_ui
             .cached_automations
             .iter()
@@ -423,15 +448,27 @@ impl App {
                     id.chars().take(8).collect()
                 })
         });
-        info_panel::render_info_panel(
-            frame,
-            info_area,
+        InfoPanelData {
+            automations,
+            parent_name,
+        }
+    }
+
+    /// Rows (incl. borders) the active session's info panel needs for its full
+    /// content — feeds the inline/auto dock in [`Self::layout_for`]. `0` with
+    /// no active session (nothing to inline).
+    pub(crate) fn info_panel_rows(&self) -> u16 {
+        let Some(info) = self.sessions.get(self.active_index).map(|s| &s.info) else {
+            return 0;
+        };
+        let data = self.info_panel_data(info);
+        info_panel::content_rows(
             info,
             Some(&self.metrics.system_metrics),
-            &automation_entries,
-            agent_usage,
-            parent_name.as_deref(),
-        );
+            &data.automations,
+            self.usage.get(&info.agent),
+            data.parent_name.as_deref(),
+        )
     }
 
     /// Render the tasks panel column (when present).

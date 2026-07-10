@@ -1,5 +1,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
+use crate::session::settings::InfoPanelPosition;
+
 pub struct PanelAreas {
     pub header: Rect,
     /// Session list area (top of the left column).
@@ -9,6 +11,9 @@ pub struct PanelAreas {
     /// enabled and the column is tall enough to fit both lists; its height
     /// grows with the automation count.
     pub automations_panel: Option<Rect>,
+    /// Info panel (F2): either the dedicated column between the session list
+    /// and the terminal, or — when [`InfoPanelPosition`] resolves to the
+    /// inline dock — a pane at the bottom of the left column.
     pub info_panel: Option<Rect>,
     /// Tasks panel — a toggleable column on the right, between the terminal and
     /// the file viewer (behaves like the file viewer).
@@ -37,25 +42,61 @@ const AUTOMATIONS_PANE_MAX_ROWS: u16 = 10;
 const AUTOMATIONS_PANE_MIN_ROWS: u16 = 3;
 /// Minimum rows the session list keeps when the automations pane is shown.
 const SESSIONS_MIN_ROWS: u16 = 3;
+/// Minimum rows (incl. borders) for the inline info pane; a shorter clamp
+/// drops the pane instead of rendering a useless sliver.
+const INFO_PANE_MIN_ROWS: u16 = 3;
 
-/// Split a left-column rect into (sessions, automations). The automations pane
-/// is always present (its height grows with `automation_count`, with a minimum
-/// so an empty pane still shows) unless the column is too short for both lists.
-fn split_left_column(col: Rect, automation_count: usize) -> (Rect, Option<Rect>) {
+/// Rows the automations pane occupies in a left column `col_height` rows tall
+/// (`0` when the feature is off or the column is too short for both lists).
+/// This is the same clamp [`split_left_column`] applies, exposed separately so
+/// the `Auto` info-pane fit test in [`compute_layout`] can never disagree with
+/// the split.
+fn automations_pane_rows(col_height: u16, show: bool, automation_count: usize) -> u16 {
+    if !show {
+        return 0;
+    }
     let desired =
         (automation_count as u16 + 2).clamp(AUTOMATIONS_PANE_MIN_ROWS, AUTOMATIONS_PANE_MAX_ROWS);
-    let auto_h = desired.min(col.height.saturating_sub(SESSIONS_MIN_ROWS));
-    if auto_h < AUTOMATIONS_PANE_MIN_ROWS {
-        return (col, None); // not enough vertical room — keep sessions only
+    let h = desired.min(col_height.saturating_sub(SESSIONS_MIN_ROWS));
+    if h < AUTOMATIONS_PANE_MIN_ROWS {
+        0
+    } else {
+        h
+    }
+}
+
+/// Split a left-column rect into (sessions, automations, inline info).
+/// `auto_rows` comes from [`automations_pane_rows`]; `inline_info_rows` is the
+/// info pane's desired height (`0` = not inlined), clamped to what's left once
+/// the session list keeps its minimum. The panes are bottom-docked in that
+/// order and the session list absorbs any slack.
+fn split_left_column(
+    col: Rect,
+    auto_rows: u16,
+    inline_info_rows: u16,
+) -> (Rect, Option<Rect>, Option<Rect>) {
+    let info_h = inline_info_rows.min(col.height.saturating_sub(SESSIONS_MIN_ROWS + auto_rows));
+    let info_h = if info_h < INFO_PANE_MIN_ROWS {
+        0
+    } else {
+        info_h
+    };
+    if auto_rows == 0 && info_h == 0 {
+        return (col, None, None); // not enough vertical room — keep sessions only
     }
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(SESSIONS_MIN_ROWS),
-            Constraint::Length(auto_h),
+            Constraint::Length(auto_rows),
+            Constraint::Length(info_h),
         ])
         .split(col);
-    (rows[0], Some(rows[1]))
+    (
+        rows[0],
+        (auto_rows > 0).then(|| rows[1]),
+        (info_h > 0).then(|| rows[2]),
+    )
 }
 
 /// Vertical bands carved from the full area: header, content region, optional
@@ -109,34 +150,21 @@ fn split_vertical(area: Rect, show_global_search: bool, show_status_row: bool) -
     }
 }
 
-/// Split a left-column rect into (session list, automations pane) honouring the
-/// `show_automations_pane` flag.
-fn left_column_split(
-    col: Rect,
-    show_automations_pane: bool,
-    automation_count: usize,
-) -> (Rect, Option<Rect>) {
-    if show_automations_pane {
-        split_left_column(col, automation_count)
-    } else {
-        (col, None)
-    }
-}
-
 /// Build the wide (≥ three_panel_min_cols) layout with optional info / tasks /
 /// file-viewer columns. Column order: list | info? | terminal | tasks? |
-/// file_viewer?.
+/// file_viewer?. `show_info_column` and `inline_info_rows` are mutually
+/// exclusive — [`compute_layout`] resolves the info-pane placement first.
 fn three_panel_layout(
     bands: &VerticalBands,
     content: Rect,
-    show_info_panel: bool,
+    show_info_column: bool,
     show_tasks_panel: bool,
     show_file_viewer: bool,
-    show_automations_pane: bool,
-    automation_count: usize,
+    auto_rows: u16,
+    inline_info_rows: u16,
 ) -> PanelAreas {
     let mut constraints: Vec<Constraint> = vec![Constraint::Percentage(18)];
-    if show_info_panel {
+    if show_info_column {
         constraints.push(Constraint::Percentage(15));
     }
     // terminal takes the remainder
@@ -154,7 +182,7 @@ fn three_panel_layout(
         .constraints(constraints)
         .split(content);
 
-    let info_panel = show_info_panel.then(|| horizontal[1]);
+    let info_column = show_info_column.then(|| horizontal[1]);
     let terminal = horizontal[terminal_idx];
     // Tasks (if shown) immediately follow the terminal; the file viewer
     // follows tasks (or the terminal when tasks are hidden).
@@ -166,13 +194,13 @@ fn three_panel_layout(
     });
     let file_viewer = show_file_viewer.then(|| horizontal[next]);
 
-    let (left_panel, automations_panel) =
-        left_column_split(horizontal[0], show_automations_pane, automation_count);
+    let (left_panel, automations_panel, inline_info) =
+        split_left_column(horizontal[0], auto_rows, inline_info_rows);
     PanelAreas {
         header: bands.header,
         left_panel: Some(left_panel),
         automations_panel,
-        info_panel,
+        info_panel: info_column.or(inline_info),
         tasks_panel,
         file_viewer,
         global_search: bands.global_search,
@@ -186,21 +214,21 @@ fn three_panel_layout(
 fn two_panel_layout(
     bands: &VerticalBands,
     content: Rect,
-    show_automations_pane: bool,
-    automation_count: usize,
+    auto_rows: u16,
+    inline_info_rows: u16,
 ) -> PanelAreas {
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
         .split(content);
 
-    let (left_panel, automations_panel) =
-        left_column_split(horizontal[0], show_automations_pane, automation_count);
+    let (left_panel, automations_panel, inline_info) =
+        split_left_column(horizontal[0], auto_rows, inline_info_rows);
     PanelAreas {
         header: bands.header,
         left_panel: Some(left_panel),
         automations_panel,
-        info_panel: None,
+        info_panel: inline_info,
         tasks_panel: None,
         file_viewer: None,
         global_search: bands.global_search,
@@ -210,34 +238,51 @@ fn two_panel_layout(
     }
 }
 
-/// Compute panel layout areas based on terminal dimensions and optional
-/// right-side panel visibility.
+/// Inputs to [`compute_layout`]: the panel-visibility flags plus the measured
+/// row counts that place the info pane.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LayoutParams {
+    /// Info panel visibility (F2).
+    pub show_info_panel: bool,
+    /// Where the info panel docks (settings key `info_panel_position`).
+    pub info_position: InfoPanelPosition,
+    /// Rows (incl. borders) the info panel's full content needs — measured via
+    /// [`super::info_panel::content_rows`]. Sizes the inline pane and drives
+    /// the `Auto` fit test; ignored for `Column`.
+    pub info_rows: u16,
+    /// Rows (incl. borders) the session list needs to show every row (sessions
+    /// plus repo-group headers). Drives the `Auto` fit test only.
+    pub session_rows: u16,
+    pub show_tasks_panel: bool,
+    pub show_file_viewer: bool,
+    pub show_global_search: bool,
+    /// False when the `automations` feature flag is off.
+    pub show_automations_pane: bool,
+    /// Sizes the automations pane.
+    pub automation_count: usize,
+    /// Carve the transient status/error row directly above the footer.
+    pub show_status_row: bool,
+}
+
+/// Compute panel layout areas based on terminal dimensions and
+/// [`LayoutParams`].
 ///
 /// At width ≥ 120, the layout becomes
 /// `list | info? | terminal | tasks? | file_viewer?` with info (15%), tasks
 /// (20%), and file_viewer (20%) appearing only when requested. The tasks panel
 /// sits between the terminal and the file viewer (both right-side columns). The
-/// left column is further split into a session list and an automations pane
+/// left column is further split into a session list, an automations pane
 /// beneath it (whenever the column is tall enough and `show_automations_pane`
-/// is set — false when the `automations` feature flag is off);
-/// `automation_count` only sizes that pane.
+/// is set — false when the `automations` feature flag is off; `automation_count`
+/// only sizes that pane), and — when [`InfoPanelPosition`] resolves to the
+/// inline dock — the info pane at the bottom.
 ///
 /// `show_status_row` carves a transient full-width 1-row band directly above the
 /// footer for the active status/error message (or the sync spinner), so a long
 /// message is never clipped by the right-aligned footer pills. It shrinks the
 /// content region by one row while shown (mirroring `show_global_search`).
-#[allow(clippy::too_many_arguments)]
-pub fn compute_layout(
-    area: Rect,
-    show_info_panel: bool,
-    show_tasks_panel: bool,
-    show_file_viewer: bool,
-    show_global_search: bool,
-    show_automations_pane: bool,
-    automation_count: usize,
-    show_status_row: bool,
-) -> PanelAreas {
-    let bands = split_vertical(area, show_global_search, show_status_row);
+pub fn compute_layout(area: Rect, p: &LayoutParams) -> PanelAreas {
+    let bands = split_vertical(area, p.show_global_search, p.show_status_row);
     let content = bands.content;
 
     let settings = crate::session::settings::global();
@@ -256,23 +301,55 @@ pub fn compute_layout(
         };
     }
 
+    // Both column branches give the left column the full content height, so
+    // the automations-pane rows (and the fit test below) are settled here.
+    let auto_rows =
+        automations_pane_rows(content.height, p.show_automations_pane, p.automation_count);
+
+    // Resolve where a visible info panel docks this frame: `inline_rows > 0`
+    // puts it at the bottom of the left column; otherwise a still-visible
+    // panel falls back to the dedicated column (three-panel widths only).
+    // `Auto` inlines only when the full session list, the automations pane,
+    // and the full info content fit the column together.
+    let inline_rows = if p.show_info_panel {
+        match p.info_position {
+            InfoPanelPosition::Column => 0,
+            InfoPanelPosition::Inline => p.info_rows,
+            InfoPanelPosition::Auto => {
+                let needed = p
+                    .session_rows
+                    .saturating_add(auto_rows)
+                    .saturating_add(p.info_rows);
+                if p.info_rows > 0 && needed <= content.height {
+                    p.info_rows
+                } else {
+                    0
+                }
+            }
+        }
+    } else {
+        0
+    };
+    let show_info_column =
+        p.show_info_panel && inline_rows == 0 && p.info_position != InfoPanelPosition::Inline;
+
     // At width ≥ three_panel_min_cols (default 120), support optional info /
     // tasks / file-viewer columns.
     if area.width >= settings.three_panel_min_cols
-        && (show_info_panel || show_tasks_panel || show_file_viewer)
+        && (show_info_column || p.show_tasks_panel || p.show_file_viewer)
     {
         return three_panel_layout(
             &bands,
             content,
-            show_info_panel,
-            show_tasks_panel,
-            show_file_viewer,
-            show_automations_pane,
-            automation_count,
+            show_info_column,
+            p.show_tasks_panel,
+            p.show_file_viewer,
+            auto_rows,
+            inline_rows,
         );
     }
 
-    two_panel_layout(&bands, content, show_automations_pane, automation_count)
+    two_panel_layout(&bands, content, auto_rows, inline_rows)
 }
 
 #[cfg(test)]
@@ -283,9 +360,56 @@ mod tests {
         Rect::new(0, 0, width, height)
     }
 
+    /// Positional wrapper pinning the classic `Column` position, so the
+    /// long-standing behavioral tests below read unchanged and keep guarding
+    /// the pre-inline layout exactly.
+    #[allow(clippy::too_many_arguments)]
+    fn layout(
+        area: Rect,
+        show_info_panel: bool,
+        show_tasks_panel: bool,
+        show_file_viewer: bool,
+        show_global_search: bool,
+        show_automations_pane: bool,
+        automation_count: usize,
+        show_status_row: bool,
+    ) -> PanelAreas {
+        compute_layout(
+            area,
+            &LayoutParams {
+                show_info_panel,
+                info_position: InfoPanelPosition::Column,
+                show_tasks_panel,
+                show_file_viewer,
+                show_global_search,
+                show_automations_pane,
+                automation_count,
+                show_status_row,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Params for the inline/auto placement tests: info panel shown with the
+    /// automations pane on, everything else off.
+    fn inline_params(
+        position: InfoPanelPosition,
+        info_rows: u16,
+        session_rows: u16,
+    ) -> LayoutParams {
+        LayoutParams {
+            show_info_panel: true,
+            info_position: position,
+            info_rows,
+            session_rows,
+            show_automations_pane: true,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn narrow_terminal_hides_left_panel() {
-        let areas = compute_layout(area(79, 24), false, false, false, false, true, 0, false);
+        let areas = layout(area(79, 24), false, false, false, false, true, 0, false);
         assert!(areas.left_panel.is_none());
         assert!(areas.info_panel.is_none());
         assert!(areas.file_viewer.is_none());
@@ -293,7 +417,7 @@ mod tests {
 
     #[test]
     fn normal_width_shows_two_panels() {
-        let areas = compute_layout(area(100, 24), false, false, false, false, true, 0, false);
+        let areas = layout(area(100, 24), false, false, false, false, true, 0, false);
         assert!(areas.left_panel.is_some());
         assert!(areas.info_panel.is_none());
         assert!(areas.file_viewer.is_none());
@@ -301,7 +425,7 @@ mod tests {
 
     #[test]
     fn wide_terminal_with_info_panel_shows_three_panels() {
-        let areas = compute_layout(area(120, 24), true, false, false, false, true, 0, false);
+        let areas = layout(area(120, 24), true, false, false, false, true, 0, false);
         assert!(areas.left_panel.is_some());
         assert!(areas.info_panel.is_some());
         assert!(areas.file_viewer.is_none());
@@ -309,7 +433,7 @@ mod tests {
 
     #[test]
     fn wide_terminal_without_info_panel_shows_two_panels() {
-        let areas = compute_layout(area(120, 24), false, false, false, false, true, 0, false);
+        let areas = layout(area(120, 24), false, false, false, false, true, 0, false);
         assert!(areas.left_panel.is_some());
         assert!(areas.info_panel.is_none());
         assert!(areas.file_viewer.is_none());
@@ -317,7 +441,7 @@ mod tests {
 
     #[test]
     fn wide_terminal_with_file_viewer_only() {
-        let areas = compute_layout(area(160, 24), false, false, true, false, true, 0, false);
+        let areas = layout(area(160, 24), false, false, true, false, true, 0, false);
         assert!(areas.left_panel.is_some());
         assert!(areas.info_panel.is_none());
         assert!(areas.file_viewer.is_some());
@@ -325,7 +449,7 @@ mod tests {
 
     #[test]
     fn wide_terminal_with_info_and_file_viewer() {
-        let areas = compute_layout(area(160, 24), true, false, true, false, true, 0, false);
+        let areas = layout(area(160, 24), true, false, true, false, true, 0, false);
         assert!(areas.left_panel.is_some());
         assert!(areas.info_panel.is_some());
         assert!(areas.file_viewer.is_some());
@@ -336,7 +460,7 @@ mod tests {
 
     #[test]
     fn wide_terminal_with_tasks_panel_only() {
-        let areas = compute_layout(area(160, 24), false, true, false, false, true, 0, false);
+        let areas = layout(area(160, 24), false, true, false, false, true, 0, false);
         assert!(areas.left_panel.is_some());
         assert!(areas.info_panel.is_none());
         assert!(areas.tasks_panel.is_some());
@@ -348,7 +472,7 @@ mod tests {
 
     #[test]
     fn tasks_panel_sits_left_of_file_viewer() {
-        let areas = compute_layout(area(180, 24), false, true, true, false, true, 0, false);
+        let areas = layout(area(180, 24), false, true, true, false, true, 0, false);
         let term = areas.terminal;
         let tp = areas.tasks_panel.expect("tasks panel shown");
         let fv = areas.file_viewer.expect("file viewer shown");
@@ -358,19 +482,19 @@ mod tests {
 
     #[test]
     fn tasks_panel_ignored_below_120_cols() {
-        let areas = compute_layout(area(119, 24), false, true, false, false, true, 0, false);
+        let areas = layout(area(119, 24), false, true, false, false, true, 0, false);
         assert!(areas.tasks_panel.is_none());
     }
 
     #[test]
     fn global_search_strip_absent_by_default() {
-        let areas = compute_layout(area(120, 40), false, false, false, false, true, 0, false);
+        let areas = layout(area(120, 40), false, false, false, false, true, 0, false);
         assert!(areas.global_search.is_none());
     }
 
     #[test]
     fn global_search_strip_present_when_active() {
-        let areas = compute_layout(area(120, 40), false, false, false, true, true, 0, false);
+        let areas = layout(area(120, 40), false, false, false, true, true, 0, false);
         let strip = areas.global_search.expect("strip shown when active");
         // Full width, carved directly above the footer.
         assert_eq!(strip.width, 120);
@@ -381,24 +505,22 @@ mod tests {
 
     #[test]
     fn global_search_strip_shrinks_content() {
-        let without =
-            compute_layout(area(120, 40), false, false, false, false, true, 0, false).terminal;
-        let with =
-            compute_layout(area(120, 40), false, false, false, true, true, 0, false).terminal;
+        let without = layout(area(120, 40), false, false, false, false, true, 0, false).terminal;
+        let with = layout(area(120, 40), false, false, false, true, true, 0, false).terminal;
         // The terminal (content) region loses the strip's rows.
         assert_eq!(without.height - with.height, GLOBAL_SEARCH_HEIGHT);
     }
 
     #[test]
     fn status_row_absent_by_default() {
-        let areas = compute_layout(area(120, 40), false, false, false, false, true, 0, false);
+        let areas = layout(area(120, 40), false, false, false, false, true, 0, false);
         assert!(areas.status_message.is_none());
         assert_eq!(areas.footer.height, 1);
     }
 
     #[test]
     fn status_row_present_when_active() {
-        let areas = compute_layout(area(120, 40), false, false, false, false, true, 0, true);
+        let areas = layout(area(120, 40), false, false, false, false, true, 0, true);
         let row = areas
             .status_message
             .expect("row shown when a message is active");
@@ -411,17 +533,15 @@ mod tests {
 
     #[test]
     fn status_row_shrinks_content_by_one() {
-        let without =
-            compute_layout(area(120, 40), false, false, false, false, true, 0, false).terminal;
-        let with =
-            compute_layout(area(120, 40), false, false, false, false, true, 0, true).terminal;
+        let without = layout(area(120, 40), false, false, false, false, true, 0, false).terminal;
+        let with = layout(area(120, 40), false, false, false, false, true, 0, true).terminal;
         assert_eq!(without.height - with.height, 1);
     }
 
     #[test]
     fn status_row_stacks_below_global_search() {
         // Both strips active: search on top, status row just above the footer.
-        let areas = compute_layout(area(120, 40), false, false, false, true, true, 0, true);
+        let areas = layout(area(120, 40), false, false, false, true, true, 0, true);
         let gs = areas.global_search.expect("search strip shown");
         let sm = areas.status_message.expect("status row shown");
         assert!(
@@ -437,14 +557,14 @@ mod tests {
 
     #[test]
     fn header_and_footer_are_one_line() {
-        let areas = compute_layout(area(100, 24), false, false, false, false, true, 0, false);
+        let areas = layout(area(100, 24), false, false, false, false, true, 0, false);
         assert_eq!(areas.header.height, 1);
         assert_eq!(areas.footer.height, 1);
     }
 
     #[test]
     fn compact_mode_hides_header_below_20_rows() {
-        let areas = compute_layout(area(100, 19), false, false, false, false, true, 0, false);
+        let areas = layout(area(100, 19), false, false, false, false, true, 0, false);
         assert_eq!(areas.header.height, 0);
         assert_eq!(areas.footer.height, 1);
         assert!(areas.left_panel.is_some());
@@ -452,25 +572,25 @@ mod tests {
 
     #[test]
     fn header_returns_at_20_rows() {
-        let areas = compute_layout(area(100, 20), false, false, false, false, true, 0, false);
+        let areas = layout(area(100, 20), false, false, false, false, true, 0, false);
         assert_eq!(areas.header.height, 1);
     }
 
     #[test]
     fn info_panel_ignored_below_120_cols() {
-        let areas = compute_layout(area(119, 24), true, false, false, false, true, 0, false);
+        let areas = layout(area(119, 24), true, false, false, false, true, 0, false);
         assert!(areas.info_panel.is_none());
     }
 
     #[test]
     fn file_viewer_ignored_below_120_cols() {
-        let areas = compute_layout(area(119, 24), false, false, true, false, true, 0, false);
+        let areas = layout(area(119, 24), false, false, true, false, true, 0, false);
         assert!(areas.file_viewer.is_none());
     }
 
     fn terminal_inner(width: u16, height: u16, show_info: bool) -> (u16, u16) {
         use ratatui::widgets::{Block, Borders};
-        let terminal = compute_layout(
+        let terminal = layout(
             area(width, height),
             show_info,
             false,
@@ -517,7 +637,7 @@ mod tests {
     #[test]
     fn automations_pane_present_even_when_empty() {
         // Zero automations still get a minimum-height pane (so it's discoverable).
-        let areas = compute_layout(area(100, 24), false, false, false, false, true, 0, false);
+        let areas = layout(area(100, 24), false, false, false, false, true, 0, false);
         assert!(areas.left_panel.is_some());
         let autos = areas.automations_panel.expect("empty pane still shown");
         assert_eq!(autos.height, AUTOMATIONS_PANE_MIN_ROWS);
@@ -525,7 +645,7 @@ mod tests {
 
     #[test]
     fn automations_pane_appears_below_sessions() {
-        let areas = compute_layout(area(100, 30), false, false, false, false, true, 2, false);
+        let areas = layout(area(100, 30), false, false, false, false, true, 2, false);
         let sessions = areas.left_panel.unwrap();
         let autos = areas.automations_panel.expect("automations pane shown");
         assert_eq!(sessions.x, autos.x);
@@ -538,7 +658,7 @@ mod tests {
 
     #[test]
     fn automations_pane_height_is_capped() {
-        let areas = compute_layout(area(100, 60), false, false, false, false, true, 50, false);
+        let areas = layout(area(100, 60), false, false, false, false, true, 50, false);
         assert_eq!(
             areas.automations_panel.unwrap().height,
             AUTOMATIONS_PANE_MAX_ROWS
@@ -547,8 +667,8 @@ mod tests {
 
     #[test]
     fn automations_pane_hidden_when_feature_disabled() {
-        let with = compute_layout(area(100, 30), false, false, false, false, true, 2, false);
-        let without = compute_layout(area(100, 30), false, false, false, false, false, 2, false);
+        let with = layout(area(100, 30), false, false, false, false, true, 2, false);
+        let without = layout(area(100, 30), false, false, false, false, false, 2, false);
         assert!(without.automations_panel.is_none());
         // The session list absorbs the whole left column.
         let full = without.left_panel.unwrap();
@@ -562,8 +682,127 @@ mod tests {
     #[test]
     fn automations_pane_hidden_when_column_too_short() {
         // Content height ≈ 4 rows leaves no room for both lists.
-        let areas = compute_layout(area(100, 6), false, false, false, false, true, 3, false);
+        let areas = layout(area(100, 6), false, false, false, false, true, 3, false);
         assert!(areas.left_panel.is_some());
         assert!(areas.automations_panel.is_none());
+    }
+
+    // ── info-pane placement (`info_panel_position`) ──
+
+    #[test]
+    fn auto_inlines_info_under_sessions_when_it_fits() {
+        // 100×40: no dedicated column below 120 cols, but the left column
+        // (38 content rows) holds sessions (6) + automations (3) + info (12).
+        let areas = compute_layout(
+            area(100, 40),
+            &inline_params(InfoPanelPosition::Auto, 12, 6),
+        );
+        let sessions = areas.left_panel.unwrap();
+        let autos = areas.automations_panel.expect("automations pane shown");
+        let info = areas.info_panel.expect("info pane inlined");
+        assert_eq!(info.x, sessions.x);
+        assert_eq!(info.width, sessions.width);
+        assert_eq!(info.height, 12);
+        // Bottom-docked: sessions | automations | info.
+        assert_eq!(autos.y, sessions.y + sessions.height);
+        assert_eq!(info.y, autos.y + autos.height);
+        // The terminal keeps the full remaining width — no info column carved.
+        assert_eq!(sessions.width + areas.terminal.width, 100);
+    }
+
+    #[test]
+    fn auto_falls_back_to_column_when_too_short() {
+        // 22 content rows can't hold sessions (10) + automations (3) + info
+        // (12), so at three-panel widths the classic column returns.
+        let areas = compute_layout(
+            area(160, 24),
+            &inline_params(InfoPanelPosition::Auto, 12, 10),
+        );
+        let sessions = areas.left_panel.unwrap();
+        let info = areas.info_panel.expect("column shown");
+        assert!(
+            info.x >= sessions.x + sessions.width,
+            "info is its own column"
+        );
+        assert_eq!(info.y, sessions.y, "column spans the full content height");
+    }
+
+    #[test]
+    fn auto_hides_info_when_neither_dock_fits() {
+        // Too narrow for the column and too short to inline.
+        let areas = compute_layout(
+            area(100, 12),
+            &inline_params(InfoPanelPosition::Auto, 12, 10),
+        );
+        assert!(areas.info_panel.is_none());
+    }
+
+    #[test]
+    fn auto_fit_accounts_for_the_automations_pane() {
+        // sessions (8) + automations (3) + info (9) = 20 > 18 content rows →
+        // column; with the automations pane off the same inputs fit → inline.
+        let mut p = inline_params(InfoPanelPosition::Auto, 9, 8);
+        let areas = compute_layout(area(160, 20), &p);
+        let sessions = areas.left_panel.unwrap();
+        assert!(areas.info_panel.unwrap().x >= sessions.x + sessions.width);
+
+        p.show_automations_pane = false;
+        let areas = compute_layout(area(160, 20), &p);
+        let sessions = areas.left_panel.unwrap();
+        assert_eq!(areas.info_panel.unwrap().x, sessions.x);
+    }
+
+    #[test]
+    fn inline_position_squeezes_sessions_to_minimum() {
+        // Forced inline on a short column: the info pane keeps its rows even
+        // though the session list needs more than what's left.
+        let areas = compute_layout(
+            area(100, 20),
+            &inline_params(InfoPanelPosition::Inline, 10, 12),
+        );
+        let sessions = areas.left_panel.unwrap();
+        let info = areas.info_panel.expect("inline pane forced");
+        assert_eq!(info.height, 10);
+        assert!(sessions.height < 12, "session list gave up rows");
+        assert!(sessions.height >= SESSIONS_MIN_ROWS);
+    }
+
+    #[test]
+    fn inline_position_never_uses_the_column() {
+        // Even at three-panel widths with too little room for the full
+        // content, `inline` clamps into the left column instead of falling
+        // back to the dedicated column.
+        let areas = compute_layout(
+            area(160, 24),
+            &inline_params(InfoPanelPosition::Inline, 30, 10),
+        );
+        let sessions = areas.left_panel.unwrap();
+        let info = areas.info_panel.expect("clamped inline pane");
+        assert_eq!(info.x, sessions.x);
+        assert!(info.height < 30, "pane clamped to the column");
+    }
+
+    #[test]
+    fn inline_pane_dropped_below_minimum_rows() {
+        // The clamp leaves under INFO_PANE_MIN_ROWS → no useless sliver.
+        let areas = compute_layout(
+            area(100, 8),
+            &inline_params(InfoPanelPosition::Inline, 10, 4),
+        );
+        assert!(areas.info_panel.is_none());
+    }
+
+    #[test]
+    fn inline_info_coexists_with_right_columns() {
+        // Inline dock in the left column while the tasks column is open.
+        let p = LayoutParams {
+            show_tasks_panel: true,
+            ..inline_params(InfoPanelPosition::Auto, 10, 5)
+        };
+        let areas = compute_layout(area(160, 40), &p);
+        let sessions = areas.left_panel.unwrap();
+        let info = areas.info_panel.expect("inlined");
+        assert_eq!(info.x, sessions.x);
+        assert!(areas.tasks_panel.is_some());
     }
 }
