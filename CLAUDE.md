@@ -1721,7 +1721,7 @@ code_review`.
 
 ## Claude Code activity view (workflows + subagents)
 
-Thurbox surfaces what happens **inside** a running Claude Code session — the
+Friring surfaces what happens **inside** a running Claude Code session — the
 Task subagents and multi-agent workflows it spawns, and the actual transcript
 text (thinking / tool calls / tool output) of each — in a native central-pane
 view (the `Activity` tab; **F9**, rebindable `Action::ToggleCcActivity`), gated

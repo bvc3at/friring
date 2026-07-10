@@ -40,8 +40,7 @@ project *name* is rebranded, in `README.md` and `CLAUDE.md`.
 
 #### Claude Code activity view (F9)
 
-*The first Friring feature — currently on the `feature/cc-workflows-view`
-branch, pending merge into `main`.*
+*The first Friring feature — merged into `main` (#1).*
 
 A native central-pane view (**F9**, gated by a `[features] cc_activity` flag)
 that shows a live + historical **tree of a Claude Code session's workflows and
@@ -80,4 +79,6 @@ the fork.
 - `.github/workflows/cd.yml` (Release) — dormant; the fork does not cut its own
   releases.
 - `.github/workflows/ci.yml` — the `sonarqube` job is dormant; SonarQube is not
-  set up for the fork at the moment.
+  set up for the fork at the moment. The `changes` (paths-filter) job also grants
+  `pull-requests: read`, which a **private** repo's default token lacks (public
+  upstream doesn't need it).
