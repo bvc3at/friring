@@ -50,10 +50,11 @@ _site/
 .claude/scheduled_tasks.lock
 .aider*
 
-# Fork (Friring): keep .claude local-only. Files upstream already tracks under
-# .claude/ (commands, the publish + ui-review skills) stay tracked; this only
-# ignores NEW local additions — session skills, settings.local.json, worktrees/.
-.claude/
+# Fork (Friring): Claude Code project config is committed (commands, skills,
+# path-scoped rules under .claude/rules/). Only machine-local settings and the
+# local git worktrees stay ignored (.claude/scheduled_tasks.lock is above).
+.claude/settings.local.json
+.claude/worktrees/
 
 # Local orchestrator/agent worker workspaces (stray nested checkouts)
 thurbox/

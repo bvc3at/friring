@@ -5,8 +5,9 @@ set up your environment, the conventions we follow, and how to get a change
 merged.
 
 Thurbox is a multi-session coding-agent TUI orchestrator built with Rust. Before
-diving in, skimming the [`README.md`](README.md), [`CLAUDE.md`](CLAUDE.md), and
-the design docs under [`docs/`](docs/) will save you time.
+diving in, skimming the [`README.md`](README.md), [`AGENTS.md`](AGENTS.md) (the
+always-loaded agent brief; `CLAUDE.md` is a symlink to it), and the design docs
+under [`docs/`](docs/) will save you time.
 
 ## Code of conduct
 
@@ -76,7 +77,7 @@ The TUI has in-process acceptance tests with `insta` snapshots
 (`src/app/acceptance.rs`) and a black-box smoke test
 (`scripts/dev/smoke/tui-smoke.sh`). Update snapshots with
 `INSTA_UPDATE=always cargo test` (or `cargo insta review`). See the Testing
-section of [`CLAUDE.md`](CLAUDE.md) for the full picture.
+section of [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the full picture.
 
 ## Linting & formatting
 
@@ -142,8 +143,8 @@ doc in the **same PR**. Rationale lives in:
 - [`docs/FEATURES.md`](docs/FEATURES.md) — feature-level design choices
 - [`docs/CONFIG.md`](docs/CONFIG.md) — every config file/env var/DB setting
 
-Comments should explain **why**, not **what** — see the Comments section of
-[`CLAUDE.md`](CLAUDE.md).
+Comments should explain **why**, not **what** — see the "Every change" section
+of [`AGENTS.md`](AGENTS.md).
 
 ## Architecture
 
