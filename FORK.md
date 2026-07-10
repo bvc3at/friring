@@ -150,6 +150,17 @@ creates a normal session that `--resume`s it **in a directory you choose**
   than restoring; surfacing other agents' conversation stores (codex/opencode)
   if they ever expose stable resume-by-id semantics.
 
+### Behavior fixes
+
+- **Worktree branch pre-fill keeps `/`.** In the new-worktree flow, the branch
+  name suggested from the session name upstream drops every char that isn't
+  alphanumeric / space / `-` / `_`, so a git-flow style session name like
+  `fix/branch-naming` was pre-filled as `fixbranch-naming`. The fork preserves
+  `/` as a hierarchy separator (collapsing repeats, absorbing adjacent hyphens,
+  trimming at the ends). Everything downstream already handled slash branches —
+  the worktree directory flattens `/` to `-` and tmux window names sanitize
+  separately (`session_name_to_branch` in `src/app/key_handlers.rs`).
+
 ### Documentation / branding
 
 - `README.md` and the agent guide prose call the project **Friring** (the

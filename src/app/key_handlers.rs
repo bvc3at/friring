@@ -15,19 +15,32 @@ use tracing::{error, warn};
 
 /// Convert a session name into a git-branch-friendly name.
 ///
-/// Lowercases, replaces spaces/underscores with hyphens, drops other
-/// non-alphanumeric chars, collapses consecutive hyphens, and trims
-/// leading/trailing hyphens.
+/// Lowercases, collapses each run of spaces/underscores/hyphens to a single
+/// `-`, drops other non-alphanumeric chars, and trims leading/trailing `-`.
+/// `/` is kept so hierarchical names (`fix/branch-naming`) survive as the
+/// branch pre-fill: a `/` absorbs any `-` that would sit next to it (so a
+/// separator adjacent to a `/` collapses into the `/` rather than becoming a
+/// hyphen), consecutive `/` collapse, and leading/trailing `/` are trimmed —
+/// keeping the result valid per `git check-ref-format`.
 fn session_name_to_branch(name: &str) -> String {
     let mut result = String::with_capacity(name.len());
     for c in name.chars() {
         if c.is_alphanumeric() {
             result.push(c.to_ascii_lowercase());
-        } else if (c == ' ' || c == '-' || c == '_') && !result.ends_with('-') {
+        } else if c == '/' {
+            while result.ends_with('-') || result.ends_with('/') {
+                result.pop();
+            }
+            if !result.is_empty() {
+                result.push('/');
+            }
+        } else if (c == ' ' || c == '-' || c == '_')
+            && !(result.ends_with('-') || result.ends_with('/'))
+        {
             result.push('-');
         }
     }
-    result.trim_matches('-').to_string()
+    result.trim_matches(['-', '/']).to_string()
 }
 
 /// Whether a pressed chord is a bare `Ctrl+<letter>` — the namespace thurbox
@@ -2223,5 +2236,31 @@ mod tests {
     #[test]
     fn unicode_alphanumeric() {
         assert_eq!(session_name_to_branch("café"), "café");
+    }
+
+    #[test]
+    fn preserves_slash_hierarchy() {
+        assert_eq!(
+            session_name_to_branch("fix/branch-naming"),
+            "fix/branch-naming"
+        );
+    }
+
+    #[test]
+    fn slash_absorbs_adjacent_separators() {
+        assert_eq!(
+            session_name_to_branch("Fix / Branch Naming"),
+            "fix/branch-naming"
+        );
+    }
+
+    #[test]
+    fn collapses_and_trims_slashes() {
+        assert_eq!(session_name_to_branch("//a//b//"), "a/b");
+    }
+
+    #[test]
+    fn only_slashes() {
+        assert_eq!(session_name_to_branch("///"), "");
     }
 }
