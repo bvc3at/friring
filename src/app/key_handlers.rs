@@ -385,6 +385,7 @@ impl App {
             Modal::HostPicker(_) => self.handle_host_picker_key(code),
             Modal::ThemePicker(_) => self.handle_theme_picker_key(code),
             Modal::RepoPicker(_) => self.handle_repo_picker_key(code, mods),
+            Modal::ConversationPicker(_) => self.handle_conversation_picker_key(code, mods),
             Modal::TaskActionPicker(_) => self.handle_task_action_picker_key(code),
             Modal::ConfirmDelete(_) => self.handle_confirm_delete_key(code),
             Modal::ConfirmRestore(_) => self.handle_confirm_restore_key(code),
@@ -909,6 +910,7 @@ impl App {
             self.new_session.spawn_config = None;
             self.new_session.spawn_worktrees.clear();
             self.new_session.fork = false;
+            self.new_session.import = false;
             self.new_session.parent_session_id = None;
         }
     }
@@ -924,9 +926,11 @@ impl App {
             self.modal = super::modals::Modal::WorktreeName(modal);
         } else if let Some(config) = self.new_session.spawn_config.take() {
             let worktrees = std::mem::take(&mut self.new_session.spawn_worktrees);
-            if self.new_session.fork {
-                // Fork flow — role already set, spawn directly.
+            if self.new_session.fork || self.new_session.import {
+                // Fork / conversation-import flow — agent already set on the
+                // config, spawn directly.
                 self.new_session.fork = false;
+                self.new_session.import = false;
                 self.do_spawn_session_async(name, &config, worktrees);
             } else {
                 // Normal flow — proceed to role selection / spawn.
@@ -1235,6 +1239,15 @@ impl App {
             Action::SessionListMoveDown => self.move_active_session(true),
             Action::SessionListMoveUp => self.move_active_session(false),
             Action::SessionListSortAlphabetically => self.sort_sessions_alphabetically(),
+            // Same switch as the F9 view: both features read Claude Code's
+            // undocumented on-disk layout, so one flag governs both.
+            Action::SessionListImport => {
+                self.gated(
+                    self.features.cc_activity,
+                    "CC activity",
+                    Self::start_conversation_import,
+                );
+            }
             _ => return None,
         }
         Some(true)

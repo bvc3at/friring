@@ -125,4 +125,4 @@ Detail is read on demand — jump to the doc for what you're touching:
 | Render-loop performance, perf counters, redraw throttling | `docs/PERFORMANCE.md` |
 | The headless CLI (`thurbox-cli`) | `docs/CLI.md` |
 | Cutting a release, versioning, installers, packaging | `docs/RELEASING.md` |
-| What this fork changes vs upstream, and fork-only features (e.g. the F9 Claude Code activity view) | `FORK.md` |
+| What this fork changes vs upstream, and fork-only features (e.g. the F9 activity view, conversation import) | `FORK.md` |

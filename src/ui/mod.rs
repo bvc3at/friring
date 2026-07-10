@@ -8,6 +8,7 @@ pub mod cc_activity;
 pub mod code_review;
 pub mod confirm_delete_modal;
 pub mod confirm_restore_modal;
+pub mod conversation_picker_modal;
 pub mod file_viewer;
 pub mod global_search;
 pub mod highlight;

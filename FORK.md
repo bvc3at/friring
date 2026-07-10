@@ -97,6 +97,59 @@ rather than in `docs/FEATURES.md`):
   (`ssh:`/`wsl:`) support. **Done since v1:** daemon-worker attribution + live
   overview, per-session `--settings` for exact attribution, find-in-transcript.
 
+#### Import an existing Claude Code conversation (`i` in the session list)
+
+*The counterpart to the F9 activity view — adopt conversations Friring didn't
+start.*
+
+Upstream Thurbox resumes only sessions it spawned (it pins `agent_session_id`
+at launch); a raw `claude` run elsewhere, or one in a pre-existing worktree,
+could not be adopted. Pressing **`i`** in the session list (gated by the same
+`[features] cc_activity` flag — both features read Claude Code's undocumented
+on-disk layout) opens a picker of every conversation on disk, and launching one
+creates a normal session that `--resume`s it **in a directory you choose**
+(default: the conversation's original cwd). Claude + local sessions only (v1).
+
+- **Browse.** An off-thread one-shot scan lists every top-level
+  `~/.claude/projects/*/<uuid>.jsonl` (`$CLAUDE_CONFIG_DIR` honored): title
+  (Claude Code's `summary` line if present, else the first typed prompt — meta
+  lines like slash-command envelopes are skipped), original cwd, git branch,
+  last-active age. Fuzzy search (`/`), newest first. Conversations already
+  tracked by a live session are excluded (importing one would race the running
+  agent on its own transcript); duplicate ids across project dirs (earlier
+  imports) collapse to the newest copy.
+- **Pick a directory.** `Enter` moves to a working-directory input prefilled
+  with the original cwd (fish-style Tab completion, mirrors the repo picker).
+  This is the "resume without cd-ing to the original directory" gap: point an
+  old conversation at a fresh worktree.
+- **Transcript staging.** `claude --resume <id>` only finds transcripts under
+  the *current* directory's project slug (verified v2.1.206), so importing into
+  a different directory copies the newest `<id>.jsonl` into
+  `projects/<slug-of-destination>/` first. The original file is never touched;
+  an existing same-or-newer destination copy is kept (re-importing never rolls
+  a continued conversation back). This is the one place thurbox *computes* a
+  slug (`paths::claude_project_slug`, every non-alphanumeric → `-`, destination
+  canonicalized first because `claude` slugs its physical cwd) — finding
+  existing dirs still scans instead. If a future Claude Code changes the rule,
+  the failure is visible (`--resume` errors in the pane), not silent.
+- **Spawn.** The session config pins **both** `resume_session_id` (selects the
+  `--resume {id}` arg group) and `agent_session_id` (identity: `THURBOX_SESSION_ID`,
+  the F9 activity scan, the DB row, later `Ctrl+R` restarts), so an imported
+  session behaves exactly like one Friring started. The relaunch agent is the
+  registry default when it resumes by id, else the first agent whose
+  `resume_args` carry `{id}` (`AgentDef::resumes_by_id`); the agent picker is
+  skipped. The session-name modal is prefilled from the conversation title.
+- **Code shape.** Pure head-parsing (`parse_conversation_head`) in
+  `session::cc_activity` beside the other defensive Claude Code parsers; scan +
+  staging + modal state + key handlers in `app::cc_import`; renderer in
+  `ui::conversation_picker_modal` (mirrors the repo picker's
+  search/list/input/footer shape).
+- **Follow-ups** (named, not silently dropped): remote (`ssh:`/`wsl:`) imports
+  (scan the remote `~/.claude` and stage over the transport); importing
+  conversations of *deleted* (tombstoned) sessions currently re-imports rather
+  than restoring; surfacing other agents' conversation stores (codex/opencode)
+  if they ever expose stable resume-by-id semantics.
+
 ### Documentation / branding
 
 - `README.md` and the agent guide prose call the project **Friring** (the

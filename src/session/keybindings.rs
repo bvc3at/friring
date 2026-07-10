@@ -74,6 +74,9 @@ pub enum Action {
     /// Sort sessions alphabetically by name within each repo group, preserving
     /// group order and parent/child nesting (children sort among siblings).
     SessionListSortAlphabetically,
+    /// Import an existing Claude Code conversation from disk as a new session
+    /// (browse `~/.claude/projects`, pick a launch directory, `--resume` it).
+    SessionListImport,
     // ── Automations pane (scoped) ───────────────────────────────────────
     AutomationsNew,
     AutomationsNext,
@@ -166,6 +169,7 @@ impl Action {
             Action::SessionListMoveDown,
             Action::SessionListMoveUp,
             Action::SessionListSortAlphabetically,
+            Action::SessionListImport,
             Action::AutomationsNew,
             Action::AutomationsNext,
             Action::AutomationsPrev,
@@ -233,6 +237,7 @@ impl Action {
             Action::SessionListMoveDown => "Move session down",
             Action::SessionListMoveUp => "Move session up",
             Action::SessionListSortAlphabetically => "Sort sessions A→Z",
+            Action::SessionListImport => "Import CC conversation",
             Action::AutomationsNew => "New automation",
             Action::AutomationsNext => "Next item",
             Action::AutomationsPrev => "Previous item",
@@ -276,7 +281,8 @@ impl Action {
             | Action::SessionListOpen
             | Action::SessionListMoveDown
             | Action::SessionListMoveUp
-            | Action::SessionListSortAlphabetically => KeyContext::SessionList,
+            | Action::SessionListSortAlphabetically
+            | Action::SessionListImport => KeyContext::SessionList,
             Action::AutomationsNew
             | Action::AutomationsNext
             | Action::AutomationsPrev
@@ -454,6 +460,10 @@ impl Action {
             Action::SessionListSortAlphabetically => {
                 vec![KeyChord::normalized(KeyModifiers::NONE, KeyCode::Char('S'))]
             }
+            // Scoped plain `i` (mnemonic: import) — every free bare
+            // `Ctrl+<letter>` is taken or reserved, and the session list is
+            // where imported sessions land.
+            Action::SessionListImport => vec![KeyChord::plain('i')],
             // Automations pane (scoped) — same letters as the session list,
             // safe because the context lookup keeps them apart.
             Action::AutomationsNew => vec![KeyChord::plain('n')],
@@ -585,6 +595,7 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
                 SessionListMoveDown,
                 SessionListMoveUp,
                 SessionListSortAlphabetically,
+                SessionListImport,
             ],
         ),
         (
@@ -1370,6 +1381,7 @@ mod tests {
                 Action::SessionListMoveDown => 0,
                 Action::SessionListMoveUp => 0,
                 Action::SessionListSortAlphabetically => 0,
+                Action::SessionListImport => 0,
                 Action::AutomationsNew => 0,
                 Action::AutomationsNext => 0,
                 Action::AutomationsPrev => 0,
@@ -1402,7 +1414,7 @@ mod tests {
         }
         // The listed variants must equal Action::all().len(). If you add
         // a variant, update both `Action::all()` and the match above.
-        const EXPECTED: usize = 61;
+        const EXPECTED: usize = 62;
         assert_eq!(Action::all().len(), EXPECTED);
         for a in Action::all() {
             classify(*a);

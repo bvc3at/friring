@@ -2,6 +2,7 @@ mod automation;
 mod automation_state;
 mod background;
 pub(crate) mod cc_activity;
+pub(crate) mod cc_import;
 pub(crate) mod clock;
 pub(crate) mod code_review;
 mod config_reload;
@@ -533,6 +534,9 @@ pub(crate) enum ClickAction {
     ModalField(usize),
     /// Focus the repo picker's `Input`/`Search` sub-area (its editable fields).
     RepoFocus(modals::RepoPickerFocus),
+    /// Focus the conversation picker's `Search`/`Dir` sub-area (its editable
+    /// fields).
+    ConvoFocus(cc_import::ConversationPickerFocus),
     /// Focus an **in-pane editor** (automation / task) and select its index-th
     /// visible field. Dispatched by `activate_click_target`.
     PaneField { focus: InputFocus, index: usize },
@@ -742,6 +746,9 @@ pub struct App {
     /// interactive new-session flow, polled each tick. Programmatic spawns
     /// stay synchronous.
     session_spawn: background::BackgroundTask<Result<Session, String>>,
+    /// One-shot background scan of `~/.claude/projects` for the
+    /// conversation-import picker (`i` in the session list), polled each tick.
+    conversation_scan: background::BackgroundTask<Vec<cc_import::CcConversation>>,
     /// Off-thread code-review diff build (open/retarget), applied by
     /// [`Self::poll_review_build`]. See ADR-P8 in `docs/PERFORMANCE.md`.
     review_build: background::BackgroundTask<code_review::ReviewBuildResult>,
@@ -1061,6 +1068,7 @@ impl App {
             worktree_create: background::BackgroundTask::default(),
             pending_worktree_create: None,
             session_spawn: background::BackgroundTask::default(),
+            conversation_scan: background::BackgroundTask::default(),
             review_build: background::BackgroundTask::default(),
             pending_session_spawn: None,
             remote_restore: None,
@@ -2620,6 +2628,9 @@ impl App {
         if self.try_repo_focus_click(pos) {
             return;
         }
+        if self.try_convo_focus_click(pos) {
+            return;
+        }
         self.try_modal_row_click(pos);
     }
 
@@ -2674,6 +2685,20 @@ impl App {
         true
     }
 
+    /// Conversation picker: clicking the search / directory field focuses it.
+    fn try_convo_focus_click(&mut self, pos: Position) -> bool {
+        let Some(focus) = self.click_targets.iter().find_map(|t| match t.action {
+            ClickAction::ConvoFocus(focus) if t.rect.contains(pos) => Some(focus),
+            _ => None,
+        }) else {
+            return false;
+        };
+        if let modals::Modal::ConversationPicker(ref mut cp) = self.modal {
+            cp.focus = focus;
+        }
+        true
+    }
+
     /// A list-row click selects the row and replays its activation key.
     fn try_modal_row_click(&mut self, pos: Position) {
         let Some(row) = self.click_targets.iter().find_map(|t| match t.action {
@@ -2696,10 +2721,14 @@ impl App {
     /// frame's renderer, so it is always in bounds) and return the key that
     /// activates a row there (see [`modals::Modal::list_selection`]).
     fn select_modal_row(&mut self, row: usize) -> Option<KeyCode> {
-        // The repo picker routes keys by its internal focus; a row click always
-        // means the list (mirrors the keyboard path), so force it before moving.
+        // The repo/conversation pickers route keys by their internal focus; a
+        // row click always means the list (mirrors the keyboard path), so
+        // force it before moving.
         if let modals::Modal::RepoPicker(ref mut rp) = self.modal {
             rp.focus = modals::RepoPickerFocus::List;
+        }
+        if let modals::Modal::ConversationPicker(ref mut cp) = self.modal {
+            cp.focus = cc_import::ConversationPickerFocus::List;
         }
         let (index, activation_key) = self.modal.list_selection()?;
         *index = row;
@@ -2781,7 +2810,8 @@ impl App {
             ClickAction::ModalRow(_)
             | ClickAction::ModalButton { .. }
             | ClickAction::ModalField(_)
-            | ClickAction::RepoFocus(_) => true,
+            | ClickAction::RepoFocus(_)
+            | ClickAction::ConvoFocus(_) => true,
             ClickAction::Global(action) => {
                 self.dispatch_action(action);
                 true
@@ -4053,6 +4083,9 @@ impl App {
         // `Session::spawn`) so `Ctrl+N` never freezes the UI.
         self.poll_worktree_create();
         self.poll_session_spawn();
+
+        // Fill the conversation-import picker once its disk scan completes.
+        self.poll_conversation_import();
 
         // Apply a finished off-thread code-review diff build (ADR-P8).
         self.poll_review_build();
