@@ -30,6 +30,12 @@ jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
+    # Fork (Friring): a PRIVATE repo's default GITHUB_TOKEN lacks
+    # pull-requests:read, which dorny/paths-filter needs (else "Resource not
+    # accessible by integration"). Upstream is public, so it works without this.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       rust: ${{ steps.filter.outputs.rust || steps.all.outputs.all }}
       shell: ${{ steps.filter.outputs.shell || steps.all.outputs.all }}
