@@ -801,7 +801,7 @@ scope; the payoff of reviewing *inside* an orchestrator is closing the
 loop — `e` (Send→Agent) pastes the compiled review into the session's agent
 to address, and `y` (Copy) yields markdown. Diff data types (`DiffFile` /
 `DiffHunk` / `DiffLine`, `Classification`, `CommentAnchor`, `ReviewComment`)
-+ the unit-tested `parse_unified_diff` live in `session::review` (pure, so
+and the unit-tested `parse_unified_diff` live in `session::review` (pure, so
 `ui` renders them without importing `git`); `git::diff_against{,_on}` runs
 `git diff` (local or over SSH); persistence in `storage::review`
 (`review_comments` + `review_marks` tables, schema **v38**). The
@@ -1546,8 +1546,8 @@ dispatching a selection live on `App` (`build_global_search_results`,
 the owning panel's cursor (`preview_global_search_result` →
 `active_index` / `task_panel_index` / `automation_panel_index`;
 `global_search_preview_kind()` tells the view which panel owns it);
-`open_global_search` captures a `SearchSnapshot` (focus + those three indices
-+ `show_tasks_panel`/`show_file_viewer`) that `Esc` restores and `Enter`
+`open_global_search` captures a `SearchSnapshot` (focus + those three indices +
+`show_tasks_panel`/`show_file_viewer`) that `Esc` restores and `Enter`
 drops. `InputFocus::GlobalSearch` captures all input before the global
 keybinding lookup; `compute_layout`'s `show_global_search` carves the
 full-width `PanelAreas::global_search` strip (rendered by

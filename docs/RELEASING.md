@@ -66,7 +66,7 @@ package channels (each gated on its secret, skipped on forks). See
   release `checksums.txt`) and pushes to the `Thurbeen/homebrew-thurbox` tap over
   SSH. Needs `HOMEBREW_TAP_DEPLOY_KEY` (a write deploy key; the org blocks
   cross-repo PATs). Install: `brew install thurbeen/thurbox/thurbox`. macOS arm64
-  + Linux x86_64 (musl).
+  and Linux x86_64 (musl).
 - **AUR** (`publish-aur`) — bumps + pushes `thurbox`/`thurbox-bin` PKGBUILDs.
   Needs `AUR_SSH_PRIVATE_KEY`.
 - **Chocolatey** (`publish-chocolatey`) — bumps `<version>` in
