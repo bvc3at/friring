@@ -28,6 +28,7 @@ the TUI polls their mtime (~1/s) and applies edits with a confirmation
 toast — no restart. For `settings.toml` only the **feature flags that
 gate UI panels** (`tasks`, `file_viewer`, `info_panel`, `global_search`,
 `shell_pane`, `code_review`, `cc_activity`, `perf_hud`, `soft_delete`)
+and `info_panel_position`
 apply live; the restart-only values stay published through a write-once
 global (so they can't drift mid-frame),
 and the reload toast says when a restart is needed. `hosts.toml` (SSH
@@ -35,10 +36,11 @@ backends register at startup) and `themes.toml` need a restart.
 
 `settings.toml` can also be edited from the TUI: **`Ctrl+,`** (alt `F6`)
 opens a **Settings panel** listing every knob. It writes the file back
-**preserving its comments**, and feature flags that gate UI panels apply
-**live** on save; the rest (`mouse`, `notifications`, `automations`,
-`version_check`, `auto_update`, the four editable `[notifications]` knobs,
-and the scalars) take effect on the next launch — the panel marks those rows
+**preserving its comments**, and feature flags that gate UI panels (plus
+`info_panel_position`) apply **live** on save; the rest (`mouse`,
+`notifications`, `automations`, `version_check`, `auto_update`, the four
+editable `[notifications]` knobs, and the numeric scalars) take effect on
+the next launch — the panel marks those rows
 with `⟳` and toasts a restart note. The panel exposes only the four
 editable notification knobs (`also_on_waiting`, `suppress_for_active`,
 `sound`, `min_interval_secs`); `[notifications] backend` is **not** in
@@ -357,7 +359,18 @@ all commented so defaults still apply out of the box.
 | `scrollback_lines` | `1000` | terminal scrollback kept per session |
 | `two_panel_min_cols` | `80` | width below which only the terminal renders |
 | `three_panel_min_cols` | `120` | width unlocking the optional third column |
+| `info_panel_position` | `"auto"` | where the F2 info pane docks: `auto` / `column` / `inline` |
 | `audit_retention_days` | `90` | audit-log history kept (pruned on startup) |
+
+`info_panel_position` is the one top-level key that applies **live** (on
+panel save or file reload, like the UI feature flags): `auto` docks the
+pane at the bottom of the session column whenever the full session list,
+the automations pane, and the full info content fit together, and falls
+back to the dedicated column otherwise; `column` always uses the dedicated
+column (the classic layout, needs `three_panel_min_cols`); `inline` always
+docks it under the session list, squeezing the list down to its 3-row
+minimum if it must. The inline dock only needs `two_panel_min_cols`, so
+`auto`/`inline` keep F2 usable on terminals too narrow for the column.
 
 A complete `settings.toml` showing every knob at its default — copy
 this, uncomment what you want to change, and restart:
@@ -369,6 +382,7 @@ config_version = 1
 scrollback_lines      = 1000   # terminal scrollback kept per session
 two_panel_min_cols    = 80     # width below which only the terminal renders
 three_panel_min_cols  = 120    # width unlocking the optional third column
+info_panel_position   = "auto" # F2 info pane dock: auto | column | inline
 audit_retention_days  = 90     # audit-log history kept (pruned on startup)
 
 [features]
@@ -413,7 +427,7 @@ no results. Data is never touched, so re-enabling a flag is lossless.
 | `automations` | `true` | automations pane, `Ctrl+P`, TUI schedule firing, heartbeat arming |
 | `file_viewer` | `true` | file viewer column (`F3`) and file search results |
 | `global_search` | `true` | global search strip (`Ctrl+/`) |
-| `info_panel` | `true` | info panel column (`F2`) |
+| `info_panel` | `true` | info panel (`F2`; docking via `info_panel_position`) |
 | `shell_pane` | `true` | per-session shell toggle (`Ctrl+T`) |
 | `code_review` | `true` | native code-review view (diff + comments, `Ctrl+X`) |
 | `cc_activity` | `true` | Claude Code activity view: workflow/subagent transcripts (`F9`); Claude + local sessions only |

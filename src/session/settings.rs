@@ -34,6 +34,10 @@ pub struct Settings {
     /// Days of audit-log history kept (pruned on startup).
     #[serde(default = "default_audit_retention_days")]
     pub audit_retention_days: u64,
+    /// Where the info panel (F2) docks — see [`InfoPanelPosition`]. Applies
+    /// live (mirrored into `App` state like the UI-panel feature flags).
+    #[serde(default)]
+    pub info_panel_position: InfoPanelPosition,
     /// Per-feature on/off switches (`[features]` table). Absent table = all
     /// enabled.
     #[serde(default)]
@@ -118,6 +122,44 @@ pub struct FeatureFlags {
     /// call and replaces files on disk. The new version applies on the next launch.
     #[serde(default = "default_false")]
     pub auto_update: bool,
+}
+
+/// Where the info panel (F2) docks (`info_panel_position`).
+///
+/// `Auto` (the default) inlines it at the bottom of the left/session column
+/// whenever the full session list, the automations pane, and the full info
+/// content all fit; otherwise it falls back to the dedicated column (which
+/// needs `three_panel_min_cols`). `Column` always uses the dedicated column
+/// (the classic layout). `Inline` always docks it in the left column, even
+/// when that squeezes the session list down to its minimum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InfoPanelPosition {
+    /// Inline under the session list when everything fits, else the column.
+    #[default]
+    Auto,
+    /// Always the dedicated column (the classic layout).
+    Column,
+    /// Always under the session list, squeezing it if needed.
+    Inline,
+}
+
+impl InfoPanelPosition {
+    /// All variants in `←`/`→` cycle order (settings panel stepper).
+    pub const ALL: [InfoPanelPosition; 3] = [
+        InfoPanelPosition::Auto,
+        InfoPanelPosition::Column,
+        InfoPanelPosition::Inline,
+    ];
+
+    /// The `settings.toml` value string (mirrors serde's lowercase rename).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InfoPanelPosition::Auto => "auto",
+            InfoPanelPosition::Column => "column",
+            InfoPanelPosition::Inline => "inline",
+        }
+    }
 }
 
 /// Which OS-notification delivery backend to use (`[notifications] backend`).
@@ -235,9 +277,10 @@ impl Settings {
     /// `[notifications]` knob, and the feature flags whose effect is wired at
     /// launch — `automations`, `mouse`, `notifications`, `version_check`). The
     /// remaining feature flags gate UI panels read from `App.features` every
-    /// frame, so they apply live and are intentionally excluded here. Drives the
-    /// "some changes apply after restart" hint shown by the settings panel and
-    /// the live-reload toast.
+    /// frame, so they apply live and are intentionally excluded here — as is
+    /// `info_panel_position`, which is mirrored into `App` state the same way.
+    /// Drives the "some changes apply after restart" hint shown by the settings
+    /// panel and the live-reload toast.
     pub fn restart_only_differs(&self, other: &Settings) -> bool {
         self.scrollback_lines != other.scrollback_lines
             || self.two_panel_min_cols != other.two_panel_min_cols
@@ -260,6 +303,7 @@ impl Default for Settings {
             two_panel_min_cols: default_two_panel_min_cols(),
             three_panel_min_cols: default_three_panel_min_cols(),
             audit_retention_days: default_audit_retention_days(),
+            info_panel_position: InfoPanelPosition::default(),
             features: FeatureFlags::default(),
             notifications: NotificationSettings::default(),
         }
@@ -305,6 +349,40 @@ mod tests {
     fn type_mismatch_is_rejected() {
         let err = toml::from_str::<Settings>("scrollback_lines = \"many\"").unwrap_err();
         assert!(err.to_string().contains("scrollback_lines"));
+    }
+
+    #[test]
+    fn info_panel_position_defaults_to_auto_and_parses_each_variant() {
+        let s: Settings = toml::from_str("").unwrap();
+        assert_eq!(s.info_panel_position, InfoPanelPosition::Auto);
+        for (raw, want) in [
+            ("auto", InfoPanelPosition::Auto),
+            ("column", InfoPanelPosition::Column),
+            ("inline", InfoPanelPosition::Inline),
+        ] {
+            let s: Settings =
+                toml::from_str(&format!("info_panel_position = \"{raw}\"\n")).unwrap();
+            assert_eq!(s.info_panel_position, want, "info_panel_position = {raw}");
+            assert_eq!(want.as_str(), raw, "as_str mirrors the serde rename");
+        }
+    }
+
+    #[test]
+    fn info_panel_position_rejects_unknown_value() {
+        let err = toml::from_str::<Settings>("info_panel_position = \"floating\"").unwrap_err();
+        assert!(
+            err.to_string().contains("info_panel_position") || err.to_string().contains("variant")
+        );
+    }
+
+    #[test]
+    fn info_panel_position_applies_live() {
+        // Mirrored into `App` state on save/reload like the live feature
+        // flags, so it must not register as a restart-only difference.
+        let base = Settings::default();
+        let mut moved = base.clone();
+        moved.info_panel_position = InfoPanelPosition::Inline;
+        assert!(!base.restart_only_differs(&moved));
     }
 
     #[test]

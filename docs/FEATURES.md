@@ -1623,9 +1623,10 @@ commented examples).
 **Why some rows take effect immediately and others need a restart.** The
 feature flags that gate UI panels (`tasks`, `file_viewer`, `info_panel`,
 `global_search`, `shell_pane`, `code_review`, `soft_delete`) are read from
-`App.features` every frame, so `submit_settings_panel` copies the draft's
-flags into `self.features` via `App::apply_live_settings` and they apply at
-once. `apply_live_settings` also runs `enforce_feature_visibility`, which
+`App.features` every frame — and `info_panel_position` from
+`App.info_panel_position` the same way — so `submit_settings_panel` copies
+the draft's values into `App` state via `App::apply_live_settings` and they
+apply at once. `apply_live_settings` also runs `enforce_feature_visibility`, which
 tears down any surface a now-disabled flag left open (the `show_*` panel
 toggles, a session's open shell view, an open code review) and moves focus
 off it — each branch only forces the *hidden* state, so re-enabling never
@@ -1709,6 +1710,29 @@ optional columns that appear at wider widths:
 | `<80` | Terminal only | Sidebar would leave <60 cols — too narrow |
 | `>=80` | Sidebar + terminal | 20-col sidebar + 60-col terminal min |
 | `>=120` | Sidebar + terminal + info | Terminal still gets ~70+ cols |
+
+### Info panel docking (`info_panel_position`)
+
+The F2 info pane has two possible homes: its **own column** between the
+sidebar and the terminal (the classic layout above), or **inline** at
+the bottom of the sidebar — below the session list and automations pane
+— which costs no terminal width. The `info_panel_position` setting
+picks between them (`docs/CONFIG.md`):
+
+- **`auto`** (default) — inline whenever the full session list, the
+  automations pane, and the full info content fit the sidebar together;
+  the dedicated column otherwise. Content-height changes (an agent
+  section appearing, automations added) can move the dock; a tick-side
+  drift check re-pushes PTY sizes when that shifts the terminal width.
+- **`column`** — always the dedicated column, exactly the old behavior.
+- **`inline`** — always the sidebar dock, even when the session list
+  must shrink to its 3-row minimum to make room (the pane clamps to the
+  space left and never falls back to the column).
+
+Because the inline dock lives in the sidebar it works from
+`two_panel_min_cols` (80) up, so `auto`/`inline` keep F2 usable on
+terminals too narrow for the third column. F2 toggles visibility the
+same in every mode.
 
 ### Why not user-configurable?
 

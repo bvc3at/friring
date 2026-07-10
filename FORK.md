@@ -150,6 +150,23 @@ creates a normal session that `--resume`s it **in a directory you choose**
   than restoring; surfacing other agents' conversation stores (codex/opencode)
   if they ever expose stable resume-by-id semantics.
 
+#### Inline info-pane docking (`info_panel_position`)
+
+Upstream's F2 info panel is always a dedicated column (needs ≥120 cols and
+costs the terminal ~15% of its width). The fork adds a top-level
+`info_panel_position` setting — `auto` (new default) / `column` / `inline` —
+that can dock the pane **inline at the bottom of the sidebar** instead, below
+the session list and automations pane, costing no terminal width and working
+from 80 cols up. `auto` inlines whenever the full session list + automations
+pane + full info content fit the sidebar and falls back to the column
+otherwise; `column` is exactly the upstream behavior; `inline` forces the
+sidebar dock even when the session list must shrink to its minimum. Applies
+live (settings panel / file reload), F2 still toggles visibility, and a
+tick-side drift check re-pushes PTY sizes when an `auto` flip moves the dock
+(a content-driven layout change no resize event covers). Details in
+`docs/CONFIG.md` + `docs/FEATURES.md` ("Info panel docking"); the **default
+changed** from upstream's always-column to `auto`.
+
 ### Behavior fixes
 
 - **Worktree branch pre-fill keeps `/`.** In the new-worktree flow, the branch
