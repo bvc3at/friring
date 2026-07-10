@@ -335,12 +335,23 @@ pub fn claude_jobs_dir(config_dir_override: Option<&Path>) -> Option<PathBuf> {
 /// *creating* the destination dir for a conversation import, where there is
 /// nothing to scan yet. `claude` resolves its cwd via `getcwd`, which returns
 /// the physical path, so callers must canonicalize first or the slugs diverge
-/// on any symlinked component. Verified against Claude Code v2.1.206.
+/// on any symlinked component.
+///
+/// The rule is **per UTF-8 byte**, not per `char`: a multi-byte character
+/// yields one `-` per byte (verified against Claude Code v2.1.206 — `café`
+/// slugs to `caf--` because `é` is two bytes). A `chars()`-based rule would
+/// undercount and stage the transcript into a dir `--resume` never reads.
 pub fn claude_project_slug(canonical_cwd: &Path) -> String {
     canonical_cwd
         .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                b as char
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -1164,6 +1175,8 @@ mod tests {
             claude_project_slug(Path::new("/home/me/.claude/worktrees/x-y")),
             "-home-me--claude-worktrees-x-y"
         );
+        // Non-ASCII is per-byte: `é` (2 UTF-8 bytes) → `--`, matching CC.
+        assert_eq!(claude_project_slug(Path::new("/tmp/café")), "-tmp-caf--");
     }
 
     #[test]

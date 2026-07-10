@@ -134,7 +134,9 @@ fn render_conversation_list(
 
     if cp.filtered_indices.is_empty() {
         let msg = if cp.loading {
-            "  Scanning ~/.claude/projects…"
+            // Not "~/.claude/projects" — the scan honors $CLAUDE_CONFIG_DIR, so
+            // a fixed path here would mislead anyone who has overridden it.
+            "  Scanning Claude Code conversations…"
         } else if cp.search_input.value().is_empty() {
             "  No importable conversations found"
         } else {
