@@ -143,6 +143,7 @@ impl App {
                         | ClickAction::ModalButton { .. }
                         | ClickAction::ModalField(_)
                         | ClickAction::RepoFocus(_)
+                        | ClickAction::ConvoFocus(_)
                 )
             } else {
                 matches!(
@@ -1075,6 +1076,31 @@ impl App {
         // Automations list modal
         if let super::modals::Modal::AutomationsList(ref al) = self.modal {
             return Some(self.render_automations_list_modal(frame, al));
+        }
+
+        // Conversation-import picker. Same borrow dance as the repo picker
+        // below: render immutably, then record the editable sub-field targets.
+        if matches!(self.modal, super::modals::Modal::ConversationPicker(_)) {
+            let (render, areas) = {
+                let super::modals::Modal::ConversationPicker(ref cp) = self.modal else {
+                    unreachable!()
+                };
+                let now_ms = crate::sync::current_time_millis();
+                crate::ui::conversation_picker_modal::render_conversation_picker_modal(
+                    frame, cp, now_ms,
+                )
+            };
+            if let Some(search) = areas.search {
+                self.record_click(
+                    search,
+                    ClickAction::ConvoFocus(super::cc_import::ConversationPickerFocus::Search),
+                );
+            }
+            self.record_click(
+                areas.dir,
+                ClickAction::ConvoFocus(super::cc_import::ConversationPickerFocus::Dir),
+            );
+            return Some(render);
         }
 
         // Repo picker modal. Render under an immutable borrow of the modal,

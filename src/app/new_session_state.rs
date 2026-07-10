@@ -42,5 +42,9 @@ pub(crate) struct NewSessionWizardState {
     pub(crate) parent_session_id: Option<SessionId>,
     pub(crate) fork: bool,
     pub(crate) restart: bool,
+    /// A conversation-import spawn (`i` in the session list): the agent and the
+    /// pinned resume ids are already on `spawn_config`, so the name modal
+    /// spawns directly instead of opening the agent picker (mirrors `fork`).
+    pub(crate) import: bool,
     pub(crate) spawn_name: Option<String>,
 }

@@ -86,6 +86,14 @@ impl AgentDef {
     pub fn resumes_latest(&self) -> bool {
         self.resume_latest && !self.resume_args.is_empty()
     }
+
+    /// Whether this agent can resume a *specific* conversation by id: its
+    /// `resume_args` carry the `{id}` placeholder and it doesn't rely on
+    /// "latest in cwd" resolution. This is what the conversation-import flow
+    /// needs — an id-less resume group would silently open the wrong session.
+    pub fn resumes_by_id(&self) -> bool {
+        !self.resume_latest && self.resume_args.iter().any(|t| t.contains(ID_PLACEHOLDER))
+    }
 }
 
 /// Replace `placeholder` with `value` in every token of `tokens`.
@@ -217,6 +225,17 @@ mod tests {
             vec!["fork", "--last"]
         );
         assert!(d.resumes_latest());
+    }
+
+    #[test]
+    fn resumes_by_id_requires_id_placeholder_without_resume_latest() {
+        assert!(claude().resumes_by_id());
+        let mut idless = claude();
+        idless.resume_args = vec!["--continue".into()];
+        assert!(!idless.resumes_by_id());
+        let mut latest = claude();
+        latest.resume_latest = true;
+        assert!(!latest.resumes_by_id());
     }
 
     #[test]

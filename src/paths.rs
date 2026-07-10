@@ -326,6 +326,35 @@ pub fn claude_jobs_dir(config_dir_override: Option<&Path>) -> Option<PathBuf> {
     claude_config_root(config_dir_override).map(|r| r.join("jobs"))
 }
 
+/// Claude Code's `projects/<slug>` directory name for a working directory:
+/// every non-ASCII-alphanumeric byte becomes `-` (so `/a/b.c` → `-a-b-c`).
+///
+/// For *finding* an existing session dir thurbox never computes a slug — it
+/// scans `projects/*/` (see `claude_transcript_exists`) precisely because this
+/// rule is undocumented and version-specific. Computing it is only needed when
+/// *creating* the destination dir for a conversation import, where there is
+/// nothing to scan yet. `claude` resolves its cwd via `getcwd`, which returns
+/// the physical path, so callers must canonicalize first or the slugs diverge
+/// on any symlinked component.
+///
+/// The rule is **per UTF-8 byte**, not per `char`: a multi-byte character
+/// yields one `-` per byte (verified against Claude Code v2.1.206 — `café`
+/// slugs to `caf--` because `é` is two bytes). A `chars()`-based rule would
+/// undercount and stage the transcript into a dir `--resume` never reads.
+pub fn claude_project_slug(canonical_cwd: &Path) -> String {
+    canonical_cwd
+        .to_string_lossy()
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                b as char
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 /// Returns true if a Claude transcript file `<agent_session_id>.jsonl` exists
 /// under `<root>/projects/*/`.
 ///
@@ -1132,6 +1161,22 @@ mod tests {
             sanitize_workspace_segment("d5715d35-9599-4507-9901-ef33b9476358"),
             "d5715d35-9599-4507-9901-ef33b9476358"
         );
+    }
+
+    #[test]
+    fn claude_project_slug_dashes_every_non_alphanumeric() {
+        // Leading `/`, separators, dots, and existing dashes all become `-`
+        // (so a dashed dir yields a double dash) — observed CC v2.1.206 rule.
+        assert_eq!(
+            claude_project_slug(Path::new("/mnt/shared/projects/thurbox")),
+            "-mnt-shared-projects-thurbox"
+        );
+        assert_eq!(
+            claude_project_slug(Path::new("/home/me/.claude/worktrees/x-y")),
+            "-home-me--claude-worktrees-x-y"
+        );
+        // Non-ASCII is per-byte: `é` (2 UTF-8 bytes) → `--`, matching CC.
+        assert_eq!(claude_project_slug(Path::new("/tmp/café")), "-tmp-caf--");
     }
 
     #[test]

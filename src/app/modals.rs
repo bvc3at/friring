@@ -1878,6 +1878,7 @@ pub enum Modal {
     AutomationEditor(AutomationEditorModal),
     AutomationsList(AutomationsListModal),
     RepoPicker(RepoPickerModal),
+    ConversationPicker(super::cc_import::ConversationPickerModal),
     SessionName(SessionNameModal),
     ThemePicker(ThemePickerModal),
     TaskActionPicker(TaskActionPickerModal),
@@ -1914,6 +1915,7 @@ impl Modal {
             Modal::AutomationsList(al) => Some((&mut al.index, KeyCode::Enter)),
             Modal::RestoreSessions(rs) => Some((&mut rs.index, KeyCode::Enter)),
             Modal::RepoPicker(rp) => Some((&mut rp.list_index, KeyCode::Char(' '))),
+            Modal::ConversationPicker(cp) => Some((&mut cp.list_index, KeyCode::Enter)),
             _ => None,
         }
     }
