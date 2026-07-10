@@ -4075,9 +4075,19 @@ impl App {
     /// Re-push PTY sizes when the computed content area drifted without a
     /// resize event: the `auto` info-pane dock moves between the left column
     /// and its own column as its inputs (info content, session/automation
-    /// counts) change, which shifts the terminal width mid-session. No-op —
-    /// no backend traffic — while the size is stable.
+    /// counts) change, which shifts the terminal width mid-session.
+    ///
+    /// Runs on every (unthrottled ~100 Hz) tick, so it must stay cheap. Only
+    /// the `auto` dock with the panel open can resize the terminal from
+    /// content — `column`/`inline` never do, and every explicit panel toggle
+    /// already re-pushes sizes — so gate on that before the (line-building)
+    /// `content_area_size` measure and keep the idle tick allocation-free.
+    /// A no-op (no backend traffic) while the size is stable.
     fn sync_content_size(&mut self) {
+        use crate::session::settings::InfoPanelPosition;
+        if !(self.show_info_panel && self.info_panel_position == InfoPanelPosition::Auto) {
+            return;
+        }
         if self.last_content_size != Some(self.content_area_size()) {
             self.resize_sessions_to_content_area();
         }
@@ -8602,6 +8612,47 @@ mod tests {
         assert!(
             session_parser_size(&app, 0).1 < inline_width,
             "flip to the column must shrink the pushed PTY width"
+        );
+    }
+
+    #[test]
+    fn sync_content_size_is_gated_to_auto_with_panel_open() {
+        // The drift check runs on every unthrottled tick, so it must short-
+        // circuit unless the `auto` dock (the only content-driven terminal
+        // resize) is actually in play. Stale `last_content_size` + a size that
+        // would differ must NOT trigger a re-push when the panel is closed or
+        // the position is pinned.
+        let mut app = app_with_sessions(1);
+        app.update(AppMessage::Resize(160, 40));
+
+        // Panel closed: gated out even though last_content_size is stale.
+        app.last_content_size = Some((1, 1));
+        app.sync_content_size();
+        assert_eq!(
+            app.last_content_size,
+            Some((1, 1)),
+            "closed panel must skip the measure entirely"
+        );
+
+        // Panel open but pinned to the column: still gated out (column never
+        // resizes the terminal from content).
+        app.info_panel_position = crate::session::settings::InfoPanelPosition::Column;
+        app.show_info_panel = true;
+        app.last_content_size = Some((1, 1));
+        app.sync_content_size();
+        assert_eq!(
+            app.last_content_size,
+            Some((1, 1)),
+            "column mode must skip the measure entirely"
+        );
+
+        // Auto + open: the gate opens and the stale size is reconciled.
+        app.info_panel_position = crate::session::settings::InfoPanelPosition::Auto;
+        app.sync_content_size();
+        assert_ne!(
+            app.last_content_size,
+            Some((1, 1)),
+            "auto + open must run the drift check"
         );
     }
 

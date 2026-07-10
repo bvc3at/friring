@@ -82,7 +82,10 @@ fn split_left_column(
         info_h
     };
     if auto_rows == 0 && info_h == 0 {
-        return (col, None, None); // not enough vertical room — keep sessions only
+        // No bottom panes to dock (automations pane absent — feature off or the
+        // column too short — and info not inlined here): the session list takes
+        // the whole column.
+        return (col, None, None);
     }
     let rows = Layout::default()
         .direction(Direction::Vertical)
