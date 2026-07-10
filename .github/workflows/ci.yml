@@ -30,6 +30,12 @@ jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
+    # Fork (Friring): a PRIVATE repo's default GITHUB_TOKEN lacks
+    # pull-requests:read, which dorny/paths-filter needs (else "Resource not
+    # accessible by integration"). Upstream is public, so it works without this.
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       rust: ${{ steps.filter.outputs.rust || steps.all.outputs.all }}
       shell: ${{ steps.filter.outputs.shell || steps.all.outputs.all }}
@@ -352,7 +358,11 @@ jobs:
   sonarqube:
     name: SonarQube
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    # Fork (Friring): SonarQube is deferred — not set up for the fork at the
+    # moment (no SonarCloud project/token), so this runs only on upstream for
+    # now. A skipped job still counts as success for the `all-checks` gate below
+    # (it fails only on 'failure'/'cancelled'). See FORK.md.
+    if: needs.changes.outputs.rust == 'true' && github.repository == 'Thurbeen/thurbox'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7

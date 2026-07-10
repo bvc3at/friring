@@ -27,8 +27,9 @@ development checkout never touches your real setup.
 the TUI polls their mtime (~1/s) and applies edits with a confirmation
 toast — no restart. For `settings.toml` only the **feature flags that
 gate UI panels** (`tasks`, `file_viewer`, `info_panel`, `global_search`,
-`shell_pane`, `code_review`, `cc_activity`, `perf_hud`, `soft_delete`) apply live; the restart-only values stay
-published through a write-once global (so they can't drift mid-frame),
+`shell_pane`, `code_review`, `cc_activity`, `perf_hud`, `soft_delete`)
+apply live; the restart-only values stay published through a write-once
+global (so they can't drift mid-frame),
 and the reload toast says when a restart is needed. `hosts.toml` (SSH
 backends register at startup) and `themes.toml` need a restart.
 

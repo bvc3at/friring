@@ -23,6 +23,9 @@ concurrency:
 jobs:
   deploy:
     name: Deploy to GitHub Pages
+    # Fork (Friring): the fork has no GitHub Pages site, so this deploy only
+    # runs on upstream. See FORK.md.
+    if: github.repository == 'Thurbeen/thurbox'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

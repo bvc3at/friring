@@ -14,6 +14,11 @@ jobs:
   # Analyze commits and determine if release is needed
   check-release:
     name: Analyze commits for release
+    # Fork (Friring): don't auto-cut releases/tags on the fork. This gate job
+    # produces the `should_release` output every downstream job needs, so
+    # guarding it here cascades — the whole pipeline skips on any repo but
+    # upstream. See FORK.md.
+    if: github.repository == 'Thurbeen/thurbox'
     runs-on: ubuntu-latest
     outputs:
       should_release: ${{ steps.parse.outputs.should_release }}

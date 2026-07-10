@@ -15,7 +15,7 @@
 //!   finishes.
 //!
 //! This module is the **pure** layer (arch rule `ui ← session`, no filesystem):
-//! it defines the [`CcActivity`] index the app polls onto [`SessionInfo`], the
+//! it defines the [`CcActivity`] index the app polls onto `SessionInfo`, the
 //! [`TranscriptBlock`] stream the transcript view renders, and defensive parsers
 //! over the (undocumented, version-specific) on-disk JSON. Everything is
 //! `serde_json::Value`-based and skips shapes it doesn't recognise, so a Claude
