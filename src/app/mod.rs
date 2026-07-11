@@ -5229,8 +5229,11 @@ impl App {
     /// [`git::sync_worktree`]), so the prompt names it exactly rather than
     /// assuming `origin/main`.
     fn send_conflict_prompt(&mut self, session_id: SessionId, base_ref: &str) {
+        // `git fetch --all`, not bare `git fetch`: the base ref may point at a
+        // user-chosen non-default remote (e.g. `fork/main`), which a bare fetch
+        // (default remote only) would leave stale before the rebase.
         let prompt = format!(
-            "Please sync this worktree with {base_ref}. Run: git fetch && git rebase \
+            "Please sync this worktree with {base_ref}. Run: git fetch --all && git rebase \
              {base_ref} -- if there are conflicts, resolve them and continue the \
              rebase with git rebase --continue."
         );

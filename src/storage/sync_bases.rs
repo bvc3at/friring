@@ -14,10 +14,11 @@ impl Database {
     /// sync base picker. May name a remote that no longer exists — callers
     /// validate against the repo's live remote list.
     pub fn get_sync_base_remote(&self, repo_path: &Path) -> rusqlite::Result<Option<String>> {
+        let path_str = repo_path.to_string_lossy().to_string();
         self.conn
             .query_row(
                 "SELECT remote FROM repo_sync_bases WHERE repo_path = ?1",
-                params![repo_path.to_string_lossy()],
+                params![path_str],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -25,10 +26,11 @@ impl Database {
 
     /// Save a repo's default base remote (the last picker choice wins).
     pub fn set_sync_base_remote(&self, repo_path: &Path, remote: &str) -> rusqlite::Result<()> {
+        let path_str = repo_path.to_string_lossy().to_string();
         self.conn.execute(
             "INSERT INTO repo_sync_bases (repo_path, remote) VALUES (?1, ?2) \
              ON CONFLICT(repo_path) DO UPDATE SET remote = excluded.remote",
-            params![repo_path.to_string_lossy(), remote],
+            params![path_str, remote],
         )?;
         Ok(())
     }
