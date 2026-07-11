@@ -77,6 +77,7 @@ wall-clock-free `u64` counters bumped at the render/tick hot paths:
 | `hook_state_loads` | `refresh_session_statuses` actually reloaded the persisted hook columns (`load_hook_states`) — gated on a `data_version` change (ADR-P6), so it stays flat while idle |
 | `external_poll_checks` / `external_poll_reloads` | `poll_external_changes` ran its cheap `PRAGMA data_version` check / found a change and did a full shared-state reload |
 | `review_builds_dispatched` / `review_builds_applied` | code-review diff builds handed to the background worker / applied back on the UI thread (ADR-P8) |
+| `branch_loads_dispatched` / `branch_loads_applied` | new-session branch listings handed to the background worker / applied into the still-open selector (ADR-P12) |
 | `restore_seed_prefetches` | restore history captures prefetched in parallel, one per matched pane (ADR-P9) |
 | `agent_meta_syncs` | a session's OSC title/notification actually re-read (gated on the reader thread's meta generation, ADR-P10) |
 | `data_version_checks` | the status refresh actually ran its `PRAGMA data_version` read (throttled ~10×/s, ADR-P10) |
@@ -491,6 +492,73 @@ rule holds.
 - *A timing dependency (hdrhistogram etc.)* — same licensing/vetting cost
   ADR-P5 rejected for criterion; the fixed-bucket histogram is sufficient.
 - *CI assertions on the new timings* — explicitly ruled out; ADR-P2 stands.
+
+---
+
+## ADR-P12: The new-session dialog never runs git on the UI thread
+
+**Choice**: The new-session wizard's worktree flow used to freeze twice, both
+measured by driving the real TUI with a git wrapper simulating a slow remote
+(fetch = 1.5 s, other git calls = 100 ms):
+
+- Submitting the repo picker with a worktree repo ran `git fetch origin` + the
+  branch listing + the default-branch probes **synchronously in the key
+  handler** — a `slow op input_dispatch ms=1841` freeze before the branch
+  selector appeared.
+- The agent picker only opened after every `git worktree add` finished, and
+  its `Enter` paid the backend readiness round-trip (control-mode attach /
+  SSH connect) on the UI thread, then the adopt tick paid one
+  `git remote get-url` per member repo.
+
+Now the flow overlaps everything with the user's own think-time:
+
+- **Branch selector opens instantly** in a `loading` state; the listing +
+  ordering run on a `spawn_blocking` worker (`branch_load`, the ADR-P8
+  fire-and-poll shape, applied by `App::poll_branch_load`). A result whose
+  selector was cancelled is dropped; the ordering also dedupes a doubled
+  `symbolic-ref` subprocess.
+- **The fetch leaves the selection path entirely.** `git branch` lists local
+  refs only, so the fetch never changed the *list* — it matters at
+  `git worktree add` time (fork from a fresh `origin/<default>`). It now runs
+  concurrently from the moment the selector opens; its completion signal
+  (`new_session.fetch_done`) is awaited **by the worktree-create worker**
+  (bounded at 30 s, failures stay non-fatal), typically finishing while the
+  user picks a branch and types the name.
+- **The agent picker opens over the in-flight creation**
+  (`PendingWorktreeCreate::agent_pick` state machine: open → chosen /
+  cancelled): whichever of {user picks, worker delivers} finishes last
+  triggers the spawn. A cancel (Esc) drops the delivered worktrees exactly
+  like a cancel after creation always did.
+- **Backend readiness + repo display names move into the async spawn
+  worker** (`ensure_backend_ready`, `session_member_dirs`-derived names), so
+  the picker's `Enter` and the adopt tick no longer shell out.
+
+Gate: `branch_loads_dispatched` / `branch_loads_applied` +
+`perf_branch_selection_never_lists_on_ui_thread`,
+`perf_branch_load_result_applied_via_poll`,
+`branch_load_for_cancelled_selector_is_dropped`,
+`perf_worktree_confirm_opens_agent_picker_during_create`,
+`agent_choice_during_create_spawns_on_delivery`,
+`agent_picker_esc_during_create_cancels_pending` (`src/app/mod.rs` tests).
+
+**Why**: after ADR-P8 removed the code-review stall, this was the largest
+remaining interactive freeze — and unlike a stall on an open pane, it blocks a
+*modal flow* the user is actively typing through. All inputs are owned/
+cloneable (host def, repo paths, agent registry rows), so the work moves
+off-thread with the patterns the codebase already uses.
+
+**Rejected**:
+
+- *Dropping the fetch* — the worktree must fork from a fresh
+  `origin/<default>`; keeping the fetch but re-homing the wait into the
+  already-background create worker preserves the semantics for free.
+- *Prefetching branches on the `w` keypress (before Enter)* — with the
+  listing off-thread the selector fills in tens of milliseconds locally;
+  speculative loads per toggled row would add cache/invalidations for an
+  imperceptible win.
+- *Streaming two-phase results (local list now, post-fetch refresh)* — the
+  fetch cannot change `git branch`'s local-only output, so there is nothing
+  to refresh; one delivery suffices.
 
 ---
 

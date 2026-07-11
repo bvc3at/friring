@@ -523,6 +523,10 @@ fn apply_text_edit_op(f: &mut TextInput, code: KeyCode) {
 pub struct BranchSelectorModal {
     pub index: usize,
     pub branches: Vec<String>,
+    /// The branch list is still being read off-thread (ADR-P12): the modal
+    /// opened instantly with a placeholder row and `Enter` is inert until the
+    /// background load delivers.
+    pub loading: bool,
 }
 
 #[derive(Debug, Clone, Default)]

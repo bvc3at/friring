@@ -825,7 +825,9 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 bs.index = bs.index.saturating_sub(1);
             }
-            KeyCode::Enter => {
+            // Inert until the background load delivers (ADR-P12) — there is
+            // no branch to select yet.
+            KeyCode::Enter if !bs.loading && !bs.branches.is_empty() => {
                 let base_branch = bs.branches[bs.index].clone();
                 self.new_session.base_branch = Some(base_branch);
                 self.modal =
@@ -1005,6 +1007,14 @@ impl App {
                 self.new_session.spawn_config = None;
                 self.new_session.spawn_worktrees.clear();
                 self.new_session.spawn_name = None;
+                // A picker opened over an in-flight worktree creation
+                // (ADR-P12): mark the pending create cancelled so its result
+                // is dropped instead of spawning a session nobody asked for.
+                if let Some(pending) = self.pending_worktree_create.as_mut() {
+                    if matches!(pending.agent_pick, super::AgentPick::Open) {
+                        pending.agent_pick = super::AgentPick::Cancelled;
+                    }
+                }
             }
             KeyCode::Char('j') | KeyCode::Down if ap.selected_index + 1 < choice_count => {
                 ap.selected_index += 1;
@@ -1025,15 +1035,27 @@ impl App {
     /// spawn config and launch the session (a no-op if any pending state is
     /// missing). The chosen agent name is passed in to avoid re-borrowing the
     /// modal after it's closed.
+    ///
+    /// In the worktree flow the picker opens *while* the worktrees are still
+    /// being created (ADR-P12), so the spawn config may not exist yet: the
+    /// choice is parked on the pending create and `continue_worktree_spawn`
+    /// completes the spawn when the worker delivers.
     fn confirm_agent_picker(&mut self, chosen: Option<String>) {
         if let (Some(mut config), Some(name), Some(agent)) = (
             self.new_session.spawn_config.take(),
             self.new_session.spawn_name.take(),
-            chosen,
+            chosen.clone(),
         ) {
             config.agent = agent;
             let worktrees = std::mem::take(&mut self.new_session.spawn_worktrees);
             self.do_spawn_session_async(name, &config, worktrees);
+            return;
+        }
+        if let (Some(pending), Some(agent)) = (self.pending_worktree_create.as_mut(), chosen) {
+            if matches!(pending.agent_pick, super::AgentPick::Open) {
+                pending.agent_pick = super::AgentPick::Chosen(agent);
+                self.set_info("Creating worktree(s)…");
+            }
         }
     }
 
@@ -1505,44 +1527,68 @@ impl App {
         self.active_theme = entry;
     }
 
+    /// Open the base-branch selector for the worktree flow **without blocking
+    /// the UI** (ADR-P12): the modal opens instantly in a loading state, the
+    /// branch listing runs on a `spawn_blocking` worker (applied by
+    /// `poll_branch_load`), and the `git fetch origin` — a network round-trip
+    /// that used to freeze the key handler for seconds — runs concurrently on
+    /// its own worker. The fetch never changes the *list* (`git branch` shows
+    /// local refs only); it matters at `git worktree add` time, so its
+    /// completion signal is parked in `new_session.fetch_done` for the
+    /// worktree-create worker to wait on.
     pub(crate) fn start_branch_selection(&mut self) {
+        if self.branch_load.in_progress() {
+            self.set_info("Branch listing already in progress…");
+            return;
+        }
+
         // Resolve the remote host (if any) so branch listing targets the
         // session's machine. Cloned so we don't hold a borrow on `self`.
         let host = self
             .host_for_backend(self.new_session.backend.as_deref())
             .cloned();
-        let host = host.as_ref();
 
         let Some(repo_path) = self.new_session.repo_path.clone() else {
             return;
         };
-        let repo_path = repo_path.as_path();
 
-        Self::fetch_pending_repos(host, repo_path, self.new_session.all_repos.as_ref());
+        self.modal = super::modals::Modal::BranchSelector(super::modals::BranchSelectorModal {
+            index: 0,
+            branches: Vec::new(),
+            loading: true,
+        });
 
-        match crate::git::list_branches_on(host, repo_path) {
-            Ok(branches) if branches.is_empty() => {
-                self.set_error("No branches found in repository");
-                self.new_session.repo_path = None;
-            }
-            Ok(branches) => {
-                let branches = Self::ordered_branch_list(host, repo_path, branches);
-                self.modal =
-                    super::modals::Modal::BranchSelector(super::modals::BranchSelectorModal {
-                        index: 0,
-                        branches,
-                    });
-            }
-            Err(e) => {
-                error!("Failed to list branches: {e}");
-                self.set_error(format!("Failed to list branches: {e:#}"));
-                self.new_session.repo_path = None;
-            }
-        }
+        let tx = self.branch_load.start();
+        self.metrics.bump(|p| &mut p.branch_loads_dispatched);
+        let list_host = host.clone();
+        let list_repo = repo_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = match crate::git::list_branches_on(list_host.as_ref(), &list_repo) {
+                Ok(branches) if branches.is_empty() => {
+                    Err("No branches found in repository".to_string())
+                }
+                Ok(branches) => Ok(Self::ordered_branch_list(
+                    list_host.as_ref(),
+                    &list_repo,
+                    branches,
+                )),
+                Err(e) => Err(format!("Failed to list branches: {e:#}")),
+            };
+            let _ = tx.send(result);
+        });
+
+        let (fetch_tx, fetch_rx) = std::sync::mpsc::channel();
+        self.new_session.fetch_done = Some(fetch_rx);
+        let all_repos = self.new_session.all_repos.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::fetch_pending_repos(host.as_ref(), &repo_path, all_repos.as_ref());
+            let _ = fetch_tx.send(());
+        });
     }
 
-    /// Fetch origin for the primary repo and any extra worktree repos so
-    /// branch lists are up-to-date. Failures are non-fatal (logged only).
+    /// Fetch origin for the primary repo and any extra worktree repos so the
+    /// worktrees fork from fresh refs. Failures are non-fatal (logged only).
+    /// Runs on a background worker — never on the UI thread (ADR-P12).
     fn fetch_pending_repos(
         host: Option<&crate::session::HostDef>,
         repo_path: &std::path::Path,
@@ -1571,8 +1617,23 @@ impl App {
         repo_path: &std::path::Path,
         mut branches: Vec<String>,
     ) -> Vec<String> {
-        // Move the default branch to front so it's pre-selected.
-        if let Some(default) = crate::git::default_branch_on(host, repo_path, &branches) {
+        // One `symbolic-ref` subprocess serves both the local-default pick and
+        // the `origin/<default>` pin below (it used to run twice).
+        let remote_default = crate::git::default_branch_from_remote_on(host, repo_path);
+
+        // Move the default branch to front so it's pre-selected: the remote's
+        // default when it exists locally, else a local `main`/`master`.
+        let default = remote_default
+            .as_ref()
+            .filter(|name| branches.contains(*name))
+            .cloned()
+            .or_else(|| {
+                ["main", "master"]
+                    .into_iter()
+                    .find(|c| branches.iter().any(|b| b == c))
+                    .map(str::to_string)
+            });
+        if let Some(default) = default {
             if let Some(pos) = branches.iter().position(|b| b == &default) {
                 let branch = branches.remove(pos);
                 branches.insert(0, branch);
@@ -1580,7 +1641,7 @@ impl App {
         }
 
         // Insert origin/<default> at position 0 for remote-based branching.
-        let remote_ref = crate::git::default_branch_from_remote_on(host, repo_path)
+        let remote_ref = remote_default
             .map(|name| format!("origin/{name}"))
             .or_else(|| {
                 for candidate in ["origin/main", "origin/master"] {

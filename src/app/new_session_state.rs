@@ -7,6 +7,7 @@
 //! cancelled.
 
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 use crate::session::{SessionConfig, SessionId, WorktreeInfo};
 
@@ -47,4 +48,11 @@ pub(crate) struct NewSessionWizardState {
     /// spawns directly instead of opening the agent picker (mirrors `fork`).
     pub(crate) import: bool,
     pub(crate) spawn_name: Option<String>,
+    /// Completion signal of the background `git fetch origin` kicked off when
+    /// branch selection starts (ADR-P12). The worktree-create worker waits on
+    /// it (bounded) before `git worktree add`, so the new worktree still forks
+    /// from a fresh `origin/<default>` without the fetch ever blocking the UI.
+    /// Dropped (not waited on) when the flow is cancelled; a stale receiver is
+    /// simply overwritten by the next flow.
+    pub(crate) fetch_done: Option<mpsc::Receiver<()>>,
 }

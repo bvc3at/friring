@@ -178,6 +178,18 @@ changed** from upstream's always-column to `auto`.
   the worktree directory flattens `/` to `-` and tmux window names sanitize
   separately (`session_name_to_branch` in `src/app/key_handlers.rs`).
 
+### Performance
+
+- **New-session dialog never blocks on git (ADR-P12).** Upstream's worktree
+  flow runs `git fetch origin` + the branch listing synchronously in the key
+  handler (a measured 1.8 s+ freeze on a slow remote), and only shows the agent
+  picker after every `git worktree add` finished. The fork opens the branch
+  selector instantly with an off-thread listing, runs the fetch concurrently
+  (worktree creation waits on it off-thread, so worktrees still fork from fresh
+  origin refs), overlaps the agent picker with the worktree creation, and moves
+  backend readiness + repo-display-name resolution into the async spawn worker.
+  See ADR-P12 in `docs/PERFORMANCE.md` for measurements and gates.
+
 ### Documentation / branding
 
 - `README.md` and the agent guide prose call the project **Friring** (the

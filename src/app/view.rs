@@ -1051,6 +1051,7 @@ impl App {
                 &branch_selector_modal::BranchSelectorState {
                     branches: &bs.branches,
                     selected_index: bs.index,
+                    loading: bs.loading,
                 },
             ));
         }
