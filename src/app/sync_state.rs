@@ -42,7 +42,7 @@ pub(crate) struct WorktreeSyncState {
     pub(crate) completed: Vec<(SessionId, git::SyncResult)>,
     /// Background `git remote` listing for the repos of a just-requested run,
     /// polled each tick ([`App::poll_sync_remotes`](super::App)).
-    pub(crate) remotes_load: background::BackgroundTask<HashMap<PathBuf, Vec<String>>>,
+    pub(crate) remotes_load: background::BackgroundTask<Vec<(PathBuf, Vec<String>)>>,
     /// The run those remotes are for; consumed when the run launches or the
     /// base picker is cancelled.
     pub(crate) awaiting: Option<PendingSyncRun>,

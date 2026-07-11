@@ -5296,7 +5296,7 @@ impl App {
                     let remotes = git::list_remotes(&repo);
                     (repo, remotes)
                 })
-                .collect::<std::collections::HashMap<_, _>>();
+                .collect::<Vec<_>>();
             let _ = tx.send(remotes);
         });
 
@@ -5325,9 +5325,7 @@ impl App {
             return;
         };
 
-        let mut repos: Vec<_> = remotes.into_iter().collect();
-        repos.sort();
-        for (repo, remotes) in repos {
+        for (repo, remotes) in remotes {
             match remotes.as_slice() {
                 // Multi-remote repos need an explicit base — queue a picker.
                 [_, _, ..] => run.queue.push((repo, remotes)),
@@ -11726,8 +11724,7 @@ mod tests {
             chosen: HashMap::new(),
         });
         let tx = app.worktree_sync.remotes_load.start();
-        tx.send(HashMap::from([(repo, vec!["origin".to_string()])]))
-            .unwrap();
+        tx.send(vec![(repo, vec!["origin".to_string()])]).unwrap();
 
         app.poll_sync_remotes();
 
@@ -11753,11 +11750,8 @@ mod tests {
             chosen: HashMap::new(),
         });
         let tx = app.worktree_sync.remotes_load.start();
-        tx.send(HashMap::from([(
-            repo,
-            vec!["fork".to_string(), "origin".to_string()],
-        )]))
-        .unwrap();
+        tx.send(vec![(repo, vec!["fork".to_string(), "origin".to_string()])])
+            .unwrap();
 
         app.poll_sync_remotes();
 
@@ -11788,11 +11782,8 @@ mod tests {
             chosen: HashMap::new(),
         });
         let tx = app.worktree_sync.remotes_load.start();
-        tx.send(HashMap::from([(
-            repo,
-            vec!["fork".to_string(), "origin".to_string()],
-        )]))
-        .unwrap();
+        tx.send(vec![(repo, vec!["fork".to_string(), "origin".to_string()])])
+            .unwrap();
 
         app.poll_sync_remotes();
 
