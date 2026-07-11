@@ -4290,6 +4290,7 @@ impl App {
         self.detect_lost_remote_sessions();
 
         // Poll for sync results from background worktree sync threads
+        self.poll_sync_remotes();
         self.poll_sync_results();
 
         // Poll for backgrounded interactive spawn work (branch listing +
@@ -5226,11 +5227,22 @@ impl App {
     }
 
     /// Send a conflict resolution prompt to a session via bracketed paste,
-    /// with a deferred Enter so the app processes the text first.
+    /// with a deferred Enter so the app processes the text first. When the run
+    /// synced onto an explicitly-chosen remote, the prompt names it instead of
+    /// the default `origin` wording.
     fn send_conflict_prompt(&mut self, session_id: SessionId) {
+        let prompt = match self.worktree_sync.base_remotes.get(&session_id) {
+            Some(remote) => format!(
+                "Please sync this worktree with its base remote '{remote}'. Run: \
+                 git fetch {remote} && git rebase {remote}/main (or {remote}/master \
+                 if that is its default branch) -- if there are conflicts, resolve \
+                 them and continue the rebase with git rebase --continue."
+            ),
+            None => SYNC_CONFLICT_PROMPT.to_string(),
+        };
         if let Some(session) = self.sessions.iter().find(|s| s.info.id == session_id) {
             let mut paste = b"\x1b[200~".to_vec();
-            paste.extend_from_slice(SYNC_CONFLICT_PROMPT.as_bytes());
+            paste.extend_from_slice(prompt.as_bytes());
             paste.extend_from_slice(b"\x1b[201~");
             if let Err(e) = session.send_input(paste) {
                 error!("Failed to send sync prompt to session: {e}");
@@ -5246,10 +5258,16 @@ impl App {
 
     /// Start syncing the active session's worktrees with their base ref.
     ///
-    /// Worktrees sharing the same parent repo are synced sequentially (to avoid
-    /// concurrent `index.lock` contention), while different repos sync in parallel.
+    /// The `git remote` listing for the involved repos runs on a background
+    /// thread first (no git on the UI thread, the ADR-P12 discipline), polled
+    /// by [`Self::poll_sync_remotes`]. Repos with more than one remote route
+    /// through the sync base picker before the run launches; the rest use the
+    /// default origin chain.
     pub(crate) fn start_sync(&mut self) {
-        if self.worktree_sync.in_progress {
+        if self.worktree_sync.in_progress
+            || self.worktree_sync.remotes_load.in_progress()
+            || self.worktree_sync.awaiting.is_some()
+        {
             return;
         }
 
@@ -5269,25 +5287,165 @@ impl App {
             return;
         }
 
-        let count = worktree_sessions.len();
+        let mut repos: Vec<PathBuf> = worktree_sessions
+            .iter()
+            .map(|(_, _, repo)| repo.clone())
+            .collect();
+        repos.sort();
+        repos.dedup();
+
+        let tx = self.worktree_sync.remotes_load.start();
+        std::thread::spawn(move || {
+            let remotes = repos
+                .into_iter()
+                .map(|repo| {
+                    let remotes = git::list_remotes(&repo);
+                    (repo, remotes)
+                })
+                .collect::<std::collections::HashMap<_, _>>();
+            let _ = tx.send(remotes);
+        });
+
+        self.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: worktree_sessions,
+            queue: Vec::new(),
+            chosen: std::collections::HashMap::new(),
+        });
+        self.set_status(StatusLevel::Info, "Preparing sync...");
+    }
+
+    /// Apply a completed background remote listing to the parked sync run:
+    /// launch it directly when every repo has at most one remote, else open
+    /// the base picker for the first multi-remote repo.
+    fn poll_sync_remotes(&mut self) {
+        let remotes = match self.worktree_sync.remotes_load.poll() {
+            background::TaskPoll::Pending => return,
+            background::TaskPoll::Died => {
+                self.worktree_sync.awaiting = None;
+                self.set_error("Sync failed (remote listing worker died)");
+                return;
+            }
+            background::TaskPoll::Done(remotes) => remotes,
+        };
+        let Some(mut run) = self.worktree_sync.awaiting.take() else {
+            return;
+        };
+
+        let mut repos: Vec<_> = remotes.into_iter().collect();
+        repos.sort();
+        for (repo, remotes) in repos {
+            match remotes.as_slice() {
+                // Multi-remote repos need an explicit base — queue a picker.
+                [_, _, ..] => run.queue.push((repo, remotes)),
+                // A single remote named other than `origin` would fail the
+                // default chain's hardcoded `git fetch origin` — pin it.
+                [only] if only != "origin" => {
+                    run.chosen.insert(repo, only.clone());
+                }
+                // `origin` only (or no remotes): the default chain applies.
+                _ => {}
+            }
+        }
+
+        if run.queue.is_empty() {
+            self.launch_sync_run(run);
+        } else {
+            self.worktree_sync.awaiting = Some(run);
+            self.open_sync_base_picker();
+        }
+    }
+
+    /// Open the base picker for the front of the parked run's repo queue,
+    /// preselecting the repo's saved default remote (falling back to `origin`).
+    fn open_sync_base_picker(&mut self) {
+        let Some(run) = &self.worktree_sync.awaiting else {
+            return;
+        };
+        let Some((repo, remotes)) = run.queue.first() else {
+            return;
+        };
+        let saved = self.db.get_sync_base_remote(repo).ok().flatten();
+        let index = saved
+            .and_then(|s| remotes.iter().position(|r| *r == s))
+            .or_else(|| remotes.iter().position(|r| r == "origin"))
+            .unwrap_or(0);
+        self.modal = modals::Modal::SyncBasePicker(modals::SyncBasePickerModal {
+            repo_name: repo
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| repo.display().to_string()),
+            remotes: remotes.clone(),
+            index,
+        });
+        self.request_redraw();
+    }
+
+    /// Record the picker's choice for the front repo of the parked run,
+    /// persist it as that repo's default, and advance: next multi-remote repo
+    /// (another picker) or launch.
+    pub(crate) fn confirm_sync_base(&mut self, remote: String) {
+        let Some(mut run) = self.worktree_sync.awaiting.take() else {
+            return;
+        };
+        if run.queue.is_empty() {
+            return;
+        }
+        let (repo, _) = run.queue.remove(0);
+        if let Err(e) = self.db.set_sync_base_remote(&repo, &remote) {
+            // Non-fatal: the run still uses the choice, only the default is lost.
+            error!("Failed to save sync base for {}: {e}", repo.display());
+        }
+        run.chosen.insert(repo, remote);
+
+        if run.queue.is_empty() {
+            self.launch_sync_run(run);
+        } else {
+            self.worktree_sync.awaiting = Some(run);
+            self.open_sync_base_picker();
+        }
+    }
+
+    /// Cancel a parked sync run from the base picker (Esc): nothing has
+    /// synced yet, so the whole run is dropped.
+    pub(crate) fn cancel_sync_base(&mut self) {
+        self.worktree_sync.awaiting = None;
+        self.set_status(StatusLevel::Info, "Sync cancelled");
+    }
+
+    /// Launch the sync threads for a fully-decided run.
+    ///
+    /// Worktrees sharing the same parent repo are synced sequentially (to avoid
+    /// concurrent `index.lock` contention), while different repos sync in parallel.
+    fn launch_sync_run(&mut self, run: sync_state::PendingSyncRun) {
+        let count = run.worktrees.len();
         let (tx, rx) = mpsc::channel();
 
         // Group worktrees by repo so those sharing a repo sync sequentially.
         let mut by_repo = std::collections::HashMap::<PathBuf, Vec<(SessionId, PathBuf)>>::new();
-        for (session_id, worktree_path, repo_path) in worktree_sessions {
+        for (session_id, worktree_path, repo_path) in run.worktrees {
             by_repo
                 .entry(repo_path)
                 .or_default()
                 .push((session_id, worktree_path));
         }
 
-        for worktrees in by_repo.into_values() {
+        self.worktree_sync.base_remotes.clear();
+        for (repo, worktrees) in by_repo {
             let tx = tx.clone();
+            // The picked (or single non-origin) base remote; `None` derives
+            // the rebase target per-worktree (upstream → origin/HEAD →
+            // origin/main → origin/master).
+            let remote = run.chosen.get(&repo).cloned();
+            if let Some(r) = &remote {
+                for (session_id, _) in &worktrees {
+                    self.worktree_sync
+                        .base_remotes
+                        .insert(*session_id, r.clone());
+                }
+            }
             std::thread::spawn(move || {
                 for (session_id, worktree_path) in worktrees {
-                    // base_ref = None: derive the rebase target per-worktree
-                    // (upstream → origin/HEAD → origin/main → origin/master).
-                    let result = git::sync_worktree(&worktree_path, None);
+                    let result = git::sync_worktree(&worktree_path, remote.as_deref());
                     let _ = tx.send((session_id, result));
                 }
             });
@@ -11506,6 +11664,28 @@ mod tests {
         assert_eq!(msg.text, "No worktrees to sync");
     }
 
+    /// ADR-P12 discipline: Ctrl+S dispatches the `git remote` listing to a
+    /// background worker and parks the run — no git subprocess (and no modal)
+    /// on the UI thread at the keypress.
+    #[test]
+    fn start_sync_parks_run_and_lists_remotes_off_thread() {
+        let mut app = app_with_sessions(1);
+        app.sessions[0].info.worktrees = vec![WorktreeInfo {
+            repo_path: PathBuf::from("/tmp/nonexistent-repo"),
+            worktree_path: PathBuf::from("/tmp/nonexistent-wt"),
+            branch: "test-branch".to_string(),
+        }];
+
+        app.start_sync();
+        assert!(!app.worktree_sync.in_progress, "no sync threads yet");
+        assert!(app.worktree_sync.remotes_load.in_progress());
+        assert!(app.worktree_sync.awaiting.is_some());
+        assert!(matches!(app.modal, modals::Modal::None));
+        let msg = app.status_message.as_ref().unwrap();
+        assert_eq!(msg.level, StatusLevel::Info);
+        assert!(msg.text.contains("Preparing sync"));
+    }
+
     #[test]
     fn start_sync_with_worktree_sessions_sets_in_progress() {
         let mut app = app_with_sessions(1);
@@ -11516,11 +11696,225 @@ mod tests {
         }];
 
         app.start_sync();
+        // The remote listing runs on a real thread (a nonexistent repo lists
+        // no remotes → the run launches straight away); poll until it lands.
+        for _ in 0..500 {
+            app.poll_sync_remotes();
+            if app.worktree_sync.in_progress {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(app.worktree_sync.in_progress);
         assert_eq!(app.worktree_sync.pending, 1);
         let msg = app.status_message.as_ref().unwrap();
         assert_eq!(msg.level, StatusLevel::Info);
         assert!(msg.text.contains("Syncing 1 worktree"));
+    }
+
+    /// A parked run whose repos all resolve to ≤1 remote launches straight
+    /// from the poll — no base picker.
+    #[test]
+    fn sync_run_with_single_remote_launches_without_picker() {
+        let mut app = app_with_sessions(1);
+        let repo = PathBuf::from("/tmp/single-remote-repo");
+        app.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: vec![(
+                app.sessions[0].info.id,
+                PathBuf::from("/tmp/single-remote-wt"),
+                repo.clone(),
+            )],
+            queue: Vec::new(),
+            chosen: HashMap::new(),
+        });
+        let tx = app.worktree_sync.remotes_load.start();
+        tx.send(HashMap::from([(repo, vec!["origin".to_string()])]))
+            .unwrap();
+
+        app.poll_sync_remotes();
+
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(app.worktree_sync.in_progress);
+        assert_eq!(app.worktree_sync.pending, 1);
+        assert!(app.worktree_sync.awaiting.is_none());
+    }
+
+    /// A repo with more than one remote opens the base picker instead of
+    /// launching, with `origin` preselected when no default is saved.
+    #[test]
+    fn sync_run_multi_remote_opens_base_picker() {
+        let mut app = app_with_sessions(1);
+        let repo = PathBuf::from("/tmp/multi-remote-repo");
+        app.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: vec![(
+                app.sessions[0].info.id,
+                PathBuf::from("/tmp/multi-remote-wt"),
+                repo.clone(),
+            )],
+            queue: Vec::new(),
+            chosen: HashMap::new(),
+        });
+        let tx = app.worktree_sync.remotes_load.start();
+        tx.send(HashMap::from([(
+            repo,
+            vec!["fork".to_string(), "origin".to_string()],
+        )]))
+        .unwrap();
+
+        app.poll_sync_remotes();
+
+        assert!(!app.worktree_sync.in_progress, "launch waits on the picker");
+        match app.modal {
+            modals::Modal::SyncBasePicker(ref sb) => {
+                assert_eq!(sb.repo_name, "multi-remote-repo");
+                assert_eq!(sb.remotes, ["fork", "origin"]);
+                assert_eq!(sb.index, 1, "origin preselected without a saved default");
+            }
+            ref other => panic!("expected the sync base picker, got {other:?}"),
+        }
+    }
+
+    /// A saved default remote wins the preselection over `origin`.
+    #[test]
+    fn sync_base_picker_preselects_saved_default() {
+        let mut app = app_with_sessions(1);
+        let repo = PathBuf::from("/tmp/default-remote-repo");
+        app.db.set_sync_base_remote(&repo, "fork").unwrap();
+        app.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: vec![(
+                app.sessions[0].info.id,
+                PathBuf::from("/tmp/default-remote-wt"),
+                repo.clone(),
+            )],
+            queue: Vec::new(),
+            chosen: HashMap::new(),
+        });
+        let tx = app.worktree_sync.remotes_load.start();
+        tx.send(HashMap::from([(
+            repo,
+            vec!["fork".to_string(), "origin".to_string()],
+        )]))
+        .unwrap();
+
+        app.poll_sync_remotes();
+
+        match app.modal {
+            modals::Modal::SyncBasePicker(ref sb) => assert_eq!(sb.index, 0),
+            ref other => panic!("expected the sync base picker, got {other:?}"),
+        }
+    }
+
+    /// Enter in the picker saves the choice as the repo's default and
+    /// launches the run.
+    #[test]
+    fn sync_base_picker_enter_persists_default_and_launches() {
+        let mut app = app_with_sessions(1);
+        let repo = PathBuf::from("/tmp/pick-remote-repo");
+        app.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: vec![(
+                app.sessions[0].info.id,
+                PathBuf::from("/tmp/pick-remote-wt"),
+                repo.clone(),
+            )],
+            queue: vec![(repo.clone(), vec!["fork".to_string(), "origin".to_string()])],
+            chosen: HashMap::new(),
+        });
+        app.modal = modals::Modal::SyncBasePicker(modals::SyncBasePickerModal {
+            repo_name: "pick-remote-repo".to_string(),
+            remotes: vec!["fork".to_string(), "origin".to_string()],
+            index: 0,
+        });
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            app.db.get_sync_base_remote(&repo).unwrap().as_deref(),
+            Some("fork")
+        );
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(app.worktree_sync.in_progress);
+        assert!(app.worktree_sync.awaiting.is_none());
+    }
+
+    /// Esc in the picker drops the whole parked run — nothing syncs.
+    #[test]
+    fn sync_base_picker_esc_cancels_run() {
+        let mut app = app_with_sessions(1);
+        let repo = PathBuf::from("/tmp/cancel-remote-repo");
+        app.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: vec![(
+                app.sessions[0].info.id,
+                PathBuf::from("/tmp/cancel-remote-wt"),
+                repo.clone(),
+            )],
+            queue: vec![(repo, vec!["fork".to_string(), "origin".to_string()])],
+            chosen: HashMap::new(),
+        });
+        app.modal = modals::Modal::SyncBasePicker(modals::SyncBasePickerModal {
+            repo_name: "cancel-remote-repo".to_string(),
+            remotes: vec!["fork".to_string(), "origin".to_string()],
+            index: 0,
+        });
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(!app.worktree_sync.in_progress);
+        assert!(app.worktree_sync.awaiting.is_none());
+        let msg = app.status_message.as_ref().unwrap();
+        assert_eq!(msg.text, "Sync cancelled");
+    }
+
+    /// With two multi-remote repos the pickers chain: Enter on the first
+    /// opens the second, Enter on the second launches the full run.
+    #[test]
+    fn sync_base_picker_queue_advances_across_repos() {
+        let mut app = app_with_sessions(1);
+        let repo_a = PathBuf::from("/tmp/queue-repo-a");
+        let repo_b = PathBuf::from("/tmp/queue-repo-b");
+        let remotes = vec!["fork".to_string(), "origin".to_string()];
+        app.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: vec![
+                (
+                    app.sessions[0].info.id,
+                    PathBuf::from("/tmp/queue-wt-a"),
+                    repo_a.clone(),
+                ),
+                (
+                    app.sessions[0].info.id,
+                    PathBuf::from("/tmp/queue-wt-b"),
+                    repo_b.clone(),
+                ),
+            ],
+            queue: vec![(repo_a, remotes.clone()), (repo_b.clone(), remotes.clone())],
+            chosen: HashMap::new(),
+        });
+        app.modal = modals::Modal::SyncBasePicker(modals::SyncBasePickerModal {
+            repo_name: "queue-repo-a".to_string(),
+            remotes,
+            index: 0,
+        });
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        match app.modal {
+            modals::Modal::SyncBasePicker(ref sb) => {
+                assert_eq!(sb.repo_name, "queue-repo-b", "second repo's picker opens");
+                assert_eq!(sb.index, 1, "each picker re-preselects independently");
+            }
+            ref other => panic!("expected the second sync base picker, got {other:?}"),
+        }
+        assert!(!app.worktree_sync.in_progress);
+
+        // Move off the preselected `origin` onto `fork`, then confirm.
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(app.worktree_sync.in_progress);
+        assert_eq!(app.worktree_sync.pending, 2);
+        assert_eq!(
+            app.db.get_sync_base_remote(&repo_b).unwrap().as_deref(),
+            Some("fork")
+        );
     }
 
     #[test]
@@ -11577,8 +11971,9 @@ mod tests {
         app.sessions.push(other);
         // Only the active session's 1 worktree should be synced, not 2.
         app.start_sync();
-        assert!(app.worktree_sync.in_progress);
-        assert_eq!(app.worktree_sync.pending, 1);
+        let run = app.worktree_sync.awaiting.as_ref().unwrap();
+        assert_eq!(run.worktrees.len(), 1);
+        assert_eq!(run.worktrees[0].2, PathBuf::from("/tmp/active-repo"));
     }
 
     #[test]

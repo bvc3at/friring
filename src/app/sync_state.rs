@@ -5,13 +5,32 @@
 //! distinct from the inter-instance [`SyncState`](crate::sync::SyncState),
 //! which polls for DB changes from other thurbox instances.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::mpsc;
 
+use super::background;
 use crate::git;
 use crate::session::SessionId;
 
+/// A Ctrl+S run parked between the keypress and the actual sync threads: the
+/// remote listing runs off-thread first (no git on the UI thread, the ADR-P12
+/// discipline), and any repo with more than one remote routes through the
+/// [`SyncBasePickerModal`](super::modals::SyncBasePickerModal) before the run
+/// launches.
+pub(crate) struct PendingSyncRun {
+    /// `(session, worktree, repo)` triples captured at the keypress, so a
+    /// session switch while the picker is open can't retarget the run.
+    pub(crate) worktrees: Vec<(SessionId, PathBuf, PathBuf)>,
+    /// Repos (with their remotes) still awaiting a base choice; front drives
+    /// the open picker.
+    pub(crate) queue: Vec<(PathBuf, Vec<String>)>,
+    /// Chosen/derived base remote per repo. Absent = the default origin chain.
+    pub(crate) chosen: HashMap<PathBuf, String>,
+}
+
 /// State for the worktree-to-main git sync (`Ctrl+S`): a background thread
-/// rebases each session's worktree onto `origin/main` and reports results over
+/// rebases each session's worktree onto its base ref and reports results over
 /// a channel polled in `tick`.
 #[derive(Default)]
 pub(crate) struct WorktreeSyncState {
@@ -21,4 +40,15 @@ pub(crate) struct WorktreeSyncState {
     /// Number of sessions the in-flight run is syncing.
     pub(crate) pending: usize,
     pub(crate) completed: Vec<(SessionId, git::SyncResult)>,
+    /// Background `git remote` listing for the repos of a just-requested run,
+    /// polled each tick ([`App::poll_sync_remotes`](super::App)).
+    pub(crate) remotes_load: background::BackgroundTask<HashMap<PathBuf, Vec<String>>>,
+    /// The run those remotes are for; consumed when the run launches or the
+    /// base picker is cancelled.
+    pub(crate) awaiting: Option<PendingSyncRun>,
+    /// Explicit base remote per session of the in-flight run, so a conflict
+    /// prompt names the remote the rebase actually targeted. Last write wins
+    /// for a session spanning repos with different picks (the prompt is
+    /// per-session, not per-worktree). Absent = the default origin chain.
+    pub(crate) base_remotes: HashMap<SessionId, String>,
 }

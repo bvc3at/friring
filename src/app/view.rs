@@ -1056,6 +1056,20 @@ impl App {
             ));
         }
 
+        // Sync base picker modal (Ctrl+S with a multi-remote repo)
+        if let super::modals::Modal::SyncBasePicker(ref sb) = self.modal {
+            return Some(
+                crate::ui::sync_base_picker_modal::render_sync_base_picker_modal(
+                    frame,
+                    &crate::ui::sync_base_picker_modal::SyncBasePickerState {
+                        repo_name: &sb.repo_name,
+                        remotes: &sb.remotes,
+                        selected_index: sb.index,
+                    },
+                ),
+            );
+        }
+
         // Agent picker modal
         if let super::modals::Modal::AgentPicker(ref ap) = self.modal {
             return Some(agent_picker_modal::render_agent_picker_modal(frame, ap));

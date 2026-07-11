@@ -21,6 +21,7 @@ mod sessions;
 mod settings;
 pub use sessions::{DeletedSessionInfo, HookRow};
 pub mod sync;
+mod sync_bases;
 pub mod tasks;
 mod worktrees;
 

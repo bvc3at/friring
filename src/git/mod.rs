@@ -861,6 +861,23 @@ pub fn git_fetch(worktree_path: &Path) -> Result<()> {
     git_fetch_on(None, worktree_path)
 }
 
+/// Fetch from an explicit remote (the Ctrl+S sync path, where the base remote
+/// may be a user-chosen non-`origin` remote).
+fn git_fetch_remote(worktree_path: &Path, remote: &str) -> Result<()> {
+    let output = git_program()
+        .args(["fetch", remote])
+        .current_dir(worktree_path)
+        .output()
+        .context("failed to run git fetch")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git fetch {remote} failed: {stderr}");
+    }
+
+    Ok(())
+}
+
 /// [`git_fetch`], optionally on a remote `host`.
 pub fn git_fetch_on(host: Option<&HostDef>, worktree_path: &Path) -> Result<()> {
     let output = git_command(host, worktree_path, &["fetch", "origin"])
@@ -1101,14 +1118,51 @@ fn resolve_base_ref(worktree_path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// List the repo's configured remote names (`git remote`), in git's output
+/// order (alphabetical). Empty on any failure — callers treat "no remotes
+/// known" and "not a repo" alike (the sync falls back to the origin chain).
+pub fn list_remotes(repo_path: &Path) -> Vec<String> {
+    run_git_capture(&["remote"], repo_path)
+        .map(|out| out.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// [`resolve_base_ref`] scoped to an explicitly-chosen remote: that remote's
+/// advertised HEAD (`<remote>/HEAD`), then `<remote>/main` / `<remote>/master`.
+/// Deliberately skips `@{upstream}` — the user picked the *remote* to sync
+/// onto, and the branch's upstream usually tracks a different one.
+fn resolve_base_ref_for_remote(worktree_path: &Path, remote: &str) -> Option<String> {
+    if let Some(out) = run_git_capture(
+        &[
+            "symbolic-ref",
+            "--short",
+            &format!("refs/remotes/{remote}/HEAD"),
+        ],
+        worktree_path,
+    ) {
+        let advertised = out.trim();
+        if !advertised.is_empty() {
+            return Some(advertised.to_string());
+        }
+    }
+
+    [format!("{remote}/main"), format!("{remote}/master")]
+        .into_iter()
+        .find(|r| {
+            run_git_capture(&["rev-parse", "--verify", "--quiet", r], worktree_path).is_some()
+        })
+}
+
 /// High-level sync: stash, fetch, rebase onto the base ref, pop stash.
 ///
-/// `base_ref` pins the ref to rebase onto; when `None` it is derived from the
-/// worktree via `resolve_base_ref` (upstream → `origin/HEAD` →
-/// `origin/main` → `origin/master`) rather than hardcoding `origin/main`.
+/// `remote` pins which remote to fetch and rebase onto (a user-chosen base for
+/// multi-remote repos, resolved via `resolve_base_ref_for_remote`); when `None`
+/// the fetch targets `origin` and the base ref is derived from the worktree via
+/// `resolve_base_ref` (upstream → `origin/HEAD` → `origin/main` →
+/// `origin/master`) rather than hardcoding `origin/main`.
 /// On conflict the rebase is aborted and any stash is restored.
 /// Retries `git stash` on transient index-lock errors.
-pub fn sync_worktree(worktree_path: &Path, base_ref: Option<&str>) -> SyncResult {
+pub fn sync_worktree(worktree_path: &Path, remote: Option<&str>) -> SyncResult {
     cleanup_stale_index_lock(worktree_path);
 
     let stashed = match stash_with_retry(worktree_path) {
@@ -1122,25 +1176,27 @@ pub fn sync_worktree(worktree_path: &Path, base_ref: Option<&str>) -> SyncResult
         }
     };
 
-    if let Err(e) = git_fetch(worktree_path) {
+    if let Err(e) = git_fetch_remote(worktree_path, remote.unwrap_or("origin")) {
         restore_stash();
         return SyncResult::Error(format!("fetch: {e:#}"));
     }
 
     // Resolve the rebase target after the fetch so derived refs (origin/HEAD,
     // origin/main, …) reflect the just-fetched remote state.
-    let base_ref = match base_ref
-        .map(str::to_string)
-        .or_else(|| resolve_base_ref(worktree_path))
+    let base_ref = match remote
+        .map(|r| resolve_base_ref_for_remote(worktree_path, r))
+        .unwrap_or_else(|| resolve_base_ref(worktree_path))
     {
         Some(r) => r,
         None => {
             restore_stash();
-            return SyncResult::Error(
-                "could not resolve a base ref to sync onto (no upstream, \
-                 origin/HEAD, origin/main, or origin/master)"
-                    .to_string(),
-            );
+            let missing = match remote {
+                Some(r) => format!("no {r}/HEAD, {r}/main, or {r}/master"),
+                None => "no upstream, origin/HEAD, origin/main, or origin/master".to_string(),
+            };
+            return SyncResult::Error(format!(
+                "could not resolve a base ref to sync onto ({missing})"
+            ));
         }
     };
 
@@ -1525,6 +1581,81 @@ mod tests {
         run(&work, &["push", "-q", "-u", "origin", "HEAD"]);
 
         assert_eq!(resolve_base_ref(&work), Some("@{upstream}".to_string()));
+    }
+
+    #[test]
+    fn list_remotes_returns_configured_remotes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        let git = |args: &[&str]| {
+            let out = git_program()
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        assert!(list_remotes(repo).is_empty());
+
+        git(&["remote", "add", "origin", "https://example.com/a.git"]);
+        git(&["remote", "add", "upstream", "https://example.com/b.git"]);
+        assert_eq!(list_remotes(repo), ["origin", "upstream"]);
+    }
+
+    #[test]
+    fn list_remotes_is_empty_outside_a_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(list_remotes(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn resolve_base_ref_for_remote_ignores_upstream() {
+        // A tracked branch resolves to `@{upstream}` on the default chain, but
+        // an explicitly-chosen remote resolves against that remote's refs only.
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        let work = tmp.path().join("work");
+        let run = |dir: &Path, args: &[&str]| {
+            let out = git_program()
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        std::fs::create_dir_all(&remote).unwrap();
+        run(&remote, &["init", "-q", "--bare"]);
+
+        std::fs::create_dir_all(&work).unwrap();
+        run(&work, &["init", "-q", "-b", "main"]);
+        run(&work, &["config", "user.email", "t@example.com"]);
+        run(&work, &["config", "user.name", "t"]);
+        std::fs::write(work.join("file.txt"), "hi").unwrap();
+        run(&work, &["add", "."]);
+        run(&work, &["commit", "-qm", "init"]);
+        run(
+            &work,
+            &["remote", "add", "fork", &remote.display().to_string()],
+        );
+        run(&work, &["push", "-q", "-u", "fork", "HEAD"]);
+
+        // No fork/HEAD symbolic ref (never advertised) → falls to fork/main.
+        assert_eq!(
+            resolve_base_ref_for_remote(&work, "fork"),
+            Some("fork/main".to_string())
+        );
+        // A remote with no refs at all resolves to nothing.
+        assert_eq!(resolve_base_ref_for_remote(&work, "missing"), None);
     }
 
     #[test]
