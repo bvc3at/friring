@@ -225,6 +225,27 @@ struct PendingWorktreeCreate {
     /// Base branch the worktrees were forked from, carried through to the spawn
     /// so it can be persisted for the code-review view.
     base_branch: String,
+    /// Progress of the agent picker that overlaps the creation (ADR-P12).
+    agent_pick: AgentPick,
+}
+
+/// Progress of the agent picker opened *while* the worktrees are still being
+/// created (ADR-P12) — the two run concurrently, and whichever finishes last
+/// triggers the spawn.
+enum AgentPick {
+    /// No overlapping picker (≤1 agent, or a flow without a session name):
+    /// `continue_worktree_spawn` routes through the classic picker-after-create
+    /// path.
+    NotOpened,
+    /// The picker is open; the user hasn't chosen yet. A finished create
+    /// stashes its config for `confirm_agent_picker` to consume.
+    Open,
+    /// The user chose this agent before the create finished; spawn immediately
+    /// on delivery.
+    Chosen(String),
+    /// The user cancelled the picker mid-create: drop the delivered worktrees
+    /// (they stay on disk, matching a cancel after creation).
+    Cancelled,
 }
 
 /// Create one worktree per repo off the UI thread, rolling back any already
@@ -748,6 +769,10 @@ pub struct App {
     /// wizard, polled each tick; in-flight state guards against re-entry and
     /// clobbering the pending continuation.
     worktree_create: background::BackgroundTask<Result<Vec<WorktreeInfo>, String>>,
+    /// Background branch listing for the new-session worktree flow's base
+    /// branch selector, polled each tick. The selector opens instantly in a
+    /// loading state and is filled by [`Self::poll_branch_load`] (ADR-P12).
+    branch_load: background::BackgroundTask<Result<Vec<String>, String>>,
     /// Continuation for a completed worktree-creation: the wizard inputs needed
     /// to resume the spawn flow once the worktrees exist.
     pending_worktree_create: Option<PendingWorktreeCreate>,
@@ -1077,6 +1102,7 @@ impl App {
             },
             version_check_task: background::BackgroundTask::default(),
             worktree_create: background::BackgroundTask::default(),
+            branch_load: background::BackgroundTask::default(),
             pending_worktree_create: None,
             session_spawn: background::BackgroundTask::default(),
             conversation_scan: background::BackgroundTask::default(),
@@ -1595,24 +1621,10 @@ impl App {
             return;
         }
 
-        let default = self.agents.default_name();
-        let selected_index = names.iter().position(|n| *n == default).unwrap_or(0);
-        let choices = self
-            .agents
-            .agents
-            .iter()
-            .map(|a| crate::ui::agent_picker_modal::AgentChoice {
-                name: a.name.clone(),
-                command: a.command.clone(),
-            })
-            .collect();
         self.new_session.spawn_name = Some(name);
         self.new_session.spawn_config = Some(config);
         self.new_session.spawn_worktrees = worktrees;
-        self.modal = modals::Modal::AgentPicker(crate::ui::agent_picker_modal::AgentPickerState {
-            choices,
-            selected_index,
-        });
+        self.open_agent_picker();
     }
 
     fn restart_active_session(&mut self) {
@@ -3457,10 +3469,21 @@ impl App {
         let backend = self.new_session.backend.take();
         let host = self.host_for_backend(backend.as_deref()).cloned();
         let normal_repos = std::mem::take(&mut self.new_session.normal_repos);
+        let fetch_done = self.new_session.fetch_done.take();
 
         let repo_paths = repo_paths.to_vec();
         let new_branch = new_branch.to_string();
         let base_branch = base_branch.to_string();
+
+        // Overlap the agent picker with the creation (ADR-P12): with the name
+        // known and >1 agents to choose from, the user picks the agent while
+        // the worker runs; `continue_worktree_spawn` joins the two.
+        let open_picker = session_name.is_some() && self.agents.names().len() > 1;
+        let agent_pick = if open_picker {
+            AgentPick::Open
+        } else {
+            AgentPick::NotOpened
+        };
 
         // Shell out to `git worktree add` off the UI thread (one per repo, with
         // rollback on failure); the spawn flow resumes in `poll_worktree_create`.
@@ -3470,12 +3493,86 @@ impl App {
             normal_repos,
             session_name,
             base_branch: base_branch.clone(),
+            agent_pick,
         });
         self.set_status(StatusLevel::Info, "Creating worktree(s)…");
         tokio::task::spawn_blocking(move || {
+            // The branch-selection fetch runs concurrently (ADR-P12); wait for
+            // it (bounded) so the worktrees fork from fresh origin refs. A
+            // timeout falls through — fetch failures were always non-fatal.
+            if let Some(rx) = fetch_done {
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    rx.recv_timeout(std::time::Duration::from_secs(30))
+                {
+                    tracing::warn!("origin fetch still running after 30s; creating worktrees now");
+                }
+            }
             let result = create_worktrees(host.as_ref(), &repo_paths, &new_branch, &base_branch);
             let _ = tx.send(result);
         });
+
+        if open_picker {
+            self.open_agent_picker();
+        }
+    }
+
+    /// Open the agent picker populated from the registry, pre-selecting the
+    /// default agent. Callers must ensure the registry has >1 agent.
+    fn open_agent_picker(&mut self) {
+        let names = self.agents.names();
+        let default = self.agents.default_name();
+        let selected_index = names.iter().position(|n| *n == default).unwrap_or(0);
+        let choices = self
+            .agents
+            .agents
+            .iter()
+            .map(|a| crate::ui::agent_picker_modal::AgentChoice {
+                name: a.name.clone(),
+                command: a.command.clone(),
+            })
+            .collect();
+        self.modal = modals::Modal::AgentPicker(crate::ui::agent_picker_modal::AgentPickerState {
+            choices,
+            selected_index,
+        });
+    }
+
+    /// Apply a completed background branch listing (ADR-P12), if one has
+    /// finished, into the still-open branch selector. A result whose selector
+    /// was cancelled (Esc) — or replaced by a later flow — is dropped.
+    fn poll_branch_load(&mut self) {
+        let result = match self.branch_load.poll() {
+            background::TaskPoll::Pending => return,
+            background::TaskPoll::Died => Err("Branch listing failed (worker died)".to_string()),
+            background::TaskPoll::Done(result) => result,
+        };
+        let loading_selector = matches!(
+            self.modal,
+            modals::Modal::BranchSelector(ref bs) if bs.loading
+        );
+        if !loading_selector {
+            return;
+        }
+        match result {
+            Ok(branches) => {
+                if let modals::Modal::BranchSelector(ref mut bs) = self.modal {
+                    bs.branches = branches;
+                    bs.loading = false;
+                }
+                self.metrics.bump(|p| &mut p.branch_loads_applied);
+                self.request_redraw();
+            }
+            Err(e) => {
+                error!("{e}");
+                self.modal.close();
+                self.set_error(e);
+                // Mirror the selector's Esc: abort the pending worktree flow.
+                self.new_session.repo_path = None;
+                self.new_session.all_repos = None;
+                self.new_session.normal_repos.clear();
+                self.new_session.fetch_done = None;
+            }
+        }
     }
 
     /// Apply a completed background worktree-creation, if one has finished, and
@@ -3496,7 +3593,17 @@ impl App {
 
         match result {
             Ok(worktree_infos) => self.continue_worktree_spawn(worktree_infos, pending),
-            Err(e) => self.set_error(format!("Failed to create worktree: {e}")),
+            Err(e) => {
+                // Close an agent picker overlapping this create (ADR-P12) —
+                // there is nothing left to pick for.
+                if matches!(pending.agent_pick, AgentPick::Open)
+                    && matches!(self.modal, modals::Modal::AgentPicker(_))
+                {
+                    self.modal.close();
+                    self.new_session.spawn_name = None;
+                }
+                self.set_error(format!("Failed to create worktree: {e}"));
+            }
         }
     }
 
@@ -3530,11 +3637,35 @@ impl App {
             ..SessionConfig::default()
         };
 
-        if let Some(name) = pending.session_name {
-            // Session name already known (worktree flow) — skip name modal.
-            self.finish_prepare_spawn(name, config, worktree_infos);
-        } else {
+        let Some(name) = pending.session_name else {
             self.prepare_spawn(config, worktree_infos);
+            return;
+        };
+
+        // Session name already known (worktree flow). The agent picker ran
+        // concurrently with the creation (ADR-P12) — join on its progress.
+        match pending.agent_pick {
+            // The user already picked: spawn right away.
+            AgentPick::Chosen(agent) => {
+                let config = SessionConfig { agent, ..config };
+                self.do_spawn_session_async(name, &config, worktree_infos);
+            }
+            // Still picking: park the inputs for `confirm_agent_picker` and
+            // retire the now-stale "Creating worktree(s)…" status.
+            AgentPick::Open if matches!(self.modal, modals::Modal::AgentPicker(_)) => {
+                self.new_session.spawn_name = Some(name);
+                self.new_session.spawn_config = Some(config);
+                self.new_session.spawn_worktrees = worktree_infos;
+                self.status_message = None;
+            }
+            // Cancelled (or the picker vanished some other way): drop the
+            // result. The worktrees stay on disk, matching a cancel after
+            // creation.
+            AgentPick::Open | AgentPick::Cancelled => {
+                self.set_info("Session creation cancelled (worktrees kept on disk)");
+            }
+            // No overlapping picker — classic picker-after-create path.
+            AgentPick::NotOpened => self.finish_prepare_spawn(name, config, worktree_infos),
         }
     }
 
@@ -3626,28 +3757,34 @@ impl App {
         Some(self.backends.default_backend().clone())
     }
 
-    /// Resolve the backend a session should spawn on, ensuring it is ready.
-    ///
-    /// Looks up `config.backend` in the registry (falling back to the default
-    /// local backend), then calls `ensure_ready()` so a remote backend's SSH
-    /// control-mode connection is established lazily on first use. Returns a
-    /// status-line-friendly error if the backend is unknown or unreachable.
+    /// Resolve the backend a session should spawn on, ensuring it is ready —
+    /// [`Self::backend_lookup`] + [`ensure_backend_ready`] in one blocking
+    /// call. Kept for tests exercising the combined behavior; the spawn paths
+    /// call the halves separately so readiness can leave the UI thread.
+    #[cfg(test)]
     pub(crate) fn backend_for(
         &self,
         config: &SessionConfig,
     ) -> Result<Arc<dyn SessionBackend>, String> {
-        let backend = match config.backend.as_deref() {
+        let backend = self.backend_lookup(config)?;
+        ensure_backend_ready(&backend)?;
+        Ok(backend)
+    }
+
+    /// Look up `config.backend` in the registry (falling back to the default
+    /// local backend), **without** the readiness round-trip — the async spawn
+    /// path runs [`ensure_backend_ready`] on its worker instead (the
+    /// control-mode attach / SSH connect is a measurable UI stall, ADR-P12).
+    /// Returns a status-line-friendly error if the backend is unknown.
+    fn backend_lookup(&self, config: &SessionConfig) -> Result<Arc<dyn SessionBackend>, String> {
+        match config.backend.as_deref() {
             Some(name) if !name.is_empty() => self
                 .backends
                 .get(name)
                 .cloned()
-                .ok_or_else(|| format!("Unknown backend '{name}'"))?,
-            _ => self.backends.default_backend().clone(),
-        };
-        backend
-            .ensure_ready()
-            .map_err(|e| format!("Backend '{}' not ready: {e:#}", backend.name()))?;
-        Ok(backend)
+                .ok_or_else(|| format!("Unknown backend '{name}'")),
+            _ => Ok(self.backends.default_backend().clone()),
+        }
     }
 
     /// Common spawn preparation shared by the sync and async paths: fill in
@@ -3696,7 +3833,9 @@ impl App {
             spawn_host.as_ref(),
         );
 
-        let backend = match self.backend_for(&config) {
+        // Lookup only — readiness is the caller's job: the sync path blocks on
+        // it inline, the async path readies on its worker (ADR-P12).
+        let backend = match self.backend_lookup(&config) {
             Ok(b) => b,
             Err(e) => {
                 error!("Failed to select backend: {e}");
@@ -3736,7 +3875,12 @@ impl App {
         session.info.additional_dirs = additional_dirs;
         session.info.parent_session_id = parent_session_id;
 
-        resolve_repo_display_names(&mut session.info);
+        // The async spawn worker pre-resolves the display names off-thread
+        // from the same member set (ADR-P12); only the synchronous path still
+        // resolves here (`git remote get-url` per member repo).
+        if session.info.repo_display_names.is_empty() {
+            resolve_repo_display_names(&mut session.info);
+        }
         let session_id = session.info.id;
         self.sessions.push(session);
         self.active_index = self.sessions.len() - 1;
@@ -3797,6 +3941,12 @@ impl App {
         let Some(inputs) = self.build_spawn_inputs(config, &worktrees, &additional_dirs) else {
             return;
         };
+        // Synchronous path: blocking on backend readiness here is the point.
+        if let Err(e) = ensure_backend_ready(&inputs.backend) {
+            error!("Failed to select backend: {e}");
+            self.set_error(e);
+            return;
+        }
 
         match Session::spawn(
             name,
@@ -3860,6 +4010,12 @@ impl App {
 
         let agent = config.agent.clone();
         let tx = self.session_spawn.start();
+        // Clones for the worker's display-name resolution (`git remote
+        // get-url` per member repo — a subprocess that must not run on the UI
+        // thread, ADR-P12); the originals ride in the pending continuation.
+        let worker_cwd = primary_cwd.clone();
+        let worker_worktrees = worktrees.clone();
+        let worker_dirs = additional_dirs.clone();
         self.pending_session_spawn = Some(PendingSessionSpawn {
             primary_cwd,
             worktrees,
@@ -3872,8 +4028,21 @@ impl App {
         self.set_status(StatusLevel::Info, format!("Spawning {name}…"));
 
         tokio::task::spawn_blocking(move || {
-            let result = Session::spawn(name, rows, cols, &config, &backend, &provider)
-                .map_err(|e| format!("{e:#}"));
+            // Backend readiness (control-mode attach / SSH connect) belongs on
+            // the worker too — it stalled the agent-picker Enter (ADR-P12).
+            let result = ensure_backend_ready(&backend)
+                .and_then(|()| {
+                    Session::spawn(name, rows, cols, &config, &backend, &provider)
+                        .map_err(|e| format!("{e:#}"))
+                })
+                .map(|mut session| {
+                    session.info.repo_display_names =
+                        session_member_dirs(worker_cwd.as_deref(), &worker_worktrees, &worker_dirs)
+                            .into_iter()
+                            .filter_map(|(name, _)| name)
+                            .collect();
+                    session
+                });
             let _ = tx.send(result);
         });
     }
@@ -4123,8 +4292,10 @@ impl App {
         // Poll for sync results from background worktree sync threads
         self.poll_sync_results();
 
-        // Poll for backgrounded interactive spawn work (worktree creation +
-        // `Session::spawn`) so `Ctrl+N` never freezes the UI.
+        // Poll for backgrounded interactive spawn work (branch listing +
+        // worktree creation + `Session::spawn`) so `Ctrl+N` never freezes
+        // the UI.
+        self.poll_branch_load();
         self.poll_worktree_create();
         self.poll_session_spawn();
 
@@ -6549,6 +6720,16 @@ impl App {
         let inner = Block::default().borders(Borders::ALL).inner(terminal);
         (inner.height, inner.width)
     }
+}
+
+/// Bring a backend up (control-mode attach for local tmux, SSH connect +
+/// remote tmux bring-up for a remote host), with the status-line-friendly
+/// error both spawn paths surface. The async path calls this on its worker;
+/// the sync path blocks on it inline (ADR-P12).
+fn ensure_backend_ready(backend: &Arc<dyn SessionBackend>) -> Result<(), String> {
+    backend
+        .ensure_ready()
+        .map_err(|e| format!("Backend '{}' not ready: {e:#}", backend.name()))
 }
 
 /// Populate `repo_display_names` on a session from worktree repo paths,
@@ -11722,6 +11903,7 @@ mod tests {
             normal_repos: vec![PathBuf::from("/other")],
             session_name: None, // no name yet → routes through the name modal
             base_branch: "main".into(),
+            agent_pick: AgentPick::NotOpened,
         });
 
         app.poll_worktree_create();
@@ -11747,6 +11929,7 @@ mod tests {
             normal_repos: vec![],
             session_name: None,
             base_branch: "main".into(),
+            agent_pick: AgentPick::NotOpened,
         });
 
         app.poll_worktree_create();
@@ -11831,6 +12014,219 @@ mod tests {
         assert!(app.code_reviews.is_empty(), "no state resurrected");
         assert_eq!(app.perf_counters().review_builds_applied, 0);
         assert!(!app.review_build.in_progress());
+    }
+
+    /// ADR-P12: the `w` flow's branch selection dispatches the git listing to
+    /// a background worker; the open path itself must leave the selector in
+    /// its loading state (no git subprocess on the UI thread).
+    #[tokio::test]
+    async fn perf_branch_selection_never_lists_on_ui_thread() {
+        let mut app = app_with_sessions(0);
+        app.new_session.repo_path = Some(std::env::temp_dir());
+
+        app.start_branch_selection();
+
+        assert_eq!(app.perf_counters().branch_loads_dispatched, 1);
+        assert!(app.branch_load.in_progress());
+        match app.modal {
+            modals::Modal::BranchSelector(ref bs) => {
+                assert!(bs.loading, "opens in the loading state");
+                assert!(bs.branches.is_empty(), "no git work ran on the UI thread");
+            }
+            ref other => panic!("expected the branch selector, got {other:?}"),
+        }
+        // The origin fetch runs concurrently; its completion signal is parked
+        // for the worktree-create worker to wait on.
+        assert!(app.new_session.fetch_done.is_some());
+    }
+
+    /// The worker's branch list lands via the tick poll: loading clears and
+    /// the applied counter bumps.
+    #[test]
+    fn perf_branch_load_result_applied_via_poll() {
+        let mut app = app_with_sessions(0);
+        app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
+            index: 0,
+            branches: Vec::new(),
+            loading: true,
+        });
+        let tx = app.branch_load.start();
+        tx.send(Ok(vec!["origin/main".into(), "main".into()]))
+            .unwrap();
+
+        app.poll_branch_load();
+
+        match app.modal {
+            modals::Modal::BranchSelector(ref bs) => {
+                assert!(!bs.loading);
+                assert_eq!(
+                    bs.branches,
+                    vec!["origin/main".to_string(), "main".to_string()]
+                );
+            }
+            ref other => panic!("expected the branch selector, got {other:?}"),
+        }
+        assert_eq!(app.perf_counters().branch_loads_applied, 1);
+        assert!(!app.branch_load.in_progress());
+    }
+
+    /// A failed listing closes the selector, surfaces the error, and aborts
+    /// the pending worktree flow (mirroring the selector's Esc).
+    #[test]
+    fn branch_load_error_closes_selector_and_clears_flow() {
+        let mut app = app_with_sessions(0);
+        app.new_session.repo_path = Some(PathBuf::from("/repo"));
+        app.new_session.all_repos = Some(vec![PathBuf::from("/repo")]);
+        app.new_session.normal_repos = vec![PathBuf::from("/other")];
+        app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
+            index: 0,
+            branches: Vec::new(),
+            loading: true,
+        });
+        let tx = app.branch_load.start();
+        tx.send(Err("No branches found in repository".into()))
+            .unwrap();
+
+        app.poll_branch_load();
+
+        assert!(matches!(app.modal, modals::Modal::None));
+        let msg = app.status_message.as_ref().unwrap();
+        assert_eq!(msg.level, StatusLevel::Error);
+        assert!(app.new_session.repo_path.is_none());
+        assert!(app.new_session.all_repos.is_none());
+        assert!(app.new_session.normal_repos.is_empty());
+    }
+
+    /// A list whose selector was cancelled (Esc) before delivery is dropped,
+    /// not applied (and not counted).
+    #[test]
+    fn branch_load_for_cancelled_selector_is_dropped() {
+        let mut app = app_with_sessions(0);
+        let tx = app.branch_load.start();
+        tx.send(Ok(vec!["main".into()])).unwrap();
+
+        app.poll_branch_load();
+
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert_eq!(app.perf_counters().branch_loads_applied, 0);
+        assert!(!app.branch_load.in_progress());
+    }
+
+    /// ADR-P12: with the session name known and >1 agents, the agent picker
+    /// opens immediately over the in-flight worktree creation instead of
+    /// waiting for it.
+    #[tokio::test]
+    async fn perf_worktree_confirm_opens_agent_picker_during_create() {
+        let mut app = app_with_sessions(0);
+
+        app.spawn_worktree_session(
+            &[PathBuf::from("/repo")],
+            "feat",
+            "main",
+            Some("sess".into()),
+        );
+
+        assert!(app.worktree_create.in_progress());
+        assert!(matches!(app.modal, modals::Modal::AgentPicker(_)));
+        assert!(matches!(
+            app.pending_worktree_create.as_ref().unwrap().agent_pick,
+            AgentPick::Open
+        ));
+    }
+
+    /// The user picked an agent before the create delivered: the choice is
+    /// parked and the spawn dispatches straight from the poll.
+    #[tokio::test]
+    async fn agent_choice_during_create_spawns_on_delivery() {
+        let mut app = app_with_sessions(0);
+        let tx = app.worktree_create.start();
+        app.pending_worktree_create = Some(PendingWorktreeCreate {
+            backend: None,
+            normal_repos: vec![],
+            session_name: Some("sess".into()),
+            base_branch: "main".into(),
+            agent_pick: AgentPick::Chosen("claude".into()),
+        });
+        tx.send(Ok(vec![WorktreeInfo {
+            repo_path: PathBuf::from("/repo"),
+            worktree_path: PathBuf::from("/repo/.worktrees/feat"),
+            branch: "feat".into(),
+        }]))
+        .unwrap();
+
+        app.poll_worktree_create();
+
+        assert!(app.session_spawn.in_progress(), "spawn dispatched");
+        assert_eq!(
+            app.pending_session_spawn.as_ref().map(|p| p.agent.as_str()),
+            Some("claude")
+        );
+    }
+
+    /// The create delivered while the picker is still open: the spawn inputs
+    /// are parked for `confirm_agent_picker` and the picker stays up.
+    #[test]
+    fn worktree_done_while_picker_open_stashes_spawn() {
+        let mut app = app_with_sessions(0);
+        app.modal =
+            modals::Modal::AgentPicker(crate::ui::agent_picker_modal::AgentPickerState::default());
+        let tx = app.worktree_create.start();
+        app.pending_worktree_create = Some(PendingWorktreeCreate {
+            backend: None,
+            normal_repos: vec![],
+            session_name: Some("sess".into()),
+            base_branch: "main".into(),
+            agent_pick: AgentPick::Open,
+        });
+        tx.send(Ok(vec![WorktreeInfo {
+            repo_path: PathBuf::from("/repo"),
+            worktree_path: PathBuf::from("/repo/.worktrees/feat"),
+            branch: "feat".into(),
+        }]))
+        .unwrap();
+
+        app.poll_worktree_create();
+
+        assert!(matches!(app.modal, modals::Modal::AgentPicker(_)));
+        assert_eq!(app.new_session.spawn_name.as_deref(), Some("sess"));
+        assert!(app.new_session.spawn_config.is_some());
+        assert_eq!(app.new_session.spawn_worktrees.len(), 1);
+        assert!(!app.session_spawn.in_progress(), "spawn waits for the pick");
+    }
+
+    /// Esc on the overlapping picker cancels the pending create: the
+    /// delivered worktrees are dropped instead of spawning a session.
+    #[test]
+    fn agent_picker_esc_during_create_cancels_pending() {
+        let mut app = app_with_sessions(0);
+        app.modal =
+            modals::Modal::AgentPicker(crate::ui::agent_picker_modal::AgentPickerState::default());
+        let tx = app.worktree_create.start();
+        app.pending_worktree_create = Some(PendingWorktreeCreate {
+            backend: None,
+            normal_repos: vec![],
+            session_name: Some("sess".into()),
+            base_branch: "main".into(),
+            agent_pick: AgentPick::Open,
+        });
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(
+            app.pending_worktree_create.as_ref().unwrap().agent_pick,
+            AgentPick::Cancelled
+        ));
+
+        tx.send(Ok(vec![WorktreeInfo {
+            repo_path: PathBuf::from("/repo"),
+            worktree_path: PathBuf::from("/repo/.worktrees/feat"),
+            branch: "feat".into(),
+        }]))
+        .unwrap();
+        app.poll_worktree_create();
+
+        assert!(!app.session_spawn.in_progress(), "nothing spawns");
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(app.pending_worktree_create.is_none());
     }
 
     #[test]
@@ -12008,6 +12404,7 @@ mod tests {
             normal_repos: vec![],
             session_name: None,
             base_branch: "main".into(),
+            agent_pick: AgentPick::NotOpened,
         });
 
         app.poll_worktree_create();
@@ -13105,9 +13502,14 @@ mod tests {
         app.new_session.repo_path = Some(PathBuf::from("/repo"));
         app.new_session.all_repos = Some(vec![PathBuf::from("/repo")]);
         app.new_session.normal_repos = vec![PathBuf::from("/other")];
+        // A parked origin-fetch signal (ADR-P12): Esc must drop it too, so no
+        // later worktree create consumes a stale receiver.
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.new_session.fetch_done = Some(rx);
         app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
             index: 0,
             branches: vec!["main".into(), "dev".into()],
+            loading: false,
         });
         // j advances the selection; Esc aborts and wipes the pending spawn state.
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
@@ -13120,6 +13522,7 @@ mod tests {
         assert!(app.new_session.repo_path.is_none());
         assert!(app.new_session.all_repos.is_none());
         assert!(app.new_session.normal_repos.is_empty());
+        assert!(app.new_session.fetch_done.is_none());
     }
 
     #[test]

@@ -53,6 +53,13 @@ pub(crate) struct PerfCounters {
     /// Worker-built review results applied back on the UI thread (a dispatched
     /// build whose review was closed before delivery is dropped, not applied).
     pub(crate) review_builds_applied: u64,
+    /// New-session branch lists handed to a background worker (the `w` flow's
+    /// branch selector). Proves the git subprocess fan-out left the UI thread
+    /// (ADR-P12): the open path bumps this and must leave the modal loading.
+    pub(crate) branch_loads_dispatched: u64,
+    /// Worker-listed branch results applied back on the UI thread (a load
+    /// whose selector was cancelled before delivery is dropped, not applied).
+    pub(crate) branch_loads_applied: u64,
     /// Scrollback captures prefetched in parallel during the local session
     /// restore, one per matched pane (ADR-P9). Proves the sequential adopt
     /// loop received pre-captured seeds instead of capturing inline.
@@ -101,6 +108,12 @@ impl PerfCounters {
             review_builds_applied: self
                 .review_builds_applied
                 .wrapping_sub(prev.review_builds_applied),
+            branch_loads_dispatched: self
+                .branch_loads_dispatched
+                .wrapping_sub(prev.branch_loads_dispatched),
+            branch_loads_applied: self
+                .branch_loads_applied
+                .wrapping_sub(prev.branch_loads_applied),
             restore_seed_prefetches: self
                 .restore_seed_prefetches
                 .wrapping_sub(prev.restore_seed_prefetches),
