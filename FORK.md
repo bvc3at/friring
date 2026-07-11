@@ -250,44 +250,74 @@ the fork.
 ## Migration
 
 Upgrading an existing `thurbox` install to the renamed `friring`? The rename
-changed where the app looks, so move your state across once:
+changed where the app looks, so move your state across once. The paths below
+assume the default XDG roots; if you set `XDG_CONFIG_HOME` / `XDG_DATA_HOME`,
+substitute `$XDG_CONFIG_HOME/thurbox` and `$XDG_DATA_HOME/thurbox` accordingly.
+**Do these steps in order** — stop every writer before copying the database, or
+you lose whatever it writes mid-copy.
 
-- **Config** — copy the config dir:
+1. **Stop all writers first.** Quit the TUI, disable the automation
+   units (below) so the heartbeat stops, drain in-flight agents, and stop the
+   old tmux server. Session hooks and the automation tick keep writing to the
+   database until the server is gone.
 
-  ```bash
-  cp -r ~/.config/thurbox ~/.config/friring
-  ```
+   ```bash
+   tmux -L thurbox attach        # drain in-flight sessions
+   tmux -L thurbox kill-server   # once none are left running
+   ```
 
-- **Data + DB** — copy the data dir, then rename the database file:
+   The same applies on each remote host (`tmux -L thurbox …` there too).
 
-  ```bash
-  cp -r ~/.local/share/thurbox ~/.local/share/friring
-  mv ~/.local/share/friring/thurbox.db ~/.local/share/friring/friring.db
-  ```
+2. **Config** — copy the config dir. If you have **not** launched `friring`
+   yet, `~/.config/friring` doesn't exist and a plain copy is correct;
+   if it already exists, copy the *contents* (`cp -rT`, or `cp -r
+   ~/.config/thurbox/. ~/.config/friring/`) so the old tree isn't nested as
+   `~/.config/friring/thurbox`:
 
-- **Live sessions** keep running on the old tmux server (the socket name is
-  fixed for a running server). Reattach and drain them on the old socket, then
-  stop it once nothing is left:
+   ```bash
+   cp -r ~/.config/thurbox ~/.config/friring   # dest must not pre-exist
+   ```
 
-  ```bash
-  tmux -L thurbox attach        # drain in-flight sessions
-  tmux -L thurbox kill-server   # once none are left running
-  ```
+3. **Data + DB** — with writers stopped (step 1), copy the data dir and rename
+   the database, including its WAL/SHM sidecars, so the renamed DB keeps its
+   uncheckpointed pages:
 
-  The same applies on remote hosts, and existing sessions' remote
-  `~/.local/share/thurbox` worktrees stay where they are — leave them until
-  those sessions are retired.
+   ```bash
+   cp -r ~/.local/share/thurbox ~/.local/share/friring   # dest must not pre-exist
+   cd ~/.local/share/friring
+   for ext in "" -wal -shm; do
+     [ -e "thurbox.db$ext" ] && mv "thurbox.db$ext" "friring.db$ext"
+   done
+   ```
 
-- **Env vars** — rename any `THURBOX_*` you set in shell rc files, agent
-  wrappers, or hooks to `FRIRING_*`.
+   **Keep the old data dir** until every migrated session is retired: sessions,
+   worktrees, and multi-repo workspaces store **absolute** paths (both local and
+   remote) under `~/.local/share/thurbox`, and the rename does not rewrite them.
+   Deleting it early orphans those worktrees/workspaces.
 
-- **Automation units** — reinstall your systemd / launchd units under the new
-  `friring` names and disable the old `thurbox` ones.
+4. **Env vars** — rename only the Friring **runtime / build / dev** variables
+   you set in shell rc files, agent wrappers, or hooks: `THURBOX_CONFIG_DIR`,
+   `THURBOX_DATA_DIR`, `THURBOX_SOCKET`, `THURBOX_SESSION`, `THURBOX_SESSION_ID`,
+   `THURBOX_TASK`, `THURBOX_METRICS_DIR`, `THURBOX_PERF_LOG` → `FRIRING_*`.
+   Variables read by the **retained upstream** installer / release tooling keep
+   the `THURBOX_` prefix — leave `THURBOX_VERSION`, `THURBOX_INSTALL_DIR`,
+   `THURBOX_REPO`, `THURBOX_PS_TEST`, and `THURBOX_RELEASE_VERSION` as-is.
 
-- **Dev sandbox** — profiles under `target/dev-sandbox/*/thurbox-*` are stale;
-  recreate them (see `docs/DEVELOPMENT.md`).
+5. **Automation units** — reinstall your systemd / launchd units under the new
+   `friring` names and disable the old `thurbox` ones.
 
-- **Extensions & self-update** — extensions fetched at runtime from upstream
-  still invoke `thurbox-cli`; use this repo's local copies instead. The
-  self-update / version-check paths still track upstream **Thurbox** releases
-  and aren't meaningful for a source-built `friring`.
+6. **Dev sandbox** — profiles under `target/dev-sandbox/*/thurbox-*` are stale;
+   recreate them (see `docs/DEVELOPMENT.md`).
+
+7. **Extensions** — previously-installed hooks and managed extension files still
+   invoke `thurbox-cli`, and the installer recognizes only the `friring` marker,
+   so it won't prune or refresh the old `thurbox`-marked entries automatically
+   (it treats them as user-owned). Uninstall the old extensions with the
+   *previous* build if you still have it, or remove the stale hook entries by
+   hand, then reinstall from this repo's local copies (`friring-cli extension
+   install ./extensions/<name>`). Bare-name / upstream-URL installs fetch
+   upstream **Thurbox** payloads that call `thurbox-cli`.
+
+8. **Self-update** — the self-update / version-check paths still track upstream
+   **Thurbox** releases and aren't meaningful for a source-built `friring`;
+   update by pulling this repo and rebuilding.
