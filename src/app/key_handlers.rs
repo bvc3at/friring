@@ -818,6 +818,9 @@ impl App {
                 self.new_session.repo_path = None;
                 self.new_session.all_repos = None;
                 self.new_session.normal_repos.clear();
+                // Drop the parked origin-fetch signal (ADR-P12) — no worktree
+                // create will consume it now.
+                self.new_session.fetch_done = None;
             }
             KeyCode::Char('j') | KeyCode::Down if bs.index + 1 < bs.branches.len() => {
                 bs.index += 1;
@@ -868,6 +871,7 @@ impl App {
         self.new_session.all_repos = None;
         self.new_session.normal_repos.clear();
         self.new_session.session_name = None;
+        self.new_session.fetch_done = None;
     }
 
     /// Spawn the worktree session for the confirmed branch name.
@@ -920,6 +924,7 @@ impl App {
             self.new_session.repo_path = None;
             self.new_session.all_repos = None;
             self.new_session.normal_repos.clear();
+            self.new_session.fetch_done = None;
         } else {
             // Normal flow — clean up spawn state.
             self.new_session.spawn_config = None;

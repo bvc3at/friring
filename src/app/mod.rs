@@ -3570,6 +3570,7 @@ impl App {
                 self.new_session.repo_path = None;
                 self.new_session.all_repos = None;
                 self.new_session.normal_repos.clear();
+                self.new_session.fetch_done = None;
             }
         }
     }
@@ -13501,6 +13502,10 @@ mod tests {
         app.new_session.repo_path = Some(PathBuf::from("/repo"));
         app.new_session.all_repos = Some(vec![PathBuf::from("/repo")]);
         app.new_session.normal_repos = vec![PathBuf::from("/other")];
+        // A parked origin-fetch signal (ADR-P12): Esc must drop it too, so no
+        // later worktree create consumes a stale receiver.
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.new_session.fetch_done = Some(rx);
         app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
             index: 0,
             branches: vec!["main".into(), "dev".into()],
@@ -13517,6 +13522,7 @@ mod tests {
         assert!(app.new_session.repo_path.is_none());
         assert!(app.new_session.all_repos.is_none());
         assert!(app.new_session.normal_repos.is_empty());
+        assert!(app.new_session.fetch_done.is_none());
     }
 
     #[test]
