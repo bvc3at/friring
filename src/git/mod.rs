@@ -833,8 +833,10 @@ fn worktree_subpath_posix(base: &str, repo_path: &Path, branch: &str) -> String 
 pub enum SyncResult {
     /// Rebase succeeded (includes already-up-to-date).
     Synced,
-    /// Rebase failed due to conflicts (aborted, stash restored).
-    Conflict(String),
+    /// Rebase failed due to conflicts (aborted, stash restored). Carries the
+    /// resolved base ref the rebase actually targeted, so the conflict prompt
+    /// names it exactly instead of guessing the branch.
+    Conflict { base_ref: String },
     /// Unexpected failure.
     Error(String),
 }
@@ -1202,7 +1204,11 @@ pub fn sync_worktree(worktree_path: &Path, remote: Option<&str>) -> SyncResult {
 
     if let Err(e) = git_rebase_onto(worktree_path, &base_ref) {
         restore_stash();
-        return SyncResult::Conflict(format!("{e:#}"));
+        warn!(
+            "rebase onto {base_ref} conflicted in {}: {e:#}",
+            worktree_path.display()
+        );
+        return SyncResult::Conflict { base_ref };
     }
 
     if stashed {

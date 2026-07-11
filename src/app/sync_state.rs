@@ -46,9 +46,4 @@ pub(crate) struct WorktreeSyncState {
     /// The run those remotes are for; consumed when the run launches or the
     /// base picker is cancelled.
     pub(crate) awaiting: Option<PendingSyncRun>,
-    /// Explicit base remote per session of the in-flight run, so a conflict
-    /// prompt names the remote the rebase actually targeted. Last write wins
-    /// for a session spanning repos with different picks (the prompt is
-    /// per-session, not per-worktree). Absent = the default origin chain.
-    pub(crate) base_remotes: HashMap<SessionId, String>,
 }

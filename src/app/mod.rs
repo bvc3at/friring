@@ -89,9 +89,6 @@ const PERF_SNAPSHOT_TICKS: u64 = 500;
 /// own-connection writes bypass the throttle via cache invalidation.
 const HOOK_VERSION_CHECK_TICKS: u64 = 10;
 
-/// Prompt sent to Claude sessions when a worktree rebase has conflicts.
-const SYNC_CONFLICT_PROMPT: &str = "Please sync this worktree with main. Run: git fetch origin && git rebase origin/main -- if there are conflicts, resolve them and continue the rebase with git rebase --continue.";
-
 /// Tick delay before sending Enter after pasting text into a session.
 /// At ~10ms per tick, 10 ticks ≈ 100ms — enough for the app to process the pasted text.
 const DEFERRED_INPUT_DELAY_TICKS: u64 = 10;
@@ -5206,9 +5203,9 @@ impl App {
         for (session_id, result) in results {
             match result {
                 git::SyncResult::Synced => synced += 1,
-                git::SyncResult::Conflict(_) => {
+                git::SyncResult::Conflict { base_ref } => {
                     conflicts += 1;
-                    self.send_conflict_prompt(session_id);
+                    self.send_conflict_prompt(session_id, &base_ref);
                 }
                 git::SyncResult::Error(msg) => errors.push(msg),
             }
@@ -5227,19 +5224,16 @@ impl App {
     }
 
     /// Send a conflict resolution prompt to a session via bracketed paste,
-    /// with a deferred Enter so the app processes the text first. When the run
-    /// synced onto an explicitly-chosen remote, the prompt names it instead of
-    /// the default `origin` wording.
-    fn send_conflict_prompt(&mut self, session_id: SessionId) {
-        let prompt = match self.worktree_sync.base_remotes.get(&session_id) {
-            Some(remote) => format!(
-                "Please sync this worktree with its base remote '{remote}'. Run: \
-                 git fetch {remote} && git rebase {remote}/main (or {remote}/master \
-                 if that is its default branch) -- if there are conflicts, resolve \
-                 them and continue the rebase with git rebase --continue."
-            ),
-            None => SYNC_CONFLICT_PROMPT.to_string(),
-        };
+    /// with a deferred Enter so the app processes the text first. `base_ref` is
+    /// the ref the rebase actually targeted (resolved per-worktree by
+    /// [`git::sync_worktree`]), so the prompt names it exactly rather than
+    /// assuming `origin/main`.
+    fn send_conflict_prompt(&mut self, session_id: SessionId, base_ref: &str) {
+        let prompt = format!(
+            "Please sync this worktree with {base_ref}. Run: git fetch && git rebase \
+             {base_ref} -- if there are conflicts, resolve them and continue the \
+             rebase with git rebase --continue."
+        );
         if let Some(session) = self.sessions.iter().find(|s| s.info.id == session_id) {
             let mut paste = b"\x1b[200~".to_vec();
             paste.extend_from_slice(prompt.as_bytes());
@@ -5384,12 +5378,23 @@ impl App {
     /// persist it as that repo's default, and advance: next multi-remote repo
     /// (another picker) or launch.
     pub(crate) fn confirm_sync_base(&mut self, remote: String) {
-        let Some(mut run) = self.worktree_sync.awaiting.take() else {
-            return;
-        };
-        if run.queue.is_empty() {
+        // Peek before taking: the picker is only open with a non-empty queue,
+        // so an empty one means a lost invariant — leave the parked run intact
+        // rather than silently cancelling it (and dropping the whole sync).
+        let has_pending = self
+            .worktree_sync
+            .awaiting
+            .as_ref()
+            .is_some_and(|run| !run.queue.is_empty());
+        if !has_pending {
+            error!("confirm_sync_base with no queued repo; leaving the run parked");
             return;
         }
+        let mut run = self
+            .worktree_sync
+            .awaiting
+            .take()
+            .expect("awaiting checked non-empty above");
         let (repo, _) = run.queue.remove(0);
         if let Err(e) = self.db.set_sync_base_remote(&repo, &remote) {
             // Non-fatal: the run still uses the choice, only the default is lost.
@@ -5429,20 +5434,13 @@ impl App {
                 .push((session_id, worktree_path));
         }
 
-        self.worktree_sync.base_remotes.clear();
         for (repo, worktrees) in by_repo {
             let tx = tx.clone();
             // The picked (or single non-origin) base remote; `None` derives
             // the rebase target per-worktree (upstream → origin/HEAD →
-            // origin/main → origin/master).
+            // origin/main → origin/master). The resolved ref rides back on
+            // `SyncResult::Conflict` so the prompt names it per-worktree.
             let remote = run.chosen.get(&repo).cloned();
-            if let Some(r) = &remote {
-                for (session_id, _) in &worktrees {
-                    self.worktree_sync
-                        .base_remotes
-                        .insert(*session_id, r.clone());
-                }
-            }
             std::thread::spawn(move || {
                 for (session_id, worktree_path) in worktrees {
                     let result = git::sync_worktree(&worktree_path, remote.as_deref());
@@ -11836,6 +11834,30 @@ mod tests {
         assert!(app.worktree_sync.awaiting.is_none());
     }
 
+    /// `confirm_sync_base` with an empty queue (a lost invariant) leaves the
+    /// parked run intact instead of silently taking + dropping it.
+    #[test]
+    fn confirm_sync_base_with_empty_queue_keeps_run_parked() {
+        let mut app = app_with_sessions(1);
+        app.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: vec![(
+                app.sessions[0].info.id,
+                PathBuf::from("/tmp/empty-queue-wt"),
+                PathBuf::from("/tmp/empty-queue-repo"),
+            )],
+            queue: Vec::new(),
+            chosen: HashMap::new(),
+        });
+
+        app.confirm_sync_base("origin".to_string());
+
+        assert!(
+            app.worktree_sync.awaiting.is_some(),
+            "the parked run is preserved, not dropped"
+        );
+        assert!(!app.worktree_sync.in_progress);
+    }
+
     /// Esc in the picker drops the whole parked run — nothing syncs.
     #[test]
     fn sync_base_picker_esc_cancels_run() {
@@ -12154,7 +12176,9 @@ mod tests {
             (SessionId::default(), git::SyncResult::Synced),
             (
                 SessionId::default(),
-                git::SyncResult::Conflict("merge conflict".into()),
+                git::SyncResult::Conflict {
+                    base_ref: "origin/main".into(),
+                },
             ),
         ];
         app.finish_sync();
@@ -12170,7 +12194,9 @@ mod tests {
         app.worktree_sync.completed = vec![
             (
                 SessionId::default(),
-                git::SyncResult::Conflict("merge conflict".into()),
+                git::SyncResult::Conflict {
+                    base_ref: "origin/main".into(),
+                },
             ),
             (
                 SessionId::default(),
@@ -12932,7 +12958,7 @@ mod tests {
     #[test]
     fn send_conflict_prompt_noop_for_unknown_session() {
         let mut app = App::new(24, 80, stub_backend(), stub_agents(), test_db());
-        app.send_conflict_prompt(SessionId::default());
+        app.send_conflict_prompt(SessionId::default(), "origin/main");
         assert!(app.deferred_inputs.is_empty());
     }
 
@@ -12943,7 +12969,7 @@ mod tests {
 
         // Stub's channel rx is dropped, so send_input fails.
         // No deferred input should be created.
-        app.send_conflict_prompt(sid);
+        app.send_conflict_prompt(sid, "origin/main");
         assert!(app.deferred_inputs.is_empty());
     }
 
