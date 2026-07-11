@@ -111,7 +111,10 @@ impl FuzzyFilter {
         }
     }
 
-    /// Drop the whole query (Esc), keeping the selected row selected.
+    /// Drop the whole query (Esc), mapping the cursor back to list space so the
+    /// selected match stays selected. When the query had *no* matches there is
+    /// no row under the cursor to preserve, so the cleared list selects its
+    /// first row.
     pub(crate) fn clear(&mut self, index: &mut usize) {
         if !self.is_active() {
             return;
@@ -248,6 +251,17 @@ mod tests {
         assert!(!f.is_active());
         assert_eq!(index, 2, "filtered position mapped back to list space");
         assert_eq!(f.len(ROWS.len()), ROWS.len());
+    }
+
+    #[test]
+    fn filter_clear_on_zero_matches_falls_back_to_first_row() {
+        let mut f = FuzzyFilter::default();
+        let mut index = 2;
+        f.push('z', ROWS, &mut index); // matches nothing
+        assert_eq!(f.len(ROWS.len()), 0);
+        f.clear(&mut index);
+        assert!(!f.is_active());
+        assert_eq!(index, 0, "no row under the cursor → first row of the list");
     }
 
     #[test]

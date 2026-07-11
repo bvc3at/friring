@@ -829,6 +829,11 @@ pub fn selector_list_item<'a>(label: &str, selected: bool) -> ratatui::widgets::
 /// highlighting reads identically; positions are byte offsets sliced by char
 /// width (multi-byte safe). A non-matching or empty query yields `display`
 /// unhighlighted.
+///
+/// The accent recolors only the foreground of the incoming `style`, so a
+/// matched character keeps the row's background and modifiers — e.g. a selected
+/// row is bold (`Theme::selected_item`), and its matched chars must stay bold
+/// rather than dropping to a thinner default weight.
 pub fn fuzzy_highlighted_spans(query: &str, display: &str, style: Style) -> Vec<Span<'static>> {
     let positions = crate::fuzzy::fuzzy_match(query, display)
         .map(|m| m.positions)
@@ -846,7 +851,7 @@ pub fn fuzzy_highlighted_spans(query: &str, display: &str, style: Style) -> Vec<
             .unwrap_or(pos + 1);
         result.push(Span::styled(
             display[pos..end].to_string(),
-            Style::default().fg(Theme::accent()),
+            style.fg(Theme::accent()),
         ));
         last = end;
     }
@@ -883,7 +888,9 @@ pub fn render_filter_row(frame: &mut Frame, area: Rect, query: &str, shown: usiz
             Span::styled("/ ", Style::default().fg(Theme::accent())),
             Span::styled(
                 query.to_string(),
-                Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+                Style::default()
+                    .fg(Theme::text_primary())
+                    .add_modifier(ratatui::style::Modifier::BOLD),
             ),
             Span::styled(
                 format!("  {shown}/{total}"),
