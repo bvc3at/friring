@@ -138,11 +138,16 @@ your preferred helper.)
 
 ```bash
 sudo pacman -S --needed git tmux rust   # Arch deps; use your distro's equivalent
-git clone https://github.com/Thurbeen/thurbox.git
-cd thurbox
+git clone https://github.com/bvc3at/friring.git
+cd friring
 cargo build --release
 # binary at target/release/friring
 ```
+
+The packaged installers above (Homebrew, winget, curl, AUR, Chocolatey) install
+the upstream **Thurbox** binary. To run **Friring** specifically, build it from
+source from this fork — there is no Friring package yet, so a source build is the
+only supported way to obtain `friring` for now.
 
 See [Prerequisites](#prerequisites) for required tooling.
 
@@ -887,7 +892,10 @@ friring-cli extension uninstall <name> [--purge]
 
 A bare `<name>` resolves against the official source, **pinned to your
 binary's release tag** so the fetched extension matches the binary;
-a URL or local dir installs from there instead. Installed extensions
+a URL or local dir installs from there instead. On friring, prefer
+local-dir installs (`friring-cli extension install ./extensions/<name>`) —
+bare-name/upstream installs fetch upstream Thurbox payloads that call
+`thurbox-cli`. Installed extensions
 **self-heal** — their declared sessions and automations are re-ensured
 at TUI startup and on every headless `automation tick`, so `deactivate`
 (not deleting the session) is the way to turn one off.
@@ -951,8 +959,8 @@ see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ### Setup
 
 ```bash
-git clone https://github.com/Thurbeen/thurbox.git
-cd thurbox
+git clone https://github.com/bvc3at/friring.git
+cd friring
 prek install   # Install pre-commit hooks
 ```
 

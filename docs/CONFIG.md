@@ -498,6 +498,12 @@ location (`~/.local/bin`) is user-writable; a system-wide install in a
 root-owned directory will fail the replace (logged, non-fatal). `version_check`
 and `auto_update` are independent — enable either or both.
 
+**Fork caveat (friring):** version-check and self-update deliberately retain the
+upstream **Thurbox** release contract — they query `Thurbeen/thurbox` releases
+and replace on-disk `thurbox`/`thurbox-cli` assets — so they do **not** update a
+source-built `friring`. Update friring by pulling this repo and rebuilding. See
+`FORK.md`'s Migration section.
+
 `auto_update = true` also keeps **installed extensions** in step with the
 binary. Extension versions are pinned to the binary's release tag, so an
 extension only goes stale (`installed_with` ≠ the running binary) right after an
@@ -779,6 +785,12 @@ validated against traversal (no absolute paths or `..`), and a
 `substitute` file you've edited isn't overwritten on reinstall (use
 `--force`). Payload files are fetched as **text** (specs/scripts/JSON),
 not binaries.
+
+**Fork caveat (friring):** a bare `<name>` (or an upstream URL) fetches upstream
+**Thurbox** payloads pinned to a release tag equal to your binary version — for
+a source-built `friring` that upstream tag may not exist, and the fetched hooks
+invoke `thurbox-cli`. Prefer a local-directory install from this repo:
+`friring-cli extension install ./extensions/<name>`.
 
 While an extension is **active**, friring **self-heals** its declared
 resources: on TUI startup and on every `automation tick` it re-creates

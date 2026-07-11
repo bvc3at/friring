@@ -63,6 +63,11 @@ a box where you'd rather pipe a script:
 curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/main/extensions/flow/install.sh | sh
 ```
 
+**Fork caveat (friring):** that one-liner is the upstream **Thurbox** path — its
+shim invokes/requires `thurbox-cli`, not `friring-cli`. On a source-built
+`friring`, install Flow from this repo's local `extensions/flow` directory
+instead (`friring-cli extension install ./extensions/flow`).
+
 ### Self-healing
 
 The flow session is **managed**: friring re-creates it automatically if it's
