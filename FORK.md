@@ -194,6 +194,32 @@ schema v40) and preselected on the next sync; a single non-`origin` remote is
 pinned automatically instead of failing upstream's hardcoded fetch. Details in
 `docs/FEATURES.md` ("Choosing the base remote").
 
+#### Type-to-filter selectors (host / base-branch / agent pickers)
+
+Upstream's new-session picker modals for the run-on host, the worktree base
+branch, and the coding agent are `j`/`k` + `Enter` selection lists — fine at a
+handful of rows, tedious once a repo has many branches or the registry many
+agents. The fork makes all three **fuzzy-filterable as you type**: a printable
+key builds a subsequence query over the row label (`ma` → `main`, `cl` →
+`claude`), matched characters are accent-highlighted, and the cursor snaps to
+the first match.
+
+- **Keymap shifts** because printable keys now type: navigation moves to
+  `↑`/`↓` (and `Ctrl+N`/`Ctrl+P`); `j`/`k` no longer navigate these three
+  modals. `Backspace` narrows the query; `Esc` clears an active query first and
+  only closes the modal once it is empty (the footer's secondary button reads
+  `Clear` while filtering).
+- **Shared plumbing.** A new `fuzzy::FuzzyFilter` holds the query + matching row
+  indices and remaps the selection cursor across edits (kept in *filtered* row
+  space); the highlight/line/query-row rendering is factored into shared
+  `ui::` helpers (`fuzzy_highlighted_spans`, `selector_line_filtered`,
+  `render_filter_row`, `render_filter_selector_footer`) that the repo and
+  conversation pickers' existing highlighter now also route through. The match
+  is the same greedy scan already used elsewhere — microseconds, never a frame
+  block — and the base-branch query survives the background branch load
+  (ADR-P12), applying the instant the list lands. Details in `docs/FEATURES.md`
+  ("Type-to-filter selectors").
+
 ### Behavior fixes
 
 - **Worktree branch pre-fill keeps `/`.** In the new-worktree flow, the branch

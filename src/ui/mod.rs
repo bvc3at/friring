@@ -393,6 +393,37 @@ pub fn render_selector_footer(frame: &mut Frame, area: Rect) -> ModalButtons {
     )
 }
 
+/// [`render_selector_footer`] variant for the type-to-filter selectors
+/// (host / base-branch / agent pickers), where printable keys edit the fuzzy
+/// query instead of navigating: the hint teaches the two-mode keymap, and the
+/// secondary button reads `Clear` while a query is active because Esc drops
+/// the filter first and only closes the modal once it is empty.
+pub fn render_filter_selector_footer(
+    frame: &mut Frame,
+    area: Rect,
+    filter_active: bool,
+) -> ModalButtons {
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("type", Theme::keybind()),
+            Span::styled(" filter  ", Theme::keybind_desc()),
+            Span::styled("↑/↓", Theme::keybind()),
+            Span::styled(" navigate", Theme::keybind_desc()),
+        ])),
+        area,
+    );
+    render_action_footer(
+        frame,
+        area,
+        (
+            "Select",
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ),
+        if filter_active { "Clear" } else { "Cancel" },
+    )
+}
+
 pub fn status_color(status: SessionStatus) -> Color {
     match status {
         SessionStatus::Working => Theme::status_working(),
@@ -791,6 +822,76 @@ pub fn selector_line<'a>(label: &str, selected: bool) -> Line<'a> {
 /// selected/normal theme styles.
 pub fn selector_list_item<'a>(label: &str, selected: bool) -> ratatui::widgets::ListItem<'a> {
     ratatui::widgets::ListItem::new(selector_line(label, selected))
+}
+
+/// Build spans for `display` with the characters `query` fuzzy-matches
+/// accented on top of `style`. Shared by every fuzzy-filterable list so match
+/// highlighting reads identically; positions are byte offsets sliced by char
+/// width (multi-byte safe). A non-matching or empty query yields `display`
+/// unhighlighted.
+pub fn fuzzy_highlighted_spans(query: &str, display: &str, style: Style) -> Vec<Span<'static>> {
+    let positions = crate::fuzzy::fuzzy_match(query, display)
+        .map(|m| m.positions)
+        .unwrap_or_default();
+    let mut result = Vec::new();
+    let mut last = 0;
+    for &pos in &positions {
+        if pos > last {
+            result.push(Span::styled(display[last..pos].to_string(), style));
+        }
+        let end = display[pos..]
+            .chars()
+            .next()
+            .map(|c| pos + c.len_utf8())
+            .unwrap_or(pos + 1);
+        result.push(Span::styled(
+            display[pos..end].to_string(),
+            Style::default().fg(Theme::accent()),
+        ));
+        last = end;
+    }
+    if last < display.len() {
+        result.push(Span::styled(display[last..].to_string(), style));
+    }
+    result
+}
+
+/// [`selector_line`] variant for type-to-filter lists: the label's
+/// fuzzy-matched characters are accented. Falls back to the plain line while
+/// no query is typed.
+pub fn selector_line_filtered<'a>(label: &str, query: &str, selected: bool) -> Line<'a> {
+    if query.is_empty() {
+        return selector_line(label, selected);
+    }
+    let style = if selected {
+        Theme::selected_item()
+    } else {
+        Theme::normal_item()
+    };
+    let prefix = if selected { "▸ " } else { "  " };
+    let mut spans = vec![Span::styled(prefix.to_string(), style)];
+    spans.extend(fuzzy_highlighted_spans(query, label, style));
+    Line::from(spans)
+}
+
+/// Render the one-line query row of a type-to-filter selector: a `/` sigil,
+/// the typed query, and a muted `shown/total` match count. Only drawn while a
+/// query is active, so the sigil doubles as the "you are filtering" marker.
+pub fn render_filter_row(frame: &mut Frame, area: Rect, query: &str, shown: usize, total: usize) {
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("/ ", Style::default().fg(Theme::accent())),
+            Span::styled(
+                query.to_string(),
+                Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {shown}/{total}"),
+                Style::default().fg(Theme::text_muted()),
+            ),
+        ])),
+        area,
+    );
 }
 
 /// Render a labeled text input field with cursor visualization and horizontal

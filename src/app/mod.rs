@@ -1445,6 +1445,7 @@ impl App {
         self.modal = modals::Modal::HostPicker(crate::ui::host_picker_modal::HostPickerState {
             choices,
             selected_index: 0,
+            filter: Default::default(),
         });
     }
 
@@ -3531,6 +3532,7 @@ impl App {
         self.modal = modals::Modal::AgentPicker(crate::ui::agent_picker_modal::AgentPickerState {
             choices,
             selected_index,
+            filter: Default::default(),
         });
     }
 
@@ -3555,6 +3557,8 @@ impl App {
                 if let modals::Modal::BranchSelector(ref mut bs) = self.modal {
                     bs.branches = branches;
                     bs.loading = false;
+                    // A query typed while the list was loading applies now.
+                    bs.filter.refilter(&bs.branches, &mut bs.index);
                 }
                 self.metrics.bump(|p| &mut p.branch_loads_applied);
                 self.request_redraw();
@@ -12463,6 +12467,7 @@ mod tests {
         app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
             index: 0,
             branches: Vec::new(),
+            filter: Default::default(),
             loading: true,
         });
         let tx = app.branch_load.start();
@@ -12496,6 +12501,7 @@ mod tests {
         app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
             index: 0,
             branches: Vec::new(),
+            filter: Default::default(),
             loading: true,
         });
         let tx = app.branch_load.start();
@@ -13924,10 +13930,11 @@ mod tests {
         app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
             index: 0,
             branches: vec!["main".into(), "dev".into()],
+            filter: Default::default(),
             loading: false,
         });
-        // j advances the selection; Esc aborts and wipes the pending spawn state.
-        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        // ↓ advances the selection; Esc aborts and wipes the pending spawn state.
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         match app.modal {
             modals::Modal::BranchSelector(ref bs) => assert_eq!(bs.index, 1),
             ref other => panic!("expected the branch selector, got {other:?}"),
@@ -13938,6 +13945,130 @@ mod tests {
         assert!(app.new_session.all_repos.is_none());
         assert!(app.new_session.normal_repos.is_empty());
         assert!(app.new_session.fetch_done.is_none());
+    }
+
+    /// Typing in the branch selector fuzzy-filters the list; Enter picks the
+    /// selected *match* (not the row at the raw index), and the flow advances
+    /// to the session-name modal.
+    #[test]
+    fn branch_selector_typing_filters_and_enter_picks_match() {
+        let mut app = app_with_sessions(1);
+        app.new_session.repo_path = Some(PathBuf::from("/repo"));
+        app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
+            index: 0,
+            branches: vec!["develop".into(), "main".into(), "feature/map".into()],
+            filter: Default::default(),
+            loading: false,
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        match app.modal {
+            modals::Modal::BranchSelector(ref bs) => {
+                assert_eq!(bs.filter.len(bs.branches.len()), 2, "main + feature/map");
+                assert_eq!(bs.index, 0, "cursor snapped to the first match");
+            }
+            ref other => panic!("expected the branch selector, got {other:?}"),
+        }
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.new_session.base_branch.as_deref(), Some("main"));
+        assert!(matches!(app.modal, modals::Modal::SessionName(_)));
+    }
+
+    /// Esc on the branch selector is two-stage while a query is typed: the
+    /// first press only clears the filter (the modal and its pending flow
+    /// survive), the second closes.
+    #[test]
+    fn branch_selector_esc_clears_filter_before_closing() {
+        let mut app = app_with_sessions(1);
+        app.new_session.repo_path = Some(PathBuf::from("/repo"));
+        app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
+            index: 0,
+            branches: vec!["main".into(), "dev".into()],
+            filter: Default::default(),
+            loading: false,
+        });
+
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        match app.modal {
+            modals::Modal::BranchSelector(ref bs) => {
+                assert!(!bs.filter.is_active(), "first Esc only drops the query");
+            }
+            ref other => panic!("expected the branch selector, got {other:?}"),
+        }
+        assert!(app.new_session.repo_path.is_some(), "flow still pending");
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(app.new_session.repo_path.is_none());
+    }
+
+    /// A branch-filter query typed while the list is still loading (ADR-P12)
+    /// applies as soon as the background load delivers.
+    #[test]
+    fn branch_filter_typed_during_load_applies_on_delivery() {
+        let mut app = app_with_sessions(0);
+        app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
+            index: 0,
+            branches: Vec::new(),
+            filter: Default::default(),
+            loading: true,
+        });
+        let tx = app.branch_load.start();
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        tx.send(Ok(vec!["main".into(), "dev".into()])).unwrap();
+
+        app.poll_branch_load();
+
+        match app.modal {
+            modals::Modal::BranchSelector(ref bs) => {
+                assert!(!bs.loading);
+                assert_eq!(bs.filter.len(bs.branches.len()), 1, "only dev matches");
+                assert_eq!(bs.filter.real_index(bs.index, 2), Some(1));
+            }
+            ref other => panic!("expected the branch selector, got {other:?}"),
+        }
+    }
+
+    /// Typing in the agent picker filters on the rendered label (name +
+    /// command); Enter confirms the match under the cursor.
+    #[test]
+    fn agent_picker_typing_filters_and_enter_confirms_match() {
+        let mut app = app_with_sessions(0);
+        app.modal = modals::Modal::AgentPicker(crate::ui::agent_picker_modal::AgentPickerState {
+            choices: vec![
+                crate::ui::agent_picker_modal::AgentChoice {
+                    name: "claude".into(),
+                    command: "claude".into(),
+                },
+                crate::ui::agent_picker_modal::AgentChoice {
+                    name: "codex".into(),
+                    command: "codex".into(),
+                },
+            ],
+            selected_index: 1,
+            filter: Default::default(),
+        });
+        // The pending create an overlapping picker parks its choice on.
+        let _tx = app.worktree_create.start();
+        app.pending_worktree_create = Some(PendingWorktreeCreate {
+            backend: None,
+            normal_repos: vec![],
+            session_name: Some("sess".into()),
+            base_branch: "main".into(),
+            agent_pick: AgentPick::Open,
+        });
+
+        app.handle_key(KeyCode::Char('l'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(matches!(
+            app.pending_worktree_create.as_ref().unwrap().agent_pick,
+            AgentPick::Chosen(ref agent) if agent == "claude"
+        ));
     }
 
     #[test]

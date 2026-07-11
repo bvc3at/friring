@@ -249,11 +249,25 @@ not applicable.
    first selected repo becomes the session's `cwd`; the rest may be
    exposed to the agent depending on the agent's own flags.
 3. **Base branch selector** — worktree mode only.
+   Type-to-filter (see below).
 4. **Session name** — free text identifier shown in the sidebar.
 5. **New branch name** — worktree mode only.
 6. **Agent picker** — choose which coding agent runs in this
    session. Skipped when only one agent is defined in
-   `agents.toml`.
+   `agents.toml`. Type-to-filter (see below).
+
+**Type-to-filter selectors.** The host, base-branch, and agent
+pickers are single-key fuzzy-filterable: printable keys build a
+query (a subsequence match over the row label — `ma` → `main`, `cl`
+→ `claude`), matched characters are accent-highlighted, and the
+cursor snaps to the first match. Because printable keys type,
+navigation is `↑`/`↓` (or `Ctrl+N`/`Ctrl+P`) rather than `j`/`k`;
+`Backspace` narrows the query, `Enter` picks the highlighted match,
+and `Esc` clears an active query before it closes the modal. The
+match runs in microseconds (`fuzzy::FuzzyFilter`, the same greedy
+scan the repo/conversation pickers use), so it never blocks a
+frame — the base-branch query even survives the background branch
+load (ADR-P12), applying the moment the list arrives.
 
 A session is fully described by its repos and agent. There is no
 per-session model selection, permissions, prompt, tool, or skill

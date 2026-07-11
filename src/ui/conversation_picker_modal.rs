@@ -207,42 +207,13 @@ fn conversation_item<'a>(
     let mut spans = if query.is_empty() {
         vec![Span::styled(display, style)]
     } else {
-        highlighted_spans(query, &display, style)
+        super::fuzzy_highlighted_spans(query, &display, style)
     };
     spans.push(Span::styled(
         format!("  {}", age_label(now_ms, entry.mtime_ms)),
         Style::default().fg(Theme::text_muted()),
     ));
     ListItem::new(Line::from(spans))
-}
-
-/// Build spans for a row with fuzzy-match positions highlighted in the accent
-/// color (same slicing rules as the repo picker's highlighter).
-fn highlighted_spans(query: &str, display: &str, style: Style) -> Vec<Span<'static>> {
-    let positions = crate::fuzzy::fuzzy_match(query, display)
-        .map(|m| m.positions)
-        .unwrap_or_default();
-    let mut result = Vec::new();
-    let mut last = 0;
-    for &pos in &positions {
-        if pos > last {
-            result.push(Span::styled(display[last..pos].to_string(), style));
-        }
-        let end = display[pos..]
-            .chars()
-            .next()
-            .map(|c| pos + c.len_utf8())
-            .unwrap_or(pos + 1);
-        result.push(Span::styled(
-            display[pos..end].to_string(),
-            Style::default().fg(Theme::accent()),
-        ));
-        last = end;
-    }
-    if last < display.len() {
-        result.push(Span::styled(display[last..].to_string(), style));
-    }
-    result
 }
 
 /// Compact "last active" age: `now`, `12m`, `3h`, `5d`.
@@ -318,7 +289,8 @@ mod tests {
 
     #[test]
     fn highlighted_spans_accents_fuzzy_matches() {
-        let spans = highlighted_spans("fix", "fix the docs — ~/repo", Style::default());
+        let spans =
+            crate::ui::fuzzy_highlighted_spans("fix", "fix the docs — ~/repo", Style::default());
         assert_eq!(span_text(&spans), "fix the docs — ~/repo");
         let accented: String = spans
             .iter()
