@@ -388,6 +388,11 @@ fn install_external_file(
 /// merged entries on uninstall — robust across payload schema changes.
 const HOOK_SIGNAL_MARKER: &str = "friring-cli session signal";
 
+/// Pre-rename marker (Thurbox era). Existing installs merged their hook entries
+/// under this command name; uninstall must still prune them or the rename leaves
+/// stale `thurbox-cli` hooks behind (and reinstall would duplicate ours).
+const LEGACY_HOOK_SIGNAL_MARKER: &str = "thurbox-cli session signal";
+
 /// Read the JSON config at `path` (or `{}` when absent), parsed. A malformed
 /// file is an error rather than a silent overwrite — we never clobber config we
 /// can't safely round-trip.
@@ -456,8 +461,10 @@ fn install_config_merge(
 }
 
 /// Reverse an [`install_config_merge`]: prune our marked hook entries out of the
-/// agent's config file, leaving the user's own settings intact. A missing file
-/// is a no-op. Returns whether the path was touched.
+/// agent's config file, leaving the user's own settings intact. Prunes both the
+/// current and the legacy (pre-rename `thurbox-cli`) markers, so migrating an
+/// existing install also cleans up entries merged by the previous version. A
+/// missing file is a no-op. Returns whether the path was touched.
 fn revert_config_merge(m: &crate::session::ConfigMerge) -> Result<bool, String> {
     let dest = crate::agent::extension_config::expand_tilde(&m.path);
     if !dest.exists() {
@@ -473,6 +480,7 @@ fn revert_config_merge(m: &crate::session::ConfigMerge) -> Result<bool, String> 
         }
     };
     crate::agent::json_merge::prune_marked(&mut doc, HOOK_SIGNAL_MARKER);
+    crate::agent::json_merge::prune_marked(&mut doc, LEGACY_HOOK_SIGNAL_MARKER);
     write_json_if_changed(&dest, &doc)
 }
 
@@ -774,15 +782,24 @@ fn safe_join(home: &Path, rel: &str) -> Result<PathBuf, String> {
 
 /// Marker an installer-managed `substitute` file carries (in the template
 /// content) so reinstall can overwrite *its own* file but not one the user has
-/// edited (or whose marker they removed).
+/// edited (or whose marker they removed). [`LEGACY_MANAGED_MARKER`] is recognized
+/// too, so a file written by the pre-rename version is still treated as ours.
 const MANAGED_MARKER: &str = "friring `extension install`";
 
+/// Pre-rename managed marker (Thurbox era): files written by the previous version
+/// carry it, so uninstall/reinstall must still recognize them as ours rather than
+/// refuse to touch them (we self-heal to [`MANAGED_MARKER`] on the next rewrite).
+const LEGACY_MANAGED_MARKER: &str = "thurbox `extension install`";
+
 /// Whether `dest` is a `substitute` file the user has taken ownership of: it
-/// exists but no longer carries the managed marker. A missing file (fresh
-/// install) or one still carrying the marker is ours to (over)write.
+/// exists but carries neither the current nor the legacy managed marker. A
+/// missing file (fresh install) or one still carrying either marker is ours to
+/// (over)write.
 fn is_user_modified(dest: &Path) -> bool {
     match std::fs::read_to_string(dest) {
-        Ok(content) => !content.contains(MANAGED_MARKER),
+        Ok(content) => {
+            !(content.contains(MANAGED_MARKER) || content.contains(LEGACY_MANAGED_MARKER))
+        }
         Err(_) => false,
     }
 }
@@ -2343,6 +2360,57 @@ prompt = "tick"
     fn guard_refuses_shallow_dirs() {
         assert!(guard_removable_dir(Path::new("/x")).is_err());
         assert!(guard_removable_dir(Path::new("/home/me/flow")).is_ok());
+    }
+
+    #[test]
+    fn is_user_modified_recognizes_legacy_and_current_markers() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        // A file written by the pre-rename version carries the legacy marker and
+        // is still ours (it self-heals to the friring marker on the next rewrite).
+        let legacy = temp.path().join("legacy.json");
+        std::fs::write(&legacy, "thurbox `extension install` managed\n").unwrap();
+        assert!(!is_user_modified(&legacy), "legacy-managed file is ours");
+
+        // The current marker is ours too.
+        let current = temp.path().join("current.json");
+        std::fs::write(&current, "friring `extension install` managed\n").unwrap();
+        assert!(!is_user_modified(&current), "friring-managed file is ours");
+
+        // Neither marker → the user has taken ownership of the file.
+        let edited = temp.path().join("edited.json");
+        std::fs::write(&edited, "MY CUSTOM PERMS").unwrap();
+        assert!(is_user_modified(&edited), "an unmarked file is a user edit");
+    }
+
+    #[test]
+    fn revert_prunes_legacy_thurbox_hook_but_keeps_user_entry() {
+        // A pre-rename install merged its hook entry under the `thurbox-cli`
+        // command name; the friring-only marker no longer matches it, so uninstall
+        // must prune via the legacy marker while leaving the user's own hook alone.
+        let temp = tempfile::TempDir::new().unwrap();
+        let settings = temp.path().join("settings.json");
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"Stop":[{"command":"user"},{"hooks":[{"type":"command","command":"thurbox-cli session signal --state done || true"}]}]}}"#,
+        )
+        .unwrap();
+
+        let merge = crate::session::ConfigMerge {
+            path: settings.to_string_lossy().into_owned(),
+            source: None,
+            requires_dir: None,
+        };
+        let touched = revert_config_merge(&merge).unwrap();
+        assert!(touched, "the legacy entry was pruned");
+
+        let restored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            restored,
+            serde_json::json!({"hooks":{"Stop":[{"command":"user"}]}}),
+            "legacy thurbox-cli hook gone, the user's own hook remains"
+        );
     }
 
     #[test]
