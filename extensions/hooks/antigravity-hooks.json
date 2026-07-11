@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "thurbox-cli session signal --state idle || true"
+            "command": "friring-cli session signal --state idle || true"
           }
         ]
       }
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "thurbox-cli session signal --state working || true"
+            "command": "friring-cli session signal --state working || true"
           }
         ]
       }
@@ -25,7 +25,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "case \"$(cat)\" in *permission*|*Permission*|*approval*|*approve*) thurbox-cli session signal --state blocked ;; esac; true"
+            "command": "case \"$(cat)\" in *permission*|*Permission*|*approval*|*approve*) friring-cli session signal --state blocked ;; esac; true"
           }
         ]
       }
@@ -35,7 +35,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "thurbox-cli session signal --state done || true"
+            "command": "friring-cli session signal --state done || true"
           }
         ]
       }

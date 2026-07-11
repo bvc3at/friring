@@ -683,9 +683,9 @@ mod tests {
     #[test]
     fn subscription_changed_parses_canonical_line() {
         assert_eq!(
-            parse_notification("%subscription-changed thurbox-status $1 @5 2 %7 : done"),
+            parse_notification("%subscription-changed friring-status $1 @5 2 %7 : done"),
             Notification::SubscriptionChanged {
-                name: "thurbox-status".into(),
+                name: "friring-status".into(),
                 pane_id: "%7".into(),
                 value: "done".into(),
             }
@@ -696,10 +696,10 @@ mod tests {
     fn subscription_changed_ignores_future_use_args() {
         assert_eq!(
             parse_notification(
-                "%subscription-changed thurbox-status $1 @5 2 %7 extra stuff : working"
+                "%subscription-changed friring-status $1 @5 2 %7 extra stuff : working"
             ),
             Notification::SubscriptionChanged {
-                name: "thurbox-status".into(),
+                name: "friring-status".into(),
                 pane_id: "%7".into(),
                 value: "working".into(),
             }
@@ -1086,7 +1086,7 @@ mod tests {
 /// Property/fuzz tests proving the tmux control-mode **transport** is byte
 /// transparent: whatever the agent writes is exactly what comes out of
 /// [`decode_octal`] + [`ControlModeReader`], regardless of how tmux escapes it
-/// or how the byte stream is chunked. If these stay green, thurbox's transport
+/// or how the byte stream is chunked. If these stay green, friring's transport
 /// layer cannot be the source of glitched/stray characters in the rendered pane.
 #[cfg(test)]
 mod transport_proptests {

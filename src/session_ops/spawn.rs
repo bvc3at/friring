@@ -37,7 +37,7 @@ pub struct SpawnRequest {
     /// Optional parent session (lead/worker relationship for orchestration).
     /// Must reference an existing active session.
     pub parent_session_id: Option<SessionId>,
-    /// Optional originating task id. When set it is injected as `THURBOX_TASK`
+    /// Optional originating task id. When set it is injected as `FRIRING_TASK`
     /// so the session's outgoing messages auto-tag `from_task_id` without the
     /// agent passing any id by hand.
     pub task_id: Option<i64>,
@@ -61,7 +61,7 @@ pub struct SpawnResult {
     pub parent_session_id: Option<SessionId>,
 }
 
-/// Spawn a new session inside `tmux -L thurbox`, persisting its state to the
+/// Spawn a new session inside `tmux -L friring`, persisting its state to the
 /// shared SQLite database.
 pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnResult, String> {
     crate::paths::validate_safe_name(&req.name)?;
@@ -76,7 +76,7 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
     // `ssh:<host>`; `host` is the matching HostDef for remote git/tmux ops.
     let (backend_type, host) = resolve_host(req.host.as_deref())?;
 
-    // The def's `args` may reference thurbox-managed config files by their
+    // The def's `args` may reference friring-managed config files by their
     // *local* absolute path (e.g. claude's hooks `--settings <config>/hooks/
     // claude.json`), which the agent errors on when the path doesn't exist on
     // the host ("Settings file not found" → the pane dies instantly). Rewrite
@@ -115,8 +115,8 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         host.as_ref(),
     );
 
-    // Mint the thurbox SessionId up front so it can be injected into the
-    // process env (`THURBOX_SESSION`) before the agent launches.
+    // Mint the friring SessionId up front so it can be injected into the
+    // process env (`FRIRING_SESSION`) before the agent launches.
     let session_id = SessionId::default();
 
     let mut config = SessionConfig {
@@ -127,7 +127,7 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         backend: (backend_type != LOCAL_TMUX_BACKEND_TYPE).then(|| backend_type.clone()),
         ..SessionConfig::default()
     };
-    super::inject_thurbox_env(&mut config, &agent_session_id, req.task_id);
+    super::inject_friring_env(&mut config, &agent_session_id, req.task_id);
 
     let (command, args) = super::build_agent_invocation(&agent_def, &config);
 
@@ -367,7 +367,7 @@ pub(crate) fn build_multi_repo_workspace(
     }
 }
 
-/// Adapt agent `args` that reference thurbox-managed config files (by their
+/// Adapt agent `args` that reference friring-managed config files (by their
 /// *local* absolute path) for a spawn on the remote `host`, returning the args
 /// to actually launch with. An agent handed a path that doesn't exist on the
 /// host errors out and the pane dies instantly (claude: "Settings file not
@@ -383,13 +383,13 @@ pub(crate) fn build_multi_repo_workspace(
 ///   preceding flag** (e.g. the whole `--settings <path>` pair) with a warning
 ///   so the agent launches clean instead of dead.
 ///
-/// Scope is deliberately narrow: only paths under the **thurbox config dir**
+/// Scope is deliberately narrow: only paths under the **friring config dir**
 /// are touched (and only existing local files are copied), so an arbitrary
 /// path in the agent's own args — a repo path, a user file — is never
-/// rewritten or shipped. Each shipped file also has its thurbox-managed hook
+/// rewritten or shipped. Each shipped file also has its friring-managed hook
 /// commands rewritten for the host
 /// ([`super::builtin_hooks::rewrite_hook_signals_for_remote`]): the local
-/// `thurbox-cli session signal` can't work there, but a tmux pane user option
+/// `friring-cli session signal` can't work there, but a tmux pane user option
 /// can — the local TUI receives it over its control-mode subscription, so
 /// remote sessions get live hooks-driven status.
 ///
@@ -425,7 +425,7 @@ pub(crate) fn adapt_agent_args_for_remote(host: &HostDef, args: Vec<String>) -> 
     })
 }
 
-/// Where the local thurbox config root lands on `host`, or `None` when no
+/// Where the local friring config root lands on `host`, or `None` when no
 /// remote location can hold it (→ strip the args instead):
 /// - a non-POSIX (Windows `C:\…`) local root or a `psmux` host can't take a
 ///   POSIX copy at all;
@@ -436,7 +436,7 @@ fn remote_config_root(host: &HostDef, config_root: &str) -> Option<String> {
     if !config_root.starts_with('/') || host.mux() == "psmux" {
         tracing::warn!(
             "stripping local agent-config args for host '{}': no POSIX path for the \
-             thurbox config dir there",
+             friring config dir there",
             host.name
         );
         return None;
@@ -469,7 +469,7 @@ fn remote_config_root(host: &HostDef, config_root: &str) -> Option<String> {
 
 /// True when `path` is `root` itself or a descendant — a plain
 /// `starts_with` would also claim sibling dirs sharing the prefix
-/// (`…/thurbox-backup` under root `…/thurbox`).
+/// (`…/friring-backup` under root `…/friring`).
 fn path_under_root(path: &str, root: &str) -> bool {
     path.strip_prefix(root)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
@@ -629,7 +629,7 @@ mod tests {
 
     #[test]
     fn adapt_agent_args_is_identity_without_config_paths() {
-        // No arg references the thurbox config dir → args pass through
+        // No arg references the friring config dir → args pass through
         // untouched and, because the remote root is resolved lazily, no ssh
         // round-trip is attempted (the host here doesn't exist).
         let temp = tempfile::TempDir::new().unwrap();
@@ -647,15 +647,15 @@ mod tests {
 
     #[test]
     fn rewrite_config_args_substitutes_translated_path() {
-        let args: Vec<String> = ["--settings", "/home/a/.config/thurbox/hooks/claude.json"]
+        let args: Vec<String> = ["--settings", "/home/a/.config/friring/hooks/claude.json"]
             .map(String::from)
             .into();
-        let out = rewrite_config_path_args(args, "/home/a/.config/thurbox", |p| {
+        let out = rewrite_config_path_args(args, "/home/a/.config/friring", |p| {
             Some(p.replace("/home/a/", "/home/b/"))
         });
         assert_eq!(
             out,
-            ["--settings", "/home/b/.config/thurbox/hooks/claude.json"].map(String::from)
+            ["--settings", "/home/b/.config/friring/hooks/claude.json"].map(String::from)
         );
     }
 
@@ -666,13 +666,13 @@ mod tests {
         let args: Vec<String> = [
             "--verbose",
             "--settings",
-            "/home/a/.config/thurbox/hooks/claude.json",
+            "/home/a/.config/friring/hooks/claude.json",
             "--session-id",
             "x",
         ]
         .map(String::from)
         .into();
-        let out = rewrite_config_path_args(args, "/home/a/.config/thurbox", |_| None);
+        let out = rewrite_config_path_args(args, "/home/a/.config/friring", |_| None);
         assert_eq!(out, ["--verbose", "--session-id", "x"].map(String::from));
     }
 
@@ -725,7 +725,7 @@ mod tests {
         let args: Vec<String> = ["--model", "opus", "--add-dir", "/home/a/repo"]
             .map(String::from)
             .into();
-        let out = rewrite_config_path_args(args.clone(), "/home/a/.config/thurbox", |_| {
+        let out = rewrite_config_path_args(args.clone(), "/home/a/.config/friring", |_| {
             panic!("map must not be called for non-config args")
         });
         assert_eq!(out, args);

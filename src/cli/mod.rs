@@ -1,7 +1,7 @@
-//! Command-line interface dispatcher for the `thurbox-cli` binary.
+//! Command-line interface dispatcher for the `friring-cli` binary.
 //!
 //! Output is human-readable by default and switches to JSON automatically when
-//! stdout is a pipe (so `thurbox-cli … | jq` keeps working). Force a format with
+//! stdout is a pipe (so `friring-cli … | jq` keeps working). Force a format with
 //! `--json` (compact), `--pretty` (indented JSON), or `--text` (human). See
 //! [`output::Format`].
 //!
@@ -30,9 +30,9 @@ pub mod version;
 
 use output::{CommandOutput, Format};
 
-/// Thurbox CLI — manage sessions, scheduled commands, and more.
+/// Friring CLI — manage sessions, scheduled commands, and more.
 #[derive(Parser, Debug)]
-#[command(name = "thurbox-cli", version, about)]
+#[command(name = "friring-cli", version, about)]
 pub struct Cli {
     /// Output JSON instead of the human-readable default.
     #[arg(long, global = true)]
@@ -103,7 +103,7 @@ pub enum Command {
     Update(update::UpdateArgs),
     /// Diagnose OS desktop notifications; `--test` fires a sample.
     Notify(notify::NotifyArgs),
-    /// Print the perf snapshot a running TUI publishes (THURBOX_PERF_LOG or
+    /// Print the perf snapshot a running TUI publishes (FRIRING_PERF_LOG or
     /// the perf HUD must be active in that TUI).
     Perf,
 }
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn pretty_flag_is_global() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "session", "list", "--pretty"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "session", "list", "--pretty"]).unwrap();
         assert!(cli.pretty);
         assert!(matches!(
             cli.command,
@@ -228,20 +228,20 @@ mod tests {
 
     #[test]
     fn json_and_text_flags_are_global() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "task", "list", "--json"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "task", "list", "--json"]).unwrap();
         assert!(cli.json);
         assert!(!cli.text);
-        let cli = Cli::try_parse_from(["thurbox-cli", "--text", "task", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "--text", "task", "list"]).unwrap();
         assert!(cli.text);
         assert!(!cli.json);
     }
 
     #[test]
     fn parse_session_create_requires_name_and_repo() {
-        assert!(Cli::try_parse_from(["thurbox-cli", "session", "create"]).is_err());
+        assert!(Cli::try_parse_from(["friring-cli", "session", "create"]).is_err());
 
         let cli = Cli::try_parse_from([
-            "thurbox-cli",
+            "friring-cli",
             "session",
             "create",
             "--name",
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn parse_session_create_accepts_parent() {
         let cli = Cli::try_parse_from([
-            "thurbox-cli",
+            "friring-cli",
             "session",
             "create",
             "--name",
@@ -308,7 +308,7 @@ mod tests {
         // disambiguate; this test fails-to-compile-or-panics if either side
         // regresses back to the colliding id.
         let cli = Cli::try_parse_from([
-            "thurbox-cli",
+            "friring-cli",
             "session",
             "send",
             "0f4dec1e-9d4b-4c4f-9d05-3a3a3a3a3a3a",
@@ -326,7 +326,7 @@ mod tests {
 
         // The original collision-triggering invocation: global `--text` flag set.
         let cli = Cli::try_parse_from([
-            "thurbox-cli",
+            "friring-cli",
             "--text",
             "session",
             "send",
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn parse_session_focus_takes_uuid() {
         let cli = Cli::try_parse_from([
-            "thurbox-cli",
+            "friring-cli",
             "session",
             "focus",
             "0f4dec1e-9d4b-4c4f-9d05-3a3a3a3a3a3a",
@@ -361,12 +361,12 @@ mod tests {
         };
         assert_eq!(uuid, "0f4dec1e-9d4b-4c4f-9d05-3a3a3a3a3a3a");
 
-        assert!(Cli::try_parse_from(["thurbox-cli", "session", "focus"]).is_err());
+        assert!(Cli::try_parse_from(["friring-cli", "session", "focus"]).is_err());
     }
 
     #[test]
     fn parse_session_signal_accepts_state_and_rejects_garbage() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "session", "signal", "--state", "blocked"])
+        let cli = Cli::try_parse_from(["friring-cli", "session", "signal", "--state", "blocked"])
             .unwrap();
         let Command::Session {
             action: sessions::Action::Signal { state, session },
@@ -379,7 +379,7 @@ mod tests {
 
         // The value_parser allow-list rejects unknown states.
         assert!(
-            Cli::try_parse_from(["thurbox-cli", "session", "signal", "--state", "exploded",])
+            Cli::try_parse_from(["friring-cli", "session", "signal", "--state", "exploded",])
                 .is_err()
         );
     }
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn parse_session_list_accepts_parent_filter() {
         let cli = Cli::try_parse_from([
-            "thurbox-cli",
+            "friring-cli",
             "session",
             "list",
             "--parent",
@@ -408,14 +408,14 @@ mod tests {
 
     #[test]
     fn parse_editor_set_and_get() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "editor", "get"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "editor", "get"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Editor {
                 action: editor::Action::Get
             }
         ));
-        let cli = Cli::try_parse_from(["thurbox-cli", "editor", "set", "code --wait"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "editor", "set", "code --wait"]).unwrap();
         let Command::Editor {
             action: editor::Action::Set { command },
         } = cli.command
@@ -428,11 +428,11 @@ mod tests {
     #[test]
     fn parse_automation_create_requires_args() {
         assert!(
-            Cli::try_parse_from(["thurbox-cli", "automation", "create"]).is_err(),
+            Cli::try_parse_from(["friring-cli", "automation", "create"]).is_err(),
             "missing required args should fail"
         );
         let cli = Cli::try_parse_from([
-            "thurbox-cli",
+            "friring-cli",
             "automation",
             "create",
             "--name",
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn automation_alias_auto_parses() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "auto", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "auto", "list"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Automation {
@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn automation_tick_parses() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "automation", "tick"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "automation", "tick"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Automation {
@@ -480,11 +480,11 @@ mod tests {
     #[test]
     fn parse_task_create_requires_title() {
         assert!(
-            Cli::try_parse_from(["thurbox-cli", "task", "create"]).is_err(),
+            Cli::try_parse_from(["friring-cli", "task", "create"]).is_err(),
             "missing --title should fail"
         );
         let cli =
-            Cli::try_parse_from(["thurbox-cli", "task", "create", "--title", "Fix bug"]).unwrap();
+            Cli::try_parse_from(["friring-cli", "task", "create", "--title", "Fix bug"]).unwrap();
         let Command::Task {
             action:
                 tasks::Action::Create {
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn parse_task_create_accepts_description() {
         let cli = Cli::try_parse_from([
-            "thurbox-cli",
+            "friring-cli",
             "task",
             "create",
             "--title",
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn parse_task_edit_accepts_description() {
         let cli = Cli::try_parse_from([
-            "thurbox-cli",
+            "friring-cli",
             "task",
             "edit",
             "3",
@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn task_alias_todo_parses() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "todo", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "todo", "list"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Task {
@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn parse_extension_install() {
         let cli = Cli::try_parse_from([
-            "thurbox-cli",
+            "friring-cli",
             "extension",
             "install",
             "flow",
@@ -587,7 +587,7 @@ mod tests {
 
     #[test]
     fn parse_extension_uninstall() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "extension", "uninstall", "flow", "--purge"])
+        let cli = Cli::try_parse_from(["friring-cli", "extension", "uninstall", "flow", "--purge"])
             .unwrap();
         let Command::Extension {
             action: extensions::Action::Uninstall { name, purge },
@@ -601,7 +601,7 @@ mod tests {
 
     #[test]
     fn parse_extension_activate() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "extension", "activate", "flow"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "extension", "activate", "flow"]).unwrap();
         let Command::Extension {
             action: extensions::Action::Activate { name },
         } = cli.command
@@ -614,7 +614,7 @@ mod tests {
     #[test]
     fn parse_extension_deactivate_with_flags() {
         let cli = Cli::try_parse_from([
-            "thurbox-cli",
+            "friring-cli",
             "extension",
             "deactivate",
             "flow",
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn parse_extension_update() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "extension", "update", "flow"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "extension", "update", "flow"]).unwrap();
         let Command::Extension {
             action: extensions::Action::Update { name, all, force },
         } = cli.command
@@ -647,7 +647,7 @@ mod tests {
         assert!(!force);
 
         let all_cli =
-            Cli::try_parse_from(["thurbox-cli", "ext", "update", "--all", "--force"]).unwrap();
+            Cli::try_parse_from(["friring-cli", "ext", "update", "--all", "--force"]).unwrap();
         let Command::Extension {
             action: extensions::Action::Update { name, all, force },
         } = all_cli.command
@@ -662,7 +662,7 @@ mod tests {
     #[test]
     fn parse_extension_update_no_name_means_all() {
         // No name and no --all is now valid: it updates every installed extension.
-        let cli = Cli::try_parse_from(["thurbox-cli", "extension", "update"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "extension", "update"]).unwrap();
         let Command::Extension {
             action: extensions::Action::Update { name, all, force },
         } = cli.command
@@ -676,7 +676,7 @@ mod tests {
 
     #[test]
     fn parse_extension_reinstall() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "extension", "reinstall", "flow", "--purge"])
+        let cli = Cli::try_parse_from(["friring-cli", "extension", "reinstall", "flow", "--purge"])
             .unwrap();
         let Command::Extension {
             action: extensions::Action::Reinstall { name, purge },
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn parse_extension_available_and_search_alias() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "extension", "available"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "extension", "available"]).unwrap();
         let Command::Extension {
             action: extensions::Action::Available { query },
         } = cli.command
@@ -699,7 +699,7 @@ mod tests {
         };
         assert!(query.is_none());
 
-        let cli = Cli::try_parse_from(["thurbox-cli", "ext", "search", "deps"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "ext", "search", "deps"]).unwrap();
         let Command::Extension {
             action: extensions::Action::Available { query },
         } = cli.command
@@ -711,7 +711,7 @@ mod tests {
 
     #[test]
     fn extension_alias_ext_parses() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "ext", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "ext", "list"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Extension {
@@ -723,11 +723,11 @@ mod tests {
     #[test]
     fn parse_message_send_requires_to_kind_body() {
         assert!(
-            Cli::try_parse_from(["thurbox-cli", "message", "send", "--to", "flow"]).is_err(),
+            Cli::try_parse_from(["friring-cli", "message", "send", "--to", "flow"]).is_err(),
             "missing --kind/--body should fail"
         );
         let cli = Cli::try_parse_from([
-            "thurbox-cli",
+            "friring-cli",
             "message",
             "send",
             "--to",
@@ -765,7 +765,7 @@ mod tests {
     #[test]
     fn parse_message_inbox_claim() {
         let cli = Cli::try_parse_from([
-            "thurbox-cli",
+            "friring-cli",
             "message",
             "inbox",
             "--for",
@@ -792,7 +792,7 @@ mod tests {
 
     #[test]
     fn message_alias_msg_parses() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "msg", "prune", "--older-than-days", "30"])
+        let cli = Cli::try_parse_from(["friring-cli", "msg", "prune", "--older-than-days", "30"])
             .unwrap();
         let Command::Message {
             action: messages::Action::Prune {
@@ -807,13 +807,13 @@ mod tests {
 
     #[test]
     fn parse_version_with_and_without_check() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "version"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "version"]).unwrap();
         let Command::Version(args) = cli.command else {
             panic!("expected Version");
         };
         assert!(!args.check);
 
-        let cli = Cli::try_parse_from(["thurbox-cli", "version", "--check"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "version", "--check"]).unwrap();
         let Command::Version(args) = cli.command else {
             panic!("expected Version");
         };
@@ -822,13 +822,13 @@ mod tests {
 
     #[test]
     fn parse_update_with_and_without_force() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "update"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "update"]).unwrap();
         let Command::Update(args) = cli.command else {
             panic!("expected Update");
         };
         assert!(!args.force);
 
-        let cli = Cli::try_parse_from(["thurbox-cli", "update", "--force"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "update", "--force"]).unwrap();
         let Command::Update(args) = cli.command else {
             panic!("expected Update");
         };
@@ -837,13 +837,13 @@ mod tests {
 
     #[test]
     fn parse_notify_with_and_without_test() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "notify"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "notify"]).unwrap();
         let Command::Notify(args) = cli.command else {
             panic!("expected Notify");
         };
         assert!(!args.test);
 
-        let cli = Cli::try_parse_from(["thurbox-cli", "notify", "--test"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "notify", "--test"]).unwrap();
         let Command::Notify(args) = cli.command else {
             panic!("expected Notify");
         };
@@ -852,7 +852,7 @@ mod tests {
 
     #[test]
     fn task_run_parses() {
-        let cli = Cli::try_parse_from(["thurbox-cli", "task", "run", "7"]).unwrap();
+        let cli = Cli::try_parse_from(["friring-cli", "task", "run", "7"]).unwrap();
         assert!(matches!(
             cli.command,
             Command::Task {

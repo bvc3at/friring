@@ -1,18 +1,18 @@
 # Flow extension manifest.
 #
 # This is the single source of truth for installing + running flow. Install it
-# with `thurbox-cli extension install flow` (or point at this directory:
-# `thurbox-cli extension install ./extensions/flow`). thurbox fetches this file,
+# with `friring-cli extension install flow` (or point at this directory:
+# `friring-cli extension install ./extensions/flow`). friring fetches this file,
 # lays down the [[files]] / [[symlinks]] under `home`, registers the [[agents]]
 # in agents.toml, then activates the [[sessions]] and self-heals them if
 # they're ever deleted. `{home}` is replaced with the
-# resolved home dir. Turn flow off with `thurbox-cli extension deactivate flow`.
+# resolved home dir. Turn flow off with `friring-cli extension deactivate flow`.
 
 name = "flow"
 description = "Focus-protecting triage agent"
 config_version = 1
 version = "1.3.0"                 # this extension's own version; bump on changes
-min_thurbox_version = "0.120.0"  # needs the `thurbox-cli message` mailbox queue
+min_thurbox_version = "0.120.0"  # needs the `friring-cli message` mailbox queue
 # No `home`: defaults to `<config>/extensions/flow` (override with --home).
 
 # --- agents registered in agents.toml (override the model by editing it) ------

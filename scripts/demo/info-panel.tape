@@ -1,13 +1,13 @@
-# VHS tape — Thurbox info panel feature clip.
+# VHS tape — Friring info panel feature clip.
 #
 # Do NOT run directly — run `scripts/demo/record.sh info-panel`, which
 # builds the dev binary, sets up the isolated env, seeds one session per real
-# agent CLI in a sample repo, and exports $THURBOX_BIN.
+# agent CLI in a sample repo, and exports $FRIRING_BIN.
 #
 # Ctrl+B toggles the info panel; Ctrl+J/K move between sessions. (No F-keys.)
 
-Output docs/media/thurbox-info-panel.gif
-Output docs/media/thurbox-info-panel.mp4
+Output docs/media/friring-info-panel.gif
+Output docs/media/friring-info-panel.mp4
 
 Set Shell "bash"
 Set FontSize 18
@@ -19,7 +19,7 @@ Set PlaybackSpeed 1.0
 
 # Launch the dev binary (isolated env from record.sh).
 Hide
-Type `exec "$THURBOX_BIN"`
+Type `exec "$FRIRING_BIN"`
 Enter
 Sleep 2s
 Show

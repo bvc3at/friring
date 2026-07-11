@@ -1,11 +1,11 @@
-# VHS tape for the ui-review skill — captures a PNG of each thurbox TUI state.
+# VHS tape for the ui-review skill — captures a PNG of each friring TUI state.
 #
 # Do NOT run this directly. scripts/capture.sh substitutes the __PLACEHOLDERS__
-# (__SHOT_DIR__, __WIDTH__, __HEIGHT__) and exports $THURBOX_BIN, then runs VHS in
+# (__SHOT_DIR__, __WIDTH__, __HEIGHT__) and exports $FRIRING_BIN, then runs VHS in
 # an isolated sandbox. VHS Screenshot paths are literal (no env expansion), which is
 # why capture.sh sed-substitutes the absolute screenshot dir here.
 #
-# VHS has no function-key commands, so this uses thurbox's Ctrl aliases:
+# VHS has no function-key commands, so this uses friring's Ctrl aliases:
 #   Ctrl+B = info panel, Ctrl+E = file viewer, Ctrl+W = tasks, Ctrl+P = automations,
 #   Ctrl+A = global search, Ctrl+Y = theme picker, Ctrl+N = new session,
 #   Ctrl+G = keybindings help, Ctrl+J = next session, Ctrl+X = settings.
@@ -25,7 +25,7 @@ Set Theme "Catppuccin Mocha"
 
 # --- Launch the dev TUI (isolated env from capture.sh) ----------------------
 Hide
-Type `exec "$THURBOX_BIN"`
+Type `exec "$FRIRING_BIN"`
 Enter
 Sleep 2s
 Show
@@ -85,7 +85,7 @@ Screenshot "__SHOT_DIR__/02-second-session.png"
 
 # Focus the session list. The panel-toggle chords below (Ctrl+B/E/W/P) are
 # terminal-PASSTHROUGH actions: while a session terminal is focused they are
-# forwarded to the agent CLI instead of running the thurbox command, so they
+# forwarded to the agent CLI instead of running the friring command, so they
 # must be issued from the session list. Ctrl+H (focus previous pane) is NOT a
 # passthrough, so it reliably moves focus Terminal -> session list. Each toggle
 # below returns focus to the session list when closed, so one Ctrl+H suffices.

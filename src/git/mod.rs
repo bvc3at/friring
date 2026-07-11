@@ -14,7 +14,7 @@ use crate::shell::{posix_quote, ssh_command, wsl_command};
 /// The ambient `GIT_*` variables that pin git to a specific repo/index/worktree,
 /// overriding the path we point it at via `current_dir`/`-C`. Git exports these
 /// to hook processes (a `pre-commit` hook runs with `GIT_DIR`/`GIT_INDEX_FILE`
-/// set), so if thurbox — or its test suite under the project's pre-commit
+/// set), so if friring — or its test suite under the project's pre-commit
 /// `cargo nextest` hook — inherits them, a `git` call targeting an explicit
 /// worktree would silently operate on the *hook's* repo instead (writing the
 /// wrong index, running the wrong hooks). Every git invocation scrubs them so it
@@ -133,7 +133,7 @@ pub(crate) fn remote_home(host: &HostDef) -> Result<String> {
 /// Deterministic worktree directory path for a repo + branch on the given host.
 ///
 /// Local hosts use [`worktree_path`]. Remote hosts place worktrees under the
-/// host's `worktrees_dir` (or `$HOME/.local/share/thurbox/worktrees` resolved
+/// host's `worktrees_dir` (or `$HOME/.local/share/friring/worktrees` resolved
 /// over ssh), preserving the same `<repo-hash>/<sanitized-branch>` layout.
 fn worktree_path_for(host: Option<&HostDef>, repo_path: &Path, branch: &str) -> Result<PathBuf> {
     match host {
@@ -141,10 +141,10 @@ fn worktree_path_for(host: Option<&HostDef>, repo_path: &Path, branch: &str) -> 
         Some(h) => {
             let base = match &h.worktrees_dir {
                 Some(dir) => dir.clone(),
-                None => format!("{}/.local/share/thurbox/worktrees", remote_home(h)?),
+                None => format!("{}/.local/share/friring/worktrees", remote_home(h)?),
             };
             // The host is remote (always POSIX), so the path must be `/`-joined
-            // even when thurbox itself runs on Windows — `PathBuf::join` would
+            // even when friring itself runs on Windows — `PathBuf::join` would
             // otherwise insert `\` and produce a path the remote shell rejects.
             Ok(PathBuf::from(worktree_subpath_posix(
                 &base, repo_path, branch,
@@ -189,8 +189,8 @@ pub fn ensure_remote_workspace(
 }
 
 /// The remote workspace directory for a session id on `host`, mirroring the
-/// local layout (`<thurbox data root>/workspaces/<sanitized id>`). Base:
-/// `<worktrees_dir>/..`, or `$HOME/.local/share/thurbox`. Sanitizes the id
+/// local layout (`<friring data root>/workspaces/<sanitized id>`). Base:
+/// `<worktrees_dir>/..`, or `$HOME/.local/share/friring`. Sanitizes the id
 /// with the same shared helper as the local builder
 /// (`workspace::workspace_dir`) — including its empty-id rejection: an empty
 /// segment would make the `rm -rf` in ensure/remove target the workspaces
@@ -201,7 +201,7 @@ pub(crate) fn remote_workspace_dir(host: &HostDef, id: &str) -> Result<String> {
             .parent()
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_else(|| dir.clone()),
-        None => format!("{}/.local/share/thurbox", remote_home(host)?),
+        None => format!("{}/.local/share/friring", remote_home(host)?),
     };
     let segment = crate::paths::sanitize_workspace_segment(id);
     anyhow::ensure!(!segment.is_empty(), "empty workspace id");
@@ -273,9 +273,9 @@ fn host_shell_c(host: &HostDef, script: &str) -> Command {
 /// Write `bytes` to `remote_path` on `host`, creating the parent directory.
 /// Streams the bytes over the host launcher's stdin into `cat > <path>`, so it
 /// is transport-neutral (ssh/wsl) and needs no `scp`/`\\wsl$` share. Used to
-/// materialize thurbox-managed agent config (e.g. the hooks `--settings
+/// materialize friring-managed agent config (e.g. the hooks `--settings
 /// claude.json`, with its commands rewritten for the host) on the remote so
-/// the agent — launched with a `--settings <path>` that thurbox generated
+/// the agent — launched with a `--settings <path>` that friring generated
 /// against the *local* config dir — finds the file at that path there too.
 pub fn copy_bytes_to_remote(host: &HostDef, bytes: &[u8], remote_path: &str) -> Result<()> {
     use std::io::Write;
@@ -394,7 +394,7 @@ fn repo_name_cache() -> &'static Mutex<HashMap<PathBuf, String>> {
 /// Get a short display name for a repo directory.
 ///
 /// Tries to extract the repo name from `git remote get-url origin`
-/// (e.g. `github.com/user/thurbox.git` → `"thurbox"`).
+/// (e.g. `github.com/user/friring.git` → `"friring"`).
 /// Falls back to the directory's file name if no remote is found.
 /// Results are cached globally.
 pub fn repo_display_name(path: &Path) -> Option<String> {
@@ -573,7 +573,7 @@ fn run_diff(host: Option<&HostDef>, worktree: &Path, args: &[&str]) -> Option<St
 /// Create a git worktree on a new branch and return the worktree directory path.
 ///
 /// Creates `new_branch` starting from `base_branch`.
-/// Path format: `~/.local/share/thurbox/worktrees/<repo-hash>/<sanitized-branch>`
+/// Path format: `~/.local/share/friring/worktrees/<repo-hash>/<sanitized-branch>`
 pub fn create_worktree(repo_path: &Path, new_branch: &str, base_branch: &str) -> Result<PathBuf> {
     create_worktree_on(None, repo_path, new_branch, base_branch)
 }
@@ -770,7 +770,7 @@ pub fn branch_exists_on(host: Option<&HostDef>, repo_path: &Path, branch: &str) 
 /// the source repo (which would cause Claude Code to discover duplicate
 /// `.claude/commands/` skill files).
 ///
-/// Path format: `~/.local/share/thurbox/worktrees/<repo-hash>/<sanitized-branch>`
+/// Path format: `~/.local/share/friring/worktrees/<repo-hash>/<sanitized-branch>`
 fn worktree_path(repo_path: &Path, branch: &str) -> Option<PathBuf> {
     Some(worktree_subpath(
         paths::worktrees_directory()?,
@@ -1875,8 +1875,8 @@ mod tests {
     #[test]
     fn parse_ssh_url() {
         assert_eq!(
-            parse_repo_name_from_url("git@github.com:user/thurbox.git"),
-            Some("thurbox".to_string())
+            parse_repo_name_from_url("git@github.com:user/friring.git"),
+            Some("friring".to_string())
         );
     }
 

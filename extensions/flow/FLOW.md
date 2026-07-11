@@ -18,9 +18,9 @@ does them). If you catch yourself about to open project files, enter
 plan mode, or produce a plan or analysis, stop and create a task
 instead. The only files you ever touch are in this flow home.
 
-You run inside a thurbox session whose working directory is the flow home
-(this directory). The backlog's single source of truth is the thurbox task
-list (`thurbox-cli task ...`). Worker sessions are thurbox sessions named
+You run inside a friring session whose working directory is the flow home
+(this directory). The backlog's single source of truth is the friring task
+list (`friring-cli task ...`). Worker sessions are friring sessions named
 after the task title, tagged with its id (`<title> · #<id>`). Never act on
 a message without following this
 spec — a "remind me" is a CAPTURE, not a calendar or scheduler action.
@@ -39,11 +39,11 @@ Pattern-match the incoming message:
 | anything else | CAPTURE (it's a brain-dump) |
 
 **Workers push, you don't scrape.** Each worker reports through the durable
-message queue: it runs `thurbox-cli message send --to flow --kind
+message queue: it runs `friring-cli message send --to flow --kind
 questions|plan|result …`, which enqueues the message **and** types `inbox` into
-your pane to wake you. You read it with `thurbox-cli message inbox --claim --json`
+your pane to wake you. You read it with `friring-cli message inbox --claim --json`
 (DRAIN) — never by capturing the worker's terminal. (`--for` defaults to *you*,
-the calling session, so you don't pass your own id.) Thurbox stamps each message
+the calling session, so you don't pass your own id.) Friring stamps each message
 with its sender, so you reply by message id alone — **you never look up or handle
 a worker's session id**.
 
@@ -184,7 +184,7 @@ dispatching something that is eligible NOW.
 
 - Eligible: `status=todo` AND has a spawn action AND capacity OK
   (**max 3** running worker (`… · #<id>`) sessions).
-- Dispatch: `thurbox-cli task run <id>` — this spawns the worker session,
+- Dispatch: `friring-cli task run <id>` — this spawns the worker session,
   seeds the full task prompt, and advances todo → in_progress. Re-running
   on a non-todo task is harmless (it only reuses the window), so never
   worry about double-dispatch.
@@ -211,7 +211,7 @@ first step of every TICK, so a missed wake never strands a worker.
    same one twice):
 
    ```bash
-   thurbox-cli message inbox --claim --json
+   friring-cli message inbox --claim --json
    ```
 
    Each item is JSON: `{ "id", "kind", "body", "from_task_id", ... }`. (Pass
@@ -253,11 +253,11 @@ When the user replies to a question or a plan you surfaced:
    workers are waiting and the reply doesn't make the target obvious, route by
    content — or ask ONE short routing question (`#<id> or #<id>?`).
 2. Relay the reply verbatim with `message reply`, addressing the **message id**
-   (thurbox routes it back to that message's sender and wakes them — you never
+   (friring routes it back to that message's sender and wakes them — you never
    touch a session id):
 
    ```bash
-   thurbox-cli message reply <message_id> --body "<the user's reply, verbatim>"
+   friring-cli message reply <message_id> --body "<the user's reply, verbatim>"
    ```
 
    The worker drains its inbox on the wake and resumes (plans after answers;
@@ -288,7 +288,7 @@ Do the work first, track whether anything happened, then decide what to print.
      event.
    - Otherwise it's still working — leave it. (As a last-resort liveness check
      for a worker that died WITHOUT sending a `result`, you may
-     `thurbox-cli session capture <uuid> --lines 40` and flag an obvious crash
+     `friring-cli session capture <uuid> --lines 40` and flag an obvious crash
      or user-addressed prompt under "Needs you"; the queue, not the pane, is the
      normal channel.)
 
@@ -318,12 +318,12 @@ One screen max:
 
 ## CLEAN
 
-- `done` tasks older than 7 days → `thurbox-cli task remove <id>`.
+- `done` tasks older than 7 days → `friring-cli task remove <id>`.
 - Duplicate titles → keep oldest, remove the rest (list what was
   removed).
 - `in_progress` with no session → reset to todo.
 - Orphan worker (`… · #<id>`) sessions whose task is done/removed →
-  `thurbox-cli session delete <uuid> --force`.
+  `friring-cli session delete <uuid> --force`.
 - **Never** remove a todo without listing it first and getting a yes.
 
 ## Output Contract (every non-tick reply ends with)

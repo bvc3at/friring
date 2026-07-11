@@ -16,7 +16,7 @@ rendered as terminal panels via ratatui + tui-term. Sessions survive
 crashes/restarts because tmux keeps the processes alive.
 
 Each session picks **which agent** to run from a declarative registry
-(`~/.config/thurbox/agents.toml`). Friring is agent-neutral: it knows nothing
+(`~/.config/friring/agents.toml`). Friring is agent-neutral: it knows nothing
 about any agent's model, permissions, prompts, or tools — only how to launch the
 CLI with the right `command + args`.
 
@@ -28,13 +28,18 @@ This repository is **Friring**, a personal fork of
 
 Two rules matter when working here:
 
-- **Don't rename the plumbing.** The binary (`thurbox`/`thurbox-cli`), config
-  dirs (`~/.config/thurbox`), tmux socket (`-L thurbox`), `THURBOX_*` env vars,
-  and the crate name stay as-is — Friring is a branding layer over the upstream
-  binary, and renaming them would break drop-in compatibility and make every
-  upstream merge conflict-heavy. Only the project *name* in prose is rebranded
-  (this file + `README.md`); URLs, install, and packaging still point at
-  upstream on purpose.
+- **The plumbing is renamed to `friring` (July 2026).** The binaries
+  (`friring`/`friring-cli`), the crate, config dir (`~/.config/friring`), data
+  dir + DB (`~/.local/share/friring/friring.db`), tmux socket (`-L friring`),
+  and `FRIRING_*` env vars are all `friring` now. What still says `thurbox` is
+  deliberate: upstream **attributions** (repo URLs, `LICENSE`, provenance) and
+  the upstream **distribution machinery** the fork reuses rather than
+  republishes — `packaging/` registry manifests, `scripts/install.*`,
+  `cd.yml`/`pages.yml`, `website/`, self-update / version-check code, the
+  `min_thurbox_version` manifest key, and the `tb-`/`tbs-` tmux window prefixes.
+  Upstream merges now carry rename conflicts; resolve them toward `friring` for
+  this app's own identifiers, leaving the attribution/distribution names as
+  upstream.
 - **Log every divergence in [`FORK.md`](FORK.md).** Whenever a change makes this
   fork behave differently from upstream (a new feature, a changed default, a
   guarded workflow), add a bullet under its "Differences from upstream" section
@@ -43,7 +48,7 @@ Two rules matter when working here:
 ## Commands
 
 ```bash
-just build                           # build thurbox + thurbox-cli
+just build                           # build friring + friring-cli
 just test                            # cargo nextest run --all
 just lint                            # fmt-check + clippy + deny + rumdl + shellcheck
 cargo nextest run -E 'test(name)'    # run a single test by name
@@ -81,12 +86,12 @@ loop, and every ADR are in **`docs/ARCHITECTURE.md`**.
 Key facts:
 
 - MSRV 1.75, Edition 2021; async runtime tokio (multi-threaded).
-- Session backend `TmuxBackend` over a `TmuxTransport` (local `tmux -L thurbox`,
+- Session backend `TmuxBackend` over a `TmuxTransport` (local `tmux -L friring`,
   or `ssh <dest> tmux …` / `wsl.exe …` for remote hosts). Requires tmux ≥ 3.2.
 - Output read in `spawn_blocking`, parsed by `vt100::Parser`, rendered by
   `tui_term`; input written via mpsc.
-- State in SQLite `~/.local/share/thurbox/thurbox.db` (`XDG_DATA_HOME`
-  respected); agents in `~/.config/thurbox/agents.toml`, hosts in `hosts.toml`.
+- State in SQLite `~/.local/share/friring/friring.db` (`XDG_DATA_HOME`
+  respected); agents in `~/.config/friring/agents.toml`, hosts in `hosts.toml`.
 
 ## Every change
 
@@ -123,6 +128,6 @@ Detail is read on demand — jump to the doc for what you're touching:
 | Any config file (agents / hosts / settings / themes / keybindings), env var, or DB setting | `docs/CONFIG.md` |
 | A user-facing feature — sessions, code review, automations, tasks, global search, notifications, status, remote/WSL, extensions, keybindings | `docs/FEATURES.md` |
 | Render-loop performance, perf counters, redraw throttling | `docs/PERFORMANCE.md` |
-| The headless CLI (`thurbox-cli`) | `docs/CLI.md` |
+| The headless CLI (`friring-cli`) | `docs/CLI.md` |
 | Cutting a release, versioning, installers, packaging | `docs/RELEASING.md` |
 | What this fork changes vs upstream, and fork-only features (e.g. the F9 activity view, conversation import) | `FORK.md` |

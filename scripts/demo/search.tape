@@ -1,9 +1,9 @@
-# VHS tape for the Thurbox Global Search feature demo (Ctrl+A).
+# VHS tape for the Friring Global Search feature demo (Ctrl+A).
 #
 # Do NOT run this directly — run `scripts/demo/record.sh search`, which builds
 # the dev binary, sets up an isolated environment, seeds one session per real
 # agent CLI plus a few tasks/automations to search over, and exports the env
-# vars this tape relies on ($THURBOX_BIN).
+# vars this tape relies on ($FRIRING_BIN).
 #
 # Requires: vhs (charmbracelet/vhs) + ffmpeg + ttyd. Global search opens with
 # Ctrl+A (a reliable chord on every terminal); the strip docks full-width along
@@ -20,9 +20,9 @@ Set Padding 16
 Set Theme "Catppuccin Mocha"
 Set PlaybackSpeed 1.0
 
-# Launch the dev binary (isolated thurbox-dev socket + XDG dirs from the runner).
+# Launch the dev binary (isolated friring-dev socket + XDG dirs from the runner).
 Hide
-Type `exec "$THURBOX_BIN"`
+Type `exec "$FRIRING_BIN"`
 Enter
 Sleep 2s
 Show

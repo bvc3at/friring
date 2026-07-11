@@ -1,4 +1,4 @@
-# ShellCheck configuration for thurbox shell scripts.
+# ShellCheck configuration for friring shell scripts.
 # Run by the `shellcheck` pre-commit hook and the CI `shellcheck` job.
 #
 # The disabled checks below flag patterns that are intentional, idiomatic,

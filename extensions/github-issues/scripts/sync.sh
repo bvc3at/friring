@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # sync.sh — the deterministic one-shot reconcile run by the github-issues-tick
 # automation (an `AutomationAction::Exec` command — no agent, no session, no
-# tokens). thurbox's scheduler runs this every 15 min (TUI or headless
+# tokens). friring's scheduler runs this every 15 min (TUI or headless
 # heartbeat) and records its output in the automation run history.
 #
 # Order is push-then-pull so local status changes reach GitHub before the pull
 # reads state back:
-#   1. push-status.sh — push thurbox task status to GitHub (push_back=yes rows)
+#   1. push-status.sh — push friring task status to GitHub (push_back=yes rows)
 #   2. for each tracker row: fetch.sh "<query>" | upsert.sh --source github
 #
 # Provider-neutral except for SOURCE; every task-integration extension ships an

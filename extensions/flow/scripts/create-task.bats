@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
 # Tests for create-task.sh's plan-first prompt composition. These exercise the
-# pure `--dry-run` path (no thurbox-cli, no side effects), so they run anywhere
+# pure `--dry-run` path (no friring-cli, no side effects), so they run anywhere
 # bats is installed: `bats extensions/flow/scripts/create-task.bats`.
 
 setup() {
@@ -32,7 +32,7 @@ setup() {
   # The old batched phrasing (and its multi-question example body) must be gone.
   [[ "$output" != *"as ONE message"* ]]
   [[ "$output" != *"Q1 ..."* ]]
-  # The worker passes NO ids — thurbox injects identity + task tag. The old
+  # The worker passes NO ids — friring injects identity + task tag. The old
   # `--task <id>` / `--from` hand-typing must be gone, and the reply arrives in
   # the worker's own inbox (drained on the `inbox` wake).
   [[ "$output" != *"--task <id>"* ]]

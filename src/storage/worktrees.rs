@@ -123,7 +123,7 @@ mod tests {
             id: SessionId::default(),
             name: "S1".to_string(),
             agent: "developer".to_string(),
-            backend_id: "thurbox:@0".to_string(),
+            backend_id: "friring:@0".to_string(),
             backend_type: "tmux".to_string(),
             agent_session_id: None,
             cwd: None,

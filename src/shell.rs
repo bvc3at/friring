@@ -1,6 +1,6 @@
 //! Small shell/SSH command helpers shared across modules.
 //!
-//! Centralizes two things that would otherwise be duplicated wherever thurbox
+//! Centralizes two things that would otherwise be duplicated wherever friring
 //! shells out over SSH: POSIX single-quote escaping for tokens that a remote
 //! login shell will re-split, and construction of the `ssh <opts> <dest>`
 //! command prefix.
@@ -28,7 +28,7 @@ pub fn posix_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Defensive `ssh` options thurbox appends to **every** ssh invocation so a
+/// Defensive `ssh` options friring appends to **every** ssh invocation so a
 /// broken, unreachable, or password-only host fails fast and non-interactively
 /// instead of freezing the single-threaded TUI.
 ///
@@ -58,7 +58,7 @@ pub const SSH_HARDENING_OPTS: [&str; 8] = [
 /// Build an `ssh <opts> <hardening> <destination>` [`Command`], ready for the
 /// caller to append the remote command and its arguments.
 ///
-/// Every thurbox ssh use is non-interactive, so [`SSH_HARDENING_OPTS`] is always
+/// Every friring ssh use is non-interactive, so [`SSH_HARDENING_OPTS`] is always
 /// applied (after the caller's `ssh_opts`, which therefore take precedence).
 pub fn ssh_command(destination: &str, ssh_opts: &[String]) -> Command {
     let mut cmd = Command::new("ssh");
@@ -85,11 +85,11 @@ pub fn ssh_command(destination: &str, ssh_opts: &[String]) -> Command {
 ///   literally and the shell treats the whole blob as one command name (see
 ///   `git::host_shell_c`, which branches on this).
 ///
-/// No `--` separator is used (none of thurbox's commands start with a `-`,
+/// No `--` separator is used (none of friring's commands start with a `-`,
 /// matching the SSH path which also omits it).
 ///
 /// `wsl.exe` inherits the **caller's** current directory and tries to `chdir`
-/// to the same path inside the target distro — which fails when thurbox itself
+/// to the same path inside the target distro — which fails when friring itself
 /// runs inside *another* WSL distro (the caller's cwd, e.g. `/home/me/repo`,
 /// doesn't exist on the target). That failure prints a `WSL Relay ERROR:
 /// CreateProcessCommon chdir(...) failed` on stderr and corrupts the tmux
@@ -104,7 +104,7 @@ pub fn ssh_command(destination: &str, ssh_opts: &[String]) -> Command {
 /// mangles the pinned path into `<sibling-suffix>` + cwd — producing
 /// `chdir(Perso/home/…)` — so `current_dir("/")` alone does *not* suppress the
 /// error. `--cd /` bypasses that translation entirely. `--cd` is a Store/WSL2
-/// flag; the Unix-caller case is always WSL2 (thurbox is running inside a
+/// flag; the Unix-caller case is always WSL2 (friring is running inside a
 /// distro), so the legacy Windows-10-inbox concern doesn't apply here. A native
 /// Windows caller keeps the inherit behavior (its `C:\…` cwd maps to
 /// `/mnt/c/…` under default automount; there is no universally-valid Windows

@@ -1,23 +1,23 @@
 ---
 name: ui-review
-description: Capture screenshots of the thurbox TUI across its screens and panels, then generate an HTML report with UI/UX feedback. Run from the thurbox repo.
+description: Capture screenshots of the friring TUI across its screens and panels, then generate an HTML report with UI/UX feedback. Run from the friring repo.
 user-invocable: true
 allowed-tools: Read, Write, Bash, Glob, Skill
 ---
 
-# ui-review — screenshot the thurbox TUI and critique its UI/UX
+# ui-review — screenshot the friring TUI and critique its UI/UX
 
-This skill drives the **real** thurbox TUI inside an isolated, throwaway
+This skill drives the **real** friring TUI inside an isolated, throwaway
 environment, takes a PNG screenshot of each major screen/panel, then has Claude
 *look at* every screenshot and write a self-contained **HTML report** with UI/UX
 feedback.
 
 It reuses the proven isolation + seeding model from `scripts/demo/record.sh`, but
 swaps VHS video output for VHS `Screenshot` directives. Nothing it does touches your
-real thurbox sessions, tmux server, or agent accounts — everything runs against the
-`thurbox-dev` dev build in a `mktemp` sandbox that is torn down on exit.
+real friring sessions, tmux server, or agent accounts — everything runs against the
+`friring-dev` dev build in a `mktemp` sandbox that is torn down on exit.
 
-**Run this from the thurbox repo root** (or any subdir of it). The output lands in
+**Run this from the friring repo root** (or any subdir of it). The output lands in
 `target/ui-review/` (git-ignored).
 
 ## Requirements
@@ -36,7 +36,7 @@ per UI state plus a `manifest.json` describing them.
 ```bash
 SKILL_DIR="$(cd "$(dirname "$(readlink -f .claude/skills/ui-review/SKILL.md)")" && pwd)"
 # Default output dir is <repo>/target/ui-review/screenshots. Override with arg 1.
-# Optional flags: --theme <thurbox-theme> (default doom), --width N, --height N.
+# Optional flags: --theme <friring-theme> (default doom), --width N, --height N.
 "$SKILL_DIR/scripts/capture.sh"
 ```
 
@@ -96,8 +96,8 @@ publishes to GitHub Pages.
 
    ```json
    {
-     "title": "thurbox TUI — UI/UX Review",
-     "version": "<thurbox --version>", "theme": "Doom",
+     "title": "friring TUI — UI/UX Review",
+     "version": "<friring --version>", "theme": "Doom",
      "generated_at": "<date -u '+%Y-%m-%d %H:%M UTC'>",
      "recommendations": ["...top cross-screen recs..."],
      "screens": [

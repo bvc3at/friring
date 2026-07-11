@@ -1,27 +1,27 @@
 # Configuration Reference
 
-Every knob thurbox reads, where it lives, and how it behaves. One file
+Every knob friring reads, where it lives, and how it behaves. One file
 per audience/lifecycle: hand-edited registries are TOML, the
 machine-written keybindings are JSON, and concurrently-written runtime
 state lives in SQLite (see ADR-8/ADR-19 in `ARCHITECTURE.md` for the
 rationale).
 
-Dev builds (version `0.0.0-dev`) use `thurbox-dev` in place of
-`thurbox` in every path below, plus a `thurbox-dev` tmux socket, so a
+Dev builds (version `0.0.0-dev`) use `friring-dev` in place of
+`friring` in every path below, plus a `friring-dev` tmux socket, so a
 development checkout never touches your real setup.
 
 ## Files at a glance
 
 | File | Format | Edited by | Read | Purpose |
 |------|--------|-----------|------|---------|
-| `~/.config/thurbox/agents.toml` | TOML | you | **live** (mtime poll) | coding-agent CLI definitions |
-| `~/.config/thurbox/hosts.toml` | TOML | you | startup | remote SSH hosts + local WSL distros |
-| `~/.config/thurbox/settings.toml` | TOML | you + `Ctrl+,` panel | **live** (feature flags) / startup (rest) | tuning knobs + feature flags |
-| `~/.config/thurbox/themes.toml` | TOML | you | startup | custom theme palettes |
-| `~/.config/thurbox/keybindings.json` | JSON | F1 editor (or you) | **live** (mtime poll) | key chord overrides |
-| `~/.config/thurbox/extensions/<name>.toml` | TOML | `thurbox-cli extension install` | startup + tick | extension manifests (self-healed resources) |
-| `~/.local/share/thurbox/thurbox.db` | SQLite | thurbox | live | sessions, automations, tasks, theme, editor command |
-| `~/.local/share/thurbox/thurbox.log` | text | thurbox | — | logs (incl. config warnings) |
+| `~/.config/friring/agents.toml` | TOML | you | **live** (mtime poll) | coding-agent CLI definitions |
+| `~/.config/friring/hosts.toml` | TOML | you | startup | remote SSH hosts + local WSL distros |
+| `~/.config/friring/settings.toml` | TOML | you + `Ctrl+,` panel | **live** (feature flags) / startup (rest) | tuning knobs + feature flags |
+| `~/.config/friring/themes.toml` | TOML | you | startup | custom theme palettes |
+| `~/.config/friring/keybindings.json` | JSON | F1 editor (or you) | **live** (mtime poll) | key chord overrides |
+| `~/.config/friring/extensions/<name>.toml` | TOML | `friring-cli extension install` | startup + tick | extension manifests (self-healed resources) |
+| `~/.local/share/friring/friring.db` | SQLite | friring | live | sessions, automations, tasks, theme, editor command |
+| `~/.local/share/friring/friring.log` | text | friring | — | logs (incl. config warnings) |
 
 `agents.toml`, `keybindings.json`, and `settings.toml` reload **live**:
 the TUI polls their mtime (~1/s) and applies edits with a confirmation
@@ -86,8 +86,8 @@ back to the built-ins.
 Check everything from the command line:
 
 ```bash
-thurbox-cli config validate   # strict parse of every file; exit 1 on problems
-thurbox-cli config show       # effective config + where each value came from
+friring-cli config validate   # strict parse of every file; exit 1 on problems
+friring-cli config show       # effective config + where each value came from
 ```
 
 `validate` fails on unknown keys (they are typos or leftovers either
@@ -116,7 +116,7 @@ new_session_args = ["--session-id", "{id}"]   # emitted on a fresh spawn
 resume_latest = false       # true = id-less "resume last session in cwd"
 ```
 
-`{id}` is substituted with the thurbox-generated session UUID. Groups
+`{id}` is substituted with the friring-generated session UUID. Groups
 are emitted only when their driving value exists; precedence is
 fork > resume > new-session. `args` is always passed. **No model is
 ever passed** — each agent uses its own default config, so bake
@@ -125,7 +125,7 @@ ever passed** — each agent uses its own default config, so bake
 knobs. An agent that omits `resume_args` starts fresh on restart; the
 live tmux process is what carries its state across TUI restarts.
 
-**Session-id pinning vs. `resume_latest`.** thurbox generates the
+**Session-id pinning vs. `resume_latest`.** friring generates the
 `agent_session_id` (a UUID), but only `claude` accepts it at creation
 (`--session-id {id}`), so only claude can resume or fork *by that exact
 id*. The other built-ins can't pin or report their id, so they set
@@ -182,9 +182,9 @@ config_version = 1
 name = "devbox"               # backend id "ssh:devbox"; what --host expects
 destination = "me@devbox"     # "user@host" or a ~/.ssh/config alias
 ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
-socket = "thurbox"            # host `tmux -L` socket   (default "thurbox")
-session = "thurbox"           # host tmux session name  (default "thurbox")
-worktrees_dir = "/home/me/.local/share/thurbox/worktrees"  # abs; optional
+socket = "friring"            # host `tmux -L` socket   (default "friring")
+session = "friring"           # host tmux session name  (default "friring")
+worktrees_dir = "/home/me/.local/share/friring/worktrees"  # abs; optional
 multiplexer = "tmux"          # "psmux" for a Windows SSH host
 
 # A WSL distro (only to OVERRIDE auto-discovery, e.g. a custom worktrees_dir):
@@ -201,12 +201,12 @@ distro = "Ubuntu-22.04"       # the wsl.exe distro name (default = name)
 | `destination` | for ssh | — | ssh target (`user@host` or `~/.ssh/config` alias) |
 | `distro` | no | `name` | WSL distro name (`kind = "wsl"` only) |
 | `ssh_opts` | no | `[]` | extra ssh flags, one token per element (ssh only) |
-| `socket` | no | `thurbox` | host `tmux -L` socket |
-| `session` | no | `thurbox` | host tmux session name |
-| `worktrees_dir` | no | host `$HOME/.local/share/thurbox/worktrees` | absolute worktrees dir on the host/distro |
+| `socket` | no | `friring` | host `tmux -L` socket |
+| `session` | no | `friring` | host tmux session name |
+| `worktrees_dir` | no | host `$HOME/.local/share/friring/worktrees` | absolute worktrees dir on the host/distro |
 | `multiplexer` | no | `tmux` | host multiplexer binary; set to `psmux` for a Windows SSH host |
 
-**SSH** auth comes entirely from your `~/.ssh/config`; thurbox never
+**SSH** auth comes entirely from your `~/.ssh/config`; friring never
 handles credentials. **WSL** distros are reached with
 `wsl.exe -d <distro>` and need no config entry at all — on Windows they
 are **auto-discovered** (`wsl.exe -l -q`) and appear in the host picker
@@ -225,9 +225,9 @@ only the one-time process launch differs by host kind:
 
 | Kind | Launch prefix | Multiplexer |
 |------|---------------|-------------|
-| local | `<mux> -L thurbox …` | `tmux` (Linux/macOS) / `psmux` (Windows) — `DEFAULT_MUX` |
-| `ssh:<name>` | `ssh <dest> <mux> -L thurbox …` | the `multiplexer` field |
-| `wsl:<name>` | `wsl.exe -d <distro> tmux -L thurbox …` | `tmux`, inside the distro |
+| local | `<mux> -L friring …` | `tmux` (Linux/macOS) / `psmux` (Windows) — `DEFAULT_MUX` |
+| `ssh:<name>` | `ssh <dest> <mux> -L friring …` | the `multiplexer` field |
+| `wsl:<name>` | `wsl.exe -d <distro> tmux -L friring …` | `tmux`, inside the distro |
 
 Everything downstream of the launch is identical: the same POSIX quoting
 (`shell::posix_quote`) and the **byte-identical control-mode protocol**
@@ -262,7 +262,7 @@ remote SSH host can also pin `multiplexer = "psmux"`. psmux has known
   spawns (`psmux_window_command`) frame it in double quotes, and the
   headless local `spawn_window` passes it as a single argv arg.
 
-The **local** socket name honours the `THURBOX_SOCKET` env override
+The **local** socket name honours the `FRIRING_SOCKET` env override
 (`local_socket()`) — the only way to fully scope an instance on Windows,
 where every `-L <name>` resolves machine-wide (no `TMUX_TMPDIR`). Remote
 hosts take their socket from `hosts.toml`.
@@ -284,10 +284,10 @@ backend-name helpers `is_ssh_backend` / `is_wsl_backend` /
   (or `None` = local). The TUI new-session flow shows a **host picker**
   first (skipped when none are configured or discovered); the chosen host
   runs git worktree creation + branch listing. Headless:
-  `thurbox-cli session create --host <name>`.
+  `friring-cli session create --host <name>`.
 - **Worktrees** run via the host launcher (`git::*_on(host, …)` →
   `git::host_launcher` → `ssh …` / `wsl.exe …`) and live under the host's
-  `worktrees_dir` (else `$HOME/.local/share/thurbox/worktrees`, resolved
+  `worktrees_dir` (else `$HOME/.local/share/friring/worktrees`, resolved
   and cached per backend name — a WSL distro has no `destination`).
 - **Persistence/restore.** `backend_type` round-trips in SQLite; restore
   discovers windows **per backend**, so off-local sessions re-adopt
@@ -299,7 +299,7 @@ backend-name helpers `is_ssh_backend` / `is_wsl_backend` /
 
 ### Agent config, status, and teardown on a host
 
-- **Agent args.** Args that reference thurbox-managed config by a *local*
+- **Agent args.** Args that reference friring-managed config by a *local*
   path (the hooks extension's `--settings <config>/hooks/claude.json`)
   would kill a remote agent ("Settings file not found"), so
   `session_ops::spawn::adapt_agent_args_for_remote` rewrites them per
@@ -307,18 +307,18 @@ backend-name helpers `is_ssh_backend` / `is_wsl_backend` /
   remote home, the file copied there, and the arg substituted; on a
   **psmux host / non-POSIX config root / failed copy** the flag+path pair
   is **stripped** so the agent launches clean. The local-path env hints
-  (`THURBOX_METRICS_DIR` / `THURBOX_CONFIG_DIR` / `THURBOX_DATA_DIR`) are
-  likewise skipped for remote spawns (`inject_thurbox_env`); only the
+  (`FRIRING_METRICS_DIR` / `FRIRING_CONFIG_DIR` / `FRIRING_DATA_DIR`) are
+  likewise skipped for remote spawns (`inject_friring_env`); only the
   opaque identity vars travel.
 - **Session status** (hooks-driven, like local — see [Session
-  status](#session-status)). `thurbox-cli session signal` can't run from a
+  status](#session-status)). `friring-cli session signal` can't run from a
   host (there is no CLI there, and it would write the host's own DB), so
   the materialized hook file's commands are rewritten
   (`builtin_hooks::rewrite_hook_signals_for_remote`) to set a tmux **pane
-  user option** instead: `tmux set-option -p @thurbox_state <s>` needs no
+  user option** instead: `tmux set-option -p @friring_state <s>` needs no
   socket, pane id, or identity. The local TUI's control-mode connection
   subscribes once per connection (`refresh-client -B
-  'thurbox-status:%*:#{@thurbox_state}'`, re-armed on reconnect in
+  'friring-status:%*:#{@friring_state}'`, re-armed on reconnect in
   `ControlMode::start`; tmux ≥ 3.2) and drains `%subscription-changed`
   pushes (≤ 1/s) via `App::drain_remote_hook_events` into the same
   `set_hook_state` columns local signals use — so Done→seen
@@ -435,13 +435,13 @@ no results. Data is never touched, so re-enabling a flag is lossless.
 | `mouse` | `true` | mouse capture: clicks, wheel, drag-select, hover, scrollbars |
 | `notifications` | `true` | OS desktop notifications when a session needs attention |
 | `soft_delete` | `true` | TUI `Ctrl+D` soft-deletes (Ctrl+Z undo); off = hard delete after a confirmation prompt |
-| `version_check` | `false` | GitHub update check: TUI header "update available" badge + `thurbox-cli version --check` |
-| `auto_update` | `false` | Silent self-update: download + verify + replace the binaries on startup + `thurbox-cli update`; also auto-refreshes stale extensions |
+| `version_check` | `false` | GitHub update check: TUI header "update available" badge + `friring-cli version --check` |
+| `auto_update` | `false` | Silent self-update: download + verify + replace the binaries on startup + `friring-cli update`; also auto-refreshes stale extensions |
 
 `automations = false` is a full stop on the TUI side: the pane
 disappears (the session list takes the whole left column and `j`/`k`
 wrap within it), and the TUI neither fires due schedules nor arms the
-tmux heartbeat keeper on startup. Explicit `thurbox-cli automation`
+tmux heartbeat keeper on startup. Explicit `friring-cli automation`
 commands still work — and `automation create` still arms the
 heartbeat, so an already-armed keeper window (or an OS timer from
 `packaging/`) keeps firing schedules externally. Disabling
@@ -461,20 +461,20 @@ after a confirmation prompt (`Enter`/`y` to delete, `Esc`/`n` to
 cancel), since the teardown is irreversible. The soft-deleted row is
 still written last, so the session remains restorable via `Ctrl+U`
 (which re-spawns it fresh). This flag governs the TUI only:
-`thurbox-cli session delete` always soft-deletes unless you pass
+`friring-cli session delete` always soft-deletes unless you pass
 `--force`, regardless of the setting.
 
 `version_check = true` enables the update check (default `false`, since
 it makes a network call). On launch the TUI reads a cached result
-(`~/.local/share/thurbox/version-check.json`) and, if it is older than
+(`~/.local/share/friring/version-check.json`) and, if it is older than
 24 h, fires a single best-effort background fetch of GitHub's latest
 release (`api.github.com/repos/Thurbeen/thurbox/releases/latest`, via
 `curl`/`wget` — no new dependency); a newer release shows a `⬆ vX.Y.Z
 available` badge next to the version in the header. The fetch never runs
 on the render path and never blocks startup; failures are silent. Dev
 builds (`0.0.0-dev`) never show the badge. The same flag enables
-`thurbox-cli version --check`, which fetches fresh on demand and reports
-current vs. latest (`thurbox-cli version` with no flag always prints the
+`friring-cli version --check`, which fetches fresh on demand and reports
+current vs. latest (`friring-cli version` with no flag always prints the
 current version, regardless of the flag).
 
 `auto_update = true` goes a step further than `version_check`: instead of
@@ -484,14 +484,14 @@ that gate let the badge keep the cache "fresh" and starve the updater) it
 fetches the latest release tag; if a newer release exists it downloads that
 release's tarball + checksums from GitHub Releases (`curl`/`wget`, no new
 dependency), verifies the SHA256 (`sha256sum`/`shasum`), extracts it
-(`tar`), and atomically replaces the installed `thurbox`/`thurbox-cli`
+(`tar`), and atomically replaces the installed `friring`/`friring-cli`
 binaries in place — mirroring `scripts/install.sh`. The download is verified
 **before** any installed file is touched, so a failed/corrupt download leaves
 the current binaries untouched; the whole step runs before the TUI takes the
 terminal and is best-effort (any failure is logged and startup continues on
 the current version). The replaced binary takes effect on the **next launch**
 (the running process keeps its open file), so the TUI shows an "Updated to
-vX.Y.Z — restart to apply" status line. `thurbox-cli update` performs the
+vX.Y.Z — restart to apply" status line. `friring-cli update` performs the
 same update on demand (with `--force` to bypass the up-to-date and dev-build
 guards); dev builds (`0.0.0-dev`) never auto-update. The default install
 location (`~/.local/bin`) is user-writable; a system-wide install in a
@@ -504,7 +504,7 @@ extension only goes stale (`installed_with` ≠ the running binary) right after 
 upgrade. The self-heal pass — which already runs on TUI startup and on the
 headless `automation tick` — then refreshes each stale extension in place
 (re-fetching it from its recorded source) instead of only nudging you to run
-`thurbox-cli extension update`. The staleness check is local and network-free,
+`friring-cli extension update`. The staleness check is local and network-free,
 so a launch where nothing is stale does no extra work; a refresh runs at most
 once per extension per binary version. With `auto_update` off, the nudge is
 shown and you update extensions by hand.
@@ -532,8 +532,8 @@ inside the TUI, so a headless `automation tick` never notifies.
 | Backend | When | Click-to-focus |
 |---------|------|----------------|
 | `dbus` | normal Linux desktop with a running notification daemon (`org.freedesktop.Notifications`) | **yes** — clicking the banner writes a focus request the running TUI reads next tick and switches to that session |
-| `windows` (toast) | **native Windows**, or **WSL** / any Linux with no dbus daemon — delivers a Windows toast via `powershell.exe` (WSL needs interop, on by default) | no (a Windows toast can't call back into the thurbox process) |
-| `macos` | macOS native banner. Uses **`terminal-notifier`** when it's in `PATH` (own bundle + icon, looks like a real app notification — `brew install terminal-notifier`), otherwise the built-in **`osascript`** `display notification` (attributed to Apple's Script Editor). The `UNUserNotificationCenter` click API needs a signed `.app` bundle, which thurbox is not, so the `osascript` path is informational | **with `terminal-notifier`** — clicking the banner runs `thurbox-cli session focus <id>`, which writes the same metadata row the dbus path does and the TUI picks it up next tick. Without `terminal-notifier` (osascript fallback): no |
+| `windows` (toast) | **native Windows**, or **WSL** / any Linux with no dbus daemon — delivers a Windows toast via `powershell.exe` (WSL needs interop, on by default) | no (a Windows toast can't call back into the friring process) |
+| `macos` | macOS native banner. Uses **`terminal-notifier`** when it's in `PATH` (own bundle + icon, looks like a real app notification — `brew install terminal-notifier`), otherwise the built-in **`osascript`** `display notification` (attributed to Apple's Script Editor). The `UNUserNotificationCenter` click API needs a signed `.app` bundle, which friring is not, so the `osascript` path is informational | **with `terminal-notifier`** — clicking the banner runs `friring-cli session focus <id>`, which writes the same metadata row the dbus path does and the TUI picks it up next tick. Without `terminal-notifier` (osascript fallback): no |
 
 `auto` prefers `dbus` whenever a daemon answers, and only falls back to
 the Windows toast when no dbus service is reachable. Force a specific
@@ -547,8 +547,8 @@ logfile, so the user saw nothing. Delivery errors are now recorded and
 surfaced by the diagnostic:
 
 ```bash
-thurbox-cli notify          # show the detected backend + last delivery error
-thurbox-cli notify --test   # fire a sample notification to confirm it works
+friring-cli notify          # show the detected backend + last delivery error
+friring-cli notify --test   # fire a sample notification to confirm it works
 ```
 
 | Key | Default | Purpose |
@@ -566,11 +566,11 @@ you), and with `also_on_waiting = true` also on `Working → Done`.
 ## Session status
 
 Each session's state (Blocked / Working / Done / Idle / Error) is driven by
-**agent hooks** that call `thurbox-cli session signal --state
+**agent hooks** that call `friring-cli session signal --state
 <working|blocked|done|idle>`. The state is persisted on the `sessions` row
 (`hook_state`, `hook_state_at`, `seen_at` — schema v34) and survives the TUI
 being closed; a hook fired headlessly is picked up via `PRAGMA data_version`.
-Identity comes from the injected `THURBOX_SESSION` env var, so a hook passes
+Identity comes from the injected `FRIRING_SESSION` env var, so a hook passes
 no id. A finished turn shows `Done` (blue) — for the session you're watching too
 — and becomes `Idle` once you switch focus off it. Remote (`ssh:` /
 `wsl:`) sessions can't run the CLI, so their hooks report over a tmux
@@ -578,29 +578,29 @@ pane user option delivered by control-mode instead, landing in the same
 columns — see [hosts.toml](#hoststoml).
 
 The hooks are wired up automatically by the built-in **hooks** extension
-(auto-activated on first run). Opt out with `thurbox-cli extension deactivate
+(auto-activated on first run). Opt out with `friring-cli extension deactivate
 hooks`. The status colours are tunable theme keys (`status_working` /
 `status_blocked` / `status_done` / `status_idle` / `status_error` /
 `status_unreachable` — see `themes.toml`).
 
-The wiring is applied **only to agents thurbox launches** — it never edits your
-own global agent config (e.g. your personal `~/.claude/settings.json`). thurbox's
+The wiring is applied **only to agents friring launches** — it never edits your
+own global agent config (e.g. your personal `~/.claude/settings.json`). friring's
 managed hook config lives per agent, applied by injecting a flag into
 `agents.toml` or by a reversible merge into / managed file in the agent's own
 config dir:
 
 | Agent | On-disk location | How it's applied |
 |-------|------------------|------------------|
-| claude | `~/.config/thurbox/hooks/claude.json` | `--settings` flag (claude merges it with your own settings) |
+| claude | `~/.config/friring/hooks/claude.json` | `--settings` flag (claude merges it with your own settings) |
 | aider | — (no file) | `--notifications-command` flag |
-| opencode | `~/.config/opencode/plugin/thurbox-status.js` | managed plugin file |
-| codex | `~/.codex/hooks.json` | reversible JSON-merge of thurbox's entries |
+| opencode | `~/.config/opencode/plugin/friring-status.js` | managed plugin file |
+| codex | `~/.codex/hooks.json` | reversible JSON-merge of friring's entries |
 | vibe | `~/.vibe/hooks.toml` | managed file (refused if you already have one) |
-| antigravity | `~/.gemini/settings.json` | reversible JSON-merge of thurbox's entries |
+| antigravity | `~/.gemini/settings.json` | reversible JSON-merge of friring's entries |
 
-The home dir is `~/.config/thurbox/hooks` on a release build and
-`~/.config/thurbox-dev/hooks` on a dev build. Because claude *merges* the
-`--settings` file, your own hooks still fire inside a thurbox session — both run.
+The home dir is `~/.config/friring/hooks` on a release build and
+`~/.config/friring-dev/hooks` on a dev build. Because claude *merges* the
+`--settings` file, your own hooks still fire inside a friring session — both run.
 Hand-edits to a managed file are rewritten from the embedded payload on the next
 TUI start / heartbeat tick; to customize, deactivate the extension and wire the
 hook yourself, or edit the payload under `extensions/hooks/` and reinstall. Full
@@ -641,7 +641,7 @@ Custom themes load through
 (`session::theme_config::CustomThemeDef` → `ThemeEntry`) and are published
 to the renderer by `ui::theme::set_custom_themes`. The active choice is
 persisted in SQLite (`metadata.active_theme`, see [SQLite-backed
-settings](#sqlite-backed-settings)); other thurbox processes pick up a
+settings](#sqlite-backed-settings)); other friring processes pick up a
 change within one tick via `PRAGMA data_version` polling.
 
 ## keybindings.json
@@ -669,8 +669,8 @@ Maps `Action` names to one or more chord strings:
   readline / shell line-editing chords (`Ctrl+A` start-of-line, `Ctrl+E`
   end-of-line, `Ctrl+W` delete-word, `Ctrl+U` kill-line, `Ctrl+R`
   reverse-search, `Ctrl+D` EOF, plus `Ctrl+B/F/O/P/S`) are **forwarded to the
-  agent CLI** instead of triggering their thurbox command, so your terminal
-  muscle memory works inside a session. Those thurbox commands stay reachable
+  agent CLI** instead of triggering their friring command, so your terminal
+  muscle memory works inside a session. Those friring commands stay reachable
   from the **session list** (focus it with `Ctrl+H`) and via their `F`-key
   alternates (`F2` info panel, `F3` file viewer, `F5` tasks). Rebinding such an
   action to a key that isn't a bare `Ctrl+<letter>` makes it work in the
@@ -682,10 +682,10 @@ Maps `Action` names to one or more chord strings:
 ## extensions/
 
 Each opt-in extension (see `extensions/<name>/`) is described by a single
-`extension.toml` manifest. `thurbox-cli extension install` writes the
-home-resolved copy to `~/.config/thurbox/extensions/<name>.toml` (thurbox
+`extension.toml` manifest. `friring-cli extension install` writes the
+home-resolved copy to `~/.config/friring/extensions/<name>.toml` (friring
 never seeds this dir). The install **home** (where payload files land and the
-session runs) defaults to `~/.config/thurbox/extensions/<name>/` — a sibling dir
+session runs) defaults to `~/.config/friring/extensions/<name>/` — a sibling dir
 of that manifest — unless the manifest pins a `home` or you pass `--home`. The
 manifest has two halves — an **install** spec and a **runtime** spec:
 
@@ -694,7 +694,7 @@ name = "flow"
 description = "Focus-protecting triage agent"
 config_version = 1              # manifest *format* version (for migrations)
 version = "1.0.0"              # the extension's own version (bumped by its author)
-min_thurbox_version = "0.113.0" # minimum thurbox; older binaries get a warning
+min_thurbox_version = "0.113.0" # minimum friring; older binaries get a warning
 # home = "~/flow"               # OPTIONAL; default is <config>/extensions/<name>.
                                 # {home} is substituted everywhere it appears
 
@@ -755,19 +755,19 @@ prompt = "tick"
 Manage extensions with the CLI:
 
 ```bash
-thurbox-cli extension install flow         # fetch + lay files + agents + activate
-thurbox-cli extension install ./extensions/flow   # from a local dir
-thurbox-cli extension install <url> --home ~/x    # from a URL, custom home
-thurbox-cli extension uninstall <name>     # reverse install (keep home dir)
-thurbox-cli extension uninstall <name> --purge    # also delete the home dir
-thurbox-cli extension list                 # installed + active/healthy + version/stale
-thurbox-cli extension update <name>        # re-fetch from recorded source (refresh)
-thurbox-cli extension update --all         # update every installed extension
-thurbox-cli extension update <name> --force # also overwrite user-edited seed files
-thurbox-cli extension activate <name>      # (re)create resources + mark active
-thurbox-cli extension deactivate <name>    # tear down + stop self-heal
-thurbox-cli extension deactivate <name> --force --purge  # also kill tmux + drop manifest
-thurbox-cli extension status [<name>]      # per-resource presence + version/stale
+friring-cli extension install flow         # fetch + lay files + agents + activate
+friring-cli extension install ./extensions/flow   # from a local dir
+friring-cli extension install <url> --home ~/x    # from a URL, custom home
+friring-cli extension uninstall <name>     # reverse install (keep home dir)
+friring-cli extension uninstall <name> --purge    # also delete the home dir
+friring-cli extension list                 # installed + active/healthy + version/stale
+friring-cli extension update <name>        # re-fetch from recorded source (refresh)
+friring-cli extension update --all         # update every installed extension
+friring-cli extension update <name> --force # also overwrite user-edited seed files
+friring-cli extension activate <name>      # (re)create resources + mark active
+friring-cli extension deactivate <name>    # tear down + stop self-heal
+friring-cli extension deactivate <name> --force --purge  # also kill tmux + drop manifest
+friring-cli extension status [<name>]      # per-resource presence + version/stale
 ```
 
 A bare name installs from the official source
@@ -780,7 +780,7 @@ validated against traversal (no absolute paths or `..`), and a
 `--force`). Payload files are fetched as **text** (specs/scripts/JSON),
 not binaries.
 
-While an extension is **active**, thurbox **self-heals** its declared
+While an extension is **active**, friring **self-heals** its declared
 resources: on TUI startup and on every `automation tick` it re-creates
 any session/automation that has been deleted. So deleting them by hand is
 a no-op (they come back); `extension deactivate` is the real off-switch.
@@ -796,30 +796,30 @@ into the discovery-dir copy so staleness can be detected:
 | Field | Where set | Purpose |
 |-------|-----------|---------|
 | `version` | source manifest | the extension's own semver (author-bumped) |
-| `min_thurbox_version` | source manifest | minimum thurbox; older binaries warn |
-| `installed_with` | stamped on install | the thurbox version that installed it |
+| `min_thurbox_version` | source manifest | minimum friring; older binaries warn |
+| `installed_with` | stamped on install | the friring version that installed it |
 | `source` | stamped on install | the target it was installed from |
 
 A **bare-name** install (`extension install flow`) fetches from the
 official source **pinned to the running binary's release tag**, so the
-extension you get always matches your thurbox. When you later **upgrade
-thurbox**, the on-disk copy is now older than the binary — thurbox
+extension you get always matches your friring. When you later **upgrade
+friring**, the on-disk copy is now older than the binary — friring
 flags it as `stale` (in `extension list`/`status`, and as a one-line
 nudge from self-heal at startup). Run `extension update <name>` (or
 `--all`) to re-fetch from the recorded `source`; because a bare name
 re-resolves against the *new* binary's tag, this pulls the version that
-matches your upgraded thurbox. Updates honour the same file rules as
+matches your upgraded friring. Updates honour the same file rules as
 install — user-edited `substitute` files and `if_absent` seeds are
 preserved unless you pass `--force`.
 
 `min_thurbox_version` is a **soft** gate: an extension authored for a
-newer thurbox still installs on an older binary, but install/activate and
+newer friring still installs on an older binary, but install/activate and
 self-heal emit a compatibility warning so the mismatch is visible.
 **Dev builds** (`0.0.0-dev`) skip both the staleness and compatibility
 checks — their version doesn't order against release tags.
 
 **Rollback.** There's no version snapshot store: to roll an extension
-back, pin a specific thurbox tag — `extension install
+back, pin a specific friring tag — `extension install
 https://raw.githubusercontent.com/Thurbeen/thurbox/v0.112.0/extensions/flow`
 — or downgrade the binary and run `extension update`, which re-resolves
 the bare name to that older tag.
@@ -831,46 +831,46 @@ Live in the `metadata` table and apply immediately (no restart):
 | Key | Set via | Purpose |
 |-----|---------|---------|
 | `active_theme` | `Ctrl+Y` / `F4` picker | TUI palette (fifteen built-ins) |
-| `editor_command` | `thurbox-cli editor set "<cmd>"` | what `Ctrl+O` runs |
-| `active_extensions` | `thurbox-cli extension activate/deactivate` | JSON array of active extensions to self-heal |
-| `builtin_hooks_optout` | `thurbox-cli extension deactivate hooks` | `1` when the user opted out of the auto-activated hooks extension |
-| `perf_snapshot` | the TUI, while perf timing is active (`THURBOX_PERF_LOG` or an open perf HUD) | JSON perf snapshot read by `thurbox-cli perf` (see `docs/PERFORMANCE.md`) |
+| `editor_command` | `friring-cli editor set "<cmd>"` | what `Ctrl+O` runs |
+| `active_extensions` | `friring-cli extension activate/deactivate` | JSON array of active extensions to self-heal |
+| `builtin_hooks_optout` | `friring-cli extension deactivate hooks` | `1` when the user opted out of the auto-activated hooks extension |
+| `perf_snapshot` | the TUI, while perf timing is active (`FRIRING_PERF_LOG` or an open perf HUD) | JSON perf snapshot read by `friring-cli perf` (see `docs/PERFORMANCE.md`) |
 
 These are in the DB rather than a file because they are written
-concurrently by multiple thurbox processes (TUI, CLI, MCP) and picked
+concurrently by multiple friring processes (TUI, CLI, MCP) and picked
 up live via `PRAGMA data_version` polling.
 
 ## Environment variables
 
-User-set (read by thurbox):
+User-set (read by friring):
 
 | Variable | Used for |
 |----------|----------|
 | `XDG_CONFIG_HOME`, `XDG_DATA_HOME` | config/data roots |
 | `VISUAL`, then `EDITOR` | `Ctrl+O` editor when `editor_command` is unset |
 | `SHELL` | the `Ctrl+T` companion shell pane (fallback `/bin/sh`). For a remote/WSL session the pane uses the **host's** `$SHELL` as an interactive login shell (the SSH-login environment), not the local one. |
-| `RUST_LOG` | log filter for `thurbox.log` |
-| `THURBOX_PERF_LOG` | opt-in performance logging: a one-shot `startup` phase breakdown at first paint, per-session `restore_adopt`/`adopt_split` lines, steady-state `perf_window` lines (~10 s cadence), and wall-clock frame/tick timing collection. Any value enables it. See `docs/PERFORMANCE.md`. |
-| `THURBOX_SOCKET` | overrides the **local** multiplexer socket name (default `thurbox`; dev builds `thurbox-dev`). For test/sandbox tooling: Unix scoping uses `TMUX_TMPDIR`, but psmux (Windows) resolves every `-L <name>` machine-wide, so this is the only way to fully scope an instance there. Remote hosts are unaffected (socket from `hosts.toml`). Empty = unset. |
+| `RUST_LOG` | log filter for `friring.log` |
+| `FRIRING_PERF_LOG` | opt-in performance logging: a one-shot `startup` phase breakdown at first paint, per-session `restore_adopt`/`adopt_split` lines, steady-state `perf_window` lines (~10 s cadence), and wall-clock frame/tick timing collection. Any value enables it. See `docs/PERFORMANCE.md`. |
+| `FRIRING_SOCKET` | overrides the **local** multiplexer socket name (default `friring`; dev builds `friring-dev`). For test/sandbox tooling: Unix scoping uses `TMUX_TMPDIR`, but psmux (Windows) resolves every `-L <name>` machine-wide, so this is the only way to fully scope an instance there. Remote hosts are unaffected (socket from `hosts.toml`). Empty = unset. |
 
-Set **by** thurbox into every spawned agent process (not user-set;
-`session_ops::inject_thurbox_env` / `App::build_spawn_inputs`). An
-agent — or a `thurbox-cli` call running inside the session — reads
+Set **by** friring into every spawned agent process (not user-set;
+`session_ops::inject_friring_env` / `App::build_spawn_inputs`). An
+agent — or a `friring-cli` call running inside the session — reads
 these to prove its own identity without scraping panes or names:
 
 | Variable | Set into agent process |
 |----------|------------------------|
-| `THURBOX_SESSION` | the stable thurbox `SessionId` (the registry key); read back by `thurbox-cli message`/`inbox` for self-identity |
-| `THURBOX_SESSION_ID` | the agent's own conversation id (`agent_session_id`); consumed by the metrics statusline. Distinct from `THURBOX_SESSION` |
-| `THURBOX_TASK` | the originating task id; task-spawned sessions only (headless `task run`) |
-| `THURBOX_METRICS_DIR` | metrics output dir |
-| `THURBOX_CONFIG_DIR` / `THURBOX_DATA_DIR` | the resolved config/data dirs, so the agent's `thurbox-cli` (its status hook) targets the same DB the TUI reads — independent of XDG, which `thurbox-cli` is on PATH, or a stale tmux-server env. Also honored if you set them yourself to relocate thurbox's state. |
+| `FRIRING_SESSION` | the stable friring `SessionId` (the registry key); read back by `friring-cli message`/`inbox` for self-identity |
+| `FRIRING_SESSION_ID` | the agent's own conversation id (`agent_session_id`); consumed by the metrics statusline. Distinct from `FRIRING_SESSION` |
+| `FRIRING_TASK` | the originating task id; task-spawned sessions only (headless `task run`) |
+| `FRIRING_METRICS_DIR` | metrics output dir |
+| `FRIRING_CONFIG_DIR` / `FRIRING_DATA_DIR` | the resolved config/data dirs, so the agent's `friring-cli` (its status hook) targets the same DB the TUI reads — independent of XDG, which `friring-cli` is on PATH, or a stale tmux-server env. Also honored if you set them yourself to relocate friring's state. |
 
 Set **at build time** (not runtime):
 
 | Variable | Used for |
 |----------|----------|
-| `THURBOX_RELEASE_VERSION` | read by `build.rs` to inject the binary version at build (CI release workflow sets it, e.g. `v0.7.0`); absent → falls back to `CARGO_PKG_VERSION` |
+| `FRIRING_RELEASE_VERSION` | read by `build.rs` to inject the binary version at build (CI release workflow sets it, e.g. `v0.7.0`); absent → falls back to `CARGO_PKG_VERSION` |
 
 Editor resolution order: DB `editor_command` → `$VISUAL` → `$EDITOR` →
 error toast.

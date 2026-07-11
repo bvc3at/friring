@@ -21,18 +21,32 @@ contributed back to upstream over time; conversely, upstream's own improvements
 are merged down into Friring as they land. The original commit history is kept
 intact as a tribute to the upstream author.
 
-## Why it still carries the Thurbox name
+## Renamed to friring (July 2026)
 
-Almost everything here still uses the upstream name on purpose. The binary
-(`thurbox` / `thurbox-cli`), the config and data dirs (`~/.config/thurbox`,
-`~/.local/share/thurbox`), the tmux socket (`tmux -L thurbox`), the `THURBOX_*`
-env vars, and the crate keep their original names, and every install command,
-badge, package, and link points at `Thurbeen/thurbox`. Friring is a *branding*
-layer over the upstream binary — it publishes no releases, packages, or website
-of its own, so installing it installs upstream Thurbox. Keeping the functional
-identifiers identical also lets Friring stay drop-in compatible with an existing
-Thurbox install and easy to keep in sync with upstream. Only the human-facing
-project *name* is rebranded, in `README.md` and the agent brief (`AGENTS.md`).
+Friring began as a pure *branding* layer: only the human-facing name was
+rebranded, while every functional identifier kept the upstream `thurbox` name.
+As of July 2026 the plumbing is renamed too. The app's own identifiers are now
+`friring` — the `friring` / `friring-cli` binaries, the crate, the config dir
+(`~/.config/friring`), the data dir and DB
+(`~/.local/share/friring/friring.db`), the tmux socket (`tmux -L friring`), and
+the `FRIRING_*` env vars.
+
+What still says `thurbox` is deliberate, and splits in two:
+
+- **Upstream attribution** — the repo URLs, badges, `LICENSE`, and provenance
+  notes point at [`Thurbeen/thurbox`](https://github.com/Thurbeen/thurbox) and
+  stay as-is (this is a fork, and the credit is upstream's).
+- **Upstream distribution machinery** — Friring publishes no releases,
+  packages, or website of its own, so everything that fetches or ships an
+  upstream artifact keeps the upstream name: `packaging/` registry manifests,
+  `scripts/install.*`, the `cd.yml` / `pages.yml` workflows, `website/`, the
+  self-update / version-check code, the `min_thurbox_version` extension-manifest
+  key (a wire format shared with upstream), and the `tb-` / `tbs-` tmux window
+  prefixes (brand-neutral, kept for live-window compatibility).
+
+The tradeoff the branding-only approach used to avoid is now real: upstream
+merges carry rename conflicts on the renamed identifiers, and an existing
+`thurbox` install needs a one-time [migration](#migration).
 
 ## Differences from upstream
 
@@ -73,7 +87,7 @@ rather than in `docs/FEATURES.md`):
 - **Path resolution.** The dir is found by scanning `projects/*/` for the
   `<agent_session_id>/subagents` child (`paths::claude_projects_dir`), not by
   computing Claude Code's slug (which replaces `/`, `.`, and likely all non-alnum
-  with `-`). `agent_session_id` is what thurbox injects as `THURBOX_SESSION_ID`;
+  with `-`). `agent_session_id` is what friring injects as `FRIRING_SESSION_ID`;
   `$CLAUDE_CONFIG_DIR` is honored.
 - **Surface & keys.** A side tree in the file-viewer column
   (`InputFocus::CcActivityTree`) folds workflows over their agents; a central
@@ -127,13 +141,13 @@ creates a normal session that `--resume`s it **in a directory you choose**
   a different directory copies the newest `<id>.jsonl` into
   `projects/<slug-of-destination>/` first. The original file is never touched;
   an existing same-or-newer destination copy is kept (re-importing never rolls
-  a continued conversation back). This is the one place thurbox *computes* a
+  a continued conversation back). This is the one place friring *computes* a
   slug (`paths::claude_project_slug`, every non-alphanumeric → `-`, destination
   canonicalized first because `claude` slugs its physical cwd) — finding
   existing dirs still scans instead. If a future Claude Code changes the rule,
   the failure is visible (`--resume` errors in the pane), not silent.
 - **Spawn.** The session config pins **both** `resume_session_id` (selects the
-  `--resume {id}` arg group) and `agent_session_id` (identity: `THURBOX_SESSION_ID`,
+  `--resume {id}` arg group) and `agent_session_id` (identity: `FRIRING_SESSION_ID`,
   the F9 activity scan, the DB row, later `Ctrl+R` restarts), so an imported
   session behaves exactly like one Friring started. The relaunch agent is the
   registry default when it resumes by id, else the first agent whose
@@ -192,9 +206,20 @@ changed** from upstream's always-column to `auto`.
 
 ### Documentation / branding
 
-- `README.md` and the agent guide prose call the project **Friring** (the
-  binary, URLs, install commands, and packaging are unchanged and still say
-  `thurbox`).
+- **Renamed the plumbing to `friring` (July 2026).** The app's own identifiers
+  flipped from `thurbox` to `friring`: the `friring` / `friring-cli` binaries,
+  the crate, `~/.config/friring`, `~/.local/share/friring/friring.db`, the
+  `tmux -L friring` socket, and the `FRIRING_*` env vars. What deliberately
+  still says `thurbox`: upstream **attribution** (repo URLs, `LICENSE`,
+  provenance, badges) and the upstream **distribution machinery** the fork
+  reuses rather than republishes — `packaging/` registry manifests,
+  `scripts/install.*`, the `cd.yml` / `pages.yml` workflows, `website/`, the
+  self-update / version-check code, the `min_thurbox_version` manifest key, and
+  the `tb-` / `tbs-` tmux window prefixes. See [Migration](#migration); upstream
+  merges now carry rename conflicts on the renamed identifiers.
+- `README.md` and the agent-guide prose call the project **Friring**; the repo
+  URLs, install commands, badges, and packaging still point at upstream (that's
+  attribution and shared distribution, not a rename target).
 - A fork notice at the top of `README.md` explains the fork, the name, and that
   all links intentionally point upstream.
 - **Agent-guide layout.** Upstream keeps one large `CLAUDE.md`. On the fork the
@@ -221,3 +246,48 @@ the fork.
   set up for the fork at the moment. The `changes` (paths-filter) job also grants
   `pull-requests: read`, which a **private** repo's default token lacks (public
   upstream doesn't need it).
+
+## Migration
+
+Upgrading an existing `thurbox` install to the renamed `friring`? The rename
+changed where the app looks, so move your state across once:
+
+- **Config** — copy the config dir:
+
+  ```bash
+  cp -r ~/.config/thurbox ~/.config/friring
+  ```
+
+- **Data + DB** — copy the data dir, then rename the database file:
+
+  ```bash
+  cp -r ~/.local/share/thurbox ~/.local/share/friring
+  mv ~/.local/share/friring/thurbox.db ~/.local/share/friring/friring.db
+  ```
+
+- **Live sessions** keep running on the old tmux server (the socket name is
+  fixed for a running server). Reattach and drain them on the old socket, then
+  stop it once nothing is left:
+
+  ```bash
+  tmux -L thurbox attach        # drain in-flight sessions
+  tmux -L thurbox kill-server   # once none are left running
+  ```
+
+  The same applies on remote hosts, and existing sessions' remote
+  `~/.local/share/thurbox` worktrees stay where they are — leave them until
+  those sessions are retired.
+
+- **Env vars** — rename any `THURBOX_*` you set in shell rc files, agent
+  wrappers, or hooks to `FRIRING_*`.
+
+- **Automation units** — reinstall your systemd / launchd units under the new
+  `friring` names and disable the old `thurbox` ones.
+
+- **Dev sandbox** — profiles under `target/dev-sandbox/*/thurbox-*` are stale;
+  recreate them (see `docs/DEVELOPMENT.md`).
+
+- **Extensions & self-update** — extensions fetched at runtime from upstream
+  still invoke `thurbox-cli`; use this repo's local copies instead. The
+  self-update / version-check paths still track upstream **Thurbox** releases
+  and aren't meaningful for a source-built `friring`.

@@ -1,4 +1,4 @@
-//! Runtime-swappable theme accessors for the Thurbox UI.
+//! Runtime-swappable theme accessors for the Friring UI.
 //!
 //! Widgets read colours via `Theme::accent()` etc. — function calls that
 //! resolve through a global `OnceLock<RwLock<ThemePalette>>`. Switching a
@@ -83,7 +83,7 @@ pub fn ensure_initialized() {
     ACTIVE_THEME.get_or_init(|| RwLock::new(ThemePalette::default()));
 }
 
-/// Centralised colour and style accessors for the Thurbox UI.
+/// Centralised colour and style accessors for the Friring UI.
 ///
 /// All widget files reference `Theme::accent()` etc. instead of hard-coding
 /// colours, so swapping themes only takes one `set_active()` call.

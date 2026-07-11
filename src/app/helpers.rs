@@ -45,7 +45,7 @@ pub(super) fn open_in_editor(paths: &[PathBuf], editor_cmd: &str) -> std::io::Re
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    // Detach from Thurbox's process group so signals to Thurbox
+    // Detach from Friring's process group so signals to Friring
     // don't reach the editor. Matters on WSL, where `code`/`zed` are
     // launcher scripts that hand off to Windows via `/init` interop —
     // without this, the interop bridge tears down before the GUI appears.
@@ -103,7 +103,7 @@ mod tests {
         // because the program does not exist — deterministic and cross-platform.
         let paths = [PathBuf::from("/tmp/x")];
         let err =
-            open_in_editor(&paths, "thurbox-nonexistent-editor-xyz --wait --flag").unwrap_err();
+            open_in_editor(&paths, "friring-nonexistent-editor-xyz --wait --flag").unwrap_err();
         // NOT the InvalidInput we return for an empty command: the spawn itself failed.
         assert_ne!(err.kind(), std::io::ErrorKind::InvalidInput);
     }

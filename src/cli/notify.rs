@@ -1,6 +1,6 @@
-//! `thurbox-cli notify` — diagnose OS desktop notifications.
+//! `friring-cli notify` — diagnose OS desktop notifications.
 //!
-//! The default (no flags) prints which delivery backend thurbox would use on
+//! The default (no flags) prints which delivery backend friring would use on
 //! this host, whether it can actually deliver, whether click-to-focus is
 //! supported, and the last recorded delivery error (if any). This exists
 //! because the WSL failure mode used to be entirely silent — the dbus path
@@ -84,8 +84,8 @@ fn run_test(feature_on: bool, backend: DeliveryBackend) -> CommandOutput {
 
     let n = Notification {
         session_id: SessionId::default(),
-        title: "thurbox · test".into(),
-        body: "Notifications are working. This is a test from `thurbox-cli notify --test`.".into(),
+        title: "friring · test".into(),
+        body: "Notifications are working. This is a test from `friring-cli notify --test`.".into(),
         sound: settings::global().notifications.sound,
     };
 
@@ -139,7 +139,7 @@ fn diagnose_headline(feature_on: bool, backend: DeliveryBackend) -> String {
         );
     }
     format!(
-        "Notifications enabled — delivering via {}. Run `thurbox-cli notify --test` to confirm.",
+        "Notifications enabled — delivering via {}. Run `friring-cli notify --test` to confirm.",
         backend.label()
     )
 }

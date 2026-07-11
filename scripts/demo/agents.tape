@@ -1,15 +1,15 @@
-# VHS tape for the Thurbox REAL-AGENTS demo video.
+# VHS tape for the Friring REAL-AGENTS demo video.
 #
 # Do NOT run this directly — run `scripts/demo/record.sh`, which builds
 # the dev binary, sets up an isolated environment, seeds one session per real
-# agent CLI, and exports $THURBOX_BIN. See that script for context.
+# agent CLI, and exports $FRIRING_BIN. See that script for context.
 #
 # VHS has no function-key commands, so this uses the Ctrl aliases of the panel
 # toggles: Ctrl+B = info panel, Ctrl+E = file viewer, Ctrl+X = code review (its
 # default primary chord; F7 is the alternate VHS can't send).
 
-Output docs/media/thurbox-demo.gif
-Output docs/media/thurbox-demo.mp4
+Output docs/media/friring-demo.gif
+Output docs/media/friring-demo.mp4
 
 Set Shell "bash"
 Set FontSize 18
@@ -21,7 +21,7 @@ Set PlaybackSpeed 1.0
 
 # Launch the dev binary (isolated env from record.sh).
 Hide
-Type `exec "$THURBOX_BIN"`
+Type `exec "$FRIRING_BIN"`
 Enter
 Sleep 2s
 Show

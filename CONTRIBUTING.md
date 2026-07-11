@@ -1,17 +1,17 @@
-# Contributing to Thurbox
+# Contributing to Friring
 
-Thanks for your interest in contributing to Thurbox! This guide covers how to
+Thanks for your interest in contributing to Friring! This guide covers how to
 set up your environment, the conventions we follow, and how to get a change
 merged.
 
-Thurbox is a multi-session coding-agent TUI orchestrator built with Rust. Before
+Friring is a multi-session coding-agent TUI orchestrator built with Rust. Before
 diving in, skimming the [`README.md`](README.md), [`AGENTS.md`](AGENTS.md) (the
 always-loaded agent brief; `CLAUDE.md` is a symlink to it), and the design docs
 under [`docs/`](docs/) will save you time.
 
 ## Code of conduct
 
-Be respectful, constructive, and welcoming. We want Thurbox to be a project
+Be respectful, constructive, and welcoming. We want Friring to be a project
 people enjoy contributing to — assume good faith, keep discussions on the
 technical merits, and help newcomers find their footing.
 
@@ -45,7 +45,7 @@ scripts/install-dev-tools.sh   # installs the dev tools (including prek)
 
 You'll also need `tmux >= 3.2`, `shellcheck`, `bats`, Node + npm (for the
 website linters), and `git`. The full walkthrough — including the runtime
-sandbox for trying thurbox in isolation — lives in
+sandbox for trying friring in isolation — lives in
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
 - **MSRV:** Rust 1.75, Edition 2021.
@@ -56,16 +56,16 @@ sandbox for trying thurbox in isolation — lives in
 
 | Task | What it does |
 |------|--------------|
-| `just build` | build the dev binaries (`thurbox` + `thurbox-cli`) |
+| `just build` | build the dev binaries (`friring` + `friring-cli`) |
 | `just test` | `cargo nextest run --all` |
 | `just lint` | fmt-check + clippy + cargo-deny + rumdl + shellcheck |
 | `just fmt` | format Rust + website |
 | `just arch` | architecture-rule + rustdoc checks |
-| `just sandbox` | run thurbox in an isolated dev sandbox |
+| `just sandbox` | run friring in an isolated dev sandbox |
 
 ## Testing
 
-Thurbox follows **test-driven development** — write a failing test first, make
+Friring follows **test-driven development** — write a failing test first, make
 it pass, then refactor. Bug fixes start with a test that reproduces the bug.
 
 ```bash
@@ -148,7 +148,7 @@ of [`AGENTS.md`](AGENTS.md).
 
 ## Architecture
 
-Thurbox follows **The Elm Architecture**
+Friring follows **The Elm Architecture**
 (`Event → Message → update → view → Frame`) with one-directional module
 dependencies enforced by `tests/architecture_rules.rs`:
 

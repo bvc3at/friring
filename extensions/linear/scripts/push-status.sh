@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# push-status.sh — push thurbox task status back to Linear (the bidirectional
-# half). For every thurbox task with source=linear whose tracker row opts into
+# push-status.sh — push friring task status back to Linear (the bidirectional
+# half). For every friring task with source=linear whose tracker row opts into
 # push_back, reconcile the Linear issue's open/done state with the task:
 #   task done              -> issue moved to a completed state
 #   task todo|in_progress  -> issue moved back to an unstarted (open) state
@@ -118,7 +118,7 @@ while IFS= read -r task; do
     echo "  ! $eid: issueUpdate failed"
     skipped=$((skipped+1))
   fi
-done < <(thurbox-cli task list --json 2>/dev/null \
+done < <(friring-cli task list --json 2>/dev/null \
           | jq -c --arg s "$SOURCE" '.[] | select(.source == $s)')
 
 echo "push-status[$SOURCE]: pushed=$pushed skipped=$skipped"

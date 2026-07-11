@@ -1,7 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "description": [
-    "Global Renovate config for the thurbox renovate extension. Workers pass",
+    "Global Renovate config for the friring renovate extension. Workers pass",
     "this via RENOVATE_CONFIG_FILE and ALWAYS run `--platform=local`, so every",
     "setting here is applied against a local checkout (no bot, no token).",
     "The per-repo `strategy` column in repos.md is layered on top of this as a",

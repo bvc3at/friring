@@ -1,4 +1,4 @@
-//! Theme palettes for the Thurbox TUI.
+//! Theme palettes for the Friring TUI.
 //!
 //! A `ThemePalette` is the runtime, swappable palette. Widgets read the active
 //! palette via `crate::ui::theme::current()`; users pick one via the theme

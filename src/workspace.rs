@@ -3,12 +3,12 @@
 //! When a session spans more than one directory (multiple repos, or a repo plus
 //! an extra access dir), the agent process can only be launched in a single
 //! `cwd`. Rather than teach every agent CLI a different `--add-dir`-style flag
-//! (many have none), thurbox builds one workspace directory full of symlinks —
+//! (many have none), friring builds one workspace directory full of symlinks —
 //! one per member dir — and launches the agent there. The agent then sees every
 //! repo as a subdirectory, with no per-agent configuration.
 //!
 //! ```text
-//! ~/.local/share/thurbox/workspaces/<agent_session_id>/
+//! ~/.local/share/friring/workspaces/<agent_session_id>/
 //!     webapp  -> …/worktrees/<hash>/feat-x   (symlink)
 //!     infra   -> /home/me/repos/infra        (symlink)
 //! ```
@@ -148,7 +148,7 @@ mod tests {
         let mut p = std::env::temp_dir();
         let t = std::thread::current();
         let name = t.name().unwrap_or("ws").replace("::", "-");
-        p.push(format!("thurbox-ws-test-{name}"));
+        p.push(format!("friring-ws-test-{name}"));
         let _ = std::fs::remove_dir_all(&p);
         p
     }

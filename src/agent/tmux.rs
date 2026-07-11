@@ -16,12 +16,12 @@ use crate::agent::control_mode::{
 };
 use crate::agent::transport::{TmuxTransport, DEFAULT_MUX};
 
-/// Dedicated tmux socket name — isolates thurbox sessions from the user's tmux.
-/// Dev builds use "thurbox-dev" to avoid interfering with an installed release binary.
+/// Dedicated tmux socket name — isolates friring sessions from the user's tmux.
+/// Dev builds use "friring-dev" to avoid interfering with an installed release binary.
 const TMUX_SOCKET: &str = if cfg!(dev_build) {
-    "thurbox-dev"
+    "friring-dev"
 } else {
-    "thurbox"
+    "friring"
 };
 
 /// Env var overriding the **local** multiplexer socket name.
@@ -30,9 +30,9 @@ const TMUX_SOCKET: &str = if cfg!(dev_build) {
 /// private directory, but psmux (native Windows) has no socket-directory
 /// concept — every `-L <name>` resolves machine-wide, so without this override
 /// a scoped test on Windows would share (and could tear down) the user's real
-/// `thurbox`/`thurbox-dev` server. Remote hosts are unaffected (their socket
+/// `friring`/`friring-dev` server. Remote hosts are unaffected (their socket
 /// comes from `hosts.toml`).
-pub const SOCKET_OVERRIDE_ENV: &str = "THURBOX_SOCKET";
+pub const SOCKET_OVERRIDE_ENV: &str = "FRIRING_SOCKET";
 
 /// The local multiplexer socket name: [`SOCKET_OVERRIDE_ENV`] when set and
 /// non-empty, else the compile-time default.
@@ -43,15 +43,15 @@ fn local_socket() -> String {
         .unwrap_or_else(|| TMUX_SOCKET.to_string())
 }
 
-/// tmux session name used to group all thurbox windows.
-/// Dev builds use "thurbox-dev" to avoid interfering with an installed release binary.
+/// tmux session name used to group all friring windows.
+/// Dev builds use "friring-dev" to avoid interfering with an installed release binary.
 const TMUX_SESSION: &str = if cfg!(dev_build) {
-    "thurbox-dev"
+    "friring-dev"
 } else {
-    "thurbox"
+    "friring"
 };
 
-/// Build a [`Command`] for the local multiplexer on the thurbox socket:
+/// Build a [`Command`] for the local multiplexer on the friring socket:
 /// `<DEFAULT_MUX> -L <TMUX_SOCKET> <args…>`. The headless one-shot helpers below
 /// (send/capture/spawn/kill/heartbeat) bypass the [`TmuxTransport`] seam — they
 /// are local-only — so this centralizes the binary name (`tmux`, or `psmux` on
@@ -59,13 +59,13 @@ const TMUX_SESSION: &str = if cfg!(dev_build) {
 fn local_mux_command(args: &[&str]) -> Command {
     let mut cmd = Command::new(DEFAULT_MUX);
     cmd.arg("-L").arg(local_socket()).args(args);
-    // Strip nesting env so these one-shots target thurbox's own socket even when
-    // thurbox is launched inside a tmux/psmux pane (see `strip_mux_nesting_env`).
+    // Strip nesting env so these one-shots target friring's own socket even when
+    // friring is launched inside a tmux/psmux pane (see `strip_mux_nesting_env`).
     crate::agent::transport::strip_mux_nesting_env(&mut cmd);
     cmd
 }
 
-/// Window-name prefix for thurbox-managed tmux windows. Combined with the
+/// Window-name prefix for friring-managed tmux windows. Combined with the
 /// sanitized session name (`{prefix}{sanitized_name}`) to form the tmux
 /// window target.
 pub(crate) const WINDOW_PREFIX: &str = "tb-";
@@ -96,7 +96,7 @@ pub(crate) fn sanitize_window_name(name: &str) -> String {
     out
 }
 
-/// Build the tmux window name for a thurbox agent session: `tb-<safe>`.
+/// Build the tmux window name for a friring agent session: `tb-<safe>`.
 pub(crate) fn agent_window_name(session_name: &str) -> String {
     format!("{WINDOW_PREFIX}{}", sanitize_window_name(session_name))
 }
@@ -109,7 +109,7 @@ pub(crate) fn shell_window_name(session_name: &str) -> String {
     )
 }
 
-/// Build the `session:=window` tmux target for a thurbox agent session.
+/// Build the `session:=window` tmux target for a friring agent session.
 ///
 /// The `=` prefix forces tmux to match the window name exactly. Without
 /// it tmux falls back to FNMATCH-style prefix matching, so a target of
@@ -160,7 +160,7 @@ fn check_min_version(version_output: &str) -> Result<()> {
         let (major, minor) = parse_tmux_version(rest)?;
         if (major, minor) < MIN_TMUX_VERSION {
             bail!(
-                "tmux {major}.{minor} is too old; thurbox requires >= {}.{}",
+                "tmux {major}.{minor} is too old; friring requires >= {}.{}",
                 MIN_TMUX_VERSION.0,
                 MIN_TMUX_VERSION.1
             );
@@ -188,9 +188,9 @@ const MAX_CAPTURE_LINES: u32 = 10_000;
 pub struct TmuxBackend {
     /// How `tmux` is launched (local `Command` vs `ssh <dest> tmux …`).
     transport: TmuxTransport,
-    /// tmux socket name passed via `-L` (e.g. `thurbox`).
+    /// tmux socket name passed via `-L` (e.g. `friring`).
     socket: String,
-    /// tmux session name grouping all thurbox windows.
+    /// tmux session name grouping all friring windows.
     session: String,
     /// Backend name used by the registry / persisted `backend_type`
     /// (`local-tmux` or `ssh:<host>`).
@@ -236,7 +236,7 @@ struct ControlMode {
 const SUB_EVENTS_CAP: usize = 256;
 
 impl ControlMode {
-    /// Start a control mode connection to the thurbox tmux session over the
+    /// Start a control mode connection to the friring tmux session over the
     /// given transport (local or ssh).
     fn start(transport: &TmuxTransport, socket: &str, session: &str) -> Result<Self> {
         // -C (single C): control mode with echo — works with piped stdin.
@@ -579,7 +579,7 @@ fn is_recv_timeout(err: &anyhow::Error) -> bool {
 }
 
 impl TmuxBackend {
-    /// Build the local tmux backend (`tmux -L thurbox`).
+    /// Build the local tmux backend (`tmux -L friring`).
     pub fn new() -> Self {
         Self::local()
     }
@@ -651,7 +651,7 @@ impl TmuxBackend {
         Ok(())
     }
 
-    /// Execute a tmux command on the thurbox socket and check for errors.
+    /// Execute a tmux command on the friring socket and check for errors.
     fn run_tmux(&self, args: &[&str]) -> Result<std::process::Output> {
         let output = self
             .transport
@@ -669,7 +669,7 @@ impl TmuxBackend {
         Ok(output)
     }
 
-    /// Check if the thurbox tmux session exists.
+    /// Check if the friring tmux session exists.
     fn session_exists(&self) -> bool {
         self.tmux_run(&["has-session", "-t", &self.session]).is_ok()
     }
@@ -713,7 +713,7 @@ impl TmuxBackend {
         Ok(())
     }
 
-    /// Ensure the thurbox tmux session exists and its options are applied,
+    /// Ensure the friring tmux session exists and its options are applied,
     /// **without** starting control mode.
     ///
     /// Shared by [`ensure_ready`](Self::ensure_ready) (which then starts control
@@ -739,7 +739,7 @@ impl TmuxBackend {
             .context("Failed to create tmux session")?;
             // Cheap defensiveness on Windows: poll until the freshly-created
             // session answers `has-session` before applying options. (The
-            // `no server running on 'thurbox__thurbox'` failure that originally
+            // `no server running on 'friring__friring'` failure that originally
             // motivated this was actually psmux session *nesting*, now fixed at
             // the root by `strip_mux_nesting_env`; this poll is a harmless belt
             // against any genuinely-async `new-session -d` and a no-op when the
@@ -1229,7 +1229,7 @@ impl SessionBackend for TmuxBackend {
         if !control_mode::is_valid_pane_id(backend_id) {
             bail!("refusing to adopt invalid pane id: {backend_id:?}");
         }
-        // Opt-in split timing (THURBOX_PERF_LOG): the history capture is an
+        // Opt-in split timing (FRIRING_PERF_LOG): the history capture is an
         // independent `tmux capture-pane` subprocess, while `connect_pane`
         // drives the serialized control-mode connection. Restore prefetches
         // the captures in parallel and passes them in (ADR-P9), so
@@ -1237,7 +1237,7 @@ impl SessionBackend for TmuxBackend {
         // adopt) still captures inline, before connecting so seeded history
         // can't duplicate live output. Best-effort: adoption must survive a
         // failed capture.
-        let perf_log = std::env::var_os("THURBOX_PERF_LOG").is_some();
+        let perf_log = std::env::var_os("FRIRING_PERF_LOG").is_some();
 
         let capture_start = perf_log.then(std::time::Instant::now);
         let seed = seed.unwrap_or_else(|| {
@@ -1440,7 +1440,7 @@ fn bracketed_paste(text: &str) -> String {
 
 /// Send text immediately to a session pane (no scheduling), followed by Enter.
 ///
-/// Targets the tmux window named `tb-<session_name>` in the thurbox tmux
+/// Targets the tmux window named `tb-<session_name>` in the friring tmux
 /// session and uses a "paste text → brief delay → press Enter" sequence so the
 /// target app has time to process the pasted input.
 pub fn send_prompt_now(session_name: &str, text: &str) -> Result<()> {
@@ -1473,7 +1473,7 @@ const HEARTBEAT_WINDOW: &str = "automation-heartbeat";
 /// How often the heartbeat keeper invokes `automation tick`.
 const HEARTBEAT_INTERVAL_SECS: u64 = 60;
 
-/// List the window names in the thurbox tmux session (empty if the server is
+/// List the window names in the friring tmux session (empty if the server is
 /// not running).
 fn list_window_names() -> Vec<String> {
     let Ok(out) =
@@ -1490,7 +1490,7 @@ fn list_window_names() -> Vec<String> {
         .collect()
 }
 
-/// Whether the agent window `tb-<session_name>` currently exists in the thurbox
+/// Whether the agent window `tb-<session_name>` currently exists in the friring
 /// tmux server. Used by the headless dispatcher to skip `send` automations
 /// whose target session is no longer running rather than failing into a dead
 /// pane.
@@ -1564,7 +1564,7 @@ fn ps_single_quote(s: &str) -> String {
 /// `HEARTBEAT_INTERVAL_SECS` seconds, so automations fire even with no TUI
 /// attached. The live window also keeps the tmux server alive, so spawn-only
 /// automations work with no other sessions. Idempotent — a no-op when the
-/// keeper already exists. `cli_path` is the absolute path to `thurbox-cli`.
+/// keeper already exists. `cli_path` is the absolute path to `friring-cli`.
 ///
 pub fn ensure_automation_heartbeat(cli_path: &Path) -> Result<()> {
     TmuxBackend::local().ensure_session_configured()?;
@@ -1614,15 +1614,15 @@ fn heartbeat_loop_command(cli_path: &Path) -> String {
     )
 }
 
-/// Resolve the path to the `thurbox-cli` binary that sits next to the currently
-/// running executable (TUI or CLI), falling back to a bare `thurbox-cli` on
+/// Resolve the path to the `friring-cli` binary that sits next to the currently
+/// running executable (TUI or CLI), falling back to a bare `friring-cli` on
 /// `PATH` when resolution fails.
 ///
 /// The platform executable suffix (`.exe` on Windows, empty elsewhere) is
 /// applied via [`std::env::consts::EXE_SUFFIX`], so the self/sibling match works
-/// for `thurbox-cli.exe` too.
+/// for `friring-cli.exe` too.
 pub fn resolve_cli_binary() -> std::path::PathBuf {
-    let cli_name = format!("thurbox-cli{}", std::env::consts::EXE_SUFFIX);
+    let cli_name = format!("friring-cli{}", std::env::consts::EXE_SUFFIX);
     if let Ok(exe) = std::env::current_exe() {
         if exe.file_name().and_then(|n| n.to_str()) == Some(cli_name.as_str()) {
             return exe;
@@ -1676,7 +1676,7 @@ fn history_seed_bytes(mut raw: Vec<u8>) -> Vec<u8> {
     seed
 }
 
-/// Session-level tmux options applied to the thurbox tmux session.
+/// Session-level tmux options applied to the friring tmux session.
 ///
 /// Single source of truth for both the TUI and headless paths — applied
 /// (alongside the server-wide options + `default-command`) by
@@ -1904,7 +1904,7 @@ mod tests {
     fn resolve_cli_binary_uses_platform_exe_suffix() {
         let p = resolve_cli_binary();
         let name = p.file_name().unwrap().to_string_lossy();
-        assert_eq!(name, format!("thurbox-cli{}", std::env::consts::EXE_SUFFIX));
+        assert_eq!(name, format!("friring-cli{}", std::env::consts::EXE_SUFFIX));
     }
 
     // --- build_shell_command tests ---
@@ -1995,10 +1995,10 @@ mod tests {
     fn local_socket_honors_env_override() {
         // nextest runs one process per test, so env mutation can't race other
         // tests reading `local_socket()`.
-        std::env::set_var(SOCKET_OVERRIDE_ENV, "thurbox-lab-test");
-        assert_eq!(local_socket(), "thurbox-lab-test");
-        assert_eq!(TmuxBackend::local().socket, "thurbox-lab-test");
-        // Empty counts as unset — a sandbox script exporting `THURBOX_SOCKET=`
+        std::env::set_var(SOCKET_OVERRIDE_ENV, "friring-lab-test");
+        assert_eq!(local_socket(), "friring-lab-test");
+        assert_eq!(TmuxBackend::local().socket, "friring-lab-test");
+        // Empty counts as unset — a sandbox script exporting `FRIRING_SOCKET=`
         // must not produce `-L ''`.
         std::env::set_var(SOCKET_OVERRIDE_ENV, "");
         assert_eq!(local_socket(), TMUX_SOCKET);
@@ -2106,12 +2106,12 @@ mod tests {
         // `Set-Item Env:K 'v'` (not `$env:K`) keeps the string `$`-free; sorted
         // for determinism. Values with spaces survive the PS single quotes.
         let mut env = HashMap::new();
-        env.insert("THURBOX_SESSION".to_string(), "id-1".to_string());
+        env.insert("FRIRING_SESSION".to_string(), "id-1".to_string());
         env.insert("B".to_string(), "x y".to_string());
         let cmd = TmuxBackend::psmux_window_command("claude", &[], &env);
         assert_eq!(
             cmd,
-            "\"Set-Item Env:B 'x y'; Set-Item Env:THURBOX_SESSION 'id-1'; & 'claude'\""
+            "\"Set-Item Env:B 'x y'; Set-Item Env:FRIRING_SESSION 'id-1'; & 'claude'\""
         );
     }
 

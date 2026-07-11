@@ -1,8 +1,8 @@
-//! Extension activate/deactivate subcommands for `thurbox-cli`.
+//! Extension activate/deactivate subcommands for `friring-cli`.
 //!
 //! Extensions declare the sessions/automations they need in an `extension.toml`
-//! manifest under `~/.config/thurbox/extensions/`. `activate` (re)creates those
-//! resources and marks the extension active so thurbox self-heals them if
+//! manifest under `~/.config/friring/extensions/`. `activate` (re)creates those
+//! resources and marks the extension active so friring self-heals them if
 //! deleted; `deactivate` tears them down and is the real off-switch. See
 //! [`crate::session_ops::extensions`].
 
@@ -74,7 +74,7 @@ pub enum Action {
         purge: bool,
     },
     /// Activate an extension: (re)create its sessions/automations and mark it
-    /// active so thurbox self-heals them. Idempotent.
+    /// active so friring self-heals them. Idempotent.
     Activate {
         /// Extension name (matches `<name>.toml` in the extensions dir).
         name: String,
@@ -406,7 +406,7 @@ fn load_manifest(name: &str) -> Result<ExtensionDef, String> {
     crate::agent::extension_config::load_manifest(name).ok_or_else(|| {
         format!(
             "No extension manifest '{name}' found. Install the extension first \
-             (it writes ~/.config/thurbox/extensions/{name}.toml)."
+             (it writes ~/.config/friring/extensions/{name}.toml)."
         )
     })
 }
@@ -431,7 +431,7 @@ fn available_to_json(query: Option<&str>) -> Value {
             "name": ext.name,
             "description": ext.description,
             "installed": installed.contains(ext.name),
-            "install_command": format!("thurbox-cli extension install {}", ext.name),
+            "install_command": format!("friring-cli extension install {}", ext.name),
         }));
     }
     json!({
@@ -505,7 +505,7 @@ fn health_summary(h: &crate::session_ops::ExtensionHealth) -> String {
     }
     if h.stale {
         return format!(
-            "'{}' is active but stale — run `thurbox-cli extension update {}`",
+            "'{}' is active but stale — run `friring-cli extension update {}`",
             h.name, h.name
         );
     }
@@ -591,7 +591,7 @@ mod tests {
         assert_eq!(flow["installed"], false);
         assert_eq!(
             flow["install_command"],
-            "thurbox-cli extension install flow"
+            "friring-cli extension install flow"
         );
     }
 

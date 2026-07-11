@@ -43,14 +43,14 @@ pub enum TmuxTransport {
 }
 
 /// Environment variables a tmux/psmux server reads to resolve a *nested*
-/// client's default target. If thurbox is itself launched inside a tmux/psmux
+/// client's default target. If friring is itself launched inside a tmux/psmux
 /// pane, these leak into the multiplexer subcommands it spawns and make a bare
-/// `-t <session>` resolve against the *outer* session instead of the thurbox
-/// socket — on psmux this surfaces as `set-option -t thurbox` failing with
-/// `no server running on 'thurbox__thurbox'` (psmux concatenates
-/// `PSMUX_TARGET_SESSION = <socket>__<session>`). Stripping them makes thurbox's
+/// `-t <session>` resolve against the *outer* session instead of the friring
+/// socket — on psmux this surfaces as `set-option -t friring` failing with
+/// `no server running on 'friring__friring'` (psmux concatenates
+/// `PSMUX_TARGET_SESSION = <socket>__<session>`). Stripping them makes friring's
 /// explicit `-L <socket> -t <session>` always target its own server, whether the
-/// host OS is Windows (psmux) or Unix (thurbox launched from inside tmux).
+/// host OS is Windows (psmux) or Unix (friring launched from inside tmux).
 const MUX_NESTING_ENV: &[&str] = &[
     "TMUX",
     "TMUX_PANE",
@@ -77,7 +77,7 @@ impl TmuxTransport {
     /// tokens (the binary name, `-L`, the socket name) pass through unquoted.
     ///
     /// Nesting env vars are stripped (see `strip_mux_nesting_env`) so the
-    /// command targets thurbox's own server even when thurbox runs inside a pane.
+    /// command targets friring's own server even when friring runs inside a pane.
     pub fn tmux_command(&self, socket: &str, args: &[&str]) -> Command {
         let mut cmd = match self {
             TmuxTransport::Local => {
@@ -153,10 +153,10 @@ mod tests {
     #[test]
     fn local_builds_bare_mux() {
         let t = TmuxTransport::Local;
-        let cmd = t.tmux_command("thurbox", &["has-session", "-t", "thurbox"]);
+        let cmd = t.tmux_command("friring", &["has-session", "-t", "friring"]);
         let (prog, args) = program_and_args(&cmd);
         assert_eq!(prog, DEFAULT_MUX);
-        assert_eq!(args, ["-L", "thurbox", "has-session", "-t", "thurbox"]);
+        assert_eq!(args, ["-L", "friring", "has-session", "-t", "friring"]);
     }
 
     #[test]
@@ -166,7 +166,7 @@ mod tests {
             ssh_opts: vec!["-o".into(), "ControlMaster=auto".into()],
             mux: "tmux".into(),
         };
-        let cmd = t.tmux_command("thurbox", &["has-session", "-t", "thurbox"]);
+        let cmd = t.tmux_command("friring", &["has-session", "-t", "friring"]);
         let (prog, args) = program_and_args(&cmd);
         assert_eq!(prog, "ssh");
         // User opts, then the always-appended fail-fast hardening
@@ -182,10 +182,10 @@ mod tests {
                 "me@devbox",
                 "tmux",
                 "-L",
-                "thurbox",
+                "friring",
                 "has-session",
                 "-t",
-                "thurbox",
+                "friring",
             ]
             .iter()
             .map(|s| s.to_string()),
@@ -200,7 +200,7 @@ mod tests {
             ssh_opts: vec![],
             mux: "psmux".into(),
         };
-        let cmd = t.tmux_command("thurbox", &["has-session"]);
+        let cmd = t.tmux_command("friring", &["has-session"]);
         let (prog, args) = program_and_args(&cmd);
         assert_eq!(prog, "ssh");
         let mut expected: Vec<String> = crate::shell::SSH_HARDENING_OPTS
@@ -208,7 +208,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         expected.extend(
-            ["me@winbox", "psmux", "-L", "thurbox", "has-session"]
+            ["me@winbox", "psmux", "-L", "friring", "has-session"]
                 .iter()
                 .map(|s| s.to_string()),
         );
@@ -221,7 +221,7 @@ mod tests {
             distro: "Ubuntu".into(),
             mux: "tmux".into(),
         };
-        let cmd = t.tmux_command("thurbox", &["has-session", "-t", "thurbox"]);
+        let cmd = t.tmux_command("friring", &["has-session", "-t", "friring"]);
         let (prog, args) = program_and_args(&cmd);
         assert_eq!(prog, "wsl.exe");
         // A Unix caller passes `--cd /` (see `shell::wsl_command`) so wsl.exe
@@ -234,14 +234,14 @@ mod tests {
         let expected: Vec<&str> = prefix
             .iter()
             .copied()
-            .chain(["tmux", "-L", "thurbox", "has-session", "-t", "thurbox"])
+            .chain(["tmux", "-L", "friring", "has-session", "-t", "friring"])
             .collect();
         assert_eq!(args, expected);
     }
 
     #[test]
     fn tmux_command_strips_nesting_env() {
-        let cmd = TmuxTransport::Local.tmux_command("thurbox", &["has-session"]);
+        let cmd = TmuxTransport::Local.tmux_command("friring", &["has-session"]);
         // Removed vars surface in get_envs() as (key, None).
         let removed: Vec<String> = cmd
             .get_envs()

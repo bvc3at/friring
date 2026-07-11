@@ -1,29 +1,29 @@
-# thurbox-cli — headless CLI reference
+# friring-cli — headless CLI reference
 
-A second binary (`thurbox-cli`) drives the same SQLite-backed, tmux-hosted
+A second binary (`friring-cli`) drives the same SQLite-backed, tmux-hosted
 sessions headlessly (no TUI). It shares the database with the TUI; changes
 appear via `PRAGMA data_version` polling, so a CLI mutation shows up in a running
 TUI (and vice versa) within a tick.
 
 ```bash
-cargo build --bin thurbox-cli
-thurbox-cli session create --name demo --repo-path /path \
+cargo build --bin friring-cli
+friring-cli session create --name demo --repo-path /path \
     --agent codex --worktree-branch feat/x
 # Spawn on a remote host from hosts.toml (worktree + tmux live remotely):
-thurbox-cli session create --name demo --repo-path /srv/repo \
+friring-cli session create --name demo --repo-path /srv/repo \
     --host devbox --worktree-branch feat/x
 # Spawn a worker under a lead session (parent must exist):
-thurbox-cli session create --name worker --repo-path /path \
+friring-cli session create --name worker --repo-path /path \
     --parent <lead-uuid>
 # Multi-repo: each --add-repo gets its own worktree on --worktree-branch;
 # --add-dir attaches a repo as-is (no branch). The agent launches in a
 # symlink workspace gathering every repo. Works on `task create` too.
-thurbox-cli session create --name demo --repo-path /a \
+friring-cli session create --name demo --repo-path /a \
     --agent claude --worktree-branch feat/x \
     --add-repo /b@main --add-repo /c@master --add-dir /reference
-thurbox-cli session list                       # human-readable table
-thurbox-cli session list --json | jq           # machine output for scripts
-thurbox-cli session list --parent <lead-uuid> --json | jq  # direct children only
+friring-cli session list                       # human-readable table
+friring-cli session list --json | jq           # machine output for scripts
+friring-cli session list --parent <lead-uuid> --json | jq  # direct children only
 ```
 
 ## Subcommands
@@ -52,7 +52,7 @@ thurbox-cli session list --parent <lead-uuid> --json | jq  # direct children onl
   backend and last error; `--test` fires a sample. See the OS Notifications
   section of `docs/FEATURES.md`.
 - **`perf`** — prints the perf snapshot a running TUI publishes while
-  `THURBOX_PERF_LOG` or its perf HUD is active. See `docs/PERFORMANCE.md`.
+  `FRIRING_PERF_LOG` or its perf HUD is active. See `docs/PERFORMANCE.md`.
 
 ## Output format
 
@@ -94,5 +94,5 @@ session is deleted with no prompt. A force-deleted session is then tagged in the
 restore list; restoring one via `Ctrl+U` (`Enter`) first asks for confirmation
 (`Modal::ConfirmRestore`, rendered by `ui::confirm_restore_modal`) since the
 recovery is best-effort (committed branch state only), then runs the normal
-restore path. The flag never changes `thurbox-cli session delete`, which stays
+restore path. The flag never changes `friring-cli session delete`, which stays
 soft unless `--force`.

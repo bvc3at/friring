@@ -1,6 +1,6 @@
 # Development
 
-How to set up a reproducible thurbox dev environment, build/test/lint thurbox,
+How to set up a reproducible friring dev environment, build/test/lint friring,
 run the app in an isolated sandbox, and regenerate the demo media.
 
 ## 1. Toolchain — the dev environment
@@ -41,7 +41,7 @@ You'll also need, from your package manager: `tmux >= 3.2`, `shellcheck`,
 
 | Task | What it does |
 |------|--------------|
-| `just build` | build the dev binaries (`thurbox` + `thurbox-cli`) |
+| `just build` | build the dev binaries (`friring` + `friring-cli`) |
 | `just test` | `cargo nextest run --all` |
 | `just lint` | fmt-check + clippy + cargo-deny + rumdl + shellcheck |
 | `just fmt` | format Rust + website |
@@ -53,28 +53,28 @@ You'll also need, from your package manager: `tmux >= 3.2`, `shellcheck`,
 Bare `cargo` still works for everything `just` wraps:
 
 ```bash
-cargo build --bin thurbox --bin thurbox-cli   # what `just build` runs
+cargo build --bin friring --bin friring-cli   # what `just build` runs
 cargo check --all                             # type check
 cargo build --release                         # release build (LTO, stripped)
 ```
 
-## 3. Runtime sandbox — run thurbox isolated
+## 3. Runtime sandbox — run friring isolated
 
 The sandbox runs the dev build (`0.0.0-dev` → `dev_build` cfg, which uses a
-`thurbox-dev` tmux socket) with **thurbox's own config/data redirected** into the
-sandbox (via `THURBOX_CONFIG_DIR` / `THURBOX_DATA_DIR`), so it never touches your
-real `~/.config/thurbox` or sessions. It **keeps your real `HOME`**, so your
+`friring-dev` tmux socket) with **friring's own config/data redirected** into the
+sandbox (via `FRIRING_CONFIG_DIR` / `FRIRING_DATA_DIR`), so it never touches your
+real `~/.config/friring` or sessions. It **keeps your real `HOME`**, so your
 authenticated agent CLIs (`claude`/`codex`/`antigravity`/…) work normally — and it puts
 the dev `target/debug` first on `PATH`, so an agent's status hook calls *this*
-`thurbox-cli` and writes to the sandbox DB the TUI reads.
+`friring-cli` and writes to the sandbox DB the TUI reads.
 
 ```bash
 scripts/dev/sandbox.sh                 # persistent "default" profile, launch the TUI
 scripts/dev/sandbox.sh --fresh         # throwaway env, wiped on exit
 scripts/dev/sandbox.sh --profile foo   # a named persistent profile
 scripts/dev/sandbox.sh --isolate-home  # full hermetic isolation (fresh HOME; agents have NO creds)
-scripts/dev/sandbox.sh --shell         # a shell with the sandbox env (run thurbox-cli by hand)
-scripts/dev/sandbox.sh -- session list # run a thurbox-cli command in the sandbox
+scripts/dev/sandbox.sh --shell         # a shell with the sandbox env (run friring-cli by hand)
+scripts/dev/sandbox.sh -- session list # run a friring-cli command in the sandbox
 scripts/dev/sandbox.sh --clean [name]  # kill + wipe a persistent profile
 ```
 
@@ -83,9 +83,9 @@ Or via `just`: `just sandbox`, `just sandbox-fresh`, `just sandbox-shell`,
 
 **Isolation flavors:**
 
-- **thurbox-only (default)** — real `HOME`/agents; only `thurbox-config` +
-  `thurbox-data` (+ a private `TMUX_TMPDIR`) are redirected. Use this to dev with
-  your real, logged-in agents without polluting your real thurbox state.
+- **friring-only (default)** — real `HOME`/agents; only `friring-config` +
+  `friring-data` (+ a private `TMUX_TMPDIR`) are redirected. Use this to dev with
+  your real, logged-in agents without polluting your real friring state.
 - **full (`--isolate-home`)** — also overrides `HOME` + `XDG_*`, so the env is
   hermetic and agents boot with no credentials. This is what `scripts/demo/
   record.sh` and `scripts/dev/smoke/tui-smoke.sh` use (via
@@ -108,10 +108,10 @@ The isolation logic is one helper, `scripts/dev/lib/sandbox-env.sh`, sourced by
 
 ```bash
 scripts/dev/sandbox.sh --shell
-# inside the sandbox shell (thurbox/thurbox-cli target the sandbox):
-thurbox-cli session create --name demo --repo-path "$PWD" --agent claude
-thurbox-cli session signal --state blocked --session <id>   # what an agent hook does
-thurbox-cli session list --json | jq '.[].name'
+# inside the sandbox shell (friring/friring-cli target the sandbox):
+friring-cli session create --name demo --repo-path "$PWD" --agent claude
+friring-cli session signal --state blocked --session <id>   # what an agent hook does
+friring-cli session list --json | jq '.[].name'
 ```
 
 ## 4. Testing
@@ -159,7 +159,7 @@ The TUI has two layers of end-to-end coverage:
   TUI behavior" reduces to a rule, add it to `assert_invariants` and let the
   monkey hunt for a violating sequence.
 - **Black-box smoke test** (`scripts/dev/smoke/tui-smoke.sh`, `just smoke`).
-  Launches the real `thurbox` binary inside a throwaway tmux pane (isolated
+  Launches the real `friring` binary inside a throwaway tmux pane (isolated
   `HOME`/XDG/`TMUX_TMPDIR`, mirroring `scripts/demo/record.sh`), drives it with
   `tmux send-keys`, and asserts on captured frames (boot → F1 → theme → quit).
   Gated behind the `tui-smoke` CI job (needs tmux).
@@ -187,7 +187,7 @@ names were renamed, not kept as shims).
 ### Windows test environment (VM)
 
 `scripts/dev/e2e/windows-vm.sh` provisions a throwaway **Windows VM** to exercise
-thurbox's Windows support, where the session backend is
+friring's Windows support, where the session backend is
 [psmux](https://github.com/psmux/psmux) (a native-Windows tmux clone — same
 command language, `-L` sockets, and `-C`/`-CC` control mode that `TmuxBackend`
 drives, so it installs a `tmux.exe`). Mirroring `e2e/linux-container.sh`, it runs
@@ -196,14 +196,14 @@ a real KVM-accelerated Windows VM inside a single Podman container via
 first-boot `/oem` payload that installs psmux + OpenSSH + `cargo-nextest.exe` so
 the harness drives the VM **headlessly over SSH**. Default edition is **Windows
 11** (`VERSION=11`); dockur has no "tiny" edition token, so override
-`THURBOX_WIN_VERSION` only with values dockur recognizes (`11`, `10`, `2025`, …).
+`FRIRING_WIN_VERSION` only with values dockur recognizes (`11`, `10`, `2025`, …).
 
 ```bash
 scripts/dev/e2e/windows-vm.sh up         # build /oem payload + boot the VM (first run installs Windows, ~10-20 min)
 scripts/dev/e2e/windows-vm.sh wait       # block until the VM's SSH is reachable
 scripts/dev/e2e/windows-vm.sh test       # headless smoke test (psmux/tmux + a -L control session round-trip)
 scripts/dev/e2e/windows-vm.sh test-suite # run the FULL nextest suite inside the VM (see below)
-scripts/dev/e2e/windows-vm.sh deploy     # cross-build thurbox for x86_64-pc-windows-gnu + copy the .exe in
+scripts/dev/e2e/windows-vm.sh deploy     # cross-build friring for x86_64-pc-windows-gnu + copy the .exe in
 scripts/dev/e2e/windows-vm.sh ssh        # PowerShell shell in the VM; `web`/`rdp` for eyes-on; `down`/`clean` to tear down
 ```
 
@@ -231,22 +231,22 @@ through qemu's host-forward into the VM.
 `scripts/dev/e2e/real-host.sh <host> <verb>` (or `just lab <host> <verb>`) drives
 the same checks against **any real machine over SSH** — a `~/.ssh/config` alias
 or `user@address`. Linux/Windows is auto-detected. Because lab machines may also
-run *regular* thurbox sessions, the e2e test is fully scoped: a private
-`-L thurbox-lab-test` socket + session, all remote state under one
-`thurbox-lab-test` directory (repo + `worktrees_dir`), and an isolated local
-`THURBOX_CONFIG_DIR`/`THURBOX_DATA_DIR` — the release socket (`thurbox`), the dev
-socket (`thurbox-dev`), and real config/DB are never touched. Verbs: `check`
+run *regular* friring sessions, the e2e test is fully scoped: a private
+`-L friring-lab-test` socket + session, all remote state under one
+`friring-lab-test` directory (repo + `worktrees_dir`), and an isolated local
+`FRIRING_CONFIG_DIR`/`FRIRING_DATA_DIR` — the release socket (`friring`), the dev
+socket (`friring-dev`), and real config/DB are never touched. Verbs: `check`
 (readiness probe), `hosts` (print the `hosts.toml` block), `test` (headless
 ssh-backend e2e, mirrors `e2e/linux-container.sh test`), `tui` (wire the host
 into the persistent `lab` sandbox profile + launch for manual testing), `ssh`
 (interactive shell or a one-off command), `clean`; Windows-only: `deploy`
-(cross-build + install to `C:\Tools\thurbox`), `run` (the deployed TUI over
+(cross-build + install to `C:\Tools\friring`), `run` (the deployed TUI over
 `ssh -t`), `test-suite` (nextest archive, mirrors `e2e/windows-vm.sh`),
-`wsl-setup` / `wsl-check` (provision + verify a WSL distro as a thurbox target),
+`wsl-setup` / `wsl-check` (provision + verify a WSL distro as a friring target),
 `native-test [agent]` (headless e2e of the **deployed** binaries natively on the
-host: `thurbox-cli.exe` creates a local psmux session — agent argv + `THURBOX_*`
-env asserted intact — and `thurbox.exe` boots inside a scoped psmux pane and must
-show/adopt it; isolated via the `THURBOX_SOCKET` env override, since psmux has no
+host: `friring-cli.exe` creates a local psmux session — agent argv + `FRIRING_*`
+env asserted intact — and `friring.exe` boots inside a scoped psmux pane and must
+show/adopt it; isolated via the `FRIRING_SOCKET` env override, since psmux has no
 `TMUX_TMPDIR`-style socket-dir isolation). Local state: `target/lab-test/`
 (gitignored).
 
@@ -309,13 +309,13 @@ scripts/demo/record.sh theme automations   # re-record a subset
 ```
 
 `record.sh` records every video pair in one pass: the combined hero demo
-(`thurbox-demo.*` via `agents.tape`), one clip per feature
-(`thurbox-{file-manager,info-panel,theme,session-creation,fork}.*`), and the
+(`friring-demo.*` via `agents.tape`), one clip per feature
+(`friring-{file-manager,info-panel,theme,session-creation,fork}.*`), and the
 automations/tasks/search demos (`automations-demo.*`, `tasks-demo.*`,
 `search-demo.*`) — one VHS tape each (`scripts/demo/<feature>.tape`). With no
 args it records all of them; pass tape stems to re-record a subset (the `agents`
 stem is the hero, `automations`/`tasks`/`search` map to `<stem>-demo.*`, every
-other stem maps to `thurbox-<stem>.*`).
+other stem maps to `friring-<stem>.*`).
 
 Every clip uses **real agent CLIs**: the script seeds one session per installed
 CLI (`claude`, `opencode`, `codex`, `antigravity`) in a throwaway sample repo and
@@ -330,9 +330,9 @@ seeds the same worktree-with-a-committed-diff session the dedicated `code-review
 clip uses.
 
 It runs fully isolated from your real environment — a dev build (`0.0.0-dev` →
-`dev_build` cfg) uses the `thurbox-dev` socket and XDG subdirs, and the script
+`dev_build` cfg) uses the `friring-dev` socket and XDG subdirs, and the script
 points `TMUX_TMPDIR` and `XDG_{DATA,CONFIG,STATE,CACHE}_HOME` at a throwaway temp
-dir. **`TMUX_TMPDIR` is essential**: the `thurbox-dev` socket *name* is shared by
+dir. **`TMUX_TMPDIR` is essential**: the `friring-dev` socket *name* is shared by
 every dev build, so without a private socket directory the cleanup `kill-server`
 would tear down dev sessions you already have running.
 
