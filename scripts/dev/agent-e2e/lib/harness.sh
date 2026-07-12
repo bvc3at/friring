@@ -32,7 +32,7 @@ e2e_die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; return 1; }
 # infrastructure tools are hard errors (you explicitly invoked this suite).
 e2e_require_tools() {
     local mode="${1:-test}" missing=""
-    local tools="tmux node jq git"
+    local tools="tmux node jq git curl"
     [ "$mode" = "demo" ] && tools="$tools vhs sqlite3"
     for t in $tools; do
         command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
@@ -153,7 +153,9 @@ e2e_boot() {
         # open, which would hang the run.
         tmux -L "$E2E_DRIVER_SOCKET" new-session -d -s "$E2E_DRIVER_SESSION" \
             -x "$SCENARIO_COLS" -y "$SCENARIO_ROWS" "$THURBOX_BIN" 3>&-
-        e2e_wait_pane "Friring\|thurbox" 100 \
+        # "thurbox" is the header brand every build paints (the fork keeps the
+        # binary name); a single literal also stays portable across greps.
+        e2e_wait_pane "thurbox" 100 \
             || e2e_die "TUI did not boot" || return 1
     fi
 }
@@ -263,10 +265,13 @@ step_wait_pane() {
 
 # Wait for the session's persisted hook state (sessions.hook_state — written
 # by the agent's status hook via `thurbox-cli session signal`, readable
-# without the TUI). Status hooks are a per-agent capability, not a framework
-# guarantee — the profile must declare AGENT_HAS_STATUS_HOOKS=1 to use this.
-# Demo mode has no DB probe; the state flip has no fixed visual anchor, so
-# pace with a short sleep instead.
+# without the TUI). `want` may be an alternation ('working|done'): the column
+# is overwritten in place, so a transient state can flip between two polls —
+# waiting on a transient alone is a latent race; accept the successor state
+# too. Status hooks are a per-agent capability, not a framework guarantee —
+# the profile must declare AGENT_HAS_STATUS_HOOKS=1 to use this. Demo mode
+# has no DB probe; the state flip has no fixed visual anchor, so pace with a
+# short sleep instead.
 step_wait_state() {
     local want="$1" timeout="${2:-30}"
     if [ "$E2E_MODE" = "demo" ]; then
@@ -277,7 +282,7 @@ step_wait_state() {
         || e2e_die "agent '$AGENT_NAME' does not declare status hooks; step_wait_state unusable" \
         || return 1
     for _ in $(seq 1 "$((timeout * 5))"); do
-        [ "$(e2e_hook_state)" = "$want" ] && return 0
+        [[ "$(e2e_hook_state)" =~ ^($want)$ ]] && return 0
         sleep 0.2
     done
     e2e_die "timed out waiting for hook_state=$want (last: '$(e2e_hook_state)')"

@@ -15,8 +15,8 @@
 #
 # Hermetic + offline by construction: throwaway HOME/XDG/tmux dirs, the model
 # API stubbed on loopback, all other HTTP(S) egress dead-ended. Requires:
-# tmux, node >= 18, jq, git, bats (tests) / vhs + sqlite3 (demos), and the
-# agent binary — tests SKIP (not fail) when the agent binary is missing.
+# tmux, node >= 18, jq, git, curl, bats (tests) / vhs + sqlite3 (demos), and
+# the agent binary — tests SKIP (not fail) when the agent binary is missing.
 # See docs/E2E.md.
 set -euo pipefail
 

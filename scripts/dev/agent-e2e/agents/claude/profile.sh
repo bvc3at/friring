@@ -11,6 +11,9 @@
 #                               "anthropic" (stub/anthropic-stub.mjs) or "none"
 #                               (agent can't be stubbed — its scenarios are
 #                               skipped offline, declared rather than faked)
+#   AGENT_HAS_STATUS_HOOKS      1 if the built-in hooks extension wires this
+#                               agent's signals (gates step_wait_state)
+#   AGENT_LAUNCH_ARGS           flags shared by all three drive depths
 #   agent_binary                print the absolute binary path (or fail)
 #   agent_version               print the binary version (artifact metadata)
 #   agent_env                   print KEY=VALUE lines the harness exports before

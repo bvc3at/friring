@@ -138,15 +138,18 @@ frozen into the tmux server before vhs starts, so the offline guarantee is unaff
 
 ```bash
 just agent-e2e                       # whole suite (builds dev binaries first)
-just agent-e2e 'tool-loop'           # filter tests (bats --filter regex)
+just agent-e2e 'tool-use loop'       # filter by TEST NAME (bats --filter regex)
 just agent-demo claude-text-turn     # record a scenario as gif+mp4
 scripts/dev/agent-e2e/run.sh --list  # list scenarios
 ```
 
+The filter matches bats *test names*, not scenario directory names — a non-matching filter runs
+zero tests and still exits green (bats semantics), so check the `1..N` line when filtering.
+
 `THURBOX_E2E_CLAUDE_BIN` pins the binary; `THURBOX_E2E_KEEP=1` keeps the sandbox for post-mortem;
-`THURBOX_E2E_SKIP_BUILD=1` skips the cargo build. Requires tmux, node ≥ 18, jq, git, bats (tests)
-/ vhs + sqlite3 + a browser (demos). A missing *agent binary* makes the suite **skip**, not fail,
-so machines without claude stay green; missing infrastructure tools are hard errors.
+`THURBOX_E2E_SKIP_BUILD=1` skips the cargo build. Requires tmux, node ≥ 18, jq, git, curl, bats
+(tests) / vhs + sqlite3 + a browser (demos). A missing *agent binary* makes the suite **skip**,
+not fail, so machines without claude stay green; missing infrastructure tools are hard errors.
 
 CI: the `agent-e2e` job (`.github/workflows/ci.yml`) installs tmux + bats + the **pinned**
 `@anthropic-ai/claude-code` and runs the suite. It is path-gated like every job and deliberately

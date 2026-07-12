@@ -40,8 +40,9 @@
 //   }
 //
 // First matching response wins (top to bottom). A request no fixture matches
-// gets a 400 and an UNMATCHED journal entry — strict offline mode: the suite
-// fails on surprise calls rather than improvising an answer.
+// fails OPEN here — a benign 200 marker reply keeps the agent alive and
+// debuggable — and fails CLOSED at assert time: the UNMATCHED journal entry
+// makes the harness's post-run invariant fail the scenario.
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';

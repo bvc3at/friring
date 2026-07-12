@@ -21,7 +21,9 @@ scenario_steps() {
     step_type "$SCENARIO_PROMPT"
     step_sleep 1
     step_key Enter
-    step_wait_state working 30
+    # 'working|done': hook_state is overwritten in place, so a fast turn can
+    # flip working->done between polls; done implies the turn ran.
+    step_wait_state 'working|done' 30
     step_wait_pane "$SCENARIO_DONE_PATTERN" 60
     step_wait_state 'done' 60
     step_sleep 2
