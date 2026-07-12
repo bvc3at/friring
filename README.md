@@ -1021,7 +1021,7 @@ cog commit fix "resolve memory leak" cli
 
 ### Valid Scopes
 
-`api`, `cli`, `ui`, `git`, `core`, `docs`, `deps`, `config`, `mcp`
+`api`, `cli`, `ui`, `git`, `core`, `docs`, `deps`, `config`, `mcp`, `fork`
 
 ## Contributing
 

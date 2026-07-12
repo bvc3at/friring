@@ -97,7 +97,8 @@ Key facts:
 
 - **Conventional Commits** (enforced by cocogitto). Types: `feat`, `fix`,
   `perf`, `refactor`, `docs`, `style`, `test`, `chore`, `ci`, `build`, `revert`.
-  Scopes: `api`, `cli`, `ui`, `git`, `core`, `docs`, `deps`, `config`, `mcp`.
+  Scopes: `api`, `cli`, `ui`, `git`, `core`, `docs`, `deps`, `config`, `mcp`,
+  `fork` (fork-specific: FORK.md, migration, upstream divergences).
   Use `cog commit feat "message"` (or `… fix "message" scope`).
 - **Comments earn their tokens** — a redundant or wrong comment makes agents
   *less* accurate.

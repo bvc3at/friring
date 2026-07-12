@@ -123,7 +123,7 @@ All commits **must** follow
 - **Types:** `feat`, `fix`, `perf`, `refactor`, `docs`, `style`, `test`,
   `chore`, `ci`, `build`, `revert`
 - **Scopes:** `api`, `cli`, `ui`, `git`, `core`, `docs`, `deps`, `config`,
-  `mcp`
+  `mcp`, `fork` (fork-specific: `FORK.md`, migration, upstream divergences)
 
 ```bash
 cog commit feat "add remote host picker"
