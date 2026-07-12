@@ -1262,6 +1262,8 @@ impl App {
                 input_cursor: rp.input.cursor_pos(),
                 suggestion: rp.path_suggestion.as_deref(),
                 mode: rp.input_mode(),
+                candidates: &rp.candidates,
+                candidate_index: rp.candidate_index,
                 picked: rp.picked_count(),
                 host: self
                     .host_for_backend(self.new_session.backend.as_deref())

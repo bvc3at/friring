@@ -3533,9 +3533,9 @@ impl App {
             Modal::RepoPicker(rp) => {
                 rp.input.insert_str(text);
                 rp.recompute_filter();
-                // Refresh the ghost completion for a pasted path. Done after
+                // Refresh the path candidates for a pasted path. Done after
                 // the `rp` borrow ends.
-                self.update_repo_picker_path_suggestion();
+                self.refresh_repo_picker_candidates();
             }
             Modal::AutomationEditor(m) => {
                 if let Some(field) = m.active_field_mut() {
@@ -10180,6 +10180,249 @@ mod tests {
         assert!(
             !app.db.list_repo_bookmarks("").unwrap().is_empty(),
             "the parent bookmark was persisted"
+        );
+    }
+
+    /// Type `text` into the palette input, character by character (the way a
+    /// user would), so filters/candidates refresh exactly as in production.
+    fn type_into_picker(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+    }
+
+    #[test]
+    fn repo_picker_path_mode_lists_local_dir_candidates_with_repo_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("repo1").join(".git")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("plain")).unwrap();
+
+        let mut app = app_with_sessions(0);
+        seeded_repo_picker(&mut app, &[]);
+        type_into_picker(&mut app, &format!("{}/", tmp.path().display()));
+
+        let rp = picker_state(&app);
+        let names: Vec<(&str, bool)> = rp
+            .candidates
+            .iter()
+            .map(|c| (c.name.as_str(), c.is_repo))
+            .collect();
+        assert_eq!(names, vec![("plain", false), ("repo1", true)]);
+        assert_eq!(rp.candidate_index, None, "typed path is the Enter target");
+    }
+
+    #[test]
+    fn repo_picker_tab_completes_common_prefix_and_descends() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("alpha")).unwrap();
+
+        let mut app = app_with_sessions(0);
+        seeded_repo_picker(&mut app, &[]);
+        type_into_picker(&mut app, &format!("{}/al", tmp.path().display()));
+
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
+
+        let rp = picker_state(&app);
+        assert_eq!(
+            rp.input.value(),
+            format!("{}/alpha/", tmp.path().display()),
+            "unique match completes fully and descends"
+        );
+        assert!(matches!(app.modal, modals::Modal::RepoPicker(_)));
+    }
+
+    #[test]
+    fn repo_picker_enter_on_repo_candidate_bookmarks_selects_and_advances() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("repo1").join(".git")).unwrap();
+
+        let mut app = app_with_sessions(0);
+        seeded_repo_picker(&mut app, &[]);
+        type_into_picker(&mut app, &format!("{}/", tmp.path().display()));
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE); // highlight repo1
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(matches!(app.modal, modals::Modal::SessionName(_)));
+        assert_eq!(
+            app.new_session
+                .spawn_config
+                .as_ref()
+                .unwrap()
+                .cwd
+                .as_deref(),
+            Some(tmp.path().join("repo1").as_path())
+        );
+        assert!(
+            !app.db.list_repo_bookmarks("").unwrap().is_empty(),
+            "the opened repo was bookmarked for next time"
+        );
+    }
+
+    #[test]
+    fn repo_picker_enter_on_plain_dir_candidate_drills_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("sub").join("inner")).unwrap();
+
+        let mut app = app_with_sessions(0);
+        seeded_repo_picker(&mut app, &[]);
+        type_into_picker(&mut app, &format!("{}/", tmp.path().display()));
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE); // highlight sub
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        let rp = picker_state(&app);
+        assert_eq!(
+            rp.input.value(),
+            format!("{}/sub/", tmp.path().display()),
+            "a plain directory drills in instead of opening"
+        );
+        assert_eq!(
+            rp.candidates
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["inner"],
+            "the candidate list followed the descent"
+        );
+    }
+
+    #[test]
+    fn repo_picker_enter_on_typed_full_path_adds_and_advances() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("repo1").join(".git")).unwrap();
+
+        let mut app = app_with_sessions(0);
+        seeded_repo_picker(&mut app, &[]);
+        type_into_picker(&mut app, &format!("{}/repo1", tmp.path().display()));
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        // One Enter: bookmarked, selected, and the flow advanced (the old
+        // add-then-confirm double-Enter is gone).
+        assert!(matches!(app.modal, modals::Modal::SessionName(_)));
+        assert_eq!(
+            app.new_session
+                .spawn_config
+                .as_ref()
+                .unwrap()
+                .cwd
+                .as_deref(),
+            Some(tmp.path().join("repo1").as_path())
+        );
+    }
+
+    #[test]
+    fn repo_picker_enter_with_trailing_slash_acts_on_typed_dir_not_first_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("repo1").join("child")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("repo1").join(".git")).unwrap();
+
+        let mut app = app_with_sessions(0);
+        seeded_repo_picker(&mut app, &[]);
+        type_into_picker(&mut app, &format!("{}/repo1/", tmp.path().display()));
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(matches!(app.modal, modals::Modal::SessionName(_)));
+        assert_eq!(
+            app.new_session
+                .spawn_config
+                .as_ref()
+                .unwrap()
+                .cwd
+                .as_deref(),
+            Some(tmp.path().join("repo1").as_path()),
+            "the typed dir itself opens (normalized, no trailing slash) — not its first child"
+        );
+    }
+
+    #[test]
+    fn repo_picker_enter_on_missing_typed_path_errors_and_stays() {
+        let mut app = app_with_sessions(0);
+        seeded_repo_picker(&mut app, &[]);
+        type_into_picker(&mut app, "/definitely/not/a/real/dir");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(matches!(app.modal, modals::Modal::RepoPicker(_)));
+        assert!(app.new_session.spawn_config.is_none());
+        let msg = app.status_message.as_ref().expect("an error toast");
+        assert!(msg.text.contains("Path not found"));
+    }
+
+    #[test]
+    fn repo_picker_remote_typing_never_refreshes_candidates() {
+        let mut app = app_with_sessions(0);
+        app.new_session.backend = Some("ssh:nowhere".into());
+        app.open_repo_picker();
+        type_into_picker(&mut app, "/tm");
+
+        let rp = picker_state(&app);
+        assert!(rp.remote);
+        assert!(
+            rp.candidates.is_empty() && rp.path_suggestion.is_none(),
+            "remote paths must not touch the local filesystem per keystroke"
+        );
+
+        // Tab against an unknown host resolves no lister — a safe no-op.
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(picker_state(&app).input.value(), "/tm");
+    }
+
+    #[test]
+    fn repo_picker_multibyte_candidate_completion_never_panics() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Diverge inside a multibyte char: é (0xC3 0xA9) vs ê (0xC3 0xAA).
+        std::fs::create_dir_all(tmp.path().join("répo-a")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("rêpo-b")).unwrap();
+
+        let mut app = app_with_sessions(0);
+        seeded_repo_picker(&mut app, &[]);
+        type_into_picker(&mut app, &format!("{}/r", tmp.path().display()));
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
+
+        let rp = picker_state(&app);
+        assert_eq!(rp.candidates.len(), 2);
+        assert!(rp.input.value().ends_with("/r"), "nothing shared beyond r");
+    }
+
+    #[test]
+    fn repo_picker_hidden_dirs_only_listed_for_dot_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".hidden")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("visible")).unwrap();
+
+        let mut app = app_with_sessions(0);
+        seeded_repo_picker(&mut app, &[]);
+        type_into_picker(&mut app, &format!("{}/", tmp.path().display()));
+        let names: Vec<String> = picker_state(&app)
+            .candidates
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(names, vec!["visible"]);
+
+        type_into_picker(&mut app, ".");
+        let names: Vec<String> = picker_state(&app)
+            .candidates
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(names, vec![".hidden"]);
+    }
+
+    #[test]
+    fn repo_picker_up_from_first_candidate_returns_to_typed_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("one")).unwrap();
+
+        let mut app = app_with_sessions(0);
+        seeded_repo_picker(&mut app, &[]);
+        type_into_picker(&mut app, &format!("{}/", tmp.path().display()));
+
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(picker_state(&app).candidate_index, Some(0));
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            picker_state(&app).candidate_index,
+            None,
+            "the literal typed path stays reachable above the candidates"
         );
     }
 

@@ -1271,6 +1271,20 @@ pub enum RepoInputMode {
     Path,
 }
 
+/// One live directory-completion candidate shown while the palette input is
+/// in path mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathCandidate {
+    /// Entry name as listed in the parent directory.
+    pub name: String,
+    /// The candidate's full path (tilde-expanded parent joined with `name`).
+    pub full: PathBuf,
+    /// Whether the directory is a git repo. Local only — probing a remote
+    /// candidate would cost one ssh round-trip each, so remote candidates are
+    /// always `false` and Enter drills in instead of opening.
+    pub is_repo: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RepoPickerModal {
     /// Bookmark rows in recency order (a parent header followed by its
@@ -1289,8 +1303,14 @@ pub struct RepoPickerModal {
     pub list_index: usize,
     /// The single always-focused palette input: filter text or a path.
     pub input: TextInput,
-    /// Fish-style ghost completion for the input (path mode, local only).
+    /// Fish-style ghost completion for the input (path mode; derived from
+    /// `candidates` locally, from the explicit Tab listing remotely).
     pub path_suggestion: Option<String>,
+    /// Path mode: live directory candidates under the typed prefix (local:
+    /// refreshed per keystroke; remote: filled by an explicit Tab).
+    pub candidates: Vec<PathCandidate>,
+    /// Path-mode highlight; `None` = act on the typed path itself.
+    pub candidate_index: Option<usize>,
     /// Indices into `rows` that match the current filter.
     /// When the filter is empty, contains `0..rows.len()`.
     pub filtered_indices: Vec<usize>,

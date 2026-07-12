@@ -254,16 +254,21 @@ not applicable.
    remote hosts are configured (preserving the local-only flow). For
    a remote host the repo picker shows the repos previously used *on
    that host* (bookmarks are host-scoped, schema v39); new paths are
-   typed (with `Tab` completing against the remote filesystem, `~`
-   resolving to the remote home, and existence verified on Enter) and
-   the worktree + tmux window are created on that host over SSH.
+   typed (`Tab` lists the remote directory once over ssh — filling
+   the candidate list and completing — `~` resolves to the remote
+   home, and existence is verified on Enter; typing never triggers
+   remote IO) and the worktree + tmux window are created on that
+   host over SSH.
 2. **Repo picker** — an always-type palette: one focused input over
    the recency-sorted bookmark list. Typing fuzzy-filters the list;
-   typing a path (`~`, `/`, `./`, `../` prefix) switches the input to
-   path entry with `Tab` completion — `Tab` only ever completes, it
-   never moves focus. `Enter` opens the highlighted repo directly
-   (single-keystroke fast path), confirms the picked set when
-   repos are checked, or adds + opens a fully typed path. `Space`
+   typing a path (`~`, `/`, `./`, `../` prefix) switches the list to
+   **live directory candidates** (git repos marked `(repo)`) with
+   `Tab` completion — `Tab` only ever completes, it never moves
+   focus. `↑`/`↓` browse the candidates; `Enter` on a repo candidate
+   bookmarks + opens it, on a plain directory drills in, and on the
+   typed path itself (no highlight) adds + opens any existing dir.
+   In filter mode `Enter` opens the highlighted repo directly
+   (single-keystroke fast path) or confirms the picked set. `Space`
    (while the input is empty) or `Ctrl+Space` (always) picks
    additional repos, `Ctrl+T` marks a repo as a worktree base, and
    `Del` (input empty) forgets a bookmark. A pinned `start in ~`

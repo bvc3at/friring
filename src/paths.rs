@@ -515,13 +515,18 @@ fn longest_common_prefix(strings: &[String]) -> String {
             }
         }
     }
+    // A byte-wise LCP can land mid-char when strings diverge inside a
+    // multibyte char — floor to a boundary or the slice below panics.
+    while !first.is_char_boundary(prefix_len) {
+        prefix_len -= 1;
+    }
     first[..prefix_len].to_string()
 }
 
 /// Directory names directly under `parent` that start with `prefix`. Hidden
 /// entries (`.`-prefixed) are included only when `prefix` itself is hidden.
 /// Returns an empty vec when `parent` can't be read.
-fn matching_dir_names(parent: &Path, prefix: &str) -> Vec<String> {
+pub(crate) fn matching_dir_names(parent: &Path, prefix: &str) -> Vec<String> {
     let show_hidden = prefix.starts_with('.');
     let Ok(entries) = std::fs::read_dir(parent) else {
         return Vec::new();
@@ -539,6 +544,29 @@ fn matching_dir_names(parent: &Path, prefix: &str) -> Vec<String> {
         .collect()
 }
 
+/// Split a path-style input into the directory to list and the name prefix
+/// being typed, tilde-expanded. A trailing path separator (`/` everywhere,
+/// plus `\` on Windows — tilde expansion yields `C:\Users\me\`) means "list
+/// this directory's contents" (empty prefix). `None` for an empty input or
+/// one with no listable parent.
+pub(crate) fn split_path_input(input: &str) -> Option<(PathBuf, String)> {
+    if input.is_empty() {
+        return None;
+    }
+    let expanded = expand_tilde(input);
+    let expanded_str = expanded.to_str().unwrap_or(input);
+    // Split at the last separator textually. `Path::parent()`/`file_name()`
+    // would normalize a trailing `.` component away, so "dir/." would list
+    // dir's *parent* — breaking "type `.` to see hidden dirs".
+    let sep = expanded_str
+        .char_indices()
+        .rev()
+        .find(|(_, c)| std::path::is_separator(*c))?
+        .0;
+    let (parent, prefix) = expanded_str.split_at(sep + 1);
+    Some((PathBuf::from(parent), prefix.to_string()))
+}
+
 /// Fish-style directory path completion.
 ///
 /// Given a partial path input, returns the suffix to complete it.
@@ -551,28 +579,7 @@ fn matching_dir_names(parent: &Path, prefix: &str) -> Vec<String> {
 /// - Input `"/home/user/"` → suggests first common prefix of children
 /// - Input `"/nonexistent"` → `None`
 pub fn complete_directory_path(input: &str) -> Option<String> {
-    if input.is_empty() {
-        return None;
-    }
-
-    let expanded = expand_tilde(input);
-    let expanded_str = expanded.to_str().unwrap_or(input);
-    let path = Path::new(expanded_str);
-
-    // Determine parent directory and the prefix the user is typing. A trailing
-    // path separator (`/` everywhere, plus `\` on Windows — tilde expansion
-    // yields `C:\Users\me\`) means "list this directory's contents".
-    let ends_with_sep = expanded_str
-        .chars()
-        .next_back()
-        .is_some_and(std::path::is_separator);
-    let (parent, prefix) = if ends_with_sep {
-        (path.to_path_buf(), String::new())
-    } else {
-        let parent = path.parent()?.to_path_buf();
-        let file_name = path.file_name()?.to_str()?;
-        (parent, file_name.to_string())
-    };
+    let (parent, prefix) = split_path_input(input)?;
 
     let matches = matching_dir_names(&parent, &prefix);
 
@@ -947,6 +954,44 @@ mod tests {
             longest_common_prefix(&["abc".to_string(), "xyz".to_string()]),
             ""
         );
+    }
+
+    #[test]
+    fn longest_common_prefix_floors_multibyte_divergence() {
+        // é (C3 A9) and ê (C3 AA) share their first byte — the byte-wise LCP
+        // lands mid-char and must be floored, not panic on the slice.
+        assert_eq!(
+            longest_common_prefix(&["répo".to_string(), "rêpo".to_string()]),
+            "r"
+        );
+    }
+
+    #[test]
+    fn split_path_input_empty_is_none() {
+        assert_eq!(split_path_input(""), None);
+    }
+
+    #[test]
+    fn split_path_input_trailing_sep_lists_that_dir() {
+        let (parent, prefix) = split_path_input("/tmp/").unwrap();
+        assert_eq!(parent, PathBuf::from("/tmp"));
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn split_path_input_splits_parent_and_typed_prefix() {
+        let (parent, prefix) = split_path_input("/tmp/fo").unwrap();
+        assert_eq!(parent, PathBuf::from("/tmp"));
+        assert_eq!(prefix, "fo");
+    }
+
+    #[test]
+    fn split_path_input_expands_tilde() {
+        if let Some(home) = home_dir() {
+            let (parent, prefix) = split_path_input("~/co").unwrap();
+            assert_eq!(parent, home);
+            assert_eq!(prefix, "co");
+        }
     }
 
     #[test]

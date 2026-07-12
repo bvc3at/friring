@@ -1922,7 +1922,7 @@ impl App {
                     rp.list_index = 0;
                     self.recompute_repo_filter();
                 }
-                self.update_repo_picker_path_suggestion();
+                self.refresh_repo_picker_candidates();
             }
         }
     }
@@ -1936,11 +1936,33 @@ impl App {
         }
     }
 
-    /// Move the list highlight by `delta`, clamped to the visible rows.
+    /// Move the highlight by `delta`. In filter mode this walks the bookmark
+    /// rows; in path mode it walks the directory candidates, where stepping up
+    /// past the first candidate returns to `None` — "act on the typed path
+    /// itself" — so the literal input always stays reachable.
     fn repo_picker_move(&mut self, delta: i32) {
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
             return;
         };
+        if rp.input_mode() == super::modals::RepoInputMode::Path {
+            let len = rp.candidates.len() as i32;
+            if len == 0 {
+                return;
+            }
+            rp.candidate_index = match rp.candidate_index {
+                None if delta > 0 => Some(((delta - 1).min(len - 1)) as usize),
+                None => None,
+                Some(i) => {
+                    let next = i as i32 + delta;
+                    if next < 0 {
+                        None
+                    } else {
+                        Some(next.min(len - 1) as usize)
+                    }
+                }
+            };
+            return;
+        }
         let len = rp.filtered_indices.len();
         if len == 0 {
             return;
@@ -2047,10 +2069,10 @@ impl App {
     }
 
     /// `Tab`: complete the typed path — and nothing else. A Tab with nothing
-    /// to complete is a no-op. Remote targets have no per-keystroke suggestion
-    /// (that would fire an ssh/wsl round-trip on every character); compute one
-    /// on demand here by listing the remote directory. Completion only applies
-    /// with the cursor at the end (inserting mid-string would garble the path).
+    /// to complete is a no-op. Remote targets have no per-keystroke candidates
+    /// (that would fire an ssh/wsl round-trip on every character); list the
+    /// remote directory on demand here instead. Completion only applies with
+    /// the cursor at the end (inserting mid-string would garble the path).
     fn repo_picker_complete(&mut self) {
         if self.new_session.backend.is_some() {
             let super::modals::Modal::RepoPicker(ref rp) = self.modal else {
@@ -2059,12 +2081,26 @@ impl App {
             let value = rp.input.value().to_string();
             let at_end = rp.input.cursor_pos() == value.chars().count();
             let sug = at_end
-                .then(|| self.remote_path_completion(&value))
+                .then(|| self.remote_path_candidates(&value))
                 .flatten();
             if let super::modals::Modal::RepoPicker(ref mut rp) = self.modal {
                 if let Some(sug) = sug {
                     for c in sug.chars() {
                         rp.input.insert(c);
+                    }
+                    // A descent invalidates the listed candidates (they were
+                    // the parent's); a partial completion just narrows them.
+                    if sug.ends_with('/') {
+                        rp.candidates.clear();
+                        rp.candidate_index = None;
+                    } else if let Some((_, prefix)) = rp
+                        .input
+                        .value()
+                        .rsplit_once('/')
+                        .map(|(a, b)| (a, b.to_string()))
+                    {
+                        rp.candidates.retain(|c| c.name.starts_with(&prefix));
+                        rp.candidate_index = None;
                     }
                 }
             }
@@ -2079,7 +2115,7 @@ impl App {
             }
             self.recompute_repo_filter();
         }
-        self.update_repo_picker_path_suggestion();
+        self.refresh_repo_picker_candidates();
     }
 
     /// `Enter` — the palette's primary action, in priority order: a typed path
@@ -2091,6 +2127,23 @@ impl App {
             return;
         };
         if rp.input_mode() == super::modals::RepoInputMode::Path {
+            // A highlighted candidate acts directly: a git repo opens (the
+            // browse fast path), anything else drills in. The typed path
+            // itself stays reachable at `candidate_index == None`.
+            if let Some(ci) = rp.candidate_index {
+                let Some(c) = rp.candidates.get(ci) else {
+                    return;
+                };
+                let (is_repo, name, full) = (c.is_repo, c.name.clone(), c.full.clone());
+                if is_repo {
+                    self.repo_picker_open_candidate(&full);
+                } else {
+                    self.repo_picker_drill_into(&name);
+                }
+                return;
+            }
+            // No highlight: commit the typed path (any existing dir — also
+            // the way to open a non-repo directory) and advance.
             if self.repo_picker_commit_path_input() {
                 self.submit_repo_picker();
             }
@@ -2135,6 +2188,47 @@ impl App {
         self.spawn_repo_picker_no_repos();
     }
 
+    /// Enter on a candidate that is a git repo: bookmark it, select it, and
+    /// advance the flow with it.
+    fn repo_picker_open_candidate(&mut self, full: &std::path::Path) {
+        let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
+            return;
+        };
+        let persist = Self::repo_picker_select_or_add_row(rp, full);
+        if persist {
+            if let Err(e) = self.db.upsert_repo_bookmark(self.bookmark_host_key(), full) {
+                error!("Failed to save repo bookmark: {e}");
+                self.set_error(format!("Failed to save repo bookmark: {e}"));
+            }
+        }
+        self.submit_repo_picker();
+    }
+
+    /// Enter on a candidate that is a plain directory: descend into it,
+    /// keeping the user's typed form (a `~/…` input stays tilde-style).
+    fn repo_picker_drill_into(&mut self, name: &str) {
+        let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
+            return;
+        };
+        let value = rp.input.value().to_string();
+        // The name-prefix is everything after the last separator (mirrors
+        // `paths::split_path_input`); replace it with the chosen candidate.
+        // A separator-free input (bare `~`) completes against the expanded
+        // parent, so fall back to the candidate's absolute form there.
+        let new = match value.rfind('/') {
+            Some(i) => format!("{}{}/", &value[..=i], name),
+            None => {
+                let Some(c) = rp.candidates.iter().find(|c| c.name == name) else {
+                    return;
+                };
+                format!("{}/", c.full.display())
+            }
+        };
+        rp.input.set(&new);
+        self.recompute_repo_filter();
+        self.refresh_repo_picker_candidates();
+    }
+
     /// Commit the typed path in the palette input: add or re-select the
     /// bookmark, persist it (scoped to the target host), and clear the input.
     /// Returns whether a repo row ended up selected (the caller then advances
@@ -2150,10 +2244,15 @@ impl App {
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
             return false;
         };
-        let path = rp.input.value().trim().to_string();
+        let mut path = rp.input.value().trim().to_string();
         if path.is_empty() {
             self.recompute_repo_filter();
             return false;
+        }
+        // Normalize a browse-style trailing slash ("~/code/" means ~/code) so
+        // the bookmark never carries one and dedupes against the bare form.
+        while path.len() > 1 && path.ends_with('/') {
+            path.pop();
         }
         let expanded = match &remote_host {
             Some(host) => {
@@ -2199,8 +2298,8 @@ impl App {
             return false;
         };
         rp.input.clear();
-        rp.path_suggestion = None;
         self.recompute_repo_filter();
+        self.refresh_repo_picker_candidates();
         selected
     }
 
@@ -2275,40 +2374,84 @@ impl App {
         self.refresh_repo_picker_rows();
     }
 
-    /// Compute a remote directory completion for the repo-picker path input by
-    /// listing the parent directory on the selected host over ssh/wsl. Returns
-    /// the suffix to append (mirroring `paths::complete_directory_path`), or
-    /// `None`. Only called on an explicit `Tab` so it doesn't run per keystroke.
-    fn remote_path_completion(&self, input: &str) -> Option<String> {
-        let host = self.host_for_backend(self.new_session.backend.as_deref())?;
+    /// One explicit ssh/wsl listing for the typed remote path: fills the
+    /// candidate list (`is_repo` unknowable without one round-trip each, so
+    /// always `false` — Enter on a remote candidate drills in) and returns the
+    /// completion suffix (mirroring `paths::complete_directory_path`). Only
+    /// called on an explicit `Tab` so it doesn't run per keystroke.
+    fn remote_path_candidates(&mut self, input: &str) -> Option<String> {
+        let host = self
+            .host_for_backend(self.new_session.backend.as_deref())?
+            .clone();
         // Need at least one `/` to know which remote dir to list.
         let (parent, prefix) = input.rsplit_once('/')?;
         let parent = if parent.is_empty() { "/" } else { parent };
-        let entries = crate::git::list_dir_on(host, parent).ok()?;
-        dir_completion_suffix(&entries, prefix)
+        let entries = crate::git::list_dir_on(&host, parent).ok()?;
+        let sug = dir_completion_suffix(&entries, prefix);
+        let show_hidden = prefix.starts_with('.');
+        if let super::modals::Modal::RepoPicker(ref mut rp) = self.modal {
+            let mut names: Vec<String> = entries
+                .into_iter()
+                .filter(|n| (show_hidden || !n.starts_with('.')) && n.starts_with(prefix))
+                .collect();
+            names.sort();
+            rp.candidates = names
+                .into_iter()
+                .map(|name| super::modals::PathCandidate {
+                    full: std::path::PathBuf::from(format!(
+                        "{}/{name}",
+                        parent.trim_end_matches('/')
+                    )),
+                    name,
+                    is_repo: false,
+                })
+                .collect();
+            rp.candidate_index = None;
+        }
+        sug
     }
 
-    pub(super) fn update_repo_picker_path_suggestion(&mut self) {
-        // For a remote target (SSH host or WSL distro) the path lives on the
-        // *remote* filesystem, so completing against the local one would suggest
-        // the wrong directories entirely. Suppress the local-filesystem
-        // suggestion in that case — the path is typed as a plain remote path.
+    /// Recompute the path-mode candidate list and the ghost completion derived
+    /// from it. For a remote target (SSH host or WSL distro) the path lives on
+    /// the *remote* filesystem, so listing the local one would suggest the
+    /// wrong directories entirely — remote candidates are only filled by an
+    /// explicit `Tab` (see [`Self::remote_path_candidates`]).
+    pub(super) fn refresh_repo_picker_candidates(&mut self) {
         let remote = self.new_session.backend.is_some();
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
             return;
         };
-        // Filter text is not a path — a ghost completion there would be noise.
+        rp.candidates.clear();
+        rp.candidate_index = None;
+        rp.path_suggestion = None;
+        // Filter text is not a path — completing it would be noise.
         if remote || rp.input_mode() != super::modals::RepoInputMode::Path {
-            rp.path_suggestion = None;
             return;
         }
         let value = rp.input.value().to_string();
-        let at_end = rp.input.cursor_pos() == value.chars().count();
-        if at_end && !value.is_empty() {
-            rp.path_suggestion = paths::complete_directory_path(&value);
-        } else {
-            rp.path_suggestion = None;
+        // Completion only applies with the cursor at the end (inserting
+        // mid-string would garble the path).
+        if rp.input.cursor_pos() != value.chars().count() {
+            return;
         }
+        let Some((parent, prefix)) = paths::split_path_input(&value) else {
+            return;
+        };
+        let mut names = paths::matching_dir_names(&parent, &prefix);
+        names.sort();
+        rp.path_suggestion = dir_completion_suffix(&names, &prefix);
+        rp.candidates = names
+            .into_iter()
+            .map(|name| {
+                let full = parent.join(&name);
+                let is_repo = crate::git::is_git_repo(&full);
+                super::modals::PathCandidate {
+                    name,
+                    full,
+                    is_repo,
+                }
+            })
+            .collect();
     }
 
     fn recompute_repo_filter(&mut self) {

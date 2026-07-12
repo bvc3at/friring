@@ -12,7 +12,7 @@ use ratatui::{
 use super::render_modal_frame;
 use super::theme::Theme;
 use super::{centered_fixed_height_rect, render_text_field_with_suggestion};
-use crate::app::modals::{RepoInputMode, RepoRow, RepoRowKind};
+use crate::app::modals::{PathCandidate, RepoInputMode, RepoRow, RepoRowKind};
 
 pub struct RepoPickerState<'a> {
     /// Bookmark rows (headers, children, standalone repos) followed by the
@@ -32,6 +32,10 @@ pub struct RepoPickerState<'a> {
     /// Fish-style ghost completion (path mode, local only).
     pub suggestion: Option<&'a str>,
     pub mode: RepoInputMode,
+    /// Path mode: live directory candidates + the highlighted one (`None` =
+    /// the typed path itself is the Enter target).
+    pub candidates: &'a [PathCandidate],
+    pub candidate_index: Option<usize>,
     /// Checked-repo count (shown in the list title and the Enter hint).
     pub picked: usize,
     /// The target host's name for an off-local session (`None` = local).
@@ -44,11 +48,11 @@ pub fn render_repo_picker_modal(
     frame: &mut Frame,
     state: &RepoPickerState<'_>,
 ) -> super::ModalRender {
-    let visible_count = if state.filtered_indices.is_empty() {
-        1
-    } else {
-        state.filtered_indices.len().min(10)
+    let row_count = match state.mode {
+        RepoInputMode::Filter => state.filtered_indices.len(),
+        RepoInputMode::Path => state.candidates.len(),
     };
+    let visible_count = row_count.clamp(1, 10);
     let list_height = visible_count as u16 + 2; // +2 for borders
 
     // Layout: list + palette input(3) + footer(1) + outer border(2)
@@ -68,7 +72,10 @@ pub fn render_repo_picker_modal(
         .split(inner);
     let (list_area, input_area, footer_area) = (chunks[0], chunks[1], chunks[2]);
 
-    let hitboxes = render_bookmark_list(frame, list_area, state);
+    let hitboxes = match state.mode {
+        RepoInputMode::Filter => render_bookmark_list(frame, list_area, state),
+        RepoInputMode::Path => render_candidate_list(frame, list_area, state),
+    };
 
     render_text_field_with_suggestion(
         frame,
@@ -172,6 +179,73 @@ fn render_bookmark_list(
         super::scrollbar::render_into(frame, t, total, visible_count, state.list_index)
     });
     (hitboxes, geom)
+}
+
+/// Render the path-mode directory candidates. No row hitboxes: the palette is
+/// keyboard-first here (the wheel still steps the highlight via Up/Down), and
+/// a candidate click would need its own index space vs `list_index`.
+fn render_candidate_list(
+    frame: &mut Frame,
+    list_area: ratatui::layout::Rect,
+    state: &RepoPickerState<'_>,
+) -> super::SelectorHits {
+    let title = match state.host {
+        Some(host) => format!(" Directories on {host} ({}) ", state.candidates.len()),
+        None => format!(" Directories ({}) ", state.candidates.len()),
+    };
+    let list_block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::border_unfocused()));
+    let list_inner_area = list_block.inner(list_area);
+    frame.render_widget(list_block, list_area);
+
+    if state.candidates.is_empty() {
+        let msg = match state.host {
+            Some(_) => "  Tab lists remote directories (one ssh call)",
+            None => "  No matching directories",
+        };
+        let placeholder = Paragraph::new(Line::from(Span::styled(
+            msg,
+            Style::default().fg(Theme::text_muted()),
+        )));
+        frame.render_widget(placeholder, list_inner_area);
+        return (Vec::new(), None);
+    }
+
+    let visible_count = list_inner_area.height as usize;
+    let anchor = state.candidate_index.unwrap_or(0);
+    let scroll_offset = if anchor >= visible_count {
+        anchor - visible_count + 1
+    } else {
+        0
+    };
+
+    let items: Vec<ListItem<'_>> = state
+        .candidates
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_count)
+        .map(|(i, c)| {
+            let style = if Some(i) == state.candidate_index {
+                Theme::selected_item()
+            } else {
+                Theme::normal_item()
+            };
+            let mut spans = vec![Span::styled(format!("{}/", c.name), style)];
+            if c.is_repo {
+                spans.push(Span::styled(
+                    " (repo)",
+                    Style::default().fg(Theme::accent()),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    frame.render_widget(List::new(items), list_inner_area);
+
+    (Vec::new(), None)
 }
 
 /// Build a single list item for whatever kind of row this is.
@@ -291,7 +365,8 @@ fn footer_line(state: &RepoPickerState<'_>) -> Line<'static> {
     match state.mode {
         RepoInputMode::Path => {
             spans.extend(hint("Tab", " complete  "));
-            spans.extend(hint("Enter", " add + open  "));
+            spans.extend(hint("↑↓", " browse  "));
+            spans.extend(hint("Enter", " open / drill in  "));
             spans.extend(hint("Esc", " cancel"));
         }
         RepoInputMode::Filter => {
@@ -397,6 +472,8 @@ mod tests {
             input_cursor: input.len(),
             suggestion: None,
             mode,
+            candidates: &[],
+            candidate_index: None,
             picked,
             host: None,
         }
@@ -407,7 +484,7 @@ mod tests {
         let s = picker_state("~/co", RepoInputMode::Path, 0);
         let text = span_text(&footer_line(&s).spans);
         assert!(text.contains("Tab complete"));
-        assert!(text.contains("add + open"));
+        assert!(text.contains("open / drill in"));
         assert!(!text.contains("worktree"));
     }
 
