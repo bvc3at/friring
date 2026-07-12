@@ -47,13 +47,18 @@ const GLOBAL_SEARCH_POPUP_MAX_WIDTH: u16 = 90;
 /// the content — computed from the full frame area, independent of the
 /// band/column splits, so opening the search never resizes the panels or the
 /// session PTYs behind it.
-fn global_search_popup(area: Rect) -> Rect {
+fn global_search_popup(area: Rect, show_status_row: bool) -> Rect {
     let width = ((area.width as u32 * 3 / 5) as u16)
         .clamp(GLOBAL_SEARCH_POPUP_MIN_WIDTH, GLOBAL_SEARCH_POPUP_MAX_WIDTH)
         .min(area.width);
     let y_off = (area.height / 6).min(area.height.saturating_sub(1));
-    // Keep the footer row visible below the popup.
-    let height = GLOBAL_SEARCH_POPUP_ROWS.min(area.height.saturating_sub(y_off).saturating_sub(1));
+    // Keep the footer — and, when shown, the transient status-message row above
+    // it — visible below the popup. Both render *after* the popup (`App::view`),
+    // so an overlap would overwrite the popup's bottom border on short
+    // terminals; reserving their rows keeps the popup clean instead.
+    let reserved = if show_status_row { 2 } else { 1 };
+    let height =
+        GLOBAL_SEARCH_POPUP_ROWS.min(area.height.saturating_sub(y_off).saturating_sub(reserved));
     Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + y_off,
@@ -304,7 +309,9 @@ pub struct LayoutParams {
 /// over the content; no band is carved and no panel shrinks.
 pub fn compute_layout(area: Rect, p: &LayoutParams) -> PanelAreas {
     let mut areas = compute_panel_areas(area, p);
-    areas.global_search = p.show_global_search.then(|| global_search_popup(area));
+    areas.global_search = p
+        .show_global_search
+        .then(|| global_search_popup(area, p.show_status_row));
     areas
 }
 
@@ -567,6 +574,20 @@ mod tests {
         // Shorter than the full popup: clamp the height, keep the footer row.
         assert!(popup.height < GLOBAL_SEARCH_POPUP_ROWS);
         assert!(popup.y + popup.height < 12);
+    }
+
+    #[test]
+    fn global_search_popup_clears_the_status_row_when_both_show() {
+        // Short terminal + an active status message: the status row renders
+        // over the popup, so the popup must reserve it (footer + status) and
+        // never extend onto the status row's line.
+        let areas = layout(area(120, 14), false, false, false, true, true, 0, true);
+        let popup = areas.global_search.expect("popup shown");
+        let status = areas.status_message.expect("status row shown");
+        assert!(
+            popup.y + popup.height <= status.y,
+            "popup {popup:?} must end at or above the status row {status:?}"
+        );
     }
 
     #[test]

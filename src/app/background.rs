@@ -46,7 +46,9 @@ impl<T> BackgroundTask<T> {
 
     /// Mark a job in flight and return the sender to hand to the worker.
     /// Callers must check [`in_progress`](Self::in_progress) first; starting
-    /// over an in-flight job would orphan its receiver.
+    /// over an in-flight job would orphan its receiver — unless dropping the
+    /// prior receiver is the intent, in which case call [`cancel`](Self::cancel)
+    /// (it makes the reset explicit and reads as idle).
     pub(crate) fn start(&mut self) -> mpsc::Sender<T> {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);

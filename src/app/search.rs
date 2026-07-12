@@ -139,6 +139,12 @@ impl App {
     /// Open the global-search popup: snapshot the current UI state (so cancel
     /// can restore it), clear the query, focus the popup, seed the (cheap)
     /// metadata results, and kick off the off-thread Files-index build.
+    ///
+    /// Unlike the old bottom strip, the popup floats over the content and does
+    /// not change any panel's size, so opening it pushes no PTY resize — the
+    /// content area is identical to the previous frame. (`close` still resizes:
+    /// restoring `show_tasks_panel`/`show_file_viewer` a preview may have
+    /// changed does alter the layout.)
     pub(crate) fn open_global_search(&mut self) {
         self.global_search.snapshot = Some(SearchSnapshot {
             focus: self.focus,
@@ -157,7 +163,6 @@ impl App {
         self.focus = InputFocus::GlobalSearch;
         self.start_global_search_file_index();
         self.recompute_global_search_metadata();
-        self.resize_sessions_to_content_area();
     }
 
     /// Snapshot the Files-scope index off-thread: the bounded tree walk (up to
