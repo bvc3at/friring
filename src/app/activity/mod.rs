@@ -950,18 +950,33 @@ mod tests {
 
     #[test]
     fn provider_resolves_by_command_basename() {
-        assert_eq!(
-            ProviderKind::for_command("claude"),
-            Some(ProviderKind::Claude)
-        );
+        // Every supported command's bare basename must route to its variant —
+        // a typo in any arm would silently misroute or disable that provider.
+        let table = [
+            ("claude", ProviderKind::Claude),
+            ("vibe", ProviderKind::Vibe),
+            ("qwen", ProviderKind::Qwen),
+            ("cursor-agent", ProviderKind::Cursor),
+            ("gemini", ProviderKind::Gemini),
+            ("crush", ProviderKind::Crush),
+            ("copilot", ProviderKind::Copilot),
+            ("aider", ProviderKind::Aider),
+            ("goose", ProviderKind::Goose),
+            ("opencode", ProviderKind::Opencode),
+            ("codex", ProviderKind::Codex),
+            ("cline", ProviderKind::Cline),
+        ];
+        for (command, kind) in table {
+            assert_eq!(
+                ProviderKind::for_command(command),
+                Some(kind),
+                "command {command:?} should resolve to {kind:?}"
+            );
+        }
+        // A path-qualified command resolves by basename.
         assert_eq!(
             ProviderKind::for_command("/usr/local/bin/claude"),
             Some(ProviderKind::Claude)
-        );
-        assert_eq!(ProviderKind::for_command("vibe"), Some(ProviderKind::Vibe));
-        assert_eq!(
-            ProviderKind::for_command("codex"),
-            Some(ProviderKind::Codex)
         );
         // agy (encrypted store) and amp (server-side threads) are deliberate
         // gaps with named reasons, not providers.
