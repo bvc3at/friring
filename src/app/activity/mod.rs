@@ -387,6 +387,13 @@ impl App {
                 ))
             })
             .collect();
+        // Evict accumulators for sessions no longer eligible (deleted, gone
+        // remote, or repointed to an unsupported command) so their event
+        // vectors don't leak across session churn. Safe here: the in_progress
+        // guard means no accumulator is checked out, and it must run even when
+        // `pre` is empty so every stale entry clears.
+        let ids: std::collections::HashSet<SessionId> = pre.iter().map(|(id, ..)| *id).collect();
+        self.activity.retain(|id, _| ids.contains(id));
         if pre.is_empty() {
             return;
         }
