@@ -193,6 +193,10 @@ pub enum TranscriptBlock {
     ToolUse { name: String, input: String },
     /// A tool result body (already normalised to text).
     ToolResult { content: String, is_error: bool },
+    /// One normalized activity event — the F9 section views (timeline /
+    /// commands / web) render event streams through the same block engine as
+    /// transcripts, so folds, find, and wrap behave identically.
+    Event(super::activity::ActivityEvent),
 }
 
 // -------------------------------------------------------------------------
@@ -576,8 +580,10 @@ fn is_meta_prompt(text: &str) -> bool {
 
 /// The first typed-prompt text of a `user` line, if it has one. Content is a
 /// plain string on old lines and an array of blocks on new ones; either way,
-/// meta/sidechain/compact-summary lines never yield a title.
-fn user_prompt_text(v: &serde_json::Value) -> Option<String> {
+/// meta/sidechain/compact-summary lines never yield a title. Shared with the
+/// activity provider (`activity::claude`), which derives a session title the
+/// same way.
+pub(crate) fn user_prompt_text(v: &serde_json::Value) -> Option<String> {
     if v.get("isSidechain").and_then(|x| x.as_bool()) == Some(true)
         || v.get("isMeta").and_then(|x| x.as_bool()) == Some(true)
         || v.get("isCompactSummary").and_then(|x| x.as_bool()) == Some(true)
@@ -725,8 +731,10 @@ fn render_tool_input(name: &str, input: Option<&serde_json::Value>) -> String {
 }
 
 /// A `tool_result.content` is a string or an array of `{type:"text",text}`
-/// blocks; normalise either to a single string.
-fn normalize_tool_result(content: Option<&serde_json::Value>) -> String {
+/// blocks; normalise either to a single string. Shared with the activity
+/// provider (`activity::claude`), which extracts result heads from the same
+/// block shape.
+pub(crate) fn normalize_tool_result(content: Option<&serde_json::Value>) -> String {
     match content {
         Some(v) if v.is_string() => v.as_str().unwrap_or_default().to_string(),
         Some(v) if v.is_array() => v

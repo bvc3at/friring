@@ -1,3 +1,4 @@
+pub(crate) mod activity;
 mod automation;
 mod automation_state;
 mod background;
@@ -103,6 +104,11 @@ const METRICS_REFRESH_TICKS: u64 = 100;
 /// activity view (in ticks, ~1 s). The scan is stat-gated: an unchanged tree
 /// skips the JSONL parse, so idle sessions stay cheap.
 const CC_REFRESH_TICKS: u64 = 100;
+
+/// How often to tail each local session's agent activity sources (in ticks,
+/// ~1 s), offset half a cadence from [`CC_REFRESH_TICKS`] so the two scans
+/// never land on the same tick. Also stat-gated.
+const ACTIVITY_REFRESH_TICKS: u64 = 100;
 
 /// How often to refresh git stats for the active session (in ticks). Git stats
 /// shell out to `git`, so they run on a slower cadence than other metrics
@@ -754,6 +760,14 @@ pub struct App {
     /// unchanged `subagents/` tree skips re-parsing. `None`/absent = never
     /// scanned. Pure in-memory (the index is file-derived, never persisted).
     cached_cc_signatures: std::collections::HashMap<SessionId, u64>,
+    /// Per-session agent-neutral activity accumulators (normalized command /
+    /// edit / read / web event streams tailed from each agent's on-disk
+    /// records). Entries are *moved* into the in-flight scan and re-inserted
+    /// by `poll_activity_refresh`. File-derived, never persisted.
+    pub(crate) activity: std::collections::HashMap<SessionId, activity::SessionActivity>,
+    /// Background per-session activity-event tail, polled each tick; gated on
+    /// `[features] cc_activity` like the tree scan above.
+    activity_refresh: background::BackgroundTask<activity::ActivityRefresh>,
     /// Background active-session git-stats refresh, polled each tick.
     git_stats: background::BackgroundTask<(SessionId, Option<crate::session::GitStats>)>,
     /// Cached update-check result, rendered as the header "update available"
@@ -1092,6 +1106,8 @@ impl App {
             metrics_refresh: background::BackgroundTask::default(),
             cc_refresh: background::BackgroundTask::default(),
             cached_cc_signatures: std::collections::HashMap::new(),
+            activity: std::collections::HashMap::new(),
+            activity_refresh: background::BackgroundTask::default(),
             git_stats: background::BackgroundTask::default(),
             // Seed the badge from the cache (no network); refreshed on first
             // tick if the flag is on and the cache is stale.
@@ -4627,12 +4643,19 @@ impl App {
         self.poll_metrics_refresh();
         self.poll_git_stats();
         self.poll_cc_refresh();
+        self.poll_activity_refresh();
 
         if self.metrics.tick_count % METRICS_REFRESH_TICKS == 0 {
             self.start_metrics_refresh();
         }
         if self.features.cc_activity && self.metrics.tick_count % CC_REFRESH_TICKS == 0 {
             self.start_cc_refresh();
+        }
+        // Offset half a cadence from the tree scan so the two never share a tick.
+        if self.features.cc_activity
+            && self.metrics.tick_count % ACTIVITY_REFRESH_TICKS == ACTIVITY_REFRESH_TICKS / 2
+        {
+            self.start_activity_refresh();
         }
         if self.metrics.tick_count % GIT_REFRESH_TICKS == 0 {
             self.start_git_stats_refresh();

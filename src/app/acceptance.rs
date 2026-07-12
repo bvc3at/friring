@@ -1030,14 +1030,24 @@ fn cc_activity_view_opens_navigates_folds_and_closes() {
     let mut h = Harness::spawnable(1);
     h.app.sessions[0].info.cc_activity = Some(activity);
 
-    // F9 opens the view, focused on the tree (workflow header + 2 agents + 1
-    // standalone subagent = 4 rows).
+    // F9 opens the view, focused on the navigator: 6 section rows, then the
+    // agents subtree (workflow header + 2 agents + 1 standalone subagent).
     h.key(KeyCode::F(9), KeyModifiers::NONE);
     assert_eq!(h.app.focus, InputFocus::CcActivityTree);
-    assert_eq!(h.app.active_cc_activity().unwrap().tree.len(), 4);
+    assert_eq!(h.app.active_cc_activity().unwrap().tree.len(), 10);
+    // The Overview section auto-previews on open.
+    assert_eq!(
+        h.app.active_cc_activity().unwrap().open,
+        Some(super::cc_activity::CcNodeRef::Section(
+            super::activity::Section::Overview
+        ))
+    );
 
-    // Moving to the first workflow agent auto-previews its transcript; `Enter`
+    // `6` jumps to the Agents section; the next two rows are the workflow
+    // header and its first agent, whose transcript auto-previews; `Enter`
     // drops into it to read (prompt + assistant text = 2 rows).
+    h.key(KeyCode::Char('6'), KeyModifiers::NONE);
+    h.key(KeyCode::Char('j'), KeyModifiers::NONE);
     h.key(KeyCode::Char('j'), KeyModifiers::NONE);
     h.key(KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(h.app.focus, InputFocus::CcActivity);
@@ -1081,16 +1091,21 @@ fn cc_activity_view_opens_navigates_folds_and_closes() {
         "clearing the search keeps the view open"
     );
 
-    // `h` steps back to the tree; folding the workflow hides its agents.
+    // `h` steps back to the navigator; folding the workflow hides its agents.
     h.key(KeyCode::Char('h'), KeyModifiers::NONE);
     assert_eq!(h.app.focus, InputFocus::CcActivityTree);
-    h.key(KeyCode::Home, KeyModifiers::NONE); // back onto the workflow header
+    h.key(KeyCode::Char('6'), KeyModifiers::NONE);
+    h.key(KeyCode::Char('j'), KeyModifiers::NONE); // onto the workflow header
     h.key(KeyCode::Char(' '), KeyModifiers::NONE);
     assert_eq!(
         h.app.active_cc_activity().unwrap().tree.len(),
-        2,
-        "a folded workflow hides its 2 agents (header + the standalone subagent remain)"
+        8,
+        "a folded workflow hides its 2 agents (sections + header + standalone remain)"
     );
+    // Space on the Agents section folds the whole subtree to sections only.
+    h.key(KeyCode::Char('6'), KeyModifiers::NONE);
+    h.key(KeyCode::Char(' '), KeyModifiers::NONE);
+    assert_eq!(h.app.active_cc_activity().unwrap().tree.len(), 6);
 
     // Esc closes and returns focus to the terminal.
     h.key(KeyCode::Esc, KeyModifiers::NONE);

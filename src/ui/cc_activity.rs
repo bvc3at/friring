@@ -1,6 +1,7 @@
-//! Native renderer for the Claude Code activity view: a side tree of workflows
-//! → agents (+ standalone subagents) and a central pane showing the selected
-//! node's transcript (thinking / tool calls / tool output) or a workflow
+//! Native renderer for the activity view (F9): a side navigator of sections
+//! (overview / timeline / commands / files / web / agents — the agents tree
+//! nested under its section) and a central pane showing the selected
+//! section's normalized event stream, an agent transcript, or a workflow
 //! overview. Pure rendering — it returns click/scroll hitboxes for the app
 //! layer to record. Mirrors the code-review renderer's shape (`ui/code_review`)
 //! without the diff machinery.
@@ -11,7 +12,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use crate::app::activity::{fmt_time, Section};
 use crate::app::cc_activity::{CcActivityState, CcNodeRef, CcRow, CcTreeRow};
+use crate::session::activity::{ActionKind, ActivityEvent};
 use crate::session::{CcAgent, CcAgentState, CcRunStatus, TranscriptBlock};
 use crate::ui::scrollbar::{self, ScrollbarGeom};
 use crate::ui::theme::Theme;
@@ -83,7 +86,7 @@ pub(crate) fn render(
     let footer = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " j/k scroll · / find · w wrap · Enter fold · h tree · Esc close",
+            " j/k scroll · / find · w wrap · Enter fold · 1-6 section · h nav · Esc close",
             dim(),
         ))),
         footer,
@@ -202,6 +205,7 @@ fn render_search_bar(frame: &mut Frame, area: Rect, state: &CcActivityState) {
 
 fn open_label(state: &CcActivityState) -> String {
     match &state.open {
+        Some(CcNodeRef::Section(s)) => s.label().to_string(),
         Some(CcNodeRef::WorkflowOverview(run)) => format!("workflow {run}"),
         Some(CcNodeRef::WorkflowAgent(run, aid)) => state
             .activity
@@ -322,6 +326,80 @@ fn block_lines(
                 out
             }
         }
+        // Events are compact by default (one line each — a retrospective list,
+        // not a transcript); Enter *expands* to note/result. The fold set is
+        // therefore read inverted for this variant.
+        TranscriptBlock::Event(e) => event_lines(e, collapsed, wrap, h, width, query),
+    }
+}
+
+/// The one-line header (+ optional expanded body) of a normalized activity
+/// event: `HH:MM:SS  tag  detail`, error-marked when the action failed.
+fn event_lines(
+    e: &ActivityEvent,
+    expanded: bool,
+    wrap: bool,
+    h: usize,
+    width: usize,
+    query: Option<&str>,
+) -> Vec<Line<'static>> {
+    let mut header: Vec<Span<'static>> = Vec::new();
+    if let Some(ts) = e.ts_ms {
+        header.push(Span::styled(format!("{} ", fmt_time(ts)), dim()));
+    }
+    header.push(Span::styled(
+        format!("{:<5} ", event_tag(e.kind)),
+        event_style(e.kind),
+    ));
+    header.push(Span::styled(
+        truncate(&first_line(&e.detail), width.saturating_sub(16).max(20)),
+        normal(),
+    ));
+    if e.ok == Some(false) {
+        header.push(Span::styled(" ✗", danger()));
+    }
+    let has_body = e.note.is_some() || e.result_head.is_some() || e.origin.is_some();
+    if has_body && !expanded {
+        header.push(Span::styled(" ▸", dim()));
+    }
+    let mut out = vec![Line::from(header)];
+    if expanded {
+        if let Some(o) = &e.origin {
+            out.push(Line::from(Span::styled(format!("  · in {o}"), dim())));
+        }
+        if let Some(n) = &e.note {
+            out.extend(body_lines(n, dim(), wrap, h, width, query));
+        }
+        if let Some(r) = &e.result_head {
+            let style = if e.ok == Some(false) { danger() } else { dim() };
+            out.push(Line::from(Span::styled("  ⎿ result", dim())));
+            out.extend(body_lines(r, style, wrap, h, width, query));
+        }
+    }
+    out
+}
+
+/// Short fixed-width kind tag prefixing an event's header line.
+fn event_tag(kind: ActionKind) -> &'static str {
+    match kind {
+        ActionKind::Command => "$",
+        ActionKind::Edit => "edit",
+        ActionKind::Read => "read",
+        ActionKind::Search => "grep",
+        ActionKind::WebSearch => "web",
+        ActionKind::WebFetch => "fetch",
+        ActionKind::Subagent => "agent",
+        ActionKind::Mcp => "mcp",
+        ActionKind::Other => "tool",
+    }
+}
+
+fn event_style(kind: ActionKind) -> Style {
+    match kind {
+        ActionKind::Command => accent(),
+        ActionKind::Edit => Style::default().fg(Theme::status_working()),
+        ActionKind::WebSearch | ActionKind::WebFetch => Style::default().fg(Theme::status_done()),
+        _ => dim().add_modifier(Modifier::BOLD),
     }
 }
 
@@ -429,7 +507,7 @@ pub(crate) fn render_tree(
     state: &CcActivityState,
     level: FocusLevel,
 ) -> Vec<RowHitbox> {
-    let block = focus_block(" Workflows ", level);
+    let block = focus_block(" Activity ", level);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
@@ -467,8 +545,37 @@ pub(crate) fn render_tree(
     hitboxes
 }
 
+/// A section's navigator label with its live count, e.g. `Commands (42)`.
+fn section_label(state: &CcActivityState, section: Section) -> String {
+    let c = &state.counts;
+    let count = match section {
+        Section::Overview => None,
+        Section::Timeline => Some(c.total()),
+        Section::Commands => Some(c.commands),
+        Section::Files => Some(state.files_count),
+        Section::Web => Some(c.web),
+        Section::Agents => Some(state.activity.agent_count()),
+    };
+    match count {
+        Some(n) if n > 0 => format!("{} ({n})", section.label()),
+        _ => section.label().to_string(),
+    }
+}
+
 fn tree_row_line(state: &CcActivityState, row: &CcTreeRow, selected: bool) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = match row {
+        CcTreeRow::Section(section) => {
+            let digit = crate::app::activity::SECTIONS
+                .iter()
+                .position(|s| s == section)
+                .map(|i| i + 1)
+                .unwrap_or_default();
+            let mut label = format!("{digit} {}", section_label(state, *section));
+            if *section == Section::Agents {
+                label = format!("{} {}", if state.agents_folded { "▸" } else { "▾" }, label);
+            }
+            vec![Span::styled(label, accent())]
+        }
         CcTreeRow::Workflow(wi) => {
             let w = state.activity.workflows.get(*wi);
             let folded = w
@@ -483,8 +590,9 @@ fn tree_row_line(state: &CcActivityState, row: &CcTreeRow, selected: bool) -> Li
                 .map(|w| matches!(w.status, CcRunStatus::Running))
                 .unwrap_or(false);
             let tag = if running { "running" } else { "done" };
+            // Nested one level under the Agents section row.
             vec![Span::styled(
-                format!("{chevron} {name}  ({count} agents, {tag})"),
+                format!("  {chevron} {name}  ({count} agents, {tag})"),
                 accent(),
             )]
         }
@@ -496,10 +604,13 @@ fn tree_row_line(state: &CcActivityState, row: &CcTreeRow, selected: bool) -> Li
                 .and_then(|w| w.agents.get(*ai))
             {
                 Some(a) => vec![
-                    Span::styled(format!("  {} ", state_glyph(a.state)), state_style(a.state)),
+                    Span::styled(
+                        format!("    {} ", state_glyph(a.state)),
+                        state_style(a.state),
+                    ),
                     Span::styled(agent_label(a), normal()),
                 ],
-                None => vec![Span::styled("  ?".to_string(), dim())],
+                None => vec![Span::styled("    ?".to_string(), dim())],
             }
         }
         CcTreeRow::Subagent(si) => match state.activity.subagents.get(*si) {
@@ -509,13 +620,13 @@ fn tree_row_line(state: &CcActivityState, row: &CcTreeRow, selected: bool) -> Li
                     label.push_str(&format!(": {}", truncate(d, 40)));
                 }
                 vec![
-                    Span::styled(format!("{} ", state_glyph(a.state)), state_style(a.state)),
+                    Span::styled(format!("  {} ", state_glyph(a.state)), state_style(a.state)),
                     Span::styled(label, normal()),
                 ]
             }
-            None => vec![Span::styled("?".to_string(), dim())],
+            None => vec![Span::styled("  ?".to_string(), dim())],
         },
-        CcTreeRow::Info(s) => vec![Span::styled(s.clone(), dim())],
+        CcTreeRow::Info(s) => vec![Span::styled(format!("  {s}"), dim())],
     };
     if selected {
         for span in &mut spans {

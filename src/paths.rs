@@ -355,6 +355,41 @@ pub fn claude_project_slug(canonical_cwd: &Path) -> String {
         .collect()
 }
 
+/// Resolve a Claude conversation transcript `<root>/projects/*/<id>.jsonl` by
+/// scanning the slug dirs (computing the slug is avoidable here — see
+/// [`claude_project_slug`]). Same root resolution as [`claude_projects_dir`].
+/// Used by the activity scan to tail the session's main transcript.
+pub fn claude_transcript_path(
+    agent_session_id: &str,
+    config_dir_override: Option<&Path>,
+) -> Option<PathBuf> {
+    let projects = claude_projects_dir(config_dir_override)?;
+    let target = format!("{agent_session_id}.jsonl");
+    for entry in std::fs::read_dir(&projects).ok()?.flatten() {
+        let candidate = entry.path().join(&target);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Mistral Vibe's per-session log root: `$VIBE_HOME/logs/session` →
+/// `~/.vibe/logs/session`. Each session is a
+/// `<prefix>_<utc-ts>_<shortid>/` dir holding `meta.json` + `messages.jsonl`
+/// (subagents nested under `agents/`). `home_override` is the test hook,
+/// mirroring [`claude_projects_dir`]'s `config_dir_override`.
+pub fn vibe_sessions_dir(home_override: Option<&Path>) -> Option<PathBuf> {
+    let root = if let Some(p) = home_override {
+        p.to_path_buf()
+    } else if let Some(env) = std::env::var_os("VIBE_HOME") {
+        PathBuf::from(env)
+    } else {
+        home_dir()?.join(".vibe")
+    };
+    Some(root.join("logs").join("session"))
+}
+
 /// Returns true if a Claude transcript file `<agent_session_id>.jsonl` exists
 /// under `<root>/projects/*/`.
 ///
