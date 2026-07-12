@@ -572,6 +572,11 @@ impl App {
             .as_ref()
             .map(|s| s.focus)
             .unwrap_or(InputFocus::SessionList);
+        // The Files scope is pinned to the session active at open (=
+        // snapshot.active_index), but live preview may have retargeted
+        // `active_index` to a previewed session result. Capture the pinned index
+        // so the File branch rebuilds the correct session's viewer.
+        let pinned_active = self.global_search.snapshot.as_ref().map(|s| s.active_index);
         self.global_search.active = false;
         self.global_search.results.clear();
         self.global_search.query.clear();
@@ -612,6 +617,13 @@ impl App {
             }
             SearchTarget::File { root: _, path } => {
                 self.show_file_viewer = true;
+                // Reveal against the pinned session's viewer, not whatever
+                // session live preview last selected.
+                if let Some(idx) = pinned_active {
+                    if idx < self.sessions.len() {
+                        self.active_index = idx;
+                    }
+                }
                 self.rebuild_file_viewer_for_active();
                 self.file_viewer.reveal_path(&path);
                 self.focus = InputFocus::FileViewer;
