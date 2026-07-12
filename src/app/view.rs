@@ -150,7 +150,6 @@ impl App {
                     ClickAction::ModalRow(_)
                         | ClickAction::ModalButton { .. }
                         | ClickAction::ModalField(_)
-                        | ClickAction::RepoFocus(_)
                         | ClickAction::ConvoFocus(_)
                 )
             } else {
@@ -1187,27 +1186,11 @@ impl App {
             return Some(render);
         }
 
-        // Repo picker modal. Render under an immutable borrow of the modal,
-        // then (borrow released) record click targets that focus its editable
-        // sub-fields (path input + search bar).
-        if matches!(self.modal, super::modals::Modal::RepoPicker(_)) {
-            let (render, areas) = {
-                let super::modals::Modal::RepoPicker(ref rp) = self.modal else {
-                    unreachable!()
-                };
-                self.render_repo_picker_modal(frame, rp)
-            };
-            if let Some(search) = areas.search {
-                self.record_click(
-                    search,
-                    ClickAction::RepoFocus(super::modals::RepoPickerFocus::Search),
-                );
-            }
-            self.record_click(
-                areas.input,
-                ClickAction::RepoFocus(super::modals::RepoPickerFocus::Input),
-            );
-            return Some(render);
+        // Repo picker palette. Its single input is always focused, so there
+        // are no editable-sub-field click targets to record — a click in the
+        // input area is simply swallowed like any other modal chrome.
+        if let super::modals::Modal::RepoPicker(ref rp) = self.modal {
+            return Some(self.render_repo_picker_modal(frame, rp));
         }
 
         None
@@ -1265,10 +1248,7 @@ impl App {
         &self,
         frame: &mut Frame,
         rp: &super::modals::RepoPickerModal,
-    ) -> (
-        crate::ui::ModalRender,
-        crate::ui::repo_picker_modal::RepoFocusAreas,
-    ) {
+    ) -> crate::ui::ModalRender {
         crate::ui::repo_picker_modal::render_repo_picker_modal(
             frame,
             &crate::ui::repo_picker_modal::RepoPickerState {
@@ -1277,15 +1257,12 @@ impl App {
                 worktree: &rp.worktree,
                 collapsed: &rp.collapsed,
                 list_index: rp.list_index,
-                path_input: rp.path_input.value(),
-                path_cursor: rp.path_input.cursor_pos(),
-                path_suggestion: rp.path_suggestion.as_deref(),
-                focus: rp.focus,
-                search_query: rp.search_input.value(),
-                search_cursor: rp.search_input.cursor_pos(),
-                search_active: rp.focus == super::modals::RepoPickerFocus::Search
-                    || !rp.search_input.value().is_empty(),
                 filtered_indices: &rp.filtered_indices,
+                input: rp.input.value(),
+                input_cursor: rp.input.cursor_pos(),
+                suggestion: rp.path_suggestion.as_deref(),
+                mode: rp.input_mode(),
+                picked: rp.picked_count(),
                 host: self
                     .host_for_backend(self.new_session.backend.as_deref())
                     .map(|h| h.name.as_str()),

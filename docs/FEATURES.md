@@ -257,12 +257,21 @@ not applicable.
    typed (with `Tab` completing against the remote filesystem, `~`
    resolving to the remote home, and existence verified on Enter) and
    the worktree + tmux window are created on that host over SSH.
-2. **Repo picker** — fuzzy-searchable list of bookmarked repo
-   paths. `Space` toggles selection, `w` marks the selected repo
-   as a worktree base, `d` deletes the bookmark, and a path-input
-   field with filesystem autocomplete adds new bookmarks. The
-   first selected repo becomes the session's `cwd`; the rest may be
-   exposed to the agent depending on the agent's own flags.
+2. **Repo picker** — an always-type palette: one focused input over
+   the recency-sorted bookmark list. Typing fuzzy-filters the list;
+   typing a path (`~`, `/`, `./`, `../` prefix) switches the input to
+   path entry with `Tab` completion — `Tab` only ever completes, it
+   never moves focus. `Enter` opens the highlighted repo directly
+   (single-keystroke fast path), confirms the picked set when
+   repos are checked, or adds + opens a fully typed path. `Space`
+   (while the input is empty) or `Ctrl+Space` (always) picks
+   additional repos, `Ctrl+T` marks a repo as a worktree base, and
+   `Del` (input empty) forgets a bookmark. A pinned `start in ~`
+   row makes the no-repo session an explicit choice, and a first
+   run with no bookmarks offers one-key imports of common project
+   folders (`~/code`, `~/src`, …). The first picked repo becomes
+   the session's `cwd`; the rest may be exposed to the agent
+   depending on the agent's own flags.
 3. **Base branch selector** — worktree mode only.
    Type-to-filter (see below).
 4. **Session name** — free text identifier shown in the sidebar.
@@ -336,9 +345,9 @@ self-describing and lets you mix agents across the sidebar
 
 **Why a bookmark list rather than a path picker every time?** Users
 work on the same handful of repos repeatedly. Bookmarks make the
-common case a 2-keystroke selection while still allowing arbitrary
-paths via the input field. Bookmark deletion (`d`) keeps the list
-from accumulating stale entries.
+common case a type-and-Enter selection while still allowing
+arbitrary paths through the same input. Bookmark deletion (`Del`)
+keeps the list from accumulating stale entries.
 
 ### Agent definitions
 
@@ -568,13 +577,13 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Esc` | Global search | Close search | |
 | `Enter` | Session list | Focus terminal | |
 | `Esc` | Session list | Focus terminal (back out of the list) | |
-| `j` / `Down` | Repo picker | Next repo | |
-| `k` / `Up` | Repo picker | Previous repo | |
-| `Space` | Repo picker | Toggle repo selection | |
-| `w` | Repo picker | Toggle worktree mode for repo | |
-| `d` | Repo picker | Delete bookmark | |
-| `Tab` | Repo picker | Switch to path input | |
-| `Enter` | Repo picker | Confirm selection | |
+| `↑` / `↓` / `PgUp` / `PgDn` | Repo picker | Move the highlight (typing always goes to the input) | |
+| `Space` (input empty) / `Ctrl+Space` | Repo picker | Pick/unpick the highlighted repo, fold a parent | |
+| `Ctrl+T` | Repo picker | Toggle worktree mode for the highlighted repo | |
+| `Del` (input empty) | Repo picker | Forget the highlighted bookmark | |
+| `Tab` | Repo picker | Complete the typed path (never moves focus) | |
+| `Ctrl+P` | Repo picker | Import the typed folder's repos as a parent | |
+| `Enter` | Repo picker | Open picked repos / the highlighted row; add + open a typed path | |
 | `Esc` | Repo picker | Cancel | |
 | `Shift+Up` | Focused terminal | Scroll up 1 line | |
 | `Shift+Down` | Focused terminal | Scroll down 1 line | |
@@ -584,7 +593,7 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | Click | Session row | Select the session and focus the terminal | |
 | Click | Task/automation/file row | Select the row and focus its pane | |
 | Click | Any pane | Focus the pane under the cursor | |
-| Click | Picker modal row | Select and confirm (Enter; repo picker: Space toggle) | |
+| Click | Picker modal row | Select and confirm (Enter; repo picker: pick/fold, not confirm) | |
 | Hover | Clickable rows | Underline the row a click would hit | |
 | All other keys | Focused terminal | Forwarded to PTY (snaps to bottom if scrolled) | |
 
@@ -1867,13 +1876,13 @@ demand emerges.
 ## Git Worktree Integration
 
 Sessions can optionally run inside git worktrees for branch
-isolation. This is opt-in by marking a repo with `w` in the repo
-picker.
+isolation. This is opt-in by marking a repo with `Ctrl+T` in the
+repo picker.
 
 ### Flow
 
 1. `Ctrl+N` triggers session creation and opens the repo picker.
-2. Marking a repo with `w` in the picker routes through the
+2. Marking a repo with `Ctrl+T` in the picker routes through the
    worktree branch flow.
 3. A base branch selector lists local branches from the selected
    repo.

@@ -1866,74 +1866,108 @@ impl App {
 
     // ── Repo Picker Modal ────────────────────────────────────────────────
 
+    /// The repo palette: one always-focused input, no internal focus zones.
+    /// Typing edits the input (filter or path); everything acting on the
+    /// highlighted row lives on chords/arrows that can never collide with text
+    /// (plain `Space`/`Delete` act on rows only while the input is empty).
     fn handle_repo_picker_key(&mut self, code: KeyCode, mods: KeyModifiers) {
-        let super::modals::Modal::RepoPicker(ref rp) = self.modal else {
-            return;
-        };
-        // Ctrl+P: import the typed path as a *parent* folder whose git
-        // sub-directories are re-scanned on each picker open. Works from any
-        // focus (uses the path input value). Not `Ctrl+I` — that is `Tab`.
-        if mods.contains(KeyModifiers::CONTROL)
-            && matches!(code, KeyCode::Char('p') | KeyCode::Char('P'))
-        {
-            self.repo_picker_import_parent();
+        if !matches!(self.modal, super::modals::Modal::RepoPicker(_)) {
             return;
         }
-        match rp.focus {
-            super::modals::RepoPickerFocus::List => self.handle_repo_picker_list_key(code),
-            super::modals::RepoPickerFocus::Input => self.handle_repo_picker_input_key(code, mods),
-            super::modals::RepoPickerFocus::Search => {
-                self.handle_repo_picker_search_key(code, mods)
+        // Row-action chords win over text editing. Ctrl+P is not `Ctrl+I` —
+        // that is `Tab`. Ctrl+Space arrives as `Char(' ')` on modern
+        // keyboard-protocol terminals and as NUL on legacy ones.
+        if mods.contains(KeyModifiers::CONTROL) {
+            match code {
+                KeyCode::Char('p') | KeyCode::Char('P') => {
+                    self.repo_picker_import_parent();
+                    return;
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') => {
+                    self.repo_picker_toggle_worktree();
+                    return;
+                }
+                KeyCode::Char(' ') | KeyCode::Null => {
+                    self.repo_picker_row_action();
+                    return;
+                }
+                _ => {}
             }
         }
-    }
-
-    fn handle_repo_picker_list_key(&mut self, code: KeyCode) {
-        let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
-            return;
-        };
         match code {
             KeyCode::Esc => {
                 self.modal.close();
             }
-            KeyCode::Tab => {
-                rp.focus = super::modals::RepoPickerFocus::Input;
+            KeyCode::Enter => self.repo_picker_enter(),
+            KeyCode::Up => self.repo_picker_move(-1),
+            KeyCode::Down => self.repo_picker_move(1),
+            KeyCode::PageUp => self.repo_picker_move(-10),
+            KeyCode::PageDown => self.repo_picker_move(10),
+            // Tab ONLY completes — it never moves focus (there is none to
+            // move) and never toggles anything.
+            KeyCode::Tab => self.repo_picker_complete(),
+            KeyCode::Char(' ') if self.repo_picker_input_empty() => self.repo_picker_row_action(),
+            KeyCode::Delete if self.repo_picker_input_empty() => self.repo_picker_delete_bookmark(),
+            other => {
+                let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
+                    return;
+                };
+                let before = rp.input.value().to_string();
+                if !super::modals::apply_text_input_key(Some(&mut rp.input), other, mods) {
+                    return;
+                }
+                // An edit re-filters and snaps the highlight to the best (first)
+                // match; a bare cursor move does neither.
+                if rp.input.value() != before {
+                    rp.list_index = 0;
+                    self.recompute_repo_filter();
+                }
+                self.update_repo_picker_path_suggestion();
             }
-            KeyCode::Char('/') => {
-                rp.clear_search();
-                rp.focus = super::modals::RepoPickerFocus::Search;
-            }
-            KeyCode::Char('j') | KeyCode::Down if rp.list_index + 1 < rp.filtered_indices.len() => {
-                rp.list_index += 1;
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                rp.list_index = rp.list_index.saturating_sub(1);
-            }
-            KeyCode::Char(' ') => self.repo_picker_toggle_selected(),
-            KeyCode::Char('w') => self.repo_picker_toggle_worktree(),
-            KeyCode::Char('d') => self.repo_picker_delete_bookmark(),
-            KeyCode::Enter => {
-                self.submit_repo_picker();
-            }
-            _ => {}
         }
     }
 
-    /// `Space` on the row under the cursor: toggle the selected flag of a repo,
-    /// or expand/collapse a parent header's child tree.
-    fn repo_picker_toggle_selected(&mut self) {
+    /// Whether the palette input is empty (plain `Space`/`Delete` act on the
+    /// highlighted row only then — once the user types, keys edit text).
+    fn repo_picker_input_empty(&self) -> bool {
+        match &self.modal {
+            super::modals::Modal::RepoPicker(rp) => rp.input.value().is_empty(),
+            _ => false,
+        }
+    }
+
+    /// Move the list highlight by `delta`, clamped to the visible rows.
+    fn repo_picker_move(&mut self, delta: i32) {
+        let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
+            return;
+        };
+        let len = rp.filtered_indices.len();
+        if len == 0 {
+            return;
+        }
+        rp.list_index = (rp.list_index as i32 + delta).clamp(0, len as i32 - 1) as usize;
+    }
+
+    /// `Space` (input empty) / `Ctrl+Space` / row click: act on the highlighted
+    /// row — toggle a repo's checkbox, fold a parent header, import a suggested
+    /// folder, or (for the pinned "start here" row) start the session.
+    fn repo_picker_row_action(&mut self) {
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
             return;
         };
         let Some(&real_idx) = rp.filtered_indices.get(rp.list_index) else {
             return;
         };
-        if rp.is_header_row(real_idx) {
-            rp.toggle_collapsed(real_idx);
+        let Some(row) = rp.rows.get(real_idx) else {
             return;
+        };
+        let (kind, path) = (row.kind, row.path.clone());
+        match kind {
+            super::modals::RepoRowKind::Header => rp.toggle_collapsed(real_idx),
+            super::modals::RepoRowKind::Repo { .. } => rp.toggle_selected(&path),
+            super::modals::RepoRowKind::ImportSuggestion => self.repo_picker_import_folder(&path),
+            super::modals::RepoRowKind::StartHere => self.repo_picker_start_here(),
         }
-        let path = rp.rows[real_idx].path.clone();
-        rp.toggle_selected(&path);
     }
 
     /// Toggle the worktree flag of the repo under the cursor, auto-selecting it
@@ -1945,10 +1979,13 @@ impl App {
         let Some(&real_idx) = rp.filtered_indices.get(rp.list_index) else {
             return;
         };
-        if rp.is_header_row(real_idx) {
+        let Some(row) = rp.rows.get(real_idx) else {
+            return;
+        };
+        if !row.is_repo() {
             return;
         }
-        let path = rp.rows[real_idx].path.clone();
+        let path = row.path.clone();
         rp.toggle_worktree(&path);
     }
 
@@ -1963,7 +2000,17 @@ impl App {
         let Some(&real_idx) = rp.filtered_indices.get(rp.list_index) else {
             return;
         };
-        let path = rp.rows[real_idx].path.clone();
+        let Some(row) = rp.rows.get(real_idx) else {
+            return;
+        };
+        // Pinned helper rows have no bookmark to forget.
+        if matches!(
+            row.kind,
+            super::modals::RepoRowKind::ImportSuggestion | super::modals::RepoRowKind::StartHere
+        ) {
+            return;
+        }
+        let path = row.path.clone();
         let is_header = rp.is_header_row(real_idx);
         let is_child = rp.is_child_row(real_idx);
 
@@ -1999,72 +2046,100 @@ impl App {
         self.recompute_repo_filter();
     }
 
-    fn handle_repo_picker_input_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+    /// `Tab`: complete the typed path — and nothing else. A Tab with nothing
+    /// to complete is a no-op. Remote targets have no per-keystroke suggestion
+    /// (that would fire an ssh/wsl round-trip on every character); compute one
+    /// on demand here by listing the remote directory. Completion only applies
+    /// with the cursor at the end (inserting mid-string would garble the path).
+    fn repo_picker_complete(&mut self) {
+        if self.new_session.backend.is_some() {
+            let super::modals::Modal::RepoPicker(ref rp) = self.modal else {
+                return;
+            };
+            let value = rp.input.value().to_string();
+            let at_end = rp.input.cursor_pos() == value.chars().count();
+            let sug = at_end
+                .then(|| self.remote_path_completion(&value))
+                .flatten();
+            if let super::modals::Modal::RepoPicker(ref mut rp) = self.modal {
+                if let Some(sug) = sug {
+                    for c in sug.chars() {
+                        rp.input.insert(c);
+                    }
+                }
+            }
+            return;
+        }
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
             return;
         };
-        match code {
-            KeyCode::Esc => {
-                self.modal.close();
-                return;
+        if let Some(suggestion) = rp.path_suggestion.take() {
+            for c in suggestion.chars() {
+                rp.input.insert(c);
             }
-            KeyCode::Tab => {
-                // Remote targets have no per-keystroke suggestion (that would
-                // fire an ssh/wsl round-trip on every character); compute one on
-                // demand here by listing the remote directory. Mirrors the local
-                // branch below: completion only applies with the cursor at the
-                // end (inserting mid-string would garble the path), and a Tab
-                // with nothing to complete moves focus to the list.
-                if self.new_session.backend.is_some() {
-                    let value = rp.path_input.value().to_string();
-                    let at_end = rp.path_input.cursor_pos() == value.chars().count();
-                    let sug = at_end
-                        .then(|| self.remote_path_completion(&value))
-                        .flatten();
-                    if let super::modals::Modal::RepoPicker(ref mut rp) = self.modal {
-                        match sug {
-                            Some(sug) => {
-                                for c in sug.chars() {
-                                    rp.path_input.insert(c);
-                                }
-                            }
-                            None => rp.focus = super::modals::RepoPickerFocus::List,
-                        }
-                    }
-                    return;
-                }
-                if let Some(suggestion) = rp.path_suggestion.take() {
-                    for c in suggestion.chars() {
-                        rp.path_input.insert(c);
-                    }
-                } else {
-                    rp.focus = super::modals::RepoPickerFocus::List;
-                    rp.path_suggestion = None;
-                    return;
-                }
-            }
-            KeyCode::BackTab => {
-                rp.focus = super::modals::RepoPickerFocus::List;
-                rp.path_suggestion = None;
-                return;
-            }
-            KeyCode::Enter => {
-                self.repo_picker_commit_path_input();
-                return;
-            }
-            other => {
-                if !super::modals::apply_text_input_key(Some(&mut rp.path_input), other, mods) {
-                    return;
-                }
-            }
+            self.recompute_repo_filter();
         }
         self.update_repo_picker_path_suggestion();
     }
 
-    /// Commit the typed path in the repo-picker input: add or re-select the
-    /// bookmark, persist it (scoped to the target host), clear the input, and
-    /// refresh the filter.
-    fn repo_picker_commit_path_input(&mut self) {
+    /// `Enter` — the palette's primary action, in priority order: a typed path
+    /// is committed and the flow advances with it; checked repos submit;
+    /// otherwise the highlighted row acts (open repo / fold header / import
+    /// suggestion / start without a repo).
+    fn repo_picker_enter(&mut self) {
+        let super::modals::Modal::RepoPicker(ref rp) = self.modal else {
+            return;
+        };
+        if rp.input_mode() == super::modals::RepoInputMode::Path {
+            if self.repo_picker_commit_path_input() {
+                self.submit_repo_picker();
+            }
+            return;
+        }
+        if rp.picked_count() > 0 {
+            self.submit_repo_picker();
+            return;
+        }
+        let Some(&real_idx) = rp.filtered_indices.get(rp.list_index) else {
+            return;
+        };
+        let Some(row) = rp.rows.get(real_idx) else {
+            return;
+        };
+        let (kind, path) = (row.kind, row.path.clone());
+        match kind {
+            super::modals::RepoRowKind::Header => {
+                let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
+                    return;
+                };
+                rp.toggle_collapsed(real_idx);
+            }
+            // Single-repo fast path: nothing is checked, so Enter means "this
+            // one" — check it and go.
+            super::modals::RepoRowKind::Repo { .. } => {
+                let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
+                    return;
+                };
+                rp.selected.insert(path);
+                self.submit_repo_picker();
+            }
+            super::modals::RepoRowKind::ImportSuggestion => self.repo_picker_import_folder(&path),
+            super::modals::RepoRowKind::StartHere => self.repo_picker_start_here(),
+        }
+    }
+
+    /// The pinned "start here" row: an explicit no-repo session (local `$HOME`,
+    /// remote default directory).
+    fn repo_picker_start_here(&mut self) {
+        self.modal.close();
+        self.spawn_repo_picker_no_repos();
+    }
+
+    /// Commit the typed path in the palette input: add or re-select the
+    /// bookmark, persist it (scoped to the target host), and clear the input.
+    /// Returns whether a repo row ended up selected (the caller then advances
+    /// the flow) — `false` on an empty input or a validation error.
+    fn repo_picker_commit_path_input(&mut self) -> bool {
         // A remote path expands `~` against the *remote* home (never the local
         // one) and is verified to exist on the host before it's accepted —
         // catching a typo here beats failing minutes later at branch listing
@@ -2073,12 +2148,12 @@ impl App {
             .host_for_backend(self.new_session.backend.as_deref())
             .cloned();
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
-            return;
+            return false;
         };
-        let path = rp.path_input.value().trim().to_string();
+        let path = rp.input.value().trim().to_string();
         if path.is_empty() {
             self.recompute_repo_filter();
-            return;
+            return false;
         }
         let expanded = match &remote_host {
             Some(host) => {
@@ -2086,21 +2161,31 @@ impl App {
                     Ok(p) => p,
                     Err(e) => {
                         self.set_error(format!("Cannot resolve ~ on '{}': {e:#}", host.name));
-                        return;
+                        return false;
                     }
                 };
                 if crate::git::list_dir_on(host, &expanded).is_err() {
                     self.set_error(format!("Path not found on '{}': {expanded}", host.name));
-                    return;
+                    return false;
                 }
                 std::path::PathBuf::from(expanded)
             }
-            None => paths::expand_tilde(&path),
+            None => {
+                // Mirror the remote check locally: a typo'd path must not
+                // become a bookmark that spawns a session in a dead cwd.
+                let expanded = paths::expand_tilde(&path);
+                if !expanded.is_dir() {
+                    self.set_error(format!("Path not found: {}", expanded.display()));
+                    return false;
+                }
+                expanded
+            }
         };
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
-            return;
+            return false;
         };
         let persist = Self::repo_picker_select_or_add_row(rp, &expanded);
+        let selected = rp.selected.contains(&expanded);
         if persist {
             if let Err(e) = self
                 .db
@@ -2111,11 +2196,12 @@ impl App {
             }
         }
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
-            return;
+            return false;
         };
-        rp.path_input.clear();
+        rp.input.clear();
         rp.path_suggestion = None;
         self.recompute_repo_filter();
+        selected
     }
 
     /// Select an already-represented bookmark row for `expanded`, or push a new
@@ -2159,7 +2245,7 @@ impl App {
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
             return;
         };
-        let path = rp.path_input.value().trim().to_string();
+        let path = rp.input.value().trim().to_string();
         if path.is_empty() {
             self.set_status(
                 super::StatusLevel::Info,
@@ -2168,18 +2254,23 @@ impl App {
             return;
         }
         let expanded = paths::expand_tilde(&path);
-        // Equivalent to a literal "" (the remote guard above means the wizard
-        // is local here), but keeps the `"" = local` encoding owned by
+        if let super::modals::Modal::RepoPicker(ref mut rp) = self.modal {
+            rp.input.clear();
+            rp.path_suggestion = None;
+        }
+        self.repo_picker_import_folder(&expanded);
+    }
+
+    /// Persist `dir` as a parent bookmark and re-scan the picker rows. Shared
+    /// by the typed-path `Ctrl+P` and the first-run import-suggestion rows.
+    fn repo_picker_import_folder(&mut self, dir: &std::path::Path) {
+        // The wizard is local at both call sites, so this is equivalent to a
+        // literal "" — but the `"" = local` encoding stays owned by
         // `bookmark_host_key` alone.
         let host = self.bookmark_host_key().to_string();
-        if let Err(e) = self.db.upsert_repo_bookmark_kind(&host, &expanded, true) {
+        if let Err(e) = self.db.upsert_repo_bookmark_kind(&host, dir, true) {
             error!("Failed to save parent bookmark: {e}");
             self.set_error(format!("Failed to save parent bookmark: {e}"));
-        }
-        if let super::modals::Modal::RepoPicker(ref mut rp) = self.modal {
-            rp.path_input.clear();
-            rp.path_suggestion = None;
-            rp.focus = super::modals::RepoPickerFocus::List;
         }
         self.refresh_repo_picker_rows();
     }
@@ -2206,41 +2297,17 @@ impl App {
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
             return;
         };
-        if remote {
+        // Filter text is not a path — a ghost completion there would be noise.
+        if remote || rp.input_mode() != super::modals::RepoInputMode::Path {
             rp.path_suggestion = None;
             return;
         }
-        let value = rp.path_input.value().to_string();
-        let at_end = rp.path_input.cursor_pos() == value.chars().count();
+        let value = rp.input.value().to_string();
+        let at_end = rp.input.cursor_pos() == value.chars().count();
         if at_end && !value.is_empty() {
             rp.path_suggestion = paths::complete_directory_path(&value);
         } else {
             rp.path_suggestion = None;
-        }
-    }
-
-    fn handle_repo_picker_search_key(&mut self, code: KeyCode, mods: KeyModifiers) {
-        let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
-            return;
-        };
-        match code {
-            KeyCode::Esc => {
-                rp.clear_search();
-                rp.focus = super::modals::RepoPickerFocus::List;
-            }
-            KeyCode::Enter => {
-                rp.focus = super::modals::RepoPickerFocus::List;
-            }
-            // Cursor moves don't change the filter; edits (incl. Ctrl+W/U) do.
-            KeyCode::Left => rp.search_input.move_left(),
-            KeyCode::Right => rp.search_input.move_right(),
-            KeyCode::Home => rp.search_input.home(),
-            KeyCode::End => rp.search_input.end(),
-            other => {
-                if super::modals::apply_text_input_key(Some(&mut rp.search_input), other, mods) {
-                    self.recompute_repo_filter();
-                }
-            }
         }
     }
 
@@ -2264,11 +2331,15 @@ impl App {
             }
         }
 
+        // Nothing checked: Enter acts on the highlighted row instead (see
+        // `repo_picker_enter`); the old silent $HOME fallthrough is gone.
+        if worktree_repos.is_empty() && normal_repos.is_empty() {
+            return;
+        }
+
         self.modal.close();
 
-        if worktree_repos.is_empty() && normal_repos.is_empty() {
-            self.spawn_repo_picker_no_repos();
-        } else if !worktree_repos.is_empty() {
+        if !worktree_repos.is_empty() {
             self.spawn_repo_picker_worktrees(worktree_repos, normal_repos);
         } else {
             self.spawn_repo_picker_normal(normal_repos);

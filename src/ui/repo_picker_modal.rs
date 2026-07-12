@@ -11,11 +11,12 @@ use ratatui::{
 
 use super::render_modal_frame;
 use super::theme::Theme;
-use super::{centered_fixed_height_rect, render_text_field, render_text_field_with_suggestion};
-use crate::app::modals::{RepoPickerFocus, RepoRow};
+use super::{centered_fixed_height_rect, render_text_field_with_suggestion};
+use crate::app::modals::{RepoInputMode, RepoRow, RepoRowKind};
 
 pub struct RepoPickerState<'a> {
-    /// Bookmark rows (headers, children, standalone repos) in display order.
+    /// Bookmark rows (headers, children, standalone repos) followed by the
+    /// pinned helper rows, in display order.
     pub rows: &'a [RepoRow],
     /// Checked repos, keyed by path.
     pub selected: &'a HashSet<PathBuf>,
@@ -24,31 +25,25 @@ pub struct RepoPickerState<'a> {
     /// Parent folders whose child tree is collapsed (drives the ▸/▾ glyph).
     pub collapsed: &'a HashSet<PathBuf>,
     pub list_index: usize,
-    pub path_input: &'a str,
-    pub path_cursor: usize,
-    pub path_suggestion: Option<&'a str>,
-    pub focus: RepoPickerFocus,
-    pub search_query: &'a str,
-    pub search_cursor: usize,
-    pub search_active: bool,
     pub filtered_indices: &'a [usize],
+    /// The single always-focused palette input.
+    pub input: &'a str,
+    pub input_cursor: usize,
+    /// Fish-style ghost completion (path mode, local only).
+    pub suggestion: Option<&'a str>,
+    pub mode: RepoInputMode,
+    /// Checked-repo count (shown in the list title and the Enter hint).
+    pub picked: usize,
     /// The target host's name for an off-local session (`None` = local).
     /// Shown in the list title so it's unambiguous whose filesystem the
     /// repos (and the typed path) belong to.
     pub host: Option<&'a str>,
 }
 
-/// The clickable sub-areas of the repo picker that focus an editable field:
-/// the always-present path input and the optional search bar.
-pub struct RepoFocusAreas {
-    pub input: ratatui::layout::Rect,
-    pub search: Option<ratatui::layout::Rect>,
-}
-
 pub fn render_repo_picker_modal(
     frame: &mut Frame,
     state: &RepoPickerState<'_>,
-) -> (super::ModalRender, RepoFocusAreas) {
+) -> super::ModalRender {
     let visible_count = if state.filtered_indices.is_empty() {
         1
     } else {
@@ -56,51 +51,36 @@ pub fn render_repo_picker_modal(
     };
     let list_height = visible_count as u16 + 2; // +2 for borders
 
-    let search_height: u16 = if state.search_active { 3 } else { 0 };
-
-    // Layout: search(optional 3) + list + path input(3) + footer(1) + outer border(2)
-    let total_height = search_height + list_height + 3 + 1 + 2;
+    // Layout: list + palette input(3) + footer(1) + outer border(2)
+    let total_height = list_height + 3 + 1 + 2;
 
     let area = centered_fixed_height_rect(60, total_height, frame.area());
 
     let inner = render_modal_frame(frame, area, "Select Repos");
 
-    let mut constraints = Vec::new();
-    if state.search_active {
-        constraints.push(Constraint::Length(3));
-    }
-    constraints.push(Constraint::Length(list_height));
-    constraints.push(Constraint::Length(3));
-    constraints.push(Constraint::Min(1));
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(constraints)
+        .constraints([
+            Constraint::Length(list_height),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
         .split(inner);
-
-    let (search_area, list_area, input_area, footer_area) = if state.search_active {
-        (Some(chunks[0]), chunks[1], chunks[2], chunks[3])
-    } else {
-        (None, chunks[0], chunks[1], chunks[2])
-    };
-
-    if let Some(area) = search_area {
-        render_search_bar(frame, area, state);
-    }
+    let (list_area, input_area, footer_area) = (chunks[0], chunks[1], chunks[2]);
 
     let hitboxes = render_bookmark_list(frame, list_area, state);
 
     render_text_field_with_suggestion(
         frame,
         input_area,
-        "Add Repo Path",
-        state.path_input,
-        state.path_cursor,
-        state.focus == RepoPickerFocus::Input,
-        state.path_suggestion,
+        "Filter or path",
+        state.input,
+        state.input_cursor,
+        true,
+        state.suggestion,
     );
 
-    // Footer: focus-dependent key hints on the left, clickable `[ Done ]`
+    // Footer: mode-dependent key hints on the left, clickable `[ Open ]`
     // (Enter) / `[ Cancel ]` (Esc) buttons on the right. The hint is clipped to
     // the space left of the pills so a wide hint row can't render underneath
     // them (see `render_hint_action_footer`).
@@ -109,36 +89,13 @@ pub fn render_repo_picker_modal(
         footer_area,
         footer_line(state),
         (
-            "Done",
+            "Open",
             crossterm::event::KeyCode::Enter,
             crossterm::event::KeyModifiers::NONE,
         ),
         "Cancel",
     );
-    (
-        (hitboxes, buttons),
-        RepoFocusAreas {
-            input: input_area,
-            search: search_area,
-        },
-    )
-}
-
-/// Render the search bar at the top of the modal (only shown when search is active).
-fn render_search_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &RepoPickerState<'_>) {
-    let match_label = format!(
-        "Search ({}/{})",
-        state.filtered_indices.len(),
-        state.rows.len()
-    );
-    render_text_field(
-        frame,
-        area,
-        &match_label,
-        state.search_query,
-        state.search_cursor,
-        state.focus == RepoPickerFocus::Search,
-    );
+    (hitboxes, buttons)
 }
 
 /// Render the bookmark list with checkboxes, fuzzy highlighting, and scrolling.
@@ -147,34 +104,27 @@ fn render_bookmark_list(
     list_area: ratatui::layout::Rect,
     state: &RepoPickerState<'_>,
 ) -> super::SelectorHits {
-    let list_focused = state.focus == RepoPickerFocus::List;
-    let border_color = if list_focused {
-        Theme::border_focused()
-    } else {
-        Theme::border_unfocused()
+    let repo_count = state.rows.iter().filter(|r| r.is_repo()).count();
+    let mut title = match state.host {
+        Some(host) => format!(" Repos on {host} ({repo_count})"),
+        None => format!(" Repos ({repo_count})"),
     };
-
-    let title = match state.host {
-        Some(host) => format!(" Repos on {host} ({}) ", state.rows.len()),
-        None => format!(" Repos ({}) ", state.rows.len()),
-    };
+    if state.picked > 0 {
+        title.push_str(&format!(" — {} picked", state.picked));
+    }
+    title.push(' ');
 
     let list_block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(Theme::border_unfocused()));
 
     let list_inner_area = list_block.inner(list_area);
     frame.render_widget(list_block, list_area);
 
     if state.filtered_indices.is_empty() {
-        let msg = if state.search_query.is_empty() {
-            "  No bookmarks — add via path input below"
-        } else {
-            "  No matches"
-        };
         let placeholder = Paragraph::new(Line::from(Span::styled(
-            msg,
+            "  No matches",
             Style::default().fg(Theme::text_muted()),
         )));
         frame.render_widget(placeholder, list_inner_area);
@@ -198,7 +148,7 @@ fn render_bookmark_list(
         .enumerate()
         .skip(scroll_offset)
         .take(visible_count)
-        .map(|(vi, &real_idx)| bookmark_item(state, vi, real_idx, list_focused))
+        .map(|(vi, &real_idx)| bookmark_item(state, vi, real_idx))
         .collect();
 
     frame.render_widget(List::new(items), rows_area);
@@ -224,15 +174,14 @@ fn render_bookmark_list(
     (hitboxes, geom)
 }
 
-/// Build a single bookmark list item (checkbox + path + optional `[wt]` marker).
+/// Build a single list item for whatever kind of row this is.
 fn bookmark_item<'a>(
     state: &RepoPickerState<'a>,
     visible_index: usize,
     real_idx: usize,
-    list_focused: bool,
 ) -> ListItem<'a> {
     let row = &state.rows[real_idx];
-    let is_cursor = visible_index == state.list_index && list_focused;
+    let is_cursor = visible_index == state.list_index;
 
     let style = if is_cursor {
         Theme::selected_item()
@@ -240,12 +189,30 @@ fn bookmark_item<'a>(
         Theme::normal_item()
     };
 
-    // Parent header row: no checkbox, a collapse glyph + basename + dim marker.
-    if row.is_header() {
-        return header_item(state, &row.path, style);
+    match row.kind {
+        RepoRowKind::Header => header_item(state, &row.path, style),
+        RepoRowKind::Repo { .. } => child_item(state, row, style),
+        RepoRowKind::ImportSuggestion => ListItem::new(Line::from(vec![
+            Span::styled("⊕ ", Style::default().fg(Theme::accent())),
+            Span::styled(
+                format!(
+                    "import repos from {}",
+                    crate::paths::display_path(&row.path)
+                ),
+                style,
+            ),
+        ])),
+        RepoRowKind::StartHere => {
+            let label = match state.host {
+                Some(_) => "start in the host's default dir (no repo)",
+                None => "start in ~ (no repo)",
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled("~ ", Style::default().fg(Theme::text_muted())),
+                Span::styled(label, style),
+            ]))
+        }
     }
-
-    child_item(state, row, style)
 }
 
 /// Build a parent header row: a collapse glyph + basename + dim `(parent)` marker.
@@ -266,8 +233,8 @@ fn header_item<'a>(
     ]))
 }
 
-/// Build a (possibly indented) child bookmark row: checkbox + path + optional
-/// `[wt]` marker, with the search query highlighted when present.
+/// Build a (possibly indented) repo row: checkbox + path + optional `[wt]`
+/// marker, with the filter query highlighted when one is active.
 fn child_item<'a>(state: &RepoPickerState<'a>, row: &RepoRow, style: Style) -> ListItem<'a> {
     let path = &row.path;
     let checked = state.selected.contains(path);
@@ -276,17 +243,16 @@ fn child_item<'a>(state: &RepoPickerState<'a>, row: &RepoRow, style: Style) -> L
     let indent = if row.is_child() { "  " } else { "" };
     let check = if checked { "[x] " } else { "[ ] " };
     let display = crate::paths::display_path(path);
+    let query = match state.mode {
+        RepoInputMode::Filter => state.input,
+        RepoInputMode::Path => "",
+    };
 
     let mut spans = vec![Span::styled(indent, style)];
-    if state.search_query.is_empty() {
+    if query.is_empty() {
         spans.push(Span::styled(format!("{check}{display}"), style));
     } else {
-        spans.extend(highlighted_spans(
-            state.search_query,
-            check,
-            &display,
-            style,
-        ));
+        spans.extend(highlighted_spans(query, check, &display, style));
     }
 
     if checked && is_wt {
@@ -304,49 +270,55 @@ fn highlighted_spans(query: &str, check: &str, display: &str, style: Style) -> V
     result
 }
 
-/// Build the footer hint line for the current focus.
+/// One `key desc` hint pair, styled for the footer.
+fn hint(key: &'static str, desc: &'static str) -> [Span<'static>; 2] {
+    [
+        Span::styled(key, Theme::keybind()),
+        Span::styled(desc, Theme::keybind_desc()),
+    ]
+}
+
+/// Build the footer hint line for the current palette mode.
 fn footer_line(state: &RepoPickerState<'_>) -> Line<'static> {
-    match state.focus {
-        RepoPickerFocus::List => Line::from(vec![
-            Span::styled("j/k", Theme::keybind()),
-            Span::styled(" nav  ", Theme::keybind_desc()),
-            Span::styled("Space", Theme::keybind()),
-            Span::styled(" toggle/fold  ", Theme::keybind_desc()),
-            Span::styled("w", Theme::keybind()),
-            Span::styled(" worktree  ", Theme::keybind_desc()),
-            Span::styled("/", Theme::keybind()),
-            Span::styled(" search  ", Theme::keybind_desc()),
-            Span::styled("d", Theme::keybind()),
-            Span::styled(" delete  ", Theme::keybind_desc()),
-            Span::styled("Tab", Theme::keybind()),
-            Span::styled(" input  ", Theme::keybind_desc()),
-            Span::styled("Enter", Theme::keybind()),
-            Span::styled(" ok", Theme::keybind_desc()),
-        ]),
-        RepoPickerFocus::Input => {
-            let tab_hint = if state.path_suggestion.is_some() {
-                " complete  "
-            } else {
-                " list  "
-            };
-            Line::from(vec![
-                Span::styled("Tab", Theme::keybind()),
-                Span::styled(tab_hint, Theme::keybind_desc()),
-                Span::styled("Enter", Theme::keybind()),
-                Span::styled(" add repo  ", Theme::keybind_desc()),
-                Span::styled("Ctrl+P", Theme::keybind()),
-                Span::styled(" import parent  ", Theme::keybind_desc()),
-                Span::styled("Esc", Theme::keybind()),
-                Span::styled(" cancel", Theme::keybind_desc()),
-            ])
+    // Plain Space/Delete act on rows only while the input is empty; once the
+    // user types, the chorded variants stay available.
+    let pick_key = if state.input.is_empty() {
+        "Space"
+    } else {
+        "^Space"
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    match state.mode {
+        RepoInputMode::Path => {
+            spans.extend(hint("Tab", " complete  "));
+            spans.extend(hint("Enter", " add + open  "));
+            spans.extend(hint("Esc", " cancel"));
         }
-        RepoPickerFocus::Search => Line::from(vec![
-            Span::styled("Enter", Theme::keybind()),
-            Span::styled(" keep filter  ", Theme::keybind_desc()),
-            Span::styled("Esc", Theme::keybind()),
-            Span::styled(" clear  ", Theme::keybind_desc()),
-        ]),
+        RepoInputMode::Filter => {
+            if state.picked > 0 {
+                spans.push(Span::styled("Enter", Theme::keybind()));
+                spans.push(Span::styled(
+                    format!(" open {} picked  ", state.picked),
+                    Theme::keybind_desc(),
+                ));
+            } else {
+                spans.extend(hint("Enter", " open  "));
+            }
+            spans.push(Span::styled(pick_key, Theme::keybind()));
+            spans.extend([
+                Span::styled(" pick  ", Theme::keybind_desc()),
+                Span::styled("^T", Theme::keybind()),
+                Span::styled(" worktree  ", Theme::keybind_desc()),
+            ]);
+            if state.input.is_empty() {
+                spans.extend(hint("Del", " forget  "));
+                spans.extend(hint("^P", " import folder"));
+            } else {
+                spans.extend(hint("Esc", " cancel"));
+            }
+        }
     }
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -404,8 +376,9 @@ mod tests {
     }
 
     fn picker_state(
-        focus: RepoPickerFocus,
-        suggestion: Option<&'static str>,
+        input: &'static str,
+        mode: RepoInputMode,
+        picked: usize,
     ) -> RepoPickerState<'static> {
         static EMPTY_ROWS: &[RepoRow] = &[];
         static EMPTY_IDX: &[usize] = &[];
@@ -419,44 +392,47 @@ mod tests {
             worktree,
             collapsed,
             list_index: 0,
-            path_input: "",
-            path_cursor: 0,
-            path_suggestion: suggestion,
-            focus,
-            search_query: "",
-            search_cursor: 0,
-            search_active: false,
             filtered_indices: EMPTY_IDX,
+            input,
+            input_cursor: input.len(),
+            suggestion: None,
+            mode,
+            picked,
             host: None,
         }
     }
 
     #[test]
-    fn footer_line_list_focus_shows_navigation_hints() {
-        let s = picker_state(RepoPickerFocus::List, None);
+    fn footer_line_path_mode_shows_tab_completes_only() {
+        let s = picker_state("~/co", RepoInputMode::Path, 0);
         let text = span_text(&footer_line(&s).spans);
-        assert!(text.contains("toggle/fold"));
-        assert!(text.contains("worktree"));
+        assert!(text.contains("Tab complete"));
+        assert!(text.contains("add + open"));
+        assert!(!text.contains("worktree"));
     }
 
     #[test]
-    fn footer_line_input_focus_tab_hint_depends_on_suggestion() {
-        let with = picker_state(RepoPickerFocus::Input, Some("/home/me/proj"));
-        let with_text = span_text(&footer_line(&with).spans);
-        assert!(with_text.contains("complete"));
-        assert!(with_text.contains("add repo"));
-
-        let without = picker_state(RepoPickerFocus::Input, None);
-        let without_text = span_text(&footer_line(&without).spans);
-        assert!(without_text.contains("list"));
-        assert!(!without_text.contains("complete"));
+    fn footer_line_empty_input_offers_plain_space_and_del() {
+        let s = picker_state("", RepoInputMode::Filter, 0);
+        let text = span_text(&footer_line(&s).spans);
+        assert!(text.contains("Space pick"));
+        assert!(!text.contains("^Space pick"));
+        assert!(text.contains("Del forget"));
+        assert!(text.contains("^P import folder"));
     }
 
     #[test]
-    fn footer_line_search_focus_shows_filter_hints() {
-        let s = picker_state(RepoPickerFocus::Search, None);
+    fn footer_line_while_typing_switches_to_chorded_pick() {
+        let s = picker_state("fri", RepoInputMode::Filter, 0);
         let text = span_text(&footer_line(&s).spans);
-        assert!(text.contains("keep filter"));
-        assert!(text.contains("clear"));
+        assert!(text.contains("^Space pick"));
+        assert!(!text.contains("Del forget"), "Del edits text while typing");
+    }
+
+    #[test]
+    fn footer_line_with_picks_counts_them_on_enter() {
+        let s = picker_state("", RepoInputMode::Filter, 2);
+        let text = span_text(&footer_line(&s).spans);
+        assert!(text.contains("open 2 picked"));
     }
 }
