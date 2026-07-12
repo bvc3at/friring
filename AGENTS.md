@@ -124,5 +124,6 @@ Detail is read on demand — jump to the doc for what you're touching:
 | A user-facing feature — sessions, code review, automations, tasks, global search, notifications, status, remote/WSL, extensions, keybindings | `docs/FEATURES.md` |
 | Render-loop performance, perf counters, redraw throttling | `docs/PERFORMANCE.md` |
 | The headless CLI (`thurbox-cli`) | `docs/CLI.md` |
+| Real-agent e2e tests, the model stub, scenario-driven demos | `docs/E2E.md` |
 | Cutting a release, versioning, installers, packaging | `docs/RELEASING.md` |
 | What this fork changes vs upstream, and fork-only features (e.g. the F9 activity view, conversation import) | `FORK.md` |

@@ -128,10 +128,10 @@ bats scripts/install.bats            # test the install script (needs bats-core)
 
 ### TUI acceptance (e2e) tests
 
-The TUI has two layers of end-to-end coverage:
+The TUI has three layers of end-to-end coverage:
 
 - **In-process driver + snapshots** (`src/app/acceptance.rs`, a `#[cfg(test)]`
-  module). A `Harness` builds a real `App` on a no-op `StubBackend` +
+  module). A `Harness` builds a real `App` on a no-op `FakeBackend` +
   `Database::open_in_memory()` + a `TestPathGuard` tempdir (fully hermetic),
   feeds `AppMessage::KeyPress` events exactly as `main.rs`'s loop does, and
   renders to a headless ratatui `TestBackend`. It also drives the loop's
@@ -163,6 +163,14 @@ The TUI has two layers of end-to-end coverage:
   `HOME`/XDG/`TMUX_TMPDIR`, mirroring `scripts/demo/record.sh`), drives it with
   `tmux send-keys`, and asserts on captured frames (boot → F1 → theme → quit).
   Gated behind the `tui-smoke` CI job (needs tmux).
+- **Real-agent e2e** (`scripts/dev/agent-e2e/`, `just agent-e2e`). A *real*
+  agent binary (Claude Code is the reference) inside a Friring-managed pane,
+  with the model API stubbed on loopback — hermetic, deterministic, offline.
+  One scenario description drives both the asserting bats suite and a VHS demo
+  recording (`just agent-demo <scenario>`). Not part of `cargo nextest`; runs
+  via the non-blocking `agent-e2e` CI job and skips cleanly when the agent
+  binary is missing. Architecture, scenario/agent-profile contracts, and the
+  conformance status live in **`docs/E2E.md`** (decision record: ADR-23).
 - **Performance counter tests** (`perf_*` in `src/app/acceptance.rs`). Assert on
   `App::perf_counters()` — wall-clock-free `u64` counters bumped at the
   render/tick hot paths (`MetricsState::perf`) — to gate the perf optimizations
@@ -307,6 +315,11 @@ The demo media is **generated**, not hand-recorded. A single script drives the
 scripts/demo/record.sh                 # regenerate ALL demo videos
 scripts/demo/record.sh theme automations   # re-record a subset
 ```
+
+Real-agent e2e scenarios are demo-able too: `just agent-demo <scenario>`
+records the same scenario the asserting suite runs — real agent, stubbed model,
+deterministic `Wait+Screen` sync — into `target/agent-e2e/demos/` (see
+`docs/E2E.md`).
 
 `record.sh` records every video pair in one pass: the combined hero demo
 (`thurbox-demo.*` via `agents.tape`), one clip per feature
