@@ -1655,7 +1655,8 @@ commented examples).
 
 **Why some rows take effect immediately and others need a restart.** The
 feature flags that gate UI panels (`tasks`, `file_viewer`, `info_panel`,
-`global_search`, `shell_pane`, `code_review`, `soft_delete`) are read from
+`global_search`, `double_shift_search`, `shell_pane`, `code_review`,
+`soft_delete`) are read from
 `App.features` every frame — and `info_panel_position` from
 `App.info_panel_position` the same way — so `submit_settings_panel` copies
 the draft's values into `App` state via `App::apply_live_settings` and they
