@@ -222,6 +222,10 @@ impl App {
                         // matches aren't dropped by a metadata-only pass.
                         self.recompute_global_search_content();
                     }
+                    // Paint the newly-folded file matches now instead of waiting
+                    // for the 250 ms forced-redraw floor. Gated on `active` so a
+                    // delivery to a closed popup doesn't force a needless repaint.
+                    self.request_redraw();
                 }
             }
             TaskPoll::Pending | TaskPoll::Died => {}
