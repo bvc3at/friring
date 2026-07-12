@@ -825,13 +825,20 @@ fn file_line(f: &FileTouch) -> String {
     line
 }
 
-/// Local wall-clock `HH:MM:SS` of an epoch-ms timestamp.
+/// Local wall-clock `HH:MM:SS` of an epoch-ms timestamp. Out-of-range values
+/// (a malformed record's garbage `ts`) render a placeholder rather than
+/// panicking the render thread — `from_timestamp_millis` rejects them.
 pub(crate) fn fmt_time(ts_ms: u64) -> String {
-    chrono::DateTime::<chrono::Local>::from(
-        std::time::UNIX_EPOCH + std::time::Duration::from_millis(ts_ms),
-    )
-    .format("%H:%M:%S")
-    .to_string()
+    match i64::try_from(ts_ms)
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+    {
+        Some(dt) => dt
+            .with_timezone(&chrono::Local)
+            .format("%H:%M:%S")
+            .to_string(),
+        None => "--:--:--".to_string(),
+    }
 }
 
 /// The Overview section: session/provider identity, metadata, per-kind
@@ -955,6 +962,15 @@ mod tests {
         assert!(unsupported_reason("agy").is_some());
         assert!(unsupported_reason("amp").is_some());
         assert_eq!(unsupported_reason("my-agent-cli"), None);
+    }
+
+    #[test]
+    fn fmt_time_never_panics_on_out_of_range_ts() {
+        // A malformed record can carry an arbitrary `ts`; the conversion must
+        // degrade to a placeholder instead of panicking the render thread.
+        assert_eq!(fmt_time(u64::MAX), "--:--:--");
+        // A sane in-range timestamp still formats to wall-clock.
+        assert_ne!(fmt_time(1_783_512_000_000), "--:--:--");
     }
 
     #[test]
