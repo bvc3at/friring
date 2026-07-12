@@ -1166,6 +1166,44 @@ fn activity_sections_render_seeded_events() {
         );
         assert_eq!(ca.rows.len(), 5);
     }
+
+    // Enter expands a Timeline event. Drop focus into the content pane, then
+    // press Enter on the selected event row: for events, membership in
+    // `collapsed_tools` reads as *expanded* (see ui/cc_activity.rs), so the
+    // toggle reveals the result body.
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(h.app.focus, InputFocus::CcActivity);
+    let ev_bi = {
+        let ca = h.app.active_cc_activity().unwrap();
+        match ca.rows[ca.selected] {
+            super::cc_activity::CcRow::Block(bi) => bi,
+            _ => panic!("Timeline rows are event blocks"),
+        }
+    };
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        h.app
+            .active_cc_activity()
+            .unwrap()
+            .collapsed_tools
+            .contains(&ev_bi),
+        "Enter records the event block as expanded"
+    );
+    assert!(
+        h.render().contains("output head"),
+        "the expanded event renders its result body"
+    );
+    // Enter again collapses the event back to its compact one-line form.
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        !h.app
+            .active_cc_activity()
+            .unwrap()
+            .collapsed_tools
+            .contains(&ev_bi),
+        "Enter again collapses the event"
+    );
+
     h.key(KeyCode::Char('3'), KeyModifiers::NONE);
     assert_eq!(h.app.active_cc_activity().unwrap().rows.len(), 2);
 

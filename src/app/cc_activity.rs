@@ -1677,11 +1677,16 @@ impl App {
         let Some(&CcRow::Block(bi)) = ca.rows.get(ca.selected) else {
             return;
         };
-        let is_tool = matches!(
+        // Event blocks are foldable too: for them `collapsed_tools` membership
+        // is read inverted (present = *expanded*), so Enter still toggles the
+        // set — see the `TranscriptBlock::Event` arm in ui/cc_activity.rs.
+        let is_foldable = matches!(
             ca.blocks.get(bi),
-            Some(TranscriptBlock::ToolResult { .. }) | Some(TranscriptBlock::ToolUse { .. })
+            Some(TranscriptBlock::ToolResult { .. })
+                | Some(TranscriptBlock::ToolUse { .. })
+                | Some(TranscriptBlock::Event(_))
         );
-        if is_tool && !ca.collapsed_tools.remove(&bi) {
+        if is_foldable && !ca.collapsed_tools.remove(&bi) {
             ca.collapsed_tools.insert(bi);
         }
     }
