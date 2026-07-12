@@ -475,7 +475,7 @@ e2e_collect_artifacts() {
     cp "$XDG_CONFIG_HOME/thurbox-dev/agents.toml" "$dest/" 2>/dev/null || true
     ( cd "$E2E_WS" 2>/dev/null && { git status --short; git diff; } > "$dest/workspace.diff" ) || true
     env | grep -E '^(THURBOX|ANTHROPIC|CLAUDE|XDG|HOME|no_proxy|http_proxy)' \
-        | sed 's/\(TOKEN=\).*/\1<redacted>/' > "$dest/env.txt" 2>/dev/null || true
+        | sed -E 's/((TOKEN|KEY|SECRET|PASSWORD)=).*/\1<redacted>/' > "$dest/env.txt" 2>/dev/null || true
     e2e_log "failure artifacts: $dest"
 }
 
