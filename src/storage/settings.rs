@@ -68,8 +68,8 @@ impl Database {
     }
 
     /// Publish the TUI's latest perf snapshot (a JSON blob) for
-    /// `thurbox-cli perf` to read. Written only while perf timing is active
-    /// (THURBOX_PERF_LOG or an open perf HUD) — each write bumps other
+    /// `friring-cli perf` to read. Written only while perf timing is active
+    /// (FRIRING_PERF_LOG or an open perf HUD) — each write bumps other
     /// connections' `data_version`, so an idle default-config TUI must never
     /// churn this row.
     pub fn set_perf_snapshot(&self, json: &str) -> rusqlite::Result<()> {
@@ -94,7 +94,7 @@ impl Database {
 
     /// The set of currently-active extension names (e.g. `["flow"]`), stored as
     /// a JSON array under the `active_extensions` metadata key. Drives self-heal:
-    /// thurbox re-ensures each active extension's resources on startup and tick.
+    /// friring re-ensures each active extension's resources on startup and tick.
     /// A malformed/missing value reads as an empty set rather than erroring.
     pub fn get_active_extensions(&self) -> rusqlite::Result<Vec<String>> {
         let raw: Option<String> = self
@@ -203,7 +203,7 @@ impl Database {
     }
 
     /// Record a "focus this session" request for the running TUI to consume.
-    /// Used by the macOS click-to-focus CLI (`thurbox-cli session focus`) —
+    /// Used by the macOS click-to-focus CLI (`friring-cli session focus`) —
     /// the symmetric writer to [`Self::take_pending_focus_session_id`].
     /// Linux dispatches in-process from the dbus action callback and writes
     /// the metadata row directly; the CLI path needs this helper because it

@@ -1,7 +1,7 @@
 //! Remote-host definitions — pure data describing the off-local targets
-//! thurbox can run sessions on: SSH machines and local WSL distros.
+//! friring can run sessions on: SSH machines and local WSL distros.
 //!
-//! Loaded from `~/.config/thurbox/hosts.toml` by
+//! Loaded from `~/.config/friring/hosts.toml` by
 //! [`crate::agent::host_config`] (and, for WSL, auto-discovered there too).
 //! Kept here in `session` (the dependency sink) so both `agent` (which builds
 //! the tmux backend) and `git` (which runs `git` on the host for remote
@@ -41,7 +41,7 @@ pub fn is_remote_backend(backend_name: &str) -> bool {
     is_ssh_backend(backend_name) || is_wsl_backend(backend_name)
 }
 
-/// How thurbox reaches a host: over SSH, or into a local WSL distro.
+/// How friring reaches a host: over SSH, or into a local WSL distro.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum HostKind {
@@ -71,7 +71,7 @@ pub struct HostDef {
     #[serde(default)]
     pub distro: Option<String>,
     /// Optional override for the host's `tmux -L` socket name. Defaults to the
-    /// same socket thurbox uses locally.
+    /// same socket friring uses locally.
     #[serde(default)]
     pub socket: Option<String>,
     /// Optional override for the host's tmux session name.
@@ -83,7 +83,7 @@ pub struct HostDef {
     pub ssh_opts: Vec<String>,
     /// Optional absolute directory (inside the host / distro) under which git
     /// worktrees are created. When unset, the host's
-    /// `$HOME/.local/share/thurbox/worktrees` is resolved at spawn time.
+    /// `$HOME/.local/share/friring/worktrees` is resolved at spawn time.
     #[serde(default)]
     pub worktrees_dir: Option<String>,
     /// Optional multiplexer binary on the host. Defaults to `tmux` (the WSL

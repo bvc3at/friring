@@ -1,4 +1,4 @@
-//! Task CRUD subcommands for `thurbox-cli`.
+//! Task CRUD subcommands for `friring-cli`.
 //!
 //! Tasks are persisted to the shared database; the TUI's right-side panel reads
 //! them. `run` triggers a task's agent action headlessly (Send into a live tmux

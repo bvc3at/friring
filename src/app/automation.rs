@@ -1,4 +1,4 @@
-//! Automations cluster for the Thurbox TUI application.
+//! Automations cluster for the Friring TUI application.
 //!
 //! Relocated from `app/mod.rs` and `app/key_handlers.rs` (ADR-22 step 2): the
 //! `impl App` methods that drive scheduled automations — firing due schedules,
@@ -21,7 +21,7 @@ impl App {
     /// `force = true` for the one-shot startup catch-up pass (ignores cadence).
     pub(crate) fn process_automations(&mut self, force: bool) {
         // Automations fully off: the TUI neither fires schedules nor catches
-        // up at startup (explicit `thurbox-cli automation` use still works).
+        // up at startup (explicit `friring-cli automation` use still works).
         if !self.features.automations {
             return;
         }

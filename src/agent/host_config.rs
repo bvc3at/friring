@@ -1,7 +1,7 @@
 //! Loading and seeding of the remote-host config file.
 //!
 //! Remote SSH hosts are defined declaratively in
-//! `~/.config/thurbox/hosts.toml`. Each entry becomes a selectable session
+//! `~/.config/friring/hosts.toml`. Each entry becomes a selectable session
 //! backend named `ssh:<name>`. On first run the file is seeded with a
 //! commented-out example so a fresh install registers *zero* remote backends
 //! and behaves exactly as before. If the file exists but cannot be read or
@@ -15,18 +15,18 @@ use crate::session::{HostDef, HostRegistry};
 
 /// Seed contents for `hosts.toml` on first run: full field documentation plus a
 /// commented-out example, but no active hosts.
-pub const SEED_HOSTS_TOML: &str = r#"# Thurbox hosts  —  ~/.config/thurbox/hosts.toml
+pub const SEED_HOSTS_TOML: &str = r#"# Friring hosts  —  ~/.config/friring/hosts.toml
 #
-# Each [[hosts]] entry describes an off-local target thurbox can run agent
+# Each [[hosts]] entry describes an off-local target friring can run agent
 # sessions on: a remote machine over SSH, or a local WSL distro. A host named
 # "<name>" registers a session backend ("ssh:<name>" or "wsl:<name>"), offered
 # in the new-session host picker (TUI) and selectable with
-# `thurbox-cli session create --host <name>`. The agent process, its tmux
+# `friring-cli session create --host <name>`. The agent process, its tmux
 # window, and any git worktrees all live on the host (or inside the distro);
 # only the TUI runs locally.
 #
-# SSH hosts: thurbox shells out to the system `ssh` binary, so authentication,
-# keys, and connection details all come from your ~/.ssh/config — thurbox never
+# SSH hosts: friring shells out to the system `ssh` binary, so authentication,
+# keys, and connection details all come from your ~/.ssh/config — friring never
 # handles credentials itself. The remote host needs `tmux` >= 3.2 and `git`.
 #
 # WSL distros are AUTO-DISCOVERED on Windows (via `wsl.exe -l -q`) and appear in
@@ -39,7 +39,7 @@ pub const SEED_HOSTS_TOML: &str = r#"# Thurbox hosts  —  ~/.config/thurbox/hos
 # registers zero SSH hosts (WSL distros still auto-discover) and otherwise
 # behaves like a local-only setup. Uncomment and edit an entry to add one.
 #
-# Unknown keys are reported on startup (and fail `thurbox-cli config
+# Unknown keys are reported on startup (and fail `friring-cli config
 # validate`) but don't break the load.
 #
 # Fields per [[hosts]] entry:
@@ -60,20 +60,20 @@ pub const SEED_HOSTS_TOML: &str = r#"# Thurbox hosts  —  ~/.config/thurbox/hos
 #
 #   ssh_opts       (array of strings, optional, default: []; ssh only)
 #       Extra flags inserted before the destination, one token per array
-#       element (e.g. "-p" then "2222"). thurbox does NOT expand `~`, so use
+#       element (e.g. "-p" then "2222"). friring does NOT expand `~`, so use
 #       absolute paths for things like `-i <keyfile>`.
 #
-#   socket         (string, optional, default: "thurbox")
+#   socket         (string, optional, default: "friring")
 #       Host `tmux -L` socket name. Override only to avoid colliding with
-#       another thurbox/tmux server on the same host.
+#       another friring/tmux server on the same host.
 #
-#   session        (string, optional, default: "thurbox")
-#       Host tmux session name that groups thurbox's windows.
+#   session        (string, optional, default: "friring")
+#       Host tmux session name that groups friring's windows.
 #
 #   worktrees_dir  (string, optional)
 #       Absolute directory (on the host / inside the distro) under which git
-#       worktrees are created. When unset, thurbox uses
-#       $HOME/.local/share/thurbox/worktrees there ($HOME resolved on first use).
+#       worktrees are created. When unset, friring uses
+#       $HOME/.local/share/friring/worktrees there ($HOME resolved on first use).
 #
 #   multiplexer    (string, optional, default: "tmux")
 #       Multiplexer binary on the host. Set to "psmux" when an SSH host is a
@@ -103,13 +103,13 @@ config_version = 1
 #
 # # ControlMaster reuses one SSH connection so reconnects are instant;
 # # ControlPersist keeps it warm; ServerAliveInterval drops half-open links.
-# # One token per array element; thurbox does NOT expand `~` (use abs paths).
+# # One token per array element; friring does NOT expand `~` (use abs paths).
 # ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m", "-o", "ServerAliveInterval=15"]
 #
 # # Optional overrides, shown with their defaults:
-# # socket = "thurbox"          # remote `tmux -L` socket; change to avoid a clash
-# # session = "thurbox"         # remote tmux session grouping thurbox windows
-# # worktrees_dir = "/home/me/.local/share/thurbox/worktrees"  # abs remote path
+# # socket = "friring"          # remote `tmux -L` socket; change to avoid a clash
+# # session = "friring"         # remote tmux session grouping friring windows
+# # worktrees_dir = "/home/me/.local/share/friring/worktrees"  # abs remote path
 # # multiplexer = "tmux"        # set to "psmux" for a Windows remote host
 #
 # ──────────────────────────────────────────────────────────────────────────
@@ -121,10 +121,10 @@ config_version = 1
 # name = "ubuntu"               # → backend "wsl:ubuntu", value for --host
 # kind = "wsl"
 # distro = "Ubuntu-22.04"       # the wsl.exe distro name (defaults to `name`)
-# # worktrees_dir = "/home/me/.local/share/thurbox/worktrees"  # abs path in WSL
+# # worktrees_dir = "/home/me/.local/share/friring/worktrees"  # abs path in WSL
 "#;
 
-/// Path to the remote-host config file: `~/.config/thurbox/hosts.toml`
+/// Path to the remote-host config file: `~/.config/friring/hosts.toml`
 /// (sibling of `config.toml`).
 pub fn hosts_config_path() -> Option<PathBuf> {
     crate::paths::config_file().map(|p| p.with_file_name("hosts.toml"))
@@ -264,7 +264,7 @@ pub(crate) fn discover_wsl_hosts() -> Vec<HostDef> {
 
 /// Whether `wsl.exe` can be invoked: always attempted on Windows; elsewhere
 /// only when it resolves on `PATH` (WSL interop exposes it inside a distro, so
-/// thurbox running in one WSL distro can still reach its siblings).
+/// friring running in one WSL distro can still reach its siblings).
 fn wsl_exe_available() -> bool {
     cfg!(windows) || crate::paths::which_on_path("wsl.exe")
 }

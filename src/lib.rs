@@ -1,4 +1,4 @@
-//! Thurbox — multi-session TUI orchestrator for coding-agent CLIs.
+//! Friring — multi-session TUI orchestrator for coding-agent CLIs.
 
 pub mod agent;
 pub mod app;

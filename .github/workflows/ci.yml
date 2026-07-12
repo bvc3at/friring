@@ -399,7 +399,7 @@ jobs:
             echo ""
             echo "| Binary | Size |"
             echo "| ------ | ---- |"
-            for bin in thurbox thurbox-cli; do
+            for bin in friring friring-cli; do
               path="target/release/$bin"
               [ -f "$path" ] || continue
               size=$(du -h "$path" | cut -f1)
@@ -412,8 +412,8 @@ jobs:
         with:
           name: release-binaries
           path: |
-            target/release/thurbox
-            target/release/thurbox-cli
+            target/release/friring
+            target/release/friring-cli
           if-no-files-found: warn
 
   all-checks:

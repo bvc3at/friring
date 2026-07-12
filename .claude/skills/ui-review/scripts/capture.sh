@@ -1,16 +1,16 @@
 #!/usr/bin/env sh
-# ui-review capture: drive the REAL thurbox TUI in an isolated sandbox and take a
+# ui-review capture: drive the REAL friring TUI in an isolated sandbox and take a
 # PNG screenshot of each major screen/panel using VHS.
 #
 # This adapts the isolation + seeding model from scripts/demo/record.sh, but emits
 # still PNGs (via VHS `Screenshot`) instead of GIF/MP4 video. Nothing here can touch
-# your real thurbox sessions, tmux server, or agent accounts:
+# your real friring sessions, tmux server, or agent accounts:
 #
 #   * HOME + XDG_{DATA,CONFIG,STATE,CACHE}_HOME point at a throwaway mktemp dir, so
 #     agents (if any) boot fresh and the dev DB/config live in the sandbox.
-#   * TMUX_TMPDIR points at a throwaway dir, so the `thurbox-dev` tmux server lives
+#   * TMUX_TMPDIR points at a throwaway dir, so the `friring-dev` tmux server lives
 #     in its own socket directory and cleanup can't kill sessions you have running.
-#   * The dev binary (0.0.0-dev => dev_build cfg) uses the `thurbox-dev` socket/dirs.
+#   * The dev binary (0.0.0-dev => dev_build cfg) uses the `friring-dev` socket/dirs.
 #
 # Stub-agent fallback: if none of claude/codex/antigravity/opencode are on PATH, a trivial
 # stub agent (a long-lived shell) is registered so the TUI still spawns a session and
@@ -19,7 +19,7 @@
 # Usage:  capture.sh [OUTPUT_DIR] [--theme NAME] [--width N] [--height N]
 #
 #   OUTPUT_DIR  where PNGs + manifest.json go (default: <repo>/target/ui-review/screenshots)
-#   --theme     thurbox TUI theme string (default: doom; e.g. "Tokyo Night")
+#   --theme     friring TUI theme string (default: doom; e.g. "Tokyo Night")
 #   --width     VHS viewport width  in px (default 1920; keep >=120 cols equivalent)
 #   --height    VHS viewport height in px (default 1080)
 #
@@ -35,7 +35,7 @@ die()  { printf '[ui-review] FATAL: %s\n' "$*" >&2; exit 2; }
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SKILL_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 REPO_ROOT=$(git -C "$SKILL_DIR" rev-parse --show-toplevel 2>/dev/null) \
-    || die "not inside a git repo — run this from the thurbox repo"
+    || die "not inside a git repo — run this from the friring repo"
 cd "$REPO_ROOT"
 
 # --- Args -------------------------------------------------------------------
@@ -70,12 +70,12 @@ done
 [ -n "$missing" ] && die "missing required tool(s):$missing (vhs needs ffmpeg + ttyd)"
 
 # --- Build the dev binaries (BEFORE the HOME override so cargo finds ~/.cargo) -
-log "Building thurbox (dev) ..."
-cargo build --bin thurbox --bin thurbox-cli >&2
-THURBOX_BIN="$REPO_ROOT/target/debug/thurbox"
-CLI_BIN="$REPO_ROOT/target/debug/thurbox-cli"
-export THURBOX_BIN
-[ -x "$THURBOX_BIN" ] || die "dev binary not found at $THURBOX_BIN"
+log "Building friring (dev) ..."
+cargo build --bin friring --bin friring-cli >&2
+FRIRING_BIN="$REPO_ROOT/target/debug/friring"
+CLI_BIN="$REPO_ROOT/target/debug/friring-cli"
+export FRIRING_BIN
+[ -x "$FRIRING_BIN" ] || die "dev binary not found at $FRIRING_BIN"
 
 # Map a featured-agent display name to its actual CLI binary. They differ only
 # for antigravity, whose binary is `agy` (the Gemini CLI successor); identity for
@@ -104,8 +104,8 @@ fi
 # dev-sandbox helper already used by the demo recorder + TUI smoke test.
 # `tbx_sandbox_init_full fresh` gives FULL hermetic isolation — a throwaway
 # mktemp root with fresh HOME + XDG_* — and crucially UNSETS any inherited
-# THURBOX_CONFIG_DIR / THURBOX_DATA_DIR. paths.rs honors those ahead of XDG, so an
-# inherited override (e.g. from a thurbox-dev direnv/sandbox shell) would silently
+# FRIRING_CONFIG_DIR / FRIRING_DATA_DIR. paths.rs honors those ahead of XDG, so an
+# inherited override (e.g. from a friring-dev direnv/sandbox shell) would silently
 # defeat XDG isolation and make the dev binary read/WRITE your REAL db + config.
 # `fresh` => the root is removed on teardown. Build the binaries BEFORE this (done
 # above) so cargo still resolves your real ~/.cargo before HOME is overridden.
@@ -115,8 +115,8 @@ fi
 tbx_sandbox_init_full fresh
 
 SANDBOX="$TBX_SANDBOX_ROOT"
-CFG_DIR="$XDG_CONFIG_HOME/thurbox-dev"
-DB_FILE="$XDG_DATA_HOME/thurbox-dev/thurbox.db"
+CFG_DIR="$XDG_CONFIG_HOME/friring-dev"
+DB_FILE="$XDG_DATA_HOME/friring-dev/friring.db"
 mkdir -p "$CFG_DIR" "$(dirname "$DB_FILE")"
 
 cleanup() { tbx_sandbox_teardown; }
@@ -163,7 +163,7 @@ mkdir -p "$DEMO_REPO/src" "$DEMO_REPO/tests" "$DEMO_REPO/docs"
 cat > "$DEMO_REPO/README.md" <<'EOF'
 # sample-project
 
-A tiny demo repository used to exercise the Thurbox UI for review.
+A tiny demo repository used to exercise the Friring UI for review.
 EOF
 cat > "$DEMO_REPO/src/main.rs" <<'EOF'
 fn main() {
@@ -187,8 +187,8 @@ cat > "$DEMO_REPO/docs/ARCHITECTURE.md" <<'EOF'
 Sample document for the file-viewer review.
 EOF
 git init -q "$DEMO_REPO"
-git -C "$DEMO_REPO" -c user.email=ui@thurbox -c user.name=ui add -A
-git -C "$DEMO_REPO" -c user.email=ui@thurbox -c user.name=ui commit -q -m "init sample project"
+git -C "$DEMO_REPO" -c user.email=ui@friring -c user.name=ui add -A
+git -C "$DEMO_REPO" -c user.email=ui@friring -c user.name=ui commit -q -m "init sample project"
 DEMO_BASE_BRANCH=$(git -C "$DEMO_REPO" symbolic-ref --short HEAD)
 
 # --- Seed sessions + tasks + an automation ----------------------------------
@@ -200,7 +200,7 @@ done
 # Isolation tripwire: at this point (CLI-only, no TUI yet) the sandbox DB must
 # hold EXACTLY the sessions we just seeded, all rooted under $SANDBOX. If the
 # count is off or any cwd escapes the sandbox, isolation has broken — abort
-# LOUDLY rather than read/pollute the caller's real thurbox database.
+# LOUDLY rather than read/pollute the caller's real friring database.
 # shellcheck disable=SC2086 # $AGENTS is a space-separated list, split on purpose
 want=$(printf '%s\n' $AGENTS | grep -c .)
 got=$(sqlite3 "$DB_FILE" "SELECT count(*) FROM sessions WHERE deleted_at IS NULL" 2>/dev/null || echo "?")
@@ -213,7 +213,7 @@ if [ "$got" != "$want" ] || [ -n "$escaped" ]; then
   expected: $want session(s), all under $SANDBOX
   found:    $got session(s)${escaped:+, incl. cwd(s) OUTSIDE the sandbox:
 $escaped}
-This means THURBOX_DATA_DIR/THURBOX_CONFIG_DIR (or similar) pointed the dev
+This means FRIRING_DATA_DIR/FRIRING_CONFIG_DIR (or similar) pointed the dev
 binary at your real data. Aborting before any further writes."
 fi
 
@@ -249,8 +249,8 @@ fn main() {
     println!("{}", greet::greet("sample-project"));
 }
 EOF
-    git -C "$REVIEW_WT" -c user.email=ui@thurbox -c user.name=ui add -A
-    git -C "$REVIEW_WT" -c user.email=ui@thurbox -c user.name=ui \
+    git -C "$REVIEW_WT" -c user.email=ui@friring -c user.name=ui add -A
+    git -C "$REVIEW_WT" -c user.email=ui@friring -c user.name=ui \
         commit -q -m "feat: add greeting + checked arithmetic"
 fi
 

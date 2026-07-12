@@ -1,4 +1,4 @@
-//! Output rendering for `thurbox-cli`.
+//! Output rendering for `friring-cli`.
 //!
 //! Every subcommand builds a [`CommandOutput`] carrying *both* a machine-
 //! readable JSON `Value` and a pre-rendered human string. [`mod@crate::cli`]'s
@@ -7,7 +7,7 @@
 //! - `--json` forces JSON (compact); `--pretty` forces pretty-printed JSON.
 //! - `--text` forces the human rendering.
 //! - With no flag we auto-detect: a TTY gets human output, a pipe gets JSON, so
-//!   existing `thurbox-cli … | jq` pipelines keep working untouched.
+//!   existing `friring-cli … | jq` pipelines keep working untouched.
 //!
 //! Subcommands build the human string where they already hold the typed data
 //! (no fragile re-parsing of `Value` in a central renderer). The small

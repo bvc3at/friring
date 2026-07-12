@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# push-status.sh — push thurbox task status back to GitLab (the bidirectional
-# half). For every thurbox task with source=gitlab whose tracker row opts into
+# push-status.sh — push friring task status back to GitLab (the bidirectional
+# half). For every friring task with source=gitlab whose tracker row opts into
 # push_back, reconcile the GitLab issue's open/closed state with the task:
 #   task done              -> issue closed
 #   task todo|in_progress  -> issue open (reopened if currently closed)
@@ -76,7 +76,7 @@ while IFS= read -r task; do
   else
     skipped=$((skipped+1))
   fi
-done < <(thurbox-cli task list --json 2>/dev/null \
+done < <(friring-cli task list --json 2>/dev/null \
           | jq -c --arg s "$SOURCE" '.[] | select(.source == $s)')
 
 echo "push-status[$SOURCE]: pushed=$pushed skipped=$skipped"

@@ -24,7 +24,7 @@ struct RestartPlan {
 }
 
 /// Build the [`RestartPlan`] for a persisted session: keep its identity stable,
-/// inject the standard `THURBOX_*` env, decide the resume trigger from the
+/// inject the standard `FRIRING_*` env, decide the resume trigger from the
 /// agent definition, and resolve the process cwd (the symlink workspace for a
 /// multi-repo session, else the primary repo — mirroring the TUI's
 /// `App::resolve_process_cwd`).
@@ -37,14 +37,14 @@ fn build_restart_plan(session: &SharedSession) -> Result<RestartPlan, String> {
     })?;
 
     let mut config = SessionConfig {
-        // Keep the same identity across a restart so `THURBOX_SESSION` is stable.
+        // Keep the same identity across a restart so `FRIRING_SESSION` is stable.
         session_id: Some(session.id),
         agent_session_id: Some(agent_session_id.clone()),
         cwd: session.cwd.clone(),
         agent: session.agent.clone(),
         ..SessionConfig::default()
     };
-    super::inject_thurbox_env(&mut config, &agent_session_id, None);
+    super::inject_friring_env(&mut config, &agent_session_id, None);
     let def = super::resolve_agent_def(Some(&config.agent));
     config.resume_session_id = super::resume_trigger_for(&def, &agent_session_id, &config.env);
 
@@ -160,11 +160,11 @@ mod tests {
         let sess = session(Some("agent-conv-uuid"), Some(PathBuf::from("/tmp/repo")));
         let plan = build_restart_plan(&sess).unwrap();
 
-        // The thurbox session key and the agent conversation id are both present
+        // The friring session key and the agent conversation id are both present
         // and distinct, exactly as a fresh spawn would inject them.
-        assert_eq!(plan.env.get("THURBOX_SESSION"), Some(&sess.id.to_string()));
+        assert_eq!(plan.env.get("FRIRING_SESSION"), Some(&sess.id.to_string()));
         assert_eq!(
-            plan.env.get("THURBOX_SESSION_ID"),
+            plan.env.get("FRIRING_SESSION_ID"),
             Some(&"agent-conv-uuid".to_string())
         );
     }

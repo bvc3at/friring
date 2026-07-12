@@ -4,7 +4,7 @@
 # and it hard-codes `--platform=local`: Renovate never talks to a git host, never
 # needs a token, and never opens a branch/PR itself. It detects dependencies and
 # (in `apply` mode) writes the updated manifests + lockfiles straight into the
-# working tree. The thurbox worker then reviews, tests, commits, and — if you
+# working tree. The friring worker then reviews, tests, commits, and — if you
 # want a reviewable PR — pushes the branch and opens it (that part is the
 # worker's job, not Renovate's).
 #
@@ -21,7 +21,7 @@
 #   minor -> patch + minor updates    (major disabled)        [default]
 #   major | all -> everything
 #
-# --config defaults to ~/.config/thurbox/extensions/renovate/renovate-config.json (Renovate's own config,
+# --config defaults to ~/.config/friring/extensions/renovate/renovate-config.json (Renovate's own config,
 # passed via RENOVATE_CONFIG_FILE). Set GITHUB_COM_TOKEN in the environment to
 # raise GitHub API limits / fetch changelogs; it is optional and read-only.
 

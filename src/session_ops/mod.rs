@@ -3,7 +3,7 @@
 //! Callers (MCP, CLI) use these helpers to drive the same local-tmux-backed
 //! sessions the TUI manages, without requiring the TUI event loop. All
 //! operations are synchronous against the SQLite database and the `tmux -L
-//! thurbox` server.
+//! friring` server.
 
 pub mod builtin_hooks;
 pub mod delete;
@@ -172,50 +172,50 @@ fn build_agent_invocation(
     (command, args)
 }
 
-/// Inject the standard thurbox env hints into a session config so a
-/// `thurbox-cli` call running *inside* the session can prove its own identity
+/// Inject the standard friring env hints into a session config so a
+/// `friring-cli` call running *inside* the session can prove its own identity
 /// without scraping panes or names:
 ///
-/// - `THURBOX_SESSION` — the thurbox [`SessionId`] (the registry key). Read by
+/// - `FRIRING_SESSION` — the friring [`SessionId`] (the registry key). Read by
 ///   the mailbox CLI to auto-stamp provenance and default the inbox to "me".
 ///   Requires `config.session_id` to be set before calling.
-/// - `THURBOX_SESSION_ID` — the *agent's* conversation id (`agent_session_id`),
-///   consumed by the metrics statusline. Distinct from `THURBOX_SESSION`.
-/// - `THURBOX_TASK` — the originating task id, when this session was spawned for
+/// - `FRIRING_SESSION_ID` — the *agent's* conversation id (`agent_session_id`),
+///   consumed by the metrics statusline. Distinct from `FRIRING_SESSION`.
+/// - `FRIRING_TASK` — the originating task id, when this session was spawned for
 ///   a task (so messages auto-tag `from_task_id`). Headless `task run` only; the
 ///   TUI task-spawn path tracks the link in-memory instead.
-/// - `THURBOX_METRICS_DIR` — metrics output dir.
-/// - `THURBOX_CONFIG_DIR` / `THURBOX_DATA_DIR` — the resolved config/data dirs,
-///   so the agent's `thurbox-cli` (its status hook) targets the same DB the TUI
+/// - `FRIRING_METRICS_DIR` — metrics output dir.
+/// - `FRIRING_CONFIG_DIR` / `FRIRING_DATA_DIR` — the resolved config/data dirs,
+///   so the agent's `friring-cli` (its status hook) targets the same DB the TUI
 ///   reads regardless of XDG / PATH / a stale tmux-server env.
 ///
 /// The three *path* vars are **local-only**: a remote (SSH/WSL) session skips
-/// them — the local dirs don't exist on the host, and a remote `thurbox-cli`
+/// them — the local dirs don't exist on the host, and a remote `friring-cli`
 /// pinned to them would resolve garbage instead of its own defaults. The
-/// identity vars (`THURBOX_SESSION`/`THURBOX_SESSION_ID`/`THURBOX_TASK`) are
+/// identity vars (`FRIRING_SESSION`/`FRIRING_SESSION_ID`/`FRIRING_TASK`) are
 /// opaque and travel everywhere.
 ///
 /// Kept in sync with `App::build_spawn_inputs` so headless and TUI sessions look
-/// identical to the spawned process (modulo `THURBOX_TASK` as noted above).
+/// identical to the spawned process (modulo `FRIRING_TASK` as noted above).
 ///
 /// Shared by the headless spawn/restart paths and the TUI `Ctrl+R` restart
 /// (`App::restart_active_session`), so a restarted session keeps the same
 /// identity env a fresh spawn would have had.
-pub(crate) fn inject_thurbox_env(
+pub(crate) fn inject_friring_env(
     config: &mut SessionConfig,
     agent_session_id: &str,
     task_id: Option<i64>,
 ) {
     config
         .env
-        .insert("THURBOX_SESSION_ID".into(), agent_session_id.into());
+        .insert("FRIRING_SESSION_ID".into(), agent_session_id.into());
     if let Some(id) = config.session_id {
-        config.env.insert("THURBOX_SESSION".into(), id.to_string());
+        config.env.insert("FRIRING_SESSION".into(), id.to_string());
     }
     if let Some(task_id) = task_id {
         config
             .env
-            .insert("THURBOX_TASK".into(), task_id.to_string());
+            .insert("FRIRING_TASK".into(), task_id.to_string());
     }
     if config
         .backend
@@ -227,11 +227,11 @@ pub(crate) fn inject_thurbox_env(
     if let Some(dir) = crate::paths::metrics_directory() {
         config
             .env
-            .insert("THURBOX_METRICS_DIR".into(), dir.to_string_lossy().into());
+            .insert("FRIRING_METRICS_DIR".into(), dir.to_string_lossy().into());
     }
-    // Pin the agent's `thurbox-cli` (its status hook) to the *same* config/data
-    // dirs this thurbox resolved, so a status `signal` always lands in the DB
-    // the TUI reads — independent of XDG, which `thurbox-cli` is on PATH, or a
+    // Pin the agent's `friring-cli` (its status hook) to the *same* config/data
+    // dirs this friring resolved, so a status `signal` always lands in the DB
+    // the TUI reads — independent of XDG, which `friring-cli` is on PATH, or a
     // stale tmux-server env. Derived from the resolved file paths' parents.
     if let Some(dir) = crate::paths::config_file().and_then(|p| p.parent().map(|d| d.to_path_buf()))
     {
@@ -279,27 +279,27 @@ mod tests {
             session_id: Some(sid),
             ..SessionConfig::default()
         };
-        inject_thurbox_env(&mut config, "agent-conv-uuid", Some(42));
-        // The thurbox session key and the agent conversation id are distinct.
-        assert_eq!(config.env.get("THURBOX_SESSION"), Some(&sid.to_string()));
+        inject_friring_env(&mut config, "agent-conv-uuid", Some(42));
+        // The friring session key and the agent conversation id are distinct.
+        assert_eq!(config.env.get("FRIRING_SESSION"), Some(&sid.to_string()));
         assert_eq!(
-            config.env.get("THURBOX_SESSION_ID"),
+            config.env.get("FRIRING_SESSION_ID"),
             Some(&"agent-conv-uuid".to_string())
         );
-        assert_eq!(config.env.get("THURBOX_TASK"), Some(&"42".to_string()));
+        assert_eq!(config.env.get("FRIRING_TASK"), Some(&"42".to_string()));
     }
 
     #[test]
     fn inject_env_pins_config_and_data_dirs() {
         // The agent's status hook must target the same DB the TUI reads, so the
-        // resolved config/data dirs are injected for `thurbox-cli` to honour.
+        // resolved config/data dirs are injected for `friring-cli` to honour.
         let tmp = tempfile::tempdir().unwrap();
         let _guard = crate::paths::TestPathGuard::new(tmp.path());
         let mut config = SessionConfig {
             session_id: Some(SessionId::default()),
             ..SessionConfig::default()
         };
-        inject_thurbox_env(&mut config, "agent-conv-uuid", None);
+        inject_friring_env(&mut config, "agent-conv-uuid", None);
 
         let cfg_dir = config
             .env
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn inject_env_skips_local_path_dirs_for_remote_backend() {
         // The metrics/config/data dirs are *local* paths — meaningless on an
-        // SSH/WSL host, and a remote `thurbox-cli` pinned to them would resolve
+        // SSH/WSL host, and a remote `friring-cli` pinned to them would resolve
         // garbage. Identity vars still travel.
         let tmp = tempfile::tempdir().unwrap();
         let _guard = crate::paths::TestPathGuard::new(tmp.path());
@@ -335,10 +335,10 @@ mod tests {
             backend: Some("ssh:devbox".into()),
             ..SessionConfig::default()
         };
-        inject_thurbox_env(&mut config, "agent-conv-uuid", None);
-        assert!(config.env.contains_key("THURBOX_SESSION"));
-        assert!(config.env.contains_key("THURBOX_SESSION_ID"));
-        assert!(!config.env.contains_key("THURBOX_METRICS_DIR"));
+        inject_friring_env(&mut config, "agent-conv-uuid", None);
+        assert!(config.env.contains_key("FRIRING_SESSION"));
+        assert!(config.env.contains_key("FRIRING_SESSION_ID"));
+        assert!(!config.env.contains_key("FRIRING_METRICS_DIR"));
         assert!(!config
             .env
             .contains_key(crate::paths::CONFIG_DIR_OVERRIDE_ENV));
@@ -351,9 +351,9 @@ mod tests {
             session_id: Some(SessionId::default()),
             ..SessionConfig::default()
         };
-        inject_thurbox_env(&mut config, "agent-conv-uuid", None);
-        assert!(config.env.contains_key("THURBOX_SESSION"));
-        assert!(!config.env.contains_key("THURBOX_TASK"));
+        inject_friring_env(&mut config, "agent-conv-uuid", None);
+        assert!(config.env.contains_key("FRIRING_SESSION"));
+        assert!(!config.env.contains_key("FRIRING_TASK"));
     }
 
     #[test]
@@ -391,8 +391,8 @@ mod tests {
         assert!(codex.resumes_latest());
         let env = HashMap::new();
         assert_eq!(
-            resume_trigger_for(&codex, "thurbox-uuid", &env),
-            Some("thurbox-uuid".to_string())
+            resume_trigger_for(&codex, "friring-uuid", &env),
+            Some("friring-uuid".to_string())
         );
     }
 

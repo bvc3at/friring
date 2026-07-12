@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # link-sessions.sh — flag change requests that already have a *live, non-fixer*
-# thurbox session on their head branch.
+# friring session on their head branch.
 #
 # The shepherd dispatches a fixer per actionable request, but a PR/MR may
-# already be getting hands-on work in another thurbox session — one the user
+# already be getting hands-on work in another friring session — one the user
 # (or another agent) opened on that branch. That session is a *worker*, not a
 # blocker: the shepherd shouldn't dispatch a duplicate fixer (two worktrees
 # force-pushing one branch would clobber each other), but it should keep
@@ -12,7 +12,7 @@
 # so the shepherd can do that instead of dispatching over it.
 #
 # Reads the normalized request JSON array (the provider.sh `list` shape) on
-# stdin and takes the `thurbox-cli session list --json` array as $1 (a file
+# stdin and takes the `friring-cli session list --json` array as $1 (a file
 # path; default /dev/null = no sessions). Prints one line per (request,
 # session) overlap, nothing when there is none:
 #   "  ⮑ #<n> head=<branch> already has a live session: <name>  <id>  cwd=<cwd>"

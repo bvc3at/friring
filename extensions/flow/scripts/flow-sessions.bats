@@ -3,7 +3,7 @@
 # Worker sessions are named "<title> · #<id>" (current) or "task-<id>[-…]"
 # (legacy); both scripts must list them and tag them with their task #<id> for
 # the **human board** (routing now goes through `message reply <id>`, which
-# thurbox resolves — these scripts no longer drive it). A stub `thurbox-cli` on
+# friring resolves — these scripts no longer drive it). A stub `friring-cli` on
 # PATH feeds canned `session list` / `task list` JSON, so these run anywhere
 # bats + jq are installed.
 
@@ -34,7 +34,7 @@ JSON
 JSON
 
   mkdir -p "${STUBDIR}/bin"
-  cat >"${STUBDIR}/bin/thurbox-cli" <<EOF
+  cat >"${STUBDIR}/bin/friring-cli" <<EOF
 #!/usr/bin/env bash
 case "\$1 \$2" in
   "task list")    cat "${STUBDIR}/tasks.json" ;;
@@ -42,7 +42,7 @@ case "\$1 \$2" in
   *) echo "[]" ;;
 esac
 EOF
-  chmod +x "${STUBDIR}/bin/thurbox-cli"
+  chmod +x "${STUBDIR}/bin/friring-cli"
   PATH="${STUBDIR}/bin:${PATH}"
 }
 

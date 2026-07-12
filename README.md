@@ -17,10 +17,11 @@
 > kept intact as a tribute to the upstream author.
 >
 > **Heads up** — every link, install command, badge, and doc below points at
-> the **original** Thurbox project, and that's intentional: Friring currently
-> builds and installs as the upstream `thurbox` binary and publishes no
-> releases or website of its own. See **[FORK.md](./FORK.md)** for the running
-> list of how this fork diverges from upstream.
+> the **original** Thurbox project, and that's intentional: the packaged
+> installs still fetch the upstream `thurbox` binary and Friring publishes no
+> releases or website of its own. Building *this* repo from source, though, now
+> produces the renamed `friring` binary. See **[FORK.md](./FORK.md)** for the
+> running list of how this fork diverges from upstream.
 
 Run any coding-agent CLI in persistent terminal sessions.
 Friring is a multi-session TUI orchestrator that launches
@@ -34,7 +35,7 @@ worktrees are first-class citizens.
 [![Website](https://img.shields.io/badge/Website-thurbox.thurbeen.eu-blue)](https://thurbox.thurbeen.eu/)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=Thurbeen_thurbox&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Thurbeen_thurbox)
 
-![Friring Demo](./docs/media/thurbox-demo.gif)
+![Friring Demo](./docs/media/friring-demo.gif)
 
 > **Note:** Thurbox is still **v0.x.x**. While we try hard to avoid
 > them, breaking changes may occasionally happen between releases
@@ -137,15 +138,20 @@ your preferred helper.)
 
 ```bash
 sudo pacman -S --needed git tmux rust   # Arch deps; use your distro's equivalent
-git clone https://github.com/Thurbeen/thurbox.git
-cd thurbox
+git clone https://github.com/bvc3at/friring.git
+cd friring
 cargo build --release
-# binary at target/release/thurbox
+# binary at target/release/friring
 ```
+
+The packaged installers above (Homebrew, winget, curl, AUR, Chocolatey) install
+the upstream **Thurbox** binary. To run **Friring** specifically, build it from
+source from this fork — there is no Friring package yet, so a source build is the
+only supported way to obtain `friring` for now.
 
 See [Prerequisites](#prerequisites) for required tooling.
 
-**Contributing / hacking on thurbox?** The dev environment is a reproducible Nix
+**Contributing / hacking on friring?** The dev environment is a reproducible Nix
 flake (`nix develop` / `direnv allow`) with `just` tasks and an isolated runtime
 sandbox (`scripts/dev/sandbox.sh`) — see
 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
@@ -159,12 +165,12 @@ adds:
 
 - **Persistence** — sessions live in tmux and survive Friring
   crashes, restarts, and reboots. Reattach from any terminal with
-  `tmux -L thurbox attach`.
+  `tmux -L friring attach`.
 - **Parallelism** — many agents side-by-side, each on its own
   repo(s) and branch, each running the agent you chose.
 - **Any agent** — a session runs one coding-agent CLI selected at
   creation time. Built-ins (claude, codex, antigravity, opencode,
-  aider, copilot, vibe) are seeded into `~/.config/thurbox/agents.toml`; add your
+  aider, copilot, vibe) are seeded into `~/.config/friring/agents.toml`; add your
   own without recompiling.
 - **Git worktree isolation** — each session can spawn on a fresh
   worktree; `Ctrl+S` syncs them with their base branch and asks the
@@ -195,7 +201,7 @@ point):
 
 - **Real tmux, not a re-implemented multiplexer.** Sessions live in the same
   battle-tested mux that already survives crashes, restarts, and reboots —
-  reattach from any terminal with `tmux -L thurbox attach`. A custom multiplexer
+  reattach from any terminal with `tmux -L friring attach`. A custom multiplexer
   is one more thing that can lose your session. (Of the tools above, only Claude
   Squad shares this.)
 - **A TUI, not an Electron app.** Tiny footprint; runs in a plain terminal,
@@ -204,7 +210,7 @@ point):
   agent's model, prompts, or tools — it just runs `command + args` — so you get
   the newest agent features the day the CLI ships them, with no wrapper in the
   way (vs Cursor, which runs its own models).
-- **Any agent CLI as data** (`~/.config/thurbox/agents.toml`) — add your own with
+- **Any agent CLI as data** (`~/.config/friring/agents.toml`) — add your own with
   no recompile; Friring is deliberately agent-neutral.
 - **Multi-repo sessions.** One session can span several repos at once — each
   repo in its **own git worktree** on a shared branch, gathered into a
@@ -225,7 +231,7 @@ point):
 
 On top of that, Friring is the only entry here that is terminal-native **and**
 runs on Windows **and** over SSH, and it ships a full headless CLI
-(`thurbox-cli`) plus cron-like automations to drive and schedule fleets of
+(`friring-cli`) plus cron-like automations to drive and schedule fleets of
 agents with no GUI at all — now with its own native code-review view, so the
 click-to-review visual diff is no longer a GUI-only trade-off. The GUI tools
 still trade footprint and that scriptability for a gentler on-ramp — and the
@@ -259,7 +265,7 @@ as of June 2026; check each project for the latest.
 
 Many coding agents side-by-side, each in its own tmux-backed pane that
 survives crashes, restarts, and reboots. Pick the agent and repo(s) at
-`Ctrl+N`; reattach from any terminal with `tmux -L thurbox attach`. Reorder
+`Ctrl+N`; reattach from any terminal with `tmux -L friring attach`. Reorder
 by hand (`Shift+J`/`Shift+K`), sort (`Shift+S`), restart with resume
 (`Ctrl+R`), or soft-delete with undo.
 
@@ -267,7 +273,7 @@ by hand (`Shift+J`/`Shift+K`), sort (`Shift+S`), restart with resume
 
 </td>
 <td width="50%">
-  <img src="./docs/media/thurbox-session-creation.gif"
+  <img src="./docs/media/friring-session-creation.gif"
        alt="Session creation workflow" width="100%" />
 </td>
 </tr>
@@ -285,7 +291,7 @@ never cascades to its workers.
 
 </td>
 <td width="50%">
-  <img src="./docs/media/thurbox-fork.gif" alt="Session forking" width="100%" />
+  <img src="./docs/media/friring-fork.gif" alt="Session forking" width="100%" />
 </td>
 </tr>
 <tr>
@@ -373,7 +379,7 @@ metrics, right beside the terminal.
 
 </td>
 <td width="50%">
-  <img src="./docs/media/thurbox-info-panel.gif" alt="Info panel" width="100%" />
+  <img src="./docs/media/friring-info-panel.gif" alt="Info panel" width="100%" />
 </td>
 </tr>
 <tr>
@@ -387,7 +393,7 @@ metrics, right beside the terminal.
 
 </td>
 <td width="50%">
-  <img src="./docs/media/thurbox-file-manager.gif" alt="File manager" width="100%" />
+  <img src="./docs/media/friring-file-manager.gif" alt="File manager" width="100%" />
 </td>
 </tr>
 <tr>
@@ -402,7 +408,7 @@ switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
 
 </td>
 <td width="50%">
-  <img src="./docs/media/thurbox-theme.gif" alt="Theme switcher" width="100%" />
+  <img src="./docs/media/friring-theme.gif" alt="Theme switcher" width="100%" />
 </td>
 </tr>
 </table>
@@ -416,7 +422,7 @@ switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
   installs, activates, and self-heals each.
 - **[Inter-session messages](#features)** — an agent-neutral mailbox queue
   for structured agent↔agent coordination, with atomic exactly-once
-  `--claim` drains and wake nudges. Agents pass no ids — thurbox injects a
+  `--claim` drains and wake nudges. Agents pass no ids — friring injects a
   stable identity.
 - **[Agent definitions](#agents)** — every launchable agent is declared as
   data in `agents.toml` (seeded with claude, codex, antigravity, opencode,
@@ -445,7 +451,7 @@ switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
 ## Prerequisites
 
 - **tmux >= 3.2** (Linux / macOS), or **[psmux](https://github.com/psmux/psmux)**
-  on native Windows — a drop-in tmux clone thurbox drives identically
+  on native Windows — a drop-in tmux clone friring drives identically
 - **A coding-agent CLI** — e.g.
   [claude](https://github.com/anthropics/claude-code), codex,
   antigravity, opencode, or aider (whichever agents you plan to run)
@@ -467,19 +473,19 @@ choco uninstall thurbox        # Chocolatey (Windows)
 Sessions outlive Friring in tmux, so stop them too:
 
 ```bash
-tmux -L thurbox kill-server    # ends all running agent sessions
+tmux -L friring kill-server    # ends all running agent sessions
 ```
 
 To also delete state and config (optional — this erases your
 session history, theme, and `agents.toml`):
 
 ```bash
-rm -rf ~/.local/share/thurbox ~/.config/thurbox
+rm -rf ~/.local/share/friring ~/.config/friring
 ```
 
 ## Getting Started
 
-1. **Launch** — run `thurbox`. You'll see a sidebar on the left
+1. **Launch** — run `friring`. You'll see a sidebar on the left
    listing your sessions and a terminal panel on the right.
 2. **Create your first session** — press `Ctrl+N` to open the repo
    picker. Toggle repos with `Space`; press `w` on a repo to mark
@@ -494,14 +500,14 @@ rm -rf ~/.local/share/thurbox ~/.config/thurbox
    sidebar; `Ctrl+L` / `Ctrl+H` cycle focus between panes.
    `Ctrl+O` opens the session's worktree in your editor.
 5. **Quit without killing** — `Ctrl+Q` detaches all sessions.
-   Tmux keeps them running; relaunch `thurbox` and they resume.
+   Tmux keeps them running; relaunch `friring` and they resume.
 
 See the full [keybindings](#keybindings) below.
 
 ## Agents
 
 A session launches exactly one coding-agent CLI. Agents are
-described as data in `~/.config/thurbox/agents.toml`, which is
+described as data in `~/.config/friring/agents.toml`, which is
 seeded with built-ins (claude, codex, antigravity, opencode, aider,
 vibe) on first run. Edit the file to tweak an agent or add a new one — no
 recompile required.
@@ -536,7 +542,7 @@ command = "codex"
   another in side-by-side sessions; each session remembers its own
   agent.
 - **Recover a crash** — if Friring dies, relaunch it: sessions
-  resume from tmux. Prefer raw tmux? `tmux -L thurbox attach`.
+  resume from tmux. Prefer raw tmux? `tmux -L friring attach`.
 
 ### Recipe: provision a monorepo headless
 
@@ -561,7 +567,7 @@ N_DEVELOPERS="${N_DEVELOPERS:-2}"
 N_REVIEWERS="${N_REVIEWERS:-1}"
 HOST="${HOST:-}"                          # e.g. devbox to run remotely; empty = local
 STAMP="$(date +%y%m%d-%H%M)"
-cli() { thurbox-cli "$@"; }
+cli() { friring-cli "$@"; }
 
 host_flag() { [ -n "$HOST" ] && printf -- '--host\n%s\n' "$HOST"; }
 
@@ -607,7 +613,7 @@ cli session list
 
 The "custom MCP config" is just an **agent** that launches `claude`
 with a different `--mcp-config` file — Friring stays agent-neutral.
-Define the three roles in `~/.config/thurbox/agents.toml`:
+Define the three roles in `~/.config/friring/agents.toml`:
 
 ```toml
 default = "claude"
@@ -616,7 +622,7 @@ default = "claude"
 name = "operator"                 # prod backoffice: read/write
 command = "claude"
 args = [
-  "--mcp-config", "/home/me/.config/thurbox/mcp/backoffice-rw.json",
+  "--mcp-config", "/home/me/.config/friring/mcp/backoffice-rw.json",
   "--model", "opus",              # bake any default flags into args
 ]
 new_session_args = ["--session-id", "{id}"]
@@ -626,7 +632,7 @@ fork_args        = ["--resume", "{id}", "--fork-session"]
 [[agents]]
 name = "developer"                # prod backoffice: read-only
 command = "claude"
-args = ["--mcp-config", "/home/me/.config/thurbox/mcp/backoffice-ro.json"]
+args = ["--mcp-config", "/home/me/.config/friring/mcp/backoffice-ro.json"]
 new_session_args = ["--session-id", "{id}"]
 resume_args      = ["--resume", "{id}"]
 fork_args        = ["--resume", "{id}", "--fork-session"]
@@ -641,7 +647,7 @@ fork_args        = ["--resume", "{id}", "--fork-session"]
 ```
 
 The read/write vs read-only split lives entirely in the two MCP
-config files those agents point at (`~/.config/thurbox/mcp/`):
+config files those agents point at (`~/.config/friring/mcp/`):
 
 ```json
 {
@@ -701,7 +707,7 @@ repos? Add `--add-repo PATH@main` (its own worktree per repo) or
 | `F12` | Toggle perf HUD (live counters + frame/tick timing) | Diagnostics |
 
 Every chord above is rebindable from the `F1` editor (or by editing
-`~/.config/thurbox/keybindings.json`). `Shift+J`/`Shift+K`/`Shift+S`
+`~/.config/friring/keybindings.json`). `Shift+J`/`Shift+K`/`Shift+S`
 reorder or sort the session list only while it is focused.
 
 **macOS:** in kitty-protocol terminals (iTerm2 3.5+, kitty, WezTerm,
@@ -734,11 +740,11 @@ own in-file `/` text search is unrelated and still there.)
 | Mouse drag | Select text |
 | Any other key | Snap to bottom + forward to PTY |
 
-## Headless CLI (`thurbox-cli`)
+## Headless CLI (`friring-cli`)
 
-The `thurbox-cli` binary drives Friring without the TUI — useful
+The `friring-cli` binary drives Friring without the TUI — useful
 for scripting and automation. It shares the same SQLite database
-and `tmux -L thurbox` server as the TUI, so changes made by either
+and `tmux -L friring` server as the TUI, so changes made by either
 appear live in the other (the TUI polls `PRAGMA data_version`).
 
 Output is human-readable by default and switches to JSON
@@ -749,26 +755,26 @@ thin — it parses arguments, calls into the database / tmux helpers,
 and prints the result. There is no TUI and no event loop.
 
 ```bash
-cargo build --bin thurbox-cli
+cargo build --bin friring-cli
 ```
 
 ### Sessions
 
 ```bash
-thurbox-cli session list                 # all active sessions
-thurbox-cli session get <uuid>           # one session by UUID
-thurbox-cli session create \
+friring-cli session list                 # all active sessions
+friring-cli session get <uuid>           # one session by UUID
+friring-cli session create \
   --name reviewer \
   --repo-path /path/to/repo \
   --agent codex \
   --worktree-branch feat/x \
   --base-branch main \
   --host devbox          # optional — run on a remote host from hosts.toml
-thurbox-cli session send <uuid> "run the test suite"
-thurbox-cli session capture <uuid> --lines 500
-thurbox-cli session restart <uuid>       # kill + re-spawn with --resume
-thurbox-cli session delete <uuid>        # soft-delete (see below)
-thurbox-cli session restore <uuid>       # undo a soft-delete
+friring-cli session send <uuid> "run the test suite"
+friring-cli session capture <uuid> --lines 500
+friring-cli session restart <uuid>       # kill + re-spawn with --resume
+friring-cli session delete <uuid>        # soft-delete (see below)
+friring-cli session restore <uuid>       # undo a soft-delete
 ```
 
 - **`create`** runs synchronously — the tmux window is live by the
@@ -814,17 +820,17 @@ Scheduled agent runs, persisted to the shared DB. See
 [Automations](#automations) for the model.
 
 ```bash
-thurbox-cli automation create \
+friring-cli automation create \
   --name nightly-triage \
   --trigger weekdays --time 09:00 \
   --session <uuid> --prompt "triage new issues"
-thurbox-cli automation list
-thurbox-cli automation show <id>
-thurbox-cli automation edit <id> --prompt "..." --disabled
-thurbox-cli automation remove <id>
-thurbox-cli automation run <id>          # mark due for the next tick
-thurbox-cli automation runs <id> --limit 20   # run history
-thurbox-cli automation tick              # fire all due automations now
+friring-cli automation list
+friring-cli automation show <id>
+friring-cli automation edit <id> --prompt "..." --disabled
+friring-cli automation remove <id>
+friring-cli automation run <id>          # mark due for the next tick
+friring-cli automation runs <id> --limit 20   # run history
+friring-cli automation tick              # fire all due automations now
 ```
 
 `--trigger` accepts `hourly`, `daily`, `weekdays`, `weekly`,
@@ -839,12 +845,12 @@ systemd/cron timer call to fire due automations without a TUI.
 The built-in todo list (see [Tasks](#tasks) for the model).
 
 ```bash
-thurbox-cli task create --title "audit deps" --description "markdown notes"
-thurbox-cli task list
-thurbox-cli task show <id>
-thurbox-cli task edit <id> --status done   # --description "" clears notes
-thurbox-cli task remove <id>
-thurbox-cli task run <id>                   # trigger its Send/Spawn action
+friring-cli task create --title "audit deps" --description "markdown notes"
+friring-cli task list
+friring-cli task show <id>
+friring-cli task edit <id> --status done   # --description "" clears notes
+friring-cli task remove <id>
+friring-cli task run <id>                   # trigger its Send/Spawn action
 ```
 
 `create` with neither `--session` nor `--repo` is a plain local todo;
@@ -856,15 +862,15 @@ it to a coding agent like an automation.
 The [inter-session message queue](#features).
 
 ```bash
-thurbox-cli message send --to flow --kind questions --body "scope?"
-thurbox-cli message reply <message_id> --body "go ahead"
-thurbox-cli message inbox --for flow --claim   # atomic, exactly-once drain
-thurbox-cli message prune --older-than-days 14
+friring-cli message send --to flow --kind questions --body "scope?"
+friring-cli message reply <message_id> --body "go ahead"
+friring-cli message inbox --for flow --claim   # atomic, exactly-once drain
+friring-cli message prune --older-than-days 14
 ```
 
 Run *inside* a session, `send`/`reply`/`inbox` default their sender,
 task, and recipient to the caller's injected identity
-(`THURBOX_SESSION` / `THURBOX_TASK`), so an agent passes no ids. `send`
+(`FRIRING_SESSION` / `FRIRING_TASK`), so an agent passes no ids. `send`
 and `reply` wake the recipient by default (`--no-wake` to suppress).
 
 ### Extensions (alias `ext`)
@@ -873,20 +879,23 @@ Manage opt-in add-ons (see [Extensions](#features) for the model).
 Every subcommand prints a JSON result with a human-readable `summary`.
 
 ```bash
-thurbox-cli extension install <name|url|dir>   # install + activate
-thurbox-cli extension list                     # installed, with staleness flags
-thurbox-cli extension available [query]        # built-ins, with install commands
-thurbox-cli extension status <name>            # one extension's health
-thurbox-cli extension update [--all] [--force] # refresh payload (no name => all)
-thurbox-cli extension reinstall <name>         # clean-slate uninstall + install
-thurbox-cli extension activate <name>          # (re)create its sessions/automations
-thurbox-cli extension deactivate <name>        # tear them down (real off-switch)
-thurbox-cli extension uninstall <name> [--purge]
+friring-cli extension install <name|url|dir>   # install + activate
+friring-cli extension list                     # installed, with staleness flags
+friring-cli extension available [query]        # built-ins, with install commands
+friring-cli extension status <name>            # one extension's health
+friring-cli extension update [--all] [--force] # refresh payload (no name => all)
+friring-cli extension reinstall <name>         # clean-slate uninstall + install
+friring-cli extension activate <name>          # (re)create its sessions/automations
+friring-cli extension deactivate <name>        # tear them down (real off-switch)
+friring-cli extension uninstall <name> [--purge]
 ```
 
 A bare `<name>` resolves against the official source, **pinned to your
 binary's release tag** so the fetched extension matches the binary;
-a URL or local dir installs from there instead. Installed extensions
+a URL or local dir installs from there instead. On friring, prefer
+local-dir installs (`friring-cli extension install ./extensions/<name>`) —
+bare-name/upstream installs fetch upstream Thurbox payloads that call
+`thurbox-cli`. Installed extensions
 **self-heal** — their declared sessions and automations are re-ensured
 at TUI startup and on every headless `automation tick`, so `deactivate`
 (not deleting the session) is the way to turn one off.
@@ -894,8 +903,8 @@ at TUI startup and on every headless `automation tick`, so `deactivate`
 ### Editor
 
 ```bash
-thurbox-cli editor get                   # print configured command
-thurbox-cli editor set "code --wait"     # set (empty string clears)
+friring-cli editor get                   # print configured command
+friring-cli editor set "code --wait"     # set (empty string clears)
 ```
 
 This is the command `Ctrl+O` runs in the TUI; the worktree path is
@@ -904,8 +913,8 @@ appended as the final argument.
 ### Config
 
 ```bash
-thurbox-cli config validate              # strict-parse every config file (exit 1 on a problem)
-thurbox-cli config show                  # print the effective resolved config
+friring-cli config validate              # strict-parse every config file (exit 1 on a problem)
+friring-cli config show                  # print the effective resolved config
 ```
 
 `validate` is handy in dotfiles CI; see
@@ -916,7 +925,7 @@ thurbox-cli config show                  # print the effective resolved config
 Friring follows **The Elm Architecture** (TEA):
 `Event → Message → update(model, msg) → view(model) → Frame`.
 All state lives in a single `App` model. Sessions run via a
-`SessionBackend` trait backed by local tmux (`tmux -L thurbox`).
+`SessionBackend` trait backed by local tmux (`tmux -L friring`).
 Terminal output is parsed by `vt100::Parser` and rendered by
 `tui_term`. All persistent state (sessions, worktrees, automations)
 is stored in SQLite.
@@ -950,8 +959,8 @@ see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ### Setup
 
 ```bash
-git clone https://github.com/Thurbeen/thurbox.git
-cd thurbox
+git clone https://github.com/bvc3at/friring.git
+cd friring
 prek install   # Install pre-commit hooks
 ```
 
@@ -1012,7 +1021,7 @@ cog commit fix "resolve memory leak" cli
 
 ### Valid Scopes
 
-`api`, `cli`, `ui`, `git`, `core`, `docs`, `deps`, `config`, `mcp`
+`api`, `cli`, `ui`, `git`, `core`, `docs`, `deps`, `config`, `mcp`, `fork`
 
 ## Contributing
 

@@ -3,7 +3,7 @@
 # by every task-integration extension (github-issues/gitlab-issues/linear/jira).
 # Testing this one canonical copy covers them all.
 #
-# They mock `thurbox-cli` with a tiny fake on PATH: `task list` prints a canned
+# They mock `friring-cli` with a tiny fake on PATH: `task list` prints a canned
 # "existing tasks" fixture, and `task create`/`task edit` append their args to a
 # log the assertions inspect. Real `jq` is used. Run anywhere bats + jq exist:
 #   bats extensions/github-issues/scripts/upsert.bats
@@ -16,14 +16,14 @@ setup() {
   echo '[]' >"$MOCK_EXISTING"
   : >"$MOCK_CALLS"
   mkdir -p "$TMP/bin"
-  cat >"$TMP/bin/thurbox-cli" <<'SH'
+  cat >"$TMP/bin/friring-cli" <<'SH'
 #!/usr/bin/env bash
 if [ "$1" = task ] && [ "$2" = list ]; then cat "$MOCK_EXISTING"; exit 0; fi
 if [ "$1" = task ] && [ "$2" = create ]; then shift 2; printf 'create %s\n' "$*" >>"$MOCK_CALLS"; exit 0; fi
 if [ "$1" = task ] && [ "$2" = edit ]; then shift 2; printf 'edit %s\n' "$*" >>"$MOCK_CALLS"; exit 0; fi
-echo "unexpected: thurbox-cli $*" >&2; exit 99
+echo "unexpected: friring-cli $*" >&2; exit 99
 SH
-  chmod +x "$TMP/bin/thurbox-cli"
+  chmod +x "$TMP/bin/friring-cli"
   PATH="$TMP/bin:$PATH"
 }
 

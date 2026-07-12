@@ -73,7 +73,7 @@ const SLOW_OP_RECORD_MS: u64 = 5;
 const SLOW_OP_WARN_MS: u64 = 100;
 
 /// Ticks (~10 ms each) per steady-state perf report window (~10 s): under
-/// `THURBOX_PERF_LOG` each window emits one `perf_window` log line (counter
+/// `FRIRING_PERF_LOG` each window emits one `perf_window` log line (counter
 /// deltas + timing percentiles) and refreshes the published snapshot.
 /// Tick-based so tests can drive windows without a wall clock.
 const PERF_WINDOW_TICKS: u64 = 1_000;
@@ -737,7 +737,7 @@ pub struct App {
     pub(crate) modal: modals::Modal,
     /// In-progress new-session wizard (also drives fork/restart re-spawns).
     pub(crate) new_session: new_session_state::NewSessionWizardState,
-    /// Inter-instance DB sync (polls for changes from other thurbox instances).
+    /// Inter-instance DB sync (polls for changes from other friring instances).
     sync_state: SyncState,
     /// Worktree-to-main git sync (Ctrl+S).
     worktree_sync: sync_state::WorktreeSyncState,
@@ -834,7 +834,7 @@ pub struct App {
     /// `db.set_active_theme` writes.
     pub(crate) active_theme: crate::session::theme_config::ThemeEntry,
     /// User-customizable global keybindings. Loaded from
-    /// `~/.config/thurbox/keybindings.json` on startup, falling back to defaults
+    /// `~/.config/friring/keybindings.json` on startup, falling back to defaults
     /// when the file is missing or malformed.
     pub(crate) keybindings: crate::session::KeyBindings,
     /// Account-level usage/rate-limit info per agent name (the `/usage`
@@ -907,7 +907,7 @@ pub struct App {
     /// reused across frames until [`Self::session_order_signature`] changes,
     /// skipping the per-frame grouping/sort/nest work. See `render_left_panel`.
     cached_session_order: Option<(u64, crate::ui::project_list::SessionOrder)>,
-    /// `THURBOX_PERF_LOG` presence, read once at construction so the hot loop's
+    /// `FRIRING_PERF_LOG` presence, read once at construction so the hot loop's
     /// timing gate ([`Self::perf_timing_active`]) is a bool check, not an env
     /// lookup per iteration.
     perf_log_env: bool,
@@ -918,13 +918,13 @@ pub struct App {
     /// deltas (the counters themselves stay cumulative for the tests/HUD).
     perf_window_base: metrics_state::PerfCounters,
     /// Startup phase breakdown handed over by `main` (the `startup` log line's
-    /// fields), included in the published perf snapshot so `thurbox-cli perf`
+    /// fields), included in the published perf snapshot so `friring-cli perf`
     /// shows boot cost too.
     startup_phases: Option<serde_json::Value>,
 }
 
 const EDITOR_NOT_CONFIGURED: &str =
-    "No editor configured — run `thurbox-cli editor set <cmd>` or export $EDITOR/$VISUAL";
+    "No editor configured — run `friring-cli editor set <cmd>` or export $EDITOR/$VISUAL";
 
 /// Output-quiescence threshold that breaks a *stuck* `working` hook state.
 ///
@@ -988,7 +988,7 @@ fn build_notification_state() -> Option<NotificationState> {
     // the configured preference plus host probing, then start the dispatcher
     // for it. A `none` backend (e.g. WSL without powershell, or backend="off")
     // still starts the thread but drops every notification — the reason is
-    // recorded for the `thurbox-cli notify` diagnostic rather than silently
+    // recorded for the `friring-cli notify` diagnostic rather than silently
     // lost as before.
     let backend = crate::notifications::detect_backend(settings.notifications.backend);
     if !backend.is_deliverable() {
@@ -1145,7 +1145,7 @@ impl App {
             last_draw_at: clock::now(),
             last_output_gen: 0,
             cached_session_order: None,
-            perf_log_env: std::env::var_os("THURBOX_PERF_LOG").is_some(),
+            perf_log_env: std::env::var_os("FRIRING_PERF_LOG").is_some(),
             show_perf_hud: false,
             perf_window_base: metrics_state::PerfCounters::default(),
             startup_phases: None,
@@ -1382,7 +1382,7 @@ impl App {
     }
 
     /// [`Self::provider_for`], plus remote arg adaptation: when `config` targets
-    /// a remote (SSH/WSL) backend, the def's args that reference thurbox-managed
+    /// a remote (SSH/WSL) backend, the def's args that reference friring-managed
     /// config files by *local* path (claude's hooks `--settings …`) are rewritten
     /// for the host — materialized at a home-translated remote path, or stripped
     /// when no remote path can work — because an unresolvable path kills the
@@ -1645,8 +1645,8 @@ impl App {
         };
 
         let agent = session.info.agent.clone();
-        // Keep the same thurbox identity across a restart so injected env stays
-        // stable (`THURBOX_SESSION`).
+        // Keep the same friring identity across a restart so injected env stays
+        // stable (`FRIRING_SESSION`).
         let session_id = session.info.id;
         // Preserve a remote backend on the config — set *before* env injection
         // (which skips the local-path dir vars for remote sessions) and used to
@@ -1667,10 +1667,10 @@ impl App {
             ..SessionConfig::default()
         };
         // `Session::restart` replaces the session env wholesale, so re-inject the
-        // standard `THURBOX_*` identity vars (the same set a fresh spawn gets via
+        // standard `FRIRING_*` identity vars (the same set a fresh spawn gets via
         // `build_spawn_inputs`); otherwise the restarted agent loses its identity
         // and the metrics/status hooks break.
-        crate::session_ops::inject_thurbox_env(&mut config, &agent_session_id, None);
+        crate::session_ops::inject_friring_env(&mut config, &agent_session_id, None);
         let def = self.agent_def_for(&config.agent);
         config.resume_session_id =
             crate::session_ops::resume_trigger_for(&def, &agent_session_id, &config.env);
@@ -1919,7 +1919,7 @@ impl App {
             return Some(modals::DeleteRisk::unknown());
         }
 
-        // Inspect each worktree thurbox would tear down; for a non-worktree
+        // Inspect each worktree friring would tear down; for a non-worktree
         // session fall back to its cwd (the live agent's working dir).
         let paths: Vec<std::path::PathBuf> = if session.info.worktrees.is_empty() {
             session.info.cwd.iter().cloned().collect()
@@ -3808,17 +3808,17 @@ impl App {
             .agent_session_id
             .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
             .clone();
-        // Mint the thurbox SessionId up front (unless a respawn supplied one) so
-        // it can be injected as `THURBOX_SESSION` before launch and `Session::spawn`
+        // Mint the friring SessionId up front (unless a respawn supplied one) so
+        // it can be injected as `FRIRING_SESSION` before launch and `Session::spawn`
         // reuses it. Stable across restarts.
         if config.session_id.is_none() {
             config.session_id = Some(SessionId::default());
         }
 
-        // Inject identity + statusline env vars. `THURBOX_TASK` is left unset: TUI
+        // Inject identity + statusline env vars. `FRIRING_TASK` is left unset: TUI
         // task spawns track the task↔session link in-memory (`task_session_links`),
         // so only the headless `task run` path auto-tags messages with it.
-        crate::session_ops::inject_thurbox_env(&mut config, &agent_session_id, None);
+        crate::session_ops::inject_friring_env(&mut config, &agent_session_id, None);
 
         // For a multi-repo session, launch the agent in a symlink workspace that
         // gathers every member dir; `info.cwd` keeps the primary repo (restored
@@ -4344,12 +4344,12 @@ impl App {
         self.tick_perf_window();
     }
 
-    /// Steady-state perf reporting: once per window (under `THURBOX_PERF_LOG`)
+    /// Steady-state perf reporting: once per window (under `FRIRING_PERF_LOG`)
     /// log counter deltas + timing percentiles + the window's slow ops, then
     /// reset the per-window timing state so each report stands alone. The
     /// startup line at first paint is separate and unaffected. Both the window
     /// report and an open HUD also refresh the published snapshot
-    /// (`thurbox-cli perf`); a default run publishes nothing.
+    /// (`friring-cli perf`); a default run publishes nothing.
     fn tick_perf_window(&mut self) {
         let tick = self.metrics.tick_count;
         let window_due = self.perf_log_env && tick % PERF_WINDOW_TICKS == 0;
@@ -4401,9 +4401,9 @@ impl App {
     }
 
     /// Write the current counters + timing stats as a JSON blob into the
-    /// `metadata` table for `thurbox-cli perf`. Only called while perf timing
+    /// `metadata` table for `friring-cli perf`. Only called while perf timing
     /// is active (see [`Self::tick_perf_window`]) — the write bumps other
-    /// thurbox connections' `data_version`, so it must never run on a
+    /// friring connections' `data_version`, so it must never run on a
     /// default-config idle instance. Best-effort: a failed write only warns.
     fn publish_perf_snapshot(&self) {
         let p = self.perf_counters();
@@ -4459,7 +4459,7 @@ impl App {
     }
 
     /// Whether wall-clock perf timing should be collected this iteration:
-    /// opted in via `THURBOX_PERF_LOG` or by opening the perf HUD. A cached
+    /// opted in via `FRIRING_PERF_LOG` or by opening the perf HUD. A cached
     /// bool so the hot loop pays nothing when observability is off.
     pub fn perf_timing_active(&self) -> bool {
         self.perf_log_env || self.show_perf_hud
@@ -4654,7 +4654,7 @@ impl App {
     /// Recompute each session's status/activity/notification for this tick.
     ///
     /// Status is **hooks-driven**: agents report `working`/`blocked`/`done` via
-    /// `thurbox-cli session signal` (local sessions) or a tmux pane user option
+    /// `friring-cli session signal` (local sessions) or a tmux pane user option
     /// pushed over the control-mode subscription (remote sessions — drained
     /// below into the same hook columns), persisted in `sessions` and read here
     /// in one batch (see [`derive_session_status`]). A `done` session stays
@@ -4750,7 +4750,7 @@ impl App {
     }
 
     /// Drain remote-hook status events from every backend and persist them,
-    /// exactly as `thurbox-cli session signal` would have done locally.
+    /// exactly as `friring-cli session signal` would have done locally.
     ///
     /// A remote agent's hooks set a tmux pane user option; the backend's
     /// control-mode subscription queues `(pane_id, state)` pairs (see
@@ -4952,7 +4952,7 @@ impl App {
         state.prune_to(&live);
     }
 
-    /// Poll for external state changes from other thurbox instances (DB-based)
+    /// Poll for external state changes from other friring instances (DB-based)
     /// and apply any theme change / session delta they produced.
     fn poll_external_changes(&mut self) {
         let Ok(Some(result)) = sync::poll_for_changes(&mut self.sync_state, &mut self.db) else {
@@ -4998,7 +4998,7 @@ impl App {
         info!("focused session {id} from notification click");
     }
 
-    /// Pick up theme changes made by other thurbox processes (e.g. an MCP
+    /// Pick up theme changes made by other friring processes (e.g. an MCP
     /// `set_theme` call from another session).
     fn apply_external_theme_change(&mut self) {
         let Ok(Some(name)) = self.db.get_active_theme() else {
@@ -5471,7 +5471,7 @@ impl App {
     /// Build the [`SessionConfig`] for relaunching an *existing* session — either
     /// a startup-restore respawn ([`Self::spawn_restored_session`]) or a `Ctrl+U`
     /// undelete ([`Self::restore_deleted_session`]). Both reuse the session's
-    /// stable `SessionId` and must inject the `THURBOX_*` identity/dir env so the
+    /// stable `SessionId` and must inject the `FRIRING_*` identity/dir env so the
     /// agent's status hooks can attribute their `session signal` — without it the
     /// row's `hook_state` never updates and the session renders Idle forever
     /// (the bug these paths previously hit by calling `Session::spawn` directly).
@@ -5496,10 +5496,10 @@ impl App {
                 .then(|| backend_type.to_string()),
             ..SessionConfig::default()
         };
-        // `THURBOX_SESSION` (derived from `session_id`) is the identity that
-        // matters; an empty `THURBOX_SESSION_ID` for an id-less agent is harmless
-        // since the CLI resolves identity from `THURBOX_SESSION` first.
-        crate::session_ops::inject_thurbox_env(
+        // `FRIRING_SESSION` (derived from `session_id`) is the identity that
+        // matters; an empty `FRIRING_SESSION_ID` for an id-less agent is harmless
+        // since the CLI resolves identity from `FRIRING_SESSION` first.
+        crate::session_ops::inject_friring_env(
             &mut config,
             agent_session_id.as_deref().unwrap_or_default(),
             None,
@@ -5696,12 +5696,12 @@ impl App {
     /// down host) and must never block the first frame.
     pub fn restore_sessions(&mut self, sessions: Vec<sync::SharedSession>, session_counter: usize) {
         self.session_counter = session_counter;
-        // Opt-in startup-restore breakdown (THURBOX_PERF_LOG). Local restore is
+        // Opt-in startup-restore breakdown (FRIRING_PERF_LOG). Local restore is
         // sequential — each session is adopted with a blocking
         // `capture_pane_text` — so per-backend discover and per-session adopt
         // timings show where the remaining time goes. Read once here, never
         // per tick.
-        let perf_log = std::env::var_os("THURBOX_PERF_LOG").is_some();
+        let perf_log = std::env::var_os("FRIRING_PERF_LOG").is_some();
 
         // Only sessions with an agent_session_id are resumable.
         let resumable: Vec<sync::SharedSession> = sessions
@@ -6401,7 +6401,7 @@ impl App {
     ) {
         // Reuse the original SessionId so the session's identity is stable across
         // restarts: `do_spawn_session` upserts in place (no soft-delete + new-row
-        // churn), and `THURBOX_SESSION` is re-injected with the same id. Any
+        // churn), and `FRIRING_SESSION` is re-injected with the same id. Any
         // cached id / queued message addressed to this session stays valid.
         // Preserving a remote `backend` keeps the respawn on its own host —
         // without it `do_spawn_session` would silently relaunch the session on
@@ -6593,7 +6593,7 @@ impl App {
     /// The full agent prompt for a task (id + title + description + CLI hints),
     /// falling back to `title` if the task is no longer cached. Keeps the
     /// trigger paths from seeding an agent with just the bare title — the agent
-    /// gets explicit context that it is solving a Thurbox task and how to fetch
+    /// gets explicit context that it is solving a Friring task and how to fetch
     /// more / close it out (see [`crate::session::Task::agent_prompt`]).
     fn task_agent_prompt(&self, task_id: i64, title: &str) -> String {
         self.task_ui
@@ -7170,7 +7170,7 @@ mod tests {
 
     #[test]
     fn restored_session_config_injects_identity_env() {
-        // Regression: a restored/undeleted session must carry `THURBOX_SESSION`
+        // Regression: a restored/undeleted session must carry `FRIRING_SESSION`
         // so its status hooks can attribute `session signal` — otherwise the row
         // stays Idle forever. The two relaunch paths previously skipped this.
         let tmp = tempfile::tempdir().unwrap();
@@ -7186,15 +7186,15 @@ mod tests {
         assert_eq!(config.session_id, Some(id));
         assert_eq!(config.backend, None, "local backend stays None");
         assert_eq!(
-            config.env.get("THURBOX_SESSION"),
+            config.env.get("FRIRING_SESSION"),
             Some(&id.to_string()),
-            "THURBOX_SESSION must match the reused SessionId"
+            "FRIRING_SESSION must match the reused SessionId"
         );
         assert_eq!(
-            config.env.get("THURBOX_SESSION_ID"),
+            config.env.get("FRIRING_SESSION_ID"),
             Some(&"agent-conv-uuid".to_string())
         );
-        // The config/data dir overrides pin the hook's `thurbox-cli` to this DB.
+        // The config/data dir overrides pin the hook's `friring-cli` to this DB.
         assert!(config
             .env
             .contains_key(crate::paths::CONFIG_DIR_OVERRIDE_ENV));
@@ -7203,13 +7203,13 @@ mod tests {
 
     #[test]
     fn restored_session_config_idless_agent_still_has_session_identity() {
-        // An agent that can't report its own id (None) still gets `THURBOX_SESSION`
+        // An agent that can't report its own id (None) still gets `FRIRING_SESSION`
         // from the reused SessionId — the identity the CLI resolves from first.
         let tmp = tempfile::tempdir().unwrap();
         let _guard = crate::paths::TestPathGuard::new(tmp.path());
         let id = crate::session::SessionId::default();
         let config = App::restored_session_config(id, None, "codex".into(), None, "local-tmux");
-        assert_eq!(config.env.get("THURBOX_SESSION"), Some(&id.to_string()));
+        assert_eq!(config.env.get("FRIRING_SESSION"), Some(&id.to_string()));
     }
 
     #[test]
@@ -7228,7 +7228,7 @@ mod tests {
             "ssh:devbox",
         );
         assert_eq!(config.backend.as_deref(), Some("ssh:devbox"));
-        assert!(config.env.contains_key("THURBOX_SESSION"));
+        assert!(config.env.contains_key("FRIRING_SESSION"));
         assert!(!config
             .env
             .contains_key(crate::paths::CONFIG_DIR_OVERRIDE_ENV));
@@ -8246,7 +8246,7 @@ mod tests {
 
     #[test]
     fn help_capture_then_key_rebinds_and_clears_capturing() {
-        let base = std::env::temp_dir().join("thurbox-help-rebind-test");
+        let base = std::env::temp_dir().join("friring-help-rebind-test");
         let _ = std::fs::remove_dir_all(&base);
         let _g = crate::paths::TestPathGuard::new(&base);
 
@@ -8290,7 +8290,7 @@ mod tests {
 
     #[test]
     fn help_capturing_ctrl_q_rebinds_not_quits() {
-        let base = std::env::temp_dir().join("thurbox-help-ctrlq-test");
+        let base = std::env::temp_dir().join("friring-help-ctrlq-test");
         let _ = std::fs::remove_dir_all(&base);
         let _g = crate::paths::TestPathGuard::new(&base);
 
@@ -8310,7 +8310,7 @@ mod tests {
 
     #[test]
     fn help_reset_d_restores_defaults() {
-        let base = std::env::temp_dir().join("thurbox-help-reset-test");
+        let base = std::env::temp_dir().join("friring-help-reset-test");
         let _ = std::fs::remove_dir_all(&base);
         let _g = crate::paths::TestPathGuard::new(&base);
 
@@ -8337,7 +8337,7 @@ mod tests {
 
     #[test]
     fn help_reset_all_restores_every_default() {
-        let base = std::env::temp_dir().join("thurbox-help-reset-all-test");
+        let base = std::env::temp_dir().join("friring-help-reset-all-test");
         let _ = std::fs::remove_dir_all(&base);
         let _g = crate::paths::TestPathGuard::new(&base);
 
@@ -8421,7 +8421,7 @@ mod tests {
 
     #[test]
     fn file_viewer_search_action_is_rebindable() {
-        let base = std::env::temp_dir().join("thurbox-fv-rebind-test");
+        let base = std::env::temp_dir().join("friring-fv-rebind-test");
         let _ = std::fs::remove_dir_all(&base);
         let _g = crate::paths::TestPathGuard::new(&base);
 
@@ -8491,7 +8491,7 @@ mod tests {
 
     /// When the terminal is focused, readline/shell `Ctrl+<letter>` chords
     /// (here `Ctrl+W` = delete-word) defer to the PTY instead of running their
-    /// thurbox command — but the same chord still works from the session list,
+    /// friring command — but the same chord still works from the session list,
     /// and the `F`-key alternate works everywhere.
     #[test]
     fn terminal_focus_defers_readline_ctrl_chords_to_pty() {
@@ -10049,7 +10049,7 @@ mod tests {
 
     #[test]
     fn global_search_chord_is_rebindable() {
-        let base = std::env::temp_dir().join("thurbox-gs-rebind-test");
+        let base = std::env::temp_dir().join("friring-gs-rebind-test");
         let _ = std::fs::remove_dir_all(&base);
         let _g = crate::paths::TestPathGuard::new(&base);
 
@@ -10885,7 +10885,7 @@ mod tests {
         m.prompt.set("hi");
         m.action = AutomationActionKind::Spawn;
         m.trigger_kind = TriggerKind::Daily; // yields a future next_run
-        m.repo.set("~/Repositories/thurbox");
+        m.repo.set("~/Repositories/friring");
         app.modal = modals::Modal::AutomationEditor(m);
 
         app.submit_automation_editor();
@@ -10900,7 +10900,7 @@ mod tests {
                 let home = std::env::var(home_var).expect("home var set in tests");
                 assert_eq!(
                     repo_path,
-                    &std::path::PathBuf::from(home).join("Repositories/thurbox"),
+                    &std::path::PathBuf::from(home).join("Repositories/friring"),
                     "leading ~ should be expanded to an absolute path"
                 );
             }
@@ -11317,7 +11317,7 @@ mod tests {
 
     #[test]
     fn process_cwd_multi_member_is_workspace() {
-        let base = std::env::temp_dir().join("thurbox-procwd-test");
+        let base = std::env::temp_dir().join("friring-procwd-test");
         let _ = std::fs::remove_dir_all(&base);
         let _g = crate::paths::TestPathGuard::new(&base);
 
@@ -12251,7 +12251,7 @@ mod tests {
 
     /// The perf snapshot write bumps *other* connections' `data_version`
     /// (forcing their shared-state reload), so a default-config idle instance
-    /// must never publish it — only THURBOX_PERF_LOG or an open HUD opts in
+    /// must never publish it — only FRIRING_PERF_LOG or an open HUD opts in
     /// (ADR-P11).
     #[tokio::test]
     async fn perf_snapshot_published_only_while_timing_active() {
@@ -12598,7 +12598,7 @@ mod tests {
     fn poll_auto_update_surfaces_message_and_drops_receiver() {
         let mut app = App::new(24, 80, stub_backend(), stub_agents(), test_db());
         let (tx, rx) = mpsc::channel();
-        tx.send("Updated to v9.9.9 — restart thurbox to apply.".to_string())
+        tx.send("Updated to v9.9.9 — restart friring to apply.".to_string())
             .unwrap();
         app.set_auto_update_receiver(rx);
 
@@ -12806,47 +12806,47 @@ mod tests {
 
     #[test]
     fn find_matching_discovered_by_backend_id() {
-        let shared = make_shared_session("thurbox:@0", "1");
+        let shared = make_shared_session("friring:@0", "1");
         let discovered = vec![
-            make_discovered("thurbox:@0", "tb-1", true),
-            make_discovered("thurbox:@1", "tb-2", true),
+            make_discovered("friring:@0", "tb-1", true),
+            make_discovered("friring:@1", "tb-2", true),
         ];
         let result = App::find_matching_discovered(&shared, &discovered);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().backend_id, "thurbox:@0");
+        assert_eq!(result.unwrap().backend_id, "friring:@0");
     }
 
     #[test]
     fn find_matching_discovered_by_name_fallback() {
         let shared = make_shared_session("", "1");
         let discovered = vec![
-            make_discovered("thurbox:@5", "tb-1", true),
-            make_discovered("thurbox:@6", "tb-2", true),
+            make_discovered("friring:@5", "tb-1", true),
+            make_discovered("friring:@6", "tb-2", true),
         ];
         let result = App::find_matching_discovered(&shared, &discovered);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().backend_id, "thurbox:@5");
+        assert_eq!(result.unwrap().backend_id, "friring:@5");
     }
 
     #[test]
     fn find_matching_discovered_skips_dead() {
-        let shared = make_shared_session("thurbox:@0", "1");
-        let discovered = vec![make_discovered("thurbox:@0", "tb-1", false)];
+        let shared = make_shared_session("friring:@0", "1");
+        let discovered = vec![make_discovered("friring:@0", "tb-1", false)];
         let result = App::find_matching_discovered(&shared, &discovered);
         assert!(result.is_none());
     }
 
     #[test]
     fn find_matching_discovered_no_match() {
-        let shared = make_shared_session("thurbox:@99", "99");
-        let discovered = vec![make_discovered("thurbox:@0", "tb-1", true)];
+        let shared = make_shared_session("friring:@99", "99");
+        let discovered = vec![make_discovered("friring:@0", "tb-1", true)];
         let result = App::find_matching_discovered(&shared, &discovered);
         assert!(result.is_none());
     }
 
     #[test]
     fn find_matching_discovered_empty_list() {
-        let shared = make_shared_session("thurbox:@0", "1");
+        let shared = make_shared_session("friring:@0", "1");
         let result = App::find_matching_discovered(&shared, &[]);
         assert!(result.is_none());
     }

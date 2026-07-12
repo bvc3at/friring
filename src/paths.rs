@@ -1,11 +1,11 @@
 //! Centralized path resolution for application data files.
 //!
 //! This module provides a unified interface for resolving paths to:
-//! - Config files (`~/.config/thurbox[-dev]/config.toml`)
-//! - SQLite database (`~/.local/share/thurbox[-dev]/thurbox.db`)
-//! - Log directories (`~/.local/share/thurbox[-dev]/`)
+//! - Config files (`~/.config/friring[-dev]/config.toml`)
+//! - SQLite database (`~/.local/share/friring[-dev]/friring.db`)
+//! - Log directories (`~/.local/share/friring[-dev]/`)
 //!
-//! Dev builds (`0.0.0-dev`) use `thurbox-dev` subdirectories to avoid
+//! Dev builds (`0.0.0-dev`) use `friring-dev` subdirectories to avoid
 //! interfering with an installed release binary.
 //!
 //! ## Production Behavior
@@ -33,19 +33,19 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 /// Env var pinning the resolved config app dir for a child process (an agent
-/// whose hook calls `thurbox-cli`), so it targets the same config the spawning
-/// thurbox uses regardless of XDG/binary-flavor/tmux-server-env drift. Injected
+/// whose hook calls `friring-cli`), so it targets the same config the spawning
+/// friring uses regardless of XDG/binary-flavor/tmux-server-env drift. Injected
 /// at spawn ([`crate::session_ops`]); consumed by `config_app_dir`.
-pub const CONFIG_DIR_OVERRIDE_ENV: &str = "THURBOX_CONFIG_DIR";
-/// Data counterpart of [`CONFIG_DIR_OVERRIDE_ENV`] (`THURBOX_DATA_DIR`).
-pub const DATA_DIR_OVERRIDE_ENV: &str = "THURBOX_DATA_DIR";
+pub const CONFIG_DIR_OVERRIDE_ENV: &str = "FRIRING_CONFIG_DIR";
+/// Data counterpart of [`CONFIG_DIR_OVERRIDE_ENV`] (`FRIRING_DATA_DIR`).
+pub const DATA_DIR_OVERRIDE_ENV: &str = "FRIRING_DATA_DIR";
 
-/// Returns "thurbox-dev" for dev builds, "thurbox" for release builds.
+/// Returns "friring-dev" for dev builds, "friring" for release builds.
 fn app_dir_name() -> &'static str {
     if cfg!(dev_build) {
-        "thurbox-dev"
+        "friring-dev"
     } else {
-        "thurbox"
+        "friring"
     }
 }
 
@@ -98,11 +98,11 @@ fn data_base() -> Option<PathBuf> {
     }
 }
 
-/// Resolved thurbox config app dir. A `THURBOX_CONFIG_DIR` env override (the
-/// already-resolved dir, incl. the `thurbox`/`thurbox-dev` segment) wins — this
-/// is how the TUI pins child processes (agent hooks calling `thurbox-cli`) to
+/// Resolved friring config app dir. A `FRIRING_CONFIG_DIR` env override (the
+/// already-resolved dir, incl. the `friring`/`friring-dev` segment) wins — this
+/// is how the TUI pins child processes (agent hooks calling `friring-cli`) to
 /// the *same* config it uses, immune to a stale tmux-server env or which
-/// `thurbox-cli` binary is on PATH. Otherwise `<config_base>/<app>`.
+/// `friring-cli` binary is on PATH. Otherwise `<config_base>/<app>`.
 fn config_app_dir() -> Option<PathBuf> {
     if let Some(x) = std::env::var_os(CONFIG_DIR_OVERRIDE_ENV).filter(|s| !s.is_empty()) {
         return Some(PathBuf::from(x));
@@ -110,7 +110,7 @@ fn config_app_dir() -> Option<PathBuf> {
     Some(config_base()?.join(app_dir_name()))
 }
 
-/// Resolved thurbox data app dir; see [`config_app_dir`] (`THURBOX_DATA_DIR`).
+/// Resolved friring data app dir; see [`config_app_dir`] (`FRIRING_DATA_DIR`).
 fn data_app_dir() -> Option<PathBuf> {
     if let Some(x) = std::env::var_os(DATA_DIR_OVERRIDE_ENV).filter(|s| !s.is_empty()) {
         return Some(PathBuf::from(x));
@@ -135,23 +135,23 @@ fn xdg_data_subpath(segments: &[&str]) -> Option<PathBuf> {
 /// Categories of application paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathKind {
-    /// Config file: `~/.config/thurbox/config.toml` (legacy, used for migration only)
+    /// Config file: `~/.config/friring/config.toml` (legacy, used for migration only)
     Config,
-    /// Log directory: `~/.local/share/thurbox/`
+    /// Log directory: `~/.local/share/friring/`
     LogDir,
-    /// SQLite database: `~/.local/share/thurbox/thurbox.db`
+    /// SQLite database: `~/.local/share/friring/friring.db`
     Database,
-    /// Agent metrics files: `~/.local/share/thurbox/metrics/`
+    /// Agent metrics files: `~/.local/share/friring/metrics/`
     MetricsDir,
     /// Embedded built-in extensions materialized for install:
-    /// `~/.local/share/thurbox/builtin-extensions/`
+    /// `~/.local/share/friring/builtin-extensions/`
     BuiltinExtensionsDir,
-    /// Git worktrees: `~/.local/share/thurbox/worktrees/`
+    /// Git worktrees: `~/.local/share/friring/worktrees/`
     WorktreesDir,
     /// Per-session multi-repo symlink workspaces:
-    /// `~/.local/share/thurbox/workspaces/`
+    /// `~/.local/share/friring/workspaces/`
     WorkspacesDir,
-    /// User keybindings JSON file: `~/.config/thurbox/keybindings.json`
+    /// User keybindings JSON file: `~/.config/friring/keybindings.json`
     KeybindingsFile,
 }
 
@@ -188,7 +188,7 @@ pub fn resolve(kind: PathKind) -> Option<PathBuf> {
 fn resolve_xdg(kind: PathKind) -> Option<PathBuf> {
     match kind {
         PathKind::Config => xdg_config_subpath("config.toml"),
-        PathKind::Database => xdg_data_subpath(&["thurbox.db"]),
+        PathKind::Database => xdg_data_subpath(&["friring.db"]),
         PathKind::LogDir => xdg_data_subpath(&[]),
         PathKind::MetricsDir => xdg_data_subpath(&["metrics"]),
         PathKind::BuiltinExtensionsDir => xdg_data_subpath(&["builtin-extensions"]),
@@ -203,7 +203,7 @@ fn resolve_override(base: &Path, kind: PathKind) -> PathBuf {
     match kind {
         PathKind::Config => base.join("config.toml"),
         PathKind::LogDir => base.to_path_buf(),
-        PathKind::Database => base.join("thurbox.db"),
+        PathKind::Database => base.join("friring.db"),
         PathKind::MetricsDir => base.join("metrics"),
         PathKind::BuiltinExtensionsDir => base.join("builtin-extensions"),
         PathKind::WorktreesDir => base.join("worktrees"),
@@ -214,21 +214,21 @@ fn resolve_override(base: &Path, kind: PathKind) -> PathBuf {
 
 /// Resolve the config file path.
 ///
-/// Returns: `$XDG_CONFIG_HOME/thurbox/config.toml` or `$HOME/.config/thurbox/config.toml`
+/// Returns: `$XDG_CONFIG_HOME/friring/config.toml` or `$HOME/.config/friring/config.toml`
 pub fn config_file() -> Option<PathBuf> {
     resolve(PathKind::Config)
 }
 
 /// Resolve the log directory path.
 ///
-/// Returns: `$XDG_DATA_HOME/thurbox/` or `$HOME/.local/share/thurbox/`
+/// Returns: `$XDG_DATA_HOME/friring/` or `$HOME/.local/share/friring/`
 pub fn log_directory() -> Option<PathBuf> {
     resolve(PathKind::LogDir)
 }
 
 /// Resolve the database file path.
 ///
-/// Returns: `$XDG_DATA_HOME/thurbox/thurbox.db` or `$HOME/.local/share/thurbox/thurbox.db`
+/// Returns: `$XDG_DATA_HOME/friring/friring.db` or `$HOME/.local/share/friring/friring.db`
 pub fn database_file() -> Option<PathBuf> {
     resolve(PathKind::Database)
 }
@@ -254,7 +254,7 @@ pub fn validate_safe_name(name: &str) -> Result<(), String> {
 
 /// Resolve the agent metrics directory path.
 ///
-/// Returns: `$XDG_DATA_HOME/thurbox/metrics/` or `$HOME/.local/share/thurbox/metrics/`
+/// Returns: `$XDG_DATA_HOME/friring/metrics/` or `$HOME/.local/share/friring/metrics/`
 pub fn metrics_directory() -> Option<PathBuf> {
     resolve(PathKind::MetricsDir)
 }
@@ -262,31 +262,31 @@ pub fn metrics_directory() -> Option<PathBuf> {
 /// Directory where embedded built-in extensions are materialized so the
 /// extension installer can treat them as a local source.
 ///
-/// Returns: `$XDG_DATA_HOME/thurbox/builtin-extensions/` or
-/// `$HOME/.local/share/thurbox/builtin-extensions/`
+/// Returns: `$XDG_DATA_HOME/friring/builtin-extensions/` or
+/// `$HOME/.local/share/friring/builtin-extensions/`
 pub fn builtin_extensions_directory() -> Option<PathBuf> {
     resolve(PathKind::BuiltinExtensionsDir)
 }
 
 /// Resolve the worktrees directory path.
 ///
-/// Returns: `$XDG_DATA_HOME/thurbox/worktrees/` or `$HOME/.local/share/thurbox/worktrees/`
+/// Returns: `$XDG_DATA_HOME/friring/worktrees/` or `$HOME/.local/share/friring/worktrees/`
 pub fn worktrees_directory() -> Option<PathBuf> {
     resolve(PathKind::WorktreesDir)
 }
 
 /// Resolve the multi-repo workspaces directory path.
 ///
-/// Returns: `$XDG_DATA_HOME/thurbox/workspaces/` or
-/// `$HOME/.local/share/thurbox/workspaces/`
+/// Returns: `$XDG_DATA_HOME/friring/workspaces/` or
+/// `$HOME/.local/share/friring/workspaces/`
 pub fn workspaces_directory() -> Option<PathBuf> {
     resolve(PathKind::WorkspacesDir)
 }
 
 /// Resolve the user keybindings file path.
 ///
-/// Returns: `$XDG_CONFIG_HOME/thurbox/keybindings.json` or
-/// `$HOME/.config/thurbox/keybindings.json`.
+/// Returns: `$XDG_CONFIG_HOME/friring/keybindings.json` or
+/// `$HOME/.config/friring/keybindings.json`.
 pub fn keybindings_file() -> Option<PathBuf> {
     resolve(PathKind::KeybindingsFile)
 }
@@ -314,7 +314,7 @@ pub fn claude_projects_dir(config_dir_override: Option<&Path>) -> Option<PathBuf
 /// The Claude Code daemon roster (`<root>/daemon/roster.json`): the live registry
 /// of background/detached workers. Same root resolution as
 /// [`claude_projects_dir`]. Used by the activity scan to attribute a background
-/// worker's `subagents/` tree back to the thurbox session that launched it.
+/// worker's `subagents/` tree back to the friring session that launched it.
 pub fn claude_daemon_roster(config_dir_override: Option<&Path>) -> Option<PathBuf> {
     claude_config_root(config_dir_override).map(|r| r.join("daemon").join("roster.json"))
 }
@@ -329,7 +329,7 @@ pub fn claude_jobs_dir(config_dir_override: Option<&Path>) -> Option<PathBuf> {
 /// Claude Code's `projects/<slug>` directory name for a working directory:
 /// every non-ASCII-alphanumeric byte becomes `-` (so `/a/b.c` → `-a-b-c`).
 ///
-/// For *finding* an existing session dir thurbox never computes a slug — it
+/// For *finding* an existing session dir friring never computes a slug — it
 /// scans `projects/*/` (see `claude_transcript_exists`) precisely because this
 /// rule is undocumented and version-specific. Computing it is only needed when
 /// *creating* the destination dir for a conversation import, where there is
@@ -384,7 +384,7 @@ pub fn claude_transcript_exists(
 /// This is primarily intended for testing. All paths will resolve under the given base:
 /// - `config_file()` → `base/config.toml`
 /// - `log_directory()` → `base/`
-/// - `database_file()` → `base/thurbox.db`
+/// - `database_file()` → `base/friring.db`
 ///
 /// # Note
 ///
@@ -473,8 +473,8 @@ fn strip_tilde_prefix(path: &str) -> Option<&str> {
 /// Short display label for a repo/dir path: the final path component,
 /// falling back to the full path when there is no file name (e.g. `/`).
 ///
-/// - `/home/user/Repositories/thurbox` → `thurbox`
-/// - `/home/user/Repositories/thurbox/` → `thurbox` (trailing slash ignored)
+/// - `/home/user/Repositories/friring` → `friring`
+/// - `/home/user/Repositories/friring/` → `friring` (trailing slash ignored)
 /// - `/` → `/`
 pub fn display_path(path: &Path) -> String {
     match path.file_name() {
@@ -636,8 +636,8 @@ mod tests {
     #[test]
     fn display_path_uses_basename() {
         assert_eq!(
-            display_path(Path::new("/home/user/Repositories/thurbox")),
-            "thurbox"
+            display_path(Path::new("/home/user/Repositories/friring")),
+            "friring"
         );
     }
 
@@ -665,8 +665,8 @@ mod tests {
     #[test]
     fn display_path_ignores_trailing_slash() {
         assert_eq!(
-            display_path(Path::new("/home/user/Repositories/thurbox/")),
-            "thurbox"
+            display_path(Path::new("/home/user/Repositories/friring/")),
+            "friring"
         );
     }
 
@@ -708,7 +708,7 @@ mod tests {
 
         assert_eq!(config_file(), Some(base.join("config.toml")));
         assert_eq!(log_directory(), Some(base.clone()));
-        assert_eq!(database_file(), Some(base.join("thurbox.db")));
+        assert_eq!(database_file(), Some(base.join("friring.db")));
 
         reset_to_xdg();
     }
@@ -750,7 +750,7 @@ mod tests {
 
         assert_eq!(resolve(PathKind::Config), Some(base.join("config.toml")));
         assert_eq!(resolve(PathKind::LogDir), Some(base.clone()));
-        assert_eq!(resolve(PathKind::Database), Some(base.join("thurbox.db")));
+        assert_eq!(resolve(PathKind::Database), Some(base.join("friring.db")));
         assert_eq!(resolve(PathKind::MetricsDir), Some(base.join("metrics")));
         assert_eq!(
             resolve(PathKind::WorktreesDir),
@@ -792,7 +792,7 @@ mod tests {
         set_test_dir(&base);
 
         let path = database_file().unwrap();
-        assert!(path.ends_with("thurbox.db"));
+        assert!(path.ends_with("friring.db"));
 
         reset_to_xdg();
     }
@@ -861,7 +861,7 @@ mod tests {
         );
         assert_eq!(
             resolve_override(base, PathKind::Database),
-            PathBuf::from("/data/thurbox.db")
+            PathBuf::from("/data/friring.db")
         );
         assert_eq!(
             resolve_override(base, PathKind::MetricsDir),
@@ -1168,8 +1168,8 @@ mod tests {
         // Leading `/`, separators, dots, and existing dashes all become `-`
         // (so a dashed dir yields a double dash) — observed CC v2.1.206 rule.
         assert_eq!(
-            claude_project_slug(Path::new("/mnt/shared/projects/thurbox")),
-            "-mnt-shared-projects-thurbox"
+            claude_project_slug(Path::new("/mnt/shared/projects/friring")),
+            "-mnt-shared-projects-friring"
         );
         assert_eq!(
             claude_project_slug(Path::new("/home/me/.claude/worktrees/x-y")),

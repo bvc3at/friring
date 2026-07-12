@@ -3,7 +3,7 @@
 //! Grouped out of the [`App`](super::App) god object. Fields are `pub(crate)`
 //! so call-sites keep direct access (`self.worktree_sync.in_progress`). Kept
 //! distinct from the inter-instance [`SyncState`](crate::sync::SyncState),
-//! which polls for DB changes from other thurbox instances.
+//! which polls for DB changes from other friring instances.
 
 use std::sync::mpsc;
 

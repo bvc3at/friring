@@ -107,7 +107,7 @@ mod tests {
             id,
             name: name.to_string(),
             agent: "claude".to_string(),
-            backend_id: "thurbox:@0".to_string(),
+            backend_id: "friring:@0".to_string(),
             backend_type: "tmux".to_string(),
             agent_session_id: None,
             cwd: None,
@@ -284,7 +284,7 @@ mod tests {
 
         let mut new_state = SharedState::new();
         let mut s = make_session(session_id, "Session");
-        s.shell_backend_id = Some("thurbox:@1".to_string());
+        s.shell_backend_id = Some("friring:@1".to_string());
         new_state.sessions.push(s);
 
         let delta = StateDelta::compute(&old_state, &new_state);
@@ -292,7 +292,7 @@ mod tests {
         assert_eq!(delta.updated_sessions.len(), 1);
         assert_eq!(
             delta.updated_sessions[0].shell_backend_id,
-            Some("thurbox:@1".to_string())
+            Some("friring:@1".to_string())
         );
     }
 

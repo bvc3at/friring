@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# create-task.sh — create a thurbox task and (when dispatchable) spawn its
+# create-task.sh — create a friring task and (when dispatchable) spawn its
 # worker in the SAME call, so capture → session is atomic and immediate.
 #
 # Usage:
@@ -29,14 +29,14 @@
 #   phase** → the result/notify footer — so every worker follows the same
 # clarify → plan → build contract BEFORE touching code. The planning phase makes
 # the worker (1) ask clarifying questions ONE AT A TIME — push a single question
-# via `thurbox-cli message send --kind questions` and WAIT for its answer before
+# via `friring-cli message send --kind questions` and WAIT for its answer before
 # sending the next (flow relays each question to the user and sends the answer
 # back), adaptively, dropping later questions once an answer clarifies enough —
 # then (2) push a written plan via
 # `--kind plan` and WAIT for the user's approval (relayed by flow), then
 # (3) implement strictly against the approved plan. Worker → flow handoffs go
 # through the durable message queue (not pane scraping); the worker passes NO ids
-# (thurbox injects THURBOX_SESSION/THURBOX_TASK and auto-stamps provenance + the
+# (friring injects FRIRING_SESSION/FRIRING_TASK and auto-stamps provenance + the
 # task tag), and flow → worker replies arrive back in the worker's own inbox
 # (drained on the `inbox` wake). The flow agent no longer hand-types this
 # boilerplate; it passes the structured flags and the script keeps the contract
@@ -111,12 +111,12 @@ build_description() {
 ## Planning phase — do this FIRST, before writing any code
 
 Clarify, then plan, then build — strictly in that order. You coordinate with the
-flow agent through the thurbox message queue. Thurbox already knows who you are
+flow agent through the friring message queue. Friring already knows who you are
 and which task you're on, so you pass **no ids** — just `--to flow --kind … --body
 …`. When flow relays the user's reply, your pane is woken with the word `inbox`;
 the moment you see it, read the reply with:
 
-    thurbox-cli message inbox --claim
+    friring-cli message inbox --claim
 
 (the answer/approval is the message body — `--for` defaults to you, no id needed).
 
@@ -125,7 +125,7 @@ the moment you see it, read the reply with:
    acceptance bar, and anything underspecified — but send them **one at a time, in
    order, never batched**. Send a SINGLE question, then STOP:
 
-       thurbox-cli message send --to flow --kind questions \
+       friring-cli message send --to flow --kind questions \
          --body 'Q: ...'
 
    End your turn and wait — do NOT send the next question, plan, or write code
@@ -139,7 +139,7 @@ the moment you see it, read the reply with:
 2. **Plan, then wait for approval.** With the answers in hand, write a structured
    plan and send it to flow for the user to approve — do NOT start coding yet:
 
-       thurbox-cli message send --to flow --kind plan \
+       friring-cli message send --to flow --kind plan \
          --body '## Problem
        <1–2 sentences>
        ## Acceptance criteria
@@ -165,11 +165,11 @@ sub-directory of your working dir, and the worktree repos are each on a dedicate
 branch ${branch} (off their own base). Make each repo's changes in ITS OWN
 sub-directory, commit them on that repo's branch, and **open a separate PR per
 repo you changed** (do not touch a repo you did not need to change). When
-finished: mark this task done (thurbox-cli task edit \$THURBOX_TASK --status done),
+finished: mark this task done (friring-cli task edit \$FRIRING_TASK --status done),
 then report the result to the flow agent — this also wakes flow so the next task
-dispatches immediately (no ids: thurbox tags the message with your task for you):
+dispatches immediately (no ids: friring tags the message with your task for you):
 
-    thurbox-cli message send --to flow --kind result \\
+    friring-cli message send --to flow --kind result \\
       --body '{"status":"ok|error","artifact":"...","notes":"...","pr_urls":["...","..."]}'
 FOOTER
   elif [[ "$WORKER" -eq 1 ]]; then
@@ -177,11 +177,11 @@ FOOTER
 
 You are working in a dedicated git worktree on branch ${branch}; commit
 your work there and open a PR when the accept criterion is met. When finished:
-mark this task done (thurbox-cli task edit \$THURBOX_TASK --status done), then
+mark this task done (friring-cli task edit \$FRIRING_TASK --status done), then
 report the result to the flow agent — this also wakes flow so the next task
-dispatches immediately (no ids: thurbox tags the message with your task for you):
+dispatches immediately (no ids: friring tags the message with your task for you):
 
-    thurbox-cli message send --to flow --kind result \\
+    friring-cli message send --to flow --kind result \\
       --body '{"status":"ok|error","artifact":"...","notes":"...","pr_url":"..."}'
 FOOTER
   fi
@@ -227,10 +227,10 @@ if [[ -n "$REPO" ]]; then
   done
 fi
 
-CREATED="$(thurbox-cli "${ARGS[@]}")"
+CREATED="$(friring-cli "${ARGS[@]}")"
 printf '%s\n' "$CREATED"
 
 if [[ -n "$REPO" && "$DISPATCH" -eq 1 ]]; then
   ID="$(printf '%s' "$CREATED" | jq -r .id)"
-  thurbox-cli task run "$ID"
+  friring-cli task run "$ID"
 fi

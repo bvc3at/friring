@@ -12,13 +12,13 @@
 # Columns: ID  SESSION  AGENT  STATUS  AGE  TITLE
 # Status glyphs: ◆ monitor (flow) · ● running · ○ queued · ✔ done · ⚠ orphan
 #
-# No arguments. Reads `thurbox-cli session list` + `task list`; degrades to a
+# No arguments. Reads `friring-cli session list` + `task list`; degrades to a
 # one-line notice if either call fails or there are no sessions to show.
 
 set -euo pipefail
 
-SESSIONS="$(thurbox-cli session list --json 2>/dev/null || echo '[]')"
-TASKS="$(thurbox-cli task list --json 2>/dev/null || echo '[]')"
+SESSIONS="$(friring-cli session list --json 2>/dev/null || echo '[]')"
+TASKS="$(friring-cli task list --json 2>/dev/null || echo '[]')"
 
 ROWS="$(printf '%s' "$SESSIONS" | jq -r --argjson tasks "$TASKS" '
   # tasks indexed by id (string keys)

@@ -27,7 +27,7 @@
 #   --base          the target branch to rebase onto (default: filled from the
 #                   provider meta for built-in forges, else the repo's default).
 #
-# thurbox's own --worktree always passes `git worktree add -b` and so FAILS on a
+# friring's own --worktree always passes `git worktree add -b` and so FAILS on a
 # branch that already exists — which a request branch always does. So we adopt
 # the branch ourselves into a shepherd-owned worktree, then spawn the fixer with
 # --repo pointing at it. The fixer pushes straight back to the request branch.
@@ -162,19 +162,19 @@ If you are blocked (a decision only the user can make, missing credentials, an
 ambiguous review request), do NOT guess — stop and report it in the result
 \`question\` field.
 
-When finished: mark this task done (thurbox-cli task edit \$THURBOX_TASK --status done),
+When finished: mark this task done (friring-cli task edit \$FRIRING_TASK --status done),
 print a final line \`===RESULT===\` followed by one line of JSON:
 {"status":"ok|error","url":"...","notes":"...","question":"..."}
 then notify the shepherd so the next request dispatches immediately:
-thurbox-cli session send "\$(thurbox-cli session list --json | jq -r '.[] | select(.name=="shepherd") | .id')" "tick"
+friring-cli session send "\$(friring-cli session list --json | jq -r '.[] | select(.name=="shepherd") | .id')" "tick"
 EOF
 )"
 
-CREATED="$(thurbox-cli task create --title "fix #$NUMBER: $TITLE" \
+CREATED="$(friring-cli task create --title "fix #$NUMBER: $TITLE" \
   --description "$DESC" --repo "$WT" --agent "$AGENT")"
 printf '%s\n' "$CREATED"
 
 if [ "$DISPATCH" -eq 1 ]; then
   ID="$(printf '%s' "$CREATED" | jq -r .id)"
-  thurbox-cli task run "$ID"
+  friring-cli task run "$ID"
 fi

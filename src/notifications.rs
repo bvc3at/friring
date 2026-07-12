@@ -19,7 +19,7 @@
 //!   `display notification` (always available, attributed to Apple's
 //!   Script Editor). Both paths are informational; the
 //!   `UNUserNotificationCenter` click API needs a signed app bundle,
-//!   which thurbox is not. `notify-rust`'s macOS backend
+//!   which friring is not. `notify-rust`'s macOS backend
 //!   (`mac-notification-sys`) is intentionally not used: it rides the
 //!   deprecated `NSUserNotificationCenter` API, which silently no-ops on
 //!   macOS 12+ for unbundled CLIs.
@@ -27,7 +27,7 @@
 //! A previous silent-failure bug motivated this: under WSL the dbus path errors
 //! on connect, but the only signal was a `warn!` to the logfile — the user saw
 //! nothing. We now (a) auto-detect the working backend, (b) record the last
-//! delivery error so `thurbox-cli notify` can surface it, and (c) treat "no
+//! delivery error so `friring-cli notify` can surface it, and (c) treat "no
 //! backend at all" as a reported condition rather than a silent drop.
 //!
 //! Notify-rust on Linux blocks on dbus, and `powershell.exe` is slow to spawn;
@@ -86,7 +86,7 @@ impl DeliveryBackend {
     /// Whether clicking the notification focuses the session in the TUI.
     /// Linux dbus wires this up natively (action callback); macOS does too
     /// when `terminal-notifier` is in PATH (its `-execute` flag shells back
-    /// into `thurbox-cli session focus <id>`). The `osascript` fallback
+    /// into `friring-cli session focus <id>`). The `osascript` fallback
     /// can't, so on macOS this flips to false when only the fallback path
     /// is available.
     pub fn supports_click_to_focus(self) -> bool {
@@ -141,7 +141,7 @@ impl NotificationSender {
 }
 
 /// Process-wide record of the last delivery failure, so the diagnostic
-/// (`thurbox-cli notify`) and a future TUI warning can surface what would
+/// (`friring-cli notify`) and a future TUI warning can surface what would
 /// otherwise be a silent drop. `None` = no failure recorded yet.
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
@@ -171,7 +171,7 @@ pub fn start(backend: DeliveryBackend) -> NotificationSender {
         .get_or_init(|| {
             let (tx, rx) = mpsc::channel::<Notification>();
             thread::Builder::new()
-                .name("thurbox-notifications".into())
+                .name("friring-notifications".into())
                 .spawn(move || dispatch_loop(rx, backend))
                 .expect("spawn notification dispatcher thread");
             NotificationSender { tx }
@@ -189,7 +189,7 @@ fn dispatch_loop(rx: Receiver<Notification>, backend: DeliveryBackend) {
 }
 
 /// Synchronously deliver a single notification over `backend`, blocking until
-/// the OS call returns. Used by the `thurbox-cli notify --test` diagnostic,
+/// the OS call returns. Used by the `friring-cli notify --test` diagnostic,
 /// which is a short-lived process with no dispatcher thread — it must complete
 /// the delivery before exiting. Returns an error string on failure (the dbus
 /// path's click-wait thread is still spawned but the process may exit before a
@@ -228,7 +228,7 @@ fn dispatch_dbus(n: &Notification) -> Result<(), Box<dyn std::error::Error>> {
     notif
         .summary(&n.title)
         .body(&n.body)
-        .appname("thurbox")
+        .appname("friring")
         .hint(Hint::Category("im.received".into()))
         // The "default" action fires when the user clicks the banner body
         // itself, distinct from the explicit "open" button — both route the
@@ -245,7 +245,7 @@ fn dispatch_dbus(n: &Notification) -> Result<(), Box<dyn std::error::Error>> {
     // notification times out — run it on its own short-lived thread so the
     // dispatcher can move on to the next queued notification.
     thread::Builder::new()
-        .name("thurbox-notification-wait".into())
+        .name("friring-notification-wait".into())
         .spawn(move || {
             handle.wait_for_action(|action| match action {
                 "default" | "open" => {
@@ -263,7 +263,7 @@ fn dispatch_dbus(n: &Notification) -> Result<(), Box<dyn std::error::Error>> {
 fn dispatch_macos(n: &Notification) -> Result<(), Box<dyn std::error::Error>> {
     // notify-rust's macOS backend (`mac-notification-sys`) uses the
     // deprecated `NSUserNotificationCenter` API, which silently no-ops on
-    // macOS 12+ for unbundled CLIs — the cause of "thurbox notifications
+    // macOS 12+ for unbundled CLIs — the cause of "friring notifications
     // don't fire on Mac". Two viable replacements that need no `.app`
     // bundle / no code signing:
     //
@@ -281,7 +281,7 @@ fn dispatch_macos(n: &Notification) -> Result<(), Box<dyn std::error::Error>> {
     // we still land on the `osascript` path.
     //
     // No action callbacks on either path: those need `UNUserNotificationCenter`
-    // (a signed `.app`), which thurbox is not.
+    // (a signed `.app`), which friring is not.
     if terminal_notifier_available() {
         match dispatch_macos_terminal_notifier(n) {
             Ok(()) => return Ok(()),
@@ -314,21 +314,21 @@ fn dispatch_macos_terminal_notifier(n: &Notification) -> Result<(), Box<dyn std:
         .arg("-message")
         .arg(&n.body)
         .arg("-group")
-        .arg(format!("thurbox-{}", n.session_id));
+        .arg(format!("friring-{}", n.session_id));
     if n.sound {
         cmd.arg("-sound").arg("default");
     }
     // Click-to-focus: `terminal-notifier -execute "<cmd>"` runs the command
     // via `/bin/sh -c` when the user clicks the banner. We point it at
-    // `thurbox-cli session focus <id>`, which writes the same
+    // `friring-cli session focus <id>`, which writes the same
     // `pending_focus_session_id` metadata row the Linux dbus path writes;
     // the TUI's external-state poll then switches active_index. We resolve
-    // an *absolute* `thurbox-cli` path from the running binary's directory
+    // an *absolute* `friring-cli` path from the running binary's directory
     // — the click handler runs under launchd's environment, which has a
-    // very sparse PATH, so a bare `thurbox-cli` would often not resolve.
+    // very sparse PATH, so a bare `friring-cli` would often not resolve.
     // If we can't locate the CLI binary the click is simply non-interactive
     // (the banner still shows).
-    if let Some(focus_cmd) = thurbox_cli_focus_command(n.session_id) {
+    if let Some(focus_cmd) = friring_cli_focus_command(n.session_id) {
         cmd.arg("-execute").arg(focus_cmd);
     }
     let status = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status()?;
@@ -339,15 +339,15 @@ fn dispatch_macos_terminal_notifier(n: &Notification) -> Result<(), Box<dyn std:
 }
 
 /// Build the shell command `terminal-notifier -execute` should run on click:
-/// `<thurbox-cli> session focus <session-id>`, with the thurbox-cli path
+/// `<friring-cli> session focus <session-id>`, with the friring-cli path
 /// quoted for `/bin/sh`. Returns `None` if we can't find a sibling
-/// `thurbox-cli` binary next to the running executable — the path probe
+/// `friring-cli` binary next to the running executable — the path probe
 /// is cached, the resolution is not, because `current_exe()` is cheap.
 #[cfg(target_os = "macos")]
-fn thurbox_cli_focus_command(session_id: SessionId) -> Option<String> {
+fn friring_cli_focus_command(session_id: SessionId) -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     let parent = exe.parent()?;
-    let cli = parent.join("thurbox-cli");
+    let cli = parent.join("friring-cli");
     if !cli.exists() {
         return None;
     }
@@ -614,7 +614,7 @@ fn detect_powershell() -> bool {
 /// boundaries.
 pub const FOCUS_REQUEST_KEY: &str = PENDING_FOCUS_SESSION_ID_KEY;
 
-/// Resolve the DB path the same way the rest of thurbox does. Returned as a
+/// Resolve the DB path the same way the rest of friring does. Returned as a
 /// PathBuf so the click handler can open a short-lived connection without
 /// holding any global state.
 #[cfg(target_os = "linux")]
@@ -628,7 +628,7 @@ fn db_path() -> Option<PathBuf> {
 /// of its own.
 #[cfg(target_os = "linux")]
 fn write_focus_request(session_id: SessionId) -> Result<(), Box<dyn std::error::Error>> {
-    let path = db_path().ok_or("could not resolve thurbox DB path")?;
+    let path = db_path().ok_or("could not resolve friring DB path")?;
     let conn = rusqlite::Connection::open(&path)?;
     conn.execute(
         "INSERT INTO metadata (key, value) VALUES (?1, ?2) \

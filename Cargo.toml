@@ -1,13 +1,13 @@
 [package]
-name = "thurbox"
+name = "friring"
 # Development version marker: real version injected at build time from git tags
 version = "0.0.0-dev"
 edition = "2021"
-# Build script injects version from THURBOX_RELEASE_VERSION env variable (set by CI)
+# Build script injects version from FRIRING_RELEASE_VERSION env variable (set by CI)
 # Fallback to version above for local development builds
 build = "build.rs"
-# `cargo run` (no --bin) launches the TUI; thurbox-cli is the headless binary.
-default-run = "thurbox"
+# `cargo run` (no --bin) launches the TUI; friring-cli is the headless binary.
+default-run = "friring"
 authors = ["LeTuR <magicletur@protonmail.com>"]
 license = "MIT"
 description = "A TUI for orchestrating multiple coding-agent CLI sessions in persistent tmux panels"
@@ -56,7 +56,7 @@ sysinfo = "0.39"
 anyhow = "1.0"
 
 # Clipboard (text only — the default `image-data` feature pulls in the
-# image/png/moxcms decoding stack we never use; thurbox only copies/pastes text)
+# image/png/moxcms decoding stack we never use; friring only copies/pastes text)
 arboard = { version = "3", default-features = false }
 
 # Temporary directories (used by tests and session_ops)
@@ -65,7 +65,7 @@ tempfile = "3"
 # JSON (session metadata, keybindings, agent config)
 serde_json = "1"
 
-# CLI argument parsing (thurbox-cli)
+# CLI argument parsing (friring-cli)
 clap = { version = "4", features = ["derive"] }
 
 # Date/time + cron scheduling (automations)
@@ -85,8 +85,8 @@ serde_ignored = "0.1.14"
 notify-rust = "4"
 
 [[bin]]
-name = "thurbox-cli"
-path = "src/bin/thurbox-cli.rs"
+name = "friring-cli"
+path = "src/bin/friring-cli.rs"
 
 # Development tool requirements (install with `cargo binstall` or `cargo install`)
 [package.metadata.dev-tools]
@@ -119,7 +119,7 @@ strip = false
 # default-features off keeps the dep tree minimal (just `similar`).
 insta = { version = "1.48.0", default-features = false }
 
-# Property/fuzz testing — proves thurbox's terminal pipeline is byte- and
+# Property/fuzz testing — proves friring's terminal pipeline is byte- and
 # render-transparent (control_mode transport + terminal_view rendering). Runs in
 # the normal `cargo nextest --all`.
 proptest = "1"

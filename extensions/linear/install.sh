@@ -1,13 +1,13 @@
 #!/usr/bin/env sh
 # Thin wrapper kept for the curl|sh one-liner. The real installer lives in
-# thurbox itself:
+# friring itself:
 #
-#   thurbox-cli extension install linear
+#   friring-cli extension install linear
 #
 # This script just forwards to it — using a local checkout when run from one,
 # otherwise the official remote source. It fetches the manifest + payload, lays
-# down ~/.config/thurbox/extensions/linear, and activates the linear-tick automation — a deterministic exec
-# sync (no agent, no session), which thurbox then self-heals.
+# down ~/.config/friring/extensions/linear, and activates the linear-tick automation — a deterministic exec
+# sync (no agent, no session), which friring then self-heals.
 #
 # Usage:
 #   ./install.sh                  # from a checkout
@@ -17,15 +17,15 @@
 #   LINEAR_HOME=<dir>   override install home (default: <config>/extensions/linear)
 #
 # Authenticate afterwards: put your Linear personal API key in
-# ~/.config/thurbox/extensions/linear/credentials.env as `LINEAR_API_KEY=lin_api_xxom` (Settings → Account →
-# Security & access → Personal API keys). Then add teams to ~/.config/thurbox/extensions/linear/trackers.md.
+# ~/.config/friring/extensions/linear/credentials.env as `LINEAR_API_KEY=lin_api_xxom` (Settings → Account →
+# Security & access → Personal API keys). Then add teams to ~/.config/friring/extensions/linear/trackers.md.
 # To turn it off:
-#   thurbox-cli extension deactivate linear [--force --purge]
+#   friring-cli extension deactivate linear [--force --purge]
 
 set -eu
 
-command -v thurbox-cli >/dev/null 2>&1 || {
-  echo "error: thurbox-cli not found in PATH (install thurbox first)" >&2
+command -v friring-cli >/dev/null 2>&1 || {
+  echo "error: friring-cli not found in PATH (install friring first)" >&2
   exit 1
 }
 
@@ -37,7 +37,7 @@ set --
 # otherwise install the official "linear" extension from the remote source.
 SRC_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || true)"
 if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/extension.toml" ]; then
-  exec thurbox-cli extension install "$SRC_DIR" "$@"
+  exec friring-cli extension install "$SRC_DIR" "$@"
 else
-  exec thurbox-cli extension install linear "$@"
+  exec friring-cli extension install linear "$@"
 fi

@@ -13,7 +13,7 @@
 //!   entry, so self-heal stops resurrecting it. This is the real off-switch.
 //!
 //! Deleting an extension's session/automation by hand (TUI `Ctrl+D`, `clean`,
-//! `thurbox-cli session/automation delete`) is therefore a no-op while the
+//! `friring-cli session/automation delete`) is therefore a no-op while the
 //! extension is active: the next ensure pass recreates it. `deactivate` is how a
 //! user turns an extension off for good.
 //!
@@ -74,7 +74,7 @@ pub struct ExtensionHealth {
     pub automations: Vec<(String, bool)>,
     /// The extension's own declared version (`version` in its manifest), if any.
     pub version: Option<String>,
-    /// The thurbox version that installed it (`installed_with`), if recorded.
+    /// The friring version that installed it (`installed_with`), if recorded.
     pub installed_with: Option<String>,
     /// The running binary's version (the staleness reference point).
     pub current_binary: String,
@@ -383,10 +383,15 @@ fn install_external_file(
     Ok(())
 }
 
-/// Marker present in every hook command we ship (`thurbox-cli session signal
+/// Marker present in every hook command we ship (`friring-cli session signal
 /// …`). [`crate::agent::json_merge::prune_marked`] uses it to remove exactly our
 /// merged entries on uninstall — robust across payload schema changes.
-const HOOK_SIGNAL_MARKER: &str = "thurbox-cli session signal";
+const HOOK_SIGNAL_MARKER: &str = "friring-cli session signal";
+
+/// Pre-rename marker (Thurbox era). Existing installs merged their hook entries
+/// under this command name; uninstall must still prune them or the rename leaves
+/// stale `thurbox-cli` hooks behind (and reinstall would duplicate ours).
+const LEGACY_HOOK_SIGNAL_MARKER: &str = "thurbox-cli session signal";
 
 /// Read the JSON config at `path` (or `{}` when absent), parsed. A malformed
 /// file is an error rather than a silent overwrite — we never clobber config we
@@ -456,8 +461,10 @@ fn install_config_merge(
 }
 
 /// Reverse an [`install_config_merge`]: prune our marked hook entries out of the
-/// agent's config file, leaving the user's own settings intact. A missing file
-/// is a no-op. Returns whether the path was touched.
+/// agent's config file, leaving the user's own settings intact. Prunes both the
+/// current and the legacy (pre-rename `thurbox-cli`) markers, so migrating an
+/// existing install also cleans up entries merged by the previous version. A
+/// missing file is a no-op. Returns whether the path was touched.
 fn revert_config_merge(m: &crate::session::ConfigMerge) -> Result<bool, String> {
     let dest = crate::agent::extension_config::expand_tilde(&m.path);
     if !dest.exists() {
@@ -473,6 +480,7 @@ fn revert_config_merge(m: &crate::session::ConfigMerge) -> Result<bool, String> 
         }
     };
     crate::agent::json_merge::prune_marked(&mut doc, HOOK_SIGNAL_MARKER);
+    crate::agent::json_merge::prune_marked(&mut doc, LEGACY_HOOK_SIGNAL_MARKER);
     write_json_if_changed(&dest, &doc)
 }
 
@@ -519,7 +527,7 @@ pub struct UpdateReport {
 
 /// Re-install an already-installed extension from its **recorded source**,
 /// refreshing its payload + manifest to match the running binary. This is the
-/// mechanism that keeps extensions in sync after a thurbox upgrade: a bare-name
+/// mechanism that keeps extensions in sync after a friring upgrade: a bare-name
 /// source re-resolves against the new binary's release tag, so the matching
 /// extension version is fetched.
 ///
@@ -531,8 +539,8 @@ pub fn update_extension(db: &Database, name: &str, force: bool) -> Result<Update
         .ok_or_else(|| format!("extension '{name}' is not installed (no manifest found)"))?;
     let source = installed.source.clone().ok_or_else(|| {
         format!(
-            "extension '{name}' has no recorded install source (installed by an older thurbox); \
-             reinstall it with `thurbox-cli extension install {name}`"
+            "extension '{name}' has no recorded install source (installed by an older friring); \
+             reinstall it with `friring-cli extension install {name}`"
         )
     })?;
     // Keep it in its existing home, regardless of what the new manifest defaults to.
@@ -593,9 +601,9 @@ pub fn reinstall_extension(
         .ok_or_else(|| format!("extension '{name}' is not installed (no manifest found)"))?;
     let source = installed.source.clone().ok_or_else(|| {
         format!(
-            "extension '{name}' has no recorded install source (installed by an older thurbox); \
-             reinstall it by hand: `thurbox-cli extension uninstall {name}` then \
-             `thurbox-cli extension install {name}`"
+            "extension '{name}' has no recorded install source (installed by an older friring); \
+             reinstall it by hand: `friring-cli extension uninstall {name}` then \
+             `friring-cli extension install {name}`"
         )
     })?;
     // Keep the extension in its existing home unless the caller purges it.
@@ -774,15 +782,24 @@ fn safe_join(home: &Path, rel: &str) -> Result<PathBuf, String> {
 
 /// Marker an installer-managed `substitute` file carries (in the template
 /// content) so reinstall can overwrite *its own* file but not one the user has
-/// edited (or whose marker they removed).
-const MANAGED_MARKER: &str = "thurbox `extension install`";
+/// edited (or whose marker they removed). [`LEGACY_MANAGED_MARKER`] is recognized
+/// too, so a file written by the pre-rename version is still treated as ours.
+const MANAGED_MARKER: &str = "friring `extension install`";
+
+/// Pre-rename managed marker (Thurbox era): files written by the previous version
+/// carry it, so uninstall/reinstall must still recognize them as ours rather than
+/// refuse to touch them (we self-heal to [`MANAGED_MARKER`] on the next rewrite).
+const LEGACY_MANAGED_MARKER: &str = "thurbox `extension install`";
 
 /// Whether `dest` is a `substitute` file the user has taken ownership of: it
-/// exists but no longer carries the managed marker. A missing file (fresh
-/// install) or one still carrying the marker is ours to (over)write.
+/// exists but carries neither the current nor the legacy managed marker. A
+/// missing file (fresh install) or one still carrying either marker is ours to
+/// (over)write.
 fn is_user_modified(dest: &Path) -> bool {
     match std::fs::read_to_string(dest) {
-        Ok(content) => !content.contains(MANAGED_MARKER),
+        Ok(content) => {
+            !(content.contains(MANAGED_MARKER) || content.contains(LEGACY_MANAGED_MARKER))
+        }
         Err(_) => false,
     }
 }
@@ -1055,7 +1072,7 @@ pub fn deactivate_extension(
 /// so one bad extension can't block the others (or, in tick, the firing pass).
 ///
 /// The active set is read from SQLite `metadata`; `activate_extension` /
-/// `deactivate_extension` (i.e. `thurbox-cli extension …`) manage membership.
+/// `deactivate_extension` (i.e. `friring-cli extension …`) manage membership.
 pub fn heal_active_extensions(db: &Database) -> Vec<String> {
     let active = db.get_active_extensions().unwrap_or_default();
     let mut messages = Vec::new();
@@ -1074,7 +1091,7 @@ fn heal_one_extension(db: &Database, name: &str, messages: &mut Vec<String>) {
     let Some(def) = crate::agent::extension_config::load_manifest(name) else {
         messages.push(format!(
             "extension '{name}' is active but its manifest is missing; reinstall it \
-             or run `thurbox-cli extension deactivate {name}`"
+             or run `friring-cli extension deactivate {name}`"
         ));
         return;
     };
@@ -1149,8 +1166,8 @@ fn heal_version_drift(
 /// by self-heal when an extension is stale and auto-update is off (or failed).
 fn stale_extension_nudge(def: &ExtensionDef, name: &str, current: &str) -> String {
     format!(
-        "extension '{name}' was installed under thurbox {} but this binary is {current}; \
-         run `thurbox-cli extension update {name}` to refresh it",
+        "extension '{name}' was installed under friring {} but this binary is {current}; \
+         run `friring-cli extension update {name}` to refresh it",
         def.installed_with.as_deref().unwrap_or("an older version")
     )
 }
@@ -1176,7 +1193,7 @@ fn heal_recreated_message(report: &EnsureReport, name: &str) -> String {
     }
     format!(
         "Repaired {} for managed extension '{name}' \
-         (`thurbox-cli extension deactivate {name}` to turn it off)",
+         (`friring-cli extension deactivate {name}` to turn it off)",
         parts.join(" + ")
     )
 }
@@ -1544,7 +1561,7 @@ requires_dir = '{plugin_dir}'
         // The plugin payload carries the managed marker so uninstall can remove it.
         std::fs::write(
             src.path().join("status.js"),
-            "// thurbox `extension install` managed\n",
+            "// friring `extension install` managed\n",
         )
         .unwrap();
 
@@ -1619,7 +1636,7 @@ requires_dir = '{agent_dir}'
         .unwrap();
         std::fs::write(
             src.path().join("gemini-hooks.json"),
-            r#"{"hooks":{"BeforeTool":[{"hooks":[{"type":"command","command":"thurbox-cli session signal --state working || true"}]}],"AfterAgent":[{"hooks":[{"type":"command","command":"thurbox-cli session signal --state done || true"}]}]}}"#,
+            r#"{"hooks":{"BeforeTool":[{"hooks":[{"type":"command","command":"friring-cli session signal --state working || true"}]}],"AfterAgent":[{"hooks":[{"type":"command","command":"friring-cli session signal --state done || true"}]}]}}"#,
         )
         .unwrap();
 
@@ -1778,7 +1795,7 @@ requires_dir = '{agent_dir}'
         .unwrap();
         std::fs::write(
             src.path().join("gemini-hooks.json"),
-            r#"{"hooks":{"AfterAgent":[{"hooks":[{"type":"command","command":"thurbox-cli session signal --state done || true"}]}]}}"#,
+            r#"{"hooks":{"AfterAgent":[{"hooks":[{"type":"command","command":"friring-cli session signal --state done || true"}]}]}}"#,
         )
         .unwrap();
 
@@ -1822,7 +1839,7 @@ requires_dir = '{req}'
         .unwrap();
         std::fs::write(
             src.path().join("status.js"),
-            "// thurbox `extension install`\n",
+            "// friring `extension install`\n",
         )
         .unwrap();
 
@@ -1886,7 +1903,7 @@ requires_dir = '{req}'
         // Template carries the managed marker so a fresh install owns it.
         std::fs::write(
             src.path().join("settings.json"),
-            "thurbox `extension install` managed {home}",
+            "friring `extension install` managed {home}",
         )
         .unwrap();
         let target = src.path().to_string_lossy().to_string();
@@ -1972,7 +1989,7 @@ requires_dir = '{req}'
     // OS handle to that working dir and only releases it on `kill-server`
     // (`kill-window`/`respawn-pane`/waiting do NOT release it — verified directly
     // in the Windows VM), so `remove_dir_all(flowhome)` hits os error 32. This is
-    // an upstream psmux limitation, not a thurbox bug; `force_teardown`'s
+    // an upstream psmux limitation, not a friring bug; `force_teardown`'s
     // pane-reap + `remove_dir_all_resilient` are partial mitigations but cannot
     // free a *server*-held handle without killing the shared server.
     #[cfg_attr(windows, ignore = "psmux leaks the pane cwd handle until kill-server")]
@@ -2169,7 +2186,7 @@ prompt = "tick"
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("run `thurbox-cli extension update flow`")),
+                .any(|m| m.contains("run `friring-cli extension update flow`")),
             "got: {messages:?}"
         );
         // The discovery copy is untouched — still the old version, never fetched.
@@ -2227,7 +2244,7 @@ prompt = "tick"
         assert!(!updated, "compat warning is not an auto-update");
         assert_eq!(messages.len(), 1, "got: {messages:?}");
         assert!(
-            messages[0].contains("wants thurbox >= 5.0.0"),
+            messages[0].contains("wants friring >= 5.0.0"),
             "got: {messages:?}"
         );
     }
@@ -2253,7 +2270,7 @@ prompt = "tick"
         assert!(
             messages
                 .iter()
-                .any(|m| m.contains("run `thurbox-cli extension update flow`")),
+                .any(|m| m.contains("run `friring-cli extension update flow`")),
             "falls back to the manual nudge; got: {messages:?}"
         );
         // The discovery copy is untouched — the failed fetch wrote nothing.
@@ -2271,7 +2288,7 @@ prompt = "tick"
         let temp = tempfile::TempDir::new().unwrap();
         let _guard = crate::paths::TestPathGuard::new(temp.path());
         let db = Database::open_in_memory().unwrap();
-        // A manifest installed by an older thurbox carries no `source`.
+        // A manifest installed by an older friring carries no `source`.
         crate::agent::extension_config::write_manifest(&ExtensionDef {
             name: "legacy".into(),
             ..Default::default()
@@ -2343,6 +2360,57 @@ prompt = "tick"
     fn guard_refuses_shallow_dirs() {
         assert!(guard_removable_dir(Path::new("/x")).is_err());
         assert!(guard_removable_dir(Path::new("/home/me/flow")).is_ok());
+    }
+
+    #[test]
+    fn is_user_modified_recognizes_legacy_and_current_markers() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        // A file written by the pre-rename version carries the legacy marker and
+        // is still ours (it self-heals to the friring marker on the next rewrite).
+        let legacy = temp.path().join("legacy.json");
+        std::fs::write(&legacy, "thurbox `extension install` managed\n").unwrap();
+        assert!(!is_user_modified(&legacy), "legacy-managed file is ours");
+
+        // The current marker is ours too.
+        let current = temp.path().join("current.json");
+        std::fs::write(&current, "friring `extension install` managed\n").unwrap();
+        assert!(!is_user_modified(&current), "friring-managed file is ours");
+
+        // Neither marker → the user has taken ownership of the file.
+        let edited = temp.path().join("edited.json");
+        std::fs::write(&edited, "MY CUSTOM PERMS").unwrap();
+        assert!(is_user_modified(&edited), "an unmarked file is a user edit");
+    }
+
+    #[test]
+    fn revert_prunes_legacy_thurbox_hook_but_keeps_user_entry() {
+        // A pre-rename install merged its hook entry under the `thurbox-cli`
+        // command name; the friring-only marker no longer matches it, so uninstall
+        // must prune via the legacy marker while leaving the user's own hook alone.
+        let temp = tempfile::TempDir::new().unwrap();
+        let settings = temp.path().join("settings.json");
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"Stop":[{"command":"user"},{"hooks":[{"type":"command","command":"thurbox-cli session signal --state done || true"}]}]}}"#,
+        )
+        .unwrap();
+
+        let merge = crate::session::ConfigMerge {
+            path: settings.to_string_lossy().into_owned(),
+            source: None,
+            requires_dir: None,
+        };
+        let touched = revert_config_merge(&merge).unwrap();
+        assert!(touched, "the legacy entry was pruned");
+
+        let restored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            restored,
+            serde_json::json!({"hooks":{"Stop":[{"command":"user"}]}}),
+            "legacy thurbox-cli hook gone, the user's own hook remains"
+        );
     }
 
     #[test]

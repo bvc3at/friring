@@ -4,9 +4,9 @@
 /// database file and verify that session changes are properly shared.
 use std::path::PathBuf;
 
-use thurbox::session::SessionId;
-use thurbox::storage::Database;
-use thurbox::sync::{self, SharedSession, SharedState, SharedWorktree};
+use friring::session::SessionId;
+use friring::storage::Database;
+use friring::sync::{self, SharedSession, SharedState, SharedWorktree};
 
 /// Helper to create a test session.
 fn make_session(id: SessionId, name: &str) -> SharedSession {
@@ -14,7 +14,7 @@ fn make_session(id: SessionId, name: &str) -> SharedSession {
         id,
         name: name.to_string(),
         agent: "developer".to_string(),
-        backend_id: "thurbox:@0".to_string(),
+        backend_id: "friring:@0".to_string(),
         backend_type: "tmux".to_string(),
         agent_session_id: Some(format!("claude-{name}")),
         cwd: None,
@@ -361,7 +361,7 @@ fn db_session_metadata_preserved_across_instances() {
         id: session_id,
         name: "Dev Session".to_string(),
         agent: "developer".to_string(),
-        backend_id: "thurbox:@0".to_string(),
+        backend_id: "friring:@0".to_string(),
         backend_type: "tmux".to_string(),
         agent_session_id: Some("claude-123".to_string()),
         cwd: Some(PathBuf::from("/home/dev")),
@@ -382,7 +382,7 @@ fn db_session_metadata_preserved_across_instances() {
     assert_eq!(s.id, session_id);
     assert_eq!(s.name, "Dev Session");
     assert_eq!(s.agent, "developer");
-    assert_eq!(s.backend_id, "thurbox:@0");
+    assert_eq!(s.backend_id, "friring:@0");
     assert_eq!(s.agent_session_id, Some("claude-123".to_string()));
     assert_eq!(s.cwd, Some(PathBuf::from("/home/dev")));
 }

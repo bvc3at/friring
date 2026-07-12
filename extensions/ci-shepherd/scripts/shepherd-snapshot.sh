@@ -19,10 +19,10 @@ WT_DIR="$HOME_DIR/worktrees"
 trim() { printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
 
 # Snapshot the live session list ONCE so each request can be cross-referenced
-# against any thurbox session already working on its head branch (link-sessions.sh).
+# against any friring session already working on its head branch (link-sessions.sh).
 SESS_FILE="$(mktemp -t shepherd-sessions.XXXXXX)"
 trap 'rm -f "$SESS_FILE"' EXIT
-thurbox-cli session list --json 2>/dev/null > "$SESS_FILE" || echo '[]' > "$SESS_FILE"
+friring-cli session list --json 2>/dev/null > "$SESS_FILE" || echo '[]' > "$SESS_FILE"
 
 echo "## change requests (watched repos)"
 if [ ! -f "$REPOS_MD" ]; then
@@ -57,21 +57,21 @@ else
         printf '%s' "$CRS" | "$HERE/classify.sh" 2>/dev/null \
           || echo "  (could not parse provider output)"
         # Flag any request whose head branch already has a live, non-fixer
-        # thurbox session — hands-on work the shepherd must not race.
+        # friring session — hands-on work the shepherd must not race.
         printf '%s' "$CRS" | "$HERE/link-sessions.sh" "$SESS_FILE" 2>/dev/null || true
       done
 fi
 
 echo
 echo "## fixer tasks"
-if TASKS="$(thurbox-cli task list 2>/dev/null)"; then
+if TASKS="$(friring-cli task list 2>/dev/null)"; then
   printf '%s' "$TASKS" | jq -r '
     [.[] | select(.title | startswith("fix #"))] |
     if length == 0 then "  (none)" else
       .[] | "  #\(.id) [\(.status)] \(.title)  {repo=\(.action.repo_path // "?")}"
     end' 2>/dev/null || true
 else
-  echo "  (thurbox-cli task list failed)"
+  echo "  (friring-cli task list failed)"
 fi
 
 echo
