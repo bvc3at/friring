@@ -430,7 +430,7 @@ no results. Data is never touched, so re-enabling a flag is lossless.
 | `info_panel` | `true` | info panel (`F2`; docking via `info_panel_position`) |
 | `shell_pane` | `true` | per-session shell toggle (`Ctrl+T`) |
 | `code_review` | `true` | native code-review view (diff + comments, `Ctrl+X`) |
-| `cc_activity` | `true` | Claude Code activity view: workflow/subagent transcripts (`F9`); Claude + local sessions only |
+| `cc_activity` | `true` | agent activity view (`F9`): per-session retrospective (commands / edits / reads / web / subagents) across supported agent CLIs, incl. the Claude workflow/subagent tree + conversation import; local sessions only (see `FORK.md`) |
 | `perf_hud` | `true` | perf HUD overlay (`F12`): live perf counters + frame/tick timing (see `docs/PERFORMANCE.md`) |
 | `mouse` | `true` | mouse capture: clicks, wheel, drag-select, hover, scrollbars |
 | `notifications` | `true` | OS desktop notifications when a session needs attention |

@@ -52,64 +52,89 @@ merges carry rename conflicts on the renamed identifiers, and an existing
 
 ### Features
 
-#### Claude Code activity view (F9)
+#### Agent activity view (F9)
 
-*The first Friring feature — merged into `main` (#1).*
+*The first Friring feature (#1), redesigned in July 2026 into an
+agent-neutral retrospective.*
 
-A native central-pane view (**F9**, gated by a `[features] cc_activity` flag)
-that shows a live + historical **tree of a Claude Code session's workflows and
-Task subagents**, plus each one's transcript (thinking / tool calls / output) —
-live-tailed while running, browsable when finished. Claude + local sessions only
-(v1).
+A native central-pane view (**F9**, gated by the `[features] cc_activity`
+flag) that reconstructs **what a session's agent did** — every shell command
+it ran, file it edited, file it read, web search/fetch it made, and subagent
+it delegated to — from whatever the agent CLI persists on disk. Local
+sessions only.
 
-- **Data source.** Reads Claude Code's on-disk JSONL under
-  `~/.claude/projects/*/…/subagents/` (undocumented and version-specific;
-  `$CLAUDE_CONFIG_DIR` honored) via an off-thread, mtime-gated scan that is never
-  persisted.
-- **Daemon-worker attribution.** Unions a session's own subagents tree with
-  trees written by a background/daemon worker it launched, attributed via the
-  `--settings` flag the daemon replays, so daemon-dispatched workflows are
-  surfaced instead of showing an empty tab. In-flight background runs get a live
-  overview from the worker's job state.
+- **Section navigator.** The side column lists sections — Overview /
+  Timeline / Commands / Files / Web / Agents (`1`–`6` jump) — with live
+  counts; the central pane renders the selection. Event rows are compact
+  one-liners (`Enter` expands note + result head); the same fold / `/` find /
+  wrap / live-tail engine as transcripts.
+- **Providers.** Every supported CLI gets a provider: pure record→event
+  parsers in `session::activity::<provider>` plus discovery/tailing glue in
+  `app::activity::<provider>`, dispatched by the **command basename** of the
+  session's `agents.toml` entry (so wrapper entries like `claude-opus`
+  resolve). Sources are stat-signature-gated, append-only files tail
+  incrementally by byte offset, and nothing is persisted. Formats were
+  reverse-engineered from each CLI's source/docs (July 2026) and every parser
+  degrades to skipped records on drift.
+- **Known-unsupported agents** show *why* in the Overview (e.g. `agy`
+  encrypts its trajectory store; `amp` keeps threads server-side).
+- **The Claude workflow/subagent tree** (the original v1 feature) lives on
+  under the Agents section: live + historical tree of a session's workflows
+  and Task subagents with full transcripts (thinking / tool calls / output),
+  daemon-worker attribution via the replayed `--settings` flag, and the live
+  overview of in-flight background runs.
 - **Find-in-transcript (`/`).** Incremental find with in-place match
   highlighting, mirroring the code-review / file-viewer find.
 
 Implementation notes (this is a fork-only feature, so its detail lives here
 rather than in `docs/FEATURES.md`):
 
-- **Two data homes.** `SessionInfo.cc_activity` is a lightweight **index**
-  (workflows + agents + standalone subagents; ids, agentType, state, mtimes — no
-  transcript bodies), refreshed off the UI thread ~1 s per local session,
-  mtime-signature-gated, and **never persisted** (a high-churn DB field would
-  bump `PRAGMA data_version`). `App::cc_activities` is the **open-view** UI state
-  (rows, selection, scroll, wrap, folds); the selected agent's transcript is
-  parsed **on demand** and re-read on growth for live-tail.
+- **Three data homes.** `SessionInfo.cc_activity` is the lightweight Claude
+  **tree index** (workflows + agents + standalone subagents; ids, agentType,
+  state, mtimes — no transcript bodies), refreshed off the UI thread ~1 s per
+  local session, mtime-signature-gated, and **never persisted** (a high-churn
+  DB field would bump `PRAGMA data_version`). `App::activity` holds each
+  session's **normalized event accumulator** (`ActivityEvent` stream + meta),
+  filled by a second ~1 s scan (offset half a cadence from the first) whose
+  per-session state *moves* into the `spawn_blocking` pass and back.
+  `App::cc_activities` is the **open-view** UI state (navigator rows,
+  selection, scroll, wrap, folds); the selected agent's transcript is parsed
+  **on demand** and re-read on growth for live-tail.
 - **Path resolution.** The dir is found by scanning `projects/*/` for the
   `<agent_session_id>/subagents` child (`paths::claude_projects_dir`), not by
   computing Claude Code's slug (which replaces `/`, `.`, and likely all non-alnum
   with `-`). `agent_session_id` is what friring injects as `FRIRING_SESSION_ID`;
   `$CLAUDE_CONFIG_DIR` is honored.
-- **Surface & keys.** A side tree in the file-viewer column
-  (`InputFocus::CcActivityTree`) folds workflows over their agents; a central
-  transcript pane (`InputFocus::CcActivity`) shows assistant thinking / text /
-  foldable `tool_use` + `tool_result`, or a workflow overview (phases + per-agent
-  grid + logs, plus a background run's live pace / what it's blocked on). Keys
-  mirror the code-review view (`j`/`k`, PageUp/Down, `Ctrl+D`/`U`, `g`/`G`, `w`
-  wrap, `Left`/`Right` h-scroll, `/` find). Mutually exclusive with the
-  code-review overlay.
-- **Code shape.** Pure data + defensive parsers in `session::cc_activity` (arch
-  rule `ui ← session`); the off-thread scan + view state + key handlers in
-  `app::cc_activity`; the renderer in `ui::cc_activity` (reuses `focus_block` /
-  `scrollbar` / theme). Parsing is isolated in one module because the Claude Code
-  on-disk layout is undocumented and version-specific (verified against v2.1.201–
-  2.1.204), degrading to a partial tree rather than an error.
-- **Follow-ups** (named, not silently dropped): markdown rendering of
-  thinking/text (blocked on `ui::markdown` not being width-aware); async parse of
-  very large transcripts; parsing an in-process run's workflow `scripts/*.js` for
+- **Surface & keys.** A side navigator in the file-viewer column
+  (`InputFocus::CcActivityTree`): the six sections, with the Claude
+  workflow/subagent tree nested under Agents (Space folds a workflow or the
+  whole subtree). The central pane (`InputFocus::CcActivity`) shows the
+  selected section's event list, an agent transcript (assistant thinking /
+  text / foldable `tool_use` + `tool_result`), or a workflow overview
+  (phases, per-agent grid, logs, plus a background run's live pace / what
+  it's blocked on). Keys mirror the code-review view (`j`/`k`, PageUp/Down,
+  `Ctrl+D`/`U`, `g`/`G`, `w` wrap, `Left`/`Right` h-scroll, `/` find) plus
+  `1`–`6` section jumps. Mutually exclusive with the code-review overlay.
+- **Code shape.** Pure data + defensive parsers in `session::activity`
+  (model + one submodule per provider) and `session::cc_activity` (the
+  Claude tree; arch rule `ui ← session`); the event scan + provider
+  discovery in `app::activity` (one submodule per provider), the tree scan +
+  view state + key handlers in `app::cc_activity`; the renderer in
+  `ui::cc_activity` (reuses `focus_block` / `scrollbar` / theme). Parsing is
+  isolated per provider because every agent's on-disk layout is undocumented
+  and version-specific (Claude verified against v2.1.201–2.1.206), degrading
+  to partial data rather than an error.
+- **Follow-ups** (named, not silently dropped): event streams from Claude
+  subagent/daemon-worker transcripts (main transcript only today, sidechain
+  lines aside); hook-injected capture for `agy` (encrypted store) and a
+  session-keyed reader for `amp`; markdown rendering of thinking/text
+  (blocked on `ui::markdown` not being width-aware); async parse of very
+  large transcripts; parsing an in-process run's workflow `scripts/*.js` for
   live phase names; baking the session id into per-session hook commands so a
   daemon worker also reports `working`/`blocked`/`done` **status**; and remote
   (`ssh:`/`wsl:`) support. **Done since v1:** daemon-worker attribution + live
-  overview, per-session `--settings` for exact attribution, find-in-transcript.
+  overview, per-session `--settings` for exact attribution, find-in-transcript,
+  the July 2026 multi-agent redesign.
 
 #### Import an existing Claude Code conversation (`i` in the session list)
 

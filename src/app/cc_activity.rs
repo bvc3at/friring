@@ -1200,11 +1200,13 @@ impl App {
             }
             InputFocus::Terminal if open => {
                 // Returning to a session whose view stayed open: promote focus and
-                // refresh the snapshot, since the background scan updates
-                // `SessionInfo.cc_activity` but only live-tails the *active*
-                // session — so a workflow that finished while away is now current.
+                // refresh the snapshot, since the background scans update
+                // `SessionInfo.cc_activity` / `App::activity` but only live-tail
+                // the *active* session — so a workflow that finished (or events
+                // that accrued) while away are now current.
                 self.focus = InputFocus::CcActivityTree;
                 self.reload_cc_activity();
+                self.refresh_activity_view(false);
             }
             _ => {}
         }
@@ -1377,7 +1379,13 @@ impl App {
         match section {
             activity::Section::Overview => (
                 Vec::new(),
-                activity::overview_rows(&info.agent, self.session_provider(info), act, info),
+                activity::overview_rows(
+                    &info.agent,
+                    &self.session_command(info),
+                    self.session_provider(info),
+                    act,
+                    info,
+                ),
             ),
             activity::Section::Files => (Vec::new(), activity::files_rows(events)),
             activity::Section::Agents => {

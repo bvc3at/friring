@@ -102,6 +102,27 @@ impl ProviderKind {
     }
 }
 
+/// Why a known agent CLI has no provider — shown in the Overview instead of
+/// the generic unsupported line, so the gap reads as a decision, not a bug.
+/// (Findings from the July 2026 on-disk-format research; see FORK.md.)
+fn unsupported_reason(command: &str) -> Option<&'static str> {
+    let base = Path::new(command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(command);
+    match base {
+        "agy" => Some(
+            "agy encrypts its conversation store (AES-GCM trajectories + opaque SQLite \
+             blobs); hook-based capture is the planned follow-up.",
+        ),
+        "amp" => Some(
+            "amp keeps threads server-side; its local logs lack a stable session-to-cwd \
+             mapping to read from.",
+        ),
+        _ => None,
+    }
+}
+
 /// One session's accumulated activity: the provider, its scan state (bound
 /// sources + streaming parsers + byte offsets), and the stat signature that
 /// gates re-reads.
@@ -207,15 +228,19 @@ struct ScanRoots {
 }
 
 impl App {
-    /// The activity provider for a session, from its registry entry's command
-    /// basename (the registry name itself when the entry is gone).
-    pub(crate) fn session_provider(&self, info: &SessionInfo) -> Option<ProviderKind> {
-        let command = self
-            .agents
+    /// The CLI command behind a session's agent (the registry name itself
+    /// when the entry is gone) — the provider-dispatch key.
+    pub(super) fn session_command(&self, info: &SessionInfo) -> String {
+        self.agents
             .get(&info.agent)
             .map(|a| a.command.clone())
-            .unwrap_or_else(|| info.agent.clone());
-        ProviderKind::for_command(&command)
+            .unwrap_or_else(|| info.agent.clone())
+    }
+
+    /// The activity provider for a session, from its registry entry's command
+    /// basename.
+    pub(crate) fn session_provider(&self, info: &SessionInfo) -> Option<ProviderKind> {
+        ProviderKind::for_command(&self.session_command(info))
     }
 
     /// Kick off a background event scan for every local session with a
@@ -614,6 +639,7 @@ pub(crate) fn fmt_time(ts_ms: u64) -> String {
 /// a scan pass has run.
 pub(super) fn overview_rows(
     agent_name: &str,
+    command: &str,
     provider: Option<ProviderKind>,
     activity: Option<&SessionActivity>,
     info: &SessionInfo,
@@ -625,7 +651,9 @@ pub(super) fn overview_rows(
             rows.push(CcRow::Info(String::new()));
             rows.push(CcRow::Info(match provider {
                 Some(_) => "No activity captured yet.".to_string(),
-                None => "Activity capture isn't supported for this agent yet.".to_string(),
+                None => unsupported_reason(command)
+                    .unwrap_or("Activity capture isn't supported for this agent yet.")
+                    .to_string(),
             }));
         }
         Some(act) => {
@@ -891,15 +919,20 @@ mod tests {
     #[test]
     fn overview_rows_cover_supported_and_unsupported() {
         let mut info = SessionInfo::new("s".to_string());
-        let rows = overview_rows("my-agent", None, None, &info);
+        let rows = overview_rows("my-agent", "my-agent-cli", None, None, &info);
         assert!(rows.iter().any(
             |r| matches!(r, CcRow::Info(s) if s.contains("isn't supported for this agent yet"))
         ));
         // Supported provider, but no scan pass yet.
-        let rows = overview_rows("claude", Some(ProviderKind::Claude), None, &info);
+        let rows = overview_rows("claude", "claude", Some(ProviderKind::Claude), None, &info);
         assert!(rows
             .iter()
             .any(|r| matches!(r, CcRow::Info(s) if s.contains("No activity captured yet"))));
+        // A researched-but-unsupported CLI names its reason.
+        let rows = overview_rows("antigravity", "agy", None, None, &info);
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, CcRow::Info(s) if s.contains("encrypts its conversation store"))));
 
         let mut act = SessionActivity::new(ProviderKind::Vibe);
         if let ProviderScan::Vibe(s) = &mut act.scan {
@@ -909,7 +942,7 @@ mod tests {
             s.meta.meta.title = Some("Build it".into());
         }
         info.cc_activity = None;
-        let rows = overview_rows("vibe", Some(ProviderKind::Vibe), Some(&act), &info);
+        let rows = overview_rows("vibe", "vibe", Some(ProviderKind::Vibe), Some(&act), &info);
         assert!(rows
             .iter()
             .any(|r| matches!(r, CcRow::Text(s) if s.contains("provider vibe"))));
