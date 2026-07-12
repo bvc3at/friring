@@ -167,6 +167,20 @@ tick-side drift check re-pushes PTY sizes when an `auto` flip moves the dock
 `docs/CONFIG.md` + `docs/FEATURES.md` ("Info panel docking"); the **default
 changed** from upstream's always-column to `auto`.
 
+#### Terminal-first focus
+
+Upstream starts focused on the session list, and clicking a session row
+focuses the *list* — so the first thing typed after startup or after a
+click lands in the list's single-letter hotkeys (`i` opens the import
+picker, `Shift+S` re-sorts) instead of reaching the agent. The fork makes
+the terminal the default focus target: startup lands in the terminal when
+any session was restored, clicking a session row selects it **and**
+focuses the terminal (matching `Enter` / a notification click / a
+global-search jump), and `Esc` backs out of a focused session list. The
+list stays reachable for management (reorder, import) via `Ctrl+H` or a
+click on its empty area. See `docs/FEATURES.md` ("Focus model:
+terminal-first").
+
 ### Behavior fixes
 
 - **Worktree branch pre-fill keeps `/`.** In the new-worktree flow, the branch

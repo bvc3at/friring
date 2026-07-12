@@ -2789,7 +2789,12 @@ impl App {
                 if let Some(&idx) = self.render_order_indices().get(display_idx) {
                     self.active_index = idx;
                 }
-                self.focus = InputFocus::SessionList;
+                // Clicking a row is *activation*, not list management: land in
+                // the terminal (like Enter / a notification click) so typing
+                // reaches the agent instead of the list's single-letter
+                // hotkeys. The list itself stays reachable via Ctrl+H or a
+                // click on its empty area (the whole-rect FocusPane fallback).
+                self.focus = InputFocus::Terminal;
                 self.on_focus_changed();
                 false
             }
@@ -5746,6 +5751,22 @@ impl App {
 
         // Claim ownership of restored sessions in the shared state
         self.save_state();
+
+        self.apply_startup_focus();
+    }
+
+    /// Startup default focus: the **terminal** whenever any session was
+    /// restored. Selection already tracks the active session, so the list is a
+    /// glanceable dashboard plus an explicit "manage" surface (`Ctrl+H`), not
+    /// the place keystrokes should land first — starting there is how typed
+    /// input ends up triggering list hotkeys instead of reaching the agent.
+    /// With no sessions the list keeps focus (its empty state advertises
+    /// `Ctrl+N`). Remote sessions adopt in the background and don't count —
+    /// by the time one lands the user may already be typing somewhere.
+    fn apply_startup_focus(&mut self) {
+        if !self.sessions.is_empty() {
+            self.focus = InputFocus::Terminal;
+        }
     }
 
     /// Kick off one discovery thread per distinct remote backend and queue its
@@ -9279,9 +9300,9 @@ mod tests {
     // --- Mouse click targets (click-to-select/focus + modal rows) ---
 
     #[test]
-    fn click_session_row_selects_and_focuses_list() {
+    fn click_session_row_selects_and_focuses_terminal() {
         let mut app = app_with_sessions(3);
-        app.focus = InputFocus::Terminal;
+        app.focus = InputFocus::SessionList;
         // As recorded by view(): a row hitbox inside the left panel.
         app.click_targets.push(ClickTarget {
             rect: Rect::new(1, 3, 20, 1),
@@ -9292,9 +9313,41 @@ mod tests {
 
         let order = app.render_order_indices();
         assert_eq!(app.active_index, order[2]);
-        assert_eq!(app.focus, InputFocus::SessionList);
+        // Clicking a row is activation: focus lands in the terminal (like
+        // Enter), so typing right after the click reaches the agent.
+        assert_eq!(app.focus, InputFocus::Terminal);
         // The same press still arms drag-select inside the left panel.
         assert!(app.text_selection.is_some());
+    }
+
+    #[test]
+    fn esc_in_session_list_returns_to_terminal() {
+        let mut app = app_with_sessions(2);
+        app.focus = InputFocus::SessionList;
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.focus, InputFocus::Terminal);
+    }
+
+    #[test]
+    fn esc_in_empty_session_list_stays_put() {
+        let mut app = app_with_sessions(0);
+        app.focus = InputFocus::SessionList;
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.focus, InputFocus::SessionList);
+    }
+
+    #[test]
+    fn startup_focus_lands_in_terminal_with_sessions() {
+        let mut app = app_with_sessions(2);
+        app.apply_startup_focus();
+        assert_eq!(app.focus, InputFocus::Terminal);
+    }
+
+    #[test]
+    fn startup_focus_stays_on_list_without_sessions() {
+        let mut app = app_with_sessions(0);
+        app.apply_startup_focus();
+        assert_eq!(app.focus, InputFocus::SessionList);
     }
 
     #[test]
@@ -9471,7 +9524,7 @@ mod tests {
         app.handle_mouse_click(target.x, target.y, KeyModifiers::NONE);
         let order = app.render_order_indices();
         assert_eq!(app.active_index, order[1]);
-        assert_eq!(app.focus, InputFocus::SessionList);
+        assert_eq!(app.focus, InputFocus::Terminal);
     }
 
     #[test]

@@ -719,8 +719,15 @@ impl App {
 
     /// Session-list keys are all rebindable `SessionList`-scoped actions
     /// (`SessionListNext`/`Prev`/`Open`), resolved by the context lookup in
-    /// `handle_key` before this runs — so nothing remains to handle here.
-    pub(crate) fn handle_session_list_key(&mut self, _code: KeyCode) {}
+    /// `handle_key` before this runs. Only the fixed `Esc` escape hatch lives
+    /// here (literal, like the other panes' Esc): the list is a transient
+    /// "manage" surface, so backing out of it must never cost more than one
+    /// keystroke. No-op with no sessions — the terminal would be a dead end.
+    pub(crate) fn handle_session_list_key(&mut self, code: KeyCode) {
+        if code == KeyCode::Esc && !self.sessions.is_empty() {
+            self.focus = InputFocus::Terminal;
+        }
+    }
 
     fn handle_terminal_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         // Terminal scroll is handled by the rebindable `TerminalScroll*`

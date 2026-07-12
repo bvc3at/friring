@@ -456,6 +456,18 @@ scrollback).
 - Ctrl combos are easier to type one-handed, which matters for a
   tool used alongside other terminals.
 
+### Focus model: terminal-first
+
+The terminal is where keystrokes belong; the session list is a glanceable
+dashboard, not a destination. Selection *is* activation (the list has no
+separate cursor — the highlighted row is the active session), so every
+"go to this session" gesture lands focus in the terminal: startup (when
+sessions were restored), clicking a session row, `Enter` in the list, a
+notification click, and a global-search jump. The list is only focused
+deliberately — `Ctrl+H`, or a click on its empty area — for management
+work like reordering or import, and `Esc` backs out of it in one
+keystroke.
+
 ### Keybinding Table
 
 All global keybindings use `Ctrl` and follow Vim conventions where
@@ -503,6 +515,7 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Enter` | Global search | Jump to selected result | |
 | `Esc` | Global search | Close search | |
 | `Enter` | Session list | Focus terminal | |
+| `Esc` | Session list | Focus terminal (back out of the list) | |
 | `j` / `Down` | Repo picker | Next repo | |
 | `k` / `Up` | Repo picker | Previous repo | |
 | `Space` | Repo picker | Toggle repo selection | |
@@ -516,7 +529,8 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Shift+PageUp` / `Alt+PageUp` | Focused terminal | Scroll up half page | |
 | `Shift+PageDown` / `Alt+PageDown` | Focused terminal | Scroll down half page | |
 | Mouse wheel | Focused terminal | Scroll up/down 3 lines | |
-| Click | Session/task/automation/file row | Select the row and focus its pane | |
+| Click | Session row | Select the session and focus the terminal | |
+| Click | Task/automation/file row | Select the row and focus its pane | |
 | Click | Any pane | Focus the pane under the cursor | |
 | Click | Picker modal row | Select and confirm (Enter; repo picker: Space toggle) | |
 | Hover | Clickable rows | Underline the row a click would hit | |
