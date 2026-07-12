@@ -499,6 +499,20 @@ pub fn display_path(path: &Path) -> String {
     }
 }
 
+/// Full path for display with the home directory shortened to `~`. Used where
+/// a basename alone would be ambiguous (e.g. "import repos from ~/code").
+pub fn display_path_tilde(path: &Path) -> String {
+    if let Some(home) = home_dir() {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            if rest.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rest.display());
+        }
+    }
+    path.display().to_string()
+}
+
 /// Find the longest common prefix among a slice of strings.
 fn longest_common_prefix(strings: &[String]) -> String {
     if strings.is_empty() {
@@ -964,6 +978,15 @@ mod tests {
             longest_common_prefix(&["répo".to_string(), "rêpo".to_string()]),
             "r"
         );
+    }
+
+    #[test]
+    fn display_path_tilde_shortens_home() {
+        if let Some(home) = home_dir() {
+            assert_eq!(display_path_tilde(&home.join("code")), "~/code");
+            assert_eq!(display_path_tilde(&home), "~");
+        }
+        assert_eq!(display_path_tilde(Path::new("/opt/x")), "/opt/x");
     }
 
     #[test]

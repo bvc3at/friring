@@ -271,7 +271,7 @@ fn bookmark_item<'a>(
             Span::styled(
                 format!(
                     "import repos from {}",
-                    crate::paths::display_path(&row.path)
+                    crate::paths::display_path_tilde(&row.path)
                 ),
                 style,
             ),
@@ -387,7 +387,7 @@ fn footer_line(state: &RepoPickerState<'_>) -> Line<'static> {
             ]);
             if state.input.is_empty() {
                 spans.extend(hint("Del", " forget  "));
-                spans.extend(hint("^P", " import folder"));
+                spans.extend(hint("^P", " import"));
             } else {
                 spans.extend(hint("Esc", " cancel"));
             }
@@ -495,7 +495,7 @@ mod tests {
         assert!(text.contains("Space pick"));
         assert!(!text.contains("^Space pick"));
         assert!(text.contains("Del forget"));
-        assert!(text.contains("^P import folder"));
+        assert!(text.contains("^P import"));
     }
 
     #[test]

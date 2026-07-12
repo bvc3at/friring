@@ -2276,18 +2276,23 @@ impl App {
     }
 
     /// Enter on a candidate that is a git repo: bookmark it, select it, and
-    /// advance the flow with it.
+    /// advance the flow with it. The path input is cleared first so the
+    /// palette parked for Esc-back shows the picked bookmark, not a stale
+    /// path-mode candidate view.
     fn repo_picker_open_candidate(&mut self, full: &std::path::Path) {
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
             return;
         };
         let persist = Self::repo_picker_select_or_add_row(rp, full);
+        rp.input.clear();
         if persist {
             if let Err(e) = self.db.upsert_repo_bookmark(self.bookmark_host_key(), full) {
                 error!("Failed to save repo bookmark: {e}");
                 self.set_error(format!("Failed to save repo bookmark: {e}"));
             }
         }
+        self.recompute_repo_filter();
+        self.refresh_repo_picker_candidates();
         self.submit_repo_picker();
     }
 
@@ -2400,9 +2405,24 @@ impl App {
     ) -> bool {
         // If already represented, just select it (no duplicate row or DB entry).
         let Some(idx) = rp.rows.iter().position(|r| r.path == *expanded) else {
-            rp.push_row(
-                expanded.to_path_buf(),
-                super::modals::RepoRowKind::Repo { child: false },
+            // New rows land before the pinned helper rows, not after them.
+            let insert_at = rp
+                .rows
+                .iter()
+                .position(|r| {
+                    matches!(
+                        r.kind,
+                        super::modals::RepoRowKind::ImportSuggestion
+                            | super::modals::RepoRowKind::StartHere
+                    )
+                })
+                .unwrap_or(rp.rows.len());
+            rp.rows.insert(
+                insert_at,
+                super::modals::RepoRow {
+                    path: expanded.to_path_buf(),
+                    kind: super::modals::RepoRowKind::Repo { child: false },
+                },
             );
             rp.selected.insert(expanded.to_path_buf());
             return true;
