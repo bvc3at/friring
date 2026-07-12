@@ -444,7 +444,8 @@ fn is_shell_tool(name: &str) -> bool {
 
 /// Render a command for display. Codex records commands as an argv array
 /// (`["bash","-lc","cargo test"]`) or, for the `shell_command` tool, a string;
-/// the argv `bash -lc <script>` wrapper is unwrapped to the script itself.
+/// a *shell's* `-c` wrapper is unwrapped to the script itself, but other
+/// interpreters keep their argv (`python -c print(1)` must not lose `python`).
 fn format_command(v: &Value) -> Option<String> {
     if let Some(s) = v.as_str() {
         let s = s.trim();
@@ -454,10 +455,16 @@ fn format_command(v: &Value) -> Option<String> {
     if parts.is_empty() {
         return None;
     }
-    if parts.len() == 3 && matches!(parts[1], "-lc" | "-c" | "-lic") {
+    if parts.len() == 3 && matches!(parts[1], "-lc" | "-c" | "-lic") && is_shell(parts[0]) {
         return Some(parts[2].to_string());
     }
     Some(parts.join(" "))
+}
+
+/// Whether an argv head names a shell (path-basename aware).
+fn is_shell(argv0: &str) -> bool {
+    let base = argv0.rsplit('/').next().unwrap_or(argv0);
+    matches!(base, "bash" | "sh" | "zsh" | "dash" | "fish" | "ksh")
 }
 
 /// Find the `*** Begin Patch … *** End Patch` envelope string nested anywhere
@@ -677,6 +684,21 @@ mod tests {
         assert_eq!(s.events[3].detail, "/p/diagram.png");
         assert_eq!(s.events[4].detail, "rust tokio mpsc");
         assert_eq!(s.meta.model.as_deref(), Some("gpt-5-codex"));
+    }
+
+    #[test]
+    fn format_command_unwraps_shell_wrappers_only() {
+        let shell = serde_json::json!(["bash", "-lc", "cargo test"]);
+        assert_eq!(format_command(&shell).as_deref(), Some("cargo test"));
+        let pathed = serde_json::json!(["/usr/bin/zsh", "-c", "echo hi"]);
+        assert_eq!(format_command(&pathed).as_deref(), Some("echo hi"));
+        // A non-shell interpreter keeps its argv — the `-c` body alone would
+        // lose what actually ran.
+        let python = serde_json::json!(["python", "-c", "print(1)"]);
+        assert_eq!(
+            format_command(&python).as_deref(),
+            Some("python -c print(1)")
+        );
     }
 
     #[test]
