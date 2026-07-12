@@ -50,7 +50,8 @@ config_version = 1
 # tasks = true            # F5/Ctrl+W tasks panel
 # automations = true      # automations pane, Ctrl+P, schedule firing
 # file_viewer = true      # F3 file viewer column
-# global_search = true    # Ctrl+/ search strip
+# global_search = true    # Ctrl+/ search popup
+# double_shift_search = true   # double-Shift opens the search (kitty-protocol terminals only; Ctrl+/ unaffected)
 # info_panel = true       # F2 info panel
 # shell_pane = true       # Ctrl+T per-session shell
 # code_review = true      # native code-review view (diff + comments)
@@ -306,6 +307,7 @@ mod tests {
             "automations",
             "file_viewer",
             "global_search",
+            "double_shift_search",
             "info_panel",
             "shell_pane",
             "code_review",
