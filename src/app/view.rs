@@ -1,4 +1,4 @@
-//! View / rendering logic for the Thurbox TUI.
+//! View / rendering logic for the Friring TUI.
 //!
 //! Contains the main `App::view` method and helper functions for
 //! rendering the help overlay and formatting timestamps.

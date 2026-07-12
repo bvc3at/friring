@@ -1,6 +1,6 @@
 //! Loading and seeding of the settings config file.
 //!
-//! `~/.config/thurbox/settings.toml` holds the user-tunable scalars and
+//! `~/.config/friring/settings.toml` holds the user-tunable scalars and
 //! feature flags (see [`crate::session::settings::Settings`]). On first run the file is seeded
 //! fully commented-out, so a fresh install runs on the built-in defaults. A
 //! malformed file degrades to the defaults with a startup warning.
@@ -11,12 +11,12 @@ use crate::session::settings::{NotificationBackend, Settings};
 
 /// Seed contents for `settings.toml` on first run: every knob documented with
 /// its default, all commented out.
-pub const SEED_SETTINGS_TOML: &str = r#"# Thurbox settings  —  ~/.config/thurbox/settings.toml
+pub const SEED_SETTINGS_TOML: &str = r#"# Friring settings  —  ~/.config/friring/settings.toml
 #
 # Scalar tuning knobs. Every entry below is commented out and shows its
 # default; uncomment to change. Read once at startup.
 #
-# Unknown keys are reported on startup (and fail `thurbox-cli config
+# Unknown keys are reported on startup (and fail `friring-cli config
 # validate`) but don't break the load.
 
 config_version = 1
@@ -43,7 +43,7 @@ config_version = 1
 
 # Feature flags: turn whole TUI features off. All default to true.
 # Disabling `automations` also stops the TUI firing schedules and arming
-# the tmux heartbeat on startup; explicit `thurbox-cli automation`
+# the tmux heartbeat on startup; explicit `friring-cli automation`
 # commands (and an already-armed heartbeat window) keep working. Data is
 # never touched, so re-enabling a flag is lossless.
 # [features]
@@ -63,11 +63,11 @@ config_version = 1
 #
 # `version_check` and `auto_update` are the two flags that default to FALSE:
 # both reach the network (GitHub) on startup. `version_check` only *notifies*
-# (TUI header "update available" badge + `thurbox-cli version --check`);
+# (TUI header "update available" badge + `friring-cli version --check`);
 # `auto_update` goes further and silently downloads, verifies, and replaces the
 # installed binaries when a newer release exists (the new version applies on the
 # next launch); it also auto-refreshes any installed extension that the upgrade
-# left stale (self-heal, TUI startup + headless tick). `thurbox-cli update` does
+# left stale (self-heal, TUI startup + headless tick). `friring-cli update` does
 # the same binary update on demand.
 # version_check = false   # GitHub update check (TUI badge + `version --check`)
 # auto_update = false     # silently download+verify+replace binaries on startup
@@ -76,7 +76,7 @@ config_version = 1
 # selects the session in the running TUI); macOS shows a passive banner only.
 # Under WSL (no dbus notification daemon) the `auto` backend delivers a Windows
 # toast via powershell.exe instead — click-to-focus is unavailable on that path.
-# Run `thurbox-cli notify` to see the detected backend, or `--test` to fire a
+# Run `friring-cli notify` to see the detected backend, or `--test` to fire a
 # sample. The dispatcher only starts when [features] notifications = true.
 # [notifications]
 # also_on_waiting = false       # also fire when a session finishes (Working → Done)
@@ -113,13 +113,13 @@ config_version = 1
 # [features]
 # version_check = true
 #
-# Keep thurbox up to date automatically — silently download+verify+replace the
+# Keep friring up to date automatically — silently download+verify+replace the
 # binaries on startup when a newer release exists (restart to apply):
 # [features]
 # auto_update = true
 "#;
 
-/// Path to the settings file: `~/.config/thurbox/settings.toml`.
+/// Path to the settings file: `~/.config/friring/settings.toml`.
 pub fn settings_config_path() -> Option<PathBuf> {
     crate::paths::config_file().map(|p| p.with_file_name("settings.toml"))
 }
@@ -438,7 +438,7 @@ mod tests {
         save_settings(&s).unwrap();
 
         let raw = std::fs::read_to_string(settings_config_path().unwrap()).unwrap();
-        assert!(raw.contains("# Thurbox settings"));
+        assert!(raw.contains("# Friring settings"));
         assert!(raw.contains("Common recipes"));
     }
 

@@ -1,4 +1,4 @@
-//! Key event handlers for the Thurbox TUI application.
+//! Key event handlers for the Friring TUI application.
 //!
 //! This module contains all keyboard input handling logic organized by context:
 //! - Global keybindings (always active)
@@ -47,7 +47,7 @@ fn session_name_to_branch(name: &str) -> String {
     result.trim_matches(['-', '/']).to_string()
 }
 
-/// Whether a pressed chord is a bare `Ctrl+<letter>` — the namespace thurbox
+/// Whether a pressed chord is a bare `Ctrl+<letter>` — the namespace friring
 /// shares with readline / shell line-editing chords. Used to gate
 /// [`crate::session::Action::terminal_passthrough`] so the PTY-deferral only
 /// fires for the conflicting chords; a non-`Ctrl+letter` rebind of a
@@ -187,7 +187,7 @@ impl App {
         // line editing keeps working — see `Action::terminal_passthrough`.
         // The deferral is gated on the bound chord still being a bare
         // `Ctrl+<letter>`, so a rebind to a non-conflicting key keeps the
-        // thurbox command working even in the terminal.
+        // friring command working even in the terminal.
         let context = self.focus_key_context();
         if let Some(action) = self.keybindings.lookup_in(context, code, mods) {
             let defer_to_pty = self.focus == InputFocus::Terminal
@@ -405,7 +405,7 @@ impl App {
     }
 
     /// Serialize the current keybindings and write them to
-    /// `~/.config/thurbox/keybindings.json`. Surfaces failures via the status
+    /// `~/.config/friring/keybindings.json`. Surfaces failures via the status
     /// bar rather than aborting — the in-memory map is already updated.
     fn persist_keybindings(&mut self) {
         match self.keybindings.to_json() {

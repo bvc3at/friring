@@ -1,24 +1,24 @@
 # The built-in "hooks" extension.
 #
-# Wires each coding agent's lifecycle hooks to `thurbox-cli session signal` so
-# every session reports its state (working / blocked / done) back to thurbox.
+# Wires each coding agent's lifecycle hooks to `friring-cli session signal` so
+# every session reports its state (working / blocked / done) back to friring.
 # Unlike user extensions this one ships embedded in the binary and is
 # auto-activated on first run. Opt out with:
 #
-#     thurbox-cli extension deactivate hooks
+#     friring-cli extension deactivate hooks
 #
-# Identity is the injected $THURBOX_SESSION env var (no ids passed by hand), and
-# every hook command is `… || true` so a missing thurbox-cli or a hook firing
-# outside a thurbox session can never break the agent.
+# Identity is the injected $FRIRING_SESSION env var (no ids passed by hand), and
+# every hook command is `… || true` so a missing friring-cli or a hook firing
+# outside a friring session can never break the agent.
 
 name = "hooks"
-description = "Report each agent's lifecycle state (working/blocked/done) to thurbox via agent hooks."
+description = "Report each agent's lifecycle state (working/blocked/done) to friring via agent hooks."
 config_version = 1
 version = "1.4.0"
 # Default home; the auto-activation path overrides this with *this build's*
-# resolved config dir (`~/.config/thurbox` or `~/.config/thurbox-dev`) so dev and
+# resolved config dir (`~/.config/friring` or `~/.config/friring-dev`) so dev and
 # release installs stay isolated. See `session_ops::builtin_hooks::hooks_home`.
-home = "~/.config/thurbox/hooks"
+home = "~/.config/friring/hooks"
 
 # claude reads hooks from a settings file we pass via --settings (merged with the
 # user's own settings, never clobbering them). The file lives under the home dir.
@@ -38,13 +38,13 @@ name = "aider"
 append_args = [
   "--notifications",
   "--notifications-command",
-  "thurbox-cli session signal --state blocked",
+  "friring-cli session signal --state blocked",
 ]
 
 # opencode loads plugins from its own config dir; drop one in (only when opencode
 # is actually installed, guarded by requires_dir).
 [[external_files]]
-path = "~/.config/opencode/plugin/thurbox-status.js"
+path = "~/.config/opencode/plugin/friring-status.js"
 source = "opencode-status.js"
 requires_dir = "~/.config/opencode"
 
@@ -96,7 +96,7 @@ requires_dir = "~/.vibe"
 # preToolUse/agentStop fail-open flow. If a future copilot changes the schema,
 # edit copilot-hooks.json (no code change).
 [[external_files]]
-path = "~/.copilot/hooks/thurbox-status.json"
+path = "~/.copilot/hooks/friring-status.json"
 source = "copilot-hooks.json"
 requires_dir = "~/.copilot"
 
@@ -112,7 +112,7 @@ requires_dir = "~/.copilot"
 # approval, like claude, so an idle Notification doesn't flip the dot red). It has
 # no UserPromptSubmit, so working is signaled at the first tool call. If a future
 # agy changes the schema, fix antigravity-hooks.json (no code change needed).
-# Identity needs $THURBOX_SESSION to reach the hook process; if agy sanitizes the
+# Identity needs $FRIRING_SESSION to reach the hook process; if agy sanitizes the
 # hook env the signal is a fail-open no-op (`|| true`).
 [[config_merges]]
 path = "~/.gemini/settings.json"

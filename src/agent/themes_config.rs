@@ -1,6 +1,6 @@
 //! Loading and seeding of the custom-themes config file.
 //!
-//! `~/.config/thurbox/themes.toml` defines user themes as a base preset plus
+//! `~/.config/friring/themes.toml` defines user themes as a base preset plus
 //! per-colour overrides (see [`crate::session::theme_config::CustomThemeDef`]).
 //! Seeded with a fully commented-out example, so a fresh install ships only
 //! the built-in presets. Resolution problems (bad colours, name collisions)
@@ -12,7 +12,7 @@ use crate::session::theme_config::{ThemeEntry, ThemesFile};
 use crate::session::ThemePreset;
 
 /// Seed contents for `themes.toml` on first run.
-pub const SEED_THEMES_TOML: &str = r##"# Thurbox custom themes  —  ~/.config/thurbox/themes.toml
+pub const SEED_THEMES_TOML: &str = r##"# Friring custom themes  —  ~/.config/friring/themes.toml
 #
 # Each [[themes]] entry defines a theme offered in the Ctrl+Y picker alongside
 # the built-in presets. Start from a built-in `base` and override only the
@@ -33,7 +33,7 @@ pub const SEED_THEMES_TOML: &str = r##"# Thurbox custom themes  —  ~/.config/t
 # diff_added, diff_removed, diff_added_bg, diff_removed_bg, app_bg.
 # Plus: display_name (string), light (bool), nerd_font (bool).
 #
-# Unknown keys are reported on startup (and fail `thurbox-cli config
+# Unknown keys are reported on startup (and fail `friring-cli config
 # validate`) but don't break the load.
 
 config_version = 1
@@ -72,7 +72,7 @@ config_version = 1
 # selection_bg = "14"
 "##;
 
-/// Path to the custom-themes file: `~/.config/thurbox/themes.toml`.
+/// Path to the custom-themes file: `~/.config/friring/themes.toml`.
 pub fn themes_config_path() -> Option<PathBuf> {
     crate::paths::config_file().map(|p| p.with_file_name("themes.toml"))
 }

@@ -58,6 +58,7 @@ _site/
 
 # Local orchestrator/agent worker workspaces (stray nested checkouts)
 thurbox/
+friring/
 
 # Python bytecode cache (from the packaging bump scripts)
 __pycache__/

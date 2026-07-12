@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# Run a thurbox *dev build* in an isolated sandbox — one command to launch the
-# `thurbox-dev` TUI/CLI against a throwaway or persistent environment that never
-# touches your real ~/.config/thurbox or tmux server.
+# Run a friring *dev build* in an isolated sandbox — one command to launch the
+# `friring-dev` TUI/CLI against a throwaway or persistent environment that never
+# touches your real ~/.config/friring or tmux server.
 #
-# By default only *thurbox's own* config/data are redirected (via THURBOX_*_DIR)
+# By default only *friring's own* config/data are redirected (via FRIRING_*_DIR)
 # — your real HOME/agents stay intact, so authenticated claude/codex/antigravity work.
 # Pass --isolate-home for a fully hermetic env (fresh HOME, agents boot without
 # credentials), e.g. to reproduce the demo/smoke conditions.
@@ -15,8 +15,8 @@
 #   scripts/dev/sandbox.sh --profile foo   # named persistent profile
 #   scripts/dev/sandbox.sh --isolate-home  # full isolation (fresh HOME; no agent creds)
 #   scripts/dev/sandbox.sh --shell         # drop into a shell with the sandbox env
-#                                          #   (run `thurbox-cli ...` against the sandbox DB)
-#   scripts/dev/sandbox.sh -- session list # run `thurbox-cli <args>` in the sandbox
+#                                          #   (run `friring-cli ...` against the sandbox DB)
+#   scripts/dev/sandbox.sh -- session list # run `friring-cli <args>` in the sandbox
 #   scripts/dev/sandbox.sh --clean [name]  # kill + wipe a persistent profile, then exit
 #
 # State (persistent mode): target/dev-sandbox/<profile>/ (gitignored). Sessions
@@ -40,7 +40,7 @@ die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 mode="persistent"
 profile="default"
-isolation="thurbox" # thurbox | full
+isolation="friring" # friring | full
 action="tui"        # tui | shell | cli | clean
 cli_args=()
 
@@ -66,8 +66,8 @@ if [ "$action" = "clean" ]; then
 fi
 
 # Build the dev binaries BEFORE the HOME override (so cargo finds ~/.cargo).
-log "building thurbox (dev)"
-( cd "$TBX_REPO_ROOT" && cargo build --bin thurbox --bin thurbox-cli >&2 )
+log "building friring (dev)"
+( cd "$TBX_REPO_ROOT" && cargo build --bin friring --bin friring-cli >&2 )
 
 if [ "$isolation" = "full" ]; then
     tbx_sandbox_init_full "$mode" "$profile"
@@ -82,11 +82,11 @@ log "sandbox root: $TBX_SANDBOX_ROOT ($mode, $isolation isolation)"
 run_in_sandbox() {
     case "$action" in
         shell)
-            log "entering sandbox shell — \`thurbox\`/\`thurbox-cli\` target this sandbox; exit to leave"
+            log "entering sandbox shell — \`friring\`/\`friring-cli\` target this sandbox; exit to leave"
             "${SHELL:-bash}" -i
             ;;
-        cli) "$TBX_REPO_ROOT/target/debug/thurbox-cli" "${cli_args[@]}" ;;
-        tui) "$TBX_REPO_ROOT/target/debug/thurbox" ;;
+        cli) "$TBX_REPO_ROOT/target/debug/friring-cli" "${cli_args[@]}" ;;
+        tui) "$TBX_REPO_ROOT/target/debug/friring" ;;
     esac
 }
 

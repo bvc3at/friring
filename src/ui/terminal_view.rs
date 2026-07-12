@@ -154,7 +154,7 @@ pub fn render_empty_terminal(frame: &mut Frame, area: Rect) {
 /// the vt100 model holds is exactly what lands in the frame buffer, and no raw
 /// control byte ever leaks into a rendered cell. Complements the transport
 /// proptests in `agent::control_mode` — together they cover the whole
-/// agent-bytes → screen pipeline, so a green suite rules thurbox out as a source
+/// agent-bytes → screen pipeline, so a green suite rules friring out as a source
 /// of glitched/stray characters.
 #[cfg(test)]
 mod render_proptests {
@@ -364,7 +364,7 @@ mod render_proptests {
         // against the real UTF-8-boundary-safe chunker (`utf8_ready_prefix_len`)
         // that feeds the vt100 parser. vt100 itself is *not* split-invariant for
         // chunks that end mid-codepoint (it can swallow a following newline), so
-        // the guarantee lives in thurbox's reader loop, not in vt100 — and that
+        // the guarantee lives in friring's reader loop, not in vt100 — and that
         // is where the test belongs (the `ui` layer may not reference `agent`).
     }
 }

@@ -310,7 +310,7 @@ fn collect_workers(
     out
 }
 
-/// Attribute each worker to the thurbox session that launched it, by the
+/// Attribute each worker to the friring session that launched it, by the
 /// `--settings` path the daemon replays. Two forms (both scoped to this
 /// instance's hooks dir):
 ///
@@ -1888,7 +1888,7 @@ mod tests {
     fn collect_unions_daemon_worker_by_settings_and_cwd() {
         let tmp = tempfile::tempdir().unwrap();
         let hooks = "/cfg/hooks/claude.json";
-        let repo = "/repo/thurbox";
+        let repo = "/repo/friring";
         let worker = "95c38d32-39d4-4102-82df-24602ac3a2a0";
         let (projects, jobs) = daemon_fixture(tmp.path(), worker, hooks, repo);
 
@@ -1930,15 +1930,15 @@ mod tests {
             tmp.path(),
             worker,
             "/OTHER/hooks/claude.json",
-            "/repo/thurbox",
+            "/repo/friring",
         );
 
         // Same session, but our hooks settings differ from the worker's replayed
-        // one → not attributed. (A different instance / a non-thurbox launch.)
+        // one → not attributed. (A different instance / a non-friring launch.)
         let input = CcSessionInput {
             id: SessionId::default(),
             own_id: "0e6bcb32-fore".into(),
-            candidate_dirs: vec!["/repo/thurbox".into()],
+            candidate_dirs: vec!["/repo/friring".into()],
             prior_sig: None,
         };
         let refresh = collect_cc_activity(
@@ -1963,7 +1963,7 @@ mod tests {
         let input2 = CcSessionInput {
             id: SessionId::default(),
             own_id: "fore2".into(),
-            candidate_dirs: vec!["/repo/thurbox".into()],
+            candidate_dirs: vec!["/repo/friring".into()],
             prior_sig: None,
         };
         let refresh2 = collect_cc_activity(

@@ -1,4 +1,4 @@
-//! In-process acceptance ("end-to-end") tests for the thurbox TUI.
+//! In-process acceptance ("end-to-end") tests for the friring TUI.
 //!
 //! Where the focused unit tests in [`super::tests`] poke individual methods,
 //! these drive a *real* [`App`] the way `main.rs`'s loop does — feeding
@@ -12,7 +12,7 @@
 //! * the database is `Database::open_in_memory()`,
 //! * every config/data path is redirected to a throwaway tempdir via
 //!   [`crate::paths::TestPathGuard`], so the suite never touches the
-//!   developer's real `~/.config/thurbox`,
+//!   developer's real `~/.config/friring`,
 //! * agent output is injected per session with [`Harness::feed_output`]
 //!   (through the same vt100 parser + `TermSignals` path the PTY reader uses),
 //! * wall-clock-gated behavior (timeouts, debounces, the redraw floor) is
@@ -68,7 +68,7 @@ fn init_git_repo(dir: &Path, dirty: bool) {
     };
     git(&["init", "-q"]);
     git(&["config", "user.email", "t@example.com"]);
-    git(&["config", "user.name", "thurbox-test"]);
+    git(&["config", "user.name", "friring-test"]);
     std::fs::write(dir.join("f.txt"), "hello\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-qm", "init"]);
@@ -287,7 +287,7 @@ impl Harness {
         self
     }
 
-    /// A `Ctrl+<c>` chord (the form most global thurbox bindings take).
+    /// A `Ctrl+<c>` chord (the form most global friring bindings take).
     fn ctrl(&mut self, c: char) -> &mut Self {
         self.key(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
@@ -1526,9 +1526,9 @@ async fn ctrl_r_restarts_session_on_spawnable_backend() {
 }
 
 #[tokio::test]
-async fn ctrl_r_restart_preserves_thurbox_identity_env() {
+async fn ctrl_r_restart_preserves_friring_identity_env() {
     // `Session::restart` replaces the session env wholesale, so the restart path
-    // must re-inject the `THURBOX_*` identity vars — otherwise the restarted
+    // must re-inject the `FRIRING_*` identity vars — otherwise the restarted
     // agent loses its identity and the metrics/status hooks break.
     let mut h = Harness::spawnable(1);
     let session_id = h.app.sessions[0].info.id;
@@ -1542,12 +1542,12 @@ async fn ctrl_r_restart_preserves_thurbox_identity_env() {
 
     let env = h.app.sessions[0].env();
     assert_eq!(
-        env.get("THURBOX_SESSION"),
+        env.get("FRIRING_SESSION"),
         Some(&session_id.to_string()),
-        "the thurbox session key survives the restart"
+        "the friring session key survives the restart"
     );
     assert_eq!(
-        env.get("THURBOX_SESSION_ID"),
+        env.get("FRIRING_SESSION_ID"),
         Some(&agent_session_id),
         "the agent conversation id survives the restart"
     );
@@ -2484,7 +2484,7 @@ fn info_panel_toggles_while_review_is_open() {
 
 /// The backend queued a remote-hook event for a session's pane: one refresh
 /// drains it into the hook columns and the derived status reflects it — the
-/// remote analogue of a local `thurbox-cli session signal`.
+/// remote analogue of a local `friring-cli session signal`.
 #[test]
 fn remote_hook_event_drives_session_status() {
     let backend = Arc::new(FakeBackend::stub());
@@ -3075,7 +3075,7 @@ async fn monkey_random_events_uphold_invariants() {
                     let code = MONKEY_KEYS[rng.below(MONKEY_KEYS.len())];
                     h.key(code, KeyModifiers::NONE);
                 }
-                // Ctrl chords (thurbox's global namespace).
+                // Ctrl chords (friring's global namespace).
                 40..=59 => {
                     let c = MONKEY_CTRL[rng.below(MONKEY_CTRL.len())];
                     h.ctrl(c);

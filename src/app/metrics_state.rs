@@ -230,7 +230,7 @@ impl SlowOps {
 }
 
 /// Wall-clock timing stats for the render/tick hot paths plus named slow ops.
-/// Populated only while timing is active (`THURBOX_PERF_LOG` or the perf HUD);
+/// Populated only while timing is active (`FRIRING_PERF_LOG` or the perf HUD);
 /// display/logging only, never CI-asserted (ADR-P2).
 #[derive(Default)]
 pub(crate) struct PerfTimings {

@@ -1,9 +1,9 @@
-# Managed by thurbox `extension install` (the built-in "hooks" extension).
+# Managed by friring `extension install` (the built-in "hooks" extension).
 # Reinstalling or updating overwrites this file — do not edit; uninstalling
-# removes it. Reports Mistral Vibe's lifecycle state to thurbox via
-# `thurbox-cli session signal`. Identity comes from the inherited
-# $THURBOX_SESSION env var; every call is best-effort (`|| true`) so it can
-# never break a session running outside thurbox.
+# removes it. Reports Mistral Vibe's lifecycle state to friring via
+# `friring-cli session signal`. Identity comes from the inherited
+# $FRIRING_SESSION env var; every call is best-effort (`|| true`) so it can
+# never break a session running outside friring.
 #
 # EXPERIMENTAL: the hooks.toml schema below is not verified against the live
 # `vibe` binary. If the event/key names differ, edit this file (no code change
@@ -13,12 +13,12 @@
 
 [[hooks]]
 event = "before_tool"
-command = "thurbox-cli session signal --state working || true"
+command = "friring-cli session signal --state working || true"
 
 [[hooks]]
 event = "after_turn"
-command = "thurbox-cli session signal --state done || true"
+command = "friring-cli session signal --state done || true"
 
 [[hooks]]
 event = "notification"
-command = "thurbox-cli session signal --state blocked || true"
+command = "friring-cli session signal --state blocked || true"

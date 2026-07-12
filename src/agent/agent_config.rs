@@ -1,6 +1,6 @@
 //! Loading and seeding of the agent-definition config file.
 //!
-//! Agents are defined declaratively in `~/.config/thurbox/agents.toml`. On
+//! Agents are defined declaratively in `~/.config/friring/agents.toml`. On
 //! first run (or whenever the file is missing) the built-in definitions are
 //! written out so users have a working starting point they can edit. If the
 //! file exists but cannot be read or parsed, we fall back to the built-ins
@@ -13,7 +13,7 @@ use crate::session::{AgentDef, AgentRegistry};
 /// Built-in agent definitions, also used to seed `agents.toml` on first run.
 ///
 /// Kept deliberately small per agent: just the command, plus resume/fork/
-/// session-id groups. `claude` pins a thurbox-generated id (`--session-id`) so
+/// session-id groups. `claude` pins a friring-generated id (`--session-id`) so
 /// it can resume/fork by that exact id. The other built-ins can't pin or report
 /// their session id, so they use `resume_latest = true` with id-less,
 /// cwd-scoped flags (`codex resume --last`, `opencode --continue`, …): the agent
@@ -21,14 +21,14 @@ use crate::session::{AgentDef, AgentRegistry};
 /// resume group simply start fresh on restart. No model is passed — each agent
 /// uses its own default config. Bake extra flags (including a model) into
 /// `args` if you want them.
-pub const BUILTIN_AGENTS_TOML: &str = r#"# Thurbox coding-agent definitions.
+pub const BUILTIN_AGENTS_TOML: &str = r#"# Friring coding-agent definitions.
 #
 # Each [[agents]] entry describes how to launch one coding-agent CLI. The
 # `*_args` groups are appended only when their value is present, with {id}
 # substituted. `args` is always passed — put any extra flags (e.g. a model)
 # there. Add your own [[agents]] entries to support any CLI.
 #
-# Unknown keys are reported on startup (and fail `thurbox-cli config
+# Unknown keys are reported on startup (and fail `friring-cli config
 # validate`) but don't break the load — your agents stay in effect.
 
 config_version = 1
@@ -42,7 +42,7 @@ fork_args = ["--resume", "{id}", "--fork-session"]
 new_session_args = ["--session-id", "{id}"]
 
 # codex can't pin or report its session id, so resume/fork target the most
-# recent session in the launch directory. thurbox keeps that directory stable
+# recent session in the launch directory. friring keeps that directory stable
 # across restart (same cwd) and single-repo fork (child reuses the parent cwd).
 [[agents]]
 name = "codex"
@@ -93,8 +93,8 @@ command = "vibe"
 # Add your own agent (uncomment and edit)
 # ──────────────────────────────────────────────────────────────────────────
 #
-# Any CLI works — thurbox only needs `command` plus the optional `*_args`
-# groups below. The agent uses its OWN default config; thurbox never passes a
+# Any CLI works — friring only needs `command` plus the optional `*_args`
+# groups below. The agent uses its OWN default config; friring never passes a
 # model or permissions of its own.
 #
 # [[agents]]
@@ -107,7 +107,7 @@ command = "vibe"
 # resume_latest = false         # true ⇒ resume "the last session in this dir"
 #                               #   (id-less flags); leave false to pin by {id}
 #
-# {id} is a thurbox-generated UUID. Only agents that accept it at creation
+# {id} is a friring-generated UUID. Only agents that accept it at creation
 # (like claude's `--session-id {id}`) can resume/fork by that exact id; for
 # everything else use `resume_latest = true` with id-less, cwd-scoped flags
 # (e.g. `["resume", "--last"]`). Omit every resume group to start fresh on
@@ -117,7 +117,7 @@ command = "vibe"
 # Pin a model (or any flag) — put it in `args`, which is always passed
 # ──────────────────────────────────────────────────────────────────────────
 #
-# thurbox is model-neutral; to force a model, bake the flag into `args`. E.g.
+# friring is model-neutral; to force a model, bake the flag into `args`. E.g.
 # a claude variant pinned to Opus, kept alongside the default `claude` entry:
 #
 # [[agents]]
@@ -132,7 +132,7 @@ command = "vibe"
 "#;
 
 /// Path to the agent-definition config file:
-/// `~/.config/thurbox/agents.toml` (sibling of `config.toml`).
+/// `~/.config/friring/agents.toml` (sibling of `config.toml`).
 pub fn agents_config_path() -> Option<PathBuf> {
     crate::paths::config_file().map(|p| p.with_file_name("agents.toml"))
 }
@@ -214,7 +214,7 @@ const KNOWN_TOP_LEVEL_KEYS: [&str; 3] = ["config_version", "default", "agents"];
 /// registry only when the document is syntactically broken (unrecoverable) or
 /// yields no usable agents at all.
 ///
-/// This is deliberately more forgiving than `thurbox-cli config validate`,
+/// This is deliberately more forgiving than `friring-cli config validate`,
 /// which still strict-parses the whole document — `validate` is the diagnostic
 /// that tells you to fix the file, while the TUI degrades gracefully so a
 /// single typo never strands you on the built-ins.
@@ -317,7 +317,7 @@ fn deserialize_agent(
 }
 
 /// Parse a TOML config document leniently, reporting every unknown field by
-/// path instead of failing on it. Stale keys from older thurbox versions and
+/// path instead of failing on it. Stale keys from older friring versions and
 /// typos both surface as warnings without stranding the user on defaults; a
 /// real syntax/type error still fails the parse.
 pub(crate) fn parse_toml_reporting_unknown<T: serde::de::DeserializeOwned>(
@@ -365,7 +365,7 @@ mod tests {
         assert!(reg.get("copilot").is_some());
         assert!(reg.get("vibe").is_some());
 
-        // Claude pins a thurbox id and resumes/forks by it.
+        // Claude pins a friring id and resumes/forks by it.
         let claude = reg.get("claude").unwrap();
         assert!(!claude.resume_args.is_empty());
         assert!(!claude.resume_latest);
@@ -390,7 +390,7 @@ mod tests {
         }
 
         // No non-claude resume/fork token may carry a {id} placeholder — these
-        // agents can't be addressed by a thurbox-known id.
+        // agents can't be addressed by a friring-known id.
         for name in ["codex", "antigravity", "opencode", "aider", "copilot"] {
             let a = reg.get(name).unwrap();
             assert!(
@@ -467,7 +467,7 @@ mod tests {
         let path = agents_config_path().unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         // Typo'd field: `resumeargs` instead of `resume_args`. The user's
-        // agents must stay in effect (stale keys from older thurbox versions
+        // agents must stay in effect (stale keys from older friring versions
         // are common); the warning names the bad key.
         std::fs::write(
             &path,

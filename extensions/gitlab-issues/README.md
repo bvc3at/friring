@@ -1,20 +1,20 @@
-# gitlab-issues (thurbox extension)
+# gitlab-issues (friring extension)
 
-> **Experimental.** Bidirectionally syncs **GitLab issues** with the thurbox
+> **Experimental.** Bidirectionally syncs **GitLab issues** with the friring
 > task list: your issues show up as tasks, and marking a task done closes the
 > issue.
 
 A `gitlab-issues-tick` **automation** runs a deterministic sync script
-(`scripts/sync.sh`) every 15 minutes — **no agent, no LLM, no tokens**. thurbox's
+(`scripts/sync.sh`) every 15 minutes — **no agent, no LLM, no tokens**. friring's
 scheduler runs it (TUI or headless heartbeat) and records the result in the
-automation run history. The script only calls `thurbox-cli` and the `glab` CLI.
+automation run history. The script only calls `friring-cli` and the `glab` CLI.
 
 ## Setup
 
 ### 1. Prerequisites
 
-- `thurbox-cli` **≥ 0.141** on `PATH` (needs the `Exec` automation action +
-  `task --source/--external-id/--external-url`; check `thurbox-cli version`).
+- `friring-cli` **≥ 0.141** on `PATH` (needs the `Exec` automation action +
+  `task --source/--external-id/--external-url`; check `friring-cli version`).
 - `glab` (GitLab CLI) and `jq`.
 
 ### 2. Authenticate GitLab
@@ -30,18 +30,18 @@ No token env var is needed — `glab` stores the credential itself. (`GITLAB_HOS
 ### 3. Install the extension
 
 ```sh
-thurbox-cli extension install gitlab-issues
+friring-cli extension install gitlab-issues
 # or from a checkout:
-thurbox-cli extension install ./extensions/gitlab-issues
+friring-cli extension install ./extensions/gitlab-issues
 ```
 
-This lays down `~/.config/thurbox/extensions/gitlab-issues/` (override with
-`--home`) and activates the `gitlab-issues-tick` automation, which thurbox
+This lays down `~/.config/friring/extensions/gitlab-issues/` (override with
+`--home`) and activates the `gitlab-issues-tick` automation, which friring
 self-heals if deleted.
 
 ### 4. Configure the projects to sync
 
-Edit `~/.config/thurbox/extensions/gitlab-issues/trackers.md` — one row per project or saved filter:
+Edit `~/.config/friring/extensions/gitlab-issues/trackers.md` — one row per project or saved filter:
 
 ```markdown
 | name    | query                            | push_back |
@@ -59,15 +59,15 @@ The automation fires every 15 min. To run it now, trigger it from the
 **Automations** pane (`Ctrl+P` → select `gitlab-issues-tick` → `r`) or headless:
 
 ```sh
-thurbox-cli automation run <id>     # id from: thurbox-cli automation list
+friring-cli automation run <id>     # id from: friring-cli automation list
 # or run the script directly:
-~/.config/thurbox/extensions/gitlab-issues/scripts/sync.sh
+~/.config/friring/extensions/gitlab-issues/scripts/sync.sh
 ```
 
 Then check the imported tasks:
 
 ```sh
-thurbox-cli task list --json | jq -c '.[] | select(.source=="gitlab") | {id,status,external_id,title}'
+friring-cli task list --json | jq -c '.[] | select(.source=="gitlab") | {id,status,external_id,title}'
 ```
 
 Open issues import as `todo` (or `in_progress` if assigned), closed as `done`.
@@ -88,7 +88,7 @@ state back.
 - **query** — `group/project` plus any `glab issue list` flags. Open issues are
   the default; pass `--all` to include closed, `--assignee=@me`, `--label=…`,
   `--milestone=…`, etc. (There is no `--state` flag for `glab issue list`.)
-- **push_back** — `yes` enables thurbox → GitLab status push for that row.
+- **push_back** — `yes` enables friring → GitLab status push for that row.
 
 Imported tasks carry `source=gitlab` and `external_id="group/project#<iid>"`, so
 re-syncing never duplicates them.
@@ -108,20 +108,20 @@ local `todo`↔`in_progress` distinction is preserved.
 ## Troubleshooting
 
 - **Nothing syncs** — check the automation run history (`Ctrl+P`, or
-  `thurbox-cli automation runs <id>`) for the script's output; run
-  `~/.config/thurbox/extensions/gitlab-issues/scripts/sync.sh` by hand to see errors directly.
+  `friring-cli automation runs <id>`) for the script's output; run
+  `~/.config/friring/extensions/gitlab-issues/scripts/sync.sh` by hand to see errors directly.
 - **`glab` auth error / 401 Unauthorized** — the stored token expired or lacks
   the `api` scope; re-run `glab auth login` and confirm with `glab auth status`.
 - **Empty pull** — confirm the project path and that `glab issue list -R <path>`
   returns issues (default is open issues; add `--all`).
-- **`unknown option '--source'`** — your `thurbox-cli` predates 0.141; rebuild /
-  update thurbox.
+- **`unknown option '--source'`** — your `friring-cli` predates 0.141; rebuild /
+  update friring.
 
 ## Turn it off
 
 ```sh
-thurbox-cli extension deactivate gitlab-issues          # stop syncing
-thurbox-cli extension uninstall gitlab-issues --purge   # remove home + automation
+friring-cli extension deactivate gitlab-issues          # stop syncing
+friring-cli extension uninstall gitlab-issues --purge   # remove home + automation
 ```
 
 Imported tasks remain in your task list (they are not deleted on uninstall).

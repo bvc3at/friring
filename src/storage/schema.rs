@@ -24,7 +24,7 @@ pub const SCHEMA_VERSION: u32 = 39;
 type MigrationStep = (u32, fn(&Connection) -> rusqlite::Result<()>);
 
 /// How long a connection waits on a locked database before erroring.
-/// The DB is shared by the TUI, thurbox-cli, and the automation heartbeat;
+/// The DB is shared by the TUI, friring-cli, and the automation heartbeat;
 /// writes are short single-row upserts, so 5 s outlasts any WAL checkpoint.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -812,7 +812,7 @@ fn migrate_v21_drop_model(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// v21 → v22: drop tables for removed subsystems. VM, devcontainer,
-/// and process-plugin subsystems were removed to focus thurbox on
+/// and process-plugin subsystems were removed to focus friring on
 /// the TUI surface; the session_commands queue is unused now that
 /// MCP `restart_session` / `create_session` run synchronously.
 fn migrate_v22_drop_subsystems(conn: &Connection) -> rusqlite::Result<()> {
@@ -1026,7 +1026,7 @@ fn migrate_v33_action_extra_repos(conn: &Connection) -> rusqlite::Result<()> {
 ///
 /// `hook_state` (`working`/`blocked`/`done`, NULL = no hook fired yet) and
 /// `hook_state_at` (epoch ms it was reported) are written by
-/// `thurbox-cli session signal` from an agent hook; `seen_at` (epoch ms) is
+/// `friring-cli session signal` from an agent hook; `seen_at` (epoch ms) is
 /// written by the TUI when the user views a `done` session, so it renders
 /// `Idle` instead of `Done`. NULL on every existing row, so they decode
 /// identically to the pre-hooks behaviour.

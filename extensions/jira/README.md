@@ -1,21 +1,21 @@
-# jira (thurbox extension)
+# jira (friring extension)
 
-> **Experimental.** Bidirectionally syncs **Jira issues** with the thurbox task
+> **Experimental.** Bidirectionally syncs **Jira issues** with the friring task
 > list: your issues show up as tasks, and marking a task done transitions the
 > issue into the Done category.
 
 A `jira-tick` **automation** runs a deterministic sync script (`scripts/sync.sh`)
-every 15 minutes — **no agent, no LLM, no tokens**. thurbox's scheduler runs it
+every 15 minutes — **no agent, no LLM, no tokens**. friring's scheduler runs it
 (TUI or headless heartbeat) and records the result in the automation run
-history. The script only calls `thurbox-cli`, `curl`, and `jq` against the Jira
+history. The script only calls `friring-cli`, `curl`, and `jq` against the Jira
 Cloud REST API.
 
 ## Setup
 
 ### 1. Prerequisites
 
-- `thurbox-cli` **≥ 0.141** on `PATH` (needs the `Exec` automation action +
-  `task --source/--external-id/--external-url`; check `thurbox-cli version`).
+- `friring-cli` **≥ 0.141** on `PATH` (needs the `Exec` automation action +
+  `task --source/--external-id/--external-url`; check `friring-cli version`).
 - `curl` and `jq`.
 
 ### 2. Create a Jira API token & credentials.env
@@ -26,17 +26,17 @@ Create an Atlassian API token at
 Because the sync runs **headless** (via the automation, with no shell session to
 inherit your environment), the robust way to hand it the credentials is a
 `credentials.env` file in the extension home — `sync.sh` sources
-`~/.config/thurbox/extensions/jira/credentials.env` if present. Create it with
+`~/.config/friring/extensions/jira/credentials.env` if present. Create it with
 the three required vars:
 
 ```sh
-mkdir -p ~/.config/thurbox/extensions/jira
-cat > ~/.config/thurbox/extensions/jira/credentials.env <<'EOF'
+mkdir -p ~/.config/friring/extensions/jira
+cat > ~/.config/friring/extensions/jira/credentials.env <<'EOF'
 JIRA_BASE_URL=https://your-domain.atlassian.net
 JIRA_EMAIL=you@example.com
 JIRA_API_TOKEN=your-atlassian-api-token
 EOF
-chmod 600 ~/.config/thurbox/extensions/jira/credentials.env
+chmod 600 ~/.config/friring/extensions/jira/credentials.env
 ```
 
 Alternatively you can `export` those three vars from your shell profile, but that
@@ -47,17 +47,17 @@ recommended.
 ### 3. Install the extension
 
 ```sh
-thurbox-cli extension install jira
+friring-cli extension install jira
 # or from a checkout:
-thurbox-cli extension install ./extensions/jira
+friring-cli extension install ./extensions/jira
 ```
 
-This lays down `~/.config/thurbox/extensions/jira/` (override with `--home`) and
-activates the `jira-tick` automation, which thurbox self-heals if deleted.
+This lays down `~/.config/friring/extensions/jira/` (override with `--home`) and
+activates the `jira-tick` automation, which friring self-heals if deleted.
 
 ### 4. Configure the projects/filters to sync
 
-Edit `~/.config/thurbox/extensions/jira/trackers.md` — one row per project or
+Edit `~/.config/friring/extensions/jira/trackers.md` — one row per project or
 saved filter. Each row's `query` is a **JQL string** (it may contain spaces and
 is used verbatim):
 
@@ -76,15 +76,15 @@ The automation fires every 15 min. To run it now, trigger it from the
 **Automations** pane (`Ctrl+P` → select `jira-tick` → `r`) or headless:
 
 ```sh
-thurbox-cli automation run <id>     # id from: thurbox-cli automation list
+friring-cli automation run <id>     # id from: friring-cli automation list
 # or run the script directly:
-~/.config/thurbox/extensions/jira/scripts/sync.sh
+~/.config/friring/extensions/jira/scripts/sync.sh
 ```
 
 Then check the imported tasks:
 
 ```sh
-thurbox-cli task list --json | jq -c '.[] | select(.source=="jira") | {id,status,external_id,title}'
+friring-cli task list --json | jq -c '.[] | select(.source=="jira") | {id,status,external_id,title}'
 ```
 
 Issues import as `todo`/`in_progress`/`done` by their Jira status category.
@@ -110,7 +110,7 @@ tied back to a specific JQL tracker row, so push-back is gated on "at least one
 - **query** — a **JQL string**, used verbatim (e.g.
   `project = ENG AND statusCategory != Done`). It may contain spaces; it is not
   word-split.
-- **push_back** — `yes` enables thurbox → Jira status push (all-or-nothing
+- **push_back** — `yes` enables friring → Jira status push (all-or-nothing
   across jira tasks, see above).
 
 Imported tasks carry `source=jira` and `external_id="<issue key>"` (e.g.
@@ -142,20 +142,20 @@ Notes:
 ## Troubleshooting
 
 - **Nothing syncs** — check the automation run history (`Ctrl+P`, or
-  `thurbox-cli automation runs <id>`) for the script's output; run
-  `~/.config/thurbox/extensions/jira/scripts/sync.sh` by hand to see errors directly.
+  `friring-cli automation runs <id>`) for the script's output; run
+  `~/.config/friring/extensions/jira/scripts/sync.sh` by hand to see errors directly.
 - **`set JIRA_BASE_URL …` / auth errors** — the headless run can't see the vars;
-  confirm `~/.config/thurbox/extensions/jira/credentials.env` exists with all
+  confirm `~/.config/friring/extensions/jira/credentials.env` exists with all
   three (`JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`). Test with
   `curl -u "$JIRA_EMAIL:$JIRA_API_TOKEN" "$JIRA_BASE_URL/rest/api/3/myself"`.
-- **`unknown option '--source'`** — your `thurbox-cli` predates 0.141; rebuild /
-  update thurbox.
+- **`unknown option '--source'`** — your `friring-cli` predates 0.141; rebuild /
+  update friring.
 
 ## Turn it off
 
 ```sh
-thurbox-cli extension deactivate jira          # stop syncing
-thurbox-cli extension uninstall jira --purge   # remove home + automation
+friring-cli extension deactivate jira          # stop syncing
+friring-cli extension uninstall jira --purge   # remove home + automation
 ```
 
 Imported tasks remain in your task list (they are not deleted on uninstall).

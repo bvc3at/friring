@@ -1,8 +1,8 @@
-# VHS tape — Thurbox theme switcher feature clip.
+# VHS tape — Friring theme switcher feature clip.
 #
 # Do NOT run directly — run `scripts/demo/record.sh theme`, which builds
 # the dev binary, sets up the isolated env, seeds one session per real agent CLI
-# in a sample repo, and exports $THURBOX_BIN.
+# in a sample repo, and exports $FRIRING_BIN.
 #
 # Ctrl+Y opens the theme picker; Down/Up move, Enter selects. (No F-keys.)
 # Moving the selection LIVE-PREVIEWS the palette (the whole TUI recolors), so
@@ -12,8 +12,8 @@
 # tokyo-night-day -> catppuccin-latte -> gruvbox-dark -> tokyo-night ->
 # catppuccin-mocha -> default, alternating dark and light palettes.
 
-Output docs/media/thurbox-theme.gif
-Output docs/media/thurbox-theme.mp4
+Output docs/media/friring-theme.gif
+Output docs/media/friring-theme.mp4
 
 Set Shell "bash"
 Set FontSize 18
@@ -25,7 +25,7 @@ Set PlaybackSpeed 1.0
 
 # Launch the dev binary (isolated env from record.sh).
 Hide
-Type `exec "$THURBOX_BIN"`
+Type `exec "$FRIRING_BIN"`
 Enter
 Sleep 2s
 Show

@@ -18,7 +18,7 @@ Needs you: #51 (api): worker asks whether to drop the v1 field or deprecate it
 🎯 Next: #48 (ui) — CI green after the fix, ready for your re-review
 ```
 
-It is **forge-agnostic** *and* **agent-agnostic**, like thurbox itself. The only
+It is **forge-agnostic** *and* **agent-agnostic**, like friring itself. The only
 thing baked in is **git** — *how* to talk to a repo's host is decided by the
 **shepherd agent**, fresh each tick, from what the repo actually is. The monitor
 and fixer are plain `agents.toml` entries (`shepherd`, `shepherd-worker`), so
@@ -49,56 +49,56 @@ want to *promote* a forge you use often into a built-in.
 
 ## Requirements
 
-- `git`, `jq`, and `thurbox-cli` on `PATH`.
+- `git`, `jq`, and `friring-cli` on `PATH`.
 - The client for each forge you watch, authenticated: `gh auth login` /
   `glab auth login`, or `BB_TOKEN` (or `BB_USER`+`BB_APP_PASSWORD`) for
   Bitbucket.
 
 ## Install
 
-CI-shepherd is a thurbox **extension** (a declarative `extension.toml` manifest):
+CI-shepherd is a friring **extension** (a declarative `extension.toml` manifest):
 
 ```bash
-thurbox-cli extension install ci-shepherd
+friring-cli extension install ci-shepherd
 ```
 
-or from a checkout: `thurbox-cli extension install ./extensions/ci-shepherd`
+or from a checkout: `friring-cli extension install ./extensions/ci-shepherd`
 (the `install.sh` / curl one-liner is a thin shim over this). Override the home
 with `--home <dir>`. Installing:
 
-1. lays down the shepherd home (`~/.config/thurbox/extensions/ci-shepherd`):
+1. lays down the shepherd home (`~/.config/friring/extensions/ci-shepherd`):
    `SHEPHERD.md` spec, helper scripts (incl. the provider adapter),
    context-file symlinks, claude
    permission settings, and a `repos.md` watch list (seeded once, then
    user-owned);
 2. registers the `shepherd` / `shepherd-worker` agents in
-   `~/.config/thurbox/agents.toml` (defaults: claude on haiku for the monitor,
+   `~/.config/friring/agents.toml` (defaults: claude on haiku for the monitor,
    opus for the worker — edit the entries to change the model/CLI);
 3. activates the dedicated `shepherd` session and a `shepherd-tick` automation
-   (every 15 minutes) — both **self-healed** by thurbox at startup and on every
+   (every 15 minutes) — both **self-healed** by friring at startup and on every
    tick, so deleting them is a no-op until you `deactivate`.
 
-Re-running `extension install` refreshes the installer-owned files. `thurbox-cli
+Re-running `extension install` refreshes the installer-owned files. `friring-cli
 extension list` / `status ci-shepherd` show what's active.
 
 ## Use
 
-- Add the repos to watch to `~/.config/thurbox/extensions/ci-shepherd/repos.md`
+- Add the repos to watch to `~/.config/friring/extensions/ci-shepherd/repos.md`
   (one row each; `author` defaults to `@me`, `provider` to `auto`).
 - The shepherd sweeps on its schedule; trigger one now by sending `tick` to the
   shepherd session (or open it in the TUI).
 - `status` for a one-screen report; `clean` to prune merged/closed worktrees.
-- A fixer is a thurbox **task** named `fix #<n>: …`; its worker runs in an
+- A fixer is a friring **task** named `fix #<n>: …`; its worker runs in an
   isolated worktree on the request branch and self-reports via a `===RESULT===`
   sentinel, pinging the shepherd the moment it finishes.
 - The shepherd stays out of your way without losing track: if you (or another
-  agent) already have a live thurbox session on a request's head branch, it
+  agent) already have a live friring session on a request's head branch, it
   **won't** dispatch a duplicate fixer there (the two would fight over the same
   branch) — instead it **monitors** that request and folds it into the merge
   ordering, treating your session as that repo's active worker so the other
   same-repo PRs queue behind it. When that request still needs work (a rebase,
   a CI fix, a review change), the shepherd **proactively messages your session**
-  over the thurbox inter-session message queue (`thurbox-cli message send`)
+  over the friring inter-session message queue (`friring-cli message send`)
   asking for the specific next step — once per pending ask, not every tick — so
   the rebase others are queued behind actually gets done.
 - When several PRs in the **same repo** only need a rebase (branch protection
@@ -109,10 +109,10 @@ extension list` / `status ci-shepherd` show what's active.
 
 ## How the fixer gets the request branch
 
-thurbox's own `--worktree` always runs `git worktree add -b`, which fails on a
+friring's own `--worktree` always runs `git worktree add -b`, which fails on a
 branch that already exists — and a request's head branch always does. So
 `dispatch-fix.sh` adopts the branch itself into a shepherd-owned worktree under
-`~/.config/thurbox/extensions/ci-shepherd/worktrees/<repo>-<provider>-<n>`, then
+`~/.config/friring/extensions/ci-shepherd/worktrees/<repo>-<provider>-<n>`, then
 spawns the fixer there. The checkout is git-universal: for a built-in forge it
 uses the provider's
 checkout (`gh pr checkout` / `glab mr checkout` / `git fetch`), and for any
@@ -129,20 +129,20 @@ branch; `clean` removes the worktree once the request is no longer actionable
 | `scripts/provider.sh` | The forge adapter layer — normalizes GitHub/GitLab/Bitbucket onto one contract (incl. the `rebase` behind/conflict signal, overridden by a git-local check) |
 | `scripts/rebase-check.sh` | Authoritative git-local behind/conflict check (`none`/`NEEDED`/`CONFLICT`) — fetched `origin/<base>` vs `origin/<head>`; unit-tested by `rebase-check.bats` |
 | `scripts/classify.sh` | Pure request → action-flag classifier (`CHANGES-REQ`/`CI-FAIL`/`REBASE`/`REBASE-QUEUED`/…), incl. per-repo rebase serialization; unit-tested by `classify.bats` |
-| `scripts/link-sessions.sh` | Pure (requests × sessions) head-branch join — flags requests already worked by a live, non-fixer thurbox session; unit-tested by `link-sessions.bats` |
+| `scripts/link-sessions.sh` | Pure (requests × sessions) head-branch join — flags requests already worked by a live, non-fixer friring session; unit-tested by `link-sessions.bats` |
 | `scripts/shepherd-snapshot.sh` | One-call view: watched requests (with action flags + live-session links) + fixer tasks/sessions/worktrees |
 | `scripts/dispatch-fix.sh` | Prepare a request-branch worktree + create and run the fixer task |
 | `scripts/parse-result.sh` | Extract the worker `===RESULT===` sentinel |
-| `extension.toml` | Declarative install + runtime manifest (`thurbox-cli extension install` reads this) |
+| `extension.toml` | Declarative install + runtime manifest (`friring-cli extension install` reads this) |
 | `claude-settings.json` | Pre-approved permissions template (laid down as `.claude/settings.json`) |
-| `install.sh` | Thin curl/sh shim over `thurbox-cli extension install` |
+| `install.sh` | Thin curl/sh shim over `friring-cli extension install` |
 
 ## Uninstall
 
 ```bash
-thurbox-cli extension deactivate ci-shepherd   # off-switch: tears down session + automation
-thurbox-cli extension uninstall ci-shepherd    # also removes the agents + manifest
-thurbox-cli extension uninstall ci-shepherd --purge  # ...and deletes ~/.config/thurbox/extensions/ci-shepherd
+friring-cli extension deactivate ci-shepherd   # off-switch: tears down session + automation
+friring-cli extension uninstall ci-shepherd    # also removes the agents + manifest
+friring-cli extension uninstall ci-shepherd --purge  # ...and deletes ~/.config/friring/extensions/ci-shepherd
 ```
 
 > Remove any leftover fixer worktrees first (`git -C <repo> worktree remove …`)

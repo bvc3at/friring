@@ -535,7 +535,7 @@ impl App {
 
         // Both ids pinned: `resume_session_id` selects the `--resume {id}` arg
         // group, `agent_session_id` is the session's identity everywhere else
-        // (THURBOX_SESSION_ID, the F9 activity scan, the DB row, restarts).
+        // (FRIRING_SESSION_ID, the F9 activity scan, the DB row, restarts).
         let config = crate::session::SessionConfig {
             agent,
             agent_session_id: Some(convo.id.clone()),

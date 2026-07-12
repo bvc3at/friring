@@ -38,7 +38,7 @@ Every push to `main` automatically triggers the release workflow:
 
 - **Cargo.toml version** is always `0.0.0-dev` (a static development marker).
 - The **real version** is determined by the release workflow (`v0.1.0`, …).
-- **Build-time injection**: `build.rs` reads the `THURBOX_RELEASE_VERSION`
+- **Build-time injection**: `build.rs` reads the `FRIRING_RELEASE_VERSION`
   environment variable (set by the workflow) to inject the version into the
   binary. Development builds show `0.0.0-dev` when it is unset; release builds
   show the actual version.

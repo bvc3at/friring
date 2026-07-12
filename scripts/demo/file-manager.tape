@@ -1,13 +1,13 @@
-# VHS tape — Thurbox file manager (file viewer) feature clip.
+# VHS tape — Friring file manager (file viewer) feature clip.
 #
 # Do NOT run directly — run `scripts/demo/record.sh file-manager`, which
 # builds the dev binary, sets up the isolated env, seeds one session per real
-# agent CLI in a sample repo, and exports $THURBOX_BIN.
+# agent CLI in a sample repo, and exports $FRIRING_BIN.
 #
 # Ctrl+E toggles the file viewer; Ctrl+L/H cycle pane focus. (VHS has no F-keys.)
 
-Output docs/media/thurbox-file-manager.gif
-Output docs/media/thurbox-file-manager.mp4
+Output docs/media/friring-file-manager.gif
+Output docs/media/friring-file-manager.mp4
 
 Set Shell "bash"
 Set FontSize 18
@@ -19,7 +19,7 @@ Set PlaybackSpeed 1.0
 
 # Launch the dev binary (isolated env from record.sh).
 Hide
-Type `exec "$THURBOX_BIN"`
+Type `exec "$FRIRING_BIN"`
 Enter
 Sleep 2s
 Show

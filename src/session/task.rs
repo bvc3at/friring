@@ -17,7 +17,7 @@
 
 use super::AutomationAction;
 
-/// `source` value for a task created locally inside thurbox.
+/// `source` value for a task created locally inside friring.
 pub const SOURCE_LOCAL: &str = "local";
 
 /// Lifecycle state of a task.
@@ -100,14 +100,14 @@ impl Task {
     /// (`Send` into a running session, or `Spawn` of a fresh one).
     ///
     /// Beyond the bare title it gives the agent enough context to act on its
-    /// own: that it is solving a Thurbox task, the markdown description, how to
-    /// fetch the full record (`thurbox-cli task show <id>`), and how to mark the
+    /// own: that it is solving a Friring task, the markdown description, how to
+    /// fetch the full record (`friring-cli task show <id>`), and how to mark the
     /// task done when finished (the trigger already advances it to *in
-    /// progress*). Shared by the TUI (`app`) and headless (`thurbox-cli task
+    /// progress*). Shared by the TUI (`app`) and headless (`friring-cli task
     /// run`) dispatch paths so the two never drift.
     pub fn agent_prompt(&self) -> String {
         let mut prompt = format!(
-            "You are working on Thurbox task #{id}.\n\n# {title}\n",
+            "You are working on Friring task #{id}.\n\n# {title}\n",
             id = self.id,
             title = self.title,
         );
@@ -119,9 +119,9 @@ impl Task {
             }
         }
         prompt.push_str(&format!(
-            "\n---\nThis is a Thurbox task. Run `thurbox-cli task show {id}` for the full \
+            "\n---\nThis is a Friring task. Run `friring-cli task show {id}` for the full \
              record. The task is now marked **in progress**; when you finish, run \
-             `thurbox-cli task edit {id} --status done`.\n",
+             `friring-cli task edit {id} --status done`.\n",
             id = self.id,
         ));
         prompt
@@ -247,11 +247,11 @@ mod tests {
     #[test]
     fn agent_prompt_carries_id_title_and_cli_hints() {
         let prompt = sample_task(Some("Implement `SshTmuxBackend`.")).agent_prompt();
-        assert!(prompt.contains("Thurbox task #42"));
+        assert!(prompt.contains("Friring task #42"));
         assert!(prompt.contains("# Wire up SSH backend"));
         assert!(prompt.contains("Implement `SshTmuxBackend`."));
-        assert!(prompt.contains("thurbox-cli task show 42"));
-        assert!(prompt.contains("thurbox-cli task edit 42 --status done"));
+        assert!(prompt.contains("friring-cli task show 42"));
+        assert!(prompt.contains("friring-cli task edit 42 --status done"));
     }
 
     #[test]

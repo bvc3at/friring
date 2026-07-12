@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::session::SessionId;
 
-/// In-memory snapshot of shared state across all thurbox instances.
+/// In-memory snapshot of shared state across all friring instances.
 ///
 /// Used for computing deltas between local and database state.
 #[derive(Debug, Clone)]
@@ -45,7 +45,7 @@ pub struct SharedSession {
     pub agent: String,
 
     /// Backend identifier for finding the session in tmux.
-    /// Format: "thurbox:@0" for local tmux sessions.
+    /// Format: "friring:@0" for local tmux sessions.
     pub backend_id: String,
 
     /// Backend type (e.g., "tmux").

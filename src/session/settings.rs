@@ -1,4 +1,4 @@
-//! User-tunable settings (`~/.config/thurbox/settings.toml`): scalar knobs
+//! User-tunable settings (`~/.config/friring/settings.toml`): scalar knobs
 //! plus the `[features]` whole-feature switches.
 //!
 //! Pure data + parsing, per the `session/` architecture rule; the file IO and
@@ -52,7 +52,7 @@ pub struct Settings {
 /// Whole-feature switches (`[features]` in settings.toml). Each flag hides the
 /// feature's UI and blocks its keybinding; disabling `automations` also stops
 /// the TUI firing schedules and arming the tmux heartbeat. Data and
-/// `thurbox-cli` surfaces stay fully functional regardless, so re-enabling a
+/// `friring-cli` surfaces stay fully functional regardless, so re-enabling a
 /// flag is lossless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureFlags {
@@ -108,19 +108,19 @@ pub struct FeatureFlags {
     /// offer Ctrl+Z undo, leaving the tmux window + worktrees intact. Disabled
     /// = the TUI **hard-deletes** (kills the tmux window, removes worktrees +
     /// symlink workspace, disables send automations) after a confirmation
-    /// prompt. `thurbox-cli session delete` is unaffected (always soft unless
+    /// prompt. `friring-cli session delete` is unaffected (always soft unless
     /// `--force`).
     #[serde(default = "default_true")]
     pub soft_delete: bool,
     /// Version-update check: the TUI header "update available" badge and the
-    /// `thurbox-cli version --check` command. **Off by default** — unlike the
+    /// `friring-cli version --check` command. **Off by default** — unlike the
     /// other flags, this one is opt-in because it makes a network call to
     /// GitHub. Enable it to learn when a newer release is available.
     #[serde(default = "default_false")]
     pub version_check: bool,
     /// Silent auto-update: the TUI silently downloads, verifies, and replaces
     /// the installed binaries on startup when a newer release exists, and the
-    /// `thurbox-cli update` command does the same on demand. Also keeps installed
+    /// `friring-cli update` command does the same on demand. Also keeps installed
     /// extensions fresh — once the binary upgrades, the self-heal pass (TUI
     /// startup + headless tick) refreshes any extension that is now stale instead
     /// of merely nudging. **Off by default** — opt-in because it makes a network
@@ -200,7 +200,7 @@ pub struct NotificationSettings {
     #[serde(default)]
     pub also_on_waiting: bool,
     /// Skip notifications for the session currently in focus (you're already
-    /// looking at it). Defaults on; flip off if you run thurbox in a
+    /// looking at it). Defaults on; flip off if you run friring in a
     /// background window and want every transition surfaced.
     #[serde(default = "default_true")]
     pub suppress_for_active: bool,

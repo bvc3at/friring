@@ -52,7 +52,7 @@ mod tests {
     #[test]
     fn mtime_is_none_for_none_and_missing_paths() {
         assert!(mtime(None).is_none());
-        let missing = std::path::Path::new("/nonexistent/thurbox/does-not-exist.toml");
+        let missing = std::path::Path::new("/nonexistent/friring/does-not-exist.toml");
         assert!(mtime(Some(missing)).is_none());
     }
 

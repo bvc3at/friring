@@ -1,16 +1,16 @@
-# VHS tape — Thurbox session-creation workflow feature clip.
+# VHS tape — Friring session-creation workflow feature clip.
 #
 # Do NOT run directly — run `scripts/demo/record.sh session-creation`,
 # which builds the dev binary, sets up the isolated env, seeds one session per
 # real agent CLI in a sample repo, seeds a `~/projects` folder of several repos,
-# and exports $THURBOX_BIN.
+# and exports $FRIRING_BIN.
 #
 # Ctrl+N opens the repo picker. Highlights: repos show by basename (not full
 # path); Ctrl+P imports a parent folder whose git sub-dirs are listed beneath a
 # collapsible header; then the usual name -> agent picker -> spawn flow.
 
-Output docs/media/thurbox-session-creation.gif
-Output docs/media/thurbox-session-creation.mp4
+Output docs/media/friring-session-creation.gif
+Output docs/media/friring-session-creation.mp4
 
 Set Shell "bash"
 Set FontSize 18
@@ -22,7 +22,7 @@ Set PlaybackSpeed 1.0
 
 # Launch the dev binary (isolated env from record.sh).
 Hide
-Type `exec "$THURBOX_BIN"`
+Type `exec "$FRIRING_BIN"`
 Enter
 Sleep 2s
 Show

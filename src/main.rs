@@ -10,10 +10,10 @@ use crossterm::event::{
 };
 use crossterm::execute;
 
-use thurbox::agent::tmux::{LocalTmuxBackend, TmuxBackend};
-use thurbox::agent::{BackendRegistry, SessionBackend};
-use thurbox::app::{App, AppMessage};
-use thurbox::storage::Database;
+use friring::agent::tmux::{LocalTmuxBackend, TmuxBackend};
+use friring::agent::{BackendRegistry, SessionBackend};
+use friring::app::{App, AppMessage};
+use friring::storage::Database;
 
 /// Whether we pushed kitty keyboard-protocol flags onto the terminal. The
 /// panic hook is installed before the push happens, so it reads this to know
@@ -93,7 +93,7 @@ impl Drop for TerminalGuard {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Process start, for the opt-in time-to-first-frame measurement (logged
-    // once by `run_loop` when `THURBOX_PERF_LOG` is set). Captured first so it
+    // once by `run_loop` when `FRIRING_PERF_LOG` is set). Captured first so it
     // covers config load, DB open, and session restore.
     let process_start = std::time::Instant::now();
 
@@ -105,13 +105,13 @@ async fn main() -> Result<()> {
     }));
 
     // File-based logging (stdout is owned by the TUI)
-    let log_dir = thurbox::paths::log_directory().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let log_dir = friring::paths::log_directory().unwrap_or_else(|| std::path::PathBuf::from("."));
     std::fs::create_dir_all(&log_dir).ok();
-    let file_appender = tracing_appender::rolling::daily(log_dir, "thurbox.log");
+    let file_appender = tracing_appender::rolling::daily(log_dir, "friring.log");
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("thurbox=debug".parse().unwrap()),
+                .add_directive("friring=debug".parse().unwrap()),
         )
         .with_writer(file_appender)
         .with_ansi(false)
@@ -119,7 +119,7 @@ async fn main() -> Result<()> {
 
     // Coarse, always-cheap startup phase marks (a handful of one-shot
     // `Instant::now()` calls, never in a loop). The breakdown is only *emitted*
-    // when THURBOX_PERF_LOG is set; capturing it unconditionally keeps the code
+    // when FRIRING_PERF_LOG is set; capturing it unconditionally keeps the code
     // simple at no measurable cost. See docs/PERFORMANCE.md (ADR-P5).
     let mut startup = StartupTimings::default();
 
@@ -145,8 +145,8 @@ async fn main() -> Result<()> {
     // session restore below (so healed sessions are adopted like any other) and
     // before the TUI takes over the terminal (so tmux spawn output can't corrupt
     // it). Deleting an active extension's resources is therefore a no-op — they
-    // come back; `thurbox-cli extension deactivate <name>` is the real off-switch.
-    let heal_messages = thurbox::session_ops::heal_active_extensions(&db);
+    // come back; `friring-cli extension deactivate <name>` is the real off-switch.
+    let heal_messages = friring::session_ops::heal_active_extensions(&db);
     for m in &heal_messages {
         tracing::info!("{m}");
     }
@@ -155,8 +155,8 @@ async fn main() -> Result<()> {
     // Auto-activate the built-in `hooks` extension so the default agent reports
     // its lifecycle state out of the box (working/blocked/done). Idempotent;
     // re-applies the agent hook wiring on every launch. Opt out with
-    // `thurbox-cli extension deactivate hooks`.
-    let hook_messages = thurbox::session_ops::ensure_builtin_hooks_extension(&db);
+    // `friring-cli extension deactivate hooks`.
+    let hook_messages = friring::session_ops::ensure_builtin_hooks_extension(&db);
     for m in &hook_messages {
         tracing::info!("{m}");
     }
@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
     // in-memory copy App spawns from reflects that on the *first* run too
     // (otherwise a freshly-seeded profile would spawn agents without their hooks
     // and statuses would be stuck until the next launch).
-    let agents = thurbox::agent::agent_config::load_or_seed();
+    let agents = friring::agent::agent_config::load_or_seed();
     startup.extension_heal_ms = t_phase.elapsed().as_millis();
 
     // Silent auto-update (opt-in via [features] auto_update). Kicked off on a
@@ -212,7 +212,7 @@ async fn main() -> Result<()> {
     startup.heartbeat_ms = t_phase.elapsed().as_millis();
 
     // Hand the phase breakdown to the app so the published perf snapshot
-    // (`thurbox-cli perf`) can show boot cost alongside the runtime stats.
+    // (`friring-cli perf`) can show boot cost alongside the runtime stats.
     app.set_startup_phases(startup.as_json());
 
     let res = run_loop(&mut terminal, &mut app, process_start, startup).await;
@@ -221,7 +221,7 @@ async fn main() -> Result<()> {
     // `shutdown()` detaches tmux/SSH sessions, and while it runs the event loop
     // is no longer draining stdin. With mouse capture still on, any mouse motion
     // in that window queues SGR reports (`ESC[<b;x;yM`) in the tty buffer that
-    // the shell then echoes as `51;82;30M`-style garbage once thurbox exits.
+    // the shell then echoes as `51;82;30M`-style garbage once friring exits.
     // `restore_terminal` is idempotent, so the `_terminal_guard` drop below (and
     // early-error returns) still restore correctly.
     restore_terminal();
@@ -236,8 +236,8 @@ async fn main() -> Result<()> {
 #[allow(clippy::type_complexity)]
 fn init_backends_and_config() -> Result<(
     BackendRegistry,
-    thurbox::session::AgentRegistry,
-    thurbox::session::HostRegistry,
+    friring::session::AgentRegistry,
+    friring::session::HostRegistry,
     Vec<String>,
 )> {
     let local_tmux: Arc<dyn SessionBackend> = Arc::new(LocalTmuxBackend::new());
@@ -249,31 +249,31 @@ fn init_backends_and_config() -> Result<(
     // anything reads them (Database::open prunes the audit log; layout and
     // terminal wiring read breakpoints/scrollback).
     let (settings, mut config_warnings) =
-        thurbox::agent::settings_config::load_or_seed_with_warnings();
-    thurbox::session::settings::init(settings);
+        friring::agent::settings_config::load_or_seed_with_warnings();
+    friring::session::settings::init(settings);
 
     // Register one backend per off-local host: each configured SSH host in
-    // ~/.config/thurbox/hosts.toml, plus every auto-discovered local WSL distro
+    // ~/.config/friring/hosts.toml, plus every auto-discovered local WSL distro
     // (`wsl.exe -l -q`, Windows only). These are registered lazily: a down or
     // slow host must not block TUI startup, so check_available()/ensure_ready()
     // are deferred to first spawn/restore (see App::backend_for).
-    let (hosts, host_warnings) = thurbox::agent::host_config::load_all_with_warnings();
+    let (hosts, host_warnings) = friring::agent::host_config::load_all_with_warnings();
     config_warnings.extend(host_warnings);
     for host in &hosts.hosts {
         tracing::debug!(host = %host.name, backend = %host.backend_name(), "Registering backend");
         backends.register(Arc::new(TmuxBackend::from_host(host)));
     }
 
-    // Load (or seed) the coding-agent registry from ~/.config/thurbox/agents.toml.
-    let (agents, agent_warnings) = thurbox::agent::agent_config::load_or_seed_with_warnings();
+    // Load (or seed) the coding-agent registry from ~/.config/friring/agents.toml.
+    let (agents, agent_warnings) = friring::agent::agent_config::load_or_seed_with_warnings();
     config_warnings.extend(agent_warnings);
 
     // Load (or seed) custom themes and publish them so the picker and the
     // persisted-theme lookup below can resolve them by name.
     let (custom_themes, theme_warnings) =
-        thurbox::agent::themes_config::load_or_seed_with_warnings();
+        friring::agent::themes_config::load_or_seed_with_warnings();
     config_warnings.extend(theme_warnings);
-    thurbox::ui::theme::set_custom_themes(custom_themes);
+    friring::ui::theme::set_custom_themes(custom_themes);
 
     for w in &config_warnings {
         tracing::warn!("{w}");
@@ -285,7 +285,7 @@ fn init_backends_and_config() -> Result<(
 /// Open the SQLite database for persistent state, falling back to the default
 /// XDG location (dev vs. prod build) when the path can't be resolved.
 fn open_database() -> Result<Database> {
-    let db_path = thurbox::paths::database_file().unwrap_or_else(fallback_database_path);
+    let db_path = friring::paths::database_file().unwrap_or_else(fallback_database_path);
     Database::open(&db_path)
         .with_context(|| format!("failed to open database at {}", db_path.display()))
 }
@@ -299,9 +299,9 @@ fn open_database() -> Result<Database> {
 /// `$HOME/.local/share` on Unix).
 fn fallback_database_path() -> std::path::PathBuf {
     let app = if cfg!(dev_build) {
-        "thurbox-dev"
+        "friring-dev"
     } else {
-        "thurbox"
+        "friring"
     };
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
@@ -316,22 +316,22 @@ fn fallback_database_path() -> std::path::PathBuf {
             }
             #[cfg(not(windows))]
             {
-                let mut p = thurbox::paths::home_dir().unwrap_or_default();
+                let mut p = friring::paths::home_dir().unwrap_or_default();
                 p.push(".local");
                 p.push("share");
                 p
             }
         });
-    base.join(app).join("thurbox.db")
+    base.join(app).join("friring.db")
 }
 
 /// Activate the persisted theme — built-in or custom — falling back to the
 /// default when unset or unknown.
 fn activate_persisted_theme(db: &Database) {
     if let Ok(Some(name)) = db.get_active_theme() {
-        thurbox::ui::theme::apply_theme_by_name(&name);
+        friring::ui::theme::apply_theme_by_name(&name);
     } else {
-        thurbox::ui::theme::ensure_initialized();
+        friring::ui::theme::ensure_initialized();
     }
 }
 
@@ -339,7 +339,7 @@ fn activate_persisted_theme(db: &Database) {
 /// the terminal. Without mouse capture the terminal keeps its native mouse
 /// behavior and no mouse events ever reach the app.
 fn enable_terminal_features() -> Result<()> {
-    if thurbox::session::settings::global().features.mouse {
+    if friring::session::settings::global().features.mouse {
         execute!(std::io::stdout(), EnableMouseCapture)?;
     }
     execute!(std::io::stdout(), EnableBracketedPaste)?;
@@ -348,12 +348,12 @@ fn enable_terminal_features() -> Result<()> {
 
 /// Arm the tmux heartbeat keeper so automations keep firing after the TUI is
 /// closed (best-effort: a missing/old tmux just means TUI-only firing). Skipped
-/// when the `automations` feature flag is off — `thurbox-cli automation create`
+/// when the `automations` feature flag is off — `friring-cli automation create`
 /// still arms it, since that's explicit user intent.
 fn arm_automation_heartbeat() {
-    if thurbox::session::settings::global().features.automations {
-        let cli = thurbox::agent::tmux::resolve_cli_binary();
-        if let Err(e) = thurbox::agent::tmux::ensure_automation_heartbeat(&cli) {
+    if friring::session::settings::global().features.automations {
+        let cli = friring::agent::tmux::resolve_cli_binary();
+        if let Err(e) = friring::agent::tmux::ensure_automation_heartbeat(&cli) {
             tracing::warn!("Failed to arm automation heartbeat: {e}");
         }
     }
@@ -379,11 +379,11 @@ fn arm_automation_heartbeat() {
 /// feature is opted into); `perform_update(false)` short-circuits to `UpToDate`
 /// after that single fetch when already current.
 fn spawn_auto_update() -> Option<std::sync::mpsc::Receiver<String>> {
-    let features = &thurbox::session::settings::global().features;
+    let features = &friring::session::settings::global().features;
     if !features.auto_update {
         return None;
     }
-    if thurbox::agent::extension_config::is_dev_build() {
+    if friring::agent::extension_config::is_dev_build() {
         return None;
     }
     let (tx, rx) = std::sync::mpsc::channel();
@@ -397,13 +397,13 @@ fn spawn_auto_update() -> Option<std::sync::mpsc::Receiver<String>> {
 /// and swallowed. A send error means the TUI already exited, so there is nothing
 /// to surface; it is ignored.
 fn run_auto_update(tx: &std::sync::mpsc::Sender<String>) {
-    match thurbox::agent::self_update::perform_update(false) {
+    match friring::agent::self_update::perform_update(false) {
         Ok(outcome) => {
             // The update ran, so freshen the version-check cache too — the badge
             // stays accurate and reflects the newest release on the next launch.
-            let _ = thurbox::agent::version_check::refresh_cache();
-            if let thurbox::agent::self_update::UpdateOutcome::Updated { to, .. } = outcome {
-                let msg = format!("Updated to v{to} — restart thurbox to apply.");
+            let _ = friring::agent::version_check::refresh_cache();
+            if let friring::agent::self_update::UpdateOutcome::Updated { to, .. } = outcome {
+                let msg = format!("Updated to v{to} — restart friring to apply.");
                 tracing::info!("{msg}");
                 let _ = tx.send(msg);
             }
@@ -413,7 +413,7 @@ fn run_auto_update(tx: &std::sync::mpsc::Sender<String>) {
 }
 
 /// Coarse one-shot startup phase durations (milliseconds), captured in `main`
-/// and logged once after the first paint when `THURBOX_PERF_LOG` is set. The
+/// and logged once after the first paint when `FRIRING_PERF_LOG` is set. The
 /// phases sum to roughly `first_frame_ms`, so a slow boot can be attributed to
 /// config/backend init, DB open, extension heal, or session restore rather than
 /// guessed at. See docs/PERFORMANCE.md (ADR-P5).
@@ -458,11 +458,11 @@ async fn run_loop(
     process_start: std::time::Instant,
     startup: StartupTimings,
 ) -> Result<()> {
-    // Opt-in (THURBOX_PERF_LOG) time-to-first-frame measurement: logged once,
+    // Opt-in (FRIRING_PERF_LOG) time-to-first-frame measurement: logged once,
     // right after the first paint, so it never affects normal runs or the smoke
-    // test. Read `~/.local/share/thurbox/thurbox.log` for the `startup` line
+    // test. Read `~/.local/share/friring/friring.log` for the `startup` line
     // (phase breakdown + `first_frame_ms`). See docs/PERFORMANCE.md.
-    let perf_log = std::env::var_os("THURBOX_PERF_LOG").is_some();
+    let perf_log = std::env::var_os("FRIRING_PERF_LOG").is_some();
     let mut first_frame_logged = false;
 
     loop {
@@ -470,7 +470,7 @@ async fn run_loop(
         // or the forced-redraw floor elapsed. The loop still spins every ≤10ms
         // (cheap: poll + output check + tick), but the expensive layout/vt100
         // render is skipped when idle — see App::should_redraw / docs/PERFORMANCE.md.
-        // Wall-clock timing is opt-in (THURBOX_PERF_LOG or the perf HUD): the
+        // Wall-clock timing is opt-in (FRIRING_PERF_LOG or the perf HUD): the
         // cached-bool gate keeps the default hot loop free of Instant reads.
         let timing = app.perf_timing_active();
 

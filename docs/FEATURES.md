@@ -60,9 +60,9 @@ with `…` to fit the panel. The repo/branch and agent live in the info
 panel, not the list row.
 
 The colored **status dot** is driven by **agent hooks**, not output
-heuristics. Each agent CLI's lifecycle hooks call `thurbox-cli session
+heuristics. Each agent CLI's lifecycle hooks call `friring-cli session
 signal --state <working|blocked|done|idle>` (identity from the injected
-`THURBOX_SESSION`), and `refresh_session_statuses` maps the persisted
+`FRIRING_SESSION`), and `refresh_session_statuses` maps the persisted
 state to one of six `SessionStatus` values once per tick:
 
 | State | Colour | Glyph | Meaning |
@@ -88,7 +88,7 @@ roll up to their most-urgent member
 (`Blocked > Error > Working > Done > Unreachable > Idle`).
 
 The hooks are wired automatically by the built-in **hooks** extension
-(auto-activated on first run; opt out with `thurbox-cli extension
+(auto-activated on first run; opt out with `friring-cli extension
 deactivate hooks`). How much each agent can report depends on the
 lifecycle surface its CLI exposes — claude, opencode, and antigravity
 report the full range, codex reports idle/working/done, aider reports
@@ -100,13 +100,13 @@ blocked, and vibe is experimental. See the per-agent matrix in
 `SessionStatus` (`src/session/mod.rs`) is the six-state enum above. The
 implementation anchors:
 
-- **The callback.** Agents report transitions with `thurbox-cli session
+- **The callback.** Agents report transitions with `friring-cli session
   signal --state <working|blocked|done|idle>` (`cli::sessions::Action::Signal`);
-  identity is the injected `THURBOX_SESSION` (falling back to a lookup by
-  `agent_session_id` / `THURBOX_SESSION_ID`), so a hook passes no id. It writes
+  identity is the injected `FRIRING_SESSION` (falling back to a lookup by
+  `agent_session_id` / `FRIRING_SESSION_ID`), so a hook passes no id. It writes
   the persisted state and the TUI picks it up via `PRAGMA data_version` — works
   headless. **Remote** sessions can't run the CLI, so the materialized hook
-  file instead sets a tmux pane user option (`@thurbox_state`) delivered over
+  file instead sets a tmux pane user option (`@friring_state`) delivered over
   the control-mode subscription into the same columns (see *Remote SSH & WSL*).
 - **Persistence.** `sessions.hook_state` / `hook_state_at` / `seen_at` (schema
   **v34**), with targeted-UPDATE accessors `set_hook_state` /
@@ -193,7 +193,7 @@ you". The agents already emit these signals — we just read them. This
 mirrors how dashboards like Orca surface working / waiting / finished.
 
 **Caveat (Claude in tmux):** Claude Code only emits the OSC 9 desktop
-notification for Ghostty/Kitty/iTerm2, so inside thurbox's tmux pane
+notification for Ghostty/Kitty/iTerm2, so inside friring's tmux pane
 set `claude config set --global preferredNotifChannel terminal_bell`
 to get the bell we can detect. We capture bell + OSC 9 + OSC 777,
 whichever the agent produces.
@@ -228,7 +228,7 @@ spatial map you can build muscle memory against.
 
 ## Session Creation
 
-![Session creation workflow](media/thurbox-session-creation.gif)
+![Session creation workflow](media/friring-session-creation.gif)
 
 `Ctrl+N` walks through a series of modals to configure a new
 session. Each step has a sensible default and can be skipped when
@@ -267,9 +267,9 @@ some repos may be worktree-based (new branch created) while others
 are added as-is.
 
 **How does one agent reach multiple repos?** Agent CLIs disagree on
-how (or whether) to accept extra directories, so thurbox stays
+how (or whether) to accept extra directories, so friring stays
 agent-neutral: a multi-repo session is launched in a per-session
-**symlink workspace** (`~/.local/share/thurbox/workspaces/<agent_session_id>/`)
+**symlink workspace** (`~/.local/share/friring/workspaces/<agent_session_id>/`)
 holding one symlink per repo, with the agent's cwd set there. Every
 agent then sees each repo as a subdirectory — no per-agent flags and
 no `agents.toml` changes. The workspace is only symlinks, rebuilt
@@ -284,7 +284,7 @@ picks workspace-vs-primary. Single-repo sessions launch directly in the repo
 as before.
 
 **Headless multi-repo.** The same shape is reachable without the TUI.
-`thurbox-cli session create` (and `task create`) take repeatable
+`friring-cli session create` (and `task create`) take repeatable
 `--add-repo PATH[@BASE]` — each gets its **own isolated worktree** on
 the spawn's shared `--worktree-branch`, off its own base — and `--add-dir
 PATH`, which attaches a repo **as-is** (no branch). This travels as
@@ -314,7 +314,7 @@ from accumulating stale entries.
 ### Agent definitions
 
 The set of available agents is **data**, not code. On first run
-Thurbox seeds `~/.config/thurbox/agents.toml` with built-in
+Friring seeds `~/.config/friring/agents.toml` with built-in
 definitions for claude, codex, antigravity, opencode, aider, and vibe
 (`agent::agent_config::load_or_seed`). Editing the file — adding an
 `[[agents]]` entry or tweaking an existing one — extends the agent
@@ -337,7 +337,7 @@ each group **only when its driving value is present**, substituting
 new-session id; static `args` follow. A group with no value is
 simply omitted — no unresolved-placeholder heuristics.
 
-Only `claude` accepts the thurbox-generated id at creation
+Only `claude` accepts the friring-generated id at creation
 (`--session-id {id}`), so only it resumes/forks by that exact id.
 The other built-ins can't pin or report their session id, so they
 set `resume_latest = true` and resume/fork via id-less, cwd-scoped
@@ -373,7 +373,7 @@ resume_latest = true
 Like agents, off-local hosts are **data**. A session can run on a
 remote machine over SSH, or inside a local **WSL distro**, while the
 TUI stays local. Hosts are declared in
-`~/.config/thurbox/hosts.toml` (seeded commented-out, so a fresh
+`~/.config/friring/hosts.toml` (seeded commented-out, so a fresh
 install has none and behaves exactly as before) — **and WSL distros
 are auto-discovered on Windows** (`wsl.exe -l -q`), so they need no
 entry at all:
@@ -401,14 +401,14 @@ documents each field inline:
 | `destination` | for ssh | — | ssh target (`user@host` or a `~/.ssh/config` alias) |
 | `distro` | no | `name` | WSL distro name (`kind = "wsl"` only) |
 | `ssh_opts` | no | `[]` | extra `ssh` flags, one token per array element; no `~` expansion (use absolute paths) |
-| `socket` | no | `thurbox` | host `tmux -L` socket name |
-| `session` | no | `thurbox` | host tmux session name |
-| `worktrees_dir` | no | `$HOME/.local/share/thurbox/worktrees` | absolute dir on the host/distro for git worktrees |
+| `socket` | no | `friring` | host `tmux -L` socket name |
+| `session` | no | `friring` | host tmux session name |
+| `worktrees_dir` | no | `$HOME/.local/share/friring/worktrees` | absolute dir on the host/distro for git worktrees |
 
 Each host becomes a session backend named `ssh:<name>` / `wsl:<name>`.
-For **SSH**, thurbox shells out to the system `ssh` binary, so
+For **SSH**, friring shells out to the system `ssh` binary, so
 authentication, keys, and connection multiplexing come from your
-`~/.ssh/config` — thurbox never handles credentials. A **WSL distro**
+`~/.ssh/config` — friring never handles credentials. A **WSL distro**
 is reached with `wsl.exe -d <distro>` (no credentials, no network);
 `wsl.exe` forwards whitespace-free tokens to the in-distro shell like
 `ssh` does, so the *same* tmux control-mode protocol, POSIX quoting,
@@ -429,10 +429,10 @@ on the correct host after a restart.
 
 **Why lean on `~/.ssh/config`?** Re-implementing SSH auth, agent
 forwarding, and ControlMaster multiplexing would be a large, fragile
-surface. Deferring to the system `ssh` keeps thurbox out of the
+surface. Deferring to the system `ssh` keeps friring out of the
 credential path and inherits whatever the user already configured.
 
-Headless: `thurbox-cli session create --host devbox --repo-path
+Headless: `friring-cli session create --host devbox --repo-path
 /srv/repo --worktree-branch feat/x` does the same over the CLI.
 
 ---
@@ -464,7 +464,7 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 
 | Key | Context | Action | Mnemonic |
 |-----|---------|--------|----------|
-| `Ctrl+Q` | Global | Quit Thurbox (detach sessions) | **Q**uit |
+| `Ctrl+Q` | Global | Quit Friring (detach sessions) | **Q**uit |
 | `Ctrl+N` | Global | New session (opens repo picker) | **N**ew |
 | `Ctrl+C` | Terminal | Copy selection, or send SIGINT if none | **C**opy |
 | `Ctrl+V` | Terminal | Paste from clipboard into PTY | Paste |
@@ -532,7 +532,7 @@ the chord you want — the next physical keypress (including chords like
 action's defaults, and `Shift+D` resets every action at once (removing the
 override file). If the chord conflicts it is reassigned from the other action
 and a status toast reports the move. Changes persist immediately to
-`~/.config/thurbox/keybindings.json` (`Action` name → chord strings, e.g.
+`~/.config/friring/keybindings.json` (`Action` name → chord strings, e.g.
 `{ "QuitApp": ["ctrl+a"] }`) and take effect on the next keystroke — no
 restart. The file can also be hand-edited directly.
 
@@ -555,7 +555,7 @@ terminal's catch-all PTY forwarding. The automations and tasks panes themselves
 are **rebindable** scoped contexts (`KeyContext::Automations`/`Tasks`),
 mirroring the session list.
 
-**Terminal PTY passthrough.** thurbox's global chords share the `Ctrl+<letter>`
+**Terminal PTY passthrough.** friring's global chords share the `Ctrl+<letter>`
 namespace with readline / shell line editing (`Ctrl+A` = start-of-line, `Ctrl+E`
 = end-of-line, `Ctrl+W` = delete-word, `Ctrl+U` = kill-line, `Ctrl+R` =
 reverse-search, `Ctrl+D` = EOF, …). So when a session **terminal is focused**,
@@ -564,7 +564,7 @@ the actions flagged by `Action::terminal_passthrough` (`ToggleInfoPanel` /
 `OpenAutomations` / `RestartSession` / `StartSync` / `OpenRestoreSessions` /
 `FocusTasks` / `ToggleReview`) **defer to the agent CLI** — `handle_key` skips
 `dispatch_action` and falls through to `handle_terminal_key`, forwarding the
-bytes to the PTY (so e.g. `Ctrl+X` reaches emacs's prefix key). The thurbox
+bytes to the PTY (so e.g. `Ctrl+X` reaches emacs's prefix key). The friring
 command stays reachable from the **session list** (and via its `F`-key alternate
 where one exists — `F2`/`F3`/`F5`/`F7`). The deferral is gated on the bound chord
 still being a bare `Ctrl+<letter>` (`is_ctrl_letter_chord`), so rebinding a
@@ -573,7 +573,7 @@ Navigation / app-control chords (`Ctrl+H/J/K/L`, `Ctrl+Q`, `Ctrl+N`, …) are
 **not** deferred — they are the keyboard escape route out of the terminal, so
 they keep working there even though a few collide with readline.
 
-**Readline editing in modal text fields.** Thurbox's own text inputs
+**Readline editing in modal text fields.** Friring's own text inputs
 (session / branch name, repo-picker path & search, automation editor,
 task title / description) accept the standard emacs/readline
 line-editing chords, so the muscle memory that works in a terminal works
@@ -590,7 +590,7 @@ Ctrl chords pass through macOS terminals unchanged (raw mode disables
 flow control; the `Ctrl+Y` DSUSP quirk is why the `F4` alternate
 exists). Beyond that:
 
-- **Cmd as a modifier.** Thurbox enables the kitty keyboard protocol
+- **Cmd as a modifier.** Friring enables the kitty keyboard protocol
   when the terminal supports it (`main.rs` pushes
   `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`, gated on
   `supports_keyboard_enhancement()`, popped on shutdown and in the panic
@@ -600,7 +600,7 @@ exists). Beyond that:
   iTerm2 3.5+, kitty, WezTerm, and Ghostty; Terminal.app lacks the protocol,
   so Cmd chords never arrive there (everything else degrades gracefully).
   Note the emulator consumes its own Cmd shortcuts (`Cmd+Q/W/N/T/C/V`,
-  `Cmd+K` clear, `Cmd+H` hide, `Cmd+digit` tabs) before Thurbox can
+  `Cmd+K` clear, `Cmd+H` hide, `Cmd+digit` tabs) before Friring can
   see them — only unclaimed chords are bindable.
 - **macOS default alternates.** On macOS builds four Cmd chords are
   appended after the Ctrl primaries via `Action::default_chords_for(macos)`
@@ -686,18 +686,18 @@ editor of choice can open them as a workspace.
 
 ## Code Review (native)
 
-Thurbox ships a **native, built-in** tuicr-like review view (`Ctrl+X`, `F7`
+Friring ships a **native, built-in** tuicr-like review view (`Ctrl+X`, `F7`
 alternate; rebindable `Action::ToggleReview`, gated by `[features]
 code_review`): a GitHub-style continuous diff of the active session's worktree
 (`<base>..HEAD`) with classified comments (issue / suggestion / note /
 praise), per-file/hunk "reviewed" marks, and a review summary — rendered
-directly by thurbox and persisted in SQLite. `Ctrl+X` is in
+directly by friring and persisted in SQLite. `Ctrl+X` is in
 `terminal_passthrough` (the emacs prefix key), so in a focused terminal it
 reaches the agent and `F7` opens the review.
 
 **Why native, not the external `tuicr` binary?** An earlier attempt
 launched `tuicr` inside a tmux pane. Nesting a full ratatui TUI inside
-thurbox's vt100 parser is janky (double-render, input quirks), needs the
+friring's vt100 parser is janky (double-render, input quirks), needs the
 binary installed, and the feedback loop was clunky. Rendering the diff
 ourselves makes it a first-class panel: instant toggle, real mouse
 support, and direct access to the session's git state and agent.
@@ -727,7 +727,7 @@ diff (`ReviewTarget`, `build_target_diff`, `git::{diff_working_on,
 show_commit_on, list_commits_on}`). A session with no resolvable base
 defaults to the working-changes target, so even a bare checkout reviews.
 
-**Why review all repos at once?** A thurbox session can span several
+**Why review all repos at once?** A friring session can span several
 repositories (and flow opens a PR per repo), so a review that only saw the
 primary repo would miss most of the change. A multi-repo session reviews
 every worktree in one stream (`Vec<ReviewRepo>` on `CodeReviewState`, the
@@ -761,7 +761,7 @@ free to carry syntax colour. It's heuristic + language-agnostic (no
 grammar engine, no heavy dependency); a grammar-aware upgrade is a
 follow-up.
 
-**Why mouse-first, no vim modal?** To match thurbox's own interaction
+**Why mouse-first, no vim modal?** To match friring's own interaction
 model (clicks, buttons, scrollbars, wheel) rather than tuicr's heavy vim
 modes — though the tuicr movement keys work too (`j`/`k` + arrows,
 PageUp/Down + `Ctrl+D`/`U`, `g`/`G`, `{`/`}` or Tab next/prev file, `[`/`]`
@@ -777,7 +777,7 @@ hunk, `✓`) works from **any** row in the file — line, hunk, header, or a
 comment — not just its header.
 
 **Why persist a base branch?** Reviewing `<base>..HEAD` needs the fork
-point, which thurbox didn't store. A write-once `sessions.base_branch`
+point, which friring didn't store. A write-once `sessions.base_branch`
 column (schema v38, like the hook columns) records it at spawn; legacy
 rows fall back to the repo's default branch.
 
@@ -894,7 +894,7 @@ enable/disable-able task that fires on a schedule (one-shot or
 recurring) and, when it fires, either pastes a prompt into an
 existing session (**send**) or spawns a new session — optionally on
 a fresh git worktree — and prompts it (**spawn**). This is the
-Thurbox analogue of "scheduled agent runs": queue follow-up
+Friring analogue of "scheduled agent runs": queue follow-up
 prompts, run nightly maintenance, or kick off a fresh triage
 session every weekday morning.
 
@@ -937,7 +937,7 @@ spent one-shot clears it and disables the automation.
   `session_ops::run_exec_command` (called by both the headless `automation
   tick` and the TUI `App::fire_automation`); the command is stored in the
   `action_command` column (schema **v36**, on both `tasks` and `automations`).
-  Author one with `thurbox-cli automation create --command "<shell>"`
+  Author one with `friring-cli automation create --command "<shell>"`
   (mutually exclusive with `--session`/`--repo`), in the TUI editor (the
   action selector cycles Send → Spawn → Exec), or from an extension manifest
   (`[[automations]]` with a `command` field). `Task.action` shares the
@@ -946,15 +946,15 @@ spent one-shot clears it and disables the automation.
 ### Execution model
 
 Automations fire from **three** places, all going through the same
-`thurbox-cli automation tick` logic and made safe by **claim-based
+`friring-cli automation tick` logic and made safe by **claim-based
 firing** (see below):
 
 1. **TUI tick loop** (`process_automations`, ~1 s cadence) — while
    the TUI is open. On startup it runs an immediate catch-up pass
    so runs missed while the TUI was down fire once on boot.
 2. **tmux heartbeat keeper** — a detached `automation-heartbeat`
-   window (armed on TUI startup and on `thurbox-cli automation
-   create`) that loops `thurbox-cli automation tick` every 60 s.
+   window (armed on TUI startup and on `friring-cli automation
+   create`) that loops `friring-cli automation tick` every 60 s.
    Because it is a live tmux window it also keeps the tmux server
    alive, so automations — **including spawn** — fire even after
    the TUI is closed and even with no other sessions open. This
@@ -1082,9 +1082,9 @@ Automations live in the `automations` SQLite table (`name`,
 fire appends to `automation_runs` (`status` = success/skipped/error
 plus a free-text `detail`) for history.
 
-### Headless access (`thurbox-cli`)
+### Headless access (`friring-cli`)
 
-`thurbox-cli automation` (alias `auto`) provides
+`friring-cli automation` (alias `auto`) provides
 `create`/`list`/`show`/`edit`/`remove`/`run`/`runs`/`tick` without
 the TUI, sharing the same tables. `run` marks an automation due;
 `tick` fires all currently-due automations headlessly (this is what
@@ -1102,8 +1102,8 @@ the TUI uses a **trigger-time picker** (`r`): you choose *Send → a running
 session* or *Spawn new session…* (the normal repo→agent flow) at the moment
 you act. Either way the agent is seeded with a **full context prompt**, not
 the bare title — `Task::agent_prompt()` builds an `id + # title + markdown
-description` block plus self-service hints (`thurbox-cli task show <id>` to
-read the record, `thurbox-cli task edit <id> --status done` to close it out).
+description` block plus self-service hints (`friring-cli task show <id>` to
+read the record, `friring-cli task edit <id> --status done` to close it out).
 The TUI seeds it via `App::task_agent_prompt` (bracketed-paste safe, so the
 multi-line body never submits early); the headless `task run` path builds the
 same string. Triggering advances the task `Todo → InProgress` (TUI:
@@ -1200,9 +1200,9 @@ The `source`/`external_id`/`external_url` columns feed the per-provider
 imported items carry a tracker tag, and the `(source, external_id)` pair is
 the natural dedup key for the bidirectional sync.
 
-### Headless access (`thurbox-cli`)
+### Headless access (`friring-cli`)
 
-`thurbox-cli task` (alias `todo`) provides
+`friring-cli task` (alias `todo`) provides
 `create`/`list`/`show`/`edit`/`remove`/`run`. `create`/`edit` take an
 optional `--description` (markdown; `edit --description ""` clears it) and the
 external-sync fields `--source`/`--external-id`/`--external-url` (an empty
@@ -1237,13 +1237,13 @@ thing to focus on (`🎯 Next: …`).
 Nothing in the extension names a vendor:
 
 - The behavior is a plain context file, `FLOW.md`, installed into the
-  flow home (`~/.config/thurbox/extensions/flow`) and surfaced to whichever CLI runs the session
+  flow home (`~/.config/friring/extensions/flow`) and surfaced to whichever CLI runs the session
   via symlinks to each CLI's context convention
   (`CLAUDE.md`/`AGENTS.md`/`GEMINI.md` → `FLOW.md`).
 - The triager and workers are **agents.toml aliases** — `flow`,
   `flow-worker` (default), `flow-worker-heavy` (long/hard work) — that
   the installer seeds with defaults and the user remaps freely.
-- All orchestration goes through `thurbox-cli` (`task create/run`,
+- All orchestration goes through `friring-cli` (`task create/run`,
   `session capture/send`, `automation create`) plus `jq`; the core
   binary has no flow-specific code.
 
@@ -1265,7 +1265,7 @@ task status (workers self-mark done) with an orchestrate-style
 ### Install
 
 Flow installs with the generic extension installer —
-`thurbox-cli extension install flow` — which reads flow's
+`friring-cli extension install flow` — which reads flow's
 `extension.toml` manifest: it lays down the flow home, registers the
 agents.toml aliases, creates the dedicated `flow` session, and marks
 the extension active so it **self-heals** if deleted. `extension
@@ -1284,10 +1284,10 @@ integration's `README.md`):
 - **`forge`** *(experimental)* — a workflow analyst. A weekly `forge-scan`
   automation on the `forge` session mines your tasks/sessions/automations (and
   their run history) for **recurring patterns** and writes ready-to-apply
-  `thurbox-cli automation` proposals; it *proposes, never imposes* — a scan
+  `friring-cli automation` proposals; it *proposes, never imposes* — a scan
   only reads state and writes `proposals.jsonl` (rendered to `proposals.md`),
   and nothing is created until you `apply <slug>` (and `proposals.sh apply`
-  refuses any command not starting with `thurbox-cli`). Spec: `FORGE.md`.
+  refuses any command not starting with `friring-cli`). Spec: `FORGE.md`.
 - **`ci-shepherd`** *(experimental)* — watches your open change requests
   (GitHub PRs / GitLab MRs / Bitbucket PRs; repos in `repos.md`) and dispatches
   a `shepherd-worker` fixer for each with **failing CI**, a
@@ -1300,19 +1300,19 @@ integration's `README.md`):
   `REBASE-QUEUED (behind #n)` — so the shepherd rebases one at a time (each
   merge advances the base for the next), clearing the stack in O(n) rebases
   instead of O(n²). A `shepherd` session monitors via a `shepherd-tick`
-  automation; fixers are thurbox **tasks** (`fix #<n>: …`) that self-report
+  automation; fixers are friring **tasks** (`fix #<n>: …`) that self-report
   with the same `===RESULT===` sentinel as flow. It is **forge-agnostic** —
   the only thing baked in is **git**; *how* to talk to a repo's host is decided
   by the agent each tick: built-in **fast paths** (github `gh` / gitlab `glab`
   / bitbucket REST via `scripts/provider.sh`) plus an **agent-driven** path for
   any other git forge (`provider.sh describe` hands the agent the remote +
   clients; it passes `--branch`/`--checkout-cmd`/`--feedback-cmd`/
-  `--comment-cmd` to `dispatch-fix.sh`). Because thurbox's `--worktree` always
+  `--comment-cmd` to `dispatch-fix.sh`). Because friring's `--worktree` always
   runs `git worktree add -b` (which fails on an existing branch),
   `dispatch-fix.sh` adopts the request branch itself into a shepherd-owned
   worktree. It is also **session-aware**: `scripts/link-sessions.sh` joins each
   request's head branch against the live `session list`; a branch already owned
-  by a **non-fixer** thurbox session is **not** dispatched (two worktrees would
+  by a **non-fixer** friring session is **not** dispatched (two worktrees would
   force-push the same branch) but is monitored and folded into the merge
   ordering, and when still actionable the shepherd **proactively nudges the
   live session** over the message queue (once per pending ask). Spec:
@@ -1323,19 +1323,19 @@ integration's `README.md`):
   repo; the worker runs **Renovate's `local` platform only**
   (`scripts/renovate-run.sh` hard-codes `--platform=local` — no hosted bot, no
   token, no Renovate-opened PR), tests the result, commits to a fresh
-  `renovate/updates-<ts>` branch, and opens a review PR. Updaters are thurbox
+  `renovate/updates-<ts>` branch, and opens a review PR. Updaters are friring
   **tasks** (`update <repo> deps …`) with the same `===RESULT===` sentinel.
   Unlike ci-shepherd it starts a *new* branch, so `scripts/dispatch-update.sh`
-  uses thurbox's native `--worktree` (no branch adoption). Version strategy is
+  uses friring's native `--worktree` (no branch adoption). Version strategy is
   per-repo (`strategy` column: `patch`/`minor`/`major`/`all`, a `RENOVATE_CONFIG`
   overlay) plus a global `renovate-config.json`. Spec: `RENOVATE.md`.
 - **Task integrations** (`github-issues`, `gitlab-issues`, `linear`, `jira`) —
   one per provider, each **bidirectionally** syncing an external issue tracker
-  with the thurbox task list. **No agent/LLM**: a `*-tick` automation (every
+  with the friring task list. **No agent/LLM**: a `*-tick` automation (every
   15 min) is a deterministic `AutomationAction::Exec` that runs
   `{home}/scripts/sync.sh`, which sources `{home}/credentials.env` (how
   Linear/Jira keys reach the headless run) then push-then-pull:
-  `push-status.sh` (push thurbox status back — `done` closes the issue,
+  `push-status.sh` (push friring status back — `done` closes the issue,
   reopening on revert; only `push_back=yes` rows), then per `trackers.md` row
   `fetch.sh "<query>"` (provider API → normalized JSON) `| upsert.sh --source
   <tag>` (dedup by `(source, external_id)`; the status rule treats only
@@ -1347,13 +1347,13 @@ integration's `README.md`):
   `curl` GraphQL (linear), `curl` REST v3 (jira). The only Rust support is the
   generic, tracker-neutral `task --source/--external-id/--external-url` flags,
   `get_task_by_external_id`, and the `Exec` automation action (ADR-20: no
-  provider name in the binary). `thurbox-cli extension install <provider>`.
+  provider name in the binary). `friring-cli extension install <provider>`.
 
 ---
 
 ## Extension Mechanism (manifests, hooks, self-heal)
 
-Extensions stay **data, not binary** (ADR-20): core thurbox knows a
+Extensions stay **data, not binary** (ADR-20): core friring knows a
 declarative **manifest format**, never a specific extension. Each extension
 ships an `extension.toml` (`session::ExtensionDef`, pure data in
 `session/extension_def.rs`; loaded by `agent::extension_config`) with two
@@ -1380,7 +1380,7 @@ manifest touch files an agent owns:
   `settings.json`). The merge (`agent::json_merge`) recurses objects, unions
   arrays by deep-equality, and leaves a user's conflicting value untouched;
   uninstall **prunes by marker** (every shipped hook command contains
-  `thurbox-cli session signal`), so removal stays correct even after the
+  `friring-cli session signal`), so removal stays correct even after the
   payload schema changes across an update. Writes are skipped when unchanged
   (it re-runs every startup + heartbeat tick).
 
@@ -1398,11 +1398,11 @@ a `[[config_merges]]` deep-merges codex's claude-shaped hooks into
 `~/.codex/hooks.json` (idle/working/done, *experimental*); an
 `[[external_files]]` drops an opencode plugin into `~/.config/opencode/plugin/`
 and a managed `~/.vibe/hooks.toml` for Mistral `vibe` (refused if a user file
-exists) and a `~/.copilot/hooks/thurbox-status.json` for GitHub Copilot (both
+exists) and a `~/.copilot/hooks/friring-status.json` for GitHub Copilot (both
 `bash`+`powershell` commands); and a `[[config_merges]]` merges hook entries
 into antigravity's shared `~/.gemini/settings.json` (`PreToolUse` → working,
 `Notification` → blocked, verified against agy 1.0.9). Opt out with
-`thurbox-cli extension deactivate hooks` (records a `builtin_hooks_optout`
+`friring-cli extension deactivate hooks` (records a `builtin_hooks_optout`
 metadata flag so self-heal won't resurrect it); `activate`/`install hooks`
 clears it. (See *Status internals*
 under Session Sidebar for the downstream `session signal` contract, and
@@ -1410,7 +1410,7 @@ under Session Sidebar for the downstream `session signal` contract, and
 
 ### Install / uninstall / reinstall
 
-`thurbox-cli extension install <name|url|dir> [--home <dir>] [--force]`
+`friring-cli extension install <name|url|dir> [--home <dir>] [--force]`
 (`session_ops::install_extension`) resolves the source
 (`agent::extension_config::resolve_source` — a bare name → the official source
 `official_base()/<name>` over curl/wget, **pinned to the binary's release tag**
@@ -1430,7 +1430,7 @@ clean-slate hammer (uninstall + `install --force` from the recorded source).
 
 ### CLI, versioning & self-heal
 
-`thurbox-cli extension` (alias `ext`) — `install` / `uninstall` / `reinstall`
+`friring-cli extension` (alias `ext`) — `install` / `uninstall` / `reinstall`
 / `list` / `available [<query>]` (alias `search`) / `update [<name>] [--all]
 [--force]` / `activate` / `deactivate [--force] [--purge]` / `status
 [<name>]`. `ensure_extension` idempotently (re)creates any missing declared
@@ -1444,7 +1444,7 @@ offline, each with an `installed` flag and ready-to-run `install_command`.
 A manifest declares its own `version` and a `min_thurbox_version` (soft compat
 gate — install/activate/heal *warn*, never block, if the binary is older). The
 installer stamps `installed_with` + `source` provenance into the discovery-dir
-copy; after a thurbox upgrade the on-disk copy is older, so
+copy; after a friring upgrade the on-disk copy is older, so
 `ExtensionDef::is_stale` flags it. With `[features] auto_update` on, the
 self-heal pass (`heal_one_extension`) **refreshes the stale extension in
 place** (`update_extension` re-runs `install_extension` from the recorded
@@ -1589,7 +1589,7 @@ and fully rebindable from the F1 editor like any other action.
 **Double-`Shift`** also opens the search — two bare `Shift` taps within
 ~400 ms with no other key between (`App::handle_modifier_press`). Bare
 modifier presses are only reported by kitty-keyboard-protocol terminals
-(kitty, WezTerm, foot, ghostty, recent iTerm2/Alacritty; thurbox pushes
+(kitty, WezTerm, foot, ghostty, recent iTerm2/Alacritty; friring pushes
 `REPORT_ALL_KEYS_AS_ESCAPE_CODES` when supported — see
 `push_keyboard_enhancement` in `src/main.rs`), so on legacy terminals the
 gesture is silently unavailable and `Ctrl+/` remains the opener. It is a
@@ -1614,13 +1614,13 @@ behaviour switch for the TUI `Ctrl+D` delete (soft-delete with a
 off — see *Explicit close vs quit*). Two flags are the opposite —
 opt-in (default `false`, because they reach the network):
 `version_check` (the "update available" badge +
-`thurbox-cli version --check`) and `auto_update` (silent self-update on
-startup + `thurbox-cli update`). See `docs/CONFIG.md`.
+`friring-cli version --check`) and `auto_update` (silent self-update on
+startup + `friring-cli update`). See `docs/CONFIG.md`.
 
 **Decision: flags are UI-level gates, not data switches.** A disabled
 feature hides its pane, consumes its keybinding with an explanatory
 status toast (the chord never reaches the PTY), and contributes no
-global-search results — but its data and the `thurbox-cli` surface
+global-search results — but its data and the `friring-cli` surface
 stay fully functional, so flipping a flag back on is lossless. The one
 deliberate exception is `automations = false`, which also stops the
 TUI firing due schedules and arming the tmux heartbeat at startup —
@@ -1696,16 +1696,22 @@ Two opt-in `[features]` flags (default `false`, because they reach the
 network — see *Feature Flags*) cover staying current:
 
 - **`version_check`** adds an "update available" badge in the TUI header
-  and the `thurbox-cli version --check` query. The latest release is
+  and the `friring-cli version --check` query. The latest release is
   fetched from GitHub and cached for 24 h, so it costs at most one
   request a day.
 - **`auto_update`** adds a silent self-update on TUI startup and the
-  `thurbox-cli update` command, which downloads, checksum-verifies, and
+  `friring-cli update` command, which downloads, checksum-verifies, and
   replaces the installed binaries with the latest release. `--force`
   bypasses the up-to-date and dev-build guards.
 
 Both are off by default so a fresh install makes **no** network calls and
 never mutates its own binary unless the user asks.
+
+**Fork caveat (friring):** version-check and self-update deliberately retain the
+upstream **Thurbox** release contract — they query `Thurbeen/thurbox` releases
+and replace on-disk `thurbox`/`thurbox-cli` assets — so they do **not** update a
+source-built `friring`. Update friring by pulling this repo and rebuilding (see
+`FORK.md`'s Migration section).
 
 ---
 
@@ -1733,9 +1739,9 @@ auto-clear after a timeout or on the next successful action.
 The info panel (`Ctrl+B`) and file viewer (`Ctrl+E`) are the
 optional columns that appear at wider widths:
 
-![Info panel](media/thurbox-info-panel.gif)
+![Info panel](media/friring-info-panel.gif)
 
-![File viewer](media/thurbox-file-manager.gif)
+![File viewer](media/friring-file-manager.gif)
 
 ### Breakpoint Rationale
 
@@ -1800,14 +1806,14 @@ picker.
 ### Worktree storage
 
 Worktrees are created at
-`<repo>/.git/thurbox-worktrees/<sanitized-branch>`, where `/` in
+`<repo>/.git/friring-worktrees/<sanitized-branch>`, where `/` in
 branch names is replaced by `-`.
 
 ### Cleanup behavior
 
 - Closing a worktree session (`Ctrl+D`) automatically removes the
   worktree via `git worktree remove --force`.
-- Quitting Thurbox (`Ctrl+Q`) preserves worktrees on disk so they
+- Quitting Friring (`Ctrl+Q`) preserves worktrees on disk so they
   can be resumed on next launch (see [Session Persistence](#session-persistence)).
 - Cleanup errors are logged but do not block session close or app
   shutdown.
@@ -1857,7 +1863,7 @@ processing within a repo group eliminates this.
 
 ### Stale index lock cleanup
 
-Before stashing, Thurbox checks for stale `.git/index.lock` files
+Before stashing, Friring checks for stale `.git/index.lock` files
 left behind by crashed git processes:
 
 - **Linux**: reads the PID from the lock file and checks
@@ -1866,7 +1872,7 @@ left behind by crashed git processes:
   based on file mtime.
 
 If the first stash attempt fails with a lock-related error,
-Thurbox retries up to 3 times with increasing delays (100 ms,
+Friring retries up to 3 times with increasing delays (100 ms,
 500 ms, 1 s) after cleaning stale locks.
 
 ### Results
@@ -1893,35 +1899,35 @@ complete. The TUI remains fully interactive during sync.
 
 ## Session Persistence
 
-Sessions run inside a dedicated tmux server (`tmux -L thurbox`)
-and survive thurbox crashes, restarts, and even multiple concurrent
-thurbox instances.
+Sessions run inside a dedicated tmux server (`tmux -L friring`)
+and survive friring crashes, restarts, and even multiple concurrent
+friring instances.
 
 ### How it works
 
-- Sessions spawn as tmux windows in the `thurbox` session. The
-  tmux pane keeps running regardless of thurbox's lifecycle.
-- On every session spawn, Thurbox assigns an `agent_session_id`
+- Sessions spawn as tmux windows in the `friring` session. The
+  tmux pane keeps running regardless of friring's lifecycle.
+- On every session spawn, Friring assigns an `agent_session_id`
   (UUID v4) via the agent CLI's `--session-id` flag. This tells
   the agent to use a stable conversation ID from the start.
 - On shutdown (`Ctrl+Q`), session metadata (including backend IDs)
   is written to the SQLite database at
-  `$XDG_DATA_HOME/thurbox/thurbox.db`. Thurbox detaches from each
+  `$XDG_DATA_HOME/friring/friring.db`. Friring detaches from each
   session without killing it.
-- On next startup, Thurbox discovers existing sessions from tmux,
+- On next startup, Friring discovers existing sessions from tmux,
   matches them to persisted metadata by `backend_id`, and adopts
   them — reconnecting to the live tmux panes with terminal content
   intact. Unmatched persisted sessions fall back to
   `--resume <session-id>` to create new tmux panes.
-- External recovery is always possible via `tmux -L thurbox attach`.
+- External recovery is always possible via `tmux -L friring attach`.
 
 ### State storage
 
-All session state is stored in the SQLite database (`thurbox.db`).
+All session state is stored in the SQLite database (`friring.db`).
 Tables include `sessions`, `worktrees`, `scheduled_commands`, and
 `metadata`. The database uses WAL mode
 for concurrent multi-instance access. Agent definitions are the
-exception — they live in `~/.config/thurbox/agents.toml`.
+exception — they live in `~/.config/friring/agents.toml`.
 
 ### Worktree preservation
 
@@ -1943,12 +1949,12 @@ branch name) is saved in the database and reconstructed on restore.
   (default `true`): set it `false` and `Ctrl+D` becomes a **hard
   delete** — the full teardown with no `Ctrl+Z` undo, so it is gated
   behind a confirmation modal (`Modal::ConfirmDeleteSession`) instead.
-  The flag never affects `thurbox-cli session delete`, which stays soft
+  The flag never affects `friring-cli session delete`, which stays soft
   unless `--force`.
 
 ### Multi-instance support
 
-Multiple thurbox instances can view the same tmux sessions. Each
+Multiple friring instances can view the same tmux sessions. Each
 instance independently connects to tmux in control mode (`-C`).
 Tmux broadcasts `%output` notifications to all connected clients —
 there is no primary/secondary distinction.
@@ -1960,7 +1966,7 @@ there is no primary/secondary distinction.
 Sessions carry an optional `parent_session_id` (nullable column on
 `sessions`, schema v30; v29 is reserved by an in-flight branch) so
 orchestration scripts can model a lead session that spawns workers:
-`thurbox-cli session create --parent <uuid>` sets it (validated as an
+`friring-cli session create --parent <uuid>` sets it (validated as an
 existing active session before any side effect), `session list`/`get`
 expose it (`null` for top-level sessions), and `session list --parent
 <uuid>` lists direct children. In the TUI, `Ctrl+F` fork records the
@@ -1999,7 +2005,7 @@ is still defensive: cycle members render flat rather than vanish.
 ## Inter-Session Messages (Mailbox Queue)
 
 A general, agent-neutral message queue (`session_messages` table, schema
-v32; `thurbox-cli message`) lets one session hand another a **structured
+v32; `friring-cli message`) lets one session hand another a **structured
 payload** — addressed to a session, with a free-form `kind` tag, a `body`,
 and optional `from_session_id`/`from_task_id` provenance. It is the channel
 extensions use for agent↔agent coordination; flow's clarify→plan→build
@@ -2007,9 +2013,9 @@ relay is the first consumer.
 
 ### Identity-aware, no ids to pass
 
-At spawn thurbox injects each session's own identity into its environment
-(`THURBOX_SESSION` = the stable `SessionId`, and `THURBOX_TASK` for
-task-spawned sessions), so a `thurbox-cli` call running *inside* a session
+At spawn friring injects each session's own identity into its environment
+(`FRIRING_SESSION` = the stable `SessionId`, and `FRIRING_TASK` for
+task-spawned sessions), so a `friring-cli` call running *inside* a session
 knows who it is. `message send`/`inbox` therefore default the
 sender + task provenance (and `--for`) to the caller's own identity — an
 agent sends and reads its own mail with **no ids**. Replies never need a
@@ -2054,16 +2060,16 @@ surface unread counts with no schema change.
 - **Identity is self-knowable and stable.** A session's `SessionId` is stable
   for life — `respawn_stale_session` reuses the original id on re-adoption
   (no soft-delete churn), so a cached id or a queued message never goes stale.
-  `THURBOX_SESSION` (= the `SessionId`, threaded via `SessionConfig.session_id`
-  so it's known *before* launch) and `THURBOX_TASK` are distinct from the
-  pre-existing `THURBOX_SESSION_ID` (= `agent_session_id`, read by the metrics
+  `FRIRING_SESSION` (= the `SessionId`, threaded via `SessionConfig.session_id`
+  so it's known *before* launch) and `FRIRING_TASK` are distinct from the
+  pre-existing `FRIRING_SESSION_ID` (= `agent_session_id`, read by the metrics
   statusline).
-- **CLI** (`thurbox-cli message`, alias `msg`), identity-aware:
+- **CLI** (`friring-cli message`, alias `msg`), identity-aware:
   - `send --to <uuid|name> --kind <k> [--task <id>] [--from <uuid|name>]
     --body <text> [--no-wake]` enqueues and, unless `--no-wake`, types a short
     `inbox` token into the recipient's pane (`agent::tmux::send_prompt_now`).
-    Provenance + task tag default to the caller's `THURBOX_SESSION` /
-    `THURBOX_TASK`.
+    Provenance + task tag default to the caller's `FRIRING_SESSION` /
+    `FRIRING_TASK`.
   - `reply <message_id> --body <text> [--kind k] [--from …] [--no-wake]` —
     enqueues back to the original message's sender (via `get_message`),
     carrying the original `from_task_id`.
@@ -2094,7 +2100,7 @@ the offset is 0, new output naturally stays at the bottom.
 `Alt+PageUp/PageDown`) scrolls half a page, and the mouse wheel
 scrolls three lines per tick. The `Alt+Page` pair exists because
 Terminal.app and iTerm2 claim `Shift+Page` for their own scrollback,
-so on macOS those chords never reach Thurbox (`Fn+Option+Up/Down`
+so on macOS those chords never reach Friring (`Fn+Option+Up/Down`
 on a Mac laptop).
 Any other keypress while scrolled up snaps back to the bottom
 before forwarding to the PTY. This matches the mental model of
@@ -2103,7 +2109,7 @@ present."
 
 **Why Shift, not Ctrl?**
 
-Ctrl-prefixed keys are reserved for Thurbox global commands.
+Ctrl-prefixed keys are reserved for Friring global commands.
 Shift+arrow and Shift+Page are the conventional scrollback
 keybindings in most terminal emulators (GNOME Terminal, Kitty,
 Alacritty) and do not conflict with the agent CLI or shell readline.
@@ -2122,21 +2128,21 @@ historical output.
 
 ## Theme System
 
-![Theme switcher](media/thurbox-theme.gif)
+![Theme switcher](media/friring-theme.gif)
 
 All UI colors are centralized in `src/ui/theme.rs` via a semantic
 palette. Widget files reference named colors (accent, text, status,
 border) rather than hard-coded `Color::*` values, so the whole UI
 can be re-skinned by swapping the active palette.
 
-Thurbox ships fifteen built-in presets — eleven dark (Default,
+Friring ships fifteen built-in presets — eleven dark (Default,
 Catppuccin Mocha, Tokyo Night, Gruvbox Dark, Doom, Nord, Dracula,
 One Dark, Rosé Pine Moon, Everforest, Kanagawa) and four light
 (Catppuccin Latte, Tokyo Night Day, Gruvbox Light, Solarized
 Light). Press `Ctrl+Y` (or `F4`, which avoids terminals that
 intercept `Ctrl+Y` as DSUSP) to pick one. The choice is persisted
 in SQLite under `metadata.active_theme` and survives restarts;
-other Thurbox processes pick it up within one tick via
+other Friring processes pick it up within one tick via
 `PRAGMA data_version` polling.
 
 ### Why centralized?
@@ -2196,7 +2202,7 @@ Status messages are in-app and transient; OS notifications are the
 out-of-app analog for the one event a user must not miss — a session
 that **needs them**. When a session transitions to
 `SessionStatus::Blocked` (the agent's hook reported it needs input or
-approval), thurbox fires an OS desktop notification. An opt-in
+approval), friring fires an OS desktop notification. An opt-in
 `also_on_waiting` extends the trigger to the `Working → Done` (finished)
 edge for when you want a nudge each time a turn completes.
 
@@ -2224,7 +2230,7 @@ WinRT script, `build_powershell_toast_script`, single-quote-escaped). The WSL
 path fixed a silent-failure bug: the dbus path used to error on connect there
 but only log a `warn!`, so the user saw nothing. Delivery errors now land in a
 process-wide slot (`notifications::last_error`) surfaced by the diagnostic:
-`thurbox-cli notify` (`cli/notify.rs`) prints the detected backend, whether it
+`friring-cli notify` (`cli/notify.rs`) prints the detected backend, whether it
 can deliver, click-to-focus support, and the last error; `--test` fires a
 sample notification *synchronously* (`notifications::send_blocking`, since the
 short-lived CLI has no dispatcher thread).
@@ -2239,12 +2245,12 @@ external-state poll (`App::poll_external_changes` →
 (`Database::take_pending_focus_session_id`, a single `DELETE … RETURNING`) on
 its next tick and switches `active_index` + `InputFocus::Terminal`. On macOS
 the same row is written by `terminal-notifier`'s `-execute` flag (which shells
-back into `thurbox-cli session focus <id>`), so **click-to-focus works
+back into `friring-cli session focus <id>`), so **click-to-focus works
 whenever `terminal-notifier` is installed**. The Windows toast and macOS's
 `osascript` fallback show the banner but ignore clicks — a Windows toast can't
 call back into WSL, and the `osascript`/`UNUserNotificationCenter` action
-callbacks need a signed app bundle (which thurbox is not). **Terminal
-window-raising is deliberately not implemented**: thurbox runs inside an
+callbacks need a signed app bundle (which friring is not). **Terminal
+window-raising is deliberately not implemented**: friring runs inside an
 arbitrary terminal emulator it doesn't own, and per-emulator window control is
 fragile (especially on Wayland), so the session is merely pre-selected and the
 user alt-tabs back themselves.

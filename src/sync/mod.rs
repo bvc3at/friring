@@ -1,11 +1,11 @@
-//! Multi-instance real-time data synchronization for Thurbox.
+//! Multi-instance real-time data synchronization for Friring.
 //!
-//! This module enables multiple thurbox instances to see each other's changes
+//! This module enables multiple friring instances to see each other's changes
 //! in real-time through SQLite-based shared state with `PRAGMA data_version` polling.
 //!
 //! # Design
 //!
-//! - **Shared state**: SQLite database at `~/.local/share/thurbox/thurbox.db`
+//! - **Shared state**: SQLite database at `~/.local/share/friring/friring.db`
 //! - **Polling interval**: 250ms (configurable)
 //! - **Change detection**: SQLite `PRAGMA data_version` (increments on external writes in WAL mode)
 //! - **Write protocol**: SQLite WAL mode handles concurrency automatically
@@ -99,7 +99,7 @@ impl Default for SyncState {
 pub struct PollResult {
     /// Delta between local and DB state (may be empty).
     pub delta: StateDelta,
-    /// Whether the database was modified externally (another thurbox instance,
+    /// Whether the database was modified externally (another friring instance,
     /// the headless CLI, or an automation tick). True even when the delta is
     /// empty, indicating that state not carried by `delta` may have changed —
     /// the active theme, session hook-states, automation/task/message rows, or

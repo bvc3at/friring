@@ -1,5 +1,5 @@
 {
-  description = "thurbox — multi-session coding-agent TUI orchestrator (dev environment)";
+  description = "friring — multi-session coding-agent TUI orchestrator (dev environment)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -39,7 +39,7 @@
           cocogitto
         ];
 
-        # System deps to build/test/lint thurbox (mirrors .github/workflows/ci.yml).
+        # System deps to build/test/lint friring (mirrors .github/workflows/ci.yml).
         systemTools = with pkgs; [
           tmux # session backend (CLAUDE.md: >= 3.2)
           git
@@ -48,7 +48,7 @@
           nodejs_22 # website linters (CI uses 26; 22 runs eleventy/eslint/etc.)
           just # task runner (see justfile)
           sqlite # demo/record.sh queries the dev DB
-          jq # handy for `thurbox-cli … --json` in the sandbox
+          jq # handy for `friring-cli … --json` in the sandbox
         ];
 
         # Optional demo-recording stack (scripts/demo/record.sh).
@@ -80,7 +80,7 @@
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
 
           shellHook = ''
-            echo "thurbox dev shell — rust $(rustc --version | cut -d' ' -f2), tmux $(tmux -V | cut -d' ' -f2)"
+            echo "friring dev shell — rust $(rustc --version | cut -d' ' -f2), tmux $(tmux -V | cut -d' ' -f2)"
             echo "  build/test/lint: just <task>   |   run isolated: scripts/dev/sandbox.sh   |   git hooks: prek install"
             ${missingHint}
           '';

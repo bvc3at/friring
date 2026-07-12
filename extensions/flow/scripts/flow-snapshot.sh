@@ -6,7 +6,7 @@
 set -euo pipefail
 
 echo "## tasks"
-if TASKS="$(thurbox-cli task list 2>/dev/null)"; then
+if TASKS="$(friring-cli task list 2>/dev/null)"; then
   printf '%s' "$TASKS" | jq -r '
     group_by(.status) | .[] |
     "### \(.[0].status) (\(length))",
@@ -20,7 +20,7 @@ if TASKS="$(thurbox-cli task list 2>/dev/null)"; then
          else "" end))
   ' 2>/dev/null || printf '%s\n' "$TASKS"
 else
-  echo "  (thurbox-cli task list failed)"
+  echo "  (friring-cli task list failed)"
 fi
 
 echo
@@ -29,9 +29,9 @@ echo "## sessions (flow / workers)"
 # (legacy) — mirror Task::matches_spawn_session. The derived #<id> is printed
 # first purely for the **human board** (it tells you which task a worker is on).
 # Routing no longer relies on it: ANSWER replies by message id
-# (`message reply <id>`), and thurbox resolves the sender — flow never maps a
+# (`message reply <id>`), and friring resolves the sender — flow never maps a
 # task id to a session uuid.
-if SESSIONS="$(thurbox-cli session list --json 2>/dev/null)"; then
+if SESSIONS="$(friring-cli session list --json 2>/dev/null)"; then
   printf '%s' "$SESSIONS" | jq -r '
     .[]
     # extract <id> from "<title> · #<id>" (current) or "task-<id>[-…]" (legacy);
@@ -44,5 +44,5 @@ if SESSIONS="$(thurbox-cli session list --json 2>/dev/null)"; then
     | "  \($idtag)  \(.name)  \(.id)  agent=\(.agent)  cwd=\(.cwd)"
   ' 2>/dev/null || true
 else
-  echo "  (thurbox-cli session list failed)"
+  echo "  (friring-cli session list failed)"
 fi

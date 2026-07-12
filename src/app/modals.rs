@@ -1,4 +1,4 @@
-// Modal state management for Thurbox TUI: a single discriminated `Modal` enum
+// Modal state management for Friring TUI: a single discriminated `Modal` enum
 // makes invalid states (two modals open at once) unrepresentable.
 
 use std::collections::HashSet;

@@ -4,10 +4,10 @@
 # linux-container.sh and windows-vm.sh — the real-host member of the e2e family
 # (see scripts/dev/README.md). Linux and Windows hosts are auto-detected.
 #
-# Safe for machines that also run regular thurbox sessions: the e2e test uses a
-# private multiplexer socket (thurbox-lab-test), keeps ALL remote state under
+# Safe for machines that also run regular friring sessions: the e2e test uses a
+# private multiplexer socket (friring-lab-test), keeps ALL remote state under
 # one scoped directory, and runs the local CLI against an isolated
-# THURBOX_CONFIG_DIR/THURBOX_DATA_DIR — your real config/sessions and the
+# FRIRING_CONFIG_DIR/FRIRING_DATA_DIR — your real config/sessions and the
 # host's default tmux/psmux server are never touched.
 #
 # Usage:
@@ -27,28 +27,28 @@
 #   clean           remove everything `test` may have left on the host
 #
 # Verbs (Windows hosts):
-#   deploy          cross-build thurbox/thurbox-cli (x86_64-pc-windows-gnu) and
-#                   install them to C:\Tools\thurbox (added to the machine PATH)
-#   run             run the deployed thurbox.exe interactively over `ssh -t`
+#   deploy          cross-build friring/friring-cli (x86_64-pc-windows-gnu) and
+#                   install them to C:\Tools\friring (added to the machine PATH)
+#   run             run the deployed friring.exe interactively over `ssh -t`
 #                   (native-Windows manual testing; WSL distros appear in its
 #                   host picker)
 #   native-test [agent]  headless e2e of the DEPLOYED binaries on the host:
-#                   thurbox-cli.exe creates a local psmux session (agent argv +
-#                   THURBOX_* env asserted intact) and thurbox.exe boots to a
-#                   frame that shows it. Scoped via THURBOX_SOCKET (needs a
+#                   friring-cli.exe creates a local psmux session (agent argv +
+#                   FRIRING_* env asserted intact) and friring.exe boots to a
+#                   frame that shows it. Scoped via FRIRING_SOCKET (needs a
 #                   deploy of a build that supports it). Default agent: claude
 #   test-suite      run the full nextest suite on the host (cross-built
 #                   archive; installs cargo-nextest.exe there if missing)
 #   wsl-setup [distro]   install WSL + <distro> (default Debian) and provision
-#                        it as a thurbox target: git/tmux/claude + a non-root
+#                        it as a friring target: git/tmux/claude + a non-root
 #                        default user (Debian/Ubuntu-family distros only)
-#   wsl-check [distro]   verify the distro is thurbox-ready
+#   wsl-check [distro]   verify the distro is friring-ready
 #
 # Env overrides:
-#   THURBOX_LAB_DIR      remote scoped state dir (default ~/thurbox-lab-test on
-#                        Linux, C:/thurbox-lab-test on Windows). Must contain
-#                        "thurbox-lab" — `test`/`clean` rm -rf this path.
-#   THURBOX_WSL_DISTRO   default distro for the wsl-* verbs (default: Debian)
+#   FRIRING_LAB_DIR      remote scoped state dir (default ~/friring-lab-test on
+#                        Linux, C:/friring-lab-test on Windows). Must contain
+#                        "friring-lab" — `test`/`clean` rm -rf this path.
+#   FRIRING_WSL_DISTRO   default distro for the wsl-* verbs (default: Debian)
 #
 # Requires: ssh/scp; `test`/`tui` need cargo; `deploy`/`test-suite` need the
 # x86_64-pc-windows-gnu target + mingw-w64 (test-suite also needs cargo-nextest
@@ -62,20 +62,20 @@ REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 . "$REPO_ROOT/scripts/dev/e2e/lib/e2e-common.sh"
 
 WORKDIR="$REPO_ROOT/target/lab-test"
-WSL_DISTRO="${THURBOX_WSL_DISTRO:-Debian}"
+WSL_DISTRO="${FRIRING_WSL_DISTRO:-Debian}"
 WIN_TARGET="x86_64-pc-windows-gnu"
 NEXTEST_VERSION="${NEXTEST_VERSION:-latest}"
 NEXTEST_ZIP_URL="https://get.nexte.st/${NEXTEST_VERSION}/windows"
 
 # Everything the e2e test creates on the host is scoped to this socket/session
 # name and to LAB_DIR — private to this script, so killing/removing it can
-# never reach a real thurbox (release socket "thurbox") or a dev sandbox
-# session (socket "thurbox-dev") on the same machine.
-LAB_SOCKET="thurbox-lab-test"
+# never reach a real friring (release socket "friring") or a dev sandbox
+# session (socket "friring-dev") on the same machine.
+LAB_SOCKET="friring-lab-test"
 E2E_NAME="lab-e2e"
 E2E_BRANCH="test/lab-e2e"
 # ssh_opts for a regular/manual hosts.toml block (default socket + session, so
-# sessions land where a normal thurbox on this machine expects them).
+# sessions land where a normal friring on this machine expects them).
 LAB_SSH_OPTS='["-o", "ControlMaster=auto", "-o", "ControlPersist=10m", "-o", "ServerAliveInterval=15"]'
 
 usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; }
@@ -90,7 +90,7 @@ mkdir -p "$WORKDIR"
 # Control sockets live in a short runtime dir, NOT under target/ — AF_UNIX
 # socket paths are limited to ~104 bytes and a deep checkout blows past that
 # (same constraint as the sandbox tmux sockets in lib/sandbox-env.sh).
-CM_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/thurbox-lab-cm"
+CM_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/friring-lab-cm"
 mkdir -p "$CM_DIR"
 
 # One multiplexed connection for the many small remote calls below.
@@ -115,8 +115,8 @@ detect_os() {
   local probe
   # Keep stderr visible: ssh's own error (auth, DNS, ControlPath, …) is the
   # only clue when the probe fails.
-  probe="$(ssh_host 'echo thurbox-probe' | tr -d '\r' || true)"
-  [ "$probe" = "thurbox-probe" ] || die "cannot reach '$DEST' over SSH"
+  probe="$(ssh_host 'echo friring-probe' | tr -d '\r' || true)"
+  [ "$probe" = "friring-probe" ] || die "cannot reach '$DEST' over SSH"
   local u
   u="$(remote_out 'uname -s')"
   case "$u" in
@@ -128,24 +128,24 @@ detect_os() {
       ;;
   esac
   if [ "$HOST_OS" = windows ]; then
-    LAB_DIR="${THURBOX_LAB_DIR:-C:/thurbox-lab-test}"
+    LAB_DIR="${FRIRING_LAB_DIR:-C:/friring-lab-test}"
     MUX="psmux"
   else
     local rhome
     # shellcheck disable=SC2016 # $HOME must expand on the remote, not here
     rhome="$(ssh_host 'printf %s "$HOME"' | tr -d '\r')" \
       || die "cannot read \$HOME on $DEST"
-    LAB_DIR="${THURBOX_LAB_DIR:-$rhome/thurbox-lab-test}"
+    LAB_DIR="${FRIRING_LAB_DIR:-$rhome/friring-lab-test}"
     MUX="tmux"
   fi
   # `test`/`clean` rm -rf LAB_DIR on a real machine — insist on a marker so a
-  # stray THURBOX_LAB_DIR override can't point them at a directory that
+  # stray FRIRING_LAB_DIR override can't point them at a directory that
   # matters, and reject whitespace: the path is embedded in remote command
   # strings that would split on it.
   case "$LAB_DIR" in
-    *[[:space:]]*) die "THURBOX_LAB_DIR must not contain whitespace (got: $LAB_DIR)" ;;
-    *thurbox-lab*) ;;
-    *) die "THURBOX_LAB_DIR must contain 'thurbox-lab' (got: $LAB_DIR)" ;;
+    *[[:space:]]*) die "FRIRING_LAB_DIR must not contain whitespace (got: $LAB_DIR)" ;;
+    *friring-lab*) ;;
+    *) die "FRIRING_LAB_DIR must contain 'friring-lab' (got: $LAB_DIR)" ;;
   esac
   log "host $DEST is $HOST_OS (remote test dir: $LAB_DIR)"
 }
@@ -177,7 +177,7 @@ run_ps() {
 }
 
 # Default hosts.toml block name: the alias, or the address part of user@addr,
-# sanitized to thurbox's name charset.
+# sanitized to friring's name charset.
 block_name() {
   local n="${1:-}"
   if [ -z "$n" ]; then
@@ -193,7 +193,7 @@ lab_hosts_block() {
   [ "$HOST_OS" = windows ] && mux="psmux"
   hosts_block "$name" "$DEST" "$LAB_SSH_OPTS" "$mux"
   [ "$HOST_OS" = windows ] && \
-    printf '# worktrees_dir = "C:/Users/<user>/.local/share/thurbox/worktrees"\n'
+    printf '# worktrees_dir = "C:/Users/<user>/.local/share/friring/worktrees"\n'
   return 0
 }
 
@@ -216,7 +216,7 @@ cmd_check() {
       bad "tmux not found"
     fi
     # Agent CLIs live in ~/.local/bin, put on PATH by login-shell profiles —
-    # the same way thurbox's remote tmux windows resolve them.
+    # the same way friring's remote tmux windows resolve them.
     v="$(remote_out 'bash -lc "claude --version"' | head -1)"
     [ -n "$v" ] && ok "claude: $v" || bad "claude not found via a login shell"
   else
@@ -230,10 +230,10 @@ cmd_check() {
     [ -n "$v" ] && ok "git: $v" || bad "git not found"
     v="$(remote_out 'claude --version' | head -1)"
     [ -n "$v" ] && ok "claude (Windows): $v" || info "claude not on the Windows PATH (only needed for native sessions)"
-    if ssh_host 'powershell -NoProfile -Command "Test-Path C:/Tools/thurbox/thurbox.exe"' 2>/dev/null | grep -qi true; then
-      ok "thurbox.exe deployed (C:/Tools/thurbox)"
+    if ssh_host 'powershell -NoProfile -Command "Test-Path C:/Tools/friring/friring.exe"' 2>/dev/null | grep -qi true; then
+      ok "friring.exe deployed (C:/Tools/friring)"
     else
-      info "thurbox.exe not deployed — '$0 $DEST deploy' for native/WSL manual testing"
+      info "friring.exe not deployed — '$0 $DEST deploy' for native/WSL manual testing"
     fi
     v="$(run_ps <<'EOF' | tr -d '\r' || true
 $env:WSL_UTF8 = '1'
@@ -251,7 +251,7 @@ EOF
   fi
   echo
   if [ "$FAILS" -eq 0 ]; then
-    pass "$DEST is ready as a thurbox $HOST_OS host"
+    pass "$DEST is ready as a friring $HOST_OS host"
   else
     fail "$FAILS missing requirement(s) — see above"
   fi
@@ -268,7 +268,7 @@ cmd_tui() {
   detect_os
   local name cfg
   name="$(block_name "${1:-}")"
-  cfg="$REPO_ROOT/target/dev-sandbox/lab/thurbox-config"
+  cfg="$REPO_ROOT/target/dev-sandbox/lab/friring-config"
   mkdir -p "$cfg"
   if [ -f "$cfg/hosts.toml" ] && grep -q "name = \"$name\"" "$cfg/hosts.toml"; then
     log "host '$name' already wired into the lab sandbox"
@@ -313,13 +313,13 @@ cmd_test() {
   # Plain git invocations run identically under sh, cmd, and powershell — one
   # call per step because Windows PowerShell 5.1 has no `&&`.
   ssh_host "git -C $repo init -qb main"
-  ssh_host "git -C $repo config user.email test@thurbox"
-  ssh_host "git -C $repo config user.name thurbox-lab"
+  ssh_host "git -C $repo config user.email test@friring"
+  ssh_host "git -C $repo config user.name friring-lab"
   ssh_host "git -C $repo commit -qm init --allow-empty"
   ssh_host "git -C $repo branch -f feature/example main"
 
-  # Isolated local config/data (THURBOX_*_DIR, honored ahead of XDG) so the
-  # e2e run never sees — or is seen by — your real thurbox database.
+  # Isolated local config/data (FRIRING_*_DIR, honored ahead of XDG) so the
+  # e2e run never sees — or is seen by — your real friring database.
   local tmp
   tmp="$(mktemp -d "$WORKDIR/e2e.XXXXXX")"
   # EXIT (not RETURN) so aborts via die/set -e still tear down the remote
@@ -342,8 +342,8 @@ name = "shell"
 command = "$agent_cmd"
 EOF
 
-  log "creating an ssh:lab session via thurbox-cli (isolated DB)"
-  export THURBOX_CONFIG_DIR="$tmp/config" THURBOX_DATA_DIR="$tmp/data"
+  log "creating an ssh:lab session via friring-cli (isolated DB)"
+  export FRIRING_CONFIG_DIR="$tmp/config" FRIRING_DATA_DIR="$tmp/data"
   local result backend
   result="$(e2e_create_and_get \
     --name "$E2E_NAME" --host lab --repo-path "$repo" \
@@ -377,20 +377,20 @@ require_win_target() {
 cmd_deploy() {
   require_windows
   require_win_target
-  log "cross-building thurbox + thurbox-cli for $WIN_TARGET"
-  (cd "$REPO_ROOT" && cargo build --release --target "$WIN_TARGET" --bin thurbox --bin thurbox-cli)
+  log "cross-building friring + friring-cli for $WIN_TARGET"
+  (cd "$REPO_ROOT" && cargo build --release --target "$WIN_TARGET" --bin friring --bin friring-cli)
 
-  log "installing to C:/Tools/thurbox (machine PATH)"
+  log "installing to C:/Tools/friring (machine PATH)"
   run_ps <<'EOF'
 $ErrorActionPreference = 'Stop'
-New-Item -ItemType Directory -Force -Path 'C:/Tools/thurbox' | Out-Null
+New-Item -ItemType Directory -Force -Path 'C:/Tools/friring' | Out-Null
 $p = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-if ($p -notlike '*C:\Tools\thurbox*') {
-  [Environment]::SetEnvironmentVariable('Path', "$p;C:\Tools\thurbox", 'Machine')
+if ($p -notlike '*C:\Tools\friring*') {
+  [Environment]::SetEnvironmentVariable('Path', "$p;C:\Tools\friring", 'Machine')
 }
 EOF
   local bindir="$REPO_ROOT/target/$WIN_TARGET/release"
-  scp_host "$bindir/thurbox.exe" "$bindir/thurbox-cli.exe" "$DEST:C:/Tools/thurbox/"
+  scp_host "$bindir/friring.exe" "$bindir/friring-cli.exe" "$DEST:C:/Tools/friring/"
 
   echo
   printf '\033[1;32mdeployed\033[0m  manual test:  %s %s run\n' "$0" "$DEST"
@@ -399,77 +399,77 @@ EOF
 
 cmd_run() {
   require_windows
-  ssh_host 'powershell -NoProfile -Command "Test-Path C:/Tools/thurbox/thurbox.exe"' 2> /dev/null \
-    | grep -qi true || die "thurbox.exe not deployed — run '$0 $DEST deploy' first"
-  log "running thurbox.exe on $DEST (quit the TUI to return)"
-  exec ssh -t "$DEST" "C:/Tools/thurbox/thurbox.exe"
+  ssh_host 'powershell -NoProfile -Command "Test-Path C:/Tools/friring/friring.exe"' 2> /dev/null \
+    | grep -qi true || die "friring.exe not deployed — run '$0 $DEST deploy' first"
+  log "running friring.exe on $DEST (quit the TUI to return)"
+  exec ssh -t "$DEST" "C:/Tools/friring/friring.exe"
 }
 
-# Native e2e of the DEPLOYED binaries, entirely on the host: thurbox-cli.exe
+# Native e2e of the DEPLOYED binaries, entirely on the host: friring-cli.exe
 # creates a local (psmux) session whose agent must come up with its argv and
-# THURBOX_* env intact, then thurbox.exe boots inside a scoped psmux pane and
-# must adopt that session. Fully isolated via THURBOX_SOCKET (the deployed
-# build must support it) + THURBOX_CONFIG_DIR/THURBOX_DATA_DIR under LAB_DIR —
+# FRIRING_* env intact, then friring.exe boots inside a scoped psmux pane and
+# must adopt that session. Fully isolated via FRIRING_SOCKET (the deployed
+# build must support it) + FRIRING_CONFIG_DIR/FRIRING_DATA_DIR under LAB_DIR —
 # psmux has no TMUX_TMPDIR-style socket-dir isolation, so the env override is
-# the only thing keeping this off the machine's real thurbox/thurbox-dev
+# the only thing keeping this off the machine's real friring/friring-dev
 # servers.
 cmd_native_test() {
   require_windows
-  ssh_host 'powershell -NoProfile -Command "Test-Path C:/Tools/thurbox/thurbox-cli.exe"' 2> /dev/null \
-    | grep -qi true || die "thurbox-cli.exe not deployed — run '$0 $DEST deploy' first"
+  ssh_host 'powershell -NoProfile -Command "Test-Path C:/Tools/friring/friring-cli.exe"' 2> /dev/null \
+    | grep -qi true || die "friring-cli.exe not deployed — run '$0 $DEST deploy' first"
   local agent="${1:-claude}"
   log "native e2e on $DEST: agent '$agent', scoped socket $LAB_SOCKET, state $LAB_DIR/native"
   run_ps "$LAB_DIR" "$LAB_SOCKET" "$agent" <<'EOF'
 param([string]$LabDir, [string]$Socket, [string]$Agent)
 $ErrorActionPreference = 'Stop'
-$cli = 'C:/Tools/thurbox/thurbox-cli.exe'
-$tui = 'C:/Tools/thurbox/thurbox.exe'
+$cli = 'C:/Tools/friring/friring-cli.exe'
+$tui = 'C:/Tools/friring/friring.exe'
 $name = 'lab-native'
 $fails = 0
 function Assert([bool]$ok, [string]$what) {
   if ($ok) { Write-Output "  ok   $what" } else { Write-Output "  FAIL $what"; $script:fails++ }
 }
 
-# Scoped env for every thurbox child below. THURBOX_SOCKET keeps the whole run
+# Scoped env for every friring child below. FRIRING_SOCKET keeps the whole run
 # off the machine's real psmux servers.
-$env:THURBOX_SOCKET = $Socket
-$env:THURBOX_CONFIG_DIR = "$LabDir/native/config"
-$env:THURBOX_DATA_DIR = "$LabDir/native/data"
+$env:FRIRING_SOCKET = $Socket
+$env:FRIRING_CONFIG_DIR = "$LabDir/native/config"
+$env:FRIRING_DATA_DIR = "$LabDir/native/data"
 
 psmux -L $Socket kill-server 2>$null
 Remove-Item -Recurse -Force "$LabDir/native" -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path "$LabDir/native/repo" | Out-Null
 git -C "$LabDir/native/repo" init -qb main
-git -C "$LabDir/native/repo" config user.email test@thurbox
-git -C "$LabDir/native/repo" config user.name thurbox-lab
+git -C "$LabDir/native/repo" config user.email test@friring
+git -C "$LabDir/native/repo" config user.name friring-lab
 git -C "$LabDir/native/repo" commit -qm init --allow-empty
 
-Write-Output "== thurbox-cli session create (local psmux backend) =="
+Write-Output "== friring-cli session create (local psmux backend) =="
 $out = & $cli --json session create --name $name --repo-path "$LabDir/native/repo" --agent $Agent 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) { Write-Output $out; Write-Output "FAIL session create exited $LASTEXITCODE"; exit 1 }
 $json = $out | ConvertFrom-Json
 Assert ($json.name -eq $name) "session created (id $($json.id))"
 Start-Sleep 8
 
-# The scoped server (NOT thurbox-dev) must own the agent window, alive.
+# The scoped server (NOT friring-dev) must own the agent window, alive.
 $panes = (psmux -L $Socket list-panes -a -F '#{window_name} #{pane_dead}') -join "`n"
 Assert ($panes -match "tb-$name 0") "agent window alive on scoped socket ($Socket)"
 
 # The window process must carry the folded env + argv (psmux drops -e and
 # joined tokens; the deployed build must route around both).
-$procs = (Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'Set-Item Env:THURBOX_SESSION' }).CommandLine -join "`n"
-Assert ($procs -match [regex]::Escape($json.id)) "THURBOX_SESSION env folded into the window command"
+$procs = (Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'Set-Item Env:FRIRING_SESSION' }).CommandLine -join "`n"
+Assert ($procs -match [regex]::Escape($json.id)) "FRIRING_SESSION env folded into the window command"
 Assert ($procs -match "'$Agent'") "agent argv delivered ($Agent)"
 
 $list = & $cli --json session list | Out-String | ConvertFrom-Json
-Assert (@($list | Where-Object { $_.name -eq $name }).Count -eq 1) "thurbox-cli session list sees the session"
+Assert (@($list | Where-Object { $_.name -eq $name }).Count -eq 1) "friring-cli session list sees the session"
 
-Write-Output "== thurbox.exe TUI boot (inside a scoped psmux pane) =="
+Write-Output "== friring.exe TUI boot (inside a scoped psmux pane) =="
 # psmux targets are session-qualified; the session name is the deployed
 # build's compile-time default, so discover it instead of hardcoding.
 $sess = (psmux -L $Socket list-sessions -F '#{session_name}' | Select-Object -First 1)
 # Window command is one argv token: env + exec. The pane gives the TUI a ConPTY.
-$boot = "Set-Item Env:THURBOX_SOCKET '$Socket'; Set-Item Env:THURBOX_CONFIG_DIR '$LabDir/native/config'; Set-Item Env:THURBOX_DATA_DIR '$LabDir/native/data'; & '$tui'"
+$boot = "Set-Item Env:FRIRING_SOCKET '$Socket'; Set-Item Env:FRIRING_CONFIG_DIR '$LabDir/native/config'; Set-Item Env:FRIRING_DATA_DIR '$LabDir/native/data'; & '$tui'"
 psmux -L $Socket new-window -d -t "${sess}:" -n lab-tui $boot
 Start-Sleep 8
 $frame = (psmux -L $Socket capture-pane -p -t "${sess}:lab-tui") -join "`n"
@@ -479,7 +479,7 @@ psmux -L $Socket kill-server 2>$null
 if ($fails -gt 0) { Write-Output "NATIVE-TEST FAILURES: $fails"; exit 1 }
 Write-Output "NATIVE-TEST OK"
 EOF
-  pass "native thurbox (dev) runs correctly on $DEST"
+  pass "native friring (dev) runs correctly on $DEST"
 }
 
 cmd_test_suite() {
@@ -573,12 +573,12 @@ Write-Output "[lab] installing git/tmux/curl inside $Distro"
 wsl.exe -d $Distro -u root -- sh -c "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git tmux curl ca-certificates sudo"
 if ($LASTEXITCODE -ne 0) { Write-Output '[lab] package install failed'; exit 1 }
 
-Write-Output '[lab] ensuring a non-root default user (thurbox)'
-wsl.exe -d $Distro -u root -- sh -c "id -u thurbox >/dev/null 2>&1 || useradd -m -s /bin/bash -G sudo thurbox"
-wsl.exe -d $Distro -u root -- sh -c "printf '[user]\ndefault=thurbox\n' > /etc/wsl.conf"
+Write-Output '[lab] ensuring a non-root default user (friring)'
+wsl.exe -d $Distro -u root -- sh -c "id -u friring >/dev/null 2>&1 || useradd -m -s /bin/bash -G sudo friring"
+wsl.exe -d $Distro -u root -- sh -c "printf '[user]\ndefault=friring\n' > /etc/wsl.conf"
 
 Write-Output '[lab] installing Claude Code for the default user'
-wsl.exe -d $Distro -u thurbox -- bash -c "command -v claude >/dev/null 2>&1 || curl -fsSL https://claude.ai/install.sh | bash"
+wsl.exe -d $Distro -u friring -- bash -c "command -v claude >/dev/null 2>&1 || curl -fsSL https://claude.ai/install.sh | bash"
 
 wsl.exe --terminate $Distro *> $null
 Write-Output '[lab] done'
@@ -624,7 +624,7 @@ $claude = (wsl.exe -d $Distro -- bash -lc 'claude --version 2>/dev/null') -join 
 if ($claude) { Write-Output "ok   claude: $claude" }
 else { Write-Output 'miss claude not found via a login shell'; $fails++ }
 
-if ($fails -eq 0) { Write-Output "PASS wsl:$Distro is thurbox-ready"; exit 0 }
+if ($fails -eq 0) { Write-Output "PASS wsl:$Distro is friring-ready"; exit 0 }
 Write-Output "FAIL $fails requirement(s) missing"
 exit 1
 EOF

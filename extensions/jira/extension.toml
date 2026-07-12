@@ -1,14 +1,14 @@
 # Jira extension manifest.
 #
-# Install with `thurbox-cli extension install jira` (or point at this directory:
-# `thurbox-cli extension install ./extensions/jira`). thurbox fetches this file,
+# Install with `friring-cli extension install jira` (or point at this directory:
+# `friring-cli extension install ./extensions/jira`). friring fetches this file,
 # lays the [[files]] down under `home`, and activates the [[automations]] — a
-# deterministic `exec` job (no agent, no session): thurbox's scheduler runs
+# deterministic `exec` job (no agent, no session): friring's scheduler runs
 # `{home}/scripts/sync.sh` every 15 min and self-heals the automation if
-# deleted. Turn it off with `thurbox-cli extension deactivate jira`.
+# deleted. Turn it off with `friring-cli extension deactivate jira`.
 
 name = "jira"
-description = "Syncs Jira issues bidirectionally with the thurbox task list"
+description = "Syncs Jira issues bidirectionally with the friring task list"
 config_version = 1
 version = "2.0.0"                # v2: deterministic exec sync (was an agent session)
 min_thurbox_version = "0.141.0"  # needs the Exec automation action + task --source flags
