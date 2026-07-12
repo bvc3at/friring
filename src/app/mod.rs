@@ -658,13 +658,16 @@ pub enum InputFocus {
     /// viewer: `j`/`k` walk the files (the diff follows), `Enter` drops into the
     /// diff at the selected file, `r`/`R` toggle reviewed.
     ReviewFiles,
-    /// The Claude Code activity view (workflow/subagent transcripts) in the
-    /// central pane (toggled like the review). Captures keys for scrolling +
-    /// tool folding.
+    /// The agent activity view's **content pane** (the selected section's
+    /// event list, an agent transcript, or a workflow overview) in the central
+    /// pane (toggled like the review). Captures keys for scrolling + folding.
+    /// The `Cc` prefix is historical — the view is agent-neutral.
     CcActivity,
-    /// The activity view's **tree** in the file-viewer column (workflows →
-    /// agents + standalone subagents). Focusable like `ReviewFiles`: `j`/`k`
-    /// browse (the transcript follows), `Enter`/`l` drops into the transcript.
+    /// The activity view's **navigator** in the file-viewer column: the six
+    /// sections (Overview/Timeline/Commands/Files/Web/Agents) with the Claude
+    /// workflow/subagent tree nested under Agents. Focusable like
+    /// `ReviewFiles`: `j`/`k` browse (the content follows), `Enter`/`l` drops
+    /// into the content pane.
     CcActivityTree,
 }
 
@@ -684,7 +687,8 @@ pub(crate) enum CentralTab {
     Agent,
     Shell,
     Review,
-    /// The Claude Code activity view (workflow/subagent transcripts).
+    /// The agent activity view (per-session retrospective across agent CLIs;
+    /// `Cc` prefix historical).
     CcActivity,
 }
 
@@ -736,9 +740,10 @@ pub struct App {
     /// sessions and returning keeps the review open. The active session's entry
     /// (if any) is reached via [`Self::active_review`] / [`Self::active_review_mut`].
     pub(crate) code_reviews: std::collections::HashMap<SessionId, code_review::CodeReviewState>,
-    /// Open Claude Code activity views, keyed by session — persisted per session
-    /// like [`Self::code_reviews`], so switching sessions and returning keeps the
-    /// view open. Reached via [`Self::active_cc_activity`] / `_mut`.
+    /// Open agent-activity views (section navigator + content state), keyed by
+    /// session — persisted per session like [`Self::code_reviews`], so switching
+    /// sessions and returning keeps the view open. Reached via
+    /// [`Self::active_cc_activity`] / `_mut` (`cc_` prefix historical).
     pub(crate) cc_activities: std::collections::HashMap<SessionId, cc_activity::CcActivityState>,
     pub(crate) modal: modals::Modal,
     /// In-progress new-session wizard (also drives fork/restart re-spawns).
