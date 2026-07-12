@@ -43,6 +43,7 @@ jobs:
       website: ${{ steps.filter.outputs.website || steps.all.outputs.all }}
       install_sh: ${{ steps.filter.outputs.install_sh || steps.all.outputs.all }}
       install_ps: ${{ steps.filter.outputs.install_ps || steps.all.outputs.all }}
+      agent_e2e: ${{ steps.filter.outputs.agent_e2e || steps.all.outputs.all }}
     steps:
       # A merge queue entry already contains exactly the PR's changes; validate
       # the whole suite against it rather than diffing (paths-filter has no PR
@@ -89,6 +90,13 @@ jobs:
             install_ps:
               - 'scripts/install.ps1'
               - 'scripts/install.Tests.ps1'
+              - '.github/workflows/ci.yml'
+            agent_e2e:
+              - 'scripts/dev/agent-e2e/**'
+              - 'src/**'
+              - 'extensions/hooks/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
               - '.github/workflows/ci.yml'
 
   check:
@@ -414,6 +422,37 @@ jobs:
           path: |
             target/release/thurbox
             target/release/thurbox-cli
+          if-no-files-found: warn
+
+  # Real-agent e2e (fork-only): the pinned Claude Code binary against the local
+  # model stub, driven through the real TUI (scripts/dev/agent-e2e/, see
+  # docs/E2E.md). Deliberately NOT in `all-checks.needs`, so it never blocks a
+  # merge — it exercises an externally-pinned binary, and its failures need a
+  # human eye (conformance drift vs real regression).
+  agent-e2e:
+    name: Real-Agent E2E
+    needs: changes
+    if: needs.changes.outputs.agent_e2e == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install tmux + bats
+        run: sudo apt-get update && sudo apt-get install -y tmux bats
+      - name: Install pinned Claude Code
+        # The pin is the binary version the fixtures were conformance-tested
+        # against; bump it deliberately and re-run the suite locally first
+        # (docs/E2E.md, "Updating the pinned agent binary").
+        run: npm install -g @anthropic-ai/claude-code@2.1.207
+      - name: Run real-agent e2e suite
+        run: scripts/dev/agent-e2e/run.sh
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agent-e2e-artifacts
+          path: target/agent-e2e/artifacts
           if-no-files-found: warn
 
   all-checks:
