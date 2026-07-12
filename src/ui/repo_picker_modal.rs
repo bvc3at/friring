@@ -60,7 +60,7 @@ pub fn render_repo_picker_modal(
 
     let area = centered_fixed_height_rect(60, total_height, frame.area());
 
-    let inner = render_modal_frame(frame, area, "Select Repos");
+    let inner = render_modal_frame(frame, area, "New Session — Repo");
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)

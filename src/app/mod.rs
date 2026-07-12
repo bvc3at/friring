@@ -1730,13 +1730,35 @@ impl App {
 
     /// Route session creation through the name modal, then agent selection.
     ///
-    /// Shows an empty session-name modal. After the user enters a name, the
-    /// agent picker is shown, then spawn.
+    /// The name modal opens prefilled with a suggestion derived from the
+    /// working directory, so the common case is Enter-through; the user edits
+    /// or clears it freely.
     pub(crate) fn prepare_spawn(&mut self, config: SessionConfig, worktrees: Vec<WorktreeInfo>) {
-        // Show session name modal (empty — user types from scratch).
+        let mut modal = modals::SessionNameModal::default();
+        modal
+            .name
+            .set(&self.suggested_session_name(config.cwd.as_deref()));
         self.new_session.spawn_config = Some(config);
         self.new_session.spawn_worktrees = worktrees;
-        self.modal = modals::Modal::SessionName(modals::SessionNameModal::default());
+        self.modal = modals::Modal::SessionName(modal);
+    }
+
+    /// A prefilled session name: the working directory's basename, deduped
+    /// against existing session names with a numeric suffix — duplicate names
+    /// make the tmux window lookup ambiguous.
+    pub(crate) fn suggested_session_name(&self, cwd: Option<&std::path::Path>) -> String {
+        let base = cwd.map(crate::paths::display_path).unwrap_or_default();
+        if base.is_empty() {
+            return base;
+        }
+        let taken = |name: &str| self.sessions.iter().any(|s| s.info.name == name);
+        if !taken(&base) {
+            return base;
+        }
+        (2..100)
+            .map(|i| format!("{base}-{i}"))
+            .find(|c| !taken(c))
+            .unwrap_or(base)
     }
 
     /// Continue spawn after the user has chosen a session name: open the agent
@@ -10458,6 +10480,110 @@ mod tests {
             None,
             "the literal typed path stays reachable above the candidates"
         );
+    }
+
+    #[test]
+    fn session_name_prefill_uses_repo_basename() {
+        let mut app = app_with_sessions(0);
+        seeded_repo_picker(&mut app, &["/tmp/friring"]);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        let modals::Modal::SessionName(ref sn) = app.modal else {
+            panic!("expected the session-name modal");
+        };
+        assert_eq!(sn.name.value(), "friring");
+    }
+
+    #[test]
+    fn session_name_prefill_dedupes_with_numeric_suffix() {
+        let mut app = app_with_sessions(2);
+        app.sessions[0].info.name = "friring".into();
+        app.sessions[1].info.name = "friring-2".into();
+
+        assert_eq!(
+            app.suggested_session_name(Some(std::path::Path::new("/tmp/friring"))),
+            "friring-3"
+        );
+        assert_eq!(
+            app.suggested_session_name(Some(std::path::Path::new("/tmp/other"))),
+            "other"
+        );
+        assert_eq!(app.suggested_session_name(None), "");
+    }
+
+    #[test]
+    fn wizard_breadcrumb_accumulates_choices() {
+        let mut app = app_with_sessions(0);
+        assert_eq!(app.wizard_breadcrumb(), None);
+
+        app.new_session.repo_path = Some(PathBuf::from("/tmp/friring"));
+        app.new_session.base_branch = Some("main".into());
+        app.new_session.normal_repos = vec![PathBuf::from("/tmp/other")];
+        assert_eq!(
+            app.wizard_breadcrumb().as_deref(),
+            Some("friring +1 · wt from main")
+        );
+
+        // Normal flow after the backend/cwd moved onto the spawn config.
+        let mut app = app_with_sessions(0);
+        app.new_session.spawn_config = Some(SessionConfig {
+            cwd: Some(PathBuf::from("/tmp/friring")),
+            ..SessionConfig::default()
+        });
+        assert_eq!(app.wizard_breadcrumb().as_deref(), Some("friring"));
+    }
+
+    /// Render the app once and return the visible buffer as a flat string.
+    fn rendered_text(app: &mut App) -> String {
+        let backend = ratatui::backend::TestBackend::new(120, 35);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.view(f)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn branch_selector_title_names_the_repo() {
+        let mut app = app_with_sessions(0);
+        app.new_session.repo_path = Some(PathBuf::from("/tmp/friring"));
+        app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
+            index: 0,
+            branches: vec!["main".into()],
+            loading: false,
+        });
+        let text = rendered_text(&mut app);
+        assert!(
+            text.contains("New Session — Base Branch (friring)"),
+            "title must carry the repo context"
+        );
+    }
+
+    #[test]
+    fn session_name_modal_shows_flow_breadcrumb() {
+        let mut app = app_with_sessions(0);
+        app.new_session.repo_path = Some(PathBuf::from("/tmp/friring"));
+        app.new_session.base_branch = Some("main".into());
+        app.modal = modals::Modal::SessionName(modals::SessionNameModal::default());
+        let text = rendered_text(&mut app);
+        assert!(text.contains("New Session — Name"));
+        assert!(
+            text.contains("friring · wt from main"),
+            "the accumulated choices must be visible"
+        );
+
+        // Fork and import flows announce themselves in the title.
+        app.new_session.base_branch = None;
+        app.new_session.repo_path = None;
+        app.new_session.fork = true;
+        let text = rendered_text(&mut app);
+        assert!(text.contains("Fork — Name"));
     }
 
     #[test]

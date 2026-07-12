@@ -373,9 +373,47 @@ Alt's *release* — and key auto-repeat — are reported, with repeats
 the PTY. Legacy terminals lose only the visual overlay: `Alt+digit` /
 `Alt+A` still work, the latter as a sticky overlay dismissed by a digit,
 `Esc`, or any other key.
+#### New-session wizard redesign (palette picker, back-navigation, prefills)
+
+Upstream's repo picker is a three-focus-zone modal (list / path input / a
+separate `/` search bar) where `Tab` completes *or* moves focus depending on
+whether a ghost suggestion happens to exist, `Enter` with nothing checked
+silently starts a session in `$HOME`, and every step's `Esc` throws the whole
+flow away. The fork rebuilds the flow:
+
+- **Always-type palette.** One focused input; typing fuzzy-filters the
+  recency-sorted bookmarks, typing a path (`~`, `/`, `./`, `../`) switches the
+  list to live directory candidates (git repos marked, local per-keystroke,
+  remote only on the explicit `Tab` listing). `Tab` only ever completes. Row
+  actions move off typed keys: `Space` (input empty) / `Ctrl+Space` pick,
+  `Ctrl+T` worktree (was `w`), `Del` forgets (was `d`), `Ctrl+P` unchanged.
+  `Enter` opens the highlighted repo directly, confirms the picked set, opens
+  a repo candidate, drills into plain directories, or adds + opens a typed
+  path in one step. Typed local paths are validated to exist (remote already
+  was). Selection is keyed by path, so it survives filtering and re-scans.
+- **Explicit no-repo + first-run help.** The silent `$HOME` fallthrough became
+  a pinned `start in ~` row; a first run with zero bookmarks offers one-key
+  imports of common project folders (`~/code`, `~/src`, …).
+- **Esc steps back** through the whole wizard with state preserved (the
+  palette returns exactly as left; branch load + origin fetch re-dispatch per
+  ADR-P12). First step cancels; the agent picker with a worktree create in
+  flight and a fork stay full cancels.
+- **Wizard chrome + name prefill.** Every step is titled `New Session — <step>`
+  (fork/import variants say so), the name/branch/agent steps show a muted
+  breadcrumb of accumulated choices, and the session name is prefilled from
+  the repo basename (deduped `-2`, `-3`, … against existing sessions) so the
+  common case is Enter-through. The base-branch and agent steps keep their
+  upstream type-to-filter selectors.
+
+Keys and flow are documented in `docs/FEATURES.md`; the back-navigation
+interplay with ADR-P12 in `docs/PERFORMANCE.md`.
 
 ### Behavior fixes
 
+- **Cancelled multi-repo flow no longer leaks `additional_dirs`.** The
+  new-session-name cancel left the wizard's derived extra dirs populated, so
+  the *next* spawn silently attached the stale directories. Cleared on
+  back-navigation/cancel now (fixed as part of the wizard redesign).
 - **Copy falls back to `tmux load-buffer` / OSC 52 when no display server is
   reachable.** Upstream copies only through `arboard`, which needs X11/Wayland —
   over SSH, under a display-less tmux, or in WSL without WSLg every copy failed

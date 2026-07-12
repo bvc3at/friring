@@ -1,4 +1,5 @@
-//! In-progress new-session wizard state (host → repo → branch → agent → name).
+//! In-progress new-session wizard state
+//! (host → repo → [base branch] → name → [branch name] → agent).
 //!
 //! Grouped out of the [`App`](super::App) god object. Fields are `pub(crate)`
 //! so call-sites keep direct access (`self.new_session.repo_path`). The whole

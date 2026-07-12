@@ -281,10 +281,15 @@ disk), and a fork — it has no prior step.
    folders (`~/code`, `~/src`, …). The first picked repo becomes
    the session's `cwd`; the rest may be exposed to the agent
    depending on the agent's own flags.
-3. **Base branch selector** — worktree mode only.
+3. **Base branch selector** — worktree mode only; titled with the
+   repo it lists (`New Session — Base Branch (friring)`).
    Type-to-filter (see below).
-4. **Session name** — free text identifier shown in the sidebar.
-5. **New branch name** — worktree mode only.
+4. **Session name** — the sidebar identifier, prefilled from the
+   repo basename (deduped `-2`, `-3`, … against existing sessions)
+   so the common case is Enter-through; edit or clear it freely.
+   Shows a muted breadcrumb of the choices so far.
+5. **New branch name** — worktree mode only, prefilled from the
+   session name (`/` preserved as a hierarchy separator).
 6. **Agent picker** — choose which coding agent runs in this
    session. Skipped when only one agent is defined in
    `agents.toml`. Type-to-filter (see below).
@@ -1903,9 +1908,13 @@ repo picker.
 
 ### Worktree storage
 
-Worktrees are created at
-`<repo>/.git/friring-worktrees/<sanitized-branch>`, where `/` in
-branch names is replaced by `-`.
+Worktrees live outside the repo, in the data dir:
+`$XDG_DATA_HOME/friring/worktrees/<repo-hash>/<sanitized-branch>`
+(default `~/.local/share/friring/worktrees/…`). On a remote host they
+go under the host's `worktrees_dir` (default
+`$HOME/.local/share/friring/worktrees`) with the same layout. `/` in
+a branch name is replaced by `-` in the *directory* name only — the
+git branch itself keeps the `/`.
 
 ### Cleanup behavior
 

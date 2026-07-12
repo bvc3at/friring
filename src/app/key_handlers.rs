@@ -953,9 +953,9 @@ impl App {
                     return;
                 };
                 let base_branch = bs.branches[real].clone();
-                self.new_session.base_branch = Some(base_branch);
-                self.modal =
-                    super::modals::Modal::SessionName(super::modals::SessionNameModal::default());
+                // Records the base branch AND prefills the name step from the
+                // repo basename (the worktree branch name derives from it).
+                self.confirm_branch_selection(base_branch);
             }
             KeyCode::Backspace => bs.filter.pop(&bs.branches, &mut bs.index),
             KeyCode::Char('n') if mods.contains(KeyModifiers::CONTROL) => {
@@ -998,6 +998,17 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// `Enter` on the branch selector: record the base branch and advance to
+    /// the name step, prefilled from the repo (worktree flow — the name also
+    /// seeds the branch name).
+    fn confirm_branch_selection(&mut self, base_branch: String) {
+        self.new_session.base_branch = Some(base_branch);
+        let mut modal = super::modals::SessionNameModal::default();
+        let cwd = self.new_session.repo_path.clone();
+        modal.name.set(&self.suggested_session_name(cwd.as_deref()));
+        self.modal = super::modals::Modal::SessionName(modal);
     }
 
     fn handle_worktree_name_key(&mut self, code: KeyCode, mods: KeyModifiers) {

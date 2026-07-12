@@ -1007,6 +1007,49 @@ impl App {
         self.record_scrollbar(modal_geom, ScrollTarget::Modal);
     }
 
+    /// One muted line of the wizard's accumulated choices ("devbox · friring
+    /// +1 · wt from main"), so the later steps don't appear out of nowhere.
+    /// `None` when nothing is known yet (e.g. a prefilled fork flow).
+    pub(super) fn wizard_breadcrumb(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        // The backend is consumed by `spawn_session_with_config` in the normal
+        // flow — fall back to the pending config's copy.
+        let backend = self.new_session.backend.as_deref().or_else(|| {
+            self.new_session
+                .spawn_config
+                .as_ref()
+                .and_then(|c| c.backend.as_deref())
+        });
+        if let Some(host) = self.host_for_backend(backend) {
+            parts.push(host.name.clone());
+        }
+        let repo = self.new_session.repo_path.as_deref().or_else(|| {
+            self.new_session
+                .spawn_config
+                .as_ref()
+                .and_then(|c| c.cwd.as_deref())
+        });
+        if let Some(repo) = repo {
+            let mut label = crate::paths::display_path(repo);
+            let extra = self
+                .new_session
+                .all_repos
+                .as_ref()
+                .map(|v| v.len().saturating_sub(1))
+                .unwrap_or(0)
+                + self.new_session.normal_repos.len()
+                + self.new_session.additional_dirs.len();
+            if extra > 0 {
+                label.push_str(&format!(" +{extra}"));
+            }
+            parts.push(label);
+        }
+        if let Some(base) = self.new_session.base_branch.as_deref() {
+            parts.push(format!("wt from {base}"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
     /// Render the text-input modals (worktree / session name) and the
     /// hard-delete confirmation. These report only footer buttons (every other
     /// click is swallowed), so they are rendered separately from selectors.
@@ -1014,23 +1057,35 @@ impl App {
         // Worktree name modal
         if let super::modals::Modal::WorktreeName(ref wn) = self.modal {
             let base = self.new_session.base_branch.as_deref().unwrap_or("");
+            let crumb = self.wizard_breadcrumb();
             return worktree_name_modal::render_worktree_name_modal(
                 frame,
                 &worktree_name_modal::WorktreeNameState {
                     name: wn.name.value(),
                     cursor: wn.name.cursor_pos(),
                     base_branch: base,
+                    breadcrumb: crumb.as_deref(),
                 },
             );
         }
 
         // Session name modal
         if let super::modals::Modal::SessionName(ref sn) = self.modal {
+            let title = if self.new_session.fork {
+                "Fork — Name"
+            } else if self.new_session.import {
+                "Import — Name"
+            } else {
+                "New Session — Name"
+            };
+            let crumb = self.wizard_breadcrumb();
             return session_name_modal::render_session_name_modal(
                 frame,
                 &session_name_modal::SessionNameState {
                     name: sn.name.value(),
                     cursor: sn.name.cursor_pos(),
+                    title,
+                    breadcrumb: crumb.as_deref(),
                 },
             );
         }
@@ -1083,6 +1138,11 @@ impl App {
                     selected_index: bs.index,
                     filter: &bs.filter,
                     loading: bs.loading,
+                    repo: self
+                        .new_session
+                        .repo_path
+                        .as_deref()
+                        .map(crate::paths::display_path),
                 },
             ));
         }
@@ -1103,7 +1163,12 @@ impl App {
 
         // Agent picker modal
         if let super::modals::Modal::AgentPicker(ref ap) = self.modal {
-            return Some(agent_picker_modal::render_agent_picker_modal(frame, ap));
+            let crumb = self.wizard_breadcrumb();
+            return Some(agent_picker_modal::render_agent_picker_modal(
+                frame,
+                ap,
+                crumb.as_deref(),
+            ));
         }
 
         // Host picker modal
