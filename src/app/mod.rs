@@ -457,6 +457,10 @@ const AGENT_BOOT_DELAY_TICKS: u64 = 300;
 
 pub enum AppMessage {
     KeyPress(KeyCode, KeyModifiers),
+    /// Alt pressed (`true`) / released (`false`) — kitty-protocol modifier
+    /// key events (legacy terminals never produce this). Drives the
+    /// session-jump number overlay; see `App::set_alt_held`.
+    AltHeld(bool),
     /// Text pasted via the terminal's bracketed paste mode.
     Paste(String),
     /// Mouse wheel up/down, carrying the cursor position so the scroll can be
@@ -669,6 +673,18 @@ pub(crate) enum TerminalView {
     Shell,
 }
 
+/// How the blocked-only jump overlay (`Alt+A`) was entered, which decides how
+/// it is dismissed. `Held` = entered while Alt was down (kitty-protocol
+/// terminals): the Alt release dismisses it, like letting go of a modifier.
+/// `Sticky` = entered by a tap (legacy terminals, where modifier state is
+/// invisible): it stays until a digit jump, `Esc`, the toggle chord, or any
+/// other key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockedJumpMode {
+    Held,
+    Sticky,
+}
+
 /// The three mutually-exclusive central-pane views, surfaced as a clickable tab
 /// strip in the pane's top border. `Agent`/`Shell` map to [`TerminalView`];
 /// `Review` is the native code-review overlay. A tab click *selects* the view
@@ -699,6 +715,19 @@ pub struct App {
     /// [`Self::set_active_index`]; bookkeeping moves (restore reshuffles,
     /// delete clamps, search previews) bypass it on purpose.
     last_active_session: Option<SessionId>,
+    /// Whether the Alt key is currently held (kitty-protocol modifier events;
+    /// always `false` on legacy terminals). See [`Self::set_alt_held`].
+    alt_held: bool,
+    /// When Alt went down — the jump numbers appear only after
+    /// [`JUMP_OVERLAY_DELAY_MS`] so pass-through Alt chords (readline
+    /// `M-b`/`M-f`) don't flash them.
+    alt_held_since: Option<std::time::Instant>,
+    /// Whether the redraw for the delay elapsing was already requested
+    /// (the overlay appears on a timer, not an input event — see
+    /// [`Self::tick_jump_overlay`]).
+    alt_overlay_redraw_requested: bool,
+    /// The blocked-only jump overlay (`Alt+A`), when open.
+    blocked_jump: Option<BlockedJumpMode>,
     backends: BackendRegistry,
     /// Registry of declarative agent definitions, used to build providers per
     /// session at spawn/restart time.
@@ -946,6 +975,12 @@ const EDITOR_NOT_CONFIGURED: &str =
 /// threshold is generous so a slow-but-live turn never trips it.
 const WORKING_OUTPUT_STALE_MS: u64 = 10_000;
 
+/// How long Alt must be held before the session-jump numbers appear: long
+/// enough that pass-through Alt chords (readline `M-b`/`M-f` in the shell
+/// pane) don't flash the overlay, short enough that a deliberate hold feels
+/// immediate. See [`App::jump_overlay_blocked_only`] / [`App::set_alt_held`].
+const JUMP_OVERLAY_DELAY_MS: u64 = 150;
+
 /// Map a session's persisted hook state to its rendered [`SessionStatus`]. Pure
 /// so it's unit-testable without an `App`/DB. `exited` forces `Idle` (a crashed/
 /// finished process); `just_seen` is `true` when the user just moved focus off a
@@ -1072,6 +1107,10 @@ impl App {
             sessions: Vec::new(),
             active_index: 0,
             last_active_session: None,
+            alt_held: false,
+            alt_held_since: None,
+            alt_overlay_redraw_requested: false,
+            blocked_jump: None,
             backends,
             agents,
             hosts: crate::session::HostRegistry::default(),
@@ -2295,6 +2334,7 @@ impl App {
         }
         match msg {
             AppMessage::KeyPress(code, mods) => self.handle_key(code, mods),
+            AppMessage::AltHeld(held) => self.set_alt_held(held),
             AppMessage::Paste(text) => self.handle_paste(text),
             AppMessage::MouseScrollUp { x, y } => self.handle_mouse_scroll(x, y, true),
             AppMessage::MouseScrollDown { x, y } => self.handle_mouse_scroll(x, y, false),
@@ -4243,6 +4283,107 @@ impl App {
         self.set_active_index(order[next]);
     }
 
+    /// Track the Alt key's held state (kitty-protocol modifier events).
+    /// While held, the session list numbers its rows for `Alt+<digit>` jumps
+    /// (after [`JUMP_OVERLAY_DELAY_MS`]); releasing Alt also dismisses a
+    /// held-mode blocked overlay. Repeats / duplicate events are no-ops.
+    pub(crate) fn set_alt_held(&mut self, held: bool) {
+        if held == self.alt_held {
+            return;
+        }
+        self.alt_held = held;
+        self.alt_overlay_redraw_requested = false;
+        self.alt_held_since = held.then(std::time::Instant::now);
+        if !held && self.blocked_jump == Some(BlockedJumpMode::Held) {
+            self.blocked_jump = None;
+        }
+    }
+
+    /// Which jump overlay the session list should paint this frame:
+    /// `Some(true)` = blocked-only numbering (`Alt+A`), `Some(false)` = all
+    /// sessions (Alt held past the delay), `None` = no overlay.
+    pub(crate) fn jump_overlay_blocked_only(&self) -> Option<bool> {
+        if self.blocked_jump.is_some() {
+            return Some(true);
+        }
+        let delay_elapsed = self
+            .alt_held_since
+            .is_some_and(|t| t.elapsed().as_millis() as u64 >= JUMP_OVERLAY_DELAY_MS);
+        if self.alt_held && delay_elapsed {
+            return Some(false);
+        }
+        None
+    }
+
+    /// Tick hook: the Alt-hold overlay appears on a *timer*, not an input
+    /// event, so the frame where the delay elapses must be requested here —
+    /// nothing else marks the UI dirty while the user just holds Alt.
+    fn tick_jump_overlay(&mut self) {
+        if self.alt_held
+            && !self.alt_overlay_redraw_requested
+            && self.jump_overlay_blocked_only().is_some()
+        {
+            self.alt_overlay_redraw_requested = true;
+            self.request_redraw();
+        }
+    }
+
+    /// The sessions digits `1`–`9` jump to, in the order the overlay numbers
+    /// them: rendered order, optionally filtered to `Blocked`, capped at 9.
+    /// Must stay consistent with the numbering `App::view` paints (same
+    /// order, same predicate — see `render_left_panel`).
+    pub(crate) fn session_jump_targets(&self, blocked_only: bool) -> Vec<usize> {
+        self.render_order_indices()
+            .into_iter()
+            .filter(|&i| !blocked_only || self.sessions[i].info.status == SessionStatus::Blocked)
+            .take(9)
+            .collect()
+    }
+
+    /// Activate the `digit`-numbered session of the jump overlay (all
+    /// sessions or blocked-only, matching what the overlay renders) and land
+    /// in the terminal. An out-of-range digit reports instead of guessing.
+    pub(crate) fn jump_to_digit(&mut self, digit: char, blocked_only: bool) {
+        let n = digit.to_digit(10).unwrap_or(0) as usize;
+        let targets = self.session_jump_targets(blocked_only);
+        match n.checked_sub(1).and_then(|i| targets.get(i)) {
+            Some(&idx) => {
+                self.set_active_index(idx);
+                self.focus = InputFocus::Terminal;
+                self.on_focus_changed();
+            }
+            None => {
+                let what = if blocked_only {
+                    "blocked session"
+                } else {
+                    "session"
+                };
+                self.set_status(StatusLevel::Info, format!("No {what} #{n}"));
+            }
+        }
+    }
+
+    /// Toggle the blocked-only jump overlay (`Alt+A`): blocked sessions get
+    /// numbers `1`–`9` and a digit jumps to that one — fewer, lower digits
+    /// than the all-session numbering when the list is long. Entered while
+    /// Alt is held it lives until the Alt release; entered by a tap (legacy
+    /// terminals) it is sticky — see [`BlockedJumpMode`].
+    pub(crate) fn toggle_blocked_jump(&mut self) {
+        if self.blocked_jump.is_some() {
+            self.blocked_jump = None;
+            return;
+        }
+        if self.session_jump_targets(true).is_empty() {
+            self.set_status(StatusLevel::Info, "No blocked sessions");
+            return;
+        }
+        self.blocked_jump = Some(if self.alt_held {
+            BlockedJumpMode::Held
+        } else {
+            BlockedJumpMode::Sticky
+        });
+    }
+
     /// Jump to the next session that needs attention (`Blocked`), scanning
     /// forward from the active session in **rendered** order (wraps) and
     /// landing focus in the terminal — so pressing the key repeatedly walks
@@ -4365,6 +4506,8 @@ impl App {
     /// without a runtime; `main`'s loop always runs both halves via `tick()`.
     pub(crate) fn tick_core(&mut self) {
         self.metrics.tick_count = self.metrics.tick_count.wrapping_add(1);
+
+        self.tick_jump_overlay();
 
         self.tick_global_search_content();
 
@@ -10665,6 +10808,134 @@ mod tests {
         assert_eq!(app.active_index, 0);
         let msg = app.status_message.as_ref().expect("status hint set");
         assert!(msg.text.contains("No other blocked"), "{}", msg.text);
+    }
+
+    // --- Session jump overlays (Alt hold / Alt+digit / Alt+A) ---
+
+    #[test]
+    fn alt_digit_jumps_to_nth_session_and_focuses_terminal() {
+        let mut app = app_with_sessions(3);
+        app.focus = InputFocus::SessionList;
+        app.active_index = 0;
+        app.handle_key(KeyCode::Char('2'), KeyModifiers::ALT);
+        assert_eq!(app.active_index, 1);
+        assert_eq!(app.focus, InputFocus::Terminal);
+    }
+
+    #[test]
+    fn alt_digit_out_of_range_reports() {
+        let mut app = app_with_sessions(3);
+        app.active_index = 0;
+        app.handle_key(KeyCode::Char('9'), KeyModifiers::ALT);
+        assert_eq!(app.active_index, 0);
+        let msg = app.status_message.as_ref().expect("status hint set");
+        assert!(msg.text.contains("No session #9"), "{}", msg.text);
+    }
+
+    #[test]
+    fn alt_hold_overlay_appears_after_delay_and_clears_on_release() {
+        let mut app = app_with_sessions(2);
+        app.update(AppMessage::AltHeld(true));
+        // Before the debounce delay nothing shows (a readline M-chord in the
+        // shell shouldn't flash numbers).
+        assert_eq!(app.jump_overlay_blocked_only(), None);
+        app.alt_held_since = Some(
+            std::time::Instant::now() - std::time::Duration::from_millis(JUMP_OVERLAY_DELAY_MS),
+        );
+        assert_eq!(app.jump_overlay_blocked_only(), Some(false));
+        app.update(AppMessage::AltHeld(false));
+        assert_eq!(app.jump_overlay_blocked_only(), None);
+    }
+
+    #[test]
+    fn session_jump_targets_filter_blocked_and_cap_at_nine() {
+        let mut app = app_with_sessions(12);
+        assert_eq!(app.session_jump_targets(false).len(), 9);
+        app.sessions[4].info.status = SessionStatus::Blocked;
+        app.sessions[10].info.status = SessionStatus::Blocked;
+        assert_eq!(app.session_jump_targets(true), vec![4, 10]);
+    }
+
+    #[test]
+    fn alt_a_sticky_overlay_numbers_blocked_and_plain_digit_jumps() {
+        let mut app = app_with_sessions(4);
+        app.sessions[2].info.status = SessionStatus::Blocked;
+        app.focus = InputFocus::Terminal;
+        app.active_index = 0;
+
+        // Tap (Alt not held → legacy terminal): sticky overlay.
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
+        assert_eq!(app.blocked_jump, Some(BlockedJumpMode::Sticky));
+        assert_eq!(app.jump_overlay_blocked_only(), Some(true));
+
+        // A plain digit indexes the *blocked* numbering, not the row number.
+        app.handle_key(KeyCode::Char('1'), KeyModifiers::NONE);
+        assert_eq!(app.active_index, 2);
+        assert_eq!(app.focus, InputFocus::Terminal);
+        assert_eq!(app.blocked_jump, None, "a jump dismisses the overlay");
+    }
+
+    #[test]
+    fn alt_a_without_blocked_sessions_reports() {
+        let mut app = app_with_sessions(2);
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
+        assert_eq!(app.blocked_jump, None);
+        let msg = app.status_message.as_ref().expect("status hint set");
+        assert!(msg.text.contains("No blocked"), "{}", msg.text);
+    }
+
+    #[test]
+    fn sticky_overlay_esc_dismisses_and_other_keys_pass_through() {
+        let mut app = app_with_sessions(3);
+        app.sessions[1].info.status = SessionStatus::Blocked;
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.blocked_jump, None, "Esc dismisses");
+
+        // A non-digit key dismisses the sticky overlay *and* still performs
+        // its normal action (here: session-list j moves the selection).
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
+        app.focus = InputFocus::SessionList;
+        app.active_index = 0;
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.blocked_jump, None);
+        assert_eq!(app.active_index, 1, "the key still acted normally");
+    }
+
+    #[test]
+    fn alt_a_toggles_the_overlay_off() {
+        let mut app = app_with_sessions(2);
+        app.sessions[0].info.status = SessionStatus::Blocked;
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
+        assert!(app.blocked_jump.is_some());
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
+        assert_eq!(app.blocked_jump, None);
+    }
+
+    #[test]
+    fn held_mode_blocked_overlay_dismissed_by_alt_release() {
+        let mut app = app_with_sessions(2);
+        app.sessions[1].info.status = SessionStatus::Blocked;
+        app.update(AppMessage::AltHeld(true));
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
+        assert_eq!(app.blocked_jump, Some(BlockedJumpMode::Held));
+        // Other keys don't dismiss a held overlay (Alt chords keep flowing) …
+        app.handle_key(KeyCode::Char('x'), KeyModifiers::ALT);
+        assert_eq!(app.blocked_jump, Some(BlockedJumpMode::Held));
+        // … releasing Alt does.
+        app.update(AppMessage::AltHeld(false));
+        assert_eq!(app.blocked_jump, None);
+    }
+
+    #[test]
+    fn missed_alt_release_self_heals_on_the_next_plain_key() {
+        let mut app = app_with_sessions(2);
+        app.focus = InputFocus::SessionList;
+        app.update(AppMessage::AltHeld(true));
+        assert!(app.alt_held);
+        // A key event without the ALT bit means the release was lost.
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert!(!app.alt_held);
     }
 
     // --- Unified left-column (session list ↔ automations) navigation ---

@@ -308,6 +308,31 @@ impl App {
         // A (global) search is active iff there's a query — non-matching rows dim.
         let session_search_active = global_query.is_some();
 
+        // Jump-overlay numbering (Alt held / Alt+A), parallel to the ordered
+        // rows. Must stay consistent with `App::session_jump_targets` — same
+        // order, same predicate — so the painted digit is the one a keypress
+        // jumps to.
+        let jump_digits: Vec<Option<char>> = match self.jump_overlay_blocked_only() {
+            None => vec![None; ordered.sessions.len()],
+            Some(blocked_only) => {
+                let mut n = 0u32;
+                ordered
+                    .sessions
+                    .iter()
+                    .map(|info| {
+                        let eligible =
+                            !blocked_only || info.status == crate::session::SessionStatus::Blocked;
+                        if eligible && n < 9 {
+                            n += 1;
+                            char::from_digit(n, 10)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
+        };
+
         let spinner =
             crate::ui::SPINNER_FRAMES[self.spinner_frame() % crate::ui::SPINNER_FRAMES.len()];
         let rows = project_list::render_left_panel(
@@ -324,6 +349,7 @@ impl App {
                 headers: ordered.headers,
                 depths: ordered.depths,
                 spinner,
+                jump_digits: &jump_digits,
             },
         );
         self.record_row_clicks(

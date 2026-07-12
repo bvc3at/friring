@@ -13,6 +13,9 @@ expression: h.render()
 │                   │  ctrl+l          Focus next pane                        █│                   │
 │                   │  ctrl+j          Next session                           █│                   │
 │                   │  ctrl+k          Previous session                       ║│                   │
+│                   │  f10             Next blocked session                   ║│                   │
+│                   │  ctrl+6 / ctrl+^ Last session (toggle)                  ║│                   │
+│                   │  alt+a           Jump to blocked by number              ║│                   │
 │                   │                                                         ║│                   │
 │                   │Sessions                                                 ║│                   │
 │                   │  ctrl+n          New session                            ║│                   │
@@ -22,10 +25,7 @@ expression: h.render()
 │                   │  ctrl+p          Automations                            ║│                   │
 │                   │  ctrl+w / f5     Tasks                                  ║│                   │
 │                   │  ctrl+z          Undo delete                            ║│                   │
-│                   │  ctrl+u          Restore deleted sessions               ║│                   │
-│                   │                                                         ║│                   │
-│                   │Project                                                  ║│                   │
-│                   │  ctrl+o          Open in editor                         ▼│                   │
+│                   │  ctrl+u          Restore deleted sessions               ▼│                   │
 │                   │j/k move · r rebind · d reset           Reset all   Close │                   │
 ╰───────────────────╰──────────────────────────────────────────────────────────╯                   │
 ┌ Automations ──────────┐│                                                                         │

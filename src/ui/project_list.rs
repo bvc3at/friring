@@ -507,6 +507,9 @@ pub struct LeftPanelState<'a> {
     /// Current animated spinner frame for the `Working` status
     /// (`SPINNER_FRAMES[App::spinner_frame()]`).
     pub spinner: &'a str,
+    /// Parallel to `sessions`: the jump-overlay digit painted ahead of the
+    /// status dot (Alt-hold / Alt+A numbering), `None` when hidden.
+    pub jump_digits: &'a [Option<char>],
 }
 
 pub fn render_left_panel(
@@ -529,6 +532,7 @@ pub fn render_left_panel(
         state.headers,
         state.depths,
         state.spinner,
+        state.jump_digits,
     )
 }
 
@@ -613,6 +617,7 @@ fn render_session_section(
     headers: &[Option<String>],
     depths: &[u8],
     spinner: &str,
+    jump_digits: &[Option<char>],
 ) -> Vec<super::RowHitbox> {
     let mut block = focus_block(" Sessions ", level);
 
@@ -697,6 +702,7 @@ fn render_session_section(
                 cross_group_child,
                 inner_width,
                 spinner,
+                jump_digits.get(i).copied().flatten(),
             )];
 
             // Prepend a subtle repo-group header above the first session of
@@ -969,6 +975,7 @@ fn build_session_line<'a>(
     cross_group_child: bool,
     inner_width: usize,
     spinner: &str,
+    jump_digit: Option<char>,
 ) -> Line<'a> {
     let name_style = name_span_style(is_active, is_dimmed);
     let status_style = if is_dimmed {
@@ -977,10 +984,26 @@ fn build_session_line<'a>(
         Style::default().fg(super::status_color(info.status))
     };
 
-    let mut spans = vec![Span::styled(
-        format!(" {} ", super::status_glyph(info.status, spinner)),
-        status_style,
-    )];
+    // The jump digit takes the status dot's leading pad column, so the
+    // overlay appearing/disappearing never shifts the row.
+    let mut spans = match jump_digit {
+        Some(d) => vec![
+            Span::styled(
+                d.to_string(),
+                Style::default()
+                    .fg(Theme::accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} ", super::status_glyph(info.status, spinner)),
+                status_style,
+            ),
+        ],
+        None => vec![Span::styled(
+            format!(" {} ", super::status_glyph(info.status, spinner)),
+            status_style,
+        )],
+    };
 
     push_prefix_marks(&mut spans, info, is_dimmed, depth, cross_group_child);
 
@@ -1289,6 +1312,7 @@ mod tests {
                         headers: ordered.headers,
                         depths: ordered.depths,
                         spinner: "◐",
+                        jump_digits: &[],
                     },
                 );
             })
@@ -1327,14 +1351,14 @@ mod tests {
             worktree_path: std::path::PathBuf::from("/tmp/wt/feat"),
             branch: "feat".to_string(),
         });
-        let line = build_session_line(&s, None, false, false, 0, false, WIDE, "◐");
+        let line = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", None);
         assert!(line_text(&line).contains('\u{2442}'));
     }
 
     #[test]
     fn line_no_worktree_glyph_for_plain_session() {
         let s = info("plain");
-        let line = build_session_line(&s, None, false, false, 0, false, WIDE, "◐");
+        let line = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", None);
         assert!(!line_text(&line).contains('\u{2442}'));
     }
 
@@ -1342,28 +1366,28 @@ mod tests {
     fn line_shows_remote_glyph_when_remote_host_present() {
         let mut s = info("remote");
         s.remote_host = Some("devbox".to_string());
-        let line = build_session_line(&s, None, false, false, 0, false, WIDE, "◐");
+        let line = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", None);
         assert!(line_text(&line).contains('\u{21c5}'));
     }
 
     #[test]
     fn line_no_remote_glyph_for_local_session() {
         let s = info("local");
-        let line = build_session_line(&s, None, false, false, 0, false, WIDE, "◐");
+        let line = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", None);
         assert!(!line_text(&line).contains('\u{21c5}'));
     }
 
     #[test]
     fn line_shows_tree_prefix_for_nested_child() {
         let s = info("worker");
-        let line = build_session_line(&s, None, false, false, 1, false, WIDE, "◐");
+        let line = build_session_line(&s, None, false, false, 1, false, WIDE, "◐", None);
         assert!(line_text(&line).contains('\u{2514}')); // └
     }
 
     #[test]
     fn line_shows_arrow_for_cross_group_child() {
         let s = info("worker");
-        let line = build_session_line(&s, None, false, false, 0, true, WIDE, "◐");
+        let line = build_session_line(&s, None, false, false, 0, true, WIDE, "◐", None);
         let text = line_text(&line);
         assert!(text.contains('\u{21b3}')); // ↳
         assert!(!text.contains('\u{2514}'));
@@ -1374,7 +1398,7 @@ mod tests {
         let mut s = info("quiet");
         s.status = SessionStatus::Done;
         let text = line_text(&build_session_line(
-            &s, None, false, false, 0, false, WIDE, "◐",
+            &s, None, false, false, 0, false, WIDE, "◐", None,
         ));
         assert!(!text.contains("Waiting"));
         assert!(text.trim_end().ends_with("quiet"));
@@ -1386,15 +1410,27 @@ mod tests {
         s.status = SessionStatus::Working;
         s.agent_activity = Some("Compacting conversation".to_string());
         let text = line_text(&build_session_line(
-            &s, None, false, false, 0, false, WIDE, "◐",
+            &s, None, false, false, 0, false, WIDE, "◐", None,
         ));
         assert!(text.contains("busy  Compacting conversation"));
     }
 
     #[test]
+    fn line_jump_digit_replaces_leading_pad_without_shifting_the_row() {
+        let s = info("target");
+        let plain = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", None);
+        let numbered = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", Some('3'));
+        let text = line_text(&numbered);
+        assert!(text.starts_with('3'), "digit leads the row: {text:?}");
+        // The digit takes the dot's pad column, so nothing moves.
+        assert_eq!(line_text(&plain)[1..], text[1..]);
+        assert_eq!(plain.width(), numbered.width());
+    }
+
+    #[test]
     fn active_line_paints_selection_background_to_full_width() {
         let s = info("active");
-        let line = build_session_line(&s, None, true, false, 0, false, WIDE, "◐");
+        let line = build_session_line(&s, None, true, false, 0, false, WIDE, "◐", None);
         // The bar is painted on the row itself (every span), so it can't bleed
         // onto a prepended group header, and it fills the full inner width.
         assert!(line
@@ -1409,7 +1445,7 @@ mod tests {
         // Inner width smaller than the rendered row: nothing to pad, but the
         // selection background must still cover the spans (and not panic).
         let s = info("a-fairly-long-session-name");
-        let line = build_session_line(&s, None, true, false, 0, false, 4, "◐");
+        let line = build_session_line(&s, None, true, false, 0, false, 4, "◐", None);
         assert!(line
             .spans
             .iter()
@@ -1419,7 +1455,7 @@ mod tests {
     #[test]
     fn inactive_line_has_no_selection_background() {
         let s = info("idle");
-        let line = build_session_line(&s, None, false, false, 0, false, WIDE, "◐");
+        let line = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", None);
         assert!(line.spans.iter().all(|sp| sp.style.bg.is_none()));
     }
 
@@ -1439,7 +1475,7 @@ mod tests {
         s.status = SessionStatus::Blocked;
         s.notification = Some("Review this diff".to_string());
         let text = line_text(&build_session_line(
-            &s, None, false, false, 0, false, WIDE, "◐",
+            &s, None, false, false, 0, false, WIDE, "◐", None,
         ));
         assert!(text.contains("attn  Review this diff"));
     }
@@ -1448,7 +1484,7 @@ mod tests {
     fn line_truncates_agent_status_with_ellipsis() {
         let mut s = info("busy");
         s.agent_activity = Some("a very long activity title that cannot fit".to_string());
-        let line = build_session_line(&s, None, false, false, 0, false, 20, "◐");
+        let line = build_session_line(&s, None, false, false, 0, false, 20, "◐", None);
         let text = line_text(&line);
         assert!(text.chars().count() <= 20);
         assert!(text.ends_with('\u{2026}'));
@@ -1460,7 +1496,7 @@ mod tests {
         s.agent_activity = Some("Ready".to_string());
         // used = " ● " (3) + "busy" (4) + separator (2) = 9; "Ready" fits exactly.
         let text = line_text(&build_session_line(
-            &s, None, false, false, 0, false, 14, "◐",
+            &s, None, false, false, 0, false, 14, "◐", None,
         ));
         assert!(text.ends_with("busy  Ready"));
         assert!(!text.contains('\u{2026}'));
@@ -1472,11 +1508,11 @@ mod tests {
         s.agent_activity = Some("Ready".to_string());
         // avail = AGENT_STATUS_MIN_WIDTH → shown truncated; one column less → skipped.
         let shown = line_text(&build_session_line(
-            &s, None, false, false, 0, false, 13, "◐",
+            &s, None, false, false, 0, false, 13, "◐", None,
         ));
         assert!(shown.ends_with("Rea\u{2026}"));
         let skipped = line_text(&build_session_line(
-            &s, None, false, false, 0, false, 12, "◐",
+            &s, None, false, false, 0, false, 12, "◐", None,
         ));
         assert!(skipped.trim_end().ends_with("busy"));
     }
@@ -1486,7 +1522,7 @@ mod tests {
         let mut s = info("a-rather-long-session-name");
         s.agent_activity = Some("activity".to_string());
         let text = line_text(&build_session_line(
-            &s, None, false, false, 0, false, 30, "◐",
+            &s, None, false, false, 0, false, 30, "◐", None,
         ));
         assert!(!text.contains("activity"));
         assert!(text.trim_end().ends_with("a-rather-long-session-name"));

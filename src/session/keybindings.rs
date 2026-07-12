@@ -11,7 +11,8 @@
 //!
 //! A few stateful keys remain literal in `key_handlers.rs` and are *not*
 //! rebindable: modal-internal selectors (j/k/Enter/Esc), the automations/tasks
-//! panes, and the file-viewer search sub-mode.
+//! panes, the file-viewer search sub-mode, and the session jump digits
+//! (`Alt+1`–`9`, plus plain digits/`Esc` while a jump overlay is open).
 
 use std::collections::HashMap;
 
@@ -54,6 +55,9 @@ pub enum Action {
     /// Toggle between the two most recent sessions (tmux `last-window`,
     /// vim's alternate buffer).
     LastSession,
+    /// Open the blocked-only jump overlay: blocked sessions get numbers 1–9
+    /// in the session list and a digit jumps straight to that one.
+    JumpToBlocked,
     ToggleHelp,
     ToggleInfoPanel,
     ToggleFileViewer,
@@ -162,6 +166,7 @@ impl Action {
             Action::PreviousSession,
             Action::NextBlockedSession,
             Action::LastSession,
+            Action::JumpToBlocked,
             Action::ToggleHelp,
             Action::ToggleInfoPanel,
             Action::ToggleFileViewer,
@@ -232,6 +237,7 @@ impl Action {
             Action::PreviousSession => "Previous session",
             Action::NextBlockedSession => "Next blocked session",
             Action::LastSession => "Last session (toggle)",
+            Action::JumpToBlocked => "Jump to blocked by number",
             Action::ToggleHelp => "Help",
             Action::ToggleInfoPanel => "Toggle info panel",
             Action::ToggleFileViewer => "Toggle file viewer",
@@ -438,6 +444,13 @@ impl Action {
             // both are bound. Not a bare Ctrl+<letter>, so it never defers to
             // the PTY. Fully rebindable.
             Action::LastSession => vec![KeyChord::ctrl('6'), KeyChord::ctrl('^')],
+            // Alt+A (mnemonic: Attention) — part of the deliberate, narrow
+            // Alt exception for session jumps (with the fixed `Alt+1…9`
+            // digits): held Alt already drives the number overlay, so its
+            // blocked-only variant lives on the same modifier. Shadows
+            // readline's rarely-used M-a (backward-sentence) in the terminal;
+            // fully rebindable.
+            Action::JumpToBlocked => vec![KeyChord::alt(KeyCode::Char('a'))],
             Action::ToggleHelp => vec![KeyChord::ctrl('g'), KeyChord::function(1)],
             Action::ToggleInfoPanel => vec![KeyChord::ctrl('b'), KeyChord::function(2)],
             Action::ToggleFileViewer => vec![KeyChord::ctrl('e'), KeyChord::function(3)],
@@ -582,6 +595,7 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
                 PreviousSession,
                 NextBlockedSession,
                 LastSession,
+                JumpToBlocked,
             ],
         ),
         (
@@ -1397,6 +1411,7 @@ mod tests {
                 Action::PreviousSession => 0,
                 Action::NextBlockedSession => 0,
                 Action::LastSession => 0,
+                Action::JumpToBlocked => 0,
                 Action::ToggleHelp => 0,
                 Action::ToggleInfoPanel => 0,
                 Action::ToggleFileViewer => 0,
@@ -1445,7 +1460,7 @@ mod tests {
         }
         // The listed variants must equal Action::all().len(). If you add
         // a variant, update both `Action::all()` and the match above.
-        const EXPECTED: usize = 64;
+        const EXPECTED: usize = 65;
         assert_eq!(Action::all().len(), EXPECTED);
         for a in Action::all() {
             classify(*a);

@@ -5,8 +5,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, ModifierKeyCode, MouseButton,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 
@@ -20,19 +20,36 @@ use thurbox::storage::Database;
 /// whether a matching pop is needed.
 static KEYBOARD_ENHANCEMENT_PUSHED: AtomicBool = AtomicBool::new(false);
 
-/// Enable the kitty keyboard protocol where the terminal supports it: with
-/// DISAMBIGUATE_ESCAPE_CODES, Cmd/Super-modified keys are reported at all
-/// (otherwise the terminal never delivers them), while plain keys keep their
-/// legacy encodings and no Release/Repeat events arrive — the
-/// `KeyEventKind::Press` filter in `run_loop` stays correct. The support
-/// query needs raw mode, so call this only after `ratatui::init()`.
+/// Enable the kitty keyboard protocol where the terminal supports it:
+///
+/// - DISAMBIGUATE_ESCAPE_CODES — Cmd/Super-modified keys are reported at all
+///   (otherwise the terminal never delivers them).
+/// - REPORT_EVENT_TYPES + REPORT_ALL_KEYS_AS_ESCAPE_CODES — press/release
+///   events *including the modifier keys themselves*, which is what lets the
+///   app track "Alt is held" and paint the session-jump numbers
+///   (`App::set_alt_held`). Auto-repeat now arrives as `Repeat` instead of
+///   repeated `Press`, so `key_to_message` dispatches both kinds.
+/// - REPORT_ALTERNATE_KEYS — with ALL_KEYS reporting, a shifted key carries
+///   its shifted codepoint (`Shift+a` → `A`), keeping text input in modals
+///   and the PTY forwarding identical to the legacy encoding.
+///
+/// Legacy terminals (query answers no) keep the old behavior: no flags, no
+/// Release/Repeat events, no modifier-key events — the Alt-hold overlay just
+/// never shows, while `Alt+<digit>` chords still arrive as `ESC <digit>` and
+/// keep working blind. The support query needs raw mode, so call this only
+/// after `ratatui::init()`.
 fn push_keyboard_enhancement() {
     if matches!(
         crossterm::terminal::supports_keyboard_enhancement(),
         Ok(true)
     ) && execute!(
         std::io::stdout(),
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        )
     )
     .is_ok()
     {
@@ -520,17 +537,33 @@ async fn run_loop(
 }
 
 /// Translate a crossterm `Event` into the matching `AppMessage`, or `None` for
-/// events the app ignores (key release/repeat, unhandled mouse kinds, …).
+/// events the app ignores (key releases, unhandled mouse kinds, …).
 fn event_to_message(event: Event) -> Option<AppMessage> {
     match event {
-        Event::Key(k) if k.kind == KeyEventKind::Press => {
-            Some(AppMessage::KeyPress(k.code, k.modifiers))
-        }
+        Event::Key(k) => key_to_message(k),
         Event::Mouse(m) => mouse_to_message(m),
         Event::Paste(text) => Some(AppMessage::Paste(text)),
         Event::Resize(cols, rows) => Some(AppMessage::Resize(cols, rows)),
         _ => None,
     }
+}
+
+/// Translate a key event. Modifier keys arrive as their own events under the
+/// kitty protocol (REPORT_ALL_KEYS_AS_ESCAPE_CODES): Alt's press/release
+/// drives the session-jump overlay, every other bare modifier is dropped —
+/// they must never reach `handle_key` (or worse, the PTY). For regular keys,
+/// `Repeat` dispatches like `Press` (that's how auto-repeat arrives with
+/// REPORT_EVENT_TYPES; legacy terminals send repeated `Press` instead) and
+/// `Release` is dropped.
+fn key_to_message(k: event::KeyEvent) -> Option<AppMessage> {
+    if let KeyCode::Modifier(m) = k.code {
+        if matches!(m, ModifierKeyCode::LeftAlt | ModifierKeyCode::RightAlt) {
+            return Some(AppMessage::AltHeld(k.kind != KeyEventKind::Release));
+        }
+        return None;
+    }
+    matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        .then_some(AppMessage::KeyPress(k.code, k.modifiers))
 }
 
 /// Translate a crossterm mouse event into the matching `AppMessage`, or `None`
@@ -563,5 +596,51 @@ fn mouse_to_message(m: event::MouseEvent) -> Option<AppMessage> {
             y: m.row,
         }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, kind: KeyEventKind) -> Event {
+        let mut k = KeyEvent::new(code, KeyModifiers::NONE);
+        k.kind = kind;
+        Event::Key(k)
+    }
+
+    /// Alt's own press/release events (kitty ALL_KEYS reporting) drive the
+    /// jump overlay; other bare modifiers are dropped entirely.
+    #[test]
+    fn modifier_key_events_map_to_alt_held() {
+        let alt = KeyCode::Modifier(ModifierKeyCode::LeftAlt);
+        assert!(matches!(
+            event_to_message(key(alt, KeyEventKind::Press)),
+            Some(AppMessage::AltHeld(true))
+        ));
+        assert!(matches!(
+            event_to_message(key(alt, KeyEventKind::Release)),
+            Some(AppMessage::AltHeld(false))
+        ));
+        let ctrl = KeyCode::Modifier(ModifierKeyCode::LeftControl);
+        assert!(event_to_message(key(ctrl, KeyEventKind::Press)).is_none());
+    }
+
+    /// With REPORT_EVENT_TYPES, terminal auto-repeat arrives as `Repeat` —
+    /// it must dispatch like `Press` (holding a key in the PTY keeps
+    /// repeating), while `Release` stays dropped.
+    #[test]
+    fn repeat_dispatches_and_release_is_dropped() {
+        let a = KeyCode::Char('a');
+        assert!(matches!(
+            event_to_message(key(a, KeyEventKind::Press)),
+            Some(AppMessage::KeyPress(KeyCode::Char('a'), _))
+        ));
+        assert!(matches!(
+            event_to_message(key(a, KeyEventKind::Repeat)),
+            Some(AppMessage::KeyPress(KeyCode::Char('a'), _))
+        ));
+        assert!(event_to_message(key(a, KeyEventKind::Release)).is_none());
     }
 }

@@ -193,7 +193,7 @@ of the status dots) and in the footer (`◆ N blocked · F10`, with the live
 shortcut), so attention is visible even when the sidebar is hidden on a
 narrow terminal. See `docs/FEATURES.md` ("Live status & needs attention").
 
-#### Quick session switching (last-session toggle)
+#### Quick session switching (last-session toggle & numbered jumps)
 
 `Ctrl+6` / `Ctrl+^` (rebindable `LastSession`) bounces between the two
 most recent sessions — tmux `last-window`, vim's alternate buffer. Every
@@ -201,6 +201,21 @@ deliberate switch records the session it left (`Ctrl+J`/`K`, list `j`/`k`,
 clicks, jumps, a committed global-search result, spawn/undelete);
 bookkeeping moves (restore reshuffles, delete clamps, search
 live-previews) don't, so the toggle always means "where I actually was".
+
+`Alt+1`–`9` jumps to the Nth session in rendered order (tmux
+`Alt+digit`), and **holding Alt paints the numbers** on the session list
+so the target is visible before the digit is pressed. `Alt+A` (rebindable
+`JumpToBlocked`) is the attention variant: it numbers only the *blocked*
+sessions and a digit jumps among those. This is a deliberate, narrow Alt
+exception to upstream's "Ctrl = global, everything else = PTY" philosophy
+(documented in `docs/FEATURES.md`); every other Alt chord still forwards
+to the agent. The hold-to-peek overlay needs the kitty keyboard protocol —
+the fork widens upstream's `DISAMBIGUATE_ESCAPE_CODES` push to also report
+event types, alternate keys, and modifier-key events (`main.rs`), with
+auto-repeat (`Repeat` kind) handled explicitly so held keys keep repeating
+into the PTY. Legacy terminals lose only the visual overlay: `Alt+digit` /
+`Alt+A` still work, the latter as a sticky overlay dismissed by a digit,
+`Esc`, or any other key.
 
 ### Behavior fixes
 
