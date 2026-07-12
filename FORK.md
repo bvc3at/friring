@@ -81,9 +81,11 @@ sessions only.
   **qwen**, **copilot**, **vibe**, **cursor-agent** (JSONL transcripts),
   **opencode**, **goose**, **crush** (SQLite), **aider** (markdown history),
   **cline** (full-rewrite JSON). Each provider honors its CLI's state-dir
-  env override (`CODEX_HOME`, `GEMINI_CLI_HOME`, `QWEN_HOME`, `COPILOT_HOME`,
-  `VIBE_HOME`, `CURSOR_DATA_DIR`, `GOOSE_PATH_ROOT`, `CLINE_DIR`, XDG for
-  opencode).
+  env overrides (`CODEX_HOME`; `GEMINI_CLI_HOME`; `QWEN_HOME` /
+  `QWEN_RUNTIME_DIR`; `COPILOT_HOME`; `VIBE_HOME`; `CURSOR_DATA_DIR`;
+  `GOOSE_PATH_ROOT`; `CLINE_DIR` / `CLINE_DATA_DIR` /
+  `CLINE_SESSION_DATA_DIR`; `AIDER_CHAT_HISTORY_FILE`; `OPENCODE_DB`;
+  `XDG_DATA_HOME` for opencode and goose).
 - **Known-unsupported agents** show *why* in the Overview (e.g. `agy`
   encrypts its trajectory store; `amp` keeps threads server-side).
 - **The Claude workflow/subagent tree** (the original v1 feature) lives on
