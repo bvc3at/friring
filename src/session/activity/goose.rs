@@ -134,8 +134,13 @@ fn classify(name: &str, input: Option<&serde_json::Value>) -> Option<ActivityEve
                 _ => (ActionKind::Edit, path, None),
             }
         }
-        // `read_image` targets a local path or an http(s) image URL.
-        "read_image" => (ActionKind::Read, get("path").or_else(|| get("url"))?, None),
+        // `read_image` targets a local path (a file read) or an http(s) image
+        // URL (a web fetch — a URL in the Files section would be wrong).
+        "read_image" => match (get("path"), get("url")) {
+            (Some(path), _) => (ActionKind::Read, path, None),
+            (None, Some(url)) => (ActionKind::WebFetch, url, None),
+            (None, None) => return None,
+        },
         // `tree` lists a directory's structure — the closest kind to a search.
         "tree" => (
             ActionKind::Search,
@@ -321,6 +326,19 @@ mod tests {
             .unwrap()
             .contains("rust sqlx wal"));
         assert_eq!(s.events[7].detail, "ls"); // developer__shell folded to shell
+    }
+
+    #[test]
+    fn read_image_with_url_is_a_web_fetch_not_a_file_read() {
+        let content = r#"[
+            {"type":"toolRequest","id":"a1","toolCall":{"status":"success","value":{"name":"read_image","arguments":{"url":"https://example.com/chart.png"}}}}
+        ]"#
+        .replace('\n', " ");
+        let s = scan(&content, None);
+        assert_eq!(s.events.len(), 1);
+        // A URL in the Files section would be wrong — it belongs under Web.
+        assert_eq!(s.events[0].kind, ActionKind::WebFetch);
+        assert_eq!(s.events[0].detail, "https://example.com/chart.png");
     }
 
     #[test]
