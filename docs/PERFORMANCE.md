@@ -540,13 +540,33 @@ Now the flow overlaps everything with the user's own think-time:
   worker** (`ensure_backend_ready`, `session_member_dirs`-derived names), so
   the picker's `Enter` and the adopt tick no longer shell out.
 
+**Back-navigation interplay** (the wizard's Esc steps back one step): the
+async discipline holds across back-and-forward traversal.
+
+- `fetch_done` is still cleared at every abort site; stepping back from the
+  branch selector clears it, and stepping forward again (or Esc from the name
+  modal back *to* the selector) re-dispatches `start_branch_selection`, which
+  re-arms a fresh channel. Re-dispatch over an in-flight load is safe by
+  construction: `BackgroundTask::start` hands out a new channel, the orphaned
+  worker's send fails silently, and `poll_branch_load` reads only the newest
+  receiver (gate: `back_then_forward_tolerates_inflight_branch_load`).
+- Esc on the agent picker **with a worktree create in flight stays a full
+  cancel** (pending create marked cancelled, worktrees kept on disk):
+  stepping back and re-confirming would re-run `git worktree add -b` against
+  the branch the in-flight create is already making. Without a pending create
+  it steps back to the name modal — `finish_prepare_spawn` is side-effect-free
+  to re-run.
+- Remote listing stays Tab-only in the palette; back-navigation never adds
+  IO to the UI thread.
+
 Gate: `branch_loads_dispatched` / `branch_loads_applied` +
 `perf_branch_selection_never_lists_on_ui_thread`,
 `perf_branch_load_result_applied_via_poll`,
 `branch_load_for_cancelled_selector_is_dropped`,
 `perf_worktree_confirm_opens_agent_picker_during_create`,
 `agent_choice_during_create_spawns_on_delivery`,
-`agent_picker_esc_during_create_cancels_pending` (`src/app/mod.rs` tests).
+`agent_picker_esc_during_create_cancels_pending`,
+`back_then_forward_tolerates_inflight_branch_load` (`src/app/mod.rs` tests).
 
 **Why**: after ADR-P8 removed the code-review stall, this was the largest
 remaining interactive freeze — and unlike a stall on an open pane, it blocks a

@@ -932,12 +932,17 @@ impl App {
             KeyCode::Esc if bs.filter.is_active() => bs.filter.clear(&mut bs.index),
             KeyCode::Esc => {
                 self.modal.close();
+                // These are re-derived when the palette re-submits; dropping
+                // the parked origin-fetch signal here keeps the ADR-P12
+                // abort-site rule (no worktree create may consume a stale one —
+                // re-submitting re-arms it with a fresh channel).
                 self.new_session.repo_path = None;
                 self.new_session.all_repos = None;
                 self.new_session.normal_repos.clear();
-                // Drop the parked origin-fetch signal (ADR-P12) — no worktree
-                // create will consume it now.
+                self.new_session.base_branch = None;
                 self.new_session.fetch_done = None;
+                // Back one step: the palette as the user left it.
+                self.restore_repo_picker();
             }
             KeyCode::Down if bs.index + 1 < visible => bs.index += 1,
             KeyCode::Up => bs.index = bs.index.saturating_sub(1),
@@ -1002,7 +1007,7 @@ impl App {
         match code {
             KeyCode::Esc => {
                 self.modal.close();
-                self.cancel_worktree_name();
+                self.worktree_name_back();
             }
             KeyCode::Enter => {
                 let new_branch = wn.name.value().trim().to_string();
@@ -1019,14 +1024,16 @@ impl App {
         }
     }
 
-    /// Clear the worktree-flow pending state when the branch-name modal is cancelled.
-    fn cancel_worktree_name(&mut self) {
-        self.new_session.base_branch = None;
-        self.new_session.repo_path = None;
-        self.new_session.all_repos = None;
-        self.new_session.normal_repos.clear();
-        self.new_session.session_name = None;
-        self.new_session.fetch_done = None;
+    /// `Esc` on the branch-name modal: back to the session-name step (the name
+    /// seeds the branch, so it's the natural place to edit). All worktree-flow
+    /// pending state (base branch, repos, fetch signal) stays armed for the
+    /// re-confirm.
+    fn worktree_name_back(&mut self) {
+        let mut modal = super::modals::SessionNameModal::default();
+        if let Some(name) = self.new_session.session_name.take() {
+            modal.name.set(&name);
+        }
+        self.modal = super::modals::Modal::SessionName(modal);
     }
 
     /// Spawn the worktree session for the confirmed branch name.
@@ -1054,7 +1061,7 @@ impl App {
         match code {
             KeyCode::Esc => {
                 self.modal.close();
-                self.cancel_session_name();
+                self.session_name_back();
             }
             KeyCode::Enter => {
                 let name = sn.name.value().trim().to_string();
@@ -1071,23 +1078,61 @@ impl App {
         }
     }
 
-    /// Clear pending state when the session-name modal is cancelled.
-    fn cancel_session_name(&mut self) {
-        if self.new_session.base_branch.is_some() {
-            // Worktree flow — clean up worktree-specific pending state.
-            self.new_session.base_branch = None;
-            self.new_session.repo_path = None;
-            self.new_session.all_repos = None;
-            self.new_session.normal_repos.clear();
-            self.new_session.fetch_done = None;
-        } else {
-            // Normal flow — clean up spawn state.
+    /// `Esc` on the name modal: step back to wherever this flow came from —
+    /// or cancel when there is no prior step to return to.
+    fn session_name_back(&mut self) {
+        // Fork has no prior step — Esc cancels as before. Checked first: a
+        // fork of a worktree session pre-seeds `spawn_worktrees` with the
+        // *source's* worktrees, which must not read as "created" below.
+        if self.new_session.fork {
             self.new_session.spawn_config = None;
             self.new_session.spawn_worktrees.clear();
             self.new_session.fork = false;
+            self.new_session.parent_session_id = None;
+            return;
+        }
+        // Worktrees already created (the agent picker stepped back here, or a
+        // create completed earlier): stepping further back can't un-create
+        // them, so this stays a cancel — re-running the create would collide
+        // on `git worktree add -b`.
+        if !self.new_session.spawn_worktrees.is_empty() {
+            self.new_session.spawn_config = None;
+            self.new_session.spawn_worktrees.clear();
             self.new_session.import = false;
             self.new_session.parent_session_id = None;
+            self.new_session.additional_dirs.clear();
+            self.new_session.saved_repo_picker = None;
+            self.set_info("Cancelled — created worktree(s) kept on disk");
+            return;
         }
+        // Worktree flow → back to the branch selector. A fresh dispatch
+        // re-arms the branch load and the origin fetch (ADR-P12: the previous
+        // `fetch_done` was already consumed or is safely overwritten); the
+        // previously chosen base stays highlighted via `poll_branch_load`.
+        if self.new_session.base_branch.is_some() {
+            self.start_branch_selection();
+            return;
+        }
+        // Import flow → back to the conversation picker's directory step
+        // (re-confirming re-stages the transcript, which is idempotent).
+        if self.new_session.import {
+            self.new_session.import = false;
+            self.new_session.spawn_config = None;
+            if let Some(cp) = self.new_session.saved_conversation_picker.take() {
+                self.modal = super::modals::Modal::ConversationPicker(*cp);
+            }
+            return;
+        }
+        // Normal flow → back to the repo palette. `spawn_session_with_config`
+        // consumed the backend; restore it so bookmarks stay host-scoped, and
+        // drop the derived `additional_dirs` (the re-submit recomputes them —
+        // leaving them would leak stale dirs into the next spawn).
+        if let Some(config) = self.new_session.spawn_config.take() {
+            self.new_session.backend = config.backend;
+        }
+        self.new_session.additional_dirs.clear();
+        self.new_session.parent_session_id = None;
+        self.restore_repo_picker();
     }
 
     /// Advance from the confirmed session name to the next step of the flow.
@@ -1188,17 +1233,7 @@ impl App {
             KeyCode::Esc if ap.filter.is_active() => ap.filter.clear(&mut ap.selected_index),
             KeyCode::Esc => {
                 self.modal.close();
-                self.new_session.spawn_config = None;
-                self.new_session.spawn_worktrees.clear();
-                self.new_session.spawn_name = None;
-                // A picker opened over an in-flight worktree creation
-                // (ADR-P12): mark the pending create cancelled so its result
-                // is dropped instead of spawning a session nobody asked for.
-                if let Some(pending) = self.pending_worktree_create.as_mut() {
-                    if matches!(pending.agent_pick, super::AgentPick::Open) {
-                        pending.agent_pick = super::AgentPick::Cancelled;
-                    }
-                }
+                self.agent_picker_back();
             }
             KeyCode::Down if ap.selected_index + 1 < visible => ap.selected_index += 1,
             KeyCode::Up => ap.selected_index = ap.selected_index.saturating_sub(1),
@@ -1229,6 +1264,33 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// `Esc` on the agent picker. With a worktree creation in flight (ADR-P12:
+    /// the picker opens *over* the create) this stays a full cancel — stepping
+    /// back and re-confirming would re-run `git worktree add -b` against the
+    /// branch the in-flight create is already making, a guaranteed collision —
+    /// and the pending create is marked cancelled so its result is dropped.
+    /// Otherwise it steps back to the name modal; re-confirming there just
+    /// re-runs the side-effect-free `finish_prepare_spawn`.
+    fn agent_picker_back(&mut self) {
+        if self.pending_worktree_create.is_some() {
+            self.new_session.spawn_config = None;
+            self.new_session.spawn_worktrees.clear();
+            self.new_session.spawn_name = None;
+            self.new_session.saved_repo_picker = None;
+            if let Some(pending) = self.pending_worktree_create.as_mut() {
+                if matches!(pending.agent_pick, super::AgentPick::Open) {
+                    pending.agent_pick = super::AgentPick::Cancelled;
+                }
+            }
+            return;
+        }
+        let mut modal = super::modals::SessionNameModal::default();
+        if let Some(name) = self.new_session.spawn_name.take() {
+            modal.name.set(&name);
+        }
+        self.modal = super::modals::Modal::SessionName(modal);
     }
 
     /// `Enter` on the agent picker: stamp the chosen agent onto the pending
@@ -1740,10 +1802,10 @@ impl App {
     /// completion signal is parked in `new_session.fetch_done` for the
     /// worktree-create worker to wait on.
     pub(crate) fn start_branch_selection(&mut self) {
-        if self.branch_load.in_progress() {
-            self.set_info("Branch listing already in progress…");
-            return;
-        }
+        // Re-dispatching over an in-flight load is fine (back-then-forward
+        // navigation): `BackgroundTask::start` hands out a fresh channel, the
+        // orphaned worker's send fails silently, and `poll_branch_load` only
+        // ever reads the newest receiver.
 
         // Resolve the remote host (if any) so branch listing targets the
         // session's machine. Cloned so we don't hold a borrow on `self`.
@@ -1895,9 +1957,7 @@ impl App {
             }
         }
         match code {
-            KeyCode::Esc => {
-                self.modal.close();
-            }
+            KeyCode::Esc => self.repo_picker_back(),
             KeyCode::Enter => self.repo_picker_enter(),
             KeyCode::Up => self.repo_picker_move(-1),
             KeyCode::Down => self.repo_picker_move(1),
@@ -1925,6 +1985,18 @@ impl App {
                 self.refresh_repo_picker_candidates();
             }
         }
+    }
+
+    /// `Esc` on the repo palette: back to the host picker when that step was
+    /// shown, else — this is the first step — cancel the flow.
+    fn repo_picker_back(&mut self) {
+        self.modal.close();
+        self.new_session.saved_repo_picker = None;
+        if self.hosts.is_empty() {
+            self.new_session.backend = None;
+            return;
+        }
+        self.open_host_picker();
     }
 
     /// Whether the palette input is empty (plain `Space`/`Delete` act on the
@@ -2184,6 +2256,10 @@ impl App {
     /// The pinned "start here" row: an explicit no-repo session (local `$HOME`,
     /// remote default directory).
     fn repo_picker_start_here(&mut self) {
+        // Park the palette so Esc from the name step restores it as-was.
+        if let super::modals::Modal::RepoPicker(ref rp) = self.modal {
+            self.new_session.saved_repo_picker = Some(Box::new(rp.clone()));
+        }
         self.modal.close();
         self.spawn_repo_picker_no_repos();
     }
@@ -2480,6 +2556,10 @@ impl App {
             return;
         }
 
+        // Park the palette so Esc from a later step restores it as-was.
+        if let super::modals::Modal::RepoPicker(ref rp) = self.modal {
+            self.new_session.saved_repo_picker = Some(Box::new(rp.clone()));
+        }
         self.modal.close();
 
         if !worktree_repos.is_empty() {

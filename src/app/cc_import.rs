@@ -337,6 +337,8 @@ impl App {
         // cancelled wizard/fork/task flow left behind (mirrors `act_new_session`).
         self.new_session.backend = None;
         self.new_session.parent_session_id = None;
+        self.new_session.saved_repo_picker = None;
+        self.new_session.saved_conversation_picker = None;
         self.task_ui.pending_task_prompt = None;
 
         self.modal = modals::Modal::ConversationPicker(ConversationPickerModal {
@@ -569,6 +571,11 @@ impl App {
         if let Err(e) = stage_transcript_for_resume(&projects, &convo.path, &convo.id, &canonical) {
             self.set_error(format!("Failed to stage transcript for resume: {e}"));
             return;
+        }
+        // Park the picker (at its directory step) so Esc on the name modal
+        // steps back here instead of cancelling the import.
+        if let modals::Modal::ConversationPicker(ref cp) = self.modal {
+            self.new_session.saved_conversation_picker = Some(Box::new(cp.clone()));
         }
         self.modal.close();
 

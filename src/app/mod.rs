@@ -1521,12 +1521,20 @@ impl App {
     pub(crate) fn start_new_session(&mut self) {
         // Clear any choice left over from a previously cancelled flow.
         self.new_session.backend = None;
+        self.new_session.saved_repo_picker = None;
+        self.new_session.saved_conversation_picker = None;
 
         if self.hosts.is_empty() {
             self.open_repo_picker();
             return;
         }
+        self.open_host_picker();
+    }
 
+    /// Open the host picker (`local` + every configured host), preselecting
+    /// the wizard's current backend so Esc-back from the repo palette lands on
+    /// the choice that was made.
+    pub(crate) fn open_host_picker(&mut self) {
         let mut choices = vec![crate::ui::host_picker_modal::HostChoice {
             label: "local".to_string(),
             backend: String::new(),
@@ -1537,9 +1545,14 @@ impl App {
                 backend: host.backend_name(),
             });
         }
+        let current = self.new_session.backend.as_deref().unwrap_or_default();
+        let selected_index = choices
+            .iter()
+            .position(|c| c.backend == current)
+            .unwrap_or(0);
         self.modal = modals::Modal::HostPicker(crate::ui::host_picker_modal::HostPickerState {
             choices,
-            selected_index: 0,
+            selected_index,
             filter: Default::default(),
         });
     }
@@ -1576,6 +1589,15 @@ impl App {
                 tracing::error!("Failed to load repo bookmarks: {e}");
                 Vec::new()
             }
+        }
+    }
+
+    /// Reopen the repo palette parked by a forward step (Esc-back), falling
+    /// back to a fresh open for flows that entered the wizard mid-way.
+    pub(crate) fn restore_repo_picker(&mut self) {
+        match self.new_session.saved_repo_picker.take() {
+            Some(rp) => self.modal = modals::Modal::RepoPicker(*rp),
+            None => self.open_repo_picker(),
         }
     }
 
@@ -3690,6 +3712,13 @@ impl App {
         match result {
             Ok(branches) => {
                 if let modals::Modal::BranchSelector(ref mut bs) = self.modal {
+                    // Back-then-forward navigation: keep the previously chosen
+                    // base branch highlighted instead of snapping to the top.
+                    if let Some(prev) = self.new_session.base_branch.as_deref() {
+                        if let Some(pos) = branches.iter().position(|b| b == prev) {
+                            bs.index = pos;
+                        }
+                    }
                     bs.branches = branches;
                     bs.loading = false;
                     // A query typed while the list was loading applies now.
@@ -4127,6 +4156,11 @@ impl App {
         config: &SessionConfig,
         worktrees: Vec<WorktreeInfo>,
     ) {
+        // The wizard is committed — the parked back-navigation states have
+        // nothing to return to.
+        self.new_session.saved_repo_picker = None;
+        self.new_session.saved_conversation_picker = None;
+
         if self.session_spawn.in_progress() {
             self.do_spawn_session(name, config, worktrees);
             return;
@@ -15053,13 +15087,21 @@ mod tests {
     }
 
     #[test]
-    fn branch_selector_esc_closes_and_clears_pending_repo_state() {
+    fn branch_selector_esc_returns_to_repo_picker_and_clears_pending_state() {
         let mut app = app_with_sessions(1);
         app.new_session.repo_path = Some(PathBuf::from("/repo"));
         app.new_session.all_repos = Some(vec![PathBuf::from("/repo")]);
         app.new_session.normal_repos = vec![PathBuf::from("/other")];
+        // The palette parked by the forward step, selections intact.
+        let mut parked = modals::RepoPickerModal::default();
+        parked.push_row("/repo".into(), modals::RepoRowKind::Repo { child: false });
+        parked.selected.insert(PathBuf::from("/repo"));
+        parked.worktree.insert(PathBuf::from("/repo"));
+        parked.input.set("re");
+        app.new_session.saved_repo_picker = Some(Box::new(parked));
         // A parked origin-fetch signal (ADR-P12): Esc must drop it too, so no
-        // later worktree create consumes a stale receiver.
+        // later worktree create consumes a stale receiver (re-submitting
+        // re-arms a fresh one).
         let (_tx, rx) = std::sync::mpsc::channel();
         app.new_session.fetch_done = Some(rx);
         app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
@@ -15068,18 +15110,271 @@ mod tests {
             filter: Default::default(),
             loading: false,
         });
-        // ↓ advances the selection; Esc aborts and wipes the pending spawn state.
+        // ↓ advances the selection; Esc steps back and wipes the pending state.
         app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         match app.modal {
             modals::Modal::BranchSelector(ref bs) => assert_eq!(bs.index, 1),
             ref other => panic!("expected the branch selector, got {other:?}"),
         }
         app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
-        assert!(matches!(app.modal, modals::Modal::None));
         assert!(app.new_session.repo_path.is_none());
         assert!(app.new_session.all_repos.is_none());
         assert!(app.new_session.normal_repos.is_empty());
         assert!(app.new_session.fetch_done.is_none());
+        // Back on the palette, exactly as the user left it.
+        let rp = picker_state(&app);
+        assert!(rp.selected.contains(std::path::Path::new("/repo")));
+        assert!(rp.worktree.contains(std::path::Path::new("/repo")));
+        assert_eq!(rp.input.value(), "re");
+    }
+
+    #[test]
+    fn repo_picker_esc_returns_to_host_picker_when_hosts_configured() {
+        let mut app = app_with_sessions(0);
+        app.hosts.hosts.push(crate::session::HostDef {
+            name: "devbox".into(),
+            destination: "me@devbox".into(),
+            ..Default::default()
+        });
+
+        app.start_new_session();
+        assert!(matches!(app.modal, modals::Modal::HostPicker(_)));
+        // Pick the remote host → the palette opens for that host.
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(app.modal, modals::Modal::RepoPicker(_)));
+        assert_eq!(app.new_session.backend.as_deref(), Some("ssh:devbox"));
+
+        // Esc: back to the host picker with the previous choice highlighted.
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        match app.modal {
+            modals::Modal::HostPicker(ref hp) => assert_eq!(hp.selected_index, 1),
+            ref other => panic!("expected the host picker, got {other:?}"),
+        }
+        // Esc on the first step cancels.
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(app.modal, modals::Modal::None));
+    }
+
+    #[tokio::test]
+    async fn session_name_esc_returns_to_branch_selector_and_redispatches_load() {
+        let mut app = app_with_sessions(0);
+        app.new_session.repo_path = Some(std::env::temp_dir());
+        app.new_session.base_branch = Some("main".into());
+        app.modal = modals::Modal::SessionName(modals::SessionNameModal::default());
+        let dispatched_before = app.perf_counters().branch_loads_dispatched;
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        match app.modal {
+            modals::Modal::BranchSelector(ref bs) => assert!(bs.loading),
+            ref other => panic!("expected the branch selector, got {other:?}"),
+        }
+        assert_eq!(
+            app.perf_counters().branch_loads_dispatched,
+            dispatched_before + 1,
+            "back-nav re-dispatches the branch load"
+        );
+        assert!(
+            app.new_session.fetch_done.is_some(),
+            "the origin fetch is re-armed for the eventual worktree create"
+        );
+        assert!(
+            app.new_session.base_branch.is_some(),
+            "the previous choice is kept for preselection"
+        );
+    }
+
+    #[test]
+    fn session_name_esc_returns_to_repo_picker_in_normal_flow_restoring_backend() {
+        let mut app = app_with_sessions(0);
+        app.new_session.saved_repo_picker = Some(Box::new(modals::RepoPickerModal::default()));
+        app.new_session.additional_dirs = vec![PathBuf::from("/stale")];
+        app.new_session.spawn_config = Some(SessionConfig {
+            cwd: Some(PathBuf::from("/repo")),
+            backend: Some("ssh:devbox".into()),
+            ..SessionConfig::default()
+        });
+        app.modal = modals::Modal::SessionName(modals::SessionNameModal::default());
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(matches!(app.modal, modals::Modal::RepoPicker(_)));
+        assert_eq!(
+            app.new_session.backend.as_deref(),
+            Some("ssh:devbox"),
+            "the backend consumed by spawn_session_with_config is restored"
+        );
+        assert!(app.new_session.spawn_config.is_none());
+        assert!(
+            app.new_session.additional_dirs.is_empty(),
+            "stale derived dirs must not leak into the next spawn"
+        );
+    }
+
+    #[test]
+    fn session_name_esc_returns_to_conversation_dir_step_in_import_flow() {
+        let mut app = app_with_sessions(0);
+        let mut cp = cc_import::ConversationPickerModal::default();
+        cp.dir_input.set("/some/dir");
+        cp.chosen = Some(0);
+        app.new_session.saved_conversation_picker = Some(Box::new(cp));
+        app.new_session.import = true;
+        app.new_session.spawn_config = Some(SessionConfig::default());
+        app.modal = modals::Modal::SessionName(modals::SessionNameModal::default());
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        match app.modal {
+            modals::Modal::ConversationPicker(ref cp) => {
+                assert_eq!(cp.dir_input.value(), "/some/dir");
+                assert_eq!(cp.chosen, Some(0));
+            }
+            ref other => panic!("expected the conversation picker, got {other:?}"),
+        }
+        assert!(!app.new_session.import);
+        assert!(app.new_session.spawn_config.is_none());
+    }
+
+    #[test]
+    fn session_name_esc_cancels_fork_flow() {
+        let mut app = app_with_sessions(1);
+        app.new_session.fork = true;
+        app.new_session.spawn_config = Some(SessionConfig::default());
+        app.new_session.spawn_worktrees = vec![WorktreeInfo {
+            repo_path: PathBuf::from("/repo"),
+            worktree_path: PathBuf::from("/wt"),
+            branch: "b".into(),
+        }];
+        app.new_session.parent_session_id = Some(crate::session::SessionId::default());
+        app.modal = modals::Modal::SessionName(modals::SessionNameModal::default());
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(app.new_session.spawn_config.is_none());
+        assert!(app.new_session.spawn_worktrees.is_empty());
+        assert!(!app.new_session.fork);
+        assert!(app.new_session.parent_session_id.is_none());
+        assert!(
+            app.status_message.is_none(),
+            "a fork's source worktrees must not toast as 'created'"
+        );
+    }
+
+    #[test]
+    fn session_name_esc_after_create_cancels_and_keeps_worktrees() {
+        let mut app = app_with_sessions(0);
+        app.new_session.spawn_config = Some(SessionConfig::default());
+        app.new_session.spawn_worktrees = vec![WorktreeInfo {
+            repo_path: PathBuf::from("/repo"),
+            worktree_path: PathBuf::from("/wt"),
+            branch: "b".into(),
+        }];
+        app.new_session.saved_repo_picker = Some(Box::new(modals::RepoPickerModal::default()));
+        app.modal = modals::Modal::SessionName(modals::SessionNameModal::default());
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        // Can't step back past an already-created worktree: full cancel.
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(app.new_session.spawn_worktrees.is_empty());
+        assert!(app.new_session.saved_repo_picker.is_none());
+        let msg = app.status_message.as_ref().unwrap();
+        assert!(msg.text.contains("kept on disk"));
+    }
+
+    #[test]
+    fn worktree_name_esc_returns_to_session_name_preserving_name_and_base() {
+        let mut app = app_with_sessions(0);
+        app.new_session.base_branch = Some("main".into());
+        app.new_session.repo_path = Some(PathBuf::from("/repo"));
+        app.new_session.session_name = Some("my-feature".into());
+        let mut wn = modals::WorktreeNameModal::default();
+        wn.name.set("my-feature");
+        app.modal = modals::Modal::WorktreeName(wn);
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        match app.modal {
+            modals::Modal::SessionName(ref sn) => assert_eq!(sn.name.value(), "my-feature"),
+            ref other => panic!("expected the session-name modal, got {other:?}"),
+        }
+        assert_eq!(
+            app.new_session.base_branch.as_deref(),
+            Some("main"),
+            "the worktree flow stays armed for the re-confirm"
+        );
+        assert!(app.new_session.repo_path.is_some());
+    }
+
+    #[test]
+    fn agent_picker_esc_without_pending_create_returns_to_session_name() {
+        let mut app = app_with_sessions(0);
+        app.new_session.spawn_name = Some("chosen-name".into());
+        app.new_session.spawn_config = Some(SessionConfig::default());
+        app.modal = modals::Modal::AgentPicker(crate::ui::agent_picker_modal::AgentPickerState {
+            choices: vec![],
+            selected_index: 0,
+        });
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        match app.modal {
+            modals::Modal::SessionName(ref sn) => assert_eq!(sn.name.value(), "chosen-name"),
+            ref other => panic!("expected the session-name modal, got {other:?}"),
+        }
+        assert!(
+            app.new_session.spawn_config.is_some(),
+            "re-confirming the name re-runs finish_prepare_spawn from this config"
+        );
+    }
+
+    #[test]
+    fn cancel_flow_clears_saved_wizard_state() {
+        let mut app = app_with_sessions(0);
+        app.new_session.saved_repo_picker = Some(Box::new(modals::RepoPickerModal::default()));
+        app.new_session.saved_conversation_picker =
+            Some(Box::new(cc_import::ConversationPickerModal::default()));
+
+        // A fresh flow must not resurrect last flow's parked state.
+        app.start_new_session();
+        assert!(app.new_session.saved_repo_picker.is_none());
+        assert!(app.new_session.saved_conversation_picker.is_none());
+
+        // Esc on the palette (first step, no hosts) cancels and clears too.
+        let modals::Modal::RepoPicker(_) = app.modal else {
+            panic!("expected repo picker");
+        };
+        app.new_session.saved_repo_picker = Some(Box::new(modals::RepoPickerModal::default()));
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(app.new_session.saved_repo_picker.is_none());
+    }
+
+    #[tokio::test]
+    async fn back_then_forward_tolerates_inflight_branch_load() {
+        let mut app = app_with_sessions(0);
+        app.new_session.repo_path = Some(std::env::temp_dir());
+
+        app.start_branch_selection();
+        assert_eq!(app.perf_counters().branch_loads_dispatched, 1);
+
+        // Esc out while the load is still in flight, then straight back in.
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(app.modal, modals::Modal::RepoPicker(_)));
+        app.new_session.repo_path = Some(std::env::temp_dir());
+        app.start_branch_selection();
+
+        assert_eq!(
+            app.perf_counters().branch_loads_dispatched,
+            2,
+            "re-entry re-dispatches instead of refusing"
+        );
+        match app.modal {
+            modals::Modal::BranchSelector(ref bs) => assert!(bs.loading),
+            ref other => panic!("expected the branch selector, got {other:?}"),
+        }
     }
 
     /// Typing in the branch selector fuzzy-filters the list; Enter picks the

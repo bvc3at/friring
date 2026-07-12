@@ -247,7 +247,11 @@ spatial map you can build muscle memory against.
 
 `Ctrl+N` walks through a series of modals to configure a new
 session. Each step has a sensible default and can be skipped when
-not applicable.
+not applicable. `Esc` steps **back** one step with your choices
+preserved (the repo palette returns exactly as you left it); on the
+first step it cancels. Two exceptions stay full cancels: the agent
+picker while its worktrees are still being created (they're kept on
+disk), and a fork — it has no prior step.
 
 1. **Host picker** — choose where the session runs: `local`, or any
    remote SSH host defined in `hosts.toml`. Skipped entirely when no
@@ -589,7 +593,7 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Tab` | Repo picker | Complete the typed path (never moves focus) | |
 | `Ctrl+P` | Repo picker | Import the typed folder's repos as a parent | |
 | `Enter` | Repo picker | Open picked repos / the highlighted row; add + open a typed path | |
-| `Esc` | Repo picker | Cancel | |
+| `Esc` | New-session wizard | Back one step (first step cancels) | |
 | `Shift+Up` | Focused terminal | Scroll up 1 line | |
 | `Shift+Down` | Focused terminal | Scroll down 1 line | |
 | `Shift+PageUp` / `Alt+PageUp` | Focused terminal | Scroll up half page | |
