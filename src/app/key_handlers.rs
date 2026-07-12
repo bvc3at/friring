@@ -1932,9 +1932,8 @@ impl App {
             rp.toggle_collapsed(real_idx);
             return;
         }
-        if let Some(sel) = rp.selected.get_mut(real_idx) {
-            *sel = !*sel;
-        }
+        let path = rp.rows[real_idx].path.clone();
+        rp.toggle_selected(&path);
     }
 
     /// Toggle the worktree flag of the repo under the cursor, auto-selecting it
@@ -1949,15 +1948,8 @@ impl App {
         if rp.is_header_row(real_idx) {
             return;
         }
-        let Some(wt) = rp.worktree.get_mut(real_idx) else {
-            return;
-        };
-        *wt = !*wt;
-        if *wt {
-            if let Some(sel) = rp.selected.get_mut(real_idx) {
-                *sel = true;
-            }
-        }
+        let path = rp.rows[real_idx].path.clone();
+        rp.toggle_worktree(&path);
     }
 
     /// Delete the bookmark under the cursor. A standalone repo is removed in
@@ -1971,7 +1963,7 @@ impl App {
         let Some(&real_idx) = rp.filtered_indices.get(rp.list_index) else {
             return;
         };
-        let path = rp.bookmarks[real_idx].clone();
+        let path = rp.rows[real_idx].path.clone();
         let is_header = rp.is_header_row(real_idx);
         let is_child = rp.is_child_row(real_idx);
 
@@ -1999,11 +1991,11 @@ impl App {
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
             return;
         };
-        rp.bookmarks.remove(real_idx);
-        rp.selected.remove(real_idx);
-        rp.worktree.remove(real_idx);
-        rp.is_header.remove(real_idx);
-        rp.is_child.remove(real_idx);
+        rp.rows.remove(real_idx);
+        // Forgetting a bookmark also drops its picks — a hidden selection that
+        // resurfaces on re-add would be surprising.
+        rp.selected.remove(&path);
+        rp.worktree.remove(&path);
         self.recompute_repo_filter();
     }
 
@@ -2135,14 +2127,18 @@ impl App {
         expanded: &std::path::Path,
     ) -> bool {
         // If already represented, just select it (no duplicate row or DB entry).
-        let Some(idx) = rp.bookmarks.iter().position(|p| p == expanded) else {
-            rp.push_row(expanded.to_path_buf(), true, false, false);
+        let Some(idx) = rp.rows.iter().position(|r| r.path == *expanded) else {
+            rp.push_row(
+                expanded.to_path_buf(),
+                super::modals::RepoRowKind::Repo { child: false },
+            );
+            rp.selected.insert(expanded.to_path_buf());
             return true;
         };
         let is_child = rp.is_child_row(idx);
         let is_header = rp.is_header_row(idx);
         if !is_header {
-            rp.selected[idx] = true;
+            rp.selected.insert(expanded.to_path_buf());
         }
         !is_child && !is_header
     }
@@ -2326,14 +2322,16 @@ impl App {
     ) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
         let mut worktree_repos: Vec<std::path::PathBuf> = Vec::new();
         let mut normal_repos: Vec<std::path::PathBuf> = Vec::new();
-        for (i, path) in rp.bookmarks.iter().enumerate() {
-            if !rp.selected.get(i).copied().unwrap_or(false) {
+        // Iterate rows (not the selection set) so the result keeps the list's
+        // recency order — the first selected repo becomes the session cwd.
+        for row in &rp.rows {
+            if row.is_header() || !rp.selected.contains(&row.path) {
                 continue;
             }
-            if rp.worktree.get(i).copied().unwrap_or(false) {
-                worktree_repos.push(path.clone());
+            if rp.worktree.contains(&row.path) {
+                worktree_repos.push(row.path.clone());
             } else {
-                normal_repos.push(path.clone());
+                normal_repos.push(row.path.clone());
             }
         }
         (worktree_repos, normal_repos)

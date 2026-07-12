@@ -1233,20 +1233,44 @@ pub enum RepoPickerFocus {
     Search,
 }
 
+/// What a repo-picker row is. Selection and worktree flags do NOT live on the
+/// row — they live in path-keyed sets on [`RepoPickerModal`], because rows are
+/// rebuilt on every parent re-scan and the user's picks must survive that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoRowKind {
+    /// Parent-folder header (non-selectable group title; folds its children).
+    Header,
+    /// A selectable repo; `child` nests it under the preceding header.
+    Repo { child: bool },
+}
+
+/// One row of the repo-picker list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoRow {
+    pub path: PathBuf,
+    pub kind: RepoRowKind,
+}
+
+impl RepoRow {
+    pub fn is_header(&self) -> bool {
+        matches!(self.kind, RepoRowKind::Header)
+    }
+
+    pub fn is_child(&self) -> bool {
+        matches!(self.kind, RepoRowKind::Repo { child: true })
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RepoPickerModal {
-    /// Bookmarked repos shown in the list. For a header row this is the parent
-    /// folder; for a child/standalone row it is the repo path.
-    pub bookmarks: Vec<PathBuf>,
-    /// Which bookmarks are selected (checked). Header rows stay unselected.
-    pub selected: Vec<bool>,
-    /// Whether each selected repo should use worktree mode (parallel to `bookmarks`).
-    pub worktree: Vec<bool>,
-    /// Whether each row is a parent header (non-selectable group title).
-    pub is_header: Vec<bool>,
-    /// Whether each row is a child repo nested under a parent header (drives the
-    /// indentation). `false` for headers and standalone repos. Parallel to `bookmarks`.
-    pub is_child: Vec<bool>,
+    /// Bookmark rows in recency order (a parent header followed by its
+    /// scanned children, or a standalone repo).
+    pub rows: Vec<RepoRow>,
+    /// Checked repos, keyed by path so rebuilds and filtering can't lose them.
+    pub selected: HashSet<PathBuf>,
+    /// Repos flagged for worktree mode, keyed by path. Toggling the flag on
+    /// also checks the repo (see [`Self::toggle_worktree`]).
+    pub worktree: HashSet<PathBuf>,
     /// Parent folders whose child tree is currently collapsed (keyed by path).
     /// Survives row rebuilds so collapsing state is kept across re-scans.
     pub collapsed: HashSet<PathBuf>,
@@ -1260,29 +1284,44 @@ pub struct RepoPickerModal {
     pub focus: RepoPickerFocus,
     /// Fuzzy search input for filtering bookmarks.
     pub search_input: TextInput,
-    /// Indices into `bookmarks` that match the current search query.
-    /// When search is empty, contains `0..bookmarks.len()`.
+    /// Indices into `rows` that match the current search query.
+    /// When search is empty, contains `0..rows.len()`.
     pub filtered_indices: Vec<usize>,
 }
 
 impl RepoPickerModal {
-    /// Push a row, keeping all parallel vectors in lockstep.
-    pub fn push_row(&mut self, path: PathBuf, selected: bool, is_header: bool, is_child: bool) {
-        self.bookmarks.push(path);
-        self.selected.push(selected);
-        self.worktree.push(false);
-        self.is_header.push(is_header);
-        self.is_child.push(is_child);
+    /// Append a row.
+    pub fn push_row(&mut self, path: PathBuf, kind: RepoRowKind) {
+        self.rows.push(RepoRow { path, kind });
     }
 
     /// Whether the row at `idx` is a parent header (bounds-safe).
     pub fn is_header_row(&self, idx: usize) -> bool {
-        self.is_header.get(idx).copied().unwrap_or(false)
+        self.rows.get(idx).is_some_and(RepoRow::is_header)
     }
 
     /// Whether the row at `idx` is a child repo under a parent (bounds-safe).
     pub fn is_child_row(&self, idx: usize) -> bool {
-        self.is_child.get(idx).copied().unwrap_or(false)
+        self.rows.get(idx).is_some_and(RepoRow::is_child)
+    }
+
+    /// Toggle whether the repo at `path` is checked. Callers guard against
+    /// header rows (a header has no selectable identity).
+    pub fn toggle_selected(&mut self, path: &std::path::Path) {
+        if !self.selected.remove(path) {
+            self.selected.insert(path.to_path_buf());
+        }
+    }
+
+    /// Toggle the worktree flag of the repo at `path`, checking the repo when
+    /// the flag turns on — a worktree mark on an unchecked repo would be
+    /// silently ignored at submit.
+    pub fn toggle_worktree(&mut self, path: &std::path::Path) {
+        if self.worktree.remove(path) {
+            return;
+        }
+        self.worktree.insert(path.to_path_buf());
+        self.selected.insert(path.to_path_buf());
     }
 
     /// Clear the search query and recompute the filter (collapse still applies).
@@ -1298,7 +1337,7 @@ impl RepoPickerModal {
         if !self.is_header_row(real_idx) {
             return;
         }
-        let path = self.bookmarks[real_idx].clone();
+        let path = self.rows[real_idx].path.clone();
         if !self.collapsed.insert(path.clone()) {
             self.collapsed.remove(&path);
         }
@@ -1312,21 +1351,23 @@ impl RepoPickerModal {
     pub fn recompute_filter(&mut self) {
         let query = self.search_input.value().to_string();
         let searching = !query.is_empty();
-        let matches = |path: &PathBuf| {
+        let matches = |path: &std::path::Path| {
             !searching || crate::fuzzy::fuzzy_match(&query, &path.display().to_string()).is_some()
         };
 
         let mut indices = Vec::new();
         let mut current_collapsed = false;
-        for (i, path) in self.bookmarks.iter().enumerate() {
-            let visible = if self.is_header[i] {
-                current_collapsed = self.collapsed.contains(path);
-                true
-            } else if self.is_child[i] {
-                let hidden = current_collapsed && !searching;
-                !hidden && matches(path)
-            } else {
-                matches(path)
+        for (i, row) in self.rows.iter().enumerate() {
+            let visible = match row.kind {
+                RepoRowKind::Header => {
+                    current_collapsed = self.collapsed.contains(&row.path);
+                    true
+                }
+                RepoRowKind::Repo { child: true } => {
+                    let hidden = current_collapsed && !searching;
+                    !hidden && matches(&row.path)
+                }
+                RepoRowKind::Repo { child: false } => matches(&row.path),
             };
             if visible {
                 indices.push(i);
@@ -2596,9 +2637,9 @@ mod tests {
     #[test]
     fn test_repo_picker_clear_search_resets_filter() {
         let mut rp = RepoPickerModal::default();
-        rp.push_row("/a".into(), false, false, false);
-        rp.push_row("/b".into(), true, false, false);
-        rp.push_row("/c".into(), false, false, false);
+        rp.push_row("/a".into(), RepoRowKind::Repo { child: false });
+        rp.push_row("/b".into(), RepoRowKind::Repo { child: false });
+        rp.push_row("/c".into(), RepoRowKind::Repo { child: false });
         rp.list_index = 1;
         rp.filtered_indices = vec![1]; // simulating an active filter
         rp.search_input.set("b");
@@ -2611,26 +2652,37 @@ mod tests {
     }
 
     #[test]
-    fn test_repo_picker_push_row_keeps_vectors_in_lockstep() {
+    fn repo_rows_keep_selection_keyed_by_path() {
         let mut rp = RepoPickerModal::default();
-        rp.push_row("/repo".into(), true, false, false);
-        rp.push_row("/parent".into(), false, true, false);
-        rp.push_row("/parent/child".into(), false, false, true);
+        rp.push_row("/repo".into(), RepoRowKind::Repo { child: false });
+        rp.push_row("/parent".into(), RepoRowKind::Header);
+        rp.push_row("/parent/child".into(), RepoRowKind::Repo { child: true });
 
-        let n = rp.bookmarks.len();
-        assert_eq!(n, 3);
-        assert_eq!(rp.selected.len(), n);
-        assert_eq!(rp.worktree.len(), n);
-        assert_eq!(rp.is_header.len(), n);
-        assert_eq!(rp.is_child.len(), n);
-        assert_eq!(rp.is_header, vec![false, true, false]);
-        assert_eq!(rp.is_child, vec![false, false, true]);
+        rp.toggle_selected(std::path::Path::new("/repo"));
+        rp.toggle_worktree(std::path::Path::new("/parent/child"));
+
+        assert!(rp.selected.contains(std::path::Path::new("/repo")));
+        // The worktree toggle checks the repo too.
+        assert!(rp.selected.contains(std::path::Path::new("/parent/child")));
+        assert!(rp.worktree.contains(std::path::Path::new("/parent/child")));
+
+        // Rows can be rebuilt (even reshaped) without losing the flags.
+        rp.rows.clear();
+        rp.push_row("/parent/child".into(), RepoRowKind::Repo { child: false });
+        assert!(rp.selected.contains(std::path::Path::new("/parent/child")));
+        assert!(rp.worktree.contains(std::path::Path::new("/parent/child")));
+
+        // Toggling worktree off leaves the selection alone.
+        rp.toggle_worktree(std::path::Path::new("/parent/child"));
+        assert!(!rp.worktree.contains(std::path::Path::new("/parent/child")));
+        assert!(rp.selected.contains(std::path::Path::new("/parent/child")));
     }
 
     #[test]
     fn test_repo_picker_toggle_collapsed_ignores_non_header_rows() {
         let mut rp = RepoPickerModal::default();
-        rp.push_row("/repo".into(), false, false, false); // standalone, not a header
+        // Standalone repo, not a header.
+        rp.push_row("/repo".into(), RepoRowKind::Repo { child: false });
         rp.toggle_collapsed(0);
         assert!(
             rp.collapsed.is_empty(),
@@ -2644,9 +2696,9 @@ mod tests {
     #[test]
     fn test_repo_picker_search_overrides_collapse() {
         let mut rp = RepoPickerModal::default();
-        rp.push_row("/parent".into(), false, true, false); // header
-        rp.push_row("/parent/foo".into(), false, false, true);
-        rp.push_row("/parent/bar".into(), false, false, true);
+        rp.push_row("/parent".into(), RepoRowKind::Header);
+        rp.push_row("/parent/foo".into(), RepoRowKind::Repo { child: true });
+        rp.push_row("/parent/bar".into(), RepoRowKind::Repo { child: true });
         rp.collapsed.insert("/parent".into());
         rp.recompute_filter();
         // Collapsed: only the header is visible.

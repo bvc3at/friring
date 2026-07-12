@@ -12,16 +12,15 @@ use ratatui::{
 use super::render_modal_frame;
 use super::theme::Theme;
 use super::{centered_fixed_height_rect, render_text_field, render_text_field_with_suggestion};
-use crate::app::modals::RepoPickerFocus;
+use crate::app::modals::{RepoPickerFocus, RepoRow};
 
 pub struct RepoPickerState<'a> {
-    pub bookmarks: &'a [PathBuf],
-    pub selected: &'a [bool],
-    pub worktree: &'a [bool],
-    /// Whether each row is a parent header (non-selectable group title).
-    pub is_header: &'a [bool],
-    /// Whether each row is a child repo nested under a parent (drives indentation).
-    pub is_child: &'a [bool],
+    /// Bookmark rows (headers, children, standalone repos) in display order.
+    pub rows: &'a [RepoRow],
+    /// Checked repos, keyed by path.
+    pub selected: &'a HashSet<PathBuf>,
+    /// Repos flagged for worktree mode, keyed by path.
+    pub worktree: &'a HashSet<PathBuf>,
     /// Parent folders whose child tree is collapsed (drives the ▸/▾ glyph).
     pub collapsed: &'a HashSet<PathBuf>,
     pub list_index: usize,
@@ -130,7 +129,7 @@ fn render_search_bar(frame: &mut Frame, area: ratatui::layout::Rect, state: &Rep
     let match_label = format!(
         "Search ({}/{})",
         state.filtered_indices.len(),
-        state.bookmarks.len()
+        state.rows.len()
     );
     render_text_field(
         frame,
@@ -156,8 +155,8 @@ fn render_bookmark_list(
     };
 
     let title = match state.host {
-        Some(host) => format!(" Repos on {host} ({}) ", state.bookmarks.len()),
-        None => format!(" Repos ({}) ", state.bookmarks.len()),
+        Some(host) => format!(" Repos on {host} ({}) ", state.rows.len()),
+        None => format!(" Repos ({}) ", state.rows.len()),
     };
 
     let list_block = Block::default()
@@ -232,8 +231,7 @@ fn bookmark_item<'a>(
     real_idx: usize,
     list_focused: bool,
 ) -> ListItem<'a> {
-    let path = &state.bookmarks[real_idx];
-    let is_header = state.is_header.get(real_idx).copied().unwrap_or(false);
+    let row = &state.rows[real_idx];
     let is_cursor = visible_index == state.list_index && list_focused;
 
     let style = if is_cursor {
@@ -243,11 +241,11 @@ fn bookmark_item<'a>(
     };
 
     // Parent header row: no checkbox, a collapse glyph + basename + dim marker.
-    if is_header {
-        return header_item(state, path, style);
+    if row.is_header() {
+        return header_item(state, &row.path, style);
     }
 
-    child_item(state, real_idx, style)
+    child_item(state, row, style)
 }
 
 /// Build a parent header row: a collapse glyph + basename + dim `(parent)` marker.
@@ -270,13 +268,12 @@ fn header_item<'a>(
 
 /// Build a (possibly indented) child bookmark row: checkbox + path + optional
 /// `[wt]` marker, with the search query highlighted when present.
-fn child_item<'a>(state: &RepoPickerState<'a>, real_idx: usize, style: Style) -> ListItem<'a> {
-    let path = &state.bookmarks[real_idx];
-    let checked = state.selected[real_idx];
-    let is_wt = state.worktree[real_idx];
-    let is_child = state.is_child.get(real_idx).copied().unwrap_or(false);
+fn child_item<'a>(state: &RepoPickerState<'a>, row: &RepoRow, style: Style) -> ListItem<'a> {
+    let path = &row.path;
+    let checked = state.selected.contains(path);
+    let is_wt = state.worktree.contains(path);
 
-    let indent = if is_child { "  " } else { "" };
+    let indent = if row.is_child() { "  " } else { "" };
     let check = if checked { "[x] " } else { "[ ] " };
     let display = crate::paths::display_path(path);
 
@@ -410,17 +407,16 @@ mod tests {
         focus: RepoPickerFocus,
         suggestion: Option<&'static str>,
     ) -> RepoPickerState<'static> {
-        static EMPTY_PATHS: &[PathBuf] = &[];
-        static EMPTY_BOOLS: &[bool] = &[];
+        static EMPTY_ROWS: &[RepoRow] = &[];
         static EMPTY_IDX: &[usize] = &[];
-        // Leaked once so the borrow is 'static — fine for a test fixture.
+        // Leaked once so the borrows are 'static — fine for a test fixture.
+        let selected: &'static HashSet<PathBuf> = Box::leak(Box::new(HashSet::new()));
+        let worktree: &'static HashSet<PathBuf> = Box::leak(Box::new(HashSet::new()));
         let collapsed: &'static HashSet<PathBuf> = Box::leak(Box::new(HashSet::new()));
         RepoPickerState {
-            bookmarks: EMPTY_PATHS,
-            selected: EMPTY_BOOLS,
-            worktree: EMPTY_BOOLS,
-            is_header: EMPTY_BOOLS,
-            is_child: EMPTY_BOOLS,
+            rows: EMPTY_ROWS,
+            selected,
+            worktree,
             collapsed,
             list_index: 0,
             path_input: "",

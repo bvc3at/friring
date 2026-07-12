@@ -1272,11 +1272,9 @@ impl App {
         crate::ui::repo_picker_modal::render_repo_picker_modal(
             frame,
             &crate::ui::repo_picker_modal::RepoPickerState {
-                bookmarks: &rp.bookmarks,
+                rows: &rp.rows,
                 selected: &rp.selected,
                 worktree: &rp.worktree,
-                is_header: &rp.is_header,
-                is_child: &rp.is_child,
                 collapsed: &rp.collapsed,
                 list_index: rp.list_index,
                 path_input: rp.path_input.value(),

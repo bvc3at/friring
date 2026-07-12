@@ -1606,11 +1606,10 @@ impl App {
     ) {
         use std::collections::HashSet;
 
-        rp.bookmarks.clear();
-        rp.selected.clear();
-        rp.worktree.clear();
-        rp.is_header.clear();
-        rp.is_child.clear();
+        // Only the rows are rebuilt. `selected`/`worktree`/`collapsed` are
+        // path-keyed and deliberately kept: a mid-flow refresh (parent import,
+        // bookmark delete) must not drop the user's in-flight picks.
+        rp.rows.clear();
 
         // Scan each parent once; a path that appears as a child of any parent
         // takes precedence over a standalone bookmark of the same path, so the
@@ -1655,17 +1654,20 @@ impl App {
                 return;
             }
             if emitted.insert(bm.repo_path.clone()) {
-                rp.push_row(bm.repo_path.clone(), false, false, false);
+                rp.push_row(
+                    bm.repo_path.clone(),
+                    modals::RepoRowKind::Repo { child: false },
+                );
             }
             return;
         }
         if !emitted.insert(bm.repo_path.clone()) {
             return;
         }
-        rp.push_row(bm.repo_path.clone(), false, true, false);
+        rp.push_row(bm.repo_path.clone(), modals::RepoRowKind::Header);
         for child in scans.get(&bm.repo_path).into_iter().flatten() {
             if emitted.insert(child.clone()) {
-                rp.push_row(child.clone(), false, false, true);
+                rp.push_row(child.clone(), modals::RepoRowKind::Repo { child: true });
             }
         }
     }
@@ -9948,11 +9950,8 @@ mod tests {
             panic!("expected repo picker");
         };
         // Seed two plain bookmarks (no headers/children).
-        rp.bookmarks = vec!["/tmp/a".into(), "/tmp/b".into()];
-        rp.selected = vec![false, false];
-        rp.worktree = vec![false, false];
-        rp.is_header = vec![false, false];
-        rp.is_child = vec![false, false];
+        rp.push_row("/tmp/a".into(), modals::RepoRowKind::Repo { child: false });
+        rp.push_row("/tmp/b".into(), modals::RepoRowKind::Repo { child: false });
         rp.filtered_indices = vec![0, 1];
         app.click_targets.push(ClickTarget {
             rect: Rect::new(30, 9, 40, 1),
@@ -9967,7 +9966,7 @@ mod tests {
             panic!("repo picker must stay open after a row click");
         };
         assert_eq!(rp.list_index, 1);
-        assert!(rp.selected[1]);
+        assert!(rp.selected.contains(std::path::Path::new("/tmp/b")));
     }
 
     #[test]
@@ -12214,17 +12213,18 @@ mod tests {
 
         // Rows: parent header, alpha (child), beta (child). The standalone
         // `alpha` was dropped in favour of the grouped child.
-        assert_eq!(rp.bookmarks.len(), 3);
-        assert_eq!(rp.is_header, vec![true, false, false]);
-        let alpha_rows = rp.bookmarks.iter().filter(|p| p.ends_with("alpha")).count();
+        assert_eq!(rp.rows.len(), 3);
+        assert!(rp.rows[0].is_header());
+        assert!(!rp.rows[1].is_header() && !rp.rows[2].is_header());
+        let alpha_rows = rp.rows.iter().filter(|r| r.path.ends_with("alpha")).count();
         assert_eq!(alpha_rows, 1, "alpha must not be duplicated");
         // The single `alpha` row is the grouped child (nested under the parent).
         let alpha_idx = rp
-            .bookmarks
+            .rows
             .iter()
-            .position(|p| p.ends_with("alpha"))
+            .position(|r| r.path.ends_with("alpha"))
             .unwrap();
-        assert!(rp.is_child[alpha_idx]);
+        assert!(rp.rows[alpha_idx].is_child());
     }
 
     #[test]
@@ -12245,9 +12245,9 @@ mod tests {
         App::rebuild_repo_picker_rows(&mut rp, bookmarks);
 
         let sub_rows = rp
-            .bookmarks
+            .rows
             .iter()
-            .filter(|p| p.file_name().is_some_and(|n| n == "sub"))
+            .filter(|r| r.path.file_name().is_some_and(|n| n == "sub"))
             .count();
         assert_eq!(sub_rows, 1, "sub must not be duplicated across parents");
     }
@@ -12271,6 +12271,24 @@ mod tests {
         // Expanding restores the children.
         rp.toggle_collapsed(0);
         assert_eq!(rp.filtered_indices.len(), 3);
+    }
+
+    #[test]
+    fn rebuild_preserves_selection_and_worktree_flags_across_rescan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("alpha").join(".git")).unwrap();
+
+        let mut rp = modals::RepoPickerModal::default();
+        App::rebuild_repo_picker_rows(&mut rp, vec![repo_bookmark(root, true)]);
+        let alpha = root.join("alpha");
+        rp.toggle_worktree(&alpha); // also checks the repo
+
+        // A refresh (e.g. after a parent import) rebuilds the rows; the
+        // path-keyed picks must survive it.
+        App::rebuild_repo_picker_rows(&mut rp, vec![repo_bookmark(root, true)]);
+        assert!(rp.selected.contains(&alpha));
+        assert!(rp.worktree.contains(&alpha));
     }
 
     // --- Worktree sync tests ---
