@@ -60,6 +60,8 @@ e2e_scenario_load() {
     SCENARIO_PROMPT=""
     SCENARIO_AGENT_READY=""
     SCENARIO_DONE_PATTERN=""
+    SCENARIO_PERF=0
+    E2E_PERF_MARKS=""
     scenario_assert_effects() { :; }
     scenario_assert_ui() { :; }
     # shellcheck disable=SC1091
@@ -82,10 +84,14 @@ e2e_boot() {
     # into the tmux server env and misattribute hook signals.
     unset THURBOX_SESSION THURBOX_SESSION_ID THURBOX_TASK THURBOX_METRICS_DIR THURBOX_SOCKET
 
-    THURBOX_BIN="$REPO_ROOT/target/debug/thurbox"
+    # THURBOX_E2E_BIN points perf runs at a release build — timing numbers
+    # from an unoptimized debug binary are noise, not measurements.
+    THURBOX_BIN="${THURBOX_E2E_BIN:-$REPO_ROOT/target/debug/thurbox}"
     export THURBOX_BIN
     if [ "$E2E_MODE" != "protocol" ]; then
-        [ -x "$THURBOX_BIN" ] || e2e_die "build first: cargo build --bins" || return 1
+        [ -x "$THURBOX_BIN" ] \
+            || e2e_die "no TUI binary at $THURBOX_BIN (cargo build --bins, or set THURBOX_E2E_BIN)" \
+            || return 1
     fi
 
     # Fresh HOME has no git identity; sessions and scenario workspaces need one.
@@ -124,6 +130,11 @@ e2e_boot() {
         [ -n "$kv" ] && export "${kv?}"
     done < <(agent_env)
     agent_seed_config "$E2E_WS"
+
+    # Perf scenarios make the TUI publish its perf snapshot (counters +
+    # frame/tick percentiles) into the sandbox DB for `thurbox-cli perf`.
+    # Exported before the tmux servers start, like the agent env.
+    [ "$SCENARIO_PERF" = "1" ] && export THURBOX_PERF_LOG=1
 
     # Protocol/interactive smokes stop here: no Friring in that loop.
     [ "$E2E_MODE" = "protocol" ] && return 0
@@ -342,6 +353,56 @@ assert_stub_invariants() {
 }
 
 # ---------------------------------------------------------------------------
+# Perf capture (SCENARIO_PERF=1). Reports are benchmarks, not gates: the
+# scenario still passes/fails on its functional asserts; the report records
+# wall-clock marks + the TUI's own perf snapshot for a human (or a trend
+# script) to compare across runs. Resolution of marks is bounded by the
+# wait-poll interval (~100ms).
+
+perf_mark() {
+    [ "$E2E_MODE" = "test" ] || return 0
+    E2E_PERF_MARKS="${E2E_PERF_MARKS}$1 $(date +%s%3N)"$'\n'
+}
+
+# Write marks + the TUI-published snapshot to target/agent-e2e/perf/. The
+# snapshot only publishes once per perf window (~1000 ticks ≈ 10s idle), so
+# poll for it — a missing snapshot after the wait is a real failure: it means
+# the THURBOX_PERF_LOG → publish → `thurbox-cli perf` chain is broken.
+e2e_perf_report() {
+    local dest
+    dest="$REPO_ROOT/target/agent-e2e/perf/$E2E_SCENARIO_NAME-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$dest"
+    {
+        echo "scenario: $E2E_SCENARIO_NAME"
+        # version via the CLI binary (same build): the TUI binary answers
+        # --version with terminal-mode escapes, not text
+        echo "bin: $THURBOX_BIN ($(thurbox-cli --text version 2>/dev/null | head -1))"
+        echo "agent: ${AGENT_NAME:-?} $(agent_version 2>/dev/null || true)"
+        echo "pane: ${SCENARIO_COLS}x${SCENARIO_ROWS}"
+    } > "$dest/meta.txt"
+    printf '%s' "$E2E_PERF_MARKS" > "$dest/marks.txt"
+    # Derived deltas between consecutive marks — the numbers a human actually
+    # compares across runs.
+    awk 'prev { printf "%s -> %s: %dms\n", pname, $1, $2 - prev }
+         { prev = $2; pname = $1 }' "$dest/marks.txt" > "$dest/deltas.txt"
+    local ok=1
+    for _ in $(seq 1 150); do
+        if thurbox-cli --json perf > "$dest/snapshot.json" 2>/dev/null; then
+            ok=0
+            break
+        fi
+        sleep 0.2
+    done
+    [ "$ok" = "0" ] || {
+        e2e_die "TUI never published a perf snapshot (THURBOX_PERF_LOG chain broken?)"
+        return 1
+    }
+    # --text: piped stdout would otherwise auto-switch this copy to JSON too
+    thurbox-cli --text perf > "$dest/snapshot.txt" 2>/dev/null || true
+    e2e_log "perf report: $dest"
+}
+
+# ---------------------------------------------------------------------------
 # Demo mode: emit a record.sh-compatible tape from the same scenario steps,
 # then run vhs inside the (already exported) hermetic env.
 e2e_demo_record() {
@@ -446,6 +507,9 @@ e2e_scenario() {
     assert_stub_invariants || return 1
     scenario_assert_effects || return 1
     scenario_assert_ui || return 1
+    if [ "$SCENARIO_PERF" = "1" ]; then
+        e2e_perf_report || return 1
+    fi
 }
 
 # ---------------------------------------------------------------------------

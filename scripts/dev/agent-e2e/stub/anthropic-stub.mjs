@@ -32,6 +32,9 @@
 //       "delayMs": 0,       // pause between SSE deltas (demo pacing)
 //       "reply": {
 //         "text": "…",                        // text block
+//         "flood": {"line": "…", "count": 500}, // prepend line×count to text
+//                                             // (perf scenarios: large output
+//                                             // without megabytes of JSON)
 //         "toolUse": {"id": "toolu_e2e_1", "name": "Write", "input": {…}},
 //         "stopReason": "end_turn"            // default; tool_use if toolUse
 //       }
@@ -131,9 +134,16 @@ function pick(s) {
   return null;
 }
 
+function effectiveText(reply) {
+  let text = reply.text || '';
+  if (reply.flood) text = `${reply.flood.line}\n`.repeat(reply.flood.count) + text;
+  return text;
+}
+
 function buildContentBlocks(reply) {
   const blocks = [];
-  if (reply.text) blocks.push({ type: 'text', text: reply.text });
+  const text = effectiveText(reply);
+  if (text) blocks.push({ type: 'text', text });
   if (reply.toolUse)
     blocks.push({
       type: 'tool_use',
@@ -186,8 +196,15 @@ async function respondStream(res, model, picked) {
         content_block: { type: 'text', text: '' },
       });
       // Chunked like the real API so the TUI exercises streaming render; word
-      // granularity gives demos a natural typing cadence under delayMs.
-      for (const piece of block.text.split(/(?<= )/)) {
+      // granularity gives demos a natural typing cadence under delayMs. Flood
+      // texts switch to fixed 1KiB chunks — the render path under test cares
+      // about bytes and cadence, and word-splitting 100KB would drown the
+      // stream in per-event overhead instead.
+      const pieces =
+        block.text.length > 4096
+          ? block.text.match(/[\s\S]{1,1024}/g)
+          : block.text.split(/(?<= )/);
+      for (const piece of pieces) {
         sseWrite(res, 'content_block_delta', {
           type: 'content_block_delta',
           index,

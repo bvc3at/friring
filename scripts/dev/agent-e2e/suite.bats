@@ -42,3 +42,7 @@ teardown() {
 @test "e2e: claude tool-use loop through Friring writes a real workspace file" {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-tool-loop"
 }
+
+@test "perf: claude flood turn through Friring publishes a perf report" {
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-perf-flood"
+}

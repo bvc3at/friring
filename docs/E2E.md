@@ -156,6 +156,31 @@ CI: the `agent-e2e` job (`.github/workflows/ci.yml`) installs tmux + bats + the 
 **not** in `all-checks.needs` — it exercises an externally-pinned binary, so its failures need a
 human eye (conformance drift vs real regression) and must never block a merge.
 
+## Performance scenarios
+
+A scenario with `SCENARIO_PERF=1` doubles as a **benchmark rig**: the whole real pipeline (tmux →
+control-mode reader → `vt100` → `tui_term`) under an exactly reproducible load — the stub's
+`flood` fixture field generates large streamed replies (`{"line": "…", "count": 1200}` ≈ 85KB in
+1KiB SSE chunks) without megabytes of hand-written JSON. The harness exports `THURBOX_PERF_LOG=1`
+to the TUI, records wall-clock marks (`perf_mark`, ~100ms resolution), and writes a report to
+`target/agent-e2e/perf/<scenario>-<ts>/`: mark deltas, plus the TUI's own published snapshot
+(`thurbox-cli perf` — counters, frame/tick percentiles, startup breakdown, slow ops).
+
+Reports are benchmarks, **not gates**: the test passes/fails on functional asserts and on the
+perf-publishing chain working (a missing snapshot fails the scenario), never on timing thresholds
+— wall-clock gates flake on shared runners, and counter-based regression *gating* stays with the
+`perf_*` tests (`docs/PERFORMANCE.md`). Numbers from the default debug build are for plumbing
+only; for measurements, point the harness at a release build:
+
+```bash
+cargo build --release --bins
+THURBOX_E2E_BIN=target/release/thurbox just agent-e2e 'perf'
+```
+
+The shipped `claude-perf-flood` scenario is the template: flood turn through the pane, marks at
+ready / prompt-sent / flood-rendered / turn-done, snapshot polled after the turn (the TUI
+publishes once per ~1000-tick perf window, so the report waits up to 30s for it).
+
 ## Updating the pinned agent binary
 
 The npm pin in the CI job is the version the fixtures are conformance-tested against (not

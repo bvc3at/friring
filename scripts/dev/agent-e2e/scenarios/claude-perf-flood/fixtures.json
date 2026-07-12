@@ -1,0 +1,21 @@
+{
+  "responses": [
+    {
+      "name": "flood",
+      "match": { "promptContains": "flood", "hasToolResult": false },
+      "reply": {
+        "flood": {
+          "line": "flood-line 0123456789 abcdefghijklmnopqrstuvwxyz the quick brown fox jumps over",
+          "count": 1200
+        },
+        "text": "PERF-FLOOD-DONE"
+      }
+    },
+    {
+      "name": "ambient",
+      "ambient": true,
+      "match": { "modelContains": "haiku" },
+      "reply": { "text": "ok" }
+    }
+  ]
+}

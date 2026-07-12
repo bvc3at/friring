@@ -210,6 +210,13 @@ won't pay off.
 - **Local profiling**: `cargo flamegraph --bin thurbox` (build with the
   `release-with-debug` profile for symbols) for CPU; `cargo bloat --release
   --crates` for size attribution. Neither is a dependency — run them ad hoc.
+- **Real-pipeline load benchmarks**: the agent-e2e harness's perf scenarios
+  (`SCENARIO_PERF=1`, e.g. `claude-perf-flood`) stream a reproducible flood
+  from the model stub through a *real* agent + tmux + vt100 + render path and
+  write a report (wall-clock marks + the published perf snapshot) under
+  `target/agent-e2e/perf/`. Benchmarks only, never a gate; run against a
+  release build via `THURBOX_E2E_BIN` — see `docs/E2E.md` ("Performance
+  scenarios").
 
 **Why**: criterion/divan pull a large transitive dependency tree, and
 `cargo deny check licenses` (a **gating** CI job with a strict allowlist) would
