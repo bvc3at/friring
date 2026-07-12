@@ -93,6 +93,7 @@ jobs:
               - '.github/workflows/ci.yml'
             agent_e2e:
               - 'scripts/dev/agent-e2e/**'
+              - 'scripts/dev/lib/**'
               - 'src/**'
               - 'extensions/hooks/**'
               - 'Cargo.toml'
@@ -443,8 +444,12 @@ jobs:
       - name: Install pinned Claude Code
         # The pin is the binary version the fixtures were conformance-tested
         # against; bump it deliberately and re-run the suite locally first
-        # (docs/E2E.md, "Updating the pinned agent binary").
-        run: npm install -g @anthropic-ai/claude-code@2.1.207
+        # (docs/E2E.md, "Updating the pinned agent binary"). The version check
+        # fails the job fast on a broken install — without it the suite would
+        # SKIP (dev-machine semantics) and report a false green.
+        run: |
+          npm install -g @anthropic-ai/claude-code@2.1.207
+          claude --version
       - name: Run real-agent e2e suite
         run: scripts/dev/agent-e2e/run.sh
       - name: Upload failure artifacts
