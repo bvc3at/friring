@@ -78,9 +78,11 @@ pub struct FeatureFlags {
     /// keybinding.
     #[serde(default = "default_true")]
     pub code_review: bool,
-    /// Claude Code activity view (F9): the workflow/subagent transcript view +
-    /// its keybinding, plus the off-thread scan of `~/.claude/.../subagents/`.
-    /// Claude, local sessions only.
+    /// Agent activity view (F9): the per-session retrospective (commands /
+    /// edits / reads / web / subagents across supported agent CLIs) + its
+    /// keybinding, the off-thread scans behind it, and conversation import.
+    /// Local sessions only. The key stays `cc_activity` for config
+    /// compatibility with the view's Claude-only v1.
     #[serde(default = "default_true")]
     pub cc_activity: bool,
     /// Perf HUD overlay (F12): live perf counters + frame/tick timing. Opening
