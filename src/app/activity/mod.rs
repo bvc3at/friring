@@ -15,6 +15,8 @@
 //! built rows, so rendering never blocks on the scan.
 
 mod aider;
+mod cline;
+mod codex;
 mod copilot;
 mod crush;
 mod cursor;
@@ -96,6 +98,8 @@ pub(crate) enum ProviderKind {
     Aider,
     Goose,
     Opencode,
+    Codex,
+    Cline,
 }
 
 impl ProviderKind {
@@ -115,6 +119,8 @@ impl ProviderKind {
             "aider" => Some(Self::Aider),
             "goose" => Some(Self::Goose),
             "opencode" => Some(Self::Opencode),
+            "codex" => Some(Self::Codex),
+            "cline" => Some(Self::Cline),
             _ => None,
         }
     }
@@ -131,6 +137,8 @@ impl ProviderKind {
             ProviderKind::Aider => "aider",
             ProviderKind::Goose => "goose",
             ProviderKind::Opencode => "opencode",
+            ProviderKind::Codex => "codex",
+            ProviderKind::Cline => "cline",
         }
     }
 }
@@ -178,6 +186,8 @@ impl SessionActivity {
             ProviderKind::Aider => ProviderScan::Aider(aider::AiderSource::default()),
             ProviderKind::Goose => ProviderScan::Goose(goose::GooseSource::default()),
             ProviderKind::Opencode => ProviderScan::Opencode(opencode::OpencodeSource::default()),
+            ProviderKind::Codex => ProviderScan::Codex(codex::CodexSource::default()),
+            ProviderKind::Cline => ProviderScan::Cline(cline::ClineSource::default()),
         };
         Self {
             provider,
@@ -198,6 +208,8 @@ impl SessionActivity {
             ProviderScan::Aider(s) => &s.scan.events,
             ProviderScan::Goose(s) => &s.scan.events,
             ProviderScan::Opencode(s) => &s.events,
+            ProviderScan::Codex(s) => &s.scan.events,
+            ProviderScan::Cline(s) => &s.events,
         }
     }
 
@@ -216,6 +228,8 @@ impl SessionActivity {
             // Meta comes from the sessions table, not the message stream.
             ProviderScan::Goose(s) => s.meta.clone(),
             ProviderScan::Opencode(s) => s.meta.clone(),
+            ProviderScan::Codex(s) => s.scan.meta.clone(),
+            ProviderScan::Cline(s) => s.meta.meta.clone(),
         }
     }
 
@@ -232,6 +246,8 @@ impl SessionActivity {
             ProviderScan::Aider(s) => s.truncated,
             ProviderScan::Goose(s) => s.truncated,
             ProviderScan::Opencode(s) => s.truncated,
+            ProviderScan::Codex(s) => s.truncated,
+            ProviderScan::Cline(s) => s.truncated,
         }
     }
 
@@ -251,6 +267,8 @@ impl SessionActivity {
             ProviderScan::Aider(s) => s.scan.events = events,
             ProviderScan::Goose(s) => s.scan.events = events,
             ProviderScan::Opencode(s) => s.events = events,
+            ProviderScan::Codex(s) => s.scan.events = events,
+            ProviderScan::Cline(s) => s.events = events,
         }
         act
     }
@@ -270,6 +288,8 @@ enum ProviderScan {
     Aider(aider::AiderSource),
     Goose(goose::GooseSource),
     Opencode(opencode::OpencodeSource),
+    Codex(codex::CodexSource),
+    Cline(cline::ClineSource),
 }
 
 /// Claude Code: the session's main conversation transcript
@@ -326,6 +346,8 @@ struct ScanRoots {
     aider_history: Option<PathBuf>,
     goose_sessions: Option<PathBuf>,
     opencode_db: Option<PathBuf>,
+    codex_sessions: Option<PathBuf>,
+    cline_sessions: Option<PathBuf>,
 }
 
 impl App {
@@ -396,6 +418,8 @@ impl App {
             aider_history: aider::aider_history_override(None),
             goose_sessions: goose::goose_sessions_dir(None),
             opencode_db: opencode::opencode_db_path(None),
+            codex_sessions: codex::codex_sessions_dir(None),
+            cline_sessions: cline::cline_sessions_dir(None),
         };
         let tx = self.activity_refresh.start();
         tokio::task::spawn_blocking(move || {
@@ -493,6 +517,20 @@ fn collect_activity(roots: ScanRoots, inputs: Vec<ActivityInput>) -> ActivityRef
                 roots.opencode_db.as_deref(),
                 input.own_id.as_deref(),
                 &input.dirs,
+            ),
+            ProviderScan::Codex(src) => codex::scan_codex(
+                src,
+                &mut state.sig,
+                roots.codex_sessions.as_deref(),
+                &input.dirs,
+                input.own_id.as_deref(),
+            ),
+            ProviderScan::Cline(src) => cline::scan_cline(
+                src,
+                &mut state.sig,
+                roots.cline_sessions.as_deref(),
+                &input.dirs,
+                input.own_id.as_deref(),
             ),
         };
         updates.push((input.id, state, changed));
@@ -907,7 +945,16 @@ mod tests {
             Some(ProviderKind::Claude)
         );
         assert_eq!(ProviderKind::for_command("vibe"), Some(ProviderKind::Vibe));
-        assert_eq!(ProviderKind::for_command("codex"), None); // provider not implemented yet
+        assert_eq!(
+            ProviderKind::for_command("codex"),
+            Some(ProviderKind::Codex)
+        );
+        // agy (encrypted store) and amp (server-side threads) are deliberate
+        // gaps with named reasons, not providers.
+        assert_eq!(ProviderKind::for_command("agy"), None);
+        assert!(unsupported_reason("agy").is_some());
+        assert!(unsupported_reason("amp").is_some());
+        assert_eq!(unsupported_reason("my-agent-cli"), None);
     }
 
     #[test]

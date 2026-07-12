@@ -2,7 +2,7 @@
 //! Crush session's `messages` rows into [`ActivityEvent`]s.
 //!
 //! Crush stores each project's history in a per-project SQLite DB
-//! (`<cwd>/.crush/crush.db`); the app layer ([`crate::app::activity`]) reads it
+//! (`<cwd>/.crush/crush.db`); the app layer (`app::activity::crush`) reads it
 //! and feeds this pure parser one message at a time. A message's `parts` column
 //! is a JSON array of `{"type","data"}` wrappers: `tool_call` parts are the
 //! actions (agent `bash`/`edit`/`view`/…, where `data.input` is itself a

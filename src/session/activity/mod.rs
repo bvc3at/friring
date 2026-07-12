@@ -16,6 +16,8 @@
 
 pub mod aider;
 pub mod claude;
+pub mod cline;
+pub mod codex;
 pub mod copilot;
 pub mod crush;
 pub mod cursor;
