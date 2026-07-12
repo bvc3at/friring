@@ -106,12 +106,12 @@ fn discover_transcript(root: &Path, session_id: Option<&str>, dirs: &[String]) -
             }
         }
     }
-    for dir in dirs {
-        if let Some(p) = newest_transcript(&agent_transcripts_dir(root, dir)) {
-            return Some(p);
-        }
-    }
-    None
+    // Globally newest across all candidate dirs — a multi-repo session must
+    // not bind an older transcript just because its dir sorts first.
+    dirs.iter()
+        .filter_map(|dir| newest_transcript(&agent_transcripts_dir(root, dir)))
+        .max_by_key(|(mtime, _)| *mtime)
+        .map(|(_, p)| p)
 }
 
 /// `<root>/projects/<sanitize(cwd)>/agent-transcripts` for a candidate cwd.
@@ -126,7 +126,7 @@ fn agent_transcripts_dir(root: &Path, cwd: &str) -> PathBuf {
 /// time-sortable), so recency comes from the filesystem. Subagent transcripts
 /// (nested in a `subagents/` subdir) are ignored: only `<name>/<name>.jsonl`
 /// parent transcripts match.
-fn newest_transcript(transcripts: &Path) -> Option<PathBuf> {
+fn newest_transcript(transcripts: &Path) -> Option<(std::time::SystemTime, PathBuf)> {
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(transcripts).ok()?.flatten() {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -145,7 +145,7 @@ fn newest_transcript(transcripts: &Path) -> Option<PathBuf> {
             best = Some((mtime, jsonl));
         }
     }
-    best.map(|(_, p)| p)
+    best
 }
 
 /// Cursor's `projects/<name>` encoding of a working directory: every
