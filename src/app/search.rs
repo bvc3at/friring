@@ -166,6 +166,10 @@ impl App {
     /// The scope is pinned to the session that is active **at open time**;
     /// live-previewing a session result mid-search doesn't retarget it.
     fn start_global_search_file_index(&mut self) {
+        // Drop any receiver a prior open installed first, so even the early
+        // returns below (feature off / no active session / no roots) can't leave
+        // a stale walk's delivery to be folded into this open's pinned scope.
+        self.global_search.file_index_task.cancel();
         self.global_search.file_index.clear();
         if !self.features.file_viewer {
             return;
