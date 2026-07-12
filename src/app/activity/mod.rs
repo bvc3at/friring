@@ -14,6 +14,7 @@
 //! / [`App::poll_activity_refresh`]). While in flight the view keeps its last
 //! built rows, so rendering never blocks on the scan.
 
+mod cursor;
 mod qwen;
 
 use std::collections::hash_map::DefaultHasher;
@@ -82,6 +83,7 @@ pub(crate) enum ProviderKind {
     Claude,
     Vibe,
     Qwen,
+    Cursor,
 }
 
 impl ProviderKind {
@@ -94,6 +96,7 @@ impl ProviderKind {
             "claude" => Some(Self::Claude),
             "vibe" => Some(Self::Vibe),
             "qwen" => Some(Self::Qwen),
+            "cursor-agent" => Some(Self::Cursor),
             _ => None,
         }
     }
@@ -103,6 +106,7 @@ impl ProviderKind {
             ProviderKind::Claude => "claude-code",
             ProviderKind::Vibe => "vibe",
             ProviderKind::Qwen => "qwen-code",
+            ProviderKind::Cursor => "cursor-agent",
         }
     }
 }
@@ -143,6 +147,7 @@ impl SessionActivity {
             ProviderKind::Claude => ProviderScan::Claude(ClaudeSource::default()),
             ProviderKind::Vibe => ProviderScan::Vibe(VibeSource::default()),
             ProviderKind::Qwen => ProviderScan::Qwen(qwen::QwenSource::default()),
+            ProviderKind::Cursor => ProviderScan::Cursor(cursor::CursorSource::default()),
         };
         Self {
             provider,
@@ -156,6 +161,7 @@ impl SessionActivity {
             ProviderScan::Claude(s) => &s.scan.events,
             ProviderScan::Vibe(s) => &s.scan.events,
             ProviderScan::Qwen(s) => &s.scan.events,
+            ProviderScan::Cursor(s) => &s.scan.events,
         }
     }
 
@@ -166,6 +172,7 @@ impl SessionActivity {
             // sidecar meta.json.
             ProviderScan::Vibe(s) => s.meta.meta.clone(),
             ProviderScan::Qwen(s) => s.scan.meta.clone(),
+            ProviderScan::Cursor(s) => s.scan.meta.clone(),
         }
     }
 
@@ -175,6 +182,7 @@ impl SessionActivity {
             ProviderScan::Claude(s) => s.truncated,
             ProviderScan::Vibe(s) => s.truncated,
             ProviderScan::Qwen(s) => s.truncated,
+            ProviderScan::Cursor(s) => s.truncated,
         }
     }
 
@@ -187,6 +195,7 @@ impl SessionActivity {
             ProviderScan::Claude(s) => s.scan.events = events,
             ProviderScan::Vibe(s) => s.scan.events = events,
             ProviderScan::Qwen(s) => s.scan.events = events,
+            ProviderScan::Cursor(s) => s.scan.events = events,
         }
         act
     }
@@ -199,6 +208,7 @@ enum ProviderScan {
     Claude(ClaudeSource),
     Vibe(VibeSource),
     Qwen(qwen::QwenSource),
+    Cursor(cursor::CursorSource),
 }
 
 /// Claude Code: the session's main conversation transcript
@@ -249,6 +259,7 @@ struct ScanRoots {
     claude_projects: Option<PathBuf>,
     vibe_sessions: Option<PathBuf>,
     qwen_projects: Option<PathBuf>,
+    cursor_root: Option<PathBuf>,
 }
 
 impl App {
@@ -313,6 +324,7 @@ impl App {
             claude_projects: crate::paths::claude_projects_dir(None),
             vibe_sessions: crate::paths::vibe_sessions_dir(None),
             qwen_projects: qwen::qwen_projects_dir(None),
+            cursor_root: cursor::cursor_root(None),
         };
         let tx = self.activity_refresh.start();
         tokio::task::spawn_blocking(move || {
@@ -362,6 +374,13 @@ fn collect_activity(roots: ScanRoots, inputs: Vec<ActivityInput>) -> ActivityRef
                 roots.qwen_projects.as_deref(),
                 &input.dirs,
                 input.own_id.as_deref(),
+            ),
+            ProviderScan::Cursor(src) => cursor::scan_cursor(
+                src,
+                &mut state.sig,
+                roots.cursor_root.as_deref(),
+                input.own_id.as_deref(),
+                &input.dirs,
             ),
         };
         updates.push((input.id, state, changed));

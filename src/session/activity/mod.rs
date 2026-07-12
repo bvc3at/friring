@@ -15,6 +15,7 @@
 //! degrade to skipped records, never errors.
 
 pub mod claude;
+pub mod cursor;
 pub mod qwen;
 pub mod vibe;
 
