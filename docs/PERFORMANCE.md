@@ -562,6 +562,56 @@ off-thread with the patterns the codebase already uses.
 
 ---
 
+## ADR-P13: Global-search keystrokes do no I/O
+
+**Choice**: The global search used to do two kinds of blocking I/O inside the
+per-keystroke update path:
+
+- `search_files` re-ran the bounded filesystem walk (`enumerate_paths`, up to
+  `SEARCH_NODE_LIMIT` = 5000 `read_dir` calls + per-directory sorts) on
+  **every keystroke** — tens of milliseconds on a local disk, seconds on a
+  network mount, making typing visibly lag.
+- Previewing a task result called `refresh_tasks()` — a synchronous SQLite
+  `list_tasks()` — on every keystroke and every `Up`/`Down` landing on a task.
+
+Now a keystroke only does in-memory fuzzy/substring matching:
+
+- The Files scope matches against a **prebuilt index**
+  (`GlobalSearchState::file_index`): `open_global_search` snapshots the active
+  session's roots and hands the walk to a thread
+  (`start_global_search_file_index`, the `BackgroundTask` fire-and-poll
+  shape); `poll_global_search_file_index` (tick) folds the delivered index
+  into the open results. Lowercasing happens once at index build, not per
+  keystroke.
+- Task previews read the in-memory task cache (`recompute_task_filter`); the
+  SQLite re-read happens once, on `Enter`
+  (`activate_global_search_result`).
+
+The vt100 buffer-content scan keeps its ADR-independent debounce (~150 ms
+query-idle) — it is in-memory but O(sessions × lines), too heavy for every
+keystroke, too useful to drop.
+
+Gate: `global_search_files_match_from_the_cached_index`,
+`global_search_content_scan_waits_for_debounce` (`src/app/acceptance.rs`).
+
+**Why**: the popup is a typing surface — latency there is the product. The
+walk's output is stable within one search interaction, so snapshotting it at
+open trades at most one stale-listing edge (files created mid-search don't
+appear until the next open) for a keystroke path with zero I/O.
+
+**Rejected**:
+
+- *Caching the walk with invalidation (mtime/watcher)* — the index lives for
+  one popup interaction (seconds); invalidation machinery would outweigh the
+  staleness it prevents.
+- *Debouncing the walk like the content scan* — still blocks the UI thread
+  when it fires; a network-mount walk would freeze mid-typing anyway.
+- *Indexing every session's roots* — N sessions × 5000 nodes of walk for
+  results the Files group caps at 8; the active session matches the file
+  viewer's scope and user intent.
+
+---
+
 ## Quick reference
 
 | I want to… | Do this |

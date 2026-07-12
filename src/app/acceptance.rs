@@ -304,6 +304,15 @@ impl Harness {
         self.key(KeyCode::Char(c.to_ascii_uppercase()), KeyModifiers::SHIFT)
     }
 
+    /// A bare `Shift` press, as kitty-protocol terminals report it — one tap
+    /// of the double-`Shift` search gesture.
+    fn shift_tap(&mut self) -> &mut Self {
+        self.key(
+            KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftShift),
+            KeyModifiers::SHIFT,
+        )
+    }
+
     /// Draw the current state to the headless backend and return the visible
     /// glyphs as newline-separated rows (one string per terminal line), the
     /// shape both `insta` snapshots and substring assertions read.
@@ -491,21 +500,100 @@ fn f5_toggles_tasks_panel_like_ctrl_w() {
 }
 
 #[test]
-fn ctrl_slash_opens_global_search_strip() {
+fn ctrl_slash_opens_global_search_popup() {
     let mut h = Harness::standard(2);
     assert!(!h.app.global_search.active);
 
     h.ctrl('/'); // GlobalSearch
-    assert!(h.app.global_search.active, "Ctrl+/ opens the search strip");
+    assert!(h.app.global_search.active, "Ctrl+/ opens the search popup");
 
-    // The strip captures typing before global keybindings, so a plain letter
+    // The popup captures typing before global keybindings, so a plain letter
     // edits the query rather than triggering a binding.
     h.key(KeyCode::Char('s'), KeyModifiers::NONE);
     assert_eq!(h.app.global_search.query.value(), "s");
 
     // Esc restores the prior state.
     h.key(KeyCode::Esc, KeyModifiers::NONE);
-    assert!(!h.app.global_search.active, "Esc closes the search strip");
+    assert!(!h.app.global_search.active, "Esc closes the search popup");
+}
+
+#[test]
+fn double_shift_opens_global_search() {
+    let mut h = Harness::standard(1);
+
+    h.shift_tap();
+    assert!(
+        !h.app.global_search.active,
+        "a single Shift tap only arms the gesture"
+    );
+    h.shift_tap();
+    assert!(
+        h.app.global_search.active,
+        "the second tap within the window opens the search"
+    );
+}
+
+#[test]
+fn double_shift_times_out_and_rearms() {
+    let mut h = Harness::standard(1);
+
+    h.shift_tap();
+    h.advance(std::time::Duration::from_millis(
+        key_handlers::DOUBLE_SHIFT_WINDOW_MS + 10,
+    ));
+    h.shift_tap();
+    assert!(
+        !h.app.global_search.active,
+        "a tap after the window expired must not trigger — it re-arms instead"
+    );
+    h.shift_tap();
+    assert!(h.app.global_search.active, "…so the next quick tap opens");
+}
+
+#[test]
+fn double_shift_is_broken_by_an_intervening_key() {
+    let mut h = Harness::standard(1);
+
+    // Shift → letter → Shift is ordinary typing (e.g. a capital, a pause,
+    // another capital) — never a gesture.
+    h.shift_tap();
+    h.key(KeyCode::Char('j'), KeyModifiers::NONE);
+    h.shift_tap();
+    assert!(!h.app.global_search.active);
+}
+
+#[test]
+fn double_shift_ignored_while_search_or_modal_owns_input() {
+    let mut h = Harness::standard(1);
+
+    // While the popup is open, Shift presses are just capitals being typed.
+    h.ctrl('/');
+    h.shift_tap().shift_tap();
+    assert!(h.app.global_search.active, "popup stays open");
+    assert_eq!(
+        h.app.global_search.query.value(),
+        "",
+        "bare modifier presses never reach the query"
+    );
+
+    // While a modal captures input, the gesture must not fire underneath it.
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    h.ctrl(','); // OpenSettings
+    h.shift_tap().shift_tap();
+    assert!(!h.app.global_search.active);
+    assert!(h.app.modal.is_open(), "the modal is untouched");
+}
+
+#[test]
+fn double_shift_respects_the_feature_flag() {
+    let mut h = Harness::standard(1);
+    h.app.features.double_shift_search = false;
+
+    h.shift_tap().shift_tap();
+    assert!(!h.app.global_search.active, "flag off ⇒ gesture inert");
+
+    h.ctrl('/');
+    assert!(h.app.global_search.active, "the chord keeps working");
 }
 
 #[test]
@@ -2620,6 +2708,85 @@ fn global_search_content_scan_waits_for_debounce() {
 }
 
 #[test]
+fn global_search_files_match_from_the_cached_index() {
+    // Files are matched against the index snapshotted at open — typing must
+    // never walk the filesystem (the old per-keystroke walk was the strip's
+    // dominant latency). Delivery through the task seam stands in for the
+    // off-thread walk, keeping the test deterministic.
+    let mut h = Harness::standard(1);
+    h.ctrl('/');
+    for c in "zanzi".chars() {
+        h.key(KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    let file_hit = |app: &App| {
+        app.global_search
+            .results
+            .iter()
+            .any(|r| r.kind == search::SearchKind::File && r.label == "zanzibar.txt")
+    };
+    assert!(
+        !file_hit(&h.app),
+        "no index delivered yet ⇒ no file results"
+    );
+
+    let tx = h.app.global_search.file_index_task.start();
+    tx.send(vec![search::FileIndexEntry {
+        root: "/repo".into(),
+        path: "/repo/zanzibar.txt".into(),
+        name: "zanzibar.txt".into(),
+        name_lc: "zanzibar.txt".into(),
+    }])
+    .unwrap();
+    h.tick();
+    assert!(
+        file_hit(&h.app),
+        "once the walk delivers, file matches fold into the open results"
+    );
+}
+
+#[test]
+fn global_search_matches_session_cwd_and_every_branch() {
+    let mut h = Harness::standard(1);
+    h.app.sessions[0].info.cwd = Some("/mnt/velociraptor-repo".into());
+    h.app.sessions[0].info.worktrees = vec![
+        crate::session::WorktreeInfo {
+            repo_path: "/r".into(),
+            worktree_path: "/w1".into(),
+            branch: "main".into(),
+        },
+        crate::session::WorktreeInfo {
+            repo_path: "/r".into(),
+            worktree_path: "/w2".into(),
+            branch: "feature/quokka-lift".into(),
+        },
+    ];
+
+    let session_hit = |h: &mut Harness, query: &str| {
+        h.ctrl('/');
+        for c in query.chars() {
+            h.key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        let hit = h
+            .app
+            .global_search
+            .results
+            .iter()
+            .any(|r| r.kind == search::SearchKind::Session);
+        h.key(KeyCode::Esc, KeyModifiers::NONE);
+        hit
+    };
+
+    assert!(
+        session_hit(&mut h, "velociraptor"),
+        "the session's cwd is indexed (FEATURES.md promises all four fields)"
+    );
+    assert!(
+        session_hit(&mut h, "quokka"),
+        "every worktree branch is indexed, not just the first"
+    );
+}
+
+#[test]
 fn forced_redraw_floor_repaints_after_interval() {
     let mut h = Harness::standard(1);
     h.app.mark_redrawn();
@@ -2639,12 +2806,13 @@ fn forced_redraw_floor_repaints_after_interval() {
 
 #[test]
 fn global_search_on_short_terminal_does_not_panic_session_resize() {
-    // The search strip + footer can eat a short terminal's entire height,
-    // producing a zero-row content area. `Session::resize` must clamp before
-    // vt100's `set_size` (which underflows on 0) — this panicked pre-clamp.
+    // Historically the bottom-strip search shrank the content area to zero
+    // rows on short terminals, and `Session::resize` had to clamp before
+    // vt100's `set_size` (which underflows on 0). The popup floats now, but
+    // this still guards opening + rendering the search on a tiny terminal.
     let mut h = Harness::new(30, 8, 1);
     h.render();
-    h.ctrl('/'); // GlobalSearch — resizes sessions to the shrunken content area
+    h.ctrl('/'); // GlobalSearch
     h.render();
     assert!(h.app.global_search.active);
 }

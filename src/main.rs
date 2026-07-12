@@ -20,21 +20,29 @@ use thurbox::storage::Database;
 /// whether a matching pop is needed.
 static KEYBOARD_ENHANCEMENT_PUSHED: AtomicBool = AtomicBool::new(false);
 
-/// Enable the kitty keyboard protocol where the terminal supports it: with
-/// DISAMBIGUATE_ESCAPE_CODES, Cmd/Super-modified keys are reported at all
-/// (otherwise the terminal never delivers them), while plain keys keep their
-/// legacy encodings and no Release/Repeat events arrive — the
+/// Enable the kitty keyboard protocol where the terminal supports it:
+///
+/// - DISAMBIGUATE_ESCAPE_CODES — Cmd/Super-modified keys are reported at all
+///   (otherwise the terminal never delivers them).
+/// - REPORT_ALL_KEYS_AS_ESCAPE_CODES — bare modifier presses arrive as
+///   `KeyCode::Modifier` events, which the double-`Shift` search opener needs
+///   (`App::handle_modifier_press`); they are swallowed everywhere else.
+/// - REPORT_ALTERNATE_KEYS — with all-keys reporting the terminal sends the
+///   *base* key (`a` + SHIFT) unless it also reports the shifted alternate;
+///   this flag keeps `Shift+a` arriving as `Char('A')` (crossterm substitutes
+///   the alternate), so text inputs and PTY forwarding see capitals unchanged.
+///
+/// REPORT_EVENT_TYPES stays off, so no Release/Repeat events arrive and the
 /// `KeyEventKind::Press` filter in `run_loop` stays correct. The support
 /// query needs raw mode, so call this only after `ratatui::init()`.
 fn push_keyboard_enhancement() {
+    let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
     if matches!(
         crossterm::terminal::supports_keyboard_enhancement(),
         Ok(true)
-    ) && execute!(
-        std::io::stdout(),
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    )
-    .is_ok()
+    ) && execute!(std::io::stdout(), PushKeyboardEnhancementFlags(flags)).is_ok()
     {
         KEYBOARD_ENHANCEMENT_PUSHED.store(true, Ordering::SeqCst);
     }

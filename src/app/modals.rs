@@ -1506,6 +1506,7 @@ pub enum SettingsField {
     FeatAutomations,
     FeatFileViewer,
     FeatGlobalSearch,
+    FeatDoubleShiftSearch,
     FeatInfoPanel,
     FeatShellPane,
     FeatCodeReview,
@@ -1532,11 +1533,12 @@ pub enum SettingsField {
 impl SettingsField {
     /// Field nav order — also the render order (headers are interleaved by the
     /// renderer). Used by [`cycle_field`] and the scroll-windowing logic.
-    pub const ORDER: [SettingsField; 23] = [
+    pub const ORDER: [SettingsField; 24] = [
         SettingsField::FeatTasks,
         SettingsField::FeatAutomations,
         SettingsField::FeatFileViewer,
         SettingsField::FeatGlobalSearch,
+        SettingsField::FeatDoubleShiftSearch,
         SettingsField::FeatInfoPanel,
         SettingsField::FeatShellPane,
         SettingsField::FeatCodeReview,
@@ -1573,7 +1575,12 @@ impl SettingsField {
                 "Automations pane and schedule firing",
             ),
             FeatFileViewer => ("file_viewer", "File viewer", "File viewer column"),
-            FeatGlobalSearch => ("global_search", "Global search", "Global search strip"),
+            FeatGlobalSearch => ("global_search", "Global search", "Global search popup"),
+            FeatDoubleShiftSearch => (
+                "double_shift_search",
+                "Double Shift",
+                "Double-Shift opens the search (kitty-protocol terminals)",
+            ),
             FeatInfoPanel => ("info_panel", "Info panel", "Info panel column"),
             FeatShellPane => ("shell_pane", "Shell pane", "Per-session shell pane"),
             FeatCodeReview => (
@@ -1748,6 +1755,7 @@ impl SettingsModal {
             FeatAutomations => f.automations = !f.automations,
             FeatFileViewer => f.file_viewer = !f.file_viewer,
             FeatGlobalSearch => f.global_search = !f.global_search,
+            FeatDoubleShiftSearch => f.double_shift_search = !f.double_shift_search,
             FeatInfoPanel => f.info_panel = !f.info_panel,
             FeatShellPane => f.shell_pane = !f.shell_pane,
             FeatCodeReview => f.code_review = !f.code_review,
@@ -1817,6 +1825,7 @@ impl SettingsModal {
             FeatAutomations => on(f.automations),
             FeatFileViewer => on(f.file_viewer),
             FeatGlobalSearch => on(f.global_search),
+            FeatDoubleShiftSearch => on(f.double_shift_search),
             FeatInfoPanel => on(f.info_panel),
             FeatShellPane => on(f.shell_pane),
             FeatCodeReview => on(f.code_review),
@@ -3242,7 +3251,7 @@ mod tests {
 
     #[test]
     fn settings_order_lists_every_field_once() {
-        assert_eq!(SettingsField::ORDER.len(), 23);
+        assert_eq!(SettingsField::ORDER.len(), 24);
         for f in SettingsField::ORDER {
             assert_eq!(
                 SettingsField::ORDER.iter().filter(|x| **x == f).count(),
@@ -3314,6 +3323,7 @@ mod tests {
             FeatTasks,
             FeatFileViewer,
             FeatGlobalSearch,
+            FeatDoubleShiftSearch,
             FeatInfoPanel,
             FeatShellPane,
             FeatCodeReview,
