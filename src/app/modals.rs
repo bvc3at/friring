@@ -1583,8 +1583,8 @@ impl SettingsField {
             ),
             FeatCcActivity => (
                 "cc_activity",
-                "CC activity",
-                "Claude workflow/subagent transcript view",
+                "Agent activity",
+                "Per-session agent activity retrospective (F9)",
             ),
             FeatPerfHud => (
                 "perf_hud",
