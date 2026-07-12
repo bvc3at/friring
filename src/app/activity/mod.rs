@@ -14,7 +14,13 @@
 //! / [`App::poll_activity_refresh`]). While in flight the view keeps its last
 //! built rows, so rendering never blocks on the scan.
 
+mod aider;
+mod copilot;
+mod crush;
 mod cursor;
+mod gemini;
+mod goose;
+mod opencode;
 mod qwen;
 
 use std::collections::hash_map::DefaultHasher;
@@ -84,6 +90,12 @@ pub(crate) enum ProviderKind {
     Vibe,
     Qwen,
     Cursor,
+    Gemini,
+    Crush,
+    Copilot,
+    Aider,
+    Goose,
+    Opencode,
 }
 
 impl ProviderKind {
@@ -97,6 +109,12 @@ impl ProviderKind {
             "vibe" => Some(Self::Vibe),
             "qwen" => Some(Self::Qwen),
             "cursor-agent" => Some(Self::Cursor),
+            "gemini" => Some(Self::Gemini),
+            "crush" => Some(Self::Crush),
+            "copilot" => Some(Self::Copilot),
+            "aider" => Some(Self::Aider),
+            "goose" => Some(Self::Goose),
+            "opencode" => Some(Self::Opencode),
             _ => None,
         }
     }
@@ -107,6 +125,12 @@ impl ProviderKind {
             ProviderKind::Vibe => "vibe",
             ProviderKind::Qwen => "qwen-code",
             ProviderKind::Cursor => "cursor-agent",
+            ProviderKind::Gemini => "gemini-cli",
+            ProviderKind::Crush => "crush",
+            ProviderKind::Copilot => "copilot",
+            ProviderKind::Aider => "aider",
+            ProviderKind::Goose => "goose",
+            ProviderKind::Opencode => "opencode",
         }
     }
 }
@@ -148,6 +172,12 @@ impl SessionActivity {
             ProviderKind::Vibe => ProviderScan::Vibe(VibeSource::default()),
             ProviderKind::Qwen => ProviderScan::Qwen(qwen::QwenSource::default()),
             ProviderKind::Cursor => ProviderScan::Cursor(cursor::CursorSource::default()),
+            ProviderKind::Gemini => ProviderScan::Gemini(gemini::GeminiSource::default()),
+            ProviderKind::Crush => ProviderScan::Crush(crush::CrushSource::default()),
+            ProviderKind::Copilot => ProviderScan::Copilot(copilot::CopilotSource::default()),
+            ProviderKind::Aider => ProviderScan::Aider(aider::AiderSource::default()),
+            ProviderKind::Goose => ProviderScan::Goose(goose::GooseSource::default()),
+            ProviderKind::Opencode => ProviderScan::Opencode(opencode::OpencodeSource::default()),
         };
         Self {
             provider,
@@ -162,6 +192,12 @@ impl SessionActivity {
             ProviderScan::Vibe(s) => &s.scan.events,
             ProviderScan::Qwen(s) => &s.scan.events,
             ProviderScan::Cursor(s) => &s.scan.events,
+            ProviderScan::Gemini(s) => &s.scan.events,
+            ProviderScan::Crush(s) => &s.scan.events,
+            ProviderScan::Copilot(s) => &s.scan.events,
+            ProviderScan::Aider(s) => &s.scan.events,
+            ProviderScan::Goose(s) => &s.scan.events,
+            ProviderScan::Opencode(s) => &s.events,
         }
     }
 
@@ -173,6 +209,13 @@ impl SessionActivity {
             ProviderScan::Vibe(s) => s.meta.meta.clone(),
             ProviderScan::Qwen(s) => s.scan.meta.clone(),
             ProviderScan::Cursor(s) => s.scan.meta.clone(),
+            ProviderScan::Gemini(s) => s.scan.meta.clone(),
+            ProviderScan::Crush(s) => s.scan.meta.clone(),
+            ProviderScan::Copilot(s) => s.meta(),
+            ProviderScan::Aider(s) => s.scan.meta.clone(),
+            // Meta comes from the sessions table, not the message stream.
+            ProviderScan::Goose(s) => s.meta.clone(),
+            ProviderScan::Opencode(s) => s.meta.clone(),
         }
     }
 
@@ -183,6 +226,12 @@ impl SessionActivity {
             ProviderScan::Vibe(s) => s.truncated,
             ProviderScan::Qwen(s) => s.truncated,
             ProviderScan::Cursor(s) => s.truncated,
+            ProviderScan::Gemini(s) => s.truncated,
+            ProviderScan::Crush(s) => s.truncated,
+            ProviderScan::Copilot(s) => s.truncated,
+            ProviderScan::Aider(s) => s.truncated,
+            ProviderScan::Goose(s) => s.truncated,
+            ProviderScan::Opencode(s) => s.truncated,
         }
     }
 
@@ -196,6 +245,12 @@ impl SessionActivity {
             ProviderScan::Vibe(s) => s.scan.events = events,
             ProviderScan::Qwen(s) => s.scan.events = events,
             ProviderScan::Cursor(s) => s.scan.events = events,
+            ProviderScan::Gemini(s) => s.scan.events = events,
+            ProviderScan::Crush(s) => s.scan.events = events,
+            ProviderScan::Copilot(s) => s.scan.events = events,
+            ProviderScan::Aider(s) => s.scan.events = events,
+            ProviderScan::Goose(s) => s.scan.events = events,
+            ProviderScan::Opencode(s) => s.events = events,
         }
         act
     }
@@ -209,6 +264,12 @@ enum ProviderScan {
     Vibe(VibeSource),
     Qwen(qwen::QwenSource),
     Cursor(cursor::CursorSource),
+    Gemini(gemini::GeminiSource),
+    Crush(crush::CrushSource),
+    Copilot(copilot::CopilotSource),
+    Aider(aider::AiderSource),
+    Goose(goose::GooseSource),
+    Opencode(opencode::OpencodeSource),
 }
 
 /// Claude Code: the session's main conversation transcript
@@ -260,6 +321,11 @@ struct ScanRoots {
     vibe_sessions: Option<PathBuf>,
     qwen_projects: Option<PathBuf>,
     cursor_root: Option<PathBuf>,
+    gemini_home: Option<PathBuf>,
+    copilot_sessions: Option<PathBuf>,
+    aider_history: Option<PathBuf>,
+    goose_sessions: Option<PathBuf>,
+    opencode_db: Option<PathBuf>,
 }
 
 impl App {
@@ -325,6 +391,11 @@ impl App {
             vibe_sessions: crate::paths::vibe_sessions_dir(None),
             qwen_projects: qwen::qwen_projects_dir(None),
             cursor_root: cursor::cursor_root(None),
+            gemini_home: gemini::gemini_root(None),
+            copilot_sessions: copilot::copilot_sessions_dir(None),
+            aider_history: aider::aider_history_override(None),
+            goose_sessions: goose::goose_sessions_dir(None),
+            opencode_db: opencode::opencode_db_path(None),
         };
         let tx = self.activity_refresh.start();
         tokio::task::spawn_blocking(move || {
@@ -379,6 +450,47 @@ fn collect_activity(roots: ScanRoots, inputs: Vec<ActivityInput>) -> ActivityRef
                 src,
                 &mut state.sig,
                 roots.cursor_root.as_deref(),
+                input.own_id.as_deref(),
+                &input.dirs,
+            ),
+            ProviderScan::Gemini(src) => gemini::scan_gemini(
+                src,
+                &mut state.sig,
+                roots.gemini_home.as_deref(),
+                &input.dirs,
+                input.own_id.as_deref(),
+            ),
+            ProviderScan::Crush(src) => crush::scan_crush(
+                src,
+                &mut state.sig,
+                &input.dirs,
+                input.own_id.as_deref(),
+                None,
+            ),
+            ProviderScan::Copilot(src) => copilot::scan_copilot(
+                src,
+                &mut state.sig,
+                roots.copilot_sessions.as_deref(),
+                input.own_id.as_deref(),
+                &input.dirs,
+            ),
+            ProviderScan::Aider(src) => aider::scan_aider(
+                src,
+                &mut state.sig,
+                roots.aider_history.as_deref(),
+                &input.dirs,
+            ),
+            ProviderScan::Goose(src) => goose::scan_goose(
+                src,
+                &mut state.sig,
+                roots.goose_sessions.as_deref(),
+                &input.dirs,
+                input.own_id.as_deref(),
+            ),
+            ProviderScan::Opencode(src) => opencode::scan_opencode(
+                src,
+                &mut state.sig,
+                roots.opencode_db.as_deref(),
                 input.own_id.as_deref(),
                 &input.dirs,
             ),

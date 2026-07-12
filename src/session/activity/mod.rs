@@ -14,8 +14,14 @@
 //! on-disk formats are undocumented and version-specific, so unknown shapes
 //! degrade to skipped records, never errors.
 
+pub mod aider;
 pub mod claude;
+pub mod copilot;
+pub mod crush;
 pub mod cursor;
+pub mod gemini;
+pub mod goose;
+pub mod opencode;
 pub mod qwen;
 pub mod vibe;
 
