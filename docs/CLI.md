@@ -60,6 +60,13 @@ Output is **human-readable by default** and switches to JSON automatically when
 stdout is piped (so `… | jq` keeps working). Force a format with `--json`
 (compact), `--pretty` (indented JSON), or `--text` (human even when piped).
 
+`session get`/`session list` JSON includes `hook_state`/`hook_state_at` — the
+**raw** persisted status-hook columns (`working`/`blocked`/`done`/`idle`, epoch
+ms; `null` until the first signal), deliberately *not* the TUI's derived status
+(which downgrades a stale `working`). This is the contract external observers —
+automations, the real-agent e2e harness (`docs/E2E.md`) — poll for status
+transitions instead of reading SQLite.
+
 ## Delete and restore semantics
 
 `session delete <uuid>` **soft-deletes** by default — only the DB row is marked
