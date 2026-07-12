@@ -1114,6 +1114,81 @@ fn cc_activity_view_opens_navigates_folds_and_closes() {
 }
 
 #[test]
+fn activity_sections_render_seeded_events() {
+    use super::activity::{ProviderKind, Section, SessionActivity};
+    use crate::session::activity::{ActionKind, ActivityEvent};
+
+    let ev = |kind, detail: &str, ok| ActivityEvent {
+        ts_ms: Some(1_783_512_000_000),
+        kind,
+        detail: detail.into(),
+        note: None,
+        result_head: Some("output head".into()),
+        ok,
+        origin: None,
+    };
+    let mut h = Harness::spawnable(1);
+    let sid = h.app.sessions[0].info.id;
+    h.app.activity.insert(
+        sid,
+        SessionActivity::seeded(
+            ProviderKind::Claude,
+            vec![
+                ev(ActionKind::Command, "cargo test", Some(true)),
+                ev(ActionKind::Command, "cargo bench", Some(false)),
+                ev(ActionKind::Edit, "/repo/src/a.rs", Some(true)),
+                ev(ActionKind::Read, "/repo/src/a.rs", Some(true)),
+                ev(ActionKind::WebSearch, "ratatui table", Some(true)),
+            ],
+        ),
+    );
+
+    // F9 opens on Overview; counts land in the navigator state.
+    h.key(KeyCode::F(9), KeyModifiers::NONE);
+    {
+        let ca = h.app.active_cc_activity().unwrap();
+        assert_eq!(ca.counts.commands, 2);
+        assert_eq!(ca.counts.total(), 5);
+        assert_eq!(ca.files_count, 1, "edit+read of one path aggregate");
+        assert!(ca
+            .rows
+            .iter()
+            .any(|r| matches!(r, super::cc_activity::CcRow::Text(s) if s.contains("5 actions"))));
+    }
+
+    // Timeline shows every event; Commands filters to the two commands.
+    h.key(KeyCode::Char('2'), KeyModifiers::NONE);
+    {
+        let ca = h.app.active_cc_activity().unwrap();
+        assert_eq!(
+            ca.open,
+            Some(super::cc_activity::CcNodeRef::Section(Section::Timeline))
+        );
+        assert_eq!(ca.rows.len(), 5);
+    }
+    h.key(KeyCode::Char('3'), KeyModifiers::NONE);
+    assert_eq!(h.app.active_cc_activity().unwrap().rows.len(), 2);
+
+    // Files section groups the touched path under "Edited (1)".
+    h.key(KeyCode::Char('4'), KeyModifiers::NONE);
+    {
+        let ca = h.app.active_cc_activity().unwrap();
+        assert!(ca
+            .rows
+            .iter()
+            .any(|r| matches!(r, super::cc_activity::CcRow::Info(s) if s.contains("Edited (1)"))));
+        assert!(ca.rows.iter().any(
+            |r| matches!(r, super::cc_activity::CcRow::Text(s) if s.contains("/repo/src/a.rs"))
+        ));
+    }
+
+    // Web section holds the single search; the frame renders without panic.
+    h.key(KeyCode::Char('5'), KeyModifiers::NONE);
+    assert_eq!(h.app.active_cc_activity().unwrap().rows.len(), 1);
+    h.render();
+}
+
+#[test]
 fn review_jump_to_file_anchors_header_to_top() {
     let mut h = Harness::standard(1);
     open_review(&mut h, 5);

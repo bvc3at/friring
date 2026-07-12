@@ -168,6 +168,18 @@ impl SessionActivity {
             ProviderScan::Vibe(s) => s.truncated,
         }
     }
+
+    /// Test seam: an accumulator pre-filled with `events`, as if a scan pass
+    /// had ingested them (acceptance tests can't run the fs scan).
+    #[cfg(test)]
+    pub(super) fn seeded(provider: ProviderKind, events: Vec<ActivityEvent>) -> Self {
+        let mut act = Self::new(provider);
+        match &mut act.scan {
+            ProviderScan::Claude(s) => s.scan.events = events,
+            ProviderScan::Vibe(s) => s.scan.events = events,
+        }
+        act
+    }
 }
 
 /// Per-provider scan state. Append-only JSONL sources tail incrementally by
