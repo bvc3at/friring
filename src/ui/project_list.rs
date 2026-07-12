@@ -617,15 +617,28 @@ fn render_session_section(
     let mut block = focus_block(" Sessions ", level);
 
     if !sessions.is_empty() {
-        let dots: Vec<Span> = sessions
+        let mut dots: Vec<Span> = Vec::with_capacity(sessions.len() + 1);
+        // A count in front of the per-session dots makes "how many need me"
+        // scannable without counting colored glyphs (and it survives the dots
+        // being clipped on a narrow sidebar).
+        let blocked = sessions
             .iter()
-            .map(|info| {
-                Span::styled(
-                    super::status_glyph(info.status, spinner).to_string(),
-                    Style::default().fg(status_color(info.status)),
-                )
-            })
-            .collect();
+            .filter(|info| info.status == SessionStatus::Blocked)
+            .count();
+        if blocked > 0 {
+            dots.push(Span::styled(
+                format!("\u{25c6}{blocked} "),
+                Style::default()
+                    .fg(status_color(SessionStatus::Blocked))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        dots.extend(sessions.iter().map(|info| {
+            Span::styled(
+                super::status_glyph(info.status, spinner).to_string(),
+                Style::default().fg(status_color(info.status)),
+            )
+        }));
         block = block.title_top(Line::from(dots).right_aligned());
     }
 

@@ -48,6 +48,9 @@ pub enum Action {
     FocusForward,
     NextSession,
     PreviousSession,
+    /// Jump to the next session whose status is Blocked (needs attention),
+    /// scanning forward from the active session in rendered order (wraps).
+    NextBlockedSession,
     ToggleHelp,
     ToggleInfoPanel,
     ToggleFileViewer,
@@ -154,6 +157,7 @@ impl Action {
             Action::FocusForward,
             Action::NextSession,
             Action::PreviousSession,
+            Action::NextBlockedSession,
             Action::ToggleHelp,
             Action::ToggleInfoPanel,
             Action::ToggleFileViewer,
@@ -222,6 +226,7 @@ impl Action {
             Action::FocusForward => "Focus next pane",
             Action::NextSession => "Next session",
             Action::PreviousSession => "Previous session",
+            Action::NextBlockedSession => "Next blocked session",
             Action::ToggleHelp => "Help",
             Action::ToggleInfoPanel => "Toggle info panel",
             Action::ToggleFileViewer => "Toggle file viewer",
@@ -416,6 +421,11 @@ impl Action {
             Action::FocusForward => vec![KeyChord::ctrl('l')],
             Action::NextSession => vec![KeyChord::ctrl('j')],
             Action::PreviousSession => vec![KeyChord::ctrl('k')],
+            // F10 only (F1–F9 are taken, and every free bare `Ctrl+<letter>`
+            // would collide with readline in the terminal/shell panes — an
+            // F-key dispatches from any pane without a PTY collision). Fully
+            // rebindable.
+            Action::NextBlockedSession => vec![KeyChord::function(10)],
             Action::ToggleHelp => vec![KeyChord::ctrl('g'), KeyChord::function(1)],
             Action::ToggleInfoPanel => vec![KeyChord::ctrl('b'), KeyChord::function(2)],
             Action::ToggleFileViewer => vec![KeyChord::ctrl('e'), KeyChord::function(3)],
@@ -553,7 +563,13 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
     vec![
         (
             "Navigation",
-            vec![FocusBackward, FocusForward, NextSession, PreviousSession],
+            vec![
+                FocusBackward,
+                FocusForward,
+                NextSession,
+                PreviousSession,
+                NextBlockedSession,
+            ],
         ),
         (
             "Sessions",
@@ -1366,6 +1382,7 @@ mod tests {
                 Action::FocusForward => 0,
                 Action::NextSession => 0,
                 Action::PreviousSession => 0,
+                Action::NextBlockedSession => 0,
                 Action::ToggleHelp => 0,
                 Action::ToggleInfoPanel => 0,
                 Action::ToggleFileViewer => 0,
@@ -1414,7 +1431,7 @@ mod tests {
         }
         // The listed variants must equal Action::all().len(). If you add
         // a variant, update both `Action::all()` and the match above.
-        const EXPECTED: usize = 62;
+        const EXPECTED: usize = 63;
         assert_eq!(Action::all().len(), EXPECTED);
         for a in Action::all() {
             classify(*a);

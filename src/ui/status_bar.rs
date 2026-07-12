@@ -74,6 +74,11 @@ pub struct HeaderBadge<'a> {
 /// State needed to render the footer bar.
 pub struct FooterState<'a> {
     pub session_count: usize,
+    /// Sessions currently `Blocked` (needing attention). Rendered as a badge
+    /// next to the session count — with the live `NextBlockedSession`
+    /// shortcut as its hint — so attention is visible even when the sidebar
+    /// is hidden (narrow terminals) or its dots are clipped.
+    pub blocked_count: usize,
     pub status: Option<&'a StatusMessage>,
     pub focus_label: &'a str,
     pub sync_in_progress: bool,
@@ -276,6 +281,21 @@ fn push_idle_counts<'a>(spans: &mut Vec<Span<'a>>, state: &FooterState<'a>) {
         format!(" {} session(s) ", state.session_count),
         Style::default().fg(Theme::text_secondary()),
     ));
+    if state.blocked_count > 0 {
+        let shortcut = crate::session::compact_shortcut(
+            state.keybindings.chords_for(Action::NextBlockedSession),
+        );
+        let label = match shortcut {
+            Some(sc) => format!(" \u{25c6} {} blocked · {sc} ", state.blocked_count),
+            None => format!(" \u{25c6} {} blocked ", state.blocked_count),
+        };
+        spans.push(Span::styled(
+            label,
+            Style::default()
+                .fg(Theme::text_primary())
+                .bg(super::status_color(crate::session::SessionStatus::Blocked)),
+        ));
+    }
     if state.automation_count > 0 {
         spans.push(Span::styled(
             format!(" {} automation(s) ", state.automation_count),
@@ -386,6 +406,7 @@ mod tests {
     fn footer_state(file_viewer_open: bool) -> FooterState<'static> {
         FooterState {
             session_count: 1,
+            blocked_count: 0,
             status: None,
             focus_label: "Files",
             sync_in_progress: false,
@@ -605,6 +626,33 @@ mod tests {
         );
         let last = hits.iter().max_by_key(|(h, _)| h.rect.x).unwrap().0.rect;
         assert_eq!(last.x + last.width, 120);
+    }
+
+    /// Blocked sessions surface as a footer badge carrying the live
+    /// `NextBlockedSession` shortcut hint; without any it stays hidden.
+    /// Asserted on the spans directly (like the hint-cluster test below) —
+    /// the right-aligned pills overlay the left text in a full render.
+    #[test]
+    fn footer_blocked_badge_shows_count_and_shortcut() {
+        let idle_counts = |blocked: usize| -> String {
+            let mut state = footer_state(false);
+            state.blocked_count = blocked;
+            let mut spans = Vec::new();
+            push_idle_counts(&mut spans, &state);
+            spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+
+        let text = idle_counts(2);
+        assert!(
+            text.contains("◆ 2 blocked · F10"),
+            "blocked badge with live shortcut hint: {text:?}"
+        );
+
+        let text = idle_counts(0);
+        assert!(
+            !text.contains("blocked"),
+            "badge hidden with nothing blocked: {text:?}"
+        );
     }
 
     /// The left informational hint cluster advertises both Focus (^H/^L) and

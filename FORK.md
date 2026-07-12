@@ -181,6 +181,18 @@ list stays reachable for management (reorder, import) via `Ctrl+H` or a
 click on its empty area. See `docs/FEATURES.md` ("Focus model:
 terminal-first").
 
+#### Attention navigation (`F10` + blocked badges)
+
+Upstream surfaces a blocked agent only as a red dot (and a desktop
+notification) — there is no way to *navigate* by attention. The fork adds
+`F10` (rebindable `NextBlockedSession`): jump to the next `Blocked`
+session in rendered order (wrapping), focus landing in the terminal, so
+repeated presses walk the attention queue and answer each prompt in turn.
+The blocked count is badged in the session list's title bar (`◆N` ahead
+of the status dots) and in the footer (`◆ N blocked · F10`, with the live
+shortcut), so attention is visible even when the sidebar is hidden on a
+narrow terminal. See `docs/FEATURES.md` ("Live status & needs attention").
+
 ### Behavior fixes
 
 - **Worktree branch pre-fill keeps `/`.** In the new-worktree flow, the branch

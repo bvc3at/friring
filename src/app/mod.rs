@@ -4200,6 +4200,48 @@ impl App {
         self.active_index = order[next];
     }
 
+    /// Jump to the next session that needs attention (`Blocked`), scanning
+    /// forward from the active session in **rendered** order (wraps) and
+    /// landing focus in the terminal — so pressing the key repeatedly walks
+    /// the attention queue top-to-bottom, answering each prompt in turn.
+    /// Rendered order (not blocked-since time) so the walk matches the
+    /// sidebar the user is looking at; status never reorders rows, so the
+    /// walk is stable. No-ops with a status hint when nothing is blocked.
+    pub(crate) fn focus_next_blocked(&mut self) {
+        let order = self.render_order_indices();
+        if order.is_empty() {
+            return;
+        }
+        let pos = order
+            .iter()
+            .position(|&i| i == self.active_index)
+            .unwrap_or(0);
+        // Steps 1..len visit every *other* session once, so the active one
+        // (blocked or not) never counts as its own jump target.
+        let target = (1..order.len())
+            .map(|step| order[(pos + step) % order.len()])
+            .find(|&idx| self.sessions[idx].info.status == SessionStatus::Blocked);
+        match target {
+            Some(idx) => {
+                self.active_index = idx;
+                self.focus = InputFocus::Terminal;
+                self.on_focus_changed();
+            }
+            None => {
+                let active_blocked = self
+                    .sessions
+                    .get(self.active_index)
+                    .is_some_and(|s| s.info.status == SessionStatus::Blocked);
+                let msg = if active_blocked {
+                    "No other blocked sessions"
+                } else {
+                    "No blocked sessions"
+                };
+                self.set_status(StatusLevel::Info, msg);
+            }
+        }
+    }
+
     /// Switch to the previous session in the **rendered** order (wraps around).
     pub(crate) fn switch_session_backward(&mut self) {
         if self.sessions.is_empty() {
@@ -10490,6 +10532,56 @@ mod tests {
         app.active_index = 0;
         app.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL);
         assert_eq!(app.active_index, 2);
+    }
+
+    // --- Next-blocked navigation (F10) ---
+
+    #[test]
+    fn f10_walks_blocked_sessions_in_render_order_and_wraps() {
+        let mut app = app_with_sessions(4);
+        app.sessions[1].info.status = SessionStatus::Blocked;
+        app.sessions[3].info.status = SessionStatus::Blocked;
+        app.focus = InputFocus::SessionList;
+        app.active_index = 0;
+
+        // Routed through the real pipeline so the F10 default binding is
+        // covered too.
+        app.handle_key(KeyCode::F(10), KeyModifiers::NONE);
+        assert_eq!(app.active_index, 1);
+        assert_eq!(
+            app.focus,
+            InputFocus::Terminal,
+            "an attention jump lands in the terminal"
+        );
+
+        app.handle_key(KeyCode::F(10), KeyModifiers::NONE);
+        assert_eq!(app.active_index, 3);
+
+        // Past the last blocked session the walk wraps to the first.
+        app.handle_key(KeyCode::F(10), KeyModifiers::NONE);
+        assert_eq!(app.active_index, 1);
+    }
+
+    #[test]
+    fn f10_without_blocked_sessions_reports_and_stays() {
+        let mut app = app_with_sessions(2);
+        app.focus = InputFocus::Terminal;
+        app.active_index = 0;
+        app.handle_key(KeyCode::F(10), KeyModifiers::NONE);
+        assert_eq!(app.active_index, 0);
+        let msg = app.status_message.as_ref().expect("status hint set");
+        assert!(msg.text.contains("No blocked"), "{}", msg.text);
+    }
+
+    #[test]
+    fn f10_with_only_the_active_session_blocked_stays_put() {
+        let mut app = app_with_sessions(2);
+        app.sessions[0].info.status = SessionStatus::Blocked;
+        app.active_index = 0;
+        app.handle_key(KeyCode::F(10), KeyModifiers::NONE);
+        assert_eq!(app.active_index, 0);
+        let msg = app.status_message.as_ref().expect("status hint set");
+        assert!(msg.text.contains("No other blocked"), "{}", msg.text);
     }
 
     // --- Unified left-column (session list ↔ automations) navigation ---

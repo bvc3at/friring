@@ -904,6 +904,11 @@ impl App {
         };
         status_bar::FooterState {
             session_count: self.sessions.len(),
+            blocked_count: self
+                .sessions
+                .iter()
+                .filter(|s| s.info.status == crate::session::SessionStatus::Blocked)
+                .count(),
             status: self.status_message.as_ref(),
             focus_label,
             sync_in_progress: self.worktree_sync.in_progress,

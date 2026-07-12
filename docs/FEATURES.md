@@ -87,6 +87,15 @@ manual order is never disturbed (see *Smart ordering* below). Repo groups
 roll up to their most-urgent member
 (`Blocked > Error > Working > Done > Unreachable > Idle`).
 
+**Navigating to what needs you.** `F10` (rebindable `NextBlockedSession`)
+jumps to the next `Blocked` session — scanning forward from the active one
+in rendered order, wrapping — and lands focus in the terminal, so pressing
+it repeatedly walks the attention queue top-to-bottom, answering each
+prompt in turn. The blocked count is surfaced twice: a `◆N` badge ahead of
+the status dots in the session list's title bar, and a `◆ N blocked · F10`
+badge in the footer (carrying the live shortcut), so attention stays
+visible even when the sidebar is hidden on a narrow terminal.
+
 The hooks are wired automatically by the built-in **hooks** extension
 (auto-activated on first run; opt out with `thurbox-cli extension
 deactivate hooks`). How much each agent can report depends on the
@@ -489,6 +498,7 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Ctrl+J` | Global | Select next session | Vim: **j** = down |
 | `Ctrl+K` | Global | Select previous session | Vim: **k** = up |
 | `Ctrl+L` | Global | Focus next pane (cycle forward) | Vim: **l** = right |
+| `F10` | Global | Jump to next blocked session (wraps, focuses terminal) | Attention |
 | `Ctrl+D` | Session list | Delete selected session | Vim: **d** = delete |
 | `Ctrl+O` | Global | Open active session's worktrees in editor | **O**pen |
 | `Ctrl+R` | Global | Restart active session | **R**estart |
