@@ -73,9 +73,17 @@ sessions only.
   `app::activity::<provider>`, dispatched by the **command basename** of the
   session's `agents.toml` entry (so wrapper entries like `claude-opus`
   resolve). Sources are stat-signature-gated, append-only files tail
-  incrementally by byte offset, and nothing is persisted. Formats were
-  reverse-engineered from each CLI's source/docs (July 2026) and every parser
-  degrades to skipped records on drift.
+  incrementally by byte offset, SQLite stores are read read-only (WAL-aware),
+  and nothing is persisted. Formats were reverse-engineered from each CLI's
+  source/docs (July 2026) and every parser degrades to skipped records on
+  drift. Twelve providers ship: **claude** (main-transcript `tool_use`
+  tailing), **codex** (rollout JSONL, `history_mode`-aware), **gemini**,
+  **qwen**, **copilot**, **vibe**, **cursor-agent** (JSONL transcripts),
+  **opencode**, **goose**, **crush** (SQLite), **aider** (markdown history),
+  **cline** (full-rewrite JSON). Each provider honors its CLI's state-dir
+  env override (`CODEX_HOME`, `GEMINI_CLI_HOME`, `QWEN_HOME`, `COPILOT_HOME`,
+  `VIBE_HOME`, `CURSOR_DATA_DIR`, `GOOSE_PATH_ROOT`, `CLINE_DIR`, XDG for
+  opencode).
 - **Known-unsupported agents** show *why* in the Overview (e.g. `agy`
   encrypts its trajectory store; `amp` keeps threads server-side).
 - **The Claude workflow/subagent tree** (the original v1 feature) lives on
