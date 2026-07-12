@@ -15,6 +15,7 @@
 //! degrade to skipped records, never errors.
 
 pub mod claude;
+pub mod qwen;
 pub mod vibe;
 
 /// What kind of action an [`ActivityEvent`] records, normalized across

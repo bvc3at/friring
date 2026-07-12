@@ -14,6 +14,8 @@
 //! / [`App::poll_activity_refresh`]). While in flight the view keeps its last
 //! built rows, so rendering never blocks on the scan.
 
+mod qwen;
+
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom};
@@ -79,6 +81,7 @@ impl Section {
 pub(crate) enum ProviderKind {
     Claude,
     Vibe,
+    Qwen,
 }
 
 impl ProviderKind {
@@ -90,6 +93,7 @@ impl ProviderKind {
         match base {
             "claude" => Some(Self::Claude),
             "vibe" => Some(Self::Vibe),
+            "qwen" => Some(Self::Qwen),
             _ => None,
         }
     }
@@ -98,6 +102,7 @@ impl ProviderKind {
         match self {
             ProviderKind::Claude => "claude-code",
             ProviderKind::Vibe => "vibe",
+            ProviderKind::Qwen => "qwen-code",
         }
     }
 }
@@ -137,6 +142,7 @@ impl SessionActivity {
         let scan = match provider {
             ProviderKind::Claude => ProviderScan::Claude(ClaudeSource::default()),
             ProviderKind::Vibe => ProviderScan::Vibe(VibeSource::default()),
+            ProviderKind::Qwen => ProviderScan::Qwen(qwen::QwenSource::default()),
         };
         Self {
             provider,
@@ -149,6 +155,7 @@ impl SessionActivity {
         match &self.scan {
             ProviderScan::Claude(s) => &s.scan.events,
             ProviderScan::Vibe(s) => &s.scan.events,
+            ProviderScan::Qwen(s) => &s.scan.events,
         }
     }
 
@@ -158,6 +165,7 @@ impl SessionActivity {
             // The transcript has no meta records — everything lives in the
             // sidecar meta.json.
             ProviderScan::Vibe(s) => s.meta.meta.clone(),
+            ProviderScan::Qwen(s) => s.scan.meta.clone(),
         }
     }
 
@@ -166,6 +174,7 @@ impl SessionActivity {
         match &self.scan {
             ProviderScan::Claude(s) => s.truncated,
             ProviderScan::Vibe(s) => s.truncated,
+            ProviderScan::Qwen(s) => s.truncated,
         }
     }
 
@@ -177,6 +186,7 @@ impl SessionActivity {
         match &mut act.scan {
             ProviderScan::Claude(s) => s.scan.events = events,
             ProviderScan::Vibe(s) => s.scan.events = events,
+            ProviderScan::Qwen(s) => s.scan.events = events,
         }
         act
     }
@@ -188,6 +198,7 @@ impl SessionActivity {
 enum ProviderScan {
     Claude(ClaudeSource),
     Vibe(VibeSource),
+    Qwen(qwen::QwenSource),
 }
 
 /// Claude Code: the session's main conversation transcript
@@ -237,6 +248,7 @@ struct ActivityInput {
 struct ScanRoots {
     claude_projects: Option<PathBuf>,
     vibe_sessions: Option<PathBuf>,
+    qwen_projects: Option<PathBuf>,
 }
 
 impl App {
@@ -300,6 +312,7 @@ impl App {
         let roots = ScanRoots {
             claude_projects: crate::paths::claude_projects_dir(None),
             vibe_sessions: crate::paths::vibe_sessions_dir(None),
+            qwen_projects: qwen::qwen_projects_dir(None),
         };
         let tx = self.activity_refresh.start();
         tokio::task::spawn_blocking(move || {
@@ -342,6 +355,13 @@ fn collect_activity(roots: ScanRoots, inputs: Vec<ActivityInput>) -> ActivityRef
                 &mut state.sig,
                 roots.vibe_sessions.as_deref(),
                 &input.dirs,
+            ),
+            ProviderScan::Qwen(src) => qwen::scan_qwen(
+                src,
+                &mut state.sig,
+                roots.qwen_projects.as_deref(),
+                &input.dirs,
+                input.own_id.as_deref(),
             ),
         };
         updates.push((input.id, state, changed));
