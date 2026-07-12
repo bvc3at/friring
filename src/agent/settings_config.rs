@@ -239,6 +239,7 @@ pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
         set_table_bool(features, "automations", f.automations);
         set_table_bool(features, "file_viewer", f.file_viewer);
         set_table_bool(features, "global_search", f.global_search);
+        set_table_bool(features, "double_shift_search", f.double_shift_search);
         set_table_bool(features, "info_panel", f.info_panel);
         set_table_bool(features, "shell_pane", f.shell_pane);
         set_table_bool(features, "code_review", f.code_review);
@@ -397,6 +398,7 @@ mod tests {
         // Non-default so the round-trip check below would catch a dropped key.
         s.info_panel_position = crate::session::settings::InfoPanelPosition::Inline;
         s.features.tasks = false;
+        s.features.double_shift_search = false;
         s.features.version_check = true;
         s.features.auto_update = true;
         s.notifications.min_interval_secs = 30;
