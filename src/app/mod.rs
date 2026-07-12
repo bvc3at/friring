@@ -693,6 +693,12 @@ struct PendingDelete {
 pub struct App {
     pub(crate) sessions: Vec<Session>,
     pub(crate) active_index: usize,
+    /// The session that was active before the last deliberate switch, for the
+    /// `LastSession` toggle (tmux `last-window`). By id, not index — deletes
+    /// shift indices; a stale id is dropped lazily by the toggle. Recorded by
+    /// [`Self::set_active_index`]; bookkeeping moves (restore reshuffles,
+    /// delete clamps, search previews) bypass it on purpose.
+    last_active_session: Option<SessionId>,
     backends: BackendRegistry,
     /// Registry of declarative agent definitions, used to build providers per
     /// session at spawn/restart time.
@@ -1065,6 +1071,7 @@ impl App {
         let mut app = Self {
             sessions: Vec::new(),
             active_index: 0,
+            last_active_session: None,
             backends,
             agents,
             hosts: crate::session::HostRegistry::default(),
@@ -2081,7 +2088,7 @@ impl App {
 
         let session_name = pending.session.info.name.clone();
         self.sessions.push(pending.session);
-        self.active_index = self.sessions.len() - 1;
+        self.set_active_index(self.sessions.len() - 1);
         self.save_state();
 
         self.set_status(StatusLevel::Success, format!("Restored '{session_name}'"));
@@ -2222,7 +2229,7 @@ impl App {
                 // session simply re-appends at the end of its repo group.
                 resolve_repo_display_names(&mut session.info);
                 self.sessions.push(session);
-                self.active_index = self.sessions.len() - 1;
+                self.set_active_index(self.sessions.len() - 1);
                 self.focus = InputFocus::Terminal;
 
                 self.save_state();
@@ -2787,7 +2794,7 @@ impl App {
         match action {
             ClickAction::SelectSession(display_idx) => {
                 if let Some(&idx) = self.render_order_indices().get(display_idx) {
-                    self.active_index = idx;
+                    self.set_active_index(idx);
                 }
                 // Clicking a row is *activation*, not list management: land in
                 // the terminal (like Enter / a notification click) so typing
@@ -3888,7 +3895,7 @@ impl App {
         }
         let session_id = session.info.id;
         self.sessions.push(session);
-        self.active_index = self.sessions.len() - 1;
+        self.set_active_index(self.sessions.len() - 1);
         self.focus = InputFocus::Terminal;
         self.status_message = None;
 
@@ -4174,7 +4181,7 @@ impl App {
     /// the automations pane back into the session list.
     pub(crate) fn select_last_session(&mut self) {
         if let Some(&last) = self.render_order_indices().last() {
-            self.active_index = last;
+            self.set_active_index(last);
         }
     }
 
@@ -4182,8 +4189,44 @@ impl App {
     /// the automations pane back to the top of the session list.
     pub(crate) fn select_first_session(&mut self) {
         if let Some(&first) = self.render_order_indices().first() {
-            self.active_index = first;
+            self.set_active_index(first);
         }
+    }
+
+    /// Change the active session, remembering the one it replaces for the
+    /// `LastSession` toggle. Every *deliberate* switch funnels through here
+    /// (Ctrl+J/K, list j/k, clicks, jumps, search commit, spawn/undelete);
+    /// bookkeeping moves that merely keep the selection valid (restore
+    /// reshuffles, delete clamps, search live-previews) assign `active_index`
+    /// directly so they never pollute the toggle history.
+    pub(crate) fn set_active_index(&mut self, idx: usize) {
+        if idx != self.active_index {
+            self.last_active_session = self.active_session_id();
+        }
+        self.active_index = idx;
+    }
+
+    /// Toggle between the two most recent sessions (tmux `last-window`, vim's
+    /// alternate buffer — hence the `Ctrl+^`/`Ctrl+6` default). Focus lands in
+    /// the terminal like the other jumps, and the toggle re-records the
+    /// session it left, so pressing it again bounces back.
+    pub(crate) fn toggle_last_session(&mut self) {
+        let Some(id) = self.last_active_session else {
+            self.set_status(StatusLevel::Info, "No previous session");
+            return;
+        };
+        let Some(idx) = self.sessions.iter().position(|s| s.info.id == id) else {
+            // The remembered session was deleted since; drop the stale id.
+            self.last_active_session = None;
+            self.set_status(StatusLevel::Info, "Previous session is gone");
+            return;
+        };
+        if idx == self.active_index {
+            return;
+        }
+        self.set_active_index(idx);
+        self.focus = InputFocus::Terminal;
+        self.on_focus_changed();
     }
 
     /// Switch to the next session in the **rendered** order (wraps around).
@@ -4197,7 +4240,7 @@ impl App {
             .position(|&i| i == self.active_index)
             .unwrap_or(0);
         let next = (pos + 1) % order.len();
-        self.active_index = order[next];
+        self.set_active_index(order[next]);
     }
 
     /// Jump to the next session that needs attention (`Blocked`), scanning
@@ -4223,7 +4266,7 @@ impl App {
             .find(|&idx| self.sessions[idx].info.status == SessionStatus::Blocked);
         match target {
             Some(idx) => {
-                self.active_index = idx;
+                self.set_active_index(idx);
                 self.focus = InputFocus::Terminal;
                 self.on_focus_changed();
             }
@@ -4253,7 +4296,7 @@ impl App {
             .position(|&i| i == self.active_index)
             .unwrap_or(0);
         let prev = if pos == 0 { order.len() - 1 } else { pos - 1 };
-        self.active_index = order[prev];
+        self.set_active_index(order[prev]);
     }
 
     fn handle_resize(&mut self, cols: u16, rows: u16) {
@@ -5040,7 +5083,7 @@ impl App {
             debug!("focus request for unknown session {id}; ignoring");
             return;
         };
-        self.active_index = idx;
+        self.set_active_index(idx);
         self.focus = InputFocus::Terminal;
         info!("focused session {id} from notification click");
     }
@@ -10532,6 +10575,46 @@ mod tests {
         app.active_index = 0;
         app.handle_key(KeyCode::Char('k'), KeyModifiers::CONTROL);
         assert_eq!(app.active_index, 2);
+    }
+
+    // --- Last-session toggle (Ctrl+6 / Ctrl+^) ---
+
+    #[test]
+    fn ctrl6_bounces_between_the_two_most_recent_sessions() {
+        let mut app = app_with_sessions(3);
+        app.active_index = 0;
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(app.active_index, 1);
+
+        app.handle_key(KeyCode::Char('6'), KeyModifiers::CONTROL);
+        assert_eq!(app.active_index, 0);
+        assert_eq!(app.focus, InputFocus::Terminal, "the toggle is a jump");
+
+        // The kitty-protocol encoding of the same physical key.
+        app.handle_key(KeyCode::Char('^'), KeyModifiers::CONTROL);
+        assert_eq!(app.active_index, 1);
+    }
+
+    #[test]
+    fn last_session_toggle_without_history_reports() {
+        let mut app = app_with_sessions(2);
+        app.active_index = 0;
+        app.handle_key(KeyCode::Char('6'), KeyModifiers::CONTROL);
+        assert_eq!(app.active_index, 0);
+        let msg = app.status_message.as_ref().expect("status hint set");
+        assert!(msg.text.contains("No previous"), "{}", msg.text);
+    }
+
+    #[test]
+    fn last_session_toggle_drops_a_deleted_previous_session() {
+        let mut app = app_with_sessions(2);
+        app.active_index = 0;
+        app.last_active_session = Some(SessionId::default());
+        app.handle_key(KeyCode::Char('6'), KeyModifiers::CONTROL);
+        assert_eq!(app.active_index, 0);
+        assert_eq!(app.last_active_session, None, "stale id dropped");
+        let msg = app.status_message.as_ref().expect("status hint set");
+        assert!(msg.text.contains("gone"), "{}", msg.text);
     }
 
     // --- Next-blocked navigation (F10) ---

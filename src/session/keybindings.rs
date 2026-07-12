@@ -51,6 +51,9 @@ pub enum Action {
     /// Jump to the next session whose status is Blocked (needs attention),
     /// scanning forward from the active session in rendered order (wraps).
     NextBlockedSession,
+    /// Toggle between the two most recent sessions (tmux `last-window`,
+    /// vim's alternate buffer).
+    LastSession,
     ToggleHelp,
     ToggleInfoPanel,
     ToggleFileViewer,
@@ -158,6 +161,7 @@ impl Action {
             Action::NextSession,
             Action::PreviousSession,
             Action::NextBlockedSession,
+            Action::LastSession,
             Action::ToggleHelp,
             Action::ToggleInfoPanel,
             Action::ToggleFileViewer,
@@ -227,6 +231,7 @@ impl Action {
             Action::NextSession => "Next session",
             Action::PreviousSession => "Previous session",
             Action::NextBlockedSession => "Next blocked session",
+            Action::LastSession => "Last session (toggle)",
             Action::ToggleHelp => "Help",
             Action::ToggleInfoPanel => "Toggle info panel",
             Action::ToggleFileViewer => "Toggle file viewer",
@@ -426,6 +431,13 @@ impl Action {
             // F-key dispatches from any pane without a PTY collision). Fully
             // rebindable.
             Action::NextBlockedSession => vec![KeyChord::function(10)],
+            // Ctrl+^ — vim's alternate-buffer chord, reached as Ctrl+6 on US
+            // layouts. Terminals encode it inconsistently (like Ctrl+/ above):
+            // legacy ones send the raw 0x1E byte that crossterm decodes as
+            // `Ctrl+6`, kitty-protocol ones deliver the shifted `Ctrl+^` — so
+            // both are bound. Not a bare Ctrl+<letter>, so it never defers to
+            // the PTY. Fully rebindable.
+            Action::LastSession => vec![KeyChord::ctrl('6'), KeyChord::ctrl('^')],
             Action::ToggleHelp => vec![KeyChord::ctrl('g'), KeyChord::function(1)],
             Action::ToggleInfoPanel => vec![KeyChord::ctrl('b'), KeyChord::function(2)],
             Action::ToggleFileViewer => vec![KeyChord::ctrl('e'), KeyChord::function(3)],
@@ -569,6 +581,7 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
                 NextSession,
                 PreviousSession,
                 NextBlockedSession,
+                LastSession,
             ],
         ),
         (
@@ -1383,6 +1396,7 @@ mod tests {
                 Action::NextSession => 0,
                 Action::PreviousSession => 0,
                 Action::NextBlockedSession => 0,
+                Action::LastSession => 0,
                 Action::ToggleHelp => 0,
                 Action::ToggleInfoPanel => 0,
                 Action::ToggleFileViewer => 0,
@@ -1431,7 +1445,7 @@ mod tests {
         }
         // The listed variants must equal Action::all().len(). If you add
         // a variant, update both `Action::all()` and the match above.
-        const EXPECTED: usize = 63;
+        const EXPECTED: usize = 64;
         assert_eq!(Action::all().len(), EXPECTED);
         for a in Action::all() {
             classify(*a);

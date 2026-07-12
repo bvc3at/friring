@@ -193,6 +193,15 @@ of the status dots) and in the footer (`◆ N blocked · F10`, with the live
 shortcut), so attention is visible even when the sidebar is hidden on a
 narrow terminal. See `docs/FEATURES.md` ("Live status & needs attention").
 
+#### Quick session switching (last-session toggle)
+
+`Ctrl+6` / `Ctrl+^` (rebindable `LastSession`) bounces between the two
+most recent sessions — tmux `last-window`, vim's alternate buffer. Every
+deliberate switch records the session it left (`Ctrl+J`/`K`, list `j`/`k`,
+clicks, jumps, a committed global-search result, spawn/undelete);
+bookkeeping moves (restore reshuffles, delete clamps, search
+live-previews) don't, so the toggle always means "where I actually was".
+
 ### Behavior fixes
 
 - **Worktree branch pre-fill keeps `/`.** In the new-worktree flow, the branch

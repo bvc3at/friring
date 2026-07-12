@@ -476,6 +476,17 @@ impl App {
             .as_ref()
             .map(|s| s.focus)
             .unwrap_or(InputFocus::SessionList);
+        // For the LastSession toggle the meaningful "previous" is the session
+        // active before the search *opened* — live previews already moved
+        // `active_index` while browsing results, so recording via
+        // `set_active_index` here would remember an arbitrary preview.
+        let prior_index = self
+            .global_search
+            .snapshot
+            .as_ref()
+            .map(|s| s.active_index.min(self.sessions.len().saturating_sub(1)))
+            .unwrap_or(self.active_index);
+        let prior_id = self.sessions.get(prior_index).map(|s| s.info.id);
         self.global_search.active = false;
         self.global_search.results.clear();
         self.global_search.query.clear();
@@ -483,6 +494,9 @@ impl App {
         match result.target {
             SearchTarget::Session { index } => {
                 if index < self.sessions.len() {
+                    if index != prior_index {
+                        self.last_active_session = prior_id;
+                    }
                     self.active_index = index;
                     self.focus = InputFocus::Terminal;
                 } else {

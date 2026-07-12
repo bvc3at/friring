@@ -1184,6 +1184,7 @@ impl App {
             Action::NextSession => self.switch_session_forward(),
             Action::PreviousSession => self.switch_session_backward(),
             Action::NextBlockedSession => self.focus_next_blocked(),
+            Action::LastSession => self.toggle_last_session(),
             _ => return None,
         }
         Some(true)

@@ -499,6 +499,7 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Ctrl+K` | Global | Select previous session | Vim: **k** = up |
 | `Ctrl+L` | Global | Focus next pane (cycle forward) | Vim: **l** = right |
 | `F10` | Global | Jump to next blocked session (wraps, focuses terminal) | Attention |
+| `Ctrl+6` / `Ctrl+^` | Global | Toggle between the two most recent sessions | vim alternate buffer |
 | `Ctrl+D` | Session list | Delete selected session | Vim: **d** = delete |
 | `Ctrl+O` | Global | Open active session's worktrees in editor | **O**pen |
 | `Ctrl+R` | Global | Restart active session | **R**estart |
