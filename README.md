@@ -495,9 +495,11 @@ rm -rf ~/.local/share/thurbox ~/.config/thurbox
    `Ctrl+O` opens the session's worktree in your editor. Keystrokes
    land in the terminal by default — clicking a session row (or
    launching with restored sessions) focuses the right pane — and
-   `Alt+1`–`Alt+9` jump to the Nth session from any pane; hold `Alt`
-   on kitty-protocol terminals to paint those numbers on the rows,
-   and `F10` walks the blocked sessions.
+   `Alt+1`–`Alt+9` jump to the Nth session; hold `Alt` on
+   kitty-protocol terminals to paint those numbers on the rows, and
+   `F10` walks the blocked sessions. (Like the other global chords,
+   these are swallowed while a capture pane — code review, F9
+   activity, an editor — has focus.)
 5. **Quit without killing** — `Ctrl+Q` detaches all sessions.
    Tmux keeps them running; relaunch `thurbox` and they resume.
 
