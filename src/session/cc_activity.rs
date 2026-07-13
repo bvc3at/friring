@@ -645,18 +645,26 @@ pub fn parse_conversation_head(s: &str) -> CcConversationMeta {
 /// [`parse_session_names`]: Claude Code appends `{"type":"custom-title",
 /// "customTitle":…}` on `/rename` and `{"type":"ai-title","aiTitle":…}` when it
 /// auto-titles a session (verified v2.1.207).
+///
+/// Each field is the **last value seen** in the chunk, kept raw so a three-way
+/// distinction survives the head/tail [`or`](Self::or) merge: `None` means no
+/// line of that type appeared, while `Some("")` records an explicit *clear* (a
+/// rename back to empty). A newer chunk's clear must override an older chunk's
+/// name rather than fall back to it, so the empty-vs-absent difference has to
+/// reach the merge; it is collapsed only in [`best`](Self::best).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CcSessionNames {
-    /// The newest user-set title (`/rename`).
+    /// The last user-set title (`/rename`); `Some("")` on an explicit clear.
     pub custom: Option<String>,
-    /// The newest auto-generated title.
+    /// The last auto-generated title; `Some("")` on an explicit clear.
     pub ai: Option<String>,
 }
 
 impl CcSessionNames {
-    /// Merge with an `older` chunk's scan, keeping `self`'s fields when both
-    /// have one (callers scan the file tail before the head — rename lines are
-    /// appended, so the tail holds the newest).
+    /// Merge with an `older` chunk's scan, keeping `self`'s fields whenever it
+    /// saw a line of that type at all — including a clear (`Some("")`). Callers
+    /// scan the file tail before the head, and rename lines are appended, so
+    /// the tail is newer: a name (or a clear) in the tail wins over the head.
     pub fn or(self, older: CcSessionNames) -> CcSessionNames {
         CcSessionNames {
             custom: self.custom.or(older.custom),
@@ -665,20 +673,24 @@ impl CcSessionNames {
     }
 
     /// The display name: a user-set title beats the auto title — the
-    /// precedence Claude Code's own resume picker applies.
+    /// precedence Claude Code's own resume picker applies. An empty value (a
+    /// cleared rename) is treated as no title, so it falls through instead of
+    /// showing a blank name.
     pub fn best(self) -> Option<String> {
-        self.custom.or(self.ai)
+        let non_empty = |t: Option<String>| t.filter(|s| !s.trim().is_empty());
+        non_empty(self.custom).or_else(|| non_empty(self.ai))
     }
 }
 
 /// Extract a session's name from a chunk of its top-level transcript. Name
-/// lines are appended on every change, so within a chunk the **last** one wins
-/// — and a last-seen *empty* value (a cleared rename) hides earlier lines in
-/// the chunk instead of falling back to them, mirroring Claude Code's own
-/// last-line-only read.
+/// lines are appended on every change, so within a chunk the **last** one of
+/// each type wins — a last-seen *empty* value (a cleared rename) overriding
+/// earlier lines rather than falling back to them, mirroring Claude Code's own
+/// last-line-only read. The empty value is preserved (not dropped here) so the
+/// head/tail merge in [`CcSessionNames::or`] can honor a clear; see that type's
+/// doc for the three-state representation.
 pub fn parse_session_names(s: &str) -> CcSessionNames {
-    let mut custom: Option<String> = None;
-    let mut ai: Option<String> = None;
+    let mut names = CcSessionNames::default();
     for line in s.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -688,15 +700,12 @@ pub fn parse_session_names(s: &str) -> CcSessionNames {
             continue;
         };
         match str_field(&v, "type").as_deref() {
-            Some("custom-title") => custom = str_field(&v, "customTitle").or(custom),
-            Some("ai-title") => ai = str_field(&v, "aiTitle").or(ai),
+            Some("custom-title") => names.custom = str_field(&v, "customTitle").or(names.custom),
+            Some("ai-title") => names.ai = str_field(&v, "aiTitle").or(names.ai),
             _ => {}
         }
     }
-    CcSessionNames {
-        custom: custom.filter(|t| !t.trim().is_empty()),
-        ai: ai.filter(|t| !t.trim().is_empty()),
-    }
+    names
 }
 
 /// Parse an `agent-<id>.jsonl` transcript into the block stream the view
@@ -1039,7 +1048,8 @@ garbage line that is not json
     #[test]
     fn session_names_cleared_rename_hides_earlier_lines() {
         // A rename to "" clears the name; the earlier custom title must not
-        // resurface, but the auto title still may.
+        // resurface, but the auto title still may. The clear is kept as
+        // `Some("")` (not dropped) so the head/tail merge can honor it.
         let jsonl = concat!(
             r#"{"type":"custom-title","customTitle":"Old name"}"#,
             "\n",
@@ -1049,7 +1059,7 @@ garbage line that is not json
             "\n",
         );
         let n = parse_session_names(jsonl);
-        assert_eq!(n.custom, None);
+        assert_eq!(n.custom.as_deref(), Some(""));
         assert_eq!(n.best().as_deref(), Some("Auto title"));
     }
 
@@ -1064,6 +1074,31 @@ garbage line that is not json
         let merged = tail.or(head);
         assert_eq!(merged.custom.as_deref(), Some("Head name"));
         assert_eq!(merged.ai.as_deref(), Some("Tail auto"));
+    }
+
+    #[test]
+    fn session_names_merge_honors_a_clear_in_the_newer_chunk() {
+        // The head named the session; the tail (newer) cleared it. The old
+        // name must not resurface through the merge — the cleared field wins
+        // and `best()` falls through (here, to nothing).
+        let head = parse_session_names(r#"{"type":"custom-title","customTitle":"Head name"}"#);
+        let tail = parse_session_names(r#"{"type":"custom-title","customTitle":""}"#);
+        let merged = tail.or(head);
+        assert_eq!(merged.custom.as_deref(), Some(""));
+        assert_eq!(merged.best(), None);
+
+        // With an auto title also present in the head, the cleared custom title
+        // falls through to it rather than back to the old custom name.
+        let head_with_ai = parse_session_names(concat!(
+            r#"{"type":"custom-title","customTitle":"Head name"}"#,
+            "\n",
+            r#"{"type":"ai-title","aiTitle":"Head auto"}"#,
+        ));
+        let cleared = parse_session_names(r#"{"type":"custom-title","customTitle":""}"#);
+        assert_eq!(
+            cleared.or(head_with_ai).best().as_deref(),
+            Some("Head auto")
+        );
     }
 
     #[test]
