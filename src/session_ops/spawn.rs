@@ -125,6 +125,7 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         cwd: Some(launch_cwd.clone()),
         agent: agent_name.clone(),
         backend: (backend_type != LOCAL_TMUX_BACKEND_TYPE).then(|| backend_type.clone()),
+        session_name: Some(req.name.clone()),
         ..SessionConfig::default()
     };
     super::inject_friring_env(&mut config, &agent_session_id, req.task_id);

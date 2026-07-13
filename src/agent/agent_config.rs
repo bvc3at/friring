@@ -25,8 +25,8 @@ pub const BUILTIN_AGENTS_TOML: &str = r#"# Friring coding-agent definitions.
 #
 # Each [[agents]] entry describes how to launch one coding-agent CLI. The
 # `*_args` groups are appended only when their value is present, with {id}
-# substituted. `args` is always passed — put any extra flags (e.g. a model)
-# there. Add your own [[agents]] entries to support any CLI.
+# and {name} substituted. `args` is always passed — put any extra flags
+# (e.g. a model) there. Add your own [[agents]] entries to support any CLI.
 #
 # Unknown keys are reported on startup (and fail `friring-cli config
 # validate`) but don't break the load — your agents stay in effect.
@@ -34,12 +34,17 @@ pub const BUILTIN_AGENTS_TOML: &str = r#"# Friring coding-agent definitions.
 config_version = 1
 default = "claude"
 
+# claude also takes the friring session name (`-n {name}`) when a conversation
+# is *created* (fresh spawn or fork), so it shows up under the same name in
+# claude's own /resume picker. Resume deliberately omits {name}: a restart
+# never renames a conversation the agent already owns (e.g. after an in-agent
+# /rename).
 [[agents]]
 name = "claude"
 command = "claude"
 resume_args = ["--resume", "{id}"]
-fork_args = ["--resume", "{id}", "--fork-session"]
-new_session_args = ["--session-id", "{id}"]
+fork_args = ["--resume", "{id}", "--fork-session", "-n", "{name}"]
+new_session_args = ["--session-id", "{id}", "-n", "{name}"]
 
 # codex can't pin or report its session id, so resume/fork target the most
 # recent session in the launch directory. friring keeps that directory stable
@@ -101,9 +106,9 @@ command = "vibe"
 # name = "my-agent"             # shown in the new-session agent picker
 # command = "my-agent-cli"      # the executable on your PATH
 # args = []                     # ALWAYS passed (see "Pin a model" below)
-# resume_args = []              # appended on restart/resume, with {id} substituted
-# fork_args = []                # appended on Ctrl+F fork, with {id} substituted
-# new_session_args = []         # appended on a fresh spawn, with {id} substituted
+# resume_args = []              # appended on restart/resume, with {id}/{name} substituted
+# fork_args = []                # appended on Ctrl+F fork, with {id}/{name} substituted
+# new_session_args = []         # appended on a fresh spawn, with {id}/{name} substituted
 # resume_latest = false         # true ⇒ resume "the last session in this dir"
 #                               #   (id-less flags); leave false to pin by {id}
 #
@@ -112,6 +117,11 @@ command = "vibe"
 # everything else use `resume_latest = true` with id-less, cwd-scoped flags
 # (e.g. `["resume", "--last"]`). Omit every resume group to start fresh on
 # restart.
+#
+# {name} is the friring session name, for agents whose CLI can name a session
+# at launch (claude's `-n {name}`). A launch without a name drops the {name}
+# token together with its preceding flag, so the pair vanishes cleanly. Omit
+# {name} everywhere for agents with no naming flag.
 #
 # ──────────────────────────────────────────────────────────────────────────
 # Pin a model (or any flag) — put it in `args`, which is always passed
@@ -125,8 +135,8 @@ command = "vibe"
 # command = "claude"
 # args = ["--model", "opus"]    # always-on flag
 # resume_args = ["--resume", "{id}"]
-# fork_args = ["--resume", "{id}", "--fork-session"]
-# new_session_args = ["--session-id", "{id}"]
+# fork_args = ["--resume", "{id}", "--fork-session", "-n", "{name}"]
+# new_session_args = ["--session-id", "{id}", "-n", "{name}"]
 #
 # Set `default = "claude-opus"` at the top of this file to make it the default.
 "#;

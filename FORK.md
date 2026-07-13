@@ -207,6 +207,24 @@ creates a normal session that `--resume`s it **in a directory you choose**
   than restoring; surfacing other agents' conversation stores (codex/opencode)
   if they ever expose stable resume-by-id semantics.
 
+#### Session name passed to the agent (`{name}` in agents.toml)
+
+Upstream's session name lives only in the Thurbox DB and UI (plus the
+sanitized `tb-<name>` tmux window title); the agent's own conversation gets an
+auto-generated title. The fork adds a `{name}` placeholder to the
+`agents.toml` argument templates — substituted with the friring session name
+alongside `{id}` — and the seeded claude entry uses it (`-n {name}` in
+`new_session_args` and `fork_args`, verified claude v2.1.207), so a
+conversation friring *creates* shows up under the same name in claude's own
+`/resume` picker. Resume templates deliberately omit `{name}`: a restart never
+renames a conversation the agent already owns (an in-agent `/rename`
+survives), and conversation *imports* keep the CC title untouched for the same
+reason. A name-less launch drops a `{name}` token together with its preceding
+flag (no dangling `-n`); previously-seeded `agents.toml` files keep working
+and opt in by adding the flag pair. Claude only for now — codex/agy have no
+launch-time naming, opencode's needs its `run -i` entry mode. Details in
+`docs/CONFIG.md` ("agents.toml").
+
 #### Inline info-pane docking (`info_panel_position`)
 
 Upstream's F2 info panel is always a dedicated column (needs ≥120 cols and

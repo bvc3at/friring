@@ -111,8 +111,8 @@ name = "claude"             # display + lookup name (unique)
 command = "claude"          # executable
 args = []                   # always passed; bake a model here if you want one
 resume_args = ["--resume", "{id}"]            # emitted when resuming
-fork_args = ["--resume", "{id}", "--fork-session"]
-new_session_args = ["--session-id", "{id}"]   # emitted on a fresh spawn
+fork_args = ["--resume", "{id}", "--fork-session", "-n", "{name}"]
+new_session_args = ["--session-id", "{id}", "-n", "{name}"]  # fresh spawn
 resume_latest = false       # true = id-less "resume last session in cwd"
 ```
 
@@ -124,6 +124,18 @@ ever passed** — each agent uses its own default config, so bake
 **agent name**; there are no per-session model/permission/prompt/tool
 knobs. An agent that omits `resume_args` starts fresh on restart; the
 live tmux process is what carries its state across TUI restarts.
+
+`{name}` is substituted with the **friring session name**, for agents
+whose CLI can name a session at launch: the seeded claude entry passes
+`-n {name}` when a conversation is *created* (fresh spawn or fork), so
+it shows up under the same name in claude's own `/resume` picker. The
+resume group deliberately omits `{name}` — a restart never renames a
+conversation the agent already owns (e.g. after an in-agent `/rename`).
+A launch without a name drops a `{name}` token together with its
+preceding flag, so the pair vanishes cleanly; agents with no naming
+flag simply don't reference `{name}`. An `agents.toml` seeded before
+`{name}` existed keeps working — add `-n {name}` to your claude entry
+to opt in.
 
 **Session-id pinning vs. `resume_latest`.** friring generates the
 `agent_session_id` (a UUID), but only `claude` accepts it at creation

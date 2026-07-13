@@ -42,6 +42,10 @@ fn build_restart_plan(session: &SharedSession) -> Result<RestartPlan, String> {
         agent_session_id: Some(agent_session_id.clone()),
         cwd: session.cwd.clone(),
         agent: session.agent.clone(),
+        // Only reaches the args when the restart falls back to a *fresh*
+        // conversation (no transcript → new_session_args); a resume never
+        // renames — the resume template carries no {name}.
+        session_name: Some(session.name.clone()),
         ..SessionConfig::default()
     };
     super::inject_friring_env(&mut config, &agent_session_id, None);

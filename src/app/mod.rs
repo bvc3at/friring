@@ -1694,6 +1694,7 @@ impl App {
         };
 
         let agent = session.info.agent.clone();
+        let session_name = session.info.name.clone();
         // Keep the same friring identity across a restart so injected env stays
         // stable (`FRIRING_SESSION`).
         let session_id = session.info.id;
@@ -1713,6 +1714,9 @@ impl App {
             agent,
             fork_session_id: None,
             backend: crate::session::is_remote_backend(&backend_type).then_some(backend_type),
+            // Only reaches the args when the restart falls back to a fresh
+            // conversation (new_session_args); a resume never renames.
+            session_name: Some(session_name),
             ..SessionConfig::default()
         };
         // `Session::restart` replaces the session env wholesale, so re-inject the
@@ -2246,6 +2250,7 @@ impl App {
             deleted.id,
             deleted.agent_session_id.clone(),
             deleted.agent,
+            deleted.name.clone(),
             cwd,
             &deleted.backend_type,
         );
@@ -3886,6 +3891,7 @@ impl App {
     /// the backend is unknown or unreachable.
     fn build_spawn_inputs(
         &mut self,
+        name: &str,
         config: &SessionConfig,
         worktrees: &[WorktreeInfo],
         additional_dirs: &[PathBuf],
@@ -3896,6 +3902,9 @@ impl App {
         if config.agent.is_empty() {
             config.agent = self.agents.default_name();
         }
+        // Fill `{name}` in the agent's launch templates (e.g. claude's `-n`) so
+        // a conversation this spawn *creates* carries the friring session name.
+        config.session_name = Some(name.to_string());
         let agent_session_id = config
             .agent_session_id
             .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
@@ -4030,7 +4039,8 @@ impl App {
         let additional_dirs = std::mem::take(&mut self.new_session.additional_dirs);
         let parent_session_id = self.new_session.parent_session_id.take();
         let base_branch = self.new_session.spawn_base_branch.take();
-        let Some(inputs) = self.build_spawn_inputs(config, &worktrees, &additional_dirs) else {
+        let Some(inputs) = self.build_spawn_inputs(&name, config, &worktrees, &additional_dirs)
+        else {
             return;
         };
         // Synchronous path: blocking on backend readiness here is the point.
@@ -4086,7 +4096,8 @@ impl App {
         let additional_dirs = std::mem::take(&mut self.new_session.additional_dirs);
         let parent_session_id = self.new_session.parent_session_id.take();
         let base_branch = self.new_session.spawn_base_branch.take();
-        let Some(inputs) = self.build_spawn_inputs(config, &worktrees, &additional_dirs) else {
+        let Some(inputs) = self.build_spawn_inputs(&name, config, &worktrees, &additional_dirs)
+        else {
             return;
         };
         let task_prompt = self.task_ui.pending_task_prompt.take();
@@ -5741,6 +5752,7 @@ impl App {
         id: crate::session::SessionId,
         agent_session_id: Option<String>,
         agent: String,
+        name: String,
         cwd: Option<PathBuf>,
         backend_type: &str,
     ) -> SessionConfig {
@@ -5754,6 +5766,9 @@ impl App {
             // dir vars for remote sessions. Local stays `None`.
             backend: crate::session::is_remote_backend(backend_type)
                 .then(|| backend_type.to_string()),
+            // Only reaches the args when the relaunch starts a fresh
+            // conversation (new_session_args); a resume never renames.
+            session_name: Some(name),
             ..SessionConfig::default()
         };
         // `FRIRING_SESSION` (derived from `session_id`) is the identity that
@@ -5793,6 +5808,7 @@ impl App {
             shared_session.id,
             Some(agent_sid.clone()),
             shared_session.agent.clone(),
+            shared_session.name.clone(),
             cwd,
             &shared_session.backend_type,
         );
@@ -7440,6 +7456,7 @@ mod tests {
             id,
             Some("agent-conv-uuid".into()),
             "claude".into(),
+            "restored".into(),
             None,
             "local-tmux",
         );
@@ -7468,7 +7485,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = crate::paths::TestPathGuard::new(tmp.path());
         let id = crate::session::SessionId::default();
-        let config = App::restored_session_config(id, None, "codex".into(), None, "local-tmux");
+        let config = App::restored_session_config(
+            id,
+            None,
+            "codex".into(),
+            "restored".into(),
+            None,
+            "local-tmux",
+        );
         assert_eq!(config.env.get("FRIRING_SESSION"), Some(&id.to_string()));
     }
 
@@ -7484,6 +7508,7 @@ mod tests {
             id,
             Some("agent-conv-uuid".into()),
             "claude".into(),
+            "restored".into(),
             None,
             "ssh:devbox",
         );

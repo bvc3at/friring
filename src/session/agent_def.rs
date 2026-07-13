@@ -16,12 +16,19 @@ use serde::{Deserialize, Serialize};
 /// Placeholder substituted with a session id in resume/fork/new-session groups.
 const ID_PLACEHOLDER: &str = "{id}";
 
+/// Placeholder substituted with the friring session name in resume/fork/
+/// new-session groups, for agents whose CLI can name a session at launch
+/// (e.g. claude's `-n {name}`). A group token referencing `{name}` when the
+/// launch has no name is dropped together with its preceding flag, so an
+/// unnamed launch never emits a dangling `-n`.
+const NAME_PLACEHOLDER: &str = "{name}";
+
 /// One coding-agent CLI definition.
 ///
 /// Each `*_args` group is appended to the final argument list **only** when its
 /// driving value is present (the session is being resumed/forked, etc.), with
-/// `{id}` substituted token-by-token. This avoids any "unresolved placeholder"
-/// heuristics: a group with no value is simply omitted.
+/// `{id}` and `{name}` substituted token-by-token. This avoids any "unresolved
+/// placeholder" heuristics: a group with no value is simply omitted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentDef {
     /// Display + lookup name (e.g. `"claude"`). Unique within a registry.
@@ -58,20 +65,27 @@ impl AgentDef {
     /// fork wins over resume, which wins over a fresh `new_session` id. After
     /// the selection group come the static `args`. No model is ever passed —
     /// the agent uses its own default config (bake one into `args` if needed).
+    ///
+    /// `session_name` fills `{name}` tokens in the selected group. Whether a
+    /// launch pushes the friring name into the agent is decided by the
+    /// *templates*: the built-in claude entry references `{name}` only in its
+    /// fork/new-session groups, so a resume never renames a conversation the
+    /// agent already owns.
     pub fn build_args(
         &self,
         resume_id: Option<&str>,
         fork_id: Option<&str>,
         new_session_id: Option<&str>,
+        session_name: Option<&str>,
     ) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
 
         if let Some(id) = fork_id {
-            out.extend(subst(&self.fork_args, ID_PLACEHOLDER, id));
+            out.extend(subst_group(&self.fork_args, id, session_name));
         } else if let Some(id) = resume_id {
-            out.extend(subst(&self.resume_args, ID_PLACEHOLDER, id));
+            out.extend(subst_group(&self.resume_args, id, session_name));
         } else if let Some(id) = new_session_id {
-            out.extend(subst(&self.new_session_args, ID_PLACEHOLDER, id));
+            out.extend(subst_group(&self.new_session_args, id, session_name));
         }
 
         out.extend(self.args.iter().cloned());
@@ -96,12 +110,36 @@ impl AgentDef {
     }
 }
 
-/// Replace `placeholder` with `value` in every token of `tokens`.
-fn subst(tokens: &[String], placeholder: &str, value: &str) -> Vec<String> {
-    tokens
-        .iter()
-        .map(|t| t.replace(placeholder, value))
-        .collect()
+/// Substitute `{id}` — and `{name}`, when the launch has a non-empty session
+/// name — in every token of one selected arg group.
+///
+/// A `{name}` token with no name to fill it is dropped **together with** its
+/// immediately preceding value-taking flag (same pair rule as the remote
+/// config-path rewriting in `session_ops`), so `["-n", "{name}"]` vanishes as
+/// a pair instead of leaving a dangling `-n` to eat the next arg. A
+/// self-contained `--flag={name}` token drops alone.
+fn subst_group(tokens: &[String], id: &str, name: Option<&str>) -> Vec<String> {
+    let name = name.filter(|n| !n.is_empty());
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let token = token.replace(ID_PLACEHOLDER, id);
+        if !token.contains(NAME_PLACEHOLDER) {
+            out.push(token);
+            continue;
+        }
+        match name {
+            Some(n) => out.push(token.replace(NAME_PLACEHOLDER, n)),
+            None => {
+                if out
+                    .last()
+                    .is_some_and(|prev| prev.starts_with('-') && !prev.contains('='))
+                {
+                    out.pop();
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A set of agent definitions plus the name of the default agent.
@@ -157,8 +195,19 @@ mod tests {
             command: "claude".into(),
             args: vec![],
             resume_args: vec!["--resume".into(), "{id}".into()],
-            fork_args: vec!["--resume".into(), "{id}".into(), "--fork-session".into()],
-            new_session_args: vec!["--session-id".into(), "{id}".into()],
+            fork_args: vec![
+                "--resume".into(),
+                "{id}".into(),
+                "--fork-session".into(),
+                "-n".into(),
+                "{name}".into(),
+            ],
+            new_session_args: vec![
+                "--session-id".into(),
+                "{id}".into(),
+                "-n".into(),
+                "{name}".into(),
+            ],
             resume_latest: false,
         }
     }
@@ -166,24 +215,74 @@ mod tests {
     #[test]
     fn fresh_session_pins_id() {
         let d = claude();
-        let args = d.build_args(None, None, Some("new-id"));
+        let args = d.build_args(None, None, Some("new-id"), None);
         assert_eq!(args, vec!["--session-id", "new-id"]);
         // No model is ever passed.
         assert!(!args.iter().any(|a| a == "--model"));
     }
 
     #[test]
+    fn fresh_session_with_name_appends_name_flag() {
+        let d = claude();
+        // A name with spaces stays a single argv token — no re-splitting.
+        let args = d.build_args(None, None, Some("new-id"), Some("fix auth flow"));
+        assert_eq!(args, vec!["--session-id", "new-id", "-n", "fix auth flow"]);
+    }
+
+    #[test]
+    fn empty_name_drops_the_flag_pair_like_none() {
+        let d = claude();
+        let args = d.build_args(None, None, Some("new-id"), Some(""));
+        assert_eq!(args, vec!["--session-id", "new-id"]);
+    }
+
+    #[test]
+    fn equals_form_name_token_drops_alone() {
+        // A self-contained `--flag={name}` token must not pop the (complete)
+        // token before it when the launch has no name.
+        let mut d = claude();
+        d.new_session_args = vec!["--session-id={id}".into(), "--name={name}".into()];
+        assert_eq!(
+            d.build_args(None, None, Some("new-id"), None),
+            vec!["--session-id=new-id"]
+        );
+        assert_eq!(
+            d.build_args(None, None, Some("new-id"), Some("x")),
+            vec!["--session-id=new-id", "--name=x"]
+        );
+    }
+
+    #[test]
     fn resume_takes_precedence_over_new() {
         let d = claude();
-        let args = d.build_args(Some("resume-id"), None, Some("new-id"));
+        let args = d.build_args(Some("resume-id"), None, Some("new-id"), None);
+        assert_eq!(args, vec!["--resume", "resume-id"]);
+    }
+
+    #[test]
+    fn resume_never_pushes_the_name() {
+        // The resume template carries no {name} token: a conversation the agent
+        // already owns is never renamed, even though the launch has a name.
+        let d = claude();
+        let args = d.build_args(Some("resume-id"), None, None, Some("my session"));
         assert_eq!(args, vec!["--resume", "resume-id"]);
     }
 
     #[test]
     fn fork_takes_precedence_over_resume() {
         let d = claude();
-        let args = d.build_args(Some("resume-id"), Some("fork-id"), Some("new-id"));
+        let args = d.build_args(Some("resume-id"), Some("fork-id"), Some("new-id"), None);
         assert_eq!(args, vec!["--resume", "fork-id", "--fork-session"]);
+    }
+
+    #[test]
+    fn fork_with_name_names_the_forked_conversation() {
+        let d = claude();
+        let args = d.build_args(None, Some("fork-id"), None, Some("child"));
+        assert_eq!(
+            args,
+            vec!["--resume", "fork-id", "--fork-session", "-n", "child"]
+        );
     }
 
     #[test]
@@ -197,7 +296,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
         };
-        let args = d.build_args(None, None, Some("ignored"));
+        let args = d.build_args(None, None, Some("ignored"), None);
         assert_eq!(args, vec!["--quiet"]);
     }
 
@@ -216,12 +315,12 @@ mod tests {
         };
         // resume id present, but no {id} token -> tokens unchanged.
         assert_eq!(
-            d.build_args(Some("ignored-uuid"), None, None),
+            d.build_args(Some("ignored-uuid"), None, None, None),
             vec!["resume", "--last"]
         );
         // fork wins over resume, still id-less.
         assert_eq!(
-            d.build_args(Some("ignored-uuid"), Some("also-ignored"), None),
+            d.build_args(Some("ignored-uuid"), Some("also-ignored"), None, None),
             vec!["fork", "--last"]
         );
         assert!(d.resumes_latest());
