@@ -70,3 +70,25 @@ JSON
     grep -q '^Type "Create hello.txt' "$tape" # the prompt was typed
     grep -q '^Ctrl+Q$' "$tape"                # the closing quit beat
 }
+
+@test "drift: an unexpected non-message endpoint is surfaced but never fails" {
+    REPO_ROOT="$BATS_TEST_TMPDIR/repo"
+    E2E_SCENARIO_NAME="unit"
+    printf '%s\n' \
+        '{"kind":"other","method":"HEAD","url":"/"}' \
+        '{"kind":"other","method":"GET","url":"/v1/telemetry"}' > "$E2E_JOURNAL"
+    run e2e_surface_unexpected_endpoints
+    [ "$status" -eq 0 ] # visibility, not a gate
+    grep -q 'GET /v1/telemetry' "$REPO_ROOT/target/agent-e2e/unexpected-endpoints.log"
+    # the known connectivity probe is allowlisted, not logged as drift
+    ! grep -q 'HEAD /' "$REPO_ROOT/target/agent-e2e/unexpected-endpoints.log"
+}
+
+@test "drift: only the allowlisted HEAD / probe → nothing surfaced" {
+    REPO_ROOT="$BATS_TEST_TMPDIR/repo2"
+    E2E_SCENARIO_NAME="unit"
+    printf '%s\n' '{"kind":"other","method":"HEAD","url":"/"}' > "$E2E_JOURNAL"
+    run e2e_surface_unexpected_endpoints
+    [ "$status" -eq 0 ]
+    [ ! -f "$REPO_ROOT/target/agent-e2e/unexpected-endpoints.log" ]
+}

@@ -197,10 +197,14 @@ publishes once per ~1000-tick perf window, so the report waits up to 30s for it)
 ## Updating the pinned agent binary
 
 The npm pin in the CI job is the version the fixtures are conformance-tested against (not
-tracked by renovate — it lives in a run command on purpose). To bump: update the pin, run
-`just agent-e2e` locally against that version, and check the journals for new traffic (a new
-endpoint or side-model call shows up as `UNMATCHED`/`other` entries) — cover genuine new
-background traffic with an `ambient` fixture, and treat everything else as a finding.
+tracked by renovate — it lives in a run command on purpose). To bump: update the pin and run
+`just agent-e2e` locally against that version. Two drift signals catch new traffic for you: a new
+**model / side-model call** with no matching fixture is `UNMATCHED` — a hard failure — so cover
+genuine new background traffic with an `ambient` fixture; a new **non-message endpoint** (a
+telemetry or config probe) is harmless (a custom `ANTHROPIC_BASE_URL` proxy ignores it too), so
+it doesn't fail the run but is surfaced to `target/agent-e2e/unexpected-endpoints.log` and a CI
+`::warning::` annotation — review it, and extend the allowlist in
+`e2e_surface_unexpected_endpoints` if it's expected.
 
 ## Conformance status (claude 2.1.207)
 

@@ -452,6 +452,18 @@ jobs:
           claude --version
       - name: Run real-agent e2e suite
         run: scripts/dev/agent-e2e/run.sh
+      - name: Surface unexpected-endpoint drift
+        # Non-message endpoints the pinned binary hits that the stub didn't
+        # expect (a new telemetry/config probe on a version bump) are harmless
+        # — the suite still passes — but should be visible, not silent. A
+        # warning annotation flags them without failing the job.
+        if: always()
+        run: |
+          f=target/agent-e2e/unexpected-endpoints.log
+          if [ -f "$f" ]; then
+            echo "::warning title=Agent API drift::agent-e2e saw unexpected non-message endpoint(s) — review before the next pin bump (docs/E2E.md)"
+            cat "$f"
+          fi
       - name: Upload failure artifacts
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

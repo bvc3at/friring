@@ -558,8 +558,46 @@ e2e_collect_artifacts() {
     e2e_log "failure artifacts: $dest"
 }
 
+# Surface (never fail on) unexpected non-message endpoints. The correctness-
+# critical surface — model + secondary-model calls — arrives as POST
+# /v1/messages and is already gated by assert_stub_invariants (a surprise one
+# is UNMATCHED → hard failure). The ancillary endpoints a client may add
+# between versions (telemetry, config probes) are harmless — a custom
+# ANTHROPIC_BASE_URL proxy just ignores them, which is why they aren't a
+# stable contract — but a pin bump that starts hitting a new one should be
+# VISIBLE, not silently answered {} on a green run. So we allowlist the known
+# HEAD / connectivity probe and record anything else to a durable log (kept
+# across green runs, unlike the failure-only artifacts) plus, in bats, FD 3
+# (shown even for passing tests). Never fails: this is drift *visibility*, and
+# the harmless-but-unstable surface must not turn a benign bump red.
+e2e_surface_unexpected_endpoints() {
+    [ -f "$E2E_JOURNAL" ] || return 0
+    local unexpected
+    unexpected="$(jq -rs '[.[]
+        | select(.kind == "other")
+        | select(.method != "HEAD" or .url != "/")
+        | "\(.method) \(.url)"] | unique | .[]' "$E2E_JOURNAL" 2>/dev/null)"
+    [ -n "$unexpected" ] || return 0
+    local drift="$REPO_ROOT/target/agent-e2e/unexpected-endpoints.log"
+    mkdir -p "$(dirname "$drift")"
+    {
+        echo "# ${E2E_SCENARIO_NAME:-?} @ $(date -u +%Y-%m-%dT%H:%M:%SZ) — agent ${AGENT_NAME:-?} $(agent_version 2>/dev/null)"
+        printf '%s\n' "$unexpected"
+    } >> "$drift"
+    e2e_log "unexpected endpoint(s) hit — NOT a failure; logged to $drift:"
+    printf '  %s\n' "$unexpected" >&2
+    # bats surfaces FD 3 even for passing tests, so a green run still flags it.
+    if { : >&3; } 2>/dev/null; then
+        printf '# agent-e2e drift: %s hit %s\n' \
+            "${E2E_SCENARIO_NAME:-?}" "$(printf '%s' "$unexpected" | tr '\n' ' ')" >&3
+    fi
+}
+
 e2e_teardown() {
     local failed="${1:-0}"
+    # Always surface endpoint drift (pass or fail), before the sandbox — and
+    # its journal — is wiped.
+    e2e_surface_unexpected_endpoints
     [ "$failed" != "0" ] && e2e_collect_artifacts
     tmux -L "$E2E_DRIVER_SOCKET" kill-server >/dev/null 2>&1 || true
     [ -n "$E2E_STUB_PID" ] && kill "$E2E_STUB_PID" >/dev/null 2>&1 || true
