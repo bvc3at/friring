@@ -135,7 +135,7 @@ impl App {
             return;
         };
         let modal_open = !matches!(self.modal, super::modals::Modal::None);
-        // While the global-search strip is open clicks are swallowed (it owns
+        // While the global-search popup is open clicks are swallowed (it owns
         // all input), so don't underline rows as if they were clickable.
         if self.global_search.active && !modal_open {
             return;
@@ -255,7 +255,7 @@ impl App {
 
         let all_sessions: Vec<&SessionInfo> = self.sessions.iter().map(|s| &s.info).collect();
 
-        // While the global-search strip is open, highlight the session list from
+        // While the global-search popup is open, highlight the session list from
         // the global query (live). Otherwise there are no match positions (the
         // session list has no local search of its own anymore). Own the query so
         // it doesn't conflict with the `&mut session_list_state` borrow below.
@@ -647,8 +647,8 @@ impl App {
             self.record_scrollbar(geom, ScrollTarget::TaskPreview);
             return;
         }
-        // While the global-search strip previews a task result, mirror that in
-        // the central pane (focus stays in the strip, so the normal task-context
+        // While the global-search popup previews a task result, mirror that in
+        // the central pane (focus stays in the popup, so the normal task-context
         // branch above doesn't fire).
         if self.global_search_preview_kind() == Some(crate::app::search::SearchKind::Task)
             && self.selected_task().is_some()

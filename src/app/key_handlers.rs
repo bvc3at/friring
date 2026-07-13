@@ -7,11 +7,15 @@
 
 use crate::session::SessionConfig;
 
-use super::{App, InputFocus, TerminalView};
+use super::{clock, App, InputFocus, TerminalView};
 use crate::agent::input;
 use crate::paths;
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers, ModifierKeyCode};
 use tracing::{error, warn};
+
+/// Two bare `Shift` taps at most this far apart — with no other key between —
+/// open the global search (the JetBrains "Search Everywhere" gesture).
+pub(crate) const DOUBLE_SHIFT_WINDOW_MS: u64 = 400;
 
 /// Convert a session name into a git-branch-friendly name.
 ///
@@ -107,6 +111,17 @@ impl App {
     /// 2. Global keybindings (Ctrl+Q, Ctrl+N, etc.)
     /// 3. Focus-based handlers (ProjectList, SessionList, Terminal)
     pub(crate) fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        // Bare modifier presses only arrive on kitty-protocol terminals (we
+        // push REPORT_ALL_KEYS_AS_ESCAPE_CODES). They are inert for every
+        // handler below and must never reach a text input or the PTY, so they
+        // are consumed here — where a double-tap of `Shift` opens the global
+        // search. Any other key breaks a pending double-tap.
+        if let KeyCode::Modifier(m) = code {
+            self.handle_modifier_press(m);
+            return;
+        }
+        self.pending_double_shift = None;
+
         // Help overlay + clipboard chords are routed before any modal handler.
         if self.handle_priority_key(code, mods) {
             return;
@@ -124,7 +139,7 @@ impl App {
             return;
         }
 
-        // The global-search strip captures all input while open (typed chars
+        // The global-search popup captures all input while open (typed chars
         // edit the query; arrows/Enter/Esc navigate/activate/close).
         if self.global_search.active {
             self.handle_global_search_key(code, mods);
@@ -186,11 +201,39 @@ impl App {
         self.handle_focused_pane_key(code, mods);
     }
 
+    /// A bare modifier key press (kitty-protocol terminals only). Two `Shift`
+    /// taps within [`DOUBLE_SHIFT_WINDOW_MS`] open the global search —
+    /// mirroring the JetBrains "Search Everywhere" gesture. Taps never
+    /// accumulate while a modal or the search itself owns input (there,
+    /// `Shift` presses are just capitals being typed), and any non-`Shift`
+    /// modifier breaks a pending tap like a regular key would.
+    fn handle_modifier_press(&mut self, m: ModifierKeyCode) {
+        let is_shift = matches!(m, ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift);
+        if !is_shift
+            || self.modal.is_open()
+            || self.global_search.active
+            || !self.features.double_shift_search
+        {
+            self.pending_double_shift = None;
+            return;
+        }
+        let within_window = self.pending_double_shift.take().is_some_and(|t| {
+            clock::elapsed_since(t) <= std::time::Duration::from_millis(DOUBLE_SHIFT_WINDOW_MS)
+        });
+        if within_window {
+            // Routed through the action dispatch so the `features.global_search`
+            // gate (and its toast) behave exactly like the Ctrl+/ chord.
+            self.dispatch_action(crate::session::Action::GlobalSearch);
+        } else {
+            self.pending_double_shift = Some(clock::now());
+        }
+    }
+
     /// Cmd/Super chords are commands, never text: only the keybinding lookup
     /// may consume them. The focus-based handlers (modal inputs, the search
     /// query, in-pane editors, list hotkeys) predate the kitty keyboard
     /// protocol and match `Char` without checking SUPER, so a chord like Cmd+J
-    /// would otherwise type a bare `j`. While a modal or the search strip owns
+    /// would otherwise type a bare `j`. While a modal or the search popup owns
     /// input the chord is swallowed outright, mirroring how Ctrl chords are
     /// unavailable there. (The terminal pass-through swallows SUPER on its own —
     /// `agent::input::key_to_bytes`.)
@@ -215,7 +258,7 @@ impl App {
             InputFocus::AutomationRunHistory => self.handle_automation_run_history_key(code),
             InputFocus::TaskList => self.handle_task_list_key(code),
             InputFocus::TaskEditor => self.handle_task_editor_pane_key(code, mods),
-            // The global-search strip captures input earlier (before the global
+            // The global-search popup captures input earlier (before the global
             // keybinding lookup), so this arm is effectively unreachable.
             InputFocus::GlobalSearch => self.handle_global_search_key(code, mods),
             InputFocus::Terminal => self.handle_terminal_key(code, mods),
@@ -599,7 +642,7 @@ impl App {
             // `TaskList → editor` (like the automation editor): cycling out of
             // the editor returns to the tasks panel, never off to a session.
             TaskEditor => vec![TaskList, TaskEditor],
-            // The global-search strip is entered/left only via its keybinding
+            // The global-search popup is entered/left only via its keybinding
             // (`Ctrl+/` by default) / `Esc`, so `Ctrl+L`/`Ctrl+H` are no-ops
             // while it's open.
             GlobalSearch => vec![GlobalSearch],

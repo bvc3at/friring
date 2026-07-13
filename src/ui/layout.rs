@@ -19,8 +19,9 @@ pub struct PanelAreas {
     /// the file viewer (behaves like the file viewer).
     pub tasks_panel: Option<Rect>,
     pub file_viewer: Option<Rect>,
-    /// Global search strip — full-width, docked along the bottom (above the
-    /// footer) when active.
+    /// Global search popup — centered, floating over the content (JetBrains
+    /// Search-Everywhere-style) when active. The panels underneath keep their
+    /// size; matches highlight live inside them around the popup.
     pub global_search: Option<Rect>,
     /// Full-width transient band for the active status/error message (or the
     /// sync spinner), docked directly above the footer. Present only while a
@@ -30,10 +31,41 @@ pub struct PanelAreas {
     pub footer: Rect,
 }
 
-/// Rows the global-search strip occupies: a 2-row border around a query line, a
-/// per-scope match summary, a scrollable result list (~7 rows), and a key-hint
-/// line. Matches also highlight live in the panels behind the strip.
-const GLOBAL_SEARCH_HEIGHT: u16 = 12;
+/// Rows the global-search popup occupies: a 2-row border around a query line,
+/// a per-scope match summary, a scrollable result list (~11 rows), and a
+/// key-hint line. Matches also highlight live in the panels around the popup.
+const GLOBAL_SEARCH_POPUP_ROWS: u16 = 16;
+
+/// Popup width bounds: ~60% of the terminal, clamped so it neither collapses
+/// on medium terminals nor sprawls on ultrawide ones (below the minimum the
+/// popup just takes the full width).
+const GLOBAL_SEARCH_POPUP_MIN_WIDTH: u16 = 50;
+const GLOBAL_SEARCH_POPUP_MAX_WIDTH: u16 = 90;
+
+/// The centered global-search popup rect: horizontally centered, top edge in
+/// the upper third (where JetBrains' Search Everywhere sits), floating over
+/// the content — computed from the full frame area, independent of the
+/// band/column splits, so opening the search never resizes the panels or the
+/// session PTYs behind it.
+fn global_search_popup(area: Rect, show_status_row: bool) -> Rect {
+    let width = ((area.width as u32 * 3 / 5) as u16)
+        .clamp(GLOBAL_SEARCH_POPUP_MIN_WIDTH, GLOBAL_SEARCH_POPUP_MAX_WIDTH)
+        .min(area.width);
+    let y_off = (area.height / 6).min(area.height.saturating_sub(1));
+    // Keep the footer — and, when shown, the transient status-message row above
+    // it — visible below the popup. Both render *after* the popup (`App::view`),
+    // so an overlap would overwrite the popup's bottom border on short
+    // terminals; reserving their rows keeps the popup clean instead.
+    let reserved = if show_status_row { 2 } else { 1 };
+    let height =
+        GLOBAL_SEARCH_POPUP_ROWS.min(area.height.saturating_sub(y_off).saturating_sub(reserved));
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + y_off,
+        width,
+        height,
+    }
+}
 
 /// Max rows (including borders) the automations pane may occupy.
 const AUTOMATIONS_PANE_MAX_ROWS: u16 = 10;
@@ -103,30 +135,20 @@ fn split_left_column(
 }
 
 /// Vertical bands carved from the full area: header, content region, optional
-/// global-search strip, optional status-message row, and footer.
+/// status-message row, and footer. (The global-search popup floats over the
+/// content instead of occupying a band — see [`global_search_popup`].)
 struct VerticalBands {
     header: Rect,
     content: Rect,
-    global_search: Option<Rect>,
     status_message: Option<Rect>,
     footer: Rect,
 }
 
-/// Split the full area into header / content / global-search / status-message /
-/// footer bands.
-fn split_vertical(area: Rect, show_global_search: bool, show_status_row: bool) -> VerticalBands {
+/// Split the full area into header / content / status-message / footer bands.
+fn split_vertical(area: Rect, show_status_row: bool) -> VerticalBands {
     // Compact mode: when the terminal is shorter than 20 rows, drop the
     // header line entirely so the content + footer get every row available.
     let header_height = if area.height < 20 { 0 } else { 1 };
-
-    // The global-search strip is carved from the bottom of the content region
-    // (full width, above the footer) so every column shrinks to make room — the
-    // same way the optional right-side panels share the content width.
-    let search_height = if show_global_search {
-        GLOBAL_SEARCH_HEIGHT.min(area.height.saturating_sub(header_height + 1))
-    } else {
-        0
-    };
 
     // One transient row for the active status/error message, directly above the
     // footer (keeping the pills pinned to the bottom edge). Carved only while a
@@ -138,7 +160,6 @@ fn split_vertical(area: Rect, show_global_search: bool, show_status_row: bool) -
         .constraints([
             Constraint::Length(header_height),
             Constraint::Min(1),
-            Constraint::Length(search_height),
             Constraint::Length(status_height),
             Constraint::Length(1),
         ])
@@ -147,9 +168,8 @@ fn split_vertical(area: Rect, show_global_search: bool, show_status_row: bool) -
     VerticalBands {
         header: vertical[0],
         content: vertical[1],
-        global_search: (search_height > 0).then_some(vertical[2]),
-        status_message: (status_height > 0).then_some(vertical[3]),
-        footer: vertical[4],
+        status_message: (status_height > 0).then_some(vertical[2]),
+        footer: vertical[3],
     }
 }
 
@@ -206,7 +226,7 @@ fn three_panel_layout(
         info_panel: info_column.or(inline_info),
         tasks_panel,
         file_viewer,
-        global_search: bands.global_search,
+        global_search: None,
         status_message: bands.status_message,
         terminal,
         footer: bands.footer,
@@ -234,7 +254,7 @@ fn two_panel_layout(
         info_panel: inline_info,
         tasks_panel: None,
         file_viewer: None,
-        global_search: bands.global_search,
+        global_search: None,
         status_message: bands.status_message,
         terminal: horizontal[1],
         footer: bands.footer,
@@ -283,9 +303,22 @@ pub struct LayoutParams {
 /// `show_status_row` carves a transient full-width 1-row band directly above the
 /// footer for the active status/error message (or the sync spinner), so a long
 /// message is never clipped by the right-aligned footer pills. It shrinks the
-/// content region by one row while shown (mirroring `show_global_search`).
+/// content region by one row while shown.
+///
+/// `show_global_search` floats the centered popup (`global_search_popup`)
+/// over the content; no band is carved and no panel shrinks.
 pub fn compute_layout(area: Rect, p: &LayoutParams) -> PanelAreas {
-    let bands = split_vertical(area, p.show_global_search, p.show_status_row);
+    let mut areas = compute_panel_areas(area, p);
+    areas.global_search = p
+        .show_global_search
+        .then(|| global_search_popup(area, p.show_status_row));
+    areas
+}
+
+/// The band/column split behind [`compute_layout`] — everything except the
+/// floating global-search popup.
+fn compute_panel_areas(area: Rect, p: &LayoutParams) -> PanelAreas {
+    let bands = split_vertical(area, p.show_status_row);
     let content = bands.content;
 
     let settings = crate::session::settings::global();
@@ -297,7 +330,7 @@ pub fn compute_layout(area: Rect, p: &LayoutParams) -> PanelAreas {
             info_panel: None,
             tasks_panel: None,
             file_viewer: None,
-            global_search: bands.global_search,
+            global_search: None,
             status_message: bands.status_message,
             terminal: content,
             footer: bands.footer,
@@ -490,28 +523,71 @@ mod tests {
     }
 
     #[test]
-    fn global_search_strip_absent_by_default() {
+    fn global_search_popup_absent_by_default() {
         let areas = layout(area(120, 40), false, false, false, false, true, 0, false);
         assert!(areas.global_search.is_none());
     }
 
     #[test]
-    fn global_search_strip_present_when_active() {
+    fn global_search_popup_is_centered_in_the_upper_third() {
         let areas = layout(area(120, 40), false, false, false, true, true, 0, false);
-        let strip = areas.global_search.expect("strip shown when active");
-        // Full width, carved directly above the footer.
-        assert_eq!(strip.width, 120);
-        assert_eq!(strip.x, 0);
-        assert_eq!(strip.y + strip.height, areas.footer.y);
-        assert_eq!(strip.height, GLOBAL_SEARCH_HEIGHT);
+        let popup = areas.global_search.expect("popup shown when active");
+        // 120 cols → 60% = 72, within the [50, 90] clamp; centered.
+        assert_eq!(popup.width, 72);
+        assert_eq!(popup.x, (120 - 72) / 2);
+        // Top edge in the upper third, JetBrains-style.
+        assert_eq!(popup.y, 40 / 6);
+        assert_eq!(popup.height, GLOBAL_SEARCH_POPUP_ROWS);
+        // Floats over the content: never touches the footer row.
+        assert!(popup.y + popup.height < areas.footer.y);
     }
 
     #[test]
-    fn global_search_strip_shrinks_content() {
+    fn global_search_popup_does_not_shrink_content() {
         let without = layout(area(120, 40), false, false, false, false, true, 0, false).terminal;
         let with = layout(area(120, 40), false, false, false, true, true, 0, false).terminal;
-        // The terminal (content) region loses the strip's rows.
-        assert_eq!(without.height - with.height, GLOBAL_SEARCH_HEIGHT);
+        // The popup floats: every panel keeps its size (and the session PTYs
+        // behind it never resize when the search opens).
+        assert_eq!(without, with);
+    }
+
+    #[test]
+    fn global_search_popup_width_is_clamped() {
+        // Ultrawide: capped at the max width, still centered.
+        let wide = layout(area(300, 40), false, false, false, true, true, 0, false)
+            .global_search
+            .unwrap();
+        assert_eq!(wide.width, GLOBAL_SEARCH_POPUP_MAX_WIDTH);
+        assert_eq!(wide.x, (300 - GLOBAL_SEARCH_POPUP_MAX_WIDTH) / 2);
+        // Narrow: the min-width clamp caps at the full terminal width.
+        let narrow = layout(area(45, 40), false, false, false, true, true, 0, false)
+            .global_search
+            .unwrap();
+        assert_eq!(narrow.width, 45);
+        assert_eq!(narrow.x, 0);
+    }
+
+    #[test]
+    fn global_search_popup_clamps_to_short_terminals() {
+        let areas = layout(area(120, 12), false, false, false, true, true, 0, false);
+        let popup = areas.global_search.expect("popup shown");
+        // Shorter than the full popup: clamp the height, keep the footer row.
+        assert!(popup.height < GLOBAL_SEARCH_POPUP_ROWS);
+        assert!(popup.y + popup.height < 12);
+    }
+
+    #[test]
+    fn global_search_popup_clears_the_status_row_when_both_show() {
+        // Short terminal + an active status message: the status row renders
+        // over the popup, so the popup must reserve it (footer + status) and
+        // never extend onto the status row's line.
+        let areas = layout(area(120, 14), false, false, false, true, true, 0, true);
+        let popup = areas.global_search.expect("popup shown");
+        let status = areas.status_message.expect("status row shown");
+        assert!(
+            popup.y + popup.height <= status.y,
+            "popup {popup:?} must end at or above the status row {status:?}"
+        );
     }
 
     #[test]
@@ -542,18 +618,16 @@ mod tests {
     }
 
     #[test]
-    fn status_row_stacks_below_global_search() {
-        // Both strips active: search on top, status row just above the footer.
-        let areas = layout(area(120, 40), false, false, false, true, true, 0, true);
-        let gs = areas.global_search.expect("search strip shown");
-        let sm = areas.status_message.expect("status row shown");
-        assert!(
-            sm.y >= gs.y + gs.height,
-            "status row sits below the search strip"
-        );
+    fn status_row_unaffected_by_global_search_popup() {
+        // Popup active + status message showing: the floating popup leaves the
+        // status row pinned above the footer, exactly where it is without it.
+        let with_popup = layout(area(120, 40), false, false, false, true, true, 0, true);
+        let without_popup = layout(area(120, 40), false, false, false, false, true, 0, true);
+        let sm = with_popup.status_message.expect("status row shown");
+        assert_eq!(sm, without_popup.status_message.unwrap());
         assert_eq!(
             sm.y + sm.height,
-            areas.footer.y,
+            with_popup.footer.y,
             "status row sits above the footer"
         );
     }

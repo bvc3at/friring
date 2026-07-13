@@ -65,9 +65,14 @@ pub struct FeatureFlags {
     /// File viewer column (F3) and file search results.
     #[serde(default = "default_true")]
     pub file_viewer: bool,
-    /// Global search strip (Ctrl+/).
+    /// Global search popup (Ctrl+/ or double-Shift).
     #[serde(default = "default_true")]
     pub global_search: bool,
+    /// The double-`Shift` opener for the global search. Only effective on
+    /// kitty-keyboard-protocol terminals (legacy terminals never report bare
+    /// modifier presses); `Ctrl+/` works regardless. Off = only the chord.
+    #[serde(default = "default_true")]
+    pub double_shift_search: bool,
     /// Info panel column (F2).
     #[serde(default = "default_true")]
     pub info_panel: bool,
@@ -245,6 +250,7 @@ impl Default for FeatureFlags {
             automations: true,
             file_viewer: true,
             global_search: true,
+            double_shift_search: true,
             info_panel: true,
             shell_pane: true,
             code_review: true,
@@ -551,6 +557,7 @@ mod tests {
             automations,
             file_viewer,
             global_search,
+            double_shift_search,
             info_panel,
             shell_pane,
             code_review,
@@ -570,6 +577,7 @@ mod tests {
             automations,
             file_viewer,
             global_search,
+            double_shift_search,
             info_panel,
             shell_pane,
             code_review,
@@ -585,10 +593,11 @@ mod tests {
         // `live` flags gate UI panels read from `App.features` every frame, so
         // flipping one is NOT a restart-only difference; the rest are read once
         // at startup and MUST register as one.
-        let live: [fn(&mut FeatureFlags); 9] = [
+        let live: [fn(&mut FeatureFlags); 10] = [
             |f| f.tasks = !f.tasks,
             |f| f.file_viewer = !f.file_viewer,
             |f| f.global_search = !f.global_search,
+            |f| f.double_shift_search = !f.double_shift_search,
             |f| f.info_panel = !f.info_panel,
             |f| f.shell_pane = !f.shell_pane,
             |f| f.code_review = !f.code_review,

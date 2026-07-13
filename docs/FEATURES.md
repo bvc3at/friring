@@ -40,7 +40,7 @@ worktree), and cwd.
 
 Searching is unified into the **global search** (`Ctrl+/`) — see the
 *Global Search* section below. There is no separate per-list `/`
-filter; instead the global strip highlights matches live across the
+filter; instead the global popup highlights matches live across the
 session list, tasks panel, and automations pane at once. Sessions are
 matched on name, agent, branch name, and cwd.
 
@@ -484,7 +484,7 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Ctrl+V` | Terminal | Paste from clipboard into PTY | Paste |
 | `Ctrl+P` | Global | Automations (scheduled agent runs) | **P**rogram |
 | `Ctrl+W` / `F5` | Global | Toggle tasks panel (todo list) | Work items |
-| `Ctrl+/` | Global | Global search across every scope | **/** = search |
+| `Ctrl+/` / `Shift Shift` | Global | Global search across every scope | **/** = search; JetBrains double-shift |
 | `Ctrl+T` / `F8` | Global | Toggle shell pane alongside the agent session | **T**erminal |
 | `Ctrl+X` / `F7` | Global | Toggle the native code-review view | Review |
 | `Ctrl+H` | Global | Focus previous pane (cycle backward) | Vim: **h** = left |
@@ -1482,21 +1482,26 @@ only at TUI startup.
 
 ## Global Search
 
-`Ctrl+/` (the near-universal "search" chord) opens a **non-modal bottom
-strip** that searches every scope at once — a single place to find and jump
-to anything. The opener is fully rebindable from the F1 editor
-(`Action::GlobalSearch`).
+`Ctrl+/` (the near-universal "search" chord) — or a **double-tap of
+`Shift`**, JetBrains "Search Everywhere" muscle memory — opens a **centered
+popup** that searches every scope at once — a single place to find and jump
+to anything. The chord is fully rebindable from the F1 editor
+(`Action::GlobalSearch`); the double-`Shift` gesture is a fixed alias (see
+*Keys & bindings*).
 
 ### Scopes
 
-- **Sessions** — name, agent, and branch (fuzzy), plus the live terminal
-  **buffer content** so you can find *which session* mentioned a string
-  ("deploy failed", an error, a file path) and switch straight to it.
+- **Sessions** — name, agent, every worktree branch, and cwd (fuzzy), plus
+  the live terminal **buffer content** so you can find *which session*
+  mentioned a string ("deploy failed", an error, a file path) and switch
+  straight to it.
 - **Tasks** — title **and description** (fuzzy; a description snippet is
   shown when only the description matched).
 - **Automations** — name (fuzzy).
-- **Files** — file/dir names under the active session's roots (bounded
-  walk, same node/depth limits as the in-viewer search).
+- **Files** — file/dir names under the roots of the session that was active
+  when the popup opened (bounded walk, same node/depth limits as the
+  in-viewer search). The scope is pinned at open: live-previewing another
+  session mid-search doesn't retarget it.
 
 Scopes whose `[features]` flag is disabled (tasks / automations / file
 viewer) contribute no results.
@@ -1526,47 +1531,64 @@ underlined) on matching rows and **dim** the rows that don't match — the
 same treatment the session list's own `/` filter already uses. This is
 driven by a shared highlight helper (`src/ui/highlight.rs`) and
 `App::global_search_query()`, which the view feeds into each panel renderer
-while the strip is open.
+while the popup is open.
 
-The strip itself shows: a query line, a one-line per-scope match summary
+The popup itself shows: a query line, a one-line per-scope match summary
 (`3 sessions · 1 task · 2 files [2/6]`), the **grouped result list**
 (scrollable, with the selected row marked `▸` and highlighted; content
 matches show a dim snippet), and a row of key hints. `↑`/`↓` move the
 selection through the list and `Enter` jumps to it.
 
-### Why a bottom strip (not a modal)
+### Why a centered popup
 
-friring keeps heavy interactions out of centered modals where it can. The
-search is a full-width strip docked above the footer — the content area
-shrinks to make room (the same way the info/tasks/file columns share
-width), so the rest of the UI stays visible, live, and **highlighted**
-behind it.
+The search floats where JetBrains' Search Everywhere does: horizontally
+centered, top edge in the upper third — the eye-line position users already
+have muscle memory for. It **overlays** the content instead of carving a
+band out of it: no panel resizes and no session PTY reflows when the search
+opens (the old bottom strip shrank the whole content area, forcing a resize
+of every visible terminal on open *and* close). The background is not
+dimmed, so the live in-place highlighting stays readable around the popup.
 
 ### Responsiveness
 
-Cheap metadata matches (names/titles, fuzzy) recompute on every keystroke.
-The expensive part — scanning each running session's vt100 buffer
-(`session_content_match`) — is **debounced** (~150 ms of query-idle, measured
-with `Instant` since the tick cadence varies with event load) and capped
-(`MAX_PER_GROUP` results per group, last `CONTENT_LINE_CAP` lines per session)
-so typing never stalls.
+Every keystroke does **pure in-memory work only** — fuzzy matching over
+session/task/automation metadata and substring matching over a prebuilt
+file index. The two expensive inputs are handled off the keystroke path:
+
+- The **Files index** (a bounded filesystem walk — potentially seconds on a
+  network mount) is snapshotted **once per open, on a background thread**
+  (`BackgroundTask` + tick poll). File matches fold into the open results
+  when the walk delivers; typing never does filesystem I/O. (The old strip
+  re-walked the tree synchronously on *every keystroke* — the source of the
+  per-key latency.)
+- Scanning each running session's vt100 buffer (`session_content_match`) is
+  **debounced** (~150 ms of query-idle, measured with `Instant` since the
+  tick cadence varies with event load) and capped (`MAX_PER_GROUP` results
+  per group, last `CONTENT_LINE_CAP` lines per session).
+
+Previewing a task result reads the in-memory task cache; the SQLite
+re-read happens only when a result is activated with `Enter`.
 
 ### State & anchors
 
 State lives in `src/app/search.rs` (`GlobalSearchState`,
-`GlobalSearchResult`, `SearchTarget`/`SearchKind`); building results +
-dispatching a selection live on `App` (`build_global_search_results`,
-`activate_global_search_result`, `open`/`close_global_search`). Preview moves
+`GlobalSearchResult`, `SearchTarget`/`SearchKind`, `FileIndexEntry`);
+building results + dispatching a selection live on `App`
+(`build_global_search_results`, `activate_global_search_result`,
+`open`/`close_global_search`; the Files index is built off-thread by
+`start_global_search_file_index` and polled by
+`poll_global_search_file_index` from `tick_core`). Preview moves
 the owning panel's cursor (`preview_global_search_result` →
 `active_index` / `task_panel_index` / `automation_panel_index`;
 `global_search_preview_kind()` tells the view which panel owns it);
 `open_global_search` captures a `SearchSnapshot` (focus + those three indices +
 `show_tasks_panel`/`show_file_viewer`) that `Esc` restores and `Enter`
 drops. `InputFocus::GlobalSearch` captures all input before the global
-keybinding lookup; `compute_layout`'s `show_global_search` carves the
-full-width `PanelAreas::global_search` strip (rendered by
-`src/ui/global_search.rs`); the in-place highlight is fed to each panel
-renderer via `App::global_search_query()` (`Some` only while the strip is open
+keybinding lookup; `compute_layout`'s `show_global_search` floats the
+centered `PanelAreas::global_search` popup (`global_search_popup` in
+`src/ui/layout.rs`, rendered by `src/ui/global_search.rs`) over the
+content; the in-place highlight is fed to each panel
+renderer via `App::global_search_query()` (`Some` only while the popup is open
 with a non-empty query).
 
 ### Keys & bindings
@@ -1577,6 +1599,17 @@ restores the previous focus. The default chord is `Ctrl+/`
 (`Action::GlobalSearch`), bound to every encoding terminals deliver it as
 (`Ctrl+/` under the kitty protocol; `Ctrl+7`/`Ctrl+_` on legacy terminals)
 and fully rebindable from the F1 editor like any other action.
+
+**Double-`Shift`** also opens the search — two bare `Shift` taps within
+~400 ms with no other key between (`App::handle_modifier_press`). Bare
+modifier presses are only reported by kitty-keyboard-protocol terminals
+(kitty, WezTerm, foot, ghostty, recent iTerm2/Alacritty; friring pushes
+`REPORT_ALL_KEYS_AS_ESCAPE_CODES` when supported — see
+`push_keyboard_enhancement` in `src/main.rs`), so on legacy terminals the
+gesture is silently unavailable and `Ctrl+/` remains the opener. It is a
+fixed gesture, not a rebindable chord (the keybinding registry models
+single chords, not tap sequences); `[features] double_shift_search = false`
+turns it off.
 
 Global search is the **only** list search now: the old per-pane `/`
 filters (session list, tasks panel) were removed in its favour. The file
@@ -1636,7 +1669,8 @@ commented examples).
 
 **Why some rows take effect immediately and others need a restart.** The
 feature flags that gate UI panels (`tasks`, `file_viewer`, `info_panel`,
-`global_search`, `shell_pane`, `code_review`, `soft_delete`) are read from
+`global_search`, `double_shift_search`, `shell_pane`, `code_review`,
+`soft_delete`) are read from
 `App.features` every frame — and `info_panel_position` from
 `App.info_panel_position` the same way — so `submit_settings_panel` copies
 the draft's values into `App` state via `App::apply_live_settings` and they
@@ -2362,7 +2396,7 @@ recorded before their pane's whole-rect focus fallback.
   an open modal does nothing — a stray click can never discard
   typed input or fall through to the panes beneath. Clicks are also
   ignored while the F1 editor is capturing a chord and while the
-  global-search strip is open.
+  global-search popup is open.
 - **Hover**: the clickable row under the pointer is underlined
   (driven by mouse-move events; applied post-render from the same
   click registry).

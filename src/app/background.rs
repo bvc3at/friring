@@ -36,9 +36,19 @@ impl<T> BackgroundTask<T> {
         self.rx.is_some()
     }
 
+    /// Drop any in-flight receiver so this task reads as idle again. The stale
+    /// worker's later `send` then fails harmlessly and can never be polled as
+    /// this task's result — used to reset the state on an early-return reopen
+    /// where [`start`](Self::start) won't run to replace the receiver.
+    pub(crate) fn cancel(&mut self) {
+        self.rx = None;
+    }
+
     /// Mark a job in flight and return the sender to hand to the worker.
     /// Callers must check [`in_progress`](Self::in_progress) first; starting
-    /// over an in-flight job would orphan its receiver.
+    /// over an in-flight job would orphan its receiver — unless dropping the
+    /// prior receiver is the intent, in which case call [`cancel`](Self::cancel)
+    /// (it makes the reset explicit and reads as idle).
     pub(crate) fn start(&mut self) -> mpsc::Sender<T> {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);

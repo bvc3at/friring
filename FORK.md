@@ -216,6 +216,33 @@ tick-side drift check re-pushes PTY sizes when an `auto` flip moves the dock
 `docs/CONFIG.md` + `docs/FEATURES.md` ("Info panel docking"); the **default
 changed** from upstream's always-column to `auto`.
 
+#### Global search: centered popup + double-`Shift` opener
+
+Upstream's global search (`Ctrl+/`) is a full-width strip docked above the
+footer that shrinks the whole content area (resizing every visible session
+PTY on open/close). The fork redesigns it after JetBrains' Search
+Everywhere:
+
+- **Centered popup.** Floats horizontally centered with its top edge in the
+  upper third, overlaying the content — no panel resize, no PTY reflow, and
+  the live in-place match highlighting stays visible around it
+  (`global_search_popup` in `src/ui/layout.rs`).
+- **Double-`Shift` opens it** (in addition to `Ctrl+/`): two bare `Shift`
+  taps within ~400 ms with no key between. Requires the kitty keyboard
+  protocol — the fork widens the pushed enhancement flags to
+  `REPORT_ALL_KEYS_AS_ESCAPE_CODES | REPORT_ALTERNATE_KEYS` (upstream pushes
+  only `DISAMBIGUATE_ESCAPE_CODES`) so bare modifier presses are reported at
+  all; on legacy terminals the gesture is silently unavailable. Gated by a
+  new `[features] double_shift_search` flag (default on).
+- **Scope fixes.** Sessions now match on **cwd** (documented upstream but
+  not implemented) and on **every** worktree branch, not just the first; the
+  Files scope is pinned to the session that was active at open (it used to
+  silently follow the live preview's session switches).
+- The per-keystroke performance rework is tracked separately under
+  *Performance* (ADR-P13).
+
+Details in `docs/FEATURES.md` ("Global Search") + `docs/CONFIG.md`.
+
 #### Sync base picker (`Ctrl+S` with multiple remotes)
 
 Upstream's worktree sync hardcodes `origin`: `git fetch origin`, rebase onto
@@ -267,6 +294,14 @@ the first match.
   separately (`session_name_to_branch` in `src/app/key_handlers.rs`).
 
 ### Performance
+
+- **Global-search keystrokes do no I/O (ADR-P13).** Upstream's search re-ran
+  a bounded filesystem walk (up to 5000 `read_dir` calls) synchronously on
+  **every keystroke** and hit SQLite on every task preview — visible typing
+  lag, seconds-long on network mounts. The fork snapshots the Files index
+  once per open on a background thread (`BackgroundTask` fire-and-poll) and
+  previews tasks from the in-memory cache, so a keystroke only does
+  in-memory matching. See ADR-P13 in `docs/PERFORMANCE.md`.
 
 - **New-session dialog never blocks on git (ADR-P12).** Upstream's worktree
   flow runs `git fetch origin` + the branch listing synchronously in the key

@@ -334,10 +334,11 @@ advances it to *in progress*.
 
 ### Global Search
 
-One key (`Ctrl+/`) searches every scope at once — sessions (including live
-terminal-buffer content), tasks, automations, and the file tree —
-highlighting matches live in the panels themselves. `Enter` jumps to a
-result; `Esc` restores exactly what you had.
+`Ctrl+/` — or a double-tap of `Shift` (JetBrains "Search Everywhere"
+muscle memory) — opens a centered popup that searches every scope at
+once — sessions (including live terminal-buffer content), tasks,
+automations, and the file tree — highlighting matches live in the panels
+themselves. `Enter` jumps to a result; `Esc` restores exactly what you had.
 
 [Keybindings →](#keybindings)
 
@@ -682,7 +683,7 @@ repos? Add `--add-repo PATH@main` (its own worktree per repo) or
 | `Ctrl+C` | Copy selection / SIGINT (terminal) | **C**opy |
 | `Ctrl+V` | Paste from clipboard | Paste |
 | `Ctrl+P` | Automations (list/new/edit/toggle/run/delete) | **P**rogram |
-| `Ctrl+/` | Global search (sessions/tasks/automations/files) | **/** = search |
+| `Ctrl+/` / `Shift Shift` | Global search (sessions/tasks/automations/files) | **/** = search; JetBrains double-shift |
 | `Ctrl+W` / `F5` | Toggle tasks panel (todo list) | **W**ork items |
 | `Ctrl+T` | Toggle shell pane | **T**erminal |
 | `Ctrl+X` / `F7` | Toggle code-review pane (native diff reviewer) | Review |
@@ -724,10 +725,11 @@ Terminal.app delivers no Cmd chords; everything else works there.
 | `k` / `Up` | Previous item |
 | `Enter` | Select / focus |
 
-Searching is unified into the global search strip (`Ctrl+/`); there
-is no separate per-list `/` filter. It matches sessions on name,
-agent, branch, and live terminal-buffer content. (The file viewer's
-own in-file `/` text search is unrelated and still there.)
+Searching is unified into the global search popup (`Ctrl+/` or a
+double-tap of `Shift`), a centered overlay; there is no separate
+per-list `/` filter. It matches sessions on name, agent, every worktree
+branch, cwd, and live terminal-buffer content. (The file viewer's own
+in-file `/` text search is unrelated and still there.)
 
 ### Terminal Scrollback and Selection
 

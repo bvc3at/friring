@@ -390,6 +390,7 @@ tasks         = true
 automations   = true
 file_viewer   = true
 global_search = true
+double_shift_search = true   # double-Shift opens the search (kitty-protocol terminals)
 info_panel    = true
 shell_pane    = true
 code_review   = true
@@ -413,8 +414,8 @@ min_interval_secs   = 5        # per-session floor between notifications
 Turn major TUI features off entirely. All default to `true` **except
 `version_check` and `auto_update`, which default to `false`** (both
 reach the network, so they are opt-in). The UI-panel flags
-(`tasks`, `file_viewer`, `info_panel`, `global_search`, `shell_pane`,
-`code_review`, `cc_activity`, `perf_hud`, `soft_delete`) apply **live** on save; the rest
+(`tasks`, `file_viewer`, `info_panel`, `global_search`, `double_shift_search`,
+`shell_pane`, `code_review`, `cc_activity`, `perf_hud`, `soft_delete`) apply **live** on save; the rest
 (`automations`, `mouse`, `notifications`, `version_check`, `auto_update`)
 take effect on the next launch.
 A disabled feature's pane never renders, its keybinding shows
@@ -426,7 +427,8 @@ no results. Data is never touched, so re-enabling a flag is lossless.
 | `tasks` | `true` | tasks panel (`F5`/`Ctrl+W`) and task search results |
 | `automations` | `true` | automations pane, `Ctrl+P`, TUI schedule firing, heartbeat arming |
 | `file_viewer` | `true` | file viewer column (`F3`) and file search results |
-| `global_search` | `true` | global search strip (`Ctrl+/`) |
+| `global_search` | `true` | global search popup (`Ctrl+/` / double-`Shift`) |
+| `double_shift_search` | `true` | the double-`Shift` opener for the global search (kitty-protocol terminals only; `Ctrl+/` is unaffected) |
 | `info_panel` | `true` | info panel (`F2`; docking via `info_panel_position`) |
 | `shell_pane` | `true` | per-session shell toggle (`Ctrl+T`) |
 | `code_review` | `true` | native code-review view (diff + comments, `Ctrl+X`) |

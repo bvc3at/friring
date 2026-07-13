@@ -641,7 +641,7 @@ pub enum InputFocus {
     /// Editing the scoped task in the central pane (like a session's terminal —
     /// reached with `Enter`/`e` from the tasks panel; `Esc` returns to it).
     TaskEditor,
-    /// The global search strip docked along the bottom (`Ctrl+/` by default).
+    /// The centered global-search popup (`Ctrl+/` or double-`Shift`).
     /// Captures all input while active; entered/left only via its keybinding /
     /// `Esc`.
     GlobalSearch,
@@ -843,8 +843,13 @@ pub struct App {
     pub(crate) automation_ui: automation_state::AutomationUiState,
     /// Tasks-panel UI state (cached list, selection, editor, links).
     pub(crate) task_ui: task_state::TaskUiState,
-    /// Global search strip (`Ctrl+/`): cross-scope search docked at the bottom.
+    /// Global search popup (`Ctrl+/` or double-`Shift`): centered cross-scope
+    /// search, Search-Everywhere-style.
     pub(crate) global_search: search::GlobalSearchState,
+    /// When a bare `Shift` press last arrived (kitty-protocol terminals only)
+    /// with no other key since — the pending first tap of the double-`Shift`
+    /// search opener. See `App::handle_modifier_press`.
+    pub(crate) pending_double_shift: Option<std::time::Instant>,
     /// Currently active theme (built-in preset or custom from themes.toml),
     /// cached so the header doesn't hit SQLite every render. Kept in sync with
     /// `db.set_active_theme` writes.
@@ -1141,6 +1146,7 @@ impl App {
             automation_ui: automation_state::AutomationUiState::default(),
             task_ui: task_state::TaskUiState::default(),
             global_search: search::GlobalSearchState::default(),
+            pending_double_shift: None,
             active_theme,
             keybindings,
             usage: HashMap::new(),
@@ -2568,7 +2574,7 @@ impl App {
             return;
         }
 
-        // While the global-search strip is open it owns all input (it is
+        // While the global-search popup is open it owns all input (it is
         // entered/left only via its keybinding / Esc / Enter), so plain
         // clicks are swallowed rather than stealing focus from it.
         if self.global_search.active {
@@ -4299,6 +4305,7 @@ impl App {
         self.metrics.tick_count = self.metrics.tick_count.wrapping_add(1);
 
         self.tick_global_search_content();
+        self.poll_global_search_file_index();
 
         self.refresh_session_statuses();
 
@@ -8738,6 +8745,7 @@ mod tests {
             automations: false,
             file_viewer: false,
             global_search: false,
+            double_shift_search: false,
             info_panel: false,
             shell_pane: false,
             code_review: false,
