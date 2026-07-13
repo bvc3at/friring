@@ -35,8 +35,10 @@ Two rules matter when working here:
   deliberate: upstream **attributions** (repo URLs, `LICENSE`, provenance) and
   the upstream **distribution machinery** the fork reuses rather than
   republishes — `packaging/` registry manifests, `scripts/install.*`,
-  `cd.yml`/`pages.yml`, `website/`, self-update / version-check code, the
+  `pages.yml`, `website/`, self-update / version-check code, the
   `min_thurbox_version` manifest key, and the `tb-`/`tbs-` tmux window prefixes.
+  (`cd.yml` is the exception: the fork **does** cut its own `friring-*` release
+  binaries — see `FORK.md` → CI / automation.)
   Upstream merges now carry rename conflicts; resolve them toward `friring` for
   this app's own identifiers, leaving the attribution/distribution names as
   upstream.
