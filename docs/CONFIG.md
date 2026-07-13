@@ -854,6 +854,12 @@ These are in the DB rather than a file because they are written
 concurrently by multiple friring processes (TUI, CLI, MCP) and picked
 up live via `PRAGMA data_version` polling.
 
+Beyond the `metadata` keys above, the `repo_sync_bases` table stores
+each repo's default base remote for the `Ctrl+S` worktree sync —
+written when a choice is confirmed in the sync base picker (shown only
+for repos with more than one remote; see `docs/FEATURES.md`,
+"Choosing the base remote").
+
 ## Environment variables
 
 User-set (read by friring):

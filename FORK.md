@@ -208,6 +208,19 @@ Everywhere:
 
 Details in `docs/FEATURES.md` ("Global Search") + `docs/CONFIG.md`.
 
+#### Sync base picker (`Ctrl+S` with multiple remotes)
+
+Upstream's worktree sync hardcodes `origin`: `git fetch origin`, rebase onto
+the `@{upstream}` → `origin/HEAD` → `origin/main` → `origin/master` chain. On
+a repo with several remotes (fork + upstream is the common case) there was no
+way to sync onto anything else. The fork lists each repo's remotes off-thread
+on `Ctrl+S` (the ADR-P12 no-git-on-the-UI-thread discipline) and, **only when
+a repo has more than one remote**, opens a picker for the base remote before
+the sync threads start. The choice is persisted per repo (`repo_sync_bases`,
+schema v40) and preselected on the next sync; a single non-`origin` remote is
+pinned automatically instead of failing upstream's hardcoded fetch. Details in
+`docs/FEATURES.md` ("Choosing the base remote").
+
 ### Behavior fixes
 
 - **Worktree branch pre-fill keeps `/`.** In the new-worktree flow, the branch

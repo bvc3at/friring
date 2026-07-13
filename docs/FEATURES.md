@@ -1847,10 +1847,30 @@ Per-worktree steps:
    crashed git processes (see below).
 2. **Stash** — saves uncommitted changes so rebase can proceed on
    a clean tree.
-3. **Fetch** — `git fetch` from origin.
-4. **Rebase** — `git rebase origin/main` onto the latest upstream.
+3. **Fetch** — `git fetch` from the base remote (see below;
+   `origin` unless chosen otherwise).
+4. **Rebase** — onto the resolved base ref: with an explicitly
+   chosen remote, `<remote>/HEAD` → `<remote>/main` →
+   `<remote>/master`; otherwise the branch's `@{upstream}` →
+   `origin/HEAD` → `origin/main` → `origin/master`.
 5. **Stash pop** — restores the stashed changes. If rebase fails
    (conflict), the stash is popped before reporting the conflict.
+
+### Choosing the base remote
+
+`Ctrl+S` first lists each involved repo's remotes on a background
+thread (no git on the UI thread — the ADR-P12 discipline, see
+`docs/PERFORMANCE.md`):
+
+- **One remote (or none)** — no prompt. `origin` keeps the default
+  resolution chain above; a single remote named something else is
+  pinned automatically (upstream would fail its hardcoded
+  `git fetch origin`).
+- **More than one remote** — a **sync base picker** opens per
+  multi-remote repo before anything syncs. The chosen remote is
+  saved as that repo's default (`repo_sync_bases` in the DB) and
+  preselected next time; `Esc` cancels the whole run. Only after
+  every multi-remote repo has a choice do the sync threads start.
 
 **Why stash instead of requiring a clean tree?** Agent sessions
 frequently have uncommitted work in progress. Requiring a clean

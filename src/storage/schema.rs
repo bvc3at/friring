@@ -16,9 +16,10 @@ use rusqlite::Connection;
 /// v38 adds `base_branch` to `sessions` plus the `review_comments` /
 /// `review_marks` tables (the native code-review view); v39 scopes
 /// `repo_bookmarks` to a `host` (`''` = local), giving remote targets the
-/// same bookmark memory as local ones.
+/// same bookmark memory as local ones; v40 adds `repo_sync_bases` (the
+/// per-repo default base remote for the Ctrl+S worktree sync).
 /// Gaps in the step table are fine (there is no v18 step either).
-pub const SCHEMA_VERSION: u32 = 39;
+pub const SCHEMA_VERSION: u32 = 40;
 
 /// A single migration step: applied when the stored version is below `target`.
 type MigrationStep = (u32, fn(&Connection) -> rusqlite::Result<()>);
@@ -179,6 +180,11 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             PRIMARY KEY (host, repo_path)
         );
 
+        CREATE TABLE IF NOT EXISTS repo_sync_bases (
+            repo_path TEXT PRIMARY KEY,
+            remote    TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS tasks (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             title           TEXT NOT NULL,
@@ -286,6 +292,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         (37, migrate_v37_force_deleted),
         (38, migrate_v38_code_review),
         (39, migrate_v39_bookmark_host),
+        (40, migrate_v40_repo_sync_bases),
     ];
 
     for &(target, step) in steps {
@@ -1161,6 +1168,18 @@ fn migrate_v39_bookmark_host(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// v40: `repo_sync_bases`, the per-repo default base remote for the Ctrl+S
+/// worktree sync (chosen in the base picker when a repo has >1 remotes).
+/// `CREATE TABLE IF NOT EXISTS` keeps a re-run a no-op.
+fn migrate_v40_repo_sync_bases(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS repo_sync_bases (
+            repo_path TEXT PRIMARY KEY,
+            remote    TEXT NOT NULL
+        );",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1196,6 +1215,7 @@ mod tests {
         assert!(tables.contains(&"automations".to_string()));
         assert!(tables.contains(&"automation_runs".to_string()));
         assert!(tables.contains(&"repo_bookmarks".to_string()));
+        assert!(tables.contains(&"repo_sync_bases".to_string()));
         assert!(tables.contains(&"tasks".to_string()));
         assert!(tables.contains(&"session_messages".to_string()));
         // The legacy one-shot table is replaced by `automations`.
