@@ -14,11 +14,10 @@ jobs:
   # Analyze commits and determine if release is needed
   check-release:
     name: Analyze commits for release
-    # Fork (Friring): don't auto-cut releases/tags on the fork. This gate job
-    # produces the `should_release` output every downstream job needs, so
-    # guarding it here cascades — the whole pipeline skips on any repo but
-    # upstream. See FORK.md.
-    if: github.repository == 'Thurbeen/thurbox'
+    # Fork (Friring): this runs on the fork too — Friring cuts its own releases
+    # (friring-* binaries + GitHub Release). Only the downstream package-manager
+    # publish jobs stay upstream-guarded (the fork has no AUR/Homebrew/Choco/
+    # winget accounts or secrets). See FORK.md.
     runs-on: ubuntu-latest
     outputs:
       should_release: ${{ steps.parse.outputs.should_release }}
@@ -127,7 +126,7 @@ jobs:
       - name: Build release binary
         shell: bash
         env:
-          THURBOX_RELEASE_VERSION: ${{ needs.check-release.outputs.version }}
+          FRIRING_RELEASE_VERSION: ${{ needs.check-release.outputs.version }}
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
             cross build --release --target ${{ matrix.target }}
@@ -141,7 +140,7 @@ jobs:
         run: |
           VERSION="${{ needs.check-release.outputs.version }}"
           TARGET="${{ matrix.target }}"
-          ARCHIVE_NAME="thurbox-${VERSION}-${TARGET}.tar.gz"
+          ARCHIVE_NAME="friring-${VERSION}-${TARGET}.tar.gz"
 
           # Stage LICENSE next to the binaries so a single `tar czf` ships all
           # three. (`tar --append` cannot operate on a gzip archive, so the old
@@ -149,7 +148,7 @@ jobs:
           # failure must fail the job.
           cp LICENSE "target/$TARGET/release/"
           cd target/$TARGET/release
-          tar czf "../../../$ARCHIVE_NAME" thurbox thurbox-cli LICENSE
+          tar czf "../../../$ARCHIVE_NAME" friring friring-cli LICENSE
           cd ../../..
 
       # Windows archive: .zip with the .exe binaries + LICENSE. install.ps1
@@ -160,18 +159,18 @@ jobs:
         run: |
           $version = "${{ needs.check-release.outputs.version }}"
           $target = "${{ matrix.target }}"
-          $archive = "thurbox-$version-$target.zip"
+          $archive = "friring-$version-$target.zip"
           $rel = "target/$target/release"
           Compress-Archive -Force -DestinationPath $archive -Path `
-            "$rel/thurbox.exe", "$rel/thurbox-cli.exe", "LICENSE"
+            "$rel/friring.exe", "$rel/friring-cli.exe", "LICENSE"
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binary-${{ matrix.target }}
           path: |
-            thurbox-*.tar.gz
-            thurbox-*.zip
+            friring-*.tar.gz
+            friring-*.zip
           if-no-files-found: error
 
   # Generate checksums for all binaries
@@ -194,15 +193,15 @@ jobs:
           find . \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} . \;
 
           # Generate checksums over every release archive
-          sha256sum thurbox-*.tar.gz thurbox-*.zip > "thurbox-${VERSION}-checksums.txt"
+          sha256sum friring-*.tar.gz friring-*.zip > "friring-${VERSION}-checksums.txt"
 
-          cat "thurbox-${VERSION}-checksums.txt"
+          cat "friring-${VERSION}-checksums.txt"
 
       - name: Upload checksums
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: checksums
-          path: artifacts/thurbox-*-checksums.txt
+          path: artifacts/friring-*-checksums.txt
 
   # Generate CHANGELOG from commits
   generate-changelog:
@@ -249,7 +248,7 @@ jobs:
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ needs.check-release.outputs.version }}
-          name: thurbox ${{ needs.check-release.outputs.version }}
+          name: friring ${{ needs.check-release.outputs.version }}
           body: |
             ${{ needs.generate-changelog.outputs.changelog || '## Changes
 
@@ -267,7 +266,9 @@ jobs:
   publish-aur:
     name: Publish AUR (${{ matrix.pkgname }})
     needs: [check-release, create-tag, publish]
-    if: needs.check-release.outputs.should_release == 'true'
+    # Upstream-only: the fork republishes friring-* binaries but reuses upstream's
+    # package-manager channels (the thurbox/thurbox-bin AUR packages are theirs).
+    if: needs.check-release.outputs.should_release == 'true' && github.repository == 'Thurbeen/thurbox'
     runs-on: ubuntu-latest
     # Hoisted so the publish step can be skipped when the secret is unset
     # (the `secrets` context cannot be used directly in an `if` condition).
@@ -313,7 +314,8 @@ jobs:
   publish-homebrew:
     name: Publish Homebrew formula
     needs: [check-release, create-tag, publish]
-    if: needs.check-release.outputs.should_release == 'true'
+    # Upstream-only: the Thurbeen/homebrew-thurbox tap is upstream's. See publish-aur.
+    if: needs.check-release.outputs.should_release == 'true' && github.repository == 'Thurbeen/thurbox'
     runs-on: ubuntu-latest
     # Hoisted so the push step can be skipped when the secret is unset
     # (the `secrets` context cannot be used directly in an `if` condition).
@@ -373,7 +375,8 @@ jobs:
   publish-chocolatey:
     name: Publish Chocolatey package
     needs: [check-release, create-tag, publish]
-    if: needs.check-release.outputs.should_release == 'true'
+    # Upstream-only: the thurbox Chocolatey package id is upstream's. See publish-aur.
+    if: needs.check-release.outputs.should_release == 'true' && github.repository == 'Thurbeen/thurbox'
     runs-on: windows-latest
     # Hoisted so the steps can be skipped when the secret is unset
     # (the `secrets` context cannot be used directly in an `if` condition).
@@ -430,7 +433,8 @@ jobs:
   publish-winget:
     name: Publish winget manifest
     needs: [check-release, create-tag, publish]
-    if: needs.check-release.outputs.should_release == 'true'
+    # Upstream-only: the Thurbeen.thurbox winget id is upstream's. See publish-aur.
+    if: needs.check-release.outputs.should_release == 'true' && github.repository == 'Thurbeen/thurbox'
     runs-on: windows-latest
     # Hoisted so the steps can be skipped when the secret is unset
     # (the `secrets` context cannot be used directly in an `if` condition).

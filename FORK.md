@@ -36,13 +36,15 @@ What still says `thurbox` is deliberate, and splits in two:
 - **Upstream attribution** — the repo URLs, badges, `LICENSE`, and provenance
   notes point at [`Thurbeen/thurbox`](https://github.com/Thurbeen/thurbox) and
   stay as-is (this is a fork, and the credit is upstream's).
-- **Upstream distribution machinery** — Friring publishes no releases,
-  packages, or website of its own, so everything that fetches or ships an
-  upstream artifact keeps the upstream name: `packaging/` registry manifests,
-  `scripts/install.*`, the `cd.yml` / `pages.yml` workflows, `website/`, the
-  self-update / version-check code, the `min_thurbox_version` extension-manifest
-  key (a wire format shared with upstream), and the `tb-` / `tbs-` tmux window
-  prefixes (brand-neutral, kept for live-window compatibility).
+- **Upstream distribution machinery** — Friring cuts its **own** GitHub Releases
+  (`friring-*` binaries via `cd.yml`; see [CI / automation](#ci--automation)),
+  but reuses upstream's package-manager channels and website rather than
+  republishing them. So everything that fetches or ships an *upstream* artifact
+  keeps the upstream name: `packaging/` registry manifests, `scripts/install.*`,
+  the `pages.yml` workflow, `website/`, the self-update / version-check code, the
+  `min_thurbox_version` extension-manifest key (a wire format shared with
+  upstream), and the `tb-` / `tbs-` tmux window prefixes (brand-neutral, kept for
+  live-window compatibility).
 
 The tradeoff the branding-only approach used to avoid is now real: upstream
 merges carry rename conflicts on the renamed identifiers, and an existing
@@ -322,10 +324,11 @@ the first match.
   still says `thurbox`: upstream **attribution** (repo URLs, `LICENSE`,
   provenance, badges) and the upstream **distribution machinery** the fork
   reuses rather than republishes — `packaging/` registry manifests,
-  `scripts/install.*`, the `cd.yml` / `pages.yml` workflows, `website/`, the
-  self-update / version-check code, the `min_thurbox_version` manifest key, and
-  the `tb-` / `tbs-` tmux window prefixes. See [Migration](#migration); upstream
-  merges now carry rename conflicts on the renamed identifiers.
+  `scripts/install.*`, the `pages.yml` workflow, `website/`, the self-update /
+  version-check code, the `min_thurbox_version` manifest key, and the `tb-` /
+  `tbs-` tmux window prefixes (`cd.yml` is the exception — the fork cuts its own
+  `friring-*` releases). See [Migration](#migration); upstream merges now carry
+  rename conflicts on the renamed identifiers.
 - `README.md` and the agent-guide prose call the project **Friring**; the repo
   URLs, install commands, badges, and packaging still point at upstream (that's
   attribution and shared distribution, not a rename target).
@@ -344,13 +347,23 @@ the first match.
 
 Some upstream workflows target infrastructure the fork doesn't have, so they are
 guarded to run only on the canonical `Thurbeen/thurbox` repo and stay dormant
-here (while remaining merge-safe). All build / test / lint jobs run normally on
-the fork.
+here (while remaining merge-safe). The release pipeline (`cd.yml`) is the
+exception — the fork runs it. All build / test / lint jobs run normally on the
+fork.
 
 - `.github/workflows/pages.yml` (GitHub Pages) — dormant; the fork has no Pages
   site.
-- `.github/workflows/cd.yml` (Release) — dormant; the fork does not cut its own
-  releases.
+- `.github/workflows/cd.yml` (Release) — **active on the fork.** Every push to
+  `main` that includes a `feat` / `fix` / `perf` commit cuts a tag
+  (`cog bump --auto`) and publishes a GitHub Release with cross-platform
+  `friring-*` binaries + a checksums file — this needs only the built-in
+  `GITHUB_TOKEN`. The four package-manager publish jobs
+  (AUR / Homebrew / Chocolatey / winget) stay guarded to `Thurbeen/thurbox`:
+  those channels carry upstream's identity and the fork has no accounts or
+  secrets for them. Two things still point upstream — changelog compare links
+  (`cog.toml` `owner`/`repository`) and `scripts/install.*` (which fetch
+  `thurbox-*` from upstream); grab the fork's binaries from its Releases page
+  directly.
 - `.github/workflows/ci.yml` — the `sonarqube` job is dormant; SonarQube is not
   set up for the fork at the moment. The `changes` (paths-filter) job also grants
   `pull-requests: read`, which a **private** repo's default token lacks (public
