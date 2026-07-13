@@ -456,7 +456,7 @@ fn shared_session_to_json(s: &SharedSession, hook: Option<&HookRow>) -> Value {
         "cwd": s.cwd.as_ref().map(|p| p.display().to_string()),
         "parent_session_id": s.parent_session_id.map(|id| id.to_string()),
         "display_order": s.display_order,
-        "hook_state": hook.and_then(|h| h.state.clone()),
+        "hook_state": hook.and_then(|h| h.state.as_deref()),
         "hook_state_at": hook.and_then(|h| h.state_at),
         "worktrees": s.worktrees.iter().map(|w| json!({
             "repo_path": w.repo_path.display().to_string(),
