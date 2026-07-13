@@ -292,17 +292,22 @@ the first match.
 
 ### Behavior fixes
 
-- **Copy falls back to OSC 52 when no display server is reachable.** Upstream
-  copies only through `arboard`, which needs X11/Wayland — over SSH, under a
-  display-less tmux, or in WSL without WSLg every copy failed with "Clipboard
-  not available". The fork falls back to the OSC 52 escape (`app::clipboard`),
-  which rides the rendered-output path through tmux (default `set-clipboard
-  external` forwards it) to the outer terminal, putting the text on the
-  clipboard of the machine the user is actually looking at; the toast marks the
-  fire-and-forget path with `(OSC 52)`. Applies to all copy surfaces
-  (selection, status bar, code-review markdown). Paste keeps arboard only —
-  terminals block OSC 52 *reads* — and the error now points at the terminal's
-  own paste key (bracketed paste still works).
+- **Copy falls back to `tmux load-buffer` / OSC 52 when no display server is
+  reachable.** Upstream copies only through `arboard`, which needs X11/Wayland —
+  over SSH, under a display-less tmux, or in WSL without WSLg every copy failed
+  with "Clipboard not available". The fork adds two fallbacks (`app::clipboard`),
+  tried in the order that actually works: (1) inside tmux (`$TMUX` set — the
+  common `tmux -> friring` setup), `tmux load-buffer -w -`, which has **tmux
+  itself** set the outer terminal's clipboard; a raw application OSC 52 written
+  to our own stdout is *dropped* by tmux's default `set-clipboard external`
+  ("ignore attempts by applications to set tmux buffers"), so it must come from
+  tmux — and this path returns a real exit status rather than being
+  fire-and-forget (needs tmux ≥ 3.2 for `-w`, already required). (2) Outside
+  tmux, a raw OSC 52 escape to stdout (for a direct OSC-52-capable terminal),
+  whose toast is marked `(OSC 52)` since it is fire-and-forget. Applies to all
+  copy surfaces (selection, status bar, code-review markdown). Paste keeps
+  arboard only — terminals block OSC 52 *reads* — and the error now points at
+  the terminal's own paste key (bracketed paste still works).
 
 - **Modifier-Enter inserts a newline in the agent instead of switching
   sessions.** A legacy terminal (Windows Terminal, or anything behind an outer

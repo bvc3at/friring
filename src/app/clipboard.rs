@@ -1,25 +1,71 @@
-//! OSC 52 clipboard fallback for display-less environments.
+//! Clipboard fallbacks for display-less environments.
 //!
 //! `arboard` needs a display-server connection (X11/Wayland/AppKit/Win32), so
 //! it is unavailable exactly where friring often runs: inside tmux over SSH,
-//! or in a WSL distro without WSLg. OSC 52 covers that gap — the escape
-//! travels the same path as the rendered UI (through tmux, which forwards it
-//! to the outer terminal under its default `set-clipboard external`), so the
-//! text lands on the clipboard of the machine the user is looking at.
+//! or in a WSL distro without WSLg. Two fallbacks cover that gap, tried in the
+//! order that actually works:
 //!
-//! Write-only: most terminals refuse OSC 52 *reads* for security, so paste
-//! has no equivalent fallback — the terminal's own paste keystroke reaches
-//! friring as a bracketed paste instead (see `App::handle_paste`).
+//! 1. **`tmux load-buffer -w`** when friring is itself running inside a tmux
+//!    client (`$TMUX` set — the common `tmux -> friring` setup). This is the
+//!    primary fallback: tmux's default `set-clipboard external` *ignores* an
+//!    application's own OSC 52 (the manual: "ignore attempts by applications to
+//!    set tmux buffers"), so writing the escape to our stdout is silently
+//!    dropped. `load-buffer -w` instead has tmux *itself* set the outer
+//!    terminal's clipboard — which `external` permits — and returns an exit
+//!    status, so success is real rather than fire-and-forget. Requires tmux
+//!    ≥ 3.2 for `-w`, which friring already mandates.
+//! 2. **Raw OSC 52** (`ESC ] 52 ; c ; <base64> BEL`) when *not* inside tmux —
+//!    e.g. a direct SSH session to an OSC-52-capable terminal. Here nothing
+//!    strips the escape, so it reaches the terminal. This path is
+//!    fire-and-forget: a terminal without OSC 52 support ignores it silently.
+//!
+//! Write-only: terminals refuse OSC 52 *reads* for security, so paste has no
+//! equivalent fallback — the terminal's own paste keystroke reaches friring as
+//! a bracketed paste instead (see `App::handle_paste`).
 
 use std::io::Write;
+use std::process::{Command, Stdio};
+
+/// Set the outer terminal's clipboard through the tmux server friring is
+/// attached to (`$TMUX`), via `tmux load-buffer -w -`.
+///
+/// Works under tmux's default `set-clipboard external`, where a raw
+/// application OSC 52 is dropped: tmux is the one issuing the terminal escape,
+/// which `external` allows. `Ok(())` means the `tmux` process exited
+/// successfully (the buffer was set and the terminal clipboard *attempted* —
+/// tmux still needs the outer terminal's `Ms` capability to reach the system
+/// clipboard, but the tmux paste buffer is set regardless).
+pub(crate) fn tmux_copy(text: &str) -> std::io::Result<()> {
+    let mut child = Command::new("tmux")
+        .args(["load-buffer", "-w", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    {
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "tmux stdin unavailable")
+        })?;
+        stdin.write_all(text.as_bytes())?;
+    } // drop stdin → EOF so tmux stops reading
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "tmux load-buffer exited with {status}"
+        )))
+    }
+}
 
 /// Copy `text` to the terminal's clipboard via OSC 52
-/// (`ESC ] 52 ; c ; <base64> BEL`).
+/// (`ESC ] 52 ; c ; <base64> BEL`), written directly to stdout.
 ///
 /// Best-effort fire-and-forget: `Ok` means the sequence reached stdout, not
-/// that the terminal honoured it (one without OSC 52 support ignores it
-/// silently). Safe to emit while ratatui owns the screen — the sequence
-/// paints nothing and moves no cursor.
+/// that the terminal honoured it. Only meaningful when **not** behind tmux
+/// (see the module docs); inside tmux use [`tmux_copy`] instead. Safe to emit
+/// while ratatui owns the screen — the sequence paints nothing and moves no
+/// cursor.
 pub(crate) fn osc52_copy(text: &str) -> std::io::Result<()> {
     let mut out = std::io::stdout().lock();
     out.write_all(&osc52_sequence(text))?;

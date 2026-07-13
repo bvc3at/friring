@@ -2366,13 +2366,16 @@ confined to the active pane bounds.
   the system clipboard via `arboard`. Trailing whitespace is
   trimmed per line. When no display server is reachable (`arboard`
   needs X11/Wayland — unavailable over SSH, under a display-less
-  tmux, or in WSL without WSLg) every copy falls back to **OSC 52**
-  (`app::clipboard`): the escape rides the rendered-output path
-  through tmux (default `set-clipboard external` forwards it) to
-  the *outer* terminal, so the text lands on the clipboard of the
-  machine the user is looking at. The toast says `(OSC 52)` since
-  that path is fire-and-forget — a terminal without OSC 52 support
-  ignores it silently.
+  tmux, or in WSL without WSLg) the copy falls back (`app::clipboard`)
+  to whichever path actually reaches the outer terminal: **inside
+  tmux** (`$TMUX` set), `tmux load-buffer -w -`, which has tmux
+  itself set the outer terminal's clipboard — a raw application OSC 52
+  written to friring's own stdout is *dropped* by tmux's default
+  `set-clipboard external`, so the escape has to come from tmux (this
+  path checks the `tmux` exit status, so success is real); **outside
+  tmux**, a raw **OSC 52** escape for a direct OSC-52-capable terminal,
+  whose toast says `(OSC 52)` since it is fire-and-forget (a terminal
+  without OSC 52 support ignores it silently).
 - **`Ctrl+C`** (no selection): Forwarded to the terminal as SIGINT.
 - **`Ctrl+V`**: Pastes from the system clipboard. When a modal text
   input (worktree/session name, repo-picker path or search,

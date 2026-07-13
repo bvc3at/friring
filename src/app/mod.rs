@@ -503,11 +503,13 @@ pub enum StatusLevel {
 }
 
 /// Which mechanism served a clipboard copy (see [`App::set_clipboard_text`]).
-/// The OSC 52 path is fire-and-forget — the terminal never acknowledges it —
-/// so its toasts carry a marker instead of a plain "copied".
+/// The raw OSC 52 path is fire-and-forget — the terminal never acknowledges
+/// it — so its toasts carry a marker; the native and tmux paths report a real
+/// success (a returned `Ok`/exit status), so they read as a plain "copied".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClipboardVia {
     Native,
+    Tmux,
     Osc52,
 }
 
@@ -515,7 +517,7 @@ impl ClipboardVia {
     /// The success toast for a copy served this way.
     pub(crate) fn toast(self, msg: &str) -> String {
         match self {
-            ClipboardVia::Native => msg.into(),
+            ClipboardVia::Native | ClipboardVia::Tmux => msg.into(),
             ClipboardVia::Osc52 => format!("{msg} (OSC 52)"),
         }
     }
@@ -3319,20 +3321,49 @@ impl App {
     }
 
     /// Copy `text` to the system clipboard, preferring the native handle and
-    /// falling back to OSC 52 (see [`clipboard`]) when no display server is
-    /// reachable or the native write fails. Returns how the copy was served so
-    /// the caller's toast can flag the fire-and-forget path.
+    /// falling back (see [`clipboard`]) when no display server is reachable or
+    /// the native write fails. Returns how the copy was served so the caller's
+    /// toast can flag the fire-and-forget path.
+    ///
+    /// Fallback order (see the [`clipboard`] module docs for why): inside tmux,
+    /// `tmux load-buffer -w` — the raw OSC 52 an app writes to its own stdout
+    /// is dropped by tmux's default `set-clipboard external`, so the escape
+    /// must come from tmux itself; outside tmux, raw OSC 52 to stdout.
     pub(crate) fn set_clipboard_text(&mut self, text: &str) -> Result<ClipboardVia, String> {
-        match &mut self.clipboard {
+        // 1. Native display-server clipboard, when one is reachable.
+        let native_err = match &mut self.clipboard {
             Some(cb) => match cb.set_text(text) {
-                Ok(()) => Ok(ClipboardVia::Native),
-                Err(native) => clipboard::osc52_copy(text)
-                    .map(|()| ClipboardVia::Osc52)
-                    .map_err(|osc| format!("Clipboard write failed: {native}; OSC 52: {osc}")),
+                Ok(()) => return Ok(ClipboardVia::Native),
+                Err(e) => Some(e.to_string()),
             },
-            None => clipboard::osc52_copy(text)
-                .map(|()| ClipboardVia::Osc52)
-                .map_err(|osc| format!("Clipboard not available; OSC 52 failed: {osc}")),
+            None => None,
+        };
+
+        // 2. Inside tmux: authoritative (real exit status), works under the
+        //    default clipboard policy where a raw app OSC 52 would be dropped.
+        if std::env::var_os("TMUX").is_some() {
+            return clipboard::tmux_copy(text)
+                .map(|()| ClipboardVia::Tmux)
+                .map_err(|e| Self::clipboard_error(native_err.as_deref(), "tmux load-buffer", &e));
+        }
+
+        // 3. No display server and no tmux: raw OSC 52 to a direct terminal.
+        clipboard::osc52_copy(text)
+            .map(|()| ClipboardVia::Osc52)
+            .map_err(|e| Self::clipboard_error(native_err.as_deref(), "OSC 52", &e))
+    }
+
+    /// Compose a clipboard-failure message, folding in an earlier native error
+    /// when there was one (so a fallback failure doesn't hide why native was
+    /// skipped in the first place).
+    fn clipboard_error(
+        native_err: Option<&str>,
+        stage: &str,
+        err: &impl std::fmt::Display,
+    ) -> String {
+        match native_err {
+            Some(native) => format!("Clipboard write failed: {native}; {stage}: {err}"),
+            None => format!("Clipboard not available; {stage} failed: {err}"),
         }
     }
 
