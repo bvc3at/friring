@@ -389,14 +389,14 @@ impl App {
         }
         match self.modal {
             Modal::RestoreSessions(_) => self.handle_restore_sessions_key(code),
-            Modal::BranchSelector(_) => self.handle_branch_selector_key(code),
+            Modal::BranchSelector(_) => self.handle_branch_selector_key(code, mods),
             Modal::SyncBasePicker(_) => self.handle_sync_base_picker_key(code),
             Modal::WorktreeName(_) => self.handle_worktree_name_key(code, mods),
             Modal::SessionName(_) => self.handle_session_name_key(code, mods),
             Modal::AutomationEditor(_) => self.handle_automation_editor_key(code, mods),
             Modal::AutomationsList(_) => self.handle_automations_list_key(code),
-            Modal::AgentPicker(_) => self.handle_agent_picker_key(code),
-            Modal::HostPicker(_) => self.handle_host_picker_key(code),
+            Modal::AgentPicker(_) => self.handle_agent_picker_key(code, mods),
+            Modal::HostPicker(_) => self.handle_host_picker_key(code, mods),
             Modal::ThemePicker(_) => self.handle_theme_picker_key(code),
             Modal::RepoPicker(_) => self.handle_repo_picker_key(code, mods),
             Modal::ConversationPicker(_) => self.handle_conversation_picker_key(code, mods),
@@ -809,11 +809,16 @@ impl App {
         }
     }
 
-    fn handle_branch_selector_key(&mut self, code: KeyCode) {
+    /// Type-to-filter selector: printable keys edit the fuzzy query (so `j`/`k`
+    /// type, they don't navigate — arrows and Ctrl+N/P move the cursor), and
+    /// Esc clears an active query before it closes the modal.
+    fn handle_branch_selector_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let super::modals::Modal::BranchSelector(ref mut bs) = self.modal else {
             return;
         };
+        let visible = bs.filter.len(bs.branches.len());
         match code {
+            KeyCode::Esc if bs.filter.is_active() => bs.filter.clear(&mut bs.index),
             KeyCode::Esc => {
                 self.modal.close();
                 self.new_session.repo_path = None;
@@ -823,19 +828,30 @@ impl App {
                 // create will consume it now.
                 self.new_session.fetch_done = None;
             }
-            KeyCode::Char('j') | KeyCode::Down if bs.index + 1 < bs.branches.len() => {
-                bs.index += 1;
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                bs.index = bs.index.saturating_sub(1);
-            }
-            // Inert until the background load delivers (ADR-P12) — there is
-            // no branch to select yet.
-            KeyCode::Enter if !bs.loading && !bs.branches.is_empty() => {
-                let base_branch = bs.branches[bs.index].clone();
+            KeyCode::Down if bs.index + 1 < visible => bs.index += 1,
+            KeyCode::Up => bs.index = bs.index.saturating_sub(1),
+            // Inert until the background load delivers (ADR-P12) — there is no
+            // branch to select yet. A query with no matches is likewise inert.
+            KeyCode::Enter if !bs.loading => {
+                let Some(real) = bs.filter.real_index(bs.index, bs.branches.len()) else {
+                    return;
+                };
+                let base_branch = bs.branches[real].clone();
                 self.new_session.base_branch = Some(base_branch);
                 self.modal =
                     super::modals::Modal::SessionName(super::modals::SessionNameModal::default());
+            }
+            KeyCode::Backspace => bs.filter.pop(&bs.branches, &mut bs.index),
+            KeyCode::Char('n') if mods.contains(KeyModifiers::CONTROL) => {
+                if bs.index + 1 < visible {
+                    bs.index += 1;
+                }
+            }
+            KeyCode::Char('p') if mods.contains(KeyModifiers::CONTROL) => {
+                bs.index = bs.index.saturating_sub(1);
+            }
+            KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                bs.filter.push(c, &bs.branches, &mut bs.index);
             }
             _ => {}
         }
@@ -987,30 +1003,50 @@ impl App {
         }
     }
 
-    fn handle_host_picker_key(&mut self, code: KeyCode) {
+    /// Type-to-filter selector — same keymap as
+    /// [`Self::handle_branch_selector_key`].
+    fn handle_host_picker_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let super::modals::Modal::HostPicker(ref mut hp) = self.modal else {
             return;
         };
         let choice_count = hp.choices.len();
+        let visible = hp.filter.len(choice_count);
         match code {
+            KeyCode::Esc if hp.filter.is_active() => hp.filter.clear(&mut hp.selected_index),
             KeyCode::Esc => {
                 self.modal.close();
                 self.new_session.backend = None;
             }
-            KeyCode::Char('j') | KeyCode::Down if hp.selected_index + 1 < choice_count => {
-                hp.selected_index += 1;
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                hp.selected_index = hp.selected_index.saturating_sub(1);
-            }
+            KeyCode::Down if hp.selected_index + 1 < visible => hp.selected_index += 1,
+            KeyCode::Up => hp.selected_index = hp.selected_index.saturating_sub(1),
+            // Inert on a query with no matches (backspace to widen it).
             KeyCode::Enter => {
+                let Some(real) = hp.filter.real_index(hp.selected_index, choice_count) else {
+                    return;
+                };
                 let backend = hp
                     .choices
-                    .get(hp.selected_index)
+                    .get(real)
                     .map(|c| c.backend.clone())
                     .unwrap_or_default();
                 self.modal.close();
                 self.confirm_host_picker(backend);
+            }
+            KeyCode::Backspace => {
+                let labels = hp.choices.iter().map(|c| c.label.as_str());
+                hp.filter.pop(labels, &mut hp.selected_index);
+            }
+            KeyCode::Char('n') if mods.contains(KeyModifiers::CONTROL) => {
+                if hp.selected_index + 1 < visible {
+                    hp.selected_index += 1;
+                }
+            }
+            KeyCode::Char('p') if mods.contains(KeyModifiers::CONTROL) => {
+                hp.selected_index = hp.selected_index.saturating_sub(1);
+            }
+            KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                let labels = hp.choices.iter().map(|c| c.label.as_str());
+                hp.filter.push(c, labels, &mut hp.selected_index);
             }
             _ => {}
         }
@@ -1029,12 +1065,16 @@ impl App {
         self.open_repo_picker();
     }
 
-    fn handle_agent_picker_key(&mut self, code: KeyCode) {
+    /// Type-to-filter selector — same keymap as
+    /// [`Self::handle_branch_selector_key`].
+    fn handle_agent_picker_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let super::modals::Modal::AgentPicker(ref mut ap) = self.modal else {
             return;
         };
         let choice_count = ap.choices.len();
+        let visible = ap.filter.len(choice_count);
         match code {
+            KeyCode::Esc if ap.filter.is_active() => ap.filter.clear(&mut ap.selected_index),
             KeyCode::Esc => {
                 self.modal.close();
                 self.new_session.spawn_config = None;
@@ -1049,16 +1089,32 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down if ap.selected_index + 1 < choice_count => {
-                ap.selected_index += 1;
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                ap.selected_index = ap.selected_index.saturating_sub(1);
-            }
+            KeyCode::Down if ap.selected_index + 1 < visible => ap.selected_index += 1,
+            KeyCode::Up => ap.selected_index = ap.selected_index.saturating_sub(1),
+            // Inert on a query with no matches (backspace to widen it).
             KeyCode::Enter => {
-                let chosen = ap.choices.get(ap.selected_index).map(|c| c.name.clone());
+                let Some(real) = ap.filter.real_index(ap.selected_index, choice_count) else {
+                    return;
+                };
+                let chosen = ap.choices.get(real).map(|c| c.name.clone());
                 self.modal.close();
                 self.confirm_agent_picker(chosen);
+            }
+            KeyCode::Backspace => {
+                let labels = ap.choices.iter().map(|c| c.label());
+                ap.filter.pop(labels, &mut ap.selected_index);
+            }
+            KeyCode::Char('n') if mods.contains(KeyModifiers::CONTROL) => {
+                if ap.selected_index + 1 < visible {
+                    ap.selected_index += 1;
+                }
+            }
+            KeyCode::Char('p') if mods.contains(KeyModifiers::CONTROL) => {
+                ap.selected_index = ap.selected_index.saturating_sub(1);
+            }
+            KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                let labels = ap.choices.iter().map(|c| c.label());
+                ap.filter.push(c, labels, &mut ap.selected_index);
             }
             _ => {}
         }
@@ -1588,6 +1644,7 @@ impl App {
         self.modal = super::modals::Modal::BranchSelector(super::modals::BranchSelectorModal {
             index: 0,
             branches: Vec::new(),
+            filter: Default::default(),
             loading: true,
         });
 

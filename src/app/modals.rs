@@ -521,8 +521,12 @@ fn apply_text_edit_op(f: &mut TextInput, code: KeyCode) {
 
 #[derive(Debug, Clone, Default)]
 pub struct BranchSelectorModal {
+    /// Selection cursor in `filter`'s *filtered* row space, not directly into
+    /// `branches` (the two coincide while no query is typed).
     pub index: usize,
     pub branches: Vec<String>,
+    /// Type-to-filter query over `branches` (printable keys edit it).
+    pub(crate) filter: crate::fuzzy::FuzzyFilter,
     /// The branch list is still being read off-thread (ADR-P12): the modal
     /// opened instantly with a placeholder row and `Enter` is inert until the
     /// background load delivers.
