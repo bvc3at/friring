@@ -266,10 +266,15 @@ step_sleep() {
 step_wait_pane() {
     local pattern="$1" timeout="${2:-30}"
     if [ "$E2E_MODE" = "demo" ]; then
-        # VHS wants Go regexp; escape characters that would change meaning.
+        # VHS matches on a Go (RE2) regexp delimited by /…/. Emit the pattern as
+        # a literal: backslash-escape every RE2 metacharacter, the `/` delimiter,
+        # and `]`/`}` — so a wait-for string containing any of them can't produce
+        # an invalid or wrong-meaning tape. Backslashes first (so we don't
+        # double-escape the ones we add); then a class with `]` leading (the only
+        # position it's literal) under a `#` delimiter to keep `/` in the set.
         local esc
-        # shellcheck disable=SC2016  # sed class, not an unexpanded variable
-        esc="$(printf '%s' "$pattern" | sed 's/[.[\*^$()+?{|]/\\&/g')"
+        # shellcheck disable=SC2016  # sed classes, not unexpanded variables
+        esc="$(printf '%s' "$pattern" | sed 's/\\/\\\\/g' | sed 's#[]/.+*?(){}|^$[]#\\&#g')"
         printf 'Wait+Screen@%ss /%s/\n' "$timeout" "$esc" >> "$E2E_TAPE"
     else
         e2e_wait_pane "$pattern" "$((timeout * 10))" \
