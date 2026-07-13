@@ -17,7 +17,9 @@
 //! The sibling **top-level conversation transcript**
 //! (`projects/<slug>/<agent_session_id>.jsonl`) shares the line format;
 //! [`parse_conversation_head`] reads its head for the identity metadata
-//! (cwd / branch / title) the conversation-import picker lists.
+//! (cwd / branch / title) the conversation-import picker lists, and
+//! [`parse_session_names`] pulls the session's name (`/rename` and auto-title
+//! lines, appended on change) from a head + tail chunk pair.
 //!
 //! This module is the **pure** layer (arch rule `ui ← session`, no filesystem):
 //! it defines the [`CcActivity`] index the app polls onto `SessionInfo`, the
@@ -639,6 +641,64 @@ pub fn parse_conversation_head(s: &str) -> CcConversationMeta {
     meta
 }
 
+/// A session's name lines, extracted from transcript chunks by
+/// [`parse_session_names`]: Claude Code appends `{"type":"custom-title",
+/// "customTitle":…}` on `/rename` and `{"type":"ai-title","aiTitle":…}` when it
+/// auto-titles a session (verified v2.1.207).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CcSessionNames {
+    /// The newest user-set title (`/rename`).
+    pub custom: Option<String>,
+    /// The newest auto-generated title.
+    pub ai: Option<String>,
+}
+
+impl CcSessionNames {
+    /// Merge with an `older` chunk's scan, keeping `self`'s fields when both
+    /// have one (callers scan the file tail before the head — rename lines are
+    /// appended, so the tail holds the newest).
+    pub fn or(self, older: CcSessionNames) -> CcSessionNames {
+        CcSessionNames {
+            custom: self.custom.or(older.custom),
+            ai: self.ai.or(older.ai),
+        }
+    }
+
+    /// The display name: a user-set title beats the auto title — the
+    /// precedence Claude Code's own resume picker applies.
+    pub fn best(self) -> Option<String> {
+        self.custom.or(self.ai)
+    }
+}
+
+/// Extract a session's name from a chunk of its top-level transcript. Name
+/// lines are appended on every change, so within a chunk the **last** one wins
+/// — and a last-seen *empty* value (a cleared rename) hides earlier lines in
+/// the chunk instead of falling back to them, mirroring Claude Code's own
+/// last-line-only read.
+pub fn parse_session_names(s: &str) -> CcSessionNames {
+    let mut custom: Option<String> = None;
+    let mut ai: Option<String> = None;
+    for line in s.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match str_field(&v, "type").as_deref() {
+            Some("custom-title") => custom = str_field(&v, "customTitle").or(custom),
+            Some("ai-title") => ai = str_field(&v, "aiTitle").or(ai),
+            _ => {}
+        }
+    }
+    CcSessionNames {
+        custom: custom.filter(|t| !t.trim().is_empty()),
+        ai: ai.filter(|t| !t.trim().is_empty()),
+    }
+}
+
 /// Parse an `agent-<id>.jsonl` transcript into the block stream the view
 /// renders. Each line is one conversation entry; malformed/partial lines (a
 /// tail read racing a live append) are skipped, so a live transcript never
@@ -954,6 +1014,56 @@ garbage line that is not json
             r#"{"type":"user","message":{"content":[{"type":"text","text":"typed prompt"}]},"cwd":"/repo/b"}"#,
         );
         assert_eq!(no_summary.title.as_deref(), Some("typed prompt"));
+    }
+
+    #[test]
+    fn session_names_last_line_wins_and_custom_beats_ai() {
+        let jsonl = concat!(
+            r#"{"type":"ai-title","aiTitle":"Auto title","sessionId":"s1"}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":"First name","sessionId":"s1"}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":"Renamed","sessionId":"s1"}"#,
+            "\n",
+        );
+        let n = parse_session_names(jsonl);
+        assert_eq!(n.custom.as_deref(), Some("Renamed"));
+        assert_eq!(n.ai.as_deref(), Some("Auto title"));
+        assert_eq!(n.best().as_deref(), Some("Renamed"));
+
+        let ai_only = parse_session_names(r#"{"type":"ai-title","aiTitle":"Auto title"}"#);
+        assert_eq!(ai_only.best().as_deref(), Some("Auto title"));
+        assert_eq!(parse_session_names("").best(), None);
+    }
+
+    #[test]
+    fn session_names_cleared_rename_hides_earlier_lines() {
+        // A rename to "" clears the name; the earlier custom title must not
+        // resurface, but the auto title still may.
+        let jsonl = concat!(
+            r#"{"type":"custom-title","customTitle":"Old name"}"#,
+            "\n",
+            r#"{"type":"ai-title","aiTitle":"Auto title"}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":""}"#,
+            "\n",
+        );
+        let n = parse_session_names(jsonl);
+        assert_eq!(n.custom, None);
+        assert_eq!(n.best().as_deref(), Some("Auto title"));
+    }
+
+    #[test]
+    fn session_names_merge_prefers_the_newer_chunk() {
+        let head = parse_session_names(concat!(
+            r#"{"type":"custom-title","customTitle":"Head name"}"#,
+            "\n",
+            r#"{"type":"ai-title","aiTitle":"Head auto"}"#,
+        ));
+        let tail = parse_session_names(r#"{"type":"ai-title","aiTitle":"Tail auto"}"#);
+        let merged = tail.or(head);
+        assert_eq!(merged.custom.as_deref(), Some("Head name"));
+        assert_eq!(merged.ai.as_deref(), Some("Tail auto"));
     }
 
     #[test]

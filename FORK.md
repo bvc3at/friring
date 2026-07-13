@@ -160,9 +160,14 @@ creates a normal session that `--resume`s it **in a directory you choose**
 (default: the conversation's original cwd). Claude + local sessions only (v1).
 
 - **Browse.** An off-thread one-shot scan lists every top-level
-  `~/.claude/projects/*/<uuid>.jsonl` (`$CLAUDE_CONFIG_DIR` honored): title
-  (Claude Code's `summary` line if present, else the first typed prompt — meta
-  lines like slash-command envelopes are skipped), original cwd, git branch,
+  `~/.claude/projects/*/<uuid>.jsonl` (`$CLAUDE_CONFIG_DIR` honored): the
+  session's *name* when it has one (the newest `custom-title` line from
+  `/rename`, else the newest auto-generated `ai-title` line — both appended on
+  change, so the scan reads a 64 KiB tail besides the head, the same window
+  Claude Code's own resume picker scans, verified v2.1.207), falling back to
+  the message-derived title (Claude Code's `summary` line if present, else the
+  first typed prompt — meta lines like slash-command envelopes are skipped),
+  plus original cwd, git branch,
   last-active age. Fuzzy search (`/`), newest first. Conversations already
   tracked by a live session are excluded (importing one would race the running
   agent on its own transcript); duplicate ids across project dirs (earlier
@@ -187,12 +192,13 @@ creates a normal session that `--resume`s it **in a directory you choose**
   session behaves exactly like one Friring started. The relaunch agent is the
   registry default when it resumes by id, else the first agent whose
   `resume_args` carry `{id}` (`AgentDef::resumes_by_id`); the agent picker is
-  skipped. The session-name modal is prefilled from the conversation title.
-- **Code shape.** Pure head-parsing (`parse_conversation_head`) in
-  `session::cc_activity` beside the other defensive Claude Code parsers; scan +
-  staging + modal state + key handlers in `app::cc_import`; renderer in
-  `ui::conversation_picker_modal` (mirrors the repo picker's
-  search/list/input/footer shape).
+  skipped. The session-name modal is prefilled from the conversation's name,
+  else its title.
+- **Code shape.** Pure head/tail parsing (`parse_conversation_head`,
+  `parse_session_names`) in `session::cc_activity` beside the other defensive
+  Claude Code parsers; scan + staging + modal state + key handlers in
+  `app::cc_import`; renderer in `ui::conversation_picker_modal` (mirrors the
+  repo picker's search/list/input/footer shape).
 - **Follow-ups** (named, not silently dropped): remote (`ssh:`/`wsl:`) imports
   (scan the remote `~/.claude` and stage over the transport); importing
   conversations of *deleted* (tombstoned) sessions currently re-imports rather
