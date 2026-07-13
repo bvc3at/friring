@@ -688,8 +688,8 @@ repos? Add `--add-repo PATH@main` (its own worktree per repo) or
 | `Ctrl+T` | Toggle shell pane | **T**erminal |
 | `Ctrl+X` / `F7` | Toggle code-review pane (native diff reviewer) | Review |
 | `Ctrl+H` | Focus previous pane (cycle backward) | Vim: **h** = left |
-| `Ctrl+J` | Select next session | Vim: **j** = down |
-| `Ctrl+K` | Select previous session | Vim: **k** = up |
+| `Ctrl+J` / `Alt+J` | Select next session (`Ctrl+J` defers to the agent in a focused terminal — it doubles as a legacy `Ctrl+Enter`; use `Alt+J` there) | Vim: **j** = down |
+| `Ctrl+K` / `Alt+K` | Select previous session (`Ctrl+K` defers likewise; use `Alt+K` in a focused terminal) | Vim: **k** = up |
 | `Ctrl+L` | Focus next pane (cycle forward) | Vim: **l** = right |
 | `Shift+J` / `Shift+K` | Move selected session down/up (manual order) | reorder |
 | `Shift+S` | Sort sessions alphabetically within each repo group | **S**ort |
@@ -715,7 +715,10 @@ reorder or sort the session list only while it is focused.
 Ghostty) the Command key works as a modifier — `Cmd+J`/`Cmd+Shift+J`
 switch sessions and `Cmd+L`/`Cmd+Shift+L` cycle panes by default, and
 any action can be rebound to a `cmd+…` chord from the F1 editor.
-Terminal.app delivers no Cmd chords; everything else works there.
+Terminal.app delivers no Cmd chords; everything else works there. The
+in-terminal `Alt+J`/`Alt+K` alternates need Option mapped to Alt/Meta
+(e.g. kitty's `macos_option_as_alt yes`); without it Option+J/K types a
+composed character instead — use `Cmd+J`/`Cmd+K` or the session list.
 
 ### List Navigation
 
