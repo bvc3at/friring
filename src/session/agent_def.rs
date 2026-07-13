@@ -130,10 +130,15 @@ fn subst_group(tokens: &[String], id: &str, name: Option<&str>) -> Vec<String> {
         match name {
             Some(n) => out.push(token.replace(NAME_PLACEHOLDER, n)),
             None => {
-                // An equals-form `--name={name}` token is self-contained and
-                // drops alone; only a separate `-flag {name}` pair pops the
-                // preceding value-taking flag.
-                if !token.contains('=')
+                // Only a bare *value* token (the value half of a `-flag {name}`
+                // pair) pops the preceding value-taking flag. A token that is
+                // itself a flag (`--name={name}`, starts with `-`) is
+                // self-contained and drops alone — mirroring the flag vs
+                // `--flag=value` split in `session_ops`' `rewrite_config_path_args`.
+                // Keyed on the leading `-`, not on an embedded `=`: a value
+                // token can legitimately contain `=` (e.g. `["--label",
+                // "session={name}"]`), and that pair must still drop together.
+                if !token.starts_with('-')
                     && out
                         .last()
                         .is_some_and(|prev| prev.starts_with('-') && !prev.contains('='))
@@ -264,6 +269,29 @@ mod tests {
         let mut d = claude();
         d.new_session_args = vec!["--verbose".into(), "--name={name}".into()];
         assert_eq!(d.build_args(None, None, Some("new-id"), None), vec!["--verbose"]);
+    }
+
+    #[test]
+    fn pair_with_equals_in_value_token_drops_together() {
+        // The value half of a `-flag {name}` pair can legitimately embed `=`
+        // (`session={name}`); it is still a value token, not a self-contained
+        // `--flag=value`, so a name-less launch drops it *and* its preceding
+        // flag together. Keying the drop on an embedded `=` would strand the
+        // flag next to an unrelated arg.
+        let mut d = claude();
+        d.new_session_args = vec![
+            "--label".into(),
+            "session={name}".into(),
+            "--verbose".into(),
+        ];
+        assert_eq!(
+            d.build_args(None, None, Some("new-id"), None),
+            vec!["--verbose"]
+        );
+        assert_eq!(
+            d.build_args(None, None, Some("new-id"), Some("s")),
+            vec!["--label", "session=s", "--verbose"]
+        );
     }
 
     #[test]
