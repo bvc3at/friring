@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod agent_def;
 pub mod automation;
 pub mod cc_activity;

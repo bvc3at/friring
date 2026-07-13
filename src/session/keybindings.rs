@@ -212,7 +212,7 @@ impl Action {
             Action::StartSync => "Sync worktrees",
             Action::ToggleShell => "Toggle shell view",
             Action::ToggleReview => "Toggle code review",
-            Action::ToggleCcActivity => "Toggle CC activity",
+            Action::ToggleCcActivity => "Toggle agent activity",
             Action::ForkSession => "Fork session",
             Action::RestartSession => "Restart session",
             Action::UndoDelete => "Undo delete",

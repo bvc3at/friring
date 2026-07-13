@@ -1283,7 +1283,7 @@ impl App {
             ),
             Action::ToggleCcActivity => self.gated(
                 self.features.cc_activity,
-                "CC activity",
+                "Agent activity",
                 Self::toggle_cc_activity,
             ),
             Action::OpenAutomations => self.gated(
@@ -1368,7 +1368,7 @@ impl App {
             Action::SessionListImport => {
                 self.gated(
                     self.features.cc_activity,
-                    "CC activity",
+                    "Agent activity",
                     Self::start_conversation_import,
                 );
             }

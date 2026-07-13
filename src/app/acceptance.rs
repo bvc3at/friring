@@ -1030,14 +1030,24 @@ fn cc_activity_view_opens_navigates_folds_and_closes() {
     let mut h = Harness::spawnable(1);
     h.app.sessions[0].info.cc_activity = Some(activity);
 
-    // F9 opens the view, focused on the tree (workflow header + 2 agents + 1
-    // standalone subagent = 4 rows).
+    // F9 opens the view, focused on the navigator: 6 section rows, then the
+    // agents subtree (workflow header + 2 agents + 1 standalone subagent).
     h.key(KeyCode::F(9), KeyModifiers::NONE);
     assert_eq!(h.app.focus, InputFocus::CcActivityTree);
-    assert_eq!(h.app.active_cc_activity().unwrap().tree.len(), 4);
+    assert_eq!(h.app.active_cc_activity().unwrap().tree.len(), 10);
+    // The Overview section auto-previews on open.
+    assert_eq!(
+        h.app.active_cc_activity().unwrap().open,
+        Some(super::cc_activity::CcNodeRef::Section(
+            super::activity::Section::Overview
+        ))
+    );
 
-    // Moving to the first workflow agent auto-previews its transcript; `Enter`
+    // `6` jumps to the Agents section; the next two rows are the workflow
+    // header and its first agent, whose transcript auto-previews; `Enter`
     // drops into it to read (prompt + assistant text = 2 rows).
+    h.key(KeyCode::Char('6'), KeyModifiers::NONE);
+    h.key(KeyCode::Char('j'), KeyModifiers::NONE);
     h.key(KeyCode::Char('j'), KeyModifiers::NONE);
     h.key(KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(h.app.focus, InputFocus::CcActivity);
@@ -1081,21 +1091,139 @@ fn cc_activity_view_opens_navigates_folds_and_closes() {
         "clearing the search keeps the view open"
     );
 
-    // `h` steps back to the tree; folding the workflow hides its agents.
+    // `h` steps back to the navigator; folding the workflow hides its agents.
     h.key(KeyCode::Char('h'), KeyModifiers::NONE);
     assert_eq!(h.app.focus, InputFocus::CcActivityTree);
-    h.key(KeyCode::Home, KeyModifiers::NONE); // back onto the workflow header
+    h.key(KeyCode::Char('6'), KeyModifiers::NONE);
+    h.key(KeyCode::Char('j'), KeyModifiers::NONE); // onto the workflow header
     h.key(KeyCode::Char(' '), KeyModifiers::NONE);
     assert_eq!(
         h.app.active_cc_activity().unwrap().tree.len(),
-        2,
-        "a folded workflow hides its 2 agents (header + the standalone subagent remain)"
+        8,
+        "a folded workflow hides its 2 agents (sections + header + standalone remain)"
     );
+    // Space on the Agents section folds the whole subtree to sections only.
+    h.key(KeyCode::Char('6'), KeyModifiers::NONE);
+    h.key(KeyCode::Char(' '), KeyModifiers::NONE);
+    assert_eq!(h.app.active_cc_activity().unwrap().tree.len(), 6);
 
     // Esc closes and returns focus to the terminal.
     h.key(KeyCode::Esc, KeyModifiers::NONE);
     assert!(h.app.active_cc_activity().is_none());
     assert_eq!(h.app.focus, InputFocus::Terminal);
+}
+
+#[test]
+fn activity_sections_render_seeded_events() {
+    use super::activity::{ProviderKind, Section, SessionActivity};
+    use crate::session::activity::{ActionKind, ActivityEvent};
+
+    let ev = |kind, detail: &str, ok| ActivityEvent {
+        ts_ms: Some(1_783_512_000_000),
+        kind,
+        detail: detail.into(),
+        note: None,
+        result_head: Some("output head".into()),
+        ok,
+        origin: None,
+    };
+    let mut h = Harness::spawnable(1);
+    let sid = h.app.sessions[0].info.id;
+    h.app.activity.insert(
+        sid,
+        SessionActivity::seeded(
+            ProviderKind::Claude,
+            vec![
+                ev(ActionKind::Command, "cargo test", Some(true)),
+                ev(ActionKind::Command, "cargo bench", Some(false)),
+                ev(ActionKind::Edit, "/repo/src/a.rs", Some(true)),
+                ev(ActionKind::Read, "/repo/src/a.rs", Some(true)),
+                ev(ActionKind::WebSearch, "ratatui table", Some(true)),
+            ],
+        ),
+    );
+
+    // F9 opens on Overview; counts land in the navigator state.
+    h.key(KeyCode::F(9), KeyModifiers::NONE);
+    {
+        let ca = h.app.active_cc_activity().unwrap();
+        assert_eq!(ca.counts.commands, 2);
+        assert_eq!(ca.counts.total(), 5);
+        assert_eq!(ca.files_count, 1, "edit+read of one path aggregate");
+        assert!(ca
+            .rows
+            .iter()
+            .any(|r| matches!(r, super::cc_activity::CcRow::Text(s) if s.contains("5 actions"))));
+    }
+
+    // Timeline shows every event; Commands filters to the two commands.
+    h.key(KeyCode::Char('2'), KeyModifiers::NONE);
+    {
+        let ca = h.app.active_cc_activity().unwrap();
+        assert_eq!(
+            ca.open,
+            Some(super::cc_activity::CcNodeRef::Section(Section::Timeline))
+        );
+        assert_eq!(ca.rows.len(), 5);
+    }
+
+    // Enter expands a Timeline event. Drop focus into the content pane, then
+    // press Enter on the selected event row: for events, membership in
+    // `collapsed_tools` reads as *expanded* (see ui/cc_activity.rs), so the
+    // toggle reveals the result body.
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(h.app.focus, InputFocus::CcActivity);
+    let ev_bi = {
+        let ca = h.app.active_cc_activity().unwrap();
+        match ca.rows[ca.selected] {
+            super::cc_activity::CcRow::Block(bi) => bi,
+            _ => panic!("Timeline rows are event blocks"),
+        }
+    };
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        h.app
+            .active_cc_activity()
+            .unwrap()
+            .collapsed_tools
+            .contains(&ev_bi),
+        "Enter records the event block as expanded"
+    );
+    assert!(
+        h.render().contains("output head"),
+        "the expanded event renders its result body"
+    );
+    // Enter again collapses the event back to its compact one-line form.
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        !h.app
+            .active_cc_activity()
+            .unwrap()
+            .collapsed_tools
+            .contains(&ev_bi),
+        "Enter again collapses the event"
+    );
+
+    h.key(KeyCode::Char('3'), KeyModifiers::NONE);
+    assert_eq!(h.app.active_cc_activity().unwrap().rows.len(), 2);
+
+    // Files section groups the touched path under "Edited (1)".
+    h.key(KeyCode::Char('4'), KeyModifiers::NONE);
+    {
+        let ca = h.app.active_cc_activity().unwrap();
+        assert!(ca
+            .rows
+            .iter()
+            .any(|r| matches!(r, super::cc_activity::CcRow::Info(s) if s.contains("Edited (1)"))));
+        assert!(ca.rows.iter().any(
+            |r| matches!(r, super::cc_activity::CcRow::Text(s) if s.contains("/repo/src/a.rs"))
+        ));
+    }
+
+    // Web section holds the single search; the frame renders without panic.
+    h.key(KeyCode::Char('5'), KeyModifiers::NONE);
+    assert_eq!(h.app.active_cc_activity().unwrap().rows.len(), 1);
+    h.render();
 }
 
 #[test]

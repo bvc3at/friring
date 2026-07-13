@@ -900,7 +900,7 @@ impl App {
             InputFocus::CodeReview => "Review",
             InputFocus::ReviewFiles => "Changed files",
             InputFocus::CcActivity => "Activity",
-            InputFocus::CcActivityTree => "Workflows",
+            InputFocus::CcActivityTree => "Activity nav",
         };
         status_bar::FooterState {
             session_count: self.sessions.len(),

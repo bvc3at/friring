@@ -355,6 +355,22 @@ pub fn claude_project_slug(canonical_cwd: &Path) -> String {
         .collect()
 }
 
+/// Mistral Vibe's per-session log root: `$VIBE_HOME/logs/session` →
+/// `~/.vibe/logs/session`. Each session is a
+/// `<prefix>_<utc-ts>_<shortid>/` dir holding `meta.json` + `messages.jsonl`
+/// (subagents nested under `agents/`). `home_override` is the test hook,
+/// mirroring [`claude_projects_dir`]'s `config_dir_override`.
+pub fn vibe_sessions_dir(home_override: Option<&Path>) -> Option<PathBuf> {
+    let root = if let Some(p) = home_override {
+        p.to_path_buf()
+    } else if let Some(env) = std::env::var_os("VIBE_HOME") {
+        PathBuf::from(env)
+    } else {
+        home_dir()?.join(".vibe")
+    };
+    Some(root.join("logs").join("session"))
+}
+
 /// Returns true if a Claude transcript file `<agent_session_id>.jsonl` exists
 /// under `<root>/projects/*/`.
 ///
