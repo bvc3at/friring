@@ -267,6 +267,23 @@ mod tests {
     }
 
     #[test]
+    fn bare_positional_name_token_drops_alone() {
+        // A bare positional {name} (not a `-flag {name}` pair) drops by itself
+        // when the launch has no name: the preceding non-flag token is not a
+        // value-taking flag, so it survives. An empty name behaves like None.
+        let mut d = claude();
+        d.new_session_args = vec!["prefix".into(), "{name}".into(), "--mode".into()];
+        assert_eq!(
+            d.build_args(None, None, Some("new-id"), None),
+            vec!["prefix", "--mode"]
+        );
+        assert_eq!(
+            d.build_args(None, None, Some("new-id"), Some("")),
+            d.build_args(None, None, Some("new-id"), None)
+        );
+    }
+
+    #[test]
     fn resume_takes_precedence_over_new() {
         let d = claude();
         let args = d.build_args(Some("resume-id"), None, Some("new-id"), None);
