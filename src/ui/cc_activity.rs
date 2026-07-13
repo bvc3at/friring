@@ -329,7 +329,10 @@ fn block_lines(
         // Events are compact by default (one line each — a retrospective list,
         // not a transcript); Enter *expands* to note/result. The fold set is
         // therefore read inverted for this variant.
-        TranscriptBlock::Event(e) => event_lines(e, collapsed, wrap, h, width, query),
+        TranscriptBlock::Event(e) => {
+            let expanded = collapsed;
+            event_lines(e, expanded, wrap, h, width, query)
+        }
     }
 }
 
