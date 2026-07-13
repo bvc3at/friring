@@ -725,6 +725,32 @@ mod tests {
     }
 
     #[test]
+    fn scan_honors_a_cleared_rename_in_the_tail_over_a_head_name() {
+        // A `/rename` back to nothing appends `customTitle:""`; on a transcript
+        // larger than the head window that clear lives only in the tail and must
+        // override the earlier custom title the head scan saw — the older name
+        // must not resurface through the head/tail merge.
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path();
+        let big = format!(
+            "{}\n{}\n{{\"type\":\"assistant\",\"pad\":\"{}\"}}\n{}\n",
+            user_line("/repo/a", "the first prompt"),
+            r#"{"type":"custom-title","customTitle":"Head name"}"#,
+            "x".repeat(CONVO_HEAD_BYTES as usize + 1024),
+            r#"{"type":"custom-title","customTitle":""}"#,
+        );
+        write(
+            &projects.join("-repo-a").join(format!("{ID_A}.jsonl")),
+            &big,
+        );
+
+        let found = scan_conversations(projects, &HashSet::new());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, None);
+        assert_eq!(found[0].title.as_deref(), Some("the first prompt"));
+    }
+
+    #[test]
     fn stage_copies_into_destination_slug_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let projects = tmp.path().join("projects");
