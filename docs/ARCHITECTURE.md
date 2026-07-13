@@ -933,3 +933,41 @@ readability gain.
   coupling; behavior stays `impl App`, only pure logic moves.
 - *One big relocation PR* — unreviewable and merge-hostile; the value is
   in independently-reviewable, test-green increments.
+
+## ADR-23: Real-agent e2e — stub the model API, one scenario drives test and demo
+
+**Choice**: Test real agent binaries (Claude Code first) end-to-end
+through the real TUI by stubbing the **model HTTP API on loopback** — a
+zero-dependency node sidecar speaking the Anthropic Messages dialect
+(SSE + `tool_use`), answering from hand-curated *semantic* fixtures —
+and by expressing each covered flow as a **scenario** whose one
+description runs both as an asserting bats test and as a VHS demo
+recording (`scripts/dev/agent-e2e/`, `docs/E2E.md`). The suite lives
+outside cargo/nextest (the repo's established shape for
+process-spawning e2e), reuses `scripts/dev/lib/sandbox-env.sh` for
+hermeticity, and its CI job is path-gated and excluded from
+`all-checks.needs`.
+
+**Why**: real-agent behavior had zero coverage — the in-process
+acceptance suite fakes the backend, the smoke test never runs an agent —
+and the demo tapes could drive but not assert. The HTTP boundary is the
+narrowest stable seam for an opaque real binary (proven against the
+pinned claude: plain-HTTP loopback, full tool loop, offline under a
+dead proxy). Steps are a thin dual-backend vocabulary (tmux send-keys /
+VHS tape lines), so test and demo cannot drift apart.
+
+**Rejected**:
+
+- *Faking at the `SessionBackend` trait* (`FakeBackend`) — no real
+  process ever runs; exactly the gap being closed.
+- *Record/replay cassettes* — tool-use loops make bodies cumulative and
+  machine-specific; semantic turn-shape matching survives reruns.
+- *An in-crate Rust stub* — new heavy deps (hyper/axum) fail cargo-deny
+  policy and bloat the graph for a test sidecar; node ≥ 18 is already a
+  dev prerequisite of the toolchain.
+- *A scenario DSL (Gherkin or custom)* — scenarios stay plain bash
+  (flat step calls + assert functions); logic beyond a flat list belongs
+  in the harness, per the well-known DSL-maintenance failure mode.
+- *Putting the suite in cargo/nextest* — would drag tmux/node/claude
+  into `cargo nextest --all` and the prek pre-commit hook, and fight the
+  120s slow-timeout kill; the repo convention is shell harnesses.

@@ -1,0 +1,18 @@
+{
+  "responses": [
+    {
+      "name": "ambient",
+      "ambient": true,
+      "match": { "modelContains": "haiku" },
+      "reply": { "text": "ok" }
+    },
+    {
+      "name": "text-turn",
+      "match": { "promptContains": "ready phrase", "hasToolResult": false },
+      "delayMs": 150,
+      "reply": {
+        "text": "FRIRING-E2E-READY — this reply was streamed from the local stub through a real Claude Code binary rendered in Friring."
+      }
+    }
+  ]
+}

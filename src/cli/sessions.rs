@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::cli::output::{self, CommandOutput};
 use crate::session::SessionId;
-use crate::storage::Database;
+use crate::storage::{Database, HookRow};
 use crate::sync::SharedSession;
 
 #[derive(Subcommand, Debug)]
@@ -144,13 +144,24 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
                 .into_iter()
                 .filter(|s| parent_id.is_none() || s.parent_session_id == parent_id)
                 .collect();
-            let json = Value::Array(sessions.iter().map(shared_session_to_json).collect());
+            let hooks = db
+                .load_hook_states()
+                .map_err(|e| format!("load_hook_states: {e}"))?;
+            let json = Value::Array(
+                sessions
+                    .iter()
+                    .map(|s| shared_session_to_json(s, hooks.get(&s.id)))
+                    .collect(),
+            );
             Ok(CommandOutput::new(json, render_session_list(&sessions)))
         }
         Action::Get { uuid } => {
             let session = resolve(db, &uuid)?;
+            let hooks = db
+                .load_hook_states()
+                .map_err(|e| format!("load_hook_states: {e}"))?;
             Ok(CommandOutput::new(
-                shared_session_to_json(&session),
+                shared_session_to_json(&session, hooks.get(&session.id)),
                 render_session_detail(&session),
             ))
         }
@@ -431,7 +442,11 @@ fn resolve(db: &Database, uuid: &str) -> Result<SharedSession, String> {
         .ok_or_else(|| format!("Session not found: {uuid}"))
 }
 
-fn shared_session_to_json(s: &SharedSession) -> Value {
+// `hook_state`/`hook_state_at` are the raw persisted hook columns (schema
+// v34), not the TUI's derived status: an external observer (automation, the
+// agent-e2e harness) must see exactly what `session signal` wrote, without
+// the TUI's quiescence downgrade. Null until the first hook fires.
+fn shared_session_to_json(s: &SharedSession, hook: Option<&HookRow>) -> Value {
     json!({
         "id": s.id.to_string(),
         "name": s.name,
@@ -441,6 +456,8 @@ fn shared_session_to_json(s: &SharedSession) -> Value {
         "cwd": s.cwd.as_ref().map(|p| p.display().to_string()),
         "parent_session_id": s.parent_session_id.map(|id| id.to_string()),
         "display_order": s.display_order,
+        "hook_state": hook.and_then(|h| h.state.as_deref()),
+        "hook_state_at": hook.and_then(|h| h.state_at),
         "worktrees": s.worktrees.iter().map(|w| json!({
             "repo_path": w.repo_path.display().to_string(),
             "worktree_path": w.worktree_path.display().to_string(),
@@ -464,6 +481,39 @@ mod tests {
         assert!(v.is_array(), "got {v}");
         assert_eq!(v.as_array().unwrap().len(), 0);
         assert_eq!(v.human, "No active sessions.");
+    }
+
+    #[test]
+    fn get_and_list_expose_raw_hook_state() {
+        let db = db();
+        let shared = make_test_session("hooked");
+        let id = shared.id;
+        db.upsert_session(&shared).unwrap();
+
+        // Before any signal: fields present, null.
+        let v = run(
+            Action::Get {
+                uuid: id.to_string(),
+            },
+            &db,
+        )
+        .unwrap();
+        assert!(v["hook_state"].is_null(), "got {v}");
+        assert!(v["hook_state_at"].is_null(), "got {v}");
+
+        db.set_hook_state(id, "working").unwrap();
+        let v = run(
+            Action::Get {
+                uuid: id.to_string(),
+            },
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["hook_state"], "working");
+        assert!(v["hook_state_at"].is_i64(), "got {v}");
+
+        let v = run(Action::List { parent: None }, &db).unwrap();
+        assert_eq!(v.as_array().unwrap()[0]["hook_state"], "working");
     }
 
     #[test]

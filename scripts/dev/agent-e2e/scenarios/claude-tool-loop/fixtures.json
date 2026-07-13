@@ -1,0 +1,34 @@
+{
+  "responses": [
+    {
+      "name": "ambient",
+      "ambient": true,
+      "match": { "modelContains": "haiku" },
+      "reply": { "text": "ok" }
+    },
+    {
+      "name": "write-tool-call",
+      "match": { "promptContains": "hello.txt", "hasToolResult": false },
+      "delayMs": 100,
+      "reply": {
+        "text": "Writing hello.txt now.",
+        "toolUse": {
+          "id": "toolu_e2e_write_1",
+          "name": "Write",
+          "input": {
+            "file_path": "{{WS}}/hello.txt",
+            "content": "Hello from the Friring e2e stub!\n"
+          }
+        }
+      }
+    },
+    {
+      "name": "after-write",
+      "match": { "toolResultFor": "toolu_e2e_write_1" },
+      "delayMs": 150,
+      "reply": {
+        "text": "TOOL-LOOP-DONE — hello.txt was written by a real tool round-trip against the local stub."
+      }
+    }
+  ]
+}

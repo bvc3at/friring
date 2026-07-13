@@ -290,6 +290,21 @@ the first match.
   (ADR-P12), applying the instant the list lands. Details in `docs/FEATURES.md`
   ("Type-to-filter selectors").
 
+#### Real-agent e2e harness & scenario demos (`scripts/dev/agent-e2e/`)
+
+Hermetic, offline end-to-end tests that run a **real agent binary** (Claude
+Code is the proven reference) inside a Friring-managed pane with the **model
+API stubbed on loopback** — a zero-dep node sidecar speaking the Anthropic
+Messages dialect from hand-curated semantic fixtures. One scenario description
+runs both as an asserting bats test (`just agent-e2e`; three drive depths:
+`claude -p` → bare-tmux interactive → full Friring TUI) and as a VHS demo
+recording (`just agent-demo <scenario>`). Ships with a path-gated,
+**non-blocking** `agent-e2e` CI job that installs a pinned claude binary, and
+one small CLI addition: `session get/list --json` now expose the raw
+`hook_state`/`hook_state_at` columns so external observers (the harness,
+automations) can watch status transitions without reading SQLite. Architecture
+and contracts in `docs/E2E.md`; decision record ADR-23.
+
 ### Behavior fixes
 
 - **Worktree branch pre-fill keeps `/`.** In the new-worktree flow, the branch
