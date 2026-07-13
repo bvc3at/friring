@@ -134,7 +134,10 @@ mod tests {
         std::fs::write(older.join(HISTORY_FILE), HEADER).expect("write");
         std::fs::write(newer.join(HISTORY_FILE), HEADER).expect("write");
         // Force `newer` to have the later mtime (deterministic, no sleep).
-        std::fs::File::open(newer.join(HISTORY_FILE))
+        // Opened writable: Windows' SetFileTime denies a read-only handle.
+        std::fs::File::options()
+            .append(true)
+            .open(newer.join(HISTORY_FILE))
             .expect("open")
             .set_modified(SystemTime::now() + std::time::Duration::from_secs(60))
             .expect("set mtime");
