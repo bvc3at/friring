@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 #
-# Black-box smoke test for the thurbox TUI: launch the *real* `thurbox` binary
+# Black-box smoke test for the friring TUI: launch the *real* `friring` binary
 # inside a throwaway tmux pane, drive it with keystrokes, and assert on the
 # frames it actually paints — the one thing the in-process acceptance tests
 # (src/app/acceptance.rs) can't cover, since they never touch a terminal.
 #
 # Everything is isolated from your real environment, mirroring scripts/demo/
 # record.sh: a temp HOME + XDG dirs, and a private TMUX_TMPDIR so both the outer
-# "driver" tmux (socket `tui-smoke`) and thurbox's own dev socket
-# (`thurbox-dev`) live in — and are torn down from — the temp dir. It never
-# touches your real ~/.config/thurbox or any tmux server you have running.
+# "driver" tmux (socket `tui-smoke`) and friring's own dev socket
+# (`friring-dev`) live in — and are torn down from — the temp dir. It never
+# touches your real ~/.config/friring or any tmux server you have running.
 #
 # Usage:
 #   scripts/dev/smoke/tui-smoke.sh          # build (debug) + run the smoke test
-#   THURBOX_BIN=/path/to/thurbox \
+#   FRIRING_BIN=/path/to/friring \
 #     scripts/dev/smoke/tui-smoke.sh        # test a prebuilt binary (skip build)
 #
-# Requires: tmux >= 3.2, cargo (unless THURBOX_BIN is set).
+# Requires: tmux >= 3.2, cargo (unless FRIRING_BIN is set).
 # Exit status: 0 = all assertions passed, non-zero = a failure (printed).
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 SOCKET="tui-smoke"
-SESSION="thurbox-smoke"
+SESSION="friring-smoke"
 COLS=120
 ROWS=40
 
@@ -34,15 +34,15 @@ die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 command -v tmux >/dev/null || die "tmux not found (need >= 3.2)"
 
 # --- build (unless a binary was provided) — before the HOME override below ----
-if [ -n "${THURBOX_BIN:-}" ]; then
-  BIN="$THURBOX_BIN"
-  [ -x "$BIN" ] || die "THURBOX_BIN=$BIN is not executable"
+if [ -n "${FRIRING_BIN:-}" ]; then
+  BIN="$FRIRING_BIN"
+  [ -x "$BIN" ] || die "FRIRING_BIN=$BIN is not executable"
 else
-  log "building thurbox (debug)"
-  ( cd "$REPO_ROOT" && cargo build --bin thurbox >&2 )
-  BIN="$REPO_ROOT/target/debug/thurbox"
+  log "building friring (debug)"
+  ( cd "$REPO_ROOT" && cargo build --bin friring >&2 )
+  BIN="$REPO_ROOT/target/debug/friring"
 fi
-[ -x "$BIN" ] || die "thurbox binary not found at $BIN"
+[ -x "$BIN" ] || die "friring binary not found at $BIN"
 
 # --- isolated environment (shared dev-sandbox helper) ------------------------
 # shellcheck source=scripts/dev/lib/sandbox-env.sh
@@ -53,7 +53,7 @@ tbx_sandbox_init_full fresh   # hermetic: temp HOME/XDG so it never touches real
 # shellcheck disable=SC2317,SC2329 # body runs via the `trap` below; not unreachable
 cleanup() {
   # The outer "driver" tmux (socket `tui-smoke`) lives in the same private
-  # TMUX_TMPDIR; kill it, then let the helper kill thurbox-dev + wipe the root.
+  # TMUX_TMPDIR; kill it, then let the helper kill friring-dev + wipe the root.
   tmux -L "$SOCKET" kill-server >/dev/null 2>&1 || true
   tbx_sandbox_teardown
 }
@@ -82,7 +82,7 @@ send() { tmux -L "$SOCKET" send-keys -t "$SESSION" "$@"; }
 
 # --- assertions --------------------------------------------------------------
 # 1. It boots and paints its chrome.
-wait_for "thurbox"
+wait_for "friring"
 ok "TUI booted and rendered its header"
 wait_for "No sessions yet"
 ok "empty-state hint is shown"
@@ -99,7 +99,7 @@ wait_for "Catppuccin Mocha"
 ok "Ctrl+Y opened the theme picker"
 send Escape
 
-# 4. Ctrl+Q exits cleanly (the tmux session ends when thurbox returns).
+# 4. Ctrl+Q exits cleanly (the tmux session ends when friring returns).
 send C-q
 for _ in $(seq 1 50); do
   if ! tmux -L "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then

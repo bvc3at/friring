@@ -1,3 +1,4 @@
+pub(crate) mod activity;
 mod automation;
 mod automation_state;
 mod background;
@@ -73,7 +74,7 @@ const SLOW_OP_RECORD_MS: u64 = 5;
 const SLOW_OP_WARN_MS: u64 = 100;
 
 /// Ticks (~10 ms each) per steady-state perf report window (~10 s): under
-/// `THURBOX_PERF_LOG` each window emits one `perf_window` log line (counter
+/// `FRIRING_PERF_LOG` each window emits one `perf_window` log line (counter
 /// deltas + timing percentiles) and refreshes the published snapshot.
 /// Tick-based so tests can drive windows without a wall clock.
 const PERF_WINDOW_TICKS: u64 = 1_000;
@@ -89,9 +90,6 @@ const PERF_SNAPSHOT_TICKS: u64 = 500;
 /// own-connection writes bypass the throttle via cache invalidation.
 const HOOK_VERSION_CHECK_TICKS: u64 = 10;
 
-/// Prompt sent to Claude sessions when a worktree rebase has conflicts.
-const SYNC_CONFLICT_PROMPT: &str = "Please sync this worktree with main. Run: git fetch origin && git rebase origin/main -- if there are conflicts, resolve them and continue the rebase with git rebase --continue.";
-
 /// Tick delay before sending Enter after pasting text into a session.
 /// At ~10ms per tick, 10 ticks ≈ 100ms — enough for the app to process the pasted text.
 const DEFERRED_INPUT_DELAY_TICKS: u64 = 10;
@@ -103,6 +101,11 @@ const METRICS_REFRESH_TICKS: u64 = 100;
 /// activity view (in ticks, ~1 s). The scan is stat-gated: an unchanged tree
 /// skips the JSONL parse, so idle sessions stay cheap.
 const CC_REFRESH_TICKS: u64 = 100;
+
+/// How often to tail each local session's agent activity sources (in ticks,
+/// ~1 s), offset half a cadence from [`CC_REFRESH_TICKS`] so the two scans
+/// never land on the same tick. Also stat-gated.
+const ACTIVITY_REFRESH_TICKS: u64 = 100;
 
 /// How often to refresh git stats for the active session (in ticks). Git stats
 /// shell out to `git`, so they run on a slower cadence than other metrics
@@ -638,7 +641,7 @@ pub enum InputFocus {
     /// Editing the scoped task in the central pane (like a session's terminal —
     /// reached with `Enter`/`e` from the tasks panel; `Esc` returns to it).
     TaskEditor,
-    /// The global search strip docked along the bottom (`Ctrl+/` by default).
+    /// The centered global-search popup (`Ctrl+/` or double-`Shift`).
     /// Captures all input while active; entered/left only via its keybinding /
     /// `Esc`.
     GlobalSearch,
@@ -652,13 +655,16 @@ pub enum InputFocus {
     /// viewer: `j`/`k` walk the files (the diff follows), `Enter` drops into the
     /// diff at the selected file, `r`/`R` toggle reviewed.
     ReviewFiles,
-    /// The Claude Code activity view (workflow/subagent transcripts) in the
-    /// central pane (toggled like the review). Captures keys for scrolling +
-    /// tool folding.
+    /// The agent activity view's **content pane** (the selected section's
+    /// event list, an agent transcript, or a workflow overview) in the central
+    /// pane (toggled like the review). Captures keys for scrolling + folding.
+    /// The `Cc` prefix is historical — the view is agent-neutral.
     CcActivity,
-    /// The activity view's **tree** in the file-viewer column (workflows →
-    /// agents + standalone subagents). Focusable like `ReviewFiles`: `j`/`k`
-    /// browse (the transcript follows), `Enter`/`l` drops into the transcript.
+    /// The activity view's **navigator** in the file-viewer column: the six
+    /// sections (Overview/Timeline/Commands/Files/Web/Agents) with the Claude
+    /// workflow/subagent tree nested under Agents. Focusable like
+    /// `ReviewFiles`: `j`/`k` browse (the content follows), `Enter`/`l` drops
+    /// into the content pane.
     CcActivityTree,
 }
 
@@ -678,7 +684,8 @@ pub(crate) enum CentralTab {
     Agent,
     Shell,
     Review,
-    /// The Claude Code activity view (workflow/subagent transcripts).
+    /// The agent activity view (per-session retrospective across agent CLIs;
+    /// `Cc` prefix historical).
     CcActivity,
 }
 
@@ -730,14 +737,15 @@ pub struct App {
     /// sessions and returning keeps the review open. The active session's entry
     /// (if any) is reached via [`Self::active_review`] / [`Self::active_review_mut`].
     pub(crate) code_reviews: std::collections::HashMap<SessionId, code_review::CodeReviewState>,
-    /// Open Claude Code activity views, keyed by session — persisted per session
-    /// like [`Self::code_reviews`], so switching sessions and returning keeps the
-    /// view open. Reached via [`Self::active_cc_activity`] / `_mut`.
+    /// Open agent-activity views (section navigator + content state), keyed by
+    /// session — persisted per session like [`Self::code_reviews`], so switching
+    /// sessions and returning keeps the view open. Reached via
+    /// [`Self::active_cc_activity`] / `_mut` (`cc_` prefix historical).
     pub(crate) cc_activities: std::collections::HashMap<SessionId, cc_activity::CcActivityState>,
     pub(crate) modal: modals::Modal,
     /// In-progress new-session wizard (also drives fork/restart re-spawns).
     pub(crate) new_session: new_session_state::NewSessionWizardState,
-    /// Inter-instance DB sync (polls for changes from other thurbox instances).
+    /// Inter-instance DB sync (polls for changes from other friring instances).
     sync_state: SyncState,
     /// Worktree-to-main git sync (Ctrl+S).
     worktree_sync: sync_state::WorktreeSyncState,
@@ -754,6 +762,14 @@ pub struct App {
     /// unchanged `subagents/` tree skips re-parsing. `None`/absent = never
     /// scanned. Pure in-memory (the index is file-derived, never persisted).
     cached_cc_signatures: std::collections::HashMap<SessionId, u64>,
+    /// Per-session agent-neutral activity accumulators (normalized command /
+    /// edit / read / web event streams tailed from each agent's on-disk
+    /// records). Entries are *moved* into the in-flight scan and re-inserted
+    /// by `poll_activity_refresh`. File-derived, never persisted.
+    pub(crate) activity: std::collections::HashMap<SessionId, activity::SessionActivity>,
+    /// Background per-session activity-event tail, polled each tick; gated on
+    /// `[features] cc_activity` like the tree scan above.
+    activity_refresh: background::BackgroundTask<activity::ActivityRefresh>,
     /// Background active-session git-stats refresh, polled each tick.
     git_stats: background::BackgroundTask<(SessionId, Option<crate::session::GitStats>)>,
     /// Cached update-check result, rendered as the header "update available"
@@ -827,14 +843,19 @@ pub struct App {
     pub(crate) automation_ui: automation_state::AutomationUiState,
     /// Tasks-panel UI state (cached list, selection, editor, links).
     pub(crate) task_ui: task_state::TaskUiState,
-    /// Global search strip (`Ctrl+/`): cross-scope search docked at the bottom.
+    /// Global search popup (`Ctrl+/` or double-`Shift`): centered cross-scope
+    /// search, Search-Everywhere-style.
     pub(crate) global_search: search::GlobalSearchState,
+    /// When a bare `Shift` press last arrived (kitty-protocol terminals only)
+    /// with no other key since — the pending first tap of the double-`Shift`
+    /// search opener. See `App::handle_modifier_press`.
+    pub(crate) pending_double_shift: Option<std::time::Instant>,
     /// Currently active theme (built-in preset or custom from themes.toml),
     /// cached so the header doesn't hit SQLite every render. Kept in sync with
     /// `db.set_active_theme` writes.
     pub(crate) active_theme: crate::session::theme_config::ThemeEntry,
     /// User-customizable global keybindings. Loaded from
-    /// `~/.config/thurbox/keybindings.json` on startup, falling back to defaults
+    /// `~/.config/friring/keybindings.json` on startup, falling back to defaults
     /// when the file is missing or malformed.
     pub(crate) keybindings: crate::session::KeyBindings,
     /// Account-level usage/rate-limit info per agent name (the `/usage`
@@ -907,7 +928,7 @@ pub struct App {
     /// reused across frames until [`Self::session_order_signature`] changes,
     /// skipping the per-frame grouping/sort/nest work. See `render_left_panel`.
     cached_session_order: Option<(u64, crate::ui::project_list::SessionOrder)>,
-    /// `THURBOX_PERF_LOG` presence, read once at construction so the hot loop's
+    /// `FRIRING_PERF_LOG` presence, read once at construction so the hot loop's
     /// timing gate ([`Self::perf_timing_active`]) is a bool check, not an env
     /// lookup per iteration.
     perf_log_env: bool,
@@ -918,13 +939,13 @@ pub struct App {
     /// deltas (the counters themselves stay cumulative for the tests/HUD).
     perf_window_base: metrics_state::PerfCounters,
     /// Startup phase breakdown handed over by `main` (the `startup` log line's
-    /// fields), included in the published perf snapshot so `thurbox-cli perf`
+    /// fields), included in the published perf snapshot so `friring-cli perf`
     /// shows boot cost too.
     startup_phases: Option<serde_json::Value>,
 }
 
 const EDITOR_NOT_CONFIGURED: &str =
-    "No editor configured — run `thurbox-cli editor set <cmd>` or export $EDITOR/$VISUAL";
+    "No editor configured — run `friring-cli editor set <cmd>` or export $EDITOR/$VISUAL";
 
 /// Output-quiescence threshold that breaks a *stuck* `working` hook state.
 ///
@@ -988,7 +1009,7 @@ fn build_notification_state() -> Option<NotificationState> {
     // the configured preference plus host probing, then start the dispatcher
     // for it. A `none` backend (e.g. WSL without powershell, or backend="off")
     // still starts the thread but drops every notification — the reason is
-    // recorded for the `thurbox-cli notify` diagnostic rather than silently
+    // recorded for the `friring-cli notify` diagnostic rather than silently
     // lost as before.
     let backend = crate::notifications::detect_backend(settings.notifications.backend);
     if !backend.is_deliverable() {
@@ -1092,6 +1113,8 @@ impl App {
             metrics_refresh: background::BackgroundTask::default(),
             cc_refresh: background::BackgroundTask::default(),
             cached_cc_signatures: std::collections::HashMap::new(),
+            activity: std::collections::HashMap::new(),
+            activity_refresh: background::BackgroundTask::default(),
             git_stats: background::BackgroundTask::default(),
             // Seed the badge from the cache (no network); refreshed on first
             // tick if the flag is on and the cache is stale.
@@ -1123,6 +1146,7 @@ impl App {
             automation_ui: automation_state::AutomationUiState::default(),
             task_ui: task_state::TaskUiState::default(),
             global_search: search::GlobalSearchState::default(),
+            pending_double_shift: None,
             active_theme,
             keybindings,
             usage: HashMap::new(),
@@ -1145,7 +1169,7 @@ impl App {
             last_draw_at: clock::now(),
             last_output_gen: 0,
             cached_session_order: None,
-            perf_log_env: std::env::var_os("THURBOX_PERF_LOG").is_some(),
+            perf_log_env: std::env::var_os("FRIRING_PERF_LOG").is_some(),
             show_perf_hud: false,
             perf_window_base: metrics_state::PerfCounters::default(),
             startup_phases: None,
@@ -1382,7 +1406,7 @@ impl App {
     }
 
     /// [`Self::provider_for`], plus remote arg adaptation: when `config` targets
-    /// a remote (SSH/WSL) backend, the def's args that reference thurbox-managed
+    /// a remote (SSH/WSL) backend, the def's args that reference friring-managed
     /// config files by *local* path (claude's hooks `--settings …`) are rewritten
     /// for the host — materialized at a home-translated remote path, or stripped
     /// when no remote path can work — because an unresolvable path kills the
@@ -1448,6 +1472,7 @@ impl App {
         self.modal = modals::Modal::HostPicker(crate::ui::host_picker_modal::HostPickerState {
             choices,
             selected_index: 0,
+            filter: Default::default(),
         });
     }
 
@@ -1645,8 +1670,8 @@ impl App {
         };
 
         let agent = session.info.agent.clone();
-        // Keep the same thurbox identity across a restart so injected env stays
-        // stable (`THURBOX_SESSION`).
+        // Keep the same friring identity across a restart so injected env stays
+        // stable (`FRIRING_SESSION`).
         let session_id = session.info.id;
         // Preserve a remote backend on the config — set *before* env injection
         // (which skips the local-path dir vars for remote sessions) and used to
@@ -1667,10 +1692,10 @@ impl App {
             ..SessionConfig::default()
         };
         // `Session::restart` replaces the session env wholesale, so re-inject the
-        // standard `THURBOX_*` identity vars (the same set a fresh spawn gets via
+        // standard `FRIRING_*` identity vars (the same set a fresh spawn gets via
         // `build_spawn_inputs`); otherwise the restarted agent loses its identity
         // and the metrics/status hooks break.
-        crate::session_ops::inject_thurbox_env(&mut config, &agent_session_id, None);
+        crate::session_ops::inject_friring_env(&mut config, &agent_session_id, None);
         let def = self.agent_def_for(&config.agent);
         config.resume_session_id =
             crate::session_ops::resume_trigger_for(&def, &agent_session_id, &config.env);
@@ -1919,7 +1944,7 @@ impl App {
             return Some(modals::DeleteRisk::unknown());
         }
 
-        // Inspect each worktree thurbox would tear down; for a non-worktree
+        // Inspect each worktree friring would tear down; for a non-worktree
         // session fall back to its cwd (the live agent's working dir).
         let paths: Vec<std::path::PathBuf> = if session.info.worktrees.is_empty() {
             session.info.cwd.iter().cloned().collect()
@@ -2549,7 +2574,7 @@ impl App {
             return;
         }
 
-        // While the global-search strip is open it owns all input (it is
+        // While the global-search popup is open it owns all input (it is
         // entered/left only via its keybinding / Esc / Enter), so plain
         // clicks are swallowed rather than stealing focus from it.
         if self.global_search.active {
@@ -3534,6 +3559,7 @@ impl App {
         self.modal = modals::Modal::AgentPicker(crate::ui::agent_picker_modal::AgentPickerState {
             choices,
             selected_index,
+            filter: Default::default(),
         });
     }
 
@@ -3558,6 +3584,8 @@ impl App {
                 if let modals::Modal::BranchSelector(ref mut bs) = self.modal {
                     bs.branches = branches;
                     bs.loading = false;
+                    // A query typed while the list was loading applies now.
+                    bs.filter.refilter(&bs.branches, &mut bs.index);
                 }
                 self.metrics.bump(|p| &mut p.branch_loads_applied);
                 self.request_redraw();
@@ -3808,17 +3836,17 @@ impl App {
             .agent_session_id
             .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
             .clone();
-        // Mint the thurbox SessionId up front (unless a respawn supplied one) so
-        // it can be injected as `THURBOX_SESSION` before launch and `Session::spawn`
+        // Mint the friring SessionId up front (unless a respawn supplied one) so
+        // it can be injected as `FRIRING_SESSION` before launch and `Session::spawn`
         // reuses it. Stable across restarts.
         if config.session_id.is_none() {
             config.session_id = Some(SessionId::default());
         }
 
-        // Inject identity + statusline env vars. `THURBOX_TASK` is left unset: TUI
+        // Inject identity + statusline env vars. `FRIRING_TASK` is left unset: TUI
         // task spawns track the task↔session link in-memory (`task_session_links`),
         // so only the headless `task run` path auto-tags messages with it.
-        crate::session_ops::inject_thurbox_env(&mut config, &agent_session_id, None);
+        crate::session_ops::inject_friring_env(&mut config, &agent_session_id, None);
 
         // For a multi-repo session, launch the agent in a symlink workspace that
         // gathers every member dir; `info.cwd` keeps the primary repo (restored
@@ -4277,6 +4305,7 @@ impl App {
         self.metrics.tick_count = self.metrics.tick_count.wrapping_add(1);
 
         self.tick_global_search_content();
+        self.poll_global_search_file_index();
 
         self.refresh_session_statuses();
 
@@ -4290,6 +4319,7 @@ impl App {
         self.detect_lost_remote_sessions();
 
         // Poll for sync results from background worktree sync threads
+        self.poll_sync_remotes();
         self.poll_sync_results();
 
         // Poll for backgrounded interactive spawn work (branch listing +
@@ -4344,12 +4374,12 @@ impl App {
         self.tick_perf_window();
     }
 
-    /// Steady-state perf reporting: once per window (under `THURBOX_PERF_LOG`)
+    /// Steady-state perf reporting: once per window (under `FRIRING_PERF_LOG`)
     /// log counter deltas + timing percentiles + the window's slow ops, then
     /// reset the per-window timing state so each report stands alone. The
     /// startup line at first paint is separate and unaffected. Both the window
     /// report and an open HUD also refresh the published snapshot
-    /// (`thurbox-cli perf`); a default run publishes nothing.
+    /// (`friring-cli perf`); a default run publishes nothing.
     fn tick_perf_window(&mut self) {
         let tick = self.metrics.tick_count;
         let window_due = self.perf_log_env && tick % PERF_WINDOW_TICKS == 0;
@@ -4401,9 +4431,9 @@ impl App {
     }
 
     /// Write the current counters + timing stats as a JSON blob into the
-    /// `metadata` table for `thurbox-cli perf`. Only called while perf timing
+    /// `metadata` table for `friring-cli perf`. Only called while perf timing
     /// is active (see [`Self::tick_perf_window`]) — the write bumps other
-    /// thurbox connections' `data_version`, so it must never run on a
+    /// friring connections' `data_version`, so it must never run on a
     /// default-config idle instance. Best-effort: a failed write only warns.
     fn publish_perf_snapshot(&self) {
         let p = self.perf_counters();
@@ -4459,7 +4489,7 @@ impl App {
     }
 
     /// Whether wall-clock perf timing should be collected this iteration:
-    /// opted in via `THURBOX_PERF_LOG` or by opening the perf HUD. A cached
+    /// opted in via `FRIRING_PERF_LOG` or by opening the perf HUD. A cached
     /// bool so the hot loop pays nothing when observability is off.
     pub fn perf_timing_active(&self) -> bool {
         self.perf_log_env || self.show_perf_hud
@@ -4627,12 +4657,19 @@ impl App {
         self.poll_metrics_refresh();
         self.poll_git_stats();
         self.poll_cc_refresh();
+        self.poll_activity_refresh();
 
         if self.metrics.tick_count % METRICS_REFRESH_TICKS == 0 {
             self.start_metrics_refresh();
         }
         if self.features.cc_activity && self.metrics.tick_count % CC_REFRESH_TICKS == 0 {
             self.start_cc_refresh();
+        }
+        // Offset half a cadence from the tree scan so the two never share a tick.
+        if self.features.cc_activity
+            && self.metrics.tick_count % ACTIVITY_REFRESH_TICKS == ACTIVITY_REFRESH_TICKS / 2
+        {
+            self.start_activity_refresh();
         }
         if self.metrics.tick_count % GIT_REFRESH_TICKS == 0 {
             self.start_git_stats_refresh();
@@ -4654,7 +4691,7 @@ impl App {
     /// Recompute each session's status/activity/notification for this tick.
     ///
     /// Status is **hooks-driven**: agents report `working`/`blocked`/`done` via
-    /// `thurbox-cli session signal` (local sessions) or a tmux pane user option
+    /// `friring-cli session signal` (local sessions) or a tmux pane user option
     /// pushed over the control-mode subscription (remote sessions — drained
     /// below into the same hook columns), persisted in `sessions` and read here
     /// in one batch (see [`derive_session_status`]). A `done` session stays
@@ -4750,7 +4787,7 @@ impl App {
     }
 
     /// Drain remote-hook status events from every backend and persist them,
-    /// exactly as `thurbox-cli session signal` would have done locally.
+    /// exactly as `friring-cli session signal` would have done locally.
     ///
     /// A remote agent's hooks set a tmux pane user option; the backend's
     /// control-mode subscription queues `(pane_id, state)` pairs (see
@@ -4952,7 +4989,7 @@ impl App {
         state.prune_to(&live);
     }
 
-    /// Poll for external state changes from other thurbox instances (DB-based)
+    /// Poll for external state changes from other friring instances (DB-based)
     /// and apply any theme change / session delta they produced.
     fn poll_external_changes(&mut self) {
         let Ok(Some(result)) = sync::poll_for_changes(&mut self.sync_state, &mut self.db) else {
@@ -4998,7 +5035,7 @@ impl App {
         info!("focused session {id} from notification click");
     }
 
-    /// Pick up theme changes made by other thurbox processes (e.g. an MCP
+    /// Pick up theme changes made by other friring processes (e.g. an MCP
     /// `set_theme` call from another session).
     fn apply_external_theme_change(&mut self) {
         let Ok(Some(name)) = self.db.get_active_theme() else {
@@ -5205,9 +5242,9 @@ impl App {
         for (session_id, result) in results {
             match result {
                 git::SyncResult::Synced => synced += 1,
-                git::SyncResult::Conflict(_) => {
+                git::SyncResult::Conflict { base_ref } => {
                     conflicts += 1;
-                    self.send_conflict_prompt(session_id);
+                    self.send_conflict_prompt(session_id, &base_ref);
                 }
                 git::SyncResult::Error(msg) => errors.push(msg),
             }
@@ -5226,11 +5263,22 @@ impl App {
     }
 
     /// Send a conflict resolution prompt to a session via bracketed paste,
-    /// with a deferred Enter so the app processes the text first.
-    fn send_conflict_prompt(&mut self, session_id: SessionId) {
+    /// with a deferred Enter so the app processes the text first. `base_ref` is
+    /// the ref the rebase actually targeted (resolved per-worktree by
+    /// [`git::sync_worktree`]), so the prompt names it exactly rather than
+    /// assuming `origin/main`.
+    fn send_conflict_prompt(&mut self, session_id: SessionId, base_ref: &str) {
+        // `git fetch --all`, not bare `git fetch`: the base ref may point at a
+        // user-chosen non-default remote (e.g. `fork/main`), which a bare fetch
+        // (default remote only) would leave stale before the rebase.
+        let prompt = format!(
+            "Please sync this worktree with {base_ref}. Run: git fetch --all && git rebase \
+             {base_ref} -- if there are conflicts, resolve them and continue the \
+             rebase with git rebase --continue."
+        );
         if let Some(session) = self.sessions.iter().find(|s| s.info.id == session_id) {
             let mut paste = b"\x1b[200~".to_vec();
-            paste.extend_from_slice(SYNC_CONFLICT_PROMPT.as_bytes());
+            paste.extend_from_slice(prompt.as_bytes());
             paste.extend_from_slice(b"\x1b[201~");
             if let Err(e) = session.send_input(paste) {
                 error!("Failed to send sync prompt to session: {e}");
@@ -5246,10 +5294,16 @@ impl App {
 
     /// Start syncing the active session's worktrees with their base ref.
     ///
-    /// Worktrees sharing the same parent repo are synced sequentially (to avoid
-    /// concurrent `index.lock` contention), while different repos sync in parallel.
+    /// The `git remote` listing for the involved repos runs on a background
+    /// thread first (no git on the UI thread, the ADR-P12 discipline), polled
+    /// by [`Self::poll_sync_remotes`]. Repos with more than one remote route
+    /// through the sync base picker before the run launches; the rest use the
+    /// default origin chain.
     pub(crate) fn start_sync(&mut self) {
-        if self.worktree_sync.in_progress {
+        if self.worktree_sync.in_progress
+            || self.worktree_sync.remotes_load.in_progress()
+            || self.worktree_sync.awaiting.is_some()
+        {
             return;
         }
 
@@ -5269,25 +5323,167 @@ impl App {
             return;
         }
 
-        let count = worktree_sessions.len();
+        let mut repos: Vec<PathBuf> = worktree_sessions
+            .iter()
+            .map(|(_, _, repo)| repo.clone())
+            .collect();
+        repos.sort();
+        repos.dedup();
+
+        let tx = self.worktree_sync.remotes_load.start();
+        std::thread::spawn(move || {
+            let remotes = repos
+                .into_iter()
+                .map(|repo| {
+                    let remotes = git::list_remotes(&repo);
+                    (repo, remotes)
+                })
+                .collect::<Vec<_>>();
+            let _ = tx.send(remotes);
+        });
+
+        self.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: worktree_sessions,
+            queue: Vec::new(),
+            chosen: std::collections::HashMap::new(),
+        });
+        self.set_status(StatusLevel::Info, "Preparing sync...");
+    }
+
+    /// Apply a completed background remote listing to the parked sync run:
+    /// launch it directly when every repo has at most one remote, else open
+    /// the base picker for the first multi-remote repo.
+    fn poll_sync_remotes(&mut self) {
+        let remotes = match self.worktree_sync.remotes_load.poll() {
+            background::TaskPoll::Pending => return,
+            background::TaskPoll::Died => {
+                self.worktree_sync.awaiting = None;
+                self.set_error("Sync failed (remote listing worker died)");
+                return;
+            }
+            background::TaskPoll::Done(remotes) => remotes,
+        };
+        let Some(mut run) = self.worktree_sync.awaiting.take() else {
+            return;
+        };
+
+        for (repo, remotes) in remotes {
+            match remotes.as_slice() {
+                // Multi-remote repos need an explicit base — queue a picker.
+                [_, _, ..] => run.queue.push((repo, remotes)),
+                // A single remote named other than `origin` would fail the
+                // default chain's hardcoded `git fetch origin` — pin it.
+                [only] if only != "origin" => {
+                    run.chosen.insert(repo, only.clone());
+                }
+                // `origin` only (or no remotes): the default chain applies.
+                _ => {}
+            }
+        }
+
+        if run.queue.is_empty() {
+            self.launch_sync_run(run);
+        } else {
+            self.worktree_sync.awaiting = Some(run);
+            self.open_sync_base_picker();
+        }
+    }
+
+    /// Open the base picker for the front of the parked run's repo queue,
+    /// preselecting the repo's saved default remote (falling back to `origin`).
+    fn open_sync_base_picker(&mut self) {
+        let Some(run) = &self.worktree_sync.awaiting else {
+            return;
+        };
+        let Some((repo, remotes)) = run.queue.first() else {
+            return;
+        };
+        let saved = self.db.get_sync_base_remote(repo).ok().flatten();
+        let index = saved
+            .and_then(|s| remotes.iter().position(|r| *r == s))
+            .or_else(|| remotes.iter().position(|r| r == "origin"))
+            .unwrap_or(0);
+        self.modal = modals::Modal::SyncBasePicker(modals::SyncBasePickerModal {
+            repo_name: repo
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| repo.display().to_string()),
+            remotes: remotes.clone(),
+            index,
+        });
+        self.request_redraw();
+    }
+
+    /// Record the picker's choice for the front repo of the parked run,
+    /// persist it as that repo's default, and advance: next multi-remote repo
+    /// (another picker) or launch.
+    pub(crate) fn confirm_sync_base(&mut self, remote: String) {
+        // Peek before taking: the picker is only open with a non-empty queue,
+        // so an empty one means a lost invariant — leave the parked run intact
+        // rather than silently cancelling it (and dropping the whole sync).
+        let has_pending = self
+            .worktree_sync
+            .awaiting
+            .as_ref()
+            .is_some_and(|run| !run.queue.is_empty());
+        if !has_pending {
+            error!("confirm_sync_base with no queued repo; leaving the run parked");
+            return;
+        }
+        let mut run = self
+            .worktree_sync
+            .awaiting
+            .take()
+            .expect("awaiting checked non-empty above");
+        let (repo, _) = run.queue.remove(0);
+        if let Err(e) = self.db.set_sync_base_remote(&repo, &remote) {
+            // Non-fatal: the run still uses the choice, only the default is lost.
+            error!("Failed to save sync base for {}: {e}", repo.display());
+        }
+        run.chosen.insert(repo, remote);
+
+        if run.queue.is_empty() {
+            self.launch_sync_run(run);
+        } else {
+            self.worktree_sync.awaiting = Some(run);
+            self.open_sync_base_picker();
+        }
+    }
+
+    /// Cancel a parked sync run from the base picker (Esc): nothing has
+    /// synced yet, so the whole run is dropped.
+    pub(crate) fn cancel_sync_base(&mut self) {
+        self.worktree_sync.awaiting = None;
+        self.set_status(StatusLevel::Info, "Sync cancelled");
+    }
+
+    /// Launch the sync threads for a fully-decided run.
+    ///
+    /// Worktrees sharing the same parent repo are synced sequentially (to avoid
+    /// concurrent `index.lock` contention), while different repos sync in parallel.
+    fn launch_sync_run(&mut self, run: sync_state::PendingSyncRun) {
+        let count = run.worktrees.len();
         let (tx, rx) = mpsc::channel();
 
         // Group worktrees by repo so those sharing a repo sync sequentially.
         let mut by_repo = std::collections::HashMap::<PathBuf, Vec<(SessionId, PathBuf)>>::new();
-        for (session_id, worktree_path, repo_path) in worktree_sessions {
+        for (session_id, worktree_path, repo_path) in run.worktrees {
             by_repo
                 .entry(repo_path)
                 .or_default()
                 .push((session_id, worktree_path));
         }
 
-        for worktrees in by_repo.into_values() {
+        for (repo, worktrees) in by_repo {
             let tx = tx.clone();
+            // The picked (or single non-origin) base remote; `None` derives
+            // the rebase target per-worktree (upstream → origin/HEAD →
+            // origin/main → origin/master). The resolved ref rides back on
+            // `SyncResult::Conflict` so the prompt names it per-worktree.
+            let remote = run.chosen.get(&repo).cloned();
             std::thread::spawn(move || {
                 for (session_id, worktree_path) in worktrees {
-                    // base_ref = None: derive the rebase target per-worktree
-                    // (upstream → origin/HEAD → origin/main → origin/master).
-                    let result = git::sync_worktree(&worktree_path, None);
+                    let result = git::sync_worktree(&worktree_path, remote.as_deref());
                     let _ = tx.send((session_id, result));
                 }
             });
@@ -5471,7 +5667,7 @@ impl App {
     /// Build the [`SessionConfig`] for relaunching an *existing* session — either
     /// a startup-restore respawn ([`Self::spawn_restored_session`]) or a `Ctrl+U`
     /// undelete ([`Self::restore_deleted_session`]). Both reuse the session's
-    /// stable `SessionId` and must inject the `THURBOX_*` identity/dir env so the
+    /// stable `SessionId` and must inject the `FRIRING_*` identity/dir env so the
     /// agent's status hooks can attribute their `session signal` — without it the
     /// row's `hook_state` never updates and the session renders Idle forever
     /// (the bug these paths previously hit by calling `Session::spawn` directly).
@@ -5496,10 +5692,10 @@ impl App {
                 .then(|| backend_type.to_string()),
             ..SessionConfig::default()
         };
-        // `THURBOX_SESSION` (derived from `session_id`) is the identity that
-        // matters; an empty `THURBOX_SESSION_ID` for an id-less agent is harmless
-        // since the CLI resolves identity from `THURBOX_SESSION` first.
-        crate::session_ops::inject_thurbox_env(
+        // `FRIRING_SESSION` (derived from `session_id`) is the identity that
+        // matters; an empty `FRIRING_SESSION_ID` for an id-less agent is harmless
+        // since the CLI resolves identity from `FRIRING_SESSION` first.
+        crate::session_ops::inject_friring_env(
             &mut config,
             agent_session_id.as_deref().unwrap_or_default(),
             None,
@@ -5696,12 +5892,12 @@ impl App {
     /// down host) and must never block the first frame.
     pub fn restore_sessions(&mut self, sessions: Vec<sync::SharedSession>, session_counter: usize) {
         self.session_counter = session_counter;
-        // Opt-in startup-restore breakdown (THURBOX_PERF_LOG). Local restore is
+        // Opt-in startup-restore breakdown (FRIRING_PERF_LOG). Local restore is
         // sequential — each session is adopted with a blocking
         // `capture_pane_text` — so per-backend discover and per-session adopt
         // timings show where the remaining time goes. Read once here, never
         // per tick.
-        let perf_log = std::env::var_os("THURBOX_PERF_LOG").is_some();
+        let perf_log = std::env::var_os("FRIRING_PERF_LOG").is_some();
 
         // Only sessions with an agent_session_id are resumable.
         let resumable: Vec<sync::SharedSession> = sessions
@@ -6401,7 +6597,7 @@ impl App {
     ) {
         // Reuse the original SessionId so the session's identity is stable across
         // restarts: `do_spawn_session` upserts in place (no soft-delete + new-row
-        // churn), and `THURBOX_SESSION` is re-injected with the same id. Any
+        // churn), and `FRIRING_SESSION` is re-injected with the same id. Any
         // cached id / queued message addressed to this session stays valid.
         // Preserving a remote `backend` keeps the respawn on its own host —
         // without it `do_spawn_session` would silently relaunch the session on
@@ -6593,7 +6789,7 @@ impl App {
     /// The full agent prompt for a task (id + title + description + CLI hints),
     /// falling back to `title` if the task is no longer cached. Keeps the
     /// trigger paths from seeding an agent with just the bare title — the agent
-    /// gets explicit context that it is solving a Thurbox task and how to fetch
+    /// gets explicit context that it is solving a Friring task and how to fetch
     /// more / close it out (see [`crate::session::Task::agent_prompt`]).
     fn task_agent_prompt(&self, task_id: i64, title: &str) -> String {
         self.task_ui
@@ -7170,7 +7366,7 @@ mod tests {
 
     #[test]
     fn restored_session_config_injects_identity_env() {
-        // Regression: a restored/undeleted session must carry `THURBOX_SESSION`
+        // Regression: a restored/undeleted session must carry `FRIRING_SESSION`
         // so its status hooks can attribute `session signal` — otherwise the row
         // stays Idle forever. The two relaunch paths previously skipped this.
         let tmp = tempfile::tempdir().unwrap();
@@ -7186,15 +7382,15 @@ mod tests {
         assert_eq!(config.session_id, Some(id));
         assert_eq!(config.backend, None, "local backend stays None");
         assert_eq!(
-            config.env.get("THURBOX_SESSION"),
+            config.env.get("FRIRING_SESSION"),
             Some(&id.to_string()),
-            "THURBOX_SESSION must match the reused SessionId"
+            "FRIRING_SESSION must match the reused SessionId"
         );
         assert_eq!(
-            config.env.get("THURBOX_SESSION_ID"),
+            config.env.get("FRIRING_SESSION_ID"),
             Some(&"agent-conv-uuid".to_string())
         );
-        // The config/data dir overrides pin the hook's `thurbox-cli` to this DB.
+        // The config/data dir overrides pin the hook's `friring-cli` to this DB.
         assert!(config
             .env
             .contains_key(crate::paths::CONFIG_DIR_OVERRIDE_ENV));
@@ -7203,13 +7399,13 @@ mod tests {
 
     #[test]
     fn restored_session_config_idless_agent_still_has_session_identity() {
-        // An agent that can't report its own id (None) still gets `THURBOX_SESSION`
+        // An agent that can't report its own id (None) still gets `FRIRING_SESSION`
         // from the reused SessionId — the identity the CLI resolves from first.
         let tmp = tempfile::tempdir().unwrap();
         let _guard = crate::paths::TestPathGuard::new(tmp.path());
         let id = crate::session::SessionId::default();
         let config = App::restored_session_config(id, None, "codex".into(), None, "local-tmux");
-        assert_eq!(config.env.get("THURBOX_SESSION"), Some(&id.to_string()));
+        assert_eq!(config.env.get("FRIRING_SESSION"), Some(&id.to_string()));
     }
 
     #[test]
@@ -7228,7 +7424,7 @@ mod tests {
             "ssh:devbox",
         );
         assert_eq!(config.backend.as_deref(), Some("ssh:devbox"));
-        assert!(config.env.contains_key("THURBOX_SESSION"));
+        assert!(config.env.contains_key("FRIRING_SESSION"));
         assert!(!config
             .env
             .contains_key(crate::paths::CONFIG_DIR_OVERRIDE_ENV));
@@ -8246,7 +8442,7 @@ mod tests {
 
     #[test]
     fn help_capture_then_key_rebinds_and_clears_capturing() {
-        let base = std::env::temp_dir().join("thurbox-help-rebind-test");
+        let base = std::env::temp_dir().join("friring-help-rebind-test");
         let _ = std::fs::remove_dir_all(&base);
         let _g = crate::paths::TestPathGuard::new(&base);
 
@@ -8290,7 +8486,7 @@ mod tests {
 
     #[test]
     fn help_capturing_ctrl_q_rebinds_not_quits() {
-        let base = std::env::temp_dir().join("thurbox-help-ctrlq-test");
+        let base = std::env::temp_dir().join("friring-help-ctrlq-test");
         let _ = std::fs::remove_dir_all(&base);
         let _g = crate::paths::TestPathGuard::new(&base);
 
@@ -8310,7 +8506,7 @@ mod tests {
 
     #[test]
     fn help_reset_d_restores_defaults() {
-        let base = std::env::temp_dir().join("thurbox-help-reset-test");
+        let base = std::env::temp_dir().join("friring-help-reset-test");
         let _ = std::fs::remove_dir_all(&base);
         let _g = crate::paths::TestPathGuard::new(&base);
 
@@ -8337,7 +8533,7 @@ mod tests {
 
     #[test]
     fn help_reset_all_restores_every_default() {
-        let base = std::env::temp_dir().join("thurbox-help-reset-all-test");
+        let base = std::env::temp_dir().join("friring-help-reset-all-test");
         let _ = std::fs::remove_dir_all(&base);
         let _g = crate::paths::TestPathGuard::new(&base);
 
@@ -8421,7 +8617,7 @@ mod tests {
 
     #[test]
     fn file_viewer_search_action_is_rebindable() {
-        let base = std::env::temp_dir().join("thurbox-fv-rebind-test");
+        let base = std::env::temp_dir().join("friring-fv-rebind-test");
         let _ = std::fs::remove_dir_all(&base);
         let _g = crate::paths::TestPathGuard::new(&base);
 
@@ -8491,7 +8687,7 @@ mod tests {
 
     /// When the terminal is focused, readline/shell `Ctrl+<letter>` chords
     /// (here `Ctrl+W` = delete-word) defer to the PTY instead of running their
-    /// thurbox command — but the same chord still works from the session list,
+    /// friring command — but the same chord still works from the session list,
     /// and the `F`-key alternate works everywhere.
     #[test]
     fn terminal_focus_defers_readline_ctrl_chords_to_pty() {
@@ -8549,6 +8745,7 @@ mod tests {
             automations: false,
             file_viewer: false,
             global_search: false,
+            double_shift_search: false,
             info_panel: false,
             shell_pane: false,
             code_review: false,
@@ -10049,7 +10246,7 @@ mod tests {
 
     #[test]
     fn global_search_chord_is_rebindable() {
-        let base = std::env::temp_dir().join("thurbox-gs-rebind-test");
+        let base = std::env::temp_dir().join("friring-gs-rebind-test");
         let _ = std::fs::remove_dir_all(&base);
         let _g = crate::paths::TestPathGuard::new(&base);
 
@@ -10885,7 +11082,7 @@ mod tests {
         m.prompt.set("hi");
         m.action = AutomationActionKind::Spawn;
         m.trigger_kind = TriggerKind::Daily; // yields a future next_run
-        m.repo.set("~/Repositories/thurbox");
+        m.repo.set("~/Repositories/friring");
         app.modal = modals::Modal::AutomationEditor(m);
 
         app.submit_automation_editor();
@@ -10900,7 +11097,7 @@ mod tests {
                 let home = std::env::var(home_var).expect("home var set in tests");
                 assert_eq!(
                     repo_path,
-                    &std::path::PathBuf::from(home).join("Repositories/thurbox"),
+                    &std::path::PathBuf::from(home).join("Repositories/friring"),
                     "leading ~ should be expanded to an absolute path"
                 );
             }
@@ -11317,7 +11514,7 @@ mod tests {
 
     #[test]
     fn process_cwd_multi_member_is_workspace() {
-        let base = std::env::temp_dir().join("thurbox-procwd-test");
+        let base = std::env::temp_dir().join("friring-procwd-test");
         let _ = std::fs::remove_dir_all(&base);
         let _g = crate::paths::TestPathGuard::new(&base);
 
@@ -11506,6 +11703,28 @@ mod tests {
         assert_eq!(msg.text, "No worktrees to sync");
     }
 
+    /// ADR-P12 discipline: Ctrl+S dispatches the `git remote` listing to a
+    /// background worker and parks the run — no git subprocess (and no modal)
+    /// on the UI thread at the keypress.
+    #[test]
+    fn start_sync_parks_run_and_lists_remotes_off_thread() {
+        let mut app = app_with_sessions(1);
+        app.sessions[0].info.worktrees = vec![WorktreeInfo {
+            repo_path: PathBuf::from("/tmp/nonexistent-repo"),
+            worktree_path: PathBuf::from("/tmp/nonexistent-wt"),
+            branch: "test-branch".to_string(),
+        }];
+
+        app.start_sync();
+        assert!(!app.worktree_sync.in_progress, "no sync threads yet");
+        assert!(app.worktree_sync.remotes_load.in_progress());
+        assert!(app.worktree_sync.awaiting.is_some());
+        assert!(matches!(app.modal, modals::Modal::None));
+        let msg = app.status_message.as_ref().unwrap();
+        assert_eq!(msg.level, StatusLevel::Info);
+        assert!(msg.text.contains("Preparing sync"));
+    }
+
     #[test]
     fn start_sync_with_worktree_sessions_sets_in_progress() {
         let mut app = app_with_sessions(1);
@@ -11516,11 +11735,242 @@ mod tests {
         }];
 
         app.start_sync();
+        // The remote listing runs on a real thread (a nonexistent repo lists
+        // no remotes → the run launches straight away); poll until it lands.
+        for _ in 0..500 {
+            app.poll_sync_remotes();
+            if app.worktree_sync.in_progress {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(app.worktree_sync.in_progress);
         assert_eq!(app.worktree_sync.pending, 1);
         let msg = app.status_message.as_ref().unwrap();
         assert_eq!(msg.level, StatusLevel::Info);
         assert!(msg.text.contains("Syncing 1 worktree"));
+    }
+
+    /// A parked run whose repos all resolve to ≤1 remote launches straight
+    /// from the poll — no base picker.
+    #[test]
+    fn sync_run_with_single_remote_launches_without_picker() {
+        let mut app = app_with_sessions(1);
+        let repo = PathBuf::from("/tmp/single-remote-repo");
+        app.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: vec![(
+                app.sessions[0].info.id,
+                PathBuf::from("/tmp/single-remote-wt"),
+                repo.clone(),
+            )],
+            queue: Vec::new(),
+            chosen: HashMap::new(),
+        });
+        let tx = app.worktree_sync.remotes_load.start();
+        tx.send(vec![(repo, vec!["origin".to_string()])]).unwrap();
+
+        app.poll_sync_remotes();
+
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(app.worktree_sync.in_progress);
+        assert_eq!(app.worktree_sync.pending, 1);
+        assert!(app.worktree_sync.awaiting.is_none());
+    }
+
+    /// A repo with more than one remote opens the base picker instead of
+    /// launching, with `origin` preselected when no default is saved.
+    #[test]
+    fn sync_run_multi_remote_opens_base_picker() {
+        let mut app = app_with_sessions(1);
+        let repo = PathBuf::from("/tmp/multi-remote-repo");
+        app.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: vec![(
+                app.sessions[0].info.id,
+                PathBuf::from("/tmp/multi-remote-wt"),
+                repo.clone(),
+            )],
+            queue: Vec::new(),
+            chosen: HashMap::new(),
+        });
+        let tx = app.worktree_sync.remotes_load.start();
+        tx.send(vec![(repo, vec!["fork".to_string(), "origin".to_string()])])
+            .unwrap();
+
+        app.poll_sync_remotes();
+
+        assert!(!app.worktree_sync.in_progress, "launch waits on the picker");
+        match app.modal {
+            modals::Modal::SyncBasePicker(ref sb) => {
+                assert_eq!(sb.repo_name, "multi-remote-repo");
+                assert_eq!(sb.remotes, ["fork", "origin"]);
+                assert_eq!(sb.index, 1, "origin preselected without a saved default");
+            }
+            ref other => panic!("expected the sync base picker, got {other:?}"),
+        }
+    }
+
+    /// A saved default remote wins the preselection over `origin`.
+    #[test]
+    fn sync_base_picker_preselects_saved_default() {
+        let mut app = app_with_sessions(1);
+        let repo = PathBuf::from("/tmp/default-remote-repo");
+        app.db.set_sync_base_remote(&repo, "fork").unwrap();
+        app.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: vec![(
+                app.sessions[0].info.id,
+                PathBuf::from("/tmp/default-remote-wt"),
+                repo.clone(),
+            )],
+            queue: Vec::new(),
+            chosen: HashMap::new(),
+        });
+        let tx = app.worktree_sync.remotes_load.start();
+        tx.send(vec![(repo, vec!["fork".to_string(), "origin".to_string()])])
+            .unwrap();
+
+        app.poll_sync_remotes();
+
+        match app.modal {
+            modals::Modal::SyncBasePicker(ref sb) => assert_eq!(sb.index, 0),
+            ref other => panic!("expected the sync base picker, got {other:?}"),
+        }
+    }
+
+    /// Enter in the picker saves the choice as the repo's default and
+    /// launches the run.
+    #[test]
+    fn sync_base_picker_enter_persists_default_and_launches() {
+        let mut app = app_with_sessions(1);
+        let repo = PathBuf::from("/tmp/pick-remote-repo");
+        app.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: vec![(
+                app.sessions[0].info.id,
+                PathBuf::from("/tmp/pick-remote-wt"),
+                repo.clone(),
+            )],
+            queue: vec![(repo.clone(), vec!["fork".to_string(), "origin".to_string()])],
+            chosen: HashMap::new(),
+        });
+        app.modal = modals::Modal::SyncBasePicker(modals::SyncBasePickerModal {
+            repo_name: "pick-remote-repo".to_string(),
+            remotes: vec!["fork".to_string(), "origin".to_string()],
+            index: 0,
+        });
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(
+            app.db.get_sync_base_remote(&repo).unwrap().as_deref(),
+            Some("fork")
+        );
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(app.worktree_sync.in_progress);
+        assert!(app.worktree_sync.awaiting.is_none());
+    }
+
+    /// `confirm_sync_base` with an empty queue (a lost invariant) leaves the
+    /// parked run intact instead of silently taking + dropping it.
+    #[test]
+    fn confirm_sync_base_with_empty_queue_keeps_run_parked() {
+        let mut app = app_with_sessions(1);
+        app.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: vec![(
+                app.sessions[0].info.id,
+                PathBuf::from("/tmp/empty-queue-wt"),
+                PathBuf::from("/tmp/empty-queue-repo"),
+            )],
+            queue: Vec::new(),
+            chosen: HashMap::new(),
+        });
+
+        app.confirm_sync_base("origin".to_string());
+
+        assert!(
+            app.worktree_sync.awaiting.is_some(),
+            "the parked run is preserved, not dropped"
+        );
+        assert!(!app.worktree_sync.in_progress);
+    }
+
+    /// Esc in the picker drops the whole parked run — nothing syncs.
+    #[test]
+    fn sync_base_picker_esc_cancels_run() {
+        let mut app = app_with_sessions(1);
+        let repo = PathBuf::from("/tmp/cancel-remote-repo");
+        app.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: vec![(
+                app.sessions[0].info.id,
+                PathBuf::from("/tmp/cancel-remote-wt"),
+                repo.clone(),
+            )],
+            queue: vec![(repo, vec!["fork".to_string(), "origin".to_string()])],
+            chosen: HashMap::new(),
+        });
+        app.modal = modals::Modal::SyncBasePicker(modals::SyncBasePickerModal {
+            repo_name: "cancel-remote-repo".to_string(),
+            remotes: vec!["fork".to_string(), "origin".to_string()],
+            index: 0,
+        });
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(!app.worktree_sync.in_progress);
+        assert!(app.worktree_sync.awaiting.is_none());
+        let msg = app.status_message.as_ref().unwrap();
+        assert_eq!(msg.text, "Sync cancelled");
+    }
+
+    /// With two multi-remote repos the pickers chain: Enter on the first
+    /// opens the second, Enter on the second launches the full run.
+    #[test]
+    fn sync_base_picker_queue_advances_across_repos() {
+        let mut app = app_with_sessions(1);
+        let repo_a = PathBuf::from("/tmp/queue-repo-a");
+        let repo_b = PathBuf::from("/tmp/queue-repo-b");
+        let remotes = vec!["fork".to_string(), "origin".to_string()];
+        app.worktree_sync.awaiting = Some(sync_state::PendingSyncRun {
+            worktrees: vec![
+                (
+                    app.sessions[0].info.id,
+                    PathBuf::from("/tmp/queue-wt-a"),
+                    repo_a.clone(),
+                ),
+                (
+                    app.sessions[0].info.id,
+                    PathBuf::from("/tmp/queue-wt-b"),
+                    repo_b.clone(),
+                ),
+            ],
+            queue: vec![(repo_a, remotes.clone()), (repo_b.clone(), remotes.clone())],
+            chosen: HashMap::new(),
+        });
+        app.modal = modals::Modal::SyncBasePicker(modals::SyncBasePickerModal {
+            repo_name: "queue-repo-a".to_string(),
+            remotes,
+            index: 0,
+        });
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        match app.modal {
+            modals::Modal::SyncBasePicker(ref sb) => {
+                assert_eq!(sb.repo_name, "queue-repo-b", "second repo's picker opens");
+                assert_eq!(sb.index, 1, "each picker re-preselects independently");
+            }
+            ref other => panic!("expected the second sync base picker, got {other:?}"),
+        }
+        assert!(!app.worktree_sync.in_progress);
+
+        // Move off the preselected `origin` onto `fork`, then confirm.
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(app.worktree_sync.in_progress);
+        assert_eq!(app.worktree_sync.pending, 2);
+        assert_eq!(
+            app.db.get_sync_base_remote(&repo_b).unwrap().as_deref(),
+            Some("fork")
+        );
     }
 
     #[test]
@@ -11577,8 +12027,9 @@ mod tests {
         app.sessions.push(other);
         // Only the active session's 1 worktree should be synced, not 2.
         app.start_sync();
-        assert!(app.worktree_sync.in_progress);
-        assert_eq!(app.worktree_sync.pending, 1);
+        let run = app.worktree_sync.awaiting.as_ref().unwrap();
+        assert_eq!(run.worktrees.len(), 1);
+        assert_eq!(run.worktrees[0].2, PathBuf::from("/tmp/active-repo"));
     }
 
     #[test]
@@ -11759,7 +12210,9 @@ mod tests {
             (SessionId::default(), git::SyncResult::Synced),
             (
                 SessionId::default(),
-                git::SyncResult::Conflict("merge conflict".into()),
+                git::SyncResult::Conflict {
+                    base_ref: "origin/main".into(),
+                },
             ),
         ];
         app.finish_sync();
@@ -11775,7 +12228,9 @@ mod tests {
         app.worktree_sync.completed = vec![
             (
                 SessionId::default(),
-                git::SyncResult::Conflict("merge conflict".into()),
+                git::SyncResult::Conflict {
+                    base_ref: "origin/main".into(),
+                },
             ),
             (
                 SessionId::default(),
@@ -12048,6 +12503,7 @@ mod tests {
         app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
             index: 0,
             branches: Vec::new(),
+            filter: Default::default(),
             loading: true,
         });
         let tx = app.branch_load.start();
@@ -12081,6 +12537,7 @@ mod tests {
         app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
             index: 0,
             branches: Vec::new(),
+            filter: Default::default(),
             loading: true,
         });
         let tx = app.branch_load.start();
@@ -12251,7 +12708,7 @@ mod tests {
 
     /// The perf snapshot write bumps *other* connections' `data_version`
     /// (forcing their shared-state reload), so a default-config idle instance
-    /// must never publish it — only THURBOX_PERF_LOG or an open HUD opts in
+    /// must never publish it — only FRIRING_PERF_LOG or an open HUD opts in
     /// (ADR-P11).
     #[tokio::test]
     async fn perf_snapshot_published_only_while_timing_active() {
@@ -12537,7 +12994,7 @@ mod tests {
     #[test]
     fn send_conflict_prompt_noop_for_unknown_session() {
         let mut app = App::new(24, 80, stub_backend(), stub_agents(), test_db());
-        app.send_conflict_prompt(SessionId::default());
+        app.send_conflict_prompt(SessionId::default(), "origin/main");
         assert!(app.deferred_inputs.is_empty());
     }
 
@@ -12548,7 +13005,7 @@ mod tests {
 
         // Stub's channel rx is dropped, so send_input fails.
         // No deferred input should be created.
-        app.send_conflict_prompt(sid);
+        app.send_conflict_prompt(sid, "origin/main");
         assert!(app.deferred_inputs.is_empty());
     }
 
@@ -12598,7 +13055,7 @@ mod tests {
     fn poll_auto_update_surfaces_message_and_drops_receiver() {
         let mut app = App::new(24, 80, stub_backend(), stub_agents(), test_db());
         let (tx, rx) = mpsc::channel();
-        tx.send("Updated to v9.9.9 — restart thurbox to apply.".to_string())
+        tx.send("Updated to v9.9.9 — restart friring to apply.".to_string())
             .unwrap();
         app.set_auto_update_receiver(rx);
 
@@ -12806,47 +13263,47 @@ mod tests {
 
     #[test]
     fn find_matching_discovered_by_backend_id() {
-        let shared = make_shared_session("thurbox:@0", "1");
+        let shared = make_shared_session("friring:@0", "1");
         let discovered = vec![
-            make_discovered("thurbox:@0", "tb-1", true),
-            make_discovered("thurbox:@1", "tb-2", true),
+            make_discovered("friring:@0", "tb-1", true),
+            make_discovered("friring:@1", "tb-2", true),
         ];
         let result = App::find_matching_discovered(&shared, &discovered);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().backend_id, "thurbox:@0");
+        assert_eq!(result.unwrap().backend_id, "friring:@0");
     }
 
     #[test]
     fn find_matching_discovered_by_name_fallback() {
         let shared = make_shared_session("", "1");
         let discovered = vec![
-            make_discovered("thurbox:@5", "tb-1", true),
-            make_discovered("thurbox:@6", "tb-2", true),
+            make_discovered("friring:@5", "tb-1", true),
+            make_discovered("friring:@6", "tb-2", true),
         ];
         let result = App::find_matching_discovered(&shared, &discovered);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().backend_id, "thurbox:@5");
+        assert_eq!(result.unwrap().backend_id, "friring:@5");
     }
 
     #[test]
     fn find_matching_discovered_skips_dead() {
-        let shared = make_shared_session("thurbox:@0", "1");
-        let discovered = vec![make_discovered("thurbox:@0", "tb-1", false)];
+        let shared = make_shared_session("friring:@0", "1");
+        let discovered = vec![make_discovered("friring:@0", "tb-1", false)];
         let result = App::find_matching_discovered(&shared, &discovered);
         assert!(result.is_none());
     }
 
     #[test]
     fn find_matching_discovered_no_match() {
-        let shared = make_shared_session("thurbox:@99", "99");
-        let discovered = vec![make_discovered("thurbox:@0", "tb-1", true)];
+        let shared = make_shared_session("friring:@99", "99");
+        let discovered = vec![make_discovered("friring:@0", "tb-1", true)];
         let result = App::find_matching_discovered(&shared, &discovered);
         assert!(result.is_none());
     }
 
     #[test]
     fn find_matching_discovered_empty_list() {
-        let shared = make_shared_session("thurbox:@0", "1");
+        let shared = make_shared_session("friring:@0", "1");
         let result = App::find_matching_discovered(&shared, &[]);
         assert!(result.is_none());
     }
@@ -13509,10 +13966,11 @@ mod tests {
         app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
             index: 0,
             branches: vec!["main".into(), "dev".into()],
+            filter: Default::default(),
             loading: false,
         });
-        // j advances the selection; Esc aborts and wipes the pending spawn state.
-        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        // ↓ advances the selection; Esc aborts and wipes the pending spawn state.
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         match app.modal {
             modals::Modal::BranchSelector(ref bs) => assert_eq!(bs.index, 1),
             ref other => panic!("expected the branch selector, got {other:?}"),
@@ -13523,6 +13981,130 @@ mod tests {
         assert!(app.new_session.all_repos.is_none());
         assert!(app.new_session.normal_repos.is_empty());
         assert!(app.new_session.fetch_done.is_none());
+    }
+
+    /// Typing in the branch selector fuzzy-filters the list; Enter picks the
+    /// selected *match* (not the row at the raw index), and the flow advances
+    /// to the session-name modal.
+    #[test]
+    fn branch_selector_typing_filters_and_enter_picks_match() {
+        let mut app = app_with_sessions(1);
+        app.new_session.repo_path = Some(PathBuf::from("/repo"));
+        app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
+            index: 0,
+            branches: vec!["develop".into(), "main".into(), "feature/map".into()],
+            filter: Default::default(),
+            loading: false,
+        });
+
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        match app.modal {
+            modals::Modal::BranchSelector(ref bs) => {
+                assert_eq!(bs.filter.len(bs.branches.len()), 2, "main + feature/map");
+                assert_eq!(bs.index, 0, "cursor snapped to the first match");
+            }
+            ref other => panic!("expected the branch selector, got {other:?}"),
+        }
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.new_session.base_branch.as_deref(), Some("main"));
+        assert!(matches!(app.modal, modals::Modal::SessionName(_)));
+    }
+
+    /// Esc on the branch selector is two-stage while a query is typed: the
+    /// first press only clears the filter (the modal and its pending flow
+    /// survive), the second closes.
+    #[test]
+    fn branch_selector_esc_clears_filter_before_closing() {
+        let mut app = app_with_sessions(1);
+        app.new_session.repo_path = Some(PathBuf::from("/repo"));
+        app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
+            index: 0,
+            branches: vec!["main".into(), "dev".into()],
+            filter: Default::default(),
+            loading: false,
+        });
+
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        match app.modal {
+            modals::Modal::BranchSelector(ref bs) => {
+                assert!(!bs.filter.is_active(), "first Esc only drops the query");
+            }
+            ref other => panic!("expected the branch selector, got {other:?}"),
+        }
+        assert!(app.new_session.repo_path.is_some(), "flow still pending");
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(app.new_session.repo_path.is_none());
+    }
+
+    /// A branch-filter query typed while the list is still loading (ADR-P12)
+    /// applies as soon as the background load delivers.
+    #[test]
+    fn branch_filter_typed_during_load_applies_on_delivery() {
+        let mut app = app_with_sessions(0);
+        app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
+            index: 0,
+            branches: Vec::new(),
+            filter: Default::default(),
+            loading: true,
+        });
+        let tx = app.branch_load.start();
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        tx.send(Ok(vec!["main".into(), "dev".into()])).unwrap();
+
+        app.poll_branch_load();
+
+        match app.modal {
+            modals::Modal::BranchSelector(ref bs) => {
+                assert!(!bs.loading);
+                assert_eq!(bs.filter.len(bs.branches.len()), 1, "only dev matches");
+                assert_eq!(bs.filter.real_index(bs.index, 2), Some(1));
+            }
+            ref other => panic!("expected the branch selector, got {other:?}"),
+        }
+    }
+
+    /// Typing in the agent picker filters on the rendered label (name +
+    /// command); Enter confirms the match under the cursor.
+    #[test]
+    fn agent_picker_typing_filters_and_enter_confirms_match() {
+        let mut app = app_with_sessions(0);
+        app.modal = modals::Modal::AgentPicker(crate::ui::agent_picker_modal::AgentPickerState {
+            choices: vec![
+                crate::ui::agent_picker_modal::AgentChoice {
+                    name: "claude".into(),
+                    command: "claude".into(),
+                },
+                crate::ui::agent_picker_modal::AgentChoice {
+                    name: "codex".into(),
+                    command: "codex".into(),
+                },
+            ],
+            selected_index: 1,
+            filter: Default::default(),
+        });
+        // The pending create an overlapping picker parks its choice on.
+        let _tx = app.worktree_create.start();
+        app.pending_worktree_create = Some(PendingWorktreeCreate {
+            backend: None,
+            normal_repos: vec![],
+            session_name: Some("sess".into()),
+            base_branch: "main".into(),
+            agent_pick: AgentPick::Open,
+        });
+
+        app.handle_key(KeyCode::Char('l'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(matches!(
+            app.pending_worktree_create.as_ref().unwrap().agent_pick,
+            AgentPick::Chosen(ref agent) if agent == "claude"
+        ));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Claude Code workflow + subagent activity — pure data model and parsers.
 //!
-//! thurbox surfaces what happens *inside* a running Claude Code session: the
+//! friring surfaces what happens *inside* a running Claude Code session: the
 //! Task subagents and multi-agent workflows it spawns, and the actual transcript
 //! text (thinking / tool calls / output) of each. Claude Code persists all of it
 //! as flat JSONL under
@@ -17,7 +17,9 @@
 //! The sibling **top-level conversation transcript**
 //! (`projects/<slug>/<agent_session_id>.jsonl`) shares the line format;
 //! [`parse_conversation_head`] reads its head for the identity metadata
-//! (cwd / branch / title) the conversation-import picker lists.
+//! (cwd / branch / title) the conversation-import picker lists, and
+//! [`parse_session_names`] pulls the session's name (`/rename` and auto-title
+//! lines, appended on change) from a head + tail chunk pair.
 //!
 //! This module is the **pure** layer (arch rule `ui ← session`, no filesystem):
 //! it defines the [`CcActivity`] index the app polls onto `SessionInfo`, the
@@ -193,6 +195,10 @@ pub enum TranscriptBlock {
     ToolUse { name: String, input: String },
     /// A tool result body (already normalised to text).
     ToolResult { content: String, is_error: bool },
+    /// One normalized activity event — the F9 section views (timeline /
+    /// commands / web) render event streams through the same block engine as
+    /// transcripts, so folds, find, and wrap behave identically.
+    Event(super::activity::ActivityEvent),
 }
 
 // -------------------------------------------------------------------------
@@ -362,7 +368,7 @@ pub fn parse_workflow_completion(s: &str) -> Option<WorkflowCompletion> {
 // Claude Code can dispatch a whole session as a *detached* background worker
 // (the fleet/daemon path): a claimed spare process gets its **own** new session
 // id and writes its subagents/workflows under it — not under the launching
-// thurbox session's id. There is no parent→child lineage on disk, so a worker is
+// friring session's id. There is no parent→child lineage on disk, so a worker is
 // correlated back to the session that launched it via the one thing the daemon
 // **replays**: the `--settings <hooks>/claude.json` flag captured from the origin
 // session's CLI args (plus a cwd match). Two on-disk homes carry the state:
@@ -381,7 +387,7 @@ pub fn parse_workflow_completion(s: &str) -> Option<WorkflowCompletion> {
 
 /// A background/daemon worker from `roster.json`: its own session id (the key to
 /// its `subagents/` dir), the replayed `--settings` path + `cwd` used to
-/// attribute it to a thurbox session, and the claim `source` (`slash`/`fleet`/
+/// attribute it to a friring session, and the claim `source` (`slash`/`fleet`/
 /// `spare`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct CcWorker {
@@ -576,8 +582,10 @@ fn is_meta_prompt(text: &str) -> bool {
 
 /// The first typed-prompt text of a `user` line, if it has one. Content is a
 /// plain string on old lines and an array of blocks on new ones; either way,
-/// meta/sidechain/compact-summary lines never yield a title.
-fn user_prompt_text(v: &serde_json::Value) -> Option<String> {
+/// meta/sidechain/compact-summary lines never yield a title. Shared with the
+/// activity provider (`activity::claude`), which derives a session title the
+/// same way.
+pub(crate) fn user_prompt_text(v: &serde_json::Value) -> Option<String> {
     if v.get("isSidechain").and_then(|x| x.as_bool()) == Some(true)
         || v.get("isMeta").and_then(|x| x.as_bool()) == Some(true)
         || v.get("isCompactSummary").and_then(|x| x.as_bool()) == Some(true)
@@ -631,6 +639,73 @@ pub fn parse_conversation_head(s: &str) -> CcConversationMeta {
         }
     }
     meta
+}
+
+/// A session's name lines, extracted from transcript chunks by
+/// [`parse_session_names`]: Claude Code appends `{"type":"custom-title",
+/// "customTitle":…}` on `/rename` and `{"type":"ai-title","aiTitle":…}` when it
+/// auto-titles a session (verified v2.1.207).
+///
+/// Each field is the **last value seen** in the chunk, kept raw so a three-way
+/// distinction survives the head/tail [`or`](Self::or) merge: `None` means no
+/// line of that type appeared, while `Some("")` records an explicit *clear* (a
+/// rename back to empty). A newer chunk's clear must override an older chunk's
+/// name rather than fall back to it, so the empty-vs-absent difference has to
+/// reach the merge; it is collapsed only in [`best`](Self::best).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CcSessionNames {
+    /// The last user-set title (`/rename`); `Some("")` on an explicit clear.
+    pub custom: Option<String>,
+    /// The last auto-generated title; `Some("")` on an explicit clear.
+    pub ai: Option<String>,
+}
+
+impl CcSessionNames {
+    /// Merge with an `older` chunk's scan, keeping `self`'s fields whenever it
+    /// saw a line of that type at all — including a clear (`Some("")`). Callers
+    /// scan the file tail before the head, and rename lines are appended, so
+    /// the tail is newer: a name (or a clear) in the tail wins over the head.
+    pub fn or(self, older: CcSessionNames) -> CcSessionNames {
+        CcSessionNames {
+            custom: self.custom.or(older.custom),
+            ai: self.ai.or(older.ai),
+        }
+    }
+
+    /// The display name: a user-set title beats the auto title — the
+    /// precedence Claude Code's own resume picker applies. An empty value (a
+    /// cleared rename) is treated as no title, so it falls through instead of
+    /// showing a blank name.
+    pub fn best(self) -> Option<String> {
+        let non_empty = |t: Option<String>| t.filter(|s| !s.trim().is_empty());
+        non_empty(self.custom).or_else(|| non_empty(self.ai))
+    }
+}
+
+/// Extract a session's name from a chunk of its top-level transcript. Name
+/// lines are appended on every change, so within a chunk the **last** one of
+/// each type wins — a last-seen *empty* value (a cleared rename) overriding
+/// earlier lines rather than falling back to them, mirroring Claude Code's own
+/// last-line-only read. The empty value is preserved (not dropped here) so the
+/// head/tail merge in [`CcSessionNames::or`] can honor a clear; see that type's
+/// doc for the three-state representation.
+pub fn parse_session_names(s: &str) -> CcSessionNames {
+    let mut names = CcSessionNames::default();
+    for line in s.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match str_field(&v, "type").as_deref() {
+            Some("custom-title") => names.custom = str_field(&v, "customTitle").or(names.custom),
+            Some("ai-title") => names.ai = str_field(&v, "aiTitle").or(names.ai),
+            _ => {}
+        }
+    }
+    names
 }
 
 /// Parse an `agent-<id>.jsonl` transcript into the block stream the view
@@ -725,8 +800,10 @@ fn render_tool_input(name: &str, input: Option<&serde_json::Value>) -> String {
 }
 
 /// A `tool_result.content` is a string or an array of `{type:"text",text}`
-/// blocks; normalise either to a single string.
-fn normalize_tool_result(content: Option<&serde_json::Value>) -> String {
+/// blocks; normalise either to a single string. Shared with the activity
+/// provider (`activity::claude`), which extracts result heads from the same
+/// block shape.
+pub(crate) fn normalize_tool_result(content: Option<&serde_json::Value>) -> String {
     match content {
         Some(v) if v.is_string() => v.as_str().unwrap_or_default().to_string(),
         Some(v) if v.is_array() => v
@@ -949,6 +1026,82 @@ garbage line that is not json
     }
 
     #[test]
+    fn session_names_last_line_wins_and_custom_beats_ai() {
+        let jsonl = concat!(
+            r#"{"type":"ai-title","aiTitle":"Auto title","sessionId":"s1"}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":"First name","sessionId":"s1"}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":"Renamed","sessionId":"s1"}"#,
+            "\n",
+        );
+        let n = parse_session_names(jsonl);
+        assert_eq!(n.custom.as_deref(), Some("Renamed"));
+        assert_eq!(n.ai.as_deref(), Some("Auto title"));
+        assert_eq!(n.best().as_deref(), Some("Renamed"));
+
+        let ai_only = parse_session_names(r#"{"type":"ai-title","aiTitle":"Auto title"}"#);
+        assert_eq!(ai_only.best().as_deref(), Some("Auto title"));
+        assert_eq!(parse_session_names("").best(), None);
+    }
+
+    #[test]
+    fn session_names_cleared_rename_hides_earlier_lines() {
+        // A rename to "" clears the name; the earlier custom title must not
+        // resurface, but the auto title still may. The clear is kept as
+        // `Some("")` (not dropped) so the head/tail merge can honor it.
+        let jsonl = concat!(
+            r#"{"type":"custom-title","customTitle":"Old name"}"#,
+            "\n",
+            r#"{"type":"ai-title","aiTitle":"Auto title"}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":""}"#,
+            "\n",
+        );
+        let n = parse_session_names(jsonl);
+        assert_eq!(n.custom.as_deref(), Some(""));
+        assert_eq!(n.best().as_deref(), Some("Auto title"));
+    }
+
+    #[test]
+    fn session_names_merge_prefers_the_newer_chunk() {
+        let head = parse_session_names(concat!(
+            r#"{"type":"custom-title","customTitle":"Head name"}"#,
+            "\n",
+            r#"{"type":"ai-title","aiTitle":"Head auto"}"#,
+        ));
+        let tail = parse_session_names(r#"{"type":"ai-title","aiTitle":"Tail auto"}"#);
+        let merged = tail.or(head);
+        assert_eq!(merged.custom.as_deref(), Some("Head name"));
+        assert_eq!(merged.ai.as_deref(), Some("Tail auto"));
+    }
+
+    #[test]
+    fn session_names_merge_honors_a_clear_in_the_newer_chunk() {
+        // The head named the session; the tail (newer) cleared it. The old
+        // name must not resurface through the merge — the cleared field wins
+        // and `best()` falls through (here, to nothing).
+        let head = parse_session_names(r#"{"type":"custom-title","customTitle":"Head name"}"#);
+        let tail = parse_session_names(r#"{"type":"custom-title","customTitle":""}"#);
+        let merged = tail.or(head);
+        assert_eq!(merged.custom.as_deref(), Some(""));
+        assert_eq!(merged.best(), None);
+
+        // With an auto title also present in the head, the cleared custom title
+        // falls through to it rather than back to the old custom name.
+        let head_with_ai = parse_session_names(concat!(
+            r#"{"type":"custom-title","customTitle":"Head name"}"#,
+            "\n",
+            r#"{"type":"ai-title","aiTitle":"Head auto"}"#,
+        ));
+        let cleared = parse_session_names(r#"{"type":"custom-title","customTitle":""}"#);
+        assert_eq!(
+            cleared.or(head_with_ai).best().as_deref(),
+            Some("Head auto")
+        );
+    }
+
+    #[test]
     fn conversation_head_survives_garbage_and_empty_input() {
         assert_eq!(parse_conversation_head(""), CcConversationMeta::default());
         let m = parse_conversation_head("not json\n{\"type\":\"user\",\"mess");
@@ -1024,15 +1177,15 @@ garbage line that is not json
           "workers":{
             "95c38d32":{
               "sessionId":"95c38d32-39d4-4102-82df-24602ac3a2a0",
-              "cwd":"/mnt/shared/projects/thurbox",
+              "cwd":"/mnt/shared/projects/friring",
               "dispatch":{
                 "source":"slash",
-                "cwd":"/mnt/shared/projects/thurbox",
+                "cwd":"/mnt/shared/projects/friring",
                 "launch":{"mode":"prompt","args":[
                   "--session-id","95c38d32-39d4-4102-82df-24602ac3a2a0",
-                  "--settings","/mnt/shared/projects/thurbox/target/dev-sandbox/default/thurbox-config/hooks/claude.json",
-                  "--add-dir","/mnt/shared/projects/thurbox/"]},
-                "respawnFlags":["--settings","/mnt/shared/projects/thurbox/target/dev-sandbox/default/thurbox-config/hooks/claude.json"]
+                  "--settings","/mnt/shared/projects/friring/target/dev-sandbox/default/friring-config/hooks/claude.json",
+                  "--add-dir","/mnt/shared/projects/friring/"]},
+                "respawnFlags":["--settings","/mnt/shared/projects/friring/target/dev-sandbox/default/friring-config/hooks/claude.json"]
               }
             },
             "7492d0aa":{
@@ -1051,15 +1204,15 @@ garbage line that is not json
         let tbx = workers
             .iter()
             .find(|w| w.short == "95c38d32")
-            .expect("thurbox worker");
+            .expect("friring worker");
         assert_eq!(tbx.session_id, "95c38d32-39d4-4102-82df-24602ac3a2a0");
         assert_eq!(tbx.source.as_deref(), Some("slash"));
-        assert_eq!(tbx.cwd.as_deref(), Some("/mnt/shared/projects/thurbox"));
+        assert_eq!(tbx.cwd.as_deref(), Some("/mnt/shared/projects/friring"));
         assert_eq!(
             tbx.settings_path.as_deref(),
-            Some("/mnt/shared/projects/thurbox/target/dev-sandbox/default/thurbox-config/hooks/claude.json")
+            Some("/mnt/shared/projects/friring/target/dev-sandbox/default/friring-config/hooks/claude.json")
         );
-        // A worker launched outside thurbox carries no `--settings` (won't match).
+        // A worker launched outside friring carries no `--settings` (won't match).
         let fleet = workers.iter().find(|w| w.short == "7492d0aa").unwrap();
         assert_eq!(fleet.settings_path, None);
         assert_eq!(fleet.source.as_deref(), Some("fleet"));
@@ -1084,7 +1237,7 @@ garbage line that is not json
           "tempo":"blocked",
           "needs":"approve Bash: ls -la",
           "tokens":19030,
-          "cwd":"/mnt/shared/projects/thurbox",
+          "cwd":"/mnt/shared/projects/friring",
           "sessionId":"95c38d32-39d4-4102-82df-24602ac3a2a0",
           "daemonShort":"95c38d32",
           "backend":"daemon",

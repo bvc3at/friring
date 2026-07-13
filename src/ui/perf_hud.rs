@@ -143,7 +143,7 @@ pub(crate) fn render_perf_hud(frame: &mut Frame, area: Rect, view: &PerfHudView<
 
     // Discoverability: the log-based counterpart of this overlay.
     lines.push(Line::from(Span::styled(
-        "THURBOX_PERF_LOG=1 logs windows",
+        "FRIRING_PERF_LOG=1 logs windows",
         Style::default().fg(Theme::keybind_hint()),
     )));
 

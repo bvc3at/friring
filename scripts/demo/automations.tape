@@ -1,8 +1,8 @@
-# VHS tape for the Thurbox Automations feature demo.
+# VHS tape for the Friring Automations feature demo.
 #
 # Do NOT run this directly — run `scripts/demo/record.sh automations`, which
 # builds the dev binary, sets up an isolated environment, seeds one session per
-# real agent CLI, and exports the env vars this tape relies on ($THURBOX_BIN).
+# real agent CLI, and exports the env vars this tape relies on ($FRIRING_BIN).
 #
 # Requires: vhs (charmbracelet/vhs) + ffmpeg + ttyd. VHS has no function-key
 # commands, so this uses Ctrl-key bindings + j/k / Tab / arrows only.
@@ -18,9 +18,9 @@ Set Padding 16
 Set Theme "Catppuccin Mocha"
 Set PlaybackSpeed 1.0
 
-# Launch the dev binary (isolated thurbox-dev socket + XDG dirs from the runner).
+# Launch the dev binary (isolated friring-dev socket + XDG dirs from the runner).
 Hide
-Type `exec "$THURBOX_BIN"`
+Type `exec "$FRIRING_BIN"`
 Enter
 Sleep 2s
 Show

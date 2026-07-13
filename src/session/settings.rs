@@ -1,4 +1,4 @@
-//! User-tunable settings (`~/.config/thurbox/settings.toml`): scalar knobs
+//! User-tunable settings (`~/.config/friring/settings.toml`): scalar knobs
 //! plus the `[features]` whole-feature switches.
 //!
 //! Pure data + parsing, per the `session/` architecture rule; the file IO and
@@ -52,7 +52,7 @@ pub struct Settings {
 /// Whole-feature switches (`[features]` in settings.toml). Each flag hides the
 /// feature's UI and blocks its keybinding; disabling `automations` also stops
 /// the TUI firing schedules and arming the tmux heartbeat. Data and
-/// `thurbox-cli` surfaces stay fully functional regardless, so re-enabling a
+/// `friring-cli` surfaces stay fully functional regardless, so re-enabling a
 /// flag is lossless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureFlags {
@@ -65,9 +65,14 @@ pub struct FeatureFlags {
     /// File viewer column (F3) and file search results.
     #[serde(default = "default_true")]
     pub file_viewer: bool,
-    /// Global search strip (Ctrl+/).
+    /// Global search popup (Ctrl+/ or double-Shift).
     #[serde(default = "default_true")]
     pub global_search: bool,
+    /// The double-`Shift` opener for the global search. Only effective on
+    /// kitty-keyboard-protocol terminals (legacy terminals never report bare
+    /// modifier presses); `Ctrl+/` works regardless. Off = only the chord.
+    #[serde(default = "default_true")]
+    pub double_shift_search: bool,
     /// Info panel column (F2).
     #[serde(default = "default_true")]
     pub info_panel: bool,
@@ -78,9 +83,11 @@ pub struct FeatureFlags {
     /// keybinding.
     #[serde(default = "default_true")]
     pub code_review: bool,
-    /// Claude Code activity view (F9): the workflow/subagent transcript view +
-    /// its keybinding, plus the off-thread scan of `~/.claude/.../subagents/`.
-    /// Claude, local sessions only.
+    /// Agent activity view (F9): the per-session retrospective (commands /
+    /// edits / reads / web / subagents across supported agent CLIs) + its
+    /// keybinding, the off-thread scans behind it, and conversation import.
+    /// Local sessions only. The key stays `cc_activity` for config
+    /// compatibility with the view's Claude-only v1.
     #[serde(default = "default_true")]
     pub cc_activity: bool,
     /// Perf HUD overlay (F12): live perf counters + frame/tick timing. Opening
@@ -103,19 +110,19 @@ pub struct FeatureFlags {
     /// offer Ctrl+Z undo, leaving the tmux window + worktrees intact. Disabled
     /// = the TUI **hard-deletes** (kills the tmux window, removes worktrees +
     /// symlink workspace, disables send automations) after a confirmation
-    /// prompt. `thurbox-cli session delete` is unaffected (always soft unless
+    /// prompt. `friring-cli session delete` is unaffected (always soft unless
     /// `--force`).
     #[serde(default = "default_true")]
     pub soft_delete: bool,
     /// Version-update check: the TUI header "update available" badge and the
-    /// `thurbox-cli version --check` command. **Off by default** — unlike the
+    /// `friring-cli version --check` command. **Off by default** — unlike the
     /// other flags, this one is opt-in because it makes a network call to
     /// GitHub. Enable it to learn when a newer release is available.
     #[serde(default = "default_false")]
     pub version_check: bool,
     /// Silent auto-update: the TUI silently downloads, verifies, and replaces
     /// the installed binaries on startup when a newer release exists, and the
-    /// `thurbox-cli update` command does the same on demand. Also keeps installed
+    /// `friring-cli update` command does the same on demand. Also keeps installed
     /// extensions fresh — once the binary upgrades, the self-heal pass (TUI
     /// startup + headless tick) refreshes any extension that is now stale instead
     /// of merely nudging. **Off by default** — opt-in because it makes a network
@@ -195,7 +202,7 @@ pub struct NotificationSettings {
     #[serde(default)]
     pub also_on_waiting: bool,
     /// Skip notifications for the session currently in focus (you're already
-    /// looking at it). Defaults on; flip off if you run thurbox in a
+    /// looking at it). Defaults on; flip off if you run friring in a
     /// background window and want every transition surfaced.
     #[serde(default = "default_true")]
     pub suppress_for_active: bool,
@@ -243,6 +250,7 @@ impl Default for FeatureFlags {
             automations: true,
             file_viewer: true,
             global_search: true,
+            double_shift_search: true,
             info_panel: true,
             shell_pane: true,
             code_review: true,
@@ -549,6 +557,7 @@ mod tests {
             automations,
             file_viewer,
             global_search,
+            double_shift_search,
             info_panel,
             shell_pane,
             code_review,
@@ -568,6 +577,7 @@ mod tests {
             automations,
             file_viewer,
             global_search,
+            double_shift_search,
             info_panel,
             shell_pane,
             code_review,
@@ -583,10 +593,11 @@ mod tests {
         // `live` flags gate UI panels read from `App.features` every frame, so
         // flipping one is NOT a restart-only difference; the rest are read once
         // at startup and MUST register as one.
-        let live: [fn(&mut FeatureFlags); 9] = [
+        let live: [fn(&mut FeatureFlags); 10] = [
             |f| f.tasks = !f.tasks,
             |f| f.file_viewer = !f.file_viewer,
             |f| f.global_search = !f.global_search,
+            |f| f.double_shift_search = !f.double_shift_search,
             |f| f.info_panel = !f.info_panel,
             |f| f.shell_pane = !f.shell_pane,
             |f| f.code_review = !f.code_review,

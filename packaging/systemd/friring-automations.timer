@@ -1,8 +1,8 @@
-# Drives thurbox-automations.service on a 1-minute cadence, surviving reboots.
-# See thurbox-automations.service for install instructions.
+# Drives friring-automations.service on a 1-minute cadence, surviving reboots.
+# See friring-automations.service for install instructions.
 
 [Unit]
-Description=Fire due thurbox automations every minute
+Description=Fire due friring automations every minute
 Documentation=https://github.com/Thurbeen/thurbox
 
 [Timer]

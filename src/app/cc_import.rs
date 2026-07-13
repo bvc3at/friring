@@ -17,18 +17,18 @@
 //! [`stage_transcript_for_resume`]). The original file is never touched.
 //!
 //! Pure line parsing lives in [`crate::session::cc_activity`]
-//! (`parse_conversation_head`); this module is the filesystem glue, the picker
-//! modal state, and its key handling. Local sessions only: the scan walks the
-//! local `~/.claude`.
+//! (`parse_conversation_head`, `parse_session_names`); this module is the
+//! filesystem glue, the picker modal state, and its key handling. Local
+//! sessions only: the scan walks the local `~/.claude`.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
-use crate::session::cc_activity::parse_conversation_head;
+use crate::session::cc_activity::{parse_conversation_head, parse_session_names};
 
 use super::{background, modals, App};
 
@@ -38,6 +38,13 @@ use super::{background, modals, App};
 /// small (backups accumulate later). Bounding the read keeps a scan over
 /// hundreds of multi-megabyte transcripts cheap.
 const CONVO_HEAD_BYTES: u64 = 256 * 1024;
+
+/// How much of a transcript's tail the scan reads for the session name.
+/// `/rename` (`custom-title`) and auto-title (`ai-title`) lines are *appended*
+/// on change, so on a transcript larger than [`CONVO_HEAD_BYTES`] the newest
+/// name is only in the tail. Claude Code's own resume picker scans the same
+/// 64 KiB window (verified v2.1.207).
+const CONVO_TAIL_BYTES: u64 = 64 * 1024;
 
 /// One importable conversation found on disk. When the same session id exists
 /// under several project dirs (a previously staged import), the scan keeps only
@@ -51,8 +58,12 @@ pub struct CcConversation {
     /// The conversation's original working directory, when recorded.
     pub cwd: Option<PathBuf>,
     pub git_branch: Option<String>,
-    /// Best-available title: Claude Code's own summary line, else the first
-    /// typed user prompt.
+    /// The session's name, when it has one: the newest `/rename` title, else
+    /// the newest auto-generated title. Preferred over `title` wherever one
+    /// label is shown — the same choice Claude Code's own resume picker makes.
+    pub name: Option<String>,
+    /// Message-derived title: Claude Code's own summary line, else the first
+    /// typed user prompt. The fallback label for unnamed sessions.
     pub title: Option<String>,
     /// Transcript file mtime (ms since epoch) — the "last active" shown in the
     /// picker and the sort key.
@@ -62,11 +73,13 @@ pub struct CcConversation {
 impl CcConversation {
     /// The single-line text the picker both fuzzy-filters and renders (the
     /// match positions must map onto what is displayed, so it is one string):
-    /// a first-line, length-capped title plus the tilde-shortened directory.
+    /// a first-line, length-capped label (name, else title) plus the
+    /// tilde-shortened directory.
     pub fn display_text(&self) -> String {
         let title = self
-            .title
+            .name
             .as_deref()
+            .or(self.title.as_deref())
             .map(first_line_capped)
             .unwrap_or_else(|| "(no prompt)".to_string());
         match &self.cwd {
@@ -196,10 +209,16 @@ fn scan_conversations(projects: &Path, exclude: &HashSet<String>) -> Vec<CcConve
             if by_id.get(id).is_some_and(|prev| prev.mtime_ms >= mtime_ms) {
                 continue;
             }
-            let meta = parse_conversation_head(&read_head(&path));
-            // No cwd *and* no prompt = an empty shell (opened and abandoned)
-            // or not a conversation at all — nothing worth resuming.
-            if meta.cwd.is_none() && meta.title.is_none() {
+            let head = read_head(&path);
+            let meta = parse_conversation_head(&head);
+            let mut names = parse_session_names(&head);
+            if md.len() > CONVO_HEAD_BYTES {
+                names = parse_session_names(&read_tail(&path, md.len())).or(names);
+            }
+            let name = names.best();
+            // No cwd, no prompt, no name = an empty shell (opened and
+            // abandoned) or not a conversation at all — nothing worth resuming.
+            if meta.cwd.is_none() && meta.title.is_none() && name.is_none() {
                 continue;
             }
             by_id.insert(
@@ -209,6 +228,7 @@ fn scan_conversations(projects: &Path, exclude: &HashSet<String>) -> Vec<CcConve
                     path,
                     cwd: meta.cwd.map(PathBuf::from),
                     git_branch: meta.git_branch,
+                    name,
                     title: meta.title,
                     mtime_ms,
                 },
@@ -228,6 +248,24 @@ fn read_head(path: &Path) -> String {
     };
     let mut buf = Vec::new();
     let _ = file.take(CONVO_HEAD_BYTES).read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Read the last [`CONVO_TAIL_BYTES`] of a `len`-byte transcript, lossily
+/// decoded. The first line usually starts mid-JSON and is skipped by the
+/// parser like any malformed line.
+fn read_tail(path: &Path, len: u64) -> String {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    if file
+        .seek(SeekFrom::Start(len.saturating_sub(CONVO_TAIL_BYTES)))
+        .is_err()
+    {
+        return String::new();
+    }
+    let mut buf = Vec::new();
+    let _ = file.take(CONVO_TAIL_BYTES).read_to_end(&mut buf);
     String::from_utf8_lossy(&buf).into_owned()
 }
 
@@ -259,10 +297,11 @@ fn stage_transcript_for_resume(
     Ok(())
 }
 
-/// A session name suggested from the conversation title (editable in the name
-/// modal). Short enough for the session list; empty when there is no title.
+/// A session name suggested from the conversation's name, else its title
+/// (editable in the name modal). Short enough for the session list; empty when
+/// there is neither.
 fn suggest_session_name(convo: &CcConversation) -> String {
-    let Some(title) = convo.title.as_deref() else {
+    let Some(title) = convo.name.as_deref().or(convo.title.as_deref()) else {
         return String::new();
     };
     let line = title
@@ -535,7 +574,7 @@ impl App {
 
         // Both ids pinned: `resume_session_id` selects the `--resume {id}` arg
         // group, `agent_session_id` is the session's identity everywhere else
-        // (THURBOX_SESSION_ID, the F9 activity scan, the DB row, restarts).
+        // (FRIRING_SESSION_ID, the F9 activity scan, the DB row, restarts).
         let config = crate::session::SessionConfig {
             agent,
             agent_session_id: Some(convo.id.clone()),
@@ -632,6 +671,86 @@ mod tests {
     }
 
     #[test]
+    fn scan_prefers_session_names_over_prompts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path();
+        let renamed = format!(
+            "{}\n{}\n{}\n",
+            user_line("/repo/a", "the first prompt"),
+            r#"{"type":"ai-title","aiTitle":"Auto title"}"#,
+            r#"{"type":"custom-title","customTitle":"My renamed session"}"#,
+        );
+        write(
+            &projects.join("-repo-a").join(format!("{ID_A}.jsonl")),
+            &renamed,
+        );
+        // A name alone (no cwd, no prompt) is still worth listing.
+        write(
+            &projects.join("-repo-b").join(format!("{ID_B}.jsonl")),
+            r#"{"type":"custom-title","customTitle":"Named shell"}"#,
+        );
+
+        let found = scan_conversations(projects, &HashSet::new());
+        assert_eq!(found.len(), 2);
+        let by_id = |id: &str| found.iter().find(|c| c.id == id).unwrap();
+        let a = by_id(ID_A);
+        assert_eq!(a.name.as_deref(), Some("My renamed session"));
+        assert_eq!(a.title.as_deref(), Some("the first prompt"));
+        assert!(a.display_text().starts_with("My renamed session — "));
+        assert_eq!(suggest_session_name(a), "My renamed session");
+        assert_eq!(by_id(ID_B).display_text(), "Named shell");
+    }
+
+    #[test]
+    fn scan_finds_a_name_appended_past_the_head_window() {
+        // `/rename` appends its line, so on a transcript larger than the head
+        // window only the tail read can see it.
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path();
+        let big = format!(
+            "{}\n{{\"type\":\"assistant\",\"pad\":\"{}\"}}\n{}\n",
+            user_line("/repo/a", "the first prompt"),
+            "x".repeat(CONVO_HEAD_BYTES as usize + 1024),
+            r#"{"type":"custom-title","customTitle":"Renamed late"}"#,
+        );
+        write(
+            &projects.join("-repo-a").join(format!("{ID_A}.jsonl")),
+            &big,
+        );
+
+        let found = scan_conversations(projects, &HashSet::new());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name.as_deref(), Some("Renamed late"));
+        assert_eq!(found[0].title.as_deref(), Some("the first prompt"));
+    }
+
+    #[test]
+    fn scan_honors_a_cleared_rename_in_the_tail_over_a_head_name() {
+        // A `/rename` back to nothing appends `customTitle:""`; on a transcript
+        // larger than the head window that clear lives only in the tail and must
+        // override the earlier custom title the head scan saw — the older name
+        // must not resurface through the head/tail merge.
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path();
+        let big = format!(
+            "{}\n{}\n{{\"type\":\"assistant\",\"pad\":\"{}\"}}\n{}\n",
+            user_line("/repo/a", "the first prompt"),
+            r#"{"type":"custom-title","customTitle":"Head name"}"#,
+            "x".repeat(CONVO_HEAD_BYTES as usize + 1024),
+            r#"{"type":"custom-title","customTitle":""}"#,
+        );
+        write(
+            &projects.join("-repo-a").join(format!("{ID_A}.jsonl")),
+            &big,
+        );
+
+        let found = scan_conversations(projects, &HashSet::new());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, None);
+        assert_eq!(found[0].title.as_deref(), Some("the first prompt"));
+    }
+
+    #[test]
     fn stage_copies_into_destination_slug_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let projects = tmp.path().join("projects");
@@ -680,6 +799,7 @@ mod tests {
             path: PathBuf::from("/p"),
             cwd: Some(PathBuf::from(cwd)),
             git_branch: None,
+            name: None,
             title: Some(title.into()),
             mtime_ms: 0,
         };
@@ -701,12 +821,13 @@ mod tests {
     }
 
     #[test]
-    fn suggested_name_is_first_line_capped() {
+    fn suggested_name_is_first_line_capped_and_prefers_the_session_name() {
         let mut convo = CcConversation {
             id: ID_A.into(),
             path: PathBuf::from("/p"),
             cwd: None,
             git_branch: None,
+            name: None,
             title: Some("Fix the flaky   integration tests please\nsecond line".into()),
             mtime_ms: 0,
         };
@@ -715,6 +836,9 @@ mod tests {
             suggest_session_name(&convo),
             "Fix the flaky integration test"
         );
+        convo.name = Some("Flaky tests".into());
+        assert_eq!(suggest_session_name(&convo), "Flaky tests");
+        convo.name = None;
         convo.title = None;
         assert_eq!(suggest_session_name(&convo), "");
     }

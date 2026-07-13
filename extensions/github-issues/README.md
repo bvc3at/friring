@@ -1,20 +1,20 @@
-# github-issues (thurbox extension)
+# github-issues (friring extension)
 
-> **Experimental.** Bidirectionally syncs **GitHub issues** with the thurbox
+> **Experimental.** Bidirectionally syncs **GitHub issues** with the friring
 > task list: your issues show up as tasks, and marking a task done closes the
 > issue.
 
 A `github-issues-tick` **automation** runs a deterministic sync script
-(`scripts/sync.sh`) every 15 minutes — **no agent, no LLM, no tokens**. thurbox's
+(`scripts/sync.sh`) every 15 minutes — **no agent, no LLM, no tokens**. friring's
 scheduler runs it (TUI or headless heartbeat) and records the result in the
-automation run history. The script only calls `thurbox-cli` and the `gh` CLI.
+automation run history. The script only calls `friring-cli` and the `gh` CLI.
 
 ## Setup
 
 ### 1. Prerequisites
 
-- `thurbox-cli` **≥ 0.141** on `PATH` (needs the `Exec` automation action +
-  `task --source/--external-id/--external-url`; check `thurbox-cli version`).
+- `friring-cli` **≥ 0.141** on `PATH` (needs the `Exec` automation action +
+  `task --source/--external-id/--external-url`; check `friring-cli version`).
 - `gh` (GitHub CLI) and `jq`.
 
 ### 2. Authenticate GitHub
@@ -29,18 +29,18 @@ No token env var is needed — `gh` stores the credential itself.
 ### 3. Install the extension
 
 ```sh
-thurbox-cli extension install github-issues
+friring-cli extension install github-issues
 # or from a checkout:
-thurbox-cli extension install ./extensions/github-issues
+friring-cli extension install ./extensions/github-issues
 ```
 
-This lays down `~/.config/thurbox/extensions/github-issues/` (override with
-`--home`) and activates the `github-issues-tick` automation, which thurbox
+This lays down `~/.config/friring/extensions/github-issues/` (override with
+`--home`) and activates the `github-issues-tick` automation, which friring
 self-heals if deleted.
 
 ### 4. Configure the repos to sync
 
-Edit `~/.config/thurbox/extensions/github-issues/trackers.md` — one row per repo or saved filter:
+Edit `~/.config/friring/extensions/github-issues/trackers.md` — one row per repo or saved filter:
 
 ```markdown
 | name    | query                              | push_back |
@@ -58,15 +58,15 @@ The automation fires every 15 min. To run it now, trigger it from the
 **Automations** pane (`Ctrl+P` → select `github-issues-tick` → `r`) or headless:
 
 ```sh
-thurbox-cli automation run <id>     # id from: thurbox-cli automation list
+friring-cli automation run <id>     # id from: friring-cli automation list
 # or run the script directly:
-~/.config/thurbox/extensions/github-issues/scripts/sync.sh
+~/.config/friring/extensions/github-issues/scripts/sync.sh
 ```
 
 Then check the imported tasks:
 
 ```sh
-thurbox-cli task list --json | jq -c '.[] | select(.source=="github") | {id,status,external_id,title}'
+friring-cli task list --json | jq -c '.[] | select(.source=="github") | {id,status,external_id,title}'
 ```
 
 Open issues import as `todo` (or `in_progress` if assigned), closed as `done`.
@@ -87,7 +87,7 @@ state back.
 - **query** — `owner/repo` plus any `gh issue list` flags (`--state`,
   `--assignee`, `--label`, `--milestone`, …). Open issues are used if `--state`
   is omitted.
-- **push_back** — `yes` enables thurbox → GitHub status push for that row.
+- **push_back** — `yes` enables friring → GitHub status push for that row.
 
 Imported tasks carry `source=github` and `external_id="owner/repo#<number>"`, so
 re-syncing never duplicates them.
@@ -107,18 +107,18 @@ local `todo`↔`in_progress` distinction is preserved.
 ## Troubleshooting
 
 - **Nothing syncs** — check the automation run history (`Ctrl+P`, or
-  `thurbox-cli automation runs <id>`) for the script's output; run
-  `~/.config/thurbox/extensions/github-issues/scripts/sync.sh` by hand to see errors directly.
+  `friring-cli automation runs <id>`) for the script's output; run
+  `~/.config/friring/extensions/github-issues/scripts/sync.sh` by hand to see errors directly.
 - **`gh` auth error / empty pull** — `gh auth status`; confirm
   `gh issue list --repo <owner/repo>` works for each tracker's repo.
-- **`unknown option '--source'`** — your `thurbox-cli` predates 0.141; rebuild /
-  update thurbox.
+- **`unknown option '--source'`** — your `friring-cli` predates 0.141; rebuild /
+  update friring.
 
 ## Turn it off
 
 ```sh
-thurbox-cli extension deactivate github-issues          # stop syncing
-thurbox-cli extension uninstall github-issues --purge   # remove home + automation
+friring-cli extension deactivate github-issues          # stop syncing
+friring-cli extension uninstall github-issues --purge   # remove home + automation
 ```
 
 Imported tasks remain in your task list (they are not deleted on uninstall).

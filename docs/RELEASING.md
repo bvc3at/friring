@@ -1,10 +1,12 @@
 # Releasing & Installation
 
-> **On this fork:** Friring does **not** cut its own releases. The release
-> pipeline (`.github/workflows/cd.yml`) is guarded to run only on the canonical
-> `Thurbeen/thurbox` repo and stays dormant here — installing Friring installs
-> upstream Thurbox. This document describes the upstream release/packaging
-> machinery (kept intact and merge-safe). See [`FORK.md`](../FORK.md).
+> **On this fork:** Friring cuts its **own** GitHub Releases — `cd.yml` builds
+> cross-platform `friring-*` binaries + a checksums file on every releasable push
+> to `main`. What still routes through upstream: the package-manager channels
+> described below (the AUR / Homebrew / Chocolatey / winget publish jobs are
+> guarded to `Thurbeen/thurbox`) and the `scripts/install.*` one-liners (they
+> fetch upstream `thurbox-*`; grab the fork's binaries from its Releases page
+> directly). See [`FORK.md`](../FORK.md).
 
 ## Release process
 
@@ -38,7 +40,7 @@ Every push to `main` automatically triggers the release workflow:
 
 - **Cargo.toml version** is always `0.0.0-dev` (a static development marker).
 - The **real version** is determined by the release workflow (`v0.1.0`, …).
-- **Build-time injection**: `build.rs` reads the `THURBOX_RELEASE_VERSION`
+- **Build-time injection**: `build.rs` reads the `FRIRING_RELEASE_VERSION`
   environment variable (set by the workflow) to inject the version into the
   binary. Development builds show `0.0.0-dev` when it is unset; release builds
   show the actual version.
@@ -48,12 +50,15 @@ Every push to `main` automatically triggers the release workflow:
 Each release includes binaries for 4 platforms plus a checksums file and a
 categorized changelog:
 
-- `thurbox-v{ver}-x86_64-unknown-linux-gnu.tar.gz`
-- `thurbox-v{ver}-x86_64-unknown-linux-musl.tar.gz`
-- `thurbox-v{ver}-aarch64-apple-darwin.tar.gz`
-- `thurbox-v{ver}-x86_64-pc-windows-msvc.zip` (extracted by `install.ps1`,
-  packaged by Chocolatey + winget)
-- `thurbox-v{ver}-checksums.txt` (SHA256 sums for verification)
+- `friring-v{ver}-x86_64-unknown-linux-gnu.tar.gz`
+- `friring-v{ver}-x86_64-unknown-linux-musl.tar.gz`
+- `friring-v{ver}-aarch64-apple-darwin.tar.gz`
+- `friring-v{ver}-x86_64-pc-windows-msvc.zip`
+- `friring-v{ver}-checksums.txt` (SHA256 sums for verification)
+
+The upstream package channels below (Chocolatey / winget / Homebrew / AUR) and
+the `install.*` scripts still consume upstream's `thurbox-*` assets — those jobs
+are guarded to `Thurbeen/thurbox` and don't run here.
 
 ### Distribution packages
 

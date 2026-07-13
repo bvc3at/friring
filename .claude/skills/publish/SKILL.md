@@ -40,7 +40,7 @@ Build the candidate list in priority order:
 3. The repo containing the current working directory.
 4. Only if cwd is not itself a repo but a multi-repo workspace
    (a directory of symlinks that each resolve to a git repo —
-   e.g. a thurbox symlink workspace): the member repos.
+   e.g. a friring symlink workspace): the member repos.
 
 Hard rules:
 

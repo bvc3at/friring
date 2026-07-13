@@ -1,4 +1,4 @@
-//! Inter-session message queue subcommands (`thurbox-cli message …`).
+//! Inter-session message queue subcommands (`friring-cli message …`).
 //!
 //! A general, agent-neutral mailbox: one session hands another a structured
 //! payload (clarifying questions, a plan, a result, …) instead of the recipient
@@ -15,7 +15,7 @@ use crate::storage::Database;
 use crate::sync::{current_time_millis, SharedSession};
 
 /// Wake token typed into a recipient's pane after `send --wake`, nudging the
-/// monitor agent to drain its inbox (`thurbox-cli message inbox …`) right away
+/// monitor agent to drain its inbox (`friring-cli message inbox …`) right away
 /// rather than waiting for its next scheduled tick. Idempotent: the agent just
 /// re-reads unread messages.
 const WAKE_TOKEN: &str = "inbox";
@@ -35,12 +35,12 @@ pub enum Action {
         /// Message body.
         #[arg(long)]
         body: String,
-        /// Originating task id. Defaults to the caller's `THURBOX_TASK` when run
+        /// Originating task id. Defaults to the caller's `FRIRING_TASK` when run
         /// inside a task-spawned session; pass explicitly to override.
         #[arg(long)]
         task: Option<i64>,
         /// Sender session (UUID or name), for provenance. Defaults to the caller
-        /// (`THURBOX_SESSION`) when run inside a session; pass to override.
+        /// (`FRIRING_SESSION`) when run inside a session; pass to override.
         #[arg(long)]
         from: Option<String>,
         /// Don't type a wake nudge into the recipient's pane (enqueue silently).
@@ -58,7 +58,7 @@ pub enum Action {
         /// Reply kind tag (defaults to "reply").
         #[arg(long, default_value = "reply")]
         kind: String,
-        /// Sender session (UUID or name); defaults to the caller (`THURBOX_SESSION`).
+        /// Sender session (UUID or name); defaults to the caller (`FRIRING_SESSION`).
         #[arg(long)]
         from: Option<String>,
         /// Don't type a wake nudge into the recipient's pane.
@@ -68,7 +68,7 @@ pub enum Action {
     /// Read a session's inbox. Peeks unread by default; `--claim` drains them.
     Inbox {
         /// Recipient session (UUID or name). Defaults to the calling session
-        /// (`THURBOX_SESSION`) so an agent reads its own mail with no id.
+        /// (`FRIRING_SESSION`) so an agent reads its own mail with no id.
         #[arg(long = "for")]
         for_session: Option<String>,
         /// Atomically mark the returned messages read (exactly-once drain).
@@ -134,7 +134,7 @@ fn send_message(
 ) -> Result<CommandOutput, String> {
     let recipient = resolve_uuid_or_name(db, &to)?;
     // Provenance + task tag default to the calling session's injected
-    // identity (`THURBOX_SESSION` / `THURBOX_TASK`), so an agent never has
+    // identity (`FRIRING_SESSION` / `FRIRING_TASK`), so an agent never has
     // to know or pass its own ids. Explicit flags override.
     let from_session_id = resolve_from(db, from.as_deref())?;
     let from_task_id = task.or_else(calling_task_id);
@@ -181,7 +181,7 @@ fn reply_message(
 }
 
 /// Resolve the `--from` provenance: an explicit reference, else the calling
-/// session's injected id (`THURBOX_SESSION`).
+/// session's injected id (`FRIRING_SESSION`).
 fn resolve_from(db: &Database, from: Option<&str>) -> Result<Option<SessionId>, String> {
     match from {
         Some(f) => Ok(Some(resolve_uuid_or_name(db, f)?.id)),
@@ -200,7 +200,7 @@ fn read_inbox(
     let recipient = match for_session {
         Some(ref r) => resolve_uuid_or_name(db, r)?,
         None => calling_session(db).ok_or_else(|| {
-            "no --for given and THURBOX_SESSION is unset (not running inside a session)".to_string()
+            "no --for given and FRIRING_SESSION is unset (not running inside a session)".to_string()
         })?,
     };
     let messages = if claim {
@@ -327,14 +327,14 @@ fn enqueue_and_wake(
     ))
 }
 
-/// The calling session's id from `THURBOX_SESSION` (used for provenance).
+/// The calling session's id from `FRIRING_SESSION` (used for provenance).
 fn calling_session_id(db: &Database) -> Option<SessionId> {
     calling_session(db).map(|s| s.id)
 }
 
-/// The calling session's originating task id from the injected `THURBOX_TASK`.
+/// The calling session's originating task id from the injected `FRIRING_TASK`.
 fn calling_task_id() -> Option<i64> {
-    std::env::var("THURBOX_TASK").ok()?.parse().ok()
+    std::env::var("FRIRING_TASK").ok()?.parse().ok()
 }
 
 /// Resolve a session reference that may be either a UUID or a session name.
@@ -593,7 +593,7 @@ mod tests {
     #[test]
     fn inbox_without_for_and_no_env_errors() {
         let db = db();
-        // No --for and (in tests) THURBOX_SESSION unset → a clear error.
+        // No --for and (in tests) FRIRING_SESSION unset → a clear error.
         let err = run(
             Action::Inbox {
                 for_session: None,
@@ -604,7 +604,7 @@ mod tests {
             &db,
         )
         .unwrap_err();
-        assert!(err.contains("THURBOX_SESSION"), "got {err}");
+        assert!(err.contains("FRIRING_SESSION"), "got {err}");
     }
 
     #[test]

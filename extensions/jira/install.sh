@@ -1,13 +1,13 @@
 #!/usr/bin/env sh
 # Thin wrapper kept for the curl|sh one-liner. The real installer lives in
-# thurbox itself:
+# friring itself:
 #
-#   thurbox-cli extension install jira
+#   friring-cli extension install jira
 #
 # This script just forwards to it — using a local checkout when run from one,
 # otherwise the official remote source. It fetches the manifest + payload, lays
-# down ~/.config/thurbox/extensions/jira, and activates the jira-tick automation — a deterministic exec
-# sync (no agent, no session), which thurbox then self-heals.
+# down ~/.config/friring/extensions/jira, and activates the jira-tick automation — a deterministic exec
+# sync (no agent, no session), which friring then self-heals.
 #
 # Usage:
 #   ./install.sh                  # from a checkout
@@ -16,15 +16,15 @@
 # Environment variables:
 #   JIRA_HOME=<dir>   override install home (default: <config>/extensions/jira)
 #
-# Authenticate afterwards by creating ~/.config/thurbox/extensions/jira/credentials.env with JIRA_BASE_URL,
+# Authenticate afterwards by creating ~/.config/friring/extensions/jira/credentials.env with JIRA_BASE_URL,
 # JIRA_EMAIL, and JIRA_API_TOKEN (an Atlassian API token). Then add
-# projects/filters to ~/.config/thurbox/extensions/jira/trackers.md. To turn it off:
-#   thurbox-cli extension deactivate jira [--force --purge]
+# projects/filters to ~/.config/friring/extensions/jira/trackers.md. To turn it off:
+#   friring-cli extension deactivate jira [--force --purge]
 
 set -eu
 
-command -v thurbox-cli >/dev/null 2>&1 || {
-  echo "error: thurbox-cli not found in PATH (install thurbox first)" >&2
+command -v friring-cli >/dev/null 2>&1 || {
+  echo "error: friring-cli not found in PATH (install friring first)" >&2
   exit 1
 }
 
@@ -36,7 +36,7 @@ set --
 # otherwise install the official "jira" extension from the remote source.
 SRC_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || true)"
 if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/extension.toml" ]; then
-  exec thurbox-cli extension install "$SRC_DIR" "$@"
+  exec friring-cli extension install "$SRC_DIR" "$@"
 else
-  exec thurbox-cli extension install jira "$@"
+  exec friring-cli extension install jira "$@"
 fi

@@ -532,15 +532,23 @@ fn short_root_label(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-/// Enumerate `(root, path, name)` triples under a session's roots for the global
-/// search Files group: a bounded walk (same node/depth limits as the in-viewer
-/// search) so a huge tree can't stall the search strip. `name` is the file/dir
-/// basename used for matching + display.
-pub fn enumerate_paths(info: &SessionInfo) -> Vec<(PathBuf, PathBuf, String)> {
+/// The root directories the global search's Files scope indexes for a session
+/// — the same roots the viewer itself shows. Owned `PathBuf`s so the caller
+/// can hand them to the off-thread index build without borrowing the session.
+pub fn search_roots(info: &SessionInfo) -> Vec<PathBuf> {
+    expected_root_paths(info)
+}
+
+/// Enumerate `(root, path, name)` triples under `roots` for the global-search
+/// Files index: a bounded walk (same node/depth limits as the in-viewer
+/// search) so a huge tree can't run away. `name` is the file/dir basename used
+/// for matching + display. Runs off-thread (see `App::open_global_search`) —
+/// it does blocking `read_dir` I/O.
+pub fn enumerate_paths_under(roots: &[PathBuf]) -> Vec<(PathBuf, PathBuf, String)> {
     let mut out: Vec<(PathBuf, PathBuf, String)> = Vec::new();
     let mut budget = SEARCH_NODE_LIMIT;
-    for root in expected_root_paths(info) {
-        walk_paths(&root, &root, 0, &mut budget, &mut out);
+    for root in roots {
+        walk_paths(root, root, 0, &mut budget, &mut out);
         if budget == 0 {
             break;
         }

@@ -1,4 +1,4 @@
-// Modal state management for Thurbox TUI: a single discriminated `Modal` enum
+// Modal state management for Friring TUI: a single discriminated `Modal` enum
 // makes invalid states (two modals open at once) unrepresentable.
 
 use std::collections::HashSet;
@@ -521,12 +521,28 @@ fn apply_text_edit_op(f: &mut TextInput, code: KeyCode) {
 
 #[derive(Debug, Clone, Default)]
 pub struct BranchSelectorModal {
+    /// Selection cursor in `filter`'s *filtered* row space, not directly into
+    /// `branches` (the two coincide while no query is typed).
     pub index: usize,
     pub branches: Vec<String>,
+    /// Type-to-filter query over `branches` (printable keys edit it).
+    pub(crate) filter: crate::fuzzy::FuzzyFilter,
     /// The branch list is still being read off-thread (ADR-P12): the modal
     /// opened instantly with a placeholder row and `Enter` is inert until the
     /// background load delivers.
     pub loading: bool,
+}
+
+/// Picker shown when a Ctrl+S sync targets a repo with more than one remote:
+/// choose which remote to rebase onto. One picker per multi-remote repo; the
+/// queue of repos still awaiting a choice rides on the parked sync run
+/// ([`PendingSyncRun`](super::sync_state::PendingSyncRun)), not the modal.
+#[derive(Debug, Clone, Default)]
+pub struct SyncBasePickerModal {
+    /// Display name of the repo the choice applies to (shown in the title).
+    pub repo_name: String,
+    pub remotes: Vec<String>,
+    pub index: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1506,6 +1522,7 @@ pub enum SettingsField {
     FeatAutomations,
     FeatFileViewer,
     FeatGlobalSearch,
+    FeatDoubleShiftSearch,
     FeatInfoPanel,
     FeatShellPane,
     FeatCodeReview,
@@ -1532,11 +1549,12 @@ pub enum SettingsField {
 impl SettingsField {
     /// Field nav order — also the render order (headers are interleaved by the
     /// renderer). Used by [`cycle_field`] and the scroll-windowing logic.
-    pub const ORDER: [SettingsField; 23] = [
+    pub const ORDER: [SettingsField; 24] = [
         SettingsField::FeatTasks,
         SettingsField::FeatAutomations,
         SettingsField::FeatFileViewer,
         SettingsField::FeatGlobalSearch,
+        SettingsField::FeatDoubleShiftSearch,
         SettingsField::FeatInfoPanel,
         SettingsField::FeatShellPane,
         SettingsField::FeatCodeReview,
@@ -1573,7 +1591,12 @@ impl SettingsField {
                 "Automations pane and schedule firing",
             ),
             FeatFileViewer => ("file_viewer", "File viewer", "File viewer column"),
-            FeatGlobalSearch => ("global_search", "Global search", "Global search strip"),
+            FeatGlobalSearch => ("global_search", "Global search", "Global search popup"),
+            FeatDoubleShiftSearch => (
+                "double_shift_search",
+                "Double Shift",
+                "Double-Shift opens the search (kitty-protocol terminals)",
+            ),
             FeatInfoPanel => ("info_panel", "Info panel", "Info panel column"),
             FeatShellPane => ("shell_pane", "Shell pane", "Per-session shell pane"),
             FeatCodeReview => (
@@ -1583,8 +1606,8 @@ impl SettingsField {
             ),
             FeatCcActivity => (
                 "cc_activity",
-                "CC activity",
-                "Claude workflow/subagent transcript view",
+                "Agent activity",
+                "Per-session agent activity retrospective (F9)",
             ),
             FeatPerfHud => (
                 "perf_hud",
@@ -1748,6 +1771,7 @@ impl SettingsModal {
             FeatAutomations => f.automations = !f.automations,
             FeatFileViewer => f.file_viewer = !f.file_viewer,
             FeatGlobalSearch => f.global_search = !f.global_search,
+            FeatDoubleShiftSearch => f.double_shift_search = !f.double_shift_search,
             FeatInfoPanel => f.info_panel = !f.info_panel,
             FeatShellPane => f.shell_pane = !f.shell_pane,
             FeatCodeReview => f.code_review = !f.code_review,
@@ -1817,6 +1841,7 @@ impl SettingsModal {
             FeatAutomations => on(f.automations),
             FeatFileViewer => on(f.file_viewer),
             FeatGlobalSearch => on(f.global_search),
+            FeatDoubleShiftSearch => on(f.double_shift_search),
             FeatInfoPanel => on(f.info_panel),
             FeatShellPane => on(f.shell_pane),
             FeatCodeReview => on(f.code_review),
@@ -1895,6 +1920,7 @@ pub enum Modal {
     None,
     Help(HelpModal),
     BranchSelector(BranchSelectorModal),
+    SyncBasePicker(SyncBasePickerModal),
     WorktreeName(WorktreeNameModal),
     AgentPicker(crate::ui::agent_picker_modal::AgentPickerState),
     HostPicker(crate::ui::host_picker_modal::HostPickerState),
@@ -1935,6 +1961,7 @@ impl Modal {
             Modal::AgentPicker(ap) => Some((&mut ap.selected_index, KeyCode::Enter)),
             Modal::HostPicker(hp) => Some((&mut hp.selected_index, KeyCode::Enter)),
             Modal::BranchSelector(bs) => Some((&mut bs.index, KeyCode::Enter)),
+            Modal::SyncBasePicker(sb) => Some((&mut sb.index, KeyCode::Enter)),
             Modal::TaskActionPicker(p) => Some((&mut p.selected, KeyCode::Enter)),
             Modal::AutomationsList(al) => Some((&mut al.index, KeyCode::Enter)),
             Modal::RestoreSessions(rs) => Some((&mut rs.index, KeyCode::Enter)),
@@ -3242,7 +3269,7 @@ mod tests {
 
     #[test]
     fn settings_order_lists_every_field_once() {
-        assert_eq!(SettingsField::ORDER.len(), 23);
+        assert_eq!(SettingsField::ORDER.len(), 24);
         for f in SettingsField::ORDER {
             assert_eq!(
                 SettingsField::ORDER.iter().filter(|x| **x == f).count(),
@@ -3314,6 +3341,7 @@ mod tests {
             FeatTasks,
             FeatFileViewer,
             FeatGlobalSearch,
+            FeatDoubleShiftSearch,
             FeatInfoPanel,
             FeatShellPane,
             FeatCodeReview,

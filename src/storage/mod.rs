@@ -1,4 +1,4 @@
-//! SQLite-backed persistent storage for Thurbox state.
+//! SQLite-backed persistent storage for Friring state.
 //!
 //! Replaces `state.toml` and `shared_state.toml` with a single SQLite database.
 //! Provides soft delete with `deleted_at` columns and a full audit trail.
@@ -21,6 +21,7 @@ mod sessions;
 mod settings;
 pub use sessions::{DeletedSessionInfo, HookRow};
 pub mod sync;
+mod sync_bases;
 pub mod tasks;
 mod worktrees;
 
@@ -128,7 +129,7 @@ pub(super) fn action_from_columns(kind: &str, cols: ActionColumns) -> Automation
 /// SQLite-backed database for application state.
 pub struct Database {
     conn: Connection,
-    /// Unique ID for this thurbox instance (used in audit trail).
+    /// Unique ID for this friring instance (used in audit trail).
     instance_id: String,
     /// Last known data_version for external change detection.
     last_data_version: i64,
@@ -198,7 +199,7 @@ mod tests {
     #[test]
     fn open_creates_parent_dirs() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let path = temp_dir.path().join("sub").join("dir").join("thurbox.db");
+        let path = temp_dir.path().join("sub").join("dir").join("friring.db");
 
         let db = Database::open(&path);
         assert!(db.is_ok());

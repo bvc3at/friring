@@ -48,7 +48,7 @@ fail() {
 
 # json_field NAME — read a compact JSON object on stdin and print the string
 # value of its top-level "NAME" key (empty if absent or null). Good enough for
-# thurbox-cli's flat `--json` objects (uuid `id`, `backend_type`); it is NOT a
+# friring-cli's flat `--json` objects (uuid `id`, `backend_type`); it is NOT a
 # general JSON parser — values must be plain strings with no embedded quotes,
 # which every field it is used for satisfies.
 json_field() {
@@ -73,11 +73,11 @@ hosts_block() {
 
 # ---- create -> get -> assert core ------------------------------------------
 
-# e2e_cli ARGS… — run `thurbox-cli --json ARGS…` from the repo root. The caller
-# exports the isolated config/data env (XDG_* or THURBOX_*_DIR) beforehand so
-# the run never touches a real thurbox database.
+# e2e_cli ARGS… — run `friring-cli --json ARGS…` from the repo root. The caller
+# exports the isolated config/data env (XDG_* or FRIRING_*_DIR) beforehand so
+# the run never touches a real friring database.
 e2e_cli() {
-  ( cd "$REPO_ROOT" && cargo run -q --bin thurbox-cli -- --json "$@" )
+  ( cd "$REPO_ROOT" && cargo run -q --bin friring-cli -- --json "$@" )
 }
 
 # e2e_create_and_get CREATE_ARGS… — `session create` then `session get`, echoing

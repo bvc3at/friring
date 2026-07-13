@@ -10,7 +10,7 @@
 #       resurrected) while refreshing its title/why/command/kind.
 #   list [--all]        List open proposals (or all, with status).
 #   apply <slug>        Run the proposal's stored command (must start with
-#                       `thurbox-cli`), then mark it applied. Prints the
+#                       `friring-cli`), then mark it applied. Prints the
 #                       command output.
 #   dismiss <slug>      Mark a proposal dismissed (won't resurface on scans).
 #   render              Regenerate proposals.md from proposals.jsonl.
@@ -27,18 +27,18 @@ RENDER="$HOME_DIR/proposals.md"
 
 src() { [ -f "$STORE" ] && printf '%s' "$STORE" || printf '/dev/null'; }
 
-# is_single_thurbox_cli COMMAND
-# True iff COMMAND is exactly one `thurbox-cli` invocation: its first word is
-# `thurbox-cli` AND it contains no shell command-chaining (`;`, `&`, `|`,
+# is_single_friring_cli COMMAND
+# True iff COMMAND is exactly one `friring-cli` invocation: its first word is
+# `friring-cli` AND it contains no shell command-chaining (`;`, `&`, `|`,
 # newline) or command/process substitution (`$(...)`, backticks, `<(...)`,
 # `>(...)`) *outside* of quotes. A prefix match alone is not enough — `sh -c`
-# would happily run a second, arbitrary command chained after a `thurbox-cli `
+# would happily run a second, arbitrary command chained after a `friring-cli `
 # prefix. The scan is quote-aware so a legitimately quoted argument (e.g.
 # `--prompt "do a; then b"`) is still allowed; only operators that would let
 # `sh` execute *another* program are rejected.
-is_single_thurbox_cli() {
+is_single_friring_cli() {
   local s=$1 n i ch nxt state=none bs=$'\\'
-  [ "${s%%[[:space:]]*}" = "thurbox-cli" ] || return 1
+  [ "${s%%[[:space:]]*}" = "friring-cli" ] || return 1
   n=${#s}
   for (( i = 0; i < n; i++ )); do
     ch=${s:i:1}
@@ -149,8 +149,8 @@ case "$cmd" in
     REC="$(jq -c --arg s "$SLUG" 'select(.slug==$s)' "$STORE" | head -1)"
     [ -n "$REC" ] || { echo "no such proposal: $SLUG" >&2; exit 1; }
     CMD="$(printf '%s' "$REC" | jq -r '.command')"
-    if ! is_single_thurbox_cli "$CMD"; then
-      echo "refusing to run command that is not a single 'thurbox-cli ...' invocation: $CMD" >&2
+    if ! is_single_friring_cli "$CMD"; then
+      echo "refusing to run command that is not a single 'friring-cli ...' invocation: $CMD" >&2
       exit 3
     fi
     echo "+ $CMD"

@@ -1,13 +1,13 @@
-# linear (thurbox extension)
+# linear (friring extension)
 
-> **Experimental.** Bidirectionally syncs **Linear issues** with the thurbox
+> **Experimental.** Bidirectionally syncs **Linear issues** with the friring
 > task list: your issues show up as tasks, and marking a task done moves the
 > issue to a completed state.
 
 A `linear-tick` **automation** runs a deterministic sync script
-(`scripts/sync.sh`) every 15 minutes — **no agent, no LLM, no tokens**. thurbox's
+(`scripts/sync.sh`) every 15 minutes — **no agent, no LLM, no tokens**. friring's
 scheduler runs it (TUI or headless heartbeat) and records the result in the
-automation run history. The script only calls `thurbox-cli` and Linear's GraphQL
+automation run history. The script only calls `friring-cli` and Linear's GraphQL
 API (over `curl`). Linear has **no CLI**, so all calls hit
 `https://api.linear.app/graphql`.
 
@@ -15,8 +15,8 @@ API (over `curl`). Linear has **no CLI**, so all calls hit
 
 ### 1. Prerequisites
 
-- `thurbox-cli` **≥ 0.141** on `PATH` (needs the `Exec` automation action +
-  `task --source/--external-id/--external-url`; check `thurbox-cli version`).
+- `friring-cli` **≥ 0.141** on `PATH` (needs the `Exec` automation action +
+  `task --source/--external-id/--external-url`; check `friring-cli version`).
 - `curl` and `jq`.
 
 ### 2. Get a Linear API key
@@ -28,12 +28,12 @@ keys → New key**).
 Because the automation runs **headless** (the scheduler fires it without a
 reliable inherited shell environment), the robust way to hand the key to the
 sync is a `credentials.env` file in the install home — `sync.sh` sources it
-before running. Create `~/.config/thurbox/extensions/linear/credentials.env`:
+before running. Create `~/.config/friring/extensions/linear/credentials.env`:
 
 ```sh
-mkdir -p ~/.config/thurbox/extensions/linear
-printf 'LINEAR_API_KEY=lin_api_xxom\n' > ~/.config/thurbox/extensions/linear/credentials.env
-chmod 600 ~/.config/thurbox/extensions/linear/credentials.env
+mkdir -p ~/.config/friring/extensions/linear
+printf 'LINEAR_API_KEY=lin_api_xxom\n' > ~/.config/friring/extensions/linear/credentials.env
+chmod 600 ~/.config/friring/extensions/linear/credentials.env
 ```
 
 (Exporting `LINEAR_API_KEY` from your shell profile, e.g. `~/.zshrc`/`~/.bashrc`,
@@ -47,17 +47,17 @@ on issue ids, e.g. `ENG` in `ENG-7`).
 ### 3. Install the extension
 
 ```sh
-thurbox-cli extension install linear
+friring-cli extension install linear
 # or from a checkout:
-thurbox-cli extension install ./extensions/linear
+friring-cli extension install ./extensions/linear
 ```
 
-This lays down `~/.config/thurbox/extensions/linear/` (override with `--home`) and activates the
-`linear-tick` automation, which thurbox self-heals if deleted.
+This lays down `~/.config/friring/extensions/linear/` (override with `--home`) and activates the
+`linear-tick` automation, which friring self-heals if deleted.
 
 ### 4. Configure the teams to sync
 
-Edit `~/.config/thurbox/extensions/linear/trackers.md` — one row per Linear
+Edit `~/.config/friring/extensions/linear/trackers.md` — one row per Linear
 team, where `query` is the
 **team key** (e.g. `ENG`):
 
@@ -77,15 +77,15 @@ The automation fires every 15 min. To run it now, trigger it from the
 **Automations** pane (`Ctrl+P` → select `linear-tick` → `r`) or headless:
 
 ```sh
-thurbox-cli automation run <id>     # id from: thurbox-cli automation list
+friring-cli automation run <id>     # id from: friring-cli automation list
 # or run the script directly:
-~/.config/thurbox/extensions/linear/scripts/sync.sh
+~/.config/friring/extensions/linear/scripts/sync.sh
 ```
 
 Then check the imported tasks:
 
 ```sh
-thurbox-cli task list --json | jq -c '.[] | select(.source=="linear") | {id,status,external_id,title}'
+friring-cli task list --json | jq -c '.[] | select(.source=="linear") | {id,status,external_id,title}'
 ```
 
 Linear states map faithfully to task status (see the reference below).
@@ -105,14 +105,14 @@ reaches Linear before the pull reads state back.
 
 - **query** — a Linear **team key** (e.g. `ENG`). The whole cell is the team
   key; all of that team's issues are synced.
-- **push_back** — `yes` enables thurbox → Linear status push for that team.
+- **push_back** — `yes` enables friring → Linear status push for that team.
 
 Imported tasks carry `source=linear` and `external_id="<issue identifier>"`
 (e.g. `ENG-7`), so re-syncing never duplicates them.
 
-State mapping (Linear state type → thurbox task status):
+State mapping (Linear state type → friring task status):
 
-| Linear state type                  | thurbox status |
+| Linear state type                  | friring status |
 |------------------------------------|----------------|
 | `unstarted` / `backlog` / `triage` | `todo`         |
 | `started`                          | `in_progress`  |
@@ -121,7 +121,7 @@ State mapping (Linear state type → thurbox task status):
 ## How it works
 
 `scripts/sync.sh` (run by the automation) sources
-`~/.config/thurbox/extensions/linear/credentials.env` (so `LINEAR_API_KEY` is
+`~/.config/friring/extensions/linear/credentials.env` (so `LINEAR_API_KEY` is
 available headless), then does, in order:
 
 | Step | Script | Behavior |
@@ -136,22 +136,22 @@ Linear is authoritative for an issue's title, URL, and state; your local
 ## Troubleshooting
 
 - **Nothing syncs** — check the automation run history (`Ctrl+P`, or
-  `thurbox-cli automation runs <id>`) for the script's output; run
-  `~/.config/thurbox/extensions/linear/scripts/sync.sh` by hand to see errors directly.
-- **`LINEAR_API_KEY is unset`** — create `~/.config/thurbox/extensions/linear/credentials.env` with
+  `friring-cli automation runs <id>`) for the script's output; run
+  `~/.config/friring/extensions/linear/scripts/sync.sh` by hand to see errors directly.
+- **`LINEAR_API_KEY is unset`** — create `~/.config/friring/extensions/linear/credentials.env` with
   `LINEAR_API_KEY=lin_api_xxom` (step 2). The headless automation can't see a
   variable you only exported interactively.
 - **Empty pull / GraphQL error** — confirm the key is valid and the team key in
   `trackers.md` matches the issue id prefix (`fetch.sh "ENG"` should list
   issues, e.g. `ENG-7`).
-- **`unknown option '--source'`** — your `thurbox-cli` predates 0.141; rebuild /
-  update thurbox.
+- **`unknown option '--source'`** — your `friring-cli` predates 0.141; rebuild /
+  update friring.
 
 ## Turn it off
 
 ```sh
-thurbox-cli extension deactivate linear          # stop syncing
-thurbox-cli extension uninstall linear --purge   # remove home + automation
+friring-cli extension deactivate linear          # stop syncing
+friring-cli extension uninstall linear --purge   # remove home + automation
 ```
 
 Imported tasks remain in your task list (they are not deleted on uninstall).

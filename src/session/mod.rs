@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod agent_def;
 pub mod automation;
 pub mod cc_activity;
@@ -57,20 +58,20 @@ pub const DEFAULT_AGENT_NAME: &str = "claude";
 pub const PENDING_FOCUS_SESSION_ID_KEY: &str = "pending_focus_session_id";
 
 /// tmux **pane user option** a remote agent's hooks set to report status
-/// (`tmux set-option -p @thurbox_state <working|blocked|done|idle>`). The
-/// remote-side replacement for `thurbox-cli session signal`, which can't work
+/// (`tmux set-option -p @friring_state <working|blocked|done|idle>`). The
+/// remote-side replacement for `friring-cli session signal`, which can't work
 /// off-local (no CLI on the host, and it would write the host's own DB). The
 /// local TUI receives changes over its control-mode connection via a format
 /// subscription (see [`REMOTE_HOOK_SUBSCRIPTION`]). Defined in the pure-data
 /// layer so `agent` (subscription) and `session_ops` (hook-command rewrite)
 /// share one source of truth.
-pub const REMOTE_HOOK_STATE_OPTION: &str = "@thurbox_state";
+pub const REMOTE_HOOK_STATE_OPTION: &str = "@friring_state";
 
 /// Name of the control-mode format subscription
-/// (`refresh-client -B <name>:%*:#{@thurbox_state}`) that pushes
+/// (`refresh-client -B <name>:%*:#{@friring_state}`) that pushes
 /// [`REMOTE_HOOK_STATE_OPTION`] changes as `%subscription-changed`
 /// notifications for every pane of the attached session.
-pub const REMOTE_HOOK_SUBSCRIPTION: &str = "thurbox-status";
+pub const REMOTE_HOOK_SUBSCRIPTION: &str = "friring-status";
 
 #[derive(Debug, Clone)]
 pub struct WorktreeInfo {
@@ -103,7 +104,7 @@ impl std::str::FromStr for SessionId {
 }
 
 /// A session's lifecycle state, driven by agent hooks (see
-/// `thurbox-cli session signal`). Repo groups in the session list roll up to
+/// `friring-cli session signal`). Repo groups in the session list roll up to
 /// their most-urgent member so the whole list scans at a glance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -310,10 +311,10 @@ pub struct SessionCommand {
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionConfig {
-    /// Desired thurbox [`SessionId`] for the spawned session. When set, the
+    /// Desired friring [`SessionId`] for the spawned session. When set, the
     /// spawn path uses this id instead of minting a fresh one — so the id is
     /// known *before* launch (to inject it into the process env as
-    /// `THURBOX_SESSION`) and can be reused across a respawn so a session's
+    /// `FRIRING_SESSION`) and can be reused across a respawn so a session's
     /// identity is stable for life. `None` mints a new id at spawn.
     pub session_id: Option<SessionId>,
     /// Resume an existing agent session (process restart of a known session).
@@ -329,7 +330,7 @@ pub struct SessionConfig {
     /// Fork from an existing session's conversation (agents that support it).
     pub fork_session_id: Option<String>,
     /// Environment variables injected into the spawned session process
-    /// (thurbox-internal: session id, metrics dir, etc.).
+    /// (friring-internal: session id, metrics dir, etc.).
     pub env: HashMap<String, String>,
 }
 
@@ -395,7 +396,7 @@ mod tests {
     fn worktree_info_stores_fields() {
         let wt = WorktreeInfo {
             repo_path: PathBuf::from("/repo"),
-            worktree_path: PathBuf::from("/repo/.git/thurbox-worktrees/feat"),
+            worktree_path: PathBuf::from("/repo/.git/friring-worktrees/feat"),
             branch: "feat".to_string(),
         };
         assert_eq!(wt.repo_path, PathBuf::from("/repo"));

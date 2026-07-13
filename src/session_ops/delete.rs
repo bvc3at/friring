@@ -148,7 +148,7 @@ fn kill_local_window(session: &crate::sync::SharedSession, report: &mut ForceDel
 }
 
 /// Kill the session's pane on a remote host by its persisted pane id (`%N`) —
-/// the addressable unit remotely (there's no cheap "window by thurbox name"
+/// the addressable unit remotely (there's no cheap "window by friring name"
 /// lookup over the wire). Best-effort: a blank pane id or an unreachable host
 /// is recorded in `report.remote_teardown_error`, never aborts.
 fn kill_remote_window(

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# dispatch-update.sh — create a thurbox task on a FRESH dependency-update branch
+# dispatch-update.sh — create a friring task on a FRESH dependency-update branch
 # and spawn its updater worker in the SAME call, so capture -> session is atomic.
 #
 # Unlike ci-shepherd (which adopts an existing PR branch), a renovate run starts
-# a brand-new branch, so thurbox's native --worktree does the job: it runs
+# a brand-new branch, so friring's native --worktree does the job: it runs
 # `git worktree add -b renovate/updates-<ts> origin/main` for us. The worker runs
 # Renovate's LOCAL platform inside that worktree, tests the result, commits, and
 # (optionally) opens a review PR.
@@ -77,20 +77,20 @@ If you are blocked (a major upgrade that needs a human decision, test failures
 you can't resolve), do NOT guess — stop and report it in the result
 \`question\` field.
 
-When finished: mark this task done (thurbox-cli task edit \$THURBOX_TASK --status done),
+When finished: mark this task done (friring-cli task edit \$FRIRING_TASK --status done),
 print a final line \`===RESULT===\` followed by one line of JSON:
 {"status":"ok|error","artifact":"...","notes":"...","pr_url":"..."}
 then notify the renovate monitor so the next repo dispatches immediately:
-thurbox-cli session send "\$(thurbox-cli session list --json | jq -r '.[] | select(.name=="renovate") | .id')" "tick"
+friring-cli session send "\$(friring-cli session list --json | jq -r '.[] | select(.name=="renovate") | .id')" "tick"
 EOF
 )"
 
-CREATED="$(thurbox-cli task create --title "update $NAME deps ($STRATEGY)" \
+CREATED="$(friring-cli task create --title "update $NAME deps ($STRATEGY)" \
   --description "$DESC" --repo "$REPO" --agent "$AGENT" \
   --worktree "$BRANCH" --base "$BASE")"
 printf '%s\n' "$CREATED"
 
 if [ "$DISPATCH" -eq 1 ]; then
   ID="$(printf '%s' "$CREATED" | jq -r .id)"
-  thurbox-cli task run "$ID"
+  friring-cli task run "$ID"
 fi

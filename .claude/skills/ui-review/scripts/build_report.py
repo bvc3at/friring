@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a native thurbox-website docs page from captured screenshots + findings.
+"""Build a native friring-website docs page from captured screenshots + findings.
 
 Reads a findings JSON (authored by Claude in the analyze phase) and the screenshots
 dir, copies each PNG into website/assets/ui-review/, and writes a docs page at
@@ -16,7 +16,7 @@ Usage:
 
 The findings JSON schema:
 {
-  "title": "thurbox TUI — UI/UX Review",
+  "title": "friring TUI — UI/UX Review",
   "version": "0.0.0-dev",
   "theme": "Doom",
   "generated_at": "2026-06-03 09:30 UTC",
@@ -147,8 +147,8 @@ def build(data, shots_dir, repo_root):
     # base.njk) supplies the head, nav, full sidebar, breadcrumbs, and CSS chrome.
     page = f"""---
 layout: docs.njk
-title: 'UI/UX Review — Thurbox Docs'
-description: 'Generated UI/UX review of the thurbox TUI: screenshots of each screen with design, usability, consistency, and accessibility findings.'
+title: 'UI/UX Review — Friring Docs'
+description: 'Generated UI/UX review of the friring TUI: screenshots of each screen with design, usability, consistency, and accessibility findings.'
 currentPage: 'ui-review'
 breadcrumb: 'UI/UX Review'
 extraCss: ['ui-review.css']
@@ -156,7 +156,7 @@ extraCss: ['ui-review.css']
 ---
 <h1>{title}</h1>
 <div class="review-meta">
-  <span>thurbox {esc(data.get("version", "dev"))}</span>
+  <span>friring {esc(data.get("version", "dev"))}</span>
   <span>theme: {esc(data.get("theme", "—"))}</span>
   <span>generated {esc(data.get("generated_at", ""))}</span>
 </div>

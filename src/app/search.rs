@@ -1,7 +1,7 @@
-//! Global search — a non-modal bottom strip (`Ctrl+/` by default) that
-//! searches across every scope at once: session metadata + live buffer
-//! **content**, automation names, task titles, and the active session's file
-//! tree.
+//! Global search — a centered popup (`Ctrl+/` or double-`Shift`, JetBrains
+//! Search-Everywhere-style) that searches across every scope at once: session
+//! metadata + live buffer **content**, automation names, task titles, and the
+//! file tree of the session that was active when the popup opened.
 //!
 //! The state lives here; building results and dispatching a selection live on
 //! `App` (they touch `self.sessions`/vt100/caches). The renderer is
@@ -10,12 +10,13 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use super::background::{BackgroundTask, TaskPoll};
 use super::modals::TextInput;
 use super::{clock, App, InputFocus};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 /// Max results kept per group (sessions/tasks/automations/files), so a broad
-/// query can't flood the strip.
+/// query can't flood the popup.
 pub(crate) const MAX_PER_GROUP: usize = 8;
 
 /// How many trailing lines of a session's buffer the content scan inspects.
@@ -46,7 +47,7 @@ pub(crate) enum SearchKind {
     File,
 }
 
-/// A single match shown in the strip.
+/// A single match shown in the popup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GlobalSearchResult {
     pub kind: SearchKind,
@@ -57,7 +58,20 @@ pub(crate) struct GlobalSearchResult {
     pub target: SearchTarget,
 }
 
-/// Snapshot of the UI state taken when the strip opens, so cancelling (`Esc`)
+/// One entry of the Files-scope index: a snapshot of the active session's
+/// tree captured when the popup opened, so per-keystroke matching never
+/// touches the filesystem (the bounded walk used to run on **every**
+/// keystroke — the dominant cost of the old strip).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileIndexEntry {
+    pub root: PathBuf,
+    pub path: PathBuf,
+    pub name: String,
+    /// Lowercased `name`, precomputed off-thread so matching allocates nothing.
+    pub name_lc: String,
+}
+
+/// Snapshot of the UI state taken when the popup opens, so cancelling (`Esc`)
 /// restores exactly what the user had before searching — including selections,
 /// focus, and which optional panels were visible. Live result previews mutate
 /// these same fields, so without the snapshot a cancel would leave the cursor
@@ -72,7 +86,7 @@ pub(crate) struct SearchSnapshot {
     pub show_file_viewer: bool,
 }
 
-/// State for the global-search strip.
+/// State for the global-search popup.
 pub(crate) struct GlobalSearchState {
     pub active: bool,
     pub query: TextInput,
@@ -86,6 +100,10 @@ pub(crate) struct GlobalSearchState {
     pub query_changed_at: Option<Instant>,
     /// A content scan is pending (set on edit, cleared once it runs).
     pub content_dirty: bool,
+    /// Files-scope index, rebuilt per open (empty until the walk delivers).
+    pub file_index: Vec<FileIndexEntry>,
+    /// The in-flight off-thread build of [`Self::file_index`].
+    pub file_index_task: BackgroundTask<Vec<FileIndexEntry>>,
 }
 
 impl Default for GlobalSearchState {
@@ -98,6 +116,8 @@ impl Default for GlobalSearchState {
             snapshot: None,
             query_changed_at: None,
             content_dirty: false,
+            file_index: Vec::new(),
+            file_index_task: BackgroundTask::default(),
         }
     }
 }
@@ -114,11 +134,17 @@ impl GlobalSearchState {
 }
 
 impl App {
-    // ---- Global search (Ctrl+/ bottom strip) -----------------------------
+    // ---- Global search (Ctrl+/ or double-Shift centered popup) ------------
 
-    /// Open the global-search strip: snapshot the current UI state (so cancel
-    /// can restore it), clear the query, focus the strip, and seed the (cheap)
-    /// metadata results.
+    /// Open the global-search popup: snapshot the current UI state (so cancel
+    /// can restore it), clear the query, focus the popup, seed the (cheap)
+    /// metadata results, and kick off the off-thread Files-index build.
+    ///
+    /// Unlike the old bottom strip, the popup floats over the content and does
+    /// not change any panel's size, so opening it pushes no PTY resize — the
+    /// content area is identical to the previous frame. (`close` still resizes:
+    /// restoring `show_tasks_panel`/`show_file_viewer` a preview may have
+    /// changed does alter the layout.)
     pub(crate) fn open_global_search(&mut self) {
         self.global_search.snapshot = Some(SearchSnapshot {
             focus: self.focus,
@@ -135,11 +161,83 @@ impl App {
         self.global_search.query_changed_at = None;
         self.global_search.content_dirty = false;
         self.focus = InputFocus::GlobalSearch;
+        self.start_global_search_file_index();
         self.recompute_global_search_metadata();
-        self.resize_sessions_to_content_area();
     }
 
-    /// Cancel the strip: restore the exact UI state captured at open time
+    /// Snapshot the Files-scope index off-thread: the bounded tree walk (up to
+    /// thousands of `read_dir` calls — seconds on a network mount) must never
+    /// run on the UI thread, let alone per keystroke like the old strip did.
+    /// The scope is pinned to the session that is active **at open time**;
+    /// live-previewing a session result mid-search doesn't retarget it.
+    fn start_global_search_file_index(&mut self) {
+        // Drop any receiver a prior open installed first, so even the early
+        // returns below (feature off / no active session / no roots) can't leave
+        // a stale walk's delivery to be folded into this open's pinned scope.
+        self.global_search.file_index_task.cancel();
+        self.global_search.file_index.clear();
+        if !self.features.file_viewer {
+            return;
+        }
+        let Some(info) = self.sessions.get(self.active_index).map(|s| &s.info) else {
+            return;
+        };
+        let roots = crate::ui::file_viewer::search_roots(info);
+        if roots.is_empty() {
+            return;
+        }
+        // Re-opening while a previous walk is still in flight replaces the
+        // receiver: the stale walk's send fails harmlessly and only the fresh
+        // session's index can ever be delivered.
+        let tx = self.global_search.file_index_task.start();
+        std::thread::spawn(move || {
+            let entries: Vec<FileIndexEntry> =
+                crate::ui::file_viewer::enumerate_paths_under(&roots)
+                    .into_iter()
+                    .map(|(root, path, name)| {
+                        let name_lc = name.to_lowercase();
+                        FileIndexEntry {
+                            root,
+                            path,
+                            name,
+                            name_lc,
+                        }
+                    })
+                    .collect();
+            let _ = tx.send(entries);
+        });
+    }
+
+    /// Poll the off-thread Files-index build (from `tick_core`). On delivery,
+    /// store the index and — if the popup is still open with a live query —
+    /// fold file matches into the visible results. A died walker just means no
+    /// file results this open.
+    pub(super) fn poll_global_search_file_index(&mut self) {
+        match self.global_search.file_index_task.poll() {
+            TaskPoll::Done(index) => {
+                self.global_search.file_index = index;
+                if self.global_search.active && !self.global_search.query.value().trim().is_empty()
+                {
+                    if self.global_search.content_dirty {
+                        // A content scan is already queued behind the debounce —
+                        // rebuild cheaply now and let it fold content matches in.
+                        self.recompute_global_search_metadata();
+                    } else {
+                        // Rebuild on the content path so already-shown buffer
+                        // matches aren't dropped by a metadata-only pass.
+                        self.recompute_global_search_content();
+                    }
+                    // Paint the newly-folded file matches now instead of waiting
+                    // for the 250 ms forced-redraw floor. Gated on `active` so a
+                    // delivery to a closed popup doesn't force a needless repaint.
+                    self.request_redraw();
+                }
+            }
+            TaskPoll::Pending | TaskPoll::Died => {}
+        }
+    }
+
+    /// Cancel the popup: restore the exact UI state captured at open time
     /// (selections, focus, and panel visibility the live preview may have
     /// changed). Bound to `Esc`.
     pub(crate) fn close_global_search(&mut self) {
@@ -154,7 +252,7 @@ impl App {
         self.global_search.active = false;
         self.global_search.results.clear();
         self.global_search.query.clear();
-        // The snapshot predates any feature flag flipped while the strip was
+        // The snapshot predates any feature flag flipped while the popup was
         // open (settings live-reload): re-enforce so the restore can't
         // resurrect a panel/focus whose feature was just disabled. Runs after
         // `active = false`, so its own close-search branch is a no-op.
@@ -220,8 +318,9 @@ impl App {
         out
     }
 
-    /// Session results: fuzzy metadata (name / agent / branch) plus, on the
-    /// debounced heavy path, a buffer-content scan (skipping metadata matches).
+    /// Session results: fuzzy metadata (name / agent / every worktree branch /
+    /// cwd) plus, on the debounced heavy path, a buffer-content scan (skipping
+    /// metadata matches).
     fn search_sessions(
         &self,
         query: &str,
@@ -234,10 +333,15 @@ impl App {
                 break;
             }
             let info = &session.info;
-            let branch = info.worktrees.first().map(|w| w.branch.as_str());
             let meta_hit = crate::fuzzy::fuzzy_match(query, &info.name).is_some()
                 || crate::fuzzy::fuzzy_match(query, &info.agent).is_some()
-                || branch.is_some_and(|b| crate::fuzzy::fuzzy_match(query, b).is_some());
+                || info
+                    .worktrees
+                    .iter()
+                    .any(|w| crate::fuzzy::fuzzy_match(query, &w.branch).is_some())
+                || info.cwd.as_ref().is_some_and(|c| {
+                    crate::fuzzy::fuzzy_match(query, &c.to_string_lossy()).is_some()
+                });
             if meta_hit {
                 sessions.push(GlobalSearchResult {
                     kind: SearchKind::Session,
@@ -339,22 +443,24 @@ impl App {
         automations
     }
 
-    /// File results: case-insensitive substring over the active session's tree.
+    /// File results: case-insensitive substring over the [`FileIndexEntry`]
+    /// snapshot captured at open — pure in-memory matching, no filesystem I/O
+    /// (empty until the off-thread walk delivers).
     fn search_files(&self, query_lc: &str) -> Vec<GlobalSearchResult> {
         let mut files: Vec<GlobalSearchResult> = Vec::new();
-        let Some(info) = self.sessions.get(self.active_index).map(|s| &s.info) else {
-            return files;
-        };
-        for (root, path, name) in crate::ui::file_viewer::enumerate_paths(info) {
+        for entry in &self.global_search.file_index {
             if files.len() >= MAX_PER_GROUP {
                 break;
             }
-            if name.to_lowercase().contains(query_lc) {
+            if entry.name_lc.contains(query_lc) {
                 files.push(GlobalSearchResult {
                     kind: SearchKind::File,
-                    label: name,
+                    label: entry.name.clone(),
                     snippet: None,
-                    target: SearchTarget::File { root, path },
+                    target: SearchTarget::File {
+                        root: entry.root.clone(),
+                        path: entry.path.clone(),
+                    },
                 });
             }
         }
@@ -386,7 +492,7 @@ impl App {
     }
 
     /// The active global-search query for live in-panel highlighting: `Some`
-    /// when the strip is open with a non-empty query, else `None` (panels render
+    /// when the popup is open with a non-empty query, else `None` (panels render
     /// normally). Used by the view to highlight matched rows and dim the rest.
     pub(crate) fn global_search_query(&self) -> Option<&str> {
         if !self.global_search.active {
@@ -396,7 +502,7 @@ impl App {
         (!q.trim().is_empty()).then_some(q)
     }
 
-    /// The scope of the currently selected global-search result, while the strip
+    /// The scope of the currently selected global-search result, while the popup
     /// is active. Lets the view force-show the selected (previewed) row in the
     /// owning panel even though focus stays in the search box.
     pub(crate) fn global_search_preview_kind(&self) -> Option<SearchKind> {
@@ -431,7 +537,10 @@ impl App {
             }
             SearchTarget::Task { id } => {
                 self.show_tasks_panel = true;
-                self.refresh_tasks();
+                // Preview from the in-memory cache the results were built from —
+                // no SQLite read per keystroke/arrow; `Enter` still re-reads the
+                // DB (see `activate_global_search_result`).
+                self.recompute_task_filter();
                 if let Some(pos) = self
                     .task_ui
                     .filtered_task_indices
@@ -456,7 +565,7 @@ impl App {
         }
     }
 
-    /// Jump to the selected search result's target, then close the strip.
+    /// Jump to the selected search result's target, then close the popup.
     pub(crate) fn activate_global_search_result(&mut self) {
         let Some(result) = self
             .global_search
@@ -468,7 +577,7 @@ impl App {
             return;
         };
         // Commit: discard the snapshot (we keep the jump, don't restore) and
-        // tear the strip down, then apply the jump target. Capture the pre-search
+        // tear the popup down, then apply the jump target. Capture the pre-search
         // focus first, as the fallback when a stale target can't be opened.
         let fallback_focus = self
             .global_search
@@ -476,6 +585,11 @@ impl App {
             .as_ref()
             .map(|s| s.focus)
             .unwrap_or(InputFocus::SessionList);
+        // The Files scope is pinned to the session active at open (=
+        // snapshot.active_index), but live preview may have retargeted
+        // `active_index` to a previewed session result. Capture the pinned index
+        // so the File branch rebuilds the correct session's viewer.
+        let pinned_active = self.global_search.snapshot.as_ref().map(|s| s.active_index);
         self.global_search.active = false;
         self.global_search.results.clear();
         self.global_search.query.clear();
@@ -516,6 +630,13 @@ impl App {
             }
             SearchTarget::File { root: _, path } => {
                 self.show_file_viewer = true;
+                // Reveal against the pinned session's viewer, not whatever
+                // session live preview last selected.
+                if let Some(idx) = pinned_active {
+                    if idx < self.sessions.len() {
+                        self.active_index = idx;
+                    }
+                }
                 self.rebuild_file_viewer_for_active();
                 self.file_viewer.reveal_path(&path);
                 self.focus = InputFocus::FileViewer;
@@ -542,10 +663,10 @@ impl App {
         }
     }
 
-    /// Handle keys while the global-search strip is focused. Typed characters
+    /// Handle keys while the global-search popup is focused. Typed characters
     /// edit the query (so plain `j`/`k` insert, like the other search inputs);
     /// `Up`/`Down` and `Ctrl+P`/`Ctrl+N` move the selection; `Enter` activates
-    /// the selected result; `Esc` closes the strip.
+    /// the selected result; `Esc` closes the popup.
     pub(super) fn handle_global_search_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let ctrl = mods.contains(KeyModifiers::CONTROL);
         match code {

@@ -120,15 +120,15 @@ pub enum Action {
     ///
     /// Records the session's state so the TUI can render it (working/blocked/
     /// done/idle) — works headless; the TUI picks it up via its data_version
-    /// poll. Identity defaults to the calling session ($THURBOX_SESSION,
+    /// poll. Identity defaults to the calling session ($FRIRING_SESSION,
     /// injected at spawn), so an agent hook passes no id.
     Signal {
         /// The reported state. `idle` = agent ready/at-rest (e.g. a fresh
         /// session boot); `done` = a turn just finished (shows until you look).
         #[arg(long, value_parser = ["working", "blocked", "done", "idle"])]
         state: String,
-        /// Override the calling session (UUID). Defaults to $THURBOX_SESSION,
-        /// then a lookup by the agent conversation id ($THURBOX_SESSION_ID).
+        /// Override the calling session (UUID). Defaults to $FRIRING_SESSION,
+        /// then a lookup by the agent conversation id ($FRIRING_SESSION_ID).
         #[arg(long)]
         session: Option<String>,
     },
@@ -364,15 +364,15 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
 }
 
 /// Resolve the session a `signal` targets: an explicit `--session` UUID, else
-/// the calling session from `$THURBOX_SESSION`, else a lookup by the agent
-/// conversation id from `$THURBOX_SESSION_ID` (the env fallback for agents whose
-/// hooks don't inherit `$THURBOX_SESSION`). Errors when none resolves.
+/// the calling session from `$FRIRING_SESSION`, else a lookup by the agent
+/// conversation id from `$FRIRING_SESSION_ID` (the env fallback for agents whose
+/// hooks don't inherit `$FRIRING_SESSION`). Errors when none resolves.
 fn resolve_signal_target(db: &Database, session: Option<&str>) -> Result<SharedSession, String> {
     if let Some(uuid) = session {
         return resolve(db, uuid);
     }
     crate::cli::identity::calling_session_or_by_agent_id(db)?
-        .ok_or_else(|| "not inside a thurbox session; pass --session <uuid>".into())
+        .ok_or_else(|| "not inside a friring session; pass --session <uuid>".into())
 }
 
 /// Render the session list as an aligned table (or a friendly empty line).
@@ -541,9 +541,9 @@ mod tests {
     #[test]
     fn signal_without_identity_errors() {
         let db = db();
-        // No --session and (in test) no THURBOX_SESSION env → clear error.
-        std::env::remove_var("THURBOX_SESSION");
-        std::env::remove_var("THURBOX_SESSION_ID");
+        // No --session and (in test) no FRIRING_SESSION env → clear error.
+        std::env::remove_var("FRIRING_SESSION");
+        std::env::remove_var("FRIRING_SESSION_ID");
         let err = run(
             Action::Signal {
                 state: "done".into(),
@@ -552,7 +552,7 @@ mod tests {
             &db,
         )
         .unwrap_err();
-        assert!(err.contains("not inside a thurbox session"), "got {err}");
+        assert!(err.contains("not inside a friring session"), "got {err}");
     }
 
     fn make_test_session(name: &str) -> SharedSession {

@@ -20,8 +20,8 @@ app or a `RENOVATE_TOKEN` platform mode.
 Be terse. No preamble, no praise. Every user-facing reply ends with the Output
 Contract footer.
 
-You run inside a thurbox session whose working directory is the renovate home
-(this directory). Update workers are thurbox **tasks** named `update <repo>
+You run inside a friring session whose working directory is the renovate home
+(this directory). Update workers are friring **tasks** named `update <repo>
 deps …` whose worker session is `task-<id>-…`. The watch list is `./repos.md`.
 
 ## Update strategy (per repo)
@@ -81,11 +81,11 @@ finished update awaits review). Then it lists the live `update …` tasks and th
    - Worker marked the task `done` → note it (the branch/PR is the artifact;
      CLEAN prunes the worktree once it's merged).
    - Worker session missing from the session list → stale: reset the task to
-     todo (`thurbox-cli task edit <id> --status todo`).
+     todo (`friring-cli task edit <id> --status todo`).
    - Otherwise capture recent output and parse the worker's sentinel:
 
      ```bash
-     thurbox-cli session capture <uuid> --lines 40 --json | jq -r .output \
+     friring-cli session capture <uuid> --lines 40 --json | jq -r .output \
        | ./scripts/parse-result.sh
      ```
 
@@ -114,13 +114,13 @@ One screen max:
 ## CLEAN
 
 - Update task `done` AND its `renovate/*` branch is merged/closed (the PR landed)
-  → `thurbox-cli task remove <id>`, then remove its worktree:
+  → `friring-cli task remove <id>`, then remove its worktree:
   `git -C <repo> worktree remove --force <worktree-path>`. Never remove a
   worktree with uncommitted work — if `git -C <wt> status --porcelain` is
   non-empty, leave it and flag under "Needs you".
 - Update task `in_progress` with no session → reset to todo.
 - Orphan `task-*` sessions whose task is removed →
-  `thurbox-cli session delete <uuid> --force`.
+  `friring-cli session delete <uuid> --force`.
 
 ## ASK (anything else)
 

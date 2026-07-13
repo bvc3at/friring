@@ -378,8 +378,8 @@ impl Database {
     }
 
     /// Get a single active (non-deleted) session by its agent conversation id
-    /// (`agent_session_id`, the value injected as `THURBOX_SESSION_ID`). Used by
-    /// `session signal` as an identity fallback when `$THURBOX_SESSION` is not
+    /// (`agent_session_id`, the value injected as `FRIRING_SESSION_ID`). Used by
+    /// `session signal` as an identity fallback when `$FRIRING_SESSION` is not
     /// available to the hook process (e.g. an agent that sanitizes its env).
     pub fn get_session_by_agent_session_id(
         &self,
@@ -394,7 +394,7 @@ impl Database {
 
     /// Record an agent-reported lifecycle state (`working`/`blocked`/`done`) for
     /// a session, stamping `hook_state_at` to now. Written by
-    /// `thurbox-cli session signal` (and at spawn, defaulting to `working`).
+    /// `friring-cli session signal` (and at spawn, defaulting to `working`).
     ///
     /// Deliberately a targeted UPDATE that touches only the hook columns —
     /// [`upsert_session`](Self::upsert_session) must never list them, so the
@@ -590,7 +590,7 @@ mod tests {
             id: SessionId::default(),
             name: name.to_string(),
             agent: "claude".to_string(),
-            backend_id: "thurbox:@0".to_string(),
+            backend_id: "friring:@0".to_string(),
             backend_type: "tmux".to_string(),
             agent_session_id: None,
             cwd: None,
@@ -716,13 +716,13 @@ mod tests {
         assert!(db.list_active_sessions().unwrap().is_empty());
 
         // Respawn: same id, fresh backend_id (as the new tmux pane would have).
-        session.backend_id = "thurbox:@9".to_string();
+        session.backend_id = "friring:@9".to_string();
         db.upsert_session(&session).unwrap();
 
         let active = db.list_active_sessions().unwrap();
         assert_eq!(active.len(), 1, "exactly one active row");
         assert_eq!(active[0].id, sid, "id is stable across the respawn");
-        assert_eq!(active[0].backend_id, "thurbox:@9");
+        assert_eq!(active[0].backend_id, "friring:@9");
     }
 
     #[test]

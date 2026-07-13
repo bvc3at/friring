@@ -78,7 +78,7 @@ between it and the `app` coordinator.
   `repo_picker_modal`, `agent_picker_modal`; `selection.rs` drives
   mouse-drag text selection and `links.rs` detects clickable URLs. Colors
   are centralized in `theme.rs` (ADR-14).
-- **`cli/`** — `thurbox-cli` subcommand dispatch (headless session ops +
+- **`cli/`** — `friring-cli` subcommand dispatch (headless session ops +
   scheduling + the editor command), sharing the SQLite DB with the TUI but
   never importing `app`/`ui` (ADR-15).
 
@@ -132,7 +132,7 @@ coordinator imports every layer (ADR-22).
 **Choice**: A `SessionBackend` trait abstracts session lifecycle
 (spawn, adopt, resize, kill, detach, discover). Each session runs
 one coding-agent CLI inside the backend. The default backend is
-local tmux (`tmux -L thurbox`); the same `TmuxBackend` also runs
+local tmux (`tmux -L friring`); the same `TmuxBackend` also runs
 over SSH for remote hosts (ADR-13).
 `vt100::Parser` interprets escape sequences,
 `tui_term::PseudoTerminal` renders the parsed screen into ratatui.
@@ -140,12 +140,12 @@ over SSH for remote hosts (ADR-13).
 **Why**: The trait-based design keeps the session transport
 behind a clean boundary so the app layer never touches tmux
 directly. tmux provides truly persistent sessions
-that survive thurbox crashes/restarts, multiple thurbox instances
+that survive friring crashes/restarts, multiple friring instances
 share the same running sessions, and external recovery is
-possible via `tmux -L thurbox attach`.
+possible via `tmux -L friring attach`.
 
 **Previous design**: `portable-pty` spawned the agent CLI
-directly. Sessions died when thurbox exited, terminal content was
+directly. Sessions died when friring exited, terminal content was
 lost on restart, and multiple instances had no coordination.
 
 **Rejected**:
@@ -249,7 +249,7 @@ layout never "jitters" near a threshold.
 ## ADR-6: File-based logging only
 
 **Choice**: All tracing output goes to
-`~/.local/share/thurbox/thurbox.log`.
+`~/.local/share/friring/friring.log`.
 Nothing writes to stdout or stderr.
 
 **Why**: The TUI owns stdout entirely. Any stray `println!` or
@@ -286,13 +286,13 @@ specifically for `perf` / `flamegraph` workflows.
 
 **Choice**: All persistent state (sessions, worktrees,
 automations) is stored in a single SQLite
-database at `~/.local/share/thurbox/thurbox.db` (respects
+database at `~/.local/share/friring/friring.db` (respects
 `$XDG_DATA_HOME`). WAL mode enables concurrent multi-instance
 access. Agent definitions are the one exception: they live in a
 human-editable TOML file (see ADR-19), not the database.
 
 *This supersedes the original TOML file-based approach
-(`~/.config/thurbox/config.toml`), which was eliminated after
+(`~/.config/friring/config.toml`), which was eliminated after
 the SQLite migration.*
 
 **Why**: SQLite provides atomic transactions, concurrent access
@@ -301,7 +301,7 @@ uses `PRAGMA data_version` polling (see ADR-7b). The TUI provides
 all editing UI — there is no need for a human-editable config file.
 
 Every connection sets a **5 s busy_timeout** (the DB is shared by
-the TUI, `thurbox-cli`, and the automation heartbeat; writes are
+the TUI, `friring-cli`, and the automation heartbeat; writes are
 short single-row upserts, so a bounded wait beats an immediate
 `SQLITE_BUSY` error or an unbounded freeze) plus the WAL-friendly
 performance pragmas `synchronous = NORMAL`, `cache_size`, `mmap_size`,
@@ -330,7 +330,7 @@ growth would bloat the database over months of use.
 ## ADR-8b: Automations fire with or without the TUI
 
 **Choice**: Automations fire from three places that all funnel
-through one headless entry point, `thurbox-cli automation tick`:
+through one headless entry point, `friring-cli automation tick`:
 the TUI tick loop, a detached **tmux heartbeat keeper** window
 (`automation-heartbeat`, armed on TUI startup and on `automation
 create`, looping `tick` every 60 s), and optional systemd/launchd
@@ -429,20 +429,20 @@ code.
 **Choice**: The default `SessionBackend` is `TmuxBackend`
 parameterized over its `Local` transport (`TmuxTransport::Local`)
 and registered as `local-tmux`, using a dedicated tmux server
-(`tmux -L thurbox`) with session name `thurbox`. All I/O goes
+(`tmux -L friring`) with session name `friring`. All I/O goes
 through tmux control mode (`-C`). (The transport abstraction that
 also enables remote SSH backends is ADR-13; here the choice is
 simply that the out-of-the-box backend runs tmux locally.)
 
 **Why**: tmux provides session persistence (survives crashes),
-multi-instance support (multiple thurbox processes can independently
+multi-instance support (multiple friring processes can independently
 interact with the same sessions), and external recovery
-(`tmux -L thurbox attach`). It handles terminal capability queries
+(`tmux -L friring attach`). It handles terminal capability queries
 (DA1/DA2) natively via `extended-keys on`, eliminating the need for
-thurbox to intercept and respond to these sequences.
+friring to intercept and respond to these sequences.
 
 Control mode (`-C`) supports multiple concurrent client connections,
-each receiving independent output streams. Each thurbox instance
+each receiving independent output streams. Each friring instance
 establishes its own control mode connection, allowing all instances
 to simultaneously monitor and interact with the same tmux sessions.
 Output arrives as `%output` notifications (octal-encoded), input is
@@ -454,7 +454,7 @@ bugs (#641, #2989), required 3 external deps in the data path
 **Configuration on init**:
 
 - `remain-on-exit on` — keeps panes alive after process exit
-- `status off` — no tmux status bar (thurbox renders its own)
+- `status off` — no tmux status bar (friring renders its own)
 - `default-terminal xterm-256color` — standard terminal type
 - `history-limit 5000` — reasonable scrollback
 - `extended-keys on` — enhanced key reporting
@@ -523,7 +523,7 @@ arms share `TmuxTransport::prefixed`, since both join + shell-interpret
 the trailing POSIX-quoted tokens identically; only the launcher prefix
 differs.
 
-Hosts are declared as data in `~/.config/thurbox/hosts.toml`
+Hosts are declared as data in `~/.config/friring/hosts.toml`
 (`session::HostDef { kind: HostKind {Ssh, Wsl}, … }`/`HostRegistry`),
 and WSL distros are additionally **auto-discovered** on Windows
 (`agent::host_config::discover_wsl_hosts` via `wsl.exe -l -q`). The
@@ -559,14 +559,14 @@ WSL needs no credentials at all.
 - **Selection**: `SessionConfig.backend` (`ssh:<host>` / `wsl:<distro>`
   or `None`); `is_remote_backend` covers both. The TUI shows a host
   picker as the first new-session step (skipped when none configured/
-  discovered); `thurbox-cli session create --host` is the headless
+  discovered); `friring-cli session create --host` is the headless
   equivalent.
 - **Persistence/restore**: `backend_type` round-trips in SQLite;
   restore discovers windows **per backend** so off-local sessions
   re-adopt against their own host's tmux.
 - **Off-local worktrees**: `git::*_on(host, …)` run git via
   `git::host_launcher` (`ssh …` or `wsl.exe …`). Worktree paths resolve
-  under the host's `worktrees_dir` (or `$HOME/.local/share/thurbox/…`
+  under the host's `worktrees_dir` (or `$HOME/.local/share/friring/…`
   resolved + cached, keyed by backend name since a WSL host has no
   `destination`).
 
@@ -592,10 +592,10 @@ stalls. Worth the most manual testing.
 
 ## ADR-7b: Multi-Instance Sync — SQLite with PRAGMA data_version
 
-**Choice**: Multiple thurbox instances synchronize all state
+**Choice**: Multiple friring instances synchronize all state
 (sessions, worktrees, automations)
 via a shared SQLite database
-(`~/.local/share/thurbox/thurbox.db`). Each instance polls
+(`~/.local/share/friring/friring.db`). Each instance polls
 `PRAGMA data_version` to detect external changes. SQLite's WAL mode
 handles concurrent access safely. Deletions use soft delete
 (`deleted_at` column).
@@ -669,7 +669,7 @@ I/O coordination.
 ## ADR-15: Headless CLI as Separate Binary
 
 **Choice**: Headless automation lives in a separate binary
-(`thurbox-cli`) that shares the same SQLite database as the TUI.
+(`friring-cli`) that shares the same SQLite database as the TUI.
 It exposes `session`, `automation`, `task`, `message`, `editor`,
 `config`, `extension`, `version`, `update`, and `notify` management
 as subcommands, printing JSON results.
@@ -677,7 +677,7 @@ as subcommands, printing JSON results.
 **Why**: A separate binary keeps scripting/automation out of the
 TUI's event loop. The TUI already polls `PRAGMA data_version`
 on every tick (~10 ms event-loop cadence) (ADR-7b), so changes
-made by `thurbox-cli` appear
+made by `friring-cli` appear
 automatically — no new synchronization mechanism is needed. The
 `cli` module imports `storage`, `session`, `session_ops`, `sync`,
 and `agent::tmux`, but never `app` or `ui`, so it can operate
@@ -728,7 +728,7 @@ trivially testable. Composite styles (e.g., `focused_title()`) are
 
 **Choice**: Each session runs exactly one coding-agent CLI chosen
 at creation time; each agent runs with its own default config.
-Agents are described as **data** in `~/.config/thurbox/agents.toml`
+Agents are described as **data** in `~/.config/friring/agents.toml`
 (sibling of any other config), seeded with built-ins (claude,
 codex, antigravity, opencode, aider, copilot, vibe) on first run via
 `agent::agent_config::load_or_seed`. An `AgentDef` carries a
@@ -738,7 +738,7 @@ here if you want), and argument-template groups (`resume_args`,
 single `agent::GenericProvider` (an `AgentProvider`) launches any
 defined agent by substituting `{id}` and appending each group only
 when its driving value is present. Only `claude` can be addressed by
-the thurbox-generated id (`--session-id {id}`); the other built-ins
+the friring-generated id (`--session-id {id}`); the other built-ins
 can't pin or report a session id, so they set `resume_latest = true`
 and use id-less, cwd-scoped flags (`codex resume --last`, `opencode
 --continue`, …) that make the agent resolve "the last session in this
@@ -747,7 +747,7 @@ group fires at restart (`session_ops::resume_trigger_for`): for these
 agents restart always resumes; claude still defers to an on-disk
 transcript check.
 
-**Why**: Thurbox started as Claude-Code-specific, with a hard-coded
+**Why**: Friring started as Claude-Code-specific, with a hard-coded
 `ClaudeProvider` plus roles, skills, profiles, and an MCP/plugin
 surface tied to one agent's permission model. Generalizing to "run
 any coding agent" meant the launch contract had to be data, not
@@ -780,10 +780,10 @@ database.
 
 ## ADR-20: Agent-agnostic extensions in `extensions/`
 
-**Choice**: Opt-in workflows that *compose* thurbox (rather than
+**Choice**: Opt-in workflows that *compose* friring (rather than
 extend the binary) live in `extensions/<name>/` as data + shell:
 a plain-markdown behavior spec, portable scripts built on
-`thurbox-cli` + `jq`, and a curl-able, idempotent `install.sh` —
+`friring-cli` + `jq`, and a curl-able, idempotent `install.sh` —
 the same distribution model as `scripts/install.sh` and
 `packaging/`. The first extension is **flow** (an experimental
 focus-protecting triage agent; see FEATURES.md). Extensions reach
@@ -792,11 +792,11 @@ that the user maps to any CLI, and surface their spec through
 context-file symlinks (`CLAUDE.md`/`AGENTS.md`/`GEMINI.md` → the
 spec), so no vendor is named anywhere.
 
-**Why**: ADR-19's pivot made thurbox agent-neutral; an opinionated
+**Why**: ADR-19's pivot made friring agent-neutral; an opinionated
 LLM workflow (prompts, triage rubrics, tick cadences) would undo
 that if baked into core, and it iterates on a much faster cadence
 than the binary (editing a markdown spec vs. cutting a release).
-Keeping extensions as data over the public surface (`thurbox-cli`
+Keeping extensions as data over the public surface (`friring-cli`
 plus `agents.toml`) also makes that surface's stability a tested,
 load-bearing contract.
 
@@ -805,11 +805,11 @@ load-bearing contract.
 - *Vendor plugin formats* (e.g. a Claude Code plugin) — couples
   the workflow to one agent's ecosystem; the same agent brain must
   be runnable by codex, antigravity, opencode, vibe, ….
-- *A `thurbox-cli flow init` subcommand with embedded assets* —
+- *A `friring-cli flow init` subcommand with embedded assets* —
   puts one opinionated workflow inside the agent-neutral core and
   ties spec iteration to the release cycle.
 - *A separate repository* — the extension scripts against
-  `thurbox-cli`'s JSON surface and should version and CI alongside
+  `friring-cli`'s JSON surface and should version and CI alongside
   it.
 
 ## ADR-21: Declarative extension manifests + first-class lifecycle
@@ -817,7 +817,7 @@ load-bearing contract.
 **Choice**: Extend ADR-20 by teaching the core a single declarative
 **manifest format** (`extension.toml`, `session::ExtensionDef`) and a
 first-class lifecycle on the public surface:
-`thurbox-cli extension install/uninstall/activate/deactivate/list/status`
+`friring-cli extension install/uninstall/activate/deactivate/list/status`
 (`session_ops::*`, `agent::extension_config`). The manifest has an
 *install* half (`home`, `[[agents]]`, `[[files]]`, `[[symlinks]]`) and a
 *runtime* half (`[[sessions]]`, `[[automations]]`). `install` resolves a

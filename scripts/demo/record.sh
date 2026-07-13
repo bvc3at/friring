@@ -1,24 +1,24 @@
 #!/usr/bin/env sh
-# Regenerate ALL Thurbox demo media in one pass, using REAL coding-agent CLIs.
+# Regenerate ALL Friring demo media in one pass, using REAL coding-agent CLIs.
 #
 # This single script records every video pair under docs/media/:
 #
-#   * thurbox-demo.{gif,mp4}            (agents.tape          — the hero demo)
-#   * thurbox-file-manager.{gif,mp4}    (file-manager.tape)
-#   * thurbox-info-panel.{gif,mp4}      (info-panel.tape)
-#   * thurbox-theme.{gif,mp4}           (theme.tape)
-#   * thurbox-session-creation.{gif,mp4}(session-creation.tape)
-#   * thurbox-fork.{gif,mp4}            (fork.tape)
+#   * friring-demo.{gif,mp4}            (agents.tape          — the hero demo)
+#   * friring-file-manager.{gif,mp4}    (file-manager.tape)
+#   * friring-info-panel.{gif,mp4}      (info-panel.tape)
+#   * friring-theme.{gif,mp4}           (theme.tape)
+#   * friring-session-creation.{gif,mp4}(session-creation.tape)
+#   * friring-fork.{gif,mp4}            (fork.tape)
 #   * automations-demo.{gif,mp4}        (automations.tape)
 #   * tasks-demo.{gif,mp4}              (tasks.tape)
 #   * search-demo.{gif,mp4}             (search.tape)
 #   * code-review-demo.{gif,mp4}        (code-review.tape)
 #
 # Every clip drives the actual `claude`, `opencode`, `codex` and `antigravity` CLIs —
-# one per thurbox session — to showcase real multi-agent orchestration. No prompt
+# one per friring session — to showcase real multi-agent orchestration. No prompt
 # is sent to any agent; they are launched and left on their start screens.
 #
-# Isolation (so this never touches your real thurbox, tmux, or agent accounts):
+# Isolation (so this never touches your real friring, tmux, or agent accounts):
 #   * HOME points at a throwaway dir  -> agents boot with NO chat history (no past
 #     conversations leak into the video). To avoid login/trust dialogs on screen,
 #     each CLI's auth *token* is copied into the throwaway HOME and every demo repo
@@ -29,7 +29,7 @@
 #     both featured LOGGED OUT on purpose, because each prints your account email
 #     in its welcome box when signed in (agy fetches it from the server via its
 #     keyring auth; claude prints the org name) — see their notes below.
-#   * TMUX_TMPDIR points at a throwaway dir -> the `thurbox-dev` tmux server lives
+#   * TMUX_TMPDIR points at a throwaway dir -> the `friring-dev` tmux server lives
 #     in its own socket directory, so cleanup can't kill dev sessions you already
 #     have running.
 #   * XDG_{DATA,CONFIG,STATE,CACHE}_HOME point at a throwaway dir.
@@ -46,13 +46,13 @@
 set -eu
 
 # Tapes to record (stems of scripts/demo/<stem>.tape), hero first. `agents` is
-# the combined hero demo (docs/media/thurbox-demo.*); the rest are per-feature
+# the combined hero demo (docs/media/friring-demo.*); the rest are per-feature
 # clips (`automations` -> automations-demo.*, `tasks` -> tasks-demo.*, `search`
-# -> search-demo.*, others -> thurbox-<stem>.*).
+# -> search-demo.*, others -> friring-<stem>.*).
 ALL_TAPES="agents file-manager info-panel theme session-creation fork automations tasks search code-review"
 TAPES="${*:-$ALL_TAPES}"
 
-# thurbox TUI theme every clip starts in (persisted string in metadata.active_theme,
+# friring TUI theme every clip starts in (persisted string in metadata.active_theme,
 # see src/session/theme_config.rs). The `theme` clip switches away from it to show
 # the picker, so we re-apply this before EVERY tape to keep all videos on-brand.
 DEMO_THEME="${DEMO_THEME:-doom}"
@@ -109,12 +109,12 @@ fi
 
 # --- Build the dev binaries (version 0.0.0-dev => dev_build cfg) -------------
 # Build BEFORE the HOME override so cargo still finds ~/.cargo.
-echo "==> Building thurbox (dev) ..."
-cargo build --bin thurbox --bin thurbox-cli
+echo "==> Building friring (dev) ..."
+cargo build --bin friring --bin friring-cli
 
-THURBOX_BIN="$REPO_ROOT/target/debug/thurbox"
-CLI_BIN="$REPO_ROOT/target/debug/thurbox-cli"
-export THURBOX_BIN   # consumed by the tapes (they `exec "$THURBOX_BIN"`)
+FRIRING_BIN="$REPO_ROOT/target/debug/friring"
+CLI_BIN="$REPO_ROOT/target/debug/friring-cli"
+export FRIRING_BIN   # consumed by the tapes (they `exec "$FRIRING_BIN"`)
 
 # --- Isolated environment (shared dev-sandbox helper) ------------------------
 REAL_HOME="$HOME"                        # captured before the override below
@@ -123,8 +123,8 @@ REAL_HOME="$HOME"                        # captured before the override below
 . "$REPO_ROOT/scripts/dev/lib/sandbox-env.sh"
 tbx_sandbox_init_full fresh              # throwaway temp HOME/XDG/TMUX_TMPDIR
 DEMO_HOME="$TBX_SANDBOX_ROOT"            # fresh agent auth (no real creds/history)
-CFG_DIR="$XDG_CONFIG_HOME/thurbox-dev"   # dev_build subdir
-DB_FILE="$XDG_DATA_HOME/thurbox-dev/thurbox.db"  # SQLite db (dev_build subdir)
+CFG_DIR="$XDG_CONFIG_HOME/friring-dev"   # dev_build subdir
+DB_FILE="$XDG_DATA_HOME/friring-dev/friring.db"  # SQLite db (dev_build subdir)
 mkdir -p "$CFG_DIR"
 
 cleanup() {
@@ -177,7 +177,7 @@ mkdir -p "$DEMO_REPO/src" "$DEMO_REPO/tests" "$DEMO_REPO/docs"
 cat > "$DEMO_REPO/README.md" <<'EOF'
 # sample-project
 
-A tiny demo repository used to showcase the Thurbox file viewer.
+A tiny demo repository used to showcase the Friring file viewer.
 EOF
 cat > "$DEMO_REPO/src/main.rs" <<'EOF'
 fn main() {
@@ -201,8 +201,8 @@ cat > "$DEMO_REPO/docs/ARCHITECTURE.md" <<'EOF'
 Sample document for the file-viewer demo.
 EOF
 git init -q "$DEMO_REPO"
-git -C "$DEMO_REPO" -c user.email=demo@thurbox -c user.name=demo add -A
-git -C "$DEMO_REPO" -c user.email=demo@thurbox -c user.name=demo \
+git -C "$DEMO_REPO" -c user.email=demo@friring -c user.name=demo add -A
+git -C "$DEMO_REPO" -c user.email=demo@friring -c user.name=demo \
     commit -q -m "init sample project"
 # The branch the initial commit landed on (master or main, per the host's git
 # config) — used as the code-review demo's worktree base.
@@ -218,8 +218,8 @@ for r in api-server shared-lib web-app; do
     mkdir -p "$repo"
     printf '# %s\n' "$r" > "$repo/README.md"
     git init -q "$repo"
-    git -C "$repo" -c user.email=demo@thurbox -c user.name=demo add -A
-    git -C "$repo" -c user.email=demo@thurbox -c user.name=demo \
+    git -C "$repo" -c user.email=demo@friring -c user.name=demo add -A
+    git -C "$repo" -c user.email=demo@friring -c user.name=demo \
         commit -q -m "init $r"
 done
 
@@ -316,7 +316,7 @@ if printf '%s ' $TAPES | grep -Eq '(^| )(code-review|agents)( |$)'; then
     "$CLI_BIN" session create --name "review" --repo-path "$DEMO_REPO" \
         --agent "$review_agent" --worktree-branch "review/demo" \
         --base-branch "$DEMO_BASE_BRANCH" >/dev/null
-    # Resolve the worktree path thurbox created for branch review/demo.
+    # Resolve the worktree path friring created for branch review/demo.
     REVIEW_WT=$(git -C "$DEMO_REPO" worktree list --porcelain \
         | awk '/^worktree /{p=substr($0,10)} $0=="branch refs/heads/review/demo"{print p}')
     if [ -n "$REVIEW_WT" ]; then
@@ -341,8 +341,8 @@ fn main() {
     println!("{}", greet::greet("sample-project"));
 }
 EOF
-        git -C "$REVIEW_WT" -c user.email=demo@thurbox -c user.name=demo add -A
-        git -C "$REVIEW_WT" -c user.email=demo@thurbox -c user.name=demo \
+        git -C "$REVIEW_WT" -c user.email=demo@friring -c user.name=demo add -A
+        git -C "$REVIEW_WT" -c user.email=demo@friring -c user.name=demo \
             commit -q -m "feat: add greeting + checked arithmetic"
     fi
 fi
@@ -399,11 +399,11 @@ done
 echo "==> Done. Updated docs/media/ for tape(s):$([ "$TAPES" = "$ALL_TAPES" ] && echo " all" || echo " $TAPES")"
 for tape in $TAPES; do
     case "$tape" in
-        agents)      echo "    thurbox-demo.{gif,mp4}" ;;
+        agents)      echo "    friring-demo.{gif,mp4}" ;;
         automations) echo "    automations-demo.{gif,mp4}" ;;
         tasks)       echo "    tasks-demo.{gif,mp4}" ;;
         search)      echo "    search-demo.{gif,mp4}" ;;
         code-review) echo "    code-review-demo.{gif,mp4}" ;;
-        *)           echo "    thurbox-$tape.{gif,mp4}" ;;
+        *)           echo "    friring-$tape.{gif,mp4}" ;;
     esac
 done

@@ -1,6 +1,6 @@
 # Constitution
 
-Non-negotiable rules that define what Thurbox **must** always be.
+Non-negotiable rules that define what Friring **must** always be.
 Each principle has an automated enforcement mechanism
 — if it can't be enforced, it doesn't belong here.
 
@@ -64,7 +64,7 @@ No ad-hoc event handlers, no component-local state, no callback chains.
 ### 8. Backend-first session model
 
 Coding-agent sessions run via a `SessionBackend` trait, backed by
-local tmux (`tmux -L thurbox`). tmux provides truly persistent
+local tmux (`tmux -L friring`). tmux provides truly persistent
 sessions that survive crashes/restarts.
 We never mock, emulate, or screen-scrape a fake terminal.
 The backend is the source of truth for session lifecycle.
@@ -72,7 +72,7 @@ The backend is the source of truth for session lifecycle.
 ### 9. Logging never touches stdout
 
 Stdout belongs to the TUI. All diagnostic output goes to the log file
-at `~/.local/share/thurbox/thurbox.log`.
+at `~/.local/share/friring/friring.log`.
 
 ### 10. Test-driven development (Red, Green, Refactor)
 
@@ -112,7 +112,7 @@ binaries have correct versions while keeping the source tree clean.
 
 1. Release workflow (`release.yml`) analyzes commits via `cog bump --auto --dry-run`
 2. Workflow creates lightweight tag (v{version}) and passes version via environment variable
-3. `build.rs` reads `THURBOX_RELEASE_VERSION` and injects into binary
+3. `build.rs` reads `FRIRING_RELEASE_VERSION` and injects into binary
 4. Cargo.toml version remains `0.0.0-dev` (development marker only)
 
 **Result:**

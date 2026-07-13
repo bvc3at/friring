@@ -1,6 +1,6 @@
 # Performance
 
-How thurbox stays responsive and light, and how to measure it. The focus areas
+How friring stays responsive and light, and how to measure it. The focus areas
 are **input latency**, **runtime CPU / render cost**, **startup time**, and
 **memory / binary size**. Decisions below follow the mini-ADR format
 (**Choice**, **Why**, **Rejected alternatives**), matching
@@ -171,8 +171,8 @@ won't pay off.
 **Choice**: The gating automated perf tests are the counter assertions
 (ADR-P2). Heavier measurement is **opt-in and local**:
 
-- **Time-to-first-frame**: launch with `THURBOX_PERF_LOG=1`; `run_loop` logs one
-  `startup …` line to `~/.local/share/thurbox/thurbox.log` with a **phase
+- **Time-to-first-frame**: launch with `FRIRING_PERF_LOG=1`; `run_loop` logs one
+  `startup …` line to `~/.local/share/friring/friring.log` with a **phase
   breakdown** that sums to roughly `first_frame_ms` —
   `config_init_ms` (config-file loads + local backend ready), `db_open_ms`,
   `theme_activate_ms` (persisted-theme lookup + custom-theme publish),
@@ -202,12 +202,12 @@ won't pay off.
   Off by default — never affects normal runs or the smoke test; the timing reads
   are gated on the flag so there is zero overhead otherwise.
 - **Binary size**: the non-gating `binary-size` CI job
-  (`.github/workflows/ci.yml`) builds `--release` and records `thurbox` /
-  `thurbox-cli` sizes to the job summary + an artifact. It is intentionally
+  (`.github/workflows/ci.yml`) builds `--release` and records `friring` /
+  `friring-cli` sizes to the job summary + an artifact. It is intentionally
   **not** in `all-checks.needs`, so it never blocks a merge; it just makes
   growth visible. The release profile is already tuned (`opt-level = 3`,
   `lto = true`, `codegen-units = 1`, `strip = true`).
-- **Local profiling**: `cargo flamegraph --bin thurbox` (build with the
+- **Local profiling**: `cargo flamegraph --bin friring` (build with the
   `release-with-debug` profile for symbols) for CPU; `cargo bloat --release
   --crates` for size attribution. Neither is a dependency — run them ad hoc.
 - **Real-pipeline load benchmarks**: the agent-e2e harness's perf scenarios
@@ -254,7 +254,7 @@ explicitly: the deferred `seen_at` marks are applied **write-through** into the
 cache (otherwise a just-acknowledged `done` session would re-derive to `Done`
 next tick), and the restart path's `clear_hook_state` calls
 `App::invalidate_hook_state_cache` (forces a reload). External
-`thurbox-cli session signal` writes come from another connection and *do* bump
+`friring-cli session signal` writes come from another connection and *do* bump
 `data_version`, so they're picked up on the next tick as before.
 
 Alongside this, `Database::initialize` (`src/storage/schema.rs`) sets the
@@ -460,7 +460,7 @@ only** and never CI-asserted (the counters remain the sole regression gate):
   No new dependencies: the histogram is ~40 lines with power-of-two µs buckets
   (250 µs → 1 s + overflow), good enough to answer "is a frame 1 ms or 30 ms".
 - **Gating**: the hot-loop `Instant` reads run only while
-  `App::perf_timing_active()` — `THURBOX_PERF_LOG` set (cached at
+  `App::perf_timing_active()` — `FRIRING_PERF_LOG` set (cached at
   construction) or the perf HUD open — so a normal run pays a single cached
   bool check per loop iteration, keeping ADR-P5's zero-overhead promise.
 - **Slow ops**: `App::time_op(name, f)` wraps rare, user-triggered synchronous
@@ -468,7 +468,7 @@ only** and never CI-asserted (the counters remain the sole regression gate):
   as `input_dispatch`). Always measured (call sites are not the hot path):
   ≥ 5 ms lands in the ring, ≥ 100 ms also logs a `slow op` warning — so an
   interactive stall is attributable even when nobody was watching.
-- **Steady-state reporting**: under `THURBOX_PERF_LOG`, every 1000 ticks
+- **Steady-state reporting**: under `FRIRING_PERF_LOG`, every 1000 ticks
   (~10 s) `App::tick_perf_window` logs one `perf_window` line — counter
   **deltas** for the window (`PerfCounters::delta`), frame/tick p50/p95/max,
   and the window's slow ops — then resets the per-window timing state. The
@@ -479,8 +479,8 @@ only** and never CI-asserted (the counters remain the sole regression gate):
 - **External inspection**: while timing is active the TUI also publishes a
   JSON snapshot (counters + percentiles + slow ops + the startup phases) into
   the SQLite `metadata` table (`perf_snapshot` key, ~every 5–10 s), read by
-  **`thurbox-cli perf`** (`--json` for machine output). Publishing is gated on
-  timing being active because each write bumps *other* thurbox connections'
+  **`friring-cli perf`** (`--json` for machine output). Publishing is gated on
+  timing being active because each write bumps *other* friring connections'
   `data_version` (a full shared-state reload on their next poll) — an idle,
   default-config instance must never churn that row.
 
@@ -569,18 +569,68 @@ off-thread with the patterns the codebase already uses.
 
 ---
 
+## ADR-P13: Global-search keystrokes do no I/O
+
+**Choice**: The global search used to do two kinds of blocking I/O inside the
+per-keystroke update path:
+
+- `search_files` re-ran the bounded filesystem walk (`enumerate_paths`, up to
+  `SEARCH_NODE_LIMIT` = 5000 `read_dir` calls + per-directory sorts) on
+  **every keystroke** — tens of milliseconds on a local disk, seconds on a
+  network mount, making typing visibly lag.
+- Previewing a task result called `refresh_tasks()` — a synchronous SQLite
+  `list_tasks()` — on every keystroke and every `Up`/`Down` landing on a task.
+
+Now a keystroke only does in-memory fuzzy/substring matching:
+
+- The Files scope matches against a **prebuilt index**
+  (`GlobalSearchState::file_index`): `open_global_search` snapshots the active
+  session's roots and hands the walk to a thread
+  (`start_global_search_file_index`, the `BackgroundTask` fire-and-poll
+  shape); `poll_global_search_file_index` (tick) folds the delivered index
+  into the open results. Lowercasing happens once at index build, not per
+  keystroke.
+- Task previews read the in-memory task cache (`recompute_task_filter`); the
+  SQLite re-read happens once, on `Enter`
+  (`activate_global_search_result`).
+
+The vt100 buffer-content scan keeps its ADR-independent debounce (~150 ms
+query-idle) — it is in-memory but O(sessions × lines), too heavy for every
+keystroke, too useful to drop.
+
+Gate: `global_search_files_match_from_the_cached_index`,
+`global_search_content_scan_waits_for_debounce` (`src/app/acceptance.rs`).
+
+**Why**: the popup is a typing surface — latency there is the product. The
+walk's output is stable within one search interaction, so snapshotting it at
+open trades at most one stale-listing edge (files created mid-search don't
+appear until the next open) for a keystroke path with zero I/O.
+
+**Rejected**:
+
+- *Caching the walk with invalidation (mtime/watcher)* — the index lives for
+  one popup interaction (seconds); invalidation machinery would outweigh the
+  staleness it prevents.
+- *Debouncing the walk like the content scan* — still blocks the UI thread
+  when it fires; a network-mount walk would freeze mid-typing anyway.
+- *Indexing every session's roots* — N sessions × 5000 nodes of walk for
+  results the Files group caps at 8; the active session matches the file
+  viewer's scope and user intent.
+
+---
+
 ## Quick reference
 
 | I want to… | Do this |
 | --- | --- |
-| Measure startup | `THURBOX_PERF_LOG=1 thurbox`, read the `startup` line in `thurbox.log` |
+| Measure startup | `FRIRING_PERF_LOG=1 friring`, read the `startup` line in `friring.log` |
 | Break down startup time | Read the `startup` phase fields (`config_init_ms`/`db_open_ms`/`theme_activate_ms`/`extension_heal_ms`/`app_new_ms`/`restore_ms`/`heartbeat_ms`) + the `restore_discover`/`restore_adopt` lines |
-| Watch steady-state cost | `THURBOX_PERF_LOG=1 thurbox`, read the `perf_window` lines (~10 s cadence: counter deltas + frame/tick percentiles + slow ops) |
-| Attribute an interactive stall | Look for `slow op` warnings in `thurbox.log` (named op + ms), or the slow-op list in `perf_window` |
+| Watch steady-state cost | `FRIRING_PERF_LOG=1 friring`, read the `perf_window` lines (~10 s cadence: counter deltas + frame/tick percentiles + slow ops) |
+| Attribute an interactive stall | Look for `slow op` warnings in `friring.log` (named op + ms), or the slow-op list in `perf_window` |
 | Watch perf live in the TUI | Press `F12` (perf HUD overlay; `[features] perf_hud`) |
-| Inspect a running TUI from outside | `thurbox-cli perf` (needs THURBOX_PERF_LOG or an open HUD in that TUI) |
+| Inspect a running TUI from outside | `friring-cli perf` (needs FRIRING_PERF_LOG or an open HUD in that TUI) |
 | Verify the status-hook cache (ADR-P6) | `cargo nextest run -E 'test(perf_hook_states)'`; `hook_state_loads` stays flat while idle, +1 per external `session signal` |
 | See binary size | Check the `Binary Size` CI job summary, or `cargo bloat --release --crates` |
-| Profile CPU | `cargo flamegraph --profile release-with-debug --bin thurbox` |
+| Profile CPU | `cargo flamegraph --profile release-with-debug --bin friring` |
 | Verify no perf regression | `cargo nextest run -E 'test(perf_)'` |
 | Confirm idle CPU is low | Launch, leave it idle — `redraws_skipped` climbs while `frames_rendered` stays flat |

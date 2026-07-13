@@ -1,0 +1,26 @@
+# Reboot-proof automation firing for friring (systemd user service).
+#
+# This is the OPT-IN, guaranteed alternative to friring's default tmux
+# heartbeat keeper. It runs `friring-cli automation tick` once per activation;
+# the companion .timer drives the cadence. Firing is claim-based, so this is
+# safe to run alongside a live TUI and the tmux keeper — no double-firing.
+#
+# Install (Linux):
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/systemd/friring-automations.{service,timer} ~/.config/systemd/user/
+#   # adjust ExecStart below if friring-cli is not on PATH for systemd
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now friring-automations.timer
+#
+# Verify:  systemctl --user list-timers | grep friring
+# Logs:    journalctl --user -u friring-automations.service
+
+[Unit]
+Description=Fire due friring automations (headless)
+Documentation=https://github.com/Thurbeen/thurbox
+
+[Service]
+Type=oneshot
+# Use an absolute path if friring-cli is not on systemd's PATH, e.g.
+#   ExecStart=%h/.local/bin/friring-cli automation tick
+ExecStart=%h/.local/bin/friring-cli automation tick

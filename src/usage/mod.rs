@@ -211,7 +211,7 @@ async fn codex_app_server() -> Option<serde_json::Value> {
 
     // initialize → initialized → account/rateLimits/read (newline-delimited).
     let msgs = [
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"thurbox\",\"version\":\"0\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"friring\",\"version\":\"0\"}}}\n",
         "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}\n",
         "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"account/rateLimits/read\",\"params\":{}}\n",
     ];

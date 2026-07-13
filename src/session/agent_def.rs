@@ -3,7 +3,7 @@
 //! A [`AgentDef`] describes how to launch one coding-agent CLI (claude, codex,
 //! antigravity, opencode, aider, …) as data: the command name plus a set of
 //! argument-group templates. Definitions are loaded from
-//! `~/.config/thurbox/agents.toml` (see [`crate::agent::agent_config`]) and
+//! `~/.config/friring/agents.toml` (see [`crate::agent::agent_config`]) and
 //! seeded with built-ins on first run, so users can register custom agents
 //! without recompiling.
 //!
@@ -42,11 +42,11 @@ pub struct AgentDef {
     #[serde(default)]
     pub new_session_args: Vec<String>,
     /// When true, this agent resumes its most-recent session in the launch
-    /// directory using id-less `resume_args` (no `{id}` token). thurbox cannot
+    /// directory using id-less `resume_args` (no `{id}` token). friring cannot
     /// pin or read back the agent's real session id for these CLIs, so restart
     /// relies on the agent's own "last session in this directory" resolution
     /// (e.g. `codex resume --last`, `opencode --continue`). Agents that pin ids
-    /// (claude) leave this `false` and resume by a thurbox-known id instead.
+    /// (claude) leave this `false` and resume by a friring-known id instead.
     #[serde(default)]
     pub resume_latest: bool,
 }
@@ -81,7 +81,7 @@ impl AgentDef {
 
     /// Whether a restart should trigger this agent's resume group via
     /// "latest session in the launch directory" semantics rather than a
-    /// thurbox-known session id. True only when [`Self::resume_latest`] is set
+    /// friring-known session id. True only when [`Self::resume_latest`] is set
     /// and there are `resume_args` to emit.
     pub fn resumes_latest(&self) -> bool {
         self.resume_latest && !self.resume_args.is_empty()
