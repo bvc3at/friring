@@ -130,9 +130,13 @@ fn subst_group(tokens: &[String], id: &str, name: Option<&str>) -> Vec<String> {
         match name {
             Some(n) => out.push(token.replace(NAME_PLACEHOLDER, n)),
             None => {
-                if out
-                    .last()
-                    .is_some_and(|prev| prev.starts_with('-') && !prev.contains('='))
+                // An equals-form `--name={name}` token is self-contained and
+                // drops alone; only a separate `-flag {name}` pair pops the
+                // preceding value-taking flag.
+                if !token.contains('=')
+                    && out
+                        .last()
+                        .is_some_and(|prev| prev.starts_with('-') && !prev.contains('='))
                 {
                     out.pop();
                 }
@@ -250,6 +254,16 @@ mod tests {
             d.build_args(None, None, Some("new-id"), Some("x")),
             vec!["--session-id=new-id", "--name=x"]
         );
+    }
+
+    #[test]
+    fn equals_form_name_token_does_not_pop_an_unrelated_flag() {
+        // A self-contained `--name={name}` token must drop alone even when the
+        // token before it is a plain flag: `--verbose` is not the value slot of
+        // `--name=…`, so a name-less launch must keep it.
+        let mut d = claude();
+        d.new_session_args = vec!["--verbose".into(), "--name={name}".into()];
+        assert_eq!(d.build_args(None, None, Some("new-id"), None), vec!["--verbose"]);
     }
 
     #[test]
