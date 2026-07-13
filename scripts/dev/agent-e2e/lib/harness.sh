@@ -32,7 +32,10 @@ e2e_die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; return 1; }
 # infrastructure tools are hard errors (you explicitly invoked this suite).
 e2e_require_tools() {
     local mode="${1:-test}" missing=""
-    local tools="tmux node jq git curl"
+    # `timeout` (coreutils) bounds the protocol-smoke `claude -p`; it is
+    # `gtimeout` on stock macOS, so declaring it turns a mid-run "command not
+    # found" into a clear preflight error.
+    local tools="tmux node jq git curl timeout"
     [ "$mode" = "demo" ] && tools="$tools vhs sqlite3"
     for t in $tools; do
         command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
@@ -403,22 +406,17 @@ e2e_perf_report() {
 }
 
 # ---------------------------------------------------------------------------
-# Demo mode: emit a record.sh-compatible tape from the same scenario steps,
-# then run vhs inside the (already exported) hermetic env.
-e2e_demo_record() {
-    local out_dir="$REPO_ROOT/target/agent-e2e/demos"
-    mkdir -p "$out_dir"
-    E2E_TAPE="$TBX_SANDBOX_ROOT/$E2E_SCENARIO_NAME.tape"
-
-    if [ -n "$SCENARIO_DEMO_THEME" ]; then
-        sqlite3 "$XDG_DATA_HOME/thurbox-dev/thurbox.db" \
-            "INSERT INTO metadata (key, value) VALUES ('active_theme', '$SCENARIO_DEMO_THEME')
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-    fi
-
-    # Same Set block as scripts/demo/*.tape so generated demos match the
-    # hand-written ones frame-for-frame in styling. Output paths are relative
-    # (vhs runs from the repo root, and its parser rejects absolute paths).
+# Emit a record.sh-compatible .tape from the scenario's steps into $1, WITHOUT
+# booting anything real: the demo-mode step_* primitives are pure string
+# mapping, so this needs only a loaded scenario (e2e_scenario_load). It is the
+# testable seam for the demo path and backs `run.sh --emit-tape` (preview a
+# tape offline). The Set block mirrors scripts/demo/*.tape so generated demos
+# match the hand-written ones frame-for-frame; Output paths are relative
+# because vhs runs from the repo root and its parser rejects absolute paths.
+e2e_emit_tape() {
+    E2E_MODE=demo
+    E2E_TAPE="$1"
+    mkdir -p "$(dirname "$E2E_TAPE")"
     cat > "$E2E_TAPE" <<EOF
 Output target/agent-e2e/demos/$E2E_SCENARIO_NAME.gif
 Output target/agent-e2e/demos/$E2E_SCENARIO_NAME.mp4
@@ -446,6 +444,23 @@ Sleep 2s
 Ctrl+Q
 Sleep 1s
 EOF
+}
+
+# ---------------------------------------------------------------------------
+# Demo mode: boot the hermetic env, generate the tape (e2e_emit_tape), then run
+# vhs inside the (already exported) env.
+e2e_demo_record() {
+    local out_dir="$REPO_ROOT/target/agent-e2e/demos"
+    mkdir -p "$out_dir"
+
+    if [ -n "$SCENARIO_DEMO_THEME" ]; then
+        sqlite3 "$XDG_DATA_HOME/thurbox-dev/thurbox.db" \
+            "INSERT INTO metadata (key, value) VALUES ('active_theme', '$SCENARIO_DEMO_THEME')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+    fi
+
+    # Tape lives in the throwaway sandbox during recording.
+    e2e_emit_tape "$TBX_SANDBOX_ROOT/$E2E_SCENARIO_NAME.tape" || return 1
     e2e_log "recording $E2E_SCENARIO_NAME ($(basename "$E2E_TAPE"))"
     # vhs renders through a headless Chromium (go-rod): use the system browser
     # if present, else let rod download one into a cache that survives the

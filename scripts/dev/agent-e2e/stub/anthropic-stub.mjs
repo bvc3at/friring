@@ -38,14 +38,18 @@
 //         "toolUse": {"id": "toolu_e2e_1", "name": "Write", "input": {…}},
 //         "stopReason": "end_turn"            // default; tool_use if toolUse
 //       }
-//     }],
-//     "default": {"reply": {"text": "…"}}     // optional catch-all
+//     }]
 //   }
 //
-// First matching response wins (top to bottom). A request no fixture matches
-// fails OPEN here — a benign 200 marker reply keeps the agent alive and
-// debuggable — and fails CLOSED at assert time: the UNMATCHED journal entry
-// makes the harness's post-run invariant fail the scenario.
+// First matching response wins (top to bottom). List `ambient` fixtures FIRST:
+// a background side-model call (e.g. haiku title-gen) is model-keyed, so an
+// ambient-first order catches it before a primary fixture whose prompt text it
+// happens to echo can shadow it. A request no fixture matches fails OPEN here —
+// a benign 200 marker reply keeps the agent alive and debuggable — and fails
+// CLOSED at assert time: the UNMATCHED journal entry makes the harness's
+// post-run invariant fail the scenario. (There is deliberately no catch-all
+// default: it would answer surprise calls 200 as `matched:"default"`, silently
+// disabling the strictness the UNMATCHED marker exists to enforce.)
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -126,10 +130,6 @@ function pick(s) {
       useCounts.set(name, (useCounts.get(name) || 0) + 1);
       return { name, ambient: !!r.ambient, delayMs: r.delayMs || 0, reply: r.reply };
     }
-  }
-  if (fixtures.default) {
-    useCounts.set('default', (useCounts.get('default') || 0) + 1);
-    return { name: 'default', ambient: false, delayMs: 0, reply: fixtures.default.reply };
   }
   return null;
 }

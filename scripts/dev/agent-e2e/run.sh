@@ -2,11 +2,13 @@
 #
 # Real-agent e2e runner — one scenario description, two outputs:
 #
-#   run.sh                     run the whole asserting suite (bats)
-#   run.sh <filter…>           run matching tests only (bats --filter, regex)
-#   run.sh --demo <scenario…>  record the scenario(s) as VHS demos instead
-#                              (target/agent-e2e/demos/<name>.{gif,mp4})
-#   run.sh --list              list scenarios
+#   run.sh                      run the whole asserting suite (bats)
+#   run.sh <filter…>            run matching tests only (bats --filter, regex)
+#   run.sh --demo <scenario…>   record the scenario(s) as VHS demos instead
+#                               (target/agent-e2e/demos/<name>.{gif,mp4})
+#   run.sh --emit-tape <scen…>  generate the .tape only (no boot, no vhs) and
+#                               print its path — the demo path, offline
+#   run.sh --list               list scenarios
 #
 # Env knobs:
 #   THURBOX_E2E_CLAUDE_BIN     pin the claude binary (else `claude` on PATH)
@@ -15,9 +17,9 @@
 #
 # Hermetic + offline by construction: throwaway HOME/XDG/tmux dirs, the model
 # API stubbed on loopback, all other HTTP(S) egress dead-ended. Requires:
-# tmux, node >= 18, jq, git, curl, bats (tests) / vhs + sqlite3 (demos), and
-# the agent binary — tests SKIP (not fail) when the agent binary is missing.
-# See docs/E2E.md.
+# tmux, node >= 18, jq, git, curl, timeout, bats (tests) / vhs + sqlite3
+# (demos), and the agent binary — tests SKIP (not fail) when the agent binary
+# is missing. See docs/E2E.md.
 set -euo pipefail
 
 AGENT_E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,6 +33,7 @@ ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --demo) MODE="demo" ;;
+        --emit-tape) MODE="emit-tape" ;;
         --list)
             for d in "$AGENT_E2E_DIR"/scenarios/*/; do
                 basename "$d"
@@ -39,13 +42,30 @@ while [ $# -gt 0 ]; do
             ;;
         --keep) export THURBOX_E2E_KEEP=1 ;;
         -h|--help)
-            sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *) ARGS+=("$1") ;;
     esac
     shift
 done
+
+# Tape generation needs no build, no agent, no network — handle it before the
+# build step so it works anywhere.
+if [ "$MODE" = "emit-tape" ]; then
+    [ "${#ARGS[@]}" -gt 0 ] || die "--emit-tape needs at least one scenario name (see --list)"
+    # shellcheck disable=SC1091
+    source "$AGENT_E2E_DIR/lib/harness.sh"
+    out_dir="$REPO_ROOT/target/agent-e2e/demos"
+    for name in "${ARGS[@]}"; do
+        dir="$AGENT_E2E_DIR/scenarios/$name"
+        [ -d "$dir" ] || die "no such scenario: $name (see --list)"
+        e2e_scenario_load "$dir"
+        e2e_emit_tape "$out_dir/$name.tape"
+        echo "$out_dir/$name.tape"
+    done
+    exit 0
+fi
 
 if [ "${THURBOX_E2E_SKIP_BUILD:-0}" != "1" ]; then
     ( cd "$REPO_ROOT" && cargo build --bin thurbox --bin thurbox-cli )
@@ -75,8 +95,10 @@ fi
 command -v bats >/dev/null 2>&1 \
     || die "bats not found — install bats-core (https://bats-core.readthedocs.io)"
 
+# unit.bats first: pure-shell harness tests that need no agent binary, so a
+# green run always exercised at least the harness logic (never all-skipped).
 if [ "${#ARGS[@]}" -gt 0 ]; then
     filter="$(IFS='|'; echo "${ARGS[*]}")"
-    exec bats --filter "$filter" "$AGENT_E2E_DIR/suite.bats"
+    exec bats --filter "$filter" "$AGENT_E2E_DIR/unit.bats" "$AGENT_E2E_DIR/suite.bats"
 fi
-exec bats "$AGENT_E2E_DIR/suite.bats"
+exec bats "$AGENT_E2E_DIR/unit.bats" "$AGENT_E2E_DIR/suite.bats"

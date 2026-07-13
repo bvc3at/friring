@@ -28,6 +28,10 @@ cumulatively and embed machine-specific tool results). A fixture matches on stab
 `toolResultFor` (a pinned `tool_use` id) — first match wins, `{{WS}}` is substituted with the
 run's workspace path. `ambient: true` marks background traffic (e.g. side-model calls) that is
 answered but not required; `maxUses` guards against loops; `delayMs` paces SSE deltas for demos.
+**List `ambient` fixtures first**: they are model-keyed (e.g. `modelContains: "haiku"`), so an
+ambient-first order catches a side call before a primary fixture whose prompt text it happens to
+echo can shadow it. There is deliberately no catch-all default — it would answer surprise calls
+`200` and silently disable the strictness the `UNMATCHED` marker enforces.
 
 Strictness is enforced **at assert time, not response time**: an unmatched model call gets a
 benign marker reply (so the pane stays alive and debuggable) plus an `UNMATCHED` journal entry,
@@ -134,22 +138,31 @@ VHS renders through a headless Chromium (go-rod): a packaged system browser is u
 present. The dead-proxy vars are dropped for the `vhs` process only — the agent pane's env was
 frozen into the tmux server before vhs starts, so the offline guarantee is unaffected.
 
+Tape generation is factored out of recording (`e2e_emit_tape`): `run.sh --emit-tape <scenario>`
+writes the `.tape` and prints its path **without** booting a session or running vhs — pure
+step→tape mapping, so it works offline with no agent binary and is unit-tested (`unit.bats`).
+
 ## Running & knobs
 
 ```bash
-just agent-e2e                       # whole suite (builds dev binaries first)
-just agent-e2e 'tool-use loop'       # filter by TEST NAME (bats --filter regex)
-just agent-demo claude-text-turn     # record a scenario as gif+mp4
-scripts/dev/agent-e2e/run.sh --list  # list scenarios
+just agent-e2e                              # whole suite (builds dev binaries first)
+just agent-e2e 'tool-use loop'              # filter by TEST NAME (bats --filter regex)
+just agent-demo claude-text-turn            # record a scenario as gif+mp4
+scripts/dev/agent-e2e/run.sh --emit-tape claude-text-turn  # .tape only, offline
+scripts/dev/agent-e2e/run.sh --list         # list scenarios
 ```
 
-The filter matches bats *test names*, not scenario directory names — a non-matching filter runs
-zero tests and still exits green (bats semantics), so check the `1..N` line when filtering.
+The suite runs `unit.bats` (pure-shell harness tests — the strict-offline invariant and the tape
+generator, no agent binary) before `suite.bats` (the real-agent scenarios), so a green run always
+verified the harness logic even where claude is absent. The `--filter` matches bats *test names*,
+not scenario directory names — a non-matching filter runs zero tests and still exits green (bats
+semantics), so check the `1..N` line when filtering.
 
 `THURBOX_E2E_CLAUDE_BIN` pins the binary; `THURBOX_E2E_KEEP=1` keeps the sandbox for post-mortem;
-`THURBOX_E2E_SKIP_BUILD=1` skips the cargo build. Requires tmux, node ≥ 18, jq, git, curl, bats
-(tests) / vhs + sqlite3 + a browser (demos). A missing *agent binary* makes the suite **skip**,
-not fail, so machines without claude stay green; missing infrastructure tools are hard errors.
+`THURBOX_E2E_SKIP_BUILD=1` skips the cargo build. Requires tmux, node ≥ 18, jq, git, curl,
+`timeout` (coreutils — `gtimeout` on macOS), bats (tests) / vhs + sqlite3 + a browser (demos). A
+missing *agent binary* makes the real-agent scenarios **skip**, not fail, so machines without
+claude stay green; missing infrastructure tools are hard errors.
 
 CI: the `agent-e2e` job (`.github/workflows/ci.yml`) installs tmux + bats + the **pinned**
 `@anthropic-ai/claude-code` and runs the suite. It is path-gated like every job and deliberately

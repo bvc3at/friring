@@ -1,6 +1,12 @@
 {
   "responses": [
     {
+      "name": "ambient",
+      "ambient": true,
+      "match": { "modelContains": "haiku" },
+      "reply": { "text": "ok" }
+    },
+    {
       "name": "flood",
       "match": { "promptContains": "flood", "hasToolResult": false },
       "reply": {
@@ -10,12 +16,6 @@
         },
         "text": "PERF-FLOOD-DONE"
       }
-    },
-    {
-      "name": "ambient",
-      "ambient": true,
-      "match": { "modelContains": "haiku" },
-      "reply": { "text": "ok" }
     }
   ]
 }
