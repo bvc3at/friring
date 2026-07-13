@@ -174,6 +174,22 @@ mod tests {
     }
 
     #[test]
+    fn restart_plan_fresh_fallback_passes_session_name_to_new_session_args() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // No transcript on disk for this id, so claude's restart falls back to a
+        // fresh conversation: new_session_args run and the friring session name
+        // ("demo") reaches argv via the seeded `-n {name}` pair.
+        let plan = build_restart_plan(&session(Some("agent-conv-uuid"), Some(cwd))).unwrap();
+        assert_eq!(
+            plan.args,
+            vec!["--session-id", "agent-conv-uuid", "-n", "demo"]
+        );
+    }
+
+    #[test]
     fn restart_plan_single_repo_launches_in_primary() {
         let temp = tempfile::TempDir::new().unwrap();
         let _guard = crate::paths::TestPathGuard::new(temp.path());
