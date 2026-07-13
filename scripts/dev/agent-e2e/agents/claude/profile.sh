@@ -34,12 +34,12 @@ AGENT_HAS_STATUS_HOOKS=1
 # all three drive depths launch the binary identically.
 AGENT_LAUNCH_ARGS=(--dangerously-skip-permissions)
 
-# THURBOX_E2E_CLAUDE_BIN pins an exact binary (CI installs a pinned version);
+# FRIRING_E2E_CLAUDE_BIN pins an exact binary (CI installs a pinned version);
 # otherwise whatever `claude` is on PATH.
 agent_binary() {
-    if [ -n "${THURBOX_E2E_CLAUDE_BIN:-}" ]; then
-        [ -x "$THURBOX_E2E_CLAUDE_BIN" ] || return 1
-        echo "$THURBOX_E2E_CLAUDE_BIN"
+    if [ -n "${FRIRING_E2E_CLAUDE_BIN:-}" ]; then
+        [ -x "$FRIRING_E2E_CLAUDE_BIN" ] || return 1
+        echo "$FRIRING_E2E_CLAUDE_BIN"
         return 0
     fi
     command -v claude
@@ -57,7 +57,7 @@ agent_version() {
 agent_env() {
     cat <<EOF
 ANTHROPIC_BASE_URL=$AGENT_E2E_STUB_URL
-ANTHROPIC_AUTH_TOKEN=thurbox-e2e-dummy
+ANTHROPIC_AUTH_TOKEN=friring-e2e-dummy
 CLAUDE_CONFIG_DIR=$HOME/claude-config
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 DISABLE_AUTOUPDATER=1

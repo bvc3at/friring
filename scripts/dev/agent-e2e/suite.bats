@@ -16,7 +16,7 @@ setup() {
     # shellcheck disable=SC1091
     source "$AGENT_E2E_DIR/agents/claude/profile.sh"
     agent_binary >/dev/null 2>&1 \
-        || skip "claude binary not found (set THURBOX_E2E_CLAUDE_BIN or install claude)"
+        || skip "claude binary not found (set FRIRING_E2E_CLAUDE_BIN or install claude)"
 }
 
 teardown() {

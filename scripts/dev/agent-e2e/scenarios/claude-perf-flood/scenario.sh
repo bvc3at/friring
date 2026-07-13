@@ -12,7 +12,7 @@
 # timing thresholds (wall-clock gates flake on shared runners — see
 # docs/PERFORMANCE.md for the counter-based regression tests). For numbers
 # worth comparing, run against a release build:
-#   THURBOX_E2E_BIN=target/release/thurbox just agent-e2e 'perf'
+#   FRIRING_E2E_BIN=target/release/friring just agent-e2e 'perf'
 #
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Flood turn: large streamed reply through Friring with perf capture"

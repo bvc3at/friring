@@ -52,15 +52,15 @@ The same scenario runs at three depths, so a failure localizes itself:
 
 Assertion layers, most → least semantic: stub journal (every expected call matched, no
 surprises) → workspace filesystem/git side effects → session `hook_state` transitions (via
-`thurbox-cli session get --json`; the raw persisted value, deliberately not the TUI's derived
+`friring-cli session get --json`; the raw persisted value, deliberately not the TUI's derived
 status) → targeted pane text. Waits are always bounded event-polls; **`step_sleep` is a no-op in
 test mode** (demo pacing only), so a scenario physically cannot lean on a fixed sleep to pass.
 
 ## Hermeticity & offline model
 
 - `tbx_sandbox_init_full fresh` (shared `scripts/dev/lib/sandbox-env.sh`): throwaway
-  `HOME`/`XDG_*`/`TMUX_TMPDIR`, dev `thurbox-dev` socket in a private dir. Nothing touches the
-  real `~/.claude`, `~/.config/thurbox`, or any running tmux server. Leaked `THURBOX_*` identity
+  `HOME`/`XDG_*`/`TMUX_TMPDIR`, dev `friring-dev` socket in a private dir. Nothing touches the
+  real `~/.claude`, `~/.config/friring`, or any running tmux server. Leaked `FRIRING_*` identity
   vars (from running inside a Friring session) are scrubbed.
 - Agent env (`ANTHROPIC_BASE_URL`, dummy `ANTHROPIC_AUTH_TOKEN`, telemetry kill-switches) is
   exported **before the first tmux command** — panes inherit the tmux *server* environment, which
@@ -71,7 +71,7 @@ test mode** (demo pacing only), so a scenario physically cannot lean on a fixed 
   external is load-bearing. A kernel-level egress block (netns/iptables) would be a CI hardening
   step on top, not a replacement.
 - Teardown (bats `teardown()`, runs on failure too) reaps the stub by PID, the driver tmux
-  server, and the `thurbox-dev` server (which kills the agent panes), then wipes the sandbox
+  server, and the `friring-dev` server (which kills the agent panes), then wipes the sandbox
   root. On failure, artifacts land in `target/agent-e2e/artifacts/<scenario>-<ts>/`: both panes,
   journal + raw bodies, `agents.toml`, workspace diff, redacted env, versions.
 
@@ -128,7 +128,7 @@ nonessential-traffic kill switches.
 
 `run.sh --demo <scenario>` boots the *same* hermetic env + stub (env inheritance mirrors
 `scripts/demo/record.sh`: everything exported before the `session create` that starts the
-`thurbox-dev` server), generates a tape with the standard `scripts/demo` Set block, runs `vhs`,
+`friring-dev` server), generates a tape with the standard `scripts/demo` Set block, runs `vhs`,
 and writes `target/agent-e2e/demos/<name>.{gif,mp4}`. `SCENARIO_DEMO_THEME` seeds
 `metadata.active_theme` like `record.sh` does. Unlike the hand-written tapes, generated tapes
 synchronize on `Wait+Screen` instead of open-loop sleeps, so a slow turn can't desync the
@@ -158,8 +158,8 @@ verified the harness logic even where claude is absent. The `--filter` matches b
 not scenario directory names — a non-matching filter runs zero tests and still exits green (bats
 semantics), so check the `1..N` line when filtering.
 
-`THURBOX_E2E_CLAUDE_BIN` pins the binary; `THURBOX_E2E_KEEP=1` keeps the sandbox for post-mortem;
-`THURBOX_E2E_SKIP_BUILD=1` skips the cargo build. Requires tmux, node ≥ 18, jq, git, curl,
+`FRIRING_E2E_CLAUDE_BIN` pins the binary; `FRIRING_E2E_KEEP=1` keeps the sandbox for post-mortem;
+`FRIRING_E2E_SKIP_BUILD=1` skips the cargo build. Requires tmux, node ≥ 18, jq, git, curl,
 `timeout` (coreutils — `gtimeout` on macOS), bats (tests) / vhs + sqlite3 + a browser (demos). A
 missing *agent binary* makes the real-agent scenarios **skip**, not fail, so machines without
 claude stay green; missing infrastructure tools are hard errors.
@@ -174,10 +174,10 @@ human eye (conformance drift vs real regression) and must never block a merge.
 A scenario with `SCENARIO_PERF=1` doubles as a **benchmark rig**: the whole real pipeline (tmux →
 control-mode reader → `vt100` → `tui_term`) under an exactly reproducible load — the stub's
 `flood` fixture field generates large streamed replies (`{"line": "…", "count": 1200}` ≈ 85KB in
-1KiB SSE chunks) without megabytes of hand-written JSON. The harness exports `THURBOX_PERF_LOG=1`
+1KiB SSE chunks) without megabytes of hand-written JSON. The harness exports `FRIRING_PERF_LOG=1`
 to the TUI, records wall-clock marks (`perf_mark`, ~100ms resolution), and writes a report to
 `target/agent-e2e/perf/<scenario>-<ts>/`: mark deltas, plus the TUI's own published snapshot
-(`thurbox-cli perf` — counters, frame/tick percentiles, startup breakdown, slow ops).
+(`friring-cli perf` — counters, frame/tick percentiles, startup breakdown, slow ops).
 
 Reports are benchmarks, **not gates**: the test passes/fails on functional asserts and on the
 perf-publishing chain working (a missing snapshot fails the scenario), never on timing thresholds
@@ -187,7 +187,7 @@ only; for measurements, point the harness at a release build:
 
 ```bash
 cargo build --release --bins
-THURBOX_E2E_BIN=target/release/thurbox just agent-e2e 'perf'
+FRIRING_E2E_BIN=target/release/friring just agent-e2e 'perf'
 ```
 
 The shipped `claude-perf-flood` scenario is the template: flood turn through the pane, marks at

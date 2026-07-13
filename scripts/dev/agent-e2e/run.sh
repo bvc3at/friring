@@ -11,9 +11,9 @@
 #   run.sh --list               list scenarios
 #
 # Env knobs:
-#   THURBOX_E2E_CLAUDE_BIN     pin the claude binary (else `claude` on PATH)
-#   THURBOX_E2E_KEEP=1         keep the throwaway sandbox for debugging
-#   THURBOX_E2E_SKIP_BUILD=1   don't cargo-build first (binaries are current)
+#   FRIRING_E2E_CLAUDE_BIN     pin the claude binary (else `claude` on PATH)
+#   FRIRING_E2E_KEEP=1         keep the throwaway sandbox for debugging
+#   FRIRING_E2E_SKIP_BUILD=1   don't cargo-build first (binaries are current)
 #
 # Hermetic + offline by construction: throwaway HOME/XDG/tmux dirs, the model
 # API stubbed on loopback, all other HTTP(S) egress dead-ended. Requires:
@@ -40,7 +40,7 @@ while [ $# -gt 0 ]; do
             done
             exit 0
             ;;
-        --keep) export THURBOX_E2E_KEEP=1 ;;
+        --keep) export FRIRING_E2E_KEEP=1 ;;
         -h|--help)
             sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -67,8 +67,8 @@ if [ "$MODE" = "emit-tape" ]; then
     exit 0
 fi
 
-if [ "${THURBOX_E2E_SKIP_BUILD:-0}" != "1" ]; then
-    ( cd "$REPO_ROOT" && cargo build --bin thurbox --bin thurbox-cli )
+if [ "${FRIRING_E2E_SKIP_BUILD:-0}" != "1" ]; then
+    ( cd "$REPO_ROOT" && cargo build --bin friring --bin friring-cli )
 fi
 
 if [ "$MODE" = "demo" ]; then

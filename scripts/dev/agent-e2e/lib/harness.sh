@@ -9,12 +9,12 @@
 # `tbx_sandbox_init_full fresh` (throwaway HOME/XDG/TMUX_TMPDIR), the model API
 # is a loopback stub, and non-loopback HTTP(S) egress is routed to a dead
 # proxy port by the agent profile. Nothing touches the real ~/.claude,
-# ~/.config/thurbox, or any real tmux server.
+# ~/.config/friring, or any real tmux server.
 
 : "${AGENT_E2E_DIR:?source suite.bats/run.sh sets AGENT_E2E_DIR}"
 REPO_ROOT="$(cd "$AGENT_E2E_DIR/../../.." && pwd)"
 
-# Driver tmux socket (hosts the thurbox TUI under test). Lives in the
+# Driver tmux socket (hosts the friring TUI under test). Lives in the
 # sandbox's private TMUX_TMPDIR, so it can never collide with a real server.
 E2E_DRIVER_SOCKET="agent-e2e-driver"
 E2E_DRIVER_SESSION="agent-e2e"
@@ -82,24 +82,24 @@ e2e_boot() {
     # shellcheck disable=SC1091
     source "$REPO_ROOT/scripts/dev/lib/sandbox-env.sh"
     tbx_sandbox_init_full fresh
-    # init_full unsets THURBOX_{CONFIG,DATA}_DIR, but a shell running inside a
+    # init_full unsets FRIRING_{CONFIG,DATA}_DIR, but a shell running inside a
     # Friring session also carries identity/session vars — those would leak
     # into the tmux server env and misattribute hook signals.
-    unset THURBOX_SESSION THURBOX_SESSION_ID THURBOX_TASK THURBOX_METRICS_DIR THURBOX_SOCKET
+    unset FRIRING_SESSION FRIRING_SESSION_ID FRIRING_TASK FRIRING_METRICS_DIR FRIRING_SOCKET
 
-    # THURBOX_E2E_BIN points perf runs at a release build — timing numbers
+    # FRIRING_E2E_BIN points perf runs at a release build — timing numbers
     # from an unoptimized debug binary are noise, not measurements.
-    THURBOX_BIN="${THURBOX_E2E_BIN:-$REPO_ROOT/target/debug/thurbox}"
-    export THURBOX_BIN
+    FRIRING_BIN="${FRIRING_E2E_BIN:-$REPO_ROOT/target/debug/friring}"
+    export FRIRING_BIN
     if [ "$E2E_MODE" != "protocol" ]; then
-        [ -x "$THURBOX_BIN" ] \
-            || e2e_die "no TUI binary at $THURBOX_BIN (cargo build --bins, or set THURBOX_E2E_BIN)" \
+        [ -x "$FRIRING_BIN" ] \
+            || e2e_die "no TUI binary at $FRIRING_BIN (cargo build --bins, or set FRIRING_E2E_BIN)" \
             || return 1
     fi
 
     # Fresh HOME has no git identity; sessions and scenario workspaces need one.
-    git config --global user.name "thurbox-e2e"
-    git config --global user.email "e2e@thurbox.invalid"
+    git config --global user.name "friring-e2e"
+    git config --global user.email "e2e@friring.invalid"
     git config --global init.defaultBranch main
 
     # Workspace the agent works in (the session's repo).
@@ -127,7 +127,7 @@ e2e_boot() {
     # Export the profile env NOW — before anything that can start a tmux
     # server. tmux panes inherit the *server* environment, and the server
     # inherits ours; this is how ANTHROPIC_BASE_URL reaches the agent process
-    # with zero thurbox changes.
+    # with zero friring changes.
     local kv
     while IFS= read -r kv; do
         [ -n "$kv" ] && export "${kv?}"
@@ -135,16 +135,16 @@ e2e_boot() {
     agent_seed_config "$E2E_WS"
 
     # Perf scenarios make the TUI publish its perf snapshot (counters +
-    # frame/tick percentiles) into the sandbox DB for `thurbox-cli perf`.
+    # frame/tick percentiles) into the sandbox DB for `friring-cli perf`.
     # Exported before the tmux servers start, like the agent env.
-    [ "$SCENARIO_PERF" = "1" ] && export THURBOX_PERF_LOG=1
+    [ "$SCENARIO_PERF" = "1" ] && export FRIRING_PERF_LOG=1
 
     # Protocol/interactive smokes stop here: no Friring in that loop.
     [ "$E2E_MODE" = "protocol" ] && return 0
 
     # agents.toml under the dev build's config dir (dev_build XDG subdir
     # scheme — same one record.sh uses).
-    local cfg_dir="$XDG_CONFIG_HOME/thurbox-dev"
+    local cfg_dir="$XDG_CONFIG_HOME/friring-dev"
     mkdir -p "$cfg_dir"
     {
         echo 'default = "'"$AGENT_NAME"'"'
@@ -155,7 +155,7 @@ e2e_boot() {
     # (only the TUI boot and the extension CLI verbs do), so activate it
     # explicitly — this patches the claude agent's args with the --settings
     # hook file that makes status signals (working/done) fire.
-    thurbox-cli extension activate hooks >/dev/null \
+    friring-cli extension activate hooks >/dev/null \
         || e2e_die "extension activate hooks failed" || return 1
 
     if [ "$SCENARIO_PRECREATE" = "1" ]; then
@@ -166,10 +166,10 @@ e2e_boot() {
         # 3>&- keeps daemonizing children (tmux server) from holding bats' fd 3
         # open, which would hang the run.
         tmux -L "$E2E_DRIVER_SOCKET" new-session -d -s "$E2E_DRIVER_SESSION" \
-            -x "$SCENARIO_COLS" -y "$SCENARIO_ROWS" "$THURBOX_BIN" 3>&-
-        # "thurbox" is the header brand every build paints (the fork keeps the
-        # binary name); a single literal also stays portable across greps.
-        e2e_wait_pane "thurbox" 100 \
+            -x "$SCENARIO_COLS" -y "$SCENARIO_ROWS" "$FRIRING_BIN" 3>&-
+        # "friring" is the brand every build paints in the header bar; a single
+        # literal also stays portable across greps.
+        e2e_wait_pane "friring" 100 \
             || e2e_die "TUI did not boot" || return 1
     fi
 }
@@ -206,9 +206,9 @@ e2e_stub_start() {
 
 e2e_session_create() {
     local out
-    # 3>&-: this is what boots the thurbox-dev tmux server (bats fd-3 guard,
+    # 3>&-: this is what boots the friring-dev tmux server (bats fd-3 guard,
     # see the TUI launch above).
-    out="$(thurbox-cli --json session create --name "$E2E_SCENARIO_NAME" \
+    out="$(friring-cli --json session create --name "$E2E_SCENARIO_NAME" \
         --repo-path "$E2E_WS" --agent "$AGENT_NAME" 3>&-)" \
         || e2e_die "session create failed: $out" || return 1
     E2E_SESSION_ID="$(printf '%s' "$out" | jq -r '.id')"
@@ -283,7 +283,7 @@ step_wait_pane() {
 }
 
 # Wait for the session's persisted hook state (sessions.hook_state — written
-# by the agent's status hook via `thurbox-cli session signal`, readable
+# by the agent's status hook via `friring-cli session signal`, readable
 # without the TUI). `want` may be an alternation ('working|done'): the column
 # is overwritten in place, so a transient state can flip between two polls —
 # waiting on a transient alone is a latent race; accept the successor state
@@ -322,7 +322,7 @@ e2e_wait_pane() {
 }
 
 e2e_hook_state() {
-    thurbox-cli --json session get "$E2E_SESSION_ID" 2>/dev/null \
+    friring-cli --json session get "$E2E_SESSION_ID" 2>/dev/null \
         | jq -r '.hook_state // empty'
 }
 
@@ -375,7 +375,7 @@ perf_mark() {
 # Write marks + the TUI-published snapshot to target/agent-e2e/perf/. The
 # snapshot only publishes once per perf window (~1000 ticks ≈ 10s idle), so
 # poll for it — a missing snapshot after the wait is a real failure: it means
-# the THURBOX_PERF_LOG → publish → `thurbox-cli perf` chain is broken.
+# the FRIRING_PERF_LOG → publish → `friring-cli perf` chain is broken.
 e2e_perf_report() {
     local dest
     dest="$REPO_ROOT/target/agent-e2e/perf/$E2E_SCENARIO_NAME-$(date +%Y%m%d-%H%M%S)"
@@ -384,7 +384,7 @@ e2e_perf_report() {
         echo "scenario: $E2E_SCENARIO_NAME"
         # version via the CLI binary (same build): the TUI binary answers
         # --version with terminal-mode escapes, not text
-        echo "bin: $THURBOX_BIN ($(thurbox-cli --text version 2>/dev/null | head -1))"
+        echo "bin: $FRIRING_BIN ($(friring-cli --text version 2>/dev/null | head -1))"
         echo "agent: ${AGENT_NAME:-?} $(agent_version 2>/dev/null || true)"
         echo "pane: ${SCENARIO_COLS}x${SCENARIO_ROWS}"
     } > "$dest/meta.txt"
@@ -395,18 +395,18 @@ e2e_perf_report() {
          { prev = $2; pname = $1 }' "$dest/marks.txt" > "$dest/deltas.txt"
     local ok=1
     for _ in $(seq 1 150); do
-        if thurbox-cli --json perf > "$dest/snapshot.json" 2>/dev/null; then
+        if friring-cli --json perf > "$dest/snapshot.json" 2>/dev/null; then
             ok=0
             break
         fi
         sleep 0.2
     done
     [ "$ok" = "0" ] || {
-        e2e_die "TUI never published a perf snapshot (THURBOX_PERF_LOG chain broken?)"
+        e2e_die "TUI never published a perf snapshot (FRIRING_PERF_LOG chain broken?)"
         return 1
     }
     # --text: piped stdout would otherwise auto-switch this copy to JSON too
-    thurbox-cli --text perf > "$dest/snapshot.txt" 2>/dev/null || true
+    friring-cli --text perf > "$dest/snapshot.txt" 2>/dev/null || true
     e2e_log "perf report: $dest"
 }
 
@@ -436,7 +436,7 @@ Set PlaybackSpeed 1.0
 Set WaitTimeout 60s
 
 Hide
-Type \`exec "\$THURBOX_BIN"\`
+Type \`exec "\$FRIRING_BIN"\`
 Enter
 Sleep 2s
 Show
@@ -459,7 +459,7 @@ e2e_demo_record() {
     mkdir -p "$out_dir"
 
     if [ -n "$SCENARIO_DEMO_THEME" ]; then
-        sqlite3 "$XDG_DATA_HOME/thurbox-dev/thurbox.db" \
+        sqlite3 "$XDG_DATA_HOME/friring-dev/friring.db" \
             "INSERT INTO metadata (key, value) VALUES ('active_theme', '$SCENARIO_DEMO_THEME')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value"
     fi
@@ -471,7 +471,7 @@ e2e_demo_record() {
     # if present, else let rod download one into a cache that survives the
     # throwaway sandbox (XDG_CACHE_HOME points into the sandbox). Dropping the
     # dead-proxy vars here does NOT weaken the agent's offline guarantee — the
-    # agent pane env was frozen into the thurbox-dev tmux server at session
+    # agent pane env was frozen into the friring-dev tmux server at session
     # create, before vhs starts; only vhs's own tooling gets network.
     local vhs_cache="$REPO_ROOT/target/agent-e2e/cache"
     mkdir -p "$vhs_cache"
@@ -534,7 +534,7 @@ e2e_scenario() {
 
 # ---------------------------------------------------------------------------
 # Artifacts + teardown. Teardown must reap every child even on failure:
-# the stub, the driver tmux server, the thurbox-dev server and the agent
+# the stub, the driver tmux server, the friring-dev server and the agent
 # processes inside it (killed with the server), then the throwaway root.
 e2e_collect_artifacts() {
     local dest="$REPO_ROOT/target/agent-e2e/artifacts/$E2E_SCENARIO_NAME-$(date +%Y%m%d-%H%M%S)"
@@ -542,23 +542,23 @@ e2e_collect_artifacts() {
     {
         echo "scenario: $E2E_SCENARIO_NAME"
         echo "agent: ${AGENT_NAME:-?} $(agent_version 2>/dev/null || true)"
-        echo "thurbox: $("$THURBOX_BIN" --version 2>/dev/null || true)"
+        echo "friring: $("$FRIRING_BIN" --version 2>/dev/null || true)"
         echo "tmux: $(tmux -V)"
         echo "session: ${E2E_SESSION_ID:-none} hook_state: $(e2e_hook_state 2>/dev/null || true)"
     } > "$dest/meta.txt" 2>/dev/null
     e2e_pane > "$dest/driver-pane.txt" 2>/dev/null || true
     tmux -L "$E2E_DRIVER_SOCKET" capture-pane -p -S -200 -t "$E2E_DRIVER_SESSION" \
         > "$dest/driver-pane-history.txt" 2>/dev/null || true
-    # The agent's own pane, straight from the thurbox-dev server.
-    thurbox-cli --json session capture "$E2E_SESSION_ID" --lines 500 \
+    # The agent's own pane, straight from the friring-dev server.
+    friring-cli --json session capture "$E2E_SESSION_ID" --lines 500 \
         > "$dest/agent-pane.json" 2>/dev/null || true
     cp "$E2E_JOURNAL" "$dest/" 2>/dev/null || true
     cp -r "$E2E_STUB_DIR/raw" "$dest/" 2>/dev/null || true
     cp "$E2E_STUB_DIR/stub.log" "$dest/" 2>/dev/null || true
     cp "$E2E_FIXTURES" "$dest/" 2>/dev/null || true
-    cp "$XDG_CONFIG_HOME/thurbox-dev/agents.toml" "$dest/" 2>/dev/null || true
+    cp "$XDG_CONFIG_HOME/friring-dev/agents.toml" "$dest/" 2>/dev/null || true
     ( cd "$E2E_WS" 2>/dev/null && { git status --short; git diff; } > "$dest/workspace.diff" ) || true
-    env | grep -E '^(THURBOX|ANTHROPIC|CLAUDE|XDG|HOME|no_proxy|http_proxy)' \
+    env | grep -E '^(FRIRING|ANTHROPIC|CLAUDE|XDG|HOME|no_proxy|http_proxy)' \
         | sed -E 's/((TOKEN|KEY|SECRET|PASSWORD)=).*/\1<redacted>/' > "$dest/env.txt" 2>/dev/null || true
     e2e_log "failure artifacts: $dest"
 }
@@ -606,8 +606,8 @@ e2e_teardown() {
     [ "$failed" != "0" ] && e2e_collect_artifacts
     tmux -L "$E2E_DRIVER_SOCKET" kill-server >/dev/null 2>&1 || true
     [ -n "$E2E_STUB_PID" ] && kill "$E2E_STUB_PID" >/dev/null 2>&1 || true
-    if [ "${THURBOX_E2E_KEEP:-0}" = "1" ]; then
-        e2e_log "THURBOX_E2E_KEEP=1: sandbox left at $TBX_SANDBOX_ROOT"
+    if [ "${FRIRING_E2E_KEEP:-0}" = "1" ]; then
+        e2e_log "FRIRING_E2E_KEEP=1: sandbox left at $TBX_SANDBOX_ROOT"
         # shellcheck disable=SC2034  # read by tbx_sandbox_teardown
         TBX_SANDBOX_FRESH=0
     fi

@@ -215,7 +215,7 @@ won't pay off.
   from the model stub through a *real* agent + tmux + vt100 + render path and
   write a report (wall-clock marks + the published perf snapshot) under
   `target/agent-e2e/perf/`. Benchmarks only, never a gate; run against a
-  release build via `THURBOX_E2E_BIN` — see `docs/E2E.md` ("Performance
+  release build via `FRIRING_E2E_BIN` — see `docs/E2E.md` ("Performance
   scenarios").
 
 **Why**: criterion/divan pull a large transitive dependency tree, and
