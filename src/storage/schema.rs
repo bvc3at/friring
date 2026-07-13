@@ -16,15 +16,16 @@ use rusqlite::Connection;
 /// v38 adds `base_branch` to `sessions` plus the `review_comments` /
 /// `review_marks` tables (the native code-review view); v39 scopes
 /// `repo_bookmarks` to a `host` (`''` = local), giving remote targets the
-/// same bookmark memory as local ones.
+/// same bookmark memory as local ones; v40 adds `repo_sync_bases` (the
+/// per-repo default base remote for the Ctrl+S worktree sync).
 /// Gaps in the step table are fine (there is no v18 step either).
-pub const SCHEMA_VERSION: u32 = 39;
+pub const SCHEMA_VERSION: u32 = 40;
 
 /// A single migration step: applied when the stored version is below `target`.
 type MigrationStep = (u32, fn(&Connection) -> rusqlite::Result<()>);
 
 /// How long a connection waits on a locked database before erroring.
-/// The DB is shared by the TUI, thurbox-cli, and the automation heartbeat;
+/// The DB is shared by the TUI, friring-cli, and the automation heartbeat;
 /// writes are short single-row upserts, so 5 s outlasts any WAL checkpoint.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -179,6 +180,11 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             PRIMARY KEY (host, repo_path)
         );
 
+        CREATE TABLE IF NOT EXISTS repo_sync_bases (
+            repo_path TEXT PRIMARY KEY,
+            remote    TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS tasks (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             title           TEXT NOT NULL,
@@ -286,6 +292,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         (37, migrate_v37_force_deleted),
         (38, migrate_v38_code_review),
         (39, migrate_v39_bookmark_host),
+        (40, migrate_v40_repo_sync_bases),
     ];
 
     for &(target, step) in steps {
@@ -812,7 +819,7 @@ fn migrate_v21_drop_model(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// v21 → v22: drop tables for removed subsystems. VM, devcontainer,
-/// and process-plugin subsystems were removed to focus thurbox on
+/// and process-plugin subsystems were removed to focus friring on
 /// the TUI surface; the session_commands queue is unused now that
 /// MCP `restart_session` / `create_session` run synchronously.
 fn migrate_v22_drop_subsystems(conn: &Connection) -> rusqlite::Result<()> {
@@ -1026,7 +1033,7 @@ fn migrate_v33_action_extra_repos(conn: &Connection) -> rusqlite::Result<()> {
 ///
 /// `hook_state` (`working`/`blocked`/`done`, NULL = no hook fired yet) and
 /// `hook_state_at` (epoch ms it was reported) are written by
-/// `thurbox-cli session signal` from an agent hook; `seen_at` (epoch ms) is
+/// `friring-cli session signal` from an agent hook; `seen_at` (epoch ms) is
 /// written by the TUI when the user views a `done` session, so it renders
 /// `Idle` instead of `Done`. NULL on every existing row, so they decode
 /// identically to the pre-hooks behaviour.
@@ -1161,6 +1168,18 @@ fn migrate_v39_bookmark_host(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// v40: `repo_sync_bases`, the per-repo default base remote for the Ctrl+S
+/// worktree sync (chosen in the base picker when a repo has >1 remotes).
+/// `CREATE TABLE IF NOT EXISTS` keeps a re-run a no-op.
+fn migrate_v40_repo_sync_bases(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS repo_sync_bases (
+            repo_path TEXT PRIMARY KEY,
+            remote    TEXT NOT NULL
+        );",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1196,6 +1215,7 @@ mod tests {
         assert!(tables.contains(&"automations".to_string()));
         assert!(tables.contains(&"automation_runs".to_string()));
         assert!(tables.contains(&"repo_bookmarks".to_string()));
+        assert!(tables.contains(&"repo_sync_bases".to_string()));
         assert!(tables.contains(&"tasks".to_string()));
         assert!(tables.contains(&"session_messages".to_string()));
         // The legacy one-shot table is replaced by `automations`.

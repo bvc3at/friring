@@ -7,7 +7,7 @@
 //! keys like `j`/`k` can be rebound per-pane without stealing them from the
 //! terminal, which forwards everything to the PTY. Defaults reproduce the
 //! table in `docs/FEATURES.md`; users override via the F1 editor or by
-//! hand-editing `~/.config/thurbox/keybindings.json`.
+//! hand-editing `~/.config/friring/keybindings.json`.
 //!
 //! A few stateful keys remain literal in `key_handlers.rs` and are *not*
 //! rebindable: modal-internal selectors (j/k/Enter/Esc), the automations/tasks
@@ -225,7 +225,7 @@ impl Action {
             Action::StartSync => "Sync worktrees",
             Action::ToggleShell => "Toggle shell view",
             Action::ToggleReview => "Toggle code review",
-            Action::ToggleCcActivity => "Toggle CC activity",
+            Action::ToggleCcActivity => "Toggle agent activity",
             Action::ForkSession => "Fork session",
             Action::RestartSession => "Restart session",
             Action::UndoDelete => "Undo delete",
@@ -333,15 +333,15 @@ impl Action {
     }
 
     /// Whether this action should **defer to the agent CLI** when a session
-    /// terminal is focused, instead of running as a thurbox command.
+    /// terminal is focused, instead of running as a friring command.
     ///
-    /// thurbox's global chords share the `Ctrl+<letter>` namespace with the
+    /// friring's global chords share the `Ctrl+<letter>` namespace with the
     /// readline / shell line-editing chords users have in muscle memory
     /// (`Ctrl+A` = start-of-line, `Ctrl+E` = end-of-line, `Ctrl+W` =
     /// delete-word, `Ctrl+U` = kill-line, `Ctrl+R` = reverse-search, `Ctrl+D`
     /// = EOF, …). For the actions below we let those keystrokes pass through to
     /// the PTY while the terminal is focused, so the inner agent CLI behaves
-    /// normally; the thurbox command stays reachable from the session list (and
+    /// normally; the friring command stays reachable from the session list (and
     /// via its `F`-key alternate, where one exists). The deferral is gated on
     /// the *bound chord* still being a bare `Ctrl+<letter>` (applied in
     /// `App::handle_key`), so rebinding an action to a non-conflicting key keeps
@@ -1028,7 +1028,7 @@ impl KeyBindings {
         self.map.insert(action, action.default_chords());
     }
 
-    /// Serialize to the JSON shape `~/.config/thurbox/keybindings.json` uses.
+    /// Serialize to the JSON shape `~/.config/friring/keybindings.json` uses.
     pub fn to_json(&self) -> Result<String, String> {
         let mut out: HashMap<String, Vec<String>> = HashMap::new();
         for (action, chords) in &self.map {
@@ -1269,7 +1269,7 @@ mod tests {
     #[test]
     fn lookup_returns_none_for_unbound_chord() {
         // Ctrl+A is unbound by default (it is a readline editing chord, not a
-        // thurbox action), so it is the neutral "free chord" for fixtures.
+        // friring action), so it is the neutral "free chord" for fixtures.
         let kb = KeyBindings::default();
         assert_eq!(kb.lookup(KeyCode::Char('a'), KeyModifiers::CONTROL), None);
     }

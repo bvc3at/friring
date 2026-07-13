@@ -81,7 +81,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const M: &str = "thurbox-cli session signal";
+    const M: &str = "friring-cli session signal";
 
     fn ours(state: &str) -> Value {
         json!({"hooks": [{"type": "command", "command": format!("{M} --state {state} || true")}]})

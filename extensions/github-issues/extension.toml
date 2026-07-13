@@ -1,15 +1,15 @@
 # GitHub-issues extension manifest.
 #
-# Install with `thurbox-cli extension install github-issues` (or point at this
-# directory: `thurbox-cli extension install ./extensions/github-issues`). thurbox
+# Install with `friring-cli extension install github-issues` (or point at this
+# directory: `friring-cli extension install ./extensions/github-issues`). friring
 # fetches this file, lays the [[files]] down under `home`, and activates the
-# [[automations]] — a deterministic `exec` job (no agent, no session): thurbox's
+# [[automations]] — a deterministic `exec` job (no agent, no session): friring's
 # scheduler runs `{home}/scripts/sync.sh` every 15 min and self-heals the
 # automation if deleted. Turn it off with
-# `thurbox-cli extension deactivate github-issues`.
+# `friring-cli extension deactivate github-issues`.
 
 name = "github-issues"
-description = "Syncs GitHub issues bidirectionally with the thurbox task list"
+description = "Syncs GitHub issues bidirectionally with the friring task list"
 config_version = 1
 version = "2.0.0"                # v2: deterministic exec sync (was an agent session)
 min_thurbox_version = "0.141.0"  # needs the Exec automation action + task --source flags

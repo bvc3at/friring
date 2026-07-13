@@ -1,6 +1,6 @@
 # Renovate — keep your local repos on up-to-date dependencies
 
-> **Status: experimental.** Renovate (the thurbox extension) is new and under
+> **Status: experimental.** Renovate (the friring extension) is new and under
 > active testing — expect the behavior spec, scripts, and installer to change
 > between releases.
 
@@ -23,9 +23,9 @@ Needs you: example — major bump of `serde` 1→2 needs your call (tests pass)
 
 The worker always invokes Renovate with `--platform=local`: **no hosted bot, no
 token, no Renovate-opened PRs.** Renovate simply rewrites the dependency
-manifests + lockfiles in an isolated worktree; the thurbox worker owns the rest
+manifests + lockfiles in an isolated worktree; the friring worker owns the rest
 (test, commit, push, open a PR). That keeps it forge-agnostic *and*
-agent-agnostic, like thurbox itself — only **git** is baked in. The monitor and
+agent-agnostic, like friring itself — only **git** is baked in. The monitor and
 worker are plain `agents.toml` aliases (`renovate`, `renovate-worker`), so each
 can be claude, codex, antigravity, opencode, vibe, … The behavior lives in
 [RENOVATE.md](RENOVATE.md), surfaced to whatever CLI you pick via context-file
@@ -43,7 +43,7 @@ Two layers control how far versions move:
 
 ## Requirements
 
-- `git`, `jq`, and `thurbox-cli` on `PATH`.
+- `git`, `jq`, and `friring-cli` on `PATH`.
 - **Node ≥ 20** — Renovate runs via `npx --yes renovate` (a global `renovate`
   install is used if present). Set `GITHUB_COM_TOKEN` to raise GitHub API limits
   / fetch changelogs (optional, read-only).
@@ -53,38 +53,38 @@ Two layers control how far versions move:
 
 ## Install
 
-Renovate is a thurbox **extension** (a declarative `extension.toml` manifest):
+Renovate is a friring **extension** (a declarative `extension.toml` manifest):
 
 ```bash
-thurbox-cli extension install renovate
+friring-cli extension install renovate
 ```
 
-or from a checkout: `thurbox-cli extension install ./extensions/renovate` (the
+or from a checkout: `friring-cli extension install ./extensions/renovate` (the
 `install.sh` / curl one-liner is a thin shim over this). Override the home with
 `--home <dir>`. Installing:
 
-1. lays down the renovate home (`~/.config/thurbox/extensions/renovate`): the
+1. lays down the renovate home (`~/.config/friring/extensions/renovate`): the
    `RENOVATE.md` spec, helper scripts, context-file symlinks, claude permission
    settings, a `repos.md`
    watch list, and a `renovate-config.json` (both seeded once, then user-owned);
 2. registers the `renovate` / `renovate-worker` agents in
-   `~/.config/thurbox/agents.toml` (defaults: claude on haiku for the monitor,
+   `~/.config/friring/agents.toml` (defaults: claude on haiku for the monitor,
    opus for the worker — edit the entries to change the model/CLI);
 3. activates the dedicated `renovate` session and a `renovate-tick` automation
-   (weekly, Monday 09:00) — both **self-healed** by thurbox at startup and on
+   (weekly, Monday 09:00) — both **self-healed** by friring at startup and on
    every tick, so deleting them is a no-op until you `deactivate`.
 
-Re-running `extension install` refreshes the installer-owned files. `thurbox-cli
+Re-running `extension install` refreshes the installer-owned files. `friring-cli
 extension list` / `status renovate` show what's active.
 
 ## Use
 
-- Add the repos to keep current to `~/.config/thurbox/extensions/renovate/repos.md` (one row each;
+- Add the repos to keep current to `~/.config/friring/extensions/renovate/repos.md` (one row each;
   `strategy` defaults to `minor`, `provider` to `auto`).
 - The monitor sweeps on its schedule; trigger one now by sending `tick` to the
   renovate session (or open it in the TUI).
 - `status` for a one-screen report; `clean` to prune merged update worktrees.
-- An updater is a thurbox **task** named `update <repo> deps …`; its worker runs
+- An updater is a friring **task** named `update <repo> deps …`; its worker runs
   in an isolated worktree on a fresh `renovate/updates-<ts>` branch and
   self-reports via a `===RESULT===` sentinel, pinging the monitor when it
   finishes.
@@ -92,7 +92,7 @@ extension list` / `status renovate` show what's active.
 ## How the worker gets its branch
 
 A renovate run starts a **brand-new** branch, so — unlike ci-shepherd — there's
-no branch to adopt: `dispatch-update.sh` uses thurbox's native `--worktree`,
+no branch to adopt: `dispatch-update.sh` uses friring's native `--worktree`,
 which runs `git worktree add -b renovate/updates-<ts> origin/main`. The worker
 runs Renovate locally there, tests, commits, and pushes that branch for review.
 `clean` removes the worktree once the PR has merged (refusing if it has
@@ -109,16 +109,16 @@ uncommitted work).
 | `scripts/dispatch-update.sh` | Create a fresh update worktree + create and run the updater task |
 | `scripts/renovate-run.sh` | Run Renovate (`--platform=local` only); maps strategy → config overlay |
 | `scripts/parse-result.sh` | Extract the worker `===RESULT===` sentinel |
-| `extension.toml` | Declarative install + runtime manifest (`thurbox-cli extension install` reads this) |
+| `extension.toml` | Declarative install + runtime manifest (`friring-cli extension install` reads this) |
 | `claude-settings.json` | Pre-approved permissions template (laid down as `.claude/settings.json`) |
-| `install.sh` | Thin curl/sh shim over `thurbox-cli extension install` |
+| `install.sh` | Thin curl/sh shim over `friring-cli extension install` |
 
 ## Uninstall
 
 ```bash
-thurbox-cli extension deactivate renovate   # off-switch: tears down session + automation
-thurbox-cli extension uninstall renovate    # also removes the agents + manifest
-thurbox-cli extension uninstall renovate --purge  # ...and deletes ~/.config/thurbox/extensions/renovate
+friring-cli extension deactivate renovate   # off-switch: tears down session + automation
+friring-cli extension uninstall renovate    # also removes the agents + manifest
+friring-cli extension uninstall renovate --purge  # ...and deletes ~/.config/friring/extensions/renovate
 ```
 
 > Remove any leftover update worktrees first (`git -C <repo> worktree remove …`)

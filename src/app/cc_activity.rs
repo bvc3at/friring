@@ -30,7 +30,7 @@ use crate::session::{
     CcActivity, CcAgent, CcAgentState, CcRunStatus, CcWorkflow, SessionId, SessionInfo,
 };
 
-use super::{background, session_member_dirs, App, InputFocus};
+use super::{activity, background, session_member_dirs, App, InputFocus};
 
 /// A standalone subagent (or a journal-less workflow agent) is treated as
 /// `Active` while its transcript was appended within this window, else `Done`.
@@ -115,8 +115,9 @@ impl App {
     /// The set of launch dirs a session's agent could have started in, normalized
     /// for the worker-`cwd` match: every member dir (worktree / additional dir /
     /// primary cwd) plus the resolved process cwd (the symlink workspace for a
-    /// multi-repo session). Uniqued.
-    fn session_candidate_dirs(&self, info: &SessionInfo) -> Vec<String> {
+    /// multi-repo session). Uniqued. Shared with the agent-neutral activity
+    /// scan, whose cwd-keyed providers match against the same set.
+    pub(super) fn session_candidate_dirs(&self, info: &SessionInfo) -> Vec<String> {
         let mut dirs: Vec<PathBuf> =
             session_member_dirs(info.cwd.as_deref(), &info.worktrees, &info.additional_dirs)
                 .into_iter()
@@ -310,7 +311,7 @@ fn collect_workers(
     out
 }
 
-/// Attribute each worker to the thurbox session that launched it, by the
+/// Attribute each worker to the friring session that launched it, by the
 /// `--settings` path the daemon replays. Two forms (both scoped to this
 /// instance's hooks dir):
 ///
@@ -375,8 +376,9 @@ fn attribute_workers(
 }
 
 /// Trim trailing path separators so `/repo` and `/repo/` compare equal (the
-/// daemon records `--add-dir /repo/` but the worker `cwd` as `/repo`).
-fn normalize_dir(s: &str) -> String {
+/// daemon records `--add-dir /repo/` but the worker `cwd` as `/repo`). Shared
+/// with the activity providers' cwd matching (`super::activity`).
+pub(super) fn normalize_dir(s: &str) -> String {
     let t = s.trim_end_matches('/');
     if t.is_empty() {
         s.to_string()
@@ -742,6 +744,9 @@ fn file_mtime_ns(md: &std::fs::Metadata) -> u128 {
 /// tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CcNodeRef {
+    /// One of the activity sections (overview / timeline / commands / files /
+    /// web / agents), rendered from the session's normalized event stream.
+    Section(activity::Section),
     /// A workflow's overview (phases + per-agent grid + logs) — `run_id`.
     WorkflowOverview(String),
     /// One workflow-spawned agent's transcript — `(run_id, agent_id)`.
@@ -750,10 +755,12 @@ pub(crate) enum CcNodeRef {
     Subagent(String),
 }
 
-/// One row of the side tree. Indices point into the state's [`CcActivity`]
-/// snapshot; a collapsed workflow hides its agent rows.
+/// One row of the side navigator. Sections lead; the workflow/subagent rows
+/// nest under the Agents section (indices point into the state's
+/// [`CcActivity`] snapshot; a collapsed workflow hides its agent rows).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CcTreeRow {
+    Section(activity::Section),
     Workflow(usize),
     WorkflowAgent(usize, usize),
     Subagent(usize),
@@ -801,16 +808,27 @@ pub(crate) struct CcActivityState {
     /// Snapshot of the session's activity index, refreshed from
     /// `SessionInfo.cc_activity` while the view is open (live-tail).
     pub activity: CcActivity,
-    // ── side tree ────────────────────────────────────────────────────────
+    /// Per-kind tallies of the session's normalized event stream — the
+    /// navigator's section counts, refreshed with the event scan.
+    pub counts: crate::session::activity::ActivityCounts,
+    /// Distinct files touched (the Files section's count).
+    pub files_count: usize,
+    // ── side navigator (sections + agents tree) ──────────────────────────
     pub tree: Vec<CcTreeRow>,
     pub tree_selected: usize,
     /// Workflow run ids folded in the tree (their agents hidden).
     pub collapsed_workflows: HashSet<String>,
+    /// Whether the Agents section's subtree is folded.
+    pub agents_folded: bool,
     // ── central transcript ───────────────────────────────────────────────
     /// Which node's content is shown; `None` before the first selection.
     pub open: Option<CcNodeRef>,
-    /// Parsed transcript of the open agent (empty for a workflow overview).
+    /// Parsed transcript of the open agent, or the open section's event
+    /// blocks (empty for a workflow overview / synthetic-row sections).
     pub blocks: Vec<TranscriptBlock>,
+    /// Synthetic rows for sections that aren't event lists (overview/files):
+    /// consumed by [`Self::rebuild_rows`] when a section is open.
+    pub section_rows: Vec<CcRow>,
     /// mtime (ns) of the open transcript file, for the live-tail re-read gate.
     pub open_mtime: u128,
     pub rows: Vec<CcRow>,
@@ -831,11 +849,15 @@ impl CcActivityState {
     fn new(activity: CcActivity) -> Self {
         Self {
             activity,
+            counts: crate::session::activity::ActivityCounts::default(),
+            files_count: 0,
             tree: Vec::new(),
             tree_selected: 0,
             collapsed_workflows: HashSet::new(),
+            agents_folded: false,
             open: None,
             blocks: Vec::new(),
+            section_rows: Vec::new(),
             open_mtime: 0,
             rows: Vec::new(),
             selected: 0,
@@ -899,24 +921,30 @@ impl CcActivityState {
             .filter(|q| !q.is_empty())
     }
 
-    /// Rebuild [`Self::tree`] from the activity snapshot, honouring folds.
+    /// Rebuild [`Self::tree`]: the sections, then the workflow/subagent rows
+    /// nested under the Agents section, honouring folds.
     fn rebuild_tree(&mut self) {
         let mut tree = Vec::new();
-        for (wi, w) in self.activity.workflows.iter().enumerate() {
-            tree.push(CcTreeRow::Workflow(wi));
-            if !self.collapsed_workflows.contains(&w.run_id) {
-                for ai in 0..w.agents.len() {
-                    tree.push(CcTreeRow::WorkflowAgent(wi, ai));
+        for section in activity::SECTIONS {
+            tree.push(CcTreeRow::Section(section));
+        }
+        if !self.agents_folded {
+            for (wi, w) in self.activity.workflows.iter().enumerate() {
+                tree.push(CcTreeRow::Workflow(wi));
+                if !self.collapsed_workflows.contains(&w.run_id) {
+                    for ai in 0..w.agents.len() {
+                        tree.push(CcTreeRow::WorkflowAgent(wi, ai));
+                    }
                 }
             }
-        }
-        for si in 0..self.activity.subagents.len() {
-            tree.push(CcTreeRow::Subagent(si));
-        }
-        if tree.is_empty() {
-            tree.push(CcTreeRow::Info(
-                "No workflows or subagents yet.".to_string(),
-            ));
+            for si in 0..self.activity.subagents.len() {
+                tree.push(CcTreeRow::Subagent(si));
+            }
+            if self.activity.is_empty() {
+                tree.push(CcTreeRow::Info(
+                    "No workflows or subagents yet.".to_string(),
+                ));
+            }
         }
         self.tree = tree;
         if self.tree_selected >= self.tree.len() {
@@ -924,9 +952,18 @@ impl CcActivityState {
         }
     }
 
+    /// The navigator row of a section (sections lead the tree in
+    /// [`activity::SECTIONS`] order).
+    pub(crate) fn section_row(&self, section: activity::Section) -> Option<usize> {
+        self.tree
+            .iter()
+            .position(|r| matches!(r, CcTreeRow::Section(s) if *s == section))
+    }
+
     /// The node a tree row points at (`None` for the info placeholder).
     fn node_ref_for(&self, row: &CcTreeRow) -> Option<CcNodeRef> {
         match row {
+            CcTreeRow::Section(s) => Some(CcNodeRef::Section(*s)),
             CcTreeRow::Workflow(wi) => self
                 .activity
                 .workflows
@@ -949,8 +986,8 @@ impl CcActivityState {
         }
     }
 
-    /// Rebuild [`Self::rows`] for the open node: the transcript block list, or a
-    /// workflow overview.
+    /// Rebuild [`Self::rows`] for the open node: the transcript/event block
+    /// list, a section's synthetic rows, or a workflow overview.
     fn rebuild_rows(&mut self) {
         self.rows = match &self.open {
             Some(CcNodeRef::WorkflowOverview(run)) => self
@@ -958,11 +995,18 @@ impl CcActivityState {
                 .workflow(run)
                 .map(overview_rows)
                 .unwrap_or_else(|| vec![CcRow::Info("Workflow no longer present.".to_string())]),
+            // Synthetic-row sections (overview / files / agents summary).
+            Some(CcNodeRef::Section(_)) if !self.section_rows.is_empty() => {
+                self.section_rows.clone()
+            }
+            Some(CcNodeRef::Section(_)) if self.blocks.is_empty() => {
+                vec![CcRow::Info("No such activity yet.".to_string())]
+            }
             Some(_) if self.blocks.is_empty() => {
                 vec![CcRow::Info("(empty transcript)".to_string())]
             }
             Some(_) => (0..self.blocks.len()).map(CcRow::Block).collect(),
-            None => vec![CcRow::Info("Select a workflow or subagent.".to_string())],
+            None => vec![CcRow::Info("Select a section above.".to_string())],
         };
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
@@ -991,6 +1035,18 @@ fn block_search_text(block: &TranscriptBlock) -> String {
         | TranscriptBlock::Text(s)
         | TranscriptBlock::ToolResult { content: s, .. } => s.clone(),
         TranscriptBlock::ToolUse { name, input } => format!("{name} {input}"),
+        TranscriptBlock::Event(e) => {
+            let mut text = format!("{} {}", e.kind.label(), e.detail);
+            if let Some(n) = &e.note {
+                text.push(' ');
+                text.push_str(n);
+            }
+            if let Some(r) = &e.result_head {
+                text.push(' ');
+                text.push_str(r);
+            }
+            text
+        }
     }
 }
 
@@ -1117,6 +1173,8 @@ impl App {
             .unwrap_or(0);
         self.cc_activities.insert(session_id, state);
         self.ca_sync_open();
+        // Seed the navigator's section counts from the accumulated events.
+        self.refresh_activity_view(false);
         self.focus = InputFocus::CcActivityTree;
     }
 
@@ -1142,11 +1200,13 @@ impl App {
             }
             InputFocus::Terminal if open => {
                 // Returning to a session whose view stayed open: promote focus and
-                // refresh the snapshot, since the background scan updates
-                // `SessionInfo.cc_activity` but only live-tails the *active*
-                // session — so a workflow that finished while away is now current.
+                // refresh the snapshot, since the background scans update
+                // `SessionInfo.cc_activity` / `App::activity` but only live-tail
+                // the *active* session — so a workflow that finished (or events
+                // that accrued) while away are now current.
                 self.focus = InputFocus::CcActivityTree;
                 self.reload_cc_activity();
+                self.refresh_activity_view(false);
             }
             _ => {}
         }
@@ -1202,6 +1262,11 @@ impl App {
             };
             (open, ca.open_mtime, path)
         };
+        // Sections live-tail via `reload_open_section` on the event scan's
+        // cadence, not the tree scan's.
+        if matches!(open, Some(CcNodeRef::Section(_))) {
+            return;
+        }
         // A workflow overview has no file — rebuild from the fresh snapshot.
         if matches!(open, Some(CcNodeRef::WorkflowOverview(_))) {
             if let Some(ca) = self.active_cc_activity_mut() {
@@ -1256,7 +1321,8 @@ impl App {
     }
 
     /// Load a node's content into the central pane: read + parse an agent
-    /// transcript, or build a workflow overview.
+    /// transcript, build a workflow overview, or build a section's content
+    /// from the session's normalized event stream.
     fn load_cc_node(&mut self, node: Option<CcNodeRef>) {
         let path = {
             let Some(ca) = self.active_cc_activity() else {
@@ -1270,21 +1336,27 @@ impl App {
                 Some(CcNodeRef::Subagent(aid)) => {
                     ca.activity.subagent(aid).map(|a| a.transcript_path.clone())
                 }
-                _ => None, // overview (or None): no file
+                _ => None, // section / overview (or None): no file
             }
         };
-        let (blocks, mtime) = match &path {
-            Some(p) => (
-                std::fs::read_to_string(p)
-                    .map(|s| parse_transcript(&s))
+        let (blocks, section_rows) = match &node {
+            Some(CcNodeRef::Section(s)) => self.section_content(*s),
+            _ => (
+                path.as_deref()
+                    .map(|p| {
+                        std::fs::read_to_string(p)
+                            .map(|s| parse_transcript(&s))
+                            .unwrap_or_default()
+                    })
                     .unwrap_or_default(),
-                file_mtime(p),
+                Vec::new(),
             ),
-            None => (Vec::new(), 0),
         };
+        let mtime = path.as_deref().map(file_mtime).unwrap_or(0);
         if let Some(ca) = self.active_cc_activity_mut() {
             ca.open = node;
             ca.blocks = blocks;
+            ca.section_rows = section_rows;
             ca.open_mtime = mtime;
             ca.collapsed_tools.clear();
             ca.rebuild_rows();
@@ -1292,6 +1364,107 @@ impl App {
             ca.selected = ca.first_selectable();
             ca.scroll = 0;
             ca.follow = true;
+        }
+    }
+
+    /// Build a section's central-pane content from the active session's
+    /// event stream: event blocks for the list sections, synthetic rows for
+    /// overview / files / the agents summary.
+    fn section_content(&self, section: activity::Section) -> (Vec<TranscriptBlock>, Vec<CcRow>) {
+        let Some(info) = self.sessions.get(self.active_index).map(|s| &s.info) else {
+            return (Vec::new(), Vec::new());
+        };
+        let act = self.activity.get(&info.id);
+        let events = act.map(|a| a.events()).unwrap_or_default();
+        match section {
+            activity::Section::Overview => (
+                Vec::new(),
+                activity::overview_rows(
+                    &info.agent,
+                    &self.session_command(info),
+                    self.session_provider(info),
+                    act,
+                    info,
+                ),
+            ),
+            activity::Section::Files => (Vec::new(), activity::files_rows(events)),
+            activity::Section::Agents => {
+                let (wf, sub) = (
+                    self.active_cc_activity()
+                        .map(|ca| ca.activity.workflows.len())
+                        .unwrap_or(0),
+                    self.active_cc_activity()
+                        .map(|ca| ca.activity.subagents.len())
+                        .unwrap_or(0),
+                );
+                (
+                    Vec::new(),
+                    vec![
+                        CcRow::Text(format!("{wf} workflows · {sub} subagents")),
+                        CcRow::Info(
+                            "Select a workflow or subagent in the navigator for its transcript."
+                                .to_string(),
+                        ),
+                    ],
+                )
+            }
+            list => (activity::section_blocks(events, list), Vec::new()),
+        }
+    }
+
+    /// Refresh the counts snapshot + the open section after an event-scan
+    /// pass. `changed` gates the redraw (an idle pass costs nothing); the
+    /// rebuild itself always runs so a section opened while the accumulator
+    /// was in flight backfills.
+    pub(super) fn refresh_activity_view(&mut self, changed: bool) {
+        let Some(sid) = self.active_session_id() else {
+            return;
+        };
+        if !self.cc_activities.contains_key(&sid) {
+            return;
+        }
+        let (counts, files_count) = self
+            .activity
+            .get(&sid)
+            .map(|a| {
+                let events = a.events();
+                (
+                    crate::session::activity::ActivityCounts::tally(events),
+                    crate::session::activity::aggregate_files(events).len(),
+                )
+            })
+            .unwrap_or_default();
+        if let Some(ca) = self.cc_activities.get_mut(&sid) {
+            ca.counts = counts;
+            ca.files_count = files_count;
+        }
+        self.reload_open_section();
+        if changed {
+            self.request_redraw();
+        }
+    }
+
+    /// Rebuild an open section's content in place, keeping the live-tail
+    /// contract of [`Self::reload_open_transcript`]: sticky-bottom follow and
+    /// stable selection/scroll otherwise.
+    fn reload_open_section(&mut self) {
+        let Some(section) = self.active_cc_activity().and_then(|ca| match &ca.open {
+            Some(CcNodeRef::Section(s)) => Some(*s),
+            _ => None,
+        }) else {
+            return;
+        };
+        let (blocks, section_rows) = self.section_content(section);
+        if let Some(ca) = self.active_cc_activity_mut() {
+            let at_end = ca.selected + 1 >= ca.rows.len();
+            ca.blocks = blocks;
+            ca.section_rows = section_rows;
+            ca.rebuild_rows();
+            ca.refresh_search_matches();
+            if (ca.follow && at_end) || ca.selected >= ca.rows.len() {
+                ca.selected = ca.rows.len().saturating_sub(1);
+            }
+            ca.ensure_visible();
         }
     }
 
@@ -1350,25 +1523,51 @@ impl App {
         self.ca_sync_open();
     }
 
-    /// Fold/unfold the workflow the tree selection sits in (Space).
+    /// Fold/unfold at the tree selection (Space): a workflow's agents, or the
+    /// whole agents subtree when on the Agents section row.
     fn ca_toggle_workflow_fold(&mut self) {
         let Some(ca) = self.active_cc_activity_mut() else {
             return;
         };
-        let run_id = match ca.tree.get(ca.tree_selected) {
+        let sel = ca.tree_selected;
+        match ca.tree.get(sel) {
+            Some(CcTreeRow::Section(activity::Section::Agents)) => {
+                ca.agents_folded = !ca.agents_folded;
+            }
             Some(CcTreeRow::Workflow(wi)) | Some(CcTreeRow::WorkflowAgent(wi, _)) => {
-                ca.activity.workflows.get(*wi).map(|w| w.run_id.clone())
+                let Some(run_id) = ca.activity.workflows.get(*wi).map(|w| w.run_id.clone()) else {
+                    return;
+                };
+                if !ca.collapsed_workflows.remove(&run_id) {
+                    ca.collapsed_workflows.insert(run_id);
+                }
             }
-            _ => None,
-        };
-        if let Some(run_id) = run_id {
-            if !ca.collapsed_workflows.remove(&run_id) {
-                ca.collapsed_workflows.insert(run_id);
-            }
-            let sel = ca.tree_selected;
-            ca.rebuild_tree();
-            ca.tree_selected = sel.min(ca.tree.len().saturating_sub(1));
+            _ => return,
         }
+        ca.rebuild_tree();
+        ca.tree_selected = sel.min(ca.tree.len().saturating_sub(1));
+    }
+
+    /// Jump the navigator straight to a section (the `1`–`6` keys, working
+    /// from either activity pane).
+    fn ca_jump_section(&mut self, section: activity::Section) {
+        {
+            let Some(ca) = self.active_cc_activity_mut() else {
+                return;
+            };
+            let Some(row) = ca.section_row(section) else {
+                return;
+            };
+            ca.tree_selected = row;
+        }
+        self.ca_sync_open();
+    }
+
+    /// The section a digit key addresses, in navigator order.
+    fn section_for_digit(code: KeyCode) -> Option<activity::Section> {
+        let KeyCode::Char(c) = code else { return None };
+        let idx = c.to_digit(10)?.checked_sub(1)? as usize;
+        activity::SECTIONS.get(idx).copied()
     }
 
     /// Jump the tree to a row (a click in the tree column).
@@ -1478,11 +1677,16 @@ impl App {
         let Some(&CcRow::Block(bi)) = ca.rows.get(ca.selected) else {
             return;
         };
-        let is_tool = matches!(
+        // Event blocks are foldable too: for them `collapsed_tools` membership
+        // is read inverted (present = *expanded*), so Enter still toggles the
+        // set — see the `TranscriptBlock::Event` arm in ui/cc_activity.rs.
+        let is_foldable = matches!(
             ca.blocks.get(bi),
-            Some(TranscriptBlock::ToolResult { .. }) | Some(TranscriptBlock::ToolUse { .. })
+            Some(TranscriptBlock::ToolResult { .. })
+                | Some(TranscriptBlock::ToolUse { .. })
+                | Some(TranscriptBlock::Event(_))
         );
-        if is_tool && !ca.collapsed_tools.remove(&bi) {
+        if is_foldable && !ca.collapsed_tools.remove(&bi) {
             ca.collapsed_tools.insert(bi);
         }
     }
@@ -1680,7 +1884,11 @@ impl App {
             // `h` steps back to the tree; `l` has no pane further right.
             KeyCode::Char('h') => self.focus = InputFocus::CcActivityTree,
             KeyCode::Enter => self.ca_toggle_tool(),
-            _ => {}
+            code => {
+                if let Some(section) = Self::section_for_digit(code) {
+                    self.ca_jump_section(section);
+                }
+            }
         }
         true
     }
@@ -1715,11 +1923,15 @@ impl App {
             KeyCode::Home | KeyCode::Char('g') => self.ca_tree_home_end(false),
             KeyCode::End | KeyCode::Char('G') => self.ca_tree_home_end(true),
             KeyCode::Char(' ') => self.ca_toggle_workflow_fold(),
-            // Drop into the transcript (already previewing the selected node).
+            // Drop into the content pane (already previewing the selection).
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                 self.focus = InputFocus::CcActivity;
             }
-            _ => {}
+            code => {
+                if let Some(section) = Self::section_for_digit(code) {
+                    self.ca_jump_section(section);
+                }
+            }
         }
         true
     }
@@ -1888,7 +2100,7 @@ mod tests {
     fn collect_unions_daemon_worker_by_settings_and_cwd() {
         let tmp = tempfile::tempdir().unwrap();
         let hooks = "/cfg/hooks/claude.json";
-        let repo = "/repo/thurbox";
+        let repo = "/repo/friring";
         let worker = "95c38d32-39d4-4102-82df-24602ac3a2a0";
         let (projects, jobs) = daemon_fixture(tmp.path(), worker, hooks, repo);
 
@@ -1930,15 +2142,15 @@ mod tests {
             tmp.path(),
             worker,
             "/OTHER/hooks/claude.json",
-            "/repo/thurbox",
+            "/repo/friring",
         );
 
         // Same session, but our hooks settings differ from the worker's replayed
-        // one → not attributed. (A different instance / a non-thurbox launch.)
+        // one → not attributed. (A different instance / a non-friring launch.)
         let input = CcSessionInput {
             id: SessionId::default(),
             own_id: "0e6bcb32-fore".into(),
-            candidate_dirs: vec!["/repo/thurbox".into()],
+            candidate_dirs: vec!["/repo/friring".into()],
             prior_sig: None,
         };
         let refresh = collect_cc_activity(
@@ -1963,7 +2175,7 @@ mod tests {
         let input2 = CcSessionInput {
             id: SessionId::default(),
             own_id: "fore2".into(),
-            candidate_dirs: vec!["/repo/thurbox".into()],
+            candidate_dirs: vec!["/repo/friring".into()],
             prior_sig: None,
         };
         let refresh2 = collect_cc_activity(

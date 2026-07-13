@@ -1,4 +1,4 @@
-# thurbox dev task runner. Run `just` (or `just --list`) to see tasks.
+# friring dev task runner. Run `just` (or `just --list`) to see tasks.
 #
 # Enter the pinned toolchain first with `nix develop` (or `direnv allow`); these
 # tasks assume the dev tools (cargo-nextest, cargo-deny, rumdl, shellcheck, …)
@@ -14,7 +14,7 @@ check:
 
 # Build the dev binaries (TUI + CLI).
 build:
-    cargo build --bin thurbox --bin thurbox-cli
+    cargo build --bin friring --bin friring-cli
 
 # Run the full test suite (nextest).
 test:
@@ -59,7 +59,7 @@ sandbox *ARGS:
 sandbox-fresh:
     scripts/dev/sandbox.sh --fresh
 
-# Drop into a shell with the sandbox env (run `thurbox-cli …` by hand).
+# Drop into a shell with the sandbox env (run `friring-cli …` by hand).
 sandbox-shell:
     scripts/dev/sandbox.sh --shell
 

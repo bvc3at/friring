@@ -1,4 +1,4 @@
-//! Thurbox CLI binary — scriptable access to the same state exposed by the
+//! Friring CLI binary — scriptable access to the same state exposed by the
 //! MCP server and the TUI. Every subcommand works without the TUI running.
 
 use clap::Parser;
@@ -12,15 +12,15 @@ fn main() {
         )
         .init();
 
-    let cli = thurbox::cli::Cli::parse();
+    let cli = friring::cli::Cli::parse();
 
     // Publish settings before Database::open (audit pruning reads retention).
     // Warnings go to the WARN-level stderr logger; `config validate` is the
     // loud path.
-    let (settings, _) = thurbox::agent::settings_config::load_or_seed_with_warnings();
-    thurbox::session::settings::init(settings);
+    let (settings, _) = friring::agent::settings_config::load_or_seed_with_warnings();
+    friring::session::settings::init(settings);
 
-    let db_path = match thurbox::paths::database_file() {
+    let db_path = match friring::paths::database_file() {
         Some(p) => p,
         None => {
             eprintln!("error: cannot resolve database path (is HOME set?)");
@@ -28,7 +28,7 @@ fn main() {
         }
     };
 
-    let db = match thurbox::storage::Database::open(&db_path) {
+    let db = match friring::storage::Database::open(&db_path) {
         Ok(db) => db,
         Err(e) => {
             eprintln!(
@@ -39,7 +39,7 @@ fn main() {
         }
     };
 
-    if let Err(e) = thurbox::cli::run(cli, &db) {
+    if let Err(e) = friring::cli::run(cli, &db) {
         eprintln!("error: {e}");
         std::process::exit(1);
     }

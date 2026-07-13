@@ -1,7 +1,7 @@
 # `scripts/dev/` — developer test & run harnesses
 
 Which script for which job. Everything here is isolated from your real
-environment (its own tmux socket, scoped `THURBOX_*_DIR` / temp `HOME`, private
+environment (its own tmux socket, scoped `FRIRING_*_DIR` / temp `HOME`, private
 `-L` sockets) and writes only under `target/` (gitignored).
 
 ## e2e — session-backend end-to-end family (`e2e/`)
@@ -32,7 +32,7 @@ scripts/dev/e2e/real-host.sh devbox check  # readiness probe on a real host
 
 ## smoke — TUI smoke test (`smoke/`)
 
-`smoke/tui-smoke.sh` launches the real `thurbox` binary in a throwaway tmux
+`smoke/tui-smoke.sh` launches the real `friring` binary in a throwaway tmux
 pane, drives it with `send-keys`, and asserts on captured frames (boot → F1 →
 theme → quit). Runs in CI as the `tui-smoke` job; also `just smoke`.
 

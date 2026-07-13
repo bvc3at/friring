@@ -1,8 +1,8 @@
 //! Loading of extension manifests from the discovery directory.
 //!
 //! Opt-in extensions (see `extensions/<name>/`) drop an `extension.toml`
-//! manifest into `~/.config/thurbox/extensions/<name>.toml` from their own
-//! installer. thurbox core reads any manifest there without knowing the
+//! manifest into `~/.config/friring/extensions/<name>.toml` from their own
+//! installer. friring core reads any manifest there without knowing the
 //! extension by name (ADR-20: extensions are data + scripts, never embedded).
 //!
 //! Unlike `agents.toml`/`hosts.toml` this file is **never seeded** — a fresh
@@ -24,7 +24,7 @@ const OFFICIAL_REPO_RAW: &str = "https://raw.githubusercontent.com/Thurbeen/thur
 /// development build), injected at compile time by `build.rs`. The reference
 /// point for extension staleness + compatibility checks.
 pub fn binary_version() -> &'static str {
-    env!("THURBOX_VERSION")
+    env!("FRIRING_VERSION")
 }
 
 /// Whether this is an unstable development build (its version doesn't order
@@ -45,18 +45,18 @@ fn official_ref() -> String {
 }
 
 /// Base URL for the official extensions shipped in the thurbox repo, pinned to
-/// this binary's version. A bare `thurbox-cli extension install <name>` resolves
+/// this binary's version. A bare `friring-cli extension install <name>` resolves
 /// to `<official_base()>/<name>`.
 pub fn official_base() -> String {
     format!("{OFFICIAL_REPO_RAW}/{}/extensions", official_ref())
 }
 
 /// One officially-distributed extension, surfaced for discovery
-/// (`thurbox-cli extension available`) and typo help on a failed bare-name
+/// (`friring-cli extension available`) and typo help on a failed bare-name
 /// install. Each installs by its bare `name` against [`official_base`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OfficialExtension {
-    /// Bare install name (`thurbox-cli extension install <name>`).
+    /// Bare install name (`friring-cli extension install <name>`).
     pub name: &'static str,
     /// One-line human summary, mirrored from the extension's own manifest.
     pub description: &'static str,
@@ -88,19 +88,19 @@ pub const OFFICIAL_EXTENSIONS: &[OfficialExtension] = &[
     },
     OfficialExtension {
         name: "github-issues",
-        description: "Syncs GitHub issues bidirectionally with the thurbox task list",
+        description: "Syncs GitHub issues bidirectionally with the friring task list",
     },
     OfficialExtension {
         name: "gitlab-issues",
-        description: "Syncs GitLab issues bidirectionally with the thurbox task list",
+        description: "Syncs GitLab issues bidirectionally with the friring task list",
     },
     OfficialExtension {
         name: "linear",
-        description: "Syncs Linear issues bidirectionally with the thurbox task list",
+        description: "Syncs Linear issues bidirectionally with the friring task list",
     },
     OfficialExtension {
         name: "jira",
-        description: "Syncs Jira issues bidirectionally with the thurbox task list",
+        description: "Syncs Jira issues bidirectionally with the friring task list",
     },
 ];
 
@@ -144,7 +144,7 @@ pub fn unknown_extension_help(name: &str, cause: &str) -> String {
         msg.push_str(&format!("  {:<12} {}\n", ext.name, ext.description));
     }
     msg.push_str(
-        "\nRun `thurbox-cli extension available` to list them, or pass a URL / local path.",
+        "\nRun `friring-cli extension available` to list them, or pass a URL / local path.",
     );
     msg
 }
@@ -173,7 +173,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 }
 
 /// The extension-manifest discovery directory:
-/// `~/.config/thurbox/extensions/` (sibling of `config.toml`).
+/// `~/.config/friring/extensions/` (sibling of `config.toml`).
 pub fn extensions_dir() -> Option<PathBuf> {
     crate::paths::config_file().map(|p| p.with_file_name("extensions"))
 }
@@ -184,7 +184,7 @@ pub fn manifest_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Default install home for an extension: `<extensions_dir>/<name>/` (a sibling
-/// dir of its `<name>.toml` manifest, e.g. `~/.config/thurbox/extensions/flow`).
+/// dir of its `<name>.toml` manifest, e.g. `~/.config/friring/extensions/flow`).
 /// Used when neither `--home` nor a manifest `home` is given. Discovery
 /// (`list_manifests_with_warnings`) only reads `*.toml`, so this dir is ignored.
 pub fn default_home(name: &str) -> Option<PathBuf> {

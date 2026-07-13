@@ -1,12 +1,12 @@
 # Forge extension manifest.
 #
 # Single source of truth for installing + running forge. Install it with
-# `thurbox-cli extension install forge` (or point at this directory:
-# `thurbox-cli extension install ./extensions/forge`). thurbox fetches this file,
+# `friring-cli extension install forge` (or point at this directory:
+# `friring-cli extension install ./extensions/forge`). friring fetches this file,
 # lays down the [[files]] / [[symlinks]] under `home`, registers the [[agents]]
 # in agents.toml, then activates the [[sessions]] + [[automations]] and
 # self-heals them if they're ever deleted. `{home}` is replaced with the
-# resolved home dir. Turn forge off with `thurbox-cli extension deactivate forge`.
+# resolved home dir. Turn forge off with `friring-cli extension deactivate forge`.
 
 name = "forge"
 description = "Workflow analyst that proposes new automations"

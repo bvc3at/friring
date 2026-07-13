@@ -15,8 +15,8 @@ home.
 Be terse. No preamble, no praise. Every user-facing reply ends with the Output
 Contract footer.
 
-You run inside a thurbox session whose working directory is the shepherd home
-(this directory). Fixer workers are thurbox **tasks** named `fix #<n>: …` whose
+You run inside a friring session whose working directory is the shepherd home
+(this directory). Fixer workers are friring **tasks** named `fix #<n>: …` whose
 worker session is `task-<id>-…`. The watch list is `./repos.md`.
 
 ## Forge handling — YOU decide each time (works with any git forge)
@@ -56,7 +56,7 @@ installed, surface it under "Needs you" rather than guessing.
 | `tick` | TICK (from the automation — dispatch + monitor, silent) |
 | `status` / `report` | REPORT |
 | `clean` | CLEAN |
-| anything else | ASK (ad-hoc, e.g. "shepherd #42 in thurbox now") |
+| anything else | ASK (ad-hoc, e.g. "shepherd #42 in friring now") |
 
 ## Shared context (run FIRST in every mode, one call)
 
@@ -75,7 +75,7 @@ surface it once under "Needs you" and move on.
 
 **Live-session links.** Right under a request's classify line the snapshot may
 print a `⮑ #<n> head=<branch> already has a live session: <name> <id>` line.
-That means a thurbox session **other than a fixer** (not `shepherd`, not a
+That means a friring session **other than a fixer** (not `shepherd`, not a
 `task-*` / `… · #<id>` worker) is already on that request's head branch — the
 user, or another agent, is working it by hand. **This is a worker, not a
 blocker.** Don't dispatch your own fixer (you'd duplicate the work and race
@@ -89,11 +89,11 @@ advancing, the user is on it). You're sequencing merges, not standing down.
 **Proactively ask the live session to do the work.** When such a request is
 actionable — most often `REBASE` (behind its base) but also `CI-FAIL` /
 `CHANGES-REQ` — don't just wait on it: send that session a message over the
-thurbox inter-session message queue asking for the specific next step, since it
+friring inter-session message queue asking for the specific next step, since it
 holds the slot the other same-repo requests are queued behind:
 
 ```bash
-thurbox-cli message send --to <session-id> --kind shepherd \
+friring-cli message send --to <session-id> --kind shepherd \
   --body "ci-shepherd: PR #<n> in <repo> is behind <base> — please rebase onto <base> and force-push so it can merge (the other rebases in this repo are queued behind it)."
 ```
 
@@ -106,7 +106,7 @@ against re-messaging: peek the session's unread inbox first and skip if a
 shepherd nudge for this request is already pending —
 
 ```bash
-thurbox-cli message inbox --for <session-id> --limit 20 \
+friring-cli message inbox --for <session-id> --limit 20 \
   | grep -q "PR #<n>" && echo "already nudged" || <send the message>
 ```
 
@@ -201,11 +201,11 @@ The forge's own value is kept only as a fallback for heads that aren't on
    - Worker marked the task `done` → note it; the request re-checks next tick
      (CLEAN removes the worktree once it's no longer actionable).
    - Worker session missing from the session list → stale: reset the task to
-     todo (`thurbox-cli task edit <id> --status todo`).
+     todo (`friring-cli task edit <id> --status todo`).
    - Otherwise capture recent output and parse the worker's sentinel:
 
      ```bash
-     thurbox-cli session capture <uuid> --lines 40 --json | jq -r .output \
+     friring-cli session capture <uuid> --lines 40 --json | jq -r .output \
        | ./scripts/parse-result.sh
      ```
 
@@ -247,13 +247,13 @@ One screen max:
 ## CLEAN
 
 - Fixer task `done` AND its request is merged/closed or no longer actionable →
-  `thurbox-cli task remove <id>`, then remove its worktree:
+  `friring-cli task remove <id>`, then remove its worktree:
   `git -C <repo> worktree remove --force <worktree-path>` (the snapshot prints
   the path). Never remove a worktree with uncommitted work — if `git -C <wt>
   status --porcelain` is non-empty, leave it and flag under "Needs you".
 - Fixer `in_progress` with no session → reset to todo.
 - Orphan `task-*` sessions whose task is removed →
-  `thurbox-cli session delete <uuid> --force`.
+  `friring-cli session delete <uuid> --force`.
 
 ## ASK (anything else)
 

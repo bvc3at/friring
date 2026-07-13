@@ -1,2 +1,2 @@
 [build.env]
-passthrough = ["THURBOX_RELEASE_VERSION"]
+passthrough = ["FRIRING_RELEASE_VERSION"]

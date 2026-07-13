@@ -23,13 +23,13 @@ pub fn render_header(frame: &mut Frame, area: Rect, badge: Option<HeaderBadge<'_
         return;
     }
     let mut spans = vec![
-        Span::styled(" thurbox", brand_style()),
+        Span::styled(" friring", brand_style()),
         Span::styled(
             "  Multi-Session Agent Orchestrator",
             Style::default().fg(Theme::text_secondary()),
         ),
         Span::styled(
-            concat!("  v", env!("THURBOX_VERSION")),
+            concat!("  v", env!("FRIRING_VERSION")),
             Style::default().fg(Theme::text_muted()),
         ),
     ];

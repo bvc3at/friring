@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# upsert.sh — reconcile a normalized issue list into the thurbox task list.
+# upsert.sh — reconcile a normalized issue list into the friring task list.
 #
 # Reads a JSON array on stdin (the output of fetch.sh):
 #   [{ "external_id": "..", "title": "..", "status": "todo|in_progress|done",
@@ -10,7 +10,7 @@
 #
 # Status rule (pull direction): the tracker is authoritative for the title, url,
 # and the **open-vs-done** axis. The finer todo↔in_progress split is preserved
-# locally — when both sides are "open" the thurbox status is left untouched, so a
+# locally — when both sides are "open" the friring status is left untouched, so a
 # user marking a synced task `in_progress` is never clobbered back to `todo` on
 # the next pull. Run push-status.sh BEFORE this (push-then-pull) so any local
 # done/reopen intent is already reflected on the tracker.
@@ -28,13 +28,13 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$SOURCE" ] || { echo "usage: upsert.sh --source <tag>" >&2; exit 2; }
 
-command -v thurbox-cli >/dev/null 2>&1 || { echo "thurbox-cli not found" >&2; exit 3; }
+command -v friring-cli >/dev/null 2>&1 || { echo "friring-cli not found" >&2; exit 3; }
 command -v jq >/dev/null 2>&1 || { echo "jq not found" >&2; exit 3; }
 
 incoming="$(cat)"; [ -n "$incoming" ] || incoming='[]'
 
 # Snapshot existing tasks for this source once (so we don't re-list per item).
-existing="$(thurbox-cli task list --json 2>/dev/null \
+existing="$(friring-cli task list --json 2>/dev/null \
   | jq --arg s "$SOURCE" '[ .[] | select(.source == $s) ]')"
 [ -n "$existing" ] || existing='[]'
 
@@ -54,11 +54,11 @@ while IFS= read -r item; do
   if [ -z "$match" ]; then
     # New issue → create. Description is optional (omit the flag when blank).
     if [ -n "$desc" ]; then
-      thurbox-cli task create --title "$title" --status "$status" \
+      friring-cli task create --title "$title" --status "$status" \
         --source "$SOURCE" --external-id "$eid" --external-url "$url" \
         --description "$desc" >/dev/null
     else
-      thurbox-cli task create --title "$title" --status "$status" \
+      friring-cli task create --title "$title" --status "$status" \
         --source "$SOURCE" --external-id "$eid" --external-url "$url" >/dev/null
     fi
     created=$((created + 1))
@@ -80,7 +80,7 @@ while IFS= read -r item; do
 
   if [ "$cur_title" != "$title" ] || [ "$cur_status" != "$new_status" ] \
      || [ "$cur_url" != "$url" ]; then
-    thurbox-cli task edit "$id" --title "$title" --status "$new_status" \
+    friring-cli task edit "$id" --title "$title" --status "$new_status" \
       --external-url "$url" >/dev/null
     updated=$((updated + 1))
   else

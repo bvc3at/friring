@@ -10,10 +10,10 @@ use crossterm::event::{
 };
 use crossterm::execute;
 
-use thurbox::agent::tmux::{LocalTmuxBackend, TmuxBackend};
-use thurbox::agent::{BackendRegistry, SessionBackend};
-use thurbox::app::{App, AppMessage};
-use thurbox::storage::Database;
+use friring::agent::tmux::{LocalTmuxBackend, TmuxBackend};
+use friring::agent::{BackendRegistry, SessionBackend};
+use friring::app::{App, AppMessage};
+use friring::storage::Database;
 
 /// Whether we pushed kitty keyboard-protocol flags onto the terminal. The
 /// panic hook is installed before the push happens, so it reads this to know
@@ -24,34 +24,35 @@ static KEYBOARD_ENHANCEMENT_PUSHED: AtomicBool = AtomicBool::new(false);
 ///
 /// - DISAMBIGUATE_ESCAPE_CODES — Cmd/Super-modified keys are reported at all
 ///   (otherwise the terminal never delivers them).
-/// - REPORT_EVENT_TYPES + REPORT_ALL_KEYS_AS_ESCAPE_CODES — press/release
-///   events *including the modifier keys themselves*, which is what lets the
-///   app track "Alt is held" and paint the session-jump numbers
-///   (`App::set_alt_held`). Auto-repeat now arrives as `Repeat` instead of
-///   repeated `Press`, so `key_to_message` dispatches both kinds.
-/// - REPORT_ALTERNATE_KEYS — with ALL_KEYS reporting, a shifted key carries
-///   its shifted codepoint (`Shift+a` → `A`), keeping text input in modals
-///   and the PTY forwarding identical to the legacy encoding.
+/// - REPORT_ALL_KEYS_AS_ESCAPE_CODES — bare modifier presses arrive as
+///   `KeyCode::Modifier` events. The double-`Shift` search opener
+///   (`App::handle_modifier_press`) and the Alt-hold session-jump overlay
+///   (`App::set_alt_held`) both need them; every other bare modifier is
+///   swallowed.
+/// - REPORT_EVENT_TYPES — press/release/repeat kinds. Alt's press *and*
+///   release drive the jump overlay (so the numbers clear when Alt is let
+///   go), and auto-repeat now arrives as `Repeat`, dispatched like `Press`
+///   in `key_to_message` (matching how legacy terminals send repeated
+///   `Press`).
+/// - REPORT_ALTERNATE_KEYS — with all-keys reporting the terminal sends the
+///   *base* key (`a` + SHIFT) unless it also reports the shifted alternate;
+///   this flag keeps `Shift+a` arriving as `Char('A')` (crossterm substitutes
+///   the alternate), so text inputs and PTY forwarding see capitals unchanged.
 ///
 /// Legacy terminals (query answers no) keep the old behavior: no flags, no
-/// Release/Repeat events, no modifier-key events — the Alt-hold overlay just
-/// never shows, while `Alt+<digit>` chords still arrive as `ESC <digit>` and
-/// keep working blind. The support query needs raw mode, so call this only
-/// after `ratatui::init()`.
+/// modifier or Release/Repeat events — the double-Shift opener and the
+/// Alt-hold overlay just never fire, while `Alt+<digit>` chords still arrive
+/// as `ESC <digit>` and keep working blind. The support query needs raw mode,
+/// so call this only after `ratatui::init()`.
 fn push_keyboard_enhancement() {
+    let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
     if matches!(
         crossterm::terminal::supports_keyboard_enhancement(),
         Ok(true)
-    ) && execute!(
-        std::io::stdout(),
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-        )
-    )
-    .is_ok()
+    ) && execute!(std::io::stdout(), PushKeyboardEnhancementFlags(flags)).is_ok()
     {
         KEYBOARD_ENHANCEMENT_PUSHED.store(true, Ordering::SeqCst);
     }
@@ -102,7 +103,7 @@ impl Drop for TerminalGuard {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Process start, for the opt-in time-to-first-frame measurement (logged
-    // once by `run_loop` when `THURBOX_PERF_LOG` is set). Captured first so it
+    // once by `run_loop` when `FRIRING_PERF_LOG` is set). Captured first so it
     // covers config load, DB open, and session restore.
     let process_start = std::time::Instant::now();
 
@@ -114,13 +115,13 @@ async fn main() -> Result<()> {
     }));
 
     // File-based logging (stdout is owned by the TUI)
-    let log_dir = thurbox::paths::log_directory().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let log_dir = friring::paths::log_directory().unwrap_or_else(|| std::path::PathBuf::from("."));
     std::fs::create_dir_all(&log_dir).ok();
-    let file_appender = tracing_appender::rolling::daily(log_dir, "thurbox.log");
+    let file_appender = tracing_appender::rolling::daily(log_dir, "friring.log");
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("thurbox=debug".parse().unwrap()),
+                .add_directive("friring=debug".parse().unwrap()),
         )
         .with_writer(file_appender)
         .with_ansi(false)
@@ -128,7 +129,7 @@ async fn main() -> Result<()> {
 
     // Coarse, always-cheap startup phase marks (a handful of one-shot
     // `Instant::now()` calls, never in a loop). The breakdown is only *emitted*
-    // when THURBOX_PERF_LOG is set; capturing it unconditionally keeps the code
+    // when FRIRING_PERF_LOG is set; capturing it unconditionally keeps the code
     // simple at no measurable cost. See docs/PERFORMANCE.md (ADR-P5).
     let mut startup = StartupTimings::default();
 
@@ -154,8 +155,8 @@ async fn main() -> Result<()> {
     // session restore below (so healed sessions are adopted like any other) and
     // before the TUI takes over the terminal (so tmux spawn output can't corrupt
     // it). Deleting an active extension's resources is therefore a no-op — they
-    // come back; `thurbox-cli extension deactivate <name>` is the real off-switch.
-    let heal_messages = thurbox::session_ops::heal_active_extensions(&db);
+    // come back; `friring-cli extension deactivate <name>` is the real off-switch.
+    let heal_messages = friring::session_ops::heal_active_extensions(&db);
     for m in &heal_messages {
         tracing::info!("{m}");
     }
@@ -164,8 +165,8 @@ async fn main() -> Result<()> {
     // Auto-activate the built-in `hooks` extension so the default agent reports
     // its lifecycle state out of the box (working/blocked/done). Idempotent;
     // re-applies the agent hook wiring on every launch. Opt out with
-    // `thurbox-cli extension deactivate hooks`.
-    let hook_messages = thurbox::session_ops::ensure_builtin_hooks_extension(&db);
+    // `friring-cli extension deactivate hooks`.
+    let hook_messages = friring::session_ops::ensure_builtin_hooks_extension(&db);
     for m in &hook_messages {
         tracing::info!("{m}");
     }
@@ -179,7 +180,7 @@ async fn main() -> Result<()> {
     // in-memory copy App spawns from reflects that on the *first* run too
     // (otherwise a freshly-seeded profile would spawn agents without their hooks
     // and statuses would be stuck until the next launch).
-    let agents = thurbox::agent::agent_config::load_or_seed();
+    let agents = friring::agent::agent_config::load_or_seed();
     startup.extension_heal_ms = t_phase.elapsed().as_millis();
 
     // Silent auto-update (opt-in via [features] auto_update). Kicked off on a
@@ -221,7 +222,7 @@ async fn main() -> Result<()> {
     startup.heartbeat_ms = t_phase.elapsed().as_millis();
 
     // Hand the phase breakdown to the app so the published perf snapshot
-    // (`thurbox-cli perf`) can show boot cost alongside the runtime stats.
+    // (`friring-cli perf`) can show boot cost alongside the runtime stats.
     app.set_startup_phases(startup.as_json());
 
     let res = run_loop(&mut terminal, &mut app, process_start, startup).await;
@@ -230,7 +231,7 @@ async fn main() -> Result<()> {
     // `shutdown()` detaches tmux/SSH sessions, and while it runs the event loop
     // is no longer draining stdin. With mouse capture still on, any mouse motion
     // in that window queues SGR reports (`ESC[<b;x;yM`) in the tty buffer that
-    // the shell then echoes as `51;82;30M`-style garbage once thurbox exits.
+    // the shell then echoes as `51;82;30M`-style garbage once friring exits.
     // `restore_terminal` is idempotent, so the `_terminal_guard` drop below (and
     // early-error returns) still restore correctly.
     restore_terminal();
@@ -245,8 +246,8 @@ async fn main() -> Result<()> {
 #[allow(clippy::type_complexity)]
 fn init_backends_and_config() -> Result<(
     BackendRegistry,
-    thurbox::session::AgentRegistry,
-    thurbox::session::HostRegistry,
+    friring::session::AgentRegistry,
+    friring::session::HostRegistry,
     Vec<String>,
 )> {
     let local_tmux: Arc<dyn SessionBackend> = Arc::new(LocalTmuxBackend::new());
@@ -258,31 +259,31 @@ fn init_backends_and_config() -> Result<(
     // anything reads them (Database::open prunes the audit log; layout and
     // terminal wiring read breakpoints/scrollback).
     let (settings, mut config_warnings) =
-        thurbox::agent::settings_config::load_or_seed_with_warnings();
-    thurbox::session::settings::init(settings);
+        friring::agent::settings_config::load_or_seed_with_warnings();
+    friring::session::settings::init(settings);
 
     // Register one backend per off-local host: each configured SSH host in
-    // ~/.config/thurbox/hosts.toml, plus every auto-discovered local WSL distro
+    // ~/.config/friring/hosts.toml, plus every auto-discovered local WSL distro
     // (`wsl.exe -l -q`, Windows only). These are registered lazily: a down or
     // slow host must not block TUI startup, so check_available()/ensure_ready()
     // are deferred to first spawn/restore (see App::backend_for).
-    let (hosts, host_warnings) = thurbox::agent::host_config::load_all_with_warnings();
+    let (hosts, host_warnings) = friring::agent::host_config::load_all_with_warnings();
     config_warnings.extend(host_warnings);
     for host in &hosts.hosts {
         tracing::debug!(host = %host.name, backend = %host.backend_name(), "Registering backend");
         backends.register(Arc::new(TmuxBackend::from_host(host)));
     }
 
-    // Load (or seed) the coding-agent registry from ~/.config/thurbox/agents.toml.
-    let (agents, agent_warnings) = thurbox::agent::agent_config::load_or_seed_with_warnings();
+    // Load (or seed) the coding-agent registry from ~/.config/friring/agents.toml.
+    let (agents, agent_warnings) = friring::agent::agent_config::load_or_seed_with_warnings();
     config_warnings.extend(agent_warnings);
 
     // Load (or seed) custom themes and publish them so the picker and the
     // persisted-theme lookup below can resolve them by name.
     let (custom_themes, theme_warnings) =
-        thurbox::agent::themes_config::load_or_seed_with_warnings();
+        friring::agent::themes_config::load_or_seed_with_warnings();
     config_warnings.extend(theme_warnings);
-    thurbox::ui::theme::set_custom_themes(custom_themes);
+    friring::ui::theme::set_custom_themes(custom_themes);
 
     for w in &config_warnings {
         tracing::warn!("{w}");
@@ -294,7 +295,7 @@ fn init_backends_and_config() -> Result<(
 /// Open the SQLite database for persistent state, falling back to the default
 /// XDG location (dev vs. prod build) when the path can't be resolved.
 fn open_database() -> Result<Database> {
-    let db_path = thurbox::paths::database_file().unwrap_or_else(fallback_database_path);
+    let db_path = friring::paths::database_file().unwrap_or_else(fallback_database_path);
     Database::open(&db_path)
         .with_context(|| format!("failed to open database at {}", db_path.display()))
 }
@@ -308,9 +309,9 @@ fn open_database() -> Result<Database> {
 /// `$HOME/.local/share` on Unix).
 fn fallback_database_path() -> std::path::PathBuf {
     let app = if cfg!(dev_build) {
-        "thurbox-dev"
+        "friring-dev"
     } else {
-        "thurbox"
+        "friring"
     };
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
@@ -325,22 +326,22 @@ fn fallback_database_path() -> std::path::PathBuf {
             }
             #[cfg(not(windows))]
             {
-                let mut p = thurbox::paths::home_dir().unwrap_or_default();
+                let mut p = friring::paths::home_dir().unwrap_or_default();
                 p.push(".local");
                 p.push("share");
                 p
             }
         });
-    base.join(app).join("thurbox.db")
+    base.join(app).join("friring.db")
 }
 
 /// Activate the persisted theme — built-in or custom — falling back to the
 /// default when unset or unknown.
 fn activate_persisted_theme(db: &Database) {
     if let Ok(Some(name)) = db.get_active_theme() {
-        thurbox::ui::theme::apply_theme_by_name(&name);
+        friring::ui::theme::apply_theme_by_name(&name);
     } else {
-        thurbox::ui::theme::ensure_initialized();
+        friring::ui::theme::ensure_initialized();
     }
 }
 
@@ -348,7 +349,7 @@ fn activate_persisted_theme(db: &Database) {
 /// the terminal. Without mouse capture the terminal keeps its native mouse
 /// behavior and no mouse events ever reach the app.
 fn enable_terminal_features() -> Result<()> {
-    if thurbox::session::settings::global().features.mouse {
+    if friring::session::settings::global().features.mouse {
         execute!(std::io::stdout(), EnableMouseCapture)?;
     }
     execute!(std::io::stdout(), EnableBracketedPaste)?;
@@ -357,12 +358,12 @@ fn enable_terminal_features() -> Result<()> {
 
 /// Arm the tmux heartbeat keeper so automations keep firing after the TUI is
 /// closed (best-effort: a missing/old tmux just means TUI-only firing). Skipped
-/// when the `automations` feature flag is off — `thurbox-cli automation create`
+/// when the `automations` feature flag is off — `friring-cli automation create`
 /// still arms it, since that's explicit user intent.
 fn arm_automation_heartbeat() {
-    if thurbox::session::settings::global().features.automations {
-        let cli = thurbox::agent::tmux::resolve_cli_binary();
-        if let Err(e) = thurbox::agent::tmux::ensure_automation_heartbeat(&cli) {
+    if friring::session::settings::global().features.automations {
+        let cli = friring::agent::tmux::resolve_cli_binary();
+        if let Err(e) = friring::agent::tmux::ensure_automation_heartbeat(&cli) {
             tracing::warn!("Failed to arm automation heartbeat: {e}");
         }
     }
@@ -388,11 +389,11 @@ fn arm_automation_heartbeat() {
 /// feature is opted into); `perform_update(false)` short-circuits to `UpToDate`
 /// after that single fetch when already current.
 fn spawn_auto_update() -> Option<std::sync::mpsc::Receiver<String>> {
-    let features = &thurbox::session::settings::global().features;
+    let features = &friring::session::settings::global().features;
     if !features.auto_update {
         return None;
     }
-    if thurbox::agent::extension_config::is_dev_build() {
+    if friring::agent::extension_config::is_dev_build() {
         return None;
     }
     let (tx, rx) = std::sync::mpsc::channel();
@@ -406,13 +407,13 @@ fn spawn_auto_update() -> Option<std::sync::mpsc::Receiver<String>> {
 /// and swallowed. A send error means the TUI already exited, so there is nothing
 /// to surface; it is ignored.
 fn run_auto_update(tx: &std::sync::mpsc::Sender<String>) {
-    match thurbox::agent::self_update::perform_update(false) {
+    match friring::agent::self_update::perform_update(false) {
         Ok(outcome) => {
             // The update ran, so freshen the version-check cache too — the badge
             // stays accurate and reflects the newest release on the next launch.
-            let _ = thurbox::agent::version_check::refresh_cache();
-            if let thurbox::agent::self_update::UpdateOutcome::Updated { to, .. } = outcome {
-                let msg = format!("Updated to v{to} — restart thurbox to apply.");
+            let _ = friring::agent::version_check::refresh_cache();
+            if let friring::agent::self_update::UpdateOutcome::Updated { to, .. } = outcome {
+                let msg = format!("Updated to v{to} — restart friring to apply.");
                 tracing::info!("{msg}");
                 let _ = tx.send(msg);
             }
@@ -422,7 +423,7 @@ fn run_auto_update(tx: &std::sync::mpsc::Sender<String>) {
 }
 
 /// Coarse one-shot startup phase durations (milliseconds), captured in `main`
-/// and logged once after the first paint when `THURBOX_PERF_LOG` is set. The
+/// and logged once after the first paint when `FRIRING_PERF_LOG` is set. The
 /// phases sum to roughly `first_frame_ms`, so a slow boot can be attributed to
 /// config/backend init, DB open, extension heal, or session restore rather than
 /// guessed at. See docs/PERFORMANCE.md (ADR-P5).
@@ -467,11 +468,11 @@ async fn run_loop(
     process_start: std::time::Instant,
     startup: StartupTimings,
 ) -> Result<()> {
-    // Opt-in (THURBOX_PERF_LOG) time-to-first-frame measurement: logged once,
+    // Opt-in (FRIRING_PERF_LOG) time-to-first-frame measurement: logged once,
     // right after the first paint, so it never affects normal runs or the smoke
-    // test. Read `~/.local/share/thurbox/thurbox.log` for the `startup` line
+    // test. Read `~/.local/share/friring/friring.log` for the `startup` line
     // (phase breakdown + `first_frame_ms`). See docs/PERFORMANCE.md.
-    let perf_log = std::env::var_os("THURBOX_PERF_LOG").is_some();
+    let perf_log = std::env::var_os("FRIRING_PERF_LOG").is_some();
     let mut first_frame_logged = false;
 
     loop {
@@ -479,7 +480,7 @@ async fn run_loop(
         // or the forced-redraw floor elapsed. The loop still spins every ≤10ms
         // (cheap: poll + output check + tick), but the expensive layout/vt100
         // render is skipped when idle — see App::should_redraw / docs/PERFORMANCE.md.
-        // Wall-clock timing is opt-in (THURBOX_PERF_LOG or the perf HUD): the
+        // Wall-clock timing is opt-in (FRIRING_PERF_LOG or the perf HUD): the
         // cached-bool gate keeps the default hot loop free of Instant reads.
         let timing = app.perf_timing_active();
 
@@ -549,18 +550,24 @@ fn event_to_message(event: Event) -> Option<AppMessage> {
 }
 
 /// Translate a key event. Modifier keys arrive as their own events under the
-/// kitty protocol (REPORT_ALL_KEYS_AS_ESCAPE_CODES): Alt's press/release
-/// drives the session-jump overlay, every other bare modifier is dropped —
-/// they must never reach `handle_key` (or worse, the PTY). For regular keys,
-/// `Repeat` dispatches like `Press` (that's how auto-repeat arrives with
-/// REPORT_EVENT_TYPES; legacy terminals send repeated `Press` instead) and
-/// `Release` is dropped.
+/// kitty protocol (REPORT_ALL_KEYS_AS_ESCAPE_CODES):
+/// - Alt's press/release becomes [`AppMessage::AltHeld`], driving the
+///   session-jump overlay.
+/// - Any other bare modifier *press* is forwarded as a `KeyPress` so
+///   `handle_key` can run the double-`Shift` search opener; its release/repeat
+///   is dropped so a tap counts exactly once (and neither ever reaches a text
+///   input or the PTY — `handle_key` consumes `Modifier` codes).
+///
+/// For regular keys, `Repeat` dispatches like `Press` (that's how auto-repeat
+/// arrives with REPORT_EVENT_TYPES; legacy terminals send repeated `Press`)
+/// and `Release` is dropped.
 fn key_to_message(k: event::KeyEvent) -> Option<AppMessage> {
     if let KeyCode::Modifier(m) = k.code {
         if matches!(m, ModifierKeyCode::LeftAlt | ModifierKeyCode::RightAlt) {
             return Some(AppMessage::AltHeld(k.kind != KeyEventKind::Release));
         }
-        return None;
+        return (k.kind == KeyEventKind::Press)
+            .then_some(AppMessage::KeyPress(k.code, k.modifiers));
     }
     matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
         .then_some(AppMessage::KeyPress(k.code, k.modifiers))
@@ -611,9 +618,11 @@ mod tests {
     }
 
     /// Alt's own press/release events (kitty ALL_KEYS reporting) drive the
-    /// jump overlay; other bare modifiers are dropped entirely.
+    /// jump overlay; a non-Alt modifier *press* is forwarded to `handle_key`
+    /// (the double-`Shift` opener), and its release is dropped so a tap counts
+    /// once.
     #[test]
-    fn modifier_key_events_map_to_alt_held() {
+    fn modifier_key_events_route_alt_and_shift() {
         let alt = KeyCode::Modifier(ModifierKeyCode::LeftAlt);
         assert!(matches!(
             event_to_message(key(alt, KeyEventKind::Press)),
@@ -623,8 +632,12 @@ mod tests {
             event_to_message(key(alt, KeyEventKind::Release)),
             Some(AppMessage::AltHeld(false))
         ));
-        let ctrl = KeyCode::Modifier(ModifierKeyCode::LeftControl);
-        assert!(event_to_message(key(ctrl, KeyEventKind::Press)).is_none());
+        let shift = KeyCode::Modifier(ModifierKeyCode::LeftShift);
+        assert!(matches!(
+            event_to_message(key(shift, KeyEventKind::Press)),
+            Some(AppMessage::KeyPress(KeyCode::Modifier(_), _))
+        ));
+        assert!(event_to_message(key(shift, KeyEventKind::Release)).is_none());
     }
 
     /// With REPORT_EVENT_TYPES, terminal auto-repeat arrives as `Repeat` —

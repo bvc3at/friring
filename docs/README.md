@@ -25,7 +25,7 @@ topic docs read on demand:
 | [CONFIG.md](CONFIG.md) | Every config file / env var / DB setting | Adding/changing a config file, env var, or DB setting |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Build, test, sandbox, e2e harnesses, demos | Changing the dev/test workflow or tooling |
 | [PERFORMANCE.md](PERFORMANCE.md) | Render/tick performance + how to measure | Touching the render loop or a perf optimization |
-| [CLI.md](CLI.md) | The headless `thurbox-cli` surface | Adding/changing a CLI subcommand or flag |
+| [CLI.md](CLI.md) | The headless `friring-cli` surface | Adding/changing a CLI subcommand or flag |
 | [RELEASING.md](RELEASING.md) | Release automation, versioning, installers, packaging | Changing the release/packaging pipeline |
 
 ## Keeping docs current

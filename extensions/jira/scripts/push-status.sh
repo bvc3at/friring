@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# push-status.sh — push thurbox task status back to Jira (the bidirectional
-# half). For every thurbox task with source=jira, reconcile the Jira issue's
+# push-status.sh — push friring task status back to Jira (the bidirectional
+# half). For every friring task with source=jira, reconcile the Jira issue's
 # open/closed state with the task:
 #   task done              -> issue moved to a Done-category status
 #   task todo|in_progress  -> issue moved to a non-Done status (reopened)
@@ -119,7 +119,7 @@ while IFS= read -r task; do
     echo "  ! $key: transition POST failed — skipped"
     skipped=$((skipped+1))
   fi
-done < <(thurbox-cli task list --json 2>/dev/null \
+done < <(friring-cli task list --json 2>/dev/null \
           | jq -c --arg s "$SOURCE" '.[] | select(.source == $s)')
 
 echo "push-status[$SOURCE]: pushed=$pushed skipped=$skipped"

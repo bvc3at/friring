@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install all required development tools for thurbox.
+# Install all required development tools for friring.
 #
 # This is the NON-NIX fallback. The recommended path is the Nix flake, which
 # pins the whole toolchain reproducibly:
@@ -12,7 +12,7 @@
 
 set -e
 
-echo "Installing thurbox development tools..."
+echo "Installing friring development tools..."
 echo ""
 
 # Check if cargo-binstall is available (faster installation)

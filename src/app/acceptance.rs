@@ -1,4 +1,4 @@
-//! In-process acceptance ("end-to-end") tests for the thurbox TUI.
+//! In-process acceptance ("end-to-end") tests for the friring TUI.
 //!
 //! Where the focused unit tests in [`super::tests`] poke individual methods,
 //! these drive a *real* [`App`] the way `main.rs`'s loop does — feeding
@@ -12,7 +12,7 @@
 //! * the database is `Database::open_in_memory()`,
 //! * every config/data path is redirected to a throwaway tempdir via
 //!   [`crate::paths::TestPathGuard`], so the suite never touches the
-//!   developer's real `~/.config/thurbox`,
+//!   developer's real `~/.config/friring`,
 //! * agent output is injected per session with [`Harness::feed_output`]
 //!   (through the same vt100 parser + `TermSignals` path the PTY reader uses),
 //! * wall-clock-gated behavior (timeouts, debounces, the redraw floor) is
@@ -68,7 +68,7 @@ fn init_git_repo(dir: &Path, dirty: bool) {
     };
     git(&["init", "-q"]);
     git(&["config", "user.email", "t@example.com"]);
-    git(&["config", "user.name", "thurbox-test"]);
+    git(&["config", "user.name", "friring-test"]);
     std::fs::write(dir.join("f.txt"), "hello\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-qm", "init"]);
@@ -287,7 +287,7 @@ impl Harness {
         self
     }
 
-    /// A `Ctrl+<c>` chord (the form most global thurbox bindings take).
+    /// A `Ctrl+<c>` chord (the form most global friring bindings take).
     fn ctrl(&mut self, c: char) -> &mut Self {
         self.key(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
@@ -302,6 +302,15 @@ impl Harness {
     /// encoding, so the uppercase-char + SHIFT form resolves the same binding.
     fn shift(&mut self, c: char) -> &mut Self {
         self.key(KeyCode::Char(c.to_ascii_uppercase()), KeyModifiers::SHIFT)
+    }
+
+    /// A bare `Shift` press, as kitty-protocol terminals report it — one tap
+    /// of the double-`Shift` search gesture.
+    fn shift_tap(&mut self) -> &mut Self {
+        self.key(
+            KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftShift),
+            KeyModifiers::SHIFT,
+        )
     }
 
     /// Draw the current state to the headless backend and return the visible
@@ -491,21 +500,100 @@ fn f5_toggles_tasks_panel_like_ctrl_w() {
 }
 
 #[test]
-fn ctrl_slash_opens_global_search_strip() {
+fn ctrl_slash_opens_global_search_popup() {
     let mut h = Harness::standard(2);
     assert!(!h.app.global_search.active);
 
     h.ctrl('/'); // GlobalSearch
-    assert!(h.app.global_search.active, "Ctrl+/ opens the search strip");
+    assert!(h.app.global_search.active, "Ctrl+/ opens the search popup");
 
-    // The strip captures typing before global keybindings, so a plain letter
+    // The popup captures typing before global keybindings, so a plain letter
     // edits the query rather than triggering a binding.
     h.key(KeyCode::Char('s'), KeyModifiers::NONE);
     assert_eq!(h.app.global_search.query.value(), "s");
 
     // Esc restores the prior state.
     h.key(KeyCode::Esc, KeyModifiers::NONE);
-    assert!(!h.app.global_search.active, "Esc closes the search strip");
+    assert!(!h.app.global_search.active, "Esc closes the search popup");
+}
+
+#[test]
+fn double_shift_opens_global_search() {
+    let mut h = Harness::standard(1);
+
+    h.shift_tap();
+    assert!(
+        !h.app.global_search.active,
+        "a single Shift tap only arms the gesture"
+    );
+    h.shift_tap();
+    assert!(
+        h.app.global_search.active,
+        "the second tap within the window opens the search"
+    );
+}
+
+#[test]
+fn double_shift_times_out_and_rearms() {
+    let mut h = Harness::standard(1);
+
+    h.shift_tap();
+    h.advance(std::time::Duration::from_millis(
+        key_handlers::DOUBLE_SHIFT_WINDOW_MS + 10,
+    ));
+    h.shift_tap();
+    assert!(
+        !h.app.global_search.active,
+        "a tap after the window expired must not trigger — it re-arms instead"
+    );
+    h.shift_tap();
+    assert!(h.app.global_search.active, "…so the next quick tap opens");
+}
+
+#[test]
+fn double_shift_is_broken_by_an_intervening_key() {
+    let mut h = Harness::standard(1);
+
+    // Shift → letter → Shift is ordinary typing (e.g. a capital, a pause,
+    // another capital) — never a gesture.
+    h.shift_tap();
+    h.key(KeyCode::Char('j'), KeyModifiers::NONE);
+    h.shift_tap();
+    assert!(!h.app.global_search.active);
+}
+
+#[test]
+fn double_shift_ignored_while_search_or_modal_owns_input() {
+    let mut h = Harness::standard(1);
+
+    // While the popup is open, Shift presses are just capitals being typed.
+    h.ctrl('/');
+    h.shift_tap().shift_tap();
+    assert!(h.app.global_search.active, "popup stays open");
+    assert_eq!(
+        h.app.global_search.query.value(),
+        "",
+        "bare modifier presses never reach the query"
+    );
+
+    // While a modal captures input, the gesture must not fire underneath it.
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    h.ctrl(','); // OpenSettings
+    h.shift_tap().shift_tap();
+    assert!(!h.app.global_search.active);
+    assert!(h.app.modal.is_open(), "the modal is untouched");
+}
+
+#[test]
+fn double_shift_respects_the_feature_flag() {
+    let mut h = Harness::standard(1);
+    h.app.features.double_shift_search = false;
+
+    h.shift_tap().shift_tap();
+    assert!(!h.app.global_search.active, "flag off ⇒ gesture inert");
+
+    h.ctrl('/');
+    assert!(h.app.global_search.active, "the chord keeps working");
 }
 
 #[test]
@@ -1030,14 +1118,24 @@ fn cc_activity_view_opens_navigates_folds_and_closes() {
     let mut h = Harness::spawnable(1);
     h.app.sessions[0].info.cc_activity = Some(activity);
 
-    // F9 opens the view, focused on the tree (workflow header + 2 agents + 1
-    // standalone subagent = 4 rows).
+    // F9 opens the view, focused on the navigator: 6 section rows, then the
+    // agents subtree (workflow header + 2 agents + 1 standalone subagent).
     h.key(KeyCode::F(9), KeyModifiers::NONE);
     assert_eq!(h.app.focus, InputFocus::CcActivityTree);
-    assert_eq!(h.app.active_cc_activity().unwrap().tree.len(), 4);
+    assert_eq!(h.app.active_cc_activity().unwrap().tree.len(), 10);
+    // The Overview section auto-previews on open.
+    assert_eq!(
+        h.app.active_cc_activity().unwrap().open,
+        Some(super::cc_activity::CcNodeRef::Section(
+            super::activity::Section::Overview
+        ))
+    );
 
-    // Moving to the first workflow agent auto-previews its transcript; `Enter`
+    // `6` jumps to the Agents section; the next two rows are the workflow
+    // header and its first agent, whose transcript auto-previews; `Enter`
     // drops into it to read (prompt + assistant text = 2 rows).
+    h.key(KeyCode::Char('6'), KeyModifiers::NONE);
+    h.key(KeyCode::Char('j'), KeyModifiers::NONE);
     h.key(KeyCode::Char('j'), KeyModifiers::NONE);
     h.key(KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(h.app.focus, InputFocus::CcActivity);
@@ -1081,21 +1179,139 @@ fn cc_activity_view_opens_navigates_folds_and_closes() {
         "clearing the search keeps the view open"
     );
 
-    // `h` steps back to the tree; folding the workflow hides its agents.
+    // `h` steps back to the navigator; folding the workflow hides its agents.
     h.key(KeyCode::Char('h'), KeyModifiers::NONE);
     assert_eq!(h.app.focus, InputFocus::CcActivityTree);
-    h.key(KeyCode::Home, KeyModifiers::NONE); // back onto the workflow header
+    h.key(KeyCode::Char('6'), KeyModifiers::NONE);
+    h.key(KeyCode::Char('j'), KeyModifiers::NONE); // onto the workflow header
     h.key(KeyCode::Char(' '), KeyModifiers::NONE);
     assert_eq!(
         h.app.active_cc_activity().unwrap().tree.len(),
-        2,
-        "a folded workflow hides its 2 agents (header + the standalone subagent remain)"
+        8,
+        "a folded workflow hides its 2 agents (sections + header + standalone remain)"
     );
+    // Space on the Agents section folds the whole subtree to sections only.
+    h.key(KeyCode::Char('6'), KeyModifiers::NONE);
+    h.key(KeyCode::Char(' '), KeyModifiers::NONE);
+    assert_eq!(h.app.active_cc_activity().unwrap().tree.len(), 6);
 
     // Esc closes and returns focus to the terminal.
     h.key(KeyCode::Esc, KeyModifiers::NONE);
     assert!(h.app.active_cc_activity().is_none());
     assert_eq!(h.app.focus, InputFocus::Terminal);
+}
+
+#[test]
+fn activity_sections_render_seeded_events() {
+    use super::activity::{ProviderKind, Section, SessionActivity};
+    use crate::session::activity::{ActionKind, ActivityEvent};
+
+    let ev = |kind, detail: &str, ok| ActivityEvent {
+        ts_ms: Some(1_783_512_000_000),
+        kind,
+        detail: detail.into(),
+        note: None,
+        result_head: Some("output head".into()),
+        ok,
+        origin: None,
+    };
+    let mut h = Harness::spawnable(1);
+    let sid = h.app.sessions[0].info.id;
+    h.app.activity.insert(
+        sid,
+        SessionActivity::seeded(
+            ProviderKind::Claude,
+            vec![
+                ev(ActionKind::Command, "cargo test", Some(true)),
+                ev(ActionKind::Command, "cargo bench", Some(false)),
+                ev(ActionKind::Edit, "/repo/src/a.rs", Some(true)),
+                ev(ActionKind::Read, "/repo/src/a.rs", Some(true)),
+                ev(ActionKind::WebSearch, "ratatui table", Some(true)),
+            ],
+        ),
+    );
+
+    // F9 opens on Overview; counts land in the navigator state.
+    h.key(KeyCode::F(9), KeyModifiers::NONE);
+    {
+        let ca = h.app.active_cc_activity().unwrap();
+        assert_eq!(ca.counts.commands, 2);
+        assert_eq!(ca.counts.total(), 5);
+        assert_eq!(ca.files_count, 1, "edit+read of one path aggregate");
+        assert!(ca
+            .rows
+            .iter()
+            .any(|r| matches!(r, super::cc_activity::CcRow::Text(s) if s.contains("5 actions"))));
+    }
+
+    // Timeline shows every event; Commands filters to the two commands.
+    h.key(KeyCode::Char('2'), KeyModifiers::NONE);
+    {
+        let ca = h.app.active_cc_activity().unwrap();
+        assert_eq!(
+            ca.open,
+            Some(super::cc_activity::CcNodeRef::Section(Section::Timeline))
+        );
+        assert_eq!(ca.rows.len(), 5);
+    }
+
+    // Enter expands a Timeline event. Drop focus into the content pane, then
+    // press Enter on the selected event row: for events, membership in
+    // `collapsed_tools` reads as *expanded* (see ui/cc_activity.rs), so the
+    // toggle reveals the result body.
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(h.app.focus, InputFocus::CcActivity);
+    let ev_bi = {
+        let ca = h.app.active_cc_activity().unwrap();
+        match ca.rows[ca.selected] {
+            super::cc_activity::CcRow::Block(bi) => bi,
+            _ => panic!("Timeline rows are event blocks"),
+        }
+    };
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        h.app
+            .active_cc_activity()
+            .unwrap()
+            .collapsed_tools
+            .contains(&ev_bi),
+        "Enter records the event block as expanded"
+    );
+    assert!(
+        h.render().contains("output head"),
+        "the expanded event renders its result body"
+    );
+    // Enter again collapses the event back to its compact one-line form.
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        !h.app
+            .active_cc_activity()
+            .unwrap()
+            .collapsed_tools
+            .contains(&ev_bi),
+        "Enter again collapses the event"
+    );
+
+    h.key(KeyCode::Char('3'), KeyModifiers::NONE);
+    assert_eq!(h.app.active_cc_activity().unwrap().rows.len(), 2);
+
+    // Files section groups the touched path under "Edited (1)".
+    h.key(KeyCode::Char('4'), KeyModifiers::NONE);
+    {
+        let ca = h.app.active_cc_activity().unwrap();
+        assert!(ca
+            .rows
+            .iter()
+            .any(|r| matches!(r, super::cc_activity::CcRow::Info(s) if s.contains("Edited (1)"))));
+        assert!(ca.rows.iter().any(
+            |r| matches!(r, super::cc_activity::CcRow::Text(s) if s.contains("/repo/src/a.rs"))
+        ));
+    }
+
+    // Web section holds the single search; the frame renders without panic.
+    h.key(KeyCode::Char('5'), KeyModifiers::NONE);
+    assert_eq!(h.app.active_cc_activity().unwrap().rows.len(), 1);
+    h.render();
 }
 
 #[test]
@@ -1438,9 +1654,9 @@ async fn ctrl_r_restarts_session_on_spawnable_backend() {
 }
 
 #[tokio::test]
-async fn ctrl_r_restart_preserves_thurbox_identity_env() {
+async fn ctrl_r_restart_preserves_friring_identity_env() {
     // `Session::restart` replaces the session env wholesale, so the restart path
-    // must re-inject the `THURBOX_*` identity vars — otherwise the restarted
+    // must re-inject the `FRIRING_*` identity vars — otherwise the restarted
     // agent loses its identity and the metrics/status hooks break.
     let mut h = Harness::spawnable(1);
     let session_id = h.app.sessions[0].info.id;
@@ -1454,12 +1670,12 @@ async fn ctrl_r_restart_preserves_thurbox_identity_env() {
 
     let env = h.app.sessions[0].env();
     assert_eq!(
-        env.get("THURBOX_SESSION"),
+        env.get("FRIRING_SESSION"),
         Some(&session_id.to_string()),
-        "the thurbox session key survives the restart"
+        "the friring session key survives the restart"
     );
     assert_eq!(
-        env.get("THURBOX_SESSION_ID"),
+        env.get("FRIRING_SESSION_ID"),
         Some(&agent_session_id),
         "the agent conversation id survives the restart"
     );
@@ -2396,7 +2612,7 @@ fn info_panel_toggles_while_review_is_open() {
 
 /// The backend queued a remote-hook event for a session's pane: one refresh
 /// drains it into the hook columns and the derived status reflects it — the
-/// remote analogue of a local `thurbox-cli session signal`.
+/// remote analogue of a local `friring-cli session signal`.
 #[test]
 fn remote_hook_event_drives_session_status() {
     let backend = Arc::new(FakeBackend::stub());
@@ -2620,6 +2836,85 @@ fn global_search_content_scan_waits_for_debounce() {
 }
 
 #[test]
+fn global_search_files_match_from_the_cached_index() {
+    // Files are matched against the index snapshotted at open — typing must
+    // never walk the filesystem (the old per-keystroke walk was the strip's
+    // dominant latency). Delivery through the task seam stands in for the
+    // off-thread walk, keeping the test deterministic.
+    let mut h = Harness::standard(1);
+    h.ctrl('/');
+    for c in "zanzi".chars() {
+        h.key(KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    let file_hit = |app: &App| {
+        app.global_search
+            .results
+            .iter()
+            .any(|r| r.kind == search::SearchKind::File && r.label == "zanzibar.txt")
+    };
+    assert!(
+        !file_hit(&h.app),
+        "no index delivered yet ⇒ no file results"
+    );
+
+    let tx = h.app.global_search.file_index_task.start();
+    tx.send(vec![search::FileIndexEntry {
+        root: "/repo".into(),
+        path: "/repo/zanzibar.txt".into(),
+        name: "zanzibar.txt".into(),
+        name_lc: "zanzibar.txt".into(),
+    }])
+    .unwrap();
+    h.tick();
+    assert!(
+        file_hit(&h.app),
+        "once the walk delivers, file matches fold into the open results"
+    );
+}
+
+#[test]
+fn global_search_matches_session_cwd_and_every_branch() {
+    let mut h = Harness::standard(1);
+    h.app.sessions[0].info.cwd = Some("/mnt/velociraptor-repo".into());
+    h.app.sessions[0].info.worktrees = vec![
+        crate::session::WorktreeInfo {
+            repo_path: "/r".into(),
+            worktree_path: "/w1".into(),
+            branch: "main".into(),
+        },
+        crate::session::WorktreeInfo {
+            repo_path: "/r".into(),
+            worktree_path: "/w2".into(),
+            branch: "feature/quokka-lift".into(),
+        },
+    ];
+
+    let session_hit = |h: &mut Harness, query: &str| {
+        h.ctrl('/');
+        for c in query.chars() {
+            h.key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        let hit = h
+            .app
+            .global_search
+            .results
+            .iter()
+            .any(|r| r.kind == search::SearchKind::Session);
+        h.key(KeyCode::Esc, KeyModifiers::NONE);
+        hit
+    };
+
+    assert!(
+        session_hit(&mut h, "velociraptor"),
+        "the session's cwd is indexed (FEATURES.md promises all four fields)"
+    );
+    assert!(
+        session_hit(&mut h, "quokka"),
+        "every worktree branch is indexed, not just the first"
+    );
+}
+
+#[test]
 fn forced_redraw_floor_repaints_after_interval() {
     let mut h = Harness::standard(1);
     h.app.mark_redrawn();
@@ -2639,12 +2934,13 @@ fn forced_redraw_floor_repaints_after_interval() {
 
 #[test]
 fn global_search_on_short_terminal_does_not_panic_session_resize() {
-    // The search strip + footer can eat a short terminal's entire height,
-    // producing a zero-row content area. `Session::resize` must clamp before
-    // vt100's `set_size` (which underflows on 0) — this panicked pre-clamp.
+    // Historically the bottom-strip search shrank the content area to zero
+    // rows on short terminals, and `Session::resize` had to clamp before
+    // vt100's `set_size` (which underflows on 0). The popup floats now, but
+    // this still guards opening + rendering the search on a tiny terminal.
     let mut h = Harness::new(30, 8, 1);
     h.render();
-    h.ctrl('/'); // GlobalSearch — resizes sessions to the shrunken content area
+    h.ctrl('/'); // GlobalSearch
     h.render();
     assert!(h.app.global_search.active);
 }
@@ -2907,7 +3203,7 @@ async fn monkey_random_events_uphold_invariants() {
                     let code = MONKEY_KEYS[rng.below(MONKEY_KEYS.len())];
                     h.key(code, KeyModifiers::NONE);
                 }
-                // Ctrl chords (thurbox's global namespace).
+                // Ctrl chords (friring's global namespace).
                 40..=59 => {
                     let c = MONKEY_CTRL[rng.below(MONKEY_CTRL.len())];
                     h.ctrl(c);

@@ -1,13 +1,13 @@
-//! Extension manifests — pure data describing the thurbox resources an opt-in
+//! Extension manifests — pure data describing the friring resources an opt-in
 //! extension needs to function (a dedicated session, a tick automation, …).
 //!
 //! Extensions (see `extensions/<name>/`) are agent-agnostic add-ons built on
-//! `thurbox-cli`; per ADR-20 they live as data + shell scripts, never embedded
+//! `friring-cli`; per ADR-20 they live as data + shell scripts, never embedded
 //! in the binary. An extension ships an `extension.toml` manifest; its installer
-//! copies it into the discovery dir (`~/.config/thurbox/extensions/<name>.toml`),
-//! and thurbox core reads *any* manifest without knowing the extension by name.
+//! copies it into the discovery dir (`~/.config/friring/extensions/<name>.toml`),
+//! and friring core reads *any* manifest without knowing the extension by name.
 //!
-//! The manifest is the declarative contract behind `thurbox-cli extension
+//! The manifest is the declarative contract behind `friring-cli extension
 //! activate/deactivate` and the startup/tick self-heal: it names the
 //! sessions/automations to (re)create idempotently. Kept here in `session` (the
 //! dependency sink) so both `agent` (the loader) and `session_ops` (the
@@ -57,10 +57,10 @@ impl ExtensionFile {
 }
 
 /// A file the installer places **outside** the extension home — into an agent's
-/// own config dir (e.g. `~/.config/opencode/plugin/thurbox-status.js`). `path`
+/// own config dir (e.g. `~/.config/opencode/plugin/friring-status.js`). `path`
 /// may be absolute, start with `~`, or contain [`HOME_TOKEN`]. Unlike
 /// [`ExtensionFile`] (home-confined), this is how a hook plugin reaches an agent
-/// that has no launch flag. Removed on uninstall when still thurbox-managed.
+/// that has no launch flag. Removed on uninstall when still friring-managed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalFile {
     /// Destination path: absolute, `~`-relative, or containing `{home}`.
@@ -182,7 +182,7 @@ pub struct ExtensionSession {
 pub struct ExtensionAutomation {
     /// Automation name. Used to find/reuse it.
     pub name: String,
-    /// Trigger spec, same grammar as `thurbox-cli automation create --trigger`
+    /// Trigger spec, same grammar as `friring-cli automation create --trigger`
     /// (`hourly` | `daily` | `weekdays` | `weekly` | `cron:<expr>` | `at:<ms>`).
     pub trigger: String,
     /// Name of the extension session this automation sends its prompt to. Must
@@ -228,11 +228,11 @@ impl ExtensionAutomation {
 /// active. One manifest per `extension.toml` file.
 ///
 /// Unknown fields are tolerated but reported by the loader as a warning, so a
-/// newer manifest doesn't strand an older thurbox on defaults.
+/// newer manifest doesn't strand an older friring on defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtensionDef {
     /// Unique extension name (matches the discovery file stem and what
-    /// `thurbox-cli extension activate <name>` expects).
+    /// `friring-cli extension activate <name>` expects).
     pub name: String,
     /// Optional human-readable summary, shown in `extension list`.
     #[serde(default)]
@@ -245,14 +245,14 @@ pub struct ExtensionDef {
     /// `extension update` report what moved and surfaces in `extension list`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// Minimum thurbox version this extension needs (e.g. `"0.113.0"`). Install
+    /// Minimum friring version this extension needs (e.g. `"0.113.0"`). Install
     /// and activate emit a compatibility **warning** (never a hard block, to
     /// stay graceful) when the running binary is older. Dev builds skip it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_thurbox_version: Option<String>,
-    /// The thurbox version that performed the install. **Stamped** into the
+    /// The friring version that performed the install. **Stamped** into the
     /// discovery-dir copy by the installer (never authored in source); compared
-    /// against the running binary to flag a stale extension after a thurbox
+    /// against the running binary to flag a stale extension after a friring
     /// upgrade. `None` in a source manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_with: Option<String>,
@@ -346,7 +346,7 @@ impl ExtensionDef {
     }
 
     /// Stamp install provenance onto the (resolved) manifest before it's written
-    /// to the discovery dir: which thurbox version installed it and where it came
+    /// to the discovery dir: which friring version installed it and where it came
     /// from, so staleness can be detected and `update` can re-fetch. Returns
     /// `self` for chaining off [`Self::resolved_for_home`].
     pub fn with_provenance(mut self, installed_with: &str, source: &str) -> ExtensionDef {
@@ -355,7 +355,7 @@ impl ExtensionDef {
         self
     }
 
-    /// Whether this extension was installed under a thurbox version different
+    /// Whether this extension was installed under a friring version different
     /// from `current` — i.e. an upgrade has happened since and re-running
     /// `extension update` would refresh it. Always `false` for a dev build
     /// (`current` is unstable) or a manifest with no recorded install version.
@@ -379,8 +379,8 @@ impl ExtensionDef {
         let min = self.min_thurbox_version.as_deref()?;
         if compare_versions(current, min) == std::cmp::Ordering::Less {
             Some(format!(
-                "extension '{}' wants thurbox >= {min} but this binary is {current}; \
-                 some features may not work — upgrade thurbox",
+                "extension '{}' wants friring >= {min} but this binary is {current}; \
+                 some features may not work — upgrade friring",
                 self.name
             ))
         } else {
@@ -400,7 +400,7 @@ pub fn is_dev_version(v: &str) -> bool {
 /// `-suffix` ignored) numerically, component by component. Missing trailing
 /// components count as `0` (so `1.2` == `1.2.0`). Non-numeric components sort as
 /// `0`. A dependency-free stand-in for the `semver` crate, sufficient for the
-/// `major.minor.patch` tags thurbox ships.
+/// `major.minor.patch` tags friring ships.
 pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let parts = |s: &str| -> Vec<u64> {
         s.trim_start_matches('v')

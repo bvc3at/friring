@@ -1,12 +1,12 @@
 # Renovate extension manifest.
 #
 # Single source of truth for installing + running renovate. Install it with
-# `thurbox-cli extension install renovate` (or point at this directory:
-# `thurbox-cli extension install ./extensions/renovate`). thurbox fetches this
+# `friring-cli extension install renovate` (or point at this directory:
+# `friring-cli extension install ./extensions/renovate`). friring fetches this
 # file, lays down the [[files]] / [[symlinks]] under `home`, registers the
 # [[agents]] in agents.toml, then activates the [[sessions]] + [[automations]]
 # and self-heals them if deleted. `{home}` is replaced with the resolved home
-# dir. Turn it off with `thurbox-cli extension deactivate renovate`.
+# dir. Turn it off with `friring-cli extension deactivate renovate`.
 
 name = "renovate"
 description = "Keeps local repos on up-to-date dependencies via Renovate's local platform"

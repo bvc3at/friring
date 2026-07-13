@@ -1,4 +1,4 @@
-//! `thurbox-cli version [--check]` — print the running version and, with
+//! `friring-cli version [--check]` — print the running version and, with
 //! `--check`, query GitHub for the latest release.
 //!
 //! `--check` is gated behind the opt-in `[features] version_check` flag (off by
@@ -27,7 +27,7 @@ pub fn run(args: VersionArgs) -> CommandOutput {
     let current = crate::agent::version_check::current_version();
 
     if !args.check {
-        return CommandOutput::new(json!({ "version": current }), format!("thurbox {current}"));
+        return CommandOutput::new(json!({ "version": current }), format!("friring {current}"));
     }
 
     if !settings::global().features.version_check {
@@ -39,7 +39,7 @@ pub fn run(args: VersionArgs) -> CommandOutput {
                 "check_enabled": false,
                 "summary": hint,
             }),
-            format!("thurbox {current}\n{hint}"),
+            format!("friring {current}\n{hint}"),
         );
     }
 
@@ -75,7 +75,7 @@ pub fn run(args: VersionArgs) -> CommandOutput {
                 "summary": "Up to date — running the latest release.",
             }),
             format!(
-                "thurbox {current} (latest: {latest})\nUp to date — running the latest release."
+                "friring {current} (latest: {latest})\nUp to date — running the latest release."
             ),
         ),
         Err(e) => CommandOutput::failed(
@@ -85,7 +85,7 @@ pub fn run(args: VersionArgs) -> CommandOutput {
                 "update_available": null,
                 "error": e,
             }),
-            format!("thurbox {current}\nUpdate check failed: {e}"),
+            format!("friring {current}\nUpdate check failed: {e}"),
             format!("update check failed: {e}"),
         ),
     }
@@ -99,7 +99,7 @@ mod tests {
     fn version_without_check_prints_current_version() {
         let out = run(VersionArgs { check: false });
         assert!(out["version"].is_string(), "version field present");
-        assert!(out.human.starts_with("thurbox "), "got: {}", out.human);
+        assert!(out.human.starts_with("friring "), "got: {}", out.human);
         assert!(out.failure.is_none(), "plain version never fails");
     }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# e2e: thurbox's Windows/psmux support against a throwaway Windows VM — the
+# e2e: friring's Windows/psmux support against a throwaway Windows VM — the
 # ephemeral-Windows member of the e2e family (see scripts/dev/README.md).
 # Mirrors linux-container.sh: a single Podman container runs a real,
 # KVM-accelerated Windows VM via dockur/windows, with an unattended first-boot
@@ -17,7 +17,7 @@
 #   scripts/dev/e2e/windows-vm.sh test     # headless smoke test (asserts psmux + a control-mode session round-trip)
 #   scripts/dev/e2e/windows-vm.sh test-suite # run the FULL nextest suite inside the VM (cross-built archive)
 #   scripts/dev/e2e/windows-vm.sh ssh      # open a PowerShell shell inside the VM
-#   scripts/dev/e2e/windows-vm.sh deploy   # cross-build thurbox for Windows + copy the .exe into the VM
+#   scripts/dev/e2e/windows-vm.sh deploy   # cross-build friring for Windows + copy the .exe into the VM
 #   scripts/dev/e2e/windows-vm.sh web      # print the browser viewer URL (eyes-on)
 #   scripts/dev/e2e/windows-vm.sh rdp      # print RDP connection details
 #   scripts/dev/e2e/windows-vm.sh logs     # follow container/install logs
@@ -25,15 +25,15 @@
 #   scripts/dev/e2e/windows-vm.sh clean    # remove container + all local state (disk image included)
 #
 # Env overrides:
-#   THURBOX_WIN_SSH_PORT  (default 2223)   host port forwarded to the VM's :22
-#   THURBOX_WIN_RDP_PORT  (default 3389)   host port forwarded to the VM's :3389
-#   THURBOX_WIN_WEB_PORT  (default 8006)   host port for the browser viewer
-#   THURBOX_WIN_VERSION   (default 11) any dockur VERSION (11, 10, 2025, 2022, ...);
+#   FRIRING_WIN_SSH_PORT  (default 2223)   host port forwarded to the VM's :22
+#   FRIRING_WIN_RDP_PORT  (default 3389)   host port forwarded to the VM's :3389
+#   FRIRING_WIN_WEB_PORT  (default 8006)   host port for the browser viewer
+#   FRIRING_WIN_VERSION   (default 11) any dockur VERSION (11, 10, 2025, 2022, ...);
 #                                       note: dockur has no "tiny" edition token.
-#   THURBOX_WIN_RAM       (default 4G)
-#   THURBOX_WIN_CPUS      (default 4)
-#   THURBOX_WIN_DISK      (default 64G)
-#   THURBOX_WIN_TEST_DIR  (default <repo>/target/windows-test)
+#   FRIRING_WIN_RAM       (default 4G)
+#   FRIRING_WIN_CPUS      (default 4)
+#   FRIRING_WIN_DISK      (default 64G)
+#   FRIRING_WIN_TEST_DIR  (default <repo>/target/windows-test)
 #   PSMUX_VERSION         (default v3.3.6) psmux release tag to install in the VM
 #   NEXTEST_VERSION       (default latest) cargo-nextest release to install in the VM
 #
@@ -50,16 +50,16 @@ REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 # shellcheck disable=SC1091
 . "$REPO_ROOT/scripts/dev/e2e/lib/e2e-common.sh"
 
-WORKDIR="${THURBOX_WIN_TEST_DIR:-$REPO_ROOT/target/windows-test}"
+WORKDIR="${FRIRING_WIN_TEST_DIR:-$REPO_ROOT/target/windows-test}"
 IMAGE="docker.io/dockurr/windows"
-CONTAINER="thurbox-windows"
-SSH_PORT="${THURBOX_WIN_SSH_PORT:-2223}"
-RDP_PORT="${THURBOX_WIN_RDP_PORT:-3389}"
-WEB_PORT="${THURBOX_WIN_WEB_PORT:-8006}"
-WIN_VERSION="${THURBOX_WIN_VERSION:-11}"
-WIN_RAM="${THURBOX_WIN_RAM:-4G}"
-WIN_CPUS="${THURBOX_WIN_CPUS:-4}"
-WIN_DISK="${THURBOX_WIN_DISK:-64G}"
+CONTAINER="friring-windows"
+SSH_PORT="${FRIRING_WIN_SSH_PORT:-2223}"
+RDP_PORT="${FRIRING_WIN_RDP_PORT:-3389}"
+WEB_PORT="${FRIRING_WIN_WEB_PORT:-8006}"
+WIN_VERSION="${FRIRING_WIN_VERSION:-11}"
+WIN_RAM="${FRIRING_WIN_RAM:-4G}"
+WIN_CPUS="${FRIRING_WIN_CPUS:-4}"
+WIN_DISK="${FRIRING_WIN_DISK:-64G}"
 PSMUX_VERSION="${PSMUX_VERSION:-v3.3.6}"
 PSMUX_ZIP_URL="https://github.com/psmux/psmux/releases/download/${PSMUX_VERSION}/psmux-${PSMUX_VERSION}-windows-x64.zip"
 NEXTEST_VERSION="${NEXTEST_VERSION:-latest}"
@@ -76,9 +76,9 @@ STORAGE_DIR="$WORKDIR/storage"
 WIN_USER="Docker"
 WIN_PASS="admin"
 
-# Dev builds share the thurbox-dev tmux socket name (see docs/DEVELOPMENT.md,
+# Dev builds share the friring-dev tmux socket name (see docs/DEVELOPMENT.md,
 # demo isolation). psmux honours -L the same way, so the smoke test uses it too.
-SOCKET="thurbox-dev"
+SOCKET="friring-dev"
 
 ssh_vm() {
   ssh -p "$SSH_PORT" -i "$KEY" \
@@ -109,7 +109,7 @@ build_oem() {
 
   if [ ! -f "$KEY" ]; then
     log "generating throwaway keypair at $KEY"
-    ssh-keygen -t ed25519 -N "" -C thurbox-windows-test -f "$KEY" >/dev/null
+    ssh-keygen -t ed25519 -N "" -C friring-windows-test -f "$KEY" >/dev/null
   fi
   cp "$KEY.pub" "$OEM_DIR/authorized_keys"
 
@@ -130,16 +130,16 @@ build_oem() {
   # off to PowerShell, where the real work (CRLF-agnostic) lives.
   cat > "$OEM_DIR/install.bat" <<'EOF'
 @echo off
-echo [thurbox] running first-boot setup...
+echo [friring] running first-boot setup...
 powershell -ExecutionPolicy Bypass -NoProfile -File "%~dp0setup.ps1" >> "%~dp0setup.log" 2>&1
-echo [thurbox] setup exit code %errorlevel% >> "%~dp0setup.log"
+echo [friring] setup exit code %errorlevel% >> "%~dp0setup.log"
 EOF
 
   # PowerShell does the heavy lifting: OpenSSH server + key, psmux on PATH, git.
   cat > "$OEM_DIR/setup.ps1" <<'EOF'
 $ErrorActionPreference = 'Continue'
 $oem = $PSScriptRoot
-Write-Host "[thurbox] setup.ps1 starting from $oem"
+Write-Host "[friring] setup.ps1 starting from $oem"
 
 # --- OpenSSH server (so the harness can drive the VM headlessly) -------------
 Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0
@@ -161,7 +161,7 @@ Copy-Item "$oem\authorized_keys" $adminKeys -Force
 icacls $adminKeys /inheritance:r | Out-Null
 icacls $adminKeys /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
 
-# --- psmux (the Windows tmux that thurbox's TmuxBackend invokes) -------------
+# --- psmux (the Windows tmux that friring's TmuxBackend invokes) -------------
 $tools = 'C:\Tools\psmux'
 New-Item -ItemType Directory -Force -Path $tools | Out-Null
 Expand-Archive -Path "$oem\psmux.zip" -DestinationPath $tools -Force
@@ -189,21 +189,21 @@ if (Test-Path "$oem\nextest.zip") {
       Invoke-WebRequest 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile $vcr -UseBasicParsing
       Start-Process $vcr -ArgumentList '/install','/quiet','/norestart' -Wait
     } catch {
-      Write-Host "[thurbox] VC++ redist install failed: $_"
+      Write-Host "[friring] VC++ redist install failed: $_"
     }
   }
 }
 
-# --- git (thurbox needs it for worktrees); best-effort via winget ------------
+# --- git (friring needs it for worktrees); best-effort via winget ------------
 try {
   winget install --id Git.Git -e --silent --accept-source-agreements --accept-package-agreements
 } catch {
-  Write-Host "[thurbox] winget git install skipped: $_"
+  Write-Host "[friring] winget git install skipped: $_"
 }
 
-New-Item -ItemType File -Force -Path 'C:\thurbox-oem-done.txt' `
+New-Item -ItemType File -Force -Path 'C:\friring-oem-done.txt' `
   -Value (Get-Date -Format o) | Out-Null
-Write-Host "[thurbox] setup.ps1 finished"
+Write-Host "[friring] setup.ps1 finished"
 EOF
 
   log "/oem payload ready in $OEM_DIR"
@@ -254,7 +254,7 @@ cmd_wait() {
   for i in $(seq 1 "$tries"); do
     if ssh_vm 'echo ok' >/dev/null 2>&1; then
       log "SSH reachable after ~$((i * 10))s"
-      ssh_vm 'powershell -NoProfile -Command "Test-Path C:\thurbox-oem-done.txt"' 2>/dev/null \
+      ssh_vm 'powershell -NoProfile -Command "Test-Path C:\friring-oem-done.txt"' 2>/dev/null \
         | grep -qi true && log "first-boot setup completed (psmux + OpenSSH installed)" \
         || warn "SSH is up but first-boot setup marker not found yet — psmux may still be installing"
       return 0
@@ -275,7 +275,7 @@ cmd_test() {
 
   log "checking psmux is installed and control-mode capable"
   local ver sessions
-  # `psmux` is the canonical binary thurbox's TmuxBackend invokes on Windows
+  # `psmux` is the canonical binary friring's TmuxBackend invokes on Windows
   # (DEFAULT_MUX); it also ships `tmux`/`pmux` aliases. -V proves binary + PATH.
   ver="$(ssh_vm 'psmux -V' 2>/dev/null | tr -d '\r')" \
     || die "psmux not found on PATH inside the VM"
@@ -285,7 +285,7 @@ cmd_test() {
   # spin up headless, create a detached session in, and enumerate. No command is
   # passed so the session holds its default shell open — a self-exiting command
   # (e.g. `cmd /c ver`) would close the session before we list it. This mirrors
-  # how thurbox launches a long-running agent CLI inside the session.
+  # how friring launches a long-running agent CLI inside the session.
   ssh_vm "psmux -L $SOCKET kill-server 2>\$null; psmux -L $SOCKET new-session -d -s smoke" >/dev/null 2>&1 || true
   sessions="$(ssh_vm "psmux -L $SOCKET list-sessions -F '#{session_name}'" 2>/dev/null | tr -d '\r')"
   ssh_vm "psmux -L $SOCKET kill-server" >/dev/null 2>&1 || true
@@ -305,17 +305,17 @@ cmd_deploy() {
   rustup target list --installed 2>/dev/null | grep -qx "$target" \
     || die "missing Rust target $target — run: rustup target add $target (and install mingw-w64)"
 
-  log "cross-building thurbox + thurbox-cli for $target"
-  ( cd "$REPO_ROOT" && cargo build --release --target "$target" --bin thurbox --bin thurbox-cli )
+  log "cross-building friring + friring-cli for $target"
+  ( cd "$REPO_ROOT" && cargo build --release --target "$target" --bin friring --bin friring-cli )
 
   local bindir="$REPO_ROOT/target/$target/release"
-  log "copying binaries into the VM (C:\\Tools\\thurbox)"
-  ssh_vm 'powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path C:\Tools\thurbox | Out-Null"' >/dev/null
-  scp_vm "$bindir/thurbox.exe" "$bindir/thurbox-cli.exe" "$WIN_USER@localhost:C:/Tools/thurbox/"
+  log "copying binaries into the VM (C:\\Tools\\friring)"
+  ssh_vm 'powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path C:\Tools\friring | Out-Null"' >/dev/null
+  scp_vm "$bindir/friring.exe" "$bindir/friring-cli.exe" "$WIN_USER@localhost:C:/Tools/friring/"
 
   echo
   printf '\033[1;32mdeployed\033[0m  run it with:  %s ssh\n' "$0"
-  printf '  then inside the VM:  C:\\Tools\\thurbox\\thurbox.exe\n'
+  printf '  then inside the VM:  C:\\Tools\\friring\\friring.exe\n'
 }
 
 # Run the ENTIRE test suite inside the VM. No Rust toolchain lives in the VM, so
@@ -344,10 +344,10 @@ cmd_test_suite() {
   tar --exclude=./target --exclude=./.git -cf "$src_tar" -C "$REPO_ROOT" .
 
   log "shipping archive + sources into the VM"
-  ssh_vm 'powershell -NoProfile -Command "Remove-Item -Recurse -Force C:\thurbox-tests -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force -Path C:\thurbox-tests\src | Out-Null"' >/dev/null
-  scp_vm "$archive" "$WIN_USER@localhost:C:/thurbox-tests/nextest-archive.tar.zst"
-  scp_vm "$src_tar" "$WIN_USER@localhost:C:/thurbox-tests/src.tar"
-  ssh_vm 'tar -xf C:/thurbox-tests/src.tar -C C:/thurbox-tests/src' \
+  ssh_vm 'powershell -NoProfile -Command "Remove-Item -Recurse -Force C:\friring-tests -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force -Path C:\friring-tests\src | Out-Null"' >/dev/null
+  scp_vm "$archive" "$WIN_USER@localhost:C:/friring-tests/nextest-archive.tar.zst"
+  scp_vm "$src_tar" "$WIN_USER@localhost:C:/friring-tests/src.tar"
+  ssh_vm 'tar -xf C:/friring-tests/src.tar -C C:/friring-tests/src' \
     || die "failed to extract sources in the VM"
 
   log "running the full suite in the VM (cargo-nextest from archive)"
@@ -363,7 +363,7 @@ cmd_test_suite() {
   #     CI job and the native `windows` CI job instead.
   # The single quotes are intentional: `$env:` must reach PowerShell unexpanded.
   # shellcheck disable=SC2016
-  ssh_vm '$env:INSTA_WORKSPACE_ROOT="C:/thurbox-tests/src"; cargo-nextest nextest run --archive-file C:/thurbox-tests/nextest-archive.tar.zst --workspace-remap C:/thurbox-tests/src -E "not binary(architecture_rules)"'
+  ssh_vm '$env:INSTA_WORKSPACE_ROOT="C:/friring-tests/src"; cargo-nextest nextest run --archive-file C:/friring-tests/nextest-archive.tar.zst --workspace-remap C:/friring-tests/src -E "not binary(architecture_rules)"'
 }
 
 cmd_web()  { printf 'Browser viewer: http://localhost:%s\n' "$WEB_PORT"; }

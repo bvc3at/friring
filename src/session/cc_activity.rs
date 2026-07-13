@@ -1,6 +1,6 @@
 //! Claude Code workflow + subagent activity — pure data model and parsers.
 //!
-//! thurbox surfaces what happens *inside* a running Claude Code session: the
+//! friring surfaces what happens *inside* a running Claude Code session: the
 //! Task subagents and multi-agent workflows it spawns, and the actual transcript
 //! text (thinking / tool calls / output) of each. Claude Code persists all of it
 //! as flat JSONL under
@@ -193,6 +193,10 @@ pub enum TranscriptBlock {
     ToolUse { name: String, input: String },
     /// A tool result body (already normalised to text).
     ToolResult { content: String, is_error: bool },
+    /// One normalized activity event — the F9 section views (timeline /
+    /// commands / web) render event streams through the same block engine as
+    /// transcripts, so folds, find, and wrap behave identically.
+    Event(super::activity::ActivityEvent),
 }
 
 // -------------------------------------------------------------------------
@@ -362,7 +366,7 @@ pub fn parse_workflow_completion(s: &str) -> Option<WorkflowCompletion> {
 // Claude Code can dispatch a whole session as a *detached* background worker
 // (the fleet/daemon path): a claimed spare process gets its **own** new session
 // id and writes its subagents/workflows under it — not under the launching
-// thurbox session's id. There is no parent→child lineage on disk, so a worker is
+// friring session's id. There is no parent→child lineage on disk, so a worker is
 // correlated back to the session that launched it via the one thing the daemon
 // **replays**: the `--settings <hooks>/claude.json` flag captured from the origin
 // session's CLI args (plus a cwd match). Two on-disk homes carry the state:
@@ -381,7 +385,7 @@ pub fn parse_workflow_completion(s: &str) -> Option<WorkflowCompletion> {
 
 /// A background/daemon worker from `roster.json`: its own session id (the key to
 /// its `subagents/` dir), the replayed `--settings` path + `cwd` used to
-/// attribute it to a thurbox session, and the claim `source` (`slash`/`fleet`/
+/// attribute it to a friring session, and the claim `source` (`slash`/`fleet`/
 /// `spare`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct CcWorker {
@@ -576,8 +580,10 @@ fn is_meta_prompt(text: &str) -> bool {
 
 /// The first typed-prompt text of a `user` line, if it has one. Content is a
 /// plain string on old lines and an array of blocks on new ones; either way,
-/// meta/sidechain/compact-summary lines never yield a title.
-fn user_prompt_text(v: &serde_json::Value) -> Option<String> {
+/// meta/sidechain/compact-summary lines never yield a title. Shared with the
+/// activity provider (`activity::claude`), which derives a session title the
+/// same way.
+pub(crate) fn user_prompt_text(v: &serde_json::Value) -> Option<String> {
     if v.get("isSidechain").and_then(|x| x.as_bool()) == Some(true)
         || v.get("isMeta").and_then(|x| x.as_bool()) == Some(true)
         || v.get("isCompactSummary").and_then(|x| x.as_bool()) == Some(true)
@@ -725,8 +731,10 @@ fn render_tool_input(name: &str, input: Option<&serde_json::Value>) -> String {
 }
 
 /// A `tool_result.content` is a string or an array of `{type:"text",text}`
-/// blocks; normalise either to a single string.
-fn normalize_tool_result(content: Option<&serde_json::Value>) -> String {
+/// blocks; normalise either to a single string. Shared with the activity
+/// provider (`activity::claude`), which extracts result heads from the same
+/// block shape.
+pub(crate) fn normalize_tool_result(content: Option<&serde_json::Value>) -> String {
     match content {
         Some(v) if v.is_string() => v.as_str().unwrap_or_default().to_string(),
         Some(v) if v.is_array() => v
@@ -1024,15 +1032,15 @@ garbage line that is not json
           "workers":{
             "95c38d32":{
               "sessionId":"95c38d32-39d4-4102-82df-24602ac3a2a0",
-              "cwd":"/mnt/shared/projects/thurbox",
+              "cwd":"/mnt/shared/projects/friring",
               "dispatch":{
                 "source":"slash",
-                "cwd":"/mnt/shared/projects/thurbox",
+                "cwd":"/mnt/shared/projects/friring",
                 "launch":{"mode":"prompt","args":[
                   "--session-id","95c38d32-39d4-4102-82df-24602ac3a2a0",
-                  "--settings","/mnt/shared/projects/thurbox/target/dev-sandbox/default/thurbox-config/hooks/claude.json",
-                  "--add-dir","/mnt/shared/projects/thurbox/"]},
-                "respawnFlags":["--settings","/mnt/shared/projects/thurbox/target/dev-sandbox/default/thurbox-config/hooks/claude.json"]
+                  "--settings","/mnt/shared/projects/friring/target/dev-sandbox/default/friring-config/hooks/claude.json",
+                  "--add-dir","/mnt/shared/projects/friring/"]},
+                "respawnFlags":["--settings","/mnt/shared/projects/friring/target/dev-sandbox/default/friring-config/hooks/claude.json"]
               }
             },
             "7492d0aa":{
@@ -1051,15 +1059,15 @@ garbage line that is not json
         let tbx = workers
             .iter()
             .find(|w| w.short == "95c38d32")
-            .expect("thurbox worker");
+            .expect("friring worker");
         assert_eq!(tbx.session_id, "95c38d32-39d4-4102-82df-24602ac3a2a0");
         assert_eq!(tbx.source.as_deref(), Some("slash"));
-        assert_eq!(tbx.cwd.as_deref(), Some("/mnt/shared/projects/thurbox"));
+        assert_eq!(tbx.cwd.as_deref(), Some("/mnt/shared/projects/friring"));
         assert_eq!(
             tbx.settings_path.as_deref(),
-            Some("/mnt/shared/projects/thurbox/target/dev-sandbox/default/thurbox-config/hooks/claude.json")
+            Some("/mnt/shared/projects/friring/target/dev-sandbox/default/friring-config/hooks/claude.json")
         );
-        // A worker launched outside thurbox carries no `--settings` (won't match).
+        // A worker launched outside friring carries no `--settings` (won't match).
         let fleet = workers.iter().find(|w| w.short == "7492d0aa").unwrap();
         assert_eq!(fleet.settings_path, None);
         assert_eq!(fleet.source.as_deref(), Some("fleet"));
@@ -1084,7 +1092,7 @@ garbage line that is not json
           "tempo":"blocked",
           "needs":"approve Bash: ls -la",
           "tokens":19030,
-          "cwd":"/mnt/shared/projects/thurbox",
+          "cwd":"/mnt/shared/projects/friring",
           "sessionId":"95c38d32-39d4-4102-82df-24602ac3a2a0",
           "daemonShort":"95c38d32",
           "backend":"daemon",

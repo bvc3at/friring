@@ -1,16 +1,16 @@
-# VHS tape — Thurbox session forking (parent sessions) feature clip.
+# VHS tape — Friring session forking (parent sessions) feature clip.
 #
 # Do NOT run directly — run `scripts/demo/record.sh fork`, which builds the
 # dev binary, sets up the isolated env, seeds one session per real agent CLI
-# in a sample repo, and exports $THURBOX_BIN.
+# in a sample repo, and exports $FRIRING_BIN.
 #
 # Ctrl+F forks the active session: a name modal opens pre-filled with
 # `<name>-fork`, and the spawned copy records the source as its parent — the
 # session list nests children under their parent with a `└` tree prefix, and
 # the info panel (Ctrl+B) shows a `Parent:` row.
 
-Output docs/media/thurbox-fork.gif
-Output docs/media/thurbox-fork.mp4
+Output docs/media/friring-fork.gif
+Output docs/media/friring-fork.mp4
 
 Set Shell "bash"
 Set FontSize 18
@@ -22,7 +22,7 @@ Set PlaybackSpeed 1.0
 
 # Launch the dev binary (isolated env from record.sh).
 Hide
-Type `exec "$THURBOX_BIN"`
+Type `exec "$FRIRING_BIN"`
 Enter
 Sleep 2s
 Show

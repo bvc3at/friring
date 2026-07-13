@@ -1,4 +1,4 @@
-//! Key event handlers for the Thurbox TUI application.
+//! Key event handlers for the Friring TUI application.
 //!
 //! This module contains all keyboard input handling logic organized by context:
 //! - Global keybindings (always active)
@@ -7,11 +7,15 @@
 
 use crate::session::SessionConfig;
 
-use super::{App, InputFocus, TerminalView};
+use super::{clock, App, InputFocus, TerminalView};
 use crate::agent::input;
 use crate::paths;
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers, ModifierKeyCode};
 use tracing::{error, warn};
+
+/// Two bare `Shift` taps at most this far apart — with no other key between —
+/// open the global search (the JetBrains "Search Everywhere" gesture).
+pub(crate) const DOUBLE_SHIFT_WINDOW_MS: u64 = 400;
 
 /// Convert a session name into a git-branch-friendly name.
 ///
@@ -43,7 +47,7 @@ fn session_name_to_branch(name: &str) -> String {
     result.trim_matches(['-', '/']).to_string()
 }
 
-/// Whether a pressed chord is a bare `Ctrl+<letter>` — the namespace thurbox
+/// Whether a pressed chord is a bare `Ctrl+<letter>` — the namespace friring
 /// shares with readline / shell line-editing chords. Used to gate
 /// [`crate::session::Action::terminal_passthrough`] so the PTY-deferral only
 /// fires for the conflicting chords; a non-`Ctrl+letter` rebind of a
@@ -107,6 +111,19 @@ impl App {
     /// 2. Global keybindings (Ctrl+Q, Ctrl+N, etc.)
     /// 3. Focus-based handlers (ProjectList, SessionList, Terminal)
     pub(crate) fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        // Bare modifier presses only arrive on kitty-protocol terminals (we
+        // push REPORT_ALL_KEYS_AS_ESCAPE_CODES). They are inert for every
+        // handler below and must never reach a text input or the PTY, so they
+        // are consumed here — where a double-tap of `Shift` opens the global
+        // search. Any other key breaks a pending double-tap. (Alt press/release
+        // never lands here — it arrives as `AppMessage::AltHeld`; see
+        // `key_to_message`.)
+        if let KeyCode::Modifier(m) = code {
+            self.handle_modifier_press(m);
+            return;
+        }
+        self.pending_double_shift = None;
+
         // Self-heal a missed Alt release (a lost kitty release event, e.g.
         // terminal focus stolen mid-hold): while Alt is really held every key
         // event carries the ALT bit, so one arriving without it means the
@@ -132,7 +149,7 @@ impl App {
             return;
         }
 
-        // The global-search strip captures all input while open (typed chars
+        // The global-search popup captures all input while open (typed chars
         // edit the query; arrows/Enter/Esc navigate/activate/close).
         if self.global_search.active {
             self.handle_global_search_key(code, mods);
@@ -188,7 +205,7 @@ impl App {
         // line editing keeps working — see `Action::terminal_passthrough`.
         // The deferral is gated on the bound chord still being a bare
         // `Ctrl+<letter>`, so a rebind to a non-conflicting key keeps the
-        // thurbox command working even in the terminal.
+        // friring command working even in the terminal.
         let context = self.focus_key_context();
         if let Some(action) = self.keybindings.lookup_in(context, code, mods) {
             let defer_to_pty = self.focus == InputFocus::Terminal
@@ -202,11 +219,39 @@ impl App {
         self.handle_focused_pane_key(code, mods);
     }
 
+    /// A bare modifier key press (kitty-protocol terminals only). Two `Shift`
+    /// taps within [`DOUBLE_SHIFT_WINDOW_MS`] open the global search —
+    /// mirroring the JetBrains "Search Everywhere" gesture. Taps never
+    /// accumulate while a modal or the search itself owns input (there,
+    /// `Shift` presses are just capitals being typed), and any non-`Shift`
+    /// modifier breaks a pending tap like a regular key would.
+    fn handle_modifier_press(&mut self, m: ModifierKeyCode) {
+        let is_shift = matches!(m, ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift);
+        if !is_shift
+            || self.modal.is_open()
+            || self.global_search.active
+            || !self.features.double_shift_search
+        {
+            self.pending_double_shift = None;
+            return;
+        }
+        let within_window = self.pending_double_shift.take().is_some_and(|t| {
+            clock::elapsed_since(t) <= std::time::Duration::from_millis(DOUBLE_SHIFT_WINDOW_MS)
+        });
+        if within_window {
+            // Routed through the action dispatch so the `features.global_search`
+            // gate (and its toast) behave exactly like the Ctrl+/ chord.
+            self.dispatch_action(crate::session::Action::GlobalSearch);
+        } else {
+            self.pending_double_shift = Some(clock::now());
+        }
+    }
+
     /// Cmd/Super chords are commands, never text: only the keybinding lookup
     /// may consume them. The focus-based handlers (modal inputs, the search
     /// query, in-pane editors, list hotkeys) predate the kitty keyboard
     /// protocol and match `Char` without checking SUPER, so a chord like Cmd+J
-    /// would otherwise type a bare `j`. While a modal or the search strip owns
+    /// would otherwise type a bare `j`. While a modal or the search popup owns
     /// input the chord is swallowed outright, mirroring how Ctrl chords are
     /// unavailable there. (The terminal pass-through swallows SUPER on its own —
     /// `agent::input::key_to_bytes`.)
@@ -231,7 +276,7 @@ impl App {
             InputFocus::AutomationRunHistory => self.handle_automation_run_history_key(code),
             InputFocus::TaskList => self.handle_task_list_key(code),
             InputFocus::TaskEditor => self.handle_task_editor_pane_key(code, mods),
-            // The global-search strip captures input earlier (before the global
+            // The global-search popup captures input earlier (before the global
             // keybinding lookup), so this arm is effectively unreachable.
             InputFocus::GlobalSearch => self.handle_global_search_key(code, mods),
             InputFocus::Terminal => self.handle_terminal_key(code, mods),
@@ -378,7 +423,7 @@ impl App {
     }
 
     /// Serialize the current keybindings and write them to
-    /// `~/.config/thurbox/keybindings.json`. Surfaces failures via the status
+    /// `~/.config/friring/keybindings.json`. Surfaces failures via the status
     /// bar rather than aborting — the in-memory map is already updated.
     fn persist_keybindings(&mut self) {
         match self.keybindings.to_json() {
@@ -405,13 +450,14 @@ impl App {
         }
         match self.modal {
             Modal::RestoreSessions(_) => self.handle_restore_sessions_key(code),
-            Modal::BranchSelector(_) => self.handle_branch_selector_key(code),
+            Modal::BranchSelector(_) => self.handle_branch_selector_key(code, mods),
+            Modal::SyncBasePicker(_) => self.handle_sync_base_picker_key(code),
             Modal::WorktreeName(_) => self.handle_worktree_name_key(code, mods),
             Modal::SessionName(_) => self.handle_session_name_key(code, mods),
             Modal::AutomationEditor(_) => self.handle_automation_editor_key(code, mods),
             Modal::AutomationsList(_) => self.handle_automations_list_key(code),
-            Modal::AgentPicker(_) => self.handle_agent_picker_key(code),
-            Modal::HostPicker(_) => self.handle_host_picker_key(code),
+            Modal::AgentPicker(_) => self.handle_agent_picker_key(code, mods),
+            Modal::HostPicker(_) => self.handle_host_picker_key(code, mods),
             Modal::ThemePicker(_) => self.handle_theme_picker_key(code),
             Modal::RepoPicker(_) => self.handle_repo_picker_key(code, mods),
             Modal::ConversationPicker(_) => self.handle_conversation_picker_key(code, mods),
@@ -614,7 +660,7 @@ impl App {
             // `TaskList → editor` (like the automation editor): cycling out of
             // the editor returns to the tasks panel, never off to a session.
             TaskEditor => vec![TaskList, TaskEditor],
-            // The global-search strip is entered/left only via its keybinding
+            // The global-search popup is entered/left only via its keybinding
             // (`Ctrl+/` by default) / `Esc`, so `Ctrl+L`/`Ctrl+H` are no-ops
             // while it's open.
             GlobalSearch => vec![GlobalSearch],
@@ -874,11 +920,16 @@ impl App {
         }
     }
 
-    fn handle_branch_selector_key(&mut self, code: KeyCode) {
+    /// Type-to-filter selector: printable keys edit the fuzzy query (so `j`/`k`
+    /// type, they don't navigate — arrows and Ctrl+N/P move the cursor), and
+    /// Esc clears an active query before it closes the modal.
+    fn handle_branch_selector_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let super::modals::Modal::BranchSelector(ref mut bs) = self.modal else {
             return;
         };
+        let visible = bs.filter.len(bs.branches.len());
         match code {
+            KeyCode::Esc if bs.filter.is_active() => bs.filter.clear(&mut bs.index),
             KeyCode::Esc => {
                 self.modal.close();
                 self.new_session.repo_path = None;
@@ -888,19 +939,57 @@ impl App {
                 // create will consume it now.
                 self.new_session.fetch_done = None;
             }
-            KeyCode::Char('j') | KeyCode::Down if bs.index + 1 < bs.branches.len() => {
-                bs.index += 1;
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                bs.index = bs.index.saturating_sub(1);
-            }
-            // Inert until the background load delivers (ADR-P12) — there is
-            // no branch to select yet.
-            KeyCode::Enter if !bs.loading && !bs.branches.is_empty() => {
-                let base_branch = bs.branches[bs.index].clone();
+            KeyCode::Down if bs.index + 1 < visible => bs.index += 1,
+            KeyCode::Up => bs.index = bs.index.saturating_sub(1),
+            // Inert until the background load delivers (ADR-P12) — there is no
+            // branch to select yet. A query with no matches is likewise inert.
+            KeyCode::Enter if !bs.loading => {
+                let Some(real) = bs.filter.real_index(bs.index, bs.branches.len()) else {
+                    return;
+                };
+                let base_branch = bs.branches[real].clone();
                 self.new_session.base_branch = Some(base_branch);
                 self.modal =
                     super::modals::Modal::SessionName(super::modals::SessionNameModal::default());
+            }
+            KeyCode::Backspace => bs.filter.pop(&bs.branches, &mut bs.index),
+            KeyCode::Char('n') if mods.contains(KeyModifiers::CONTROL) => {
+                if bs.index + 1 < visible {
+                    bs.index += 1;
+                }
+            }
+            KeyCode::Char('p') if mods.contains(KeyModifiers::CONTROL) => {
+                bs.index = bs.index.saturating_sub(1);
+            }
+            KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                bs.filter.push(c, &bs.branches, &mut bs.index);
+            }
+            _ => {}
+        }
+    }
+
+    /// Drive the sync base picker (`Ctrl+S` with a multi-remote repo): Enter
+    /// picks the highlighted remote (persisted as the repo's default) and the
+    /// parked sync run advances; Esc drops the whole run.
+    fn handle_sync_base_picker_key(&mut self, code: KeyCode) {
+        let super::modals::Modal::SyncBasePicker(ref mut sb) = self.modal else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => {
+                self.modal.close();
+                self.cancel_sync_base();
+            }
+            KeyCode::Char('j') | KeyCode::Down if sb.index + 1 < sb.remotes.len() => {
+                sb.index += 1;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                sb.index = sb.index.saturating_sub(1);
+            }
+            KeyCode::Enter if !sb.remotes.is_empty() => {
+                let remote = sb.remotes[sb.index].clone();
+                self.modal.close();
+                self.confirm_sync_base(remote);
             }
             _ => {}
         }
@@ -1025,30 +1114,50 @@ impl App {
         }
     }
 
-    fn handle_host_picker_key(&mut self, code: KeyCode) {
+    /// Type-to-filter selector — same keymap as
+    /// [`Self::handle_branch_selector_key`].
+    fn handle_host_picker_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let super::modals::Modal::HostPicker(ref mut hp) = self.modal else {
             return;
         };
         let choice_count = hp.choices.len();
+        let visible = hp.filter.len(choice_count);
         match code {
+            KeyCode::Esc if hp.filter.is_active() => hp.filter.clear(&mut hp.selected_index),
             KeyCode::Esc => {
                 self.modal.close();
                 self.new_session.backend = None;
             }
-            KeyCode::Char('j') | KeyCode::Down if hp.selected_index + 1 < choice_count => {
-                hp.selected_index += 1;
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                hp.selected_index = hp.selected_index.saturating_sub(1);
-            }
+            KeyCode::Down if hp.selected_index + 1 < visible => hp.selected_index += 1,
+            KeyCode::Up => hp.selected_index = hp.selected_index.saturating_sub(1),
+            // Inert on a query with no matches (backspace to widen it).
             KeyCode::Enter => {
+                let Some(real) = hp.filter.real_index(hp.selected_index, choice_count) else {
+                    return;
+                };
                 let backend = hp
                     .choices
-                    .get(hp.selected_index)
+                    .get(real)
                     .map(|c| c.backend.clone())
                     .unwrap_or_default();
                 self.modal.close();
                 self.confirm_host_picker(backend);
+            }
+            KeyCode::Backspace => {
+                let labels = hp.choices.iter().map(|c| c.label.as_str());
+                hp.filter.pop(labels, &mut hp.selected_index);
+            }
+            KeyCode::Char('n') if mods.contains(KeyModifiers::CONTROL) => {
+                if hp.selected_index + 1 < visible {
+                    hp.selected_index += 1;
+                }
+            }
+            KeyCode::Char('p') if mods.contains(KeyModifiers::CONTROL) => {
+                hp.selected_index = hp.selected_index.saturating_sub(1);
+            }
+            KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                let labels = hp.choices.iter().map(|c| c.label.as_str());
+                hp.filter.push(c, labels, &mut hp.selected_index);
             }
             _ => {}
         }
@@ -1067,12 +1176,16 @@ impl App {
         self.open_repo_picker();
     }
 
-    fn handle_agent_picker_key(&mut self, code: KeyCode) {
+    /// Type-to-filter selector — same keymap as
+    /// [`Self::handle_branch_selector_key`].
+    fn handle_agent_picker_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let super::modals::Modal::AgentPicker(ref mut ap) = self.modal else {
             return;
         };
         let choice_count = ap.choices.len();
+        let visible = ap.filter.len(choice_count);
         match code {
+            KeyCode::Esc if ap.filter.is_active() => ap.filter.clear(&mut ap.selected_index),
             KeyCode::Esc => {
                 self.modal.close();
                 self.new_session.spawn_config = None;
@@ -1087,16 +1200,32 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down if ap.selected_index + 1 < choice_count => {
-                ap.selected_index += 1;
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                ap.selected_index = ap.selected_index.saturating_sub(1);
-            }
+            KeyCode::Down if ap.selected_index + 1 < visible => ap.selected_index += 1,
+            KeyCode::Up => ap.selected_index = ap.selected_index.saturating_sub(1),
+            // Inert on a query with no matches (backspace to widen it).
             KeyCode::Enter => {
-                let chosen = ap.choices.get(ap.selected_index).map(|c| c.name.clone());
+                let Some(real) = ap.filter.real_index(ap.selected_index, choice_count) else {
+                    return;
+                };
+                let chosen = ap.choices.get(real).map(|c| c.name.clone());
                 self.modal.close();
                 self.confirm_agent_picker(chosen);
+            }
+            KeyCode::Backspace => {
+                let labels = ap.choices.iter().map(|c| c.label());
+                ap.filter.pop(labels, &mut ap.selected_index);
+            }
+            KeyCode::Char('n') if mods.contains(KeyModifiers::CONTROL) => {
+                if ap.selected_index + 1 < visible {
+                    ap.selected_index += 1;
+                }
+            }
+            KeyCode::Char('p') if mods.contains(KeyModifiers::CONTROL) => {
+                ap.selected_index = ap.selected_index.saturating_sub(1);
+            }
+            KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                let labels = ap.choices.iter().map(|c| c.label());
+                ap.filter.push(c, labels, &mut ap.selected_index);
             }
             _ => {}
         }
@@ -1268,7 +1397,7 @@ impl App {
             ),
             Action::ToggleCcActivity => self.gated(
                 self.features.cc_activity,
-                "CC activity",
+                "Agent activity",
                 Self::toggle_cc_activity,
             ),
             Action::OpenAutomations => self.gated(
@@ -1353,7 +1482,7 @@ impl App {
             Action::SessionListImport => {
                 self.gated(
                     self.features.cc_activity,
-                    "CC activity",
+                    "Agent activity",
                     Self::start_conversation_import,
                 );
             }
@@ -1629,6 +1758,7 @@ impl App {
         self.modal = super::modals::Modal::BranchSelector(super::modals::BranchSelectorModal {
             index: 0,
             branches: Vec::new(),
+            filter: Default::default(),
             loading: true,
         });
 

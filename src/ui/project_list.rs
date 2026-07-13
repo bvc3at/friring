@@ -1347,7 +1347,7 @@ mod tests {
     fn line_shows_worktree_glyph_when_worktree_present() {
         let mut s = info("feature");
         s.worktrees.push(crate::session::WorktreeInfo {
-            repo_path: std::path::PathBuf::from("/repos/thurbox"),
+            repo_path: std::path::PathBuf::from("/repos/friring"),
             worktree_path: std::path::PathBuf::from("/tmp/wt/feat"),
             branch: "feat".to_string(),
         });

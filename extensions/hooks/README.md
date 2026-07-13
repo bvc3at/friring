@@ -1,7 +1,7 @@
-# hooks — agent lifecycle → thurbox session status
+# hooks — agent lifecycle → friring session status
 
 The **hooks** extension wires each coding agent's lifecycle hooks to
-`thurbox-cli session signal` so every session reports its state back to thurbox
+`friring-cli session signal` so every session reports its state back to friring
 and the sidebar shows, at a glance, which agents are **blocked**, **working**,
 or **done**:
 
@@ -17,19 +17,19 @@ whole list scans in one pass.
 
 ## It's on by default
 
-Unlike other extensions, **hooks ships built into thurbox and is auto-activated**
+Unlike other extensions, **hooks ships built into friring and is auto-activated**
 on first run — the default agent's hook is pre-configured with zero setup. Opt
 out at any time:
 
 ```bash
-thurbox-cli extension deactivate hooks   # remove the wiring; won't come back
-thurbox-cli extension activate hooks      # re-enable it
+friring-cli extension deactivate hooks   # remove the wiring; won't come back
+friring-cli extension activate hooks      # re-enable it
 ```
 
 ## How each agent is wired
 
-The hook command is always `thurbox-cli session signal --state <working|blocked|done>`,
-which identifies the calling session from the injected `$THURBOX_SESSION` (no ids
+The hook command is always `friring-cli session signal --state <working|blocked|done>`,
+which identifies the calling session from the injected `$FRIRING_SESSION` (no ids
 passed by hand) and is suffixed `|| true` so it can never break the agent.
 
 - **claude** — a managed settings file (under the extension home) is passed via
@@ -86,40 +86,40 @@ passed by hand) and is suffixed `|| true` so it can never break the agent.
   as claude, so an idle `Notification` doesn't flip the dot red). It has no
   `UserPromptSubmit`, so working is signaled at the first tool call rather than on
   prompt submit. **Caveat:** if agy sanitizes the hook environment,
-  `$THURBOX_SESSION` may not reach the hook, in which case the signal is a
+  `$FRIRING_SESSION` may not reach the hook, in which case the signal is a
   fail-open no-op. If a future `agy` changes the hook schema, edit
   `antigravity-hooks.json` (no code change).
 
 ## Where the config lives
 
-The wiring is applied **only to agents thurbox launches** — it never edits your
+The wiring is applied **only to agents friring launches** — it never edits your
 own global agent config (e.g. your personal `~/.claude/settings.json`). For
 claude the managed hooks file is passed with `--settings`, which claude **merges
-on top of** your own settings: inside a thurbox session both your hooks and
-thurbox's fire, while a plain `claude` outside thurbox sees only your own. The
+on top of** your own settings: inside a friring session both your hooks and
+friring's fire, while a plain `claude` outside friring sees only your own. The
 other agents are wired by a reversible merge into — or a managed file dropped in
 — their own config dir.
 
 | Agent | On-disk location | How it's applied |
 |-------|------------------|------------------|
-| claude | `~/.config/thurbox/hooks/claude.json` | `--settings` flag on the `claude` agent (claude merges it) |
+| claude | `~/.config/friring/hooks/claude.json` | `--settings` flag on the `claude` agent (claude merges it) |
 | aider | — (no file) | `--notifications-command` flag on the `aider` agent |
-| opencode | `~/.config/opencode/plugin/thurbox-status.js` | managed plugin file (`requires_dir`) |
+| opencode | `~/.config/opencode/plugin/friring-status.js` | managed plugin file (`requires_dir`) |
 | codex | `~/.codex/hooks.json` | reversible JSON-merge of our entries |
 | vibe | `~/.vibe/hooks.toml` | managed file (refused if you already have one) |
-| copilot | `~/.copilot/hooks/thurbox-status.json` | managed standalone file (`requires_dir`) |
+| copilot | `~/.copilot/hooks/friring-status.json` | managed standalone file (`requires_dir`) |
 | antigravity | `~/.gemini/settings.json` | reversible JSON-merge of our entries |
 
-The home dir is `~/.config/thurbox/hooks` for a release build and
-`~/.config/thurbox-dev/hooks` for a dev build, so the two stay isolated.
+The home dir is `~/.config/friring/hooks` for a release build and
+`~/.config/friring-dev/hooks` for a dev build, so the two stay isolated.
 
-**Inspect or customize.** To see exactly what thurbox installed, read the file
-for the agent above (e.g. `cat ~/.config/thurbox/hooks/claude.json`). The
+**Inspect or customize.** To see exactly what friring installed, read the file
+for the agent above (e.g. `cat ~/.config/friring/hooks/claude.json`). The
 injected `--settings` / `--notifications-command` flags themselves live in the
-`claude` / `aider` entries of `~/.config/thurbox/agents.toml`. You can hand-edit
+`claude` / `aider` entries of `~/.config/friring/agents.toml`. You can hand-edit
 a managed file, but self-heal rewrites it from the embedded payload on the next
 TUI start / heartbeat tick — so to keep a change, either deactivate the extension
-(`thurbox-cli extension deactivate hooks`) and wire the hook yourself, or edit
+(`friring-cli extension deactivate hooks`) and wire the hook yourself, or edit
 the payload source under `extensions/hooks/` and reinstall.
 
 ## Mechanism
@@ -139,6 +139,6 @@ This extension exercises two extension-manifest capabilities (see
   the merge is already present. A merge whose target is malformed JSON is
   soft-skipped (logged, never aborts the rest of the install).
 
-  Note: on the **first** merge, thurbox rewrites `settings.json` with normalized
+  Note: on the **first** merge, friring rewrites `settings.json` with normalized
   formatting (alphabetized keys, 2-space indent). This is one-time and lossless —
   your values are untouched and the file is stable afterward.

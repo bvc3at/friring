@@ -1,10 +1,10 @@
-//! `thurbox-cli perf` — read the perf snapshot a running TUI publishes.
+//! `friring-cli perf` — read the perf snapshot a running TUI publishes.
 //!
 //! The TUI writes a JSON snapshot (counters, frame/tick timing percentiles,
 //! slow ops, startup phase breakdown) into the SQLite `metadata` table while
-//! perf timing is active — `THURBOX_PERF_LOG=1` or an open perf HUD (F12).
+//! perf timing is active — `FRIRING_PERF_LOG=1` or an open perf HUD (F12).
 //! This command prints the latest one, so a running instance can be inspected
-//! from outside without tailing `thurbox.log`. See `docs/PERFORMANCE.md`.
+//! from outside without tailing `friring.log`. See `docs/PERFORMANCE.md`.
 
 use serde_json::Value;
 
@@ -13,7 +13,7 @@ use crate::storage::Database;
 use super::output::{kv, CommandOutput};
 
 /// Human hint shown when no snapshot exists (or it can't be parsed).
-const NO_SNAPSHOT_HINT: &str = "No perf snapshot published. Run the TUI with THURBOX_PERF_LOG=1 \
+const NO_SNAPSHOT_HINT: &str = "No perf snapshot published. Run the TUI with FRIRING_PERF_LOG=1 \
      or open its perf HUD (F12), then retry.";
 
 /// Run the `perf` command: print the last published snapshot.
@@ -135,7 +135,7 @@ mod tests {
     fn missing_snapshot_exits_nonzero_with_hint() {
         let db = Database::open_in_memory().unwrap();
         let out = run(&db).unwrap();
-        assert!(out.human.contains("THURBOX_PERF_LOG=1"));
+        assert!(out.human.contains("FRIRING_PERF_LOG=1"));
         assert!(out.failure.is_some(), "no snapshot → non-zero exit");
     }
 

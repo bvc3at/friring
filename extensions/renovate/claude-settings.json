@@ -1,8 +1,8 @@
 {
-  "_comment": "Installed by thurbox `extension install renovate` (template: claude-settings.json). Re-installing overwrites this file; remove this line to keep your own edits.",
+  "_comment": "Installed by friring `extension install renovate` (template: claude-settings.json). Re-installing overwrites this file; remove this line to keep your own edits.",
   "permissions": {
     "allow": [
-      "Bash(thurbox-cli:*)",
+      "Bash(friring-cli:*)",
       "Bash({home}/scripts/renovate-snapshot.sh:*)",
       "Bash({home}/scripts/dispatch-update.sh:*)",
       "Bash({home}/scripts/renovate-run.sh:*)",

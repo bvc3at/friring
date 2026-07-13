@@ -1,4 +1,4 @@
-//! View / rendering logic for the Thurbox TUI.
+//! View / rendering logic for the Friring TUI.
 //!
 //! Contains the main `App::view` method and helper functions for
 //! rendering the help overlay and formatting timestamps.
@@ -135,7 +135,7 @@ impl App {
             return;
         };
         let modal_open = !matches!(self.modal, super::modals::Modal::None);
-        // While the global-search strip is open clicks are swallowed (it owns
+        // While the global-search popup is open clicks are swallowed (it owns
         // all input), so don't underline rows as if they were clickable.
         if self.global_search.active && !modal_open {
             return;
@@ -255,7 +255,7 @@ impl App {
 
         let all_sessions: Vec<&SessionInfo> = self.sessions.iter().map(|s| &s.info).collect();
 
-        // While the global-search strip is open, highlight the session list from
+        // While the global-search popup is open, highlight the session list from
         // the global query (live). Otherwise there are no match positions (the
         // session list has no local search of its own anymore). Own the query so
         // it doesn't conflict with the `&mut session_list_state` borrow below.
@@ -673,8 +673,8 @@ impl App {
             self.record_scrollbar(geom, ScrollTarget::TaskPreview);
             return;
         }
-        // While the global-search strip previews a task result, mirror that in
-        // the central pane (focus stays in the strip, so the normal task-context
+        // While the global-search popup previews a task result, mirror that in
+        // the central pane (focus stays in the popup, so the normal task-context
         // branch above doesn't fire).
         if self.global_search_preview_kind() == Some(crate::app::search::SearchKind::Task)
             && self.selected_task().is_some()
@@ -926,7 +926,7 @@ impl App {
             InputFocus::CodeReview => "Review",
             InputFocus::ReviewFiles => "Changed files",
             InputFocus::CcActivity => "Activity",
-            InputFocus::CcActivityTree => "Workflows",
+            InputFocus::CcActivityTree => "Activity nav",
         };
         status_bar::FooterState {
             session_count: self.sessions.len(),
@@ -1082,9 +1082,24 @@ impl App {
                 &branch_selector_modal::BranchSelectorState {
                     branches: &bs.branches,
                     selected_index: bs.index,
+                    filter: &bs.filter,
                     loading: bs.loading,
                 },
             ));
+        }
+
+        // Sync base picker modal (Ctrl+S with a multi-remote repo)
+        if let super::modals::Modal::SyncBasePicker(ref sb) = self.modal {
+            return Some(
+                crate::ui::sync_base_picker_modal::render_sync_base_picker_modal(
+                    frame,
+                    &crate::ui::sync_base_picker_modal::SyncBasePickerState {
+                        repo_name: &sb.repo_name,
+                        remotes: &sb.remotes,
+                        selected_index: sb.index,
+                    },
+                ),
+            );
         }
 
         // Agent picker modal

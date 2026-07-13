@@ -47,21 +47,21 @@ fi
 
 echo
 echo "## update tasks"
-if TASKS="$(thurbox-cli task list 2>/dev/null)"; then
+if TASKS="$(friring-cli task list 2>/dev/null)"; then
   printf '%s' "$TASKS" | jq -r '
     [.[] | select(.title | startswith("update "))] |
     if length == 0 then "  (none)" else
       .[] | "  #\(.id) [\(.status)] \(.title)  {repo=\(.action.repo_path // "?")}"
     end' 2>/dev/null || true
 else
-  echo "  (thurbox-cli task list failed)"
+  echo "  (friring-cli task list failed)"
 fi
 
 echo
 echo "## sessions (renovate / workers)"
 # Worker sessions are named "<title> · #<id>" (current) or "task-<id>[-…]"
 # (legacy) — mirror flow-snapshot.sh / Task::matches_spawn_session.
-thurbox-cli session list --json 2>/dev/null | jq -r '
+friring-cli session list --json 2>/dev/null | jq -r '
   .[] | select(.name == "renovate"
                or (.name | startswith("task-"))
                or (.name | test(" · #[0-9]+$"))) |

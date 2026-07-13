@@ -1,14 +1,15 @@
-//! Renderer for the global-search strip (`Ctrl+/`) — a non-modal panel docked
-//! full-width along the bottom. Matches also highlight **live in the panels
-//! themselves** (session list, tasks, automations). The strip shows: a query
-//! line, a per-scope match summary, the grouped result list (scrollable, with
-//! the selected row highlighted), and key hints.
+//! Renderer for the global-search popup (`Ctrl+/` or double-`Shift`) — a
+//! centered floating panel, JetBrains Search-Everywhere-style. The background
+//! is **not** dimmed: matches highlight **live in the panels themselves**
+//! (session list, tasks, automations) around the popup. The popup shows: a
+//! query line, a per-scope match summary, the grouped result list (scrollable,
+//! with the selected row highlighted), and key hints.
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -17,7 +18,7 @@ use crate::app::search::{GlobalSearchResult, SearchKind};
 use super::theme::Theme;
 use super::truncate_ellipsis;
 
-/// View data for the strip (built by the app layer, so the UI stays free of the
+/// View data for the popup (built by the app layer, so the UI stays free of the
 /// app's private `TextInput` internals — mirrors `tasks_panel`).
 pub(crate) struct GlobalSearchView<'a> {
     pub query: &'a str,
@@ -27,6 +28,8 @@ pub(crate) struct GlobalSearchView<'a> {
 }
 
 pub(crate) fn render_global_search(frame: &mut Frame, area: Rect, state: &GlobalSearchView<'_>) {
+    // Floating popup: wipe whatever panel content is underneath first.
+    frame.render_widget(Clear, area);
     // Same dedicated search-bar accent the session-list search uses.
     let bar_style = Style::default().fg(Theme::search_bar());
     let block = Block::default()
@@ -305,7 +308,7 @@ mod tests {
             selected: 0,
         };
         let text = rendered_text(&view);
-        assert!(text.contains("needle"), "query echoes into the strip");
+        assert!(text.contains("needle"), "query echoes into the popup");
         assert!(text.contains("task-0"), "first result is listed");
     }
 

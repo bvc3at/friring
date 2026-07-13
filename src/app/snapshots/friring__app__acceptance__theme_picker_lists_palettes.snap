@@ -2,7 +2,7 @@
 source: src/app/acceptance.rs
 expression: h.render()
 ---
- thurbox  Multi-Session Agent Orchestrator  v0.0.0-dev                                    ◐ Default
+ friring  Multi-Session Agent Orchestrator  v0.0.0-dev                                    ◐ Default
 ╭ Sessions ─────────────╮┌ No Session ─────────────────────────────────────────────────────────────┐
 │                       ││                                                                         │
 │    No sessions yet    ││                                                                         │

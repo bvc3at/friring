@@ -1,4 +1,4 @@
-//! Automation CRUD subcommands for `thurbox-cli`.
+//! Automation CRUD subcommands for `friring-cli`.
 //!
 //! Automations are persisted to the shared database; the running TUI's tick
 //! loop is what actually fires them. `run` just marks an automation due so the

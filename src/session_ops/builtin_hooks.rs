@@ -1,6 +1,6 @@
 //! The built-in **hooks** extension: wires each coding agent's lifecycle hooks
-//! to `thurbox-cli session signal` so sessions report `working`/`blocked`/`done`
-//! back to thurbox (see the hooks-driven `SessionStatus`). For **remote**
+//! to `friring-cli session signal` so sessions report `working`/`blocked`/`done`
+//! back to friring (see the hooks-driven `SessionStatus`). For **remote**
 //! sessions the same hook file is shipped with its commands rewritten to a tmux
 //! pane user option (`rewrite_hook_signals_for_remote`) — the local TUI
 //! receives those over its control-mode subscription.
@@ -12,7 +12,7 @@
 //! materialized into a stable local dir, then [`install_extension`] installs them
 //! from there — so all the install/heal/uninstall logic is shared.
 //!
-//! Opt out with `thurbox-cli extension deactivate hooks`, which records an
+//! Opt out with `friring-cli extension deactivate hooks`, which records an
 //! opt-out flag so startup self-heal won't resurrect it.
 
 use std::path::PathBuf;
@@ -32,15 +32,15 @@ const CODEX_HOOKS: &str = include_str!("../../extensions/hooks/codex-hooks.json"
 const VIBE_HOOKS: &str = include_str!("../../extensions/hooks/vibe-hooks.toml");
 const COPILOT_HOOKS: &str = include_str!("../../extensions/hooks/copilot-hooks.json");
 
-/// Marker prefix of every thurbox-managed hook command; the state word
+/// Marker prefix of every friring-managed hook command; the state word
 /// (`working`/`blocked`/`done`/`idle`) follows it directly.
-const SIGNAL_MARKER: &str = "thurbox-cli session signal --state ";
+const SIGNAL_MARKER: &str = "friring-cli session signal --state ";
 
-/// Rewrite thurbox-managed hook commands for a **remote (real-tmux) host**:
-/// `thurbox-cli session signal --state <s>` →
-/// `tmux set-option -p @thurbox_state <s>`.
+/// Rewrite friring-managed hook commands for a **remote (real-tmux) host**:
+/// `friring-cli session signal --state <s>` →
+/// `tmux set-option -p @friring_state <s>`.
 ///
-/// `thurbox-cli` can't signal from a remote host (it isn't installed there,
+/// `friring-cli` can't signal from a remote host (it isn't installed there,
 /// and it would write the host's own DB — never the one the local TUI reads).
 /// A tmux **pane user option** can: inside a pane `set-option -p` needs no
 /// socket, pane id, or identity (`$TMUX`/`$TMUX_PANE` are in the pane env),
@@ -62,7 +62,7 @@ pub(crate) fn rewrite_hook_signals_for_remote(contents: &str) -> String {
 }
 
 /// The hooks extension's home, under this build's resolved config dir
-/// (`~/.config/thurbox/hooks` for a release build, `~/.config/thurbox-dev/hooks`
+/// (`~/.config/friring/hooks` for a release build, `~/.config/friring-dev/hooks`
 /// for a dev build) — so dev and release installs stay isolated and the injected
 /// `--settings` path always points inside the same tree the binary uses.
 fn hooks_home() -> Option<String> {
@@ -76,7 +76,7 @@ fn hooks_home() -> Option<String> {
 /// `["--settings", "{home}/claude.json"]` after `{home}` substitution, so it
 /// **byte-matches** the flag the CC daemon captures and replays when it
 /// backgrounds a session. The Claude Code activity scan uses it to attribute a
-/// detached background worker back to this thurbox instance (see
+/// detached background worker back to this friring instance (see
 /// `app::cc_activity`).
 pub(crate) fn hooks_settings_path() -> Option<String> {
     hooks_home().map(|h| format!("{h}/claude.json"))
@@ -88,7 +88,7 @@ pub(crate) fn hooks_settings_path() -> Option<String> {
 ///
 /// Why: when Claude Code backgrounds a session as a detached daemon worker it
 /// **replays** the origin session's `--settings` flag. A shared path can only be
-/// disambiguated back to a thurbox session by a cwd heuristic (ambiguous for two
+/// disambiguated back to a friring session by a cwd heuristic (ambiguous for two
 /// non-worktree sessions on one repo); a per-session path **names the exact
 /// session**, so the activity view (`app::cc_activity`) attributes the worker's
 /// workflow precisely. The symlink means zero content upkeep — it tracks the
@@ -211,7 +211,7 @@ pub fn ensure_builtin_hooks_extension(db: &Database) -> Vec<String> {
         Ok(d) => d,
         Err(e) => return vec![format!("hooks extension: {e}")],
     };
-    // Home lives under *this build's* config dir (`thurbox` vs `thurbox-dev`), so
+    // Home lives under *this build's* config dir (`friring` vs `friring-dev`), so
     // a dev build patches its dev `agents.toml` with a `--settings` path inside
     // the dev tree — never the release config. Manifest `home` is ignored.
     let Some(home) = hooks_home() else {
@@ -260,18 +260,18 @@ mod tests {
     fn remote_rewrite_replaces_every_signal_command() {
         let rewritten = rewrite_hook_signals_for_remote(CLAUDE_SETTINGS);
         // No local CLI reference survives, every state maps to the pane option.
-        assert!(!rewritten.contains("thurbox-cli"));
+        assert!(!rewritten.contains("friring-cli"));
         for state in ["idle", "working", "blocked", "done"] {
             assert!(
-                rewritten.contains(&format!("tmux set-option -p @thurbox_state {state}")),
+                rewritten.contains(&format!("tmux set-option -p @friring_state {state}")),
                 "missing rewritten {state} command"
             );
         }
         // The surrounding hook shape (`|| true`, the blocked `case`) survives
         // the prefix replace, and the result is still valid JSON with all five
         // hook events.
-        assert!(rewritten.contains("tmux set-option -p @thurbox_state idle || true"));
-        assert!(rewritten.contains("tmux set-option -p @thurbox_state blocked ;;"));
+        assert!(rewritten.contains("tmux set-option -p @friring_state idle || true"));
+        assert!(rewritten.contains("tmux set-option -p @friring_state blocked ;;"));
         let json: serde_json::Value = serde_json::from_str(&rewritten).expect("still valid JSON");
         let hooks = json.get("hooks").and_then(|h| h.as_object()).unwrap();
         for event in [
@@ -317,17 +317,17 @@ mod tests {
         assert!(CLAUDE_SETTINGS.contains("session signal --state working"));
         // The opencode plugin must carry the managed marker so uninstall can
         // safely remove it (see `is_user_modified`).
-        assert!(OPENCODE_PLUGIN.contains("thurbox `extension install`"));
+        assert!(OPENCODE_PLUGIN.contains("friring `extension install`"));
         // codex's hooks.json reports the full idle/working/done range.
         assert!(CODEX_HOOKS.contains("session signal --state idle"));
         // The vibe payload carries the signal marker (prune) and the managed
         // marker (external-file uninstall, see `is_user_modified`).
-        assert!(VIBE_HOOKS.contains("thurbox-cli session signal"));
-        assert!(VIBE_HOOKS.contains("thurbox `extension install`"));
+        assert!(VIBE_HOOKS.contains("friring-cli session signal"));
+        assert!(VIBE_HOOKS.contains("friring `extension install`"));
         // The copilot payload carries the signal command and the managed marker
         // (external-file uninstall, see `is_user_modified`).
-        assert!(COPILOT_HOOKS.contains("thurbox-cli session signal"));
-        assert!(COPILOT_HOOKS.contains("thurbox `extension install`"));
+        assert!(COPILOT_HOOKS.contains("friring-cli session signal"));
+        assert!(COPILOT_HOOKS.contains("friring `extension install`"));
     }
 
     #[test]
@@ -357,7 +357,7 @@ mod tests {
             serde_json::from_str(CODEX_HOOKS).expect("codex payload is valid JSON");
         assert!(codex_payload["hooks"]["SessionStart"].is_array());
         assert!(codex_payload["hooks"]["Stop"].is_array());
-        assert!(CODEX_HOOKS.contains("thurbox-cli session signal"));
+        assert!(CODEX_HOOKS.contains("friring-cli session signal"));
 
         // vibe drops a managed hooks.toml into ~/.vibe/ (guarded by requires_dir).
         let vibe = def
@@ -402,7 +402,7 @@ mod tests {
         }
         assert!(payload["hooks"]["BeforeTool"].is_null());
         assert!(payload["hooks"]["AfterAgent"].is_null());
-        assert!(ANTIGRAVITY_HOOKS.contains("thurbox-cli session signal"));
+        assert!(ANTIGRAVITY_HOOKS.contains("friring-cli session signal"));
 
         // copilot drops a managed standalone file into ~/.copilot/hooks/ (guarded
         // by requires_dir; the hooks/ subdir is created on write).
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn hooks_home_derives_from_build_config_dir() {
         // Home must track the resolved config dir (so a dev build lands under
-        // `thurbox-dev`, not the release tree) — never a hardcoded path.
+        // `friring-dev`, not the release tree) — never a hardcoded path.
         let tmp = tempfile::tempdir().unwrap();
         let _guard = crate::paths::TestPathGuard::new(tmp.path());
         let home = hooks_home().expect("home resolves");

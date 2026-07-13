@@ -298,31 +298,12 @@ fn child_item<'a>(state: &RepoPickerState<'a>, real_idx: usize, style: Style) ->
     ListItem::new(Line::from(spans))
 }
 
-/// Build spans for a bookmark with fuzzy-match positions highlighted in the accent color.
+/// Build spans for a bookmark with fuzzy-match positions highlighted in the
+/// accent color: the checkbox prefix in the base style, then the shared
+/// highlighter over the displayed path.
 fn highlighted_spans(query: &str, check: &str, display: &str, style: Style) -> Vec<Span<'static>> {
-    let positions = crate::fuzzy::fuzzy_match(query, display)
-        .map(|m| m.positions)
-        .unwrap_or_default();
     let mut result = vec![Span::styled(check.to_string(), style)];
-    let mut last = 0;
-    for &pos in &positions {
-        if pos > last {
-            result.push(Span::styled(display[last..pos].to_string(), style));
-        }
-        let end = display[pos..]
-            .chars()
-            .next()
-            .map(|c| pos + c.len_utf8())
-            .unwrap_or(pos + 1);
-        result.push(Span::styled(
-            display[pos..end].to_string(),
-            Style::default().fg(Theme::accent()),
-        ));
-        last = end;
-    }
-    if last < display.len() {
-        result.push(Span::styled(display[last..].to_string(), style));
-    }
+    result.extend(super::fuzzy_highlighted_spans(query, display, style));
     result
 }
 
