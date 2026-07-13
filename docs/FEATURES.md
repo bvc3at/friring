@@ -488,8 +488,8 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Ctrl+T` / `F8` | Global | Toggle shell pane alongside the agent session | **T**erminal |
 | `Ctrl+X` / `F7` | Global | Toggle the native code-review view | Review |
 | `Ctrl+H` | Global | Focus previous pane (cycle backward) | Vim: **h** = left |
-| `Ctrl+J` | Global | Select next session | Vim: **j** = down |
-| `Ctrl+K` | Global | Select previous session | Vim: **k** = up |
+| `Ctrl+J` / `Alt+J` | Global | Select next session (`Ctrl+J` defers to the agent in a focused terminal — it doubles as a legacy `Ctrl+Enter`; use `Alt+J` there) | Vim: **j** = down |
+| `Ctrl+K` / `Alt+K` | Global | Select previous session (`Ctrl+K` defers likewise — readline kill-to-end) | Vim: **k** = up |
 | `Ctrl+L` | Global | Focus next pane (cycle forward) | Vim: **l** = right |
 | `Ctrl+D` | Session list | Delete selected session | Vim: **d** = delete |
 | `Ctrl+O` | Global | Open active session's worktrees in editor | **O**pen |
@@ -574,18 +574,30 @@ namespace with readline / shell line editing (`Ctrl+A` = start-of-line, `Ctrl+E`
 = end-of-line, `Ctrl+W` = delete-word, `Ctrl+U` = kill-line, `Ctrl+R` =
 reverse-search, `Ctrl+D` = EOF, …). So when a session **terminal is focused**,
 the actions flagged by `Action::terminal_passthrough` (`ToggleInfoPanel` /
-`DeleteSession` / `ToggleFileViewer` / `ForkSession` / `OpenInEditor` /
-`OpenAutomations` / `RestartSession` / `StartSync` / `OpenRestoreSessions` /
-`FocusTasks` / `ToggleReview`) **defer to the agent CLI** — `handle_key` skips
-`dispatch_action` and falls through to `handle_terminal_key`, forwarding the
-bytes to the PTY (so e.g. `Ctrl+X` reaches emacs's prefix key). The friring
-command stays reachable from the **session list** (and via its `F`-key alternate
-where one exists — `F2`/`F3`/`F5`/`F7`). The deferral is gated on the bound chord
-still being a bare `Ctrl+<letter>` (`is_ctrl_letter_chord`), so rebinding a
-passthrough action to a non-conflicting key keeps it working in the terminal.
-Navigation / app-control chords (`Ctrl+H/J/K/L`, `Ctrl+Q`, `Ctrl+N`, …) are
-**not** deferred — they are the keyboard escape route out of the terminal, so
-they keep working there even though a few collide with readline.
+`DeleteSession` / `ToggleFileViewer` / `ForkSession` / `NextSession` /
+`PreviousSession` / `OpenInEditor` / `OpenAutomations` / `RestartSession` /
+`StartSync` / `OpenRestoreSessions` / `FocusTasks` / `ToggleReview`) **defer to
+the agent CLI** — `handle_key` skips `dispatch_action` and falls through to
+`handle_terminal_key`, forwarding the bytes to the PTY (so e.g. `Ctrl+X` reaches
+emacs's prefix key). The friring command stays reachable from the **session
+list** (and via its alternate where one exists — `F2`/`F3`/`F5`/`F7`,
+`Alt+J`/`Alt+K`). The deferral is gated on the bound chord still being a bare
+`Ctrl+<letter>` (`is_ctrl_letter_chord`), so rebinding a passthrough action to a
+non-conflicting key keeps it working in the terminal. Navigation / app-control
+chords (`Ctrl+H`/`Ctrl+L`, `Ctrl+Q`, `Ctrl+N`, …) are **not** deferred — they
+are the keyboard escape route out of the terminal, so they keep working there
+even though a few collide with readline.
+
+**Modifier-Enter reaches the agent as a newline.** `Ctrl+J`/`Ctrl+K` deferring
+(a fork divergence — upstream keeps them as session nav) is what makes
+`Ctrl+Enter` insert a newline in the inner agent: a legacy terminal (Windows
+Terminal, or anything behind an outer tmux, which strips the kitty protocol)
+encodes `Ctrl+Enter` as the LF byte `0x0A`, which crossterm decodes as `Ctrl+J`.
+Forwarded to the PTY it is exactly the `Ctrl+J` newline shortcut Claude Code and
+friends understand. On kitty-protocol terminals the disambiguated
+`Shift+Enter`/`Ctrl+Enter` never had a chord conflict and are forwarded as CSI-u
+(`ESC [13;<mod> u`, `agent::input::key_to_bytes`) so the modifier survives;
+`Alt+Enter` forwards as the legacy `ESC CR`.
 
 **Readline editing in modal text fields.** Friring's own text inputs
 (session / branch name, repo-picker path & search, automation editor,
@@ -2352,7 +2364,15 @@ confined to the active pane bounds.
   drag).
 - **`Ctrl+C`** (with active selection): Copies selected text to
   the system clipboard via `arboard`. Trailing whitespace is
-  trimmed per line.
+  trimmed per line. When no display server is reachable (`arboard`
+  needs X11/Wayland — unavailable over SSH, under a display-less
+  tmux, or in WSL without WSLg) every copy falls back to **OSC 52**
+  (`app::clipboard`): the escape rides the rendered-output path
+  through tmux (default `set-clipboard external` forwards it) to
+  the *outer* terminal, so the text lands on the clipboard of the
+  machine the user is looking at. The toast says `(OSC 52)` since
+  that path is fire-and-forget — a terminal without OSC 52 support
+  ignores it silently.
 - **`Ctrl+C`** (no selection): Forwarded to the terminal as SIGINT.
 - **`Ctrl+V`**: Pastes from the system clipboard. When a modal text
   input (worktree/session name, repo-picker path or search,
@@ -2362,7 +2382,9 @@ confined to the active pane bounds.
   newlines, the multi-line task description keeps them). While **any**
   modal is open the paste is swallowed so it can never leak into the
   terminal in the pane behind the overlay; otherwise it pastes into
-  the active PTY.
+  the active PTY. Paste has **no OSC 52 fallback** (terminals block
+  clipboard *reads* for security) — without a display server, use the
+  terminal's own paste key, which arrives as a bracketed paste.
 - Any other keypress clears the selection.
 
 Selection is highlighted in the terminal render buffer using

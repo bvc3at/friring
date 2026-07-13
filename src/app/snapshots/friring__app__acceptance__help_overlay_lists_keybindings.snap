@@ -11,8 +11,8 @@ expression: h.render()
 │                   │Navigation                                               ▲│                   │
 │                   │› ctrl+h          Focus previous pane                    █│                   │
 │                   │  ctrl+l          Focus next pane                        █│                   │
-│                   │  ctrl+j          Next session                           █│                   │
-│                   │  ctrl+k          Previous session                       ║│                   │
+│                   │  ctrl+j / alt+j  Next session                           █│                   │
+│                   │  ctrl+k / alt+k  Previous session                       ║│                   │
 │                   │                                                         ║│                   │
 │                   │Sessions                                                 ║│                   │
 │                   │  ctrl+n          New session                            ║│                   │

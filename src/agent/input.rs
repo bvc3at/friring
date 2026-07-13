@@ -41,8 +41,8 @@ pub fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
     unmodified_key(code)
 }
 
-/// Ctrl+letter and the Shift-special keys (Shift+Enter, reverse-tab) that have
-/// dedicated encodings handled before the generic CSI/Alt paths.
+/// Ctrl+letter and the modifier-special keys (Shift/Ctrl+Enter, reverse-tab)
+/// that have dedicated encodings handled before the generic CSI/Alt paths.
 fn ctrl_or_shift_special_bytes(
     code: KeyCode,
     shift: bool,
@@ -54,9 +54,14 @@ fn ctrl_or_shift_special_bytes(
         return Some(bytes);
     }
 
-    // Shift+Enter → ESC [ 13;2u (xterm modifyOtherKeys / kitty protocol)
-    if shift && code == KeyCode::Enter {
-        return Some(b"\x1b[13;2u".to_vec());
+    // Shift/Ctrl(+Shift)+Enter → ESC [ 13;<mod> u (xterm modifyOtherKeys /
+    // kitty protocol) — the only encoding that keeps the modifier, which agent
+    // CLIs read as "insert newline" rather than "submit". Alt-only Enter stays
+    // on the legacy `ESC CR` path (`alt_bytes`), the more widely understood
+    // option+enter encoding.
+    if (shift || ctrl) && code == KeyCode::Enter {
+        let param = xterm_modifier(shift, alt, ctrl);
+        return Some(format!("\x1b[13;{param}u").into_bytes());
     }
 
     // BackTab / Shift+Tab → reverse tab (CSI Z)
@@ -249,6 +254,24 @@ mod tests {
     fn shift_enter_produces_modified_enter() {
         let bytes = key_to_bytes(KeyCode::Enter, KeyModifiers::SHIFT);
         assert_eq!(bytes, Some(b"\x1b[13;2u".to_vec()));
+    }
+
+    #[test]
+    fn ctrl_enter_keeps_its_modifier() {
+        // Must not degrade to a plain CR — the agent would read that as
+        // "submit" where the user asked for a newline.
+        assert_eq!(
+            key_to_bytes(KeyCode::Enter, KeyModifiers::CONTROL),
+            Some(b"\x1b[13;5u".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Enter, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            Some(b"\x1b[13;6u".to_vec())
+        );
+        assert_eq!(
+            key_to_bytes(KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::ALT),
+            Some(b"\x1b[13;4u".to_vec())
+        );
     }
 
     #[test]

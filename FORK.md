@@ -292,6 +292,33 @@ the first match.
 
 ### Behavior fixes
 
+- **Copy falls back to OSC 52 when no display server is reachable.** Upstream
+  copies only through `arboard`, which needs X11/Wayland — over SSH, under a
+  display-less tmux, or in WSL without WSLg every copy failed with "Clipboard
+  not available". The fork falls back to the OSC 52 escape (`app::clipboard`),
+  which rides the rendered-output path through tmux (default `set-clipboard
+  external` forwards it) to the outer terminal, putting the text on the
+  clipboard of the machine the user is actually looking at; the toast marks the
+  fire-and-forget path with `(OSC 52)`. Applies to all copy surfaces
+  (selection, status bar, code-review markdown). Paste keeps arboard only —
+  terminals block OSC 52 *reads* — and the error now points at the terminal's
+  own paste key (bracketed paste still works).
+
+- **Modifier-Enter inserts a newline in the agent instead of switching
+  sessions.** A legacy terminal (Windows Terminal, or anything behind an outer
+  tmux, which strips the kitty protocol) encodes `Ctrl+Enter` as the LF byte,
+  which crossterm decodes as `Ctrl+J` — upstream's `NextSession` chord, so the
+  keystroke switched sessions instead of reaching the agent. The fork adds
+  `NextSession`/`PreviousSession` to `Action::terminal_passthrough` (upstream
+  deliberately kept them as in-terminal nav): with a terminal focused,
+  `Ctrl+J`/`Ctrl+K` now forward to the PTY (`Ctrl+J` is the newline shortcut
+  Claude Code & co. understand; `Ctrl+K` is readline kill-to-end), and new
+  `Alt+J`/`Alt+K` default alternates keep session cycling reachable there.
+  Kitty-protocol `Ctrl+Enter` also no longer degrades to a bare CR:
+  `agent::input::key_to_bytes` encodes Shift/Ctrl-modified Enter as CSI-u
+  (`ESC [13;<mod> u`), keeping the modifier so agents read "newline", not
+  "submit".
+
 - **Worktree branch pre-fill keeps `/`.** In the new-worktree flow, the branch
   name suggested from the session name upstream drops every char that isn't
   alphanumeric / space / `-` / `_`, so a git-flow style session name like

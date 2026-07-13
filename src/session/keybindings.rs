@@ -331,10 +331,19 @@ impl Action {
     /// `App::handle_key`), so rebinding an action to a non-conflicting key keeps
     /// it working in the terminal.
     ///
-    /// Navigation / app-control chords (`Ctrl+H/J/K/L` focus + session nav,
+    /// Navigation / app-control chords (`Ctrl+H`/`Ctrl+L` focus cycling,
     /// `Ctrl+Q` quit, `Ctrl+N` new, …) are deliberately **not** deferred: they
     /// are the keyboard escape route out of the terminal, so they must keep
     /// working there even though some collide with readline.
+    ///
+    /// `Ctrl+J`/`Ctrl+K` (session cycling) **are** deferred — a fork divergence
+    /// from upstream (which kept them as nav). `Ctrl+J` *is* the LF byte: a
+    /// legacy terminal (Windows Terminal, kitty without the kitty protocol —
+    /// i.e. anything reaching us through tmux) encodes `Ctrl+Enter` as `0x0A`,
+    /// which crossterm decodes as `Ctrl+J`. Keeping it as nav made
+    /// modifier-Enter switch sessions instead of inserting a newline in the
+    /// agent. `Ctrl+K` follows for symmetry and readline kill-to-end. `Alt+J`/
+    /// `Alt+K` are the in-terminal cycling alternates (see `default_chords_for`).
     ///
     /// `Ctrl+T` (`ToggleShell`) is a deliberate exception that is **not** in
     /// this list even though it shadows readline's transpose-chars: transpose is
@@ -353,6 +362,8 @@ impl Action {
                 | Action::DeleteSession     // Ctrl+D — EOF / delete char
                 | Action::ToggleFileViewer  // Ctrl+E — end of line      (F3 alt)
                 | Action::ForkSession       // Ctrl+F — forward char
+                | Action::NextSession       // Ctrl+J — LF: legacy Ctrl+Enter → newline
+                | Action::PreviousSession   // Ctrl+K — kill to end of line
                 | Action::OpenInEditor      // Ctrl+O — operate-and-get-next
                 | Action::OpenAutomations   // Ctrl+P — previous history
                 | Action::RestartSession    // Ctrl+R — reverse search
@@ -414,8 +425,17 @@ impl Action {
             Action::OpenThemePicker => vec![KeyChord::ctrl('y'), KeyChord::function(4)],
             Action::FocusBackward => vec![KeyChord::ctrl('h')],
             Action::FocusForward => vec![KeyChord::ctrl('l')],
-            Action::NextSession => vec![KeyChord::ctrl('j')],
-            Action::PreviousSession => vec![KeyChord::ctrl('k')],
+            // Ctrl+J/Ctrl+K primaries are in `terminal_passthrough` (Ctrl+J is
+            // the LF byte a legacy terminal sends for Ctrl+Enter, which must
+            // reach the agent as a newline), so the Alt alternates keep session
+            // cycling reachable from a focused terminal. macOS terminals need
+            // option-as-alt for those (e.g. kitty's `macos_option_as_alt`).
+            Action::NextSession => {
+                vec![KeyChord::ctrl('j'), KeyChord::alt(KeyCode::Char('j'))]
+            }
+            Action::PreviousSession => {
+                vec![KeyChord::ctrl('k'), KeyChord::alt(KeyCode::Char('k'))]
+            }
             Action::ToggleHelp => vec![KeyChord::ctrl('g'), KeyChord::function(1)],
             Action::ToggleInfoPanel => vec![KeyChord::ctrl('b'), KeyChord::function(2)],
             Action::ToggleFileViewer => vec![KeyChord::ctrl('e'), KeyChord::function(3)],
@@ -1115,7 +1135,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_passthrough_covers_readline_chords_not_navigation() {
+    fn terminal_passthrough_covers_readline_chords_not_escape_route() {
         // The readline / shell line-editing chords defer to the PTY when the
         // terminal is focused…
         for action in [
@@ -1123,6 +1143,8 @@ mod tests {
             Action::DeleteSession,       // Ctrl+D
             Action::ToggleFileViewer,    // Ctrl+E
             Action::ForkSession,         // Ctrl+F
+            Action::NextSession,         // Ctrl+J — LF, a legacy Ctrl+Enter
+            Action::PreviousSession,     // Ctrl+K — kill to end of line
             Action::OpenInEditor,        // Ctrl+O
             Action::OpenAutomations,     // Ctrl+P
             Action::RestartSession,      // Ctrl+R
@@ -1137,8 +1159,8 @@ mod tests {
             );
         }
 
-        // …but the keyboard escape route (focus / session nav) and quit must
-        // keep working in the terminal, so they never defer. Global search's
+        // …but the keyboard escape route (focus cycling) and quit must keep
+        // working in the terminal, so they never defer. Global search's
         // default (Ctrl+/) isn't a readline editing chord, so it doesn't defer
         // either — it opens from the terminal directly.
         for action in [
@@ -1146,8 +1168,6 @@ mod tests {
             Action::NewSession,
             Action::FocusBackward,
             Action::FocusForward,
-            Action::NextSession,
-            Action::PreviousSession,
             Action::ToggleShell,
             Action::UndoDelete,
             Action::Copy,
@@ -1159,6 +1179,23 @@ mod tests {
                 "{action:?} must stay active in the terminal"
             );
         }
+    }
+
+    #[test]
+    fn session_cycling_keeps_in_terminal_alternates() {
+        // Ctrl+J/Ctrl+K defer to the PTY in a focused terminal (Ctrl+J is the
+        // LF byte a legacy terminal sends for Ctrl+Enter — it must reach the
+        // agent as a newline), so cycling needs non-Ctrl-letter alternates
+        // that still dispatch there.
+        let kb = KeyBindings::default();
+        assert_eq!(
+            kb.chords_for(Action::NextSession),
+            &[KeyChord::ctrl('j'), KeyChord::alt(KeyCode::Char('j'))]
+        );
+        assert_eq!(
+            kb.chords_for(Action::PreviousSession),
+            &[KeyChord::ctrl('k'), KeyChord::alt(KeyCode::Char('k'))]
+        );
     }
 
     #[test]
