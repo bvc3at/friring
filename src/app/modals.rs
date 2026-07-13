@@ -529,6 +529,18 @@ pub struct BranchSelectorModal {
     pub loading: bool,
 }
 
+/// Picker shown when a Ctrl+S sync targets a repo with more than one remote:
+/// choose which remote to rebase onto. One picker per multi-remote repo; the
+/// queue of repos still awaiting a choice rides on the parked sync run
+/// ([`PendingSyncRun`](super::sync_state::PendingSyncRun)), not the modal.
+#[derive(Debug, Clone, Default)]
+pub struct SyncBasePickerModal {
+    /// Display name of the repo the choice applies to (shown in the title).
+    pub repo_name: String,
+    pub remotes: Vec<String>,
+    pub index: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WorktreeNameModal {
     pub name: TextInput,
@@ -1895,6 +1907,7 @@ pub enum Modal {
     None,
     Help(HelpModal),
     BranchSelector(BranchSelectorModal),
+    SyncBasePicker(SyncBasePickerModal),
     WorktreeName(WorktreeNameModal),
     AgentPicker(crate::ui::agent_picker_modal::AgentPickerState),
     HostPicker(crate::ui::host_picker_modal::HostPickerState),
@@ -1935,6 +1948,7 @@ impl Modal {
             Modal::AgentPicker(ap) => Some((&mut ap.selected_index, KeyCode::Enter)),
             Modal::HostPicker(hp) => Some((&mut hp.selected_index, KeyCode::Enter)),
             Modal::BranchSelector(bs) => Some((&mut bs.index, KeyCode::Enter)),
+            Modal::SyncBasePicker(sb) => Some((&mut sb.index, KeyCode::Enter)),
             Modal::TaskActionPicker(p) => Some((&mut p.selected, KeyCode::Enter)),
             Modal::AutomationsList(al) => Some((&mut al.index, KeyCode::Enter)),
             Modal::RestoreSessions(rs) => Some((&mut rs.index, KeyCode::Enter)),

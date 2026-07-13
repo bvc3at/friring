@@ -390,6 +390,7 @@ impl App {
         match self.modal {
             Modal::RestoreSessions(_) => self.handle_restore_sessions_key(code),
             Modal::BranchSelector(_) => self.handle_branch_selector_key(code),
+            Modal::SyncBasePicker(_) => self.handle_sync_base_picker_key(code),
             Modal::WorktreeName(_) => self.handle_worktree_name_key(code, mods),
             Modal::SessionName(_) => self.handle_session_name_key(code, mods),
             Modal::AutomationEditor(_) => self.handle_automation_editor_key(code, mods),
@@ -835,6 +836,33 @@ impl App {
                 self.new_session.base_branch = Some(base_branch);
                 self.modal =
                     super::modals::Modal::SessionName(super::modals::SessionNameModal::default());
+            }
+            _ => {}
+        }
+    }
+
+    /// Drive the sync base picker (`Ctrl+S` with a multi-remote repo): Enter
+    /// picks the highlighted remote (persisted as the repo's default) and the
+    /// parked sync run advances; Esc drops the whole run.
+    fn handle_sync_base_picker_key(&mut self, code: KeyCode) {
+        let super::modals::Modal::SyncBasePicker(ref mut sb) = self.modal else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => {
+                self.modal.close();
+                self.cancel_sync_base();
+            }
+            KeyCode::Char('j') | KeyCode::Down if sb.index + 1 < sb.remotes.len() => {
+                sb.index += 1;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                sb.index = sb.index.saturating_sub(1);
+            }
+            KeyCode::Enter if !sb.remotes.is_empty() => {
+                let remote = sb.remotes[sb.index].clone();
+                self.modal.close();
+                self.confirm_sync_base(remote);
             }
             _ => {}
         }
