@@ -355,25 +355,6 @@ pub fn claude_project_slug(canonical_cwd: &Path) -> String {
         .collect()
 }
 
-/// Resolve a Claude conversation transcript `<root>/projects/*/<id>.jsonl` by
-/// scanning the slug dirs (computing the slug is avoidable here — see
-/// [`claude_project_slug`]). Same root resolution as [`claude_projects_dir`].
-/// Used by the activity scan to tail the session's main transcript.
-pub fn claude_transcript_path(
-    agent_session_id: &str,
-    config_dir_override: Option<&Path>,
-) -> Option<PathBuf> {
-    let projects = claude_projects_dir(config_dir_override)?;
-    let target = format!("{agent_session_id}.jsonl");
-    for entry in std::fs::read_dir(&projects).ok()?.flatten() {
-        let candidate = entry.path().join(&target);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 /// Mistral Vibe's per-session log root: `$VIBE_HOME/logs/session` →
 /// `~/.vibe/logs/session`. Each session is a
 /// `<prefix>_<utc-ts>_<shortid>/` dir holding `meta.json` + `messages.jsonl`
