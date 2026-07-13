@@ -517,7 +517,7 @@ Each `[[agents]]` entry maps the resume / fork / new-session ids
 onto argument-template groups. `args` is always passed (bake in
 any flags you want, e.g. a model); the resume / fork /
 new-session groups are appended only when their driving value is
-present, with `{id}` substituted token-by-token:
+present, with `{id}` and `{name}` substituted token-by-token:
 
 ```toml
 default = "claude"
@@ -526,13 +526,19 @@ default = "claude"
 name = "claude"
 command = "claude"
 resume_args = ["--resume", "{id}"]
-fork_args = ["--resume", "{id}", "--fork-session"]
-new_session_args = ["--session-id", "{id}"]
+fork_args = ["--resume", "{id}", "--fork-session", "-n", "{name}"]
+new_session_args = ["--session-id", "{id}", "-n", "{name}"]
 
 [[agents]]
 name = "codex"
 command = "codex"
 ```
+
+`{name}` is the friring session name, passed only when a
+conversation is *created* (a fresh spawn or fork) — resume omits it,
+so an in-agent `/rename` and imported conversation titles survive. A
+name-less launch drops the `{name}` token together with its preceding
+flag, so no dangling `-n` is ever emitted.
 
 ## Common Workflows
 
