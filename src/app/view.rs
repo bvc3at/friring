@@ -150,7 +150,6 @@ impl App {
                     ClickAction::ModalRow(_)
                         | ClickAction::ModalButton { .. }
                         | ClickAction::ModalField(_)
-                        | ClickAction::RepoFocus(_)
                         | ClickAction::ConvoFocus(_)
                 )
             } else {
@@ -1008,6 +1007,49 @@ impl App {
         self.record_scrollbar(modal_geom, ScrollTarget::Modal);
     }
 
+    /// One muted line of the wizard's accumulated choices ("devbox · friring
+    /// +1 · wt from main"), so the later steps don't appear out of nowhere.
+    /// `None` when nothing is known yet (e.g. a prefilled fork flow).
+    pub(super) fn wizard_breadcrumb(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        // The backend is consumed by `spawn_session_with_config` in the normal
+        // flow — fall back to the pending config's copy.
+        let backend = self.new_session.backend.as_deref().or_else(|| {
+            self.new_session
+                .spawn_config
+                .as_ref()
+                .and_then(|c| c.backend.as_deref())
+        });
+        if let Some(host) = self.host_for_backend(backend) {
+            parts.push(host.name.clone());
+        }
+        let repo = self.new_session.repo_path.as_deref().or_else(|| {
+            self.new_session
+                .spawn_config
+                .as_ref()
+                .and_then(|c| c.cwd.as_deref())
+        });
+        if let Some(repo) = repo {
+            let mut label = crate::paths::display_path(repo);
+            let extra = self
+                .new_session
+                .all_repos
+                .as_ref()
+                .map(|v| v.len().saturating_sub(1))
+                .unwrap_or(0)
+                + self.new_session.normal_repos.len()
+                + self.new_session.additional_dirs.len();
+            if extra > 0 {
+                label.push_str(&format!(" +{extra}"));
+            }
+            parts.push(label);
+        }
+        if let Some(base) = self.new_session.base_branch.as_deref() {
+            parts.push(format!("wt from {base}"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+
     /// Render the text-input modals (worktree / session name) and the
     /// hard-delete confirmation. These report only footer buttons (every other
     /// click is swallowed), so they are rendered separately from selectors.
@@ -1015,23 +1057,35 @@ impl App {
         // Worktree name modal
         if let super::modals::Modal::WorktreeName(ref wn) = self.modal {
             let base = self.new_session.base_branch.as_deref().unwrap_or("");
+            let crumb = self.wizard_breadcrumb();
             return worktree_name_modal::render_worktree_name_modal(
                 frame,
                 &worktree_name_modal::WorktreeNameState {
                     name: wn.name.value(),
                     cursor: wn.name.cursor_pos(),
                     base_branch: base,
+                    breadcrumb: crumb.as_deref(),
                 },
             );
         }
 
         // Session name modal
         if let super::modals::Modal::SessionName(ref sn) = self.modal {
+            let title = if self.new_session.fork {
+                "Fork — Name"
+            } else if self.new_session.import {
+                "Import — Name"
+            } else {
+                "New Session — Name"
+            };
+            let crumb = self.wizard_breadcrumb();
             return session_name_modal::render_session_name_modal(
                 frame,
                 &session_name_modal::SessionNameState {
                     name: sn.name.value(),
                     cursor: sn.name.cursor_pos(),
+                    title,
+                    breadcrumb: crumb.as_deref(),
                 },
             );
         }
@@ -1084,6 +1138,11 @@ impl App {
                     selected_index: bs.index,
                     filter: &bs.filter,
                     loading: bs.loading,
+                    repo: self
+                        .new_session
+                        .repo_path
+                        .as_deref()
+                        .map(crate::paths::display_path),
                 },
             ));
         }
@@ -1104,7 +1163,12 @@ impl App {
 
         // Agent picker modal
         if let super::modals::Modal::AgentPicker(ref ap) = self.modal {
-            return Some(agent_picker_modal::render_agent_picker_modal(frame, ap));
+            let crumb = self.wizard_breadcrumb();
+            return Some(agent_picker_modal::render_agent_picker_modal(
+                frame,
+                ap,
+                crumb.as_deref(),
+            ));
         }
 
         // Host picker modal
@@ -1187,27 +1251,11 @@ impl App {
             return Some(render);
         }
 
-        // Repo picker modal. Render under an immutable borrow of the modal,
-        // then (borrow released) record click targets that focus its editable
-        // sub-fields (path input + search bar).
-        if matches!(self.modal, super::modals::Modal::RepoPicker(_)) {
-            let (render, areas) = {
-                let super::modals::Modal::RepoPicker(ref rp) = self.modal else {
-                    unreachable!()
-                };
-                self.render_repo_picker_modal(frame, rp)
-            };
-            if let Some(search) = areas.search {
-                self.record_click(
-                    search,
-                    ClickAction::RepoFocus(super::modals::RepoPickerFocus::Search),
-                );
-            }
-            self.record_click(
-                areas.input,
-                ClickAction::RepoFocus(super::modals::RepoPickerFocus::Input),
-            );
-            return Some(render);
+        // Repo picker palette. Its single input is always focused, so there
+        // are no editable-sub-field click targets to record — a click in the
+        // input area is simply swallowed like any other modal chrome.
+        if let super::modals::Modal::RepoPicker(ref rp) = self.modal {
+            return Some(self.render_repo_picker_modal(frame, rp));
         }
 
         None
@@ -1265,29 +1313,23 @@ impl App {
         &self,
         frame: &mut Frame,
         rp: &super::modals::RepoPickerModal,
-    ) -> (
-        crate::ui::ModalRender,
-        crate::ui::repo_picker_modal::RepoFocusAreas,
-    ) {
+    ) -> crate::ui::ModalRender {
         crate::ui::repo_picker_modal::render_repo_picker_modal(
             frame,
             &crate::ui::repo_picker_modal::RepoPickerState {
-                bookmarks: &rp.bookmarks,
+                rows: &rp.rows,
                 selected: &rp.selected,
                 worktree: &rp.worktree,
-                is_header: &rp.is_header,
-                is_child: &rp.is_child,
                 collapsed: &rp.collapsed,
                 list_index: rp.list_index,
-                path_input: rp.path_input.value(),
-                path_cursor: rp.path_input.cursor_pos(),
-                path_suggestion: rp.path_suggestion.as_deref(),
-                focus: rp.focus,
-                search_query: rp.search_input.value(),
-                search_cursor: rp.search_input.cursor_pos(),
-                search_active: rp.focus == super::modals::RepoPickerFocus::Search
-                    || !rp.search_input.value().is_empty(),
                 filtered_indices: &rp.filtered_indices,
+                input: rp.input.value(),
+                input_cursor: rp.input.cursor_pos(),
+                suggestion: rp.path_suggestion.as_deref(),
+                mode: rp.input_mode(),
+                candidates: &rp.candidates,
+                candidate_index: rp.candidate_index,
+                picked: rp.picked_count(),
                 host: self
                     .host_for_backend(self.new_session.backend.as_deref())
                     .map(|h| h.name.as_str()),

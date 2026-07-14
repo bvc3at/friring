@@ -1221,75 +1221,167 @@ pub struct AutomationsListModal {
 
 // ── RepoPickerModal ─────────────────────────────────────────────────────
 
-/// Which section of the repo picker is focused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RepoPickerFocus {
-    /// The list of bookmarked/recent repos (multi-select).
-    #[default]
-    List,
-    /// The text input for adding a new path.
-    Input,
-    /// The fuzzy search filter input.
-    Search,
+/// What a repo-picker row is. Selection and worktree flags do NOT live on the
+/// row — they live in path-keyed sets on [`RepoPickerModal`], because rows are
+/// rebuilt on every parent re-scan and the user's picks must survive that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoRowKind {
+    /// Parent-folder header (non-selectable group title; folds its children).
+    Header,
+    /// A selectable repo; `child` nests it under the preceding header.
+    Repo { child: bool },
+    /// First-run helper: "import repos from `path`" — shown (local only) while
+    /// there are no bookmark rows at all. Activating it imports the folder as a
+    /// parent bookmark and re-scans.
+    ImportSuggestion,
+    /// Pinned last row: start the session without a repo (`~` locally, the
+    /// host's default directory remotely). Makes the no-repo session an
+    /// explicit choice instead of a silent Enter fallthrough; `path` is unused.
+    StartHere,
+}
+
+/// One row of the repo-picker list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoRow {
+    pub path: PathBuf,
+    pub kind: RepoRowKind,
+}
+
+impl RepoRow {
+    pub fn is_header(&self) -> bool {
+        matches!(self.kind, RepoRowKind::Header)
+    }
+
+    pub fn is_child(&self) -> bool {
+        matches!(self.kind, RepoRowKind::Repo { child: true })
+    }
+
+    pub fn is_repo(&self) -> bool {
+        matches!(self.kind, RepoRowKind::Repo { .. })
+    }
+}
+
+/// Whether the palette input currently holds a bookmark filter or a
+/// filesystem path — decided by shape, so the user controls it directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoInputMode {
+    /// Fuzzy-filter the bookmark rows.
+    Filter,
+    /// A path being typed/completed (`~`, `/`, `./`, `../` prefix).
+    Path,
+}
+
+/// One live directory-completion candidate shown while the palette input is
+/// in path mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathCandidate {
+    /// Entry name as listed in the parent directory.
+    pub name: String,
+    /// The candidate's full path (tilde-expanded parent joined with `name`).
+    pub full: PathBuf,
+    /// Whether the directory is a git repo. Local only — probing a remote
+    /// candidate would cost one ssh round-trip each, so remote candidates are
+    /// always `false` and Enter drills in instead of opening.
+    pub is_repo: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct RepoPickerModal {
-    /// Bookmarked repos shown in the list. For a header row this is the parent
-    /// folder; for a child/standalone row it is the repo path.
-    pub bookmarks: Vec<PathBuf>,
-    /// Which bookmarks are selected (checked). Header rows stay unselected.
-    pub selected: Vec<bool>,
-    /// Whether each selected repo should use worktree mode (parallel to `bookmarks`).
-    pub worktree: Vec<bool>,
-    /// Whether each row is a parent header (non-selectable group title).
-    pub is_header: Vec<bool>,
-    /// Whether each row is a child repo nested under a parent header (drives the
-    /// indentation). `false` for headers and standalone repos. Parallel to `bookmarks`.
-    pub is_child: Vec<bool>,
+    /// Bookmark rows in recency order (a parent header followed by its
+    /// scanned children, or a standalone repo), plus the pinned helper rows
+    /// (import suggestions, "start here") at the end.
+    pub rows: Vec<RepoRow>,
+    /// Checked repos, keyed by path so rebuilds and filtering can't lose them.
+    pub selected: HashSet<PathBuf>,
+    /// Repos flagged for worktree mode, keyed by path. Toggling the flag on
+    /// also checks the repo (see [`Self::toggle_worktree`]).
+    pub worktree: HashSet<PathBuf>,
     /// Parent folders whose child tree is currently collapsed (keyed by path).
     /// Survives row rebuilds so collapsing state is kept across re-scans.
     pub collapsed: HashSet<PathBuf>,
     /// Cursor index in the bookmark list (indexes into `filtered_indices`).
     pub list_index: usize,
-    /// Text input for adding a new repo path.
-    pub path_input: TextInput,
-    /// Autocomplete suggestion for the path input.
+    /// The single always-focused palette input: filter text or a path.
+    pub input: TextInput,
+    /// Fish-style ghost completion for the input (path mode; derived from
+    /// `candidates` locally, from the explicit Tab listing remotely).
     pub path_suggestion: Option<String>,
-    /// Which section is focused (list vs input vs search).
-    pub focus: RepoPickerFocus,
-    /// Fuzzy search input for filtering bookmarks.
-    pub search_input: TextInput,
-    /// Indices into `bookmarks` that match the current search query.
-    /// When search is empty, contains `0..bookmarks.len()`.
+    /// Path mode: live directory candidates under the typed prefix (local:
+    /// refreshed per keystroke; remote: filled by an explicit Tab).
+    pub candidates: Vec<PathCandidate>,
+    /// Path-mode highlight; `None` = act on the typed path itself.
+    pub candidate_index: Option<usize>,
+    /// Indices into `rows` that match the current filter.
+    /// When the filter is empty, contains `0..rows.len()`.
     pub filtered_indices: Vec<usize>,
+    /// Whether the wizard targets a remote host (drives the "start here"
+    /// label and suppresses local-only rows on rebuild).
+    pub remote: bool,
 }
 
 impl RepoPickerModal {
-    /// Push a row, keeping all parallel vectors in lockstep.
-    pub fn push_row(&mut self, path: PathBuf, selected: bool, is_header: bool, is_child: bool) {
-        self.bookmarks.push(path);
-        self.selected.push(selected);
-        self.worktree.push(false);
-        self.is_header.push(is_header);
-        self.is_child.push(is_child);
+    /// Append a row.
+    pub fn push_row(&mut self, path: PathBuf, kind: RepoRowKind) {
+        self.rows.push(RepoRow { path, kind });
     }
 
     /// Whether the row at `idx` is a parent header (bounds-safe).
     pub fn is_header_row(&self, idx: usize) -> bool {
-        self.is_header.get(idx).copied().unwrap_or(false)
+        self.rows.get(idx).is_some_and(RepoRow::is_header)
     }
 
     /// Whether the row at `idx` is a child repo under a parent (bounds-safe).
     pub fn is_child_row(&self, idx: usize) -> bool {
-        self.is_child.get(idx).copied().unwrap_or(false)
+        self.rows.get(idx).is_some_and(RepoRow::is_child)
     }
 
-    /// Clear the search query and recompute the filter (collapse still applies).
-    pub fn clear_search(&mut self) {
-        self.search_input.clear();
-        self.list_index = 0;
-        self.recompute_filter();
+    /// How the input is currently interpreted (see [`RepoInputMode`]).
+    pub fn input_mode(&self) -> RepoInputMode {
+        let v = self.input.value();
+        // Path-shaped: a `~` home prefix, an explicit relative lead (`./`/`../`,
+        // and their `\` forms on Windows), or any absolute path. `is_absolute`
+        // is what makes a Windows drive path (`C:\repos`, `C:/repos`) — and a
+        // Unix `/abs` — path mode; a bare filter query like `friring` is not
+        // absolute, so it stays a fuzzy filter.
+        let path_like = v.starts_with('~')
+            || v.starts_with('/')
+            || v.starts_with("./")
+            || v.starts_with("../")
+            || (cfg!(windows) && (v.starts_with(".\\") || v.starts_with("..\\")))
+            || std::path::Path::new(v).is_absolute();
+        if path_like {
+            RepoInputMode::Path
+        } else {
+            RepoInputMode::Filter
+        }
+    }
+
+    /// Number of checked repos that are actually present as rows (a stale
+    /// selection whose bookmark was deleted doesn't count).
+    pub fn picked_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| r.is_repo() && self.selected.contains(&r.path))
+            .count()
+    }
+
+    /// Toggle whether the repo at `path` is checked. Callers guard against
+    /// non-repo rows (headers and pinned rows have no selectable identity).
+    pub fn toggle_selected(&mut self, path: &std::path::Path) {
+        if !self.selected.remove(path) {
+            self.selected.insert(path.to_path_buf());
+        }
+    }
+
+    /// Toggle the worktree flag of the repo at `path`, checking the repo when
+    /// the flag turns on — a worktree mark on an unchecked repo would be
+    /// silently ignored at submit.
+    pub fn toggle_worktree(&mut self, path: &std::path::Path) {
+        if self.worktree.remove(path) {
+            return;
+        }
+        self.worktree.insert(path.to_path_buf());
+        self.selected.insert(path.to_path_buf());
     }
 
     /// Toggle the collapsed state of the parent header at `real_idx` (a no-op on
@@ -1298,35 +1390,42 @@ impl RepoPickerModal {
         if !self.is_header_row(real_idx) {
             return;
         }
-        let path = self.bookmarks[real_idx].clone();
+        let path = self.rows[real_idx].path.clone();
         if !self.collapsed.insert(path.clone()) {
             self.collapsed.remove(&path);
         }
         self.recompute_filter();
     }
 
-    /// Rebuild `filtered_indices` from the current search query and collapse
-    /// state. Header rows are always visible; a child is hidden when its parent
-    /// is collapsed (unless a search is active, which expands all so matches are
-    /// findable). Keeps `list_index` in range.
+    /// Rebuild `filtered_indices` from the current input and collapse state.
+    /// Only filter-mode text filters (a typed path is not a query). Header rows
+    /// are always visible; a child is hidden when its parent is collapsed
+    /// (unless a filter is active, which expands all so matches are findable);
+    /// the pinned helper rows hide while filtering. Keeps `list_index` in range.
     pub fn recompute_filter(&mut self) {
-        let query = self.search_input.value().to_string();
+        let query = match self.input_mode() {
+            RepoInputMode::Filter => self.input.value().to_string(),
+            RepoInputMode::Path => String::new(),
+        };
         let searching = !query.is_empty();
-        let matches = |path: &PathBuf| {
+        let matches = |path: &std::path::Path| {
             !searching || crate::fuzzy::fuzzy_match(&query, &path.display().to_string()).is_some()
         };
 
         let mut indices = Vec::new();
         let mut current_collapsed = false;
-        for (i, path) in self.bookmarks.iter().enumerate() {
-            let visible = if self.is_header[i] {
-                current_collapsed = self.collapsed.contains(path);
-                true
-            } else if self.is_child[i] {
-                let hidden = current_collapsed && !searching;
-                !hidden && matches(path)
-            } else {
-                matches(path)
+        for (i, row) in self.rows.iter().enumerate() {
+            let visible = match row.kind {
+                RepoRowKind::Header => {
+                    current_collapsed = self.collapsed.contains(&row.path);
+                    true
+                }
+                RepoRowKind::Repo { child: true } => {
+                    let hidden = current_collapsed && !searching;
+                    !hidden && matches(&row.path)
+                }
+                RepoRowKind::Repo { child: false } => matches(&row.path),
+                RepoRowKind::ImportSuggestion | RepoRowKind::StartHere => !searching,
             };
             if visible {
                 indices.push(i);
@@ -1947,26 +2046,32 @@ impl Modal {
     }
 
     /// For a modal with a selectable list, a mutable handle to its selection
-    /// cursor plus the key a row-click replays to activate that row (`Enter` for
-    /// the selectors and the F1 editor, `Space` for the repo picker — where a
-    /// row's action is toggle/fold and `Enter` would confirm the whole modal on
-    /// a misclick). This is the **single** match over the selector modals, so the
+    /// cursor plus the key chord a row-click replays to activate that row
+    /// (`Enter` for the selectors and the F1 editor, `Ctrl+Space` for the repo
+    /// picker — a row's action there is toggle/fold, `Enter` would confirm the
+    /// whole modal on a misclick, and plain `Space` would type into the palette
+    /// input). This is the **single** match over the selector modals, so the
     /// read path (`App::modal_selected_index`) and the write path
     /// (`App::select_modal_row`) can never drift onto different modal sets — a new
     /// selectable modal is wired into both at once by adding one arm here.
-    pub(super) fn list_selection(&mut self) -> Option<(&mut usize, KeyCode)> {
+    pub(super) fn list_selection(&mut self) -> Option<(&mut usize, KeyCode, KeyModifiers)> {
+        let enter = KeyModifiers::NONE;
         match self {
-            Modal::Help(h) => Some((&mut h.selected, KeyCode::Enter)),
-            Modal::ThemePicker(tp) => Some((&mut tp.index, KeyCode::Enter)),
-            Modal::AgentPicker(ap) => Some((&mut ap.selected_index, KeyCode::Enter)),
-            Modal::HostPicker(hp) => Some((&mut hp.selected_index, KeyCode::Enter)),
-            Modal::BranchSelector(bs) => Some((&mut bs.index, KeyCode::Enter)),
-            Modal::SyncBasePicker(sb) => Some((&mut sb.index, KeyCode::Enter)),
-            Modal::TaskActionPicker(p) => Some((&mut p.selected, KeyCode::Enter)),
-            Modal::AutomationsList(al) => Some((&mut al.index, KeyCode::Enter)),
-            Modal::RestoreSessions(rs) => Some((&mut rs.index, KeyCode::Enter)),
-            Modal::RepoPicker(rp) => Some((&mut rp.list_index, KeyCode::Char(' '))),
-            Modal::ConversationPicker(cp) => Some((&mut cp.list_index, KeyCode::Enter)),
+            Modal::Help(h) => Some((&mut h.selected, KeyCode::Enter, enter)),
+            Modal::ThemePicker(tp) => Some((&mut tp.index, KeyCode::Enter, enter)),
+            Modal::AgentPicker(ap) => Some((&mut ap.selected_index, KeyCode::Enter, enter)),
+            Modal::HostPicker(hp) => Some((&mut hp.selected_index, KeyCode::Enter, enter)),
+            Modal::BranchSelector(bs) => Some((&mut bs.index, KeyCode::Enter, enter)),
+            Modal::SyncBasePicker(sb) => Some((&mut sb.index, KeyCode::Enter, enter)),
+            Modal::TaskActionPicker(p) => Some((&mut p.selected, KeyCode::Enter, enter)),
+            Modal::AutomationsList(al) => Some((&mut al.index, KeyCode::Enter, enter)),
+            Modal::RestoreSessions(rs) => Some((&mut rs.index, KeyCode::Enter, enter)),
+            Modal::RepoPicker(rp) => Some((
+                &mut rp.list_index,
+                KeyCode::Char(' '),
+                KeyModifiers::CONTROL,
+            )),
+            Modal::ConversationPicker(cp) => Some((&mut cp.list_index, KeyCode::Enter, enter)),
             _ => None,
         }
     }
@@ -2594,43 +2699,119 @@ mod tests {
     }
 
     #[test]
-    fn test_repo_picker_clear_search_resets_filter() {
+    fn repo_palette_typing_filters_and_clearing_restores() {
         let mut rp = RepoPickerModal::default();
-        rp.push_row("/a".into(), false, false, false);
-        rp.push_row("/b".into(), true, false, false);
-        rp.push_row("/c".into(), false, false, false);
-        rp.list_index = 1;
-        rp.filtered_indices = vec![1]; // simulating an active filter
-        rp.search_input.set("b");
+        rp.push_row("/alpha".into(), RepoRowKind::Repo { child: false });
+        rp.push_row("/beta".into(), RepoRowKind::Repo { child: false });
+        rp.push_row("/gamma".into(), RepoRowKind::Repo { child: false });
 
-        rp.clear_search();
+        rp.input.set("bet");
+        rp.recompute_filter();
+        assert_eq!(rp.filtered_indices, vec![1]);
 
-        assert_eq!(rp.search_input.value(), "");
+        rp.input.clear();
+        rp.recompute_filter();
         assert_eq!(rp.filtered_indices, vec![0, 1, 2]);
-        assert_eq!(rp.list_index, 0);
     }
 
     #[test]
-    fn test_repo_picker_push_row_keeps_vectors_in_lockstep() {
+    fn repo_palette_input_mode_detects_paths_by_prefix() {
         let mut rp = RepoPickerModal::default();
-        rp.push_row("/repo".into(), true, false, false);
-        rp.push_row("/parent".into(), false, true, false);
-        rp.push_row("/parent/child".into(), false, false, true);
+        for (text, mode) in [
+            ("", RepoInputMode::Filter),
+            ("friring", RepoInputMode::Filter),
+            ("with space", RepoInputMode::Filter),
+            ("~", RepoInputMode::Path),
+            ("~/code", RepoInputMode::Path),
+            ("/abs/path", RepoInputMode::Path),
+            ("./rel", RepoInputMode::Path),
+            ("../up", RepoInputMode::Path),
+        ] {
+            rp.input.set(text);
+            assert_eq!(rp.input_mode(), mode, "input {text:?}");
+        }
+    }
 
-        let n = rp.bookmarks.len();
-        assert_eq!(n, 3);
-        assert_eq!(rp.selected.len(), n);
-        assert_eq!(rp.worktree.len(), n);
-        assert_eq!(rp.is_header.len(), n);
-        assert_eq!(rp.is_child.len(), n);
-        assert_eq!(rp.is_header, vec![false, true, false]);
-        assert_eq!(rp.is_child, vec![false, false, true]);
+    /// A Windows drive path (`C:\…`, `C:/…`) is absolute, so it's path mode —
+    /// without this, typing a native Windows path in the palette would be
+    /// treated as a fuzzy filter and path completion would never engage.
+    #[cfg(windows)]
+    #[test]
+    fn repo_palette_input_mode_detects_windows_paths() {
+        let mut rp = RepoPickerModal::default();
+        for p in ["C:\\repos", "C:/repos", ".\\rel", "..\\up"] {
+            rp.input.set(p);
+            assert_eq!(rp.input_mode(), RepoInputMode::Path, "input {p:?}");
+        }
+        rp.input.set("friring");
+        assert_eq!(rp.input_mode(), RepoInputMode::Filter);
+    }
+
+    #[test]
+    fn repo_palette_path_mode_does_not_filter_rows() {
+        let mut rp = RepoPickerModal::default();
+        rp.push_row("/alpha".into(), RepoRowKind::Repo { child: false });
+        rp.push_row(PathBuf::new(), RepoRowKind::StartHere);
+        // "~/zzz" matches nothing as a query — but it's a path, not a query.
+        rp.input.set("~/zzz");
+        rp.recompute_filter();
+        assert_eq!(rp.filtered_indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn repo_palette_filter_hides_pinned_rows_and_selection_survives() {
+        let mut rp = RepoPickerModal::default();
+        rp.push_row("/alpha".into(), RepoRowKind::Repo { child: false });
+        rp.push_row("/import-me".into(), RepoRowKind::ImportSuggestion);
+        rp.push_row(PathBuf::new(), RepoRowKind::StartHere);
+        rp.toggle_selected(std::path::Path::new("/alpha"));
+        assert_eq!(rp.picked_count(), 1);
+
+        // A filter that excludes /alpha hides it (and the pinned rows), but
+        // the pick survives and still counts once visible again.
+        rp.input.set("zzz");
+        rp.recompute_filter();
+        assert!(rp.filtered_indices.is_empty());
+        assert_eq!(rp.picked_count(), 1);
+
+        rp.input.clear();
+        rp.recompute_filter();
+        assert_eq!(rp.filtered_indices, vec![0, 1, 2]);
+        assert!(rp.selected.contains(std::path::Path::new("/alpha")));
+    }
+
+    #[test]
+    fn repo_rows_keep_selection_keyed_by_path() {
+        let mut rp = RepoPickerModal::default();
+        rp.push_row("/repo".into(), RepoRowKind::Repo { child: false });
+        rp.push_row("/parent".into(), RepoRowKind::Header);
+        rp.push_row("/parent/child".into(), RepoRowKind::Repo { child: true });
+
+        rp.toggle_selected(std::path::Path::new("/repo"));
+        rp.toggle_worktree(std::path::Path::new("/parent/child"));
+
+        assert!(rp.selected.contains(std::path::Path::new("/repo")));
+        // The worktree toggle checks the repo too.
+        assert!(rp.selected.contains(std::path::Path::new("/parent/child")));
+        assert!(rp.worktree.contains(std::path::Path::new("/parent/child")));
+
+        // Rows can be rebuilt (even reshaped) without losing the flags.
+        rp.rows.clear();
+        rp.push_row("/parent/child".into(), RepoRowKind::Repo { child: false });
+        assert!(rp.selected.contains(std::path::Path::new("/parent/child")));
+        assert!(rp.worktree.contains(std::path::Path::new("/parent/child")));
+
+        // Toggling worktree off leaves the selection alone.
+        rp.toggle_worktree(std::path::Path::new("/parent/child"));
+        assert!(!rp.worktree.contains(std::path::Path::new("/parent/child")));
+        assert!(rp.selected.contains(std::path::Path::new("/parent/child")));
     }
 
     #[test]
     fn test_repo_picker_toggle_collapsed_ignores_non_header_rows() {
         let mut rp = RepoPickerModal::default();
-        rp.push_row("/repo".into(), false, false, false); // standalone, not a header
+        // Standalone repo, not a header.
+        rp.push_row("/repo".into(), RepoRowKind::Repo { child: false });
         rp.toggle_collapsed(0);
         assert!(
             rp.collapsed.is_empty(),
@@ -2644,35 +2825,29 @@ mod tests {
     #[test]
     fn test_repo_picker_search_overrides_collapse() {
         let mut rp = RepoPickerModal::default();
-        rp.push_row("/parent".into(), false, true, false); // header
-        rp.push_row("/parent/foo".into(), false, false, true);
-        rp.push_row("/parent/bar".into(), false, false, true);
+        rp.push_row("/parent".into(), RepoRowKind::Header);
+        rp.push_row("/parent/foo".into(), RepoRowKind::Repo { child: true });
+        rp.push_row("/parent/bar".into(), RepoRowKind::Repo { child: true });
         rp.collapsed.insert("/parent".into());
         rp.recompute_filter();
         // Collapsed: only the header is visible.
         assert_eq!(rp.filtered_indices, vec![0]);
 
-        // An active search expands all so matching children are findable.
-        rp.search_input.set("foo");
+        // An active filter expands all so matching children are findable.
+        rp.input.set("foo");
         rp.recompute_filter();
         // Header (always shown) + the matching child `foo`.
         assert_eq!(rp.filtered_indices, vec![0, 1]);
     }
 
     #[test]
-    fn test_repo_picker_clear_search_empty_bookmarks() {
+    fn test_repo_picker_default_is_empty_filter_mode() {
         let mut rp = RepoPickerModal::default();
-        rp.clear_search();
+        assert_eq!(rp.input.value(), "");
+        assert_eq!(rp.input_mode(), RepoInputMode::Filter);
+        rp.recompute_filter();
         assert!(rp.filtered_indices.is_empty());
         assert_eq!(rp.list_index, 0);
-    }
-
-    #[test]
-    fn test_repo_picker_default_has_empty_search() {
-        let rp = RepoPickerModal::default();
-        assert_eq!(rp.search_input.value(), "");
-        assert!(rp.filtered_indices.is_empty());
-        assert_eq!(rp.focus, RepoPickerFocus::List);
     }
 
     #[test]

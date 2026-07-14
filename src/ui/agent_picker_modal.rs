@@ -43,15 +43,21 @@ pub struct AgentPickerState {
 pub fn render_agent_picker_modal(
     frame: &mut Frame,
     state: &AgentPickerState,
+    breadcrumb: Option<&str>,
 ) -> super::ModalRender {
     let visible = state.filter.visible_indices(state.choices.len());
     let filter_active = state.filter.is_active();
-    let height = (visible.len().clamp(1, 15) as u16) + 3 + u16::from(filter_active);
+    let crumb_height = u16::from(breadcrumb.is_some());
+    let height = (visible.len().clamp(1, 15) as u16) + 3 + u16::from(filter_active) + crumb_height;
     let area = centered_fixed_height_rect(50, height, frame.area());
 
-    let inner = render_modal_frame(frame, area, "Coding Agent");
+    let inner = render_modal_frame(frame, area, "New Session — Agent");
 
+    // Variable sections, in order: [breadcrumb?] [filter?] rows footer.
     let mut constraints = Vec::new();
+    if crumb_height > 0 {
+        constraints.push(Constraint::Length(1));
+    }
     if filter_active {
         constraints.push(Constraint::Length(1));
     }
@@ -61,11 +67,22 @@ pub fn render_agent_picker_modal(
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(inner);
-    let (filter_area, rows_area, footer_area) = if filter_active {
-        (Some(chunks[0]), chunks[1], chunks[2])
-    } else {
-        (None, chunks[0], chunks[1])
-    };
+
+    let crumb_area = (crumb_height > 0).then(|| chunks[0]);
+    let filter_off = crumb_height as usize;
+    let filter_area = filter_active.then(|| chunks[filter_off]);
+    let rows_off = filter_off + usize::from(filter_active);
+    let (rows_area, footer_area) = (chunks[rows_off], chunks[rows_off + 1]);
+
+    if let (Some(ca), Some(crumb)) = (crumb_area, breadcrumb) {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!(" {crumb}"),
+                Style::default().fg(Theme::text_muted()),
+            )),
+            ca,
+        );
+    }
 
     if let Some(fa) = filter_area {
         render_filter_row(

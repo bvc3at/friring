@@ -136,10 +136,18 @@ Screenshot "__SHOT_DIR__/08-theme-picker.png"
 Escape
 Sleep 700ms
 
-# 09 — new-session / repo picker
+# 09 — new-session / repo palette (filter mode: bookmarks or first-run
+# import suggestions + the pinned "start in ~" row)
 Ctrl+N
 Sleep 1500ms
 Screenshot "__SHOT_DIR__/09-repo-picker.png"
+# 09b — path mode: typing a path swaps the list to directory candidates
+Type "~/"
+Sleep 1200ms
+Screenshot "__SHOT_DIR__/09b-repo-picker-path-mode.png"
+# Clear the typed path (Ctrl+U) so Esc backs out of the palette itself.
+Ctrl+U
+Sleep 300ms
 Escape
 Sleep 700ms
 

@@ -1,4 +1,5 @@
-//! In-progress new-session wizard state (host → repo → branch → agent → name).
+//! In-progress new-session wizard state
+//! (host → repo → [base branch] → name → [branch name] → agent).
 //!
 //! Grouped out of the [`App`](super::App) god object. Fields are `pub(crate)`
 //! so call-sites keep direct access (`self.new_session.repo_path`). The whole
@@ -55,4 +56,12 @@ pub(crate) struct NewSessionWizardState {
     /// Dropped (not waited on) when the flow is cancelled; a stale receiver is
     /// simply overwritten by the next flow.
     pub(crate) fetch_done: Option<mpsc::Receiver<()>>,
+    /// The repo palette parked when the wizard advances past it, so Esc from a
+    /// later step restores selections/flags/input as they were instead of
+    /// rebuilding (the recency order may be stale until the next fresh open —
+    /// accepted). Cleared when the flow completes or is cancelled.
+    pub(crate) saved_repo_picker: Option<Box<super::modals::RepoPickerModal>>,
+    /// Import flow: the conversation picker parked at its directory step, so
+    /// Esc on the name modal returns there. Cleared like `saved_repo_picker`.
+    pub(crate) saved_conversation_picker: Option<Box<super::cc_import::ConversationPickerModal>>,
 }

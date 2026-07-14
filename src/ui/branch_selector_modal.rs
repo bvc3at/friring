@@ -20,6 +20,9 @@ pub struct BranchSelectorState<'a> {
     /// The list is still being read off-thread (ADR-P12): render a muted
     /// placeholder row with no clickable hitboxes.
     pub loading: bool,
+    /// Display name of the repo the branches belong to (shown in the title so
+    /// the step reads in context: "New Session — Base Branch (friring)").
+    pub repo: Option<String>,
 }
 
 pub fn render_branch_selector_modal(
@@ -33,7 +36,11 @@ pub fn render_branch_selector_modal(
     let height = (visible.len().clamp(1, 15) + 4) as u16 + u16::from(filter_active);
     let area = centered_fixed_height_rect(50, height, frame.area());
 
-    let inner = render_modal_frame(frame, area, "Base Branch");
+    let title = match &state.repo {
+        Some(repo) => format!("New Session — Base Branch ({repo})"),
+        None => "New Session — Base Branch".to_string(),
+    };
+    let inner = render_modal_frame(frame, area, &title);
 
     let mut constraints = Vec::new();
     if filter_active {
@@ -120,6 +127,7 @@ mod tests {
             selected_index: 2,
             filter: &filter,
             loading: false,
+            repo: None,
         };
         assert_eq!(state.selected_index, 2);
         assert_eq!(state.branches.len(), 3);

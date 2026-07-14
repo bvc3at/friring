@@ -932,12 +932,17 @@ impl App {
             KeyCode::Esc if bs.filter.is_active() => bs.filter.clear(&mut bs.index),
             KeyCode::Esc => {
                 self.modal.close();
+                // These are re-derived when the palette re-submits; dropping
+                // the parked origin-fetch signal here keeps the ADR-P12
+                // abort-site rule (no worktree create may consume a stale one —
+                // re-submitting re-arms it with a fresh channel).
                 self.new_session.repo_path = None;
                 self.new_session.all_repos = None;
                 self.new_session.normal_repos.clear();
-                // Drop the parked origin-fetch signal (ADR-P12) — no worktree
-                // create will consume it now.
+                self.new_session.base_branch = None;
                 self.new_session.fetch_done = None;
+                // Back one step: the palette as the user left it.
+                self.restore_repo_picker();
             }
             KeyCode::Down if bs.index + 1 < visible => bs.index += 1,
             KeyCode::Up => bs.index = bs.index.saturating_sub(1),
@@ -948,9 +953,9 @@ impl App {
                     return;
                 };
                 let base_branch = bs.branches[real].clone();
-                self.new_session.base_branch = Some(base_branch);
-                self.modal =
-                    super::modals::Modal::SessionName(super::modals::SessionNameModal::default());
+                // Records the base branch AND prefills the name step from the
+                // repo basename (the worktree branch name derives from it).
+                self.confirm_branch_selection(base_branch);
             }
             KeyCode::Backspace => bs.filter.pop(&bs.branches, &mut bs.index),
             KeyCode::Char('n') if mods.contains(KeyModifiers::CONTROL) => {
@@ -995,6 +1000,17 @@ impl App {
         }
     }
 
+    /// `Enter` on the branch selector: record the base branch and advance to
+    /// the name step, prefilled from the repo (worktree flow — the name also
+    /// seeds the branch name).
+    fn confirm_branch_selection(&mut self, base_branch: String) {
+        self.new_session.base_branch = Some(base_branch);
+        let mut modal = super::modals::SessionNameModal::default();
+        let cwd = self.new_session.repo_path.clone();
+        modal.name.set(&self.suggested_session_name(cwd.as_deref()));
+        self.modal = super::modals::Modal::SessionName(modal);
+    }
+
     fn handle_worktree_name_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let super::modals::Modal::WorktreeName(ref mut wn) = self.modal else {
             return;
@@ -1002,7 +1018,7 @@ impl App {
         match code {
             KeyCode::Esc => {
                 self.modal.close();
-                self.cancel_worktree_name();
+                self.worktree_name_back();
             }
             KeyCode::Enter => {
                 let new_branch = wn.name.value().trim().to_string();
@@ -1019,14 +1035,16 @@ impl App {
         }
     }
 
-    /// Clear the worktree-flow pending state when the branch-name modal is cancelled.
-    fn cancel_worktree_name(&mut self) {
-        self.new_session.base_branch = None;
-        self.new_session.repo_path = None;
-        self.new_session.all_repos = None;
-        self.new_session.normal_repos.clear();
-        self.new_session.session_name = None;
-        self.new_session.fetch_done = None;
+    /// `Esc` on the branch-name modal: back to the session-name step (the name
+    /// seeds the branch, so it's the natural place to edit). All worktree-flow
+    /// pending state (base branch, repos, fetch signal) stays armed for the
+    /// re-confirm.
+    fn worktree_name_back(&mut self) {
+        let mut modal = super::modals::SessionNameModal::default();
+        if let Some(name) = self.new_session.session_name.take() {
+            modal.name.set(&name);
+        }
+        self.modal = super::modals::Modal::SessionName(modal);
     }
 
     /// Spawn the worktree session for the confirmed branch name.
@@ -1054,7 +1072,7 @@ impl App {
         match code {
             KeyCode::Esc => {
                 self.modal.close();
-                self.cancel_session_name();
+                self.session_name_back();
             }
             KeyCode::Enter => {
                 let name = sn.name.value().trim().to_string();
@@ -1071,23 +1089,61 @@ impl App {
         }
     }
 
-    /// Clear pending state when the session-name modal is cancelled.
-    fn cancel_session_name(&mut self) {
-        if self.new_session.base_branch.is_some() {
-            // Worktree flow — clean up worktree-specific pending state.
-            self.new_session.base_branch = None;
-            self.new_session.repo_path = None;
-            self.new_session.all_repos = None;
-            self.new_session.normal_repos.clear();
-            self.new_session.fetch_done = None;
-        } else {
-            // Normal flow — clean up spawn state.
+    /// `Esc` on the name modal: step back to wherever this flow came from —
+    /// or cancel when there is no prior step to return to.
+    fn session_name_back(&mut self) {
+        // Fork has no prior step — Esc cancels as before. Checked first: a
+        // fork of a worktree session pre-seeds `spawn_worktrees` with the
+        // *source's* worktrees, which must not read as "created" below.
+        if self.new_session.fork {
             self.new_session.spawn_config = None;
             self.new_session.spawn_worktrees.clear();
             self.new_session.fork = false;
+            self.new_session.parent_session_id = None;
+            return;
+        }
+        // Worktrees already created (the agent picker stepped back here, or a
+        // create completed earlier): stepping further back can't un-create
+        // them, so this stays a cancel — re-running the create would collide
+        // on `git worktree add -b`.
+        if !self.new_session.spawn_worktrees.is_empty() {
+            self.new_session.spawn_config = None;
+            self.new_session.spawn_worktrees.clear();
             self.new_session.import = false;
             self.new_session.parent_session_id = None;
+            self.new_session.additional_dirs.clear();
+            self.new_session.saved_repo_picker = None;
+            self.set_info("Cancelled — created worktree(s) kept on disk");
+            return;
         }
+        // Worktree flow → back to the branch selector. A fresh dispatch
+        // re-arms the branch load and the origin fetch (ADR-P12: the previous
+        // `fetch_done` was already consumed or is safely overwritten); the
+        // previously chosen base stays highlighted via `poll_branch_load`.
+        if self.new_session.base_branch.is_some() {
+            self.start_branch_selection();
+            return;
+        }
+        // Import flow → back to the conversation picker's directory step
+        // (re-confirming re-stages the transcript, which is idempotent).
+        if self.new_session.import {
+            self.new_session.import = false;
+            self.new_session.spawn_config = None;
+            if let Some(cp) = self.new_session.saved_conversation_picker.take() {
+                self.modal = super::modals::Modal::ConversationPicker(*cp);
+            }
+            return;
+        }
+        // Normal flow → back to the repo palette. `spawn_session_with_config`
+        // consumed the backend; restore it so bookmarks stay host-scoped, and
+        // drop the derived `additional_dirs` (the re-submit recomputes them —
+        // leaving them would leak stale dirs into the next spawn).
+        if let Some(config) = self.new_session.spawn_config.take() {
+            self.new_session.backend = config.backend;
+        }
+        self.new_session.additional_dirs.clear();
+        self.new_session.parent_session_id = None;
+        self.restore_repo_picker();
     }
 
     /// Advance from the confirmed session name to the next step of the flow.
@@ -1188,17 +1244,7 @@ impl App {
             KeyCode::Esc if ap.filter.is_active() => ap.filter.clear(&mut ap.selected_index),
             KeyCode::Esc => {
                 self.modal.close();
-                self.new_session.spawn_config = None;
-                self.new_session.spawn_worktrees.clear();
-                self.new_session.spawn_name = None;
-                // A picker opened over an in-flight worktree creation
-                // (ADR-P12): mark the pending create cancelled so its result
-                // is dropped instead of spawning a session nobody asked for.
-                if let Some(pending) = self.pending_worktree_create.as_mut() {
-                    if matches!(pending.agent_pick, super::AgentPick::Open) {
-                        pending.agent_pick = super::AgentPick::Cancelled;
-                    }
-                }
+                self.agent_picker_back();
             }
             KeyCode::Down if ap.selected_index + 1 < visible => ap.selected_index += 1,
             KeyCode::Up => ap.selected_index = ap.selected_index.saturating_sub(1),
@@ -1229,6 +1275,33 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// `Esc` on the agent picker. With a worktree creation in flight (ADR-P12:
+    /// the picker opens *over* the create) this stays a full cancel — stepping
+    /// back and re-confirming would re-run `git worktree add -b` against the
+    /// branch the in-flight create is already making, a guaranteed collision —
+    /// and the pending create is marked cancelled so its result is dropped.
+    /// Otherwise it steps back to the name modal; re-confirming there just
+    /// re-runs the side-effect-free `finish_prepare_spawn`.
+    fn agent_picker_back(&mut self) {
+        if self.pending_worktree_create.is_some() {
+            self.new_session.spawn_config = None;
+            self.new_session.spawn_worktrees.clear();
+            self.new_session.spawn_name = None;
+            self.new_session.saved_repo_picker = None;
+            if let Some(pending) = self.pending_worktree_create.as_mut() {
+                if matches!(pending.agent_pick, super::AgentPick::Open) {
+                    pending.agent_pick = super::AgentPick::Cancelled;
+                }
+            }
+            return;
+        }
+        let mut modal = super::modals::SessionNameModal::default();
+        if let Some(name) = self.new_session.spawn_name.take() {
+            modal.name.set(&name);
+        }
+        self.modal = super::modals::Modal::SessionName(modal);
     }
 
     /// `Enter` on the agent picker: stamp the chosen agent onto the pending
@@ -1740,10 +1813,10 @@ impl App {
     /// completion signal is parked in `new_session.fetch_done` for the
     /// worktree-create worker to wait on.
     pub(crate) fn start_branch_selection(&mut self) {
-        if self.branch_load.in_progress() {
-            self.set_info("Branch listing already in progress…");
-            return;
-        }
+        // Re-dispatching over an in-flight load is fine (back-then-forward
+        // navigation): `BackgroundTask::start` hands out a fresh channel, the
+        // orphaned worker's send fails silently, and `poll_branch_load` only
+        // ever reads the newest receiver.
 
         // Resolve the remote host (if any) so branch listing targets the
         // session's machine. Cloned so we don't hold a borrow on `self`.
@@ -1866,74 +1939,139 @@ impl App {
 
     // ── Repo Picker Modal ────────────────────────────────────────────────
 
+    /// The repo palette: one always-focused input, no internal focus zones.
+    /// Typing edits the input (filter or path); everything acting on the
+    /// highlighted row lives on chords/arrows that can never collide with text
+    /// (plain `Space`/`Delete` act on rows only while the input is empty).
     fn handle_repo_picker_key(&mut self, code: KeyCode, mods: KeyModifiers) {
-        let super::modals::Modal::RepoPicker(ref rp) = self.modal else {
-            return;
-        };
-        // Ctrl+P: import the typed path as a *parent* folder whose git
-        // sub-directories are re-scanned on each picker open. Works from any
-        // focus (uses the path input value). Not `Ctrl+I` — that is `Tab`.
-        if mods.contains(KeyModifiers::CONTROL)
-            && matches!(code, KeyCode::Char('p') | KeyCode::Char('P'))
-        {
-            self.repo_picker_import_parent();
+        if !matches!(self.modal, super::modals::Modal::RepoPicker(_)) {
             return;
         }
-        match rp.focus {
-            super::modals::RepoPickerFocus::List => self.handle_repo_picker_list_key(code),
-            super::modals::RepoPickerFocus::Input => self.handle_repo_picker_input_key(code, mods),
-            super::modals::RepoPickerFocus::Search => {
-                self.handle_repo_picker_search_key(code, mods)
+        // Row-action chords win over text editing. Ctrl+P is not `Ctrl+I` —
+        // that is `Tab`. Ctrl+Space arrives as `Char(' ')` on modern
+        // keyboard-protocol terminals and as NUL on legacy ones.
+        if mods.contains(KeyModifiers::CONTROL) {
+            match code {
+                KeyCode::Char('p') | KeyCode::Char('P') => {
+                    self.repo_picker_import_parent();
+                    return;
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') => {
+                    self.repo_picker_toggle_worktree();
+                    return;
+                }
+                KeyCode::Char(' ') | KeyCode::Null => {
+                    self.repo_picker_row_action();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        match code {
+            KeyCode::Esc => self.repo_picker_back(),
+            KeyCode::Enter => self.repo_picker_enter(),
+            KeyCode::Up => self.repo_picker_move(-1),
+            KeyCode::Down => self.repo_picker_move(1),
+            KeyCode::PageUp => self.repo_picker_move(-10),
+            KeyCode::PageDown => self.repo_picker_move(10),
+            // Tab ONLY completes — it never moves focus (there is none to
+            // move) and never toggles anything.
+            KeyCode::Tab => self.repo_picker_complete(),
+            KeyCode::Char(' ') if self.repo_picker_input_empty() => self.repo_picker_row_action(),
+            KeyCode::Delete if self.repo_picker_input_empty() => self.repo_picker_delete_bookmark(),
+            other => {
+                let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
+                    return;
+                };
+                let before = rp.input.value().to_string();
+                if !super::modals::apply_text_input_key(Some(&mut rp.input), other, mods) {
+                    return;
+                }
+                // An edit re-filters and snaps the highlight to the best (first)
+                // match; a bare cursor move does neither.
+                if rp.input.value() != before {
+                    rp.list_index = 0;
+                    self.recompute_repo_filter();
+                }
+                self.refresh_repo_picker_candidates();
             }
         }
     }
 
-    fn handle_repo_picker_list_key(&mut self, code: KeyCode) {
+    /// `Esc` on the repo palette: back to the host picker when that step was
+    /// shown, else — this is the first step — cancel the flow.
+    fn repo_picker_back(&mut self) {
+        self.modal.close();
+        self.new_session.saved_repo_picker = None;
+        if self.hosts.is_empty() {
+            self.new_session.backend = None;
+            return;
+        }
+        self.open_host_picker();
+    }
+
+    /// Whether the palette input is empty (plain `Space`/`Delete` act on the
+    /// highlighted row only then — once the user types, keys edit text).
+    fn repo_picker_input_empty(&self) -> bool {
+        match &self.modal {
+            super::modals::Modal::RepoPicker(rp) => rp.input.value().is_empty(),
+            _ => false,
+        }
+    }
+
+    /// Move the highlight by `delta`. In filter mode this walks the bookmark
+    /// rows; in path mode it walks the directory candidates, where stepping up
+    /// past the first candidate returns to `None` — "act on the typed path
+    /// itself" — so the literal input always stays reachable.
+    fn repo_picker_move(&mut self, delta: i32) {
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
             return;
         };
-        match code {
-            KeyCode::Esc => {
-                self.modal.close();
+        if rp.input_mode() == super::modals::RepoInputMode::Path {
+            let len = rp.candidates.len() as i32;
+            if len == 0 {
+                return;
             }
-            KeyCode::Tab => {
-                rp.focus = super::modals::RepoPickerFocus::Input;
-            }
-            KeyCode::Char('/') => {
-                rp.clear_search();
-                rp.focus = super::modals::RepoPickerFocus::Search;
-            }
-            KeyCode::Char('j') | KeyCode::Down if rp.list_index + 1 < rp.filtered_indices.len() => {
-                rp.list_index += 1;
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                rp.list_index = rp.list_index.saturating_sub(1);
-            }
-            KeyCode::Char(' ') => self.repo_picker_toggle_selected(),
-            KeyCode::Char('w') => self.repo_picker_toggle_worktree(),
-            KeyCode::Char('d') => self.repo_picker_delete_bookmark(),
-            KeyCode::Enter => {
-                self.submit_repo_picker();
-            }
-            _ => {}
+            rp.candidate_index = match rp.candidate_index {
+                None if delta > 0 => Some(((delta - 1).min(len - 1)) as usize),
+                None => None,
+                Some(i) => {
+                    let next = i as i32 + delta;
+                    if next < 0 {
+                        None
+                    } else {
+                        Some(next.min(len - 1) as usize)
+                    }
+                }
+            };
+            return;
         }
+        let len = rp.filtered_indices.len();
+        if len == 0 {
+            return;
+        }
+        rp.list_index = (rp.list_index as i32 + delta).clamp(0, len as i32 - 1) as usize;
     }
 
-    /// `Space` on the row under the cursor: toggle the selected flag of a repo,
-    /// or expand/collapse a parent header's child tree.
-    fn repo_picker_toggle_selected(&mut self) {
+    /// `Space` (input empty) / `Ctrl+Space` / row click: act on the highlighted
+    /// row — toggle a repo's checkbox, fold a parent header, import a suggested
+    /// folder, or (for the pinned "start here" row) start the session.
+    fn repo_picker_row_action(&mut self) {
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
             return;
         };
         let Some(&real_idx) = rp.filtered_indices.get(rp.list_index) else {
             return;
         };
-        if rp.is_header_row(real_idx) {
-            rp.toggle_collapsed(real_idx);
+        let Some(row) = rp.rows.get(real_idx) else {
             return;
-        }
-        if let Some(sel) = rp.selected.get_mut(real_idx) {
-            *sel = !*sel;
+        };
+        let (kind, path) = (row.kind, row.path.clone());
+        match kind {
+            super::modals::RepoRowKind::Header => rp.toggle_collapsed(real_idx),
+            super::modals::RepoRowKind::Repo { .. } => rp.toggle_selected(&path),
+            super::modals::RepoRowKind::ImportSuggestion => self.repo_picker_import_folder(&path),
+            super::modals::RepoRowKind::StartHere => self.repo_picker_start_here(),
         }
     }
 
@@ -1946,18 +2084,14 @@ impl App {
         let Some(&real_idx) = rp.filtered_indices.get(rp.list_index) else {
             return;
         };
-        if rp.is_header_row(real_idx) {
-            return;
-        }
-        let Some(wt) = rp.worktree.get_mut(real_idx) else {
+        let Some(row) = rp.rows.get(real_idx) else {
             return;
         };
-        *wt = !*wt;
-        if *wt {
-            if let Some(sel) = rp.selected.get_mut(real_idx) {
-                *sel = true;
-            }
+        if !row.is_repo() {
+            return;
         }
+        let path = row.path.clone();
+        rp.toggle_worktree(&path);
     }
 
     /// Delete the bookmark under the cursor. A standalone repo is removed in
@@ -1971,7 +2105,17 @@ impl App {
         let Some(&real_idx) = rp.filtered_indices.get(rp.list_index) else {
             return;
         };
-        let path = rp.bookmarks[real_idx].clone();
+        let Some(row) = rp.rows.get(real_idx) else {
+            return;
+        };
+        // Pinned helper rows have no bookmark to forget.
+        if matches!(
+            row.kind,
+            super::modals::RepoRowKind::ImportSuggestion | super::modals::RepoRowKind::StartHere
+        ) {
+            return;
+        }
+        let path = row.path.clone();
         let is_header = rp.is_header_row(real_idx);
         let is_child = rp.is_child_row(real_idx);
 
@@ -1999,80 +2143,203 @@ impl App {
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
             return;
         };
-        rp.bookmarks.remove(real_idx);
-        rp.selected.remove(real_idx);
-        rp.worktree.remove(real_idx);
-        rp.is_header.remove(real_idx);
-        rp.is_child.remove(real_idx);
+        rp.rows.remove(real_idx);
+        // Forgetting a bookmark also drops its picks — a hidden selection that
+        // resurfaces on re-add would be surprising.
+        rp.selected.remove(&path);
+        rp.worktree.remove(&path);
         self.recompute_repo_filter();
     }
 
-    fn handle_repo_picker_input_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+    /// `Tab`: complete the typed path — and nothing else. A Tab with nothing
+    /// to complete is a no-op. Remote targets have no per-keystroke candidates
+    /// (that would fire an ssh/wsl round-trip on every character); list the
+    /// remote directory on demand here instead. Completion only applies with
+    /// the cursor at the end (inserting mid-string would garble the path).
+    fn repo_picker_complete(&mut self) {
+        if self.new_session.backend.is_some() {
+            let super::modals::Modal::RepoPicker(ref rp) = self.modal else {
+                return;
+            };
+            let value = rp.input.value().to_string();
+            let at_end = rp.input.cursor_pos() == value.chars().count();
+            let sug = at_end
+                .then(|| self.remote_path_candidates(&value))
+                .flatten();
+            if let super::modals::Modal::RepoPicker(ref mut rp) = self.modal {
+                if let Some(sug) = sug {
+                    for c in sug.chars() {
+                        rp.input.insert(c);
+                    }
+                    // A descent invalidates the listed candidates (they were
+                    // the parent's); a partial completion just narrows them.
+                    if sug.ends_with('/') {
+                        rp.candidates.clear();
+                        rp.candidate_index = None;
+                    } else if let Some((_, prefix)) = rp
+                        .input
+                        .value()
+                        .rsplit_once('/')
+                        .map(|(a, b)| (a, b.to_string()))
+                    {
+                        rp.candidates.retain(|c| c.name.starts_with(&prefix));
+                        rp.candidate_index = None;
+                    }
+                }
+            }
+            return;
+        }
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
             return;
         };
-        match code {
-            KeyCode::Esc => {
-                self.modal.close();
-                return;
+        if let Some(suggestion) = rp.path_suggestion.take() {
+            for c in suggestion.chars() {
+                rp.input.insert(c);
             }
-            KeyCode::Tab => {
-                // Remote targets have no per-keystroke suggestion (that would
-                // fire an ssh/wsl round-trip on every character); compute one on
-                // demand here by listing the remote directory. Mirrors the local
-                // branch below: completion only applies with the cursor at the
-                // end (inserting mid-string would garble the path), and a Tab
-                // with nothing to complete moves focus to the list.
-                if self.new_session.backend.is_some() {
-                    let value = rp.path_input.value().to_string();
-                    let at_end = rp.path_input.cursor_pos() == value.chars().count();
-                    let sug = at_end
-                        .then(|| self.remote_path_completion(&value))
-                        .flatten();
-                    if let super::modals::Modal::RepoPicker(ref mut rp) = self.modal {
-                        match sug {
-                            Some(sug) => {
-                                for c in sug.chars() {
-                                    rp.path_input.insert(c);
-                                }
-                            }
-                            None => rp.focus = super::modals::RepoPickerFocus::List,
-                        }
-                    }
-                    return;
-                }
-                if let Some(suggestion) = rp.path_suggestion.take() {
-                    for c in suggestion.chars() {
-                        rp.path_input.insert(c);
-                    }
-                } else {
-                    rp.focus = super::modals::RepoPickerFocus::List;
-                    rp.path_suggestion = None;
-                    return;
-                }
-            }
-            KeyCode::BackTab => {
-                rp.focus = super::modals::RepoPickerFocus::List;
-                rp.path_suggestion = None;
-                return;
-            }
-            KeyCode::Enter => {
-                self.repo_picker_commit_path_input();
-                return;
-            }
-            other => {
-                if !super::modals::apply_text_input_key(Some(&mut rp.path_input), other, mods) {
-                    return;
-                }
-            }
+            self.recompute_repo_filter();
         }
-        self.update_repo_picker_path_suggestion();
+        self.refresh_repo_picker_candidates();
     }
 
-    /// Commit the typed path in the repo-picker input: add or re-select the
-    /// bookmark, persist it (scoped to the target host), clear the input, and
-    /// refresh the filter.
-    fn repo_picker_commit_path_input(&mut self) {
+    /// `Enter` — the palette's primary action, in priority order: a typed path
+    /// is committed and the flow advances with it; checked repos submit;
+    /// otherwise the highlighted row acts (open repo / fold header / import
+    /// suggestion / start without a repo).
+    fn repo_picker_enter(&mut self) {
+        let super::modals::Modal::RepoPicker(ref rp) = self.modal else {
+            return;
+        };
+        if rp.input_mode() == super::modals::RepoInputMode::Path {
+            // A highlighted candidate acts directly: a git repo opens (the
+            // browse fast path), anything else drills in. The typed path
+            // itself stays reachable at `candidate_index == None`.
+            if let Some(ci) = rp.candidate_index {
+                let Some(c) = rp.candidates.get(ci) else {
+                    return;
+                };
+                let (is_repo, name, full) = (c.is_repo, c.name.clone(), c.full.clone());
+                if is_repo {
+                    self.repo_picker_open_candidate(&full);
+                } else {
+                    self.repo_picker_drill_into(&name);
+                }
+                return;
+            }
+            // No highlight: commit the typed path (any existing dir — also
+            // the way to open a non-repo directory) and advance.
+            if self.repo_picker_commit_path_input() {
+                self.submit_repo_picker();
+            }
+            return;
+        }
+        if rp.picked_count() > 0 {
+            self.submit_repo_picker();
+            return;
+        }
+        let Some(&real_idx) = rp.filtered_indices.get(rp.list_index) else {
+            return;
+        };
+        let Some(row) = rp.rows.get(real_idx) else {
+            return;
+        };
+        let (kind, path) = (row.kind, row.path.clone());
+        match kind {
+            super::modals::RepoRowKind::Header => {
+                let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
+                    return;
+                };
+                rp.toggle_collapsed(real_idx);
+            }
+            // Single-repo fast path: nothing is checked, so Enter means "this
+            // one" — check it and go.
+            super::modals::RepoRowKind::Repo { .. } => {
+                let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
+                    return;
+                };
+                rp.selected.insert(path);
+                self.submit_repo_picker();
+            }
+            super::modals::RepoRowKind::ImportSuggestion => self.repo_picker_import_folder(&path),
+            super::modals::RepoRowKind::StartHere => self.repo_picker_start_here(),
+        }
+    }
+
+    /// The pinned "start here" row: an explicit no-repo session (local `$HOME`,
+    /// remote default directory).
+    fn repo_picker_start_here(&mut self) {
+        // Park the palette so Esc from the name step restores it as-was.
+        if let super::modals::Modal::RepoPicker(ref rp) = self.modal {
+            self.new_session.saved_repo_picker = Some(Box::new(rp.clone()));
+        }
+        self.modal.close();
+        self.spawn_repo_picker_no_repos();
+    }
+
+    /// Enter on a candidate that is a git repo: bookmark it, select it, and
+    /// advance the flow with it. The path input is cleared first so the
+    /// palette parked for Esc-back shows the picked bookmark, not a stale
+    /// path-mode candidate view.
+    fn repo_picker_open_candidate(&mut self, full: &std::path::Path) {
+        let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
+            return;
+        };
+        let persist = Self::repo_picker_select_or_add_row(rp, full);
+        rp.input.clear();
+        if persist {
+            if let Err(e) = self.db.upsert_repo_bookmark(self.bookmark_host_key(), full) {
+                error!("Failed to save repo bookmark: {e}");
+                self.set_error(format!("Failed to save repo bookmark: {e}"));
+            }
+        }
+        self.recompute_repo_filter();
+        self.refresh_repo_picker_candidates();
+        self.submit_repo_picker();
+    }
+
+    /// Enter on a candidate that is a plain directory: descend into it,
+    /// keeping the user's typed form (a `~/…` input stays tilde-style).
+    fn repo_picker_drill_into(&mut self, name: &str) {
+        let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
+            return;
+        };
+        let value = rp.input.value().to_string();
+        // Replace the name-prefix — everything after the last path separator
+        // (`/`, and `\` on Windows; `std::path::is_separator`, matching
+        // `paths::split_path_input`) — with the chosen candidate, re-appending
+        // that same separator so the next refresh lists its children while the
+        // input keeps the user's typed prefix (and thus its path-mode `~`/`/`
+        // lead). Splitting on a hardcoded `/` would miss a `~\…` input and drop
+        // into the absolute fallback below, flipping `input_mode` to Filter.
+        let new = match value.rfind(std::path::is_separator) {
+            Some(i) => {
+                let sep = &value[i..=i];
+                format!("{}{name}{sep}", &value[..=i])
+            }
+            // A separator-free path-mode input is only a bare `~` (`input_mode`
+            // requires a `~`/`/`/`./`/`../` lead). Rebuild from the candidate's
+            // full path, re-tildified so it keeps a `~` lead — an absolute
+            // `C:\…` would flip `input_mode` back to Filter on Windows.
+            None => {
+                let Some(c) = rp.candidates.iter().find(|c| c.name == name) else {
+                    return;
+                };
+                format!(
+                    "{}{}",
+                    crate::paths::display_path_tilde(&c.full),
+                    std::path::MAIN_SEPARATOR
+                )
+            }
+        };
+        rp.input.set(&new);
+        self.recompute_repo_filter();
+        self.refresh_repo_picker_candidates();
+    }
+
+    /// Commit the typed path in the palette input: add or re-select the
+    /// bookmark, persist it (scoped to the target host), and clear the input.
+    /// Returns whether a repo row ended up selected (the caller then advances
+    /// the flow) — `false` on an empty input or a validation error.
+    fn repo_picker_commit_path_input(&mut self) -> bool {
         // A remote path expands `~` against the *remote* home (never the local
         // one) and is verified to exist on the host before it's accepted —
         // catching a typo here beats failing minutes later at branch listing
@@ -2081,12 +2348,19 @@ impl App {
             .host_for_backend(self.new_session.backend.as_deref())
             .cloned();
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
-            return;
+            return false;
         };
-        let path = rp.path_input.value().trim().to_string();
+        let mut path = rp.input.value().trim().to_string();
         if path.is_empty() {
             self.recompute_repo_filter();
-            return;
+            return false;
+        }
+        // Normalize a browse-style trailing separator ("~/code/" means ~/code,
+        // and on Windows "~\code\") so the bookmark never carries one and
+        // dedupes against the bare form. `is_separator` matches `/` everywhere
+        // and `\` on Windows, mirroring `paths::split_path_input`.
+        while path.len() > 1 && path.ends_with(std::path::is_separator) {
+            path.pop();
         }
         let expanded = match &remote_host {
             Some(host) => {
@@ -2094,21 +2368,31 @@ impl App {
                     Ok(p) => p,
                     Err(e) => {
                         self.set_error(format!("Cannot resolve ~ on '{}': {e:#}", host.name));
-                        return;
+                        return false;
                     }
                 };
                 if crate::git::list_dir_on(host, &expanded).is_err() {
                     self.set_error(format!("Path not found on '{}': {expanded}", host.name));
-                    return;
+                    return false;
                 }
                 std::path::PathBuf::from(expanded)
             }
-            None => paths::expand_tilde(&path),
+            None => {
+                // Mirror the remote check locally: a typo'd path must not
+                // become a bookmark that spawns a session in a dead cwd.
+                let expanded = paths::expand_tilde(&path);
+                if !expanded.is_dir() {
+                    self.set_error(format!("Path not found: {}", expanded.display()));
+                    return false;
+                }
+                expanded
+            }
         };
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
-            return;
+            return false;
         };
         let persist = Self::repo_picker_select_or_add_row(rp, &expanded);
+        let selected = rp.selected.contains(&expanded);
         if persist {
             if let Err(e) = self
                 .db
@@ -2119,11 +2403,12 @@ impl App {
             }
         }
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
-            return;
+            return false;
         };
-        rp.path_input.clear();
-        rp.path_suggestion = None;
+        rp.input.clear();
         self.recompute_repo_filter();
+        self.refresh_repo_picker_candidates();
+        selected
     }
 
     /// Select an already-represented bookmark row for `expanded`, or push a new
@@ -2135,14 +2420,33 @@ impl App {
         expanded: &std::path::Path,
     ) -> bool {
         // If already represented, just select it (no duplicate row or DB entry).
-        let Some(idx) = rp.bookmarks.iter().position(|p| p == expanded) else {
-            rp.push_row(expanded.to_path_buf(), true, false, false);
+        let Some(idx) = rp.rows.iter().position(|r| r.path == *expanded) else {
+            // New rows land before the pinned helper rows, not after them.
+            let insert_at = rp
+                .rows
+                .iter()
+                .position(|r| {
+                    matches!(
+                        r.kind,
+                        super::modals::RepoRowKind::ImportSuggestion
+                            | super::modals::RepoRowKind::StartHere
+                    )
+                })
+                .unwrap_or(rp.rows.len());
+            rp.rows.insert(
+                insert_at,
+                super::modals::RepoRow {
+                    path: expanded.to_path_buf(),
+                    kind: super::modals::RepoRowKind::Repo { child: false },
+                },
+            );
+            rp.selected.insert(expanded.to_path_buf());
             return true;
         };
         let is_child = rp.is_child_row(idx);
         let is_header = rp.is_header_row(idx);
         if !is_header {
-            rp.selected[idx] = true;
+            rp.selected.insert(expanded.to_path_buf());
         }
         !is_child && !is_header
     }
@@ -2163,7 +2467,7 @@ impl App {
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
             return;
         };
-        let path = rp.path_input.value().trim().to_string();
+        let path = rp.input.value().trim().to_string();
         if path.is_empty() {
             self.set_status(
                 super::StatusLevel::Info,
@@ -2172,80 +2476,105 @@ impl App {
             return;
         }
         let expanded = paths::expand_tilde(&path);
-        // Equivalent to a literal "" (the remote guard above means the wizard
-        // is local here), but keeps the `"" = local` encoding owned by
+        if let super::modals::Modal::RepoPicker(ref mut rp) = self.modal {
+            rp.input.clear();
+            rp.path_suggestion = None;
+        }
+        self.repo_picker_import_folder(&expanded);
+    }
+
+    /// Persist `dir` as a parent bookmark and re-scan the picker rows. Shared
+    /// by the typed-path `Ctrl+P` and the first-run import-suggestion rows.
+    fn repo_picker_import_folder(&mut self, dir: &std::path::Path) {
+        // The wizard is local at both call sites, so this is equivalent to a
+        // literal "" — but the `"" = local` encoding stays owned by
         // `bookmark_host_key` alone.
         let host = self.bookmark_host_key().to_string();
-        if let Err(e) = self.db.upsert_repo_bookmark_kind(&host, &expanded, true) {
+        if let Err(e) = self.db.upsert_repo_bookmark_kind(&host, dir, true) {
             error!("Failed to save parent bookmark: {e}");
             self.set_error(format!("Failed to save parent bookmark: {e}"));
-        }
-        if let super::modals::Modal::RepoPicker(ref mut rp) = self.modal {
-            rp.path_input.clear();
-            rp.path_suggestion = None;
-            rp.focus = super::modals::RepoPickerFocus::List;
         }
         self.refresh_repo_picker_rows();
     }
 
-    /// Compute a remote directory completion for the repo-picker path input by
-    /// listing the parent directory on the selected host over ssh/wsl. Returns
-    /// the suffix to append (mirroring `paths::complete_directory_path`), or
-    /// `None`. Only called on an explicit `Tab` so it doesn't run per keystroke.
-    fn remote_path_completion(&self, input: &str) -> Option<String> {
-        let host = self.host_for_backend(self.new_session.backend.as_deref())?;
+    /// One explicit ssh/wsl listing for the typed remote path: fills the
+    /// candidate list (`is_repo` unknowable without one round-trip each, so
+    /// always `false` — Enter on a remote candidate drills in) and returns the
+    /// completion suffix (mirroring `paths::complete_directory_path`). Only
+    /// called on an explicit `Tab` so it doesn't run per keystroke.
+    fn remote_path_candidates(&mut self, input: &str) -> Option<String> {
+        let host = self
+            .host_for_backend(self.new_session.backend.as_deref())?
+            .clone();
         // Need at least one `/` to know which remote dir to list.
         let (parent, prefix) = input.rsplit_once('/')?;
         let parent = if parent.is_empty() { "/" } else { parent };
-        let entries = crate::git::list_dir_on(host, parent).ok()?;
-        dir_completion_suffix(&entries, prefix)
+        let entries = crate::git::list_dir_on(&host, parent).ok()?;
+        let sug = dir_completion_suffix(&entries, prefix);
+        let show_hidden = prefix.starts_with('.');
+        if let super::modals::Modal::RepoPicker(ref mut rp) = self.modal {
+            let mut names: Vec<String> = entries
+                .into_iter()
+                .filter(|n| (show_hidden || !n.starts_with('.')) && n.starts_with(prefix))
+                .collect();
+            names.sort();
+            rp.candidates = names
+                .into_iter()
+                .map(|name| super::modals::PathCandidate {
+                    full: std::path::PathBuf::from(format!(
+                        "{}/{name}",
+                        parent.trim_end_matches('/')
+                    )),
+                    name,
+                    is_repo: false,
+                })
+                .collect();
+            rp.candidate_index = None;
+        }
+        sug
     }
 
-    pub(super) fn update_repo_picker_path_suggestion(&mut self) {
-        // For a remote target (SSH host or WSL distro) the path lives on the
-        // *remote* filesystem, so completing against the local one would suggest
-        // the wrong directories entirely. Suppress the local-filesystem
-        // suggestion in that case — the path is typed as a plain remote path.
+    /// Recompute the path-mode candidate list and the ghost completion derived
+    /// from it. For a remote target (SSH host or WSL distro) the path lives on
+    /// the *remote* filesystem, so listing the local one would suggest the
+    /// wrong directories entirely — remote candidates are only filled by an
+    /// explicit `Tab` (see [`Self::remote_path_candidates`]).
+    pub(super) fn refresh_repo_picker_candidates(&mut self) {
         let remote = self.new_session.backend.is_some();
         let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
             return;
         };
-        if remote {
-            rp.path_suggestion = None;
+        rp.candidates.clear();
+        rp.candidate_index = None;
+        rp.path_suggestion = None;
+        // Filter text is not a path — completing it would be noise.
+        if remote || rp.input_mode() != super::modals::RepoInputMode::Path {
             return;
         }
-        let value = rp.path_input.value().to_string();
-        let at_end = rp.path_input.cursor_pos() == value.chars().count();
-        if at_end && !value.is_empty() {
-            rp.path_suggestion = paths::complete_directory_path(&value);
-        } else {
-            rp.path_suggestion = None;
+        let value = rp.input.value().to_string();
+        // Completion only applies with the cursor at the end (inserting
+        // mid-string would garble the path).
+        if rp.input.cursor_pos() != value.chars().count() {
+            return;
         }
-    }
-
-    fn handle_repo_picker_search_key(&mut self, code: KeyCode, mods: KeyModifiers) {
-        let super::modals::Modal::RepoPicker(ref mut rp) = self.modal else {
+        let Some((parent, prefix)) = paths::split_path_input(&value) else {
             return;
         };
-        match code {
-            KeyCode::Esc => {
-                rp.clear_search();
-                rp.focus = super::modals::RepoPickerFocus::List;
-            }
-            KeyCode::Enter => {
-                rp.focus = super::modals::RepoPickerFocus::List;
-            }
-            // Cursor moves don't change the filter; edits (incl. Ctrl+W/U) do.
-            KeyCode::Left => rp.search_input.move_left(),
-            KeyCode::Right => rp.search_input.move_right(),
-            KeyCode::Home => rp.search_input.home(),
-            KeyCode::End => rp.search_input.end(),
-            other => {
-                if super::modals::apply_text_input_key(Some(&mut rp.search_input), other, mods) {
-                    self.recompute_repo_filter();
+        let mut names = paths::matching_dir_names(&parent, &prefix);
+        names.sort();
+        rp.path_suggestion = dir_completion_suffix(&names, &prefix);
+        rp.candidates = names
+            .into_iter()
+            .map(|name| {
+                let full = parent.join(&name);
+                let is_repo = crate::git::is_git_repo(&full);
+                super::modals::PathCandidate {
+                    name,
+                    full,
+                    is_repo,
                 }
-            }
-        }
+            })
+            .collect();
     }
 
     fn recompute_repo_filter(&mut self) {
@@ -2268,11 +2597,19 @@ impl App {
             }
         }
 
+        // Nothing checked: Enter acts on the highlighted row instead (see
+        // `repo_picker_enter`); the old silent $HOME fallthrough is gone.
+        if worktree_repos.is_empty() && normal_repos.is_empty() {
+            return;
+        }
+
+        // Park the palette so Esc from a later step restores it as-was.
+        if let super::modals::Modal::RepoPicker(ref rp) = self.modal {
+            self.new_session.saved_repo_picker = Some(Box::new(rp.clone()));
+        }
         self.modal.close();
 
-        if worktree_repos.is_empty() && normal_repos.is_empty() {
-            self.spawn_repo_picker_no_repos();
-        } else if !worktree_repos.is_empty() {
+        if !worktree_repos.is_empty() {
             self.spawn_repo_picker_worktrees(worktree_repos, normal_repos);
         } else {
             self.spawn_repo_picker_normal(normal_repos);
@@ -2326,14 +2663,16 @@ impl App {
     ) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
         let mut worktree_repos: Vec<std::path::PathBuf> = Vec::new();
         let mut normal_repos: Vec<std::path::PathBuf> = Vec::new();
-        for (i, path) in rp.bookmarks.iter().enumerate() {
-            if !rp.selected.get(i).copied().unwrap_or(false) {
+        // Iterate rows (not the selection set) so the result keeps the list's
+        // recency order — the first selected repo becomes the session cwd.
+        for row in &rp.rows {
+            if row.is_header() || !rp.selected.contains(&row.path) {
                 continue;
             }
-            if rp.worktree.get(i).copied().unwrap_or(false) {
-                worktree_repos.push(path.clone());
+            if rp.worktree.contains(&row.path) {
+                worktree_repos.push(row.path.clone());
             } else {
-                normal_repos.push(path.clone());
+                normal_repos.push(row.path.clone());
             }
         }
         (worktree_repos, normal_repos)
