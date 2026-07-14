@@ -48,8 +48,7 @@ pub fn render_agent_picker_modal(
     let visible = state.filter.visible_indices(state.choices.len());
     let filter_active = state.filter.is_active();
     let crumb_height = u16::from(breadcrumb.is_some());
-    let height =
-        (visible.len().clamp(1, 15) as u16) + 3 + u16::from(filter_active) + crumb_height;
+    let height = (visible.len().clamp(1, 15) as u16) + 3 + u16::from(filter_active) + crumb_height;
     let area = centered_fixed_height_rect(50, height, frame.area());
 
     let inner = render_modal_frame(frame, area, "New Session — Agent");

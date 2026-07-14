@@ -10560,6 +10560,7 @@ mod tests {
         app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
             index: 0,
             branches: vec!["main".into()],
+            filter: Default::default(),
             loading: false,
         });
         let text = rendered_text(&mut app);
@@ -15269,8 +15270,10 @@ mod tests {
 
         app.start_new_session();
         assert!(matches!(app.modal, modals::Modal::HostPicker(_)));
-        // Pick the remote host → the palette opens for that host.
-        app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        // Pick the remote host → the palette opens for that host. The host
+        // picker is type-to-filter now (upstream #9), so navigate with ↓, not
+        // `j` (which would type into the filter).
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(app.modal, modals::Modal::RepoPicker(_)));
         assert_eq!(app.new_session.backend.as_deref(), Some("ssh:devbox"));
@@ -15446,6 +15449,7 @@ mod tests {
         app.modal = modals::Modal::AgentPicker(crate::ui::agent_picker_modal::AgentPickerState {
             choices: vec![],
             selected_index: 0,
+            filter: Default::default(),
         });
 
         app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
@@ -15538,9 +15542,10 @@ mod tests {
 
     /// Esc on the branch selector is two-stage while a query is typed: the
     /// first press only clears the filter (the modal and its pending flow
-    /// survive), the second closes.
+    /// survive); the second steps back to the repo picker (the fork's
+    /// wizard back-navigation) and drops the pending branch flow.
     #[test]
-    fn branch_selector_esc_clears_filter_before_closing() {
+    fn branch_selector_esc_clears_filter_then_steps_back() {
         let mut app = app_with_sessions(1);
         app.new_session.repo_path = Some(PathBuf::from("/repo"));
         app.modal = modals::Modal::BranchSelector(modals::BranchSelectorModal {
@@ -15560,8 +15565,10 @@ mod tests {
         }
         assert!(app.new_session.repo_path.is_some(), "flow still pending");
 
+        // Second Esc: step back to the repo picker (wizard back-nav), dropping
+        // the pending branch flow.
         app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
-        assert!(matches!(app.modal, modals::Modal::None));
+        assert!(matches!(app.modal, modals::Modal::RepoPicker(_)));
         assert!(app.new_session.repo_path.is_none());
     }
 

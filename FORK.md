@@ -414,6 +414,7 @@ interplay with ADR-P12 in `docs/PERFORMANCE.md`.
   new-session-name cancel left the wizard's derived extra dirs populated, so
   the *next* spawn silently attached the stale directories. Cleared on
   back-navigation/cancel now (fixed as part of the wizard redesign).
+
 - **Copy falls back to `tmux load-buffer` / OSC 52 when no display server is
   reachable.** Upstream copies only through `arboard`, which needs X11/Wayland —
   over SSH, under a display-less tmux, or in WSL without WSLg every copy failed
