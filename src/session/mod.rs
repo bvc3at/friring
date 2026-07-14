@@ -329,6 +329,11 @@ pub struct SessionConfig {
     pub backend: Option<String>,
     /// Fork from an existing session's conversation (agents that support it).
     pub fork_session_id: Option<String>,
+    /// The friring session name, filling `{name}` tokens in the agent's arg
+    /// templates (e.g. claude's `-n {name}`) so the conversation carries the
+    /// same name inside the agent. `None`/empty drops the name-carrying
+    /// tokens — see [`AgentDef::build_args`].
+    pub session_name: Option<String>,
     /// Environment variables injected into the spawned session process
     /// (friring-internal: session id, metrics dir, etc.).
     pub env: HashMap<String, String>,

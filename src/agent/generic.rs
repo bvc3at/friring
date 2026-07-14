@@ -35,6 +35,7 @@ impl AgentProvider for GenericProvider {
             config.resume_session_id.as_deref(),
             config.fork_session_id.as_deref(),
             config.agent_session_id.as_deref(),
+            config.session_name.as_deref(),
         )
     }
 }
@@ -68,7 +69,33 @@ mod tests {
             agent_session_id: Some("new-id".into()),
             ..SessionConfig::default()
         };
+        // No session name → the seeded `-n {name}` pair vanishes cleanly.
         let args = provider.build_args(&config);
         assert_eq!(args, vec!["--session-id", "new-id"]);
+    }
+
+    #[test]
+    fn fresh_session_with_name_passes_it_to_claude() {
+        let reg = builtin_registry();
+        let provider = GenericProvider::new(reg.get("claude").unwrap().clone());
+
+        let config = SessionConfig {
+            agent_session_id: Some("new-id".into()),
+            session_name: Some("fix auth flow".into()),
+            ..SessionConfig::default()
+        };
+        assert_eq!(
+            provider.build_args(&config),
+            vec!["--session-id", "new-id", "-n", "fix auth flow"]
+        );
+
+        // Resuming the same session never re-pushes the name (the seeded
+        // resume group carries no {name} token).
+        let config = SessionConfig {
+            resume_session_id: Some("new-id".into()),
+            session_name: Some("fix auth flow".into()),
+            ..SessionConfig::default()
+        };
+        assert_eq!(provider.build_args(&config), vec!["--resume", "new-id"]);
     }
 }

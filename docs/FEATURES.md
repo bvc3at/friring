@@ -355,16 +355,21 @@ Each definition (`session::AgentDef`) carries:
 - `command` — the CLI executable to launch.
 - argument-template groups: `args` (always passed — bake in flags
   like a model here if you want) and `resume_args` / `fork_args` /
-  `new_session_args` (with `{id}`).
+  `new_session_args` (with `{id}` / `{name}`).
 - `resume_latest` — when true, restart resumes the agent's most
   recent session in the launch directory via **id-less** flags
   (see below).
 
 `agent::GenericProvider` builds the launch arguments by appending
 each group **only when its driving value is present**, substituting
-`{id}` token-by-token. Selection precedence is fork > resume >
-new-session id; static `args` follow. A group with no value is
-simply omitted — no unresolved-placeholder heuristics.
+`{id}` and `{name}` token-by-token. Selection precedence is fork >
+resume > new-session id; static `args` follow. A group with no value
+is simply omitted — no unresolved-placeholder heuristics. `{name}` is
+the friring session name, for agents whose CLI can name a session at
+launch: the seeded claude entry passes `-n {name}` on fresh spawns and
+forks (never on resume, so an in-agent rename survives a restart), and
+a name-less launch drops the `{name}` token together with its
+preceding flag. See `docs/CONFIG.md` → agents.toml for the full rules.
 
 Only `claude` accepts the friring-generated id at creation
 (`--session-id {id}`), so only it resumes/forks by that exact id.
@@ -386,8 +391,8 @@ default = "claude"
 name = "claude"
 command = "claude"
 resume_args = ["--resume", "{id}"]
-fork_args = ["--resume", "{id}", "--fork-session"]
-new_session_args = ["--session-id", "{id}"]
+fork_args = ["--resume", "{id}", "--fork-session", "-n", "{name}"]
+new_session_args = ["--session-id", "{id}", "-n", "{name}"]
 
 [[agents]]
 name = "codex"
