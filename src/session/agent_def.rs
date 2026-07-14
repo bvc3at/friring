@@ -268,7 +268,10 @@ mod tests {
         // `--name=…`, so a name-less launch must keep it.
         let mut d = claude();
         d.new_session_args = vec!["--verbose".into(), "--name={name}".into()];
-        assert_eq!(d.build_args(None, None, Some("new-id"), None), vec!["--verbose"]);
+        assert_eq!(
+            d.build_args(None, None, Some("new-id"), None),
+            vec!["--verbose"]
+        );
     }
 
     #[test]
