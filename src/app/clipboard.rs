@@ -34,13 +34,16 @@ use std::process::{Command, Stdio};
 /// which `external` allows. `Ok(())` means the `tmux` process exited
 /// successfully (the buffer was set and the terminal clipboard *attempted* —
 /// tmux still needs the outer terminal's `Ms` capability to reach the system
-/// clipboard, but the tmux paste buffer is set regardless).
+/// clipboard, but the tmux paste buffer is set regardless). On failure the
+/// error carries tmux's own stderr (e.g. `no current client`, or an
+/// `unknown flag` on a tmux too old for `-w`) so the status-bar message is
+/// actionable rather than a bare exit code.
 pub(crate) fn tmux_copy(text: &str) -> std::io::Result<()> {
     let mut child = Command::new("tmux")
         .args(["load-buffer", "-w", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     {
         let mut stdin = child.stdin.take().ok_or_else(|| {
@@ -48,14 +51,20 @@ pub(crate) fn tmux_copy(text: &str) -> std::io::Result<()> {
         })?;
         stdin.write_all(text.as_bytes())?;
     } // drop stdin → EOF so tmux stops reading
-    let status = child.wait()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "tmux load-buffer exited with {status}"
-        )))
+    let output = child.wait_with_output()?;
+    if output.status.success() {
+        return Ok(());
     }
+    // Prefer tmux's stderr (the real reason); fall back to the exit status when
+    // it wrote nothing. The `clipboard_error` wrapper already names the stage,
+    // so keep this to the bare detail.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.trim();
+    Err(std::io::Error::other(if detail.is_empty() {
+        output.status.to_string()
+    } else {
+        detail.to_string()
+    }))
 }
 
 /// Copy `text` to the terminal's clipboard via OSC 52
