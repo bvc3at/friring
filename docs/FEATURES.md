@@ -87,6 +87,21 @@ manual order is never disturbed (see *Smart ordering* below). Repo groups
 roll up to their most-urgent member
 (`Blocked > Error > Working > Done > Unreachable > Idle`).
 
+**Navigating to what needs you.** `F10` (rebindable `NextBlockedSession`)
+jumps to the next `Blocked` session — scanning forward from the active one
+in rendered order, wrapping — and lands focus in the terminal, so pressing
+it repeatedly walks the attention queue top-to-bottom, answering each
+prompt in turn. `Alt+A` (rebindable `JumpToBlocked`) numbers only the
+blocked sessions `1`–`9` in the list and a digit jumps straight to that
+one — fewer, lower digits than the all-session `Alt+digit` numbering when
+the list is long. Held with Alt (kitty-protocol terminals) the numbers
+live until Alt is released; tapped (legacy terminals) they stay until a
+digit, `Esc`, or any other key. The blocked count is surfaced twice: a
+`◆N` badge ahead of the status dots in the session list's title bar, and
+a `◆ N blocked · F10` badge in the footer (carrying the live shortcut),
+so attention stays visible even when the sidebar is hidden on a narrow
+terminal.
+
 The hooks are wired automatically by the built-in **hooks** extension
 (auto-activated on first run; opt out with `friring-cli extension
 deactivate hooks`). How much each agent can report depends on the
@@ -470,6 +485,30 @@ scrollback).
 - Ctrl combos are easier to type one-handed, which matters for a
   tool used alongside other terminals.
 
+**The one deliberate Alt exception: session jumps.** The Ctrl namespace is
+full, and "hold a modifier to peek at jump targets" only works on a
+modifier the app owns — so `Alt+1`–`9` jump to the numbered session,
+**holding Alt** paints those numbers on the session list (kitty-protocol
+terminals; after a short delay so readline's `M-b`/`M-f` passing through
+the terminal never flash it), and `Alt+A` numbers only the *blocked*
+sessions (see *Live status*). Every other Alt chord still forwards to the
+PTY, and the shadowed readline bindings (`M-digit` argument prefixes,
+`M-a`) are rare enough to spend. `Alt+A` is rebindable; the digits are
+fixed. Some terminal emulators claim `Alt+digit` for their own tabs —
+their setting wins; rebind or disable it there.
+
+### Focus model: terminal-first
+
+The terminal is where keystrokes belong; the session list is a glanceable
+dashboard, not a destination. Selection *is* activation (the list has no
+separate cursor — the highlighted row is the active session), so every
+"go to this session" gesture lands focus in the terminal: startup (when
+sessions were restored), clicking a session row, `Enter` in the list, a
+notification click, and a global-search jump. The list is only focused
+deliberately — `Ctrl+H`, or a click on its empty area — for management
+work like reordering or import, and `Esc` backs out of it in one
+keystroke.
+
 ### Keybinding Table
 
 All global keybindings use `Ctrl` and follow Vim conventions where
@@ -491,6 +530,12 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Ctrl+J` / `Alt+J` | Global | Select next session (`Ctrl+J` defers to the agent in a focused terminal — it doubles as a legacy `Ctrl+Enter`; use `Alt+J` there) | Vim: **j** = down |
 | `Ctrl+K` / `Alt+K` | Global | Select previous session (`Ctrl+K` defers likewise — readline kill-to-end) | Vim: **k** = up |
 | `Ctrl+L` | Global | Focus next pane (cycle forward) | Vim: **l** = right |
+| `F10` | Global | Jump to next blocked session (wraps, focuses terminal) | Attention |
+| `Ctrl+6` / `Ctrl+^` | Global | Toggle between the two most recent sessions | vim alternate buffer |
+| `Alt+1`…`9` | Global | Jump to the Nth session (rendered order); fixed, not rebindable | tmux `Alt+digit` |
+| hold `Alt` | Global | Paint the jump numbers on the session list (kitty protocol) | Peek |
+| `Alt+A` | Global | Number only *blocked* sessions; a digit jumps to that one | **A**ttention |
+| `1`…`9` / `Esc` | Blocked-jump overlay | Jump to that blocked session / dismiss | |
 | `Ctrl+D` | Session list | Delete selected session | Vim: **d** = delete |
 | `Ctrl+O` | Global | Open active session's worktrees in editor | **O**pen |
 | `Ctrl+R` | Global | Restart active session | **R**estart |
@@ -517,6 +562,7 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Enter` | Global search | Jump to selected result | |
 | `Esc` | Global search | Close search | |
 | `Enter` | Session list | Focus terminal | |
+| `Esc` | Session list | Focus terminal (back out of the list) | |
 | `j` / `Down` | Repo picker | Next repo | |
 | `k` / `Up` | Repo picker | Previous repo | |
 | `Space` | Repo picker | Toggle repo selection | |
@@ -530,7 +576,8 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Shift+PageUp` / `Alt+PageUp` | Focused terminal | Scroll up half page | |
 | `Shift+PageDown` / `Alt+PageDown` | Focused terminal | Scroll down half page | |
 | Mouse wheel | Focused terminal | Scroll up/down 3 lines | |
-| Click | Session/task/automation/file row | Select the row and focus its pane | |
+| Click | Session row | Select the session and focus the terminal | |
+| Click | Task/automation/file row | Select the row and focus its pane | |
 | Click | Any pane | Focus the pane under the cursor | |
 | Click | Picker modal row | Select and confirm (Enter; repo picker: Space toggle) | |
 | Hover | Clickable rows | Underline the row a click would hit | |
@@ -618,9 +665,11 @@ exists). Beyond that:
 
 - **Cmd as a modifier.** Friring enables the kitty keyboard protocol
   when the terminal supports it (`main.rs` pushes
-  `PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`, gated on
+  `DISAMBIGUATE_ESCAPE_CODES | REPORT_EVENT_TYPES | REPORT_ALTERNATE_KEYS |
+  REPORT_ALL_KEYS_AS_ESCAPE_CODES`, gated on
   `supports_keyboard_enhancement()`, popped on shutdown and in the panic
-  hook), so the Command key is a first-class modifier: write `cmd+j` in
+  hook — the event-type/all-keys flags also power the Alt-hold session-jump
+  overlay), so the Command key is a first-class modifier: write `cmd+j` in
   `keybindings.json` (`super`, `command`, and `win` parse as aliases; `cmd`
   is canonical) or capture a Cmd chord live in the F1 editor. Supported by
   iTerm2 3.5+, kitty, WezTerm, and Ghostty; Terminal.app lacks the protocol,

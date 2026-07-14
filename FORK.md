@@ -305,6 +305,57 @@ one small CLI addition: `session get/list --json` now expose the raw
 automations) can watch status transitions without reading SQLite. Architecture
 and contracts in `docs/E2E.md`; decision record ADR-23.
 
+#### Terminal-first focus
+
+Upstream starts focused on the session list, and clicking a session row
+focuses the *list* — so the first thing typed after startup or after a
+click lands in the list's single-letter hotkeys (`i` opens the import
+picker, `Shift+S` re-sorts) instead of reaching the agent. The fork makes
+the terminal the default focus target: startup lands in the terminal when
+any session was restored, clicking a session row selects it **and**
+focuses the terminal (matching `Enter` / a notification click / a
+global-search jump), and `Esc` backs out of a focused session list. The
+list stays reachable for management (reorder, import) via `Ctrl+H` or a
+click on its empty area. See `docs/FEATURES.md` ("Focus model:
+terminal-first").
+
+#### Attention navigation (`F10` + blocked badges)
+
+Upstream surfaces a blocked agent only as a red dot (and a desktop
+notification) — there is no way to *navigate* by attention. The fork adds
+`F10` (rebindable `NextBlockedSession`): jump to the next `Blocked`
+session in rendered order (wrapping), focus landing in the terminal, so
+repeated presses walk the attention queue and answer each prompt in turn.
+The blocked count is badged in the session list's title bar (`◆N` ahead
+of the status dots) and in the footer (`◆ N blocked · F10`, with the live
+shortcut), so attention is visible even when the sidebar is hidden on a
+narrow terminal. See `docs/FEATURES.md` ("Live status & needs attention").
+
+#### Quick session switching (last-session toggle & numbered jumps)
+
+`Ctrl+6` / `Ctrl+^` (rebindable `LastSession`) bounces between the two
+most recent sessions — tmux `last-window`, vim's alternate buffer. Every
+deliberate switch records the session it left (`Ctrl+J`/`K`, list `j`/`k`,
+clicks, jumps, a committed global-search result, spawn/undelete);
+bookkeeping moves (restore reshuffles, delete clamps, search
+live-previews) don't, so the toggle always means "where I actually was".
+
+`Alt+1`–`9` jumps to the Nth session in rendered order (tmux
+`Alt+digit`), and **holding Alt paints the numbers** on the session list
+so the target is visible before the digit is pressed. `Alt+A` (rebindable
+`JumpToBlocked`) is the attention variant: it numbers only the *blocked*
+sessions and a digit jumps among those. This is a deliberate, narrow Alt
+exception to upstream's "Ctrl = global, everything else = PTY" philosophy
+(documented in `docs/FEATURES.md`); every other Alt chord still forwards
+to the agent. The hold-to-peek overlay needs the kitty keyboard protocol:
+on top of the modifier-reporting flags the double-`Shift` opener already
+pushes (see *Global search* above), the fork adds `REPORT_EVENT_TYPES` so
+Alt's *release* — and key auto-repeat — are reported, with repeats
+(`Repeat` kind) dispatched like `Press` so held keys keep repeating into
+the PTY. Legacy terminals lose only the visual overlay: `Alt+digit` /
+`Alt+A` still work, the latter as a sticky overlay dismissed by a digit,
+`Esc`, or any other key.
+
 ### Behavior fixes
 
 - **Copy falls back to `tmux load-buffer` / OSC 52 when no display server is

@@ -115,12 +115,22 @@ impl App {
         // push REPORT_ALL_KEYS_AS_ESCAPE_CODES). They are inert for every
         // handler below and must never reach a text input or the PTY, so they
         // are consumed here — where a double-tap of `Shift` opens the global
-        // search. Any other key breaks a pending double-tap.
+        // search. Any other key breaks a pending double-tap. (Alt press/release
+        // never lands here — it arrives as `AppMessage::AltHeld`; see
+        // `key_to_message`.)
         if let KeyCode::Modifier(m) = code {
             self.handle_modifier_press(m);
             return;
         }
         self.pending_double_shift = None;
+
+        // Self-heal a missed Alt release (a lost kitty release event, e.g.
+        // terminal focus stolen mid-hold): while Alt is really held every key
+        // event carries the ALT bit, so one arriving without it means the
+        // release never reached us.
+        if self.alt_held && !mods.contains(KeyModifiers::ALT) {
+            self.set_alt_held(false);
+        }
 
         // Help overlay + clipboard chords are routed before any modal handler.
         if self.handle_priority_key(code, mods) {
@@ -177,6 +187,14 @@ impl App {
             return;
         }
         if self.handle_cc_activity_tree_key(code, mods) {
+            return;
+        }
+
+        // Session jump digits (`Alt+1…9`, and plain digits / `Esc` while the
+        // blocked-only overlay is open) are fixed keys, routed here — after
+        // the modal/capture gates so typed digits still reach text inputs,
+        // before the lookup + pane handlers so they can't leak into the PTY.
+        if self.handle_session_jump_key(code, mods) {
             return;
         }
 
@@ -761,10 +779,60 @@ impl App {
         }
     }
 
+    /// The session jump-overlay keys (see `App::jump_overlay_blocked_only`).
+    /// Returns `true` when the key was consumed.
+    ///
+    /// - While the blocked-only overlay is open: a digit jumps to that
+    ///   blocked session, `Esc` dismisses, the toggle chord falls through to
+    ///   the lookup (which flips the overlay off), and any other key
+    ///   dismisses a *sticky* overlay without being consumed — stray typing
+    ///   acts normally instead of being hijacked.
+    /// - Otherwise `Alt+<digit>` jumps by the all-session numbering (works
+    ///   blind on legacy terminals that can't show the hold overlay).
+    fn handle_session_jump_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
+        use super::BlockedJumpMode;
+        let plain_or_alt = mods.is_empty() || mods == KeyModifiers::ALT;
+        if let Some(mode) = self.blocked_jump {
+            match code {
+                KeyCode::Char(c @ '1'..='9') if plain_or_alt => {
+                    self.blocked_jump = None;
+                    self.jump_to_digit(c, true);
+                    return true;
+                }
+                KeyCode::Esc => {
+                    self.blocked_jump = None;
+                    return true;
+                }
+                _ => {
+                    let is_toggle = self.keybindings.lookup(code, mods)
+                        == Some(crate::session::Action::JumpToBlocked);
+                    if !is_toggle && mode == BlockedJumpMode::Sticky {
+                        self.blocked_jump = None;
+                    }
+                    return false;
+                }
+            }
+        }
+        if mods == KeyModifiers::ALT {
+            if let KeyCode::Char(c @ '1'..='9') = code {
+                self.jump_to_digit(c, false);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Session-list keys are all rebindable `SessionList`-scoped actions
     /// (`SessionListNext`/`Prev`/`Open`), resolved by the context lookup in
-    /// `handle_key` before this runs — so nothing remains to handle here.
-    pub(crate) fn handle_session_list_key(&mut self, _code: KeyCode) {}
+    /// `handle_key` before this runs. Only the fixed `Esc` escape hatch lives
+    /// here (literal, like the other panes' Esc): the list is a transient
+    /// "manage" surface, so backing out of it must never cost more than one
+    /// keystroke. No-op with no sessions — the terminal would be a dead end.
+    pub(crate) fn handle_session_list_key(&mut self, code: KeyCode) {
+        if code == KeyCode::Esc && !self.sessions.is_empty() {
+            self.focus = InputFocus::Terminal;
+        }
+    }
 
     fn handle_terminal_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         // Terminal scroll is handled by the rebindable `TerminalScroll*`
@@ -1303,6 +1371,9 @@ impl App {
             }
             Action::NextSession => self.switch_session_forward(),
             Action::PreviousSession => self.switch_session_backward(),
+            Action::NextBlockedSession => self.focus_next_blocked(),
+            Action::LastSession => self.toggle_last_session(),
+            Action::JumpToBlocked => self.toggle_blocked_jump(),
             _ => return None,
         }
         Some(true)

@@ -275,7 +275,7 @@ impl App {
         };
         match self.sessions.iter().position(|s| s.info.id == session_id) {
             Some(idx) => {
-                self.active_index = idx;
+                self.set_active_index(idx);
                 self.focus = InputFocus::Terminal;
                 // Leaving the automation context clears the editor/run cache.
                 self.refresh_automation_view();

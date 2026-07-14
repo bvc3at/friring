@@ -11,7 +11,8 @@
 //!
 //! A few stateful keys remain literal in `key_handlers.rs` and are *not*
 //! rebindable: modal-internal selectors (j/k/Enter/Esc), the automations/tasks
-//! panes, and the file-viewer search sub-mode.
+//! panes, the file-viewer search sub-mode, and the session jump digits
+//! (`Alt+1`–`9`, plus plain digits/`Esc` while a jump overlay is open).
 
 use std::collections::HashMap;
 
@@ -48,6 +49,15 @@ pub enum Action {
     FocusForward,
     NextSession,
     PreviousSession,
+    /// Jump to the next session whose status is Blocked (needs attention),
+    /// scanning forward from the active session in rendered order (wraps).
+    NextBlockedSession,
+    /// Toggle between the two most recent sessions (tmux `last-window`,
+    /// vim's alternate buffer).
+    LastSession,
+    /// Open the blocked-only jump overlay: blocked sessions get numbers 1–9
+    /// in the session list and a digit jumps straight to that one.
+    JumpToBlocked,
     ToggleHelp,
     ToggleInfoPanel,
     ToggleFileViewer,
@@ -154,6 +164,9 @@ impl Action {
             Action::FocusForward,
             Action::NextSession,
             Action::PreviousSession,
+            Action::NextBlockedSession,
+            Action::LastSession,
+            Action::JumpToBlocked,
             Action::ToggleHelp,
             Action::ToggleInfoPanel,
             Action::ToggleFileViewer,
@@ -222,6 +235,9 @@ impl Action {
             Action::FocusForward => "Focus next pane",
             Action::NextSession => "Next session",
             Action::PreviousSession => "Previous session",
+            Action::NextBlockedSession => "Next blocked session",
+            Action::LastSession => "Last session (toggle)",
+            Action::JumpToBlocked => "Jump to blocked by number",
             Action::ToggleHelp => "Help",
             Action::ToggleInfoPanel => "Toggle info panel",
             Action::ToggleFileViewer => "Toggle file viewer",
@@ -436,6 +452,25 @@ impl Action {
             Action::PreviousSession => {
                 vec![KeyChord::ctrl('k'), KeyChord::alt(KeyCode::Char('k'))]
             }
+            // F10 only (F1–F9 are taken, and every free bare `Ctrl+<letter>`
+            // would collide with readline in the terminal/shell panes — an
+            // F-key dispatches from any pane without a PTY collision). Fully
+            // rebindable.
+            Action::NextBlockedSession => vec![KeyChord::function(10)],
+            // Ctrl+^ — vim's alternate-buffer chord, reached as Ctrl+6 on US
+            // layouts. Terminals encode it inconsistently (like Ctrl+/ above):
+            // legacy ones send the raw 0x1E byte that crossterm decodes as
+            // `Ctrl+6`, kitty-protocol ones deliver the shifted `Ctrl+^` — so
+            // both are bound. Not a bare Ctrl+<letter>, so it never defers to
+            // the PTY. Fully rebindable.
+            Action::LastSession => vec![KeyChord::ctrl('6'), KeyChord::ctrl('^')],
+            // Alt+A (mnemonic: Attention) — part of the deliberate, narrow
+            // Alt exception for session jumps (with the fixed `Alt+1…9`
+            // digits): held Alt already drives the number overlay, so its
+            // blocked-only variant lives on the same modifier. Shadows
+            // readline's rarely-used M-a (backward-sentence) in the terminal;
+            // fully rebindable.
+            Action::JumpToBlocked => vec![KeyChord::alt(KeyCode::Char('a'))],
             Action::ToggleHelp => vec![KeyChord::ctrl('g'), KeyChord::function(1)],
             Action::ToggleInfoPanel => vec![KeyChord::ctrl('b'), KeyChord::function(2)],
             Action::ToggleFileViewer => vec![KeyChord::ctrl('e'), KeyChord::function(3)],
@@ -573,7 +608,15 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
     vec![
         (
             "Navigation",
-            vec![FocusBackward, FocusForward, NextSession, PreviousSession],
+            vec![
+                FocusBackward,
+                FocusForward,
+                NextSession,
+                PreviousSession,
+                NextBlockedSession,
+                LastSession,
+                JumpToBlocked,
+            ],
         ),
         (
             "Sessions",
@@ -1403,6 +1446,9 @@ mod tests {
                 Action::FocusForward => 0,
                 Action::NextSession => 0,
                 Action::PreviousSession => 0,
+                Action::NextBlockedSession => 0,
+                Action::LastSession => 0,
+                Action::JumpToBlocked => 0,
                 Action::ToggleHelp => 0,
                 Action::ToggleInfoPanel => 0,
                 Action::ToggleFileViewer => 0,
@@ -1451,7 +1497,7 @@ mod tests {
         }
         // The listed variants must equal Action::all().len(). If you add
         // a variant, update both `Action::all()` and the match above.
-        const EXPECTED: usize = 62;
+        const EXPECTED: usize = 65;
         assert_eq!(Action::all().len(), EXPECTED);
         for a in Action::all() {
             classify(*a);

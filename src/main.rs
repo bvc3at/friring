@@ -5,8 +5,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, ModifierKeyCode, MouseButton,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 
@@ -25,18 +25,28 @@ static KEYBOARD_ENHANCEMENT_PUSHED: AtomicBool = AtomicBool::new(false);
 /// - DISAMBIGUATE_ESCAPE_CODES — Cmd/Super-modified keys are reported at all
 ///   (otherwise the terminal never delivers them).
 /// - REPORT_ALL_KEYS_AS_ESCAPE_CODES — bare modifier presses arrive as
-///   `KeyCode::Modifier` events, which the double-`Shift` search opener needs
-///   (`App::handle_modifier_press`); they are swallowed everywhere else.
+///   `KeyCode::Modifier` events. The double-`Shift` search opener
+///   (`App::handle_modifier_press`) and the Alt-hold session-jump overlay
+///   (`App::set_alt_held`) both need them; every other bare modifier is
+///   swallowed.
+/// - REPORT_EVENT_TYPES — press/release/repeat kinds. Alt's press *and*
+///   release drive the jump overlay (so the numbers clear when Alt is let
+///   go), and auto-repeat now arrives as `Repeat`, dispatched like `Press`
+///   in `key_to_message` (matching how legacy terminals send repeated
+///   `Press`).
 /// - REPORT_ALTERNATE_KEYS — with all-keys reporting the terminal sends the
 ///   *base* key (`a` + SHIFT) unless it also reports the shifted alternate;
 ///   this flag keeps `Shift+a` arriving as `Char('A')` (crossterm substitutes
 ///   the alternate), so text inputs and PTY forwarding see capitals unchanged.
 ///
-/// REPORT_EVENT_TYPES stays off, so no Release/Repeat events arrive and the
-/// `KeyEventKind::Press` filter in `run_loop` stays correct. The support
-/// query needs raw mode, so call this only after `ratatui::init()`.
+/// Legacy terminals (query answers no) keep the old behavior: no flags, no
+/// modifier or Release/Repeat events — the double-Shift opener and the
+/// Alt-hold overlay just never fire, while `Alt+<digit>` chords still arrive
+/// as `ESC <digit>` and keep working blind. The support query needs raw mode,
+/// so call this only after `ratatui::init()`.
 fn push_keyboard_enhancement() {
     let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
         | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
     if matches!(
@@ -528,17 +538,39 @@ async fn run_loop(
 }
 
 /// Translate a crossterm `Event` into the matching `AppMessage`, or `None` for
-/// events the app ignores (key release/repeat, unhandled mouse kinds, …).
+/// events the app ignores (key releases, unhandled mouse kinds, …).
 fn event_to_message(event: Event) -> Option<AppMessage> {
     match event {
-        Event::Key(k) if k.kind == KeyEventKind::Press => {
-            Some(AppMessage::KeyPress(k.code, k.modifiers))
-        }
+        Event::Key(k) => key_to_message(k),
         Event::Mouse(m) => mouse_to_message(m),
         Event::Paste(text) => Some(AppMessage::Paste(text)),
         Event::Resize(cols, rows) => Some(AppMessage::Resize(cols, rows)),
         _ => None,
     }
+}
+
+/// Translate a key event. Modifier keys arrive as their own events under the
+/// kitty protocol (REPORT_ALL_KEYS_AS_ESCAPE_CODES):
+/// - Alt's press/release becomes [`AppMessage::AltHeld`], driving the
+///   session-jump overlay.
+/// - Any other bare modifier *press* is forwarded as a `KeyPress` so
+///   `handle_key` can run the double-`Shift` search opener; its release/repeat
+///   is dropped so a tap counts exactly once (and neither ever reaches a text
+///   input or the PTY — `handle_key` consumes `Modifier` codes).
+///
+/// For regular keys, `Repeat` dispatches like `Press` (that's how auto-repeat
+/// arrives with REPORT_EVENT_TYPES; legacy terminals send repeated `Press`)
+/// and `Release` is dropped.
+fn key_to_message(k: event::KeyEvent) -> Option<AppMessage> {
+    if let KeyCode::Modifier(m) = k.code {
+        if matches!(m, ModifierKeyCode::LeftAlt | ModifierKeyCode::RightAlt) {
+            return Some(AppMessage::AltHeld(k.kind != KeyEventKind::Release));
+        }
+        return (k.kind == KeyEventKind::Press)
+            .then_some(AppMessage::KeyPress(k.code, k.modifiers));
+    }
+    matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        .then_some(AppMessage::KeyPress(k.code, k.modifiers))
 }
 
 /// Translate a crossterm mouse event into the matching `AppMessage`, or `None`
@@ -571,5 +603,57 @@ fn mouse_to_message(m: event::MouseEvent) -> Option<AppMessage> {
             y: m.row,
         }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, kind: KeyEventKind) -> Event {
+        let mut k = KeyEvent::new(code, KeyModifiers::NONE);
+        k.kind = kind;
+        Event::Key(k)
+    }
+
+    /// Alt's own press/release events (kitty ALL_KEYS reporting) drive the
+    /// jump overlay; a non-Alt modifier *press* is forwarded to `handle_key`
+    /// (the double-`Shift` opener), and its release is dropped so a tap counts
+    /// once.
+    #[test]
+    fn modifier_key_events_route_alt_and_shift() {
+        let alt = KeyCode::Modifier(ModifierKeyCode::LeftAlt);
+        assert!(matches!(
+            event_to_message(key(alt, KeyEventKind::Press)),
+            Some(AppMessage::AltHeld(true))
+        ));
+        assert!(matches!(
+            event_to_message(key(alt, KeyEventKind::Release)),
+            Some(AppMessage::AltHeld(false))
+        ));
+        let shift = KeyCode::Modifier(ModifierKeyCode::LeftShift);
+        assert!(matches!(
+            event_to_message(key(shift, KeyEventKind::Press)),
+            Some(AppMessage::KeyPress(KeyCode::Modifier(_), _))
+        ));
+        assert!(event_to_message(key(shift, KeyEventKind::Release)).is_none());
+    }
+
+    /// With REPORT_EVENT_TYPES, terminal auto-repeat arrives as `Repeat` —
+    /// it must dispatch like `Press` (holding a key in the PTY keeps
+    /// repeating), while `Release` stays dropped.
+    #[test]
+    fn repeat_dispatches_and_release_is_dropped() {
+        let a = KeyCode::Char('a');
+        assert!(matches!(
+            event_to_message(key(a, KeyEventKind::Press)),
+            Some(AppMessage::KeyPress(KeyCode::Char('a'), _))
+        ));
+        assert!(matches!(
+            event_to_message(key(a, KeyEventKind::Repeat)),
+            Some(AppMessage::KeyPress(KeyCode::Char('a'), _))
+        ));
+        assert!(event_to_message(key(a, KeyEventKind::Release)).is_none());
     }
 }

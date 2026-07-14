@@ -499,7 +499,14 @@ rm -rf ~/.local/share/friring ~/.config/friring
    you have a selection, otherwise sends SIGINT.
 4. **Navigate** — `Ctrl+J` / `Ctrl+K` move between sessions in the
    sidebar; `Ctrl+L` / `Ctrl+H` cycle focus between panes.
-   `Ctrl+O` opens the session's worktree in your editor.
+   `Ctrl+O` opens the session's worktree in your editor. Keystrokes
+   land in the terminal by default — clicking a session row (or
+   launching with restored sessions) focuses the right pane — and
+   `Alt+1`–`Alt+9` jump to the Nth session; hold `Alt` on
+   kitty-protocol terminals to paint those numbers on the rows, and
+   `F10` walks the blocked sessions. (Like the other global chords,
+   these are swallowed while a capture pane — code review, F9
+   activity, an editor — has focus.)
 5. **Quit without killing** — `Ctrl+Q` detaches all sessions.
    Tmux keeps them running; relaunch `friring` and they resume.
 
@@ -691,6 +698,9 @@ repos? Add `--add-repo PATH@main` (its own worktree per repo) or
 | `Ctrl+J` / `Alt+J` | Select next session (`Ctrl+J` defers to the agent in a focused terminal — it doubles as a legacy `Ctrl+Enter`; use `Alt+J` there) | Vim: **j** = down |
 | `Ctrl+K` / `Alt+K` | Select previous session (`Ctrl+K` defers likewise; use `Alt+K` in a focused terminal) | Vim: **k** = up |
 | `Ctrl+L` | Focus next pane (cycle forward) | Vim: **l** = right |
+| `F10` | Jump to next blocked session (wraps, focuses terminal) | Attention |
+| `Ctrl+6` / `Ctrl+^` | Toggle between the two most recent sessions | vim alternate buffer |
+| `Alt+A` | Number blocked sessions; a digit jumps to that one | Attention |
 | `Shift+J` / `Shift+K` | Move selected session down/up (manual order) | reorder |
 | `Shift+S` | Sort sessions alphabetically within each repo group | **S**ort |
 | `Ctrl+D` | Delete session | Vim: **d** = delete |
