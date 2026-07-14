@@ -36,6 +36,15 @@ scripts/dev/e2e/real-host.sh devbox check  # readiness probe on a real host
 pane, drives it with `send-keys`, and asserts on captured frames (boot → F1 →
 theme → quit). Runs in CI as the `tui-smoke` job; also `just smoke`.
 
+## agent-e2e — real-agent e2e + scenario demos (`agent-e2e/`)
+
+A **real agent binary** (Claude Code is the reference) inside a Friring-managed
+pane, with the model API stubbed on loopback — hermetic, offline, asserting.
+One scenario description runs as a bats test (`just agent-e2e`, via
+`agent-e2e/run.sh`) **and** as a VHS demo recording (`just agent-demo
+<scenario>`). Runs in CI as the non-blocking `agent-e2e` job; skips when the
+agent binary is missing. Full architecture + contracts: `docs/E2E.md`.
+
 ## Dev utilities (not tests)
 
 | Script | What it does |
@@ -46,9 +55,11 @@ theme → quit). Runs in CI as the `tui-smoke` job; also `just smoke`.
 
 ## Result contract
 
-Every e2e harness ends on a single line: `PASS <message>` (green, exit 0) or
-`FAIL <message>` (red, exit 1), from `e2e-common.sh`'s `pass`/`fail`. Set
-`E2E_JSON=1` to also emit a `{"result":…}` line for CI/automation.
+Every session-backend e2e harness ends on a single line: `PASS <message>`
+(green, exit 0) or `FAIL <message>` (red, exit 1), from `e2e-common.sh`'s
+`pass`/`fail`. Set `E2E_JSON=1` to also emit a `{"result":…}` line for
+CI/automation. (The bats-driven `agent-e2e/` suite reports through bats/TAP
+instead.)
 
 ## Moved paths
 

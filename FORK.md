@@ -36,13 +36,15 @@ What still says `thurbox` is deliberate, and splits in two:
 - **Upstream attribution** — the repo URLs, badges, `LICENSE`, and provenance
   notes point at [`Thurbeen/thurbox`](https://github.com/Thurbeen/thurbox) and
   stay as-is (this is a fork, and the credit is upstream's).
-- **Upstream distribution machinery** — Friring publishes no releases,
-  packages, or website of its own, so everything that fetches or ships an
-  upstream artifact keeps the upstream name: `packaging/` registry manifests,
-  `scripts/install.*`, the `cd.yml` / `pages.yml` workflows, `website/`, the
-  self-update / version-check code, the `min_thurbox_version` extension-manifest
-  key (a wire format shared with upstream), and the `tb-` / `tbs-` tmux window
-  prefixes (brand-neutral, kept for live-window compatibility).
+- **Upstream distribution machinery** — Friring cuts its **own** GitHub Releases
+  (`friring-*` binaries via `cd.yml`; see [CI / automation](#ci--automation)),
+  but reuses upstream's package-manager channels and website rather than
+  republishing them. So everything that fetches or ships an *upstream* artifact
+  keeps the upstream name: `packaging/` registry manifests, `scripts/install.*`,
+  the `pages.yml` workflow, `website/`, the self-update / version-check code, the
+  `min_thurbox_version` extension-manifest key (a wire format shared with
+  upstream), and the `tb-` / `tbs-` tmux window prefixes (brand-neutral, kept for
+  live-window compatibility).
 
 The tradeoff the branding-only approach used to avoid is now real: upstream
 merges carry rename conflicts on the renamed identifiers, and an existing
@@ -160,9 +162,14 @@ creates a normal session that `--resume`s it **in a directory you choose**
 (default: the conversation's original cwd). Claude + local sessions only (v1).
 
 - **Browse.** An off-thread one-shot scan lists every top-level
-  `~/.claude/projects/*/<uuid>.jsonl` (`$CLAUDE_CONFIG_DIR` honored): title
-  (Claude Code's `summary` line if present, else the first typed prompt — meta
-  lines like slash-command envelopes are skipped), original cwd, git branch,
+  `~/.claude/projects/*/<uuid>.jsonl` (`$CLAUDE_CONFIG_DIR` honored): the
+  session's *name* when it has one (the newest `custom-title` line from
+  `/rename`, else the newest auto-generated `ai-title` line — both appended on
+  change, so the scan reads a 64 KiB tail besides the head, the same window
+  Claude Code's own resume picker scans, verified v2.1.207), falling back to
+  the message-derived title (Claude Code's `summary` line if present, else the
+  first typed prompt — meta lines like slash-command envelopes are skipped),
+  plus original cwd, git branch,
   last-active age. Fuzzy search (`/`), newest first. Conversations already
   tracked by a live session are excluded (importing one would race the running
   agent on its own transcript); duplicate ids across project dirs (earlier
@@ -187,12 +194,13 @@ creates a normal session that `--resume`s it **in a directory you choose**
   session behaves exactly like one Friring started. The relaunch agent is the
   registry default when it resumes by id, else the first agent whose
   `resume_args` carry `{id}` (`AgentDef::resumes_by_id`); the agent picker is
-  skipped. The session-name modal is prefilled from the conversation title.
-- **Code shape.** Pure head-parsing (`parse_conversation_head`) in
-  `session::cc_activity` beside the other defensive Claude Code parsers; scan +
-  staging + modal state + key handlers in `app::cc_import`; renderer in
-  `ui::conversation_picker_modal` (mirrors the repo picker's
-  search/list/input/footer shape).
+  skipped. The session-name modal is prefilled from the conversation's name,
+  else its title.
+- **Code shape.** Pure head/tail parsing (`parse_conversation_head`,
+  `parse_session_names`) in `session::cc_activity` beside the other defensive
+  Claude Code parsers; scan + staging + modal state + key handlers in
+  `app::cc_import`; renderer in `ui::conversation_picker_modal` (mirrors the
+  repo picker's search/list/input/footer shape).
 - **Follow-ups** (named, not silently dropped): remote (`ssh:`/`wsl:`) imports
   (scan the remote `~/.claude` and stage over the transport); importing
   conversations of *deleted* (tombstoned) sessions currently re-imports rather
@@ -282,6 +290,21 @@ the first match.
   (ADR-P12), applying the instant the list lands. Details in `docs/FEATURES.md`
   ("Type-to-filter selectors").
 
+#### Real-agent e2e harness & scenario demos (`scripts/dev/agent-e2e/`)
+
+Hermetic, offline end-to-end tests that run a **real agent binary** (Claude
+Code is the proven reference) inside a Friring-managed pane with the **model
+API stubbed on loopback** — a zero-dep node sidecar speaking the Anthropic
+Messages dialect from hand-curated semantic fixtures. One scenario description
+runs both as an asserting bats test (`just agent-e2e`; three drive depths:
+`claude -p` → bare-tmux interactive → full Friring TUI) and as a VHS demo
+recording (`just agent-demo <scenario>`). Ships with a path-gated,
+**non-blocking** `agent-e2e` CI job that installs a pinned claude binary, and
+one small CLI addition: `session get/list --json` now expose the raw
+`hook_state`/`hook_state_at` columns so external observers (the harness,
+automations) can watch status transitions without reading SQLite. Architecture
+and contracts in `docs/E2E.md`; decision record ADR-23.
+
 #### Terminal-first focus
 
 Upstream starts focused on the session list, and clicking a session row
@@ -335,6 +358,38 @@ the PTY. Legacy terminals lose only the visual overlay: `Alt+digit` /
 
 ### Behavior fixes
 
+- **Copy falls back to `tmux load-buffer` / OSC 52 when no display server is
+  reachable.** Upstream copies only through `arboard`, which needs X11/Wayland —
+  over SSH, under a display-less tmux, or in WSL without WSLg every copy failed
+  with "Clipboard not available". The fork adds two fallbacks (`app::clipboard`),
+  tried in the order that actually works: (1) inside tmux (`$TMUX` set — the
+  common `tmux -> friring` setup), `tmux load-buffer -w -`, which has **tmux
+  itself** set the outer terminal's clipboard; a raw application OSC 52 written
+  to our own stdout is *dropped* by tmux's default `set-clipboard external`
+  ("ignore attempts by applications to set tmux buffers"), so it must come from
+  tmux — and this path returns a real exit status rather than being
+  fire-and-forget (needs tmux ≥ 3.2 for `-w`, already required). (2) Outside
+  tmux, a raw OSC 52 escape to stdout (for a direct OSC-52-capable terminal),
+  whose toast is marked `(OSC 52)` since it is fire-and-forget. Applies to all
+  copy surfaces (selection, status bar, code-review markdown). Paste keeps
+  arboard only — terminals block OSC 52 *reads* — and the error now points at
+  the terminal's own paste key (bracketed paste still works).
+
+- **Modifier-Enter inserts a newline in the agent instead of switching
+  sessions.** A legacy terminal (Windows Terminal, or anything behind an outer
+  tmux, which strips the kitty protocol) encodes `Ctrl+Enter` as the LF byte,
+  which crossterm decodes as `Ctrl+J` — upstream's `NextSession` chord, so the
+  keystroke switched sessions instead of reaching the agent. The fork adds
+  `NextSession`/`PreviousSession` to `Action::terminal_passthrough` (upstream
+  deliberately kept them as in-terminal nav): with a terminal focused,
+  `Ctrl+J`/`Ctrl+K` now forward to the PTY (`Ctrl+J` is the newline shortcut
+  Claude Code & co. understand; `Ctrl+K` is readline kill-to-end), and new
+  `Alt+J`/`Alt+K` default alternates keep session cycling reachable there.
+  Kitty-protocol `Ctrl+Enter` also no longer degrades to a bare CR:
+  `agent::input::key_to_bytes` encodes Shift/Ctrl-modified Enter as CSI-u
+  (`ESC [13;<mod> u`), keeping the modifier so agents read "newline", not
+  "submit".
+
 - **Worktree branch pre-fill keeps `/`.** In the new-worktree flow, the branch
   name suggested from the session name upstream drops every char that isn't
   alphanumeric / space / `-` / `_`, so a git-flow style session name like
@@ -373,10 +428,11 @@ the PTY. Legacy terminals lose only the visual overlay: `Alt+digit` /
   still says `thurbox`: upstream **attribution** (repo URLs, `LICENSE`,
   provenance, badges) and the upstream **distribution machinery** the fork
   reuses rather than republishes — `packaging/` registry manifests,
-  `scripts/install.*`, the `cd.yml` / `pages.yml` workflows, `website/`, the
-  self-update / version-check code, the `min_thurbox_version` manifest key, and
-  the `tb-` / `tbs-` tmux window prefixes. See [Migration](#migration); upstream
-  merges now carry rename conflicts on the renamed identifiers.
+  `scripts/install.*`, the `pages.yml` workflow, `website/`, the self-update /
+  version-check code, the `min_thurbox_version` manifest key, and the `tb-` /
+  `tbs-` tmux window prefixes (`cd.yml` is the exception — the fork cuts its own
+  `friring-*` releases). See [Migration](#migration); upstream merges now carry
+  rename conflicts on the renamed identifiers.
 - `README.md` and the agent-guide prose call the project **Friring**; the repo
   URLs, install commands, badges, and packaging still point at upstream (that's
   attribution and shared distribution, not a rename target).
@@ -395,13 +451,23 @@ the PTY. Legacy terminals lose only the visual overlay: `Alt+digit` /
 
 Some upstream workflows target infrastructure the fork doesn't have, so they are
 guarded to run only on the canonical `Thurbeen/thurbox` repo and stay dormant
-here (while remaining merge-safe). All build / test / lint jobs run normally on
-the fork.
+here (while remaining merge-safe). The release pipeline (`cd.yml`) is the
+exception — the fork runs it. All build / test / lint jobs run normally on the
+fork.
 
 - `.github/workflows/pages.yml` (GitHub Pages) — dormant; the fork has no Pages
   site.
-- `.github/workflows/cd.yml` (Release) — dormant; the fork does not cut its own
-  releases.
+- `.github/workflows/cd.yml` (Release) — **active on the fork.** Every push to
+  `main` that includes a `feat` / `fix` / `perf` commit cuts a tag
+  (`cog bump --auto`) and publishes a GitHub Release with cross-platform
+  `friring-*` binaries + a checksums file — this needs only the built-in
+  `GITHUB_TOKEN`. The four package-manager publish jobs
+  (AUR / Homebrew / Chocolatey / winget) stay guarded to `Thurbeen/thurbox`:
+  those channels carry upstream's identity and the fork has no accounts or
+  secrets for them. Two things still point upstream — changelog compare links
+  (`cog.toml` `owner`/`repository`) and `scripts/install.*` (which fetch
+  `thurbox-*` from upstream); grab the fork's binaries from its Releases page
+  directly.
 - `.github/workflows/ci.yml` — the `sonarqube` job is dormant; SonarQube is not
   set up for the fork at the moment. The `changes` (paths-filter) job also grants
   `pull-requests: read`, which a **private** repo's default token lacks (public

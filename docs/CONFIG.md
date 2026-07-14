@@ -676,14 +676,17 @@ Maps `Action` names to one or more chord strings:
 - **Terminal passthrough.** When a session **terminal is focused**, the
   readline / shell line-editing chords (`Ctrl+A` start-of-line, `Ctrl+E`
   end-of-line, `Ctrl+W` delete-word, `Ctrl+U` kill-line, `Ctrl+R`
-  reverse-search, `Ctrl+D` EOF, plus `Ctrl+B/F/O/P/S`) are **forwarded to the
+  reverse-search, `Ctrl+D` EOF, plus `Ctrl+B/F/J/K/O/P/S`) are **forwarded to the
   agent CLI** instead of triggering their friring command, so your terminal
   muscle memory works inside a session. Those friring commands stay reachable
   from the **session list** (focus it with `Ctrl+H`) and via their `F`-key
   alternates (`F2` info panel, `F3` file viewer, `F5` tasks). Rebinding such an
   action to a key that isn't a bare `Ctrl+<letter>` makes it work in the
-  terminal too. Navigation/quit chords (`Ctrl+H/J/K/L`, `Ctrl+Q`, `Ctrl+N`) are
-  **never** forwarded — they're how you leave the terminal.
+  terminal too. Navigation/quit chords (`Ctrl+H`/`Ctrl+L`, `Ctrl+Q`, `Ctrl+N`)
+  are **never** forwarded — they're how you leave the terminal. `Ctrl+J`/`Ctrl+K`
+  now defer to the agent in a focused terminal (fork divergence — `Ctrl+J`
+  doubles as a legacy `Ctrl+Enter` newline); use `Alt+J`/`Alt+K` to cycle
+  sessions there.
 - Action names and defaults: see the keybindings table in
   `docs/FEATURES.md` / README, or `src/session/keybindings.rs`.
 

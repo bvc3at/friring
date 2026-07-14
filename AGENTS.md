@@ -35,8 +35,10 @@ Two rules matter when working here:
   deliberate: upstream **attributions** (repo URLs, `LICENSE`, provenance) and
   the upstream **distribution machinery** the fork reuses rather than
   republishes — `packaging/` registry manifests, `scripts/install.*`,
-  `cd.yml`/`pages.yml`, `website/`, self-update / version-check code, the
+  `pages.yml`, `website/`, self-update / version-check code, the
   `min_thurbox_version` manifest key, and the `tb-`/`tbs-` tmux window prefixes.
+  (`cd.yml` is the exception: the fork **does** cut its own `friring-*` release
+  binaries — see `FORK.md` → CI / automation.)
   Upstream merges now carry rename conflicts; resolve them toward `friring` for
   this app's own identifiers, leaving the attribution/distribution names as
   upstream.
@@ -130,5 +132,6 @@ Detail is read on demand — jump to the doc for what you're touching:
 | A user-facing feature — sessions, code review, automations, tasks, global search, notifications, status, remote/WSL, extensions, keybindings | `docs/FEATURES.md` |
 | Render-loop performance, perf counters, redraw throttling | `docs/PERFORMANCE.md` |
 | The headless CLI (`friring-cli`) | `docs/CLI.md` |
+| Real-agent e2e tests, the model stub, scenario-driven demos | `docs/E2E.md` |
 | Cutting a release, versioning, installers, packaging | `docs/RELEASING.md` |
 | What this fork changes vs upstream, and fork-only features (e.g. the F9 activity view, conversation import) | `FORK.md` |

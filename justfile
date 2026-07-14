@@ -71,6 +71,14 @@ sandbox-clean PROFILE="default":
 smoke:
     scripts/dev/smoke/tui-smoke.sh
 
+# Real-agent e2e suite: real agent binary, model stubbed locally, offline.
+agent-e2e *ARGS:
+    scripts/dev/agent-e2e/run.sh {{ARGS}}
+
+# Record a scenario as a VHS demo: `just agent-demo claude-tool-loop`.
+agent-demo *ARGS:
+    scripts/dev/agent-e2e/run.sh --demo {{ARGS}}
+
 # Drive tests against a real SSH host: `just lab <host> <verb>`.
 lab HOST *ARGS:
     scripts/dev/e2e/real-host.sh {{HOST}} {{ARGS}}

@@ -1367,12 +1367,14 @@ impl App {
             self.set_status(StatusLevel::Info, "No review comments yet");
             return;
         };
-        match self.clipboard.as_mut() {
-            Some(cb) => match cb.set_text(&md) {
-                Ok(_) => self.set_status(StatusLevel::Success, "Review copied to clipboard"),
-                Err(e) => self.set_error(format!("Clipboard write failed: {e}")),
-            },
-            None => self.set_error("Clipboard not available"),
+        match self.set_clipboard_text(&md) {
+            Ok(via) => {
+                self.set_status(
+                    StatusLevel::Success,
+                    via.toast("Review copied to clipboard"),
+                );
+            }
+            Err(e) => self.set_error(e),
         }
     }
 
