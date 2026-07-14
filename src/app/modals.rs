@@ -1338,7 +1338,18 @@ impl RepoPickerModal {
     /// How the input is currently interpreted (see [`RepoInputMode`]).
     pub fn input_mode(&self) -> RepoInputMode {
         let v = self.input.value();
-        if v.starts_with('~') || v.starts_with('/') || v.starts_with("./") || v.starts_with("../") {
+        // Path-shaped: a `~` home prefix, an explicit relative lead (`./`/`../`,
+        // and their `\` forms on Windows), or any absolute path. `is_absolute`
+        // is what makes a Windows drive path (`C:\repos`, `C:/repos`) — and a
+        // Unix `/abs` — path mode; a bare filter query like `friring` is not
+        // absolute, so it stays a fuzzy filter.
+        let path_like = v.starts_with('~')
+            || v.starts_with('/')
+            || v.starts_with("./")
+            || v.starts_with("../")
+            || (cfg!(windows) && (v.starts_with(".\\") || v.starts_with("..\\")))
+            || std::path::Path::new(v).is_absolute();
+        if path_like {
             RepoInputMode::Path
         } else {
             RepoInputMode::Filter
@@ -2719,6 +2730,21 @@ mod tests {
             rp.input.set(text);
             assert_eq!(rp.input_mode(), mode, "input {text:?}");
         }
+    }
+
+    /// A Windows drive path (`C:\…`, `C:/…`) is absolute, so it's path mode —
+    /// without this, typing a native Windows path in the palette would be
+    /// treated as a fuzzy filter and path completion would never engage.
+    #[cfg(windows)]
+    #[test]
+    fn repo_palette_input_mode_detects_windows_paths() {
+        let mut rp = RepoPickerModal::default();
+        for p in ["C:\\repos", "C:/repos", ".\\rel", "..\\up"] {
+            rp.input.set(p);
+            assert_eq!(rp.input_mode(), RepoInputMode::Path, "input {p:?}");
+        }
+        rp.input.set("friring");
+        assert_eq!(rp.input_mode(), RepoInputMode::Filter);
     }
 
     #[test]
