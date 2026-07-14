@@ -2355,9 +2355,11 @@ impl App {
             self.recompute_repo_filter();
             return false;
         }
-        // Normalize a browse-style trailing slash ("~/code/" means ~/code) so
-        // the bookmark never carries one and dedupes against the bare form.
-        while path.len() > 1 && path.ends_with('/') {
+        // Normalize a browse-style trailing separator ("~/code/" means ~/code,
+        // and on Windows "~\code\") so the bookmark never carries one and
+        // dedupes against the bare form. `is_separator` matches `/` everywhere
+        // and `\` on Windows, mirroring `paths::split_path_input`.
+        while path.len() > 1 && path.ends_with(std::path::is_separator) {
             path.pop();
         }
         let expanded = match &remote_host {

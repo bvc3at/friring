@@ -469,7 +469,8 @@ mod tests {
             list_index: 0,
             filtered_indices: EMPTY_IDX,
             input,
-            input_cursor: input.len(),
+            // Cursor positions are char counts, not byte offsets.
+            input_cursor: input.chars().count(),
             suggestion: None,
             mode,
             candidates: &[],
