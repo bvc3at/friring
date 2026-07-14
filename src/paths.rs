@@ -568,6 +568,12 @@ pub(crate) fn split_path_input(input: &str) -> Option<(PathBuf, String)> {
         return None;
     }
     let expanded = expand_tilde(input);
+    // A bare `~` is a whole-token home reference: list home's *contents*, like
+    // `~/` does. Splitting the expanded home path (`/home/me`) at its last
+    // separator would instead list home's *siblings* matching `me`.
+    if input == "~" {
+        return Some((expanded, String::new()));
+    }
     let expanded_str = expanded.to_str().unwrap_or(input);
     // Split at the last separator textually. `Path::parent()`/`file_name()`
     // would normalize a trailing `.` component away, so "dir/." would list
@@ -1014,6 +1020,16 @@ mod tests {
             let (parent, prefix) = split_path_input("~/co").unwrap();
             assert_eq!(parent, home);
             assert_eq!(prefix, "co");
+        }
+    }
+
+    #[test]
+    fn split_path_input_bare_tilde_lists_home_contents() {
+        if let Some(home) = home_dir() {
+            // A bare `~` lists home itself (empty prefix), not home's siblings.
+            let (parent, prefix) = split_path_input("~").unwrap();
+            assert_eq!(parent, home);
+            assert_eq!(prefix, "");
         }
     }
 
