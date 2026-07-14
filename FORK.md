@@ -373,6 +373,7 @@ Alt's *release* — and key auto-repeat — are reported, with repeats
 the PTY. Legacy terminals lose only the visual overlay: `Alt+digit` /
 `Alt+A` still work, the latter as a sticky overlay dismissed by a digit,
 `Esc`, or any other key.
+
 #### New-session wizard redesign (palette picker, back-navigation, prefills)
 
 Upstream's repo picker is a three-focus-zone modal (list / path input / a
