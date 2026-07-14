@@ -307,6 +307,38 @@ and contracts in `docs/E2E.md`; decision record ADR-23.
 
 ### Behavior fixes
 
+- **Copy falls back to `tmux load-buffer` / OSC 52 when no display server is
+  reachable.** Upstream copies only through `arboard`, which needs X11/Wayland —
+  over SSH, under a display-less tmux, or in WSL without WSLg every copy failed
+  with "Clipboard not available". The fork adds two fallbacks (`app::clipboard`),
+  tried in the order that actually works: (1) inside tmux (`$TMUX` set — the
+  common `tmux -> friring` setup), `tmux load-buffer -w -`, which has **tmux
+  itself** set the outer terminal's clipboard; a raw application OSC 52 written
+  to our own stdout is *dropped* by tmux's default `set-clipboard external`
+  ("ignore attempts by applications to set tmux buffers"), so it must come from
+  tmux — and this path returns a real exit status rather than being
+  fire-and-forget (needs tmux ≥ 3.2 for `-w`, already required). (2) Outside
+  tmux, a raw OSC 52 escape to stdout (for a direct OSC-52-capable terminal),
+  whose toast is marked `(OSC 52)` since it is fire-and-forget. Applies to all
+  copy surfaces (selection, status bar, code-review markdown). Paste keeps
+  arboard only — terminals block OSC 52 *reads* — and the error now points at
+  the terminal's own paste key (bracketed paste still works).
+
+- **Modifier-Enter inserts a newline in the agent instead of switching
+  sessions.** A legacy terminal (Windows Terminal, or anything behind an outer
+  tmux, which strips the kitty protocol) encodes `Ctrl+Enter` as the LF byte,
+  which crossterm decodes as `Ctrl+J` — upstream's `NextSession` chord, so the
+  keystroke switched sessions instead of reaching the agent. The fork adds
+  `NextSession`/`PreviousSession` to `Action::terminal_passthrough` (upstream
+  deliberately kept them as in-terminal nav): with a terminal focused,
+  `Ctrl+J`/`Ctrl+K` now forward to the PTY (`Ctrl+J` is the newline shortcut
+  Claude Code & co. understand; `Ctrl+K` is readline kill-to-end), and new
+  `Alt+J`/`Alt+K` default alternates keep session cycling reachable there.
+  Kitty-protocol `Ctrl+Enter` also no longer degrades to a bare CR:
+  `agent::input::key_to_bytes` encodes Shift/Ctrl-modified Enter as CSI-u
+  (`ESC [13;<mod> u`), keeping the modifier so agents read "newline", not
+  "submit".
+
 - **Worktree branch pre-fill keeps `/`.** In the new-worktree flow, the branch
   name suggested from the session name upstream drops every char that isn't
   alphanumeric / space / `-` / `_`, so a git-flow style session name like

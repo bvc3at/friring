@@ -4,6 +4,7 @@ mod automation_state;
 mod background;
 pub(crate) mod cc_activity;
 pub(crate) mod cc_import;
+mod clipboard;
 pub(crate) mod clock;
 pub(crate) mod code_review;
 mod config_reload;
@@ -501,6 +502,27 @@ pub enum StatusLevel {
     Error,
 }
 
+/// Which mechanism served a clipboard copy (see [`App::set_clipboard_text`]).
+/// The raw OSC 52 path is fire-and-forget — the terminal never acknowledges
+/// it — so its toasts carry a marker; the native and tmux paths report a real
+/// success (a returned `Ok`/exit status), so they read as a plain "copied".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardVia {
+    Native,
+    Tmux,
+    Osc52,
+}
+
+impl ClipboardVia {
+    /// The success toast for a copy served this way.
+    pub(crate) fn toast(self, msg: &str) -> String {
+        match self {
+            ClipboardVia::Native | ClipboardVia::Tmux => msg.into(),
+            ClipboardVia::Osc52 => format!("{msg} (OSC 52)"),
+        }
+    }
+}
+
 /// Which scroll state a rendered scrollbar drives. Recorded per-frame in
 /// [`App::scrollbar_hits`] so mouse clicks/drags on a track can be routed back
 /// to the right pane.
@@ -835,7 +857,9 @@ pub struct App {
     pub(crate) mouse_hover: Option<(u16, u16)>,
     /// Cached text extracted from the frame buffer for the current selection.
     selected_text_cache: Option<String>,
-    /// Persistent clipboard handle to avoid "dropped too quickly" warnings on Linux.
+    /// Persistent clipboard handle to avoid "dropped too quickly" warnings on
+    /// Linux. `None` when no display server is reachable (SSH/tmux/WSL) —
+    /// copies then fall back to OSC 52 (see [`Self::set_clipboard_text`]).
     clipboard: Option<arboard::Clipboard>,
     /// Persistent list state for the session section (preserves scroll offset).
     pub(crate) session_list_state: ratatui::widgets::ListState,
@@ -3296,25 +3320,67 @@ impl App {
         true
     }
 
+    /// Copy `text` to the system clipboard, preferring the native handle and
+    /// falling back (see [`clipboard`]) when no display server is reachable or
+    /// the native write fails. Returns how the copy was served so the caller's
+    /// toast can flag the fire-and-forget path.
+    ///
+    /// Fallback order (see the [`clipboard`] module docs for why): inside tmux,
+    /// `tmux load-buffer -w` — the raw OSC 52 an app writes to its own stdout
+    /// is dropped by tmux's default `set-clipboard external`, so the escape
+    /// must come from tmux itself; outside tmux, raw OSC 52 to stdout.
+    pub(crate) fn set_clipboard_text(&mut self, text: &str) -> Result<ClipboardVia, String> {
+        // 1. Native display-server clipboard, when one is reachable.
+        let native_err = match &mut self.clipboard {
+            Some(cb) => match cb.set_text(text) {
+                Ok(()) => return Ok(ClipboardVia::Native),
+                Err(e) => Some(e.to_string()),
+            },
+            None => None,
+        };
+
+        // 2. Inside tmux: authoritative (real exit status), works under the
+        //    default clipboard policy where a raw app OSC 52 would be dropped.
+        if std::env::var_os("TMUX").is_some() {
+            return clipboard::tmux_copy(text)
+                .map(|()| ClipboardVia::Tmux)
+                .map_err(|e| Self::clipboard_error(native_err.as_deref(), "tmux load-buffer", &e));
+        }
+
+        // 3. No display server and no tmux: raw OSC 52 to a direct terminal.
+        clipboard::osc52_copy(text)
+            .map(|()| ClipboardVia::Osc52)
+            .map_err(|e| Self::clipboard_error(native_err.as_deref(), "OSC 52", &e))
+    }
+
+    /// Compose a clipboard-failure message, folding in an earlier native error
+    /// when there was one (so a fallback failure doesn't hide why native was
+    /// skipped in the first place).
+    fn clipboard_error(
+        native_err: Option<&str>,
+        stage: &str,
+        err: &impl std::fmt::Display,
+    ) -> String {
+        match native_err {
+            Some(native) => format!("Clipboard write failed: {native}; {stage}: {err}"),
+            None => format!("Clipboard not available; {stage} failed: {err}"),
+        }
+    }
+
     fn copy_selection_to_clipboard(&mut self) {
         let text = match &self.selected_text_cache {
             Some(t) if !t.is_empty() => t.clone(),
             _ => return,
         };
 
-        let Some(clipboard) = &mut self.clipboard else {
-            self.set_error("Clipboard not available");
-            return;
-        };
-
-        if let Err(e) = clipboard.set_text(&text) {
-            self.set_error(format!("Clipboard write failed: {e}"));
-            return;
+        match self.set_clipboard_text(&text) {
+            Ok(via) => {
+                self.text_selection = None;
+                self.selected_text_cache = None;
+                self.set_status(StatusLevel::Info, via.toast("Copied to clipboard"));
+            }
+            Err(e) => self.set_error(e),
         }
-
-        self.text_selection = None;
-        self.selected_text_cache = None;
-        self.set_status(StatusLevel::Info, "Copied to clipboard");
     }
 
     /// Copy the current status-bar message (info / error / …) to the clipboard.
@@ -3331,17 +3397,12 @@ impl App {
             return; // nothing shown → no-op (no "copied" toast to overwrite it)
         };
 
-        let Some(clipboard) = &mut self.clipboard else {
-            self.set_error("Clipboard not available");
-            return;
-        };
-
-        if let Err(e) = clipboard.set_text(&text) {
-            self.set_error(format!("Clipboard write failed: {e}"));
-            return;
+        match self.set_clipboard_text(&text) {
+            Ok(via) => {
+                self.set_status(StatusLevel::Info, via.toast("Status message copied"));
+            }
+            Err(e) => self.set_error(e),
         }
-
-        self.set_status(StatusLevel::Info, "Status message copied to clipboard");
     }
 
     /// Wrap text in bracketed paste escape sequences and send it to the
@@ -3381,8 +3442,11 @@ impl App {
         self.text_selection = None;
         self.selected_text_cache = None;
 
+        // No OSC 52 fallback here: terminals block clipboard *reads* for
+        // security. The terminal's own paste keystroke still works — it
+        // arrives as a bracketed paste (`handle_paste`), not through us.
         let Some(clipboard) = &mut self.clipboard else {
-            self.set_error("Clipboard not available");
+            self.set_error("Clipboard not available — use the terminal's paste key instead");
             return;
         };
 
@@ -10610,11 +10674,24 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_j_switches_session_when_terminal_focused() {
+    fn ctrl_j_defers_to_pty_when_terminal_focused() {
+        // Ctrl+J is the LF byte a legacy terminal sends for Ctrl+Enter; with
+        // the terminal focused it belongs to the agent (insert newline), not
+        // to session cycling — see `Action::terminal_passthrough`.
         let mut app = app_with_sessions(3);
         app.focus = InputFocus::Terminal;
         app.active_index = 0;
         app.handle_key(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(app.active_index, 0);
+    }
+
+    #[test]
+    fn alt_j_switches_session_when_terminal_focused() {
+        // The non-Ctrl-letter alternate keeps in-terminal cycling alive.
+        let mut app = app_with_sessions(3);
+        app.focus = InputFocus::Terminal;
+        app.active_index = 0;
+        app.handle_key(KeyCode::Char('j'), KeyModifiers::ALT);
         assert_eq!(app.active_index, 1);
     }
 
