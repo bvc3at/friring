@@ -2303,17 +2303,31 @@ impl App {
             return;
         };
         let value = rp.input.value().to_string();
-        // The name-prefix is everything after the last separator (mirrors
-        // `paths::split_path_input`); replace it with the chosen candidate.
-        // A separator-free input (bare `~`) completes against the expanded
-        // parent, so fall back to the candidate's absolute form there.
-        let new = match value.rfind('/') {
-            Some(i) => format!("{}{}/", &value[..=i], name),
+        // Replace the name-prefix — everything after the last path separator
+        // (`/`, and `\` on Windows; `std::path::is_separator`, matching
+        // `paths::split_path_input`) — with the chosen candidate, re-appending
+        // that same separator so the next refresh lists its children while the
+        // input keeps the user's typed prefix (and thus its path-mode `~`/`/`
+        // lead). Splitting on a hardcoded `/` would miss a `~\…` input and drop
+        // into the absolute fallback below, flipping `input_mode` to Filter.
+        let new = match value.rfind(std::path::is_separator) {
+            Some(i) => {
+                let sep = &value[i..=i];
+                format!("{}{name}{sep}", &value[..=i])
+            }
+            // A separator-free path-mode input is only a bare `~` (`input_mode`
+            // requires a `~`/`/`/`./`/`../` lead). Rebuild from the candidate's
+            // full path, re-tildified so it keeps a `~` lead — an absolute
+            // `C:\…` would flip `input_mode` back to Filter on Windows.
             None => {
                 let Some(c) = rp.candidates.iter().find(|c| c.name == name) else {
                     return;
                 };
-                format!("{}/", c.full.display())
+                format!(
+                    "{}{}",
+                    crate::paths::display_path_tilde(&c.full),
+                    std::path::MAIN_SEPARATOR
+                )
             }
         };
         rp.input.set(&new);

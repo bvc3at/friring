@@ -10339,6 +10339,10 @@ mod tests {
             vec!["inner"],
             "the candidate list followed the descent"
         );
+        // The drilled input must stay in path mode; a fallback that dropped the
+        // path lead (see the `~\…` Windows case in `repo_picker_drill_into`)
+        // would silently flip the palette back to bookmark filtering.
+        assert_eq!(rp.input_mode(), modals::RepoInputMode::Path);
     }
 
     #[test]
