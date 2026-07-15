@@ -657,6 +657,33 @@ record_tape() {
         --text-font-family "$DEMO_FONT" $DEMO_FONT_DIRS \
         >/dev/null 2>&1 || { echo "error: agg failed for $_tape" >&2; return 1; }
 
+    # Does the clip actually run for as long as the tape says? Recording drives
+    # real processes in real time, so it can stall (a wedged machine keeps the
+    # TUI repainting identical frames, which agg merges into one very long
+    # frame — `--idle-time-limit` never fires, because those are events, not
+    # idle) or come up short (a truncated cast). Both produce media that render
+    # fine and are silently wrong, which is how the previous recorder shipped a
+    # 15s demo as a 1.08s one. Compare and refuse.
+    _want=$(node "$SCRIPT_DIR/lib/drive-tape.mjs" "$SCRIPT_DIR/$_tape.tape" --print-duration)
+    _got=$(node -e '
+        const fs = require("fs");
+        const b = fs.readFileSync(process.argv[1]);
+        let cs = 0;
+        for (let i = 0; i < b.length - 8; i++)
+            if (b[i] === 0x21 && b[i + 1] === 0xf9 && b[i + 2] === 0x04)
+                cs += b[i + 4] | (b[i + 5] << 8);
+        console.log((cs / 100).toFixed(2));
+    ' "$_gif")
+    if ! node -e '
+        const [want, got] = [Number(process.argv[1]), Number(process.argv[2])];
+        // Generous: the clip legitimately carries the closing hold plus a beat
+        // of boot/attach settle on top of the script.
+        process.exit(got > want + 20 || got < want * 0.6 ? 1 : 0);
+    ' "$_want" "$_got"; then
+        echo "error: $_tape rendered ${_got}s but its tape scripts ${_want}s — refusing" >&2
+        return 1
+    fi
+
     # gif -> mp4. ffmpeg reads the gif's per-frame delays as timestamps, so
     # `fps=30` re-times to a constant rate for players that need one WITHOUT
     # changing the duration. The gif itself keeps its variable delays — never

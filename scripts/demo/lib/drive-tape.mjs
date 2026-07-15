@@ -23,7 +23,7 @@
 //
 // Usage:
 //   drive-tape.mjs <tape> --socket <name> --session <name> [--print-outputs]
-//                         [--print-set <Key>]
+//                         [--print-set <Key>] [--print-duration]
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 
@@ -127,6 +127,21 @@ if (has('print-outputs')) {
 if (has('print-set')) {
   const k = arg('print-set');
   if (tape.set[k] !== undefined) console.log(tape.set[k]);
+  process.exit(0);
+}
+
+// Seconds this tape is scripted to take. record.sh checks the rendered clip
+// against it: the recording is a real-time capture of real processes, so a
+// clip that runs wildly long (a stall) or short (a truncated cast) is broken
+// media that must not ship quietly.
+if (has('print-duration')) {
+  const ms = tape.steps.reduce(
+    (t, s) =>
+      t +
+      (s.kind === 'sleep' ? s.ms : s.kind === 'type' ? s.text.length * TYPING_SPEED_MS : 0),
+    0
+  );
+  console.log((ms / 1000).toFixed(2));
   process.exit(0);
 }
 
