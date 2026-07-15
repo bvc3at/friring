@@ -102,7 +102,8 @@ fi
 check_demo_font() {
     _probe=$(mktemp -d "${TMPDIR:-/tmp}/friring-font.XXXXXX")
     printf '{"version": 2, "width": 20, "height": 3}\n[0.0, "o", "probe"]\n' > "$_probe/p.cast"
-    _picked=$(agg "$_probe/p.cast" "$_probe/p.gif" --fps-cap 1 \
+    # shellcheck disable=SC2086 # DEMO_FONT_DIRS is a pre-split flag list
+    _picked=$(agg "$_probe/p.cast" "$_probe/p.gif" --fps-cap 1 $DEMO_FONT_DIRS \
         --text-font-family "$DEMO_FONT" -v 2>&1 \
         | sed -n 's/.*primary text font family: //p' | head -1)
     rm -r "$_probe"
@@ -167,6 +168,17 @@ cargo build --bin friring --bin friring-cli
 FRIRING_BIN="$REPO_ROOT/target/debug/friring"
 CLI_BIN="$REPO_ROOT/target/debug/friring-cli"
 export FRIRING_BIN   # consumed by the tapes (they `exec "$FRIRING_BIN"`)
+
+# Where the host keeps its fonts — captured BEFORE the sandbox replaces $HOME,
+# and handed to agg with --font-dir. A font is a host resource, not part of the
+# environment we isolate: the throwaway HOME hides the user's font directory, and
+# agg (which resolves families itself) would then find *nothing* and silently
+# render with a fallback. The symbol fallbacks friring needs live there too.
+DEMO_FONT_DIRS=
+for _fd in "$HOME/Library/Fonts" /Library/Fonts "$HOME/.local/share/fonts" \
+    /usr/share/fonts /usr/local/share/fonts; do
+    [ -d "$_fd" ] && DEMO_FONT_DIRS="$DEMO_FONT_DIRS --font-dir $_fd"
+done
 
 # --- Isolated environment (shared dev-sandbox helper) ------------------------
 # shellcheck source=scripts/dev/lib/sandbox-env.sh
@@ -639,9 +651,10 @@ record_tape() {
 
     # --idle-time-limit is deliberately far above any beat in the tapes: agg
     # would otherwise silently compress the pauses the tapes exist to script.
+    # shellcheck disable=SC2086 # DEMO_FONT_DIRS is a pre-split flag list
     agg "$_cast" "$_gif" --font-size "$DEMO_FONT_SIZE" --fps-cap 30 \
         --idle-time-limit 30 --last-frame-duration 1 --theme "$DEMO_PALETTE" \
-        --text-font-family "$DEMO_FONT" \
+        --text-font-family "$DEMO_FONT" $DEMO_FONT_DIRS \
         >/dev/null 2>&1 || { echo "error: agg failed for $_tape" >&2; return 1; }
 
     # gif -> mp4. ffmpeg reads the gif's per-frame delays as timestamps, so
