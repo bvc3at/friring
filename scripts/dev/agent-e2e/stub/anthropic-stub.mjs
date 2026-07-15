@@ -6,9 +6,11 @@
 // record/replay brittle: request bodies grow cumulatively and embed
 // machine-specific tool results (see docs/E2E.md).
 //
-// Zero npm dependencies on purpose — node's http module only — so the Rust
-// dependency graph (cargo-deny) is untouched and the same sidecar serves both
-// the bats suite and VHS demo recordings.
+// The CLI, fixture schema, matcher and journal are shared with every other
+// dialect via stub-core.mjs; only the wire encoding lives here. Zero npm
+// dependencies on purpose (node's http only), so the Rust dependency graph
+// (cargo-deny) is untouched and the same sidecar serves both the bats suite
+// and VHS demo recordings.
 //
 // Usage:
 //   node anthropic-stub.mjs --fixtures f.json --journal j.jsonl \
@@ -22,6 +24,7 @@
 //         "modelContains": "opus",           // substring of body.model
 //         "promptContains": "hello.txt",     // substring of the last user msg
 //         "anyUserContains": "…",            // substring of any user msg
+//         "systemContains": "…",             // substring of the system prompt
 //         "hasToolResult": false,            // last user msg carries tool_result
 //         "toolResultFor": "toolu_e2e_1"     // tool_result for this pinned id
 //       },
@@ -50,34 +53,13 @@
 // post-run invariant fail the scenario. (There is deliberately no catch-all
 // default: it would answer surprise calls 200 as `matched:"default"`, silently
 // disabling the strictness the UNMATCHED marker exists to enforce.)
-import http from 'node:http';
-import fs from 'node:fs';
-import path from 'node:path';
+import { createStub, serveStub, effectiveText, chunkText, sleep } from './stub-core.mjs';
 
-const argv = process.argv.slice(2);
-function arg(name, dflt) {
-  const i = argv.indexOf(`--${name}`);
-  return i >= 0 ? argv[i + 1] : dflt;
-}
-const PORT = Number(arg('port', '0'));
-const PORT_FILE = arg('port-file', '');
-const JOURNAL = arg('journal', '');
-const RAW_DIR = arg('raw-dir', '');
-const FIXTURES = arg('fixtures', '');
+const stub = createStub('anthropic-stub');
 
-if (!JOURNAL || !FIXTURES) {
-  console.error('anthropic-stub: --fixtures and --journal are required');
-  process.exit(2);
-}
-if (RAW_DIR) fs.mkdirSync(RAW_DIR, { recursive: true });
-const fixtures = JSON.parse(fs.readFileSync(FIXTURES, 'utf8'));
-const useCounts = new Map();
-
-let requestSeq = 0;
-let messageSeq = 0;
-function journal(entry) {
-  fs.appendFileSync(JOURNAL, JSON.stringify(entry) + '\n');
-}
+// Fixed usage numbers: assertions and demo captures must not vary run-to-run.
+const USAGE_START = { input_tokens: 100, output_tokens: 1 };
+const USAGE_DELTA = { output_tokens: 50 };
 
 function textOfContent(content) {
   if (typeof content === 'string') return content;
@@ -105,39 +87,11 @@ function summarize(body) {
       .filter((m) => m.role === 'user')
       .map((m) => textOfContent(m.content))
       .join('\n'),
+    systemText: textOfContent(body.system),
     hasToolResult: toolResults.length > 0,
     toolResultIds: toolResults.map((b) => b.tool_use_id),
     nTools: Array.isArray(body.tools) ? body.tools.length : 0,
   };
-}
-
-function matches(m, s) {
-  if (!m) return true;
-  if (m.modelContains && !s.model.includes(m.modelContains)) return false;
-  if (m.promptContains && !s.lastUserText.includes(m.promptContains)) return false;
-  if (m.anyUserContains && !s.allUserText.includes(m.anyUserContains)) return false;
-  if (typeof m.hasToolResult === 'boolean' && s.hasToolResult !== m.hasToolResult)
-    return false;
-  if (m.toolResultFor && !s.toolResultIds.includes(m.toolResultFor)) return false;
-  return true;
-}
-
-function pick(s) {
-  for (const r of fixtures.responses || []) {
-    const name = r.name || 'unnamed';
-    if (r.maxUses > 0 && (useCounts.get(name) || 0) >= r.maxUses) continue;
-    if (matches(r.match, s)) {
-      useCounts.set(name, (useCounts.get(name) || 0) + 1);
-      return { name, ambient: !!r.ambient, delayMs: r.delayMs || 0, reply: r.reply };
-    }
-  }
-  return null;
-}
-
-function effectiveText(reply) {
-  let text = reply.text || '';
-  if (reply.flood) text = `${reply.flood.line}\n`.repeat(reply.flood.count) + text;
-  return text;
 }
 
 function buildContentBlocks(reply) {
@@ -154,15 +108,9 @@ function buildContentBlocks(reply) {
   return blocks;
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 function sseWrite(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
-
-// Fixed usage numbers: assertions and demo captures must not vary run-to-run.
-const USAGE_START = { input_tokens: 100, output_tokens: 1 };
-const USAGE_DELTA = { output_tokens: 50 };
 
 async function respondStream(res, model, picked) {
   res.writeHead(200, {
@@ -173,7 +121,7 @@ async function respondStream(res, model, picked) {
   const { reply, delayMs } = picked;
   const blocks = buildContentBlocks(reply);
   const stopReason = reply.toolUse ? 'tool_use' : reply.stopReason || 'end_turn';
-  const msgId = `msg_e2e_${String(++messageSeq).padStart(4, '0')}`;
+  const msgId = stub.nextMessageId('msg_e2e_');
   sseWrite(res, 'message_start', {
     type: 'message_start',
     message: {
@@ -195,16 +143,7 @@ async function respondStream(res, model, picked) {
         index,
         content_block: { type: 'text', text: '' },
       });
-      // Chunked like the real API so the TUI exercises streaming render; word
-      // granularity gives demos a natural typing cadence under delayMs. Flood
-      // texts switch to fixed 1KiB chunks — the render path under test cares
-      // about bytes and cadence, and word-splitting 100KB would drown the
-      // stream in per-event overhead instead.
-      const pieces =
-        block.text.length > 4096
-          ? block.text.match(/[\s\S]{1,1024}/g)
-          : block.text.split(/(?<= )/);
-      for (const piece of pieces) {
+      for (const piece of chunkText(block.text)) {
         sseWrite(res, 'content_block_delta', {
           type: 'content_block_delta',
           index,
@@ -242,7 +181,7 @@ function respondJson(res, model, picked) {
   res.writeHead(200, { 'content-type': 'application/json' });
   res.end(
     JSON.stringify({
-      id: `msg_e2e_${String(++messageSeq).padStart(4, '0')}`,
+      id: stub.nextMessageId('msg_e2e_'),
       type: 'message',
       role: 'assistant',
       model,
@@ -254,88 +193,50 @@ function respondJson(res, model, picked) {
   );
 }
 
-const server = http.createServer((req, res) => {
-  const seq = ++requestSeq;
-  const chunks = [];
-  req.on('data', (c) => chunks.push(c));
-  req.on('end', async () => {
-    const raw = Buffer.concat(chunks).toString('utf8');
-    if (RAW_DIR && raw)
-      fs.writeFileSync(path.join(RAW_DIR, `${String(seq).padStart(3, '0')}.json`), raw);
-    const url = req.url || '';
-    const base = { seq, ts: new Date().toISOString(), method: req.method, url };
-
-    if (req.method === 'GET' && url.startsWith('/health')) {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, requests: requestSeq }));
-      return;
-    }
-    if (url.startsWith('/v1/messages/count_tokens')) {
-      journal({ ...base, kind: 'count_tokens' });
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ input_tokens: 100 }));
-      return;
-    }
-    if (req.method === 'POST' && url.startsWith('/v1/messages')) {
-      let body;
-      try {
-        body = JSON.parse(raw);
-      } catch (e) {
-        journal({ ...base, kind: 'bad_json', error: String(e) });
-        res.writeHead(400, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'stub: unparseable body' } }));
-        return;
-      }
-      const s = summarize(body);
-      const picked = pick(s);
-      journal({
-        ...base,
-        kind: 'messages',
-        model: s.model,
-        stream: s.stream,
-        nMessages: s.nMessages,
-        nTools: s.nTools,
-        hasToolResult: s.hasToolResult,
-        toolResultIds: s.toolResultIds,
-        lastUserText: s.lastUserText.slice(0, 300),
-        matched: picked ? picked.name : 'UNMATCHED',
-        ambient: picked ? picked.ambient : false,
-      });
-      // Fail-open at response time, fail-closed at assert time: an unmatched
-      // call gets a benign marker reply so the agent stays alive (a 400 here
-      // would stall the pane before the first wait and leave nothing to
-      // debug), while the UNMATCHED journal entry makes the post-run
-      // invariant fail the scenario.
-      const effective =
-        picked ||
-        {
-          name: 'UNMATCHED',
-          ambient: false,
-          delayMs: 0,
-          reply: { text: `[stub: unmatched request #${seq}]` },
-        };
-      if (s.stream) await respondStream(res, body.model, effective);
-      else respondJson(res, body.model, effective);
-      return;
-    }
-    // Anything else (HEAD / connectivity probe, unknown endpoints): journaled
-    // so conformance drift in a new pinned binary shows up in artifacts, but
-    // answered 200 so a harmless probe can't fail a scenario.
-    journal({ ...base, kind: 'other', bodyPreview: raw.slice(0, 200) });
+serveStub('anthropic-stub', stub, async ({ req, res, raw, url, base }) => {
+  if (url.startsWith('/v1/messages/count_tokens')) {
+    stub.journal({ ...base, kind: 'count_tokens' });
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end('{}');
-  });
-});
+    res.end(JSON.stringify({ input_tokens: 100 }));
+    return true;
+  }
+  if (!(req.method === 'POST' && url.startsWith('/v1/messages'))) return false;
 
-server.listen(PORT, '127.0.0.1', () => {
-  const port = server.address().port;
-  if (PORT_FILE) fs.writeFileSync(PORT_FILE, String(port));
-  console.log(`anthropic-stub listening on 127.0.0.1:${port}`);
-});
-
-for (const sig of ['SIGTERM', 'SIGINT']) {
-  process.on(sig, () => {
-    server.close();
-    process.exit(0);
+  let body;
+  try {
+    body = JSON.parse(raw);
+  } catch (e) {
+    stub.journal({ ...base, kind: 'bad_json', error: String(e) });
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: 'stub: unparseable body' },
+      })
+    );
+    return true;
+  }
+  const s = summarize(body);
+  const picked = stub.pick(s);
+  stub.journal({
+    ...base,
+    kind: 'messages',
+    model: s.model,
+    stream: s.stream,
+    nMessages: s.nMessages,
+    nTools: s.nTools,
+    hasToolResult: s.hasToolResult,
+    toolResultIds: s.toolResultIds,
+    lastUserText: s.lastUserText.slice(0, 300),
+    matched: picked ? picked.name : 'UNMATCHED',
+    ambient: picked ? picked.ambient : false,
   });
-}
+  // Fail-open at response time, fail-closed at assert time: an unmatched call
+  // gets a benign marker reply so the agent stays alive (a 400 here would stall
+  // the pane before the first wait and leave nothing to debug), while the
+  // UNMATCHED journal entry makes the post-run invariant fail the scenario.
+  const effective = picked || stub.unmatchedReply(base.seq);
+  if (s.stream) await respondStream(res, body.model, effective);
+  else respondJson(res, body.model, effective);
+  return true;
+});

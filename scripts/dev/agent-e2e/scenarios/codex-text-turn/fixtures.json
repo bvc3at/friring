@@ -1,0 +1,9 @@
+{
+  "responses": [
+    {
+      "name": "text-turn",
+      "match": { "promptContains": "ready phrase" },
+      "reply": { "text": "FRIRING-E2E-READY — stubbed codex turn complete." }
+    }
+  ]
+}

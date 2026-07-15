@@ -26,16 +26,34 @@ E2E_TAPE=""
 e2e_log() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 e2e_die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; return 1; }
 
+# Print an agent binary's version line, BOUNDED. Profiles' `agent_version` all
+# route through this because it runs on paths that must never block: teardown
+# and artifact collection run for every test (including failures), and a
+# wedged agent binary would otherwise hang the whole suite with no output
+# rather than failing one test. (Seen in the wild: a large CLI stalling
+# indefinitely in macOS's dynamic loader, so even `--version` never returns.)
+e2e_bin_version() {
+    "${E2E_TIMEOUT:-timeout}" 10 "$1" --version 2>/dev/null | head -1
+}
+
 # ---------------------------------------------------------------------------
 # Tool preflight. The agent binary is checked per-profile (missing agent =>
 # bats `skip`, so the suite stays green on machines without it); missing
 # infrastructure tools are hard errors (you explicitly invoked this suite).
 e2e_require_tools() {
     local mode="${1:-test}" missing=""
-    # `timeout` (coreutils) bounds the protocol-smoke `claude -p`; it is
-    # `gtimeout` on stock macOS, so declaring it turns a mid-run "command not
-    # found" into a clear preflight error.
-    local tools="tmux node jq git curl timeout"
+    # coreutils timeout bounds the protocol-smoke runs. Prefer `gtimeout` (the
+    # coreutils name on macOS) over `timeout`: third-party `timeout` shims
+    # exist in the wild (e.g. sysadmin-util's shell script) and silently break
+    # TUI child processes.
+    if command -v gtimeout >/dev/null 2>&1; then
+        E2E_TIMEOUT="gtimeout"
+    elif command -v timeout >/dev/null 2>&1; then
+        E2E_TIMEOUT="timeout"
+    else
+        missing=" timeout"
+    fi
+    local tools="tmux node jq git curl"
     [ "$mode" = "demo" ] && tools="$tools vhs sqlite3"
     for t in $tools; do
         command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
@@ -102,7 +120,9 @@ e2e_boot() {
     git config --global user.email "e2e@friring.invalid"
     git config --global init.defaultBranch main
 
-    # Workspace the agent works in (the session's repo).
+    # Workspace the agent works in (the session's repo). The sandbox root is
+    # already canonical (sandbox-env.sh), which the agents' folder-trust seeds
+    # depend on.
     E2E_WS="$TBX_SANDBOX_ROOT/ws"
     mkdir -p "$E2E_WS"
     if [ -d "$E2E_SCENARIO_DIR/workspace" ]; then
@@ -485,16 +505,21 @@ e2e_demo_record() {
 # binary↔stub contract, interactive = the agent's own TUI vs the stub,
 # full = Friring's rendering/keying/hooks on top.
 
-# Depth 1 — protocol: `claude -p` (print mode), no tmux, no Friring.
+# Depth 1 — protocol: the agent's print/exec mode, no tmux, no Friring. The
+# argv is profile-provided (agent_print_args): each CLI spells "one-shot
+# headless prompt" differently (claude -p, codex exec, opencode run, …).
 e2e_protocol_smoke() {
     e2e_scenario_load "$1" || return 1
     e2e_boot protocol || return 1
     local bin out
     bin="$(agent_binary)"
-    ( cd "$E2E_WS" && timeout 120 "$bin" -p "$SCENARIO_PROMPT" \
-        "${AGENT_LAUNCH_ARGS[@]}" > "$TBX_SANDBOX_ROOT/p-stdout.txt" 2>&1 ) \
+    agent_print_args "$SCENARIO_PROMPT"
+    # </dev/null: codex APPENDS piped/inherited stdin to the prompt; harmless
+    # for the other agents.
+    ( cd "$E2E_WS" && "${E2E_TIMEOUT:-timeout}" 120 "$bin" "${AGENT_PRINT_ARGS[@]}" \
+        > "$TBX_SANDBOX_ROOT/p-stdout.txt" 2>&1 < /dev/null ) \
         || { out="$(cat "$TBX_SANDBOX_ROOT/p-stdout.txt")"; \
-             e2e_die "claude -p failed: $out"; return 1; }
+             e2e_die "$AGENT_NAME print-mode run failed: $out"; return 1; }
     assert_stub_invariants || return 1
     scenario_assert_effects || return 1
 }
