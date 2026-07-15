@@ -403,6 +403,15 @@ Pre-play (and every other step) syncs on pane markers, never fixed sleeps: sever
 real CLIs boot concurrently, so "long enough" is not knowable up front. Missing
 agents are skipped with a warning.
 
+The whole state is **re-seeded before every tape**, because the clips mutate what
+the next one poses against: `agents` and `session-creation` each spawn a session,
+`fork` spawns two more, `tasks`/`automations` add rows. Seeding once and filming
+all ten in a row drifts — the session list accumulates strangers, and since the
+*selected* session is whichever was spawned most recently, `code-review` ends up
+opening a session that has no branch and filming "No changes to show". Re-seeding
+costs a rebuild per tape and buys clips that are independent and individually
+reproducible: `record.sh code-review` films exactly what the full run does.
+
 The tapes exercise the session list, info panel (`Ctrl+B`), file viewer
 (`Ctrl+E`), native code review (`Ctrl+X`, the default `ToggleReview` chord; `F7`
 alternate), theme picker, session-creation flow, and the Automations pane over the
