@@ -42,9 +42,9 @@
 #     so the `friring-dev` tmux server, agent configs, and DB are all disposable
 #     and cannot reach anything you have running.
 #
-# Requirements: cargo, git, tmux, sqlite3, jq, node (>= 18), vhs (+ ffmpeg +
-# ttyd) and whichever agent CLIs you want to feature (claude / codex / opencode
-# / antigravity). Missing agents are skipped with a warning.
+# Requirements: cargo, git, tmux, sqlite3, jq, node (>= 18), asciinema + agg +
+# ffmpeg, and whichever agent CLIs you want to feature (claude / codex /
+# opencode / antigravity). Missing agents are skipped with a warning.
 #
 # Usage:  scripts/demo/record.sh [tape-stem ...]
 #
@@ -84,12 +84,12 @@ done
 
 # --- Preflight: required tools ----------------------------------------------
 missing=
-for tool in cargo git tmux vhs sqlite3 jq node; do
+for tool in cargo git tmux asciinema agg ffmpeg sqlite3 jq node; do
     command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
 if [ -n "$missing" ]; then
     echo "error: missing required tool(s):$missing" >&2
-    echo "  vhs:  https://github.com/charmbracelet/vhs (needs ffmpeg + ttyd)" >&2
+    echo "  asciinema + agg: brew install asciinema agg" >&2
     exit 1
 fi
 [ -f "$CONTENT" ] || { echo "error: no demo content at $CONTENT" >&2; exit 1; }
@@ -328,6 +328,17 @@ fi
     done
 } > "$CFG_DIR/agents.toml"
 
+# Wire the built-in hooks extension NOW, before any session exists. Two
+# reasons: sessions only get the hook wiring patched into their agent args if
+# the extension is active when they are spawned (so this is what makes the
+# demo's working/done status indicators live), and the TUI would otherwise do
+# this itself on first launch and toast the outcome — which it reports at Error
+# level, putting a red "Config: hooks: wired agent hooks for claude" banner
+# across the bottom of every frame we film. Doing it here consumes that
+# first-wire-up, so the TUI boots clean.
+"$CLI_BIN" extension activate hooks >/dev/null 2>&1 \
+    || echo "warning: could not activate the hooks extension" >&2
+
 # --- Keybindings: rebind global search to Ctrl+A for the demo ----------------
 # The real default for Action::GlobalSearch is Ctrl+/ (plus the Ctrl+7/Ctrl+_
 # raw-0x1F encodings), which VHS+ttyd do not deliver reliably across terminals.
@@ -458,33 +469,103 @@ if printf '%s ' $TAPES | grep -Eq '(^| )(tasks|search)( |$)'; then
 fi
 
 # --- Record -----------------------------------------------------------------
-# Each tape declares its own Output paths, so one VHS run == one output pair.
+# Each tape declares its own Output paths, so one tape == one gif+mp4 pair.
 # Persist the TUI theme into the seeded db so the next launched TUI starts in it.
-# No TUI is running between vhs invocations, so this write is conflict-free.
+# No TUI is running between recordings, so this write is conflict-free.
 set_theme() {
     sqlite3 "$DB_FILE" \
         "INSERT INTO metadata (key, value) VALUES ('active_theme', '$1') \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value"
 }
 
-# vhs renders through a headless Chromium (go-rod), which it finds in — or
-# downloads into — its browser cache. Two overrides for that process ONLY:
-# a persistent cache outside the throwaway sandbox (so the browser is fetched
-# at most once across runs, not per-run into a dir we then delete), and no dead
-# proxy (the sandbox's app-level offline block would otherwise make the fetch
-# fail). Neither weakens the agents' offline guarantee: every agent pane's env
-# was frozen into the friring-dev tmux server back when its session was
-# created, long before vhs starts.
-VHS_CACHE="$REPO_ROOT/target/demo-cache"
-mkdir -p "$VHS_CACHE"
+# The terminal grid every clip is recorded at, and the font size it is rendered
+# with. 175x42 at font-size 18 lands on ~1921x1082 — the 1920x1080 the media has
+# always been, at ~the same column count VHS's ttyd produced, so the TUI lays
+# itself out exactly as before.
+DEMO_COLS=175
+DEMO_ROWS=42
+DEMO_FONT_SIZE=18
+# Catppuccin Mocha (bg,fg + the 16 ANSI slots) — the palette the tapes' `Set
+# Theme` asked VHS for. friring paints its own theme in truecolor on top; this
+# is what the agent panes' default-coloured text lands on.
+DEMO_PALETTE="1e1e2e,cdd6f4,45475a,f38ba8,a6e3a1,f9e2af,89b4fa,f5c2e7,94e2d5,bac2de,585b70,f38ba8,a6e3a1,f9e2af,89b4fa,f5c2e7,94e2d5,a6adc8"
+# Sockets live in the sandbox's private TMUX_TMPDIR, so they can never collide
+# with a real server: one hosts the TUI being filmed, one gives asciinema a tty.
+DEMO_SOCKET="friring-demo"
+CAST_SOCKET="friring-cast"
+
+# record_tape <stem> — film one tape and render its gif+mp4.
+#
+# Recording captures the TUI's *terminal byte stream* (asciinema), not pixels,
+# and renders it offline (agg). That is what makes the output independent of
+# this machine: capture costs nothing, so every paint friring emits is kept with
+# its true timestamp, and the render can take as long as it likes. Grabbing
+# pixels off a live GUI instead — VHS's model — drops frames the moment the box
+# can't rasterize fast enough and can catch a half-drawn screen, which is
+# exactly what made the previous media play ~8x too fast and tear.
+record_tape() {
+    _tape="$1"
+    _cast="$TBX_SANDBOX_ROOT/$_tape.cast"
+    _gif="$REPO_ROOT/$(node "$SCRIPT_DIR/lib/drive-tape.mjs" "$SCRIPT_DIR/$_tape.tape" --print-outputs | grep '\.gif$')"
+    _mp4="$REPO_ROOT/$(node "$SCRIPT_DIR/lib/drive-tape.mjs" "$SCRIPT_DIR/$_tape.tape" --print-outputs | grep '\.mp4$')"
+    mkdir -p "$(dirname "$_gif")"
+
+    # Boot the TUI off-camera. This is the tapes' `Hide … Show` preamble: the
+    # recorder attaches to an already-running session, so the launch cannot be
+    # on film anyway, and drive-tape.mjs skips that block.
+    tmux -L "$DEMO_SOCKET" kill-server 2>/dev/null || true
+    tmux -L "$DEMO_SOCKET" new-session -d -s demo -x "$DEMO_COLS" -y "$DEMO_ROWS" "$FRIRING_BIN"
+    # No status bar: an attached client renders it, so it would be filmed.
+    tmux -L "$DEMO_SOCKET" set -g status off
+    _i=0
+    while [ "$_i" -lt 100 ]; do
+        tmux -L "$DEMO_SOCKET" capture-pane -p -t demo 2>/dev/null | grep -q "friring" && break
+        sleep 0.1; _i=$((_i + 1))
+    done
+
+    # asciinema needs a real tty, which this script has no way to hand it, so it
+    # runs inside its own tmux pane and records an attached client of the demo
+    # session — i.e. exactly the bytes a real terminal would receive.
+    tmux -L "$CAST_SOCKET" kill-server 2>/dev/null || true
+    tmux -L "$CAST_SOCKET" new-session -d -s rec -x "$DEMO_COLS" -y "$DEMO_ROWS" \
+        "asciinema rec '$_cast' --overwrite -f asciicast-v2 --command 'tmux -L $DEMO_SOCKET attach -t demo'"
+    tmux -L "$CAST_SOCKET" set -g status off
+    sleep 1   # let the attach paint its first full frame before the beats start
+
+    node "$SCRIPT_DIR/lib/drive-tape.mjs" "$SCRIPT_DIR/$_tape.tape" \
+        --socket "$DEMO_SOCKET" --session demo
+
+    # The tape's closing Ctrl+Q quits the TUI, which ends the attach, which ends
+    # asciinema and flushes the cast.
+    _i=0
+    while tmux -L "$CAST_SOCKET" has-session -t rec 2>/dev/null && [ "$_i" -lt 40 ]; do
+        sleep 0.25; _i=$((_i + 1))
+    done
+    tmux -L "$DEMO_SOCKET" kill-server 2>/dev/null || true
+    tmux -L "$CAST_SOCKET" kill-server 2>/dev/null || true
+    [ -s "$_cast" ] || { echo "error: no cast recorded for $_tape" >&2; return 1; }
+
+    # --idle-time-limit is deliberately far above any beat in the tapes: agg
+    # would otherwise silently compress the pauses the tapes exist to script.
+    agg "$_cast" "$_gif" --font-size "$DEMO_FONT_SIZE" --fps-cap 30 \
+        --idle-time-limit 30 --last-frame-duration 1 --theme "$DEMO_PALETTE" \
+        >/dev/null 2>&1 || { echo "error: agg failed for $_tape" >&2; return 1; }
+
+    # gif -> mp4. ffmpeg reads the gif's per-frame delays as timestamps, so
+    # `fps=30` re-times to a constant rate for players that need one WITHOUT
+    # changing the duration. The gif itself keeps its variable delays — never
+    # re-encode it, that is where the exact pacing lives.
+    ffmpeg -y -loglevel error -i "$_gif" -movflags +faststart -pix_fmt yuv420p \
+        -vf "fps=30,scale=trunc(iw/2)*2:trunc(ih/2)*2" "$_mp4" \
+        || { echo "error: ffmpeg failed for $_tape" >&2; return 1; }
+}
 
 for tape in $TAPES; do
     # Re-apply before every tape: the `theme` clip switches themes (and persists
     # the change), so without this any tape after it would start on the wrong one.
     set_theme "$DEMO_THEME"
     echo "==> Recording $tape.tape (theme: $DEMO_THEME) ..."
-    env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
-        XDG_CACHE_HOME="$VHS_CACHE" vhs "$SCRIPT_DIR/$tape.tape"
+    record_tape "$tape" || exit 1
 done
 
 echo "==> Done. Updated docs/media/ for tape(s):$([ "$TAPES" = "$ALL_TAPES" ] && echo " all" || echo " $TAPES")"

@@ -9,7 +9,7 @@ run the app in an isolated sandbox, and regenerate the demo media.
 
 The `flake.nix` pins the whole toolchain CI uses — the Rust toolchain (read from
 `rust-toolchain.toml`), `tmux`, `shellcheck`, `bats`, Node, `cargo-nextest`,
-`cargo-deny`, `cocogitto`, `just`, and the demo stack (`vhs`/`ffmpeg`/`ttyd`).
+`cargo-deny`, `cocogitto`, `just`, and the demo stack (`asciinema`/`agg`/`ffmpeg`).
 
 ```bash
 # one-time, if not done already: enable flakes
@@ -307,9 +307,8 @@ it from your package manager (it is not a cargo crate —
 ## 7. Demo video
 
 The demo media is **generated**, not hand-recorded. A single script drives the
-*real* TUI via [VHS](https://github.com/charmbracelet/vhs) (needs `vhs` +
-`ffmpeg` + `ttyd` + `tmux`) and writes GIF **and** MP4 straight into
-`docs/media/`:
+*real* TUI, records it, and writes GIF **and** MP4 straight into `docs/media/`
+(needs `asciinema` + `agg` + `ffmpeg` + `tmux`):
 
 ```bash
 scripts/demo/record.sh                 # regenerate ALL demo videos
@@ -325,10 +324,53 @@ deterministic `Wait+Screen` sync — into `target/agent-e2e/demos/` (see
 (`friring-demo.*` via `agents.tape`), one clip per feature
 (`friring-{file-manager,info-panel,theme,session-creation,fork}.*`), and the
 automations/tasks/search demos (`automations-demo.*`, `tasks-demo.*`,
-`search-demo.*`) — one VHS tape each (`scripts/demo/<feature>.tape`). With no
-args it records all of them; pass tape stems to re-record a subset (the `agents`
+`search-demo.*`) — one tape each (`scripts/demo/<feature>.tape`). With no args
+it records all of them; pass tape stems to re-record a subset (the `agents`
 stem is the hero, `automations`/`tasks`/`search` map to `<stem>-demo.*`, every
 other stem maps to `friring-<stem>.*`).
+
+### How a clip is captured (and why not VHS)
+
+The recorder captures the TUI's **terminal byte stream** with `asciinema` and
+renders it to a GIF **offline** with `agg`; `lib/drive-tape.mjs` reads the tape
+and replays its beats as tmux keystrokes into the recorded session.
+
+This is the difference between a demo that sells the tool and one that doesn't.
+Capturing *pixels* off a live GUI — VHS's model, via a headless Chromium — makes
+the output a function of the recording machine: it drops frames as soon as the
+box cannot rasterize fast enough, and it can grab a half-drawn screen (tearing).
+On a 2019 Intel Mac this pipeline sustains only ~6fps at 1080p, and because VHS
+stamps a *fixed* delay per surviving frame rather than each frame's real
+timestamp, a 15s clip was emitted as a 1.08s one — roughly 8x too fast, and
+unreadable.
+
+Recording the byte stream costs approximately nothing, so **every paint friring
+emits is kept, with its true timestamp**, and rendering can take as long as it
+needs. `agg` then emits a frame only when the terminal's content actually
+changed, giving it the delay it truly held for. So a clip's pacing is exact and
+identical on any machine, every frame is a complete redraw (tearing is
+structurally impossible), and the files are smaller. friring helps here: it
+paints on demand (ADR-P1), so transitions are captured crisply and idle screens
+simply have nothing to animate.
+
+Consequences worth knowing when editing a tape or the recorder:
+
+- The tape's `Hide … Show` preamble is **skipped**: recording attaches to an
+  already-running session, so `record.sh` boots the TUI off-camera itself.
+- `Type` is replayed character-by-character (`DEMO_TYPING_SPEED_MS`, default
+  50ms, matching VHS). Pasting a line at once reads as a glitch, not as someone
+  using the tool.
+- The tmux status bar is turned **off** on both sockets — an attached client
+  renders it, so it would otherwise be filmed.
+- `agg --idle-time-limit` is set far above any beat in the tapes; it would
+  otherwise silently compress the very pauses the tapes exist to script.
+- The GIF keeps **variable** frame delays — that is where the exact pacing
+  lives, so never re-encode it. The MP4 is derived from it with ffmpeg's
+  `fps` filter, which re-times to a constant rate for players that need one
+  without changing the duration.
+- Grid and size live in `record.sh` (`DEMO_COLS`/`DEMO_ROWS`/`DEMO_FONT_SIZE`):
+  175x42 at font-size 18 renders ~1920x1080, at about the column count VHS's
+  ttyd produced, so the TUI lays itself out as before.
 
 Every clip uses **real agent CLIs driven by the e2e model stubs** — no accounts,
 no network, nothing to log in to. The script seeds one session per installed CLI

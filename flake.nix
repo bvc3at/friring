@@ -51,11 +51,14 @@
           jq # handy for `friring-cli … --json` in the sandbox
         ];
 
-        # Optional demo-recording stack (scripts/demo/record.sh).
+        # Optional demo-recording stack (scripts/demo/record.sh): record the
+        # TUI's terminal byte stream (asciinema), render it to a GIF offline
+        # (agg), derive the MP4 (ffmpeg). See docs/DEVELOPMENT.md § Demo video
+        # for why this replaced the live pixel capture (vhs/ttyd).
         demoTools = with pkgs; [
-          vhs
+          asciinema
+          agg
           ffmpeg
-          ttyd
         ];
 
         # Dev tools NOT in nixpkgs — the shellHook nudges the user to install
