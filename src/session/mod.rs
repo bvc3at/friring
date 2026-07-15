@@ -353,6 +353,24 @@ pub const MUX_SERVER_MARKER_OPTION: &str = "@friring_server";
 /// `<session id>:<launch key>`.
 pub const MUX_PANE_MARKER_OPTION: &str = "@friring_pane";
 
+/// Whether the remote hooks-driven status path is enabled for a **psmux**
+/// (native-Windows SSH) host — both halves of it: shipping hook configs with
+/// their commands rewritten to the psmux pane-option form
+/// (`session_ops::spawn::remote_config_root`), and arming the 1 s pane-option
+/// poller on the host's control-mode connection (`agent::tmux`). **Gate,
+/// currently closed**: the path rests on behaviors not yet proven against
+/// psmux 3.3.6 — in-pane `set-option -p` without `-t` (no `$TMUX_PANE`
+/// guarantee), `#{@user_option}` expansion for the poller, and claude
+/// accepting a forward-slash `--settings` path on Windows.
+/// `scripts/dev/e2e/windows-vm.sh test` carries the probes; flip this to
+/// `true` only with that evidence. Closed = exactly the old strip behavior
+/// (the agent launches clean with no hooks, surfaced via
+/// `SessionInfo::hook_wiring`). Defined in the pure-data layer so `agent`
+/// (poller) and `session_ops` (rewrite/shipping) flip on the one switch.
+pub fn psmux_hook_rewrite_supported() -> bool {
+    false
+}
+
 #[derive(Debug, Clone)]
 pub struct WorktreeInfo {
     pub repo_path: PathBuf,
