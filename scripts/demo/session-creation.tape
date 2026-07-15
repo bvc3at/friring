@@ -64,7 +64,7 @@ Enter
 Sleep 1500ms
 
 # Session-name prompt: type a name, then confirm.
-Type "review-bot"
+Type "aurora-forecast"
 Sleep 1500ms
 Enter
 Sleep 1500ms

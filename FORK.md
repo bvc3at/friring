@@ -312,16 +312,38 @@ the first match.
 
 Hermetic, offline end-to-end tests that run a **real agent binary** (Claude
 Code is the proven reference) inside a Friring-managed pane with the **model
-API stubbed on loopback** — a zero-dep node sidecar speaking the Anthropic
-Messages dialect from hand-curated semantic fixtures. One scenario description
-runs both as an asserting bats test (`just agent-e2e`; three drive depths:
-`claude -p` → bare-tmux interactive → full Friring TUI) and as a VHS demo
+API stubbed on loopback** — zero-dep node sidecars speaking each wire dialect
+from hand-curated semantic fixtures. One scenario description runs both as an
+asserting bats test (`just agent-e2e`; three drive depths: the agent's own
+print/exec mode → bare-tmux interactive → full Friring TUI) and as a VHS demo
 recording (`just agent-demo <scenario>`). Ships with a path-gated,
 **non-blocking** `agent-e2e` CI job that installs a pinned claude binary, and
 one small CLI addition: `session get/list --json` now expose the raw
 `hook_state`/`hook_state_at` columns so external observers (the harness,
 automations) can watch status transitions without reading SQLite. Architecture
 and contracts in `docs/E2E.md`; decision record ADR-23.
+
+Coverage is **multi-agent**, one stub per wire dialect rather than per agent:
+`claude` (anthropic dialect) plus `codex` and `opencode` (a shared `openai`
+dialect — Responses and Chat Completions). `antigravity` (`agy`) is declared
+**unstubbable**: it forces real Google OAuth before any model traffic, with no
+API-key or base-URL escape, so its scenarios refuse to run offline instead of
+faking a login. A missing *or unresponsive* agent binary skips only that
+agent's tests, so any subset of the CLIs stays green.
+
+#### Stub-driven demo recordings (`scripts/demo/`)
+
+The demo media are recorded against those same loopback stubs instead of real,
+logged-in agent accounts. Every pane shows a **scripted conversation** —
+pre-played through `friring-cli session send` before recording — sourced from
+one file, `scripts/demo/demo-content.json`, which also seeds the sample repo,
+the review branch's diff, the tasks/automation and the search query. This
+makes the demos deterministic (a re-record diffs cleanly instead of capturing
+whatever a live model said) and identity-free (every agent talks to
+`127.0.0.1`, so no account email, token or usage can reach the frame), and it
+lets the panes show *fictional future* model ids (`fable-67`, `gpt-6.x`, …).
+`antigravity` is featured logged-out, being unstubbable. Details in
+`docs/DEVELOPMENT.md` § Demo video.
 
 #### Terminal-first focus
 

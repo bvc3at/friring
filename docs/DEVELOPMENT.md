@@ -330,17 +330,43 @@ args it records all of them; pass tape stems to re-record a subset (the `agents`
 stem is the hero, `automations`/`tasks`/`search` map to `<stem>-demo.*`, every
 other stem maps to `friring-<stem>.*`).
 
-Every clip uses **real agent CLIs**: the script seeds one session per installed
-CLI (`claude`, `opencode`, `codex`, `antigravity`) in a throwaway sample repo and
-launches them with no prompt. It overrides `HOME`, so agents boot with fresh
-history/config (no past conversations leak); CLIs that authenticate via the
-system keyring stay logged in but show no account email on screen. The tapes
-exercise the session list, info panel (`Ctrl+B`), file viewer (`Ctrl+E`), native
-code review (`Ctrl+X`, the default `ToggleReview` chord; `F7` alternate), theme
-picker, session-creation flow, and the Automations pane over the seeded sessions
-and sample tree. The hero `agents` demo also opens the code-review view, so it
-seeds the same worktree-with-a-committed-diff session the dedicated `code-review`
-clip uses.
+Every clip uses **real agent CLIs driven by the e2e model stubs** — no accounts,
+no network, nothing to log in to. The script seeds one session per installed CLI
+(`claude`, `codex`, `opencode`, `antigravity`) in a throwaway sample repo, points
+each at a loopback stub (`scripts/dev/agent-e2e/stub/`, shared with the e2e
+suite — see `docs/E2E.md`), and **pre-plays a scripted conversation** into every
+pane before recording starts, so each agent is caught mid-work rather than idling
+on a splash screen.
+
+The conversations, the sample repo, the review diff, the tasks/automation and the
+search query all come from **`scripts/demo/demo-content.json`** — one file that is
+the demo's script. `scripts/demo/lib/gen-stub-fixtures.mjs` compiles it into stub
+fixtures plus a pre-play plan (each turn's prompt and a marker to wait for). To
+change what the demos say, edit that JSON; nothing else needs touching.
+
+Two consequences worth keeping:
+
+- **Deterministic**: the same scripted exchange every run, so a re-record diffs
+  cleanly instead of capturing whatever a live model happened to answer.
+- **Identity-free**: every agent talks to `127.0.0.1`, so no account email, token
+  or usage can appear on camera. Each CLI's *fictional* model id (`fable-67`,
+  `gpt-6.x`, …) is what renders in its own status line.
+
+`antigravity` (`agy`) is the exception: it forces real Google OAuth and cannot be
+stubbed offline, so it is featured **logged out** on its clean login screen —
+which is also what keeps a signed-in account's identity off camera. See
+`scripts/dev/agent-e2e/agents/antigravity/profile.sh`.
+
+Pre-play (and every other step) syncs on pane markers, never fixed sleeps: several
+real CLIs boot concurrently, so "long enough" is not knowable up front. Missing
+agents are skipped with a warning.
+
+The tapes exercise the session list, info panel (`Ctrl+B`), file viewer
+(`Ctrl+E`), native code review (`Ctrl+X`, the default `ToggleReview` chord; `F7`
+alternate), theme picker, session-creation flow, and the Automations pane over the
+seeded sessions and sample tree. The hero `agents` demo also opens the code-review
+view, so it seeds the same worktree-with-a-committed-diff session the dedicated
+`code-review` clip uses.
 
 It runs fully isolated from your real environment — a dev build (`0.0.0-dev` →
 `dev_build` cfg) uses the `friring-dev` socket and XDG subdirs, and the script

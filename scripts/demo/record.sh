@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
-# Regenerate ALL Friring demo media in one pass, using REAL coding-agent CLIs.
+# Regenerate ALL Friring demo media in one pass, using REAL coding-agent CLIs
+# driven by a LOCAL MODEL STUB — no real accounts, no network, no auth.
 #
 # This single script records every video pair under docs/media/:
 #
@@ -14,29 +15,36 @@
 #   * search-demo.{gif,mp4}             (search.tape)
 #   * code-review-demo.{gif,mp4}        (code-review.tape)
 #
-# Every clip drives the actual `claude`, `opencode`, `codex` and `antigravity` CLIs —
-# one per friring session — to showcase real multi-agent orchestration. No prompt
-# is sent to any agent; they are launched and left on their start screens.
+# Every clip drives the actual `claude`, `codex`, `opencode` and `antigravity`
+# CLIs — one per friring session — to showcase real multi-agent orchestration.
+# The model API is served by the e2e harness's local stubs
+# (scripts/dev/agent-e2e/stub/), so each pane shows a SCRIPTED conversation
+# from scripts/demo/demo-content.json (a deadpan techno-optimistic-future bit)
+# with no real model call and no account on screen.
+#
+# Why a stub instead of real auth (the old approach):
+#   * No account identity ever renders — every agent talks to 127.0.0.1.
+#   * Deterministic: the same scripted exchange every run, so re-records diff
+#     cleanly.
+#   * Offline: non-loopback egress is dead-proxied; nothing external is
+#     load-bearing.
+#   * antigravity (agy) is the one exception — it forces real Google OAuth and
+#     cannot be stubbed offline (see scripts/dev/agent-e2e/agents/antigravity/
+#     profile.sh), so it is featured LOGGED OUT on its clean, branded login
+#     screen, which also keeps any account identity off camera.
+#
+# The stub dialects, agent env, and config seeds are shared with the real-agent
+# e2e harness — see docs/E2E.md. The scripted conversations become stub
+# fixtures via scripts/demo/lib/gen-stub-fixtures.mjs.
 #
 # Isolation (so this never touches your real friring, tmux, or agent accounts):
-#   * HOME points at a throwaway dir  -> agents boot with NO chat history (no past
-#     conversations leak into the video). To avoid login/trust dialogs on screen,
-#     each CLI's auth *token* is copied into the throwaway HOME and every demo repo
-#     is marked trusted (see "Seed agent credentials + pre-trust" below). Only the
-#     token is copied, never history; auth files absent for a CLI you are not
-#     logged into are simply skipped. No account email/handle is shown on screen:
-#     codex surfaces no identity when logged in; antigravity (agy) and claude are
-#     both featured LOGGED OUT on purpose, because each prints your account email
-#     in its welcome box when signed in (agy fetches it from the server via its
-#     keyring auth; claude prints the org name) — see their notes below.
-#   * TMUX_TMPDIR points at a throwaway dir -> the `friring-dev` tmux server lives
-#     in its own socket directory, so cleanup can't kill dev sessions you already
-#     have running.
-#   * XDG_{DATA,CONFIG,STATE,CACHE}_HOME point at a throwaway dir.
+#   * HOME/XDG_*/TMUX_TMPDIR point at a throwaway dir (shared sandbox helper),
+#     so the `friring-dev` tmux server, agent configs, and DB are all disposable
+#     and cannot reach anything you have running.
 #
-# Requirements: cargo, git, tmux, sqlite3, jq, vhs (+ ffmpeg + ttyd) and whichever agent CLIs
-# you want to feature (claude / opencode / codex / antigravity). Missing agents are
-# skipped with a warning.
+# Requirements: cargo, git, tmux, sqlite3, jq, node (>= 18), vhs (+ ffmpeg +
+# ttyd) and whichever agent CLIs you want to feature (claude / codex / opencode
+# / antigravity). Missing agents are skipped with a warning.
 #
 # Usage:  scripts/demo/record.sh [tape-stem ...]
 #
@@ -62,6 +70,9 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 cd "$REPO_ROOT"
 
+STUB_SRC="$REPO_ROOT/scripts/dev/agent-e2e/stub"
+CONTENT="$SCRIPT_DIR/demo-content.json"
+
 # Validate requested tapes exist before doing any expensive setup.
 for tape in $TAPES; do
     if [ ! -f "$SCRIPT_DIR/$tape.tape" ]; then
@@ -73,7 +84,7 @@ done
 
 # --- Preflight: required tools ----------------------------------------------
 missing=
-for tool in cargo git tmux vhs sqlite3 jq; do
+for tool in cargo git tmux vhs sqlite3 jq node; do
     command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
 if [ -n "$missing" ]; then
@@ -81,6 +92,7 @@ if [ -n "$missing" ]; then
     echo "  vhs:  https://github.com/charmbracelet/vhs (needs ffmpeg + ttyd)" >&2
     exit 1
 fi
+[ -f "$CONTENT" ] || { echo "error: no demo content at $CONTENT" >&2; exit 1; }
 
 # Map a featured-agent display name to its actual CLI binary. They differ only
 # for antigravity, whose binary is `agy` (the Gemini CLI successor); identity for
@@ -94,7 +106,7 @@ agent_command() {
 
 # Which agent CLIs are available? Feature only the ones present.
 AGENTS=
-for a in claude opencode codex antigravity; do
+for a in claude codex opencode antigravity; do
     bin=$(agent_command "$a")
     if command -v "$bin" >/dev/null 2>&1; then
         AGENTS="$AGENTS $a"
@@ -103,9 +115,14 @@ for a in claude opencode codex antigravity; do
     fi
 done
 if [ -z "$AGENTS" ]; then
-    echo "error: none of claude/opencode/codex/antigravity (agy) are installed" >&2
+    echo "error: none of claude/codex/opencode/antigravity (agy) are installed" >&2
     exit 1
 fi
+
+# Is an agent in the available set? (space-delimited membership test.)
+have_agent() {
+    case " $AGENTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
 
 # --- Build the dev binaries (version 0.0.0-dev => dev_build cfg) -------------
 # Build BEFORE the HOME override so cargo still finds ~/.cargo.
@@ -117,39 +134,193 @@ CLI_BIN="$REPO_ROOT/target/debug/friring-cli"
 export FRIRING_BIN   # consumed by the tapes (they `exec "$FRIRING_BIN"`)
 
 # --- Isolated environment (shared dev-sandbox helper) ------------------------
-REAL_HOME="$HOME"                        # captured before the override below
 # shellcheck source=scripts/dev/lib/sandbox-env.sh
 # shellcheck disable=SC1091
 . "$REPO_ROOT/scripts/dev/lib/sandbox-env.sh"
 tbx_sandbox_init_full fresh              # throwaway temp HOME/XDG/TMUX_TMPDIR
-DEMO_HOME="$TBX_SANDBOX_ROOT"            # fresh agent auth (no real creds/history)
+DEMO_HOME="$TBX_SANDBOX_ROOT"
 CFG_DIR="$XDG_CONFIG_HOME/friring-dev"   # dev_build subdir
 DB_FILE="$XDG_DATA_HOME/friring-dev/friring.db"  # SQLite db (dev_build subdir)
 mkdir -p "$CFG_DIR"
 
+STUB_DIR="$DEMO_HOME/stubs"
+mkdir -p "$STUB_DIR/raw"
+STUB_PIDS=""
+
 cleanup() {
     # The isolated tmux server (in TMUX_TMPDIR) hosts every agent pane, so the
     # helper's single kill reaps all the real agent processes too — and cannot
-    # reach any tmux server outside this throwaway directory — then wipes it.
+    # reach any tmux server outside this throwaway directory. Then the stubs.
+    for pid in $STUB_PIDS; do kill "$pid" >/dev/null 2>&1 || true; done
     tbx_sandbox_teardown
 }
 trap cleanup EXIT INT TERM
 
-# --- Agent registry: one entry per available CLI, launched with no args ------
+# --- Model stubs: one per wire dialect, from the scripted conversations ------
+echo "==> Generating stub fixtures from $(basename "$CONTENT")"
+node "$SCRIPT_DIR/lib/gen-stub-fixtures.mjs" "$CONTENT" "$STUB_DIR"
+
+# start_stub <dialect> <fixtures> -> echoes the base URL; records PID + port.
+start_stub() {
+    _dialect="$1"; _fixtures="$2"
+    _portfile="$STUB_DIR/$_dialect.port"
+    node "$STUB_SRC/$_dialect-stub.mjs" --port 0 --port-file "$_portfile" \
+        --journal "$STUB_DIR/$_dialect-journal.jsonl" \
+        --raw-dir "$STUB_DIR/raw" --fixtures "$_fixtures" \
+        > "$STUB_DIR/$_dialect.log" 2>&1 &
+    STUB_PIDS="$STUB_PIDS $!"
+    _i=0
+    while [ ! -s "$_portfile" ] && [ "$_i" -lt 50 ]; do sleep 0.1; _i=$((_i + 1)); done
+    [ -s "$_portfile" ] || { echo "error: $_dialect stub did not start" >&2; exit 1; }
+    echo "http://127.0.0.1:$(cat "$_portfile")"
+}
+
+ANTHROPIC_URL=$(start_stub anthropic "$STUB_DIR/anthropic-fixtures.json")
+OPENAI_URL=$(start_stub openai "$STUB_DIR/openai-fixtures.json")
+echo "==> Stubs up: anthropic=$ANTHROPIC_URL openai=$OPENAI_URL"
+
+# --- Per-agent model ids (shown in each CLI's own status line) ---------------
+# Pulled from the scripted content so the fictional-future model names on
+# screen match the conversation. One value per dialect: all claude sessions
+# share ANTHROPIC_MODEL; codex/opencode read theirs from their config files.
+demo_model() { jq -r --arg a "$1" 'first(.sessions[] | select(.agent==$a) | .model) // empty' "$CONTENT"; }
+CLAUDE_MODEL=$(demo_model claude)
+CODEX_MODEL=$(demo_model codex)
+OPENCODE_MODEL=$(demo_model opencode)
+
+# --- Shared tmux-server environment (exported BEFORE any tmux server starts) --
+# tmux panes inherit the server environment, and the server inherits ours; this
+# is how each agent's stub URL / config reach it with zero friring changes. The
+# vars are differently named per agent, so a single shared env carries all of
+# them without collision. Non-loopback egress is dead-proxied (app-level
+# offline); no_proxy keeps the loopback stub calls direct.
+export CLAUDE_CONFIG_DIR="$HOME/claude-config"
+export CODEX_HOME="$HOME/codex-home"
+export OPENCODE_CONFIG="$HOME/opencode.json"
+export ANTHROPIC_BASE_URL="$ANTHROPIC_URL"
+export ANTHROPIC_AUTH_TOKEN="friring-demo-dummy"
+[ -n "$CLAUDE_MODEL" ] && export ANTHROPIC_MODEL="$CLAUDE_MODEL"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export DISABLE_AUTOUPDATER=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DISABLE_BUG_COMMAND=1
+export OPENCODE_DISABLE_MODELS_FETCH=1 OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_LSP_DOWNLOAD=1
+export http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9
+export HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9
+export no_proxy=127.0.0.1,localhost NO_PROXY=127.0.0.1,localhost
+
+# --- Sample repo (the review object's files) + a parent folder of repos ------
+# demo-content.review defines a small, realistic Rust repo (the orbital-HVAC
+# bit); its base_files are the sample repo the file viewer browses and the
+# code-review demo diffs against. Written straight from the JSON.
+DEMO_REPO="$DEMO_HOME/$(jq -r '.review.repo_name' "$CONTENT")"
+# Write a JSON object of {relative-path: file-content} to disk. The paths are
+# plain relative filenames (no newlines), so a keys loop + per-key jq lookup is
+# safe and avoids base64 (whose flags differ across BSD/GNU).
+write_files() { # <jq-path-to-object> <dest-dir>
+    jq -r "$1 | keys_unsorted[]" "$CONTENT" | while IFS= read -r _rel; do
+        _dst="$2/$_rel"
+        mkdir -p "$(dirname "$_dst")"
+        jq -r "$1[\$k]" --arg k "$_rel" "$CONTENT" > "$_dst"
+    done
+}
+mkdir -p "$DEMO_REPO"
+write_files '.review.base_files' "$DEMO_REPO"
+git init -q "$DEMO_REPO"
+git -C "$DEMO_REPO" -c user.email=demo@friring -c user.name=demo add -A
+git -C "$DEMO_REPO" -c user.email=demo@friring -c user.name=demo \
+    commit -q -m "init sample project"
+DEMO_BASE_BRANCH=$(git -C "$DEMO_REPO" symbolic-ref --short HEAD)
+
+# A parent folder of several repos, for the "import as parent" demo. Lives
+# under $HOME so the session-creation tape can type `~/projects` and have the
+# picker's tilde-expansion resolve it during recording.
+PROJECTS_DIR="$HOME/projects"
+for r in $(jq -r '.projects_dirs[]' "$CONTENT"); do
+    repo="$PROJECTS_DIR/$r"
+    mkdir -p "$repo"
+    printf '# %s\n' "$r" > "$repo/README.md"
+    git init -q "$repo"
+    git -C "$repo" -c user.email=demo@friring -c user.name=demo add -A
+    git -C "$repo" -c user.email=demo@friring -c user.name=demo commit -q -m "init $r"
+done
+
+# --- Per-agent config seeds (no auth; each points at its loopback stub) -------
+# The trusted dirs: the sample repo plus the parent-folder repos the
+# session-creation tape browses.
+TRUST_DIRS="$DEMO_REPO $PROJECTS_DIR"
+for r in $(jq -r '.projects_dirs[]' "$CONTENT"); do
+    TRUST_DIRS="$TRUST_DIRS $PROJECTS_DIR/$r"
+done
+
+# claude: onboarding + bypass + per-folder trust; no credentials (the stub
+# needs none). Seeded in both HOME and CLAUDE_CONFIG_DIR (claude reads the
+# latter when the override is set). A binary symlink keeps its self-install
+# check quiet under the throwaway HOME.
+if have_agent claude; then
+    mkdir -p "$HOME/claude-config" "$HOME/.local/bin"
+    # shellcheck disable=SC2086 # word-split TRUST_DIRS into positional args
+    claude_seed=$(jq -n '{hasCompletedOnboarding: true,
+        bypassPermissionsModeAccepted: true,
+        projects: ($ARGS.positional | map({(.): {hasTrustDialogAccepted: true}}) | add)}' \
+        --args $TRUST_DIRS)
+    printf '%s' "$claude_seed" > "$HOME/.claude.json"
+    printf '%s' "$claude_seed" > "$HOME/claude-config/.claude.json"
+    claude_bin=$(command -v claude 2>/dev/null || true)
+    [ -n "$claude_bin" ] && ln -sf "$(readlink -f "$claude_bin" 2>/dev/null || echo "$claude_bin")" \
+        "$HOME/.local/bin/claude"
+fi
+
+# codex: a custom provider against the openai stub (Responses wire); fictional
+# model; every demo dir trusted; no approval/sandbox prompts. No env_key, so no
+# auth header is sent (and no ChatGPT login is ever required).
+if have_agent codex; then
+    mkdir -p "$CODEX_HOME"
+    {
+        printf 'model = "%s"\nmodel_provider = "stub"\n' "${CODEX_MODEL:-gpt-6.x}"
+        printf 'approval_policy = "never"\nsandbox_mode = "read-only"\n\n'
+        printf '[model_providers.stub]\nname = "Stub"\nbase_url = "%s/v1"\nwire_api = "responses"\n' "$OPENAI_URL"
+        for p in $TRUST_DIRS; do
+            printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$p"
+        done
+    } > "$CODEX_HOME/config.toml"
+fi
+
+# opencode: a custom provider against the openai stub (Chat Completions wire);
+# fictional model; dummy api key (the field is required, the stub ignores it).
+if have_agent opencode; then
+    jq -n --arg url "$OPENAI_URL/v1" --arg model "${OPENCODE_MODEL:-stub-model}" '{
+        "$schema": "https://opencode.ai/config.json",
+        provider: { stub: { npm: "@ai-sdk/openai-compatible", name: "Stub",
+            options: { baseURL: $url, apiKey: "dummy" },
+            models: { ($model): { name: $model } } } },
+        model: ("stub/" + $model), autoupdate: false, share: "disabled"
+    }' > "$OPENCODE_CONFIG"
+fi
+
+# antigravity (agy): featured LOGGED OUT — it forces real Google OAuth and
+# can't be stubbed (profile.sh explains). Seed only enough ~/.gemini state that
+# its logged-out screen is tidy (onboarding complete, folders pre-trusted, auth
+# type chosen), and launch it with the keyring/D-Bus cut off so it boots to its
+# clean "select login method" screen instead of fetching+printing the signed-in
+# Google account's email. Mirrors the claude treatment: featured, identity-free.
+if have_agent antigravity; then
+    mkdir -p "$HOME/.gemini/antigravity-cli/cache"
+    printf '{"security":{"auth":{"selectedType":"oauth-personal"}}}\n' > "$HOME/.gemini/settings.json"
+    # shellcheck disable=SC2086 # word-split TRUST_DIRS into positional args
+    jq -n '$ARGS.positional | map({(.): "TRUST_FOLDER"}) | add' --args $TRUST_DIRS \
+        > "$HOME/.gemini/trustedFolders.json"
+    printf '{"consumerOnboardingComplete":true,"enterpriseOnboardingComplete":false,"onboardingComplete":true}\n' \
+        > "$HOME/.gemini/antigravity-cli/cache/onboarding.json"
+fi
+
+# --- Agent registry: one entry per available CLI -----------------------------
 {
     # shellcheck disable=SC2086 # $AGENTS is a space-separated list, split on purpose
     first=$(printf '%s\n' $AGENTS | head -n1)
     echo "default = \"$first\""
     for a in $AGENTS; do
         if [ "$a" = "antigravity" ]; then
-            # Launch agy with the keyring/D-Bus cut off so it boots to its clean,
-            # branded logged-out screen ("Welcome to the Antigravity CLI … select
-            # login method") instead of printing the real signed-in Google account
-            # email + name. agy authenticates via the system keyring (D-Bus secret
-            # service), which survives the HOME/XDG isolation, and fetches the
-            # account identity from the server — so cutting D-Bus is the only way
-            # to keep that PII off screen. Mirrors the claude treatment: featured,
-            # but identity-free on screen.
+            # Cut the keyring/D-Bus so agy can't fetch+print the account email
+            # (see the seeding note above).
             printf '\n[[agents]]\nname = "antigravity"\ncommand = "env"\nargs = ["-u", "GNOME_KEYRING_CONTROL", "DBUS_SESSION_BUS_ADDRESS=/dev/null", "agy"]\n'
         else
             printf '\n[[agents]]\nname = "%s"\ncommand = "%s"\n' "$a" "$(agent_command "$a")"
@@ -163,237 +334,157 @@ trap cleanup EXIT INT TERM
 # The search.tape opens the strip with Ctrl+A — an unambiguous chord every
 # terminal sends — so seed a keybindings.json that maps it. Only GlobalSearch is
 # overridden; every other action keeps its built-in default.
-# The code-review view needs no override: its default primary chord is Ctrl+X
-# (F7 alternate, which VHS can't send), so the agents/code-review tapes open it
-# with a plain Ctrl+X. Because Ctrl+X is in terminal_passthrough (the emacs
-# prefix key), those tapes open the review from the session list, not a focused
-# terminal, where the chord would be forwarded to the agent instead.
-printf '{\n  "GlobalSearch": ["ctrl+a"]\n}\n' \
-    > "$CFG_DIR/keybindings.json"
+printf '{\n  "GlobalSearch": ["ctrl+a"]\n}\n' > "$CFG_DIR/keybindings.json"
 
-# --- A throwaway sample repo so the file viewer shows a realistic tree --------
-DEMO_REPO="$DEMO_HOME/sample-project"
-mkdir -p "$DEMO_REPO/src" "$DEMO_REPO/tests" "$DEMO_REPO/docs"
-cat > "$DEMO_REPO/README.md" <<'EOF'
-# sample-project
-
-A tiny demo repository used to showcase the Friring file viewer.
-EOF
-cat > "$DEMO_REPO/src/main.rs" <<'EOF'
-fn main() {
-    println!("hello from sample-project");
-}
-EOF
-cat > "$DEMO_REPO/src/lib.rs" <<'EOF'
-pub fn add(a: i64, b: i64) -> i64 {
-    a + b
-}
-EOF
-cat > "$DEMO_REPO/tests/basic.rs" <<'EOF'
-#[test]
-fn it_adds() {
-    assert_eq!(sample_project::add(2, 2), 4);
-}
-EOF
-cat > "$DEMO_REPO/docs/ARCHITECTURE.md" <<'EOF'
-# Architecture
-
-Sample document for the file-viewer demo.
-EOF
-git init -q "$DEMO_REPO"
-git -C "$DEMO_REPO" -c user.email=demo@friring -c user.name=demo add -A
-git -C "$DEMO_REPO" -c user.email=demo@friring -c user.name=demo \
-    commit -q -m "init sample project"
-# The branch the initial commit landed on (master or main, per the host's git
-# config) — used as the code-review demo's worktree base.
-DEMO_BASE_BRANCH=$(git -C "$DEMO_REPO" symbolic-ref --short HEAD)
-
-# --- A parent folder of several repos, for the "import as parent" demo --------
-# Lives under $HOME so the session-creation tape can type `~/projects` and have
-# the picker's tilde-expansion resolve it during recording. The picker imports
-# the folder as a parent and lists these git sub-dirs (by basename) beneath it.
-PROJECTS_DIR="$HOME/projects"
-for r in api-server shared-lib web-app; do
-    repo="$PROJECTS_DIR/$r"
-    mkdir -p "$repo"
-    printf '# %s\n' "$r" > "$repo/README.md"
-    git init -q "$repo"
-    git -C "$repo" -c user.email=demo@friring -c user.name=demo add -A
-    git -C "$repo" -c user.email=demo@friring -c user.name=demo \
-        commit -q -m "init $r"
-done
-
-# --- Seed agent credentials + pre-trust the demo folders ---------------------
-# Agent CLIs (a) authenticate via files under $HOME and (b) prompt "do you trust
-# this folder?" on first launch in an unknown dir. The throwaway $HOME wipes both,
-# so without this the recordings show login/trust dialogs instead of the ready
-# chat UI. Seed each CLI's auth token (NOT its chat history) and mark every demo
-# repo trusted. opencode needs neither (it boots straight into a ready UI). The
-# auth files are only copied when present, so this is a no-op for any CLI you are
-# not logged into. Per-CLI on-disk formats:
-#   codex  -> ~/.codex/{auth.json, config.toml: [projects."<p>"] trust_level}
-#   antigravity (agy) -> featured logged-OUT (keyring auth can't be seeded into a
-#                        throwaway HOME and leaks the account email); we only seed
-#                        ~/.gemini/{settings.json, trustedFolders.json} +
-#                        ~/.gemini/antigravity-cli/{cache/onboarding.json,
-#                        bin/webm_encoder} to keep its logged-out screen tidy
-#   claude -> ~/.claude/.credentials.json + ~/.claude.json projects."<p>"
-#             .hasTrustDialogAccepted (+ a binary symlink so its self-install
-#             check stays quiet under the throwaway HOME)
-# The trusted dirs: the sample repo plus the parent-folder repos the
-# session-creation tape browses.
-set -- "$DEMO_REPO" "$PROJECTS_DIR" "$PROJECTS_DIR/api-server" \
-    "$PROJECTS_DIR/shared-lib" "$PROJECTS_DIR/web-app"
-
-# codex: auth token + one trusted [projects] table per demo dir
-if [ -f "$REAL_HOME/.codex/auth.json" ]; then
-    mkdir -p "$HOME/.codex"
-    cp "$REAL_HOME/.codex/auth.json" "$HOME/.codex/auth.json"
-    for p in "$@"; do
-        printf '[projects."%s"]\ntrust_level = "trusted"\n\n' "$p" \
-            >> "$HOME/.codex/config.toml"
-    done
-fi
-
-# antigravity (agy): featured logged-OUT, like claude — NO auth token is seeded.
-# agy authenticates via the system keyring (D-Bus secret service), which survives
-# the HOME/XDG isolation, and prints the signed-in Google account's email + full
-# name in its welcome box (fetched from the server). The only way to keep that PII
-# off screen is to launch it with the keyring cut off (the agents.toml entry above
-# wraps `agy` in `env … DBUS_SESSION_BUS_ADDRESS=/dev/null`), so it boots to its
-# clean, branded "not signed in / select login method" screen. We still seed
-# ~/.gemini so that screen is tidy: onboarding marked complete (skips the
-# first-run intro), the demo folders pre-trusted, the oauth-personal auth type
-# selected, and webm_encoder copied in (avoids a ~17 MB on-camera download). This
-# runs unconditionally — agy is logged out, so it needs nothing from your real
-# ~/.gemini except the (optional) cached webm_encoder.
-mkdir -p "$HOME/.gemini/antigravity-cli/cache" "$HOME/.gemini/antigravity-cli/bin"
-printf '{"security":{"auth":{"selectedType":"oauth-personal"}}}\n' \
-    > "$HOME/.gemini/settings.json"
-jq -n '$ARGS.positional | map({(.): "TRUST_FOLDER"}) | add' --args "$@" \
-    > "$HOME/.gemini/trustedFolders.json"
-printf '{"consumerOnboardingComplete":true,"enterpriseOnboardingComplete":false,"onboardingComplete":true}\n' \
-    > "$HOME/.gemini/antigravity-cli/cache/onboarding.json"
-[ -f "$REAL_HOME/.gemini/antigravity-cli/bin/webm_encoder" ] && \
-    cp "$REAL_HOME/.gemini/antigravity-cli/bin/webm_encoder" \
-        "$HOME/.gemini/antigravity-cli/bin/webm_encoder"
-
-# claude: trust + onboarding flags only — deliberately NOT logged in. claude's
-# welcome box renders the account's organizationName, and a personal org is
-# auto-named after your email; worse, claude force-syncs that field from the
-# server (overwriting any seeded override, even via a read-only file, since it
-# writes through a temp-file rename), so a logged-in claude would print your email
-# in the recording. We therefore leave it logged out: trust is pre-accepted (no
-# trust dialog) and it shows a clean "Welcome back!" with no account identity. The
-# binary symlink keeps its self-install check ("claude command missing") quiet.
-mkdir -p "$HOME/.local/bin"
-jq -n '{hasCompletedOnboarding: true,
-        projects: ($ARGS.positional
-                   | map({(.): {hasTrustDialogAccepted: true}}) | add)}' \
-    --args "$@" > "$HOME/.claude.json"
-claude_bin=$(command -v claude 2>/dev/null || true)
-[ -n "$claude_bin" ] && ln -sf "$(readlink -f "$claude_bin")" "$HOME/.local/bin/claude"
-
-# --- Pre-seed one session per agent so the TUI opens populated ---------------
-echo "==> Seeding one session per agent:$AGENTS"
-for a in $AGENTS; do
-    "$CLI_BIN" session create --name "$a" --repo-path "$DEMO_REPO" --agent "$a" >/dev/null
-done
-
-# --- Code-review demo: a worktree session with a real committed diff ---------
-# The review view diffs <base>..HEAD of a session's worktree, so any tape that
-# opens the code-review view needs a session whose branch actually has changes.
-# Both the dedicated `code-review` clip and the hero `agents` demo (which now
-# showcases the review feature) use it. Create it LAST so restore leaves it
-# selected on launch (finish_adopted_session makes the last-restored session
-# active), on a worktree off the sample repo, then commit a small multi-file
-# change into that worktree so the Branch target shows a colourful diff. Gated on
-# those two tapes so the remaining clips stay fast / unchanged.
-# shellcheck disable=SC2086 # $TAPES is a space-separated list, split on purpose
-if printf '%s ' $TAPES | grep -Eq '(^| )(code-review|agents)( |$)'; then
-    echo "==> Seeding a worktree review session with a committed diff"
-    review_agent=$(printf '%s\n' $AGENTS | head -n1)
-    "$CLI_BIN" session create --name "review" --repo-path "$DEMO_REPO" \
-        --agent "$review_agent" --worktree-branch "review/demo" \
-        --base-branch "$DEMO_BASE_BRANCH" >/dev/null
-    # Resolve the worktree path friring created for branch review/demo.
-    REVIEW_WT=$(git -C "$DEMO_REPO" worktree list --porcelain \
-        | awk '/^worktree /{p=substr($0,10)} $0=="branch refs/heads/review/demo"{print p}')
-    if [ -n "$REVIEW_WT" ]; then
-        cat > "$REVIEW_WT/src/lib.rs" <<'EOF'
-pub fn add(a: i64, b: i64) -> i64 {
-    a.wrapping_add(b)
-}
-
-pub fn mul(a: i64, b: i64) -> i64 {
-    a.wrapping_mul(b)
-}
-EOF
-        cat > "$REVIEW_WT/src/greet.rs" <<'EOF'
-pub fn greet(name: &str) -> String {
-    format!("hello, {name}!")
-}
-EOF
-        cat > "$REVIEW_WT/src/main.rs" <<'EOF'
-mod greet;
-
-fn main() {
-    println!("{}", greet::greet("sample-project"));
-}
-EOF
-        git -C "$REVIEW_WT" -c user.email=demo@friring -c user.name=demo add -A
-        git -C "$REVIEW_WT" -c user.email=demo@friring -c user.name=demo \
-            commit -q -m "feat: add greeting + checked arithmetic"
+# --- Create one session per scripted session ---------------------------------
+# Order follows demo-content.json (review LAST, so restore leaves it selected on
+# launch — finish_adopted_session makes the last-restored session active — which
+# is what the code-review and hero tapes rely on). The "review" session is a
+# worktree off the sample repo whose branch carries the review object's diff, so
+# the code-review view shows a real, colourful <base>..HEAD change.
+echo "==> Seeding one session per scripted agent"
+REVIEW_BRANCH=$(jq -r '.review.branch' "$CONTENT")
+session_count=$(jq '.sessions | length' "$CONTENT")
+i=0
+while [ "$i" -lt "$session_count" ]; do
+    sname=$(jq -r ".sessions[$i].session_name" "$CONTENT")
+    sagent=$(jq -r ".sessions[$i].agent" "$CONTENT")
+    i=$((i + 1))
+    have_agent "$sagent" || { echo "  (skipping $sname — $sagent not installed)"; continue; }
+    if [ "$sname" = "review" ]; then
+        "$CLI_BIN" session create --name "review" --repo-path "$DEMO_REPO" \
+            --agent "$sagent" --worktree-branch "$REVIEW_BRANCH" \
+            --base-branch "$DEMO_BASE_BRANCH" >/dev/null
+        REVIEW_WT=$(git -C "$DEMO_REPO" worktree list --porcelain \
+            | awk -v b="branch refs/heads/$REVIEW_BRANCH" \
+                '/^worktree /{p=substr($0,10)} $0==b{print p}')
+        if [ -n "$REVIEW_WT" ]; then
+            write_files '.review.branch_files' "$REVIEW_WT"
+            git -C "$REVIEW_WT" -c user.email=demo@friring -c user.name=demo add -A
+            git -C "$REVIEW_WT" -c user.email=demo@friring -c user.name=demo \
+                commit -q -m "$(jq -r '.review.commit_message' "$CONTENT")"
+        fi
+    else
+        "$CLI_BIN" session create --name "$sname" --repo-path "$DEMO_REPO" \
+            --agent "$sagent" >/dev/null
     fi
-fi
+done
 
-# --- Pre-seed a few tasks + an automation -----------------------------------
+# --- Pre-play each scripted conversation into its pane -----------------------
+# `friring-cli session send` types the prompt into the agent's pane (paste →
+# brief delay → Enter); the stub answers from the matching fixture. We poll the
+# pane for a short marker of each reply so the next turn (and, later, recording)
+# only starts once the exchange has rendered. Unstubbable agents (antigravity)
+# have no pre-play entry — they stay on their logged-out screen.
+sid() { "$CLI_BIN" --json session list | jq -r --arg n "$1" '.[] | select(.name==$n) | .id'; }
+
+# Wait for text to appear in a session's pane. Every pre-play step syncs on a
+# pane marker rather than a fixed sleep: several real CLIs boot concurrently
+# here, so "long enough" is not knowable up front — a prompt sent before its
+# agent is ready lands nowhere and the turn silently never renders.
+wait_pane() { # <session-id> <marker> [tries]
+    _w=0; _tries=${3:-120}
+    while [ "$_w" -lt "$_tries" ]; do
+        if "$CLI_BIN" --text session capture "$1" --lines 80 2>/dev/null \
+            | grep -qF "$2"; then return 0; fi
+        sleep 0.5; _w=$((_w + 1))
+    done
+    return 1
+}
+
+# The "ready for input" marker each agent's own TUI paints (verified against
+# claude 2.1.209, codex 0.144.4, opencode 1.17.15). Same markers the e2e
+# scenarios wait on — see scripts/dev/agent-e2e/scenarios/*/scenario.sh.
+agent_ready_marker() {
+    case "$1" in
+        claude) printf '❯' ;;
+        codex) printf '›' ;;
+        opencode) printf 'Build ·' ;;
+        *) printf '' ;;
+    esac
+}
+
+pp_count=$(jq 'length' "$STUB_DIR/preplay.json")
+p=0
+while [ "$p" -lt "$pp_count" ]; do
+    psession=$(jq -r ".[$p].session" "$STUB_DIR/preplay.json")
+    pagent=$(jq -r ".[$p].agent" "$STUB_DIR/preplay.json")
+    p=$((p + 1))
+    have_agent "$pagent" || continue
+    psid=$(sid "$psession")
+    [ -n "$psid" ] || { echo "  (no session id for $psession — skipping pre-play)"; continue; }
+    echo "==> Pre-playing $psession ($pagent)"
+    ready=$(agent_ready_marker "$pagent")
+    if [ -n "$ready" ] && ! wait_pane "$psid" "$ready"; then
+        echo "  warning: $pagent never became ready in $psession — skipping" >&2
+        continue
+    fi
+    tcount=$(jq ".[$((p - 1))].turns | length" "$STUB_DIR/preplay.json")
+    t=0
+    while [ "$t" -lt "$tcount" ]; do
+        prompt=$(jq -r ".[$((p - 1))].turns[$t].prompt" "$STUB_DIR/preplay.json")
+        marker=$(jq -r ".[$((p - 1))].turns[$t].marker" "$STUB_DIR/preplay.json")
+        t=$((t + 1))
+        "$CLI_BIN" session send "$psid" "$prompt" >/dev/null
+        wait_pane "$psid" "$marker" \
+            || echo "  warning: '$marker' never rendered in $psession" >&2
+    done
+done
+
+# --- Pre-seed the scripted tasks + automation --------------------------------
 # These give the `tasks` and `search` clips real content to render (the search
-# strip searches across sessions, tasks AND automations at once). Only needed
-# for those two tapes, but seeding is cheap and harmless for the others.
+# strip searches across sessions, tasks AND automations at once).
 # shellcheck disable=SC2086 # $TAPES is a space-separated list, split on purpose
 if printf '%s ' $TAPES | grep -Eq '(^| )(tasks|search)( |$)'; then
-    echo "==> Seeding demo tasks + an automation"
-    # A plain local todo plus one already in progress, so the checkbox glyphs
-    # (todo/in-progress/done) all show in the list.
-    "$CLI_BIN" task create --title "Write integration tests" >/dev/null 2>&1 || true
-    "$CLI_BIN" task create --title "Triage failing CI" --status in_progress \
-        >/dev/null 2>&1 || true
-    # A rich markdown description so the full-screen preview shows headings,
-    # bold and lists rendered (the headline of the tasks feature).
-    "$CLI_BIN" task create --title "Document the search feature" \
-        --description "$(printf '## Goal\n\nExplain the **global search** strip.\n\n- matches sessions, tasks & automations\n- fuzzy across *title* and *description*')" \
-        >/dev/null 2>&1 || true
-    # An automation (spawn action, inferred from --repo) so the search demo has
-    # a matching automation result too.
-    "$CLI_BIN" automation create --name "nightly-triage" --trigger daily \
-        --time "09:00" --repo "$DEMO_REPO" \
-        --prompt "Triage failing CI and summarize blockers" >/dev/null 2>&1 || true
+    echo "==> Seeding scripted tasks + an automation"
+    tk_count=$(jq '.tasks | length' "$CONTENT")
+    k=0
+    while [ "$k" -lt "$tk_count" ]; do
+        title=$(jq -r ".tasks[$k].title" "$CONTENT")
+        status=$(jq -r ".tasks[$k].status // \"todo\"" "$CONTENT")
+        desc=$(jq -r ".tasks[$k].description // \"\"" "$CONTENT")
+        k=$((k + 1))
+        if [ -n "$desc" ]; then
+            "$CLI_BIN" task create --title "$title" --status "$status" \
+                --description "$desc" >/dev/null 2>&1 || true
+        else
+            "$CLI_BIN" task create --title "$title" --status "$status" >/dev/null 2>&1 || true
+        fi
+    done
+    au_name=$(jq -r '.automation.name' "$CONTENT")
+    au_prompt=$(jq -r '.automation.prompt' "$CONTENT")
+    "$CLI_BIN" automation create --name "$au_name" --trigger daily --time "09:00" \
+        --repo "$DEMO_REPO" --prompt "$au_prompt" >/dev/null 2>&1 || true
 fi
-
-# Give the real CLIs a moment to boot before VHS starts capturing. Each tape
-# relaunches the TUI against the same seeded sessions, so they only need to be
-# warm once.
-sleep 6
 
 # --- Record -----------------------------------------------------------------
 # Each tape declares its own Output paths, so one VHS run == one output pair.
-# Loop over the requested tapes, rendering each into docs/media/.
 # Persist the TUI theme into the seeded db so the next launched TUI starts in it.
-# The db + metadata table already exist (the `session create` calls above opened
-# them). No TUI is running between vhs invocations, so this write is conflict-free.
+# No TUI is running between vhs invocations, so this write is conflict-free.
 set_theme() {
     sqlite3 "$DB_FILE" \
         "INSERT INTO metadata (key, value) VALUES ('active_theme', '$1') \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value"
 }
 
+# vhs renders through a headless Chromium (go-rod), which it finds in — or
+# downloads into — its browser cache. Two overrides for that process ONLY:
+# a persistent cache outside the throwaway sandbox (so the browser is fetched
+# at most once across runs, not per-run into a dir we then delete), and no dead
+# proxy (the sandbox's app-level offline block would otherwise make the fetch
+# fail). Neither weakens the agents' offline guarantee: every agent pane's env
+# was frozen into the friring-dev tmux server back when its session was
+# created, long before vhs starts.
+VHS_CACHE="$REPO_ROOT/target/demo-cache"
+mkdir -p "$VHS_CACHE"
+
 for tape in $TAPES; do
     # Re-apply before every tape: the `theme` clip switches themes (and persists
     # the change), so without this any tape after it would start on the wrong one.
     set_theme "$DEMO_THEME"
     echo "==> Recording $tape.tape (theme: $DEMO_THEME) ..."
-    vhs "$SCRIPT_DIR/$tape.tape"
+    env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+        XDG_CACHE_HOME="$VHS_CACHE" vhs "$SCRIPT_DIR/$tape.tape"
 done
 
 echo "==> Done. Updated docs/media/ for tape(s):$([ "$TAPES" = "$ALL_TAPES" ] && echo " all" || echo " $TAPES")"

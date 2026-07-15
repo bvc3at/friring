@@ -29,7 +29,8 @@ Show
 # Let the real agent CLIs finish booting in their panes.
 Sleep 3s
 
-# Walk through each pre-seeded agent session (claude / opencode / codex / antigravity).
+# Walk through each pre-seeded agent session — one per CLI (claude / codex /
+# opencode / antigravity), each mid-conversation on its own scripted turn.
 Ctrl+J
 Sleep 2500ms
 Ctrl+J
@@ -116,7 +117,7 @@ Enter
 Sleep 1500ms
 
 # Session-name prompt: type a name, then confirm.
-Type "review-bot"
+Type "aurora-forecast"
 Sleep 1500ms
 Enter
 Sleep 1500ms

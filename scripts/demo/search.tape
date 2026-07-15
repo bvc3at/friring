@@ -48,10 +48,12 @@ Sleep 800ms
 Ctrl+A
 Sleep 1600ms
 
-# Type a query. Matches highlight live in the panels themselves (accent + bold +
-# underline on matching rows, the rest dimmed); the strip shows per-scope counts
-# and a grouped result list.
-Type "tri"
+# Type a query. `carbo` fuzzy-matches across every scope at once — the
+# carbon-drawdown session, the carbon-capture task, and the carbon-drift-watch
+# automation — so the grouped results span all three. Matches highlight live in
+# the panels themselves (accent + bold + underline on matching rows, the rest
+# dimmed); the strip shows per-scope counts and a grouped result list.
+Type "carbo"
 Sleep 2200ms
 
 # Move the selection through the grouped results; the owning panel previews the
@@ -68,8 +70,10 @@ Sleep 1200ms
 Backspace
 Backspace
 Backspace
+Backspace
+Backspace
 Sleep 600ms
-Type "claude"
+Type "drift"
 Sleep 2000ms
 
 # Enter jumps to the selected result and focuses its pane (here, a session's
@@ -80,7 +84,7 @@ Sleep 2200ms
 # Open it once more to show a task jump, then cancel with Esc (state restored).
 Ctrl+A
 Sleep 1200ms
-Type "test"
+Type "habitat"
 Sleep 1800ms
 Down
 Sleep 1200ms
