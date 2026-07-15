@@ -58,9 +58,20 @@ _tbx_resolve_root() {
 
     case "$mode" in
         fresh)
-            TBX_SANDBOX_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/friring-sandbox.XXXXXX")"
+            # Canonicalized (`pwd -P`): on macOS $TMPDIR is /var/folders/…, a
+            # symlink to /private/var/folders/…. Agent CLIs resolve their cwd to
+            # the real path, so a folder-trust entry seeded under the symlinked
+            # path silently misses and the agent boots into a "trust this
+            # folder?" dialog instead of a usable UI.
+            TBX_SANDBOX_ROOT="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/friring-sandbox.XXXXXX")" && pwd -P)"
             TBX_SANDBOX_FRESH=1
-            TMUX_TMPDIR="$TBX_SANDBOX_ROOT/tmux"
+            # NOT under the root: AF_UNIX socket paths are ~104-byte limited,
+            # and macOS's per-user $TMPDIR (/var/folders/…/T/) pushes
+            # <root>/tmux/tmux-<uid>/friring-dev past it (ENAMETOOLONG).
+            # /tmp is tmux's own default socket home; teardown removes this
+            # dir alongside the root.
+            TBX_SANDBOX_TMUX_FRESH="$(mktemp -d /tmp/friring-sbx.XXXXXX)"
+            TMUX_TMPDIR="$TBX_SANDBOX_TMUX_FRESH"
             ;;
         persistent)
             TBX_SANDBOX_ROOT="$TBX_REPO_ROOT/target/dev-sandbox/$profile"
@@ -119,6 +130,9 @@ tbx_sandbox_teardown() {
     tmux -L "$TBX_DEV_SOCKET" kill-server >/dev/null 2>&1 || true
     if [ "$TBX_SANDBOX_FRESH" = "1" ] && [ -n "$TBX_SANDBOX_ROOT" ]; then
         rm -rf "$TBX_SANDBOX_ROOT"
+        # The fresh socket dir lives outside the root (path-length limit,
+        # see _tbx_resolve_root).
+        [ -n "${TBX_SANDBOX_TMUX_FRESH:-}" ] && rm -rf "$TBX_SANDBOX_TMUX_FRESH"
     fi
 }
 
