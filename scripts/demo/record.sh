@@ -671,10 +671,14 @@ record_tape() {
     fi
     [ -s "$_cast" ] || { echo "error: no cast recorded for $_tape" >&2; return 1; }
 
+    # Render beside the real thing, not onto it: everything below can still
+    # reject this clip, and a rejected take must not have already replaced good
+    # media. Only a clip that passes gets moved into docs/media.
+    _staged="$TBX_SANDBOX_ROOT/$_tape.gif"
     # --idle-time-limit is deliberately far above any beat in the tapes: agg
     # would otherwise silently compress the pauses the tapes exist to script.
     # shellcheck disable=SC2086 # DEMO_FONT_DIRS is a pre-split flag list
-    agg "$_cast" "$_gif" --font-size "$DEMO_FONT_SIZE" --fps-cap 30 \
+    agg "$_cast" "$_staged" --font-size "$DEMO_FONT_SIZE" --fps-cap 30 \
         --idle-time-limit 30 --last-frame-duration 1 --theme "$DEMO_PALETTE" \
         --text-font-family "$DEMO_FONT" $DEMO_FONT_DIRS \
         >/dev/null 2>&1 || { echo "error: agg failed for $_tape" >&2; return 1; }
@@ -695,7 +699,7 @@ record_tape() {
             if (b[i] === 0x21 && b[i + 1] === 0xf9 && b[i + 2] === 0x04)
                 cs += b[i + 4] | (b[i + 5] << 8);
         console.log((cs / 100).toFixed(2));
-    ' "$_gif")
+    ' "$_staged")
     if ! node -e '
         const [want, got] = [Number(process.argv[1]), Number(process.argv[2])];
         // Generous: the clip legitimately carries the closing hold plus a beat
@@ -703,8 +707,10 @@ record_tape() {
         process.exit(got > want + 20 || got < want * 0.6 ? 1 : 0);
     ' "$_want" "$_got"; then
         echo "error: $_tape rendered ${_got}s but its tape scripts ${_want}s — refusing" >&2
+        echo "  (a stall under load, usually; the existing clip is left alone)" >&2
         return 1
     fi
+    mv "$_staged" "$_gif"
 
     # gif -> mp4. ffmpeg reads the gif's per-frame delays as timestamps, so
     # `fps=30` re-times to a constant rate for players that need one WITHOUT
@@ -717,15 +723,22 @@ record_tape() {
 
 check_demo_font
 
+# Keep going after a refused clip rather than abandoning the batch: recording
+# drives real processes in real time, so a clip can lose to a stall on a busy
+# machine, and that take is simply rejected (its existing media is untouched).
+# Failing the whole run on the first one would throw away the other nine
+# recordings — each of which costs a full re-seed — for a retryable fault.
+_failed=
 for tape in $TAPES; do
     echo "==> Seeding demo state for $tape.tape ..."
     seed_demo_state
     echo "==> Recording $tape.tape (theme: $DEMO_THEME) ..."
-    record_tape "$tape" || exit 1
+    record_tape "$tape" || _failed="$_failed $tape"
 done
 
 echo "==> Done. Updated docs/media/ for tape(s):$([ "$TAPES" = "$ALL_TAPES" ] && echo " all" || echo " $TAPES")"
 for tape in $TAPES; do
+    case " $_failed " in *" $tape "*) continue ;; esac
     case "$tape" in
         agents)      echo "    friring-demo.{gif,mp4}" ;;
         automations) echo "    automations-demo.{gif,mp4}" ;;
@@ -735,3 +748,8 @@ for tape in $TAPES; do
         *)           echo "    friring-$tape.{gif,mp4}" ;;
     esac
 done
+
+if [ -n "$_failed" ]; then
+    echo "error: refused (their existing media is untouched — re-run them):$_failed" >&2
+    exit 1
+fi
