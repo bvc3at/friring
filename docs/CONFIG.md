@@ -594,16 +594,19 @@ backend-name helpers `is_ssh_backend` / `is_wsl_backend` /
   The local TUI's control-mode connection subscribes once per connection
   (`refresh-client -B 'friring-status:%*:#{@friring_state}'`, re-armed on
   reconnect in `ControlMode::start`; tmux ≥ 3.2) and receives
-  `%subscription-changed` pushes (≤ 1/s); a **psmux** connection instead
-  runs a 1 s **poller thread** (`list-panes -F` diffed by
-  `control_mode::diff_polled_hook_states`) feeding the same queue. Both
-  channels drain each tick via `App::drain_remote_hook_events` into the
+  `%subscription-changed` pushes (≤ 1/s); a **remote psmux** connection
+  instead runs a 1 s **poller thread** (`list-panes -F` diffed by
+  `control_mode::diff_polled_hook_states`) feeding the same queue — armed
+  only behind the psmux gate below (a poll is an active per-second command,
+  unlike the passive subscription, and a *local* psmux session signals via
+  `friring-cli` directly). Both channels drain each tick via `App::drain_remote_hook_events` into the
   same `set_hook_state` columns local signals use — so Done→seen
   acknowledgment, notifications, rollups, and the stuck-`working` fallback
   are shared. Events are matched by **backend name + pane id** (ids collide
-  across hosts), allow-listed, and deduped. **Remaining carve-out:** hook
-  provisioning onto psmux/Windows hosts is gated off
-  (`spawn::psmux_hook_rewrite_supported`) until
+  across hosts), allow-listed, and deduped. **Remaining carve-out:** the
+  **whole psmux/Windows-host path** — hook provisioning, rewrite shipping,
+  and the status poller — is gated off on the one switch
+  (`session::psmux_hook_rewrite_supported`) until
   `scripts/dev/e2e/windows-vm.sh test`'s probes prove the psmux behaviors —
   such sessions show a `Hooks: degraded` hint instead of silently idling.
 - **Teardown.** `session delete --force` is backend-aware:
