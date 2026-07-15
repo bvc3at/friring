@@ -104,14 +104,29 @@ agent_command() {
     esac
 }
 
-# Which agent CLIs are available? Feature only the ones present.
+# Prefer coreutils `gtimeout` over `timeout`: third-party `timeout` shims exist
+# on PATH in the wild and silently break the child.
+if command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT=gtimeout
+elif command -v timeout >/dev/null 2>&1; then
+    TIMEOUT=timeout
+else
+    TIMEOUT=
+fi
+
+# Which agent CLIs can we actually feature? Present on PATH *and* responsive:
+# an agent that cannot answer `--version` cannot render a session either, and
+# filming its dead pane would be worse than leaving it out (this is the same
+# rule the e2e suite's require_agent applies).
 AGENTS=
 for a in claude codex opencode antigravity; do
     bin=$(agent_command "$a")
-    if command -v "$bin" >/dev/null 2>&1; then
-        AGENTS="$AGENTS $a"
-    else
+    if ! command -v "$bin" >/dev/null 2>&1; then
         echo "warning: '$bin' not found on PATH — skipping '$a' in the demo" >&2
+    elif [ -n "$TIMEOUT" ] && ! $TIMEOUT 15 "$bin" --version >/dev/null 2>&1; then
+        echo "warning: '$bin' did not respond to --version — skipping '$a' in the demo" >&2
+    else
+        AGENTS="$AGENTS $a"
     fi
 done
 if [ -z "$AGENTS" ]; then
