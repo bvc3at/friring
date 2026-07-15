@@ -459,6 +459,15 @@ interplay with ADR-P12 in `docs/PERFORMANCE.md`.
 
 ### Performance
 
+- **Shell-tab keystrokes echo immediately.** The demand-driven render loop's
+  output detector (`App::detect_output_redraw`, ADR-P1) summed only the
+  *agent* panes' `last_output_at`, so a shell pane's echo never marked the UI
+  dirty and only painted on the next keypress or the 250 ms forced-redraw
+  floor — a measured ~280 ms per typed character in the shell tab (~40 ms on
+  the agent tab). The fork folds each open shell pane's `last_output_at` into
+  the detector's signature, restoring ~keypress-immediate echo. See ADR-P1 in
+  `docs/PERFORMANCE.md`.
+
 - **Global-search keystrokes do no I/O (ADR-P13).** Upstream's search re-ran
   a bounded filesystem walk (up to 5000 `read_dir` calls) synchronously on
   **every keystroke** and hit SQLite on every task preview — visible typing

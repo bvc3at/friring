@@ -333,7 +333,6 @@ pub struct ShellPane {
     /// Kept alive so the reader loop's Arc clone has a peer.
     #[allow(dead_code)]
     exited: Arc<AtomicBool>,
-    #[allow(dead_code)]
     last_output_at: Arc<AtomicU64>,
     /// Captured OSC title for the shell pane (unused; kept for symmetry).
     #[allow(dead_code)]
@@ -343,6 +342,28 @@ pub struct ShellPane {
 impl ShellPane {
     pub fn send_input(&self, data: Vec<u8>) -> Result<()> {
         send_to_input_channel(&self.input_tx, data, "Shell")
+    }
+
+    /// Raw monotonic timestamp (epoch millis) of the pane's last output — the
+    /// shell twin of [`Session::last_output_at`]. Read by the render loop's
+    /// output-change detector ([`crate::app::App::detect_output_redraw`]) so a
+    /// shell keystroke's echo repaints immediately instead of waiting out the
+    /// forced-redraw floor.
+    pub fn last_output_at(&self) -> u64 {
+        self.last_output_at.load(Ordering::Relaxed)
+    }
+
+    /// Shell twin of [`Session::feed_output_for_test`]: bump `last_output_at`
+    /// (strictly increasing) and parse the bytes, exactly as the reader loop
+    /// would.
+    #[cfg(test)]
+    pub fn feed_output_for_test(&self, bytes: &[u8]) {
+        let prev = self.last_output_at.load(Ordering::Relaxed);
+        self.last_output_at
+            .store(now_millis().max(prev + 1), Ordering::Relaxed);
+        if let Ok(mut p) = self.parser.lock() {
+            p.process(bytes);
+        }
     }
 
     /// Build a ShellPane from wired-up I/O state.

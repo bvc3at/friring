@@ -4920,15 +4920,17 @@ impl App {
         self.metrics.bump(|p| &mut p.redraws_skipped);
     }
 
-    /// Detect new agent output since the last check and mark the UI dirty if so.
-    /// Reads each session's monotonic `last_output_at` atomic (no parser lock),
-    /// summing them into a rolling signature — a change means at least one
-    /// session produced output, so the terminal needs repainting.
+    /// Detect new agent/shell output since the last check and mark the UI dirty
+    /// if so. Reads each session's monotonic `last_output_at` atomic — and its
+    /// shell pane's, when one is open (a shell keystroke's echo must repaint
+    /// immediately, not wait out the forced-redraw floor) — summing them into a
+    /// rolling signature (no parser lock); a change means at least one pane
+    /// produced output, so the terminal needs repainting.
     pub fn detect_output_redraw(&mut self) {
-        let output_gen = self
-            .sessions
-            .iter()
-            .fold(0u64, |acc, s| acc.wrapping_add(s.last_output_at()));
+        let output_gen = self.sessions.iter().fold(0u64, |acc, s| {
+            let shell = s.shell_pane.as_ref().map_or(0, |sp| sp.last_output_at());
+            acc.wrapping_add(s.last_output_at()).wrapping_add(shell)
+        });
         if output_gen != self.last_output_gen {
             self.last_output_gen = output_gen;
             self.needs_redraw = true;
