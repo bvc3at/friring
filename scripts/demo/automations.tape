@@ -29,20 +29,21 @@ Show
 # session list in the left column.
 Sleep 2500ms
 
-# The Automations pane is part of the left column: focus the session list
-# (Ctrl+H from the terminal), then press `j` down past the last session to flow
-# straight into the Automations pane — one continuous list.
+# The Automations pane sits in the left column, beneath the session list. Focus
+# the list first (Ctrl+H from the terminal), then Ctrl+P (OpenAutomations) jumps
+# straight to the pane. Ctrl+P is in terminal_passthrough (it is readline's
+# previous-history), so it only acts as the chord once focus has left the
+# terminal — hence the Ctrl+H first.
+#
+# This used to walk `Down` past the last session to show the left column being
+# one continuous list. That counted on a fixed number of sessions: seed one
+# agent fewer and the walk lands somewhere else entirely, the keystrokes meant
+# for the editor get eaten by the session list's single-letter hotkeys (the `i`
+# in "morning-triage" opens the conversation-import picker), and the clip films
+# the wrong screen. The chord is count-independent.
 Ctrl+H
 Sleep 1200ms
-Down
-Sleep 400ms
-Down
-Sleep 400ms
-Down
-Sleep 400ms
-Down
-Sleep 400ms
-Down
+Ctrl+P
 Sleep 1600ms
 
 # Create a new automation right from the pane (`n`, like Ctrl+N for a session).
@@ -103,8 +104,11 @@ Sleep 600ms
 Type "Triage failing CI and summarize blockers"
 Sleep 1200ms
 
-# Save — returns to the pane; the automation shows a live next-run countdown.
-Enter
+# Save with Ctrl+S — returns to the pane; the automation shows a live next-run
+# countdown. NOT Enter: `prompt` is the one multi-line field, so Enter inserts a
+# newline there rather than saving (see AutomationEditorModal::handle_key), which
+# left the modal open and swallowed every later beat, including the closing quit.
+Ctrl+S
 Sleep 2000ms
 
 # Toggle enabled off and back on, straight from the pane.

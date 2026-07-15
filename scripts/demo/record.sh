@@ -375,6 +375,18 @@ fi
     done
 } > "$CFG_DIR/agents.toml"
 
+# --- tmux config the agent panes inherit -------------------------------------
+# Written before any tmux server starts: a server reads ~/.tmux.conf once, at
+# start, and $HOME is the sandbox here.
+#
+# focus-events is the point. Without it the agents' own terminals never learn
+# they have focus, so Claude Code paints a "tmux focus-events off · add 'set -g
+# focus-events on' to ~/.tmux.conf" hint across the pane — filmed in every clip
+# — and the focus/query escapes the recorder's attach generates are passed
+# through to the agent instead of being consumed, where they land as a stray
+# glyph in its composer.
+printf 'set -g focus-events on\nset -g default-terminal "tmux-256color"\n' > "$HOME/.tmux.conf"
+
 # --- Keybindings: rebind global search to Ctrl+A for the demo ----------------
 # The real default for Action::GlobalSearch is Ctrl+/ (plus the Ctrl+7/Ctrl+_
 # raw-0x1F encodings), which VHS+ttyd do not deliver reliably across terminals.
@@ -640,11 +652,21 @@ record_tape() {
         sleep 0.25; _i=$((_i + 1))
     done
     _still_recording=0
-    tmux -L "$CAST_SOCKET" has-session -t rec 2>/dev/null && _still_recording=1
+    if tmux -L "$CAST_SOCKET" has-session -t rec 2>/dev/null; then
+        _still_recording=1
+        # Whatever is on screen is why the tape could not quit — a modal still
+        # open, a field still focused, a beat that landed somewhere unintended.
+        # Keep it: without the pane this failure is just an assertion, and the
+        # session is about to be killed.
+        _dump="$REPO_ROOT/target/demo-failed-$_tape.txt"
+        mkdir -p "$(dirname "$_dump")"
+        tmux -L "$DEMO_SOCKET" capture-pane -p -t demo > "$_dump" 2>/dev/null || true
+    fi
     tmux -L "$DEMO_SOCKET" kill-server 2>/dev/null || true
     tmux -L "$CAST_SOCKET" kill-server 2>/dev/null || true
     if [ "$_still_recording" = "1" ]; then
         echo "error: $_tape never quit the TUI; the cast is truncated" >&2
+        echo "  the screen it was stuck on: $_dump" >&2
         return 1
     fi
     [ -s "$_cast" ] || { echo "error: no cast recorded for $_tape" >&2; return 1; }
