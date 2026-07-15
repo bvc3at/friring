@@ -328,17 +328,6 @@ fi
     done
 } > "$CFG_DIR/agents.toml"
 
-# Wire the built-in hooks extension NOW, before any session exists. Two
-# reasons: sessions only get the hook wiring patched into their agent args if
-# the extension is active when they are spawned (so this is what makes the
-# demo's working/done status indicators live), and the TUI would otherwise do
-# this itself on first launch and toast the outcome — which it reports at Error
-# level, putting a red "Config: hooks: wired agent hooks for claude" banner
-# across the bottom of every frame we film. Doing it here consumes that
-# first-wire-up, so the TUI boots clean.
-"$CLI_BIN" extension activate hooks >/dev/null 2>&1 \
-    || echo "warning: could not activate the hooks extension" >&2
-
 # --- Keybindings: rebind global search to Ctrl+A for the demo ----------------
 # The real default for Action::GlobalSearch is Ctrl+/ (plus the Ctrl+7/Ctrl+_
 # raw-0x1F encodings), which VHS+ttyd do not deliver reliably across terminals.
@@ -347,14 +336,54 @@ fi
 # overridden; every other action keeps its built-in default.
 printf '{\n  "GlobalSearch": ["ctrl+a"]\n}\n' > "$CFG_DIR/keybindings.json"
 
+# --- Seed the demo state -----------------------------------------------------
+# Called fresh before EVERY tape, because the clips mutate the very state the
+# next one poses against: `agents` and `session-creation` each spawn a session,
+# `fork` spawns two more, `tasks`/`automations` add rows. Seeding once and
+# filming all ten in a row therefore drifts — by the last clip the session list
+# has accumulated strangers and the *selected* session is whatever was spawned
+# most recently, so `code-review` opened on a session with no branch and filmed
+# "No changes to show for this target". Re-seeding makes each clip independent
+# and reproducible on its own (`record.sh code-review` films exactly what the
+# full run does), at the cost of a rebuild per tape.
+seed_demo_state() {
+    # Wipe the state the previous clip left: the agent panes (the tmux server
+    # owns them) and every session/task/automation row.
+    tmux -L "$TBX_DEV_SOCKET" kill-server >/dev/null 2>&1 || true
+    rm -f "$DB_FILE"
+    # Wire the built-in hooks extension into the fresh DB before any session
+    # exists. Two reasons: a session only gets the hook wiring patched into its
+    # agent args if the extension is active when it is spawned (this is what
+    # makes the clips' working/done status indicators live), and the TUI would
+    # otherwise do this itself on first launch and toast the outcome — which it
+    # reports at Error level, painting a red "Config: hooks: wired agent hooks
+    # for claude" banner across the bottom of every frame we film.
+    "$CLI_BIN" extension activate hooks >/dev/null 2>&1 \
+        || echo "warning: could not activate the hooks extension" >&2
+    seed_sessions
+    preplay_conversations
+    seed_tasks_and_automation
+    set_theme "$DEMO_THEME"
+}
+
 # --- Create one session per scripted session ---------------------------------
 # Order follows demo-content.json (review LAST, so restore leaves it selected on
 # launch — finish_adopted_session makes the last-restored session active — which
 # is what the code-review and hero tapes rely on). The "review" session is a
 # worktree off the sample repo whose branch carries the review object's diff, so
 # the code-review view shows a real, colourful <base>..HEAD change.
+seed_sessions() {
 echo "==> Seeding one session per scripted agent"
 REVIEW_BRANCH=$(jq -r '.review.branch' "$CONTENT")
+# The review worktree + branch outlive the DB, so a re-seed would otherwise
+# collide with the previous clip's leftovers.
+git -C "$DEMO_REPO" worktree list --porcelain 2>/dev/null \
+    | awk '/^worktree /{print substr($0,10)}' \
+    | while IFS= read -r wt; do
+        [ "$wt" = "$DEMO_REPO" ] || git -C "$DEMO_REPO" worktree remove --force "$wt" 2>/dev/null
+    done
+git -C "$DEMO_REPO" worktree prune 2>/dev/null || true
+git -C "$DEMO_REPO" branch -D "$REVIEW_BRANCH" >/dev/null 2>&1 || true
 session_count=$(jq '.sessions | length' "$CONTENT")
 i=0
 while [ "$i" -lt "$session_count" ]; do
@@ -380,6 +409,7 @@ while [ "$i" -lt "$session_count" ]; do
             --agent "$sagent" >/dev/null
     fi
 done
+}
 
 # --- Pre-play each scripted conversation into its pane -----------------------
 # `friring-cli session send` types the prompt into the agent's pane (paste →
@@ -415,6 +445,7 @@ agent_ready_marker() {
     esac
 }
 
+preplay_conversations() {
 pp_count=$(jq 'length' "$STUB_DIR/preplay.json")
 p=0
 while [ "$p" -lt "$pp_count" ]; do
@@ -441,12 +472,13 @@ while [ "$p" -lt "$pp_count" ]; do
             || echo "  warning: '$marker' never rendered in $psession" >&2
     done
 done
+}
 
 # --- Pre-seed the scripted tasks + automation --------------------------------
-# These give the `tasks` and `search` clips real content to render (the search
-# strip searches across sessions, tasks AND automations at once).
-# shellcheck disable=SC2086 # $TAPES is a space-separated list, split on purpose
-if printf '%s ' $TAPES | grep -Eq '(^| )(tasks|search)( |$)'; then
+# Seeded for every clip, not just `tasks`/`search`: the Automations pane sits in
+# the left column of every frame, so an empty one would read as "this feature has
+# nothing in it" in nine clips out of ten.
+seed_tasks_and_automation() {
     echo "==> Seeding scripted tasks + an automation"
     tk_count=$(jq '.tasks | length' "$CONTENT")
     k=0
@@ -466,7 +498,7 @@ if printf '%s ' $TAPES | grep -Eq '(^| )(tasks|search)( |$)'; then
     au_prompt=$(jq -r '.automation.prompt' "$CONTENT")
     "$CLI_BIN" automation create --name "$au_name" --trigger daily --time "09:00" \
         --repo "$DEMO_REPO" --prompt "$au_prompt" >/dev/null 2>&1 || true
-fi
+}
 
 # --- Record -----------------------------------------------------------------
 # Each tape declares its own Output paths, so one tape == one gif+mp4 pair.
@@ -561,9 +593,8 @@ record_tape() {
 }
 
 for tape in $TAPES; do
-    # Re-apply before every tape: the `theme` clip switches themes (and persists
-    # the change), so without this any tape after it would start on the wrong one.
-    set_theme "$DEMO_THEME"
+    echo "==> Seeding demo state for $tape.tape ..."
+    seed_demo_state
     echo "==> Recording $tape.tape (theme: $DEMO_THEME) ..."
     record_tape "$tape" || exit 1
 done
