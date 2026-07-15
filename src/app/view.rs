@@ -477,9 +477,19 @@ impl App {
             info,
             Some(&self.metrics.system_metrics),
             &data.automations,
-            self.usage.get(&info.agent),
+            self.agent_usage(info),
             data.parent_name.as_deref(),
         );
+    }
+
+    /// `info`'s cached account usage, scoped per (agent, host): a remote
+    /// session shows the account its *host* is logged into, not the local one.
+    ///
+    /// Shared by rendering and measuring, which the fork split apart — one
+    /// lookup, so the two can't disagree about whether a usage row exists.
+    fn agent_usage(&self, info: &SessionInfo) -> Option<&crate::session::AgentUsage> {
+        self.usage
+            .get(&(info.agent.clone(), info.remote_host.clone()))
     }
 
     /// The owned info-panel inputs shared by rendering and measuring
@@ -535,7 +545,7 @@ impl App {
             info,
             Some(&self.metrics.system_metrics),
             &data.automations,
-            self.usage.get(&info.agent),
+            self.agent_usage(info),
             data.parent_name.as_deref(),
         )
     }
