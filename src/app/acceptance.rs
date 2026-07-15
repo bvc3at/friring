@@ -2985,6 +2985,41 @@ fn injected_output_marks_redraw_and_renders() {
     );
 }
 
+#[tokio::test]
+async fn injected_shell_output_marks_redraw_and_renders() {
+    // Regression: the output-change detector (ADR-P1) summed only the *agent*
+    // panes' `last_output_at`, so a shell keystroke's echo never marked the UI
+    // dirty — it painted on the next keypress or the 250 ms forced-redraw
+    // floor. Measured on the real pipeline: ~280 ms per echoed character in
+    // the shell tab vs ~40 ms on the agent tab.
+    let mut h = Harness::spawnable(1);
+    h.ctrl('t'); // ToggleShell — spawns the shell pane and shows the shell view
+    assert!(h.app.sessions[0].shell_pane.is_some());
+
+    // Sync the output-change detector, then settle to a clean state.
+    h.app.detect_output_redraw();
+    h.app.mark_redrawn();
+    h.app.detect_output_redraw();
+    assert!(!h.app.should_redraw(), "no new output ⇒ no repaint");
+
+    h.app.sessions[0]
+        .shell_pane
+        .as_ref()
+        .unwrap()
+        .feed_output_for_test(b"SHELL-ECHO-42\r\n");
+    h.app.detect_output_redraw();
+    assert!(
+        h.app.should_redraw(),
+        "shell-pane output marks the UI dirty (echo repaints immediately)"
+    );
+
+    let screen = h.render();
+    assert!(
+        screen.contains("SHELL-ECHO-42"),
+        "injected shell output reaches the rendered shell pane:\n{screen}"
+    );
+}
+
 #[test]
 fn osc_title_and_bell_reach_the_session() {
     let mut h = Harness::standard(1);

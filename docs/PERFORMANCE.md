@@ -20,10 +20,15 @@ iteration. State drives the paint:
 
 - **Input** marks the UI dirty: `App::update` calls `App::request_redraw`, so a
   keypress paints on the very next iteration (latency unchanged).
-- **Agent output** marks the UI dirty: `App::detect_output_redraw` sums each
-  session's monotonic `last_output_at` atomic into a rolling signature
-  (`Session::last_output_at`, no vt100 lock); a change means new output, so the
-  terminal repaints immediately.
+- **Agent and shell output** mark the UI dirty: `App::detect_output_redraw`
+  sums each session's monotonic `last_output_at` atomic — and its shell
+  pane's, when one is open — into a rolling signature (`Session::
+  last_output_at` / `ShellPane::last_output_at`, no vt100 lock); a change
+  means new output, so the terminal repaints immediately. The shell pane was
+  originally missed here, which made every shell-tab keystroke's echo wait
+  out the 250 ms floor (~280 ms measured per character vs ~40 ms on the agent
+  tab) — the regression test is
+  `injected_shell_output_marks_redraw_and_renders`.
 - **Status transitions** mark the UI dirty: `refresh_session_statuses` requests
   a redraw when a session's status/activity/notification actually changes
   (a quiet `Busy → Waiting` produces no output, so the output detector can't
