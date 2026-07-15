@@ -354,10 +354,13 @@ impl ShellPane {
     }
 
     /// Shell twin of [`Session::feed_output_for_test`]: bump `last_output_at`
-    /// (strictly increasing) and parse the bytes, exactly as the reader loop
-    /// would.
+    /// and run the bytes through the vt100 parser, driving the same state the
+    /// reader loop's `%output` path drives.
     #[cfg(test)]
     pub fn feed_output_for_test(&self, bytes: &[u8]) {
+        // Strictly-increasing bump, unlike the reader loop's plain `now_millis()`
+        // store: two feeds within the same millisecond must still read as *new*
+        // output to `App::detect_output_redraw`'s signature.
         let prev = self.last_output_at.load(Ordering::Relaxed);
         self.last_output_at
             .store(now_millis().max(prev + 1), Ordering::Relaxed);
