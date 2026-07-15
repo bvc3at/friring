@@ -799,6 +799,11 @@ pub struct SessionInfo {
     /// The narrowed effective policy a bridge child was launched under, as JSON.
     /// `None` for every session that is not one.
     pub sandbox_overlay: Option<String>,
+    /// Why hooks-driven status is degraded/absent on this (remote) session —
+    /// e.g. the hooks config was stripped for the host, or provisioning
+    /// failed. Set at spawn time, transient (never persisted); rendered as a
+    /// hint in the info panel. `None` = healthy or local.
+    pub hook_wiring: Option<String>,
 }
 
 impl SessionInfo {
@@ -832,6 +837,7 @@ impl SessionInfo {
             egress_endpoint: None,
             egress_state: EgressState::None,
             sandbox_overlay: None,
+            hook_wiring: None,
         }
     }
 }
