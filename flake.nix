@@ -59,6 +59,10 @@
           asciinema
           agg
           ffmpeg
+          # The clips' typography is pinned to this (record.sh: DEMO_FONT), and
+          # the run refuses to record without it — agg would otherwise silently
+          # fall back to whatever the machine has.
+          meslo-lg
         ];
 
         # Dev tools NOT in nixpkgs — the shellHook nudges the user to install

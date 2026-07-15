@@ -371,6 +371,16 @@ Consequences worth knowing when editing a tape or the recorder:
 - Grid and size live in `record.sh` (`DEMO_COLS`/`DEMO_ROWS`/`DEMO_FONT_SIZE`):
   175x42 at font-size 18 renders ~1920x1080, at about the column count VHS's
   ttyd produced, so the TUI lays itself out as before.
+- The font is pinned to **Meslo LG S** (`DEMO_FONT`) and the run **refuses to
+  record without it**. agg resolves families itself and silently falls back when
+  one is missing — its default list starts with JetBrains Mono, which is rarely
+  installed, so the clips used to inherit whatever the recording box happened to
+  have. It is passed as `--text-font-family`, never `--font-family`: the latter
+  bypasses agg's automatic fallbacks, and those are where friring's symbol glyphs
+  (`❯ ◐ ⏺ ✻`, box drawing) come from. Install with
+  `brew install --cask font-meslo-lg`; the Nix flake pins it.
+- Renderer: agg's default **`swash`**. `--renderer resvg` is *worse* here — it
+  breaks box-drawing borders into dashed segments and drops glyphs.
 
 Every clip uses **real agent CLIs driven by the e2e model stubs** — no accounts,
 no network, nothing to log in to. The script seeds one session per installed CLI

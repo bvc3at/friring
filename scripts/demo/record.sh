@@ -94,6 +94,26 @@ if [ -n "$missing" ]; then
 fi
 [ -f "$CONTENT" ] || { echo "error: no demo content at $CONTENT" >&2; exit 1; }
 
+# The demo font must be installed, and we have to *ask agg* rather than probe the
+# system: agg resolves families itself and, when one is missing, silently falls
+# back to whatever else it can find — which is how the media's typography
+# previously drifted with the recording machine. A one-event cast is enough to
+# make it report what it picked.
+check_demo_font() {
+    _probe=$(mktemp -d "${TMPDIR:-/tmp}/friring-font.XXXXXX")
+    printf '{"version": 2, "width": 20, "height": 3}\n[0.0, "o", "probe"]\n' > "$_probe/p.cast"
+    _picked=$(agg "$_probe/p.cast" "$_probe/p.gif" --fps-cap 1 \
+        --text-font-family "$DEMO_FONT" -v 2>&1 \
+        | sed -n 's/.*primary text font family: //p' | head -1)
+    rm -r "$_probe"
+    if [ "$_picked" != "$DEMO_FONT" ]; then
+        echo "error: demo font '$DEMO_FONT' is not installed (agg would use '${_picked:-none}')" >&2
+        echo "  macOS:  brew install --cask font-meslo-lg" >&2
+        echo "  nix:    it is in the flake's demoTools" >&2
+        exit 1
+    fi
+}
+
 # Map a featured-agent display name to its actual CLI binary. They differ only
 # for antigravity, whose binary is `agy` (the Gemini CLI successor); identity for
 # everyone else.
@@ -532,6 +552,13 @@ set_theme() {
 DEMO_COLS=175
 DEMO_ROWS=42
 DEMO_FONT_SIZE=18
+# Meslo LG S — pinned rather than left to agg's default list, whose first entry
+# (JetBrains Mono) is rarely installed, so the clips silently fell back to
+# whatever the machine happened to have (Menlo here) and the media's typography
+# changed with the recording box. Set via --text-font-family, NOT --font-family:
+# the latter bypasses agg's automatic fallbacks, which is where the symbol glyphs
+# friring paints (❯ ◐ ⏺ ✻, box drawing) come from.
+DEMO_FONT="Meslo LG S"
 # Catppuccin Mocha (bg,fg + the 16 ANSI slots) — the palette the tapes' `Set
 # Theme` asked VHS for. friring paints its own theme in truecolor on top; this
 # is what the agent panes' default-coloured text lands on.
@@ -564,11 +591,19 @@ record_tape() {
     tmux -L "$DEMO_SOCKET" new-session -d -s demo -x "$DEMO_COLS" -y "$DEMO_ROWS" "$FRIRING_BIN"
     # No status bar: an attached client renders it, so it would be filmed.
     tmux -L "$DEMO_SOCKET" set -g status off
+    # Fail closed if the TUI never paints: recording a session that isn't up
+    # yet films a blank or half-drawn screen, and the run would still report
+    # success and overwrite good media with it.
     _i=0
-    while [ "$_i" -lt 100 ]; do
+    while [ "$_i" -lt 300 ]; do
         tmux -L "$DEMO_SOCKET" capture-pane -p -t demo 2>/dev/null | grep -q "friring" && break
         sleep 0.1; _i=$((_i + 1))
     done
+    if [ "$_i" -ge 300 ]; then
+        echo "error: the TUI never painted for $_tape — refusing to record" >&2
+        tmux -L "$DEMO_SOCKET" kill-server 2>/dev/null || true
+        return 1
+    fi
 
     # asciinema needs a real tty, which this script has no way to hand it, so it
     # runs inside its own tmux pane and records an attached client of the demo
@@ -583,19 +618,30 @@ record_tape() {
         --socket "$DEMO_SOCKET" --session demo
 
     # The tape's closing Ctrl+Q quits the TUI, which ends the attach, which ends
-    # asciinema and flushes the cast.
+    # asciinema and flushes the cast. Fail closed if it is still recording: only
+    # asciinema's own exit flushes the tail of the cast, so killing it here
+    # (because the TUI never quit — a tape whose last chord was swallowed by a
+    # modal, say) would leave a truncated stream that still renders happily into
+    # a clip missing its ending. `-s` below only catches an EMPTY cast.
     _i=0
     while tmux -L "$CAST_SOCKET" has-session -t rec 2>/dev/null && [ "$_i" -lt 40 ]; do
         sleep 0.25; _i=$((_i + 1))
     done
+    _still_recording=0
+    tmux -L "$CAST_SOCKET" has-session -t rec 2>/dev/null && _still_recording=1
     tmux -L "$DEMO_SOCKET" kill-server 2>/dev/null || true
     tmux -L "$CAST_SOCKET" kill-server 2>/dev/null || true
+    if [ "$_still_recording" = "1" ]; then
+        echo "error: $_tape never quit the TUI; the cast is truncated" >&2
+        return 1
+    fi
     [ -s "$_cast" ] || { echo "error: no cast recorded for $_tape" >&2; return 1; }
 
     # --idle-time-limit is deliberately far above any beat in the tapes: agg
     # would otherwise silently compress the pauses the tapes exist to script.
     agg "$_cast" "$_gif" --font-size "$DEMO_FONT_SIZE" --fps-cap 30 \
         --idle-time-limit 30 --last-frame-duration 1 --theme "$DEMO_PALETTE" \
+        --text-font-family "$DEMO_FONT" \
         >/dev/null 2>&1 || { echo "error: agg failed for $_tape" >&2; return 1; }
 
     # gif -> mp4. ffmpeg reads the gif's per-frame delays as timestamps, so
@@ -606,6 +652,8 @@ record_tape() {
         -vf "fps=30,scale=trunc(iw/2)*2:trunc(ih/2)*2" "$_mp4" \
         || { echo "error: ffmpeg failed for $_tape" >&2; return 1; }
 }
+
+check_demo_font
 
 for tape in $TAPES; do
     echo "==> Seeding demo state for $tape.tape ..."
