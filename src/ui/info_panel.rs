@@ -311,6 +311,17 @@ fn append_session_section<'a>(
             ),
         ]));
     }
+    // Hooks-driven status is degraded on this (remote) session — without this
+    // hint the dot just silently stays Idle and looks like an agent at rest.
+    if let Some(reason) = info.hook_wiring.as_deref() {
+        lines.push(Line::from(vec![
+            Span::styled("Hooks: ", Theme::label()),
+            Span::styled(
+                format!("degraded — {reason}"),
+                Style::default().fg(Theme::text_muted()),
+            ),
+        ]));
+    }
     // Live activity from the agent-emitted OSC terminal title.
     if let Some(activity) = info.agent_activity.as_deref() {
         lines.push(Line::from(vec![
@@ -940,6 +951,35 @@ mod tests {
         assert!(row.contains('\u{26e8}'), "{row}");
         assert!(row.contains("dev"), "{row}");
         assert!(!row.contains('·'), "{row}");
+    }
+
+    // ── append_session_section tests ──
+
+    #[test]
+    fn session_section_renders_hook_wiring_degradation() {
+        let mut info = SessionInfo::new("demo".into());
+        let mut lines = Vec::new();
+        append_session_section(&mut lines, &info, &Resolved::default());
+        let text = |lines: &[Line]| {
+            lines
+                .iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Healthy/local session: no Hooks row at all.
+        assert!(!text(&lines).contains("Hooks:"));
+
+        info.hook_wiring = Some("codex hooks not provisioned on psmux host 'win'".into());
+        let mut lines = Vec::new();
+        append_session_section(&mut lines, &info, &Resolved::default());
+        let rendered = text(&lines);
+        assert!(rendered.contains("Hooks: degraded — codex hooks not provisioned"));
     }
 
     // ── human_bytes tests ──

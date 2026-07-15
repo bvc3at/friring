@@ -715,8 +715,10 @@ fn install_external_file(
 
 /// Marker present in every hook command we ship (`friring-cli session signal
 /// …`). [`crate::agent::json_merge::prune_marked`] uses it to remove exactly our
-/// merged entries on uninstall — robust across payload schema changes.
-const HOOK_SIGNAL_MARKER: &str = "friring-cli session signal";
+/// merged entries on uninstall — robust across payload schema changes. The
+/// remote provisioning (`remote_hooks`) prunes on it too, paired with the
+/// rewritten form's [`crate::session::REMOTE_HOOK_STATE_OPTION`] marker.
+pub(crate) const HOOK_SIGNAL_MARKER: &str = "friring-cli session signal";
 
 /// Pre-rename marker (Thurbox era). Existing installs merged their hook entries
 /// under this command name; uninstall must still prune them or the rename leaves
@@ -1147,7 +1149,9 @@ fn safe_join(home: &Path, rel: &str) -> Result<PathBuf, String> {
 /// content) so reinstall can overwrite *its own* file but not one the user has
 /// edited (or whose marker they removed). [`LEGACY_MANAGED_MARKER`] is recognized
 /// too, so a file written by the pre-rename version is still treated as ours.
-const MANAGED_MARKER: &str = "friring `extension install`";
+/// The remote provisioning (`remote_hooks`) applies the same rule to files it
+/// ships to a host.
+pub(crate) const MANAGED_MARKER: &str = "friring `extension install`";
 
 /// Pre-rename managed marker (Thurbox era): files written by the previous version
 /// carry it, so uninstall/reinstall must still recognize them as ours rather than

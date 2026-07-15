@@ -178,9 +178,35 @@ struct SpawnInputs {
     /// / delete resolve the same directory.
     workspace_dir: Option<PathBuf>,
     backend: Arc<dyn SessionBackend>,
-    provider: Arc<dyn crate::agent::AgentProvider>,
+    /// Un-adapted agent def; the launch provider is built by
+    /// [`finalize_launch_provider`] on the *consumer's* thread, because for a
+    /// remote host the adaptation performs ssh round-trips (arg materialization
+    /// + hook provisioning) that must stay off the UI thread on the async path.
+    agent_def: AgentDef,
+    /// The remote host `config.backend` targets (`None` = local).
+    spawn_host: Option<crate::session::HostDef>,
+    /// Whether the built-in hooks extension is active (drives remote hook
+    /// provisioning); read on the UI thread so the worker needs no DB handle.
+    hooks_enabled: bool,
     rows: u16,
     cols: u16,
+}
+
+/// Build the launch provider from prepared [`SpawnInputs`] parts: remote arg
+/// adaptation + per-agent hook provisioning
+/// ([`crate::session_ops::spawn::adapt_def_for_launch`]), then the generic
+/// provider. For a remote host this performs ssh round-trips — call it on a
+/// worker, never the UI thread (the synchronous spawn path eats it on the
+/// calling thread by contract, like `ensure_backend_ready`). Also returns the
+/// hook-wiring degradation note destined for [`SessionInfo::hook_wiring`].
+fn finalize_launch_provider(
+    agent_def: AgentDef,
+    host: Option<&crate::session::HostDef>,
+    hooks_enabled: bool,
+) -> (Arc<dyn crate::agent::AgentProvider>, Option<String>) {
+    let (def, degraded) =
+        crate::session_ops::spawn::adapt_def_for_launch(agent_def, host, hooks_enabled);
+    (Arc::new(GenericProvider::new(def)), degraded)
 }
 
 /// Continuation for a backgrounded interactive `Session::spawn`: the metadata
@@ -1877,8 +1903,10 @@ impl App {
     /// for the host — materialized at a home-translated remote path, or stripped
     /// when no remote path can work — because an unresolvable path kills the
     /// agent on launch ("Settings file not found"). Shares the headless spawn's
-    /// implementation; used by every path that launches a new agent process
-    /// (spawn, restore, respawn-on-restore).
+    /// implementation; used by restart/respawn-on-restore (which run on the
+    /// caller's thread and re-launch into an already-provisioned host). The
+    /// spawn paths use [`finalize_launch_provider`] instead, which additionally
+    /// provisions the agent's remote hook files and runs on a worker.
     fn launch_provider_for(&self, config: &SessionConfig) -> Arc<dyn crate::agent::AgentProvider> {
         let mut def = self.agent_def_for(&config.agent);
         if let Some(h) = self.host_for_backend(config.backend.as_deref()) {
@@ -5261,14 +5289,20 @@ impl App {
             }
         };
 
-        let provider = self.launch_provider_for(&config);
+        // The def is looked up here (cheap registry read); its remote
+        // adaptation — ssh round-trips — is deferred to
+        // `finalize_launch_provider` on the consumer's thread (ADR-P12).
+        let agent_def = self.agent_def_for(&config.agent);
+        let hooks_enabled = !self.db.builtin_hooks_opted_out().unwrap_or(false);
 
         Some(SpawnInputs {
             config,
             primary_cwd,
             workspace_dir,
             backend,
-            provider,
+            agent_def,
+            spawn_host,
+            hooks_enabled,
             rows,
             cols,
         })
@@ -5373,12 +5407,20 @@ impl App {
         else {
             return;
         };
-        // Synchronous path: blocking on backend readiness here is the point.
+        // This path is synchronous by contract (its callers need the session id
+        // back immediately), so it eats the ready-up + remote adaptation on the
+        // calling thread — unlike `do_spawn_session_async`, which hands both to
+        // a worker.
         if let Err(e) = ensure_backend_ready(&inputs.backend) {
             error!("Failed to select backend: {e}");
             self.set_error(e);
             return;
         }
+        let (provider, hook_wiring) = finalize_launch_provider(
+            inputs.agent_def,
+            inputs.spawn_host.as_ref(),
+            inputs.hooks_enabled,
+        );
 
         match Session::spawn(
             name,
@@ -5386,9 +5428,10 @@ impl App {
             inputs.cols,
             &inputs.config,
             &inputs.backend,
-            &inputs.provider,
+            &provider,
         ) {
-            Ok(session) => {
+            Ok(mut session) => {
+                session.info.hook_wiring = hook_wiring;
                 let task_prompt = self.task_ui.pending_task_prompt.take();
                 self.finalize_spawned_session(
                     session,
@@ -5445,7 +5488,9 @@ impl App {
             primary_cwd,
             workspace_dir,
             backend,
-            provider,
+            agent_def,
+            spawn_host,
+            hooks_enabled,
             rows,
             cols,
         } = inputs;
@@ -5473,11 +5518,19 @@ impl App {
         self.set_status(StatusLevel::Info, format!("Spawning {name}…"));
 
         tokio::task::spawn_blocking(move || {
-            // Backend readiness (control-mode attach / SSH connect) belongs on
-            // the worker too — it stalled the agent-picker Enter (ADR-P12).
+            // Backend readiness (control-mode attach / SSH connect) and the
+            // launch-provider finalization (remote agent-config materialization +
+            // hook provisioning round-trips) belong on the worker too — on the UI
+            // thread they stalled the agent-picker Enter (ADR-P12).
             let result = ensure_backend_ready(&backend)
                 .and_then(|()| {
+                    let (provider, hook_wiring) =
+                        finalize_launch_provider(agent_def, spawn_host.as_ref(), hooks_enabled);
                     Session::spawn(name, rows, cols, &config, &backend, &provider)
+                        .map(|mut session| {
+                            session.info.hook_wiring = hook_wiring;
+                            session
+                        })
                         .map_err(|e| format!("{e:#}"))
                 })
                 .map(|mut session| {

@@ -562,31 +562,50 @@ backend-name helpers `is_ssh_backend` / `is_wsl_backend` /
 - **Agent args.** Args that reference friring-managed config by a *local*
   path (the hooks extension's `--settings <config>/hooks/claude.json`)
   would kill a remote agent ("Settings file not found"), so
-  `session_ops::spawn::adapt_agent_args_for_remote` rewrites them per
+  `session_ops::spawn::adapt_def_for_launch` (shared by headless spawn and
+  the TUI, run on the spawn worker — never the UI thread) rewrites them per
   host: on a **POSIX remote** the home-anchored path is translated to the
   remote home, the file copied there, and the arg substituted; on a
-  **psmux host / non-POSIX config root / failed copy** the flag+path pair
-  is **stripped** so the agent launches clean. The local-path env hints
+  **psmux host** (while `psmux_hook_rewrite_supported` stays off) **/
+  non-POSIX config root / failed copy** the flag+path pair is **stripped**
+  so the agent launches clean — surfaced as a `Hooks: degraded` row in the
+  info panel (`SessionInfo.hook_wiring`). Literal signal commands carried
+  directly in args (aider's `--notifications-command`) are rewritten too.
+  The local-path env hints
   (`FRIRING_METRICS_DIR` / `FRIRING_CONFIG_DIR` / `FRIRING_DATA_DIR`) are
   likewise skipped for remote spawns (`inject_friring_env`); only the
   opaque identity vars travel.
-- **Session status** (hooks-driven, like local — see [Session
-  status](#session-status)). `friring-cli session signal` can't run from a
-  host (there is no CLI there, and it would write the host's own DB), so
-  the materialized hook file's commands are rewritten
-  (`builtin_hooks::rewrite_hook_signals_for_remote`) to set a tmux **pane
+- **Session status** (hooks-driven, like local, **all agents** — see
+  [Session status](#session-status)). `friring-cli session signal` can't
+  run from a host (there is no CLI there, and it would write the host's own
+  DB), so hook commands are rewritten
+  (`builtin_hooks::rewrite_hook_signals_for_target`) to set a tmux **pane
   user option** instead: `tmux set-option -p @friring_state <s>` needs no
-  socket, pane id, or identity. The local TUI's control-mode connection
-  subscribes once per connection (`refresh-client -B
-  'friring-status:%*:#{@friring_state}'`, re-armed on reconnect in
-  `ControlMode::start`; tmux ≥ 3.2) and drains `%subscription-changed`
-  pushes (≤ 1/s) via `App::drain_remote_hook_events` into the same
-  `set_hook_state` columns local signals use — so Done→seen
+  socket, pane id, or identity (the psmux form bakes in `-L <socket>`).
+  Delivery per agent: claude's hooks file travels via its `--settings` arg;
+  agents wired through their **own config dir** (codex, antigravity,
+  opencode, vibe, copilot) are provisioned at spawn time by
+  `session_ops::remote_hooks::provision_agent_hooks_on_host` — the
+  rewritten payload is shipped into the host's agent config dir with the
+  local installer's safety rules (`requires_dir` probe over ssh,
+  prune-then-merge for shared JSON, managed-marker guard for standalone
+  files, compare-before-write; cached per `(backend, agent)`, best-effort,
+  never fails the spawn; remote **cleanup** is a documented leave-behind).
+  The local TUI's control-mode connection subscribes once per connection
+  (`refresh-client -B 'friring-status:%*:#{@friring_state}'`, re-armed on
+  reconnect in `ControlMode::start`; tmux ≥ 3.2) and receives
+  `%subscription-changed` pushes (≤ 1/s); a **psmux** connection instead
+  runs a 1 s **poller thread** (`list-panes -F` diffed by
+  `control_mode::diff_polled_hook_states`) feeding the same queue. Both
+  channels drain each tick via `App::drain_remote_hook_events` into the
+  same `set_hook_state` columns local signals use — so Done→seen
   acknowledgment, notifications, rollups, and the stuck-`working` fallback
-  are shared. Events are matched by **backend name + pane id** (ids
-  collide across hosts), allow-listed, and deduped. **Carve-outs:** psmux
-  remotes (no subscriptions; hooks stripped) and non-claude agents (hook
-  configs aren't materialized remotely) stay Idle-only.
+  are shared. Events are matched by **backend name + pane id** (ids collide
+  across hosts), allow-listed, and deduped. **Remaining carve-out:** hook
+  provisioning onto psmux/Windows hosts is gated off
+  (`spawn::psmux_hook_rewrite_supported`) until
+  `scripts/dev/e2e/windows-vm.sh test`'s probes prove the psmux behaviors —
+  such sessions show a `Hooks: degraded` hint instead of silently idling.
 - **Teardown.** `session delete --force` is backend-aware:
   `teardown_runtime_resources` resolves the session's `HostDef` from its
   `backend_type` and, for a remote session, kills the pane
