@@ -97,6 +97,18 @@ const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_OAUTH_BETA: &str = "oauth-2025-04-20";
 const CLAUDE_USER_AGENT: &str = "claude-code/2.1.0";
 
+/// The usage endpoint, overridable via `FRIRING_CLAUDE_USAGE_URL` so a test or
+/// demo can point the fetch at a local stub — the same HTTP-boundary stubbing
+/// the e2e harness applies to the model API itself (`ANTHROPIC_BASE_URL`
+/// doesn't cover this endpoint: it is an OAuth account route, not part of the
+/// Messages API a gateway proxies). Empty = unset, like `FRIRING_SOCKET`.
+fn claude_usage_url() -> String {
+    match std::env::var("FRIRING_CLAUDE_USAGE_URL") {
+        Ok(url) if !url.is_empty() => url,
+        _ => CLAUDE_USAGE_URL.to_string(),
+    }
+}
+
 /// Locate Claude's credentials file (`$CLAUDE_CONFIG_DIR/.credentials.json`,
 /// else `~/.claude/.credentials.json`).
 fn claude_credentials_path() -> Option<PathBuf> {
@@ -138,11 +150,12 @@ async fn claude() -> AgentUsage {
         };
     };
     let config = format!(
-        "url = \"{CLAUDE_USAGE_URL}\"\n\
+        "url = \"{}\"\n\
          header = \"Authorization: Bearer {token}\"\n\
          header = \"anthropic-beta: {CLAUDE_OAUTH_BETA}\"\n\
          header = \"User-Agent: {CLAUDE_USER_AGENT}\"\n\
-         max-time = 15\n"
+         max-time = 15\n",
+        claude_usage_url()
     );
     match curl_json(config).await {
         Some(v) => parse_claude_usage(&v, plan),
@@ -356,6 +369,21 @@ fn parse_antigravity_quota(v: &serde_json::Value) -> AgentUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Env mutation is safe here: nextest runs each test in its own process.
+    #[test]
+    fn claude_usage_url_env_override() {
+        std::env::remove_var("FRIRING_CLAUDE_USAGE_URL");
+        assert_eq!(claude_usage_url(), CLAUDE_USAGE_URL);
+        std::env::set_var("FRIRING_CLAUDE_USAGE_URL", "");
+        assert_eq!(claude_usage_url(), CLAUDE_USAGE_URL);
+        std::env::set_var(
+            "FRIRING_CLAUDE_USAGE_URL",
+            "http://127.0.0.1:1/api/oauth/usage",
+        );
+        assert_eq!(claude_usage_url(), "http://127.0.0.1:1/api/oauth/usage");
+        std::env::remove_var("FRIRING_CLAUDE_USAGE_URL");
+    }
 
     #[test]
     fn supported_set() {

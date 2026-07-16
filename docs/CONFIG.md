@@ -887,6 +887,7 @@ User-set (read by friring):
 | `RUST_LOG` | log filter for `friring.log` |
 | `FRIRING_PERF_LOG` | opt-in performance logging: a one-shot `startup` phase breakdown at first paint, per-session `restore_adopt`/`adopt_split` lines, steady-state `perf_window` lines (~10 s cadence), and wall-clock frame/tick timing collection. Any value enables it. See `docs/PERFORMANCE.md`. |
 | `FRIRING_SOCKET` | overrides the **local** multiplexer socket name (default `friring`; dev builds `friring-dev`). For test/sandbox tooling: Unix scoping uses `TMUX_TMPDIR`, but psmux (Windows) resolves every `-L <name>` machine-wide, so this is the only way to fully scope an instance there. Remote hosts are unaffected (socket from `hosts.toml`). Empty = unset. |
+| `FRIRING_CLAUDE_USAGE_URL` | overrides the endpoint the info panel's Claude account-usage fetch calls (default `https://api.anthropic.com/api/oauth/usage`), so a test or demo can point it at a local stub — `ANTHROPIC_BASE_URL` doesn't cover it, that's a Messages-API base, not this OAuth account route. See `src/usage/mod.rs`. Empty = unset. |
 
 Set **by** friring into every spawned agent process (not user-set;
 `session_ops::inject_friring_env` / `App::build_spawn_inputs`). An

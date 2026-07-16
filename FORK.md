@@ -342,7 +342,11 @@ makes the demos deterministic (a re-record diffs cleanly instead of capturing
 whatever a live model said) and identity-free (every agent talks to
 `127.0.0.1`, so no account email, token or usage can reach the frame), and it
 lets the panes show *fictional future* model ids (`fable-67`, `gpt-6.x`, …).
-`antigravity` is featured logged-out, being unstubbable. Details in
+`antigravity` is featured logged-out, being unstubbable. The info panel's
+Claude account-usage gauges are stubbed the same way: the fork's
+`FRIRING_CLAUDE_USAGE_URL` env override (`docs/CONFIG.md`) points the fetch at
+the anthropic stub's `/api/oauth/usage` route, fed with scripted numbers from
+`demo-content.json` — otherwise every clip films "not logged in". Details in
 `docs/DEVELOPMENT.md` § Demo video.
 
 #### Terminal-first focus
