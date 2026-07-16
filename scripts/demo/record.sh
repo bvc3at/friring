@@ -656,35 +656,58 @@ record_tape() {
     node "$SCRIPT_DIR/lib/drive-tape.mjs" "$SCRIPT_DIR/$_tape.tape" \
         --socket "$DEMO_SOCKET" --session demo
 
-    # The tape's closing Ctrl+Q quits the TUI, which ends the attach, which ends
-    # asciinema and flushes the cast. Fail closed if it is still recording: only
-    # asciinema's own exit flushes the tail of the cast, so killing it here
-    # (because the TUI never quit — a tape whose last chord was swallowed by a
-    # modal, say) would leave a truncated stream that still renders happily into
-    # a clip missing its ending. `-s` below only catches an EMPTY cast.
+    # End the recording by DETACHING the filmed client, with the TUI still
+    # running. The tapes deliberately do not quit on camera: a quit films its
+    # own teardown — friring clears its alternate screen (a blank pane frame),
+    # then the dying client resets the terminal and prints "[exited]" — and
+    # that, not the demo, becomes the clip's held closing frame. Detaching ends
+    # the attach (which ends asciinema and flushes the cast) while the last
+    # real frame is still the live TUI; the detach's own smaller teardown is
+    # trimmed from the cast below.
+    tmux -L "$DEMO_SOCKET" detach-client 2>/dev/null || true
     _i=0
     while tmux -L "$CAST_SOCKET" has-session -t rec 2>/dev/null && [ "$_i" -lt 40 ]; do
         sleep 0.25; _i=$((_i + 1))
     done
-    _still_recording=0
     if tmux -L "$CAST_SOCKET" has-session -t rec 2>/dev/null; then
-        _still_recording=1
-        # Whatever is on screen is why the tape could not quit — a modal still
-        # open, a field still focused, a beat that landed somewhere unintended.
-        # Keep it: without the pane this failure is just an assertion, and the
-        # session is about to be killed.
+        # Only asciinema's own exit flushes the tail of the cast; killing it
+        # would leave a truncated stream that still renders happily into a clip
+        # missing its ending. (`-s` below only catches an EMPTY cast.)
+        tmux -L "$DEMO_SOCKET" kill-server 2>/dev/null || true
+        tmux -L "$CAST_SOCKET" kill-server 2>/dev/null || true
+        echo "error: the recording did not stop after detach for $_tape" >&2
+        return 1
+    fi
+
+    # Fail closed if the TUI cannot quit from wherever the tape ended — off
+    # camera, but the same invariant as ever: a swallowed quit chord means an
+    # earlier beat landed somewhere unintended (a modal still open, a field
+    # still focused) and the clip filmed the wrong thing.
+    tmux -L "$DEMO_SOCKET" send-keys -t demo C-q 2>/dev/null || true
+    _i=0
+    while tmux -L "$DEMO_SOCKET" has-session -t demo 2>/dev/null && [ "$_i" -lt 40 ]; do
+        sleep 0.25; _i=$((_i + 1))
+    done
+    if tmux -L "$DEMO_SOCKET" has-session -t demo 2>/dev/null; then
+        # Whatever is on screen is why the tape could not quit. Keep it:
+        # without the pane this failure is just an assertion, and the session
+        # is about to be killed.
         _dump="$REPO_ROOT/target/demo-failed-$_tape.txt"
         mkdir -p "$(dirname "$_dump")"
         tmux -L "$DEMO_SOCKET" capture-pane -p -t demo > "$_dump" 2>/dev/null || true
-    fi
-    tmux -L "$DEMO_SOCKET" kill-server 2>/dev/null || true
-    tmux -L "$CAST_SOCKET" kill-server 2>/dev/null || true
-    if [ "$_still_recording" = "1" ]; then
-        echo "error: $_tape never quit the TUI; the cast is truncated" >&2
+        tmux -L "$DEMO_SOCKET" kill-server 2>/dev/null || true
+        echo "error: $_tape ended in a state the TUI cannot quit from" >&2
         echo "  the screen it was stuck on: $_dump" >&2
         return 1
     fi
+    tmux -L "$DEMO_SOCKET" kill-server 2>/dev/null || true
     [ -s "$_cast" ] || { echo "error: no cast recorded for $_tape" >&2; return 1; }
+
+    # Drop the detach teardown from the tail (the client's leave-alt-screen,
+    # reset and "[detached]" print), so the clip ends on the final live TUI
+    # frame — see lib/trim-cast.mjs. Fails closed on a cast without one.
+    node "$SCRIPT_DIR/lib/trim-cast.mjs" "$_cast" \
+        || { echo "error: could not trim the detach tail for $_tape" >&2; return 1; }
 
     # Render beside the real thing, not onto it: everything below can still
     # reject this clip, and a rejected take must not have already replaced good

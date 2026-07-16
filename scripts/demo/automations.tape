@@ -1,11 +1,12 @@
-# VHS tape for the Friring Automations feature demo.
+# Demo tape for the Friring Automations feature (VHS-tape syntax, replayed by
+# scripts/demo/lib/drive-tape.mjs).
 #
 # Do NOT run this directly — run `scripts/demo/record.sh automations`, which
 # builds the dev binary, sets up an isolated environment, seeds one session per
 # real agent CLI, and exports the env vars this tape relies on ($FRIRING_BIN).
 #
-# Requires: vhs (charmbracelet/vhs) + ffmpeg + ttyd. VHS has no function-key
-# commands, so this uses Ctrl-key bindings + j/k / Tab / arrows only.
+# Requires: asciinema + agg + ffmpeg (see record.sh). The tape driver has no
+# function-key commands, so this uses Ctrl-key bindings + j/k / Tab / arrows.
 
 Output docs/media/automations-demo.gif
 Output docs/media/automations-demo.mp4
@@ -27,116 +28,112 @@ Show
 
 # Sessions are pre-seeded; the always-present Automations pane sits beneath the
 # session list in the left column.
-Sleep 2500ms
-
-# The Automations pane sits in the left column, beneath the session list. Focus
-# the list first (Ctrl+H from the terminal), then Ctrl+P (OpenAutomations) jumps
-# straight to the pane. Ctrl+P is in terminal_passthrough (it is readline's
-# previous-history), so it only acts as the chord once focus has left the
-# terminal — hence the Ctrl+H first.
-#
-# This used to walk `Down` past the last session to show the left column being
-# one continuous list. That counted on a fixed number of sessions: seed one
-# agent fewer and the walk lands somewhere else entirely, the keystrokes meant
-# for the editor get eaten by the session list's single-letter hotkeys (the `i`
-# in "morning-triage" opens the conversation-import picker), and the clip films
-# the wrong screen. The chord is count-independent.
-Ctrl+H
 Sleep 1200ms
-Ctrl+P
-Sleep 1600ms
+
+# Focus the session list (Ctrl+H from the terminal), then step INTO the
+# Automations pane: the left column reads as one continuous list, and `Down`
+# on the LAST session flows into the pane (act_session_list_next). The seeder
+# creates "review" last and restore leaves it selected, so one `Down` lands in
+# the pane regardless of how many agents were available — unlike a fixed walk,
+# and unlike Ctrl+P, which opens the automations list as a centered overlay
+# rather than focusing the pane (that path closes back to the session list on
+# save, which once left two-thirds of this tape typing at a static screen).
+Ctrl+H
+Sleep 600ms
+Down
+Sleep 900ms
 
 # Create a new automation right from the pane (`n`, like Ctrl+N for a session).
-# The editor opens in the central pane — one screen, no separate popup.
+# This is the in-pane path: the editor opens in the central pane — one screen,
+# no popup — and saving returns focus HERE, to the pane.
 Type "n"
-Sleep 1800ms
+Sleep 1000ms
 
 # Name it.
 Type "morning-triage"
-Sleep 900ms
+Sleep 700ms
 
 # Trigger is a selector cycled with the arrows — step through, land on "daily".
 Tab
-Sleep 700ms
+Sleep 400ms
 Right
-Sleep 800ms
+Sleep 350ms
 Right
-Sleep 800ms
+Sleep 350ms
 Left
-Sleep 800ms
+Sleep 350ms
 Left
-Sleep 900ms
+Sleep 500ms
 
 # Hour stepper (arrows adjust, wrapping); watch the "next:" preview update.
 Tab
-Sleep 600ms
+Sleep 350ms
 Right
-Sleep 500ms
+Sleep 300ms
 Right
-Sleep 700ms
+Sleep 450ms
 
 # Minute stepper.
 Tab
-Sleep 600ms
+Sleep 350ms
+Right
+Sleep 250ms
 Right
 Sleep 450ms
-Right
-Sleep 700ms
 
 # Skip timezone, leave the Action on "send".
 Tab
-Sleep 700ms
+Sleep 400ms
 Tab
-Sleep 900ms
+Sleep 500ms
 
 # Target selector — cycle through the running sessions to pick where the
 # prompt is sent.
 Tab
-Sleep 700ms
+Sleep 400ms
 Right
-Sleep 800ms
+Sleep 350ms
 Right
-Sleep 900ms
+Sleep 500ms
 
 # The prompt that fires on schedule.
 Tab
-Sleep 600ms
+Sleep 350ms
 Type "Triage failing CI and summarize blockers"
-Sleep 1200ms
+Sleep 800ms
 
-# Save with Ctrl+S — returns to the pane; the automation shows a live next-run
-# countdown. NOT Enter: `prompt` is the one multi-line field, so Enter inserts a
-# newline there rather than saving (see AutomationEditorModal::handle_key), which
-# left the modal open and swallowed every later beat, including the closing quit.
+# Save with Ctrl+S — back to the pane with the new automation selected (a new
+# one lands at the top) and a live next-run countdown. NOT Enter: `prompt` is
+# the one multi-line field, so Enter inserts a newline there rather than saving
+# (see AutomationEditorModal::handle_key).
 Ctrl+S
-Sleep 2000ms
+Sleep 1400ms
 
 # Toggle enabled off and back on, straight from the pane.
 Space
-Sleep 1100ms
+Sleep 700ms
 Space
-Sleep 1400ms
+Sleep 900ms
 
 # Step into the central pane: Ctrl+L focuses the editor (its fields), again
-# focuses the run-history panel beneath it.
+# focuses the run-history panel beneath it. The focus ring stays within the
+# automation context (pane → editor → history), never jumping to a session.
 Ctrl+L
-Sleep 1600ms
+Sleep 900ms
 Ctrl+L
-Sleep 1600ms
+Sleep 900ms
 
 # Run it now from the history panel (`r`); the run is recorded and the prompt
 # is delivered to the target session.
 Type "r"
-Sleep 2500ms
-
-# Ctrl+H walks back to the editor, then to the Automations list (like Esc) —
-# the cycle stays within the automation context, never jumping to a session.
-Ctrl+H
-Sleep 1000ms
-Ctrl+H
-Sleep 1600ms
-
-# Final beat, then quit (detaches sessions).
 Sleep 1500ms
-Ctrl+Q
-Sleep 1s
+
+# Ctrl+H walks back to the editor, then to the Automations pane (like Esc).
+Ctrl+H
+Sleep 500ms
+Ctrl+H
+Sleep 900ms
+
+# Final beat; the recorder then stops filming (detach) and quits the TUI
+# off-camera - see record.sh.
+Sleep 1000ms

@@ -362,6 +362,15 @@ Consequences worth knowing when editing a tape or the recorder:
   using the tool.
 - The tmux status bar is turned **off** on both sockets — an attached client
   renders it, so it would otherwise be filmed.
+- **No teardown is filmed.** The tapes don't quit the TUI; the recorder stops
+  filming by **detaching** the recorded client, then quits the TUI off-camera —
+  where the quit still serves as a fail-closed check that the tape ended in a
+  state the TUI can quit from (a swallowed chord means a beat landed in the
+  wrong context). A quit on camera films its own teardown (friring clearing its
+  alternate screen, then the dying client's reset + `[exited]`) as the clip's
+  held closing frame. The detach's smaller tail (leave-alt-screen, reset,
+  `[detached]`) is trimmed from the cast before rendering
+  (`lib/trim-cast.mjs`), so every clip ends on the last live TUI frame.
 - `agg --idle-time-limit` is set far above any beat in the tapes; it would
   otherwise silently compress the very pauses the tapes exist to script.
 - The GIF keeps **variable** frame delays — that is where the exact pacing
