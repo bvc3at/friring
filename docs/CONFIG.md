@@ -116,6 +116,9 @@ resume_args = ["--resume", "{id}"]            # emitted when resuming
 fork_args = ["--resume", "{id}", "--fork-session", "-n", "{name}"]
 new_session_args = ["--session-id", "{id}", "-n", "{name}"]  # fresh spawn
 resume_latest = false       # true = id-less "resume last session in cwd"
+# hook_schema = "claude"    # optional: name the hook FAMILY this CLI speaks so
+                            #   the built-in hooks extension wires its status
+                            #   hooks under this custom agent's name too
 ```
 
 `{id}` is substituted with the friring-generated session UUID. Groups
@@ -173,6 +176,16 @@ with `builtin_registry()` as the fallback; `agent::GenericProvider` wraps
 an `AgentDef` and implements the `AgentProvider` trait (`command()` +
 `build_args(&SessionConfig)`), picked per session by
 `App::provider_for(&config)`.
+
+`hook_schema` is optional. Custom agents are agent-neutral, so the built-in
+**hooks** extension normally wires status hooks only for the built-ins it knows
+by name. Set `hook_schema = "claude"` on a **rebranded** agent (one whose
+`command` runs `claude` under a different `name`) and it inherits claude's hook
+wiring — the `--settings` patch locally, and the same rewrite on a remote/WSL
+host. It names the *family* to imitate, not a boolean; today the useful value is
+`"claude"` (the only family wired via a per-agent arg patch — codex/opencode/
+antigravity/vibe/copilot are wired through their own config dir, so a rebrand
+sharing that dir already reports status).
 
 The seeded file also ships two commented, copy-pasteable templates
 below the built-ins — **Add your own agent** (every field annotated)

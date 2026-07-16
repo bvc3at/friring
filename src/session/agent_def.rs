@@ -56,6 +56,16 @@ pub struct AgentDef {
     /// (claude) leave this `false` and resume by a friring-known id instead.
     #[serde(default)]
     pub resume_latest: bool,
+    /// Names the hook *family* this CLI understands, letting the built-in
+    /// `hooks` extension wire status hooks for a **custom** agent as if it were
+    /// that built-in. A rebranded-claude agent sets `hook_schema = "claude"` so
+    /// the same `--settings` patch (and remote rewrite) that targets the
+    /// built-in `claude` also targets it. `None` = wire only if this agent's own
+    /// `name` matches a built-in family. friring bakes in no agent knowledge —
+    /// the *user* asserts the family here. See [`crate::agent::extension_config`]
+    /// (`apply_agent_patches`) and `extensions/hooks/`.
+    #[serde(default)]
+    pub hook_schema: Option<String>,
 }
 
 impl AgentDef {
@@ -218,6 +228,7 @@ mod tests {
                 "{name}".into(),
             ],
             resume_latest: false,
+            hook_schema: None,
         }
     }
 
@@ -357,6 +368,7 @@ mod tests {
             fork_args: vec![],
             new_session_args: vec![],
             resume_latest: false,
+            hook_schema: None,
         };
         let args = d.build_args(None, None, Some("ignored"), None);
         assert_eq!(args, vec!["--quiet"]);
@@ -374,6 +386,7 @@ mod tests {
             fork_args: vec!["fork".into(), "--last".into()],
             new_session_args: vec![],
             resume_latest: true,
+            hook_schema: None,
         };
         // resume id present, but no {id} token -> tokens unchanged.
         assert_eq!(
@@ -409,6 +422,7 @@ mod tests {
             fork_args: vec![],
             new_session_args: vec![],
             resume_latest: true,
+            hook_schema: None,
         };
         // Flag set but no resume_args -> nothing to emit, so not "resumes latest".
         assert!(!d.resumes_latest());
@@ -433,6 +447,7 @@ mod tests {
                     fork_args: vec![],
                     new_session_args: vec![],
                     resume_latest: false,
+                    hook_schema: None,
                 },
             ],
         };
