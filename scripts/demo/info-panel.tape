@@ -1,10 +1,12 @@
-# VHS tape — Friring info panel feature clip.
+# Demo tape — Friring info panel feature clip (VHS-tape syntax, replayed by
+# scripts/demo/lib/drive-tape.mjs).
 #
 # Do NOT run directly — run `scripts/demo/record.sh info-panel`, which
 # builds the dev binary, sets up the isolated env, seeds one session per real
 # agent CLI in a sample repo, and exports $FRIRING_BIN.
 #
-# Ctrl+B toggles the info panel; Ctrl+J/K move between sessions. (No F-keys.)
+# Requires: asciinema + agg + ffmpeg (see record.sh). Ctrl+B toggles the info
+# panel; Ctrl+J/K move between sessions. (No F-keys.)
 
 Output docs/media/friring-info-panel.gif
 Output docs/media/friring-info-panel.mp4
@@ -24,8 +26,8 @@ Enter
 Sleep 2s
 Show
 
-# Let the real agent CLIs finish booting.
-Sleep 2500ms
+# The agent CLIs are pre-played and fully rendered; a short settle beat.
+Sleep 1200ms
 
 # On launch the active session's TERMINAL is focused (session restore focuses
 # it), and Ctrl+B (ToggleInfoPanel) is a terminal-passthrough chord — so from
@@ -33,25 +35,26 @@ Sleep 2500ms
 # panel. Ctrl+H (focus previous pane) is a navigation chord that is never passed
 # through, so it reliably moves focus to the session list first.
 Ctrl+H
-Sleep 600ms
+Sleep 400ms
 
-# Open the info panel (Ctrl+B = alias for F2): name/status/agent + CPU/RAM gauges.
+# Open the info panel (Ctrl+B = alias for F2): name/status/agent, CPU/RAM
+# gauges, and the account-usage windows (served by the demo stub).
 Ctrl+B
-Sleep 3s
+Sleep 2200ms
 
-# Move between sessions — the info panel tracks the selected session.
+# Move between sessions — the info panel tracks the selected session. Hop to
+# the first session (Ctrl+J wraps forward from "review", the last) and back:
+# both stops are claude sessions, whose usage gauges the stub feeds — the
+# other agents would just film a "not logged in" note here.
 Ctrl+J
-Sleep 2s
-Ctrl+J
-Sleep 2s
+Sleep 1800ms
 Ctrl+K
-Sleep 2s
+Sleep 1800ms
 
 # Close the info panel.
 Ctrl+B
-Sleep 1200ms
+Sleep 900ms
 
-# Final beat, then quit (detaches sessions).
-Sleep 1s
-Ctrl+Q
-Sleep 1s
+# Final beat; the recorder then stops filming (detach) and quits the TUI
+# off-camera - see record.sh.
+Sleep 1000ms

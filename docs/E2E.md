@@ -10,28 +10,50 @@ just agent-e2e                        # asserting, hermetic, offline e2e suite (
 just agent-demo claude-tool-loop      # the same scenario as a VHS demo recording
 ```
 
-The agent binary is real (Claude Code is the reference agent); the **model API is stubbed
-locally**, so runs are deterministic, fully offline, and free. See ADR-23 in
-`docs/ARCHITECTURE.md` for the decision record.
+The agent binaries are real (Claude Code is the reference agent; codex and opencode are covered
+too); the **model API is stubbed locally**, so runs are deterministic, fully offline, and free.
+The same stubs also drive the demo recordings — see `docs/DEVELOPMENT.md` § Demo video. See ADR-23
+in `docs/ARCHITECTURE.md` for the decision record.
 
 ## The seam: stub the model at the HTTP boundary
 
-The stub (`stub/anthropic-stub.mjs`, a zero-dependency node ≥ 18 sidecar — deliberately outside
-the Rust dependency graph) speaks the Anthropic Messages dialect: `POST /v1/messages` answered as
-an SSE stream, including `tool_use` blocks and `input_json_delta`. The agent is pointed at it via
-`ANTHROPIC_BASE_URL` — plain HTTP on loopback works against the pinned binary; no TLS games.
+The stubs (`stub/*-stub.mjs`, zero-dependency node ≥ 18 sidecars — deliberately outside the Rust
+dependency graph) speak the agents' model APIs on loopback. Plain HTTP works against every pinned
+binary; no TLS games. One stub per **wire dialect**, not per agent, because several CLIs speak the
+same API:
+
+| Dialect | Endpoint(s) | Pointed at it by | Agents |
+|---|---|---|---|
+| `anthropic` | `POST /v1/messages` (SSE; `tool_use` + `input_json_delta`) | `ANTHROPIC_BASE_URL` | claude |
+| `openai` | `POST /v1/responses` (SSE) · `POST /v1/chat/completions` (SSE) | provider entry in the CLI's own config | codex · opencode |
+
+`stub-core.mjs` holds everything dialect-agnostic — CLI args, the fixture matcher, the journal,
+the HTTP skeleton — so a dialect stub contributes only what genuinely differs: how to summarize a
+request body into the shared match shape, and how to encode a reply in that API's wire format.
+Adding a dialect is one file; the fixture vocabulary below is identical across all of them, so
+scenarios and demo content never care which API a CLI speaks.
 
 Responses come from **hand-curated semantic fixtures** (`fixtures.json` per scenario), not
 recorded cassettes: tool-use loops make raw record/replay brittle (request bodies grow
 cumulatively and embed machine-specific tool results). A fixture matches on stable turn shape —
-`modelContains`, `promptContains` / `anyUserContains` (last / any user message), `hasToolResult`,
-`toolResultFor` (a pinned `tool_use` id) — first match wins, `{{WS}}` is substituted with the
-run's workspace path. `ambient: true` marks background traffic (e.g. side-model calls) that is
-answered but not required; `maxUses` guards against loops; `delayMs` paces SSE deltas for demos.
-**List `ambient` fixtures first**: they are model-keyed (e.g. `modelContains: "haiku"`), so an
-ambient-first order catches a side call before a primary fixture whose prompt text it happens to
-echo can shadow it. There is deliberately no catch-all default — it would answer surprise calls
-`200` and silently disable the strictness the `UNMATCHED` marker enforces.
+`modelContains`, `promptContains` / `anyUserContains` (last / any user message), `systemContains`
+(the system prompt), `hasToolResult`, `toolResultFor` (a pinned `tool_use` id) — first match wins,
+`{{WS}}` is substituted with the run's workspace path. `ambient: true` marks background traffic
+(e.g. side-model calls) that is answered but not required; `maxUses` guards against loops;
+`delayMs` paces SSE deltas for demos. **List `ambient` fixtures first**: an ambient call is keyed
+on something the primary fixture doesn't pin (`modelContains: "haiku"` for claude's side calls,
+`systemContains: "title generator"` for opencode's per-session title call), and an ambient-first
+order catches it before a primary fixture whose prompt text it happens to echo can shadow it —
+opencode's title call replays the user's prompt verbatim, so it would otherwise match. There is
+deliberately no catch-all default — it would answer surprise calls `200` and silently disable the
+strictness the `UNMATCHED` marker enforces.
+
+`reply.toolUse` is an `anthropic`-dialect feature: the tool-use loop is conformance-tested against
+Claude Code, while the `openai` dialect exists to render text turns (scenarios and demo panes).
+The `anthropic` stub also serves an account-usage route (`GET /api/oauth/usage`) when the fixture
+file carries a top-level `usage` key (reset times are minutes-from-now, converted at request
+time); friring's info panel reaches it via `FRIRING_CLAUDE_USAGE_URL` — the demo recorder uses
+this so its clips show real usage gauges instead of "not logged in".
 
 Strictness is enforced **at assert time, not response time**: an unmatched model call gets a
 benign marker reply (so the pane stays alive and debuggable) plus an `UNMATCHED` journal entry,
@@ -43,8 +65,9 @@ assertion layer and the failure artifact.
 
 The same scenario runs at three depths, so a failure localizes itself:
 
-1. **protocol** — `claude -p` against the stub. No tmux, no Friring. Proves the binary↔stub
-   contract (streaming, tool loop, auth/onboarding bypass).
+1. **protocol** — the agent's own print/exec mode against the stub (`agent_print_args`: `claude
+   -p`, `codex exec`, `opencode run`). No tmux, no Friring. Proves the binary↔stub contract
+   (streaming, tool loop, auth/onboarding bypass).
 2. **interactive** — the agent's own TUI in a bare tmux pane. Proves interactive-mode behavior
    (extra traffic, trust dialogs) without Friring in the loop.
 3. **full scenario** — through the real Friring TUI: headless `session create`, TUI boot +
@@ -61,15 +84,23 @@ test mode** (demo pacing only), so a scenario physically cannot lean on a fixed 
 - `tbx_sandbox_init_full fresh` (shared `scripts/dev/lib/sandbox-env.sh`): throwaway
   `HOME`/`XDG_*`/`TMUX_TMPDIR`, dev `friring-dev` socket in a private dir. Nothing touches the
   real `~/.claude`, `~/.config/friring`, or any running tmux server. Leaked `FRIRING_*` identity
-  vars (from running inside a Friring session) are scrubbed.
-- Agent env (`ANTHROPIC_BASE_URL`, dummy `ANTHROPIC_AUTH_TOKEN`, telemetry kill-switches) is
-  exported **before the first tmux command** — panes inherit the tmux *server* environment, which
-  freezes at server start. That ordering is load-bearing; it is how the stub URL reaches the
-  agent with zero core changes.
+  vars (from running inside a Friring session) are scrubbed. Two macOS details are load-bearing:
+  the sandbox root is **canonicalized** (`$TMPDIR` is a `/var/folders/…` symlink, and the agents
+  resolve their cwd to the real path — a folder-trust seed under the symlinked path misses, and
+  the agent boots into a trust dialog instead of a usable UI), and the fresh `TMUX_TMPDIR` lives
+  under `/tmp` rather than inside that root (the per-user `$TMPDIR` prefix overflows the ~104-byte
+  AF_UNIX socket path limit).
+- Agent env (`ANTHROPIC_BASE_URL`, `CODEX_HOME`, `OPENCODE_CONFIG`, dummy tokens, telemetry
+  kill-switches) is exported **before the first tmux command** — panes inherit the tmux *server*
+  environment, which freezes at server start. That ordering is load-bearing; it is how the stub
+  URL reaches the agent with zero core changes. The vars are per-agent by name, so one shared
+  server env carries several agents at once without collision (only claude takes its base URL from
+  the environment; codex and opencode read theirs from their seeded config files).
 - Offline enforcement is app-level: `http(s)_proxy` point at a dead loopback port with
-  `no_proxy=127.0.0.1,localhost`, and the tool-use loop is proven to survive that, so nothing
-  external is load-bearing. A kernel-level egress block (netns/iptables) would be a CI hardening
-  step on top, not a replacement.
+  `no_proxy=127.0.0.1,localhost` (**mandatory** — without it the loopback stub call is proxied to
+  the dead port too), and the tool-use loop is proven to survive that, so nothing external is
+  load-bearing. A kernel-level egress block (netns/iptables) would be a CI hardening step on top,
+  not a replacement.
 - Teardown (bats `teardown()`, runs on failure too) reaps the stub by PID, the driver tmux
   server, and the `friring-dev` server (which kills the agent panes), then wipes the sandbox
   root. On failure, artifacts land in `target/agent-e2e/artifacts/<scenario>-<ts>/`: both panes,
@@ -106,13 +137,21 @@ Demo-able scenarios must stick to keys VHS knows (no F-keys; `C-x` → `Ctrl+X`)
 | Contract item | Meaning |
 |---|---|
 | `AGENT_NAME` | `agents.toml` entry name (hooks patch by name — `claude` is load-bearing) |
-| `AGENT_STUB_DIALECT` | which `stub/<dialect>-stub.mjs` to boot, or `none` |
+| `AGENT_STUB_DIALECT` | which `stub/<dialect>-stub.mjs` to boot (`anthropic`, `openai`), or `none` |
 | `AGENT_HAS_STATUS_HOOKS` | `1` if the built-in hooks extension wires this agent's signals |
 | `AGENT_LAUNCH_ARGS` | flags shared by all three drive depths |
-| `agent_binary` / `agent_version` | discovery (env-var pin override → `PATH`) |
+| `AGENT_MODEL` | the (often fictional) model id the CLI runs and displays |
+| `agent_binary` / `agent_version` | discovery (env-var pin override → `PATH`); version via `e2e_bin_version` |
+| `agent_print_args <prompt>` | argv for the agent's one-shot headless mode (protocol depth) |
 | `agent_env` | `KEY=VALUE` lines exported before any tmux server starts |
-| `agent_seed_config <ws>` | pre-seed config so the binary runs non-interactively |
+| `agent_seed_config <ws>…` | pre-seed config so the binary runs non-interactively; every workspace to trust |
 | `agent_agents_toml_entry` | the `[[agents]]` entry (absolute binary path) |
+
+`agent_version` must route through the harness's `e2e_bin_version` (bounded): it runs on teardown
+and artifact paths that execute for *every* test, so an agent binary that hangs instead of
+answering would take the whole suite down with it rather than failing one scenario. `require_agent`
+uses the same probe as its usability gate — a binary that can't print `--version` in time is
+skipped exactly like a missing one, since it could never run a scenario either.
 
 `AGENT_STUB_DIALECT="none"` **declares** an agent unstubbable (e.g. a CLI hard-wired to GitHub
 auth): its scenarios refuse to run offline with a clear message instead of faking anything.
@@ -158,11 +197,13 @@ verified the harness logic even where claude is absent. The `--filter` matches b
 not scenario directory names — a non-matching filter runs zero tests and still exits green (bats
 semantics), so check the `1..N` line when filtering.
 
-`FRIRING_E2E_CLAUDE_BIN` pins the binary; `FRIRING_E2E_KEEP=1` keeps the sandbox for post-mortem;
-`FRIRING_E2E_SKIP_BUILD=1` skips the cargo build. Requires tmux, node ≥ 18, jq, git, curl,
-`timeout` (coreutils — `gtimeout` on macOS), bats (tests) / vhs + sqlite3 + a browser (demos). A
-missing *agent binary* makes the real-agent scenarios **skip**, not fail, so machines without
-claude stay green; missing infrastructure tools are hard errors.
+`FRIRING_E2E_{CLAUDE,CODEX,OPENCODE,ANTIGRAVITY}_BIN` pin a binary per agent; `FRIRING_E2E_KEEP=1`
+keeps the sandbox for post-mortem; `FRIRING_E2E_SKIP_BUILD=1` skips the cargo build. Requires tmux,
+node ≥ 18, jq, git, curl, coreutils `timeout` (**`gtimeout` is preferred** — third-party `timeout`
+shims exist on `PATH` in the wild and silently break TUI children), bats (tests) / vhs + sqlite3 + a
+browser (demos). An agent binary that is missing — or present but unresponsive — makes only *that*
+agent's scenarios **skip**, not fail, so a machine with any subset of the CLIs stays green; missing
+infrastructure tools are hard errors.
 
 CI: the `agent-e2e` job (`.github/workflows/ci.yml`) installs tmux + bats + the **pinned**
 `@anthropic-ai/claude-code` and runs the suite. It is path-gated like every job and deliberately
@@ -206,11 +247,41 @@ it doesn't fail the run but is surfaced to `target/agent-e2e/unexpected-endpoint
 `::warning::` annotation — review it, and extend the allowlist in
 `e2e_surface_unexpected_endpoints` if it's expected.
 
-## Conformance status (claude 2.1.207)
+## Conformance status
 
-Proven empirically: plain-HTTP loopback `ANTHROPIC_BASE_URL`; SSE streaming required; full
+Everything below is proven empirically against the pinned versions; each agent's quirks live in
+its profile, not in the harness.
+
+**claude 2.1.207** — plain-HTTP loopback `ANTHROPIC_BASE_URL`; SSE streaming required; full
 tool-use loop (real `Write` executed, `tool_result` posted with the pinned id); `-p` and
 interactive modes; traffic is `HEAD /` + `POST /v1/messages?beta=true` only (no `count_tokens`,
 no side-model calls, with or without the nonessential-traffic switch, in these flows); the whole
 loop survives dead-proxied egress; interactive mode makes **no** model calls before the first
 prompt. The `❯` input-box glyph is the ready marker; the footer text varies by permission mode.
+`ANTHROPIC_MODEL` sets the model it sends *and* displays, so a fictional id renders in its header.
+
+**codex 0.144.4** — a custom `[model_providers.*]` needs **no login at all**: the ChatGPT auth flow
+only guards the built-in `openai` provider, and with no `env_key` codex sends no auth header (with
+one set, the var must be non-empty or it hard-errors). `wire_api = "chat"` is **removed** in this
+version — it errors at startup, so the stub speaks Responses. Fictional model ids are accepted with
+only a "Model metadata not found" warning, and render in both the header box and the footer. The
+prompt glyph `›` is the ready marker (the composer's placeholder text rotates — never match it).
+Gotchas: the TUI **rewrites `config.toml` on startup**, so seed it fresh per run and never assume
+it stays byte-identical; `codex exec` appends piped stdin to the prompt, hence the harness's
+`< /dev/null`. Zero non-stub calls under dead proxies.
+
+**opencode 1.17.15** — the `@ai-sdk/openai-compatible` runtime is bundled in the binary (nothing is
+fetched from npm) and a cold cache works offline, so no warm-up step is needed; the models.dev
+catalog fetch is best-effort and disabled anyway. Fictional model ids pass with no catalog
+validation. One **ambient** call: title generation on each session's first message, to the same
+model, keyed by its "title generator" system prompt — its reply becomes the visible session title.
+No trust/onboarding dialogs. Ready marker: the input-box footer `Build · <model> <provider>`.
+
+**antigravity (`agy`) 1.1.2 — unstubbable, declared `none`.** Not the Gemini CLI and it does not
+share its auth surface: a Go binary that forces interactive Google OAuth
+(`accounts.google.com`, cloud-platform scope) before any model traffic. There is no API-key path
+and no base-URL env that bypasses the gate (`CLOUD_CODE_URL` exists but is only consulted after
+auth); `GEMINI_API_KEY` / `gemini-api-key` appear nowhere in the binary. A local stub receives
+**zero** requests, proxied or not, so its scenarios refuse to run offline rather than fake a login.
+It is featured logged-out in the demos instead — which also keeps a signed-in account's email off
+camera.

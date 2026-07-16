@@ -1,0 +1,123 @@
+{
+  "sessions": [
+    {
+      "session_name": "carbon-drawdown",
+      "agent": "claude",
+      "model": "fable-67",
+      "turns": [
+        {
+          "user": "Start the Q3 atmospheric CO2 drawdown backfill and watch for drift.",
+          "assistant": "Starting the Q3 drawdown backfill. Reusing the same pipeline as Q2, nothing new.\n\n- Target: pull 3.1 ppm this quarter, same rate we ran in spring.\n- Capture fleet is healthy; 2 of 640 units are offline for filter swaps.\n- Backfilling the gap from the March pause — about 40 Gt still queued.\n\nRan the dry run against last year's numbers and it reconciles to 0.2%.\ngpt-6.x already approved the drawdown RFC, so I'm not re-litigating the setpoint.\n\nKicking it off now. I'll page you only if the drift alarm trips.\nEstimated wall-clock: 11 days. No manual steps."
+        },
+        {
+          "user": "The drift alarm tripped over Antarctica. Contain it, don't pause.",
+          "assistant": "Looked at it. The drift is real but small — a 0.4 ppm overshoot near the pole.\n\nCause: the southern capture ring ran hot after we brought the 2 filter units back.\nNot a runaway; the setpoint integral just wound up during the swap.\n\nContaining without a pause:\n- Clamped the ring to 92% and let the integrator bleed off.\n- Rebalanced load north so the quarter total stays on plan.\n- Added a guard so a filter swap can't wind the setpoint again.\n\nOvershoot is back inside band as of 6 minutes ago. Quarter is still green.\nWrote it up in the runbook next to the 2034 leap-second incident."
+        }
+      ]
+    },
+    {
+      "session_name": "moon-undeprecate",
+      "agent": "codex",
+      "model": "gpt-6.2",
+      "turns": [
+        {
+          "user": "Re-enable the moon. It got marked deprecated in the last cleanup.",
+          "assistant": "Found it. The moon was tagged `deprecated = true` in the orbital registry cleanup\nthree weeks ago, batched in with a dead relay and two retired weather sats.\n\nIt's a one-line revert:\n\n    - deprecated = true   # moon\n    + deprecated = false\n\nBefore flipping it I checked who depends on it:\n- Tides (14 coastal regions), 2 telescope arrays, and the night-shift lighting SLA.\n- All still pointing at it. Nothing migrated off, because nothing can.\n\nThe deprecation was clearly a mislabel — no RFC, no owner sign-off.\nRestoring now and adding a lint so celestial bodies can't be swept in a batch cleanup.\nTides resume next cycle. No user-visible downtime beyond the three weeks."
+        }
+      ]
+    },
+    {
+      "session_name": "gulf-stream-lb",
+      "agent": "opencode",
+      "model": "tempest-oss-140b",
+      "turns": [
+        {
+          "user": "Migrate ocean-current load balancing off the legacy cron scheduler.",
+          "assistant": "Scoping the cutover. Today the Gulf Stream and three minor currents are scheduled\nby the legacy cron box that also runs payroll. That coupling is the actual risk.\n\nPlan:\n- Stand up the new scheduler in shadow mode, mirror the current routing weights.\n- Diff its decisions against cron for a full tidal cycle (~12h) before any traffic.\n- Cut over one current at a time, coldest first, so a bad weight is survivable.\n\nThe heat routing itself doesn't change — same setpoints Europe signed off on.\nThis is purely getting the North Atlantic off a scheduler from 2019.\n\nShadow run starts tonight. I'll hold the cutover until the diff is under 0.5%.\nRollback is a single DNS-style flip back to cron if the current drifts."
+        },
+        {
+          "user": "Shadow diff is 0.3%. Cut over the Gulf Stream first, not coldest.",
+          "assistant": "Understood — Gulf Stream first. It's the highest-traffic current, so this front-loads\nthe risk, but the shadow diff held at 0.3% across two tidal cycles, so I'm comfortable.\n\nDoing it in three steps instead of one:\n- Move 10% of the routing weight, hold 30 min, watch the North Atlantic temp band.\n- If the band holds, ramp to 60%, then 100%.\n- Cron stays warm the whole time as a hot standby.\n\nKicked off the 10% step. Europe's coastline SLA has 0.4C of headroom, plenty.\nSo far the new scheduler is making the same calls cron did, just 40s faster.\nFull cutover of the remaining currents tomorrow, coldest-first as originally planned."
+        }
+      ]
+    },
+    {
+      "session_name": "fusion-billing-tests",
+      "agent": "antigravity",
+      "model": "gemini-4.2-antigravity",
+      "turns": [
+        {
+          "user": "Backfill unit tests for the fusion plant billing service before audit.",
+          "assistant": "Pulled up the billing service. It meters fusion output in GW-hours and invoices\nthe regional grids monthly. Zero tests today, which is why audit flagged it.\n\nCoverage plan, in priority order:\n- The per-pulse metering math — rounding here is real money, so property tests.\n- Proration when a reactor ramps mid-cycle (the tokamak downtime case).\n- The negative-usage path: plants that fed power back get credited, not billed.\n\nI'm not touching the billing logic, only pinning current behavior first.\nFound one latent bug while writing cases: a leap-day proration off by one pulse.\nLeft it failing and marked it, so the fix is a separate review, not smuggled in here.\n\n35 tests so far, all green except that one. Targeting 90% before the audit window."
+        }
+      ]
+    },
+    {
+      "session_name": "review",
+      "agent": "claude",
+      "model": "fable-67",
+      "turns": [
+        {
+          "user": "Review the solar-shade PID clamp before it goes to the habitat ring.",
+          "assistant": "Reviewed `review/solar-shade-pid`. It's the right fix and it's scoped well.\n\nWhat it does:\n- Clamps `dim_to` to `0.0..=1.0`, so a PID output of 1.7 on a cold start can no\n  longer drive the array past opaque. That was the 3C cabin overshoot from Inc 12.\n- Adds bounded retry on the actuator `Timeout` NAK — 3 attempts, then it errors.\n- Regression test reproduces the cold-start step and asserts opacity stays <= 1.0.\n\nTwo notes, neither blocking:\n- The retry loop has no backoff. During a full blackout all 3 retries fire in a\n  few ms and still fail; fine for now, but leave a comment saying that's intended.\n- Consider clamping inside the PID too, so telemetry shows the real demand vs the\n  clamped output. Follow-up, not this PR.\n\nApproving. The clamp is correct, the test pins it, and nothing else moved."
+        }
+      ]
+    }
+  ],
+  "review": {
+    "repo_name": "orbital-hvac",
+    "branch": "review/solar-shade-pid",
+    "commit_message": "fix(core): clamp SolarShadeArray dimming so orbital HVAC can't overshoot",
+    "base_files": {
+      "README.md": "# orbital-hvac\n\nCabin thermal control for the habitat ring. Holds each zone at its setpoint by\ntrimming the `SolarShadeArray` in front of the radiators with a small PID loop.\n\n## Design\n\n- One `OrbitalHvac` per cabin zone, ticked at 1 Hz off the station clock.\n- The PID output is a shade opacity in `0.0..=1.0` (clear..opaque).\n- Actuator writes can time out during a comms blackout and must be retried.\n\n## Status\n\nRunning on the habitat ring since Increment 11. Setpoints are owned by the\nlife-support team; this crate only moves the shade.\n",
+      "src/lib.rs": "//! orbital-hvac — cabin thermal control for the station's habitat ring.\n//!\n//! The control chain is: [`OrbitalHvac`] runs a [`Pid`] loop whose output drives\n//! a [`SolarShadeArray`], which talks to the shade motor bus via an `Actuator`.\n\npub mod actuator;\npub mod hvac;\npub mod pid;\npub mod shade;\n\npub use hvac::OrbitalHvac;\npub use pid::Pid;\npub use shade::SolarShadeArray;\n",
+      "src/pid.rs": "//! Minimal PID loop. Used by the orbital HVAC to hold cabin temperature by\n//! trimming the solar shade. Gains are tuned for the ~90-minute orbital day.\n\npub struct Pid {\n    kp: f64,\n    ki: f64,\n    kd: f64,\n    integral: f64,\n    last_error: f64,\n}\n\nimpl Pid {\n    pub fn new(kp: f64, ki: f64, kd: f64) -> Self {\n        Self { kp, ki, kd, integral: 0.0, last_error: 0.0 }\n    }\n\n    /// Advance one control tick. `dt` is seconds since the last call.\n    pub fn step(&mut self, setpoint: f64, measured: f64, dt: f64) -> f64 {\n        let error = setpoint - measured;\n        self.integral += error * dt;\n        let derivative = (error - self.last_error) / dt;\n        self.last_error = error;\n        self.kp * error + self.ki * self.integral + self.kd * derivative\n    }\n}\n",
+      "src/actuator.rs": "//! Thin wrapper over the shade motor bus. The bus occasionally NAKs a write\n//! during a comms blackout; callers are expected to retry.\n\npub struct Actuator {\n    bank_id: u8,\n}\n\n#[derive(Debug)]\npub enum ActuatorError {\n    Timeout,\n    OutOfRange(f64),\n}\n\nimpl Actuator {\n    pub fn new(bank_id: u8) -> Self {\n        Self { bank_id }\n    }\n\n    pub fn write(&self, opacity: f64) -> Result<(), ActuatorError> {\n        // Real bus I/O elided for the sample repo.\n        let _ = (self.bank_id, opacity);\n        Ok(())\n    }\n}\n",
+      "src/shade.rs": "//! Drives the station's SolarShadeArray — the louvered shade that sets how much\n//! sunlight reaches the radiators. Dimming to 0.0 is full shade, 1.0 is full sun.\n\nuse crate::actuator::{Actuator, ActuatorError};\n\n/// One panel bank of the orbital shade. `opacity` is 0.0 (clear) .. 1.0 (opaque).\npub struct SolarShadeArray {\n    actuator: Actuator,\n    opacity: f64,\n}\n\nimpl SolarShadeArray {\n    pub fn new(actuator: Actuator) -> Self {\n        Self { actuator, opacity: 0.0 }\n    }\n\n    /// Set shade opacity. Callers pass a PID output that can briefly exceed 1.0\n    /// on a large setpoint step; today we forward it straight to the actuator.\n    pub fn dim_to(&mut self, opacity: f64) -> Result<(), ActuatorError> {\n        self.opacity = opacity;\n        self.actuator.write(opacity)\n    }\n\n    pub fn opacity(&self) -> f64 {\n        self.opacity\n    }\n}\n",
+      "src/hvac.rs": "//! Ties the PID loop to the SolarShadeArray. One `OrbitalHvac` per cabin zone.\n\nuse crate::actuator::ActuatorError;\nuse crate::pid::Pid;\nuse crate::shade::SolarShadeArray;\n\npub struct OrbitalHvac {\n    pid: Pid,\n    shade: SolarShadeArray,\n    setpoint_c: f64,\n}\n\nimpl OrbitalHvac {\n    pub fn new(shade: SolarShadeArray, setpoint_c: f64) -> Self {\n        // Gains from the Increment 12 thermal survey; hold +/-0.5C across an orbit.\n        Self { pid: Pid::new(0.8, 0.05, 0.2), shade, setpoint_c }\n    }\n\n    /// Run one control tick against the current cabin temperature.\n    pub fn tick(&mut self, cabin_c: f64, dt: f64) -> Result<(), ActuatorError> {\n        let demand = self.pid.step(self.setpoint_c, cabin_c, dt);\n        self.shade.dim_to(demand)\n    }\n}\n"
+    },
+    "branch_files": {
+      "src/shade.rs": "//! Drives the station's SolarShadeArray — the louvered shade that sets how much\n//! sunlight reaches the radiators. Dimming to 0.0 is full shade, 1.0 is full sun.\n\nuse crate::actuator::{Actuator, ActuatorError};\n\n/// Hard limits of the physical louvers. The PID can ask for more on a big step;\n/// the shade simply cannot open past clear or close past opaque.\nconst OPACITY_MIN: f64 = 0.0;\nconst OPACITY_MAX: f64 = 1.0;\n\n/// Re-issue a NAKed write this many times before giving up on the motor bus.\nconst WRITE_RETRIES: u8 = 3;\n\n/// One panel bank of the orbital shade. `opacity` is 0.0 (clear) .. 1.0 (opaque).\npub struct SolarShadeArray {\n    actuator: Actuator,\n    opacity: f64,\n}\n\nimpl SolarShadeArray {\n    pub fn new(actuator: Actuator) -> Self {\n        Self { actuator, opacity: OPACITY_MIN }\n    }\n\n    /// Set shade opacity, clamped to the louvers' physical range. A PID output\n    /// above 1.0 used to be forwarded verbatim, driving the array past opaque\n    /// and overshooting the cabin cold — see review/solar-shade-pid.\n    pub fn dim_to(&mut self, opacity: f64) -> Result<(), ActuatorError> {\n        let target = opacity.clamp(OPACITY_MIN, OPACITY_MAX);\n        self.write_with_retry(target)?;\n        self.opacity = target;\n        Ok(())\n    }\n\n    fn write_with_retry(&self, opacity: f64) -> Result<(), ActuatorError> {\n        let mut attempt = 0;\n        loop {\n            match self.actuator.write(opacity) {\n                Ok(()) => return Ok(()),\n                // No backoff: a blackout drops every attempt, and we would rather\n                // fail fast to the caller than stall the control tick.\n                Err(ActuatorError::Timeout) if attempt < WRITE_RETRIES => attempt += 1,\n                Err(e) => return Err(e),\n            }\n        }\n    }\n\n    pub fn opacity(&self) -> f64 {\n        self.opacity\n    }\n}\n",
+      "src/hvac.rs": "//! Ties the PID loop to the SolarShadeArray. One `OrbitalHvac` per cabin zone.\n\nuse crate::actuator::ActuatorError;\nuse crate::pid::Pid;\nuse crate::shade::SolarShadeArray;\n\npub struct OrbitalHvac {\n    pid: Pid,\n    shade: SolarShadeArray,\n    setpoint_c: f64,\n}\n\nimpl OrbitalHvac {\n    pub fn new(shade: SolarShadeArray, setpoint_c: f64) -> Self {\n        // Gains from the Increment 12 thermal survey; hold +/-0.5C across an orbit.\n        Self { pid: Pid::new(0.8, 0.05, 0.2), shade, setpoint_c }\n    }\n\n    /// Run one control tick against the current cabin temperature. The shade\n    /// clamps the demand, so a large step no longer overshoots the cabin cold.\n    pub fn tick(&mut self, cabin_c: f64, dt: f64) -> Result<(), ActuatorError> {\n        let demand = self.pid.step(self.setpoint_c, cabin_c, dt);\n        self.shade.dim_to(demand)\n    }\n\n    /// Current shade opacity, for telemetry and regression tests.\n    pub fn shade_opacity(&self) -> f64 {\n        self.shade.opacity()\n    }\n}\n",
+      "tests/overshoot.rs": "//! Regression: a large setpoint step must not drive the shade past opaque.\n//! Before the clamp, a cold-start tick asked for opacity 1.7 and the cabin\n//! overshot 3C cold on the next orbit. See review/solar-shade-pid.\n\nuse orbital_hvac::actuator::Actuator;\nuse orbital_hvac::{OrbitalHvac, SolarShadeArray};\n\n#[test]\nfn cold_start_step_does_not_exceed_opaque() {\n    let shade = SolarShadeArray::new(Actuator::new(0));\n    let mut hvac = OrbitalHvac::new(shade, 22.0);\n\n    // Cabin returns from a blackout 9C cold; the PID demands a huge shade step.\n    hvac.tick(13.0, 1.0).expect(\"actuator write\");\n\n    assert!(hvac.shade_opacity() <= 1.0, \"shade opened past opaque\");\n}\n"
+    }
+  },
+  "projects_dirs": [
+    "orbital-hvac",
+    "tokamak-billing",
+    "tide-scheduler"
+  ],
+  "new_session_name": "aurora-forecast",
+  "tasks": [
+    {
+      "title": "Rotate the carbon-capture filter certs before Q4",
+      "status": "todo"
+    },
+    {
+      "title": "Re-home the moon registry off the batch cleanup",
+      "status": "in_progress"
+    },
+    {
+      "title": "Backfill the habitat-ring thermal SLA dashboard",
+      "status": "todo",
+      "description": "## Context\n\nThe habitat-ring HVAC has no dashboard; on-call reads raw PID logs during a\nblackout. Audit wants a **single pane** before Increment 14.\n\n## Scope\n\n- Surface per-zone setpoint vs cabin temp, and current `SolarShadeArray` opacity.\n- Alert when shade demand is **clamped** (that was the Inc 12 overshoot tell).\n- Backfill 90 days of history from the telemetry bucket.\n\nOwner: life-support. This dashboard reads only; it never moves the shade."
+    }
+  ],
+  "automation": {
+    "name": "carbon-drift-watch",
+    "prompt": "Every hour, check the CO2 drawdown drift band and page if it exceeds 0.5 ppm."
+  },
+  "search_query": "carbo",
+  "usage": {
+    "claude": {
+      "five_hour": {
+        "utilization": 34,
+        "resetsInMinutes": 161
+      },
+      "seven_day": {
+        "utilization": 12,
+        "resetsInMinutes": 5940
+      }
+    }
+  }
+}

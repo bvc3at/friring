@@ -9,7 +9,7 @@ run the app in an isolated sandbox, and regenerate the demo media.
 
 The `flake.nix` pins the whole toolchain CI uses — the Rust toolchain (read from
 `rust-toolchain.toml`), `tmux`, `shellcheck`, `bats`, Node, `cargo-nextest`,
-`cargo-deny`, `cocogitto`, `just`, and the demo stack (`vhs`/`ffmpeg`/`ttyd`).
+`cargo-deny`, `cocogitto`, `just`, and the demo stack (`asciinema`/`agg`/`ffmpeg`).
 
 ```bash
 # one-time, if not done already: enable flakes
@@ -307,9 +307,8 @@ it from your package manager (it is not a cargo crate —
 ## 7. Demo video
 
 The demo media is **generated**, not hand-recorded. A single script drives the
-*real* TUI via [VHS](https://github.com/charmbracelet/vhs) (needs `vhs` +
-`ffmpeg` + `ttyd` + `tmux`) and writes GIF **and** MP4 straight into
-`docs/media/`:
+*real* TUI, records it, and writes GIF **and** MP4 straight into `docs/media/`
+(needs `asciinema` + `agg` + `ffmpeg` + `tmux`):
 
 ```bash
 scripts/demo/record.sh                 # regenerate ALL demo videos
@@ -325,22 +324,124 @@ deterministic `Wait+Screen` sync — into `target/agent-e2e/demos/` (see
 (`friring-demo.*` via `agents.tape`), one clip per feature
 (`friring-{file-manager,info-panel,theme,session-creation,fork}.*`), and the
 automations/tasks/search demos (`automations-demo.*`, `tasks-demo.*`,
-`search-demo.*`) — one VHS tape each (`scripts/demo/<feature>.tape`). With no
-args it records all of them; pass tape stems to re-record a subset (the `agents`
+`search-demo.*`) — one tape each (`scripts/demo/<feature>.tape`). With no args
+it records all of them; pass tape stems to re-record a subset (the `agents`
 stem is the hero, `automations`/`tasks`/`search` map to `<stem>-demo.*`, every
 other stem maps to `friring-<stem>.*`).
 
-Every clip uses **real agent CLIs**: the script seeds one session per installed
-CLI (`claude`, `opencode`, `codex`, `antigravity`) in a throwaway sample repo and
-launches them with no prompt. It overrides `HOME`, so agents boot with fresh
-history/config (no past conversations leak); CLIs that authenticate via the
-system keyring stay logged in but show no account email on screen. The tapes
-exercise the session list, info panel (`Ctrl+B`), file viewer (`Ctrl+E`), native
-code review (`Ctrl+X`, the default `ToggleReview` chord; `F7` alternate), theme
-picker, session-creation flow, and the Automations pane over the seeded sessions
-and sample tree. The hero `agents` demo also opens the code-review view, so it
-seeds the same worktree-with-a-committed-diff session the dedicated `code-review`
-clip uses.
+### How a clip is captured (and why not VHS)
+
+The recorder captures the TUI's **terminal byte stream** with `asciinema` and
+renders it to a GIF **offline** with `agg`; `lib/drive-tape.mjs` reads the tape
+and replays its beats as tmux keystrokes into the recorded session.
+
+This is the difference between a demo that sells the tool and one that doesn't.
+Capturing *pixels* off a live GUI — VHS's model, via a headless Chromium — makes
+the output a function of the recording machine: it drops frames as soon as the
+box cannot rasterize fast enough, and it can grab a half-drawn screen (tearing).
+On a 2019 Intel Mac this pipeline sustains only ~6fps at 1080p, and because VHS
+stamps a *fixed* delay per surviving frame rather than each frame's real
+timestamp, a 15s clip was emitted as a 1.08s one — roughly 8x too fast, and
+unreadable.
+
+Recording the byte stream costs approximately nothing, so **every paint friring
+emits is kept, with its true timestamp**, and rendering can take as long as it
+needs. `agg` then emits a frame only when the terminal's content actually
+changed, giving it the delay it truly held for. So a clip's pacing is exact and
+identical on any machine, every frame is a complete redraw (tearing is
+structurally impossible), and the files are smaller. friring helps here: it
+paints on demand (ADR-P1), so transitions are captured crisply and idle screens
+simply have nothing to animate.
+
+Consequences worth knowing when editing a tape or the recorder:
+
+- The tape's `Hide … Show` preamble is **skipped**: recording attaches to an
+  already-running session, so `record.sh` boots the TUI off-camera itself.
+- `Type` is replayed character-by-character (`DEMO_TYPING_SPEED_MS`, default
+  50ms, matching VHS). Pasting a line at once reads as a glitch, not as someone
+  using the tool.
+- The tmux status bar is turned **off** on both sockets — an attached client
+  renders it, so it would otherwise be filmed.
+- **No teardown is filmed.** The tapes don't quit the TUI; the recorder stops
+  filming by **detaching** the recorded client, then quits the TUI off-camera —
+  where the quit still serves as a fail-closed check that the tape ended in a
+  state the TUI can quit from (a swallowed chord means a beat landed in the
+  wrong context). A quit on camera films its own teardown (friring clearing its
+  alternate screen, then the dying client's reset + `[exited]`) as the clip's
+  held closing frame. The detach's smaller tail (leave-alt-screen, reset,
+  `[detached]`) is trimmed from the cast before rendering
+  (`lib/trim-cast.mjs`), so every clip ends on the last live TUI frame.
+- `agg --idle-time-limit` is set far above any beat in the tapes; it would
+  otherwise silently compress the very pauses the tapes exist to script.
+- The GIF keeps **variable** frame delays — that is where the exact pacing
+  lives, so never re-encode it. The MP4 is derived from it with ffmpeg's
+  `fps` filter, which re-times to a constant rate for players that need one
+  without changing the duration.
+- Grid and size live in `record.sh` (`DEMO_COLS`/`DEMO_ROWS`/`DEMO_FONT_SIZE`):
+  175x42 at font-size 18 renders ~1920x1080, at about the column count VHS's
+  ttyd produced, so the TUI lays itself out as before.
+- The font is pinned to **Meslo LG S** (`DEMO_FONT`) and the run **refuses to
+  record without it**. agg resolves families itself and silently falls back when
+  one is missing — its default list starts with JetBrains Mono, which is rarely
+  installed, so the clips used to inherit whatever the recording box happened to
+  have. It is passed as `--text-font-family`, never `--font-family`: the latter
+  bypasses agg's automatic fallbacks, and those are where friring's symbol glyphs
+  (`❯ ◐ ⏺ ✻`, box drawing) come from. Install with
+  `brew install --cask font-meslo-lg`; the Nix flake pins it.
+- Renderer: agg's default **`swash`**. `--renderer resvg` is *worse* here — it
+  breaks box-drawing borders into dashed segments and drops glyphs.
+
+Every clip uses **real agent CLIs driven by the e2e model stubs** — no accounts,
+no network, nothing to log in to. The script seeds one session per installed CLI
+(`claude`, `codex`, `opencode`, `antigravity`) in a throwaway sample repo, points
+each at a loopback stub (`scripts/dev/agent-e2e/stub/`, shared with the e2e
+suite — see `docs/E2E.md`), and **pre-plays a scripted conversation** into every
+pane before recording starts, so each agent is caught mid-work rather than idling
+on a splash screen.
+
+The conversations, the sample repo, the review diff, the tasks/automation and the
+search query all come from **`scripts/demo/demo-content.json`** — one file that is
+the demo's script. `scripts/demo/lib/gen-stub-fixtures.mjs` compiles it into stub
+fixtures plus a pre-play plan (each turn's prompt and a marker to wait for). To
+change what the demos say, edit that JSON; nothing else needs touching.
+
+Two consequences worth keeping:
+
+- **Deterministic**: the same scripted exchange every run, so a re-record diffs
+  cleanly instead of capturing whatever a live model happened to answer.
+- **Identity-free**: every agent talks to `127.0.0.1`, so no account email, token
+  or usage can appear on camera. Each CLI's *fictional* model id (`fable-67`,
+  `gpt-6.x`, …) is what renders in its own status line. The info panel's Claude
+  account-usage gauges are stubbed the same way: `FRIRING_CLAUDE_USAGE_URL`
+  (see `docs/CONFIG.md`) points friring's fetch at the anthropic stub, which
+  serves the scripted numbers from `demo-content.json`'s `usage` key against a
+  fake credentials file seeded at the `~/.claude` fallback path only — the
+  claude CLI itself reads `CLAUDE_CONFIG_DIR` and never sees it.
+
+`antigravity` (`agy`) is the exception: it forces real Google OAuth and cannot be
+stubbed offline, so it is featured **logged out** on its clean login screen —
+which is also what keeps a signed-in account's identity off camera. See
+`scripts/dev/agent-e2e/agents/antigravity/profile.sh`.
+
+Pre-play (and every other step) syncs on pane markers, never fixed sleeps: several
+real CLIs boot concurrently, so "long enough" is not knowable up front. Missing
+agents are skipped with a warning.
+
+The whole state is **re-seeded before every tape**, because the clips mutate what
+the next one poses against: `agents` and `session-creation` each spawn a session,
+`fork` spawns two more, `tasks`/`automations` add rows. Seeding once and filming
+all ten in a row drifts — the session list accumulates strangers, and since the
+*selected* session is whichever was spawned most recently, `code-review` ends up
+opening a session that has no branch and filming "No changes to show". Re-seeding
+costs a rebuild per tape and buys clips that are independent and individually
+reproducible: `record.sh code-review` films exactly what the full run does.
+
+The tapes exercise the session list, info panel (`Ctrl+B`), file viewer
+(`Ctrl+E`), native code review (`Ctrl+X`, the default `ToggleReview` chord; `F7`
+alternate), theme picker, session-creation flow, and the Automations pane over the
+seeded sessions and sample tree. The hero `agents` demo also opens the code-review
+view, so it seeds the same worktree-with-a-committed-diff session the dedicated
+`code-review` clip uses.
 
 It runs fully isolated from your real environment — a dev build (`0.0.0-dev` →
 `dev_build` cfg) uses the `friring-dev` socket and XDG subdirs, and the script

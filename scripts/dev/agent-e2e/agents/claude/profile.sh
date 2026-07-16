@@ -46,7 +46,12 @@ agent_binary() {
 }
 
 agent_version() {
-    "$(agent_binary)" --version 2>/dev/null | head -1
+    e2e_bin_version "$(agent_binary)"
+}
+
+# One-shot headless prompt argv (protocol smoke): claude's print mode.
+agent_print_args() {
+    AGENT_PRINT_ARGS=(-p "$1" "${AGENT_LAUNCH_ARGS[@]}")
 }
 
 # ANTHROPIC_AUTH_TOKEN (Bearer) rather than ANTHROPIC_API_KEY: the API-key path
@@ -75,18 +80,19 @@ EOF
 
 # hasCompletedOnboarding skips first-run setup; bypassPermissionsModeAccepted
 # lets --dangerously-skip-permissions run without an acceptance prompt (safe
-# here: throwaway workspace, loopback-only egress); the per-folder trust entry
-# skips the interactive-mode "trust this folder?" dialog for the session's
-# workspace (same trick scripts/demo/record.sh uses). Seeded in both locations
-# because claude reads $CLAUDE_CONFIG_DIR/.claude.json when the override is
-# set and ~/.claude.json otherwise.
+# here: throwaway workspace, loopback-only egress); the per-folder trust
+# entries skip the interactive-mode "trust this folder?" dialog for every
+# workspace the run touches (same trick scripts/demo/record.sh uses). Seeded
+# in both locations because claude reads $CLAUDE_CONFIG_DIR/.claude.json when
+# the override is set and ~/.claude.json otherwise.
 agent_seed_config() {
-    local ws="$1" seed
-    seed="$(jq -n --arg ws "$ws" '{
+    local seed
+    seed="$(jq -n '{
         hasCompletedOnboarding: true,
         bypassPermissionsModeAccepted: true,
-        projects: {($ws): {hasTrustDialogAccepted: true}}
-    }')"
+        projects: ($ARGS.positional
+                   | map({(.): {hasTrustDialogAccepted: true}}) | add)
+    }' --args "$@")"
     mkdir -p "$HOME/claude-config"
     printf '%s' "$seed" > "$HOME/.claude.json"
     printf '%s' "$seed" > "$HOME/claude-config/.claude.json"
