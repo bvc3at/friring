@@ -353,6 +353,14 @@ pub const MUX_SERVER_MARKER_OPTION: &str = "@friring_server";
 /// `<session id>:<launch key>`.
 pub const MUX_PANE_MARKER_OPTION: &str = "@friring_pane";
 
+/// The states `session signal` accepts — the single source for the CLI's
+/// value parser, the TUI's remote-event allow-list
+/// (`App::drain_remote_hook_events`), and the headless status poll
+/// (`session_ops::remote_hooks`). One list, so a future state (e.g. `error`
+/// once exit-code derivation lands) can't be accepted by the CLI yet silently
+/// dropped by the remote channels.
+pub const HOOK_STATES: [&str; 4] = ["working", "blocked", "done", "idle"];
+
 /// Whether the remote hooks-driven status path is enabled for a **psmux**
 /// (native-Windows SSH) host — both halves of it: shipping hook configs with
 /// their commands rewritten to the psmux pane-option form
