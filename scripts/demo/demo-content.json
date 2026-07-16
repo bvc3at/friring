@@ -107,5 +107,17 @@
     "name": "carbon-drift-watch",
     "prompt": "Every hour, check the CO2 drawdown drift band and page if it exceeds 0.5 ppm."
   },
-  "search_query": "carbo"
+  "search_query": "carbo",
+  "usage": {
+    "claude": {
+      "five_hour": {
+        "utilization": 34,
+        "resetsInMinutes": 161
+      },
+      "seven_day": {
+        "utilization": 12,
+        "resetsInMinutes": 5940
+      }
+    }
+  }
 }

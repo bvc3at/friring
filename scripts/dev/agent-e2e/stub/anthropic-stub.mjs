@@ -43,6 +43,8 @@
 //       }
 //     }]
 //   }
+// plus an optional top-level "usage" key for the account-usage endpoint (see
+// the /api/oauth/usage route below).
 //
 // First matching response wins (top to bottom). List `ambient` fixtures FIRST:
 // a background side-model call (e.g. haiku title-gen) is model-keyed, so an
@@ -194,6 +196,26 @@ function respondJson(res, model, picked) {
 }
 
 serveStub('anthropic-stub', stub, async ({ req, res, raw, url, base }) => {
+  // Account-level usage (Claude Code's `/usage`; friring's info panel fetches
+  // the same route). Served only when the fixture file carries a top-level
+  // `usage` key — reset times are minutes-from-now in the fixture, converted
+  // here so the rendered countdown is always sensibly in the future:
+  //   "usage": { "plan-window": {"utilization": 34, "resetsInMinutes": 161}, … }
+  // keyed by the wire names `five_hour` / `seven_day`. friring reaches this
+  // stub via FRIRING_CLAUDE_USAGE_URL (src/usage/mod.rs).
+  if (req.method === 'GET' && url.startsWith('/api/oauth/usage') && stub.fixtures.usage) {
+    const body = {};
+    for (const [win, v] of Object.entries(stub.fixtures.usage)) {
+      body[win] = {
+        utilization: v.utilization,
+        resets_at: new Date(Date.now() + v.resetsInMinutes * 60_000).toISOString(),
+      };
+    }
+    stub.journal({ ...base, kind: 'usage' });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(body));
+    return true;
+  }
   if (url.startsWith('/v1/messages/count_tokens')) {
     stub.journal({ ...base, kind: 'count_tokens' });
     res.writeHead(200, { 'content-type': 'application/json' });

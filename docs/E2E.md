@@ -50,6 +50,10 @@ strictness the `UNMATCHED` marker enforces.
 
 `reply.toolUse` is an `anthropic`-dialect feature: the tool-use loop is conformance-tested against
 Claude Code, while the `openai` dialect exists to render text turns (scenarios and demo panes).
+The `anthropic` stub also serves an account-usage route (`GET /api/oauth/usage`) when the fixture
+file carries a top-level `usage` key (reset times are minutes-from-now, converted at request
+time); friring's info panel reaches it via `FRIRING_CLAUDE_USAGE_URL` — the demo recorder uses
+this so its clips show real usage gauges instead of "not logged in".
 
 Strictness is enforced **at assert time, not response time**: an unmatched model call gets a
 benign marker reply (so the pane stays alive and debuggable) plus an `UNMATCHED` journal entry,

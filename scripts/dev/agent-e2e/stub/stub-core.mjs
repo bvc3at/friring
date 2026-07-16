@@ -79,6 +79,9 @@ export function createStub(stubName) {
   let messageSeq = 0;
   return {
     opts,
+    // The parsed fixture file, for dialect routes beyond `responses` (e.g. the
+    // anthropic stub's account-usage endpoint reads a top-level `usage` key).
+    fixtures,
     journal(entry) {
       fs.appendFileSync(opts.JOURNAL, JSON.stringify(entry) + '\n');
     },

@@ -246,6 +246,10 @@ export CODEX_HOME="$HOME/codex-home"
 export OPENCODE_CONFIG="$HOME/opencode.json"
 export ANTHROPIC_BASE_URL="$ANTHROPIC_URL"
 export ANTHROPIC_AUTH_TOKEN="friring-demo-dummy"
+# The info panel's Usage gauges: friring fetches the account-usage route with
+# the OAuth token from .credentials.json (seeded below) — point that fetch at
+# the stub too, or every clip films "not logged in (no subscription token)".
+export FRIRING_CLAUDE_USAGE_URL="$ANTHROPIC_URL/api/oauth/usage"
 [ -n "$CLAUDE_MODEL" ] && export ANTHROPIC_MODEL="$CLAUDE_MODEL"
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 export DISABLE_AUTOUPDATER=1 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DISABLE_BUG_COMMAND=1
@@ -314,6 +318,17 @@ if have_agent claude; then
     claude_bin=$(command -v claude 2>/dev/null || true)
     [ -n "$claude_bin" ] && ln -sf "$(readlink -f "$claude_bin" 2>/dev/null || echo "$claude_bin")" \
         "$HOME/.local/bin/claude"
+    # A fake subscription credential for friring's usage fetch (scripted
+    # numbers served by the stub via FRIRING_CLAUDE_USAGE_URL). Seeded ONLY at
+    # the ~/.claude fallback path, never in CLAUDE_CONFIG_DIR: friring checks
+    # the override dir first but falls back when the file is absent there
+    # (src/usage/mod.rs), while the claude CLI reads its own state from
+    # CLAUDE_CONFIG_DIR — so the pane keeps authing with ANTHROPIC_AUTH_TOKEN
+    # and never tries to refresh this fictional OAuth token against a dead
+    # proxy. The plan tier is the fictional-future subscription on camera.
+    mkdir -p "$HOME/.claude"
+    printf '{"claudeAiOauth":{"accessToken":"friring-demo-oauth-dummy","subscriptionType":"max-100x"}}\n' \
+        > "$HOME/.claude/.credentials.json"
 fi
 
 # codex: a custom provider against the openai stub (Responses wire); fictional

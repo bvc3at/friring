@@ -402,7 +402,12 @@ Two consequences worth keeping:
   cleanly instead of capturing whatever a live model happened to answer.
 - **Identity-free**: every agent talks to `127.0.0.1`, so no account email, token
   or usage can appear on camera. Each CLI's *fictional* model id (`fable-67`,
-  `gpt-6.x`, …) is what renders in its own status line.
+  `gpt-6.x`, …) is what renders in its own status line. The info panel's Claude
+  account-usage gauges are stubbed the same way: `FRIRING_CLAUDE_USAGE_URL`
+  (see `docs/CONFIG.md`) points friring's fetch at the anthropic stub, which
+  serves the scripted numbers from `demo-content.json`'s `usage` key against a
+  fake credentials file seeded at the `~/.claude` fallback path only — the
+  claude CLI itself reads `CLAUDE_CONFIG_DIR` and never sees it.
 
 `antigravity` (`agy`) is the exception: it forces real Google OAuth and cannot be
 stubbed offline, so it is featured **logged out** on its clean login screen —

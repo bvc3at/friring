@@ -93,9 +93,16 @@ if (sawOpencode) {
 }
 openaiOut.push(...openai);
 
+// The scripted account-usage numbers (demo-content `usage.claude`) ride along
+// as the fixture file's top-level `usage` key; the anthropic stub serves them
+// on its /api/oauth/usage route so the info panel's Usage gauges render real
+// windows instead of "not logged in".
+const anthropicOut = { responses: anthropic };
+if (content.usage && content.usage.claude) anthropicOut.usage = content.usage.claude;
+
 fs.writeFileSync(
   `${outDir}/anthropic-fixtures.json`,
-  JSON.stringify({ responses: anthropic }, null, 2) + '\n'
+  JSON.stringify(anthropicOut, null, 2) + '\n'
 );
 fs.writeFileSync(
   `${outDir}/openai-fixtures.json`,
