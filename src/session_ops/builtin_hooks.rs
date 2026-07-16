@@ -401,15 +401,17 @@ mod tests {
             ("copilot-hooks.json", COPILOT_HOOKS),
             ("extension.toml", MANIFEST), // aider's literal --notifications-command arg
         ] {
-            // Key on the command-with-flag form — a bare `session signal`
-            // mention in a comment is fine, an actual `--state` invocation
-            // must carry the exact marker prefix.
-            let occurrences = asset.matches("session signal --state").count();
+            // Key on the invocation-with-flags form (`friring-cli session
+            // signal --…`): a bare mention in a comment (ends at a backtick/
+            // newline) is fine, but ANY flagged invocation — including one
+            // whose flags drifted, e.g. `--quiet --state` — must carry the
+            // exact marker prefix, or the remote rewrite silently misses it.
+            let occurrences = asset.matches("friring-cli session signal --").count();
             assert!(occurrences > 0, "{name} carries no session-signal command");
             assert_eq!(
                 asset.matches(crate::session::STATUS_SIGNAL_MARKER).count(),
                 occurrences,
-                "a `session signal --state` command in {name} doesn't match STATUS_SIGNAL_MARKER"
+                "a `friring-cli session signal --…` command in {name} doesn't match STATUS_SIGNAL_MARKER"
             );
         }
         assert_eq!(
