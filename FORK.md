@@ -451,8 +451,15 @@ while any client is attached to the release server (no single-instance lock
 exists — two TUIs would fight over the same panes), back up `friring.db`
 (transactional `sqlite3 .backup`; migrations are forward-only and a dev
 branch may bump `SCHEMA_VERSION`), then launch the dev TUI with the four
-overrides set and `target/debug` first on `PATH`. Details in
-`docs/CONFIG.md` (env table) and `docs/DEVELOPMENT.md` ("Live mode").
+overrides set and `target/debug` first on `PATH`.
+
+`Ctrl+Alt+R` (`Action::ReloadApp`, fork-only) closes the loop in place:
+a normal quit followed by an `exec` of the on-disk binary — env (and so a
+dev-live attach) carried over, sessions re-adopted by the new image without
+the terminal ever returning to the shell. Rebuild, hit the chord, and the
+running instance *is* the new build. Details in `docs/CONFIG.md` (env
+table), `docs/DEVELOPMENT.md` ("Live mode"), and `docs/FEATURES.md`
+("Reload friring in place").
 
 #### Terminal-first focus
 

@@ -107,6 +107,12 @@ async fn main() -> Result<()> {
     // covers config load, DB open, and session restore.
     let process_start = std::time::Instant::now();
 
+    // For the in-place reload (`Action::ReloadApp`). Resolved now, not at
+    // reload time: on Linux a `cargo build` that replaces the on-disk binary
+    // while we run turns `/proc/self/exe` into "<path> (deleted)", while the
+    // path captured before the replacement stays exec-able.
+    let initial_exe = std::env::current_exe().ok();
+
     // Restore the terminal before the panic message prints (else it garbles).
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -235,8 +241,37 @@ async fn main() -> Result<()> {
     // `restore_terminal` is idempotent, so the `_terminal_guard` drop below (and
     // early-error returns) still restore correctly.
     restore_terminal();
+    let reload_requested = app.reload_requested();
     app.shutdown();
+    if reload_requested && res.is_ok() {
+        // Only returns on failure — on success the process image is replaced.
+        return reload_binary(initial_exe);
+    }
     res
+}
+
+/// Re-exec the binary in place (`Action::ReloadApp`): replace this process
+/// with whatever is on disk at the startup-time exe path, argv and env carried
+/// over — so a `FRIRING_*`-overridden dev-live run reloads straight back into
+/// the same live attach. The sessions were already detached by `shutdown()`;
+/// the new image re-adopts them like any other launch. Returns only on
+/// failure.
+#[cfg(unix)]
+fn reload_binary(initial_exe: Option<std::path::PathBuf>) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = initial_exe.context("could not resolve the running binary's path for reload")?;
+    let err = std::process::Command::new(&exe)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    Err(anyhow::Error::new(err).context(format!("failed to re-exec {}", exe.display())))
+}
+
+/// Windows has no exec(2) — a spawned replacement would fight this process
+/// for the console — so reload degrades to a plain quit with a hint.
+#[cfg(not(unix))]
+fn reload_binary(_initial_exe: Option<std::path::PathBuf>) -> Result<()> {
+    eprintln!("In-place reload is not supported on this platform - relaunch friring manually.");
+    Ok(())
 }
 
 /// Bring up the session backends and load every config file (settings, hosts,

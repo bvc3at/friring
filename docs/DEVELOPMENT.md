@@ -136,6 +136,11 @@ binary will refuse it, and you restore the backup (or keep using the dev
 build). `--shell` / `-- <cli args>` mirror the sandbox script; `--no-build`
 skips the rebuild.
 
+While the dev TUI runs, iterate without leaving it: `cargo build` in another
+terminal (or a `Ctrl+T` shell pane), then press `Ctrl+Alt+R` — friring quits
+and `exec`s the on-disk binary in place, env carried over, and the new build
+re-adopts every session (see `docs/FEATURES.md`, "Reload friring in place").
+
 ## 4. Testing
 
 `cargo nextest` is the preferred runner:

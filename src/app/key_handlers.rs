@@ -1454,6 +1454,14 @@ impl App {
                 self.should_quit = true;
                 true
             }
+            Action::ReloadApp => {
+                // A normal quit plus the flag: `main` re-execs the on-disk
+                // binary after `shutdown()`, and the new image re-adopts the
+                // detached sessions on startup.
+                self.reload_requested = true;
+                self.should_quit = true;
+                true
+            }
             Action::NewSession => {
                 self.act_new_session();
                 true

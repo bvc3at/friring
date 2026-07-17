@@ -584,6 +584,7 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Ctrl+D` | Session list | Delete selected session | Vim: **d** = delete |
 | `Ctrl+O` | Global | Open active session's worktrees in editor | **O**pen |
 | `Ctrl+R` | Global | Restart active session | **R**estart |
+| `Ctrl+Alt+R` | Global | Reload friring in place (quit + re-exec the on-disk binary) | **R**estart, one modifier up |
 | `Ctrl+F` | Global | Fork active session | **F**ork |
 | `Ctrl+S` | Global | Sync all worktree sessions with their base branch | **S**ync |
 | `Ctrl+Z` | Global | Undo session delete | **Z** = undo |
@@ -784,6 +785,23 @@ UUIDs are collision-free without coordination, simple to generate,
 and usable as map keys. Sequential IDs would work too, but UUIDs
 prevent bugs where an old session ID accidentally refers to a new
 session after recycling.
+
+### Reload friring in place (`Ctrl+Alt+R`)
+
+Where `Ctrl+R` restarts the active *session*, `Ctrl+Alt+R`
+(`Action::ReloadApp`) restarts *friring itself*: a normal quit —
+state saved, every session detached, tmux left running — followed by
+an `exec` of the on-disk binary, argv and env carried over. The new
+process image re-adopts the detached sessions on startup like any
+other launch, so nothing is lost; the terminal never returns to the
+shell in between. Its purpose is the dev loop: rebuild, hit the
+chord, and the running instance becomes the new build while keeping
+every live session (`just dev-live`, see `docs/DEVELOPMENT.md`).
+The exe path is resolved at startup (a rebuild that replaces the
+file mid-run would poison `/proc/self/exe` on Linux), and on
+Windows — which has no `exec(2)` — the chord degrades to a plain
+quit with a hint. Not a bare `Ctrl+<letter>`, so it dispatches from
+a focused terminal without colliding with the PTY.
 
 ---
 

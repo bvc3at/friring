@@ -30,6 +30,10 @@ use serde::{Deserialize, Serialize};
 pub enum Action {
     // ── Global ──────────────────────────────────────────────────────────
     QuitApp,
+    /// Quit and re-exec the on-disk binary in place. Sessions survive: they
+    /// detach on shutdown and the new process image re-adopts them on startup
+    /// — the fast path for verifying a rebuilt dev binary (`just dev-live`).
+    ReloadApp,
     NewSession,
     DeleteSession,
     OpenInEditor,
@@ -147,6 +151,7 @@ impl Action {
     pub fn all() -> &'static [Action] {
         &[
             Action::QuitApp,
+            Action::ReloadApp,
             Action::NewSession,
             Action::DeleteSession,
             Action::OpenInEditor,
@@ -218,6 +223,7 @@ impl Action {
     pub fn label(self) -> &'static str {
         match self {
             Action::QuitApp => "Quit",
+            Action::ReloadApp => "Reload friring in place",
             Action::NewSession => "New session",
             Action::DeleteSession => "Delete session",
             Action::OpenInEditor => "Open in editor",
@@ -413,6 +419,16 @@ impl Action {
     pub fn default_chords_for(self, macos: bool) -> Vec<KeyChord> {
         let mut chords = match self {
             Action::QuitApp => vec![KeyChord::ctrl('q')],
+            // Ctrl+Alt+R — Ctrl+R (restart the *session*) one modifier up
+            // restarts *friring itself* into the on-disk binary. Not a bare
+            // Ctrl+<letter>, so it dispatches from a focused terminal without
+            // a PTY collision (M-C-r is no readline chord anyone misses); on
+            // macOS it needs option-as-alt, like the other Alt chords. Fully
+            // rebindable.
+            Action::ReloadApp => vec![KeyChord::normalized(
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+                KeyCode::Char('r'),
+            )],
             Action::NewSession => vec![KeyChord::ctrl('n')],
             Action::DeleteSession => vec![KeyChord::ctrl('d')],
             Action::OpenInEditor => vec![KeyChord::ctrl('o')],
@@ -636,6 +652,7 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
             "UI",
             vec![
                 QuitApp,
+                ReloadApp,
                 ToggleShell,
                 ToggleReview,
                 ToggleCcActivity,
@@ -1413,6 +1430,18 @@ mod tests {
     }
 
     #[test]
+    fn reload_app_chord_round_trips_and_is_global() {
+        let chord = Action::ReloadApp.default_chords_for(false)[0];
+        // Multi-modifier display/parse must agree, or keybindings.json
+        // couldn't persist a rebind of this action.
+        assert_eq!(chord.display(), "ctrl+alt+r");
+        assert_eq!(KeyChord::parse("ctrl+alt+r"), Some(chord));
+        assert_eq!(Action::ReloadApp.context(), KeyContext::Global);
+        // Not a bare Ctrl+<letter>: it must dispatch from a focused terminal.
+        assert!(!Action::ReloadApp.terminal_passthrough());
+    }
+
+    #[test]
     fn every_action_has_default_chord_and_context() {
         let kb = KeyBindings::default();
         for action in Action::all() {
@@ -1438,6 +1467,7 @@ mod tests {
         fn classify(a: Action) -> u8 {
             match a {
                 Action::QuitApp => 0,
+                Action::ReloadApp => 0,
                 Action::NewSession => 0,
                 Action::DeleteSession => 0,
                 Action::OpenInEditor => 0,
@@ -1506,7 +1536,7 @@ mod tests {
         }
         // The listed variants must equal Action::all().len(). If you add
         // a variant, update both `Action::all()` and the match above.
-        const EXPECTED: usize = 65;
+        const EXPECTED: usize = 66;
         assert_eq!(Action::all().len(), EXPECTED);
         for a in Action::all() {
             classify(*a);

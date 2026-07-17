@@ -799,6 +799,10 @@ pub struct App {
     pub(crate) db: Database,
     pub(crate) focus: InputFocus,
     pub(crate) should_quit: bool,
+    /// Quit-and-re-exec (`Action::ReloadApp`): read by `main` after
+    /// `shutdown()` to exec the on-disk binary, which re-adopts the freshly
+    /// detached sessions on startup.
+    pub(crate) reload_requested: bool,
     pub(crate) status_message: Option<StatusMessage>,
     terminal_rows: u16,
     pub(crate) terminal_cols: u16,
@@ -1214,6 +1218,7 @@ impl App {
             db,
             focus: InputFocus::SessionList,
             should_quit: false,
+            reload_requested: false,
             status_message: None,
             terminal_rows: rows,
             terminal_cols: cols,
@@ -6341,6 +6346,12 @@ impl App {
         self.should_quit
     }
 
+    /// Whether the quit was a [`crate::session::Action::ReloadApp`] — `main`
+    /// re-execs the on-disk binary after [`Self::shutdown`] when set.
+    pub fn reload_requested(&self) -> bool {
+        self.reload_requested
+    }
+
     /// Persist state, then detach. The order is forced: `Session::detach`
     /// consumes the session by value, so `save_state` (which reads
     /// `session.info`) must run while `self.sessions` is intact. A hung save
@@ -10989,6 +11000,22 @@ mod tests {
         });
         app.handle_mouse_click(r.x, r.y, KeyModifiers::NONE);
         assert!(matches!(app.modal, modals::Modal::ThemePicker(_)));
+    }
+
+    /// `Ctrl+Alt+R` (ReloadApp) is a quit with the reload flag raised — and it
+    /// must dispatch even from a focused terminal (it is no bare
+    /// `Ctrl+<letter>`, so no PTY deferral applies).
+    #[test]
+    fn reload_chord_quits_with_reload_flag() {
+        let mut app = app_with_sessions(1);
+        app.focus = InputFocus::Terminal;
+        assert!(!app.reload_requested());
+        app.handle_key(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert!(app.should_quit);
+        assert!(app.reload_requested());
     }
 
     #[test]
