@@ -947,6 +947,9 @@ error toast.
 ## Versioning
 
 The SQLite schema migrates automatically (`schema_version` in
-`metadata`). The TOML files carry a `config_version = 1` marker so a
-future format change can migrate them too; current files are version 1
-and the field is optional.
+`metadata`). Migrations are forward-only: a DB whose stored version is
+*newer* than the binary supports is refused at open (upgrade the binary,
+or restore the backup taken before the newer binary migrated it — see
+`scripts/dev/live.sh` for the dev workflow that makes one). The TOML
+files carry a `config_version = 1` marker so a future format change can
+migrate them too; current files are version 1 and the field is optional.

@@ -262,6 +262,24 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         )
         .unwrap_or(0);
 
+    // Refuse a DB from a *newer* binary instead of silently opening it:
+    // migrations are forward-only, so nothing here can downgrade it, and a
+    // schema this binary doesn't know may misread much later (a rebuilt or
+    // dropped column surfaces as a query error mid-session, or as silent bad
+    // data). Typically hit by relaunching a release binary after a
+    // schema-bumping dev build ran against the real DB — `scripts/dev/live.sh`
+    // makes a restorable backup before that can happen.
+    if version > SCHEMA_VERSION {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some(format!(
+                "database schema is v{version} but this binary supports up to \
+                 v{SCHEMA_VERSION} — a newer friring wrote it; upgrade this \
+                 binary or restore the pre-upgrade DB backup"
+            )),
+        ));
+    }
+
     // Each migration step is gated on the stored version and applied in order.
     // Steps are extracted into helpers to keep this dispatcher flat.
     let steps: &[MigrationStep] = &[
@@ -1258,6 +1276,32 @@ mod tests {
         assert!(!tables.contains(&"mcp_servers".to_string()));
         assert!(!tables.contains(&"skills".to_string()));
         assert!(!tables.contains(&"profiles".to_string()));
+    }
+
+    #[test]
+    fn migrate_refuses_newer_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        conn.execute(
+            "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
+            [(SCHEMA_VERSION + 1).to_string()],
+        )
+        .unwrap();
+
+        let err = migrate(&conn).unwrap_err().to_string();
+        assert!(
+            err.contains("newer friring"),
+            "expected the newer-DB refusal, got: {err}"
+        );
+        // The stored version is untouched — the newer binary can still open it.
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, (SCHEMA_VERSION + 1).to_string());
     }
 
     #[test]

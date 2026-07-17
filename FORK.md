@@ -549,6 +549,16 @@ interplay with ADR-P12 in `docs/PERFORMANCE.md`.
 
 ### Behavior fixes
 
+- **A database written by a newer friring is refused, not silently opened.**
+  Upstream's schema migrations are forward-only and unguarded: a binary opening
+  a DB whose stored `schema_version` is *higher* than its own ran no steps and
+  proceeded anyway, deferring the breakage to whichever later query hit a
+  rebuilt/dropped column (or to silent bad data). The fork's `migrate`
+  (`src/storage/schema.rs`) now errors up front with the two ways out — upgrade
+  the binary or restore the pre-upgrade backup. Chiefly hit by relaunching the
+  release binary after a schema-bumping dev build ran on the real DB via
+  `scripts/dev/live.sh` (which backs the DB up first for exactly this reason).
+
 - **Cancelled multi-repo flow no longer leaks `additional_dirs`.** The
   new-session-name cancel left the wizard's derived extra dirs populated, so
   the *next* spawn silently attached the stale directories. Cleared on
