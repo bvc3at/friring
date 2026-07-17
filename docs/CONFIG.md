@@ -113,7 +113,7 @@ one-way). `friring-cli --json config paths` is the machine form.
 ## agents.toml
 
 Declares the launchable coding agents. Seeded with the built-ins
-(`claude`, `codex`, `antigravity`, `opencode`, `aider`, `copilot`, `vibe`) on
+(`claude`, `codex`, `antigravity`, `opencode`, `aider`, `copilot`, `vibe`, `pi`) on
 first run; edit or add `[[agents]]` entries to support any CLI — no
 recompile. A malformed `[[agents]]` entry is skipped (with a toast
 naming it) and the rest still load; only a document-level syntax error
