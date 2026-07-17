@@ -585,6 +585,7 @@ impl App {
             &info_panel::Resolved {
                 parent_name: data.parent_name.as_deref(),
                 bridge: data.bridge.as_ref(),
+                friring_dir_bytes: self.metrics.friring_dir_bytes,
             },
         );
     }
@@ -720,6 +721,7 @@ impl App {
             &info_panel::Resolved {
                 parent_name: data.parent_name.as_deref(),
                 bridge: data.bridge.as_ref(),
+                friring_dir_bytes: self.metrics.friring_dir_bytes,
             },
         )
     }

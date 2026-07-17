@@ -99,6 +99,9 @@ pub struct Resolved<'a> {
     /// Where this session sits in an orchestration, or `None` for the
     /// overwhelming majority, which are in none.
     pub bridge: Option<&'a BridgeRow>,
+    /// Friring's own on-disk data-directory size in bytes, or `None` before
+    /// the first background scan lands.
+    pub friring_dir_bytes: Option<u64>,
 }
 
 /// System-wide and active-session resource metrics.
@@ -192,7 +195,7 @@ fn build_lines<'a>(
     }
 
     if let Some(m) = metrics {
-        append_system_section(&mut lines, m, inner_width);
+        append_system_section(&mut lines, m, resolved.friring_dir_bytes, inner_width);
     }
 
     append_automations_section(&mut lines, automations, inner_width);
@@ -396,8 +399,15 @@ fn plural(n: u32) -> &'static str {
     }
 }
 
-/// Append the System Resources section (global CPU/RAM gauges).
-fn append_system_section(lines: &mut Vec<Line<'_>>, m: &SystemMetrics, inner_width: usize) {
+/// Append the System Resources section (global CPU/RAM gauges), plus friring's
+/// own on-disk footprint (`~/.local/share/friring`) when it has been measured —
+/// a heads-up when accumulated worktrees/workspaces have grown the data dir.
+fn append_system_section(
+    lines: &mut Vec<Line<'_>>,
+    m: &SystemMetrics,
+    friring_dir_bytes: Option<u64>,
+    inner_width: usize,
+) {
     lines.push(separator(inner_width));
     lines.push(Line::from(Span::styled("System", Theme::section_header())));
 
@@ -415,6 +425,16 @@ fn append_system_section(lines: &mut Vec<Line<'_>>, m: &SystemMetrics, inner_wid
         inner_width,
     );
     lines.extend(ram_lines);
+
+    if let Some(bytes) = friring_dir_bytes {
+        lines.push(Line::from(vec![
+            Span::styled("Disk", Style::default().fg(Theme::text_muted())),
+            Span::styled(
+                format!("  {} (friring dir)", format_bytes(bytes)),
+                Style::default().fg(Theme::text_primary()),
+            ),
+        ]));
+    }
 }
 
 /// Append the upcoming-automations section (skipped when there are none).
@@ -980,6 +1000,46 @@ mod tests {
         append_session_section(&mut lines, &info, &Resolved::default());
         let rendered = text(&lines);
         assert!(rendered.contains("Hooks: degraded — codex hooks not provisioned"));
+    }
+
+    // ── append_system_section tests ──
+
+    fn render_system(m: &SystemMetrics, friring_dir_bytes: Option<u64>) -> String {
+        let mut lines: Vec<Line> = Vec::new();
+        append_system_section(&mut lines, m, friring_dir_bytes, 24);
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn sample_metrics() -> SystemMetrics {
+        SystemMetrics {
+            cpu_percent: 10.0,
+            memory_used: 8_589_934_592,
+            memory_total: 17_179_869_184,
+            session_cpu_percent: 0.0,
+        }
+    }
+
+    #[test]
+    fn system_section_shows_friring_dir_size_when_measured() {
+        let out = render_system(&sample_metrics(), Some(524_288_000));
+        assert!(out.contains("Disk"));
+        assert!(out.contains("500.0 MB"));
+        assert!(out.contains("friring dir"));
+    }
+
+    #[test]
+    fn system_section_omits_disk_line_before_first_scan() {
+        let out = render_system(&sample_metrics(), None);
+        assert!(!out.contains("friring dir"));
     }
 
     // ── human_bytes tests ──

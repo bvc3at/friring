@@ -289,6 +289,12 @@ pub(crate) struct MetricsState {
     pub(crate) sys: Option<sysinfo::System>,
     /// Cached system metrics for the info panel.
     pub(crate) system_metrics: info_panel::SystemMetrics,
+    /// friring's on-disk data-directory size (`~/.local/share/friring`) in
+    /// bytes, `None` until the first background scan completes. Kept separate
+    /// from [`system_metrics`](Self::system_metrics) because the ~1 s metrics
+    /// refresh replaces that struct wholesale, whereas the folder scan runs on a
+    /// far slower cadence and must survive between scans.
+    pub(crate) friring_dir_bytes: Option<u64>,
     /// Deterministic render/tick performance counters (perf regression tests).
     pub(crate) perf: PerfCounters,
     /// Wall-clock timing stats (frame/tick histograms + slow-op ring),
@@ -307,6 +313,7 @@ impl MetricsState {
                 memory_total: 0,
                 session_cpu_percent: 0.0,
             },
+            friring_dir_bytes: None,
             perf: PerfCounters::default(),
             timings: PerfTimings::default(),
         }
