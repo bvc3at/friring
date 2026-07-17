@@ -29,7 +29,7 @@ mod tasks;
 mod view;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -139,6 +139,13 @@ const GIT_REFRESH_TICKS: u64 = 500;
 /// Ticks (~10 ms each) between config-file mtime polls (~1 s). Cheap: two
 /// `stat` calls per poll.
 const CONFIG_RELOAD_TICKS: u64 = 100;
+
+/// How often to recompute friring's on-disk data-directory size (in ticks). At
+/// ~10 ms per tick, 6000 ≈ 60 s. Walking the whole data tree (worktrees,
+/// workspaces, db, logs) is the most expensive periodic disk read and the size
+/// drifts slowly, so it runs far less often than the other metrics — fired once
+/// early, then once a minute.
+const DISK_USAGE_REFRESH_TICKS: u64 = 6_000;
 
 /// How often to refresh account usage / rate-limits (in ticks). At ~10ms per
 /// tick, 30000 ≈ 5 minutes. Usage windows are coarse and fetching hits the
@@ -505,6 +512,36 @@ fn aggregate_git_stats(paths: &[PathBuf]) -> Option<crate::session::GitStats> {
         }
     }
     agg
+}
+
+/// Sum the size of every regular file under `root`, iteratively (an explicit
+/// stack, so a deeply nested worktree can't blow the call stack). Runs off the
+/// UI thread; best-effort — unreadable entries are skipped rather than erroring,
+/// and symlinks are not followed (via `symlink_metadata`) so a multi-repo
+/// symlink workspace isn't double-counted against its worktree.
+fn directory_size(root: &Path) -> u64 {
+    let mut total: u64 = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // symlink_metadata: don't follow links, so workspace symlinks add
+            // their own (tiny) size, not the whole linked worktree again.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let file_type = meta.file_type();
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
 }
 
 pub use modals::{AutomationActionKind, AutomationField, TaskField, TriggerKind};
@@ -1020,6 +1057,11 @@ pub struct App {
     /// `SessionInfo.memory`. Polled each tick; gated on `[features]
     /// session_memory`.
     memory_refresh: background::BackgroundTask<memory::MemoryRefresh>,
+    /// Background scan of friring's data-directory size (bytes), polled each
+    /// tick. Walks the whole tree off the UI thread on a slow cadence
+    /// ([`DISK_USAGE_REFRESH_TICKS`]); the result lands in
+    /// `metrics.friring_dir_bytes` for the info panel.
+    disk_usage: background::BackgroundTask<u64>,
     /// Cached update-check result, rendered as the header "update available"
     /// badge. `Some` only when `[features] version_check` is on and a newer
     /// release is known (from the on-disk cache). Read off the network — see
@@ -1517,6 +1559,7 @@ impl App {
             activity_refresh: background::BackgroundTask::default(),
             git_stats: background::BackgroundTask::default(),
             memory_refresh: background::BackgroundTask::default(),
+            disk_usage: background::BackgroundTask::default(),
             // Seed the badge from the cache (no network); refreshed on first
             // tick if the flag is on and the cache is stale.
             update_status: if crate::session::settings::global().features.version_check {
@@ -6842,6 +6885,7 @@ impl App {
         self.poll_cc_refresh();
         self.poll_activity_refresh();
         self.poll_memory_refresh();
+        self.poll_disk_usage();
 
         if self.metrics.tick_count % METRICS_REFRESH_TICKS == 0 {
             self.start_metrics_refresh();
@@ -6864,6 +6908,14 @@ impl App {
             && self.metrics.tick_count % MEMORY_REFRESH_TICKS == MEMORY_REFRESH_TICKS / 2
         {
             self.start_memory_refresh();
+        }
+        // Fire ~1 s after startup, then once a minute (folder size is slow to
+        // walk and slow to change). Offset by the metrics cadence rather than
+        // firing at tick 1 so this shares the metrics refresh's contract that a
+        // background spawn never lands on the first ticks a runtime-less unit
+        // `tick()` drives (`spawn_blocking` would panic without a reactor).
+        if self.metrics.tick_count % DISK_USAGE_REFRESH_TICKS == METRICS_REFRESH_TICKS {
+            self.start_disk_usage_refresh();
         }
         if self.metrics.tick_count % CONFIG_RELOAD_TICKS == 0 {
             self.poll_config_reload();
@@ -7405,6 +7457,33 @@ impl App {
             if let Some(session) = self.sessions.iter_mut().find(|s| s.info.id == session_id) {
                 session.info.git_stats = stats;
             }
+        }
+    }
+
+    /// Kick off a background scan of friring's data-directory size.
+    ///
+    /// Resolves the data dir on the UI thread (cheap) and walks the whole tree
+    /// on a blocking task; the byte count is applied in [`Self::poll_disk_usage`].
+    /// Only one scan runs at a time.
+    fn start_disk_usage_refresh(&mut self) {
+        if self.disk_usage.in_progress() {
+            return;
+        }
+        let Some(dir) = crate::paths::log_directory() else {
+            return;
+        };
+        let tx = self.disk_usage.start();
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(directory_size(&dir));
+        });
+    }
+
+    /// Apply a completed background disk-usage scan, if one has finished.
+    fn poll_disk_usage(&mut self) {
+        // A dead worker (e.g. panic) just clears the guard so the next
+        // cadence can retry; the last measured value stays on screen.
+        if let background::TaskPoll::Done(bytes) = self.disk_usage.poll() {
+            self.metrics.friring_dir_bytes = Some(bytes);
         }
     }
 
@@ -17327,6 +17406,50 @@ mod tests {
         app.poll_git_stats();
 
         assert!(app.git_stats.in_progress());
+    }
+
+    #[test]
+    fn poll_disk_usage_applies_byte_count() {
+        let mut app = app_with_sessions(1);
+        assert_eq!(app.metrics.friring_dir_bytes, None);
+
+        let tx = app.disk_usage.start();
+        tx.send(4_096).unwrap();
+        app.poll_disk_usage();
+
+        assert_eq!(app.metrics.friring_dir_bytes, Some(4_096));
+        assert!(!app.disk_usage.in_progress());
+    }
+
+    #[test]
+    fn poll_disk_usage_disconnected_keeps_last_value() {
+        let mut app = app_with_sessions(1);
+        app.metrics.friring_dir_bytes = Some(1_000);
+        drop(app.disk_usage.start()); // worker died without delivering
+
+        app.poll_disk_usage();
+
+        // A dead scan clears the guard but leaves the last measurement visible.
+        assert_eq!(app.metrics.friring_dir_bytes, Some(1_000));
+        assert!(!app.disk_usage.in_progress());
+    }
+
+    #[test]
+    fn directory_size_sums_nested_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), vec![0u8; 100]).unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("b.txt"), vec![0u8; 50]).unwrap();
+
+        assert_eq!(directory_size(dir.path()), 150);
+    }
+
+    #[test]
+    fn directory_size_missing_dir_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert_eq!(directory_size(&missing), 0);
     }
 
     #[test]
