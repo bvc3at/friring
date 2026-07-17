@@ -67,6 +67,10 @@ sandbox-shell:
 sandbox-clean PROFILE="default":
     scripts/dev/sandbox.sh --clean {{PROFILE}}
 
+# Run the dev TUI against your REAL sessions (release socket/session/DB/config).
+dev-live *ARGS:
+    scripts/dev/live.sh {{ARGS}}
+
 # Black-box TUI smoke test (real binary in a throwaway tmux pane).
 smoke:
     scripts/dev/smoke/tui-smoke.sh

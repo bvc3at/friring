@@ -445,7 +445,14 @@ picks the window group `discover()` scans; remote hosts keep their
 agent alive) and startup re-adopts by window name/pane id, pointing a dev
 binary at the release socket + session + data + config attaches it to all
 live sessions — and quitting hands them back to the installed release.
-Details in `docs/CONFIG.md` (env table) and `docs/DEVELOPMENT.md`.
+
+`scripts/dev/live.sh` (`just dev-live`) packages the workflow: build, refuse
+while any client is attached to the release server (no single-instance lock
+exists — two TUIs would fight over the same panes), back up `friring.db`
+(transactional `sqlite3 .backup`; migrations are forward-only and a dev
+branch may bump `SCHEMA_VERSION`), then launch the dev TUI with the four
+overrides set and `target/debug` first on `PATH`. Details in
+`docs/CONFIG.md` (env table) and `docs/DEVELOPMENT.md` ("Live mode").
 
 #### Terminal-first focus
 

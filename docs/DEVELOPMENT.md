@@ -114,6 +114,28 @@ friring-cli session signal --state blocked --session <id>   # what an agent hook
 friring-cli session list --json | jq '.[].name'
 ```
 
+### Live mode — run the dev build on your REAL sessions
+
+`scripts/dev/live.sh` (`just dev-live`) is the sandbox's opposite: it attaches
+the dev build to the **installed release's** live state to verify a feature
+against real workloads. Quitting friring only detaches (tmux keeps every agent
+alive), so the handoff is: quit your installed friring → `just dev-live` → the
+dev TUI adopts all live sessions → quit → relaunch the installed binary.
+
+It works by overriding the dev build's compile-time isolation — the script
+exports `FRIRING_SOCKET` + `FRIRING_TMUX_SESSION` (both halves of the tmux
+identity: the socket picks the server, the session the window group) and
+`FRIRING_DATA_DIR` + `FRIRING_CONFIG_DIR` to the release locations, and puts
+`target/debug` first on `PATH`. Two guards run before launch: it refuses while
+any client is attached to the release tmux server (there is no single-instance
+lock — quit the installed friring first), and it backs up `friring.db`
+(`friring.db.dev-live-<timestamp>.bak`, newest five kept) because migrations
+are forward-only — if your branch bumps `SCHEMA_VERSION`, the migrated DB is
+the one thing the quit-and-relaunch round trip does **not** undo: the release
+binary will refuse it, and you restore the backup (or keep using the dev
+build). `--shell` / `-- <cli args>` mirror the sandbox script; `--no-build`
+skips the rebuild.
+
 ## 4. Testing
 
 `cargo nextest` is the preferred runner:
