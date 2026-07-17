@@ -431,6 +431,22 @@ the anthropic stub's `/api/oauth/usage` route, fed with scripted numbers from
 `demo-content.json` — otherwise every clip films "not logged in". Details in
 `docs/DEVELOPMENT.md` § Demo video.
 
+#### Dev-live: run a dev build against the real sessions
+
+Upstream (and the fork's sandbox) keeps dev builds fully isolated: a
+`-dev`-versioned binary compiles to the `friring-dev` socket, `friring-dev`
+tmux group session and `friring-dev` data dir, so it can never see an
+installed release's live sessions. The fork adds the deliberate escape hatch
+for verifying a feature against real workloads: a `FRIRING_TMUX_SESSION` env
+override for the local group-session name (`local_session()`, mirroring
+`FRIRING_SOCKET` — both are needed: the socket picks the server, the session
+picks the window group `discover()` scans; remote hosts keep their
+`hosts.toml` names). Since quitting friring only detaches (tmux keeps every
+agent alive) and startup re-adopts by window name/pane id, pointing a dev
+binary at the release socket + session + data + config attaches it to all
+live sessions — and quitting hands them back to the installed release.
+Details in `docs/CONFIG.md` (env table) and `docs/DEVELOPMENT.md`.
+
 #### Terminal-first focus
 
 Upstream starts focused on the session list, and clicking a session row

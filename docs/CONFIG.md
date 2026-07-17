@@ -276,8 +276,12 @@ remote SSH host can also pin `multiplexer = "psmux"`. psmux has known
 
 The **local** socket name honours the `FRIRING_SOCKET` env override
 (`local_socket()`) — the only way to fully scope an instance on Windows,
-where every `-L <name>` resolves machine-wide (no `TMUX_TMPDIR`). Remote
-hosts take their socket from `hosts.toml`.
+where every `-L <name>` resolves machine-wide (no `TMUX_TMPDIR`). The
+**local** group-session name likewise honours `FRIRING_TMUX_SESSION`
+(`local_session()`), the escape hatch that lets a dev build adopt a
+release server's live sessions (`scripts/dev/live.sh` sets both — see
+`docs/DEVELOPMENT.md`). Remote hosts take their socket and session from
+`hosts.toml`.
 
 ### Backends, worktrees, and restore
 
@@ -915,6 +919,7 @@ User-set (read by friring):
 | `RUST_LOG` | log filter for `friring.log` |
 | `FRIRING_PERF_LOG` | opt-in performance logging: a one-shot `startup` phase breakdown at first paint, per-session `restore_adopt`/`adopt_split` lines, steady-state `perf_window` lines (~10 s cadence), and wall-clock frame/tick timing collection. Any value enables it. See `docs/PERFORMANCE.md`. |
 | `FRIRING_SOCKET` | overrides the **local** multiplexer socket name (default `friring`; dev builds `friring-dev`). For test/sandbox tooling: Unix scoping uses `TMUX_TMPDIR`, but psmux (Windows) resolves every `-L <name>` machine-wide, so this is the only way to fully scope an instance there. Remote hosts are unaffected (socket from `hosts.toml`). Empty = unset. |
+| `FRIRING_TMUX_SESSION` | overrides the **local** tmux group-session name (default `friring`; dev builds `friring-dev`) — the window group `discover()` scans on startup. Together with `FRIRING_SOCKET` this lets a dev build adopt a release server's live sessions (`scripts/dev/live.sh` / `just dev-live`, see `docs/DEVELOPMENT.md`). Remote hosts are unaffected (session from `hosts.toml`). Empty = unset. |
 | `FRIRING_CLAUDE_USAGE_URL` | overrides the endpoint the info panel's Claude account-usage fetch calls (default `https://api.anthropic.com/api/oauth/usage`), so a test or demo can point it at a local stub — `ANTHROPIC_BASE_URL` doesn't cover it, that's a Messages-API base, not this OAuth account route. See `src/usage/mod.rs`. Empty = unset. |
 
 Set **by** friring into every spawned agent process (not user-set;

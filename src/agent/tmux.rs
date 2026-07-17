@@ -51,6 +51,27 @@ const TMUX_SESSION: &str = if cfg!(dev_build) {
     "friring"
 };
 
+/// Env var overriding the **local** tmux group-session name.
+///
+/// The compile-time flavor split above is what keeps a dev build away from an
+/// installed release's sessions; this override is the deliberate escape hatch
+/// that lets a dev binary adopt the release server's live sessions —
+/// `scripts/dev/live.sh` sets it together with [`SOCKET_OVERRIDE_ENV`] (both
+/// are needed: the socket picks the server, the session picks the window group
+/// `discover()` scans). Remote hosts are unaffected (their session name comes
+/// from `hosts.toml`).
+pub const SESSION_OVERRIDE_ENV: &str = "FRIRING_TMUX_SESSION";
+
+/// The local group-session name: [`SESSION_OVERRIDE_ENV`] when set and
+/// non-empty, else the compile-time default. Empty counts as unset, matching
+/// [`local_socket`].
+fn local_session() -> String {
+    std::env::var(SESSION_OVERRIDE_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| TMUX_SESSION.to_string())
+}
+
 /// Build a [`Command`] for the local multiplexer on the friring socket:
 /// `<DEFAULT_MUX> -L <TMUX_SOCKET> <args…>`. The headless one-shot helpers below
 /// (send/capture/spawn/kill/heartbeat) bypass the [`TmuxTransport`] seam — they
@@ -117,7 +138,7 @@ pub(crate) fn shell_window_name(session_name: &str) -> String {
 /// `tb-foo-bar` exist — `send-keys`/`capture-pane` then fails with
 /// "ambiguous window" and the caller's text is silently dropped.
 fn window_target(session_name: &str) -> String {
-    format!("{TMUX_SESSION}:={}", agent_window_name(session_name))
+    format!("{}:={}", local_session(), agent_window_name(session_name))
 }
 
 /// Minimum tmux version required.
@@ -589,7 +610,7 @@ impl TmuxBackend {
         Self {
             transport: TmuxTransport::Local,
             socket: local_socket(),
-            session: TMUX_SESSION.to_string(),
+            session: local_session(),
             name: "local-tmux".to_string(),
             control: Mutex::new(None),
         }
@@ -1476,9 +1497,14 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 60;
 /// List the window names in the friring tmux session (empty if the server is
 /// not running).
 fn list_window_names() -> Vec<String> {
-    let Ok(out) =
-        local_mux_command(&["list-windows", "-t", TMUX_SESSION, "-F", "#{window_name}"]).output()
-    else {
+    let Ok(out) = local_mux_command(&[
+        "list-windows",
+        "-t",
+        &local_session(),
+        "-F",
+        "#{window_name}",
+    ])
+    .output() else {
         return Vec::new();
     };
     if !out.status.success() {
@@ -1576,7 +1602,7 @@ pub fn ensure_automation_heartbeat(cli_path: &Path) -> Result<()> {
         "new-window",
         "-d",
         "-t",
-        TMUX_SESSION,
+        &local_session(),
         "-n",
         HEARTBEAT_WINDOW,
         &loop_cmd,
@@ -1712,7 +1738,7 @@ pub fn spawn_window(
         "new-window",
         "-d",
         "-t",
-        &format!("{TMUX_SESSION}:"),
+        &format!("{}:", local_session()),
         "-n",
         &window_name,
     ]);
@@ -2004,6 +2030,28 @@ mod tests {
         assert_eq!(local_socket(), TMUX_SOCKET);
         std::env::remove_var(SOCKET_OVERRIDE_ENV);
         assert_eq!(local_socket(), TMUX_SOCKET);
+    }
+
+    #[test]
+    fn local_session_honors_env_override() {
+        // nextest runs one process per test, so env mutation can't race other
+        // tests reading `local_session()`.
+        std::env::set_var(SESSION_OVERRIDE_ENV, "friring-live-test");
+        assert_eq!(local_session(), "friring-live-test");
+        assert_eq!(TmuxBackend::local().session, "friring-live-test");
+        // The remote fallback stays on the compile-time flavor: a local
+        // live-attach override must not leak into `hosts.toml` defaults.
+        let host = crate::session::HostDef {
+            name: "devbox".into(),
+            destination: "me@devbox".into(),
+            ..Default::default()
+        };
+        assert_eq!(TmuxBackend::from_host(&host).session, TMUX_SESSION);
+        // Empty counts as unset, matching `local_socket()`.
+        std::env::set_var(SESSION_OVERRIDE_ENV, "");
+        assert_eq!(local_session(), TMUX_SESSION);
+        std::env::remove_var(SESSION_OVERRIDE_ENV);
+        assert_eq!(local_session(), TMUX_SESSION);
     }
 
     #[test]
