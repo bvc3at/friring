@@ -32,6 +32,7 @@ pub(crate) const ANTIGRAVITY_HOOKS: &str =
 pub(crate) const CODEX_HOOKS: &str = include_str!("../../extensions/hooks/codex-hooks.json");
 pub(crate) const VIBE_HOOKS: &str = include_str!("../../extensions/hooks/vibe-hooks.toml");
 pub(crate) const COPILOT_HOOKS: &str = include_str!("../../extensions/hooks/copilot-hooks.json");
+pub(crate) const PI_STATUS: &str = include_str!("../../extensions/hooks/pi-status.ts");
 
 /// How a remote host's rewritten hook commands report state — which
 /// multiplexer binary sets the pane user option.
@@ -259,6 +260,7 @@ fn materialize_source() -> Result<PathBuf, String> {
         ("codex-hooks.json", CODEX_HOOKS),
         ("vibe-hooks.toml", VIBE_HOOKS),
         ("copilot-hooks.json", COPILOT_HOOKS),
+        ("pi-status.ts", PI_STATUS),
     ];
     for (name, contents) in writes {
         let path = dir.join(name);
@@ -399,6 +401,7 @@ mod tests {
             ("codex-hooks.json", CODEX_HOOKS),
             ("vibe-hooks.toml", VIBE_HOOKS),
             ("copilot-hooks.json", COPILOT_HOOKS),
+            ("pi-status.ts", PI_STATUS),
             ("extension.toml", MANIFEST), // aider's literal --notifications-command arg
         ] {
             // Key on the invocation-with-flags form (`friring-cli session
@@ -497,6 +500,11 @@ mod tests {
         // (external-file uninstall, see `is_user_modified`).
         assert!(COPILOT_HOOKS.contains("friring-cli session signal"));
         assert!(COPILOT_HOOKS.contains("friring `extension install`"));
+        // The pi payload is a TypeScript extension dropped into pi's extensions
+        // dir; it carries the signal command and the managed marker (external-
+        // file uninstall, see `is_user_modified`).
+        assert!(PI_STATUS.contains("friring-cli session signal"));
+        assert!(PI_STATUS.contains("friring `extension install`"));
     }
 
     #[test]
