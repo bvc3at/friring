@@ -2359,7 +2359,13 @@ and a managed `~/.vibe/hooks.toml` for Mistral `vibe` (refused if a user file
 exists) and a `~/.copilot/hooks/friring-status.json` for GitHub Copilot (both
 `bash`+`powershell` commands); and a `[[config_merges]]` merges hook entries
 into antigravity's shared `~/.gemini/settings.json` (`PreToolUse` → working,
-`Notification` → blocked, verified against agy 1.0.9). Opt out with
+`Notification` → blocked, verified against agy 1.0.9); and an
+`[[external_files]]` drops a managed TypeScript extension into
+`~/.pi/agent/extensions/friring-status.ts` for the pi.dev CLI (`pi`)
+(idle/working/done + blocked; **experimental** — pi has no claude-style
+Stop/permission hook, so `blocked` is inferred only from a structured
+`ask_user_question` tool call). Remote pi sessions are provisioned like the
+other config-dir agents; a psmux/Windows host shows `Hooks: degraded`. Opt out with
 `friring-cli extension deactivate hooks` (records a `builtin_hooks_optout`
 metadata flag so self-heal won't resurrect it); `activate`/`install hooks`
 clears it. (See *Status internals*

@@ -989,6 +989,7 @@ config dir:
 | codex | `~/.codex/hooks.json` | reversible JSON-merge of friring's entries |
 | vibe | `~/.vibe/hooks.toml` | managed file (refused if you already have one) |
 | antigravity | `~/.gemini/settings.json` | reversible JSON-merge of friring's entries |
+| pi | `~/.pi/agent/extensions/friring-status.ts` | managed extension file (refused if you already have one) |
 
 The home dir is `~/.config/friring/hooks` on a release build and
 `~/.config/friring-dev/hooks` on a dev build. Because claude *merges* the
