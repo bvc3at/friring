@@ -527,6 +527,20 @@ impl ClipboardVia {
     }
 }
 
+/// What became of the native clipboard write before a fallback ran — recorded
+/// so [`App::clipboard_error`] can explain a fallback failure honestly rather
+/// than always implying native was tried (see [`App::set_clipboard_text`]).
+enum NativeCopy {
+    /// Deliberately not attempted: over SSH the native clipboard wouldn't reach
+    /// the user — it's the *host's* on macOS, or absent on a display-less Linux
+    /// host (`clipboard::native_clipboard_is_remote`).
+    Skipped,
+    /// Attempted, but the display-server write errored.
+    Failed(String),
+    /// No native handle at all — no reachable display server.
+    Unavailable,
+}
+
 /// Which scroll state a rendered scrollbar drives. Recorded per-frame in
 /// [`App::scrollbar_hits`] so mouse clicks/drags on a track can be routed back
 /// to the right pane.
@@ -3417,22 +3431,30 @@ impl App {
     }
 
     /// Copy `text` to the system clipboard, preferring the native handle and
-    /// falling back (see [`clipboard`]) when no display server is reachable or
-    /// the native write fails. Returns how the copy was served so the caller's
-    /// toast can flag the fire-and-forget path.
+    /// falling back (see [`clipboard`]) when no display server is reachable,
+    /// the native write fails, or the native clipboard belongs to the SSH host
+    /// rather than the machine in front of the user. Returns how the copy was
+    /// served so the caller's toast can flag the fire-and-forget path.
     ///
     /// Fallback order (see the [`clipboard`] module docs for why): inside tmux,
     /// `tmux load-buffer -w` — the raw OSC 52 an app writes to its own stdout
     /// is dropped by tmux's default `set-clipboard external`, so the escape
     /// must come from tmux itself; outside tmux, raw OSC 52 to stdout.
     pub(crate) fn set_clipboard_text(&mut self, text: &str) -> Result<ClipboardVia, String> {
-        // 1. Native display-server clipboard, when one is reachable.
-        let native_err = match &mut self.clipboard {
-            Some(cb) => match cb.set_text(text) {
-                Ok(()) => return Ok(ClipboardVia::Native),
-                Err(e) => Some(e.to_string()),
-            },
-            None => None,
+        // 1. Native display-server clipboard — unless it is the SSH host's:
+        //    on macOS, NSPasteboard accepts writes from an SSH login, so the
+        //    copy would "succeed" onto a machine the user isn't looking at
+        //    while the terminal-routed fallbacks below never run.
+        let native = if clipboard::native_clipboard_is_remote() {
+            NativeCopy::Skipped
+        } else {
+            match &mut self.clipboard {
+                Some(cb) => match cb.set_text(text) {
+                    Ok(()) => return Ok(ClipboardVia::Native),
+                    Err(e) => NativeCopy::Failed(e.to_string()),
+                },
+                None => NativeCopy::Unavailable,
+            }
         };
 
         // 2. Inside tmux: authoritative (real exit status), works under the
@@ -3440,27 +3462,27 @@ impl App {
         if std::env::var_os("TMUX").is_some() {
             return clipboard::tmux_copy(text)
                 .map(|()| ClipboardVia::Tmux)
-                .map_err(|e| Self::clipboard_error(native_err.as_deref(), "tmux load-buffer", &e));
+                .map_err(|e| Self::clipboard_error(&native, "tmux load-buffer", &e));
         }
 
         // 3. No display server and no tmux: raw OSC 52 to a direct terminal.
         clipboard::osc52_copy(text)
             .map(|()| ClipboardVia::Osc52)
-            .map_err(|e| Self::clipboard_error(native_err.as_deref(), "OSC 52", &e))
+            .map_err(|e| Self::clipboard_error(&native, "OSC 52", &e))
     }
 
-    /// Compose a clipboard-failure message, folding in an earlier native error
-    /// when there was one (so a fallback failure doesn't hide why native was
-    /// skipped in the first place).
-    fn clipboard_error(
-        native_err: Option<&str>,
-        stage: &str,
-        err: &impl std::fmt::Display,
-    ) -> String {
-        match native_err {
-            Some(native) => format!("Clipboard write failed: {native}; {stage}: {err}"),
-            None => format!("Clipboard not available; {stage} failed: {err}"),
-        }
+    /// Compose a clipboard-failure message, prefixing the fallback's own error
+    /// with *why* the native path didn't serve the copy — honestly
+    /// distinguishing a native write that was tried and failed from one that
+    /// was deliberately skipped (so a message never claims native "failed" when
+    /// it was never attempted).
+    fn clipboard_error(native: &NativeCopy, stage: &str, err: &impl std::fmt::Display) -> String {
+        let prefix = match native {
+            NativeCopy::Skipped => "Native clipboard skipped (wouldn't reach you over SSH)".into(),
+            NativeCopy::Failed(e) => format!("Clipboard write failed: {e}"),
+            NativeCopy::Unavailable => "Clipboard not available".to_string(),
+        };
+        format!("{prefix}; {stage} failed: {err}")
     }
 
     fn copy_selection_to_clipboard(&mut self) {
@@ -3541,6 +3563,17 @@ impl App {
         // No OSC 52 fallback here: terminals block clipboard *reads* for
         // security. The terminal's own paste keystroke still works — it
         // arrives as a bracketed paste (`handle_paste`), not through us.
+        // Over SSH the native clipboard isn't the user's to read (see
+        // `clipboard::native_clipboard_is_remote`): on macOS it is the *host's*
+        // (a read would paste whatever that machine last copied), on a
+        // display-less Linux host there is none — either way, refuse rather
+        // than paste the wrong text or error obscurely.
+        if clipboard::native_clipboard_is_remote() {
+            self.set_error(
+                "Clipboard read unavailable over SSH — use the terminal's paste key instead",
+            );
+            return;
+        }
         let Some(clipboard) = &mut self.clipboard else {
             self.set_error("Clipboard not available — use the terminal's paste key instead");
             return;
