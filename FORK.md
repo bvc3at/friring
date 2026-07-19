@@ -106,6 +106,9 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
   `Ctrl+N`/`Ctrl+P` to free the arrows.
 - **Review info popup (`i`).** Target + bases, file counts, `+`/`-`,
   filter/context, and the range's commit list in one overlay.
+- **Re-review nudge.** After a review is sent, the agent's next
+  Working → idle edge toasts "F7 to re-review, F5 to reload" (once per
+  send; `[review] nudge_on_idle` opts out).
 
 #### Agent activity view (F9)
 

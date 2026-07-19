@@ -963,6 +963,14 @@ flight). Unlike a retarget — which resets to the top — a reload preserves
 your place: the exact row when it still belongs to the same file, else the
 previously selected file's header.
 
+**Re-review nudge on agent idle.** Sending a review (`e`) watches that
+session (`App::review_nudge_watch`, seeded with its current status): when
+the agent later crosses a `Working → Idle/Done` edge — it finished
+addressing the review — a status toast nudges `"Agent idle — F7 to
+re-review, F5 to reload"` (session-named when it isn't the active one).
+One nudge per send, no auto-rebuild; `[review] nudge_on_idle = false`
+(`docs/CONFIG.md`) silences it.
+
 **Reviewed marks self-invalidate.** Every mark stores a **semantic
 fingerprint** of what was marked (`session::review::{file,hunk}_fingerprint`
 — an FNV-1a hash of the `+`/`-` line contents *with signs*, excluding `@@`

@@ -2181,6 +2181,16 @@ impl App {
         };
         self.close_code_review();
         self.send_prompt_to_session(sid, &prompt, 0);
+        // Watch for the agent finishing this review so the status tick can
+        // nudge a re-review (`[review] nudge_on_idle`); seeded with the
+        // current status so only a real Working → idle edge fires.
+        let status = self
+            .sessions
+            .iter()
+            .find(|s| s.info.id == sid)
+            .map(|s| s.info.status)
+            .unwrap_or(crate::session::SessionStatus::Idle);
+        self.review_nudge_watch.insert(sid, status);
         self.set_status(StatusLevel::Success, "Review sent to agent");
     }
 

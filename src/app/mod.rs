@@ -802,6 +802,13 @@ pub struct App {
     /// the review closes on every Send→Agent, and the history must survive
     /// the reopen.
     pub(crate) review_search_history: std::collections::HashMap<SessionId, Vec<String>>,
+    /// Sessions a review was sent to (`e`) that are being watched for the
+    /// agent finishing, mapped to the last status observed — when a watched
+    /// session leaves `Working`, a re-review nudge toast fires
+    /// (`[review] nudge_on_idle`) and the watch is consumed (one nudge per
+    /// send). Outside [`CodeReviewState`](code_review::CodeReviewState)
+    /// because Send→Agent closes the review view.
+    pub(crate) review_nudge_watch: std::collections::HashMap<SessionId, SessionStatus>,
     /// Open agent-activity views (section navigator + content state), keyed by
     /// session — persisted per session like [`Self::code_reviews`], so switching
     /// sessions and returning keeps the view open. Reached via
@@ -1184,6 +1191,7 @@ impl App {
             file_viewer: crate::ui::file_viewer::FileViewerState::new(),
             code_reviews: std::collections::HashMap::new(),
             review_search_history: std::collections::HashMap::new(),
+            review_nudge_watch: std::collections::HashMap::new(),
             cc_activities: std::collections::HashMap::new(),
             modal: modals::Modal::None,
             new_session: new_session_state::NewSessionWizardState::default(),
@@ -5143,6 +5151,48 @@ impl App {
             self.request_redraw();
         }
         self.dispatch_status_notifications();
+        self.nudge_review_on_idle();
+    }
+
+    /// Toast a re-review nudge when a session whose review was sent (`e`,
+    /// [`Self::review_nudge_watch`]) finishes working — the moment to reopen
+    /// the review and check the agent's fixes. Fires once per send (the watch
+    /// entry is consumed), only after a `Working → Idle/Done` edge (the send
+    /// itself usually lands while the agent is still idle), and only when
+    /// `[review] nudge_on_idle` is on. No auto-rebuild — a hint only.
+    fn nudge_review_on_idle(&mut self) {
+        if self.review_nudge_watch.is_empty() {
+            return;
+        }
+        let statuses: std::collections::HashMap<SessionId, (SessionStatus, String)> = self
+            .sessions
+            .iter()
+            .map(|s| (s.info.id, (s.info.status, s.info.name.clone())))
+            .collect();
+        let active = self.active_session_id();
+        let mut fired: Option<String> = None;
+        self.review_nudge_watch.retain(|id, prev| {
+            // A deleted session's watch is dropped, bounding the map.
+            let Some((cur, name)) = statuses.get(id) else {
+                return false;
+            };
+            let finished = *prev == SessionStatus::Working
+                && matches!(cur, SessionStatus::Idle | SessionStatus::Done);
+            *prev = *cur;
+            if finished {
+                fired = Some(if active == Some(*id) {
+                    "Agent idle — F7 to re-review, F5 to reload".to_string()
+                } else {
+                    format!("Agent idle in {name} — F7 to re-review")
+                });
+            }
+            !finished
+        });
+        if let Some(msg) = fired {
+            if self.review_settings.nudge_on_idle {
+                self.set_info(msg);
+            }
+        }
     }
 
     /// Force [`Self::cached_hook_states`] to reload on the next status refresh.
@@ -14102,6 +14152,47 @@ mod tests {
             app.code_reviews.contains_key(&sid),
             "Esc closed the popup, not the review"
         );
+    }
+
+    /// A sent review watches its session: the first Working → Idle edge after
+    /// the send toasts a re-review nudge exactly once; `nudge_on_idle = false`
+    /// consumes the edge silently.
+    #[test]
+    fn review_nudge_fires_once_when_watched_agent_finishes() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        app.status_message = None;
+        app.review_nudge_watch.insert(sid, SessionStatus::Idle);
+
+        // The send usually lands while the agent is still idle — no edge yet.
+        app.nudge_review_on_idle();
+        assert!(app.status_message.is_none());
+
+        // Idle → Working: tracked, still no nudge.
+        app.sessions[0].info.status = SessionStatus::Working;
+        app.nudge_review_on_idle();
+        assert!(app.status_message.is_none());
+
+        // Working → Idle: the nudge fires and consumes the watch.
+        app.sessions[0].info.status = SessionStatus::Idle;
+        app.nudge_review_on_idle();
+        let msg = app.status_message.take().expect("nudge fired");
+        assert!(msg.text.contains("F7 to re-review"), "got: {}", msg.text);
+        assert!(app.review_nudge_watch.is_empty(), "one nudge per send");
+
+        // Later idle edges without a fresh send stay quiet.
+        app.sessions[0].info.status = SessionStatus::Working;
+        app.nudge_review_on_idle();
+        app.sessions[0].info.status = SessionStatus::Idle;
+        app.nudge_review_on_idle();
+        assert!(app.status_message.is_none());
+
+        // Setting off: the edge is consumed without a toast.
+        app.review_settings.nudge_on_idle = false;
+        app.review_nudge_watch.insert(sid, SessionStatus::Working);
+        app.nudge_review_on_idle();
+        assert!(app.status_message.is_none());
+        assert!(app.review_nudge_watch.is_empty());
     }
 
     /// Toggling a reviewed mark stores the current semantic fingerprint, so
