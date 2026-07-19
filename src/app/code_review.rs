@@ -571,12 +571,21 @@ impl CodeReviewState {
         let file = self.selected_file_path()?;
         let line = match self.rows.get(self.selected) {
             Some(ReviewRow::Line(fi, hi, li)) => {
-                let hunk = self.files.get(*fi)?.hunks.get(*hi)?;
-                hunk.lines[..=(*li).min(hunk.lines.len().saturating_sub(1))]
-                    .iter()
-                    .rev()
-                    .find_map(|l| l.new_no)
-                    .unwrap_or_else(|| hunk.new_start.max(1))
+                // A paired side-by-side row keys on the deletion index, so the
+                // backward scan alone would resolve a modification to the
+                // preceding context line; row_side_line resolves the aligned
+                // new-side line in either layout. Fall back to the scan only
+                // for a pure deletion (no new side).
+                if let Some(n) = self.row_side_line(self.selected, &file, Side::New) {
+                    n
+                } else {
+                    let hunk = self.files.get(*fi)?.hunks.get(*hi)?;
+                    hunk.lines[..=(*li).min(hunk.lines.len().saturating_sub(1))]
+                        .iter()
+                        .rev()
+                        .find_map(|l| l.new_no)
+                        .unwrap_or_else(|| hunk.new_start.max(1))
+                }
             }
             Some(ReviewRow::HunkHeader(fi, hi)) => {
                 self.files.get(*fi)?.hunks.get(*hi)?.new_start.max(1)
