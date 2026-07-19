@@ -1652,6 +1652,7 @@ mod tests {
             old_path: None,
             status: FileStatus::Modified,
             untracked: false,
+            binary: false,
             note: None,
             hunks: vec![DiffHunk {
                 old_start: 1,
@@ -2123,6 +2124,7 @@ mod tests {
             old_path: None,
             status: FileStatus::Modified,
             untracked: false,
+            binary: false,
             note: None,
             hunks: Vec::new(),
         };

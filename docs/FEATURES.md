@@ -845,6 +845,13 @@ shown: …)`) instead of a body; ignored files stay out. Untracked files are
 commentable and markable like any other file. Local worktrees read the file
 directly; remote ones go through `git diff --no-index` per file.
 
+**Binary diffs explain themselves.** The parser flags a `Binary files …
+differ` / `GIT binary patch` body (`DiffFile::binary`) and the build renders
+one info row under the header instead of a bare `+0 -0`: `(binary file,
+12 KiB)` where the size is free (a local Working target stats the worktree
+file), plain `(binary file)` in other targets — sizes there would cost an
+extra git subprocess per file.
+
 **Why review all repos at once?** A friring session can span several
 repositories (and flow opens a PR per repo), so a review that only saw the
 primary repo would miss most of the change. A multi-repo session reviews

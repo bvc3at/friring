@@ -98,6 +98,9 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
   line span, `c` comments on it (schema **v42**,
   `review_comments.line_end`); the handoff record reads `new:10-24` and
   quotes the span's first + last lines with `> …` between.
+- **Binary diff placeholder.** A binary body renders an explanatory
+  `(binary file[, size])` row instead of upstream's bare `+0 -0` header
+  (size only where a local stat is free — the Working target).
 
 #### Agent activity view (F9)
 

@@ -2517,6 +2517,21 @@ fn build_files(
             ReviewTarget::Commit { .. } => None,
         };
         let mut parsed = raw.as_deref().map(parse_unified_diff).unwrap_or_default();
+        // A binary diff has no hunks — surface one explanatory row instead of
+        // a bare `+0 -0` header. The current size is added only where it's
+        // free (a local Working target stats the worktree file); other
+        // targets would cost an extra git subprocess per file.
+        let stat_sizes = host.is_none() && matches!(target, ReviewTarget::Working);
+        for f in parsed.iter_mut().filter(|f| f.binary && f.note.is_none()) {
+            let size = stat_sizes
+                .then(|| std::fs::metadata(repo.dir.join(&f.path)).ok())
+                .flatten()
+                .map(|m| m.len());
+            f.note = Some(match size {
+                Some(s) => format!("(binary file, {})", human_size(s)),
+                None => "(binary file)".to_string(),
+            });
+        }
         // `git diff HEAD` never sees untracked files; the Working target
         // synthesizes them so "review my uncommitted work" really shows all
         // of it.
@@ -2547,6 +2562,7 @@ fn untracked_placeholder(path: String, why: &str) -> DiffFile {
         path,
         status: crate::session::review::FileStatus::Added,
         untracked: true,
+        binary: false,
         note: Some(format!("(untracked file not shown: {why})")),
         ..Default::default()
     }
@@ -2893,6 +2909,7 @@ impl CodeReviewState {
                 old_path: None,
                 status: FileStatus::Modified,
                 untracked: false,
+                binary: false,
                 note: None,
                 hunks: vec![DiffHunk {
                     old_start: 1,
@@ -2958,6 +2975,7 @@ mod tests {
             old_path: None,
             status: FileStatus::Modified,
             untracked: false,
+            binary: false,
             note: None,
             hunks: vec![DiffHunk {
                 old_start: 1,
@@ -3026,6 +3044,7 @@ mod tests {
             old_path: None,
             status: FileStatus::Modified,
             untracked: false,
+            binary: false,
             note: None,
             hunks: vec![DiffHunk {
                 old_start: 1,
@@ -3269,6 +3288,7 @@ mod tests {
             old_path: None,
             status: FileStatus::Modified,
             untracked: false,
+            binary: false,
             note: None,
             hunks: vec![DiffHunk {
                 old_start: 1,
@@ -3558,6 +3578,59 @@ mod tests {
         assert!(
             wide > narrow,
             "-U25 shows more context than -U3 ({wide} vs {narrow})"
+        );
+    }
+
+    /// A modified binary file gets one explanatory note row instead of a bare
+    /// `+0 -0` header — with the worktree size where a stat is free (local
+    /// Working target), plain elsewhere (Staged would cost a git call per
+    /// file).
+    #[test]
+    fn build_files_binary_note_with_size_only_in_working() {
+        use crate::git::git_program;
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let ok = git_program()
+                .args([
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        }
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        git(p, &["init", "-q"]);
+        std::fs::write(p.join("img.bin"), [0u8, 1, 2, 255]).unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-q", "-m", "init"]);
+        std::fs::write(p.join("img.bin"), [0u8, 9]).unwrap();
+
+        let repos = vec![ReviewRepo {
+            label: String::new(),
+            dir: p.to_path_buf(),
+            base: None,
+        }];
+        let working = build_files(&repos, &ReviewTarget::Working, None, false, 3);
+        let f = working.iter().find(|f| f.path == "img.bin").unwrap();
+        assert!(f.binary && f.hunks.is_empty());
+        assert_eq!(f.note.as_deref(), Some("(binary file, 1 KiB)"));
+
+        git(p, &["add", "-A"]);
+        let staged = build_files(&repos, &ReviewTarget::Staged, None, false, 3);
+        let f = staged.iter().find(|f| f.path == "img.bin").unwrap();
+        assert!(f.binary);
+        assert_eq!(
+            f.note.as_deref(),
+            Some("(binary file)"),
+            "no stat outside Working"
         );
     }
 

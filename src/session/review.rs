@@ -264,6 +264,10 @@ pub struct DiffFile {
     /// (not produced by `git diff`). Rendered with a `?` glyph so it reads
     /// apart from a staged add.
     pub untracked: bool,
+    /// The diff withheld this file's body as binary (`Binary files … differ`
+    /// / `GIT binary patch`). Set by the parser only; the app layer turns it
+    /// into an explanatory [`Self::note`] (with the worktree size when cheap).
+    pub binary: bool,
     /// An explanatory row rendered under the file header when the body is
     /// withheld (an oversized or binary untracked file, a binary diff).
     pub note: Option<String>,
@@ -408,6 +412,7 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
                 old_path: None,
                 status: FileStatus::Modified,
                 untracked: false,
+                binary: false,
                 note: None,
                 hunks: Vec::new(),
             });
@@ -466,6 +471,9 @@ fn apply_file_metadata(f: &mut DiffFile, line: &str, in_hunk: bool) -> bool {
     } else if let Some(p) = line.strip_prefix("rename to ") {
         f.status = FileStatus::Renamed;
         f.path = p.to_string();
+    } else if line.starts_with("Binary files ") || line == "GIT binary patch" {
+        // git withheld the body; the app layer renders an explanatory row.
+        f.binary = true;
     } else if let Some(p) = line.strip_prefix("--- ").filter(|_| !in_hunk) {
         let p = p.trim();
         if p != "/dev/null" {
@@ -883,6 +891,44 @@ index 111..222 100644
         assert_eq!(added.old_no, None);
     }
 
+    /// Binary diffs (`Binary files … differ`, or `GIT binary patch` under
+    /// `--binary`) flag the file instead of leaving a bare bodyless header.
+    #[test]
+    fn parses_binary_diffs_as_binary_flagged_files() {
+        let diff = "\
+diff --git a/img.png b/img.png
+index 111..222 100644
+Binary files a/img.png and b/img.png differ
+diff --git a/src/foo.rs b/src/foo.rs
+index 333..444 100644
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -1 +1 @@
+-a
++b
+";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 2);
+        assert!(files[0].binary, "binary marker line sets the flag");
+        assert!(files[0].hunks.is_empty());
+        assert!(!files[1].binary, "the text file is unaffected");
+        assert_eq!(files[1].hunks.len(), 1);
+
+        let diff = "\
+diff --git a/img.png b/img.png
+new file mode 100644
+index 000..222
+GIT binary patch
+literal 95
+zcmZ?wbh9u|oWO
+";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].binary);
+        assert_eq!(files[0].status, FileStatus::Added);
+        assert!(files[0].hunks.is_empty(), "the base85 body is skipped");
+    }
+
     #[test]
     fn parses_added_and_deleted_files() {
         let diff = "\
@@ -1090,6 +1136,7 @@ index 1..2 100644
             old_path: None,
             status: FileStatus::Modified,
             untracked: false,
+            binary: false,
             note: None,
             hunks: vec![DiffHunk {
                 old_start: start,
