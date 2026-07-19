@@ -563,6 +563,40 @@ impl CodeReviewState {
         })
     }
 
+    /// The `$EDITOR` target of the selected row: the file's diff path and the
+    /// worktree (new-side) line to open at. A deletion row (no new-side
+    /// number) falls back to the nearest preceding new-side line in its hunk,
+    /// then to the hunk's start; non-line rows open at the top of the file.
+    pub(crate) fn selected_editor_target(&self) -> Option<(String, u32)> {
+        let file = self.selected_file_path()?;
+        let line = match self.rows.get(self.selected) {
+            Some(ReviewRow::Line(fi, hi, li)) => {
+                let hunk = self.files.get(*fi)?.hunks.get(*hi)?;
+                hunk.lines[..=(*li).min(hunk.lines.len().saturating_sub(1))]
+                    .iter()
+                    .rev()
+                    .find_map(|l| l.new_no)
+                    .unwrap_or_else(|| hunk.new_start.max(1))
+            }
+            Some(ReviewRow::HunkHeader(fi, hi)) => {
+                self.files.get(*fi)?.hunks.get(*hi)?.new_start.max(1)
+            }
+            _ => 1,
+        };
+        Some((file, line))
+    }
+
+    /// Absolute worktree path of a diff path (repo-namespaced in a multi-repo
+    /// review). `None` when the namespace prefix doesn't resolve to a repo.
+    pub(crate) fn abs_path(&self, path: &str) -> Option<PathBuf> {
+        if !self.multi {
+            return Some(self.repos.first()?.dir.join(path));
+        }
+        let (label, rel) = path.split_once('/')?;
+        let repo = self.repos.iter().find(|r| r.label == label)?;
+        Some(repo.dir.join(rel))
+    }
+
     /// Whether `path`'s diff is folded (collapsed to just its header). A file
     /// folds once reviewed; [`Self::fold_override`] flips that per file so the
     /// user can peek at a reviewed file (or collapse an unreviewed one) without
@@ -2194,6 +2228,49 @@ impl App {
         self.set_status(StatusLevel::Success, "Review sent to agent");
     }
 
+    /// `E`: open the selected row's file at its line in `$VISUAL`/`$EDITOR`
+    /// (`$VISUAL` wins). Local sessions only — the editor runs on this
+    /// machine and a remote session's files don't live here. The terminal
+    /// handoff happens in the main loop ([`App::take_pending_editor`]); a
+    /// Working-target round-trip reloads the diff afterwards so the edit
+    /// shows (other targets show committed content the edit can't change,
+    /// so they skip the reload).
+    pub(crate) fn cr_open_in_editor(&mut self) {
+        let Some(cr) = self.active_review() else {
+            return;
+        };
+        if cr.host.is_some() {
+            self.set_info("Editor round-trip is local only");
+            return;
+        }
+        let Some((path, line)) = cr.selected_editor_target() else {
+            self.set_error("Select a file row to open in the editor");
+            return;
+        };
+        let Some(abs) = cr.abs_path(&path) else {
+            self.set_error("Could not resolve the file's worktree path");
+            return;
+        };
+        let reload = cr.target == ReviewTarget::Working;
+        let editor = std::env::var("VISUAL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                std::env::var("EDITOR")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            });
+        let Some(editor) = editor else {
+            self.set_error("Neither $VISUAL nor $EDITOR is set");
+            return;
+        };
+        let Some(req) = build_editor_request(&editor, &abs, line, reload) else {
+            self.set_error("Could not parse $VISUAL/$EDITOR");
+            return;
+        };
+        self.pending_editor = Some(req);
+    }
+
     /// Dispatch a footer-button click in the review view.
     pub(crate) fn cr_button(&mut self, button: ReviewButton) {
         match button {
@@ -2389,6 +2466,7 @@ impl App {
             KeyCode::Char('R') => self.cr_toggle_reviewed(true),
             KeyCode::Char('y') => self.cr_copy_markdown(),
             KeyCode::Char('e') => self.cr_send_to_agent(),
+            KeyCode::Char('E') => self.cr_open_in_editor(),
             KeyCode::Char('x') | KeyCode::Delete => self.cr_delete_selected(),
             // Manual reload of the current target (revdiff's `R`). F5 is
             // FocusTasks globally, but this pane captures keys first, so the
@@ -2710,6 +2788,29 @@ fn build_untracked_files(repo: &ReviewRepo, host: Option<&HostDef>) -> Vec<DiffF
         out.push(file);
     }
     out
+}
+
+/// Build the [`EditorRequest`](super::EditorRequest) for an editor command
+/// line, a file, and a 1-based line. The command line is whitespace-split so
+/// values like `EDITOR="code --wait"` work; the location uses the widespread
+/// `+<line> <file>` convention (vim / nvim / nano / emacs / micro / kak).
+/// `None` for an empty command line.
+fn build_editor_request(
+    cmdline: &str,
+    file: &Path,
+    line: u32,
+    reload_review: bool,
+) -> Option<super::EditorRequest> {
+    let mut parts = cmdline.split_whitespace().map(str::to_string);
+    let program = parts.next()?;
+    let mut args: Vec<String> = parts.collect();
+    args.push(format!("+{line}"));
+    args.push(file.display().to_string());
+    Some(super::EditorRequest {
+        program,
+        args,
+        reload_review,
+    })
 }
 
 /// Human-readable size for the untracked placeholder note.
@@ -4069,6 +4170,64 @@ mod tests {
         assert!(md.contains("### C15 [Note]\noverall fine\n"));
         // No comments → None (the send/copy toast path).
         assert!(review_markdown_structured(&[headed_file()], &[]).is_none());
+    }
+
+    /// The `$EDITOR` target resolution: a deletion row (no new-side number)
+    /// falls back to the nearest preceding new-side line; multi-repo paths
+    /// resolve through their repo's worktree dir.
+    #[test]
+    fn editor_target_and_abs_path_resolution() {
+        // change_block_file rows: 0 header, 1 hunk, 2 ctx(new:1), 3 del(old:2),
+        // 4 del(old:3), 5 add(new:2), 6 add(new:3).
+        let mut s = state_with(vec![change_block_file()], vec![]);
+        s.selected = 5;
+        assert_eq!(
+            s.selected_editor_target(),
+            Some(("src/foo.rs".to_string(), 2))
+        );
+        // A deletion row opens at the last line still present on the new side.
+        s.selected = 3;
+        assert_eq!(
+            s.selected_editor_target(),
+            Some(("src/foo.rs".to_string(), 1))
+        );
+
+        // Single-repo: the diff path joins the repo dir directly.
+        assert_eq!(
+            s.abs_path("src/foo.rs"),
+            Some(PathBuf::from("/tmp/src/foo.rs"))
+        );
+        // Multi-repo: the namespace prefix picks the repo.
+        s.multi = true;
+        s.repos = vec![
+            ReviewRepo {
+                label: "alpha".into(),
+                dir: PathBuf::from("/w/alpha"),
+                base: None,
+            },
+            ReviewRepo {
+                label: "beta".into(),
+                dir: PathBuf::from("/w/beta"),
+                base: None,
+            },
+        ];
+        assert_eq!(
+            s.abs_path("beta/src/foo.rs"),
+            Some(PathBuf::from("/w/beta/src/foo.rs"))
+        );
+        assert_eq!(s.abs_path("gamma/src/foo.rs"), None, "unknown repo prefix");
+    }
+
+    /// The editor command line splits on whitespace (`EDITOR="code --wait"`)
+    /// and the location is appended as `+<line> <file>`.
+    #[test]
+    fn editor_request_splits_cmdline_and_appends_location() {
+        let req =
+            build_editor_request("code --wait", Path::new("/w/src/foo.rs"), 12, true).unwrap();
+        assert_eq!(req.program, "code");
+        assert_eq!(req.args, ["--wait", "+12", "/w/src/foo.rs"]);
+        assert!(req.reload_review);
+        assert!(build_editor_request("  ", Path::new("/x"), 1, false).is_none());
     }
 
     /// `V`-range mechanics on the pure state: the compiled anchor is the

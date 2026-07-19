@@ -109,6 +109,9 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
 - **Re-review nudge.** After a review is sent, the agent's next
   Working → idle edge toasts "F7 to re-review, F5 to reload" (once per
   send; `[review] nudge_on_idle` opts out).
+- **Open in `$EDITOR` (`E`).** Suspends the TUI, opens the selected line
+  in `$VISUAL`/`$EDITOR` (`+<line>` convention), and auto-reloads a
+  Working-target diff on return. Local sessions only.
 
 #### Agent activity view (F9)
 

@@ -648,6 +648,19 @@ pub struct StatusMessage {
     pub created_at: std::time::Instant,
 }
 
+/// A pending `$VISUAL`/`$EDITOR` round-trip (the review's `E`). The app can't
+/// run the editor itself — the main loop owns the terminal — so it queues this
+/// request; the loop takes it ([`App::take_pending_editor`]), tears the TUI
+/// down, runs the editor to completion, rebuilds the terminal, and reports
+/// back via [`App::editor_closed`].
+pub struct EditorRequest {
+    pub program: String,
+    pub args: Vec<String>,
+    /// Reload the review diff after the editor exits — set for the Working
+    /// target only, where the edit changes what the diff shows.
+    pub reload_review: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputFocus {
     SessionList,
@@ -809,6 +822,9 @@ pub struct App {
     /// send). Outside [`CodeReviewState`](code_review::CodeReviewState)
     /// because Send→Agent closes the review view.
     pub(crate) review_nudge_watch: std::collections::HashMap<SessionId, SessionStatus>,
+    /// A queued editor round-trip (see [`EditorRequest`]), drained by the main
+    /// loop each tick.
+    pub(crate) pending_editor: Option<EditorRequest>,
     /// Open agent-activity views (section navigator + content state), keyed by
     /// session — persisted per session like [`Self::code_reviews`], so switching
     /// sessions and returning keeps the view open. Reached via
@@ -1192,6 +1208,7 @@ impl App {
             code_reviews: std::collections::HashMap::new(),
             review_search_history: std::collections::HashMap::new(),
             review_nudge_watch: std::collections::HashMap::new(),
+            pending_editor: None,
             cc_activities: std::collections::HashMap::new(),
             modal: modals::Modal::None,
             new_session: new_session_state::NewSessionWizardState::default(),
@@ -4664,6 +4681,27 @@ impl App {
     pub fn tick(&mut self) {
         self.tick_core();
         self.tick_background();
+    }
+
+    /// Drain the queued editor round-trip (the review's `E`), if any. Called
+    /// by the main loop, which owns the terminal teardown/rebuild around
+    /// running the editor.
+    pub fn take_pending_editor(&mut self) -> Option<EditorRequest> {
+        self.pending_editor.take()
+    }
+
+    /// Called by the main loop after an editor round-trip: the editor owned
+    /// the whole screen, so force a repaint; surface a spawn failure; and for
+    /// a Working-target trip reload the review so the edit shows.
+    pub fn editor_closed(&mut self, reload_review: bool, error: Option<String>) {
+        self.request_redraw();
+        if let Some(e) = error {
+            self.set_error(e);
+            return;
+        }
+        if reload_review && self.active_review().is_some() {
+            self.cr_reload();
+        }
     }
 
     /// The deterministic half of [`Self::tick`]: everything that only reads
@@ -14193,6 +14231,24 @@ mod tests {
         app.nudge_review_on_idle();
         assert!(app.status_message.is_none());
         assert!(app.review_nudge_watch.is_empty());
+    }
+
+    /// `E` on a remote (SSH) session's review refuses the editor round-trip —
+    /// the editor runs on this machine, the files don't live here.
+    #[test]
+    fn review_editor_is_local_only() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let mut state = code_review::CodeReviewState::for_test(sid, 1);
+        state.host = Some(crate::session::HostDef::default());
+        state.selected = 2; // a Line row
+        app.code_reviews.insert(sid, state);
+        app.focus = InputFocus::CodeReview;
+
+        app.handle_code_review_key(KeyCode::Char('E'), KeyModifiers::SHIFT);
+        assert!(app.take_pending_editor().is_none());
+        let msg = app.status_message.take().expect("toast");
+        assert!(msg.text.contains("local only"), "got: {}", msg.text);
     }
 
     /// Toggling a reviewed mark stores the current semantic fingerprint, so

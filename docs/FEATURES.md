@@ -963,6 +963,17 @@ flight). Unlike a retarget — which resets to the top — a reload preserves
 your place: the exact row when it still belongs to the same file, else the
 previously selected file's header.
 
+**Open in `$EDITOR` (`E`).** Opens the selected row's file at its line in
+`$VISUAL` (falling back to `$EDITOR`; toast when neither is set), using the
+`+<line> <file>` convention — a deletion row opens at the nearest line
+still present on the new side. The app queues an `EditorRequest`; the
+**main loop** (which owns the terminal) tears the TUI down, runs the editor
+to completion, rebuilds the terminal + forces a full repaint, and a
+Working-target round-trip then auto-reloads the diff (other targets show
+committed content the edit can't change, so they open without reloading).
+Local sessions only — a remote session toasts `"Editor round-trip is local
+only"`.
+
 **Re-review nudge on agent idle.** Sending a review (`e`) watches that
 session (`App::review_nudge_watch`, seeded with its current status): when
 the agent later crosses a `Working → Idle/Done` edge — it finished
