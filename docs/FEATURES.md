@@ -792,8 +792,10 @@ editor of choice can open them as a workspace.
 Friring ships a **native, built-in** tuicr-like review view (`Ctrl+X`, `F7`
 alternate; rebindable `Action::ToggleReview`, gated by `[features]
 code_review`): a GitHub-style continuous diff of the active session's worktree
-(`<base>..HEAD`) with classified comments (issue / suggestion / note /
-praise), per-file/hunk "reviewed" marks, and a review summary — rendered
+(`<base>..HEAD`) with classified comments (note / issue / suggestion /
+question / praise — Tab cycles them in the compose box, `Question` asks the
+agent to answer rather than change code), per-file/hunk "reviewed" marks,
+and a review summary — rendered
 directly by friring and persisted in SQLite. `Ctrl+X` is in
 `terminal_passthrough` (the emacs prefix key), so in a focused terminal it
 reaches the agent and `F7` opens the review.

@@ -29,11 +29,14 @@ pub(crate) struct CodeReviewHits {
     pub scrollbar: Option<ScrollbarGeom>,
 }
 
-/// Theme color for a classification badge.
+/// Theme color for a classification badge. Each class gets a distinct palette
+/// color so the badge reads at a glance (`Question` borrows the "working"
+/// yellow — attention-seeking without the alarm of `Issue`'s danger red).
 fn class_color(c: Classification) -> Color {
     match c {
         Classification::Issue => Theme::danger(),
         Classification::Suggestion => Theme::accent(),
+        Classification::Question => Theme::status_working(),
         Classification::Note => Theme::text_secondary(),
         Classification::Praise => Theme::status_done(),
     }

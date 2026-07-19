@@ -34,32 +34,39 @@ impl Side {
     }
 }
 
-/// A review comment's classification — the colored "type" badge. Mirrors
-/// tuicr's set (issue / suggestion / note / praise).
+/// A review comment's classification — the colored "type" badge. Extends
+/// tuicr's set (issue / suggestion / note / praise) with a first-class
+/// `Question`: explicit classification beats inferring questions from `??` in
+/// the comment text, and the structured handoff gives each class distinct
+/// semantics for the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Classification {
-    Issue,
-    Suggestion,
     #[default]
     Note,
+    Issue,
+    Suggestion,
+    Question,
     Praise,
 }
 
 impl Classification {
-    /// In selector / cycle order.
-    pub const ALL: [Classification; 4] = [
+    /// In selector / cycle order. Starts at the default (`Note`), so the first
+    /// Tab in the compose box lands on `Issue` — the most common escalation.
+    pub const ALL: [Classification; 5] = [
+        Classification::Note,
         Classification::Issue,
         Classification::Suggestion,
-        Classification::Note,
+        Classification::Question,
         Classification::Praise,
     ];
 
     /// Stable token used in storage and markdown export.
     pub fn as_str(self) -> &'static str {
         match self {
+            Classification::Note => "note",
             Classification::Issue => "issue",
             Classification::Suggestion => "suggestion",
-            Classification::Note => "note",
+            Classification::Question => "question",
             Classification::Praise => "praise",
         }
     }
@@ -67,9 +74,10 @@ impl Classification {
     /// Human-facing label.
     pub fn label(self) -> &'static str {
         match self {
+            Classification::Note => "Note",
             Classification::Issue => "Issue",
             Classification::Suggestion => "Suggestion",
-            Classification::Note => "Note",
+            Classification::Question => "Question",
             Classification::Praise => "Praise",
         }
     }
@@ -472,9 +480,17 @@ mod tests {
             assert_eq!(Classification::parse(c.as_str()), Some(c));
         }
         assert_eq!(Classification::parse("bogus"), None);
+        // Full Tab cycle from the default: Note → Issue → Suggestion →
+        // Question → Praise → Note.
+        assert_eq!(Classification::Note.next(), Classification::Issue);
         assert_eq!(Classification::Issue.next(), Classification::Suggestion);
-        assert_eq!(Classification::Issue.prev(), Classification::Praise);
-        assert_eq!(Classification::Praise.next(), Classification::Issue);
+        assert_eq!(
+            Classification::Suggestion.next(),
+            Classification::Question
+        );
+        assert_eq!(Classification::Question.next(), Classification::Praise);
+        assert_eq!(Classification::Praise.next(), Classification::Note);
+        assert_eq!(Classification::Note.prev(), Classification::Praise);
     }
 
     #[test]
