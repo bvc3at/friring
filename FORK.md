@@ -85,6 +85,13 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
 - **Comment navigation.** `(`/`)` jump prev/next comment (wrapping,
   unfolding folded files); `@` opens an all-comments popup with `C<id>`
   rows.
+- **Word-level intra-line diff.** Changed tokens of an aligned del/add pair
+  get a stronger background (new theme keys `diff_added_word_bg` /
+  `diff_removed_word_bg`, derived per preset); 30% shared-token gate;
+  composes with syntax + search highlighting in both layouts.
+- **Syntax highlighting in side-by-side.** Both halves of the paired layout
+  now render through the same highlighter pipeline as the unified body
+  (upstream painted them as plain tinted text).
 
 #### Agent activity view (F9)
 

@@ -518,6 +518,137 @@ fn parse_start(s: &str) -> u32 {
         .unwrap_or(0)
 }
 
+// ── Word-level intra-line diff ───────────────────────────────────────────────
+
+/// Token cap for [`word_diff`]'s LCS: past this the O(n·m) table stops paying
+/// for itself on machine-generated lines; whole-line tint is fine there.
+const WORD_DIFF_MAX_TOKENS: usize = 200;
+
+/// Minimum shared-token ratio for [`word_diff`] to highlight: below it the
+/// lines are essentially unrelated and a whole-line tint reads clearer than
+/// confetti (revdiff's 30% gate).
+const WORD_DIFF_MIN_COMMON: f32 = 0.30;
+
+/// Char-index ranges `[start, end)` of a line's tokens: maximal runs of
+/// alphanumeric/`_` chars vs. runs of other non-space chars. Whitespace runs
+/// separate tokens but are **not** tokens themselves — a shared space must not
+/// count toward the relatedness ratio (every pair of code lines shares
+/// spaces), nor deserve its own highlight.
+fn token_spans(line: &str) -> Vec<(usize, usize)> {
+    #[derive(PartialEq, Clone, Copy)]
+    enum Class {
+        Word,
+        Symbol,
+        Space,
+    }
+    let class = |ch: char| {
+        if ch.is_whitespace() {
+            Class::Space
+        } else if ch.is_alphanumeric() || ch == '_' {
+            Class::Word
+        } else {
+            Class::Symbol
+        }
+    };
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut run: Option<(Class, usize)> = None;
+    let mut end = 0usize;
+    for (i, ch) in line.chars().enumerate() {
+        let c = class(ch);
+        if run.map(|(rc, _)| rc) != Some(c) {
+            if let Some((rc, start)) = run {
+                if rc != Class::Space {
+                    spans.push((start, i));
+                }
+            }
+            run = Some((c, i));
+        }
+        end = i + 1;
+    }
+    if let Some((rc, start)) = run {
+        if rc != Class::Space {
+            spans.push((start, end));
+        }
+    }
+    spans
+}
+
+/// A line's changed-token char ranges (`[start, end)`), merged when adjacent.
+pub type WordRanges = Vec<(usize, usize)>;
+
+/// Word-level diff of an aligned deletion/addition pair: the char ranges (in
+/// each line) of the tokens **not** shared between them, per a token-level
+/// LCS. Returns `None` when the lines share fewer than 30% of their tokens
+/// (unrelated lines) or a side is over the token cap — the caller falls back
+/// to the whole-line tint. Adjacent changed tokens are merged into one range.
+/// Pure; rendering applies the stronger background over these ranges.
+pub fn word_diff(old: &str, new: &str) -> Option<(WordRanges, WordRanges)> {
+    let a = token_spans(old);
+    let b = token_spans(new);
+    if a.is_empty()
+        || b.is_empty()
+        || a.len() > WORD_DIFF_MAX_TOKENS
+        || b.len() > WORD_DIFF_MAX_TOKENS
+    {
+        return None;
+    }
+    let tok = |line: &str, (s, e): (usize, usize)| -> String {
+        line.chars().skip(s).take(e - s).collect()
+    };
+    let ta: Vec<String> = a.iter().map(|&r| tok(old, r)).collect();
+    let tb: Vec<String> = b.iter().map(|&r| tok(new, r)).collect();
+
+    // Classic LCS table over tokens (lines are short; the cap bounds it).
+    let (n, m) = (ta.len(), tb.len());
+    let mut dp = vec![vec![0u16; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if ta[i] == tb[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let lcs = dp[0][0] as usize;
+    let ratio = (2 * lcs) as f32 / (n + m) as f32;
+    if ratio < WORD_DIFF_MIN_COMMON {
+        return None;
+    }
+
+    // Walk the table marking which tokens are common on each side.
+    let mut common_a = vec![false; n];
+    let mut common_b = vec![false; m];
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if ta[i] == tb[j] {
+            common_a[i] = true;
+            common_b[j] = true;
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+
+    let changed = |spans: &[(usize, usize)], common: &[bool]| -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for (k, &range) in spans.iter().enumerate() {
+            if common[k] {
+                continue;
+            }
+            match out.last_mut() {
+                Some(last) if last.1 == range.0 => last.1 = range.1,
+                _ => out.push(range),
+            }
+        }
+        out
+    };
+    Some((changed(&a, &common_a), changed(&b, &common_b)))
+}
+
 // ── Side-by-side pairing ─────────────────────────────────────────────────────
 
 /// One visual row of the paired (true side-by-side) layout: the old-side and
@@ -900,6 +1031,49 @@ index 1..2 100644
                 lines,
             }],
         }
+    }
+
+    #[test]
+    fn word_diff_marks_changed_tokens_only() {
+        // One token changed: only `bar`→`baz` ranges are reported.
+        let (o, n) = word_diff("let foo = bar;", "let foo = baz;").unwrap();
+        assert_eq!(o, vec![(10, 13)]);
+        assert_eq!(n, vec![(10, 13)]);
+
+        // Identical lines: related, but nothing changed.
+        let (o, n) = word_diff("same line", "same line").unwrap();
+        assert!(o.is_empty() && n.is_empty());
+
+        // Adjacent changed tokens merge into one range: `a.b` → `x_y`
+        // changes every token of a 5-token line pair sharing " = ".
+        let (o, n) = word_diff("q = a.b", "q = x_y").unwrap();
+        assert_eq!(o, vec![(4, 7)], "a + . + b merged");
+        assert_eq!(n, vec![(4, 7)], "x_y is one word token");
+    }
+
+    #[test]
+    fn word_diff_gates_unrelated_lines_and_degenerates() {
+        // No shared tokens at all → None (whole-line tint reads clearer).
+        assert!(word_diff("alpha beta", "gamma delta").is_none());
+        // An empty side has no tokens → None.
+        assert!(word_diff("", "something").is_none());
+        // Over the token cap → None (skip the quadratic LCS).
+        let long = "x ".repeat(300);
+        assert!(word_diff(&long, &long).is_none());
+    }
+
+    #[test]
+    fn token_spans_split_word_and_symbol_runs() {
+        // "ab(cd_e)" → "ab", "(", "cd_e", ")": `_` glues words, symbols run
+        // separately.
+        assert_eq!(
+            token_spans("ab(cd_e)"),
+            vec![(0, 2), (2, 3), (3, 7), (7, 8)]
+        );
+        // Whitespace separates tokens but is not one.
+        assert_eq!(token_spans("a b"), vec![(0, 1), (2, 3)]);
+        assert!(token_spans("").is_empty());
+        assert!(token_spans("   ").is_empty());
     }
 
     #[test]

@@ -676,8 +676,11 @@ app_bg = "reset"             # keep the terminal's native background
 Colours accept anything ratatui parses: `#rrggbb`, ANSI names (`red`,
 `lightcyan`), indexed (`14`), or `reset`. The seeded file lists every
 overridable key — including the code-review diff colours `diff_added` /
-`diff_removed` (added/removed line foreground) and `diff_added_bg` /
-`diff_removed_bg` (the subtle full-row tint). Bad colours and built-in name
+`diff_removed` (added/removed line foreground), `diff_added_bg` /
+`diff_removed_bg` (the subtle full-row tint), and `diff_added_word_bg` /
+`diff_removed_word_bg` (the stronger per-token background the word-level
+intra-line diff paints over changed tokens; every preset derives them one
+saturation step brighter than the row tint). Bad colours and built-in name
 collisions degrade to startup warnings (the base colour / the built-in stays in
 effect).
 

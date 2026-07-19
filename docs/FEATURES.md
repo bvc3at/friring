@@ -856,6 +856,17 @@ reviewed-marks never collide across repos. Each repo resolves its own base
 branch); the commit target lists commits across all repos, repo-tagged, and a
 commit target scopes to its one repo.
 
+**Word-level intra-line diff.** Each aligned deletion/addition pair (the
+same positional `del[k] ↔ add[k]` pairing in both layouts) is token-diffed
+(`session::review::word_diff`: alphanumeric/`_` runs vs symbol runs,
+whitespace excluded, token-level LCS) and the changed tokens render with a
+stronger background (`diff_added_word_bg` / `diff_removed_word_bg`, see
+`docs/CONFIG.md` themes) so the exact edit pops out of the tinted line.
+Pairs sharing under 30% of their tokens (revdiff's gate) fall back to the
+whole-line tint — unrelated lines as confetti would read worse. Composes
+with syntax highlighting (word bg under token fg) and yields to
+search-match highlighting.
+
 **Why unified *and* side-by-side?** tuicr offers both (its `diff_view`);
 `v` toggles them. The side-by-side layout is **true paired** — a deletion
 (left) and its aligned addition (right) sit on the *same* screen row
@@ -867,17 +878,18 @@ stays row-granular), and which side a comment attaches to is resolved at
 compose time (`CodeReviewState::selected_anchor`) — keyboard defaults to New
 (the addition), a mouse click uses the column it hit (`App::cr_click_row` →
 `click_side`; left = Old, right = New). Alignment is positional
-(dependency-free, matching the heuristic syntax highlighter); token-level
-intra-line word diffs, and horizontal-scroll in the paired layout, remain
-follow-ups (wrap now works in both layouts — see below).
+(dependency-free, matching the heuristic syntax highlighter);
+horizontal-scroll in the paired layout remains a follow-up (wrap works in
+both layouts — see below).
 
 **Why syntax highlighting?** Plain diffs are hard to skim. A small,
 dependency-free lexer (`ui::syntax`) colours comments / strings / numbers
-/ keywords / type names from the theme palette, so code reads like code.
-Add/remove stays on the gutter `+`/`-` and the row tint, leaving the text
-free to carry syntax colour. It's heuristic + language-agnostic (no
-grammar engine, no heavy dependency); a grammar-aware upgrade is a
-follow-up.
+/ keywords / type names from the theme palette, so code reads like code —
+in the unified body and in each half of the paired layout (both render
+through the same `diff_body_spans`). Add/remove stays on the gutter
+`+`/`-` and the row tint, leaving the text free to carry syntax colour.
+It's heuristic + language-agnostic (no grammar engine, no heavy
+dependency); a grammar-aware upgrade is a follow-up.
 
 **Why mouse-first, no vim modal?** To match friring's own interaction
 model (clicks, buttons, scrollbars, wheel) rather than tuicr's heavy vim

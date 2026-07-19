@@ -443,15 +443,28 @@ fn row_visual_lines<'a>(
             let f = &state.files[*fi];
             let hunk = &f.hunks[*hi];
             if state.side_by_side {
-                paired_diff_line(hunk, *li, width, num_w, wrap, &sel_style)
-            } else if wrap {
-                let l = &hunk.lines[*li];
-                unified_diff_line_wrapped(f, l, width, num_w, selected, query, &sel_style)
+                paired_diff_line(
+                    f, hunk, *li, width, num_w, wrap, selected, query, &sel_style,
+                )
             } else {
                 let l = &hunk.lines[*li];
-                vec![unified_diff_line(
-                    f, l, width, num_w, selected, h_scroll, query, &sel_style,
-                )]
+                // Word-level highlight of the changed tokens vs the aligned
+                // counterpart line; empty for context / unrelated pairs. The
+                // selection bg owns a selected row, so no word bg there.
+                let word = word_ranges_for(hunk, *li);
+                let word_bg = (!selected && !word.is_empty()).then(|| match l.kind {
+                    DiffLineKind::Add => Theme::diff_added_word_bg(),
+                    _ => Theme::diff_removed_word_bg(),
+                });
+                if wrap {
+                    unified_diff_line_wrapped(
+                        f, l, width, num_w, selected, query, &word, word_bg, &sel_style,
+                    )
+                } else {
+                    vec![unified_diff_line(
+                        f, l, width, num_w, selected, h_scroll, query, &word, word_bg, &sel_style,
+                    )]
+                }
             }
         }
         ReviewRow::Comment(id) | ReviewRow::Summary(id) => {
@@ -574,7 +587,8 @@ fn hunk_header_line<'a>(
 
 /// A unified-diff line: a `old new ±` gutter plus the syntax-highlighted body,
 /// with the add/remove row tint (the gutter sign + tint carry the +/-, leaving
-/// the text free for syntax colour). The gutter stays pinned; the body is
+/// the text free for syntax colour). `word`/`word_bg` paint the word-level
+/// intra-line diff over changed tokens. The gutter stays pinned; the body is
 /// windowed to `[h_scroll, h_scroll + avail)` (horizontal scroll) and padded to
 /// `width`.
 #[allow(clippy::too_many_arguments)]
@@ -586,6 +600,8 @@ fn unified_diff_line<'a>(
     selected: bool,
     h_scroll: usize,
     query: Option<&str>,
+    word: &[(usize, usize)],
+    word_bg: Option<Color>,
     sel_style: &impl Fn(Style) -> Style,
 ) -> Line<'a> {
     let (sign, row_bg) = diff_row_bg(l.kind);
@@ -598,7 +614,7 @@ fn unified_diff_line<'a>(
         sel_style(bg(Style::default().fg(Theme::text_muted()))),
     )];
     spans.extend(diff_body_spans(
-        f, &l.text, h_scroll, avail, query, sel_style, &bg,
+        f, &l.text, h_scroll, avail, query, word, word_bg, sel_style, &bg,
     ));
     Line::from(spans)
 }
@@ -608,6 +624,7 @@ fn unified_diff_line<'a>(
 /// gutter-width prefix so the body stays left-aligned. The row tint + selection
 /// highlight cover every wrapped row (so a selected wrapped line reads as one
 /// block). Empty bodies still emit one row (matching the non-wrap path).
+#[allow(clippy::too_many_arguments)]
 fn unified_diff_line_wrapped<'a>(
     f: &DiffFile,
     l: &DiffLine,
@@ -615,6 +632,8 @@ fn unified_diff_line_wrapped<'a>(
     num_w: usize,
     selected: bool,
     query: Option<&str>,
+    word: &[(usize, usize)],
+    word_bg: Option<Color>,
     sel_style: &impl Fn(Style) -> Style,
 ) -> Vec<Line<'a>> {
     let (sign, row_bg) = diff_row_bg(l.kind);
@@ -643,6 +662,8 @@ fn unified_diff_line_wrapped<'a>(
             c * avail,
             avail,
             query,
+            word,
+            word_bg,
             sel_style,
             &bg,
         ));
@@ -752,16 +773,21 @@ fn paired_visual_count(hunk: &DiffHunk, li: usize, width: usize, num_w: usize) -
 
 /// Styled spans for a diff body windowed to `[start, start + avail)` chars,
 /// padded to `avail`. When the active search query hits the visible window the
-/// literal matches are highlighted over plain text (search clarity wins);
-/// otherwise the syntax-highlighted token stream is sliced to the window (the
-/// full line is tokenized for correctness, then windowed). Shared by the
-/// horizontal-scroll and wrap paths.
+/// literal matches are highlighted over plain text (search clarity wins — over
+/// syntax *and* the word-level diff); otherwise the syntax-highlighted token
+/// stream is sliced to the window (the full line is tokenized for correctness,
+/// then windowed) and the word-level diff ranges (`word`, absolute char
+/// ranges) paint `word_bg` under their tokens. Shared by the horizontal-scroll
+/// and wrap paths.
+#[allow(clippy::too_many_arguments)]
 fn diff_body_spans<'a>(
     f: &DiffFile,
     text: &str,
     start: usize,
     avail: usize,
     query: Option<&str>,
+    word: &[(usize, usize)],
+    word_bg: Option<Color>,
     sel_style: &impl Fn(Style) -> Style,
     bg: &impl Fn(Style) -> Style,
 ) -> Vec<Span<'a>> {
@@ -800,11 +826,12 @@ fn diff_body_spans<'a>(
             if piece.is_empty() {
                 continue;
             }
+            let piece_start = tok_start + skip;
             used += piece.chars().count();
-            spans.push(Span::styled(
-                piece,
-                sel_style(bg(Style::default().fg(tcolor))),
-            ));
+            // Word-diff bg over the syntax fg: split the piece at word-range
+            // boundaries so exactly the changed tokens carry the stronger bg.
+            let style = sel_style(bg(Style::default().fg(tcolor)));
+            spans.extend(word_split_spans(piece, piece_start, word, word_bg, style));
         }
     }
     // Pad so the row tint fills the available width.
@@ -815,6 +842,71 @@ fn diff_body_spans<'a>(
         ));
     }
     spans
+}
+
+/// Split `piece` (whose first char sits at absolute char index `piece_start`
+/// of the full line) at the boundaries of the word-diff `ranges`, styling
+/// covered sub-slices with `word_bg` over `base`. With no ranges (or no bg)
+/// the piece stays one span.
+fn word_split_spans<'a>(
+    piece: String,
+    piece_start: usize,
+    ranges: &[(usize, usize)],
+    word_bg: Option<Color>,
+    base: Style,
+) -> Vec<Span<'a>> {
+    let Some(wbg) = word_bg else {
+        return vec![Span::styled(piece, base)];
+    };
+    let piece_end = piece_start + piece.chars().count();
+    let mut cuts = vec![piece_start, piece_end];
+    for &(s, e) in ranges {
+        if s > piece_start && s < piece_end {
+            cuts.push(s);
+        }
+        if e > piece_start && e < piece_end {
+            cuts.push(e);
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let chars: Vec<char> = piece.chars().collect();
+    cuts.windows(2)
+        .map(|w| {
+            let sub: String = chars[w[0] - piece_start..w[1] - piece_start]
+                .iter()
+                .collect();
+            let covered = ranges.iter().any(|&(s, e)| w[0] >= s && w[1] <= e);
+            let style = if covered { base.bg(wbg) } else { base };
+            Span::styled(sub, style)
+        })
+        .collect()
+}
+
+/// Char ranges of row `li`'s changed tokens vs its positionally aligned
+/// counterpart (`del[k] ↔ add[k]`, the same pairing the side-by-side layout
+/// draws — a `-` run followed by a `+` run pairs positionally in unified
+/// rendering too). Empty for context lines, unpaired halves, and unrelated
+/// pairs (see [`crate::session::review::word_diff`]'s 30% gate).
+fn word_ranges_for(hunk: &DiffHunk, li: usize) -> Vec<(usize, usize)> {
+    let line = &hunk.lines[li];
+    if line.kind == DiffLineKind::Context {
+        return Vec::new();
+    }
+    let pair = paired_row(hunk, li);
+    let (Some(o), Some(n)) = (pair.old, pair.new) else {
+        return Vec::new();
+    };
+    let Some((old_r, new_r)) =
+        crate::session::review::word_diff(&hunk.lines[o].text, &hunk.lines[n].text)
+    else {
+        return Vec::new();
+    };
+    if line.kind == DiffLineKind::Del {
+        old_r
+    } else {
+        new_r
+    }
 }
 
 fn comment_line<'a>(
@@ -882,47 +974,48 @@ fn paired_body_width(width: usize, num_w: usize) -> usize {
 /// index; the [`SidePair`] it belongs to supplies both sides (a blank half-cell
 /// where a side is absent). The selection + comment anchor stay 1 row = 1
 /// selectable unit; which side a comment attaches to is resolved at compose
-/// time. Plain add/remove tinting (no syntax highlighting), matching the
-/// unified body's gutter-sign convention.
+/// time. Each half renders through [`diff_body_spans`], so syntax
+/// highlighting, the word-level diff bg, and search highlighting compose here
+/// exactly as in the unified body (add/remove stays on the tint + numbers,
+/// matching the gutter-sign convention).
 ///
 /// With `wrap` on, each half soft-wraps independently onto as many chunks as its
 /// text needs; the taller half drives the visual-row count (mirrored by
 /// [`paired_visual_count`]), and the shorter half pads with blank cells past its
 /// last chunk. Off, each half truncates to one row (the historical behavior).
+#[allow(clippy::too_many_arguments)]
 fn paired_diff_line<'a>(
+    f: &DiffFile,
     hunk: &DiffHunk,
     li: usize,
     width: usize,
     num_w: usize,
     wrap: bool,
+    selected: bool,
+    query: Option<&str>,
     sel_style: &impl Fn(Style) -> Style,
 ) -> Vec<Line<'a>> {
     let pair = paired_row(hunk, li);
     let half = width.saturating_sub(1) / 2;
     let body_w = paired_body_width(width, num_w);
     let prim = || Style::default().fg(Theme::text_primary());
-    let removed = || {
-        Style::default()
-            .fg(Theme::diff_removed())
-            .bg(Theme::diff_removed_bg())
-    };
-    let added = || {
-        Style::default()
-            .fg(Theme::diff_added())
-            .bg(Theme::diff_added_bg())
-    };
 
     let left = pair.old.map(|i| &hunk.lines[i]);
     let right = pair.new.map(|i| &hunk.lines[i]);
     // Each cell tints only when it carries a change (a context line pairs with
     // itself and stays plain on both sides); sel_style overrides bg on select.
-    let lstyle = match left {
-        Some(l) if l.kind == DiffLineKind::Del => removed(),
-        _ => prim(),
-    };
-    let rstyle = match right {
-        Some(l) if l.kind == DiffLineKind::Add => added(),
-        _ => prim(),
+    let ltint = matches!(left, Some(l) if l.kind == DiffLineKind::Del).then(Theme::diff_removed_bg);
+    let rtint = matches!(right, Some(l) if l.kind == DiffLineKind::Add).then(Theme::diff_added_bg);
+
+    // Word-level diff across the aligned pair (only a real del↔add pair has
+    // one); the selection bg owns a selected row, so no word bg there.
+    let (word_old, word_new) = match (left, right) {
+        (Some(l), Some(r))
+            if l.kind == DiffLineKind::Del && r.kind == DiffLineKind::Add && !selected =>
+        {
+            crate::session::review::word_diff(&l.text, &r.text).unwrap_or_default()
+        }
+        _ => Default::default(),
     };
 
     // How many chunks each present half needs (an absent half contributes none);
@@ -942,25 +1035,104 @@ fn paired_diff_line<'a>(
         .map(|c| {
             // A half renders its `c`-th chunk while it still has one; past that
             // (the shorter side, or an absent side) it pads blank + plain.
-            let (left_cell, ls) = if c < lchunks {
+            let mut spans: Vec<Span> = Vec::new();
+            if c < lchunks {
                 let l = left.expect("chunk count > 0 implies present");
-                (half_cell_chunk(l.old_no, &l.text, c, num_w, half), lstyle)
+                spans.extend(half_cell_spans(
+                    f,
+                    l.old_no,
+                    &l.text,
+                    c,
+                    num_w,
+                    half,
+                    ltint,
+                    query,
+                    &word_old,
+                    Theme::diff_removed_word_bg(),
+                    selected,
+                    sel_style,
+                ));
             } else {
-                (half_cell_chunk(None, "", 0, num_w, half), prim())
-            };
-            let (right_cell, rs) = if c < rchunks {
+                spans.push(Span::styled(
+                    half_cell_chunk(None, "", 0, num_w, half),
+                    sel_style(prim()),
+                ));
+            }
+            spans.push(Span::styled(
+                "│",
+                sel_style(Style::default().fg(Theme::text_muted())),
+            ));
+            if c < rchunks {
                 let r = right.expect("chunk count > 0 implies present");
-                (half_cell_chunk(r.new_no, &r.text, c, num_w, half), rstyle)
+                spans.extend(half_cell_spans(
+                    f,
+                    r.new_no,
+                    &r.text,
+                    c,
+                    num_w,
+                    half,
+                    rtint,
+                    query,
+                    &word_new,
+                    Theme::diff_added_word_bg(),
+                    selected,
+                    sel_style,
+                ));
             } else {
-                (half_cell_chunk(None, "", 0, num_w, half), prim())
-            };
-            Line::from(vec![
-                Span::styled(left_cell, sel_style(ls)),
-                Span::styled("│", sel_style(Style::default().fg(Theme::text_muted()))),
-                Span::styled(right_cell, sel_style(rs)),
-            ])
+                spans.push(Span::styled(
+                    half_cell_chunk(None, "", 0, num_w, half),
+                    sel_style(prim()),
+                ));
+            }
+            Line::from(spans)
         })
         .collect()
+}
+
+/// One present side-by-side half cell as styled spans: the right-aligned line
+/// number column (blank on continuation chunks), then the `c`-th `body_w`-wide
+/// slice of the body through [`diff_body_spans`] — so syntax highlighting, the
+/// word-level diff bg, and search-match highlighting compose in the paired
+/// layout exactly as in unified. Total width is exactly `cell_w`.
+#[allow(clippy::too_many_arguments)]
+fn half_cell_spans<'a>(
+    f: &DiffFile,
+    num: Option<u32>,
+    text: &str,
+    c: usize,
+    num_w: usize,
+    cell_w: usize,
+    tint: Option<Color>,
+    query: Option<&str>,
+    word: &[(usize, usize)],
+    word_bg_color: Color,
+    selected: bool,
+    sel_style: &impl Fn(Style) -> Style,
+) -> Vec<Span<'a>> {
+    let body_w = cell_w.saturating_sub(num_w + 1).max(1);
+    let n = if c == 0 {
+        num.map(|n| n.to_string()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let bg = row_bg_fn(tint, selected);
+    let word_bg = (!word.is_empty()).then_some(word_bg_color);
+    let mut spans = vec![Span::styled(
+        format!("{n:>num_w$} "),
+        sel_style(bg(Style::default().fg(Theme::text_muted()))),
+    )];
+    spans.extend(diff_body_spans(
+        f,
+        text,
+        c * body_w,
+        body_w,
+        query,
+        word,
+        word_bg,
+        sel_style,
+        &bg,
+    ));
+    spans
 }
 
 /// A fixed-width side-by-side half cell for wrap chunk `c`: the right-aligned
@@ -1531,6 +1703,112 @@ mod tests {
                 .unwrap();
             }
         }
+    }
+
+    /// A state whose one change pair shares most tokens (`let x = old;` →
+    /// `let x = new;`), so the word-level diff highlights exactly `old`/`new`.
+    fn word_diff_state() -> CodeReviewState {
+        let mut s = demo_state();
+        s.files[0].hunks[0].lines[1].text = "let x = old;".into();
+        s.files[0].hunks[0].lines[2].text = "let x = new;".into();
+        // Park the selection on the file header so no diff row is
+        // selection-styled (the selection bg would override the word bg).
+        s.selected = 0;
+        s.rebuild_rows();
+        s
+    }
+
+    /// Cells painted with `bg` on row `y`, as a string of their symbols.
+    fn cells_with_bg(buf: &ratatui::buffer::Buffer, y: u16, w: u16, bg: Color) -> String {
+        (0..w)
+            .filter(|&x| buf[(x, y)].style().bg == Some(bg))
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    /// Unified: the changed token carries the stronger word bg; the shared
+    /// tokens keep the plain row tint.
+    #[test]
+    fn word_diff_highlights_changed_token_in_unified() {
+        let mut state = word_diff_state();
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| {
+            let _ = render(f, Rect::new(0, 0, 60, 20), &mut state, FocusLevel::Focused);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let (mut removed_hl, mut added_hl) = (String::new(), String::new());
+        for y in 0..20 {
+            removed_hl.push_str(&cells_with_bg(buf, y, 60, Theme::diff_removed_word_bg()));
+            added_hl.push_str(&cells_with_bg(buf, y, 60, Theme::diff_added_word_bg()));
+        }
+        assert_eq!(removed_hl, "old", "only the removed token gets the word bg");
+        assert_eq!(added_hl, "new", "only the added token gets the word bg");
+    }
+
+    /// Side-by-side: the same word-level highlight lands in each half cell —
+    /// and the halves now carry syntax colour (`let` as a keyword), proving
+    /// the highlighter runs there too.
+    #[test]
+    fn word_diff_and_syntax_compose_in_side_by_side() {
+        let mut state = word_diff_state();
+        state.side_by_side = true;
+        state.rebuild_rows();
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let _ = render(f, Rect::new(0, 0, 80, 20), &mut state, FocusLevel::Focused);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let (mut removed_hl, mut added_hl) = (String::new(), String::new());
+        let mut fg_colors: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for y in 0..20 {
+            removed_hl.push_str(&cells_with_bg(buf, y, 80, Theme::diff_removed_word_bg()));
+            added_hl.push_str(&cells_with_bg(buf, y, 80, Theme::diff_added_word_bg()));
+            let row: String = (0..80).map(|x| buf[(x, y)].symbol()).collect();
+            if row.contains("let x = old;") {
+                // Collect the distinct fg colours across the paired row's text:
+                // syntax highlighting must produce more than one.
+                for x in 0..80 {
+                    if buf[(x, y)].symbol() != " " {
+                        fg_colors.insert(format!("{:?}", buf[(x, y)].style().fg));
+                    }
+                }
+            }
+        }
+        assert_eq!(removed_hl, "old");
+        assert_eq!(added_hl, "new");
+        assert!(
+            fg_colors.len() > 1,
+            "syntax highlighting colours the paired halves: {fg_colors:?}"
+        );
+    }
+
+    /// Search-match highlighting wins over the word-diff bg (the match must
+    /// stay legible), per the search-first rule in `diff_body_spans`.
+    #[test]
+    fn search_highlight_wins_over_word_diff() {
+        let mut state = word_diff_state();
+        state.search = Some(crate::app::code_review::ReviewSearch {
+            query: "new".into(),
+            editing: false,
+            matches: Vec::new(),
+        });
+        state.refresh_search_matches();
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| {
+            let _ = render(f, Rect::new(0, 0, 60, 20), &mut state, FocusLevel::Focused);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let mut added_hl = String::new();
+        for y in 0..20 {
+            added_hl.push_str(&cells_with_bg(buf, y, 60, Theme::diff_added_word_bg()));
+        }
+        assert!(
+            added_hl.is_empty(),
+            "the matched line renders search emphasis, not word bg: {added_hl:?}"
+        );
     }
 
     /// True paired side-by-side draws a deletion and its aligned addition on the
