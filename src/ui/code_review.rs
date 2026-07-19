@@ -336,9 +336,16 @@ fn render_info_popup(frame: &mut Frame, area: Rect, state: &mut CodeReviewState)
     .collect::<Vec<_>>()
     .join(" · ");
     let (add, del) = state.totals();
+    // The per-status breakdown is empty for an empty diff (0 files); drop the
+    // parenthetical then rather than render a bare "0 ()".
+    let files_line = if counts.is_empty() {
+        state.files.len().to_string()
+    } else {
+        format!("{} ({counts})", state.files.len())
+    };
     lines.push(Line::from(vec![
         Span::styled(" Files    ", accent),
-        Span::styled(format!("{} ({counts})", state.files.len()), text),
+        Span::styled(files_line, text),
     ]));
     lines.push(Line::from(vec![
         Span::styled(" Changes  ", accent),
@@ -2463,6 +2470,33 @@ mod tests {
         assert!(
             screen.contains("abc1234 fix the widget"),
             "commit list: {screen}"
+        );
+    }
+
+    /// An empty diff (0 files) drops the per-status parenthetical rather than
+    /// rendering a bare `0 ()`.
+    #[test]
+    fn info_popup_empty_diff_omits_empty_parenthetical() {
+        let mut state = demo_state();
+        state.files.clear();
+        state.rebuild_rows();
+        state.info_popup = Some(0);
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let _ = render(f, Rect::new(0, 0, 80, 20), &mut state, FocusLevel::Focused);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..20 {
+            for x in 0..80 {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(
+            !screen.contains("0 ()"),
+            "no bare empty parenthetical: {screen}"
         );
     }
 }
