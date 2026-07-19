@@ -58,6 +58,38 @@ pub(crate) struct TargetPickerState {
     pub selected: usize,
 }
 
+/// Changed-files filter (`o` cycles All → Unreviewed → Commented). Scopes the
+/// files **tree** and the `}`/`{` file jumps; the diff body always shows every
+/// file (hiding diff content would silently change what "the review" covers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ReviewFilter {
+    #[default]
+    All,
+    /// Files not yet marked reviewed — the "what's left" work list.
+    Unreviewed,
+    /// Files carrying at least one (line- or file-level) comment.
+    Commented,
+}
+
+impl ReviewFilter {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            ReviewFilter::All => ReviewFilter::Unreviewed,
+            ReviewFilter::Unreviewed => ReviewFilter::Commented,
+            ReviewFilter::Commented => ReviewFilter::All,
+        }
+    }
+
+    /// Short label for the tree header / toast; `None` for the default (All).
+    pub(crate) fn label(self) -> Option<&'static str> {
+        match self {
+            ReviewFilter::All => None,
+            ReviewFilter::Unreviewed => Some("unreviewed"),
+            ReviewFilter::Commented => Some("commented"),
+        }
+    }
+}
+
 /// A clickable button in the review view footer. Index-free so the renderer and
 /// click dispatch agree by value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +255,8 @@ pub(crate) struct CodeReviewState {
     pub target_picker: Option<TargetPickerState>,
     /// The open find-in-diff search, if any (see [`ReviewSearch`]).
     pub search: Option<ReviewSearch>,
+    /// Changed-files filter (`o`), scoping the tree + `}`/`{` jumps.
+    pub filter: ReviewFilter,
 }
 
 impl ReviewTarget {
@@ -397,6 +431,29 @@ impl CodeReviewState {
     /// touching its reviewed mark.
     pub(crate) fn is_file_folded(&self, path: &str) -> bool {
         self.reviewed_files.contains(path) != self.fold_override.contains(path)
+    }
+
+    /// Whether diff-file `fi` passes the active changed-files [`ReviewFilter`].
+    pub(crate) fn file_passes_filter(&self, fi: usize) -> bool {
+        let Some(file) = self.files.get(fi) else {
+            return false;
+        };
+        match self.filter {
+            ReviewFilter::All => true,
+            ReviewFilter::Unreviewed => !self.reviewed_files.contains(&file.path),
+            ReviewFilter::Commented => self
+                .comments
+                .iter()
+                .any(|c| c.anchor.file() == Some(file.path.as_str())),
+        }
+    }
+
+    /// Diff-file indices passing the active filter, in diff order — the rows
+    /// of the changed-files tree and the stops of the `}`/`{` file jumps.
+    pub(crate) fn visible_file_indices(&self) -> Vec<usize> {
+        (0..self.files.len())
+            .filter(|&i| self.file_passes_filter(i))
+            .collect()
     }
 
     /// Rebuild [`Self::rows`] from the diff + loaded comments + marks. A folded
@@ -650,6 +707,7 @@ impl App {
             host: host.clone(),
             target_picker: None,
             search: None,
+            filter: ReviewFilter::default(),
         };
         // Install the loading state (the pane opens instantly with a
         // "Building diff…" placeholder), load comments + marks through the
@@ -902,7 +960,9 @@ impl App {
         cr.ensure_visible();
     }
 
-    /// Jump to the next/previous file header.
+    /// Jump to the next/previous file header. Files hidden by the active
+    /// changed-files filter (`o`) are skipped, so the jump walks the same list
+    /// the tree shows; the trailing summary section stays a stop.
     pub(crate) fn cr_jump_file(&mut self, forward: bool) {
         let Some(cr) = self.active_review_mut() else {
             return;
@@ -917,10 +977,12 @@ impl App {
             (0..cr.selected).rev().collect()
         };
         for i in range {
-            if matches!(
-                cr.rows[i],
-                ReviewRow::FileHeader(_) | ReviewRow::SummaryHeader
-            ) {
+            let stop = match cr.rows[i] {
+                ReviewRow::FileHeader(fi) => cr.file_passes_filter(fi),
+                ReviewRow::SummaryHeader => true,
+                _ => false,
+            };
+            if stop {
                 cr.selected = i;
                 cr.ensure_visible();
                 return;
@@ -1453,10 +1515,13 @@ impl App {
             })
             .unwrap_or_default();
         let sid = cr.session_id;
-        if let Err(e) = self.db.toggle_review_mark(sid, &file, hunk, &fingerprint) {
-            self.set_error(format!("Failed to update reviewed mark: {e}"));
-            return;
-        }
+        let now_reviewed = match self.db.toggle_review_mark(sid, &file, hunk, &fingerprint) {
+            Ok(v) => v,
+            Err(e) => {
+                self.set_error(format!("Failed to update reviewed mark: {e}"));
+                return;
+            }
+        };
         // A file-level toggle returns the file to its default fold state
         // (reviewed → folded, unreviewed → expanded) by dropping any manual
         // override, so marking reviewed collapses the diff tree-style.
@@ -1466,11 +1531,64 @@ impl App {
             }
         }
         self.reload_review_data();
-        // Land the cursor on the (possibly now-folded) file header rather than a
-        // row that just disappeared.
         if hunk.is_none() {
-            self.cr_select_file_header(&file);
+            // In the Unreviewed filter, marking a file reviewed removes it
+            // from the work list — advance straight to the next unreviewed
+            // file (revdiff's review flow). Otherwise land the cursor on the
+            // (possibly now-folded) file header rather than a row that just
+            // disappeared.
+            let auto_advance = now_reviewed
+                && self
+                    .active_review()
+                    .is_some_and(|cr| cr.filter == ReviewFilter::Unreviewed);
+            if auto_advance {
+                self.cr_select_next_unreviewed(&file);
+            } else {
+                self.cr_select_file_header(&file);
+            }
         }
+    }
+
+    /// Select the header of the first unreviewed file after `after` (wrapping);
+    /// falls back to `after`'s own header when every file is now reviewed.
+    fn cr_select_next_unreviewed(&mut self, after: &str) {
+        let target = self.active_review().and_then(|cr| {
+            let n = cr.files.len();
+            let start = cr
+                .files
+                .iter()
+                .position(|f| f.path == after)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            (0..n)
+                .map(|k| (start + k) % n)
+                .find(|&i| !cr.reviewed_files.contains(&cr.files[i].path))
+        });
+        match target {
+            Some(fi) => {
+                if let Some(cr) = self.active_review_mut() {
+                    if let Some(pos) = cr
+                        .rows
+                        .iter()
+                        .position(|r| matches!(r, ReviewRow::FileHeader(f) if *f == fi))
+                    {
+                        cr.selected = pos;
+                        cr.ensure_visible();
+                    }
+                }
+            }
+            None => self.cr_select_file_header(after),
+        }
+    }
+
+    /// Cycle the changed-files filter (`o`): All → Unreviewed → Commented.
+    pub(crate) fn cr_cycle_filter(&mut self) {
+        let Some(cr) = self.active_review_mut() else {
+            return;
+        };
+        cr.filter = cr.filter.next();
+        let label = cr.filter.label().unwrap_or("all");
+        self.set_info(format!("File filter: {label}"));
     }
 
     /// Move the selection to `path`'s file-header row, if present.
@@ -1694,6 +1812,7 @@ impl App {
             KeyCode::Char('v') => self.cr_toggle_side_by_side(),
             KeyCode::Char('w') => self.cr_toggle_wrap(),
             KeyCode::Char('t') => self.cr_open_target_picker(),
+            KeyCode::Char('o') => self.cr_cycle_filter(),
             KeyCode::Char('c') => self.cr_start_comment(false),
             KeyCode::Char('f') => self.cr_start_comment(true),
             KeyCode::Char('s') => self.cr_start_summary(),
@@ -1767,6 +1886,7 @@ impl App {
             }
             KeyCode::Char('r') => self.cr_toggle_reviewed(false),
             KeyCode::Char('R') => self.cr_toggle_reviewed(true),
+            KeyCode::Char('o') => self.cr_cycle_filter(),
             // `/` searches the diff: open the find sub-mode and drop into the
             // diff pane, which the search input owns.
             KeyCode::Char('/') => {
@@ -2349,6 +2469,7 @@ impl CodeReviewState {
             host: None,
             target_picker: None,
             search: None,
+            filter: ReviewFilter::default(),
         };
         s.rebuild_rows();
         s
@@ -2420,6 +2541,7 @@ mod tests {
             host: None,
             target_picker: None,
             search: None,
+            filter: ReviewFilter::default(),
         };
         s.rebuild_rows();
         s
@@ -2987,6 +3109,29 @@ mod tests {
         // Staged sees none of them.
         let staged = build_files(&repos, &ReviewTarget::Staged, None, false);
         assert!(staged.iter().all(|f| !f.untracked));
+    }
+
+    #[test]
+    fn file_filter_predicate_and_visible_indices() {
+        let mut a = sample_file();
+        a.path = "a.rs".into();
+        let mut b = sample_file();
+        b.path = "b.rs".into();
+        let comment = line_comment(1, "b.rs", 2, Classification::Note, "x");
+        let mut s = state_with(vec![a, b], vec![comment]);
+        s.reviewed_files.insert("a.rs".into());
+        s.rebuild_rows();
+
+        assert_eq!(s.visible_file_indices(), vec![0, 1], "All shows everything");
+        s.filter = ReviewFilter::Unreviewed;
+        assert_eq!(s.visible_file_indices(), vec![1], "a.rs is reviewed");
+        s.filter = ReviewFilter::Commented;
+        assert_eq!(s.visible_file_indices(), vec![1], "only b.rs has a comment");
+
+        // Full cycle wraps.
+        assert_eq!(ReviewFilter::All.next(), ReviewFilter::Unreviewed);
+        assert_eq!(ReviewFilter::Unreviewed.next(), ReviewFilter::Commented);
+        assert_eq!(ReviewFilter::Commented.next(), ReviewFilter::All);
     }
 
     #[test]

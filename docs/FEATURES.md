@@ -976,6 +976,14 @@ the file/hunk reviewed mark, and `Esc` closes the review
 diff pane). Clicking a row jumps the diff (`ClickAction::ReviewFile` →
 `cr_jump_to_file`).
 
+**File filter (`o`, both panes).** Cycles `All → Unreviewed → Commented`
+(`ReviewFilter`), narrowing the tree **and** the `}`/`{` file jumps — the
+diff body always shows every file, so filtering never changes what "the
+review" covers. The active filter shows in the tree header (`Changed files ·
+unreviewed`); an empty result renders a hint line, never a bare pane. In
+`Unreviewed`, marking a file reviewed auto-advances the selection to the
+next unreviewed file — the "work the list down" flow.
+
 ### Long lines: horizontal scroll & wrap
 
 A diff line wider than the pane doesn't get lost. By default the body scrolls

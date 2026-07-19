@@ -2175,6 +2175,7 @@ fn open_minimal_review(h: &mut Harness) {
             host: None,
             target_picker: None,
             search: None,
+            filter: crate::app::code_review::ReviewFilter::default(),
         },
     );
     h.app.focus = InputFocus::CodeReview;

@@ -922,7 +922,13 @@ pub(crate) fn render_files_list(
     state: &CodeReviewState,
     level: FocusLevel,
 ) -> Vec<RowHitbox> {
-    let block = focus_block(" Changed files ", level);
+    // The active filter is part of the header so the narrowed list can't be
+    // mistaken for "these are all the changes".
+    let title = match state.filter.label() {
+        Some(l) => format!(" Changed files · {l} "),
+        None => " Changed files ".to_string(),
+    };
+    let block = focus_block(&title, level);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 || state.files.is_empty() {
@@ -933,7 +939,10 @@ pub(crate) fn render_files_list(
     let hint_row = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            truncate(" ↑↓ move · ↵ open · r seen · / find", inner.width as usize),
+            truncate(
+                " ↑↓ move · ↵ open · r seen · o filter · / find",
+                inner.width as usize,
+            ),
             Style::default().fg(Theme::text_muted()),
         ))),
         hint_row,
@@ -944,9 +953,27 @@ pub(crate) fn render_files_list(
         return Vec::new();
     }
 
+    // An empty *filtered* list explains itself (the unfiltered list can't be
+    // empty here) — never a bare pane with no hint of why.
+    let visible = state.visible_file_indices();
+    if visible.is_empty() {
+        let what = state.filter.label().unwrap_or("matching");
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate(
+                    &format!(" No {what} files — o cycles the filter"),
+                    list.width as usize,
+                ),
+                Style::default().fg(Theme::text_muted()),
+            ))),
+            Rect::new(list.x, list.y, list.width, 1),
+        );
+        return Vec::new();
+    }
+
     // Render the files as a folder tree (directories as headers, files indented
     // beneath). `current_file()` is `None` on the summary section.
-    let tree = build_file_tree(&state.files);
+    let tree = build_file_tree(&state.files, &visible);
     let total = tree.len();
     let current_opt = state.current_file();
     let anchor = current_opt
@@ -1036,15 +1063,15 @@ enum TreeRow {
     File { depth: usize, index: usize },
 }
 
-/// Build a folder tree from the diff files: group by directory (so files in the
+/// Build a folder tree from the diff files listed in `indices` (the
+/// filter-visible subset, in diff order): group by directory (so files in the
 /// same folder sit together under one header), preserving each file's original
 /// diff-file index for hit-testing. Multi-repo paths (`<repo>/<path>`) nest the
 /// repo as the top-level folder automatically.
-fn build_file_tree(files: &[crate::session::review::DiffFile]) -> Vec<TreeRow> {
-    let mut entries: Vec<(usize, Vec<&str>)> = files
+fn build_file_tree(files: &[crate::session::review::DiffFile], indices: &[usize]) -> Vec<TreeRow> {
+    let mut entries: Vec<(usize, Vec<&str>)> = indices
         .iter()
-        .enumerate()
-        .map(|(i, f)| (i, f.path.split('/').collect()))
+        .map(|&i| (i, files[i].path.split('/').collect()))
         .collect();
     // Sort by path segments so sibling files group under a shared directory.
     entries.sort_by(|a, b| a.1.cmp(&b.1));
@@ -1397,6 +1424,7 @@ mod tests {
             host: None,
             target_picker: None,
             search: None,
+            filter: crate::app::code_review::ReviewFilter::default(),
         };
         s.rebuild_rows();
         s
@@ -1709,7 +1737,7 @@ mod tests {
         };
         // Out of path order on purpose — the tree sorts + groups by directory.
         let files = vec![mk("src/b.rs"), mk("top.rs"), mk("src/ui/a.rs")];
-        let tree = build_file_tree(&files);
+        let tree = build_file_tree(&files, &[0, 1, 2]);
         // Folder headers appear for `src` and `src/ui`; the top-level file has no
         // folder. Each file row carries its ORIGINAL index for click→jump.
         let folders: Vec<(usize, &str)> = tree

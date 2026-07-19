@@ -79,6 +79,9 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
 - **Untracked files in the Working target.** Synthesized as all-added
   entries with a `?` glyph (upstream's `git diff HEAD` never showed them);
   oversized/binary files degrade to a placeholder row.
+- **Changed-files filter (`o`).** `All → Unreviewed → Commented`, scoping
+  the tree and the `}`/`{` jumps, with auto-advance to the next unreviewed
+  file on marking.
 
 #### Agent activity view (F9)
 

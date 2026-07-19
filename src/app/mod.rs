@@ -13844,6 +13844,37 @@ mod tests {
         assert!(cr.selected < cr.rows.len());
     }
 
+    /// With the Unreviewed filter active, `}`/`{` skip reviewed files' headers
+    /// and marking a file reviewed auto-advances to the next unreviewed file.
+    #[test]
+    fn review_unreviewed_filter_scopes_jumps_and_auto_advances() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let mut state = code_review::CodeReviewState::for_test(sid, 3);
+        state.filter = code_review::ReviewFilter::Unreviewed;
+        state.reviewed_files.insert("src/f1.rs".into());
+        state.rebuild_rows();
+        app.code_reviews.insert(sid, state);
+
+        // `}` from f0's header skips reviewed f1 straight to f2.
+        app.cr_jump_file(true);
+        let cr = &app.code_reviews[&sid];
+        assert!(
+            matches!(cr.rows[cr.selected], code_review::ReviewRow::FileHeader(2)),
+            "landed on {:?}",
+            cr.rows[cr.selected]
+        );
+
+        // Marking f2 reviewed advances (wrapping) to f0 — the only file left.
+        app.cr_toggle_reviewed(false);
+        let cr = &app.code_reviews[&sid];
+        assert!(
+            matches!(cr.rows[cr.selected], code_review::ReviewRow::FileHeader(0)),
+            "auto-advanced to {:?}",
+            cr.rows[cr.selected]
+        );
+    }
+
     /// Toggling a reviewed mark stores the current semantic fingerprint, so
     /// the next build can validate it.
     #[test]
