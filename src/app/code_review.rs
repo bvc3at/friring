@@ -1254,6 +1254,9 @@ impl App {
         let Some(cr) = self.active_review_mut() else {
             return;
         };
+        // Jumping to another file breaks the range invariant (see
+        // cr_select_row), so it cancels an active range.
+        cr.range = None;
         if let Some(pos) = cr
             .rows
             .iter()
@@ -1488,6 +1491,9 @@ impl App {
     pub(crate) fn cr_click_row(&mut self, idx: usize, rel_x: u16, width: u16) {
         if let Some(cr) = self.active_review_mut() {
             if cr.rows.get(idx).is_some_and(ReviewRow::is_selectable) {
+                // A click jumps anywhere, breaking the range invariant (see
+                // cr_select_row), so it cancels an active range.
+                cr.range = None;
                 cr.selected = idx;
                 cr.click_side = cr.side_by_side.then(|| {
                     let side = if rel_x < width / 2 {
