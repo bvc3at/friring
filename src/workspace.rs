@@ -132,6 +132,19 @@ pub fn resolve_custom_workspace_dir(raw: &str) -> Result<Option<PathBuf>, String
     let dir = if expanded.is_absolute() {
         expanded
     } else {
+        // A non-absolute path that still carries a Windows prefix or root
+        // (drive-relative `C:foo`, rootless `\foo`) would make `base.join`
+        // discard the workspaces root and escape the sandbox, so reject it —
+        // the relative branch is for plain names/segments only. (No-op on
+        // Unix, where such inputs are ordinary relative segments.)
+        if expanded.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::Prefix(_) | std::path::Component::RootDir
+            )
+        }) {
+            return Err("Workspace dir must be a plain name or an absolute path".to_string());
+        }
         let base = paths::workspaces_directory()
             .ok_or_else(|| "Could not resolve the workspaces directory".to_string())?;
         base.join(expanded)
@@ -436,6 +449,20 @@ mod tests {
             Some(abs)
         );
         assert!(resolve_custom_workspace_dir("../escape").is_err());
+    }
+
+    // Windows-only: a drive-relative (`C:foo`) or rootless (`\foo`) input is not
+    // `is_absolute()` yet would make `base.join` discard the workspaces root, so
+    // it must be refused rather than silently escaping the sandbox. On Unix these
+    // are ordinary relative segments (no `Prefix`/`RootDir`), so there is nothing
+    // to reject and the case cannot be exercised.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_custom_dir_rejects_drive_relative_or_rootless_on_windows() {
+        let base = temp_base();
+        let _g = TestPathGuard::new(&base);
+        assert!(resolve_custom_workspace_dir("C:foo").is_err());
+        assert!(resolve_custom_workspace_dir(r"\rooted").is_err());
     }
 
     #[test]
