@@ -294,8 +294,10 @@ disk), and a fork — it has no prior step.
    workspace at `~/.local/share/friring/workspaces/<name>`, a `~`
    or absolute path places it exactly there — so the agent's cwd
    can be a browsable, named directory instead of a UUID. Left
-   empty (the default) the id-derived path is used. The target must
-   be missing, empty, or a previous symlink-only workspace —
+   empty (the default) the id-derived path is used. A value
+   containing any `..` component is rejected rather than
+   normalized. The target must be missing, empty, or a previous
+   symlink-only workspace —
    `Enter` refuses anything else, and friring only ever deletes
    symlink-only directories there (never real files).
 5. **New branch name** — worktree mode only, prefilled from the
