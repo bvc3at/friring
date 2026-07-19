@@ -239,6 +239,7 @@ pub fn session_meta(
         output_tokens: output_tokens
             .and_then(|t| u64::try_from(t).ok())
             .filter(|&t| t > 0),
+        ..Default::default()
     }
 }
 

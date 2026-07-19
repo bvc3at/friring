@@ -58,12 +58,23 @@ fn tone_style(tone: Tone) -> Style {
     }
 }
 
-/// One row of Overview stat tiles: `⟨glyph⟩ ⟨value⟩ ⟨label⟩`, triple-spaced.
-fn tiles_line(tiles: &[StatTile]) -> Line<'static> {
+/// Overview stat tiles: `⟨glyph⟩ ⟨value⟩ ⟨label⟩`, triple-spaced, wrapped by
+/// whole tiles so nothing ever clips at the pane edge.
+fn tiles_lines(tiles: &[StatTile], width: usize) -> Vec<Line<'static>> {
+    let tile_width = |t: &StatTile| 2 + t.value.chars().count() + 1 + t.label.len();
+    let mut out: Vec<Line<'static>> = Vec::new();
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    for (i, t) in tiles.iter().enumerate() {
-        if i > 0 {
+    let mut used = 1usize;
+    for t in tiles {
+        let w = tile_width(t);
+        let sep = usize::from(spans.len() > 1) * 3;
+        if used + sep + w > width && spans.len() > 1 {
+            out.push(Line::from(std::mem::take(&mut spans)));
+            spans.push(Span::raw(" "));
+            used = 1;
+        } else if sep > 0 {
             spans.push(Span::raw("   "));
+            used += 3;
         }
         spans.push(Span::styled(
             format!("{} ", t.glyph),
@@ -74,16 +85,25 @@ fn tiles_line(tiles: &[StatTile]) -> Line<'static> {
             Style::default().add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(format!(" {}", t.label), dim()));
+        used += w;
     }
-    Line::from(spans)
+    if spans.len() > 1 {
+        out.push(Line::from(spans));
+    }
+    out
 }
 
-/// The Overview sparkline: `HH:MM ▁▂▅█… HH:MM  caption`.
-fn spark_line(spark: &SparkRow) -> Line<'static> {
+/// The Overview sparkline: `HH:MM ▁▂▅█… HH:MM  caption`. The bucket run is
+/// max-pooled down to the width left beside the time labels, and the caption
+/// drops to its own line when it doesn't fit — the row always stays inside
+/// the pane.
+fn spark_lines(spark: &SparkRow, width: usize) -> Vec<Line<'static>> {
     const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let max = spark.buckets.iter().copied().max().unwrap_or(0).max(1);
-    let glyph_run: String = spark
-        .buckets
+    let labels = 1 + spark.start.chars().count() + 1 + 1 + spark.end.chars().count();
+    let avail = width.saturating_sub(labels).max(8).min(spark.buckets.len());
+    let buckets = downsample_max(&spark.buckets, avail);
+    let max = buckets.iter().copied().max().unwrap_or(0).max(1);
+    let glyph_run: String = buckets
         .iter()
         .map(|&v| {
             if v == 0 {
@@ -94,12 +114,39 @@ fn spark_line(spark: &SparkRow) -> Line<'static> {
             }
         })
         .collect();
-    Line::from(vec![
+    let mut line = vec![
         Span::styled(format!(" {} ", spark.start), dim()),
         Span::styled(glyph_run, accent()),
         Span::styled(format!(" {}", spark.end), dim()),
-        Span::styled(format!("  {}", spark.caption), dim()),
-    ])
+    ];
+    let caption = format!("  {}", spark.caption);
+    if labels + avail + caption.chars().count() <= width {
+        line.push(Span::styled(caption, dim()));
+        vec![Line::from(line)]
+    } else {
+        vec![
+            Line::from(line),
+            Line::from(Span::styled(format!(" {}", spark.caption), dim())),
+        ]
+    }
+}
+
+/// Max-pool `buckets` into `cells` slots (peaks survive a squeeze).
+fn downsample_max(buckets: &[u64], cells: usize) -> Vec<u64> {
+    if cells == 0 || buckets.len() <= cells {
+        return buckets.to_vec();
+    }
+    (0..cells)
+        .map(|i| {
+            let lo = i * buckets.len() / cells;
+            let hi = ((i + 1) * buckets.len() / cells).max(lo + 1);
+            buckets[lo..hi.min(buckets.len())]
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)
+        })
+        .collect()
 }
 
 fn state_style(s: CcAgentState) -> Style {
@@ -313,8 +360,8 @@ fn row_visual_lines(
         CcRow::Info(s) => vec![styled(s, dim(), width)],
         CcRow::Header(s) => vec![styled(s, dim().add_modifier(Modifier::BOLD), width)],
         CcRow::Text(s) => body_lines(s, normal(), state.wrap, state.h_scroll, width, query),
-        CcRow::Tiles(tiles) => vec![tiles_line(tiles)],
-        CcRow::Spark(spark) => vec![spark_line(spark)],
+        CcRow::Tiles(tiles) => tiles_lines(tiles, width),
+        CcRow::Spark(spark) => spark_lines(spark, width),
         CcRow::Block(bi) => block_lines(state, *bi, width, query),
     };
     if lines.is_empty() {
@@ -431,29 +478,34 @@ fn event_lines(
     }
     used += 6;
     header.push(Span::styled(
-        format!("{:<5} ", event_tag(e.kind)),
+        format!("{:<5} ", e.kind.tag()),
         if e.minor { dim() } else { event_style(e.kind) },
     ));
+    // Build the suffixes first so the detail budget accounts for their exact
+    // width — the ✗ / ▸ markers must never fall off the pane edge.
+    let has_body = e.note.is_some() || e.result_head.is_some() || e.origin.is_some();
+    let mut suffixes: Vec<Span<'static>> = Vec::new();
+    if let Some(d) = e.dur_ms.filter(|&d| d >= 1000) {
+        suffixes.push(Span::styled(format!(" · {}", fmt_dur(d)), dim()));
+    }
+    if let Some(o) = &e.origin {
+        suffixes.push(Span::styled(format!(" · {}", truncate(o, 24)), dim()));
+    }
+    if e.ok == Some(false) {
+        suffixes.push(Span::styled(" ✗", danger()));
+    }
+    if has_body && !expanded {
+        suffixes.push(Span::styled(" ▸", dim()));
+    }
+    let suffix_width: usize = suffixes.iter().map(|s| s.content.chars().count()).sum();
     header.push(Span::styled(
         truncate(
             &first_line(&e.detail),
-            width.saturating_sub(used + 10).max(20),
+            width.saturating_sub(used + suffix_width).max(16),
         ),
         base,
     ));
-    if let Some(d) = e.dur_ms.filter(|&d| d >= 1000) {
-        header.push(Span::styled(format!(" · {}", fmt_dur(d)), dim()));
-    }
-    if let Some(o) = &e.origin {
-        header.push(Span::styled(format!(" · {}", truncate(o, 24)), dim()));
-    }
-    if e.ok == Some(false) {
-        header.push(Span::styled(" ✗", danger()));
-    }
-    let has_body = e.note.is_some() || e.result_head.is_some() || e.origin.is_some();
-    if has_body && !expanded {
-        header.push(Span::styled(" ▸", dim()));
-    }
+    header.extend(suffixes);
     let mut out = vec![Line::from(header)];
     if expanded {
         if let Some(o) = &e.origin {
@@ -502,22 +554,6 @@ fn fmt_dur(ms: u64) -> String {
         format!("{s}s")
     } else {
         format!("{}m{:02}s", s / 60, s % 60)
-    }
-}
-
-/// Short fixed-width kind tag prefixing an event's header line.
-fn event_tag(kind: ActionKind) -> &'static str {
-    match kind {
-        ActionKind::Prompt => "▶",
-        ActionKind::Command => "$",
-        ActionKind::Edit => "edit",
-        ActionKind::Read => "read",
-        ActionKind::Search => "grep",
-        ActionKind::WebSearch => "web",
-        ActionKind::WebFetch => "fetch",
-        ActionKind::Subagent => "agent",
-        ActionKind::Mcp => "mcp",
-        ActionKind::Other => "tool",
     }
 }
 
@@ -765,7 +801,38 @@ fn tree_row_line(state: &CcActivityState, row: &CcTreeRow, selected: bool) -> Li
 
 #[cfg(test)]
 mod tests {
-    use super::match_byte_positions;
+    use super::{downsample_max, match_byte_positions, tiles_lines};
+    use crate::app::cc_activity::{StatTile, Tone};
+
+    fn tile(value: &str, label: &'static str) -> StatTile {
+        StatTile {
+            glyph: "$",
+            value: value.into(),
+            label,
+            tone: Tone::Accent,
+        }
+    }
+
+    #[test]
+    fn tiles_wrap_by_whole_tiles_never_clipping() {
+        let tiles = vec![tile("23", "cmds"), tile("11", "edits"), tile("47", "reads")];
+        // Wide pane: one line. Each tile is 2+2+1+len(label) wide, +3 gaps.
+        assert_eq!(tiles_lines(&tiles, 80).len(), 1);
+        // Narrow pane: tiles flow onto following lines, whole.
+        let narrow = tiles_lines(&tiles, 14);
+        assert!(narrow.len() > 1, "tiles must wrap, not clip");
+        for line in &narrow {
+            let w: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert!(w <= 14, "no wrapped tile line may exceed the width: {w}");
+        }
+    }
+
+    #[test]
+    fn downsample_max_keeps_peaks() {
+        assert_eq!(downsample_max(&[1, 9, 1, 1, 5, 1], 3), vec![9, 1, 5]);
+        // Fewer buckets than cells → untouched.
+        assert_eq!(downsample_max(&[3, 4], 8), vec![3, 4]);
+    }
 
     #[test]
     fn match_byte_positions_finds_all_case_insensitive() {

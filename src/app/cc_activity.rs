@@ -903,7 +903,9 @@ impl CcActivityState {
             selected: 0,
             scroll: 0,
             h_scroll: 0,
-            wrap: false,
+            // Wrap by default: content should never demand a horizontal
+            // scroll to be read (`w` still toggles for raw one-liners).
+            wrap: true,
             collapsed_tools: HashSet::new(),
             follow: true,
             search: None,

@@ -137,10 +137,15 @@ sessions only.
   one-liners (`Enter` expands note + result head); the same fold / `/` find /
   wrap / live-tail engine as transcripts.
 - **Overview dashboard** (July 2026 UI redesign): identity line (agent ·
-  provider · model · output tokens), a stat-tile row (`$ ✎ ⊙ ⌕ ⚲ ⚙` counts,
-  a `✗ failed` tile only on failure), an events-over-session sparkline, the
-  hottest files, the last error with its result head, and a `⟳ indexing
-  history…` loader while a large source backfills.
+  provider · model), a full token line (`in · out · cache r / w`, folding in
+  every subagent/workflow transcript's usage), a stat-tile row (`$ ✎ ⊙ ⌕ ⚲ ⚙`
+  counts, a `✗ failed` tile only on failure), an events-over-session
+  sparkline with a turns/last-action line, the hottest files, the
+  most-repeated commands, the newest few actions, the last error with its
+  result head, and a `⟳ indexing history…` loader while a large source
+  backfills. Every widget fits the pane: tiles wrap by whole tiles, the
+  sparkline max-pools down to the available width, event-row markers are
+  width-budgeted, and text wrap is on by default (`w` toggles).
 - **Turn-grouped Timeline** (same redesign): each user prompt renders as a
   dash-filled turn header (`▶ HH:MM:SS "prompt" ───`), the turn's events sit
   in a `│` gutter — subagent-origin work nested as `└` with a dim origin

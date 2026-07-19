@@ -69,6 +69,23 @@ impl ActionKind {
             ActionKind::Other => "other",
         }
     }
+
+    /// Short fixed-width tag prefixing an event row (timeline, overview
+    /// recent list).
+    pub fn tag(self) -> &'static str {
+        match self {
+            ActionKind::Prompt => "▶",
+            ActionKind::Command => "$",
+            ActionKind::Edit => "edit",
+            ActionKind::Read => "read",
+            ActionKind::Search => "grep",
+            ActionKind::WebSearch => "web",
+            ActionKind::WebFetch => "fetch",
+            ActionKind::Subagent => "agent",
+            ActionKind::Mcp => "mcp",
+            ActionKind::Other => "tool",
+        }
+    }
 }
 
 /// One thing the agent did, in normalized form. Events order by their
@@ -130,6 +147,30 @@ pub struct ActivityMeta {
     pub model: Option<String>,
     /// Cumulative output tokens, when per-message usage is recorded.
     pub output_tokens: Option<u64>,
+    /// Cumulative non-cached input tokens.
+    pub input_tokens: Option<u64>,
+    /// Cumulative cache-read input tokens.
+    pub cache_read_tokens: Option<u64>,
+    /// Cumulative cache-creation (write) input tokens.
+    pub cache_write_tokens: Option<u64>,
+}
+
+impl ActivityMeta {
+    /// Fold `other`'s token tallies into this meta (identity fields keep
+    /// self's) — how a session's total absorbs its subagent/workflow
+    /// transcripts. `None + Some(n) = Some(n)`, so a stream that never
+    /// records a field doesn't zero the sum.
+    pub fn add_tokens(&mut self, other: &ActivityMeta) {
+        let add = |a: &mut Option<u64>, b: Option<u64>| {
+            if let Some(n) = b {
+                *a = Some(a.unwrap_or(0) + n);
+            }
+        };
+        add(&mut self.output_tokens, other.output_tokens);
+        add(&mut self.input_tokens, other.input_tokens);
+        add(&mut self.cache_read_tokens, other.cache_read_tokens);
+        add(&mut self.cache_write_tokens, other.cache_write_tokens);
+    }
 }
 
 /// Per-kind tallies over an event stream — drives the navigator counts and

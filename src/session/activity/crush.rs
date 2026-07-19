@@ -247,6 +247,7 @@ pub fn session_meta(title: Option<&str>, completion_tokens: Option<i64>) -> Acti
         title: title.map(str::to_string).filter(|t| !t.trim().is_empty()),
         model: None,
         output_tokens: completion_tokens.and_then(|t| u64::try_from(t).ok()),
+        ..Default::default()
     }
 }
 

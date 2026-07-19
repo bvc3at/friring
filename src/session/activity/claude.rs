@@ -48,7 +48,17 @@ pub struct ClaudeScan {
     /// `message.id` with cumulative `usage` — track the last id and what it
     /// contributed so re-seen ids replace rather than double-count.
     last_msg_id: Option<String>,
-    last_usage_added: u64,
+    last_usage_added: UsageAdded,
+}
+
+/// What the last-seen message id contributed to each token tally (so a
+/// re-logged id replaces its contribution instead of double-counting).
+#[derive(Debug, Clone, Copy, Default)]
+struct UsageAdded {
+    output: u64,
+    input: u64,
+    cache_read: u64,
+    cache_write: u64,
 }
 
 impl ClaudeScan {
@@ -178,22 +188,54 @@ impl ClaudeScan {
     }
 
     fn accumulate_usage(&mut self, message: &serde_json::Value) {
-        let Some(out_tokens) = message
-            .pointer("/usage/output_tokens")
-            .and_then(|t| t.as_u64())
-        else {
+        let Some(usage) = message.get("usage") else {
             return;
         };
+        // `output_tokens` is the sentinel for a real usage record — synthetic
+        // lines without it carry no tallies worth counting.
+        if usage
+            .get("output_tokens")
+            .and_then(|t| t.as_u64())
+            .is_none()
+        {
+            return;
+        }
+        let read = |key: &str| usage.get(key).and_then(|t| t.as_u64()).unwrap_or(0);
+        let fresh = UsageAdded {
+            output: read("output_tokens"),
+            input: read("input_tokens"),
+            cache_read: read("cache_read_input_tokens"),
+            cache_write: read("cache_creation_input_tokens"),
+        };
         let id = str_field(message, "id");
-        let total = self.meta.output_tokens.unwrap_or(0);
-        if id.is_some() && id == self.last_msg_id {
-            // Same API message re-logged with updated cumulative usage.
-            self.meta.output_tokens = Some(total - self.last_usage_added + out_tokens);
-        } else {
-            self.meta.output_tokens = Some(total + out_tokens);
+        // Same API message re-logged with updated cumulative usage: replace
+        // its prior contribution instead of double-counting.
+        let same = id.is_some() && id == self.last_msg_id;
+        let apply = |slot: &mut Option<u64>, added: u64, new: u64| {
+            let total = slot.unwrap_or(0);
+            *slot = Some(if same {
+                total - added + new
+            } else {
+                total + new
+            });
+        };
+        let prior = self.last_usage_added;
+        apply(&mut self.meta.output_tokens, prior.output, fresh.output);
+        apply(&mut self.meta.input_tokens, prior.input, fresh.input);
+        apply(
+            &mut self.meta.cache_read_tokens,
+            prior.cache_read,
+            fresh.cache_read,
+        );
+        apply(
+            &mut self.meta.cache_write_tokens,
+            prior.cache_write,
+            fresh.cache_write,
+        );
+        if !same {
             self.last_msg_id = id;
         }
-        self.last_usage_added = out_tokens;
+        self.last_usage_added = fresh;
     }
 }
 
@@ -424,20 +466,48 @@ mod tests {
         s.ingest(concat!(
             r#"{"type":"user","message":{"role":"user","content":"Fix the flaky test"}}"#,
             "\n",
-            r#"{"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8","usage":{"output_tokens":10},"content":[{"type":"text","text":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8","usage":{"output_tokens":10,"input_tokens":4,"cache_read_input_tokens":100,"cache_creation_input_tokens":50},"content":[{"type":"text","text":"ok"}]}}"#,
             "\n",
-            r#"{"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8","usage":{"output_tokens":25},"content":[{"type":"text","text":"more"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8","usage":{"output_tokens":25,"input_tokens":4,"cache_read_input_tokens":100,"cache_creation_input_tokens":50},"content":[{"type":"text","text":"more"}]}}"#,
             "\n",
-            r#"{"type":"assistant","message":{"id":"m2","usage":{"output_tokens":5},"content":[]}}"#,
+            r#"{"type":"assistant","message":{"id":"m2","usage":{"output_tokens":5,"input_tokens":2,"cache_read_input_tokens":30},"content":[]}}"#,
         ));
         assert_eq!(s.meta.title.as_deref(), Some("Fix the flaky test"));
         assert_eq!(s.meta.model.as_deref(), Some("claude-opus-4-8"));
-        // m1 counted once at its final value (25), plus m2's 5.
+        // m1 counted once at its final value, plus m2 — for every tally.
         assert_eq!(s.meta.output_tokens, Some(30));
+        assert_eq!(s.meta.input_tokens, Some(6));
+        assert_eq!(s.meta.cache_read_tokens, Some(130));
+        assert_eq!(s.meta.cache_write_tokens, Some(50));
 
         // A summary line overrides the prompt-derived title.
         s.ingest(r#"{"type":"summary","summary":"Flaky test fix"}"#);
         assert_eq!(s.meta.title.as_deref(), Some("Flaky test fix"));
+    }
+
+    #[test]
+    fn add_tokens_folds_subagent_meta_into_the_session_total() {
+        let mut main = ActivityMeta {
+            title: Some("t".into()),
+            output_tokens: Some(10),
+            input_tokens: Some(1),
+            ..Default::default()
+        };
+        let sub = ActivityMeta {
+            output_tokens: Some(5),
+            cache_read_tokens: Some(70),
+            ..Default::default()
+        };
+        main.add_tokens(&sub);
+        assert_eq!(main.output_tokens, Some(15));
+        assert_eq!(main.input_tokens, Some(1));
+        assert_eq!(main.cache_read_tokens, Some(70), "None + Some sums");
+        assert_eq!(main.cache_write_tokens, None, "absent stays absent");
+        assert_eq!(
+            main.title.as_deref(),
+            Some("t"),
+            "identity fields keep self's"
+        );
     }
 
     #[test]

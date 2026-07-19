@@ -223,7 +223,15 @@ impl SessionActivity {
 
     pub(crate) fn meta(&self) -> ActivityMeta {
         match &self.scan {
-            ProviderScan::Claude(s) => s.scan.meta.clone(),
+            // The session's cost is the whole tree's: fold every subagent /
+            // workflow transcript's tallies into the main meta.
+            ProviderScan::Claude(s) => {
+                let mut meta = s.scan.meta.clone();
+                for tail in s.subs.values() {
+                    meta.add_tokens(&tail.scan.meta);
+                }
+                meta
+            }
             // The transcript has no meta records — everything lives in the
             // sidecar meta.json.
             ProviderScan::Vibe(s) => s.meta.meta.clone(),
@@ -1119,12 +1127,12 @@ pub(super) fn overview_rows(
             if let Some(m) = &meta.model {
                 identity.push_str(&format!(" · {m}"));
             }
-            if let Some(t) = meta.output_tokens {
-                identity.push_str(&format!(" · {} out", fmt_tokens(t)));
-            }
             rows.push(CcRow::Text(identity));
             if let Some(t) = &meta.title {
                 rows.push(CcRow::Text(format!("Title: {t}")));
+            }
+            if let Some(line) = token_line(&meta) {
+                rows.push(CcRow::Text(line));
             }
             let events = act.events();
             let c = ActivityCounts::tally(events);
@@ -1133,6 +1141,9 @@ pub(super) fn overview_rows(
             if let Some(spark) = spark_row(events) {
                 rows.push(CcRow::Info(String::new()));
                 rows.push(CcRow::Spark(spark));
+            }
+            if let Some(line) = turns_line(&c, events) {
+                rows.push(CcRow::Text(line));
             }
             if act.backfilling() {
                 rows.push(CcRow::Info(
@@ -1148,6 +1159,21 @@ pub(super) fn overview_rows(
                 rows.push(CcRow::Info(String::new()));
                 rows.push(CcRow::Header("Hot files".to_string()));
                 rows.extend(files.iter().take(5).map(|f| CcRow::Text(file_line(f))));
+            }
+            let top = top_commands(events);
+            if !top.is_empty() {
+                rows.push(CcRow::Info(String::new()));
+                rows.push(CcRow::Header("Top commands".to_string()));
+                rows.extend(
+                    top.into_iter()
+                        .map(|(n, cmd)| CcRow::Text(format!("  ×{n}  {cmd}"))),
+                );
+            }
+            let recent = recent_rows(events);
+            if !recent.is_empty() {
+                rows.push(CcRow::Info(String::new()));
+                rows.push(CcRow::Header("Recent".to_string()));
+                rows.extend(recent);
             }
             if let Some(e) = events
                 .iter()
@@ -1236,13 +1262,102 @@ fn spark_row(events: &[ActivityEvent]) -> Option<SparkRow> {
     })
 }
 
-/// Compact token count: `128k` past four digits, exact below.
-fn fmt_tokens(t: u64) -> String {
-    if t >= 10_000 {
-        format!("{}k tok", t / 1000)
+/// Compact token count: `1.2M`, `128k`, exact below five digits.
+fn fmt_tok(t: u64) -> String {
+    if t >= 1_000_000 {
+        format!("{:.1}M", t as f64 / 1e6)
+    } else if t >= 10_000 {
+        format!("{}k", t / 1000)
     } else {
-        format!("{t} tok")
+        t.to_string()
     }
+}
+
+/// `tokens  12k in · 128k out · cache 1.2M r / 340k w` — whatever tallies the
+/// stream records (main + subagent/workflow transcripts, via
+/// [`SessionActivity::meta`]); `None` when nothing was recorded.
+fn token_line(meta: &ActivityMeta) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(t) = meta.input_tokens.filter(|&t| t > 0) {
+        parts.push(format!("{} in", fmt_tok(t)));
+    }
+    if let Some(t) = meta.output_tokens.filter(|&t| t > 0) {
+        parts.push(format!("{} out", fmt_tok(t)));
+    }
+    let read = meta.cache_read_tokens.filter(|&t| t > 0);
+    let write = meta.cache_write_tokens.filter(|&t| t > 0);
+    match (read, write) {
+        (Some(r), Some(w)) => parts.push(format!("cache {} r / {} w", fmt_tok(r), fmt_tok(w))),
+        (Some(r), None) => parts.push(format!("cache {} r", fmt_tok(r))),
+        (None, Some(w)) => parts.push(format!("cache {} w", fmt_tok(w))),
+        (None, None) => {}
+    }
+    (!parts.is_empty()).then(|| format!("tokens  {}", parts.join(" · ")))
+}
+
+/// `8 turns · last action 14:41:07`, under the sparkline.
+fn turns_line(c: &ActivityCounts, events: &[ActivityEvent]) -> Option<String> {
+    let mut parts = Vec::new();
+    match c.prompts {
+        0 => {}
+        1 => parts.push("1 turn".to_string()),
+        n => parts.push(format!("{n} turns")),
+    }
+    if let Some(ts) = events.iter().rev().find_map(|e| e.ts_ms) {
+        parts.push(format!("last action {}", fmt_time(ts)));
+    }
+    (!parts.is_empty()).then(|| format!(" {}", parts.join(" · ")))
+}
+
+/// The most-repeated command lines (≥2 runs), count-desc — surfacing what the
+/// agent looped on. At most three.
+fn top_commands(events: &[ActivityEvent]) -> Vec<(usize, String)> {
+    let mut freq: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for e in events {
+        if e.kind == ActionKind::Command && !e.minor {
+            *freq
+                .entry(e.detail.lines().next().unwrap_or(""))
+                .or_default() += 1;
+        }
+    }
+    let mut top: Vec<(usize, String)> = freq
+        .into_iter()
+        .filter(|&(_, n)| n >= 2)
+        .map(|(cmd, n)| (n, cmd.to_string()))
+        .collect();
+    top.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    top.truncate(3);
+    top
+}
+
+/// The newest few actions, oldest-first — "what just happened" without
+/// leaving the Overview.
+fn recent_rows(events: &[ActivityEvent]) -> Vec<CcRow> {
+    let newest: Vec<&ActivityEvent> = events
+        .iter()
+        .rev()
+        .filter(|e| !e.minor && e.kind != ActionKind::Prompt)
+        .take(4)
+        .collect();
+    newest
+        .into_iter()
+        .rev()
+        .map(|e| {
+            let mut line = String::from("  ");
+            if let Some(ts) = e.ts_ms {
+                line.push_str(&format!("{}  ", fmt_time(ts)));
+            }
+            line.push_str(&format!(
+                "{:<5} {}",
+                e.kind.tag(),
+                e.detail.lines().next().unwrap_or("")
+            ));
+            if e.ok == Some(false) {
+                line.push_str("  ✗");
+            }
+            CcRow::Text(line)
+        })
+        .collect()
 }
 
 /// Local wall-clock `HH:MM` (sparkline endpoints).
@@ -1507,7 +1622,7 @@ mod tests {
             concat!(
                 r#"{"type":"user","timestamp":"2026-07-08T12:00:00.000Z","message":{"role":"user","content":"Fix the tests"}}"#,
                 "\n",
-                r#"{"type":"assistant","timestamp":"2026-07-08T12:00:01.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+                r#"{"type":"assistant","timestamp":"2026-07-08T12:00:01.000Z","message":{"id":"m1","usage":{"output_tokens":20,"cache_read_input_tokens":200},"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
                 "\n",
                 r#"{"type":"assistant","timestamp":"2026-07-08T12:00:02.000Z","message":{"content":[{"type":"tool_use","id":"t2","name":"Task","input":{"description":"Explore backend","subagent_type":"Explore"}}]}}"#,
                 "\n",
@@ -1521,7 +1636,7 @@ mod tests {
                 // The subagent's task prompt must NOT become a turn marker.
                 r#"{"type":"user","timestamp":"2026-07-08T12:00:03.000Z","message":{"role":"user","content":"Explore the backend"}}"#,
                 "\n",
-                r#"{"type":"assistant","timestamp":"2026-07-08T12:00:04.000Z","message":{"content":[{"type":"tool_use","id":"s1","name":"Read","input":{"file_path":"/repo/b.rs"}}]}}"#,
+                r#"{"type":"assistant","timestamp":"2026-07-08T12:00:04.000Z","message":{"id":"sm1","usage":{"output_tokens":10,"cache_read_input_tokens":100},"content":[{"type":"tool_use","id":"s1","name":"Read","input":{"file_path":"/repo/b.rs"}}]}}"#,
                 "\n",
             ),
         )
@@ -1549,6 +1664,18 @@ mod tests {
         );
         assert_eq!(src.merged[3].origin.as_deref(), Some("Explore"));
         assert!(src.merged[..3].iter().all(|e| e.origin.is_none()));
+        // The session's token totals fold in the subagent's usage.
+        let act = SessionActivity {
+            provider: ProviderKind::Claude,
+            scan: ProviderScan::Claude(src),
+            sig,
+        };
+        let meta = act.meta();
+        assert_eq!(meta.output_tokens, Some(30), "main 20 + subagent 10");
+        assert_eq!(meta.cache_read_tokens, Some(300), "main 200 + sub 100");
+        let ProviderScan::Claude(mut src) = act.scan else {
+            unreachable!()
+        };
         // Idle pass → gated, nothing changes.
         assert!(!scan_claude(
             &mut src,
@@ -1737,6 +1864,68 @@ mod tests {
         assert!(rows
             .iter()
             .any(|r| matches!(r, CcRow::Header(s) if s == "Hot files")));
+        // The turns line counts the single prompt.
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, CcRow::Text(s) if s.contains("1 turn ·"))));
+        // Recent lists the newest actions with their kind tags.
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, CcRow::Header(s) if s == "Recent")));
+        assert!(rows.iter().any(
+            |r| matches!(r, CcRow::Text(s) if s.contains("edit") && s.contains("/repo/a.rs"))
+        ));
+    }
+
+    #[test]
+    fn token_line_reports_all_recorded_tallies() {
+        let meta = ActivityMeta {
+            output_tokens: Some(128_000),
+            input_tokens: Some(12_400),
+            cache_read_tokens: Some(1_234_567),
+            cache_write_tokens: Some(340_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            token_line(&meta).as_deref(),
+            Some("tokens  12k in · 128k out · cache 1.2M r / 340k w")
+        );
+        // Output-only stream (most non-claude providers).
+        let meta = ActivityMeta {
+            output_tokens: Some(500),
+            ..Default::default()
+        };
+        assert_eq!(token_line(&meta).as_deref(), Some("tokens  500 out"));
+        assert_eq!(token_line(&ActivityMeta::default()), None);
+    }
+
+    #[test]
+    fn top_commands_surface_only_repeats() {
+        let cmd = |detail: &str| ActivityEvent {
+            ts_ms: None,
+            kind: ActionKind::Command,
+            detail: detail.into(),
+            note: None,
+            result_head: None,
+            ok: None,
+            origin: None,
+            minor: false,
+            dur_ms: None,
+        };
+        let events = vec![
+            cmd("cargo test"),
+            cmd("cargo test"),
+            cmd("cargo test"),
+            cmd("cargo fmt"),
+            cmd("cargo fmt"),
+            cmd("git status"), // ran once → not "top"
+        ];
+        let top = top_commands(&events);
+        assert_eq!(
+            top,
+            vec![(3, "cargo test".to_string()), (2, "cargo fmt".to_string())]
+        );
+        assert!(top_commands(&[cmd("once")]).is_empty());
     }
 
     #[test]
