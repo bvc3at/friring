@@ -199,8 +199,9 @@ pub struct DiffHunk {
     pub lines: Vec<DiffLine>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FileStatus {
+    #[default]
     Modified,
     Added,
     Deleted,
@@ -218,13 +219,20 @@ impl FileStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiffFile {
     /// New path (or the old path for a deletion).
     pub path: String,
     /// Old path, when it differs from `path` (a rename).
     pub old_path: Option<String>,
     pub status: FileStatus,
+    /// An **untracked** working-tree file synthesized into the Working target
+    /// (not produced by `git diff`). Rendered with a `?` glyph so it reads
+    /// apart from a staged add.
+    pub untracked: bool,
+    /// An explanatory row rendered under the file header when the body is
+    /// withheld (an oversized or binary untracked file, a binary diff).
+    pub note: Option<String>,
     pub hunks: Vec<DiffHunk>,
 }
 
@@ -243,6 +251,50 @@ impl DiffFile {
             .flat_map(|h| &h.lines)
             .filter(|l| l.kind == DiffLineKind::Del)
             .count()
+    }
+
+    /// The status glyph shown in the file header and the changed-files tree —
+    /// `?` for an untracked file (vs `A` for a staged add), else the git
+    /// status letter.
+    pub fn glyph(&self) -> &'static str {
+        if self.untracked {
+            "?"
+        } else {
+            self.status.glyph()
+        }
+    }
+}
+
+/// Synthesize the all-added [`DiffFile`] for an **untracked** working-tree
+/// file from its content: one hunk, every line an addition numbered from 1.
+/// Pure so the Working-target synthesis is unit-testable without git.
+pub fn untracked_file_from_content(path: String, content: &str) -> DiffFile {
+    let lines: Vec<DiffLine> = content
+        .lines()
+        .enumerate()
+        .map(|(i, l)| DiffLine {
+            kind: DiffLineKind::Add,
+            old_no: None,
+            new_no: Some(i as u32 + 1),
+            text: l.to_string(),
+        })
+        .collect();
+    let hunks = if lines.is_empty() {
+        Vec::new()
+    } else {
+        vec![DiffHunk {
+            old_start: 0,
+            new_start: 1,
+            header: String::new(),
+            lines,
+        }]
+    };
+    DiffFile {
+        path,
+        status: FileStatus::Added,
+        untracked: true,
+        hunks,
+        ..Default::default()
     }
 }
 
@@ -321,6 +373,8 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
                 path,
                 old_path: None,
                 status: FileStatus::Modified,
+                untracked: false,
+                note: None,
                 hunks: Vec::new(),
             });
             continue;
@@ -837,6 +891,8 @@ index 1..2 100644
             path: "f.rs".into(),
             old_path: None,
             status: FileStatus::Modified,
+            untracked: false,
+            note: None,
             hunks: vec![DiffHunk {
                 old_start: start,
                 new_start: start,
@@ -844,6 +900,34 @@ index 1..2 100644
                 lines,
             }],
         }
+    }
+
+    #[test]
+    fn untracked_file_synthesizes_all_added_lines() {
+        let f = untracked_file_from_content("notes.txt".into(), "alpha\nbeta\n");
+        assert_eq!(f.status, FileStatus::Added);
+        assert!(f.untracked);
+        assert_eq!(f.glyph(), "?", "untracked reads apart from a staged add");
+        assert_eq!(f.added_count(), 2);
+        assert_eq!(f.deleted_count(), 0);
+        let h = &f.hunks[0];
+        assert_eq!(h.lines[0].new_no, Some(1));
+        assert_eq!(h.lines[1].new_no, Some(2));
+        assert_eq!(h.lines[0].old_no, None);
+        assert_eq!(h.lines[1].text, "beta");
+
+        // Empty content → header only, no empty hunk.
+        let empty = untracked_file_from_content("empty.txt".into(), "");
+        assert!(empty.hunks.is_empty());
+        // A tracked add keeps its status glyph.
+        assert_eq!(
+            DiffFile {
+                status: FileStatus::Added,
+                ..Default::default()
+            }
+            .glyph(),
+            "A"
+        );
     }
 
     #[test]

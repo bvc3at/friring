@@ -76,6 +76,9 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
   summary — upstream marks could silently go stale.
 - **Staged-only target.** The `t` picker gains `Staged changes (index vs
   HEAD)` (`git diff --cached`) between Working and Branch.
+- **Untracked files in the Working target.** Synthesized as all-added
+  entries with a `?` glyph (upstream's `git diff HEAD` never showed them);
+  oversized/binary files degrade to a placeholder row.
 
 #### Agent activity view (F9)
 

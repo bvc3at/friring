@@ -835,6 +835,16 @@ diff_staged_on, show_commit_on, list_commits_on}`). A session with no
 resolvable base defaults to the working-changes target, so even a bare
 checkout reviews.
 
+**Working = staged + unstaged + untracked.** `git diff HEAD` never shows
+untracked files, so the Working target synthesizes an all-added entry per
+untracked file (`git ls-files --others --exclude-standard`, honored over the
+same remote transport) with a distinct `?` glyph — a brand-new file is
+exactly what a review must not miss. Guards: files over 1 MiB and binary
+content (NUL sniff) degrade to a placeholder row (`(untracked file not
+shown: …)`) instead of a body; ignored files stay out. Untracked files are
+commentable and markable like any other file. Local worktrees read the file
+directly; remote ones go through `git diff --no-index` per file.
+
 **Why review all repos at once?** A friring session can span several
 repositories (and flow opens a PR per repo), so a review that only saw the
 primary repo would miss most of the change. A multi-repo session reviews

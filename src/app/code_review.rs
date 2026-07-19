@@ -437,6 +437,11 @@ impl CodeReviewState {
         if self.is_file_folded(&file.path) {
             return;
         }
+        // A withheld body (oversized/binary untracked file, binary diff)
+        // explains itself with one info row instead of an empty section.
+        if let Some(note) = &file.note {
+            rows.push(ReviewRow::Info(note.clone()));
+        }
         // File-level comments directly under the header.
         for c in &self.comments {
             if c.anchor.anchors_file(&file.path) {
@@ -1944,8 +1949,13 @@ fn build_files(
             }
             ReviewTarget::Commit { .. } => None,
         };
-        let Some(s) = raw else { continue };
-        let mut parsed = parse_unified_diff(&s);
+        let mut parsed = raw.as_deref().map(parse_unified_diff).unwrap_or_default();
+        // `git diff HEAD` never sees untracked files; the Working target
+        // synthesizes them so "review my uncommitted work" really shows all
+        // of it.
+        if matches!(target, ReviewTarget::Working) {
+            parsed.extend(build_untracked_files(repo, host));
+        }
         if multi {
             for f in &mut parsed {
                 f.path = format!("{}/{}", repo.label, f.path);
@@ -1957,6 +1967,87 @@ fn build_files(
         files.extend(parsed);
     }
     files
+}
+
+/// Byte cap on an untracked file rendered inline in the Working target;
+/// larger files get a placeholder row instead of a megabyte diff body.
+const UNTRACKED_MAX_BYTES: u64 = 1024 * 1024;
+
+/// A [`DiffFile`] whose body is withheld — just the untracked header plus one
+/// explanatory note row.
+fn untracked_placeholder(path: String, why: &str) -> DiffFile {
+    DiffFile {
+        path,
+        status: crate::session::review::FileStatus::Added,
+        untracked: true,
+        note: Some(format!("(untracked file not shown: {why})")),
+        ..Default::default()
+    }
+}
+
+/// Synthesize an all-added [`DiffFile`] per untracked file of `repo` (paths
+/// repo-relative; the caller namespaces multi-repo). Local worktrees read the
+/// file directly (no subprocess per file); remote ones go through
+/// `git diff --no-index` on the same SSH transport as every other review git
+/// call. Oversized (> 1 MiB) and binary (NUL sniff) files degrade to a
+/// placeholder row instead of a body.
+fn build_untracked_files(repo: &ReviewRepo, host: Option<&HostDef>) -> Vec<DiffFile> {
+    let mut out = Vec::new();
+    for rel in crate::git::list_untracked_on(host, &repo.dir) {
+        let file = match host {
+            None => local_untracked_file(&repo.dir, rel),
+            Some(_) => remote_untracked_file(host, &repo.dir, rel),
+        };
+        out.push(file);
+    }
+    out
+}
+
+/// Human-readable size for the untracked placeholder note.
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{} KiB", bytes.div_ceil(1024))
+    }
+}
+
+/// Local path: stat for the size guard, read + NUL-sniff for binary, then
+/// synthesize the all-added diff from the content.
+fn local_untracked_file(dir: &Path, rel: String) -> DiffFile {
+    let full = dir.join(&rel);
+    let size = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
+    if size > UNTRACKED_MAX_BYTES {
+        return untracked_placeholder(rel, &human_size(size));
+    }
+    let Ok(bytes) = std::fs::read(&full) else {
+        return untracked_placeholder(rel, "unreadable");
+    };
+    if bytes.contains(&0) {
+        return untracked_placeholder(rel, "binary");
+    }
+    crate::session::review::untracked_file_from_content(rel, &String::from_utf8_lossy(&bytes))
+}
+
+/// Remote path: one `git diff --no-index` per file over the transport; the
+/// diff output length stands in for the file size (no cheap remote stat).
+fn remote_untracked_file(host: Option<&HostDef>, dir: &Path, rel: String) -> DiffFile {
+    let Some(raw) = crate::git::diff_untracked_on(host, dir, &rel) else {
+        return untracked_placeholder(rel, "unreadable");
+    };
+    if raw.len() as u64 > UNTRACKED_MAX_BYTES {
+        return untracked_placeholder(rel, "> 1 MiB");
+    }
+    if raw.lines().any(|l| l.starts_with("Binary files ")) {
+        return untracked_placeholder(rel, "binary");
+    }
+    let Some(mut f) = parse_unified_diff(&raw).into_iter().next() else {
+        // An empty untracked file diffs to nothing; keep it visible.
+        return crate::session::review::untracked_file_from_content(rel, "");
+    };
+    f.status = crate::session::review::FileStatus::Added;
+    f.untracked = true;
+    f
 }
 
 /// Compile a review's comments + summary to the **legacy** markdown shape
@@ -2216,6 +2307,8 @@ impl CodeReviewState {
                 path: format!("src/f{i}.rs"),
                 old_path: None,
                 status: FileStatus::Modified,
+                untracked: false,
+                note: None,
                 hunks: vec![DiffHunk {
                     old_start: 1,
                     new_start: 1,
@@ -2275,6 +2368,8 @@ mod tests {
             path: "src/foo.rs".into(),
             old_path: None,
             status: FileStatus::Modified,
+            untracked: false,
+            note: None,
             hunks: vec![DiffHunk {
                 old_start: 1,
                 new_start: 1,
@@ -2337,6 +2432,8 @@ mod tests {
             path: "src/foo.rs".into(),
             old_path: None,
             status: FileStatus::Modified,
+            untracked: false,
+            note: None,
             hunks: vec![DiffHunk {
                 old_start: 1,
                 new_start: 1,
@@ -2574,6 +2671,8 @@ mod tests {
             path: "src/foo.rs".into(),
             old_path: None,
             status: FileStatus::Modified,
+            untracked: false,
+            note: None,
             hunks: vec![DiffHunk {
                 old_start: 1,
                 new_start: 1,
@@ -2811,6 +2910,83 @@ mod tests {
         let working = build_files(&repos, &ReviewTarget::Working, None, false);
         let working_text = text_of(&working);
         assert!(working_text.contains("unstaged"), "got: {working_text}");
+    }
+
+    /// The Working target synthesizes untracked files: text inline (all-added,
+    /// `?`-glyph), binaries and oversized files as placeholder notes. Other
+    /// targets never see them.
+    #[test]
+    fn working_target_includes_untracked_files_with_guards() {
+        use crate::git::git_program;
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let ok = git_program()
+                .args([
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        }
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        git(p, &["init", "-q"]);
+        std::fs::write(p.join("tracked.txt"), "one\n").unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-q", "-m", "init"]);
+        std::fs::write(p.join("new.txt"), "alpha\nbeta\n").unwrap();
+        std::fs::write(p.join("bin.dat"), b"a\x00b").unwrap();
+        std::fs::write(p.join("big.txt"), "x".repeat(2 * 1024 * 1024)).unwrap();
+        std::fs::write(p.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(p.join("ignored.txt"), "no\n").unwrap();
+
+        let repos = vec![ReviewRepo {
+            label: "repo".into(),
+            dir: p.to_path_buf(),
+            base: None,
+        }];
+        let files = build_files(&repos, &ReviewTarget::Working, None, false);
+        let by_path = |p: &str| files.iter().find(|f| f.path == p);
+
+        let new = by_path("new.txt").expect("untracked text file present");
+        assert!(new.untracked);
+        assert_eq!(new.status, FileStatus::Added);
+        assert_eq!(new.added_count(), 2);
+        assert!(new.note.is_none());
+
+        let bin = by_path("bin.dat").expect("binary placeholder present");
+        assert!(bin.hunks.is_empty());
+        assert_eq!(
+            bin.note.as_deref(),
+            Some("(untracked file not shown: binary)")
+        );
+
+        let big = by_path("big.txt").expect("oversized placeholder present");
+        assert!(big.hunks.is_empty());
+        assert_eq!(
+            big.note.as_deref(),
+            Some("(untracked file not shown: 2.0 MiB)")
+        );
+
+        assert!(
+            by_path("ignored.txt").is_none(),
+            "--exclude-standard keeps ignored files out"
+        );
+
+        // Multi-repo namespacing prefixes untracked paths like tracked ones.
+        let namespaced = build_files(&repos, &ReviewTarget::Working, None, true);
+        assert!(namespaced.iter().any(|f| f.path == "repo/new.txt"));
+
+        // Staged sees none of them.
+        let staged = build_files(&repos, &ReviewTarget::Staged, None, false);
+        assert!(staged.iter().all(|f| !f.untracked));
     }
 
     #[test]

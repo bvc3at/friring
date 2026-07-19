@@ -418,7 +418,7 @@ fn file_header_line<'a>(
         .fg(Theme::accent_bright())
         .add_modifier(Modifier::BOLD);
     let lead = format!("{chevron} ");
-    let glyph = f.status.glyph().to_string();
+    let glyph = f.glyph().to_string();
     let mid = format!(" {}  ", f.path);
     let adds = format!("+{}", f.added_count());
     let dels = format!(" -{}", f.deleted_count());
@@ -1019,7 +1019,7 @@ fn file_row_line<'a>(
     let tint = |c: Color| if current { base } else { base.fg(c) };
     Line::from(vec![
         Span::styled(format!("{}{mark}", "  ".repeat(depth)), base),
-        Span::styled(f.status.glyph().to_string(), tint(status_color(f.status))),
+        Span::styled(f.glyph().to_string(), tint(status_color(f.status))),
         Span::styled(format!(" {name}  "), base),
         Span::styled(format!("+{}", f.added_count()), tint(Theme::diff_added())),
         Span::styled(
@@ -1342,6 +1342,8 @@ mod tests {
             path: "src/a/very/deep/foo.rs".into(),
             old_path: None,
             status: FileStatus::Modified,
+            untracked: false,
+            note: None,
             hunks: vec![DiffHunk {
                 old_start: 1,
                 new_start: 1,
@@ -1701,6 +1703,8 @@ mod tests {
             path: p.into(),
             old_path: None,
             status: FileStatus::Modified,
+            untracked: false,
+            note: None,
             hunks: Vec::new(),
         };
         // Out of path order on purpose — the tree sorts + groups by directory.
