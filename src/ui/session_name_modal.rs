@@ -92,17 +92,17 @@ pub fn render_session_name_modal(
 /// The `Ctrl+O` workspace-dir hint for the footer: how to reveal the field, or
 /// — once shown — how to move between fields and revert to the default.
 fn workspace_hint(state: &SessionNameState<'_>) -> Line<'static> {
-    let pairs: [(&'static str, &'static str); 2] = if state.workspace_dir.is_some() {
-        [("Tab", " field  "), ("^O", " default dir")]
+    if state.workspace_dir.is_some() {
+        Line::from(vec![
+            Span::styled("Tab", Theme::keybind()),
+            Span::styled(" field  ", Theme::keybind_desc()),
+            Span::styled("^O", Theme::keybind()),
+            Span::styled(" default dir", Theme::keybind_desc()),
+        ])
     } else {
-        [("^O", " workspace dir"), ("", "")]
-    };
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for (key, desc) in pairs {
-        if !key.is_empty() {
-            spans.push(Span::styled(key, Theme::keybind()));
-            spans.push(Span::styled(desc, Theme::keybind_desc()));
-        }
+        Line::from(vec![
+            Span::styled("^O", Theme::keybind()),
+            Span::styled(" workspace dir", Theme::keybind_desc()),
+        ])
     }
-    Line::from(spans)
 }
