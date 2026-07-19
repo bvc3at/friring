@@ -525,6 +525,12 @@ pub fn diff_working_on(host: Option<&HostDef>, worktree: &Path) -> Option<String
     run_diff(host, worktree, &["diff", "--no-color", "HEAD"])
 }
 
+/// Raw unified diff of the **staged** changes only (index vs `HEAD`), for the
+/// review view's "staged changes" target. Mirrors [`diff_working_on`].
+pub fn diff_staged_on(host: Option<&HostDef>, worktree: &Path) -> Option<String> {
+    run_diff(host, worktree, &["diff", "--no-color", "--cached"])
+}
+
 /// Raw unified diff of a single commit (`git show`), for the review view's
 /// per-commit target. `--format=` suppresses the log message, leaving the patch.
 pub fn show_commit_on(host: Option<&HostDef>, worktree: &Path, sha: &str) -> Option<String> {

@@ -42,8 +42,12 @@ pub(crate) struct ReviewRepo {
 pub(crate) enum ReviewTarget {
     /// `<base>..HEAD` of every repo.
     Branch,
-    /// Uncommitted changes vs `HEAD` (staged + unstaged) of every repo.
+    /// Uncommitted changes vs `HEAD` (staged + unstaged + untracked) of every
+    /// repo.
     Working,
+    /// Staged changes only (`git diff --cached`, index vs `HEAD`) of every
+    /// repo.
+    Staged,
     /// A single commit in one repo (`repo` indexes [`CodeReviewState::repos`]).
     Commit { repo: usize, sha: String },
 }
@@ -238,6 +242,7 @@ impl ReviewTarget {
                 }
             }
             ReviewTarget::Working => "Working changes (uncommitted)".to_string(),
+            ReviewTarget::Staged => "Staged changes (index vs HEAD)".to_string(),
             ReviewTarget::Commit { repo, sha } => {
                 let subject = commits
                     .iter()
@@ -1011,7 +1016,7 @@ impl App {
         let Some(cr) = self.active_review_mut() else {
             return;
         };
-        let mut entries = vec![ReviewTarget::Working];
+        let mut entries = vec![ReviewTarget::Working, ReviewTarget::Staged];
         if cr.repos.iter().any(|r| r.base.is_some()) {
             entries.push(ReviewTarget::Branch);
         }
@@ -1931,6 +1936,7 @@ fn build_files(
                 .as_deref()
                 .and_then(|b| crate::git::diff_against_on(host, &repo.dir, b)),
             ReviewTarget::Working => crate::git::diff_working_on(host, &repo.dir),
+            ReviewTarget::Staged => crate::git::diff_staged_on(host, &repo.dir),
             // A commit target belongs to exactly one repo; the others contribute
             // nothing.
             ReviewTarget::Commit { repo: ri, sha } if *ri == i => {
@@ -2614,6 +2620,10 @@ mod tests {
         assert!(ReviewTarget::Working
             .label(&one, &commits)
             .contains("Working"));
+        assert_eq!(
+            ReviewTarget::Staged.label(&one, &commits),
+            "Staged changes (index vs HEAD)"
+        );
         // Single repo shows the base..HEAD range.
         assert!(ReviewTarget::Branch
             .label(&one, &commits)
@@ -2741,6 +2751,66 @@ mod tests {
             cpaths.iter().all(|p| p.starts_with("alpha/")),
             "got {cpaths:?}"
         );
+    }
+
+    /// `Staged` diffs the index against HEAD only; `Working` sees staged +
+    /// unstaged. Exercised against a real temp repo like the multi-repo test.
+    #[test]
+    fn build_files_staged_target_diffs_index_only() {
+        use crate::git::git_program;
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let ok = git_program()
+                .args([
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        }
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        git(p, &["init", "-q"]);
+        std::fs::write(p.join("a.txt"), "one\n").unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-q", "-m", "init"]);
+        // One staged edit, then a further unstaged edit on top.
+        std::fs::write(p.join("a.txt"), "one\nstaged\n").unwrap();
+        git(p, &["add", "-A"]);
+        std::fs::write(p.join("a.txt"), "one\nstaged\nunstaged\n").unwrap();
+
+        let repos = vec![ReviewRepo {
+            label: String::new(),
+            dir: p.to_path_buf(),
+            base: None,
+        }];
+        let text_of = |files: &[DiffFile]| -> String {
+            files
+                .iter()
+                .flat_map(|f| f.hunks.iter())
+                .flat_map(|h| h.lines.iter())
+                .map(|l| l.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let staged = build_files(&repos, &ReviewTarget::Staged, None, false);
+        let staged_text = text_of(&staged);
+        assert!(staged_text.contains("staged"), "got: {staged_text}");
+        assert!(
+            !staged_text.contains("unstaged"),
+            "index only: {staged_text}"
+        );
+
+        let working = build_files(&repos, &ReviewTarget::Working, None, false);
+        let working_text = text_of(&working);
+        assert!(working_text.contains("unstaged"), "got: {working_text}");
     }
 
     #[test]

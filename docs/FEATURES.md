@@ -823,14 +823,17 @@ jump hunks, matching tuicr.
 
 **Why selectable review targets?** Like tuicr (`-r`/`-w`/a commit), the
 diff can show the whole branch (`<base>..HEAD`), the uncommitted working
-changes (`git diff HEAD`), or a single commit (`git show`). `t` (or the
-Target footer button) opens an in-view picker listing Working, Branch, and
+changes (`git diff HEAD` + untracked files), the staged changes only
+(`git diff --cached`, index vs HEAD — review exactly what the next commit
+will contain), or a single commit (`git show`). `t` (or the Target footer
+button) opens an in-view picker listing Working, Staged, Branch, and
 each commit in the range; selecting one — keyboard ↑/↓/Enter **or a mouse
 click** (`render_target_picker` returns a `RowHitbox` per entry →
 `ClickAction::ReviewTarget(i)` → `App::cr_select_target`) — recomputes the
 diff (`ReviewTarget`, `build_target_diff`, `git::{diff_working_on,
-show_commit_on, list_commits_on}`). A session with no resolvable base
-defaults to the working-changes target, so even a bare checkout reviews.
+diff_staged_on, show_commit_on, list_commits_on}`). A session with no
+resolvable base defaults to the working-changes target, so even a bare
+checkout reviews.
 
 **Why review all repos at once?** A friring session can span several
 repositories (and flow opens a PR per repo), so a review that only saw the

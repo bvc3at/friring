@@ -74,6 +74,8 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
   of the marked content (schema **v41**, `review_marks.fingerprint`); every
   completed build deletes marks whose file/hunk content changed and toasts a
   summary — upstream marks could silently go stale.
+- **Staged-only target.** The `t` picker gains `Staged changes (index vs
+  HEAD)` (`git diff --cached`) between Working and Branch.
 
 #### Agent activity view (F9)
 

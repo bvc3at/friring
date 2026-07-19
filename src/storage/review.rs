@@ -181,10 +181,7 @@ impl Database {
     /// List a session's "reviewed" marks as `(file_path, hunk_index,
     /// fingerprint)` where `hunk_index = None` means the whole file and a
     /// `None` fingerprint is a legacy (pre-v41) row.
-    pub fn list_review_marks(
-        &self,
-        session_id: SessionId,
-    ) -> rusqlite::Result<Vec<ReviewMarkRow>> {
+    pub fn list_review_marks(&self, session_id: SessionId) -> rusqlite::Result<Vec<ReviewMarkRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT file_path, hunk_index, fingerprint FROM review_marks WHERE session_id = ?1",
         )?;
