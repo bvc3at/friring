@@ -131,6 +131,10 @@ struct SpawnInputs {
     config: SessionConfig,
     /// The primary repo path restored onto `SessionInfo.cwd` after spawn.
     primary_cwd: Option<PathBuf>,
+    /// The user-chosen workspace dir, only when it actually became the launch
+    /// cwd — persisted onto `SessionInfo.workspace_dir` so restart / shell pane
+    /// / delete resolve the same directory.
+    workspace_dir: Option<PathBuf>,
     backend: Arc<dyn SessionBackend>,
     provider: Arc<dyn crate::agent::AgentProvider>,
     rows: u16,
@@ -144,6 +148,9 @@ struct PendingSessionSpawn {
     primary_cwd: Option<PathBuf>,
     worktrees: Vec<WorktreeInfo>,
     additional_dirs: Vec<PathBuf>,
+    /// User-chosen workspace dir that became the launch cwd (see
+    /// [`SpawnInputs::workspace_dir`]).
+    workspace_dir: Option<PathBuf>,
     /// Parent session (lead/worker linkage), captured at kickoff like the
     /// other wizard state so an overlapping flow can't steal it.
     parent_session_id: Option<SessionId>,
@@ -1535,6 +1542,7 @@ impl App {
     pub(crate) fn start_new_session(&mut self) {
         // Clear any choice left over from a previously cancelled flow.
         self.new_session.backend = None;
+        self.new_session.workspace_dir = None;
         self.new_session.saved_repo_picker = None;
         self.new_session.saved_conversation_picker = None;
 
@@ -1752,9 +1760,48 @@ impl App {
         modal
             .name
             .set(&self.suggested_session_name(config.cwd.as_deref()));
+        self.prefill_workspace_dir_field(&mut modal);
         self.new_session.spawn_config = Some(config);
         self.new_session.spawn_worktrees = worktrees;
         self.modal = modals::Modal::SessionName(modal);
+    }
+
+    /// Whether the name step should offer the optional workspace-dir field
+    /// (`Ctrl+O`): only for a **local** pending spawn (a custom workspace dir
+    /// is local-only) spanning ≥2 member dirs (single-repo sessions launch in
+    /// the repo itself — there is no workspace to place).
+    pub(crate) fn pending_spawn_offers_workspace_dir(&self) -> bool {
+        // The backend is consumed by `spawn_session_with_config` in the normal
+        // flow — fall back to the pending config's copy (mirrors
+        // `wizard_breadcrumb`).
+        let backend = self.new_session.backend.as_deref().or_else(|| {
+            self.new_session
+                .spawn_config
+                .as_ref()
+                .and_then(|c| c.backend.as_deref())
+        });
+        if self.host_for_backend(backend).is_some() {
+            return false;
+        }
+        // Worktree flow: the name step precedes worktree creation, so count
+        // the picked repos rather than the not-yet-existing member dirs
+        // (`all_repos` is `Some` only for >1 worktree repos).
+        if self.new_session.base_branch.is_some() {
+            return self.new_session.all_repos.is_some()
+                || !self.new_session.normal_repos.is_empty();
+        }
+        let worktrees = self.new_session.spawn_worktrees.len();
+        worktrees.max(1) + self.new_session.additional_dirs.len() >= 2
+    }
+
+    /// Re-arm the name modal's optional workspace-dir field from wizard state,
+    /// so stepping back to the name step doesn't silently drop the choice.
+    pub(crate) fn prefill_workspace_dir_field(&self, modal: &mut modals::SessionNameModal) {
+        if let Some(dir) = &self.new_session.workspace_dir {
+            let mut field = modals::TextInput::new();
+            field.set(&crate::paths::display_path_tilde(dir));
+            modal.workspace_dir = Some(field);
+        }
     }
 
     /// A prefilled session name: the working directory's basename, deduped
@@ -2220,6 +2267,14 @@ impl App {
                     let _ = std::fs::remove_file(metrics_dir.join(format!("{sid}.json")));
                 }
                 let _ = crate::workspace::remove_workspace(sid);
+                // A user-chosen workspace dir lives outside the workspaces
+                // root — remove it via its persisted path (guarded: only a
+                // symlink-only dir is ever deleted).
+                if let Some(ws) = &pending.session.info.workspace_dir {
+                    if let Err(e) = crate::workspace::remove_workspace_at(ws) {
+                        warn!("failed to remove workspace dir {}: {e}", ws.display());
+                    }
+                }
                 // A remote session's workspace lives on its host (see
                 // `git::ensure_remote_workspace`) — tear it down there too, or
                 // it leaks forever. Gated on multi-repo so a single-repo delete
@@ -2436,6 +2491,7 @@ impl App {
         session.info.agent = shared.agent.clone();
         session.info.cwd = shared.cwd.clone();
         session.info.additional_dirs = shared.additional_dirs.clone();
+        session.info.workspace_dir = shared.workspace_dir.clone();
         session.info.agent_session_id = shared.agent_session_id.clone();
         session.info.worktrees = shared.worktrees.iter().cloned().map(Into::into).collect();
         session.info.parent_session_id = shared.parent_session_id;
@@ -3606,7 +3662,10 @@ impl App {
 
         match &mut self.modal {
             Modal::WorktreeName(wn) => wn.name.insert_str(text),
-            Modal::SessionName(sn) => sn.name.insert_str(text),
+            Modal::SessionName(sn) => match sn.workspace_dir.as_mut() {
+                Some(ws) if sn.workspace_focused => ws.insert_str(text),
+                _ => sn.name.insert_str(text),
+            },
             Modal::RepoPicker(rp) => {
                 rp.input.insert_str(text);
                 rp.recompute_filter();
@@ -3923,6 +3982,7 @@ impl App {
             &info.worktrees,
             &info.additional_dirs,
             host,
+            info.workspace_dir.as_deref(),
         )
     }
 
@@ -3937,6 +3997,11 @@ impl App {
             session_member_dirs(info.cwd.as_deref(), &info.worktrees, &info.additional_dirs);
         if members.len() < 2 {
             return info.cwd.clone();
+        }
+        // A user-chosen workspace dir is recorded only when it became the
+        // launch cwd (always local), so it *is* the deterministic answer.
+        if let Some(ws) = &info.workspace_dir {
+            return Some(ws.clone());
         }
         let Some(id) = info.agent_session_id.as_deref() else {
             return info.cwd.clone();
@@ -4018,6 +4083,7 @@ impl App {
         config: &SessionConfig,
         worktrees: &[WorktreeInfo],
         additional_dirs: &[PathBuf],
+        workspace_dir: Option<PathBuf>,
     ) -> Option<SpawnInputs> {
         let (rows, cols) = self.content_area_size();
 
@@ -4055,7 +4121,14 @@ impl App {
             worktrees,
             additional_dirs,
             spawn_host.as_ref(),
+            workspace_dir.as_deref(),
         );
+        // Persist the custom dir only when it really became the launch cwd
+        // (single-member / build-failure spawns fall back — recording the
+        // unused path would point restart and delete at a dir the agent never
+        // ran in).
+        let workspace_dir =
+            workspace_dir.filter(|dir| config.cwd.as_deref() == Some(dir.as_path()));
 
         // Lookup only — readiness is the caller's job: the sync path blocks on
         // it inline, the async path readies on its worker (ADR-P12).
@@ -4073,6 +4146,7 @@ impl App {
         Some(SpawnInputs {
             config,
             primary_cwd,
+            workspace_dir,
             backend,
             provider,
             rows,
@@ -4090,6 +4164,7 @@ impl App {
         primary_cwd: Option<PathBuf>,
         worktrees: Vec<WorktreeInfo>,
         additional_dirs: Vec<PathBuf>,
+        workspace_dir: Option<PathBuf>,
         parent_session_id: Option<SessionId>,
         task_prompt: Option<(i64, String)>,
         base_branch: Option<String>,
@@ -4097,6 +4172,7 @@ impl App {
         session.info.cwd = primary_cwd;
         session.info.worktrees = worktrees;
         session.info.additional_dirs = additional_dirs;
+        session.info.workspace_dir = workspace_dir;
         session.info.parent_session_id = parent_session_id;
 
         // The async spawn worker pre-resolves the display names off-thread
@@ -4160,9 +4236,11 @@ impl App {
         worktrees: Vec<WorktreeInfo>,
     ) {
         let additional_dirs = std::mem::take(&mut self.new_session.additional_dirs);
+        let workspace_dir = self.new_session.workspace_dir.take();
         let parent_session_id = self.new_session.parent_session_id.take();
         let base_branch = self.new_session.spawn_base_branch.take();
-        let Some(inputs) = self.build_spawn_inputs(&name, config, &worktrees, &additional_dirs)
+        let Some(inputs) =
+            self.build_spawn_inputs(&name, config, &worktrees, &additional_dirs, workspace_dir)
         else {
             return;
         };
@@ -4188,6 +4266,7 @@ impl App {
                     inputs.primary_cwd,
                     worktrees,
                     additional_dirs,
+                    inputs.workspace_dir,
                     parent_session_id,
                     task_prompt,
                     base_branch,
@@ -4222,9 +4301,11 @@ impl App {
         }
 
         let additional_dirs = std::mem::take(&mut self.new_session.additional_dirs);
+        let workspace_dir = self.new_session.workspace_dir.take();
         let parent_session_id = self.new_session.parent_session_id.take();
         let base_branch = self.new_session.spawn_base_branch.take();
-        let Some(inputs) = self.build_spawn_inputs(&name, config, &worktrees, &additional_dirs)
+        let Some(inputs) =
+            self.build_spawn_inputs(&name, config, &worktrees, &additional_dirs, workspace_dir)
         else {
             return;
         };
@@ -4233,6 +4314,7 @@ impl App {
         let SpawnInputs {
             config,
             primary_cwd,
+            workspace_dir,
             backend,
             provider,
             rows,
@@ -4251,6 +4333,7 @@ impl App {
             primary_cwd,
             worktrees,
             additional_dirs,
+            workspace_dir,
             parent_session_id,
             task_prompt,
             agent,
@@ -4299,6 +4382,7 @@ impl App {
                 pending.primary_cwd,
                 pending.worktrees,
                 pending.additional_dirs,
+                pending.workspace_dir,
                 pending.parent_session_id,
                 pending.task_prompt,
                 pending.base_branch,
@@ -6139,6 +6223,7 @@ impl App {
             spawned.info.id = shared_session.id;
             spawned.info.worktrees = worktree_infos;
             spawned.info.additional_dirs = shared_session.additional_dirs.clone();
+            spawned.info.workspace_dir = shared_session.workspace_dir.clone();
             spawned.info.parent_session_id = shared_session.parent_session_id;
             spawned.info.display_order = shared_session.display_order;
             self.sessions.push(spawned);
@@ -6233,6 +6318,7 @@ impl App {
             agent_session_id: session.info.agent_session_id.clone(),
             cwd: session.info.cwd.clone(),
             additional_dirs: session.info.additional_dirs.clone(),
+            workspace_dir: session.info.workspace_dir.clone(),
             worktrees: session
                 .info
                 .worktrees
@@ -6443,6 +6529,7 @@ impl App {
         info.agent_session_id = shared.agent_session_id.clone();
         info.cwd = shared.cwd.clone();
         info.additional_dirs = shared.additional_dirs.clone();
+        info.workspace_dir = shared.workspace_dir.clone();
         info.worktrees = shared.worktrees.iter().cloned().map(Into::into).collect();
         info.parent_session_id = shared.parent_session_id;
         info.display_order = shared.display_order;
@@ -6952,6 +7039,7 @@ impl App {
         session.info.agent_session_id = shared.agent_session_id.clone();
         session.info.cwd = shared.cwd.clone();
         session.info.additional_dirs = shared.additional_dirs.clone();
+        session.info.workspace_dir = shared.workspace_dir.clone();
         session.info.agent = agent;
         session.info.worktrees = worktrees;
         session.info.parent_session_id = shared.parent_session_id;
@@ -7025,6 +7113,7 @@ impl App {
         config.resume_session_id =
             crate::session_ops::resume_trigger_for(&def, &agent_session_id, &config.env);
         self.new_session.additional_dirs = shared.additional_dirs;
+        self.new_session.workspace_dir = shared.workspace_dir;
         self.new_session.parent_session_id = shared.parent_session_id;
         // After a reboot every session takes this path (the tmux server died),
         // so the manual list position must survive the respawn or one restart
@@ -7402,14 +7491,17 @@ fn session_member_dirs(
 /// For a single-member session that's the member itself (`primary_cwd`). For a
 /// multi-member session it is a per-session **symlink workspace** (built
 /// idempotently from the members) so the agent sees every repo as a
-/// subdirectory — agent-neutral, needing no per-CLI flag. On any failure it
-/// falls back to `primary_cwd`.
+/// subdirectory — agent-neutral, needing no per-CLI flag. `workspace_dir` is
+/// the wizard's optional user-chosen location for that workspace (local spawns
+/// only); `None` = the default id-derived path. On any failure it falls back
+/// to `primary_cwd`.
 fn resolve_process_cwd(
     agent_session_id: Option<&str>,
     primary_cwd: Option<PathBuf>,
     worktrees: &[WorktreeInfo],
     additional_dirs: &[PathBuf],
     host: Option<&crate::session::HostDef>,
+    workspace_dir: Option<&std::path::Path>,
 ) -> Option<PathBuf> {
     let members = session_member_dirs(primary_cwd.as_deref(), worktrees, additional_dirs);
     if members.len() < 2 {
@@ -7429,7 +7521,8 @@ fn resolve_process_cwd(
         })
         .collect();
 
-    crate::session_ops::spawn::build_multi_repo_workspace(host, id, &pairs).or(primary_cwd)
+    crate::session_ops::spawn::build_multi_repo_workspace(host, id, &pairs, workspace_dir)
+        .or(primary_cwd)
 }
 
 #[cfg(test)]
@@ -12791,7 +12884,7 @@ mod tests {
     #[test]
     fn process_cwd_single_member_is_primary() {
         let cwd = PathBuf::from("/src/only");
-        let out = resolve_process_cwd(Some("id-1"), Some(cwd.clone()), &[], &[], None);
+        let out = resolve_process_cwd(Some("id-1"), Some(cwd.clone()), &[], &[], None, None);
         assert_eq!(out, Some(cwd));
     }
 
@@ -12812,6 +12905,7 @@ mod tests {
             &[],
             std::slice::from_ref(&other),
             None,
+            None,
         )
         .unwrap();
 
@@ -12820,6 +12914,33 @@ mod tests {
         assert!(out.starts_with(&ws_root), "{out:?} not under {ws_root:?}");
         assert_eq!(std::fs::read_link(out.join("repo-a")).unwrap(), primary);
         assert_eq!(std::fs::read_link(out.join("repo-b")).unwrap(), other);
+    }
+
+    #[test]
+    fn process_cwd_multi_member_honors_custom_workspace_dir() {
+        let base = std::env::temp_dir().join("friring-procwd-custom-test");
+        let _ = std::fs::remove_dir_all(&base);
+        let _g = crate::paths::TestPathGuard::new(&base);
+
+        let primary = base.join("repo-a");
+        let other = base.join("repo-b");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let custom = base.join("named-ws");
+
+        let out = resolve_process_cwd(
+            Some("sess-y"),
+            Some(primary.clone()),
+            &[],
+            std::slice::from_ref(&other),
+            None,
+            Some(custom.as_path()),
+        )
+        .unwrap();
+
+        assert_eq!(out, custom);
+        assert_eq!(std::fs::read_link(custom.join("repo-a")).unwrap(), primary);
+        assert_eq!(std::fs::read_link(custom.join("repo-b")).unwrap(), other);
     }
 
     #[test]
@@ -12833,6 +12954,7 @@ mod tests {
             Some(primary.clone()),
             &[],
             std::slice::from_ref(&other),
+            None,
             None,
         );
         assert_eq!(out, Some(primary));
@@ -14184,6 +14306,7 @@ mod tests {
             primary_cwd: None,
             worktrees: vec![],
             additional_dirs: vec![],
+            workspace_dir: None,
             parent_session_id: None,
             task_prompt: None,
             agent: "codex".into(),
@@ -14210,6 +14333,7 @@ mod tests {
             primary_cwd: None,
             worktrees: vec![],
             additional_dirs: vec![],
+            workspace_dir: None,
             parent_session_id: None,
             task_prompt: None,
             agent: "claude".into(),
@@ -14545,6 +14669,7 @@ mod tests {
             agent_session_id: Some("agent-123".to_string()),
             cwd: None,
             additional_dirs: Vec::new(),
+            workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
             parent_session_id: None,

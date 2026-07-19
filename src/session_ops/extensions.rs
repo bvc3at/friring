@@ -1259,6 +1259,7 @@ mod tests {
             agent_session_id: Some(uuid::Uuid::new_v4().to_string()),
             cwd: None,
             additional_dirs: Vec::new(),
+            workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
             parent_session_id: None,

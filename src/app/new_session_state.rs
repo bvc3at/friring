@@ -33,6 +33,11 @@ pub(crate) struct NewSessionWizardState {
     /// attach to the spawned session's `SessionInfo`. Consumed by
     /// `do_spawn_session`.
     pub(crate) additional_dirs: Vec<PathBuf>,
+    /// Resolved user-chosen directory for the multi-repo symlink workspace
+    /// (the name modal's optional `Ctrl+O` field; local flows only). `None` =
+    /// the default id-derived path. Consumed by
+    /// `do_spawn_session`/`do_spawn_session_async`.
+    pub(crate) workspace_dir: Option<PathBuf>,
     /// Base branch the worktrees were forked from, carried from the worktree
     /// flow to the spawn so it can be persisted (scopes the code-review view to
     /// `<base>..HEAD`). `None` for bare-repo / fork spawns. Consumed by

@@ -462,6 +462,96 @@ fn ctrl_n_opens_repo_picker() {
 }
 
 #[test]
+fn session_name_modal_ctrl_o_workspace_dir_field() {
+    let mut h = Harness::standard(0);
+    // Name step of a *single-repo* worktree flow: the workspace-dir field is
+    // not offered, so Ctrl+O is inert.
+    h.app.new_session.base_branch = Some("main".into());
+    h.app.new_session.repo_path = Some(std::path::PathBuf::from("/r/a"));
+    let mut modal = modals::SessionNameModal::default();
+    modal.name.set("demo");
+    h.app.modal = modals::Modal::SessionName(modal);
+    h.ctrl('o');
+    let modals::Modal::SessionName(sn) = &h.app.modal else {
+        panic!("name modal gone");
+    };
+    assert!(
+        sn.workspace_dir.is_none(),
+        "single-repo must not offer field"
+    );
+
+    // Two repos picked → multi-repo: Ctrl+O reveals + focuses the field.
+    h.app.new_session.all_repos = Some(vec![
+        std::path::PathBuf::from("/r/a"),
+        std::path::PathBuf::from("/r/b"),
+    ]);
+    h.ctrl('o');
+    let modals::Modal::SessionName(sn) = &h.app.modal else {
+        panic!("name modal gone");
+    };
+    assert!(sn.workspace_dir.is_some() && sn.workspace_focused);
+
+    // A bare name confirms into `<workspaces root>/<name>` and the flow
+    // advances to the branch-name step.
+    for c in "acme".chars() {
+        h.key(KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(matches!(h.app.modal, modals::Modal::WorktreeName(_)));
+    let ws = h.app.new_session.workspace_dir.clone().expect("dir stored");
+    assert_eq!(
+        ws,
+        crate::paths::workspaces_directory().unwrap().join("acme")
+    );
+
+    // Esc back to the name step re-opens the field prefilled with the choice.
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    let modals::Modal::SessionName(sn) = &h.app.modal else {
+        panic!("name modal gone");
+    };
+    let field = sn.workspace_dir.as_ref().expect("field prefilled");
+    assert!(field.value().ends_with("acme"), "got {}", field.value());
+
+    // Ctrl+O again hides the field and reverts to the default workspace.
+    h.ctrl('o');
+    let modals::Modal::SessionName(sn) = &h.app.modal else {
+        panic!("name modal gone");
+    };
+    assert!(sn.workspace_dir.is_none());
+    assert!(h.app.new_session.workspace_dir.is_none());
+}
+
+#[test]
+fn session_name_modal_rejects_occupied_workspace_dir() {
+    let mut h = Harness::standard(0);
+    h.app.new_session.base_branch = Some("main".into());
+    h.app.new_session.repo_path = Some(std::path::PathBuf::from("/r/a"));
+    h.app.new_session.all_repos = Some(vec![
+        std::path::PathBuf::from("/r/a"),
+        std::path::PathBuf::from("/r/b"),
+    ]);
+    let mut modal = modals::SessionNameModal::default();
+    modal.name.set("demo");
+    h.app.modal = modals::Modal::SessionName(modal);
+
+    // A target holding real (non-symlink) content is refused: the modal stays
+    // open with an error toast, and nothing is recorded.
+    let busy = crate::paths::workspaces_directory().unwrap().join("busy");
+    std::fs::create_dir_all(busy.join("real-content")).unwrap();
+    h.ctrl('o');
+    for c in "busy".chars() {
+        h.key(KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(matches!(h.app.modal, modals::Modal::SessionName(_)));
+    assert_eq!(
+        h.app.status_message.as_ref().map(|m| m.level),
+        Some(StatusLevel::Error)
+    );
+    assert!(h.app.new_session.workspace_dir.is_none());
+}
+
+#[test]
 fn ctrl_j_and_k_cycle_session_selection() {
     let mut h = Harness::standard(3);
     assert_eq!(h.app.active_index, 0);

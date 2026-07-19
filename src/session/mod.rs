@@ -240,6 +240,11 @@ pub struct SessionInfo {
     pub agent_session_id: Option<String>,
     pub cwd: Option<PathBuf>,
     pub additional_dirs: Vec<PathBuf>,
+    /// User-chosen directory for the multi-repo symlink workspace (new-session
+    /// wizard, local sessions only). `None` = the default id-derived path under
+    /// the workspaces root. Persisted so restart, the shell pane, and delete
+    /// resolve the same directory the agent was launched in.
+    pub workspace_dir: Option<PathBuf>,
     pub backend_id: Option<String>,
     pub shell_backend_id: Option<String>,
     /// Bare host name (e.g. `devbox`) when the session runs on a remote
@@ -285,6 +290,7 @@ impl SessionInfo {
             agent_session_id: None,
             cwd: None,
             additional_dirs: Vec::new(),
+            workspace_dir: None,
             backend_id: None,
             shell_backend_id: None,
             remote_host: None,

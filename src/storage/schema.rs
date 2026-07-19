@@ -17,9 +17,10 @@ use rusqlite::Connection;
 /// `review_marks` tables (the native code-review view); v39 scopes
 /// `repo_bookmarks` to a `host` (`''` = local), giving remote targets the
 /// same bookmark memory as local ones; v40 adds `repo_sync_bases` (the
-/// per-repo default base remote for the Ctrl+S worktree sync).
+/// per-repo default base remote for the Ctrl+S worktree sync); v41 adds
+/// `workspace_dir` to `sessions` (user-chosen multi-repo workspace location).
 /// Gaps in the step table are fine (there is no v18 step either).
-pub const SCHEMA_VERSION: u32 = 40;
+pub const SCHEMA_VERSION: u32 = 41;
 
 /// A single migration step: applied when the stored version is below `target`.
 type MigrationStep = (u32, fn(&Connection) -> rusqlite::Result<()>);
@@ -68,6 +69,7 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             agent_session_id  TEXT,
             cwd               TEXT,
             additional_dirs   TEXT NOT NULL DEFAULT '',
+            workspace_dir     TEXT,
             shell_backend_id  TEXT,
             parent_session_id TEXT,
             display_order     INTEGER,
@@ -293,6 +295,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         (38, migrate_v38_code_review),
         (39, migrate_v39_bookmark_host),
         (40, migrate_v40_repo_sync_bases),
+        (41, migrate_v41_workspace_dir),
     ];
 
     for &(target, step) in steps {
@@ -1178,6 +1181,12 @@ fn migrate_v40_repo_sync_bases(conn: &Connection) -> rusqlite::Result<()> {
             remote    TEXT NOT NULL
         );",
     )
+}
+
+/// v40 → v41: add `workspace_dir` to `sessions` — the user-chosen multi-repo
+/// symlink-workspace directory (`NULL` = default id-derived path).
+fn migrate_v41_workspace_dir(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "sessions", "workspace_dir", "TEXT")
 }
 
 #[cfg(test)]

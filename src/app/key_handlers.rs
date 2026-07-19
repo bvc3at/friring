@@ -940,6 +940,7 @@ impl App {
                 self.new_session.all_repos = None;
                 self.new_session.normal_repos.clear();
                 self.new_session.base_branch = None;
+                self.new_session.workspace_dir = None;
                 self.new_session.fetch_done = None;
                 // Back one step: the palette as the user left it.
                 self.restore_repo_picker();
@@ -1008,6 +1009,7 @@ impl App {
         let mut modal = super::modals::SessionNameModal::default();
         let cwd = self.new_session.repo_path.clone();
         modal.name.set(&self.suggested_session_name(cwd.as_deref()));
+        self.prefill_workspace_dir_field(&mut modal);
         self.modal = super::modals::Modal::SessionName(modal);
     }
 
@@ -1044,6 +1046,7 @@ impl App {
         if let Some(name) = self.new_session.session_name.take() {
             modal.name.set(&name);
         }
+        self.prefill_workspace_dir_field(&mut modal);
         self.modal = super::modals::Modal::SessionName(modal);
     }
 
@@ -1066,6 +1069,14 @@ impl App {
     }
 
     fn handle_session_name_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        // `Ctrl+O` toggles the optional workspace-dir field. Matched before the
+        // text-input fallthrough, which swallows every Ctrl+letter chord.
+        if mods.contains(KeyModifiers::CONTROL)
+            && matches!(code, KeyCode::Char('o') | KeyCode::Char('O'))
+        {
+            self.toggle_workspace_dir_field();
+            return;
+        }
         let super::modals::Modal::SessionName(ref mut sn) = self.modal else {
             return;
         };
@@ -1074,19 +1085,76 @@ impl App {
                 self.modal.close();
                 self.session_name_back();
             }
+            KeyCode::Tab | KeyCode::BackTab if sn.workspace_dir.is_some() => {
+                sn.workspace_focused = !sn.workspace_focused;
+            }
             KeyCode::Enter => {
                 let name = sn.name.value().trim().to_string();
+                let ws_raw = sn.workspace_dir.as_ref().map(|f| f.value().to_string());
                 if name.is_empty() {
                     self.set_error("Session name cannot be empty");
                     return;
+                }
+                // Resolve + validate the workspace dir before committing, so a
+                // bad value keeps the modal open with everything editable.
+                if let Some(raw) = ws_raw {
+                    let dir = match crate::workspace::resolve_custom_workspace_dir(&raw) {
+                        Ok(dir) => dir,
+                        Err(e) => {
+                            self.set_error(e);
+                            return;
+                        }
+                    };
+                    if let Some(dir) = &dir {
+                        if let Err(e) = crate::workspace::validate_custom_workspace_dir(dir) {
+                            self.set_error(e);
+                            return;
+                        }
+                    }
+                    self.new_session.workspace_dir = dir;
                 }
                 self.modal.close();
                 self.confirm_session_name(name);
             }
             other => {
-                super::modals::apply_text_input_key(Some(&mut sn.name), other, mods);
+                let field = match sn.workspace_dir.as_mut() {
+                    Some(ws) if sn.workspace_focused => Some(ws),
+                    _ => Some(&mut sn.name),
+                };
+                super::modals::apply_text_input_key(field, other, mods);
             }
         }
+    }
+
+    /// `Ctrl+O` on the name modal: show + focus the optional workspace-dir
+    /// field, or hide it again (reverting to the default id-derived
+    /// workspace). A no-op when the pending spawn doesn't offer the field
+    /// (single-repo, or a remote host).
+    fn toggle_workspace_dir_field(&mut self) {
+        let offered = self.pending_spawn_offers_workspace_dir();
+        let prefill = self
+            .new_session
+            .workspace_dir
+            .as_ref()
+            .map(|dir| crate::paths::display_path_tilde(dir));
+        let super::modals::Modal::SessionName(ref mut sn) = self.modal else {
+            return;
+        };
+        if sn.workspace_dir.is_some() {
+            sn.workspace_dir = None;
+            sn.workspace_focused = false;
+            self.new_session.workspace_dir = None;
+            return;
+        }
+        if !offered {
+            return;
+        }
+        let mut field = super::modals::TextInput::new();
+        if let Some(prefill) = prefill {
+            field.set(&prefill);
+        }
+        sn.workspace_dir = Some(field);
+        sn.workspace_focused = true;
     }
 
     /// `Esc` on the name modal: step back to wherever this flow came from —
@@ -1100,6 +1168,7 @@ impl App {
             self.new_session.spawn_worktrees.clear();
             self.new_session.fork = false;
             self.new_session.parent_session_id = None;
+            self.new_session.workspace_dir = None;
             return;
         }
         // Worktrees already created (the agent picker stepped back here, or a
@@ -1112,6 +1181,7 @@ impl App {
             self.new_session.import = false;
             self.new_session.parent_session_id = None;
             self.new_session.additional_dirs.clear();
+            self.new_session.workspace_dir = None;
             self.new_session.saved_repo_picker = None;
             self.set_info("Cancelled — created worktree(s) kept on disk");
             return;
@@ -1142,6 +1212,7 @@ impl App {
             self.new_session.backend = config.backend;
         }
         self.new_session.additional_dirs.clear();
+        self.new_session.workspace_dir = None;
         self.new_session.parent_session_id = None;
         self.restore_repo_picker();
     }
@@ -1301,6 +1372,7 @@ impl App {
         if let Some(name) = self.new_session.spawn_name.take() {
             modal.name.set(&name);
         }
+        self.prefill_workspace_dir_field(&mut modal);
         self.modal = super::modals::Modal::SessionName(modal);
     }
 

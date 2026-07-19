@@ -287,7 +287,17 @@ disk), and a fork — it has no prior step.
 4. **Session name** — the sidebar identifier, prefilled from the
    repo basename (deduped `-2`, `-3`, … against existing sessions)
    so the common case is Enter-through; edit or clear it freely.
-   Shows a muted breadcrumb of the choices so far.
+   Shows a muted breadcrumb of the choices so far. When the pending
+   spawn is **multi-repo and local**, `Ctrl+O` reveals an optional
+   **workspace dir** field (`Tab` switches between the two fields,
+   `Ctrl+O` again hides it): a bare name places the symlink
+   workspace at `~/.local/share/friring/workspaces/<name>`, a `~`
+   or absolute path places it exactly there — so the agent's cwd
+   can be a browsable, named directory instead of a UUID. Left
+   empty (the default) the id-derived path is used. The target must
+   be missing, empty, or a previous symlink-only workspace —
+   `Enter` refuses anything else, and friring only ever deletes
+   symlink-only directories there (never real files).
 5. **New branch name** — worktree mode only, prefilled from the
    session name (`/` preserved as a hierarchy separator).
 6. **Agent picker** — choose which coding agent runs in this
@@ -330,10 +340,15 @@ idempotently on each launch (`workspace::ensure_workspace` /
 repos) when the session is deleted. `SessionInfo.cwd` keeps the **primary**
 repo (for display / editor / git context); the workspace is a spawn-time
 process-cwd detail, derived on every launch from the persisted members and
-never stored. The member set is the single `App::session_member_dirs` list
-that also feeds the rendered repo names, and `App::resolve_process_cwd`
-picks workspace-vs-primary. Single-repo sessions launch directly in the repo
-as before.
+not stored — except a **user-chosen workspace dir** (the name step's
+`Ctrl+O` field, local sessions only), which can't be re-derived from the id
+and is persisted as `SessionInfo.workspace_dir` (schema v41) so restart, the
+shell pane, and delete resolve the directory the agent actually launched in
+(`workspace::ensure_workspace_at` / `remove_workspace_at`, both refusing a
+directory holding anything but symlinks). The member set is the single
+`App::session_member_dirs` list that also feeds the rendered repo names, and
+`App::resolve_process_cwd` picks workspace-vs-primary. Single-repo sessions
+launch directly in the repo as before.
 
 **Headless multi-repo.** The same shape is reachable without the TUI.
 `friring-cli session create` (and `task create`) take repeatable
@@ -598,6 +613,8 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Tab` | Repo picker | Complete the typed path (never moves focus) | |
 | `Ctrl+P` | Repo picker | Import the typed folder's repos as a parent | |
 | `Enter` | Repo picker | Open picked repos / the highlighted row; add + open a typed path | |
+| `Ctrl+O` | Name step (multi-repo, local) | Show/hide the optional workspace-dir field | |
+| `Tab` | Name step (field shown) | Switch focus between name and workspace dir | |
 | `Esc` | New-session wizard | Back one step (first step cancels) | |
 | `Shift+Up` | Focused terminal | Scroll up 1 line | |
 | `Shift+Down` | Focused terminal | Scroll down 1 line | |

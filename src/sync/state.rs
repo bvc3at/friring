@@ -62,6 +62,11 @@ pub struct SharedSession {
     /// not just those with an `--add-dir`-style flag — can reach them.
     pub additional_dirs: Vec<PathBuf>,
 
+    /// User-chosen directory for the multi-repo symlink workspace (local
+    /// sessions only); `None` = the default id-derived path under the
+    /// workspaces root. See `SessionInfo::workspace_dir`.
+    pub workspace_dir: Option<PathBuf>,
+
     pub worktrees: Vec<SharedWorktree>,
 
     /// Backend ID of the companion shell pane (if spawned).

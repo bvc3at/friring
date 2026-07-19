@@ -415,6 +415,15 @@ fn render_session_detail(s: &SharedSession) -> String {
             output::dash(s.cwd.as_ref().map(|p| p.display().to_string()).as_deref()),
         ),
         (
+            "workspace_dir",
+            output::dash(
+                s.workspace_dir
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .as_deref(),
+            ),
+        ),
+        (
             "parent",
             output::dash(s.parent_session_id.map(|id| id.to_string()).as_deref()),
         ),
@@ -454,6 +463,8 @@ fn shared_session_to_json(s: &SharedSession, hook: Option<&HookRow>) -> Value {
         "backend_type": s.backend_type,
         "agent_session_id": s.agent_session_id,
         "cwd": s.cwd.as_ref().map(|p| p.display().to_string()),
+        "additional_dirs": s.additional_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "workspace_dir": s.workspace_dir.as_ref().map(|p| p.display().to_string()),
         "parent_session_id": s.parent_session_id.map(|id| id.to_string()),
         "display_order": s.display_order,
         "hook_state": hook.and_then(|h| h.state.as_deref()),
@@ -517,6 +528,39 @@ mod tests {
     }
 
     #[test]
+    fn get_exposes_workspace_dir_and_additional_dirs() {
+        let db = db();
+        let mut shared = make_test_session("multi");
+        shared.additional_dirs = vec![std::path::PathBuf::from("/repos/b")];
+        shared.workspace_dir = Some(std::path::PathBuf::from("/home/dev/named-ws"));
+        let id = shared.id;
+        db.upsert_session(&shared).unwrap();
+
+        let v = run(
+            Action::Get {
+                uuid: id.to_string(),
+            },
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["workspace_dir"], "/home/dev/named-ws");
+        assert_eq!(v["additional_dirs"][0], "/repos/b");
+
+        // A default-workspace session reports null, not a phantom path.
+        let plain = make_test_session("plain");
+        let pid = plain.id;
+        db.upsert_session(&plain).unwrap();
+        let v = run(
+            Action::Get {
+                uuid: pid.to_string(),
+            },
+            &db,
+        )
+        .unwrap();
+        assert!(v["workspace_dir"].is_null(), "got {v}");
+    }
+
+    #[test]
     fn signal_explicit_session_sets_hook_state() {
         let db = db();
         let shared = make_test_session("worker");
@@ -565,6 +609,7 @@ mod tests {
             agent_session_id: None,
             cwd: None,
             additional_dirs: Vec::new(),
+            workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
             parent_session_id: None,
@@ -585,6 +630,7 @@ mod tests {
             agent_session_id: None,
             cwd: Some(std::path::PathBuf::from("/tmp/repo")),
             additional_dirs: Vec::new(),
+            workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
             parent_session_id: None,
@@ -613,6 +659,7 @@ mod tests {
             agent_session_id: Some("agent-1".into()),
             cwd: Some(std::path::PathBuf::from("/tmp/repo")),
             additional_dirs: Vec::new(),
+            workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
             parent_session_id: None,
@@ -650,6 +697,7 @@ mod tests {
             agent_session_id: None,
             cwd: None,
             additional_dirs: Vec::new(),
+            workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
             parent_session_id: None,
@@ -723,6 +771,7 @@ mod tests {
             agent_session_id: None,
             cwd: None,
             additional_dirs: Vec::new(),
+            workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
             parent_session_id: None,
@@ -760,6 +809,7 @@ mod tests {
             agent_session_id: None,
             cwd: None,
             additional_dirs: Vec::new(),
+            workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
             parent_session_id: None,

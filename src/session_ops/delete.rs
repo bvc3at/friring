@@ -114,6 +114,13 @@ pub fn teardown_runtime_resources(
             tracing::warn!("remove_workspace({asid}) failed: {e}");
         }
     }
+    // A user-chosen workspace dir is not derivable from the id — remove it via
+    // its persisted path. Guarded: only a symlink-only dir is ever deleted.
+    if let Some(ws) = &session.workspace_dir {
+        if let Err(e) = crate::workspace::remove_workspace_at(ws) {
+            tracing::warn!("remove_workspace_at({}) failed: {e}", ws.display());
+        }
+    }
 }
 
 /// Kill the session's window on the local tmux server, reaping the pane's child
@@ -256,6 +263,7 @@ mod tests {
             agent_session_id: Some(uuid::Uuid::new_v4().to_string()),
             cwd: None,
             additional_dirs: Vec::new(),
+            workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
             parent_session_id: None,
@@ -396,6 +404,7 @@ mod tests {
             agent_session_id: None,
             cwd: None,
             additional_dirs: Vec::new(),
+            workspace_dir: None,
             worktrees: vec![crate::sync::SharedWorktree {
                 repo_path: "/nonexistent/repo".into(),
                 worktree_path: "/nonexistent/repo/wt".into(),
