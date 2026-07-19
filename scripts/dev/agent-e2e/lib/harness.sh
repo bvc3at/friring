@@ -82,7 +82,14 @@ e2e_scenario_load() {
     SCENARIO_AGENT_READY=""
     SCENARIO_DONE_PATTERN=""
     SCENARIO_PERF=0
+    # Extra dirs the agent profile must pre-trust (beyond $E2E_WS) — a
+    # scenario whose agent launches outside the seed workspace (e.g. a named
+    # multi-repo workspace dir) fills this from scenario_setup().
+    SCENARIO_TRUST_DIRS=()
     E2E_PERF_MARKS=""
+    # Optional boot hook: runs after the seed workspace exists but before the
+    # stub / agent config, so a scenario can lay down extra repos or dirs.
+    scenario_setup() { :; }
     scenario_assert_effects() { :; }
     scenario_assert_ui() { :; }
     # shellcheck disable=SC1091
@@ -131,6 +138,11 @@ e2e_boot() {
     ( cd "$E2E_WS" && git init -q && git add -A \
         && git commit -qm "e2e seed" --allow-empty )
 
+    # Scenario-owned extra environment (second repos, trust dirs, …) — after
+    # the seed workspace, before anything reads its results (fixtures may pin
+    # {{ROOT}} paths; agent_seed_config trusts SCENARIO_TRUST_DIRS).
+    scenario_setup || return 1
+
     # Agent profile first (it names the stub dialect), then the stub, then the
     # profile env (which needs the stub URL).
     local profile="$AGENT_E2E_DIR/agents/$SCENARIO_AGENT/profile.sh"
@@ -152,7 +164,8 @@ e2e_boot() {
     while IFS= read -r kv; do
         [ -n "$kv" ] && export "${kv?}"
     done < <(agent_env)
-    agent_seed_config "$E2E_WS"
+    # ${arr[@]+…}: safe empty-array expansion under set -u on bash 3.2 (macOS).
+    agent_seed_config "$E2E_WS" ${SCENARIO_TRUST_DIRS[@]+"${SCENARIO_TRUST_DIRS[@]}"}
 
     # Perf scenarios make the TUI publish its perf snapshot (counters +
     # frame/tick percentiles) into the sandbox DB for `friring-cli perf`.
@@ -203,10 +216,13 @@ e2e_stub_start() {
     E2E_JOURNAL="$E2E_STUB_DIR/journal.jsonl"
     mkdir -p "$E2E_STUB_DIR/raw"
 
-    # {{WS}} lets fixtures pin absolute tool inputs (Write wants an absolute
-    # file_path) without knowing the throwaway workspace path in advance.
+    # {{WS}} / {{ROOT}} let fixtures pin absolute tool inputs (Write wants an
+    # absolute file_path) without knowing the throwaway paths in advance:
+    # {{WS}} = the seed workspace repo, {{ROOT}} = the sandbox root (for
+    # scenario_setup-created dirs beside it).
     E2E_FIXTURES="$E2E_STUB_DIR/fixtures.json"
-    sed "s|{{WS}}|$E2E_WS|g" "$E2E_SCENARIO_DIR/fixtures.json" > "$E2E_FIXTURES"
+    sed -e "s|{{WS}}|$E2E_WS|g" -e "s|{{ROOT}}|$TBX_SANDBOX_ROOT|g" \
+        "$E2E_SCENARIO_DIR/fixtures.json" > "$E2E_FIXTURES"
 
     node "$stub" --port 0 --port-file "$E2E_STUB_DIR/port" \
         --journal "$E2E_JOURNAL" --raw-dir "$E2E_STUB_DIR/raw" \
@@ -245,7 +261,8 @@ e2e_session_create() {
 _vhs_key() {
     case "$1" in
         Enter|Escape|Tab|Space|Up|Down|Left|Right|PageUp|PageDown|Backspace|Delete) echo "$1" ;;
-        C-?) echo "Ctrl+${1#C-}" ;;
+        # Uppercase the letter: VHS's canonical chord form is `Ctrl+N`.
+        C-?) echo "Ctrl+$(printf '%s' "${1#C-}" | tr '[:lower:]' '[:upper:]')" ;;
         *) return 1 ;;
     esac
 }
@@ -325,6 +342,23 @@ step_wait_state() {
         sleep 0.2
     done
     e2e_die "timed out waiting for hook_state=$want (last: '$(e2e_hook_state)')"
+}
+
+# Resolve E2E_SESSION_ID for a session the *steps* created through the TUI (a
+# SCENARIO_PRECREATE=0 wizard flow), so step_wait_state / CLI probes can
+# address it. Test mode only — a demo has no DB probe (mirrors
+# step_wait_state), and the id is only meaningful to asserts anyway.
+step_resolve_session() {
+    local name="$1" timeout="${2:-15}" id=""
+    [ "$E2E_MODE" = "test" ] || return 0
+    for _ in $(seq 1 "$((timeout * 5))"); do
+        id="$(friring-cli --json session list 2>/dev/null \
+            | jq -r --arg n "$name" '[.[] | select(.name == $n)] | first | .id // empty')"
+        [ -n "$id" ] && break
+        sleep 0.2
+    done
+    [ -n "$id" ] || e2e_die "session '$name' never appeared in the DB" || return 1
+    E2E_SESSION_ID="$id"
 }
 
 # ---------------------------------------------------------------------------

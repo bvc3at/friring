@@ -1,0 +1,34 @@
+{
+  "responses": [
+    {
+      "name": "ambient",
+      "ambient": true,
+      "match": { "modelContains": "haiku" },
+      "reply": { "text": "ok" }
+    },
+    {
+      "name": "workspace-write",
+      "match": { "promptContains": "hello-workspace.txt", "hasToolResult": false },
+      "delayMs": 100,
+      "reply": {
+        "text": "Writing hello-workspace.txt through the workspace symlink.",
+        "toolUse": {
+          "id": "toolu_e2e_named_ws_1",
+          "name": "Write",
+          "input": {
+            "file_path": "{{ROOT}}/named-ws/ws/hello-workspace.txt",
+            "content": "Hello from the named workspace!\n"
+          }
+        }
+      }
+    },
+    {
+      "name": "after-workspace-write",
+      "match": { "toolResultFor": "toolu_e2e_named_ws_1" },
+      "delayMs": 150,
+      "reply": {
+        "text": "NAMED-WS-DONE — the file was written through the named workspace's symlink."
+      }
+    }
+  ]
+}
