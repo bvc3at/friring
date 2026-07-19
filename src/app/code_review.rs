@@ -2548,6 +2548,7 @@ impl App {
             }
             KeyCode::Char('r') => self.cr_toggle_reviewed(false),
             KeyCode::Char('R') => self.cr_toggle_reviewed(true),
+            KeyCode::F(5) => self.cr_reload(),
             KeyCode::Char('o') => self.cr_cycle_filter(),
             // `/` searches the diff: open the find sub-mode and drop into the
             // diff pane, which the search input owns.
