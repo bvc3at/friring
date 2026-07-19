@@ -976,6 +976,15 @@ the file/hunk reviewed mark, and `Esc` closes the review
 diff pane). Clicking a row jumps the diff (`ClickAction::ReviewFile` →
 `cr_jump_to_file`).
 
+**Comment navigation (`(` / `)` / `@`).** `)`/`(` jump to the next/previous
+comment row across files, wrapping — the jump is **fold-independent**
+(`comment_positions` orders comments without regard to folding), so a
+comment inside a folded reviewed file is reached by unfolding that file
+first (via the fold override, leaving its reviewed mark alone). `@` opens
+an all-comments popup (the target-picker overlay pattern): one row per
+comment (`C<id> [Class] <file>:<line> — body head`), ↑/↓ + Enter jumps,
+Esc closes.
+
 **File filter (`o`, both panes).** Cycles `All → Unreviewed → Commented`
 (`ReviewFilter`), narrowing the tree **and** the `}`/`{` file jumps — the
 diff body always shows every file, so filtering never changes what "the

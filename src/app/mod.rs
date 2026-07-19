@@ -13875,6 +13875,68 @@ mod tests {
         );
     }
 
+    /// `(`/`)` step comment rows across files, wrapping, and reach a comment
+    /// hidden inside a folded (reviewed) file by unfolding it; `@` opens the
+    /// popup and Enter jumps to the chosen comment.
+    #[test]
+    fn review_comment_navigation_wraps_and_unfolds() {
+        use crate::session::review::{Classification, CommentAnchor, ReviewComment, Side};
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let mut state = code_review::CodeReviewState::for_test(sid, 2);
+        let comment = |id: i64, file: &str| ReviewComment {
+            id,
+            session_id: sid,
+            anchor: CommentAnchor::Line {
+                file: file.into(),
+                side: Side::New,
+                line: 1,
+            },
+            classification: Classification::Note,
+            body: format!("c{id}"),
+            created_at: 0,
+            updated_at: 0,
+        };
+        state.comments = vec![comment(1, "src/f0.rs"), comment(2, "src/f1.rs")];
+        // f1 is reviewed → folded, so its comment row is hidden until a jump
+        // targets it.
+        state.reviewed_files.insert("src/f1.rs".into());
+        state.rebuild_rows();
+        app.code_reviews.insert(sid, state);
+
+        // From the top: `)` lands on C1, then C2 (unfolding f1), then wraps to C1.
+        app.cr_jump_comment(true);
+        assert_eq!(app.code_reviews[&sid].selected_comment_id(), Some(1));
+        app.cr_jump_comment(true);
+        assert_eq!(app.code_reviews[&sid].selected_comment_id(), Some(2));
+        assert!(
+            !app.code_reviews[&sid].is_file_folded("src/f1.rs"),
+            "the jump unfolded the reviewed file"
+        );
+        app.cr_jump_comment(true);
+        assert_eq!(
+            app.code_reviews[&sid].selected_comment_id(),
+            Some(1),
+            "wraps past the end"
+        );
+        // `(` steps back (wrapping to the last).
+        app.cr_jump_comment(false);
+        assert_eq!(app.code_reviews[&sid].selected_comment_id(), Some(2));
+
+        // `@` popup: entries in display order, Enter jumps.
+        app.focus = InputFocus::CodeReview;
+        app.cr_open_comment_picker();
+        {
+            let cr = app.code_reviews.get_mut(&sid).unwrap();
+            let picker = cr.comment_picker.as_ref().unwrap();
+            assert_eq!(picker.entries, vec![1, 2]);
+        }
+        app.handle_code_review_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        app.handle_code_review_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.code_reviews[&sid].comment_picker.is_none());
+        assert_eq!(app.code_reviews[&sid].selected_comment_id(), Some(1));
+    }
+
     /// Toggling a reviewed mark stores the current semantic fingerprint, so
     /// the next build can validate it.
     #[test]

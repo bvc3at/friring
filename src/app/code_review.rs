@@ -156,6 +156,20 @@ pub(crate) struct ReviewSearch {
     pub matches: Vec<usize>,
 }
 
+/// In-view popup listing every comment (`@`), reusing the target-picker
+/// overlay pattern: ↑/↓ select, Enter jumps to the comment, Esc closes.
+pub(crate) struct CommentPickerState {
+    /// Comment ids in display order (see [`CodeReviewState::comment_positions`]).
+    pub entries: Vec<i64>,
+    pub selected: usize,
+}
+
+/// Ordering key of a comment (or the selection) within the review's display
+/// order, fold-independent: `(file, section, hunk, line, seq)` where `section`
+/// ranks header < file-level comments < hunk content, and the summary sorts
+/// last. Lets `(`/`)` step across comments hidden inside folded files.
+pub(crate) type CommentPos = (usize, u8, usize, usize, usize);
+
 /// In-progress comment composition (an in-view sub-mode of the review).
 pub(crate) struct ComposeState {
     pub anchor: CommentAnchor,
@@ -257,6 +271,8 @@ pub(crate) struct CodeReviewState {
     pub search: Option<ReviewSearch>,
     /// Changed-files filter (`o`), scoping the tree + `}`/`{` jumps.
     pub filter: ReviewFilter,
+    /// The open all-comments popup (`@`), if any.
+    pub comment_picker: Option<CommentPickerState>,
 }
 
 impl ReviewTarget {
@@ -454,6 +470,65 @@ impl CodeReviewState {
         (0..self.files.len())
             .filter(|&i| self.file_passes_filter(i))
             .collect()
+    }
+
+    /// Every comment's [`CommentPos`] + id, sorted in display order —
+    /// **fold-independent**, so `(`/`)` and the `@` popup can reach comments
+    /// currently hidden inside a folded file. Comments whose anchor no longer
+    /// resolves in this diff are excluded (they have no row to jump to).
+    pub(crate) fn comment_positions(&self) -> Vec<(CommentPos, i64)> {
+        let mut out: Vec<(CommentPos, i64)> = Vec::new();
+        for (seq, c) in self.comments.iter().enumerate() {
+            let pos = match &c.anchor {
+                CommentAnchor::File { file } => {
+                    let Some(fi) = self.files.iter().position(|f| &f.path == file) else {
+                        continue;
+                    };
+                    (fi, 1u8, 0, 0, seq + 1)
+                }
+                CommentAnchor::Line { file, .. } => {
+                    let Some(fi) = self.files.iter().position(|f| &f.path == file) else {
+                        continue;
+                    };
+                    let Some((hi, li)) =
+                        self.files[fi].hunks.iter().enumerate().find_map(|(hi, h)| {
+                            h.lines.iter().enumerate().find_map(|(li, l)| {
+                                c.anchor
+                                    .anchors_line(file, l.old_no, l.new_no)
+                                    .then_some((hi, li))
+                            })
+                        })
+                    else {
+                        continue;
+                    };
+                    (fi, 2u8, hi, li + 1, seq + 1)
+                }
+                CommentAnchor::Review => (usize::MAX, 3u8, 0, 0, seq + 1),
+            };
+            out.push((pos, c.id));
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// The selection's [`CommentPos`], comparable against
+    /// [`Self::comment_positions`]. On a comment row it is that comment's own
+    /// position (so a strict compare steps off it); on structural rows it
+    /// sorts just before the row's comments.
+    pub(crate) fn selection_pos(&self) -> CommentPos {
+        match self.rows.get(self.selected) {
+            Some(ReviewRow::FileHeader(fi)) => (*fi, 0, 0, 0, 0),
+            Some(ReviewRow::HunkHeader(fi, hi)) => (*fi, 2, *hi, 0, 0),
+            Some(ReviewRow::Line(fi, hi, li)) => (*fi, 2, *hi, *li + 1, 0),
+            Some(ReviewRow::Comment(id)) | Some(ReviewRow::Summary(id)) => self
+                .comment_positions()
+                .into_iter()
+                .find(|(_, i)| i == id)
+                .map(|(p, _)| p)
+                .unwrap_or((0, 0, 0, 0, 0)),
+            Some(ReviewRow::SummaryHeader) => (usize::MAX, 3, 0, 0, 0),
+            _ => (0, 0, 0, 0, 0),
+        }
     }
 
     /// Rebuild [`Self::rows`] from the diff + loaded comments + marks. A folded
@@ -708,6 +783,7 @@ impl App {
             target_picker: None,
             search: None,
             filter: ReviewFilter::default(),
+            comment_picker: None,
         };
         // Install the loading state (the pane opens instantly with a
         // "Building diff…" placeholder), load comments + marks through the
@@ -1581,6 +1657,128 @@ impl App {
         }
     }
 
+    /// Jump to the previous/next comment row (`(` / `)`), wrapping across the
+    /// whole review and unfolding a folded file when its comment is the
+    /// target.
+    pub(crate) fn cr_jump_comment(&mut self, forward: bool) {
+        let Some(cr) = self.active_review() else {
+            return;
+        };
+        let positions = cr.comment_positions();
+        if positions.is_empty() {
+            self.set_info("No comments yet");
+            return;
+        }
+        let sel = cr.selection_pos();
+        let target = if forward {
+            positions
+                .iter()
+                .find(|(p, _)| *p > sel)
+                .or_else(|| positions.first())
+        } else {
+            positions
+                .iter()
+                .rev()
+                .find(|(p, _)| *p < sel)
+                .or_else(|| positions.last())
+        };
+        if let Some(&(_, id)) = target {
+            self.cr_reveal_comment(id);
+        }
+    }
+
+    /// Select comment `id`'s row, unfolding its file first if the fold is
+    /// hiding it (fold state flips via the override so the reviewed mark is
+    /// untouched).
+    pub(crate) fn cr_reveal_comment(&mut self, id: i64) {
+        let Some(cr) = self.active_review_mut() else {
+            return;
+        };
+        if let Some(path) = cr
+            .comment(id)
+            .and_then(|c| c.anchor.file().map(str::to_string))
+        {
+            if cr.is_file_folded(&path) {
+                // Expand: a reviewed file needs the override set, a manually
+                // folded one needs it cleared.
+                if cr.reviewed_files.contains(&path) {
+                    cr.fold_override.insert(path);
+                } else {
+                    cr.fold_override.remove(&path);
+                }
+                cr.rebuild_rows();
+            }
+        }
+        if let Some(pos) = cr
+            .rows
+            .iter()
+            .position(|r| matches!(r, ReviewRow::Comment(i) | ReviewRow::Summary(i) if *i == id))
+        {
+            cr.selected = pos;
+            cr.ensure_visible();
+        }
+    }
+
+    /// Open the all-comments popup (`@`) — the review-wide comment index.
+    pub(crate) fn cr_open_comment_picker(&mut self) {
+        let Some(cr) = self.active_review_mut() else {
+            return;
+        };
+        let entries: Vec<i64> = cr
+            .comment_positions()
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect();
+        if entries.is_empty() {
+            self.set_info("No comments yet");
+            return;
+        }
+        // Pre-select the comment under the cursor when there is one.
+        let selected = cr
+            .selected_comment_id()
+            .and_then(|id| entries.iter().position(|&e| e == id))
+            .unwrap_or(0);
+        cr.comment_picker = Some(CommentPickerState { entries, selected });
+    }
+
+    /// Key handling while the all-comments popup is open.
+    fn handle_comment_picker_key(&mut self, code: KeyCode) {
+        let chosen = {
+            let Some(cr) = self.active_review_mut() else {
+                return;
+            };
+            let Some(picker) = cr.comment_picker.as_mut() else {
+                return;
+            };
+            let len = picker.entries.len();
+            match code {
+                KeyCode::Esc => {
+                    cr.comment_picker = None;
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if len > 0 {
+                        picker.selected = (picker.selected + 1).min(len - 1);
+                    }
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    picker.selected = picker.selected.saturating_sub(1);
+                    None
+                }
+                KeyCode::Enter => {
+                    let id = picker.entries.get(picker.selected).copied();
+                    cr.comment_picker = None;
+                    id
+                }
+                _ => None,
+            }
+        };
+        if let Some(id) = chosen {
+            self.cr_reveal_comment(id);
+        }
+    }
+
     /// Cycle the changed-files filter (`o`): All → Unreviewed → Commented.
     pub(crate) fn cr_cycle_filter(&mut self) {
         let Some(cr) = self.active_review_mut() else {
@@ -1742,12 +1940,20 @@ impl App {
             return false;
         }
 
-        // Sub-modes capture all keys: the target picker, then the compose box.
+        // Sub-modes capture all keys: the target picker, the comment popup,
+        // then the compose box.
         if self
             .active_review()
             .is_some_and(|cr| cr.target_picker.is_some())
         {
             self.handle_target_picker_key(code);
+            return true;
+        }
+        if self
+            .active_review()
+            .is_some_and(|cr| cr.comment_picker.is_some())
+        {
+            self.handle_comment_picker_key(code);
             return true;
         }
         let composing = self.active_review().is_some_and(|cr| cr.compose.is_some());
@@ -1805,6 +2011,11 @@ impl App {
             KeyCode::BackTab | KeyCode::Char('{') => self.cr_jump_file(false),
             KeyCode::Char(']') => self.cr_jump_hunk(true),
             KeyCode::Char('[') => self.cr_jump_hunk(false),
+            // Comment navigation: `(`/`)` step comments (wrapping, unfolding),
+            // `@` opens the all-comments popup.
+            KeyCode::Char(')') => self.cr_jump_comment(true),
+            KeyCode::Char('(') => self.cr_jump_comment(false),
+            KeyCode::Char('@') => self.cr_open_comment_picker(),
             // Horizontal scroll of the body (gutter stays pinned). `h`/`l` are
             // free in the diff pane (they mean "open" only in the files pane).
             KeyCode::Left | KeyCode::Char('h') => self.cr_scroll_h(-8),
@@ -2470,6 +2681,7 @@ impl CodeReviewState {
             target_picker: None,
             search: None,
             filter: ReviewFilter::default(),
+            comment_picker: None,
         };
         s.rebuild_rows();
         s
@@ -2542,6 +2754,7 @@ mod tests {
             target_picker: None,
             search: None,
             filter: ReviewFilter::default(),
+            comment_picker: None,
         };
         s.rebuild_rows();
         s

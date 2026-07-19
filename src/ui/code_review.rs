@@ -115,6 +115,9 @@ pub(crate) fn render(
     } else if state.target_picker.is_some() {
         targets = render_target_picker(frame, diff_area, state);
         (Vec::new(), None)
+    } else if state.comment_picker.is_some() {
+        render_comment_picker(frame, diff_area, state);
+        (Vec::new(), None)
     } else {
         render_rows(frame, diff_area, state)
     };
@@ -184,6 +187,77 @@ fn render_target_picker(frame: &mut Frame, area: Rect, state: &CodeReviewState) 
     }
     frame.render_widget(Paragraph::new(lines), area);
     hits
+}
+
+/// Render the all-comments popup (`@`) in place of the diff body, mirroring
+/// [`render_target_picker`]: one row per comment — `C<id> [Class]
+/// <file>:<line> — <body head>` — with the selection windowed into view.
+fn render_comment_picker(frame: &mut Frame, area: Rect, state: &CodeReviewState) {
+    let Some(picker) = state.comment_picker.as_ref() else {
+        return;
+    };
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        " Comments  (↑/↓ select · Enter jump · Esc)",
+        Style::default().fg(Theme::text_muted()),
+    ))];
+    let height = (area.height as usize).saturating_sub(1);
+    // Window the entries so the selection stays visible in a long list.
+    let start = picker
+        .selected
+        .saturating_sub(height.saturating_sub(1))
+        .min(picker.entries.len().saturating_sub(height.max(1)));
+    for (i, id) in picker.entries.iter().enumerate().skip(start).take(height) {
+        let selected = i == picker.selected;
+        let marker = if selected { "▸ " } else { "  " };
+        let (loc, class, head) = match state.comment(*id) {
+            Some(c) => {
+                let loc = match &c.anchor {
+                    CommentAnchor::Line { file, side, line } => {
+                        format!("{file}:{}:{line}", side.as_str())
+                    }
+                    CommentAnchor::File { file } => format!("{file} (file)"),
+                    CommentAnchor::Review => "summary".to_string(),
+                };
+                let head: String = c
+                    .body
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect();
+                (loc, c.classification, head)
+            }
+            None => ("?".to_string(), Classification::default(), String::new()),
+        };
+        let style = if selected {
+            Style::default()
+                .fg(Theme::selection_fg())
+                .bg(Theme::selection_bg())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Theme::text_primary())
+        };
+        let badge_style = if selected {
+            style
+        } else {
+            Style::default()
+                .fg(class_color(class))
+                .add_modifier(Modifier::BOLD)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker}C{id} "), style),
+            Span::styled(format!("[{}] ", class.label()), badge_style),
+            Span::styled(
+                truncate(
+                    &format!("{loc} — {head}"),
+                    (area.width as usize).saturating_sub(12),
+                ),
+                style,
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Render the windowed diff/comment rows + scrollbar. Returns row hitboxes
@@ -1425,6 +1499,7 @@ mod tests {
             target_picker: None,
             search: None,
             filter: crate::app::code_review::ReviewFilter::default(),
+            comment_picker: None,
         };
         s.rebuild_rows();
         s

@@ -82,6 +82,9 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
 - **Changed-files filter (`o`).** `All → Unreviewed → Commented`, scoping
   the tree and the `}`/`{` jumps, with auto-advance to the next unreviewed
   file on marking.
+- **Comment navigation.** `(`/`)` jump prev/next comment (wrapping,
+  unfolding folded files); `@` opens an all-comments popup with `C<id>`
+  rows.
 
 #### Agent activity view (F9)
 
