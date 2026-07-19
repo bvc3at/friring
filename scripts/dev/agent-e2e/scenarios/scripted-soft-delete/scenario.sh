@@ -42,6 +42,18 @@ del_wait_listed() {
     e2e_die "session $sid never (re)appeared in the session list"
 }
 
+# Bounded wait for the restore modal to be GONE. A soft-delete restore closes
+# the modal itself; asserting its absence (rather than sending a key that
+# would swallow a stuck-open modal) is what actually catches that regression.
+del_wait_modal_gone() {
+    local tries="$1"
+    for _ in $(seq 1 "$tries"); do
+        e2e_pane | grep -q "Restore Deleted Sessions" || return 0
+        sleep 0.2
+    done
+    e2e_die "restore modal stayed open after Enter (should close itself on restore)"
+}
+
 scenario_steps() {
     # Session A (the precreated $E2E_SCENARIO_NAME) is adopted and ready.
     step_wait_pane "SCRIPTED-READY mode=new" 60
@@ -88,9 +100,10 @@ scenario_steps() {
     step_key Enter
     step_wait_pane "Restored" 15
     del_wait_listed "$E2E_SESSION_ID" 50
-    # The restore closed the modal itself; a leftover one (regression) would
-    # swallow this Esc, and the pane-title wait below would then catch it.
-    step_key Escape
+    # The restore must close the modal on its own — assert its absence rather
+    # than pressing a key that would mask a stuck-open modal (a real
+    # regression this scenario is meant to catch).
+    del_wait_modal_gone 30
 
     # The restored session is active with Terminal focus (restore sets both),
     # so its pane title must render — the session still has a live terminal.

@@ -78,8 +78,12 @@ scenario_steps() {
 }
 
 scenario_assert_effects() {
+    # review-ack keys on the unique saved comment body ("Please fix this line
+    # before merging"), NOT the static "code review" header the export always
+    # emits — so this fires only if the compiled review carried the comment
+    # through to the model, catching a regression that submits an empty review.
     [ "$(journal_matched review-ack)" -ge 1 ] \
-        || e2e_die "review-ack fixture never matched (compiled review never reached the model)"
+        || e2e_die "review-ack fixture never matched (the saved comment never reached the model)"
 }
 
 scenario_assert_ui() {

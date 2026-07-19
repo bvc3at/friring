@@ -8,7 +8,7 @@
     },
     {
       "name": "review-ack",
-      "match": { "promptContains": "code review", "hasToolResult": false },
+      "match": { "promptContains": "Please fix this line before merging", "hasToolResult": false },
       "delayMs": 150,
       "reply": {
         "text": "REVIEW-ACK-FROM-STUB — the compiled review reached the model through a real Claude Code submit."

@@ -43,6 +43,15 @@ adopt_assert_agent_window_alive() {
         || e2e_die "agent window tb-$E2E_SCENARIO_NAME did not survive the TUI quit"
 }
 
+# The agent pane's tmux id (e.g. `%3`). Pane ids are unique for the server's
+# lifetime and never reused, so an unchanged id across re-adoption is proof
+# friring re-attached to the SAME live process rather than killing it and
+# respawning (e.g. a resume) a look-alike replacement.
+adopt_agent_pane_id() {
+    tmux -L friring-dev list-panes -a -F '#{window_name} #{pane_id}' 2>/dev/null \
+        | awk -v w="tb-$E2E_SCENARIO_NAME" '$1 == w { print $2; exit }'
+}
+
 # Relaunch mirrors the harness boot verbatim (same driver socket/session,
 # same 3>&- fd guard) so the second TUI differs from the first in nothing
 # but its start time — adoption, not respawn, explains what it renders.
@@ -64,6 +73,12 @@ scenario_steps() {
     step_wait_state 'done' 60
     step_wait_pane "$SCENARIO_MARKER_ONE" 60
 
+    # Pin the original pane's id while it is unambiguously the first turn's
+    # process; re-adoption must produce the exact same id (see below).
+    E2E_ADOPT_PANE_ID="$(adopt_agent_pane_id)"
+    [ -n "$E2E_ADOPT_PANE_ID" ] \
+        || e2e_die "could not read the agent pane id before quit" || return 1
+
     # Quit the TUI; the driver session dies, the agent pane must not.
     step_key C-q
     adopt_wait_driver_gone
@@ -75,19 +90,39 @@ scenario_steps() {
     step_wait_pane "$E2E_SCENARIO_NAME" 30
     step_wait_pane "$SCENARIO_MARKER_ONE" 30
 
+    # Persistence proof (not just "a pane exists"): the re-adopted pane is the
+    # SAME object, so friring re-attached rather than respawning a resume.
+    local now
+    now="$(adopt_agent_pane_id)"
+    [ "$now" = "$E2E_ADOPT_PANE_ID" ] \
+        || e2e_die "agent pane id changed across re-adoption ($E2E_ADOPT_PANE_ID -> '$now'): pane was respawned, not re-adopted" \
+        || return 1
+
+    # Force a distinguishable baseline BEFORE the second turn: hook_state is
+    # still 'done' from turn one, so a bare post-turn 'done' wait would pass
+    # trivially and prove nothing about the re-adopted pane's hooks. From
+    # 'idle', the turn below must drive a fresh working->done, which only fires
+    # if the adopted pane's status hooks are still live.
+    friring-cli session signal --state idle --session "$E2E_SESSION_ID" >/dev/null \
+        || e2e_die "baseline idle signal failed" || return 1
+
     # Adopted sessions boot with Terminal focus, so plain typing lands in
     # the (still-live) agent PTY; its hook env was frozen at spawn, so the
     # second turn's signals still attribute to this session.
     step_wait_pane "$SCENARIO_AGENT_READY" 30
     step_type "Say the second adoption turn phrase."
     step_key Enter
+    step_wait_state 'working|done' 30
     step_wait_pane "$SCENARIO_MARKER_TWO" 60
     step_wait_state 'done' 30
 }
 
 scenario_assert_effects() {
-    [ "$(journal_matched first-adoption)" -ge 1 ] \
-        || e2e_die "first-adoption fixture never matched" || return 1
+    # Exactly one first-turn model call: the re-adoption replayed the pane
+    # from scrollback with no fresh model round-trip (a respawn/resume would
+    # have re-called it).
+    [ "$(journal_matched first-adoption)" -eq 1 ] \
+        || e2e_die "first-adoption matched $(journal_matched first-adoption) times, want exactly 1" || return 1
     [ "$(journal_matched second-adoption)" -ge 1 ] \
         || e2e_die "second-adoption fixture never matched (pane not live after re-adopt)"
 }

@@ -63,11 +63,14 @@ scenario_steps() {
     step_key Escape
     step_wait_pane "Sent task to $E2E_SCENARIO_NAME" 15
 
-    # The seeded prompt landed on the scripted agent's stdin (bracketed
-    # paste + Enter; each prompt line echoes as its own GOT: line): the
-    # header names the task id, and the closing self-service hint tells the
-    # agent how to mark it done.
-    step_wait_pane "working on Friring task #$E2E_TASK_ID" 30
+    # The seeded prompt was CONSUMED by the agent, not merely echoed by the
+    # tty: the header line must come back on a `GOT:` line (the scripted agent
+    # only emits those after reading a line from stdin). Since it is a line
+    # reader, one GOT: echo proves the whole multi-line paste was received —
+    # so the self-service hint (deep in a long, pane-wrapped line where a
+    # GOT: prefix can't be pinned on one captured row) is then a plain content
+    # check that the prompt actually carried it.
+    step_wait_pane "GOT:.*working on Friring task #$E2E_TASK_ID" 30
     step_wait_pane "task edit $E2E_TASK_ID --status done" 30
 
     # The Send trigger advanced todo -> in_progress: DB first, then the
