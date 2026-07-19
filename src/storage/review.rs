@@ -15,6 +15,11 @@ use super::Database;
 /// PKs can't rely on NULL uniqueness, so a real value is used).
 const WHOLE_FILE_HUNK: i64 = -1;
 
+/// One persisted "reviewed" mark: `(file_path, hunk_index, fingerprint)`.
+/// `hunk_index = None` means the whole file; a `None` fingerprint is a legacy
+/// (pre-v41) row awaiting backfill.
+pub type ReviewMarkRow = (String, Option<usize>, Option<String>);
+
 /// Decompose a [`CommentAnchor`] into the three nullable columns it persists as.
 fn anchor_columns(anchor: &CommentAnchor) -> (Option<String>, Option<&'static str>, Option<i64>) {
     match anchor {
@@ -131,12 +136,17 @@ impl Database {
     }
 
     /// Toggle a file/hunk "reviewed" mark. `hunk_index = None` marks the whole
-    /// file. Returns the new state (`true` = now reviewed).
+    /// file. `fingerprint` is the semantic content hash of what is being
+    /// marked ([`crate::session::review::file_fingerprint`] /
+    /// [`crate::session::review::hunk_fingerprint`]), stored so a later diff
+    /// rebuild can detect the content changed under the mark. Returns the new
+    /// state (`true` = now reviewed).
     pub fn toggle_review_mark(
         &self,
         session_id: SessionId,
         file_path: &str,
         hunk_index: Option<usize>,
+        fingerprint: &str,
     ) -> rusqlite::Result<bool> {
         let sid = session_id.to_string();
         let idx = hunk_index.map(|h| h as i64).unwrap_or(WHOLE_FILE_HUNK);
@@ -159,23 +169,25 @@ impl Database {
         } else {
             let now = current_time_millis() as i64;
             self.conn.execute(
-                "INSERT INTO review_marks (session_id, file_path, hunk_index, created_at) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![sid, file_path, idx, now],
+                "INSERT INTO review_marks \
+                 (session_id, file_path, hunk_index, created_at, fingerprint) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![sid, file_path, idx, now, fingerprint],
             )?;
             Ok(true)
         }
     }
 
-    /// List a session's "reviewed" marks as `(file_path, hunk_index)` pairs
-    /// where `hunk_index = None` means the whole file.
+    /// List a session's "reviewed" marks as `(file_path, hunk_index,
+    /// fingerprint)` where `hunk_index = None` means the whole file and a
+    /// `None` fingerprint is a legacy (pre-v41) row.
     pub fn list_review_marks(
         &self,
         session_id: SessionId,
-    ) -> rusqlite::Result<Vec<(String, Option<usize>)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT file_path, hunk_index FROM review_marks WHERE session_id = ?1")?;
+    ) -> rusqlite::Result<Vec<ReviewMarkRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_path, hunk_index, fingerprint FROM review_marks WHERE session_id = ?1",
+        )?;
         let rows = stmt.query_map(params![session_id.to_string()], |row| {
             let file: String = row.get(0)?;
             let idx: i64 = row.get(1)?;
@@ -184,9 +196,65 @@ impl Database {
             } else {
                 Some(idx.max(0) as usize)
             };
-            Ok((file, hunk))
+            Ok((file, hunk, row.get(2)?))
         })?;
         rows.collect()
+    }
+
+    /// Backfill a mark's fingerprint (a legacy NULL row observed by the
+    /// reconciliation pass — treated as valid once, then pinned).
+    pub fn set_review_mark_fingerprint(
+        &self,
+        session_id: SessionId,
+        file_path: &str,
+        hunk_index: Option<usize>,
+        fingerprint: &str,
+    ) -> rusqlite::Result<()> {
+        let idx = hunk_index.map(|h| h as i64).unwrap_or(WHOLE_FILE_HUNK);
+        self.conn.execute(
+            "UPDATE review_marks SET fingerprint = ?4 \
+             WHERE session_id = ?1 AND file_path = ?2 AND hunk_index = ?3",
+            params![session_id.to_string(), file_path, idx, fingerprint],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a single mark — the reconciliation pass removing a stale mark
+    /// whose content changed (deleted for real, not hidden, so it can't
+    /// resurrect on the next build).
+    pub fn delete_review_mark(
+        &self,
+        session_id: SessionId,
+        file_path: &str,
+        hunk_index: Option<usize>,
+    ) -> rusqlite::Result<()> {
+        let idx = hunk_index.map(|h| h as i64).unwrap_or(WHOLE_FILE_HUNK);
+        self.conn.execute(
+            "DELETE FROM review_marks \
+             WHERE session_id = ?1 AND file_path = ?2 AND hunk_index = ?3",
+            params![session_id.to_string(), file_path, idx],
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Database {
+    /// Insert a mark with a NULL fingerprint — the pre-v41 row shape — so the
+    /// reconciliation pass's legacy branch is testable through the public API.
+    pub fn insert_review_mark_without_fingerprint(
+        &self,
+        session_id: SessionId,
+        file_path: &str,
+        hunk_index: Option<usize>,
+    ) -> rusqlite::Result<()> {
+        let idx = hunk_index.map(|h| h as i64).unwrap_or(WHOLE_FILE_HUNK);
+        self.conn.execute(
+            "INSERT INTO review_marks (session_id, file_path, hunk_index, created_at) \
+             VALUES (?1, ?2, ?3, 0)",
+            params![session_id.to_string(), file_path, idx],
+        )?;
+        Ok(())
     }
 }
 
@@ -255,19 +323,49 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let sid = SessionId::default();
 
-        assert!(db.toggle_review_mark(sid, "a.rs", None).unwrap()); // file reviewed
-        assert!(db.toggle_review_mark(sid, "a.rs", Some(2)).unwrap()); // hunk 2 reviewed
+        assert!(db.toggle_review_mark(sid, "a.rs", None, "fp-file").unwrap()); // file reviewed
+        assert!(db
+            .toggle_review_mark(sid, "a.rs", Some(2), "fp-h2")
+            .unwrap()); // hunk 2 reviewed
         let mut marks = db.list_review_marks(sid).unwrap();
         marks.sort();
         assert_eq!(
             marks,
-            vec![("a.rs".to_string(), None), ("a.rs".to_string(), Some(2))]
+            vec![
+                ("a.rs".to_string(), None, Some("fp-file".to_string())),
+                ("a.rs".to_string(), Some(2), Some("fp-h2".to_string())),
+            ]
         );
 
         // Toggling the file mark again clears just it.
-        assert!(!db.toggle_review_mark(sid, "a.rs", None).unwrap());
+        assert!(!db.toggle_review_mark(sid, "a.rs", None, "fp-file").unwrap());
         let marks = db.list_review_marks(sid).unwrap();
-        assert_eq!(marks, vec![("a.rs".to_string(), Some(2))]);
+        assert_eq!(
+            marks,
+            vec![("a.rs".to_string(), Some(2), Some("fp-h2".to_string()))]
+        );
+    }
+
+    #[test]
+    fn mark_fingerprint_backfill_and_targeted_delete() {
+        let db = Database::open_in_memory().unwrap();
+        let sid = SessionId::default();
+        db.toggle_review_mark(sid, "a.rs", None, "old-fp").unwrap();
+        db.toggle_review_mark(sid, "a.rs", Some(1), "h1").unwrap();
+
+        // Backfill rewrites only the addressed mark.
+        db.set_review_mark_fingerprint(sid, "a.rs", None, "new-fp")
+            .unwrap();
+        let mut marks = db.list_review_marks(sid).unwrap();
+        marks.sort();
+        assert_eq!(marks[0].2.as_deref(), Some("new-fp"));
+        assert_eq!(marks[1].2.as_deref(), Some("h1"));
+
+        // Targeted delete removes only the addressed mark.
+        db.delete_review_mark(sid, "a.rs", Some(1)).unwrap();
+        let marks = db.list_review_marks(sid).unwrap();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].1, None);
     }
 
     #[test]

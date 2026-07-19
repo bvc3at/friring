@@ -15,7 +15,8 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use std::path::{Path, PathBuf};
 
 use crate::session::review::{
-    pair_hunk, parse_unified_diff, Classification, CommentAnchor, DiffFile, ReviewComment, Side,
+    file_fingerprint, hunk_fingerprint, pair_hunk, parse_unified_diff, Classification,
+    CommentAnchor, DiffFile, ReviewComment, Side,
 };
 use crate::session::{HostDef, SessionId};
 
@@ -75,6 +76,8 @@ pub(crate) enum ReviewButton {
     Target,
     /// Open the find-in-diff search.
     Find,
+    /// Rebuild the diff for the current target (`F5`).
+    Reload,
 }
 
 /// One rendered row in the flattened review view (diff + interleaved comments +
@@ -148,6 +151,12 @@ pub(crate) enum ReviewBuildKind {
     },
     /// A target switch on an already-open review (repos/commits unchanged).
     Retarget {
+        target: ReviewTarget,
+        files: Vec<DiffFile>,
+    },
+    /// A manual reload (`F5`) of the current target: the same rebuild as a
+    /// retarget, but selection/scroll are preserved by file instead of reset.
+    Reload {
         target: ReviewTarget,
         files: Vec<DiffFile>,
     },
@@ -664,9 +673,15 @@ impl App {
             }
             TaskPoll::Done(result) => {
                 self.note_slow_op("code_review_build", result.elapsed_ms);
-                let Some(cr) = self.code_reviews.get_mut(&result.session_id) else {
+                let sid = result.session_id;
+                let Some(cr) = self.code_reviews.get_mut(&sid) else {
                     return;
                 };
+                // A reload preserves position by file: remember where the
+                // selection was so it can be re-anchored after the new rows.
+                let prev_path = cr.selected_file_path();
+                let (prev_selected, prev_scroll) = (cr.selected, cr.scroll);
+                let is_reload = matches!(result.kind, ReviewBuildKind::Reload { .. });
                 match result.kind {
                     ReviewBuildKind::Open {
                         repos,
@@ -685,9 +700,48 @@ impl App {
                         cr.selected = 0;
                         cr.scroll = 0;
                     }
+                    ReviewBuildKind::Reload { target, files } => {
+                        cr.target = target;
+                        cr.files = files;
+                        cr.selected = prev_selected;
+                        cr.scroll = prev_scroll;
+                    }
                 }
                 cr.loading = false;
                 cr.rebuild_rows();
+                // Every completed build reconciles the persisted "reviewed"
+                // marks against the fresh diff before the marks are (re)loaded
+                // into the view, so a stale ✓ never survives a rebuild.
+                let cleared = self.reconcile_review_marks(sid);
+                self.reload_review_data_for(sid);
+                // A reload keeps the user's place (retarget/open reset instead):
+                // if the row under the cursor vanished or now belongs to another
+                // file, fall back to the previously selected file's header.
+                if is_reload {
+                    if let Some(cr) = self.code_reviews.get_mut(&sid) {
+                        let strayed = cr.selected >= cr.rows.len()
+                            || (prev_path.is_some() && cr.selected_file_path() != prev_path);
+                        if strayed {
+                            if let Some(pos) = prev_path.as_deref().and_then(|path| {
+                                cr.rows.iter().position(|r| {
+                                    matches!(r, ReviewRow::FileHeader(fi)
+                                        if cr.files.get(*fi).is_some_and(|f| f.path == path))
+                                })
+                            }) {
+                                cr.selected = pos;
+                                cr.scroll = pos.min(cr.scroll);
+                            } else {
+                                cr.selected = cr.selected.min(cr.rows.len().saturating_sub(1));
+                            }
+                        }
+                    }
+                }
+                if cleared > 0 {
+                    let noun = if cleared == 1 { "mark" } else { "marks" };
+                    self.set_info(format!(
+                        "{cleared} reviewed {noun} cleared (content changed)"
+                    ));
+                }
                 self.metrics.bump(|p| &mut p.review_builds_applied);
                 self.request_redraw();
             }
@@ -696,19 +750,28 @@ impl App {
 
     /// Reload comments + marks from the DB into the open review and rebuild rows.
     pub(crate) fn reload_review_data(&mut self) {
-        self.time_op("code_review_reload", |s| s.reload_review_data_inner());
-    }
-
-    fn reload_review_data_inner(&mut self) {
-        let Some(cr) = self.active_review() else {
+        let Some(sid) = self.active_review().map(|cr| cr.session_id) else {
             return;
         };
-        let sid = cr.session_id;
+        self.reload_review_data_for(sid);
+    }
+
+    /// [`Self::reload_review_data`] for an explicit session — a background
+    /// build result may land while another session is active, and its review
+    /// must still pick up the reconciled marks.
+    pub(crate) fn reload_review_data_for(&mut self, sid: SessionId) {
+        self.time_op("code_review_reload", |s| s.reload_review_data_inner(sid));
+    }
+
+    fn reload_review_data_inner(&mut self, sid: SessionId) {
+        if !self.code_reviews.contains_key(&sid) {
+            return;
+        }
         let comments = self.db.list_review_comments(sid).unwrap_or_default();
         let marks = self.db.list_review_marks(sid).unwrap_or_default();
         let mut reviewed_files = HashSet::new();
         let mut reviewed_hunks = HashSet::new();
-        for (file, hunk) in marks {
+        for (file, hunk, _fingerprint) in marks {
             match hunk {
                 None => {
                     reviewed_files.insert(file);
@@ -718,12 +781,50 @@ impl App {
                 }
             }
         }
-        if let Some(cr) = self.active_review_mut() {
+        if let Some(cr) = self.code_reviews.get_mut(&sid) {
             cr.comments = comments;
             cr.reviewed_files = reviewed_files;
             cr.reviewed_hunks = reviewed_hunks;
             cr.rebuild_rows();
         }
+    }
+
+    /// Reconcile the persisted "reviewed" marks of `sid`'s review against its
+    /// freshly built diff. A mark survives iff its stored fingerprint matches
+    /// the recomputed one; a `NULL` fingerprint (a pre-v41 row) is treated as
+    /// valid once and backfilled; a mismatch means the content changed under
+    /// the ✓, so the mark is **deleted from the DB** (not just hidden — it must
+    /// not resurrect on the next build). Marks on files absent from the current
+    /// target's diff are left alone (they may belong to another target).
+    /// Returns how many marks were cleared, for the caller's summary toast.
+    fn reconcile_review_marks(&mut self, sid: SessionId) -> usize {
+        let Some(cr) = self.code_reviews.get(&sid) else {
+            return 0;
+        };
+        let marks = self.db.list_review_marks(sid).unwrap_or_default();
+        let mut cleared = 0usize;
+        for (file, hunk, stored) in marks {
+            let Some(f) = cr.files.iter().find(|f| f.path == file) else {
+                continue;
+            };
+            // A hunk index past the fresh hunk list means the content changed
+            // shape entirely — no fingerprint can match.
+            let current = match hunk {
+                None => Some(file_fingerprint(f)),
+                Some(h) => f.hunks.get(h).map(hunk_fingerprint),
+            };
+            match (stored, current) {
+                (None, Some(fp)) => {
+                    let _ = self.db.set_review_mark_fingerprint(sid, &file, hunk, &fp);
+                }
+                (Some(a), Some(b)) if a == b => {}
+                _ => {
+                    let _ = self.db.delete_review_mark(sid, &file, hunk);
+                    cleared += 1;
+                }
+            }
+        }
+        cleared
     }
 
     pub(crate) fn close_code_review(&mut self) {
@@ -950,6 +1051,35 @@ impl App {
             let _ = tx.send(build_review_retarget(
                 session_id, repos, host, multi, target,
             ));
+        });
+    }
+
+    /// Manually rebuild the diff for the **current** target (`F5` / `Ctrl+R` /
+    /// the `Reload` footer button) — the friring analog of revdiff's `R`.
+    /// Runs on the shared build worker; the completed build preserves the
+    /// selection by file and reconciles stale reviewed marks
+    /// (see [`App::poll_review_build`]).
+    pub(crate) fn cr_reload(&mut self) {
+        let Some(cr) = self.active_review() else {
+            return;
+        };
+        if self.review_build.in_progress() {
+            self.set_info("A code-review build is already in progress…");
+            return;
+        }
+        let session_id = cr.session_id;
+        let repos = cr.repos.clone();
+        let host = cr.host.clone();
+        let multi = cr.multi;
+        let target = cr.target.clone();
+        if let Some(cr) = self.active_review_mut() {
+            cr.loading = true;
+        }
+        self.request_redraw();
+        self.metrics.bump(|p| &mut p.review_builds_dispatched);
+        let tx = self.review_build.start();
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(build_review_reload(session_id, repos, host, multi, target));
         });
     }
 
@@ -1287,7 +1417,9 @@ impl App {
 
     /// Toggle the "reviewed" mark for the selected file (or its hunk). Resolves
     /// the file from whatever row is selected (line, hunk header, file header, or
-    /// a comment within the file) so it works anywhere inside the file.
+    /// a comment within the file) so it works anywhere inside the file. The
+    /// current semantic fingerprint is stored with the mark so a later rebuild
+    /// can tell whether the content changed under the ✓.
     pub(crate) fn cr_toggle_reviewed(&mut self, hunk_level: bool) {
         let Some(cr) = self.active_review() else {
             return;
@@ -1301,8 +1433,17 @@ impl App {
         let Some(file) = file else {
             return;
         };
+        let fingerprint = cr
+            .files
+            .iter()
+            .find(|f| f.path == file)
+            .map(|f| match hunk {
+                None => file_fingerprint(f),
+                Some(h) => f.hunks.get(h).map(hunk_fingerprint).unwrap_or_default(),
+            })
+            .unwrap_or_default();
         let sid = cr.session_id;
-        if let Err(e) = self.db.toggle_review_mark(sid, &file, hunk) {
+        if let Err(e) = self.db.toggle_review_mark(sid, &file, hunk, &fingerprint) {
             self.set_error(format!("Failed to update reviewed mark: {e}"));
             return;
         }
@@ -1428,6 +1569,7 @@ impl App {
             ReviewButton::ToggleWrap => self.cr_toggle_wrap(),
             ReviewButton::Target => self.cr_open_target_picker(),
             ReviewButton::Find => self.cr_start_search(),
+            ReviewButton::Reload => self.cr_reload(),
         }
     }
 
@@ -1495,12 +1637,14 @@ impl App {
         }
 
         let ctrl = mods.contains(KeyModifiers::CONTROL);
-        // Ctrl+D / Ctrl+U half-page (pager convention). Handled before the guard
-        // below since they are the only Ctrl chords this view acts on.
+        // Ctrl+D / Ctrl+U half-page (pager convention) and Ctrl+R reload.
+        // Handled before the guard below since they are the only Ctrl chords
+        // this view acts on.
         if ctrl {
             match code {
                 KeyCode::Char('d') => self.cr_page(true),
                 KeyCode::Char('u') => self.cr_page(false),
+                KeyCode::Char('r') => self.cr_reload(),
                 _ => {}
             }
             return true;
@@ -1548,6 +1692,10 @@ impl App {
             KeyCode::Char('y') => self.cr_copy_markdown(),
             KeyCode::Char('e') => self.cr_send_to_agent(),
             KeyCode::Char('x') | KeyCode::Delete => self.cr_delete_selected(),
+            // Manual reload of the current target (revdiff's `R`). F5 is
+            // FocusTasks globally, but this pane captures keys first, so the
+            // pager-style reload wins while the review is focused.
+            KeyCode::F(5) => self.cr_reload(),
             KeyCode::Enter => self.cr_enter(),
             _ => {}
         }
@@ -1571,10 +1719,11 @@ impl App {
 
         let ctrl = mods.contains(KeyModifiers::CONTROL);
         if ctrl {
-            // Half-page paging, matching the diff pane's `Ctrl+D`/`Ctrl+U`.
+            // Half-page paging + reload, matching the diff pane's Ctrl chords.
             match code {
                 KeyCode::Char('d') => self.cr_page(true),
                 KeyCode::Char('u') => self.cr_page(false),
+                KeyCode::Char('r') => self.cr_reload(),
                 _ => {}
             }
             return true;
@@ -1727,6 +1876,25 @@ fn build_review_retarget(
         session_id,
         elapsed_ms: start.elapsed().as_millis() as u64,
         kind: ReviewBuildKind::Retarget { target, files },
+    }
+}
+
+/// Off-thread worker for a manual reload: identical diff work to a retarget,
+/// but tagged [`ReviewBuildKind::Reload`] so the apply step preserves the
+/// selection instead of resetting it.
+fn build_review_reload(
+    session_id: SessionId,
+    repos: Vec<ReviewRepo>,
+    host: Option<HostDef>,
+    multi: bool,
+    target: ReviewTarget,
+) -> ReviewBuildResult {
+    let start = std::time::Instant::now();
+    let files = build_files(&repos, &target, host.as_ref(), multi);
+    ReviewBuildResult {
+        session_id,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        kind: ReviewBuildKind::Reload { target, files },
     }
 }
 

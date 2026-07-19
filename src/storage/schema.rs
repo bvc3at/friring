@@ -17,9 +17,11 @@ use rusqlite::Connection;
 /// `review_marks` tables (the native code-review view); v39 scopes
 /// `repo_bookmarks` to a `host` (`''` = local), giving remote targets the
 /// same bookmark memory as local ones; v40 adds `repo_sync_bases` (the
-/// per-repo default base remote for the Ctrl+S worktree sync).
+/// per-repo default base remote for the Ctrl+S worktree sync); v41 adds
+/// `fingerprint` to `review_marks` (the semantic content hash that lets a
+/// diff rebuild drop "reviewed" marks whose file/hunk content changed).
 /// Gaps in the step table are fine (there is no v18 step either).
-pub const SCHEMA_VERSION: u32 = 40;
+pub const SCHEMA_VERSION: u32 = 41;
 
 /// A single migration step: applied when the stored version is below `target`.
 type MigrationStep = (u32, fn(&Connection) -> rusqlite::Result<()>);
@@ -102,6 +104,7 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             file_path   TEXT NOT NULL,
             hunk_index  INTEGER NOT NULL DEFAULT -1,
             created_at  INTEGER NOT NULL,
+            fingerprint TEXT,
             PRIMARY KEY (session_id, file_path, hunk_index)
         );
 
@@ -293,6 +296,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         (38, migrate_v38_code_review),
         (39, migrate_v39_bookmark_host),
         (40, migrate_v40_repo_sync_bases),
+        (41, migrate_v41_review_mark_fingerprint),
     ];
 
     for &(target, step) in steps {
@@ -1180,6 +1184,16 @@ fn migrate_v40_repo_sync_bases(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// v40 → v41: add `review_marks.fingerprint` — the semantic content hash
+/// (`session::review::{file,hunk}_fingerprint`) captured when a mark is
+/// toggled. On every completed review build a stored mark survives iff its
+/// fingerprint still matches the fresh diff; NULL (rows from before v41) is
+/// treated as valid once and backfilled. Fresh v41 databases already have the
+/// column from `initialize` and skip this step.
+fn migrate_v41_review_mark_fingerprint(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "review_marks", "fingerprint", "TEXT")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1368,6 +1382,47 @@ mod tests {
             .exists([])
             .unwrap();
         assert!(has_col, "force_deleted column should be added at v37");
+
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn migrate_from_v40_adds_review_mark_fingerprint() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Minimal v40 state: review_marks without the fingerprint column, with
+        // one existing (legacy) mark that must survive the migration.
+        conn.execute_batch(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO metadata (key, value) VALUES ('schema_version', '40');
+             CREATE TABLE review_marks (
+                session_id  TEXT NOT NULL,
+                file_path   TEXT NOT NULL,
+                hunk_index  INTEGER NOT NULL DEFAULT -1,
+                created_at  INTEGER NOT NULL,
+                PRIMARY KEY (session_id, file_path, hunk_index));
+             INSERT INTO review_marks VALUES ('s1', 'a.rs', -1, 0);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        // Legacy rows keep a NULL fingerprint (treated as valid-once and
+        // backfilled by the app on the next build).
+        let fp: Option<String> = conn
+            .query_row(
+                "SELECT fingerprint FROM review_marks WHERE session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fp, None, "existing marks survive with NULL fingerprint");
 
         let version: String = conn
             .query_row(

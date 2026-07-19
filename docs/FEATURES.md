@@ -901,6 +901,25 @@ view: switching to another session hides it and switching back restores
 it open + focused (`sync_review_focus` keeps the central-pane focus
 aligned). The file-viewer column toggles with it.
 
+**Manual reload (`F5` / `Ctrl+R` / the `Reload` footer button).** The diff
+is a snapshot; after the agent edits (the review → agent → re-review loop),
+`F5` rebuilds the **current** target through the same background build
+worker (`App::cr_reload`, refused with the usual toast while a build is in
+flight). Unlike a retarget — which resets to the top — a reload preserves
+your place: the exact row when it still belongs to the same file, else the
+previously selected file's header.
+
+**Reviewed marks self-invalidate.** Every mark stores a **semantic
+fingerprint** of what was marked (`session::review::{file,hunk}_fingerprint`
+— an FNV-1a hash of the `+`/`-` line contents *with signs*, excluding `@@`
+positions and context, so a pure line-shift from an unrelated edit above
+keeps the mark while a content change drops it). On every completed build
+(open, retarget, reload) each stored mark is compared against the fresh
+diff: mismatches are **deleted** (not hidden) and summarized in one toast
+(`"3 reviewed marks cleared (content changed)"`); pre-v41 rows with no
+fingerprint are honored once and backfilled (`review_marks.fingerprint`,
+schema v41).
+
 **Export is the agent, not GitHub.** GitHub/GitLab submit is out of
 scope; the payoff of reviewing *inside* an orchestrator is closing the
 loop — `e` (Send→Agent) pastes the compiled review into the session's agent

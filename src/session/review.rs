@@ -246,6 +246,58 @@ impl DiffFile {
     }
 }
 
+// ── Semantic fingerprints ────────────────────────────────────────────────────
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// 64-bit FNV-1a step. Hand-rolled (a dozen lines) rather than a dependency
+/// because the digest is **persisted** (`review_marks.fingerprint`) and must
+/// stay comparable across builds/platforms — `std`'s `DefaultHasher` algorithm
+/// is explicitly not stable across Rust releases.
+fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// Fold one hunk's **semantic content** into the hash: the `+`/`-` line bodies
+/// with their signs, excluding the `@@` positions and context lines — so a pure
+/// line-shift (an unrelated edit above the hunk) keeps a "reviewed" mark valid,
+/// while any change to what was actually added/removed invalidates it.
+fn fnv1a_hunk(mut h: u64, hunk: &DiffHunk) -> u64 {
+    for l in &hunk.lines {
+        let sign: &[u8] = match l.kind {
+            DiffLineKind::Add => b"+",
+            DiffLineKind::Del => b"-",
+            DiffLineKind::Context => continue,
+        };
+        h = fnv1a(h, sign);
+        h = fnv1a(h, l.text.as_bytes());
+        h = fnv1a(h, b"\n");
+    }
+    h
+}
+
+/// Semantic fingerprint of a single hunk (see [`fnv1a_hunk`]), hex-encoded for
+/// TEXT-column storage. Stored with hunk-level "reviewed" marks and compared on
+/// every diff rebuild to drop marks whose content changed.
+pub fn hunk_fingerprint(hunk: &DiffHunk) -> String {
+    format!("{:016x}", fnv1a_hunk(FNV_OFFSET, hunk))
+}
+
+/// Semantic fingerprint of a whole file's diff — every hunk's `+`/`-` content
+/// in order. Stored with file-level "reviewed" marks.
+pub fn file_fingerprint(file: &DiffFile) -> String {
+    let mut h = FNV_OFFSET;
+    for hunk in &file.hunks {
+        h = fnv1a_hunk(h, hunk);
+    }
+    format!("{h:016x}")
+}
+
 /// Parse `git diff` unified output into a list of [`DiffFile`]s. Tolerant of the
 /// metadata lines git emits (index / mode / rename / binary); unknown lines are
 /// skipped. Pure and unit-tested.
@@ -484,10 +536,7 @@ mod tests {
         // Question → Praise → Note.
         assert_eq!(Classification::Note.next(), Classification::Issue);
         assert_eq!(Classification::Issue.next(), Classification::Suggestion);
-        assert_eq!(
-            Classification::Suggestion.next(),
-            Classification::Question
-        );
+        assert_eq!(Classification::Suggestion.next(), Classification::Question);
         assert_eq!(Classification::Question.next(), Classification::Praise);
         assert_eq!(Classification::Praise.next(), Classification::Note);
         assert_eq!(Classification::Note.prev(), Classification::Praise);
@@ -749,6 +798,79 @@ index 1..2 100644
             header: String::new(),
             lines,
         }
+    }
+
+    /// Build a one-hunk file from explicit (kind, text) lines at the given
+    /// hunk start, for fingerprint tests.
+    fn file_with(start: u32, lines: &[(DiffLineKind, &str)]) -> DiffFile {
+        let (mut o, mut n) = (start, start);
+        let lines = lines
+            .iter()
+            .map(|(kind, text)| {
+                let (old, new) = match kind {
+                    DiffLineKind::Del => {
+                        let v = (Some(o), None);
+                        o += 1;
+                        v
+                    }
+                    DiffLineKind::Add => {
+                        let v = (None, Some(n));
+                        n += 1;
+                        v
+                    }
+                    DiffLineKind::Context => {
+                        let v = (Some(o), Some(n));
+                        o += 1;
+                        n += 1;
+                        v
+                    }
+                };
+                DiffLine {
+                    kind: *kind,
+                    old_no: old,
+                    new_no: new,
+                    text: (*text).to_string(),
+                }
+            })
+            .collect();
+        DiffFile {
+            path: "f.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            hunks: vec![DiffHunk {
+                old_start: start,
+                new_start: start,
+                header: String::new(),
+                lines,
+            }],
+        }
+    }
+
+    #[test]
+    fn fingerprint_survives_pure_line_shift() {
+        use DiffLineKind::*;
+        // The same +/- content at different positions with different context —
+        // an unrelated edit above the hunk must keep the mark valid.
+        let a = file_with(10, &[(Context, "ctx a"), (Del, "old"), (Add, "new")]);
+        let b = file_with(50, &[(Context, "other ctx"), (Del, "old"), (Add, "new")]);
+        assert_eq!(file_fingerprint(&a), file_fingerprint(&b));
+        assert_eq!(hunk_fingerprint(&a.hunks[0]), hunk_fingerprint(&b.hunks[0]));
+    }
+
+    #[test]
+    fn fingerprint_changes_with_content_and_sign() {
+        use DiffLineKind::*;
+        let base = file_with(1, &[(Del, "old"), (Add, "new")]);
+        // Changed added content.
+        let edited = file_with(1, &[(Del, "old"), (Add, "different")]);
+        assert_ne!(file_fingerprint(&base), file_fingerprint(&edited));
+        // Same texts with flipped signs must differ (the sign is hashed).
+        let flipped = file_with(1, &[(Add, "old"), (Del, "new")]);
+        assert_ne!(file_fingerprint(&base), file_fingerprint(&flipped));
+        // Two lines "ab"+"c" vs "a"+"bc" must differ (per-line separator).
+        let ab_c = file_with(1, &[(Add, "ab"), (Add, "c")]);
+        let a_bc = file_with(1, &[(Add, "a"), (Add, "bc")]);
+        assert_ne!(file_fingerprint(&ab_c), file_fingerprint(&a_bc));
     }
 
     #[test]

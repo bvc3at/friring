@@ -13726,6 +13726,140 @@ mod tests {
         assert!(!app.review_build.in_progress());
     }
 
+    /// A completed build reconciles persisted "reviewed" marks against the
+    /// fresh diff: a matching fingerprint survives, a stale one is deleted from
+    /// the DB with a summary toast, and a legacy NULL row is treated as valid
+    /// once and backfilled with the computed fingerprint.
+    #[test]
+    fn review_build_reconciles_stale_marks_with_toast() {
+        use crate::session::review::{file_fingerprint, hunk_fingerprint};
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let built = code_review::CodeReviewState::for_test(sid, 2);
+        let fp0 = file_fingerprint(&built.files[0]);
+        app.db
+            .toggle_review_mark(sid, "src/f0.rs", None, &fp0)
+            .unwrap();
+        app.db
+            .toggle_review_mark(sid, "src/f1.rs", None, "stale-fp")
+            .unwrap();
+        app.db
+            .insert_review_mark_without_fingerprint(sid, "src/f0.rs", Some(0))
+            .unwrap();
+
+        let mut pending = code_review::CodeReviewState::for_test(sid, 0);
+        pending.loading = true;
+        let repos = built.repos.clone();
+        app.code_reviews.insert(sid, pending);
+        let tx = app.review_build.start();
+        tx.send(code_review::ReviewBuildResult {
+            session_id: sid,
+            elapsed_ms: 1,
+            kind: code_review::ReviewBuildKind::Open {
+                repos,
+                commits: Vec::new(),
+                target: code_review::ReviewTarget::Branch,
+                files: built.files.clone(),
+            },
+        })
+        .unwrap();
+        app.poll_review_build();
+
+        let mut marks = app.db.list_review_marks(sid).unwrap();
+        marks.sort();
+        assert_eq!(
+            marks,
+            vec![
+                ("src/f0.rs".to_string(), None, Some(fp0)),
+                // Legacy hunk row survived and got the computed fingerprint.
+                (
+                    "src/f0.rs".to_string(),
+                    Some(0),
+                    Some(hunk_fingerprint(&built.files[0].hunks[0])),
+                ),
+            ],
+            "stale f1 mark deleted; f0 marks intact"
+        );
+        // The view reloaded the reconciled marks.
+        let cr = &app.code_reviews[&sid];
+        assert!(cr.reviewed_files.contains("src/f0.rs"));
+        assert!(!cr.reviewed_files.contains("src/f1.rs"));
+        // The toast summarizes what was cleared.
+        let msg = app.status_message.as_ref().expect("toast fired");
+        assert!(
+            msg.text
+                .contains("1 reviewed mark cleared (content changed)"),
+            "got: {}",
+            msg.text
+        );
+    }
+
+    /// `F5` rebuilds the current target off-thread; applying the result keeps
+    /// the selection where it was when the rows still support it, and falls
+    /// back within bounds when the selected file vanished from the diff.
+    #[test]
+    fn review_reload_preserves_selection_and_survives_missing_file() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let state = code_review::CodeReviewState::for_test(sid, 2);
+        let files = state.files.clone();
+        let target = state.target.clone();
+        app.code_reviews.insert(sid, state);
+
+        // Select f1's diff line.
+        let pos = app.code_reviews[&sid]
+            .rows
+            .iter()
+            .position(|r| matches!(r, code_review::ReviewRow::Line(1, _, _)))
+            .unwrap();
+        app.code_reviews.get_mut(&sid).unwrap().selected = pos;
+
+        // Reload with the identical diff: the exact position is kept.
+        let tx = app.review_build.start();
+        tx.send(code_review::ReviewBuildResult {
+            session_id: sid,
+            elapsed_ms: 1,
+            kind: code_review::ReviewBuildKind::Reload {
+                target: target.clone(),
+                files: files.clone(),
+            },
+        })
+        .unwrap();
+        app.poll_review_build();
+        assert_eq!(app.code_reviews[&sid].selected, pos);
+
+        // Reload with f1 gone: the selection clamps into the new rows.
+        let tx = app.review_build.start();
+        tx.send(code_review::ReviewBuildResult {
+            session_id: sid,
+            elapsed_ms: 1,
+            kind: code_review::ReviewBuildKind::Reload {
+                target,
+                files: files[..1].to_vec(),
+            },
+        })
+        .unwrap();
+        app.poll_review_build();
+        let cr = &app.code_reviews[&sid];
+        assert!(cr.selected < cr.rows.len());
+    }
+
+    /// Toggling a reviewed mark stores the current semantic fingerprint, so
+    /// the next build can validate it.
+    #[test]
+    fn review_toggle_stores_fingerprint() {
+        use crate::session::review::file_fingerprint;
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let state = code_review::CodeReviewState::for_test(sid, 1);
+        let expect = file_fingerprint(&state.files[0]);
+        app.code_reviews.insert(sid, state);
+        // Selection starts on the file header; `r` marks the file.
+        app.cr_toggle_reviewed(false);
+        let marks = app.db.list_review_marks(sid).unwrap();
+        assert_eq!(marks, vec![("src/f0.rs".to_string(), None, Some(expect))]);
+    }
+
     /// A build whose review was closed before delivery is dropped without
     /// panicking or resurrecting state.
     #[test]

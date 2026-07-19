@@ -67,6 +67,13 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
   grep-able locator (old side marked `(line was removed)`). The upstream
   bullet format is preserved behind `[review] handoff = "legacy"`
   (`docs/CONFIG.md`); the new `[review]` settings table is fork-only.
+- **Manual reload (`F5` / `Ctrl+R`).** Rebuilds the current target in place
+  (upstream's only refresh was retarget/reopen), preserving the selection by
+  file.
+- **Self-invalidating reviewed marks.** Marks store a semantic fingerprint
+  of the marked content (schema **v41**, `review_marks.fingerprint`); every
+  completed build deletes marks whose file/hunk content changed and toasts a
+  summary — upstream marks could silently go stale.
 
 #### Agent activity view (F9)
 
