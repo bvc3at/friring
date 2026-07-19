@@ -69,7 +69,10 @@ stdout is piped (so `… | jq` keeps working). Force a format with `--json`
 ms; `null` until the first signal), deliberately *not* the TUI's derived status
 (which downgrades a stale `working`). This is the contract external observers —
 automations, the real-agent e2e harness (`docs/E2E.md`) — poll for status
-transitions instead of reading SQLite.
+transitions instead of reading SQLite. Multi-repo sessions additionally expose
+`additional_dirs` (the non-primary member dirs) and `workspace_dir` (the
+user-chosen symlink-workspace directory from the wizard's `Ctrl+O` field;
+`null` = the default id-derived path).
 
 ## Delete and restore semantics
 

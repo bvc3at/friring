@@ -62,6 +62,7 @@ mod tests {
             agent_session_id: None,
             cwd: None,
             additional_dirs: Vec::new(),
+            workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
             parent_session_id: None,

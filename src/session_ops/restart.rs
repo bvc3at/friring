@@ -65,6 +65,7 @@ fn build_restart_plan(session: &SharedSession) -> Result<RestartPlan, String> {
             &session.worktrees,
             &session.additional_dirs,
             None,
+            session.workspace_dir.as_deref(),
         ));
     }
 
@@ -140,6 +141,7 @@ mod tests {
             agent_session_id: agent_session_id.map(String::from),
             cwd,
             additional_dirs: Vec::new(),
+            workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
             parent_session_id: None,
@@ -215,5 +217,24 @@ mod tests {
         // ≥2 members → the symlink workspace, not the primary repo itself.
         assert_ne!(plan.cwd.as_deref(), Some(primary.as_path()));
         assert!(plan.cwd.is_some());
+    }
+
+    #[test]
+    fn restart_plan_honors_custom_workspace_dir() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let primary = temp.path().join("primary");
+        std::fs::create_dir_all(&primary).unwrap();
+        let extra = temp.path().join("extra");
+        std::fs::create_dir_all(&extra).unwrap();
+        let custom = temp.path().join("named-ws");
+
+        let mut sess = session(Some("sid-ws"), Some(primary));
+        sess.additional_dirs = vec![extra];
+        sess.workspace_dir = Some(custom.clone());
+
+        let plan = build_restart_plan(&sess).unwrap();
+        // The relaunch happens in the user-chosen dir, not workspaces/<id>.
+        assert_eq!(plan.cwd, Some(custom));
     }
 }

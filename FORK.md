@@ -431,6 +431,20 @@ flow away. The fork rebuilds the flow:
   the repo basename (deduped `-2`, `-3`, … against existing sessions) so the
   common case is Enter-through. The base-branch and agent steps keep their
   upstream type-to-filter selectors.
+- **Optional named workspace dir (`Ctrl+O` on the name step).** Upstream
+  always builds a multi-repo session's symlink workspace at
+  `workspaces/<agent_session_id>` (a UUID). For a multi-repo **local** spawn
+  the fork's name step gains a hidden-by-default second field (`Ctrl+O`
+  shows/hides, `Tab` switches focus): a bare name puts the workspace at
+  `workspaces/<name>`, a `~`/absolute path puts it exactly there. The choice
+  is persisted (`sessions.workspace_dir`, schema v41) so restart, the shell
+  pane, and delete resolve the same directory; creation and removal refuse a
+  target holding anything but symlinks, so a mistyped path can never destroy
+  real files (`workspace::ensure_workspace_at` / `remove_workspace_at`).
+  `session get/list --json` expose `workspace_dir` + `additional_dirs`, and
+  the `claude-named-workspace` agent-e2e scenario drives the whole flow —
+  wizard keys, agent writing through the symlinks, persistence, guarded
+  delete — against the real Claude Code binary (`docs/E2E.md`).
 
 Keys and flow are documented in `docs/FEATURES.md`; the back-navigation
 interplay with ADR-P12 in `docs/PERFORMANCE.md`.

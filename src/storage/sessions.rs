@@ -68,15 +68,17 @@ impl Database {
 
         self.conn.execute(
             "INSERT INTO sessions (id, name, agent, backend_id, backend_type, \
-             agent_session_id, cwd, additional_dirs, shell_backend_id, \
-             parent_session_id, display_order, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12) \
+             agent_session_id, cwd, additional_dirs, workspace_dir, \
+             shell_backend_id, parent_session_id, display_order, \
+             created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13) \
              ON CONFLICT(id) DO UPDATE SET \
                  name = excluded.name, agent = excluded.agent, \
                  backend_id = excluded.backend_id, \
                  backend_type = excluded.backend_type, \
                  agent_session_id = excluded.agent_session_id, \
                  cwd = excluded.cwd, additional_dirs = excluded.additional_dirs, \
+                 workspace_dir = excluded.workspace_dir, \
                  shell_backend_id = excluded.shell_backend_id, \
                  parent_session_id = excluded.parent_session_id, \
                  display_order = excluded.display_order, \
@@ -93,6 +95,10 @@ impl Database {
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned()),
                 additional_dirs_to_db(&session.additional_dirs),
+                session
+                    .workspace_dir
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
                 session.shell_backend_id,
                 session.parent_session_id.map(|id| id.to_string()),
                 session.display_order,
@@ -199,8 +205,8 @@ impl Database {
     ) -> rusqlite::Result<Vec<SharedSession>> {
         let sql = format!(
             "SELECT s.id, s.name, s.agent, s.backend_id, s.backend_type, \
-             s.agent_session_id, s.cwd, s.additional_dirs, s.shell_backend_id, \
-             s.parent_session_id, s.display_order, \
+             s.agent_session_id, s.cwd, s.additional_dirs, s.workspace_dir, \
+             s.shell_backend_id, s.parent_session_id, s.display_order, \
              w.repo_path, w.worktree_path, w.branch \
              FROM sessions s \
              LEFT JOIN worktrees w ON s.id = w.session_id AND w.deleted_at IS NULL \
@@ -549,12 +555,13 @@ fn row_to_shared_session(
     let id_str: String = row.get(0)?;
     let cwd: Option<String> = row.get(6)?;
     let dirs_str: String = row.get(7)?;
-    let shell_backend_id: Option<String> = row.get(8)?;
-    let parent_str: Option<String> = row.get(9)?;
-    let display_order: Option<i64> = row.get(10)?;
-    let wt_repo: Option<String> = row.get(11)?;
-    let wt_path: Option<String> = row.get(12)?;
-    let wt_branch: Option<String> = row.get(13)?;
+    let workspace_dir: Option<String> = row.get(8)?;
+    let shell_backend_id: Option<String> = row.get(9)?;
+    let parent_str: Option<String> = row.get(10)?;
+    let display_order: Option<i64> = row.get(11)?;
+    let wt_repo: Option<String> = row.get(12)?;
+    let wt_path: Option<String> = row.get(13)?;
+    let wt_branch: Option<String> = row.get(14)?;
 
     let additional_dirs = additional_dirs_from_db(&dirs_str);
 
@@ -570,6 +577,7 @@ fn row_to_shared_session(
             agent_session_id: row.get(5)?,
             cwd: cwd.map(PathBuf::from),
             additional_dirs,
+            workspace_dir: workspace_dir.map(PathBuf::from),
             worktrees: Vec::new(),
             shell_backend_id,
             parent_session_id: parent_str.and_then(|s| s.parse().ok()),
@@ -595,6 +603,7 @@ mod tests {
             agent_session_id: None,
             cwd: None,
             additional_dirs: Vec::new(),
+            workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
             parent_session_id: None,
@@ -804,6 +813,21 @@ mod tests {
         let next = db.increment_session_counter().unwrap();
         assert_eq!(next, 6);
         assert_eq!(db.get_session_counter().unwrap(), 6);
+    }
+
+    #[test]
+    fn session_workspace_dir_roundtrips() {
+        let db = Database::open_in_memory().unwrap();
+        let mut session = make_session("ws");
+        session.workspace_dir = Some(PathBuf::from("/home/user/dev/named-ws"));
+
+        db.upsert_session(&session).unwrap();
+
+        let sessions = db.list_active_sessions().unwrap();
+        assert_eq!(
+            sessions[0].workspace_dir,
+            Some(PathBuf::from("/home/user/dev/named-ws"))
+        );
     }
 
     #[test]

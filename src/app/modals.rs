@@ -553,6 +553,12 @@ pub struct WorktreeNameModal {
 #[derive(Debug, Clone, Default)]
 pub struct SessionNameModal {
     pub name: TextInput,
+    /// Optional workspace-dir field for multi-repo local spawns: `None` =
+    /// hidden (the default id-derived workspace applies). `Ctrl+O` shows /
+    /// hides it, `Tab` moves focus between the two fields.
+    pub workspace_dir: Option<TextInput>,
+    /// Whether the (shown) workspace-dir field has keyboard focus.
+    pub workspace_focused: bool,
 }
 
 #[derive(Debug, Clone)]

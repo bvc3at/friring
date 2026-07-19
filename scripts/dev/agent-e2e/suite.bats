@@ -61,6 +61,10 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-tool-loop"
 }
 
+@test "e2e: multi-repo wizard with a named workspace dir — spawn, symlink write, persistence, guarded delete" {
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-named-workspace"
+}
+
 @test "perf: claude flood turn through Friring publishes a perf report" {
     require_agent claude
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-perf-flood"

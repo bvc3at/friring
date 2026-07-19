@@ -71,6 +71,19 @@ JSON
     grep -q '^Ctrl+Q$' "$tape"                # the closing quit beat
 }
 
+@test "demo: named-workspace wizard scenario is fully VHS-mappable (emit-tape)" {
+    e2e_scenario_load "$AGENT_E2E_DIR/scenarios/claude-named-workspace"
+    local tape="$BATS_TEST_TMPDIR/named-ws.tape"
+    # No boot: TBX_SANDBOX_ROOT is unset, so the steps' offline fallback root
+    # must keep the tape generator deterministic.
+    e2e_emit_tape "$tape"
+    grep -q '^Ctrl+N$' "$tape"                          # opens the wizard
+    grep -q '^Ctrl+P$' "$tape"                          # parent import
+    grep -q '^Ctrl+O$' "$tape"                          # workspace-dir field
+    grep -q '^Type "/tmp/friring-e2e/named-ws"$' "$tape" # the custom dir
+    grep -q '^Ctrl+Q$' "$tape"
+}
+
 @test "drift: an unexpected non-message endpoint is surfaced but never fails" {
     REPO_ROOT="$BATS_TEST_TMPDIR/repo"
     E2E_SCENARIO_NAME="unit"
