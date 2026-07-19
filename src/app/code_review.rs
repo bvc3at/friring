@@ -2740,7 +2740,15 @@ fn build_files(
         // synthesizes them so "review my uncommitted work" really shows all
         // of it.
         if matches!(target, ReviewTarget::Working) {
-            parsed.extend(build_untracked_files(repo, host));
+            // A `git rm --cached` path shows up both as a deletion in the diff
+            // and as untracked; skip the untracked copy so no path appears
+            // twice (duplicate rows would double comments/marks and C-ids).
+            let existing: HashSet<String> = parsed.iter().map(|f| f.path.clone()).collect();
+            parsed.extend(
+                build_untracked_files(repo, host)
+                    .into_iter()
+                    .filter(|f| !existing.contains(&f.path)),
+            );
         }
         if multi {
             for f in &mut parsed {
