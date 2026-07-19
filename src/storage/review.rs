@@ -20,31 +20,51 @@ const WHOLE_FILE_HUNK: i64 = -1;
 /// (pre-v41) row awaiting backfill.
 pub type ReviewMarkRow = (String, Option<usize>, Option<String>);
 
-/// Decompose a [`CommentAnchor`] into the three nullable columns it persists as.
-fn anchor_columns(anchor: &CommentAnchor) -> (Option<String>, Option<&'static str>, Option<i64>) {
+/// Decompose a [`CommentAnchor`] into the four nullable columns it persists as.
+fn anchor_columns(
+    anchor: &CommentAnchor,
+) -> (
+    Option<String>,
+    Option<&'static str>,
+    Option<i64>,
+    Option<i64>,
+) {
     match anchor {
-        CommentAnchor::Line { file, side, line } => (
+        CommentAnchor::Line {
+            file,
+            side,
+            line,
+            line_end,
+        } => (
             Some(file.clone()),
             Some(side.as_str()),
             Some(i64::from(*line)),
+            line_end.map(i64::from),
         ),
-        CommentAnchor::File { file } => (Some(file.clone()), None, None),
-        CommentAnchor::Review => (None, None, None),
+        CommentAnchor::File { file } => (Some(file.clone()), None, None, None),
+        CommentAnchor::Review => (None, None, None, None),
     }
 }
 
-/// Rebuild a [`CommentAnchor`] from the persisted columns.
+/// Rebuild a [`CommentAnchor`] from the persisted columns. A `line_end` that
+/// doesn't extend past `line_no` (hand-edited rows) is dropped rather than
+/// producing an inverted range.
 fn anchor_from_columns(
     file_path: Option<String>,
     side: Option<String>,
     line_no: Option<i64>,
+    line_end: Option<i64>,
 ) -> CommentAnchor {
     match (file_path, line_no) {
-        (Some(file), Some(line)) => CommentAnchor::Line {
-            file,
-            side: side.as_deref().and_then(Side::parse).unwrap_or(Side::New),
-            line: line.max(0) as u32,
-        },
+        (Some(file), Some(line)) => {
+            let line = line.max(0) as u32;
+            CommentAnchor::Line {
+                file,
+                side: side.as_deref().and_then(Side::parse).unwrap_or(Side::New),
+                line,
+                line_end: line_end.map(|e| e.max(0) as u32).filter(|&e| e > line),
+            }
+        }
         (Some(file), None) => CommentAnchor::File { file },
         (None, _) => CommentAnchor::Review,
     }
@@ -60,16 +80,18 @@ impl Database {
         body: &str,
     ) -> rusqlite::Result<i64> {
         let now = current_time_millis() as i64;
-        let (file_path, side, line_no) = anchor_columns(anchor);
+        let (file_path, side, line_no, line_end) = anchor_columns(anchor);
         self.conn.execute(
             "INSERT INTO review_comments \
-             (session_id, file_path, side, line_no, classification, body, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+             (session_id, file_path, side, line_no, line_end, classification, body, \
+              created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
             params![
                 session_id.to_string(),
                 file_path,
                 side,
                 line_no,
+                line_end,
                 classification.as_str(),
                 body,
                 now,
@@ -85,7 +107,8 @@ impl Database {
         session_id: SessionId,
     ) -> rusqlite::Result<Vec<ReviewComment>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, file_path, side, line_no, classification, body, created_at, updated_at \
+            "SELECT id, file_path, side, line_no, line_end, classification, body, \
+             created_at, updated_at \
              FROM review_comments \
              WHERE session_id = ?1 AND deleted_at IS NULL \
              ORDER BY created_at, id",
@@ -95,15 +118,16 @@ impl Database {
             let file_path: Option<String> = row.get(1)?;
             let side: Option<String> = row.get(2)?;
             let line_no: Option<i64> = row.get(3)?;
-            let class: String = row.get(4)?;
+            let line_end: Option<i64> = row.get(4)?;
+            let class: String = row.get(5)?;
             Ok(ReviewComment {
                 id: row.get(0)?,
                 session_id,
-                anchor: anchor_from_columns(file_path, side, line_no),
+                anchor: anchor_from_columns(file_path, side, line_no, line_end),
                 classification: Classification::parse(&class).unwrap_or_default(),
-                body: row.get(5)?,
-                created_at: row.get::<_, i64>(6)? as u64,
-                updated_at: row.get::<_, i64>(7)? as u64,
+                body: row.get(6)?,
+                created_at: row.get::<_, i64>(7)? as u64,
+                updated_at: row.get::<_, i64>(8)? as u64,
             })
         })?;
         rows.collect()
@@ -269,6 +293,7 @@ mod tests {
             file: "src/foo.rs".into(),
             side: Side::New,
             line: 42,
+            line_end: None,
         };
         db.add_review_comment(sid, &line, Classification::Issue, "bug here")
             .unwrap();
@@ -295,6 +320,40 @@ mod tests {
         assert_eq!(comments[0].classification, Classification::Issue);
         assert!(matches!(comments[1].anchor, CommentAnchor::File { .. }));
         assert_eq!(comments[2].anchor, CommentAnchor::Review);
+    }
+
+    #[test]
+    fn range_comment_round_trips_and_inverted_end_is_dropped() {
+        let db = Database::open_in_memory().unwrap();
+        let sid = SessionId::default();
+        let range = CommentAnchor::Line {
+            file: "src/foo.rs".into(),
+            side: Side::New,
+            line: 10,
+            line_end: Some(24),
+        };
+        let id = db
+            .add_review_comment(sid, &range, Classification::Issue, "span bug")
+            .unwrap();
+        assert_eq!(db.list_review_comments(sid).unwrap()[0].anchor, range);
+
+        // A line_end that doesn't extend past line_no (a hand-edited row)
+        // must not surface as an inverted range.
+        db.conn
+            .execute(
+                "UPDATE review_comments SET line_end = 10 WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        assert_eq!(
+            db.list_review_comments(sid).unwrap()[0].anchor,
+            CommentAnchor::Line {
+                file: "src/foo.rs".into(),
+                side: Side::New,
+                line: 10,
+                line_end: None,
+            }
+        );
     }
 
     #[test]

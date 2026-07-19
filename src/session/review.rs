@@ -103,8 +103,16 @@ impl Classification {
 /// Where a review comment is anchored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommentAnchor {
-    /// A specific line on one side of a file's diff.
-    Line { file: String, side: Side, line: u32 },
+    /// A specific line — or a contiguous range of lines — on one side of a
+    /// file's diff. `line_end` (exclusive of `None`, strictly `> line`) turns
+    /// the anchor into a range `line..=line_end`; a range never spans sides or
+    /// files.
+    Line {
+        file: String,
+        side: Side,
+        line: u32,
+        line_end: Option<u32>,
+    },
     /// The file as a whole.
     File { file: String },
     /// The review as a whole — the summary.
@@ -125,19 +133,45 @@ impl CommentAnchor {
         matches!(self, CommentAnchor::File { file: f } if f == file)
     }
 
-    /// Whether this line-level comment anchors to a diff line in `file` with the
-    /// given old/new line numbers (matched against the comment's side).
+    /// Whether this line-level comment **displays at** the diff line in `file`
+    /// with the given old/new line numbers (matched against the comment's
+    /// side). A range comment displays at its *last* line — the comment
+    /// interleaves after the span it covers, like a reviewer note under the
+    /// quoted block.
     pub fn anchors_line(&self, file: &str, old_no: Option<u32>, new_no: Option<u32>) -> bool {
         match self {
             CommentAnchor::Line {
                 file: f,
                 side,
                 line,
-            } if f == file => match side {
-                Side::New => new_no == Some(*line),
-                Side::Old => old_no == Some(*line),
-            },
+                line_end,
+            } if f == file => {
+                let at = line_end.unwrap_or(*line);
+                match side {
+                    Side::New => new_no == Some(at),
+                    Side::Old => old_no == Some(at),
+                }
+            }
             _ => false,
+        }
+    }
+
+    /// The `side:line` locator of a line anchor (`"new:10"`, or `"new:10-24"`
+    /// for a range); `None` for file/review anchors. One formatter shared by
+    /// the comment rows, the `@` popup, the compose header, and both handoff
+    /// compilers, so the location never renders inconsistently.
+    pub fn line_label(&self) -> Option<String> {
+        match self {
+            CommentAnchor::Line {
+                side,
+                line,
+                line_end,
+                ..
+            } => Some(match line_end {
+                Some(end) => format!("{}:{line}-{end}", side.as_str()),
+                None => format!("{}:{line}", side.as_str()),
+            }),
+            _ => None,
         }
     }
 }
@@ -333,7 +367,7 @@ fn fnv1a_hunk(mut h: u64, hunk: &DiffHunk) -> u64 {
     h
 }
 
-/// Semantic fingerprint of a single hunk (see [`fnv1a_hunk`]), hex-encoded for
+/// Semantic fingerprint of a single hunk (see `fnv1a_hunk`), hex-encoded for
 /// TEXT-column storage. Stored with hunk-level "reviewed" marks and compared on
 /// every diff rebuild to drop marks whose content changed.
 pub fn hunk_fingerprint(hunk: &DiffHunk) -> String {
@@ -741,6 +775,7 @@ mod tests {
             file: "a.rs".into(),
             side: Side::New,
             line: 5,
+            line_end: None,
         };
         // Matches only the new-side number on the right file.
         assert!(new_line.anchors_line("a.rs", None, Some(5)));
@@ -753,6 +788,7 @@ mod tests {
             file: "a.rs".into(),
             side: Side::Old,
             line: 5,
+            line_end: None,
         };
         assert!(old_line.anchors_line("a.rs", Some(5), None));
         assert!(!old_line.anchors_line("a.rs", None, Some(5)));
@@ -760,6 +796,37 @@ mod tests {
         // The review summary anchors to neither a file nor a line.
         assert!(!CommentAnchor::Review.anchors_file("a.rs"));
         assert!(!CommentAnchor::Review.anchors_line("a.rs", Some(1), Some(1)));
+    }
+
+    #[test]
+    fn range_anchor_displays_at_its_last_line_and_labels_the_span() {
+        let range = CommentAnchor::Line {
+            file: "a.rs".into(),
+            side: Side::New,
+            line: 10,
+            line_end: Some(24),
+        };
+        // The comment interleaves after the span it covers — the end line, not
+        // the start or any interior line.
+        assert!(range.anchors_line("a.rs", None, Some(24)));
+        assert!(!range.anchors_line("a.rs", None, Some(10)));
+        assert!(!range.anchors_line("a.rs", None, Some(17)));
+        assert_eq!(range.line_label().as_deref(), Some("new:10-24"));
+
+        let single = CommentAnchor::Line {
+            file: "a.rs".into(),
+            side: Side::Old,
+            line: 3,
+            line_end: None,
+        };
+        assert_eq!(single.line_label().as_deref(), Some("old:3"));
+        assert_eq!(
+            CommentAnchor::File {
+                file: "a.rs".into()
+            }
+            .line_label(),
+            None
+        );
     }
 
     #[test]

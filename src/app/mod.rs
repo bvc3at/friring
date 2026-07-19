@@ -13891,6 +13891,7 @@ mod tests {
                 file: file.into(),
                 side: Side::New,
                 line: 1,
+                line_end: None,
             },
             classification: Classification::Note,
             body: format!("c{id}"),
@@ -13957,6 +13958,58 @@ mod tests {
         // Build in flight → the next cycle is refused, context unchanged.
         app.cr_cycle_context();
         assert_eq!(app.code_reviews[&sid].context, 10);
+    }
+
+    /// The `V` range flow end to end through the key handler: start on a diff
+    /// line, `j` extends the span, `c` opens the compose box carrying a range
+    /// anchor; a fresh `V` + Esc cancels without composing.
+    #[test]
+    fn review_range_keys_extend_and_compose() {
+        use crate::session::review::{CommentAnchor, DiffLine, DiffLineKind, Side};
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let mut state = code_review::CodeReviewState::for_test(sid, 1);
+        // A second added line so a span exists (for_test files have one).
+        state.files[0].hunks[0].lines.push(DiffLine {
+            kind: DiffLineKind::Add,
+            old_no: None,
+            new_no: Some(2),
+            text: "y".into(),
+        });
+        state.rebuild_rows();
+        // Rows: 0 FileHeader, 1 HunkHeader, 2 Line(new:1), 3 Line(new:2).
+        state.selected = 2;
+        app.code_reviews.insert(sid, state);
+        app.focus = InputFocus::CodeReview;
+
+        app.handle_code_review_key(KeyCode::Char('V'), KeyModifiers::SHIFT);
+        assert!(app.code_reviews[&sid].range.is_some(), "V starts a range");
+        app.handle_code_review_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.code_reviews[&sid].selected, 3, "j extends the span");
+        // `j` at the file's last line stays put (same file only).
+        app.handle_code_review_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.code_reviews[&sid].selected, 3);
+
+        app.handle_code_review_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        let cr = &app.code_reviews[&sid];
+        assert!(cr.range.is_none(), "compose consumes the range");
+        assert_eq!(
+            cr.compose.as_ref().map(|c| c.anchor.clone()),
+            Some(CommentAnchor::Line {
+                file: "src/f0.rs".into(),
+                side: Side::New,
+                line: 1,
+                line_end: Some(2),
+            })
+        );
+
+        // Esc cancels a fresh range without opening the compose box.
+        app.handle_code_review_key(KeyCode::Esc, KeyModifiers::NONE);
+        app.handle_code_review_key(KeyCode::Char('V'), KeyModifiers::SHIFT);
+        assert!(app.code_reviews[&sid].range.is_some());
+        app.handle_code_review_key(KeyCode::Esc, KeyModifiers::NONE);
+        let cr = &app.code_reviews[&sid];
+        assert!(cr.range.is_none() && cr.compose.is_none());
     }
 
     /// Toggling a reviewed mark stores the current semantic fingerprint, so

@@ -94,6 +94,10 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
   (upstream painted them as plain tinted text).
 - **Context expansion (`=`/`+`).** Cycles `-U3 → -U10 → -U25`, shown as
   `· U<n>` in the title.
+- **Range comments (`V`).** `V` + `j`/`k` select a same-side, same-file
+  line span, `c` comments on it (schema **v42**,
+  `review_comments.line_end`); the handoff record reads `new:10-24` and
+  quotes the span's first + last lines with `> …` between.
 
 #### Agent activity view (F9)
 

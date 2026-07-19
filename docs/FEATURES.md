@@ -913,6 +913,21 @@ happens where you're looking. "Mark reviewed" (`r` / `R` toggle a file /
 hunk, `✓`) works from **any** row in the file — line, hunk, header, or a
 comment — not just its header.
 
+**Range comments (`V`).** `V` on a diff line starts a range selection:
+`j`/`k` grow the span (tinted like an extended selection), `c` composes
+the comment for it, and Esc/`V` (or a mouse click, or any diff rebuild)
+cancels. A range lives on **one side of one file** — extension passes
+over rows with no number on the range's side (the deletions between two
+kept new-side lines, say) and stops at the file boundary, so every
+reachable endpoint is valid. The anchor persists as
+`line_no..=line_end` (nullable `line_end` on `review_comments`, schema
+v42); the comment row sits at the span's **last** line labelled with the
+full span (`(new:10-24)`), the compose header reads `lines new:10-24`,
+and the structured handoff record becomes
+`### C<id> [Class] new:10-24, in `\`heading\`` quoting the span's first
+and last lines with a `> …` elision between them (old-side ranges are
+marked `(lines were removed)`).
+
 **Why persist a base branch?** Reviewing `<base>..HEAD` needs the fork
 point, which friring didn't store. A write-once `sessions.base_branch`
 column (schema v38, like the hook columns) records it at spawn; legacy
@@ -1063,14 +1078,14 @@ instantly (ADR-P8, `docs/PERFORMANCE.md`).
 
 ### v1 follow-ups
 
-Named, not silently dropped: range/multi-line comments; token-level intra-line
-word diffs on a paired row (v1 aligns whole lines positionally); grammar-aware
-syntax highlighting (v1's lexer is heuristic + language-agnostic); horizontal
-scroll in the **side-by-side** layout (wrap works there; paired rows pin
-`h_scroll = 0`); per-side search-match highlighting in side-by-side (v1
-navigates but doesn't substring-highlight paired rows); auto-revealing a
-horizontally-scrolled-off search match; and search-match highlight across a
-wrap-boundary seam.
+Named, not silently dropped: grammar-aware syntax highlighting (the lexer is
+heuristic + language-agnostic); horizontal scroll in the **side-by-side**
+layout (wrap works there; paired rows pin `h_scroll = 0`); per-side
+search-match highlighting in side-by-side (navigates but doesn't
+substring-highlight paired rows); auto-revealing a horizontally-scrolled-off
+search match; and search-match highlight across a wrap-boundary seam.
+(Range comments and word-level intra-line diffs, once on this list, have
+since landed.)
 
 ---
 

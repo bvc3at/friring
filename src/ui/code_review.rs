@@ -219,8 +219,9 @@ fn render_comment_picker(frame: &mut Frame, area: Rect, state: &CodeReviewState)
         let (loc, class, head) = match state.comment(*id) {
             Some(c) => {
                 let loc = match &c.anchor {
-                    CommentAnchor::Line { file, side, line } => {
-                        format!("{file}:{}:{line}", side.as_str())
+                    CommentAnchor::Line { file, .. } => {
+                        let label = c.anchor.line_label().unwrap_or_default();
+                        format!("{file}:{label}")
                     }
                     CommentAnchor::File { file } => format!("{file} (file)"),
                     CommentAnchor::Review => "summary".to_string(),
@@ -449,7 +450,7 @@ fn row_visual_lines<'a>(
         ReviewRow::Line(fi, hi, li) => {
             let f = &state.files[*fi];
             let hunk = &f.hunks[*hi];
-            if state.side_by_side {
+            let mut out = if state.side_by_side {
                 paired_diff_line(
                     f, hunk, *li, width, num_w, wrap, selected, query, &sel_style,
                 )
@@ -472,7 +473,19 @@ fn row_visual_lines<'a>(
                         f, l, width, num_w, selected, h_scroll, query, &word, word_bg, &sel_style,
                     )]
                 }
+            };
+            // An in-progress range selection (`V`) tints its covered rows with
+            // the selection bg (keeping each span's fg), so the growing span
+            // reads as an extended selection. The selected endpoint already
+            // carries the full selection style.
+            if !selected && state.row_in_range(i) {
+                for line in &mut out {
+                    for span in &mut line.spans {
+                        span.style = span.style.bg(Theme::selection_bg());
+                    }
+                }
             }
+            out
         }
         ReviewRow::Comment(id) | ReviewRow::Summary(id) => {
             vec![comment_line(state, *id, width, query, sel_style)]
@@ -926,7 +939,20 @@ fn comment_line<'a>(
     let Some(c) = state.comment(id) else {
         return Line::from("");
     };
-    let badge = format!("  ▸ [{}] ", c.classification.label());
+    // A range comment sits at its span's last line, so the row names the whole
+    // span (`(new:10-24)`); a single-line comment sits right under its line
+    // and needs no locator.
+    let span = match &c.anchor {
+        CommentAnchor::Line {
+            line_end: Some(_), ..
+        } => c
+            .anchor
+            .line_label()
+            .map(|l| format!("({l}) "))
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    let badge = format!("  ▸ [{}] {span}", c.classification.label());
     let first = c.body.lines().next().unwrap_or("");
     let more = if c.body.lines().count() > 1 {
         " …"
@@ -1383,7 +1409,10 @@ fn render_compose(frame: &mut Frame, area: Rect, comp: &ComposeState) {
         return;
     }
     let target = match &comp.anchor {
-        CommentAnchor::Line { side, line, .. } => format!("line {}:{}", side.as_str(), line),
+        CommentAnchor::Line { line_end, .. } => {
+            let noun = if line_end.is_some() { "lines" } else { "line" };
+            format!("{noun} {}", comp.anchor.line_label().unwrap_or_default())
+        }
         CommentAnchor::File { file } => format!("file {file}"),
         CommentAnchor::Review => "review summary".to_string(),
     };
@@ -1679,6 +1708,7 @@ mod tests {
             search: None,
             filter: crate::app::code_review::ReviewFilter::default(),
             comment_picker: None,
+            range: None,
             context: crate::app::code_review::DEFAULT_CONTEXT,
         };
         s.rebuild_rows();
@@ -2185,6 +2215,7 @@ mod tests {
                 file: "src/foo.rs".into(),
                 side: Side::New,
                 line: 2,
+                line_end: None,
             },
             classification: Classification::Issue,
             body: crate::app::modals::TextArea::new(),
@@ -2198,5 +2229,77 @@ mod tests {
             assert!(!hits.buttons.is_empty());
         })
         .unwrap();
+    }
+
+    /// An active `V` range tints its covered rows with the selection bg while
+    /// passing over side-mismatched rows, and a saved range comment's row
+    /// names its span (`(new:1-2)`).
+    #[test]
+    fn range_selection_tint_and_span_label() {
+        use crate::session::review::{Classification, CommentAnchor, ReviewComment, Side};
+        // demo_state rows: 0 FileHeader, 1 HunkHeader, 2 ctx(new:1),
+        // 3 del(old:2), 4 add(new:2). Range New from the ctx row to the add.
+        let mut state = demo_state();
+        state.range = Some(crate::app::code_review::RangeSelect {
+            start_row: 2,
+            side: Side::New,
+            file: "src/a/very/deep/foo.rs".into(),
+        });
+        state.selected = 4;
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let _ = render(f, Rect::new(0, 0, 80, 20), &mut state, FocusLevel::Focused);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let (mut ctx_tinted, mut old_tinted) = (false, false);
+        for y in 0..20 {
+            let row: String = (0..80).map(|x| buf[(x, y)].symbol()).collect();
+            let tinted = !cells_with_bg(buf, y, 80, Theme::selection_bg()).is_empty();
+            if row.contains("ctx") {
+                ctx_tinted = tinted;
+            }
+            if row.contains("old") {
+                old_tinted = tinted;
+            }
+        }
+        assert!(ctx_tinted, "the context row inside the span is tinted");
+        assert!(!old_tinted, "the old-side row between the endpoints is not");
+
+        // A persisted range comment interleaves at its span's end line and
+        // shows the span locator.
+        let mut state = demo_state();
+        state.comments = vec![ReviewComment {
+            id: 7,
+            session_id: SessionId::default(),
+            anchor: CommentAnchor::Line {
+                file: "src/a/very/deep/foo.rs".into(),
+                side: Side::New,
+                line: 1,
+                line_end: Some(2),
+            },
+            classification: Classification::Note,
+            body: "span".into(),
+            created_at: 0,
+            updated_at: 0,
+        }];
+        state.rebuild_rows();
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let _ = render(f, Rect::new(0, 0, 80, 20), &mut state, FocusLevel::Focused);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..20 {
+            for x in 0..80 {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(
+            screen.contains("(new:1-2) span"),
+            "comment row names its span: {screen}"
+        );
     }
 }

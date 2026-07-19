@@ -179,6 +179,21 @@ pub(crate) struct ComposeState {
     pub editing_id: Option<i64>,
 }
 
+/// In-progress range selection (`V`): a growing line span that `c` turns into
+/// a range comment. The span runs from the row where `V` was pressed to the
+/// current selection, on one side of one file only — `j`/`k` extension skips
+/// rows that don't exist on [`Self::side`] and stops at the file boundary, so
+/// every reachable endpoint is a valid range end. Transient: cancelled by
+/// Esc/`V`, a mouse click, or a diff rebuild (row indices go stale).
+pub(crate) struct RangeSelect {
+    /// Row index (into [`CodeReviewState::rows`]) where the range started.
+    pub start_row: usize,
+    /// The side the whole range lives on, resolved from the start row.
+    pub side: Side,
+    /// The file the range is confined to (`path`, namespaced in multi-repo).
+    pub file: String,
+}
+
 /// What an off-thread review build produced (see [`App::poll_review_build`]).
 /// The git subprocess fan-out — base resolution, commit listing, the diffs
 /// themselves, possibly over SSH — happens on a `spawn_blocking` worker so
@@ -273,6 +288,8 @@ pub(crate) struct CodeReviewState {
     pub filter: ReviewFilter,
     /// The open all-comments popup (`@`), if any.
     pub comment_picker: Option<CommentPickerState>,
+    /// The in-progress range selection (`V`), if any (see [`RangeSelect`]).
+    pub range: Option<RangeSelect>,
     /// Diff context lines (`git diff -U<n>`), cycled 3 → 10 → 25 with `=`/`+`.
     /// New-side line numbers are absolute regardless of context, so comment
     /// and mark anchors are unaffected by a context change — only how much
@@ -441,6 +458,7 @@ impl CodeReviewState {
                     file: file.path.clone(),
                     side,
                     line: ln,
+                    line_end: None,
                 })
             }
             ReviewRow::FileHeader(fi) | ReviewRow::HunkHeader(fi, _) => {
@@ -451,6 +469,81 @@ impl CodeReviewState {
             }
             _ => None,
         }
+    }
+
+    /// The line number row `row` carries on `side` of `file`, in either layout
+    /// — `None` when the row isn't a diff line, belongs to another file, or
+    /// has no number on that side (an addition asked for Old, …). The
+    /// side-resolution mirrors [`Self::selected_anchor`] so a range endpoint
+    /// and a plain comment anchor never disagree about a row's line number.
+    pub(crate) fn row_side_line(&self, row: usize, file: &str, side: Side) -> Option<u32> {
+        let (fi, hi, li) = match self.rows.get(row)? {
+            ReviewRow::Line(fi, hi, li) => (*fi, *hi, *li),
+            _ => return None,
+        };
+        let f = self.files.get(fi)?;
+        if f.path != file {
+            return None;
+        }
+        let hunk = f.hunks.get(hi)?;
+        let line = if self.side_by_side {
+            let pair = pair_hunk(hunk)
+                .into_iter()
+                .find(|p| p.old == Some(li) || p.new == Some(li))?;
+            let idx = match side {
+                Side::New => pair.new,
+                Side::Old => pair.old,
+            }?;
+            hunk.lines.get(idx)?
+        } else {
+            hunk.lines.get(li)?
+        };
+        match side {
+            Side::New => line.new_no,
+            Side::Old => line.old_no,
+        }
+    }
+
+    /// The active range selection (`V`) as ordered row bounds + side, `None`
+    /// when no range is in progress. The renderer highlights the span's
+    /// side-carrying line rows inside this window.
+    pub(crate) fn range_span(&self) -> Option<(usize, usize, Side)> {
+        let r = self.range.as_ref()?;
+        let (lo, hi) = if r.start_row <= self.selected {
+            (r.start_row, self.selected)
+        } else {
+            (self.selected, r.start_row)
+        };
+        Some((lo, hi, r.side))
+    }
+
+    /// Whether `row` is covered by the active range selection: inside the span
+    /// **and** carrying a line number on the range's side (side-mismatched
+    /// rows between the endpoints are passed over, not included).
+    pub(crate) fn row_in_range(&self, row: usize) -> bool {
+        let Some((lo, hi, side)) = self.range_span() else {
+            return false;
+        };
+        let Some(r) = self.range.as_ref() else {
+            return false;
+        };
+        row >= lo && row <= hi && self.row_side_line(row, &r.file, side).is_some()
+    }
+
+    /// The [`CommentAnchor`] the active range selection compiles to: the range
+    /// side's line numbers at the start row and the current selection, ordered
+    /// start ≤ end. A span of a single line degrades to a plain line anchor.
+    pub(crate) fn range_anchor(&self) -> Option<CommentAnchor> {
+        let r = self.range.as_ref()?;
+        let a = self.row_side_line(r.start_row, &r.file, r.side)?;
+        let b = self.row_side_line(self.selected, &r.file, r.side)?;
+        let (line, end) = if a <= b { (a, b) } else { (b, a) };
+        Some(CommentAnchor::Line {
+            file: r.file.clone(),
+            side: r.side,
+            line,
+            line_end: (end > line).then_some(end),
+        })
     }
 
     /// Whether `path`'s diff is folded (collapsed to just its header). A file
@@ -796,6 +889,7 @@ impl App {
             search: None,
             filter: ReviewFilter::default(),
             comment_picker: None,
+            range: None,
             context: DEFAULT_CONTEXT,
         };
         // Install the loading state (the pane opens instantly with a
@@ -865,6 +959,9 @@ impl App {
                     }
                 }
                 cr.loading = false;
+                // A rebuild invalidates the row indices an in-progress range
+                // selection points at — drop it rather than span random rows.
+                cr.range = None;
                 cr.rebuild_rows();
                 // Every completed build reconciles the persisted "reviewed"
                 // marks against the fresh diff before the marks are (re)loaded
@@ -1321,6 +1418,9 @@ impl App {
     pub(crate) fn cr_select_row(&mut self, idx: usize) {
         if let Some(cr) = self.active_review_mut() {
             if cr.rows.get(idx).is_some_and(ReviewRow::is_selectable) {
+                // A click jumps anywhere (another file, a comment row) — that
+                // breaks the range invariant, so it cancels an active range.
+                cr.range = None;
                 cr.selected = idx;
                 cr.click_side = None;
                 cr.ensure_visible();
@@ -1482,9 +1582,21 @@ impl App {
         self.active_review()?.selected_anchor(file_level)
     }
 
-    /// Begin composing a comment at the selected line (or the file).
+    /// Begin composing a comment at the selected line (or the file). An active
+    /// range selection (`V`) compiles to a range anchor instead and is
+    /// consumed — cancelling the compose afterwards does not revive it.
     pub(crate) fn cr_start_comment(&mut self, file_level: bool) {
-        let Some(anchor) = self.cr_selected_anchor(file_level) else {
+        let range_anchor = (!file_level)
+            .then(|| self.active_review().and_then(CodeReviewState::range_anchor))
+            .flatten();
+        let anchor = match range_anchor {
+            Some(a) => {
+                self.cr_cancel_range();
+                Some(a)
+            }
+            None => self.cr_selected_anchor(file_level),
+        };
+        let Some(anchor) = anchor else {
             self.set_error("Select a diff line or file to comment on");
             return;
         };
@@ -1496,6 +1608,71 @@ impl App {
                 editing_id: None,
             });
         }
+    }
+
+    /// Start a range selection (`V`) at the selected diff line. The range's
+    /// side is the line's default comment side (the same prefer-New resolution
+    /// as a plain comment), and the whole range stays on that side of that
+    /// file — see [`RangeSelect`].
+    pub(crate) fn cr_start_range(&mut self) {
+        let anchor = self.cr_selected_anchor(false);
+        let Some(CommentAnchor::Line { file, side, .. }) = anchor else {
+            self.set_error("Select a diff line to start a range");
+            return;
+        };
+        if let Some(cr) = self.active_review_mut() {
+            cr.range = Some(RangeSelect {
+                start_row: cr.selected,
+                side,
+                file,
+            });
+        }
+        self.set_info("Range: j/k extend · c comment · Esc cancel");
+    }
+
+    /// Drop the in-progress range selection (Esc / `V` / a mouse click).
+    pub(crate) fn cr_cancel_range(&mut self) {
+        if let Some(cr) = self.active_review_mut() {
+            cr.range = None;
+        }
+    }
+
+    /// Extend the active range: move the selection to the nearest diff-line
+    /// row in `delta`'s direction that exists on the range's side and file —
+    /// skipping interleaved comments, hunk headers, and side-mismatched lines,
+    /// stopping at the file boundary ("same side, same file only"). Every
+    /// reachable endpoint is therefore a valid range end.
+    pub(crate) fn cr_range_move(&mut self, delta: isize) {
+        let Some(cr) = self.active_review_mut() else {
+            return;
+        };
+        let Some(r) = cr.range.as_ref() else {
+            return;
+        };
+        let (file, side) = (r.file.clone(), r.side);
+        let step = delta.signum();
+        if step == 0 {
+            return;
+        }
+        let mut idx = cr.selected as isize;
+        let len = cr.rows.len() as isize;
+        loop {
+            idx += step;
+            if idx < 0 || idx >= len {
+                return;
+            }
+            // A header row of another file (or the summary section) means no
+            // further same-file line rows lie this way — stop scanning.
+            match cr.rows[idx as usize] {
+                ReviewRow::FileHeader(_) | ReviewRow::SummaryHeader => return,
+                _ => {}
+            }
+            if cr.row_side_line(idx as usize, &file, side).is_some() {
+                cr.selected = idx as usize;
+                break;
+            }
+        }
+        cr.ensure_visible();
     }
 
     /// Begin composing the review summary.
@@ -2008,6 +2185,20 @@ impl App {
             self.handle_review_search_key(code, mods);
             return true;
         }
+        // An active range selection (`V`) captures navigation: j/k extend the
+        // span, c compiles it into a comment, Esc/V cancels. Everything else
+        // is swallowed so the rows under the span can't shift mid-select.
+        let ranging = self.active_review().is_some_and(|cr| cr.range.is_some());
+        if ranging {
+            match code {
+                KeyCode::Down | KeyCode::Char('j') => self.cr_range_move(1),
+                KeyCode::Up | KeyCode::Char('k') => self.cr_range_move(-1),
+                KeyCode::Char('c') => self.cr_start_comment(false),
+                KeyCode::Esc | KeyCode::Char('V') => self.cr_cancel_range(),
+                _ => {}
+            }
+            return true;
+        }
 
         let ctrl = mods.contains(KeyModifiers::CONTROL);
         // Ctrl+D / Ctrl+U half-page (pager convention) and Ctrl+R reload.
@@ -2066,6 +2257,7 @@ impl App {
             KeyCode::Char('=') | KeyCode::Char('+') => self.cr_cycle_context(),
             KeyCode::Char('c') => self.cr_start_comment(false),
             KeyCode::Char('f') => self.cr_start_comment(true),
+            KeyCode::Char('V') => self.cr_start_range(),
             KeyCode::Char('s') => self.cr_start_summary(),
             KeyCode::Char('r') => self.cr_toggle_reviewed(false),
             KeyCode::Char('R') => self.cr_toggle_reviewed(true),
@@ -2449,10 +2641,9 @@ fn review_markdown_legacy(files: &[DiffFile], comments: &[ReviewComment]) -> Opt
                 out.push_str(&format!("\n## {}\n", file.path));
                 wrote_header = true;
             }
-            let loc = match &c.anchor {
-                CommentAnchor::Line { side, line, .. } => format!("{}:{}", side.as_str(), line),
-                _ => "file".to_string(),
-            };
+            // `line_label` renders "new:10" byte-identically to this format's
+            // original output; a range comment extends it to "new:10-24".
+            let loc = c.anchor.line_label().unwrap_or_else(|| "file".to_string());
             out.push_str(&format!(
                 "- **[{}]** ({}) {}\n",
                 c.classification.label(),
@@ -2535,8 +2726,10 @@ fn handoff_quote(text: &str) -> String {
 /// comment — `C<id>` is the comment's SQLite primary key, stable across
 /// re-sends so the agent's outcome report correlates. Line records quote the
 /// anchored diff line (see [`handoff_quote`]) plus the hunk's section heading;
-/// an anchor that no longer resolves omits the quote rather than guessing.
-/// Returns `None` when there are no comments. Pure for unit-testability.
+/// a range record (`new:10-24`) quotes its first and last lines with a `> …`
+/// elision between them; an anchor that no longer resolves omits the quote
+/// rather than guessing. Returns `None` when there are no comments. Pure for
+/// unit-testability.
 fn review_markdown_structured(files: &[DiffFile], comments: &[ReviewComment]) -> Option<String> {
     if comments.is_empty() {
         return None;
@@ -2555,27 +2748,44 @@ fn review_markdown_structured(files: &[DiffFile], comments: &[ReviewComment]) ->
         for c in file_comments {
             count += 1;
             match &c.anchor {
-                CommentAnchor::Line { side, line, .. } => {
+                CommentAnchor::Line {
+                    side,
+                    line,
+                    line_end,
+                    ..
+                } => {
                     let resolved = resolve_anchor_line(files, &file.path, *side, *line);
-                    let mut head = format!(
-                        "\n### C{} [{}] {}:{}",
-                        c.id,
-                        c.classification.label(),
-                        side.as_str(),
-                        line
-                    );
-                    if let Some((hunk, _)) = resolved {
+                    // A range quotes its first and last lines with a `> …`
+                    // elision between them — still locators, not context.
+                    let resolved_end =
+                        line_end.and_then(|e| resolve_anchor_line(files, &file.path, *side, e));
+                    let label = c.anchor.line_label().unwrap_or_default();
+                    let mut head =
+                        format!("\n### C{} [{}] {}", c.id, c.classification.label(), label);
+                    if let Some((hunk, _)) = resolved.or(resolved_end) {
                         if !hunk.header.is_empty() {
                             head.push_str(&format!(", in `{}`", hunk.header));
                         }
                     }
                     if *side == Side::Old {
-                        head.push_str(" (line was removed)");
+                        head.push_str(if line_end.is_some() {
+                            " (lines were removed)"
+                        } else {
+                            " (line was removed)"
+                        });
                     }
                     records.push_str(&head);
                     records.push('\n');
                     if let Some((_, l)) = resolved {
                         records.push_str(&handoff_quote(&l.text));
+                    }
+                    if let Some(end) = line_end {
+                        if resolved.is_some() && resolved_end.is_some() && *end > line + 1 {
+                            records.push_str("> …\n");
+                        }
+                        if let Some((_, l)) = resolved_end {
+                            records.push_str(&handoff_quote(&l.text));
+                        }
                     }
                 }
                 CommentAnchor::File { .. } => {
@@ -2726,6 +2936,7 @@ impl CodeReviewState {
             search: None,
             filter: ReviewFilter::default(),
             comment_picker: None,
+            range: None,
             context: DEFAULT_CONTEXT,
         };
         s.rebuild_rows();
@@ -2800,6 +3011,7 @@ mod tests {
             search: None,
             filter: ReviewFilter::default(),
             comment_picker: None,
+            range: None,
             context: DEFAULT_CONTEXT,
         };
         s.rebuild_rows();
@@ -2919,6 +3131,7 @@ mod tests {
                 file: "src/foo.rs".into(),
                 side: Side::New,
                 line: 2,
+                line_end: None,
             },
             classification: Classification::Issue,
             body: "bug".into(),
@@ -2977,6 +3190,7 @@ mod tests {
                 file: "src/foo.rs".into(),
                 side: Side::New,
                 line: 2,
+                line_end: None,
             },
             classification: Classification::Note,
             body: "look here".into(),
@@ -3018,6 +3232,7 @@ mod tests {
                 file: "src/foo.rs".into(),
                 side: Side::New,
                 line: 2,
+                line_end: None,
             })
         );
 
@@ -3029,6 +3244,7 @@ mod tests {
                 file: "src/foo.rs".into(),
                 side: Side::Old,
                 line: 2,
+                line_end: None,
             })
         );
 
@@ -3081,6 +3297,7 @@ mod tests {
                 file: "src/foo.rs".into(),
                 side: Side::Old,
                 line: 1,
+                line_end: None,
             })
         );
     }
@@ -3468,6 +3685,7 @@ mod tests {
                 file: file.into(),
                 side: Side::New,
                 line,
+                line_end: None,
             },
             classification: class,
             body: body.into(),
@@ -3652,6 +3870,119 @@ mod tests {
         assert!(review_markdown_structured(&[headed_file()], &[]).is_none());
     }
 
+    /// `V`-range mechanics on the pure state: the compiled anchor is the
+    /// ordered `side` span between the start row and the selection, side-
+    /// mismatched rows in between are passed over, and a one-line span
+    /// degrades to a plain line anchor.
+    #[test]
+    fn range_anchor_compiles_ordered_span_and_skips_side_mismatches() {
+        // change_block_file rows: 0 header, 1 hunk, 2 ctx(old1/new1),
+        // 3 del(old2), 4 del(old3), 5 add(new2), 6 add(new3).
+        let mut s = state_with(vec![change_block_file()], vec![]);
+        let range = |start_row| RangeSelect {
+            start_row,
+            side: Side::New,
+            file: "src/foo.rs".into(),
+        };
+        s.range = Some(range(2));
+        s.selected = 6;
+        let expected = CommentAnchor::Line {
+            file: "src/foo.rs".into(),
+            side: Side::New,
+            line: 1,
+            line_end: Some(3),
+        };
+        assert_eq!(s.range_anchor(), Some(expected.clone()));
+        assert!(s.row_in_range(2) && s.row_in_range(5) && s.row_in_range(6));
+        assert!(
+            !s.row_in_range(3) && !s.row_in_range(4),
+            "old-side rows between the endpoints are not covered"
+        );
+
+        // Extending upward yields the same normalized (start ≤ end) span…
+        s.range = Some(range(6));
+        s.selected = 2;
+        assert_eq!(s.range_anchor(), Some(expected));
+
+        // …and a span of one line is a plain line anchor.
+        s.selected = 6;
+        assert_eq!(
+            s.range_anchor(),
+            Some(CommentAnchor::Line {
+                file: "src/foo.rs".into(),
+                side: Side::New,
+                line: 3,
+                line_end: None,
+            })
+        );
+    }
+
+    /// A range record quotes its first and last lines with a `> …` elision
+    /// between them (none when adjacent), pluralizes the old-side removal
+    /// marker, and omits the quote of an endpoint that no longer resolves.
+    #[test]
+    fn structured_markdown_range_records() {
+        let range_comment = |id, side, line, end| ReviewComment {
+            id,
+            session_id: SessionId::default(),
+            anchor: CommentAnchor::Line {
+                file: "src/foo.rs".into(),
+                side,
+                line,
+                line_end: Some(end),
+            },
+            classification: Classification::Issue,
+            body: "block".into(),
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        // new:1-3 spans ctx("ctx") … add("new b") with a gap → elision.
+        let md =
+            review_markdown_structured(&[headed_file()], &[range_comment(21, Side::New, 1, 3)])
+                .unwrap();
+        assert!(
+            md.contains(
+                "### C21 [Issue] new:1-3, in `fn cr_send_to_agent`\n> ctx\n> …\n> new b\nblock\n"
+            ),
+            "range record shape: {md}"
+        );
+
+        // Adjacent endpoints (new:2-3) need no elision.
+        let md =
+            review_markdown_structured(&[headed_file()], &[range_comment(22, Side::New, 2, 3)])
+                .unwrap();
+        assert!(
+            md.contains("new:2-3, in `fn cr_send_to_agent`\n> new a\n> new b\nblock\n"),
+            "adjacent range: {md}"
+        );
+
+        // Old-side range pluralizes the removal marker.
+        let md =
+            review_markdown_structured(&[headed_file()], &[range_comment(23, Side::Old, 2, 3)])
+                .unwrap();
+        assert!(
+            md.contains(
+                "old:2-3, in `fn cr_send_to_agent` (lines were removed)\n> old a\n> old b\n"
+            ),
+            "old-side range: {md}"
+        );
+
+        // An unresolvable end (new:2-9) keeps the first quote, drops the rest.
+        let md =
+            review_markdown_structured(&[headed_file()], &[range_comment(24, Side::New, 2, 9)])
+                .unwrap();
+        assert!(
+            md.contains("new:2-9, in `fn cr_send_to_agent`\n> new a\nblock\n"),
+            "unresolvable range end: {md}"
+        );
+
+        // Legacy renders the same anchor as a `(new:1-3)` bullet.
+        let md = review_markdown_legacy(&[headed_file()], &[range_comment(25, Side::New, 1, 3)])
+            .unwrap();
+        assert!(md.contains("- **[Issue]** (new:1-3) block"), "legacy: {md}");
+    }
+
     #[test]
     fn structured_markdown_old_side_marks_removed_and_quotes_old_content() {
         let c = ReviewComment {
@@ -3661,6 +3992,7 @@ mod tests {
                 file: "src/foo.rs".into(),
                 side: Side::Old,
                 line: 2,
+                line_end: None,
             },
             classification: Classification::Question,
             body: "why was this dropped?".into(),

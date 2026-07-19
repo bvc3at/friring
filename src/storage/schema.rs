@@ -19,9 +19,11 @@ use rusqlite::Connection;
 /// same bookmark memory as local ones; v40 adds `repo_sync_bases` (the
 /// per-repo default base remote for the Ctrl+S worktree sync); v41 adds
 /// `fingerprint` to `review_marks` (the semantic content hash that lets a
-/// diff rebuild drop "reviewed" marks whose file/hunk content changed).
+/// diff rebuild drop "reviewed" marks whose file/hunk content changed);
+/// v42 adds `line_end` to `review_comments` (nullable — a range comment
+/// spans `line_no..=line_end` on one side of one file).
 /// Gaps in the step table are fine (there is no v18 step either).
-pub const SCHEMA_VERSION: u32 = 41;
+pub const SCHEMA_VERSION: u32 = 42;
 
 /// A single migration step: applied when the stored version is below `target`.
 type MigrationStep = (u32, fn(&Connection) -> rusqlite::Result<()>);
@@ -89,6 +91,7 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             file_path      TEXT,
             side           TEXT,
             line_no        INTEGER,
+            line_end       INTEGER,
             classification TEXT NOT NULL DEFAULT 'note',
             body           TEXT NOT NULL,
             created_at     INTEGER NOT NULL,
@@ -297,6 +300,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         (39, migrate_v39_bookmark_host),
         (40, migrate_v40_repo_sync_bases),
         (41, migrate_v41_review_mark_fingerprint),
+        (42, migrate_v42_review_comment_line_end),
     ];
 
     for &(target, step) in steps {
@@ -1192,6 +1196,10 @@ fn migrate_v40_repo_sync_bases(conn: &Connection) -> rusqlite::Result<()> {
 /// column from `initialize` and skip this step.
 fn migrate_v41_review_mark_fingerprint(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_absent(conn, "review_marks", "fingerprint", "TEXT")
+}
+
+fn migrate_v42_review_comment_line_end(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "review_comments", "line_end", "INTEGER")
 }
 
 #[cfg(test)]
