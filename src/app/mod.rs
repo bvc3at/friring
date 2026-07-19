@@ -531,8 +531,9 @@ impl ClipboardVia {
 /// so [`App::clipboard_error`] can explain a fallback failure honestly rather
 /// than always implying native was tried (see [`App::set_clipboard_text`]).
 enum NativeCopy {
-    /// Deliberately not attempted: the native clipboard targets the SSH host,
-    /// not the machine the user is watching (`clipboard::native_clipboard_is_remote`).
+    /// Deliberately not attempted: over SSH the native clipboard wouldn't reach
+    /// the user — it's the *host's* on macOS, or absent on a display-less Linux
+    /// host (`clipboard::native_clipboard_is_remote`).
     Skipped,
     /// Attempted, but the display-server write errored.
     Failed(String),
@@ -3477,7 +3478,7 @@ impl App {
     /// it was never attempted).
     fn clipboard_error(native: &NativeCopy, stage: &str, err: &impl std::fmt::Display) -> String {
         let prefix = match native {
-            NativeCopy::Skipped => "Native clipboard skipped (SSH host's, not yours)".to_string(),
+            NativeCopy::Skipped => "Native clipboard skipped (wouldn't reach you over SSH)".into(),
             NativeCopy::Failed(e) => format!("Clipboard write failed: {e}"),
             NativeCopy::Unavailable => "Clipboard not available".to_string(),
         };
