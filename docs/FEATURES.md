@@ -1061,12 +1061,18 @@ headings, diff line bodies, comment bodies (case-insensitive literal
 substring) — via the pure `CodeReviewState::{row_text, search_matches}`. It
 **mirrors the file viewer's find**: a bar at the top shows the `/`-prefixed
 query, match position / count, and hints; typing is incremental (the selection
-jumps to the first match live), `Enter`/`↓`/`Ctrl+N` step next and
-`↑`/`Ctrl+P` previous while typing, `Tab` commits (the bar stays for
-highlighting), and after committing `n`/`N` step matches relative to the cursor
-(`cr_search_step` scans + wraps). `Esc` clears the search (a second `Esc`
-closes the review). Matched runs highlight in place with the shared
-`ui::highlight` emphasis. State is `CodeReviewState::search: Option<ReviewSearch>`,
+jumps to the first match live), `Enter`/`Ctrl+N` step next and `Ctrl+P`
+previous while typing, `Tab` commits (the bar stays for highlighting), and
+after committing `n`/`N` step matches relative to the cursor
+(`cr_search_step` scans + wraps). `↑`/`↓` in the bar recall **search
+history** — committed queries per session, newest first, in-memory only
+(`App::review_search_history`, capped at 50): the first `↑` stashes the
+live query, `↓` past the newest restores it (readline behavior), and any
+edit turns a recalled entry back into a live query. The history outlives
+the review view itself, which closes on every Send→Agent. `Esc` clears the
+search (a second `Esc` closes the review). Matched runs highlight in place
+with the shared `ui::highlight` emphasis. State is
+`CodeReviewState::search: Option<ReviewSearch>`,
 captured before the global keybinding lookup. Side-by-side rows navigate but
 aren't substring-highlighted (a v1 follow-up); folded (reviewed) files
 contribute only their header to the search until expanded.

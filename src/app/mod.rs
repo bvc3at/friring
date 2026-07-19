@@ -796,6 +796,12 @@ pub struct App {
     /// sessions and returning keeps the review open. The active session's entry
     /// (if any) is reached via [`Self::active_review`] / [`Self::active_review_mut`].
     pub(crate) code_reviews: std::collections::HashMap<SessionId, code_review::CodeReviewState>,
+    /// Committed review-search queries per session, newest last — recalled
+    /// with `↑`/`↓` in the find bar. In-memory only (not persisted) and kept
+    /// outside [`CodeReviewState`](code_review::CodeReviewState) deliberately:
+    /// the review closes on every Send→Agent, and the history must survive
+    /// the reopen.
+    pub(crate) review_search_history: std::collections::HashMap<SessionId, Vec<String>>,
     /// Open agent-activity views (section navigator + content state), keyed by
     /// session — persisted per session like [`Self::code_reviews`], so switching
     /// sessions and returning keeps the view open. Reached via
@@ -1177,6 +1183,7 @@ impl App {
             show_file_viewer: false,
             file_viewer: crate::ui::file_viewer::FileViewerState::new(),
             code_reviews: std::collections::HashMap::new(),
+            review_search_history: std::collections::HashMap::new(),
             cc_activities: std::collections::HashMap::new(),
             modal: modals::Modal::None,
             new_session: new_session_state::NewSessionWizardState::default(),
@@ -14010,6 +14017,69 @@ mod tests {
         app.handle_code_review_key(KeyCode::Esc, KeyModifiers::NONE);
         let cr = &app.code_reviews[&sid];
         assert!(cr.range.is_none() && cr.compose.is_none());
+    }
+
+    /// Committed (`Tab`) searches join a per-session history that survives
+    /// closing the review; `↑`/`↓` in the find bar recall older/newer entries,
+    /// the first `↑` stashing the live query and `↓` past the newest restoring
+    /// it. Re-committing a query moves it to the newest slot.
+    #[test]
+    fn review_search_history_recall() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        app.code_reviews
+            .insert(sid, code_review::CodeReviewState::for_test(sid, 1));
+        app.focus = InputFocus::CodeReview;
+
+        fn commit_query(app: &mut App, q: &str) {
+            app.handle_code_review_key(KeyCode::Char('/'), KeyModifiers::NONE);
+            for c in q.chars() {
+                app.handle_code_review_key(KeyCode::Char(c), KeyModifiers::NONE);
+            }
+            app.handle_code_review_key(KeyCode::Tab, KeyModifiers::NONE);
+            app.handle_code_review_key(KeyCode::Esc, KeyModifiers::NONE);
+        }
+        commit_query(&mut app, "alpha");
+        commit_query(&mut app, "beta");
+        assert_eq!(app.review_search_history[&sid], ["alpha", "beta"]);
+        commit_query(&mut app, "alpha");
+        assert_eq!(
+            app.review_search_history[&sid],
+            ["beta", "alpha"],
+            "re-commit moves the query to the newest slot"
+        );
+
+        // The history outlives the review view itself (it closes on every
+        // Send→Agent).
+        app.close_code_review();
+        app.code_reviews
+            .insert(sid, code_review::CodeReviewState::for_test(sid, 1));
+        app.focus = InputFocus::CodeReview;
+
+        app.handle_code_review_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        app.handle_code_review_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        let query = |app: &App| {
+            app.code_reviews[&sid]
+                .search
+                .as_ref()
+                .unwrap()
+                .query
+                .clone()
+        };
+        app.handle_code_review_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(query(&app), "alpha", "↑ recalls the newest commit");
+        app.handle_code_review_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(query(&app), "beta");
+        app.handle_code_review_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(query(&app), "beta", "the oldest entry pins");
+        app.handle_code_review_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(query(&app), "alpha");
+        app.handle_code_review_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(
+            query(&app),
+            "x",
+            "↓ past the newest restores the live query"
+        );
     }
 
     /// Toggling a reviewed mark stores the current semantic fingerprint, so

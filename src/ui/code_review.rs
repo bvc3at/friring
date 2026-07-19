@@ -1612,7 +1612,7 @@ fn render_search_bar(frame: &mut Frame, area: Rect, state: &CodeReviewState) {
     };
     let caret = if s.editing { "█" } else { "" };
     let hint = if s.editing {
-        "   ↵/↓ next · ↑ prev · tab done · esc cancel"
+        "   ↵/^N next · ^P prev · ↑/↓ history · tab done · esc cancel"
     } else {
         "   n next · N prev · esc clear"
     };
@@ -1832,6 +1832,8 @@ mod tests {
             query: "new".into(),
             editing: false,
             matches: Vec::new(),
+            hist_idx: None,
+            stash: String::new(),
         });
         state.refresh_search_matches();
         let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
@@ -2185,6 +2187,8 @@ mod tests {
             query: "ctx".to_string(),
             editing: true,
             matches: state.search_matches("ctx"),
+            hist_idx: None,
+            stash: String::new(),
         });
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {

@@ -142,9 +142,10 @@ impl ReviewRow {
 /// the file viewer's find. Matches rows whose text — file paths, hunk headers,
 /// diff line bodies, and comment bodies — contains the query (case-insensitive).
 /// While [`Self::editing`] every key edits the query (the selection jumps to the
-/// first match as you type); `Enter`/`↓`/`Ctrl+N` step to the next match, `↑`/
-/// `Ctrl+P` the previous, and `Tab` commits — after which the bar stays for
-/// highlighting and `n`/`N` step matches just like the file viewer.
+/// first match as you type); `Enter`/`Ctrl+N` step to the next match, `Ctrl+P`
+/// the previous, `↑`/`↓` recall older/newer committed searches
+/// ([`App::review_search_history`]), and `Tab` commits — after which the bar
+/// stays for highlighting and `n`/`N` step matches just like the file viewer.
 pub(crate) struct ReviewSearch {
     /// The query being typed (append-only editing, like the file viewer).
     pub query: String,
@@ -154,6 +155,13 @@ pub(crate) struct ReviewSearch {
     /// "current" position shown in the bar is derived from the selection, so
     /// `n`/`N` always step relative to where the cursor actually is.
     pub matches: Vec<usize>,
+    /// History-recall cursor: `Some(i)` = the bar shows
+    /// [`App::review_search_history`] entry `i`; `None` = a live query.
+    /// Cleared by any edit (a recalled entry becomes a live query on typing).
+    pub hist_idx: Option<usize>,
+    /// The live query stashed by the first `↑` recall, restored by stepping
+    /// `↓` past the newest history entry — readline behavior.
+    pub stash: String,
 }
 
 /// In-view popup listing every comment (`@`), reusing the target-picker
@@ -303,6 +311,10 @@ pub(crate) const DEFAULT_CONTEXT: u32 = 3;
 
 /// The `=`/`+` context cycle: 3 → 10 → 25 → 3.
 const CONTEXT_CYCLE: [u32; 3] = [DEFAULT_CONTEXT, 10, 25];
+
+/// Cap on [`App::review_search_history`] entries per session — a growth guard,
+/// far above what `↑`-recall usefully reaches.
+const SEARCH_HISTORY_MAX: usize = 50;
 
 impl ReviewTarget {
     /// Display label for the picker / title, given the repos + loaded commits.
@@ -1470,6 +1482,8 @@ impl App {
                 query: String::new(),
                 editing: true,
                 matches: Vec::new(),
+                hist_idx: None,
+                stash: String::new(),
             });
         }
     }
@@ -1485,14 +1499,80 @@ impl App {
     /// matches stay highlighted and `n`/`N` step. An empty query just closes it
     /// (mirrors the file viewer hiding its bar on an empty commit).
     fn cr_commit_search(&mut self) {
-        let Some(cr) = self.active_review_mut() else {
+        let committed = {
+            let Some(cr) = self.active_review_mut() else {
+                return;
+            };
+            let sid = cr.session_id;
+            match cr.search.as_mut() {
+                Some(s) if s.query.trim().is_empty() => {
+                    cr.search = None;
+                    None
+                }
+                Some(s) => {
+                    s.editing = false;
+                    s.hist_idx = None;
+                    Some((sid, s.query.clone()))
+                }
+                None => None,
+            }
+        };
+        // A committed query joins the per-session recall history (newest
+        // last, one slot per query, in-memory only).
+        if let Some((sid, q)) = committed {
+            let hist = self.review_search_history.entry(sid).or_default();
+            hist.retain(|e| e != &q);
+            hist.push(q);
+            if hist.len() > SEARCH_HISTORY_MAX {
+                let excess = hist.len() - SEARCH_HISTORY_MAX;
+                hist.drain(..excess);
+            }
+        }
+    }
+
+    /// Recall a committed search into the find bar (`↑` older / `↓` newer),
+    /// readline-style: the first `↑` stashes the live query, and stepping `↓`
+    /// past the newest entry restores it. A recalled query re-matches and
+    /// jumps to its first match immediately, like typing does.
+    fn cr_search_recall(&mut self, older: bool) {
+        let Some(sid) = self.active_review().map(|cr| cr.session_id) else {
             return;
         };
-        match cr.search.as_mut() {
-            Some(s) if s.query.trim().is_empty() => cr.search = None,
-            Some(s) => s.editing = false,
-            None => {}
+        let hist = match self.review_search_history.get(&sid) {
+            Some(h) if !h.is_empty() => h.clone(),
+            _ => return,
+        };
+        {
+            let Some(cr) = self.active_review_mut() else {
+                return;
+            };
+            let Some(s) = cr.search.as_mut() else {
+                return;
+            };
+            match (s.hist_idx, older) {
+                (None, true) => {
+                    s.stash = std::mem::take(&mut s.query);
+                    s.hist_idx = Some(hist.len() - 1);
+                    s.query = hist[hist.len() - 1].clone();
+                }
+                // Nothing newer than the live query / older than the oldest.
+                (None, false) | (Some(0), true) => return,
+                (Some(i), true) => {
+                    s.hist_idx = Some(i - 1);
+                    s.query = hist[i - 1].clone();
+                }
+                (Some(i), false) if i + 1 < hist.len() => {
+                    s.hist_idx = Some(i + 1);
+                    s.query = hist[i + 1].clone();
+                }
+                (Some(_), false) => {
+                    s.hist_idx = None;
+                    s.query = std::mem::take(&mut s.stash);
+                }
+            }
+            cr.refresh_search_matches();
         }
+        self.cr_jump_first_match();
     }
 
     /// Edit the query (append a char or backspace), then re-match and jump the
@@ -1506,6 +1586,8 @@ impl App {
                         s.query.pop();
                     }
                 }
+                // Editing turns a recalled history entry into a live query.
+                s.hist_idx = None;
             }
             cr.refresh_search_matches();
         }
@@ -1557,15 +1639,17 @@ impl App {
         }
     }
 
-    /// Key handling while the search query line is being typed, mirroring the
-    /// file viewer: `Enter`/`↓`/`Ctrl+N` next match, `↑`/`Ctrl+P` previous (all
-    /// stay in the input), `Tab` commits, `Esc` cancels, `Backspace`/chars edit.
+    /// Key handling while the search query line is being typed: `Enter`/
+    /// `Ctrl+N` next match, `Ctrl+P` previous (all stay in the input), `↑`/`↓`
+    /// recall older/newer committed searches, `Tab` commits, `Esc` cancels,
+    /// `Backspace`/chars edit.
     fn handle_review_search_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let ctrl = mods.contains(KeyModifiers::CONTROL);
         match code {
             KeyCode::Esc => self.cr_close_search(),
-            KeyCode::Enter | KeyCode::Down => self.cr_search_step(true),
-            KeyCode::Up => self.cr_search_step(false),
+            KeyCode::Enter => self.cr_search_step(true),
+            KeyCode::Up => self.cr_search_recall(true),
+            KeyCode::Down => self.cr_search_recall(false),
             KeyCode::Tab => self.cr_commit_search(),
             KeyCode::Char('n') if ctrl => self.cr_search_step(true),
             KeyCode::Char('p') if ctrl => self.cr_search_step(false),
@@ -4177,6 +4261,8 @@ mod tests {
             query: "added".to_string(),
             editing: false,
             matches: Vec::new(),
+            hist_idx: None,
+            stash: String::new(),
         });
         s.refresh_search_matches();
         assert_eq!(

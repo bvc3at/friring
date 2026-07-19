@@ -101,6 +101,9 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
 - **Binary diff placeholder.** A binary body renders an explanatory
   `(binary file[, size])` row instead of upstream's bare `+0 -0` header
   (size only where a local stat is free — the Working target).
+- **Search history (`↑`/`↓` in the find bar).** Committed searches recall
+  per session (in-memory); match-stepping while typing moved to
+  `Ctrl+N`/`Ctrl+P` to free the arrows.
 
 #### Agent activity view (F9)
 
