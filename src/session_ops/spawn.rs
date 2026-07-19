@@ -113,6 +113,7 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         &worktrees,
         &additional_dirs,
         host.as_ref(),
+        None,
     );
 
     // Mint the friring SessionId up front so it can be injected into the
@@ -168,6 +169,7 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         // is a spawn-time launch detail, re-derived idempotently on every launch.
         cwd: Some(primary_cwd.clone()),
         additional_dirs: additional_dirs.clone(),
+        workspace_dir: None,
         worktrees: worktrees.clone(),
         shell_backend_id: None,
         parent_session_id: req.parent_session_id,
@@ -324,6 +326,7 @@ pub(crate) fn resolve_launch_cwd(
     worktrees: &[SharedWorktree],
     additional_dirs: &[PathBuf],
     host: Option<&HostDef>,
+    workspace_dir: Option<&std::path::Path>,
 ) -> PathBuf {
     let mut members: Vec<(String, PathBuf)> = Vec::new();
     if worktrees.is_empty() {
@@ -340,24 +343,39 @@ pub(crate) fn resolve_launch_cwd(
     if members.len() < 2 {
         return primary_cwd.to_path_buf();
     }
-    build_multi_repo_workspace(host, agent_session_id, &members)
+    build_multi_repo_workspace(host, agent_session_id, &members, workspace_dir)
         .unwrap_or_else(|| primary_cwd.to_path_buf())
 }
 
 /// Build the per-session multi-repo symlink workspace — on the *remote* host
 /// when one is given (a local symlink dir wouldn't exist there), else with the
-/// local builder. `None` (error already logged) tells the caller to fall back
-/// to its primary cwd. Single home for the host branching + fallback policy,
-/// shared by [`resolve_launch_cwd`] and the TUI's `App::resolve_process_cwd`.
+/// local builder. A user-chosen `workspace_dir` overrides the default
+/// id-derived path on local builds only (the wizard never offers it for a
+/// remote spawn; a stale persisted value degrades to the default rather than
+/// guessing a remote path). `None` (error already logged) tells the caller to
+/// fall back to its primary cwd. Single home for the host branching + fallback
+/// policy, shared by [`resolve_launch_cwd`] and the TUI's
+/// `App::resolve_process_cwd`.
 pub(crate) fn build_multi_repo_workspace(
     host: Option<&HostDef>,
     agent_session_id: &str,
     members: &[(String, PathBuf)],
+    workspace_dir: Option<&std::path::Path>,
 ) -> Option<PathBuf> {
     let built = match host {
-        Some(h) => crate::git::ensure_remote_workspace(h, agent_session_id, members),
-        None => crate::workspace::ensure_workspace(agent_session_id, members)
-            .map_err(anyhow::Error::from),
+        Some(h) => {
+            if workspace_dir.is_some() {
+                tracing::warn!("custom workspace dir is local-only; using the default remote path");
+            }
+            crate::git::ensure_remote_workspace(h, agent_session_id, members)
+        }
+        None => match workspace_dir {
+            Some(dir) => {
+                crate::workspace::ensure_workspace_at(dir, members).map_err(anyhow::Error::from)
+            }
+            None => crate::workspace::ensure_workspace(agent_session_id, members)
+                .map_err(anyhow::Error::from),
+        },
     };
     match built {
         Ok(ws) => Some(ws),
@@ -617,6 +635,7 @@ mod tests {
             agent_session_id: None,
             cwd: None,
             additional_dirs: Vec::new(),
+            workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
             parent_session_id: None,
@@ -845,7 +864,7 @@ mod tests {
     fn resolve_launch_cwd_single_member_is_primary() {
         let primary = PathBuf::from("/tmp/primary");
         // No worktrees, no extra dirs → 1 member → primary cwd, no workspace.
-        let got = resolve_launch_cwd("sid-1", &primary, &[], &[], None);
+        let got = resolve_launch_cwd("sid-1", &primary, &[], &[], None, None);
         assert_eq!(got, primary);
     }
 
@@ -857,9 +876,31 @@ mod tests {
         std::fs::create_dir_all(&primary).unwrap();
         let extra = temp.path().join("extra");
         std::fs::create_dir_all(&extra).unwrap();
-        let got = resolve_launch_cwd("sid-multi", &primary, &[], &[extra], None);
+        let got = resolve_launch_cwd("sid-multi", &primary, &[], &[extra], None, None);
         // Two members → a symlink workspace, not the primary itself.
         assert_ne!(got, primary);
         assert!(got.join("primary").exists() || got.exists());
+    }
+
+    #[test]
+    fn resolve_launch_cwd_honors_custom_workspace_dir() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let primary = temp.path().join("primary");
+        std::fs::create_dir_all(&primary).unwrap();
+        let extra = temp.path().join("extra");
+        std::fs::create_dir_all(&extra).unwrap();
+        let custom = temp.path().join("my-ws");
+
+        let got = resolve_launch_cwd(
+            "sid-custom",
+            &primary,
+            &[],
+            &[extra],
+            None,
+            Some(custom.as_path()),
+        );
+        assert_eq!(got, custom);
+        assert!(std::fs::read_link(custom.join("primary")).is_ok());
     }
 }

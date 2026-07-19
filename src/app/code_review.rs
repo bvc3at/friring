@@ -1106,7 +1106,7 @@ impl App {
 
     /// Reconcile the persisted "reviewed" marks of `sid`'s review against its
     /// freshly built diff. A mark survives iff its stored fingerprint matches
-    /// the recomputed one; a `NULL` fingerprint (a pre-v41 row) is treated as
+    /// the recomputed one; a `NULL` fingerprint (a pre-v42 row) is treated as
     /// valid once and backfilled; a mismatch means the content changed under
     /// the ✓, so the mark is **deleted from the DB** (not just hidden — it must
     /// not resurrect on the next build). Marks on files absent from the current

@@ -287,7 +287,19 @@ disk), and a fork — it has no prior step.
 4. **Session name** — the sidebar identifier, prefilled from the
    repo basename (deduped `-2`, `-3`, … against existing sessions)
    so the common case is Enter-through; edit or clear it freely.
-   Shows a muted breadcrumb of the choices so far.
+   Shows a muted breadcrumb of the choices so far. When the pending
+   spawn is **multi-repo and local**, `Ctrl+O` reveals an optional
+   **workspace dir** field (`Tab` switches between the two fields,
+   `Ctrl+O` again hides it): a bare name places the symlink
+   workspace at `~/.local/share/friring/workspaces/<name>`, a `~`
+   or absolute path places it exactly there — so the agent's cwd
+   can be a browsable, named directory instead of a UUID. Left
+   empty (the default) the id-derived path is used. A value
+   containing any `..` component is rejected rather than
+   normalized. The target must be missing, empty, or a previous
+   symlink-only workspace —
+   `Enter` refuses anything else, and friring only ever deletes
+   symlink-only directories there (never real files).
 5. **New branch name** — worktree mode only, prefilled from the
    session name (`/` preserved as a hierarchy separator).
 6. **Agent picker** — choose which coding agent runs in this
@@ -330,10 +342,15 @@ idempotently on each launch (`workspace::ensure_workspace` /
 repos) when the session is deleted. `SessionInfo.cwd` keeps the **primary**
 repo (for display / editor / git context); the workspace is a spawn-time
 process-cwd detail, derived on every launch from the persisted members and
-never stored. The member set is the single `App::session_member_dirs` list
-that also feeds the rendered repo names, and `App::resolve_process_cwd`
-picks workspace-vs-primary. Single-repo sessions launch directly in the repo
-as before.
+not stored — except a **user-chosen workspace dir** (the name step's
+`Ctrl+O` field, local sessions only), which can't be re-derived from the id
+and is persisted as `SessionInfo.workspace_dir` (schema v41) so restart, the
+shell pane, and delete resolve the directory the agent actually launched in
+(`workspace::ensure_workspace_at` / `remove_workspace_at`, both refusing a
+directory holding anything but symlinks). The member set is the single
+`App::session_member_dirs` list that also feeds the rendered repo names, and
+`App::resolve_process_cwd` picks workspace-vs-primary. Single-repo sessions
+launch directly in the repo as before.
 
 **Headless multi-repo.** The same shape is reachable without the TUI.
 `friring-cli session create` (and `task create`) take repeatable
@@ -598,6 +615,8 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Tab` | Repo picker | Complete the typed path (never moves focus) | |
 | `Ctrl+P` | Repo picker | Import the typed folder's repos as a parent | |
 | `Enter` | Repo picker | Open picked repos / the highlighted row; add + open a typed path | |
+| `Ctrl+O` | Name step (multi-repo, local) | Show/hide the optional workspace-dir field | |
+| `Tab` | Name step (field shown) | Switch focus between name and workspace dir | |
 | `Esc` | New-session wizard | Back one step (first step cancels) | |
 | `Shift+Up` | Focused terminal | Scroll up 1 line | |
 | `Shift+Down` | Focused terminal | Scroll down 1 line | |
@@ -928,7 +947,7 @@ over rows with no number on the range's side (the deletions between two
 kept new-side lines, say) and stops at the file boundary, so every
 reachable endpoint is valid. The anchor persists as
 `line_no..=line_end` (nullable `line_end` on `review_comments`, schema
-v42); the comment row sits at the span's **last** line labelled with the
+v43); the comment row sits at the span's **last** line labelled with the
 full span (`(new:10-24)`), the compose header reads `lines new:10-24`,
 and the structured handoff record becomes
 `### C<id> [Class] new:10-24, in `\`heading\`` quoting the span's first
@@ -989,9 +1008,9 @@ positions and context, so a pure line-shift from an unrelated edit above
 keeps the mark while a content change drops it). On every completed build
 (open, retarget, reload) each stored mark is compared against the fresh
 diff: mismatches are **deleted** (not hidden) and summarized in one toast
-(`"3 reviewed marks cleared (content changed)"`); pre-v41 rows with no
+(`"3 reviewed marks cleared (content changed)"`); pre-v42 rows with no
 fingerprint are honored once and backfilled (`review_marks.fingerprint`,
-schema v41).
+schema v42).
 
 **Export is the agent, not GitHub.** GitHub/GitLab submit is out of
 scope; the payoff of reviewing *inside* an orchestrator is closing the
@@ -2583,11 +2602,20 @@ confined to the active pane bounds.
   drag).
 - **`Ctrl+C`** (with active selection): Copies selected text to
   the system clipboard via `arboard`. Trailing whitespace is
-  trimmed per line. When no display server is reachable (`arboard`
-  needs X11/Wayland — unavailable over SSH, under a display-less
-  tmux, or in WSL without WSLg) the copy falls back (`app::clipboard`)
-  to whichever path actually reaches the outer terminal: **inside
-  tmux** (`$TMUX` set), `tmux load-buffer -w -`, which has tmux
+  trimmed per line. The native path is skipped whenever it cannot
+  reach the user: no display server (`arboard` needs X11/Wayland —
+  unavailable under a display-less tmux or in WSL without WSLg),
+  or an SSH session (`$SSH_TTY`/`$SSH_CONNECTION`) with no
+  forwarded display — there the native clipboard is the **SSH
+  host's** (macOS accepts NSPasteboard writes from an SSH login),
+  so a "successful" native copy would land on a machine the user
+  is not looking at. (A loopback SSH — `ssh localhost`, detected
+  from a loopback server address in `$SSH_CONNECTION` — is the
+  exception: host and user are the same machine, so native is kept.)
+  Either way the copy falls back
+  (`app::clipboard`) to whichever path actually reaches the
+  user's terminal: **inside tmux** (`$TMUX` set),
+  `tmux load-buffer -w -`, which has tmux
   itself set the outer terminal's clipboard — a raw application OSC 52
   written to friring's own stdout is *dropped* by tmux's default
   `set-clipboard external`, so the escape has to come from tmux (this
@@ -2605,8 +2633,10 @@ confined to the active pane bounds.
   modal is open the paste is swallowed so it can never leak into the
   terminal in the pane behind the overlay; otherwise it pastes into
   the active PTY. Paste has **no OSC 52 fallback** (terminals block
-  clipboard *reads* for security) — without a display server, use the
-  terminal's own paste key, which arrives as a bracketed paste.
+  clipboard *reads* for security) — without a display server, or
+  over SSH (where a read would return the *host's* clipboard, not
+  what the user just copied), use the terminal's own paste key,
+  which arrives as a bracketed paste.
 - Any other keypress clears the selection.
 
 Selection is highlighted in the terminal render buffer using

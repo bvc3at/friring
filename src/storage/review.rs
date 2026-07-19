@@ -17,7 +17,7 @@ const WHOLE_FILE_HUNK: i64 = -1;
 
 /// One persisted "reviewed" mark: `(file_path, hunk_index, fingerprint)`.
 /// `hunk_index = None` means the whole file; a `None` fingerprint is a legacy
-/// (pre-v41) row awaiting backfill.
+/// (pre-v42) row awaiting backfill.
 pub type ReviewMarkRow = (String, Option<usize>, Option<String>);
 
 /// Decompose a [`CommentAnchor`] into the four nullable columns it persists as.
@@ -204,7 +204,7 @@ impl Database {
 
     /// List a session's "reviewed" marks as `(file_path, hunk_index,
     /// fingerprint)` where `hunk_index = None` means the whole file and a
-    /// `None` fingerprint is a legacy (pre-v41) row.
+    /// `None` fingerprint is a legacy (pre-v42) row.
     pub fn list_review_marks(&self, session_id: SessionId) -> rusqlite::Result<Vec<ReviewMarkRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT file_path, hunk_index, fingerprint FROM review_marks WHERE session_id = ?1",
@@ -261,7 +261,7 @@ impl Database {
 
 #[cfg(test)]
 impl Database {
-    /// Insert a mark with a NULL fingerprint — the pre-v41 row shape — so the
+    /// Insert a mark with a NULL fingerprint — the pre-v42 row shape — so the
     /// reconciliation pass's legacy branch is testable through the public API.
     pub fn insert_review_mark_without_fingerprint(
         &self,

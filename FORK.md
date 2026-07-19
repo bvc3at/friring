@@ -71,7 +71,7 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
   (upstream's only refresh was retarget/reopen), preserving the selection by
   file.
 - **Self-invalidating reviewed marks.** Marks store a semantic fingerprint
-  of the marked content (schema **v41**, `review_marks.fingerprint`); every
+  of the marked content (schema **v42**, `review_marks.fingerprint`); every
   completed build deletes marks whose file/hunk content changed and toasts a
   summary — upstream marks could silently go stale.
 - **Staged-only target.** The `t` picker gains `Staged changes (index vs
@@ -95,7 +95,7 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
 - **Context expansion (`=`/`+`).** Cycles `-U3 → -U10 → -U25`, shown as
   `· U<n>` in the title.
 - **Range comments (`V`).** `V` + `j`/`k` select a same-side, same-file
-  line span, `c` comments on it (schema **v42**,
+  line span, `c` comments on it (schema **v43**,
   `review_comments.line_end`); the handoff record reads `new:10-24` and
   quotes the span's first + last lines with `> …` between.
 - **Binary diff placeholder.** A binary body renders an explanatory
@@ -497,6 +497,20 @@ flow away. The fork rebuilds the flow:
   the repo basename (deduped `-2`, `-3`, … against existing sessions) so the
   common case is Enter-through. The base-branch and agent steps keep their
   upstream type-to-filter selectors.
+- **Optional named workspace dir (`Ctrl+O` on the name step).** Upstream
+  always builds a multi-repo session's symlink workspace at
+  `workspaces/<agent_session_id>` (a UUID). For a multi-repo **local** spawn
+  the fork's name step gains a hidden-by-default second field (`Ctrl+O`
+  shows/hides, `Tab` switches focus): a bare name puts the workspace at
+  `workspaces/<name>`, a `~`/absolute path puts it exactly there. The choice
+  is persisted (`sessions.workspace_dir`, schema v41) so restart, the shell
+  pane, and delete resolve the same directory; creation and removal refuse a
+  target holding anything but symlinks, so a mistyped path can never destroy
+  real files (`workspace::ensure_workspace_at` / `remove_workspace_at`).
+  `session get/list --json` expose `workspace_dir` + `additional_dirs`, and
+  the `claude-named-workspace` agent-e2e scenario drives the whole flow —
+  wizard keys, agent writing through the symlinks, persistence, guarded
+  delete — against the real Claude Code binary (`docs/E2E.md`).
 
 Keys and flow are documented in `docs/FEATURES.md`; the back-navigation
 interplay with ADR-P12 in `docs/PERFORMANCE.md`.
@@ -508,22 +522,33 @@ interplay with ADR-P12 in `docs/PERFORMANCE.md`.
   the *next* spawn silently attached the stale directories. Cleared on
   back-navigation/cancel now (fixed as part of the wizard redesign).
 
-- **Copy falls back to `tmux load-buffer` / OSC 52 when no display server is
-  reachable.** Upstream copies only through `arboard`, which needs X11/Wayland —
-  over SSH, under a display-less tmux, or in WSL without WSLg every copy failed
-  with "Clipboard not available". The fork adds two fallbacks (`app::clipboard`),
-  tried in the order that actually works: (1) inside tmux (`$TMUX` set — the
-  common `tmux -> friring` setup), `tmux load-buffer -w -`, which has **tmux
-  itself** set the outer terminal's clipboard; a raw application OSC 52 written
-  to our own stdout is *dropped* by tmux's default `set-clipboard external`
-  ("ignore attempts by applications to set tmux buffers"), so it must come from
-  tmux — and this path returns a real exit status rather than being
-  fire-and-forget (needs tmux ≥ 3.2 for `-w`, already required). (2) Outside
-  tmux, a raw OSC 52 escape to stdout (for a direct OSC-52-capable terminal),
-  whose toast is marked `(OSC 52)` since it is fire-and-forget. Applies to all
-  copy surfaces (selection, status bar, code-review markdown). Paste keeps
-  arboard only — terminals block OSC 52 *reads* — and the error now points at
-  the terminal's own paste key (bracketed paste still works).
+- **Copy falls back to `tmux load-buffer` / OSC 52 when the native clipboard
+  can't reach the user.** Upstream copies only through `arboard`, which needs
+  X11/Wayland — over SSH to a Linux host, under a display-less tmux, or in WSL
+  without WSLg every copy failed with "Clipboard not available". The fork adds
+  two fallbacks (`app::clipboard`), tried in the order that actually works:
+  (1) inside tmux (`$TMUX` set — the common `tmux -> friring` setup),
+  `tmux load-buffer -w -`, which has **tmux itself** set the outer terminal's
+  clipboard; a raw application OSC 52 written to our own stdout is *dropped* by
+  tmux's default `set-clipboard external` ("ignore attempts by applications to
+  set tmux buffers"), so it must come from tmux — and this path returns a real
+  exit status rather than being fire-and-forget (needs tmux ≥ 3.2 for `-w`,
+  already required). (2) Outside tmux, a raw OSC 52 escape to stdout (for a
+  direct OSC-52-capable terminal), whose toast is marked `(OSC 52)` since it is
+  fire-and-forget. Applies to all copy surfaces (selection, status bar,
+  code-review markdown). The native path is also skipped when it *works but is
+  the wrong machine*: on a macOS (or Windows) host reached over SSH the native
+  clipboard API is reachable from the SSH login, so `arboard` "succeeded" onto
+  the **host's** clipboard — which the user never sees — and the fallbacks never
+  ran. An SSH session (`SSH_TTY`/`SSH_CONNECTION`) with no forwarded
+  `DISPLAY`/`WAYLAND_DISPLAY` (which on X11 platforms would route the clipboard
+  back to the user) now goes straight to the tmux/OSC 52 route
+  (`clipboard::native_clipboard_is_remote`) — except a loopback SSH
+  (`ssh localhost`, a loopback server address in `SSH_CONNECTION`), where host
+  and user are the same machine and native is kept. Paste keeps arboard only —
+  terminals block OSC 52 *reads* — and the error points at the terminal's own
+  paste key (bracketed paste still works); over SSH paste likewise refuses
+  instead of silently pasting the *host's* clipboard.
 
 - **Modifier-Enter inserts a newline in the agent instead of switching
   sessions.** A legacy terminal (Windows Terminal, or anything behind an outer

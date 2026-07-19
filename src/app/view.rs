@@ -1047,6 +1047,9 @@ impl App {
         if let Some(base) = self.new_session.base_branch.as_deref() {
             parts.push(format!("wt from {base}"));
         }
+        if let Some(ws) = self.new_session.workspace_dir.as_deref() {
+            parts.push(format!("ws {}", crate::paths::display_path_tilde(ws)));
+        }
         (!parts.is_empty()).then(|| parts.join(" · "))
     }
 
@@ -1086,6 +1089,12 @@ impl App {
                     cursor: sn.name.cursor_pos(),
                     title,
                     breadcrumb: crumb.as_deref(),
+                    workspace_dir: sn
+                        .workspace_dir
+                        .as_ref()
+                        .map(|f| (f.value(), f.cursor_pos())),
+                    workspace_focused: sn.workspace_focused,
+                    offer_workspace_dir: self.pending_spawn_offers_workspace_dir(),
                 },
             );
         }
