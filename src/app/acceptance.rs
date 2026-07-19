@@ -2289,6 +2289,97 @@ fn review_search_flow_finds_navigates_and_clears() {
     assert!(h.app.active_review().is_none());
 }
 
+/// The full annotate → send loop, key-driven end to end: a classified line
+/// comment (`c`, Tab, Ctrl+S), a range comment (`V` + `j` + `c` — cycled to
+/// `Question`), a review summary (`s`), the structured handoff compiled with
+/// C-ids + quoted locators, then `e` closing the review, arming the re-review
+/// nudge, and leaving the comments in SQLite for the reopen.
+#[test]
+fn review_annotate_send_loop_end_to_end() {
+    use crate::session::review::{Classification, CommentAnchor, DiffLine, DiffLineKind, Side};
+    let mut h = Harness::new(STD_COLS, STD_ROWS, 1);
+    let sid = h.app.sessions[0].info.id;
+    let mut cr = crate::app::code_review::CodeReviewState::for_test(sid, 1);
+    // A second added line so a range can span (for_test files carry one).
+    cr.files[0].hunks[0].lines.push(DiffLine {
+        kind: DiffLineKind::Add,
+        old_no: None,
+        new_no: Some(2),
+        text: "second".into(),
+    });
+    cr.rebuild_rows();
+    h.app.code_reviews.insert(sid, cr);
+    h.app.focus = InputFocus::CodeReview;
+
+    // Rows: 0 FileHeader, 1 HunkHeader, 2 Line(new:1), 3 Line(new:2).
+    // A classified line comment on new:1 — Tab cycles Note → Issue.
+    h.key(KeyCode::Char('j'), KeyModifiers::NONE);
+    h.key(KeyCode::Char('j'), KeyModifiers::NONE);
+    h.key(KeyCode::Char('c'), KeyModifiers::NONE);
+    h.key(KeyCode::Tab, KeyModifiers::NONE);
+    for ch in "needs a guard".chars() {
+        h.key(KeyCode::Char(ch), KeyModifiers::NONE);
+    }
+    h.ctrl('s');
+
+    // A range comment spanning both lines, cycled to Question.
+    h.key(KeyCode::Char('V'), KeyModifiers::SHIFT);
+    h.key(KeyCode::Char('j'), KeyModifiers::NONE);
+    h.key(KeyCode::Char('c'), KeyModifiers::NONE);
+    for _ in 0..3 {
+        h.key(KeyCode::Tab, KeyModifiers::NONE); // Note → Issue → Suggestion → Question
+    }
+    for ch in "why two?".chars() {
+        h.key(KeyCode::Char(ch), KeyModifiers::NONE);
+    }
+    h.ctrl('s');
+
+    // The review summary.
+    h.key(KeyCode::Char('s'), KeyModifiers::NONE);
+    for ch in "overall ok".chars() {
+        h.key(KeyCode::Char(ch), KeyModifiers::NONE);
+    }
+    h.ctrl('s');
+
+    // The compiled structured handoff carries the C-ids, the quoted locators
+    // (for_test's line text is "x"), and the range span.
+    let md = h.app.cr_review_markdown().expect("three comments compile");
+    assert!(
+        md.starts_with("Code review — 3 comments. Semantics:\n"),
+        "preamble: {md}"
+    );
+    assert!(
+        md.contains("### C1 [Issue] new:1\n> x\nneeds a guard\n"),
+        "line record: {md}"
+    );
+    assert!(
+        md.contains("### C2 [Question] new:1-2\n> x\n> second\nwhy two?\n"),
+        "range record: {md}"
+    );
+    assert!(md.contains("\n## Review summary\n"), "summary: {md}");
+
+    // `e` sends: the pane closes (the user watches the agent receive it) and
+    // the re-review nudge is armed for this session.
+    h.key(KeyCode::Char('e'), KeyModifiers::NONE);
+    assert!(h.app.active_review().is_none(), "close-on-send");
+    assert!(h.app.review_nudge_watch.contains_key(&sid));
+
+    // Everything survives in SQLite for the reopen.
+    let stored = h.app.db.list_review_comments(sid).unwrap();
+    assert_eq!(stored.len(), 3);
+    assert_eq!(stored[0].classification, Classification::Issue);
+    assert_eq!(
+        stored[1].anchor,
+        CommentAnchor::Line {
+            file: "src/f0.rs".into(),
+            side: Side::New,
+            line: 1,
+            line_end: Some(2),
+        }
+    );
+    assert_eq!(stored[2].anchor, CommentAnchor::Review);
+}
+
 /// Insert a review whose first diff line is `width` chars wide, so horizontal
 /// scroll / wrap have something to act on. Returns the session id.
 #[cfg(test)]
