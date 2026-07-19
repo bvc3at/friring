@@ -1,0 +1,34 @@
+{
+  "responses": [
+    {
+      "name": "ambient",
+      "ambient": true,
+      "match": { "modelContains": "haiku" },
+      "reply": { "text": "ok" }
+    },
+    {
+      "name": "worktree-proof",
+      "match": { "promptContains": "prove your workspace", "hasToolResult": false },
+      "delayMs": 100,
+      "reply": {
+        "text": "Recording where this agent actually runs.",
+        "toolUse": {
+          "id": "toolu_e2e_wt_proof_1",
+          "name": "Bash",
+          "input": {
+            "command": "pwd > pwd-proof.txt && git branch --show-current > branch-proof.txt",
+            "description": "record cwd and branch"
+          }
+        }
+      }
+    },
+    {
+      "name": "worktree-done",
+      "match": { "toolResultFor": "toolu_e2e_wt_proof_1" },
+      "delayMs": 150,
+      "reply": {
+        "text": "WORKTREE-PROOF-DONE — cwd and branch were recorded from inside the worktree."
+      }
+    }
+  ]
+}

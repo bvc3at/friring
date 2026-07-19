@@ -70,6 +70,131 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-perf-flood"
 }
 
+@test "e2e: tmux persistence — quitting and relaunching the TUI re-adopts the live claude pane" {
+    require_agent claude
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-adopt-restart"
+}
+
+@test "e2e: claude permission prompt drives a real blocked signal; approval resumes to done" {
+    require_agent claude
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-blocked-permission"
+}
+
+@test "e2e: Ctrl+R restarts claude with --resume and the conversation continues" {
+    require_agent claude
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-restart-resume"
+}
+
+@test "e2e: Ctrl+F forks claude — parent link, sidebar nesting, forked conversation continues" {
+    require_agent claude
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-fork"
+}
+
+@test "e2e: import a Claude Code conversation (i) and resume it in a new session" {
+    require_agent claude
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-import-conversation"
+}
+
+@test "e2e: worktree session — claude works on a fresh branch outside the repo checkout" {
+    require_agent claude
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-worktree-session"
+}
+
+@test "e2e: code review — comment on working changes and send the compiled review to claude" {
+    require_agent claude
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-review-export"
+}
+
+@test "e2e: F9 activity view reconstructs the claude turn from its on-disk records" {
+    require_agent claude
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-activity-view"
+}
+
+@test "e2e: shell-script agent through the registry — template expansion, PTY input, resume restart" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-registry-terminal"
+}
+
+@test "e2e: multi-session switching (Alt+N, Ctrl+6) with CLI send/capture/focus staying in sync" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-multi-nav"
+}
+
+@test "e2e: repo-grouped sidebar with manual reorder (Shift+J/K) persisted as display_order" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-sidebar-order"
+}
+
+@test "e2e: blocked-session attention — badges, F10 walk, Alt+A jump" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-blocked-attention"
+}
+
+@test "e2e: soft delete with Ctrl+Z undo and the Ctrl+U restore list" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-soft-delete"
+}
+
+@test "e2e: Ctrl+S sync rebases the worktree onto a moved origin/main" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-worktree-sync"
+}
+
+@test "e2e: Ctrl+S rebase conflict is handed to the session's agent as a prompt" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-sync-conflict"
+}
+
+@test "e2e: a one-shot automation fires through the TUI and lands its prompt in the pane" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-automation-fire"
+}
+
+@test "e2e: task run (F5 -> r) seeds the agent prompt and tracks status to done" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-task-run"
+}
+
+@test "e2e: extension lifecycle and offline issue sync — install, activate, upsert dedupe, self-heal" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-extension-tasks"
+}
+
+@test "e2e: inter-session messages — wake nudge, exactly-once claim, reply" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-message-queue"
+}
+
+@test "e2e: global search over sessions (live buffer), tasks, automations, and files" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-global-search"
+}
+
+@test "e2e: shell pane toggle (Ctrl+T) — real shell beside the agent, tracked per session" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-shell-pane"
+}
+
+@test "e2e: wizard back-navigation and the always-type repo palette (path mode, Tab completion)" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-wizard-backnav"
+}
+
+@test "e2e: wizard worktree flow — base branch pick, branch name, spawn into the worktree" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-wizard-worktree"
+}
+
+@test "e2e: theme persistence, settings live-reload, config error toast, perf HUD" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-theme-settings"
+}
+
+@test "e2e: info panel, seeded keybinding override, F1 rebind persisting to keybindings.json" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-info-keybind"
+}
+
 @test "protocol: codex exec completes a stubbed text turn (no Friring)" {
     require_agent codex
     e2e_protocol_smoke "$AGENT_E2E_DIR/scenarios/codex-text-turn"

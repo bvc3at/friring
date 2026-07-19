@@ -1,0 +1,4 @@
+Release notes draft.
+The parser now accepts empty input.
+The cache is invalidated on config reload.
+Error messages include the failing path.

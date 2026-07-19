@@ -184,6 +184,16 @@ e2e_boot() {
         agent_agents_toml_entry
     } > "$cfg_dir/agents.toml"
 
+    # Hermeticity: a session flipping to Blocked would otherwise fire a REAL
+    # desktop notification on the host ([features] notifications defaults to
+    # true; macOS delivers via osascript/terminal-notifier). Tests must never
+    # touch the user's desktop. Scenarios that exercise settings behavior may
+    # rewrite this file, but must keep notifications off.
+    cat > "$cfg_dir/settings.toml" <<'EOF'
+[features]
+notifications = false
+EOF
+
     # Headless `session create` does NOT wire the built-in hooks extension
     # (only the TUI boot and the extension CLI verbs do), so activate it
     # explicitly — this patches the claude agent's args with the --settings

@@ -1,0 +1,26 @@
+{
+  "responses": [
+    {
+      "name": "ambient",
+      "ambient": true,
+      "match": { "modelContains": "haiku" },
+      "reply": { "text": "ok" }
+    },
+    {
+      "name": "resume-turn-1",
+      "match": { "promptContains": "first resume turn", "hasToolResult": false },
+      "delayMs": 150,
+      "reply": {
+        "text": "RESUME-MARKER-ONE — this reply must reappear after the restart via local transcript replay, not a second model call."
+      }
+    },
+    {
+      "name": "resume-turn-2",
+      "match": { "promptContains": "second resume turn", "hasToolResult": false },
+      "delayMs": 150,
+      "reply": {
+        "text": "RESUME-MARKER-TWO — the resumed conversation answered a fresh turn."
+      }
+    }
+  ]
+}

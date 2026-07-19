@@ -1,0 +1,34 @@
+{
+  "responses": [
+    {
+      "name": "ambient",
+      "ambient": true,
+      "match": { "modelContains": "haiku" },
+      "reply": { "text": "ok" }
+    },
+    {
+      "name": "bash-tool-call",
+      "match": { "promptContains": "blocked-proof", "hasToolResult": false },
+      "delayMs": 100,
+      "reply": {
+        "text": "Running the blocked-proof command now.",
+        "toolUse": {
+          "id": "toolu_e2e_blocked_1",
+          "name": "Bash",
+          "input": {
+            "command": "touch {{WS}}/blocked-proof.txt",
+            "description": "create the proof file"
+          }
+        }
+      }
+    },
+    {
+      "name": "after-approval",
+      "match": { "toolResultFor": "toolu_e2e_blocked_1" },
+      "delayMs": 150,
+      "reply": {
+        "text": "BLOCKED-FLOW-DONE — the Bash call was approved through claude's real permission dialog and executed."
+      }
+    }
+  ]
+}
