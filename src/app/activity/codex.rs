@@ -20,9 +20,10 @@ use std::path::{Path, PathBuf};
 use crate::session::activity::codex::{parse_session_meta, CodexScan, CodexSessionMeta};
 
 /// Recent date shards (`sessions/Y/M/D/`) to walk during discovery and the
-/// newest-file rebind check — enough to find a session idle for a few days
-/// while keeping the directory scan cheap on a long-lived `~/.codex`.
-const MAX_DAY_DIRS: usize = 8;
+/// newest-file rebind check — wide enough to find a session idle for weeks
+/// (a resumed thread keeps appending to its original shard's file) while the
+/// walk stays a bounded `readdir`, not a full-tree scan.
+const MAX_DAY_DIRS: usize = 45;
 
 /// Codex: the session's rollout transcript, found by matching the head
 /// `session_meta.cwd` (or a known thread id) against the session's launch dirs,
@@ -33,7 +34,7 @@ pub(super) struct CodexSource {
     pub(super) scan: CodexScan,
     file: Option<PathBuf>,
     offset: u64,
-    pub(super) truncated: bool,
+    pub(super) backfilling: bool,
     /// Newest rollout filename at the last discovery — the rebind trigger.
     newest_seen: Option<OsString>,
 }
@@ -85,15 +86,15 @@ pub(super) fn scan_codex(
     let Some(path) = src.file.clone() else {
         return false;
     };
-    super::tail_source(&path, sig, &mut src.offset, &mut src.truncated, |chunk| {
+    super::tail_source(&path, sig, &mut src.offset, &mut src.backfilling, |chunk| {
         src.scan.ingest(chunk)
     })
     .unwrap_or_else(|| {
         // Shrank (unexpected rewrite): reset the streaming parser and re-ingest.
         src.scan = CodexScan::default();
         src.offset = 0;
-        src.truncated = false;
-        super::tail_source(&path, sig, &mut src.offset, &mut src.truncated, |chunk| {
+        src.backfilling = false;
+        super::tail_source(&path, sig, &mut src.offset, &mut src.backfilling, |chunk| {
             src.scan.ingest(chunk)
         })
         .unwrap_or(false)

@@ -775,18 +775,58 @@ impl CcTreeRow {
 
 /// One logical row of the central transcript pane. `Block` renders the
 /// transcript block at that index; `Text`/`Info` are synthetic lines (workflow
-/// overview, hints) — `Info` is non-selectable.
+/// overview, hints); `Header`/`Tiles`/`Spark` are the Overview dashboard's
+/// rows — `Info` and `Header` are non-selectable scaffolding.
 #[derive(Debug, Clone)]
 pub(crate) enum CcRow {
     Block(usize),
     Text(String),
     Info(String),
+    /// A dashboard section header ("Hot files", "Last error").
+    Header(String),
+    /// One row of stat tiles (glyph + value + label each).
+    Tiles(Vec<StatTile>),
+    /// An activity-over-time sparkline with its caption.
+    Spark(SparkRow),
 }
 
 impl CcRow {
     pub(crate) fn is_selectable(&self) -> bool {
-        !matches!(self, CcRow::Info(_))
+        !matches!(self, CcRow::Info(_) | CcRow::Header(_))
     }
+}
+
+/// One Overview stat tile. Pure data — the ui layer maps [`Tone`] onto the
+/// theme (arch rule: `app` never styles).
+#[derive(Debug, Clone)]
+pub(crate) struct StatTile {
+    pub glyph: &'static str,
+    pub value: String,
+    pub label: &'static str,
+    pub tone: Tone,
+}
+
+/// Semantic color tone for dashboard elements; resolved to theme colors by
+/// the renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tone {
+    Accent,
+    Working,
+    Done,
+    Danger,
+    Normal,
+}
+
+/// The Overview's activity-over-time sparkline: event counts bucketed across
+/// the session's timestamped span.
+#[derive(Debug, Clone)]
+pub(crate) struct SparkRow {
+    /// Wall-clock `HH:MM` of the first/last timestamped event.
+    pub start: String,
+    pub end: String,
+    pub buckets: Vec<u64>,
+    /// e.g. `47 events · 42m`.
+    pub caption: String,
 }
 
 /// In-transcript text search (the `/`-triggered find sub-mode), mirroring the
@@ -877,9 +917,19 @@ impl CcActivityState {
     /// scaffolding) aren't searchable.
     fn row_text(&self, row: &CcRow) -> Option<String> {
         match row {
-            CcRow::Info(_) => None,
+            // Non-selectable scaffolding is unsearchable — a match must be a
+            // row the selection can land on.
+            CcRow::Info(_) | CcRow::Header(_) => None,
             CcRow::Text(s) => Some(s.clone()),
             CcRow::Block(bi) => self.blocks.get(*bi).map(block_search_text),
+            CcRow::Tiles(tiles) => Some(
+                tiles
+                    .iter()
+                    .map(|t| format!("{} {}", t.value, t.label))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+            CcRow::Spark(s) => Some(s.caption.clone()),
         }
     }
 

@@ -13,7 +13,9 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::app::activity::{fmt_time, Section};
-use crate::app::cc_activity::{CcActivityState, CcNodeRef, CcRow, CcTreeRow};
+use crate::app::cc_activity::{
+    CcActivityState, CcNodeRef, CcRow, CcTreeRow, SparkRow, StatTile, Tone,
+};
 use crate::session::activity::{ActionKind, ActivityEvent};
 use crate::session::{CcAgent, CcAgentState, CcRunStatus, TranscriptBlock};
 use crate::ui::scrollbar::{self, ScrollbarGeom};
@@ -44,6 +46,60 @@ fn danger() -> Style {
 
 fn agent_label(a: &CcAgent) -> String {
     a.label.clone().unwrap_or_else(|| a.agent_type.clone())
+}
+
+fn tone_style(tone: Tone) -> Style {
+    match tone {
+        Tone::Accent => accent(),
+        Tone::Working => Style::default().fg(Theme::status_working()),
+        Tone::Done => Style::default().fg(Theme::status_done()),
+        Tone::Danger => danger(),
+        Tone::Normal => normal(),
+    }
+}
+
+/// One row of Overview stat tiles: `⟨glyph⟩ ⟨value⟩ ⟨label⟩`, triple-spaced.
+fn tiles_line(tiles: &[StatTile]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    for (i, t) in tiles.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::styled(
+            format!("{} ", t.glyph),
+            tone_style(t.tone).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            t.value.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!(" {}", t.label), dim()));
+    }
+    Line::from(spans)
+}
+
+/// The Overview sparkline: `HH:MM ▁▂▅█… HH:MM  caption`.
+fn spark_line(spark: &SparkRow) -> Line<'static> {
+    const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let max = spark.buckets.iter().copied().max().unwrap_or(0).max(1);
+    let glyph_run: String = spark
+        .buckets
+        .iter()
+        .map(|&v| {
+            if v == 0 {
+                ' '
+            } else {
+                // Scale 1..=max onto the 8 glyph levels, non-zero floor.
+                GLYPHS[((v * 8).div_ceil(max) as usize).clamp(1, 8) - 1]
+            }
+        })
+        .collect();
+    Line::from(vec![
+        Span::styled(format!(" {} ", spark.start), dim()),
+        Span::styled(glyph_run, accent()),
+        Span::styled(format!(" {}", spark.end), dim()),
+        Span::styled(format!("  {}", spark.caption), dim()),
+    ])
 }
 
 fn state_style(s: CcAgentState) -> Style {
@@ -255,7 +311,10 @@ fn row_visual_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = match &state.rows[i] {
         CcRow::Info(s) => vec![styled(s, dim(), width)],
+        CcRow::Header(s) => vec![styled(s, dim().add_modifier(Modifier::BOLD), width)],
         CcRow::Text(s) => body_lines(s, normal(), state.wrap, state.h_scroll, width, query),
+        CcRow::Tiles(tiles) => vec![tiles_line(tiles)],
+        CcRow::Spark(spark) => vec![spark_line(spark)],
         CcRow::Block(bi) => block_lines(state, *bi, width, query),
     };
     if lines.is_empty() {
@@ -331,33 +390,63 @@ fn block_lines(
         // therefore read inverted for this variant.
         TranscriptBlock::Event(e) => {
             let expanded = collapsed;
-            event_lines(e, expanded, wrap, h, width, query)
+            let timeline = matches!(&state.open, Some(CcNodeRef::Section(Section::Timeline)));
+            event_lines(e, expanded, timeline, wrap, h, width, query)
         }
     }
 }
 
 /// The one-line header (+ optional expanded body) of a normalized activity
-/// event: `HH:MM:SS  tag  detail`, error-marked when the action failed.
+/// event: `HH:MM:SS  tag  detail`, error-marked when the action failed. On
+/// the Timeline, a [`ActionKind::Prompt`] event renders as a turn header and
+/// every other row sits in a turn gutter (`│`, deepened to `└` for
+/// subagent-origin work); minor (bookkeeping) rows render dim.
 fn event_lines(
     e: &ActivityEvent,
     expanded: bool,
+    timeline: bool,
     wrap: bool,
     h: usize,
     width: usize,
     query: Option<&str>,
 ) -> Vec<Line<'static>> {
+    if e.kind == ActionKind::Prompt {
+        return vec![turn_header_line(e, width)];
+    }
+    let base = if e.minor { dim() } else { normal() };
+    let mut used = 0usize;
     let mut header: Vec<Span<'static>> = Vec::new();
+    if timeline {
+        let gutter = if e.origin.is_some() {
+            "│   └ "
+        } else {
+            "│ "
+        };
+        used += gutter.chars().count();
+        header.push(Span::styled(gutter, dim()));
+    }
     if let Some(ts) = e.ts_ms {
+        used += 9;
         header.push(Span::styled(format!("{} ", fmt_time(ts)), dim()));
     }
+    used += 6;
     header.push(Span::styled(
         format!("{:<5} ", event_tag(e.kind)),
-        event_style(e.kind),
+        if e.minor { dim() } else { event_style(e.kind) },
     ));
     header.push(Span::styled(
-        truncate(&first_line(&e.detail), width.saturating_sub(16).max(20)),
-        normal(),
+        truncate(
+            &first_line(&e.detail),
+            width.saturating_sub(used + 10).max(20),
+        ),
+        base,
     ));
+    if let Some(d) = e.dur_ms.filter(|&d| d >= 1000) {
+        header.push(Span::styled(format!(" · {}", fmt_dur(d)), dim()));
+    }
+    if let Some(o) = &e.origin {
+        header.push(Span::styled(format!(" · {}", truncate(o, 24)), dim()));
+    }
     if e.ok == Some(false) {
         header.push(Span::styled(" ✗", danger()));
     }
@@ -382,9 +471,44 @@ fn event_lines(
     out
 }
 
+/// A Timeline turn header: `▶ HH:MM:SS "prompt…" ───`, dash-filled to the
+/// pane edge so turns read as visual breaks in the stream.
+fn turn_header_line(e: &ActivityEvent, width: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = vec![Span::styled("▶ ", accent())];
+    let mut used = 2usize;
+    if let Some(ts) = e.ts_ms {
+        used += 9;
+        spans.push(Span::styled(format!("{} ", fmt_time(ts)), dim()));
+    }
+    let text = truncate(
+        &first_line(&e.detail),
+        width.saturating_sub(used + 6).max(12),
+    );
+    used += text.chars().count();
+    spans.push(Span::styled(text, accent().add_modifier(Modifier::BOLD)));
+    if width > used + 2 {
+        spans.push(Span::styled(
+            format!(" {}", "─".repeat(width - used - 2)),
+            dim(),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Compact call→result duration: `12s`, `1m03s`.
+fn fmt_dur(ms: u64) -> String {
+    let s = ms / 1000;
+    if s < 60 {
+        format!("{s}s")
+    } else {
+        format!("{}m{:02}s", s / 60, s % 60)
+    }
+}
+
 /// Short fixed-width kind tag prefixing an event's header line.
 fn event_tag(kind: ActionKind) -> &'static str {
     match kind {
+        ActionKind::Prompt => "▶",
         ActionKind::Command => "$",
         ActionKind::Edit => "edit",
         ActionKind::Read => "read",
@@ -399,7 +523,7 @@ fn event_tag(kind: ActionKind) -> &'static str {
 
 fn event_style(kind: ActionKind) -> Style {
     match kind {
-        ActionKind::Command => accent(),
+        ActionKind::Prompt | ActionKind::Command => accent(),
         ActionKind::Edit => Style::default().fg(Theme::status_working()),
         ActionKind::WebSearch | ActionKind::WebFetch => Style::default().fg(Theme::status_done()),
         _ => dim().add_modifier(Modifier::BOLD),

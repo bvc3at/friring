@@ -47,7 +47,7 @@ pub(super) struct CopilotSource {
     workspace: CopilotWorkspace,
     dir: Option<PathBuf>,
     offset: u64,
-    pub(super) truncated: bool,
+    pub(super) backfilling: bool,
     /// Hash of the session-state subdir names at the last discovery — the cheap
     /// rebind trigger (a new session dir appearing flips it without re-reading
     /// any `workspace.yaml`).
@@ -117,7 +117,7 @@ pub(super) fn scan_copilot(
         &events,
         &mut ev_sig,
         &mut src.offset,
-        &mut src.truncated,
+        &mut src.backfilling,
         |chunk| src.scan.ingest(chunk),
     )
     .is_none()
@@ -125,12 +125,12 @@ pub(super) fn scan_copilot(
         // Compaction/rewind rewrote events.jsonl in full — reset + re-ingest.
         src.scan = CopilotScan::default();
         src.offset = 0;
-        src.truncated = false;
+        src.backfilling = false;
         let _ = super::tail_source(
             &events,
             &mut ev_sig,
             &mut src.offset,
-            &mut src.truncated,
+            &mut src.backfilling,
             |chunk| src.scan.ingest(chunk),
         );
     }

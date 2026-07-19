@@ -211,6 +211,8 @@ fn base(kind: ActionKind, detail: String, note: Option<String>) -> ActivityEvent
         result_head: None,
         ok: None,
         origin: None,
+        minor: false,
+        dur_ms: None,
     }
 }
 

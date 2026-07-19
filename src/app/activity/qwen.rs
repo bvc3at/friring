@@ -31,7 +31,7 @@ pub(super) struct QwenSource {
     pub(super) scan: QwenScan,
     transcript: Option<PathBuf>,
     offset: u64,
-    pub(super) truncated: bool,
+    pub(super) backfilling: bool,
 }
 
 /// The Qwen Code `projects/` base under the resolved runtime root:
@@ -75,15 +75,15 @@ pub(super) fn scan_qwen(
     let Some(path) = src.transcript.clone() else {
         return false;
     };
-    super::tail_source(&path, sig, &mut src.offset, &mut src.truncated, |chunk| {
+    super::tail_source(&path, sig, &mut src.offset, &mut src.backfilling, |chunk| {
         src.scan.ingest(chunk)
     })
     .unwrap_or_else(|| {
         // Shrunk (rewritten): reset the streaming parser and re-ingest.
         src.scan = QwenScan::default();
         src.offset = 0;
-        src.truncated = false;
-        super::tail_source(&path, sig, &mut src.offset, &mut src.truncated, |chunk| {
+        src.backfilling = false;
+        super::tail_source(&path, sig, &mut src.offset, &mut src.backfilling, |chunk| {
             src.scan.ingest(chunk)
         })
         .unwrap_or(false)

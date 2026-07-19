@@ -19,9 +19,13 @@ use super::{head, ActionKind, ActivityEvent, ActivityMeta, RESULT_HEAD_MAX};
 /// Cap for compact-input notes (`Other`/`Mcp` events).
 const NOTE_MAX: usize = 160;
 
-/// Pure-bookkeeping tools that record no action on the world — skipped
-/// entirely so the timeline shows work, not plan churn.
-const SKIPPED_TOOLS: &[&str] = &[
+/// Cap for a turn marker's prompt head ([`ActionKind::Prompt`] `detail`).
+const PROMPT_MAX: usize = 200;
+
+/// Pure-bookkeeping tools that record no action on the world — kept on the
+/// timeline as **minor** (dim) rows so the record is complete without the
+/// plan churn drowning out real work.
+const MINOR_TOOLS: &[&str] = &[
     "TodoWrite",
     "BashOutput",
     "TaskOutput",
@@ -95,14 +99,12 @@ impl ClaudeScan {
             let Some(name) = str_field(block, "name") else {
                 continue;
             };
-            if SKIPPED_TOOLS.contains(&name.as_str()) {
-                continue;
-            }
             let Some(mut event) = classify(&name, block.get("input")) else {
                 continue;
             };
             event.ts_ms = ts;
             event.origin = origin.clone();
+            event.minor = MINOR_TOOLS.contains(&name.as_str());
             if let Some(id) = str_field(block, "id") {
                 self.pending.insert(id, self.events.len());
             }
@@ -111,11 +113,24 @@ impl ClaudeScan {
     }
 
     fn ingest_user(&mut self, entry: &serde_json::Value) {
-        // Title fallback: the first real typed prompt (a `summary` line wins).
-        if self.meta.title.is_none() {
-            if let Some(t) = crate::session::cc_activity::user_prompt_text(entry) {
+        let ts = ts_ms(entry);
+        // A real typed prompt is a turn marker on the timeline; the first one
+        // doubles as the title fallback (a `summary` line wins).
+        if let Some(t) = crate::session::cc_activity::user_prompt_text(entry) {
+            if self.meta.title.is_none() {
                 self.meta.title = Some(head(&t, NOTE_MAX));
             }
+            self.events.push(ActivityEvent {
+                ts_ms: ts,
+                kind: ActionKind::Prompt,
+                detail: head(&t, PROMPT_MAX),
+                note: None,
+                result_head: None,
+                ok: None,
+                origin: None,
+                minor: false,
+                dur_ms: None,
+            });
         }
         let Some(arr) = entry.pointer("/message/content").and_then(|c| c.as_array()) else {
             return;
@@ -140,6 +155,10 @@ impl ClaudeScan {
                     .and_then(|e| e.as_bool())
                     .unwrap_or(false),
             );
+            // Call → result wall-clock spread, when both lines are stamped.
+            event.dur_ms = ts
+                .zip(event.ts_ms)
+                .map(|(result, call)| result.saturating_sub(call));
             let mut text = crate::session::cc_activity::normalize_tool_result(block.get("content"));
             if text.trim().is_empty() {
                 // Bash results often carry the useful text in the richer
@@ -214,6 +233,8 @@ fn classify(name: &str, input: Option<&serde_json::Value>) -> Option<ActivityEve
         result_head: None,
         ok: None,
         origin: None,
+        minor: false,
+        dur_ms: None,
     })
 }
 
@@ -289,7 +310,8 @@ mod tests {
                 ActionKind::WebFetch,
                 ActionKind::Subagent,
                 ActionKind::Search,
-                ActionKind::Mcp, // TodoWrite skipped
+                ActionKind::Other, // TodoWrite — kept, as a minor row
+                ActionKind::Mcp,
             ]
         );
         assert_eq!(s.events[0].detail, "cargo test");
@@ -297,8 +319,59 @@ mod tests {
         assert_eq!(s.events[0].ts_ms, Some(1783512000000)); // 2026-07-08T12:00Z
         assert_eq!(s.events[1].detail, "/a.rs");
         assert_eq!(s.events[5].note.as_deref(), Some("Explore"));
-        assert_eq!(s.events[7].detail, "github:create_issue");
-        assert!(s.events[7].note.as_deref().unwrap().contains("bug"));
+        assert!(s.events[7].minor, "bookkeeping tools are minor");
+        assert_eq!(s.events[7].detail, "TodoWrite");
+        assert!(!s.events[0].minor);
+        assert_eq!(s.events[8].detail, "github:create_issue");
+        assert!(s.events[8].note.as_deref().unwrap().contains("bug"));
+    }
+
+    #[test]
+    fn user_prompts_become_turn_markers() {
+        let mut s = ClaudeScan::default();
+        s.ingest(concat!(
+            r#"{"type":"user","timestamp":"2026-07-08T12:00:00.000Z","message":{"role":"user","content":"Fix the failing tests"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            "\n",
+            // A tool_result-only user line is not a turn.
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            "\n",
+            // Harness plumbing (meta envelope) is not a turn either.
+            r#"{"type":"user","message":{"role":"user","content":"<system-reminder>noise</system-reminder>"}}"#,
+        ));
+        let prompts: Vec<&ActivityEvent> = s
+            .events
+            .iter()
+            .filter(|e| e.kind == ActionKind::Prompt)
+            .collect();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].detail, "Fix the failing tests");
+        assert_eq!(prompts[0].ts_ms, Some(1783512000000));
+        // The turn marker precedes the command it triggered.
+        assert_eq!(s.events[0].kind, ActionKind::Prompt);
+        assert_eq!(s.events[1].kind, ActionKind::Command);
+    }
+
+    #[test]
+    fn result_timestamps_yield_durations() {
+        let mut s = ClaudeScan::default();
+        s.ingest(
+            r#"{"type":"assistant","timestamp":"2026-07-08T12:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo build"}}]}}"#,
+        );
+        s.ingest(
+            r#"{"type":"user","timestamp":"2026-07-08T12:00:12.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"done"}]}}"#,
+        );
+        assert_eq!(s.events[0].dur_ms, Some(12_000));
+        // No timestamps → no duration, never a panic.
+        let mut bare = ClaudeScan::default();
+        bare.ingest(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+        );
+        bare.ingest(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"x"}]}}"#,
+        );
+        assert_eq!(bare.events[0].dur_ms, None);
     }
 
     #[test]

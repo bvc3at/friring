@@ -367,6 +367,8 @@ fn event(kind: ActionKind, detail: String, note: Option<String>) -> ActivityEven
         result_head: None,
         ok: None,
         origin: None,
+        minor: false,
+        dur_ms: None,
     }
 }
 

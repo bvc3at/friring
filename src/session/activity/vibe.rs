@@ -135,6 +135,8 @@ fn classify(name: &str, args: &serde_json::Value) -> Option<ActivityEvent> {
         result_head: None,
         ok: None,
         origin: None,
+        minor: false,
+        dur_ms: None,
     })
 }
 

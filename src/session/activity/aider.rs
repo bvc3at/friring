@@ -130,6 +130,8 @@ impl AiderScan {
             result_head: None,
             ok,
             origin: None,
+            minor: false,
+            dur_ms: None,
         });
     }
 }

@@ -32,6 +32,10 @@ pub mod vibe;
 /// dedicated category (its tool name goes in [`ActivityEvent::detail`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActionKind {
+    /// A user prompt — the timeline's turn marker, not an agent action.
+    /// Excluded from [`ActivityCounts::total`] and from subagent-origin
+    /// streams (a subagent's task prompt is not a conversation turn).
+    Prompt,
     /// A shell command the agent executed.
     Command,
     /// A file the agent edited, wrote, or patched.
@@ -53,6 +57,7 @@ impl ActionKind {
     /// Stable one-word label (column headers, filter footer).
     pub fn label(self) -> &'static str {
         match self {
+            ActionKind::Prompt => "prompt",
             ActionKind::Command => "command",
             ActionKind::Edit => "edit",
             ActionKind::Read => "read",
@@ -90,6 +95,12 @@ pub struct ActivityEvent {
     /// happened inside a subagent (the label names it as well as the source
     /// allows).
     pub origin: Option<String>,
+    /// Bookkeeping actions (todo churn, output polling) — shown dim and
+    /// excluded from the per-kind tallies so counts stay signal.
+    pub minor: bool,
+    /// Wall-clock duration until the action's result landed, when both ends
+    /// are timestamped.
+    pub dur_ms: Option<u64>,
 }
 
 /// Cap for [`ActivityEvent::result_head`], applied at parse time so a huge
@@ -132,13 +143,31 @@ pub struct ActivityCounts {
     pub web: usize,
     pub subagents: usize,
     pub other: usize,
+    /// User turns ([`ActionKind::Prompt`]) — not actions, tallied apart.
+    pub prompts: usize,
+    /// Actions whose result reported failure (`ok == Some(false)`).
+    pub failed: usize,
 }
 
 impl ActivityCounts {
+    /// Tally per-kind action counts. Prompts count as turns, not actions;
+    /// minor (bookkeeping) events are skipped entirely so the counts read as
+    /// work done.
     pub fn tally(events: &[ActivityEvent]) -> Self {
         let mut c = Self::default();
         for e in events {
+            if e.kind == ActionKind::Prompt {
+                c.prompts += 1;
+                continue;
+            }
+            if e.minor {
+                continue;
+            }
+            if e.ok == Some(false) {
+                c.failed += 1;
+            }
             match e.kind {
+                ActionKind::Prompt => {} // tallied above
                 ActionKind::Command => c.commands += 1,
                 ActionKind::Edit => c.edits += 1,
                 ActionKind::Read => c.reads += 1,
@@ -221,6 +250,8 @@ mod tests {
             result_head: None,
             ok: None,
             origin: None,
+            minor: false,
+            dur_ms: None,
         }
     }
 

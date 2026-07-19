@@ -27,8 +27,9 @@ use crate::session::activity::{ActivityEvent, ActivityMeta};
 
 /// Cap on parts read for one session: the newest this many, oldest clipped
 /// (surfaced via [`OpencodeSource::truncated`]). A months-old session can hold
-/// tens of thousands of parts; the retrospective only needs the recent tail.
-const MAX_PARTS: usize = 20_000;
+/// tens of thousands of parts; the cap is high enough that
+/// only pathological histories clip.
+const MAX_PARTS: usize = 100_000;
 
 /// Read timeout while a live opencode writer holds the DB — matches opencode's
 /// own `busy_timeout` (`packages/core/src/database/sqlite.node.ts`).

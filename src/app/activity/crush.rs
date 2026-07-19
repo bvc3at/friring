@@ -34,8 +34,9 @@ use super::stat_signature;
 
 /// Cap on messages read for one session, newest kept. A very long session
 /// clips oldest history (surfaced via [`CrushSource::truncated`]) so the
-/// in-memory event stream stays bounded, matching the JSONL providers' byte cap.
-const MAX_MESSAGES: usize = 10_000;
+/// in-memory event stream stays bounded, high enough that only pathological
+/// histories clip (the JSONL providers backfill in full instead).
+const MAX_MESSAGES: usize = 50_000;
 
 /// Crush: the session's bound per-project `crush.db` and the [`CrushScan`]
 /// rebuilt from it each changed pass.
