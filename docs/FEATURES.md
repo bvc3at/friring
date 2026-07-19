@@ -2445,11 +2445,17 @@ confined to the active pane bounds.
   drag).
 - **`Ctrl+C`** (with active selection): Copies selected text to
   the system clipboard via `arboard`. Trailing whitespace is
-  trimmed per line. When no display server is reachable (`arboard`
-  needs X11/Wayland — unavailable over SSH, under a display-less
-  tmux, or in WSL without WSLg) the copy falls back (`app::clipboard`)
-  to whichever path actually reaches the outer terminal: **inside
-  tmux** (`$TMUX` set), `tmux load-buffer -w -`, which has tmux
+  trimmed per line. The native path is skipped whenever it cannot
+  reach the user: no display server (`arboard` needs X11/Wayland —
+  unavailable under a display-less tmux or in WSL without WSLg),
+  or an SSH session (`$SSH_TTY`/`$SSH_CONNECTION`) with no
+  forwarded display — there the native clipboard is the **SSH
+  host's** (macOS accepts NSPasteboard writes from an SSH login),
+  so a "successful" native copy would land on a machine the user
+  is not looking at. Either way the copy falls back
+  (`app::clipboard`) to whichever path actually reaches the
+  user's terminal: **inside tmux** (`$TMUX` set),
+  `tmux load-buffer -w -`, which has tmux
   itself set the outer terminal's clipboard — a raw application OSC 52
   written to friring's own stdout is *dropped* by tmux's default
   `set-clipboard external`, so the escape has to come from tmux (this
@@ -2467,8 +2473,10 @@ confined to the active pane bounds.
   modal is open the paste is swallowed so it can never leak into the
   terminal in the pane behind the overlay; otherwise it pastes into
   the active PTY. Paste has **no OSC 52 fallback** (terminals block
-  clipboard *reads* for security) — without a display server, use the
-  terminal's own paste key, which arrives as a bracketed paste.
+  clipboard *reads* for security) — without a display server, or
+  over SSH (where a read would return the *host's* clipboard, not
+  what the user just copied), use the terminal's own paste key,
+  which arrives as a bracketed paste.
 - Any other keypress clears the selection.
 
 Selection is highlighted in the terminal render buffer using

@@ -1,9 +1,14 @@
-//! Clipboard fallbacks for display-less environments.
+//! Clipboard fallbacks for environments where the native clipboard can't
+//! reach the user.
 //!
-//! `arboard` needs a display-server connection (X11/Wayland/AppKit/Win32), so
-//! it is unavailable exactly where friring often runs: inside tmux over SSH,
-//! or in a WSL distro without WSLg. Two fallbacks cover that gap, tried in the
-//! order that actually works:
+//! That gap has two shapes. On Linux, `arboard` needs a display-server
+//! connection (X11/Wayland), so it is simply *unavailable* over SSH, under a
+//! display-less tmux, or in a WSL distro without WSLg. On macOS (and Windows)
+//! the native clipboard API is reachable even from an SSH login — there
+//! `arboard` is *available but wrong*: the write lands on the **host's**
+//! clipboard, a machine the user isn't looking at, while reporting success
+//! ([`native_clipboard_is_remote`] detects this). Two fallbacks cover both
+//! shapes, tried in the order that actually works:
 //!
 //! 1. **`tmux load-buffer -w`** when friring is itself running inside a tmux
 //!    client (`$TMUX` set — the common `tmux -> friring` setup). This is the
@@ -25,6 +30,37 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+
+/// True when the native clipboard belongs to a different machine than the one
+/// whose screen the user is watching, so even a *successful* native write
+/// would land where the user isn't.
+///
+/// The concrete case is a macOS host reached over SSH: NSPasteboard accepts
+/// writes from an SSH login, so `arboard` "succeeds" onto the SSH host's
+/// clipboard and the terminal-routed fallbacks (which do reach the user)
+/// never get a chance. Detected from the launch environment: an SSH session
+/// (`SSH_TTY`/`SSH_CONNECTION`) whose display-server clipboard, if any, does
+/// not follow the connection back to the user.
+pub(crate) fn native_clipboard_is_remote() -> bool {
+    native_targets_wrong_machine(
+        std::env::var_os("SSH_TTY").is_some() || std::env::var_os("SSH_CONNECTION").is_some(),
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        cfg!(any(target_os = "macos", target_os = "windows")),
+    )
+}
+
+/// Env-free core of [`native_clipboard_is_remote`].
+///
+/// `ssh`: the process lives in an SSH session, so the user's screen is on the
+/// client side of the connection. `display_env`: `DISPLAY`/`WAYLAND_DISPLAY`
+/// is set — on an X11/Wayland platform that display was forwarded through SSH
+/// (`ssh -X`), so the native clipboard follows it back to the user and is the
+/// right target after all. `host_owned_clipboard`: platforms (macOS/Windows)
+/// whose clipboard API always addresses the local host regardless of any
+/// display variable.
+fn native_targets_wrong_machine(ssh: bool, display_env: bool, host_owned_clipboard: bool) -> bool {
+    ssh && (host_owned_clipboard || !display_env)
+}
 
 /// Set the outer terminal's clipboard through the tmux server friring is
 /// attached to (`$TMUX`), via `tmux load-buffer -w -`.
@@ -114,6 +150,25 @@ fn base64(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_is_trusted_locally_and_distrusted_over_ssh() {
+        // No SSH → native is the user's clipboard, whatever the platform.
+        assert!(!native_targets_wrong_machine(false, false, true));
+        assert!(!native_targets_wrong_machine(false, true, false));
+        // SSH with no display env → nothing routes native back to the user.
+        assert!(native_targets_wrong_machine(true, false, false));
+        assert!(native_targets_wrong_machine(true, false, true));
+    }
+
+    #[test]
+    fn forwarded_display_reroutes_native_only_on_x11_platforms() {
+        // ssh -X on Linux: the X clipboard follows the display to the user.
+        assert!(!native_targets_wrong_machine(true, true, false));
+        // macOS/Windows: DISPLAY can't reroute NSPasteboard/Win32 — still the
+        // host's clipboard.
+        assert!(native_targets_wrong_machine(true, true, true));
+    }
 
     #[test]
     fn base64_rfc4648_vectors() {

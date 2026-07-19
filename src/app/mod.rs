@@ -3417,22 +3417,30 @@ impl App {
     }
 
     /// Copy `text` to the system clipboard, preferring the native handle and
-    /// falling back (see [`clipboard`]) when no display server is reachable or
-    /// the native write fails. Returns how the copy was served so the caller's
-    /// toast can flag the fire-and-forget path.
+    /// falling back (see [`clipboard`]) when no display server is reachable,
+    /// the native write fails, or the native clipboard belongs to the SSH host
+    /// rather than the machine in front of the user. Returns how the copy was
+    /// served so the caller's toast can flag the fire-and-forget path.
     ///
     /// Fallback order (see the [`clipboard`] module docs for why): inside tmux,
     /// `tmux load-buffer -w` — the raw OSC 52 an app writes to its own stdout
     /// is dropped by tmux's default `set-clipboard external`, so the escape
     /// must come from tmux itself; outside tmux, raw OSC 52 to stdout.
     pub(crate) fn set_clipboard_text(&mut self, text: &str) -> Result<ClipboardVia, String> {
-        // 1. Native display-server clipboard, when one is reachable.
-        let native_err = match &mut self.clipboard {
-            Some(cb) => match cb.set_text(text) {
-                Ok(()) => return Ok(ClipboardVia::Native),
-                Err(e) => Some(e.to_string()),
-            },
-            None => None,
+        // 1. Native display-server clipboard — unless it is the SSH host's:
+        //    on macOS, NSPasteboard accepts writes from an SSH login, so the
+        //    copy would "succeed" onto a machine the user isn't looking at
+        //    while the terminal-routed fallbacks below never run.
+        let native_err = if clipboard::native_clipboard_is_remote() {
+            Some("native clipboard is the SSH host's".to_string())
+        } else {
+            match &mut self.clipboard {
+                Some(cb) => match cb.set_text(text) {
+                    Ok(()) => return Ok(ClipboardVia::Native),
+                    Err(e) => Some(e.to_string()),
+                },
+                None => None,
+            }
         };
 
         // 2. Inside tmux: authoritative (real exit status), works under the
@@ -3541,6 +3549,14 @@ impl App {
         // No OSC 52 fallback here: terminals block clipboard *reads* for
         // security. The terminal's own paste keystroke still works — it
         // arrives as a bracketed paste (`handle_paste`), not through us.
+        // Over SSH the readable clipboard is the *host's* (see
+        // `clipboard::native_clipboard_is_remote`): a read would paste
+        // whatever that machine last copied, not what the user just put on
+        // their clipboard — refuse rather than paste the wrong text.
+        if clipboard::native_clipboard_is_remote() {
+            self.set_error("Clipboard is on the SSH host — use the terminal's paste key instead");
+            return;
+        }
         let Some(clipboard) = &mut self.clipboard else {
             self.set_error("Clipboard not available — use the terminal's paste key instead");
             return;
