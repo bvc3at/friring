@@ -227,7 +227,11 @@ mod tests {
         ];
         for (conn, expected) in cases {
             std::env::set_var("SSH_CONNECTION", conn);
-            assert_eq!(ssh_connection_is_loopback(), expected, "SSH_CONNECTION={conn}");
+            assert_eq!(
+                ssh_connection_is_loopback(),
+                expected,
+                "SSH_CONNECTION={conn}"
+            );
         }
         std::env::remove_var("SSH_CONNECTION");
         assert!(!ssh_connection_is_loopback(), "absent SSH_CONNECTION");

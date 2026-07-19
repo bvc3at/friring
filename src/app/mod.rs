@@ -527,6 +527,19 @@ impl ClipboardVia {
     }
 }
 
+/// What became of the native clipboard write before a fallback ran — recorded
+/// so [`App::clipboard_error`] can explain a fallback failure honestly rather
+/// than always implying native was tried (see [`App::set_clipboard_text`]).
+enum NativeCopy {
+    /// Deliberately not attempted: the native clipboard targets the SSH host,
+    /// not the machine the user is watching (`clipboard::native_clipboard_is_remote`).
+    Skipped,
+    /// Attempted, but the display-server write errored.
+    Failed(String),
+    /// No native handle at all — no reachable display server.
+    Unavailable,
+}
+
 /// Which scroll state a rendered scrollbar drives. Recorded per-frame in
 /// [`App::scrollbar_hits`] so mouse clicks/drags on a track can be routed back
 /// to the right pane.
@@ -3431,15 +3444,15 @@ impl App {
         //    on macOS, NSPasteboard accepts writes from an SSH login, so the
         //    copy would "succeed" onto a machine the user isn't looking at
         //    while the terminal-routed fallbacks below never run.
-        let native_err = if clipboard::native_clipboard_is_remote() {
-            Some("native clipboard is the SSH host's".to_string())
+        let native = if clipboard::native_clipboard_is_remote() {
+            NativeCopy::Skipped
         } else {
             match &mut self.clipboard {
                 Some(cb) => match cb.set_text(text) {
                     Ok(()) => return Ok(ClipboardVia::Native),
-                    Err(e) => Some(e.to_string()),
+                    Err(e) => NativeCopy::Failed(e.to_string()),
                 },
-                None => None,
+                None => NativeCopy::Unavailable,
             }
         };
 
@@ -3448,27 +3461,27 @@ impl App {
         if std::env::var_os("TMUX").is_some() {
             return clipboard::tmux_copy(text)
                 .map(|()| ClipboardVia::Tmux)
-                .map_err(|e| Self::clipboard_error(native_err.as_deref(), "tmux load-buffer", &e));
+                .map_err(|e| Self::clipboard_error(&native, "tmux load-buffer", &e));
         }
 
         // 3. No display server and no tmux: raw OSC 52 to a direct terminal.
         clipboard::osc52_copy(text)
             .map(|()| ClipboardVia::Osc52)
-            .map_err(|e| Self::clipboard_error(native_err.as_deref(), "OSC 52", &e))
+            .map_err(|e| Self::clipboard_error(&native, "OSC 52", &e))
     }
 
-    /// Compose a clipboard-failure message, folding in an earlier native error
-    /// when there was one (so a fallback failure doesn't hide why native was
-    /// skipped in the first place).
-    fn clipboard_error(
-        native_err: Option<&str>,
-        stage: &str,
-        err: &impl std::fmt::Display,
-    ) -> String {
-        match native_err {
-            Some(native) => format!("Clipboard write failed: {native}; {stage}: {err}"),
-            None => format!("Clipboard not available; {stage} failed: {err}"),
-        }
+    /// Compose a clipboard-failure message, prefixing the fallback's own error
+    /// with *why* the native path didn't serve the copy — honestly
+    /// distinguishing a native write that was tried and failed from one that
+    /// was deliberately skipped (so a message never claims native "failed" when
+    /// it was never attempted).
+    fn clipboard_error(native: &NativeCopy, stage: &str, err: &impl std::fmt::Display) -> String {
+        let prefix = match native {
+            NativeCopy::Skipped => "Native clipboard skipped (SSH host's, not yours)".to_string(),
+            NativeCopy::Failed(e) => format!("Clipboard write failed: {e}"),
+            NativeCopy::Unavailable => "Clipboard not available".to_string(),
+        };
+        format!("{prefix}; {stage} failed: {err}")
     }
 
     fn copy_selection_to_clipboard(&mut self) {
@@ -3549,12 +3562,15 @@ impl App {
         // No OSC 52 fallback here: terminals block clipboard *reads* for
         // security. The terminal's own paste keystroke still works — it
         // arrives as a bracketed paste (`handle_paste`), not through us.
-        // Over SSH the readable clipboard is the *host's* (see
-        // `clipboard::native_clipboard_is_remote`): a read would paste
-        // whatever that machine last copied, not what the user just put on
-        // their clipboard — refuse rather than paste the wrong text.
+        // Over SSH the native clipboard isn't the user's to read (see
+        // `clipboard::native_clipboard_is_remote`): on macOS it is the *host's*
+        // (a read would paste whatever that machine last copied), on a
+        // display-less Linux host there is none — either way, refuse rather
+        // than paste the wrong text or error obscurely.
         if clipboard::native_clipboard_is_remote() {
-            self.set_error("Clipboard is on the SSH host — use the terminal's paste key instead");
+            self.set_error(
+                "Clipboard read unavailable over SSH — use the terminal's paste key instead",
+            );
             return;
         }
         let Some(clipboard) = &mut self.clipboard else {
