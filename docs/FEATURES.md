@@ -904,7 +904,21 @@ aligned). The file-viewer column toggles with it.
 **Export is the agent, not GitHub.** GitHub/GitLab submit is out of
 scope; the payoff of reviewing *inside* an orchestrator is closing the
 loop — `e` (Send→Agent) pastes the compiled review into the session's agent
-to address, and `y` (Copy) yields markdown. Diff data types (`DiffFile` /
+to address, and `y` (Copy) yields the same markdown. The default
+**structured handoff** (`[review] handoff = "structured"`, see
+`docs/CONFIG.md`) leads with a ~7-line in-band semantics preamble (friring
+is agent-neutral — no skill/system prompt can be assumed on the other CLI)
+and renders one `### C<id> [Class] <side>:<line>` record per comment: `C<id>`
+is the comment's SQLite id (stable across re-sends, so the agent can report
+per-comment outcomes), the enclosing hunk's section heading is appended as
+`, in `\`heading\``, and the anchored diff line is quoted as a `> ` locator
+(truncated to 200 chars). Quoted lines are **locators, not context** — line
+numbers rot as soon as the agent edits, so the verbatim content is the
+grep-able key; old-side anchors are marked `(line was removed)` since that
+content no longer exists in the tree. An anchor the current diff can't
+resolve (rebuilt since the comment was written) omits its quote rather than
+guessing. `handoff = "legacy"` reproduces the original bullet format
+byte-for-byte. Diff data types (`DiffFile` /
 `DiffHunk` / `DiffLine`, `Classification`, `CommentAnchor`, `ReviewComment`)
 and the unit-tested `parse_unified_diff` live in `session::review` (pure, so
 `ui` renders them without importing `git`); `git::diff_against{,_on}` runs

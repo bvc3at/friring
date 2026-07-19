@@ -1354,11 +1354,19 @@ impl App {
 
     // ── Export ───────────────────────────────────────────────────────────────
 
-    /// Compile the review (comments grouped by file + summary) to markdown, or
-    /// `None` when there are no comments yet.
+    /// Compile the review (comments grouped by file + summary) to markdown in
+    /// the configured handoff shape (`[review] handoff`), or `None` when there
+    /// are no comments yet. Shared by `e` (send) and `y` (copy).
     pub(crate) fn cr_review_markdown(&self) -> Option<String> {
         let cr = self.active_review()?;
-        review_markdown(&cr.files, &cr.comments)
+        match self.review_settings.handoff {
+            crate::session::settings::ReviewHandoff::Structured => {
+                review_markdown_structured(&cr.files, &cr.comments)
+            }
+            crate::session::settings::ReviewHandoff::Legacy => {
+                review_markdown_legacy(&cr.files, &cr.comments)
+            }
+        }
     }
 
     /// Copy the compiled review to the clipboard.
@@ -1379,7 +1387,10 @@ impl App {
     }
 
     /// Paste the compiled review into the session's agent as a prompt to address
-    /// it — the review → agent → re-review loop.
+    /// it — the review → agent → re-review loop. The structured handoff carries
+    /// its semantics preamble in-band (friring is agent-neutral, so no skill or
+    /// system prompt can be assumed on the other side); the legacy shape keeps
+    /// its historical instruction prefix.
     pub(crate) fn cr_send_to_agent(&mut self) {
         let Some(md) = self.cr_review_markdown() else {
             self.set_status(StatusLevel::Info, "No review comments to send");
@@ -1389,7 +1400,12 @@ impl App {
             return;
         };
         let sid = cr.session_id;
-        let prompt = format!("Please address the following code review:\n\n{md}");
+        let prompt = match self.review_settings.handoff {
+            crate::session::settings::ReviewHandoff::Structured => md,
+            crate::session::settings::ReviewHandoff::Legacy => {
+                format!("Please address the following code review:\n\n{md}")
+            }
+        };
         self.close_code_review();
         self.send_prompt_to_session(sid, &prompt, 0);
         self.set_status(StatusLevel::Success, "Review sent to agent");
@@ -1769,11 +1785,15 @@ fn build_files(
     files
 }
 
-/// Compile a review's comments + summary to markdown, grouped by file in diff
-/// order. Comments anchored to a file not in `files` (e.g. after switching the
-/// review target) are omitted. Returns `None` when there are no comments. Pure
-/// so the export is unit-testable independent of [`App`].
-fn review_markdown(files: &[DiffFile], comments: &[ReviewComment]) -> Option<String> {
+/// Compile a review's comments + summary to the **legacy** markdown shape
+/// (`[review] handoff = "legacy"`), grouped by file in diff order. Comments
+/// anchored to a file not in `files` (e.g. after switching the review target)
+/// are omitted. Returns `None` when there are no comments. Kept byte-identical
+/// to the pre-v2 output for users whose agent prompts/workflows depend on it;
+/// deliberately a separate function from [`review_markdown_structured`], not a
+/// flag-riddled variant. Pure so the export is unit-testable independent of
+/// [`App`].
+fn review_markdown_legacy(files: &[DiffFile], comments: &[ReviewComment]) -> Option<String> {
     if comments.is_empty() {
         return None;
     }
@@ -1817,6 +1837,148 @@ fn review_markdown(files: &[DiffFile], comments: &[ReviewComment]) -> Option<Str
             c.body.replace('\n', "\n  ")
         ));
     }
+    Some(out)
+}
+
+/// Max chars of anchored-line content quoted in a structured handoff record.
+const HANDOFF_QUOTE_MAX: usize = 200;
+
+/// Resolve a line anchor against the current diff: the enclosing hunk and the
+/// [`DiffLine`] whose side-matching number equals `line`. `None` when the diff
+/// was rebuilt since the comment was written and the anchor no longer resolves.
+fn resolve_anchor_line<'a>(
+    files: &'a [DiffFile],
+    file: &str,
+    side: Side,
+    line: u32,
+) -> Option<(
+    &'a crate::session::review::DiffHunk,
+    &'a crate::session::review::DiffLine,
+)> {
+    let f = files.iter().find(|f| f.path == file)?;
+    for hunk in &f.hunks {
+        for l in &hunk.lines {
+            let matches = match side {
+                Side::New => l.new_no == Some(line),
+                Side::Old => l.old_no == Some(line),
+            };
+            if matches {
+                return Some((hunk, l));
+            }
+        }
+    }
+    None
+}
+
+/// The `> `-quoted locator line of a structured handoff record: the anchored
+/// diff line's content (the sign is already stripped by the parser), trailing
+/// whitespace trimmed, truncated to [`HANDOFF_QUOTE_MAX`] chars with `…`. The
+/// quote is a locator, not context — verbatim content is a grep-able search
+/// key that survives the line-number rot the agent's first fix causes.
+fn handoff_quote(text: &str) -> String {
+    let trimmed = text.trim_end();
+    let quoted: String = if trimmed.chars().count() > HANDOFF_QUOTE_MAX {
+        trimmed
+            .chars()
+            .take(HANDOFF_QUOTE_MAX)
+            .chain(std::iter::once('…'))
+            .collect()
+    } else {
+        trimmed.to_string()
+    };
+    format!("> {quoted}\n")
+}
+
+/// Compile a review's comments + summary to the **structured** handoff shape
+/// (`[review] handoff = "structured"`, the default): an in-band semantics
+/// preamble, per-file sections, and one `### C<id> [Class] …` record per
+/// comment — `C<id>` is the comment's SQLite primary key, stable across
+/// re-sends so the agent's outcome report correlates. Line records quote the
+/// anchored diff line (see [`handoff_quote`]) plus the hunk's section heading;
+/// an anchor that no longer resolves omits the quote rather than guessing.
+/// Returns `None` when there are no comments. Pure for unit-testability.
+fn review_markdown_structured(files: &[DiffFile], comments: &[ReviewComment]) -> Option<String> {
+    if comments.is_empty() {
+        return None;
+    }
+    let mut records = String::new();
+    let mut count = 0usize;
+    for file in files {
+        let file_comments: Vec<&ReviewComment> = comments
+            .iter()
+            .filter(|c| c.anchor.file() == Some(file.path.as_str()))
+            .collect();
+        if file_comments.is_empty() {
+            continue;
+        }
+        records.push_str(&format!("\n## {}\n", file.path));
+        for c in file_comments {
+            count += 1;
+            match &c.anchor {
+                CommentAnchor::Line { side, line, .. } => {
+                    let resolved = resolve_anchor_line(files, &file.path, *side, *line);
+                    let mut head = format!(
+                        "\n### C{} [{}] {}:{}",
+                        c.id,
+                        c.classification.label(),
+                        side.as_str(),
+                        line
+                    );
+                    if let Some((hunk, _)) = resolved {
+                        if !hunk.header.is_empty() {
+                            head.push_str(&format!(", in `{}`", hunk.header));
+                        }
+                    }
+                    if *side == Side::Old {
+                        head.push_str(" (line was removed)");
+                    }
+                    records.push_str(&head);
+                    records.push('\n');
+                    if let Some((_, l)) = resolved {
+                        records.push_str(&handoff_quote(&l.text));
+                    }
+                }
+                CommentAnchor::File { .. } => {
+                    records.push_str(&format!(
+                        "\n### C{} [{}] file-level\n",
+                        c.id,
+                        c.classification.label()
+                    ));
+                }
+                CommentAnchor::Review => unreachable!("review comments have no file"),
+            }
+            records.push_str(&c.body);
+            records.push('\n');
+        }
+    }
+    let summaries: Vec<&ReviewComment> = comments
+        .iter()
+        .filter(|c| c.anchor == CommentAnchor::Review)
+        .collect();
+    if !summaries.is_empty() {
+        records.push_str("\n## Review summary\n");
+        for c in summaries {
+            count += 1;
+            records.push_str(&format!(
+                "\n### C{} [{}]\n{}\n",
+                c.id,
+                c.classification.label(),
+                c.body
+            ));
+        }
+    }
+    let noun = if count == 1 { "comment" } else { "comments" };
+    let mut out = format!(
+        "Code review — {count} {noun}. Semantics:\n\
+         [Issue] fix required · [Suggestion] fix or briefly push back ·\n\
+         [Question] answer, don't change code unless the answer demands it ·\n\
+         [Note]/[Praise] no action required.\n\
+         Line numbers are from the review snapshot and may have shifted — locate each\n\
+         comment by its quoted line, and read the surrounding code before editing.\n\
+         When done, list every comment ID with its outcome\n\
+         (fixed / answered / pushed back / no action).\n"
+    );
+    out.push_str(&records);
     Some(out)
 }
 
@@ -2492,9 +2654,9 @@ mod tests {
     }
 
     #[test]
-    fn review_markdown_groups_by_file_and_omits_empty() {
+    fn legacy_markdown_groups_by_file_and_omits_empty() {
         // No comments → None.
-        assert!(review_markdown(&[sample_file()], &[]).is_none());
+        assert!(review_markdown_legacy(&[sample_file()], &[]).is_none());
 
         let comments = vec![
             line_comment(1, "src/foo.rs", 2, Classification::Issue, "bug here"),
@@ -2508,7 +2670,7 @@ mod tests {
                 updated_at: 0,
             },
         ];
-        let md = review_markdown(&[sample_file()], &comments).unwrap();
+        let md = review_markdown_legacy(&[sample_file()], &comments).unwrap();
         assert!(md.starts_with("# Code review\n"));
         assert!(md.contains("## src/foo.rs"));
         assert!(md.contains("- **[Issue]** (new:2) bug here"));
@@ -2517,8 +2679,187 @@ mod tests {
 
         // A comment on a file not in the diff is omitted (no stray header).
         let orphan = vec![line_comment(9, "gone.rs", 1, Classification::Note, "n")];
-        let md = review_markdown(&[sample_file()], &orphan).unwrap();
+        let md = review_markdown_legacy(&[sample_file()], &orphan).unwrap();
         assert!(!md.contains("gone.rs"), "orphan file omitted: {md}");
+    }
+
+    /// The legacy compiler is byte-identical to the pre-v2 output — users'
+    /// agent prompts/workflows may depend on the exact shape. `Question` (new
+    /// in v2) renders as a plain `**[Question]**` bullet.
+    #[test]
+    fn legacy_markdown_is_byte_identical_to_pre_v2_output() {
+        let comments = vec![
+            line_comment(1, "src/foo.rs", 2, Classification::Issue, "bug\nsecond"),
+            line_comment(2, "src/foo.rs", 1, Classification::Question, "why?"),
+            ReviewComment {
+                id: 3,
+                session_id: SessionId::default(),
+                anchor: CommentAnchor::File {
+                    file: "src/foo.rs".into(),
+                },
+                classification: Classification::Suggestion,
+                body: "split this".into(),
+                created_at: 0,
+                updated_at: 0,
+            },
+            ReviewComment {
+                id: 4,
+                session_id: SessionId::default(),
+                anchor: CommentAnchor::Review,
+                classification: Classification::Praise,
+                body: "solid".into(),
+                created_at: 0,
+                updated_at: 0,
+            },
+        ];
+        let md = review_markdown_legacy(&[sample_file()], &comments).unwrap();
+        assert_eq!(
+            md,
+            "# Code review\n\
+             \n\
+             ## src/foo.rs\n\
+             - **[Issue]** (new:2) bug\n  second\n\
+             - **[Question]** (new:1) why?\n\
+             - **[Suggestion]** (file) split this\n\
+             \n\
+             ## Summary\n\
+             - **[Praise]** solid\n"
+        );
+    }
+
+    /// A file whose single hunk carries a section heading, for the structured
+    /// handoff's `, in `\`heading\`` clause.
+    fn headed_file() -> DiffFile {
+        let mut f = change_block_file();
+        f.hunks[0].header = "fn cr_send_to_agent".into();
+        f
+    }
+
+    #[test]
+    fn structured_markdown_preamble_records_and_summary() {
+        let comments = vec![
+            line_comment(12, "src/foo.rs", 2, Classification::Issue, "hardcoded"),
+            ReviewComment {
+                id: 14,
+                session_id: SessionId::default(),
+                anchor: CommentAnchor::File {
+                    file: "src/foo.rs".into(),
+                },
+                classification: Classification::Suggestion,
+                body: "split this module".into(),
+                created_at: 0,
+                updated_at: 0,
+            },
+            ReviewComment {
+                id: 15,
+                session_id: SessionId::default(),
+                anchor: CommentAnchor::Review,
+                classification: Classification::Note,
+                body: "overall fine".into(),
+                created_at: 0,
+                updated_at: 0,
+            },
+        ];
+        let md = review_markdown_structured(&[headed_file()], &comments).unwrap();
+        assert!(
+            md.starts_with("Code review — 3 comments. Semantics:\n"),
+            "preamble leads with the count: {md}"
+        );
+        assert!(md.contains("[Question] answer, don't change code"));
+        assert!(md.contains("list every comment ID"));
+        assert!(md.contains("\n## src/foo.rs\n"));
+        // Line record: C-id, class, side:line, hunk heading, then the quote of
+        // the anchored line ("new a" = new line 2 in change_block_file).
+        assert!(
+            md.contains("### C12 [Issue] new:2, in `fn cr_send_to_agent`\n> new a\nhardcoded\n"),
+            "line record shape: {md}"
+        );
+        // File-level record.
+        assert!(md.contains("### C14 [Suggestion] file-level\nsplit this module\n"));
+        // Summary keeps the C-id heading for outcome correlation.
+        assert!(md.contains("\n## Review summary\n"));
+        assert!(md.contains("### C15 [Note]\noverall fine\n"));
+        // No comments → None (the send/copy toast path).
+        assert!(review_markdown_structured(&[headed_file()], &[]).is_none());
+    }
+
+    #[test]
+    fn structured_markdown_old_side_marks_removed_and_quotes_old_content() {
+        let c = ReviewComment {
+            id: 13,
+            session_id: SessionId::default(),
+            anchor: CommentAnchor::Line {
+                file: "src/foo.rs".into(),
+                side: Side::Old,
+                line: 2,
+            },
+            classification: Classification::Question,
+            body: "why was this dropped?".into(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let md = review_markdown_structured(&[change_block_file()], &[c]).unwrap();
+        // Old line 2 is "old a"; the record carries the removal marker and the
+        // removed content — the only thing that makes the question intelligible.
+        assert!(
+            md.contains(
+                "### C13 [Question] old:2 (line was removed)\n> old a\nwhy was this dropped?\n"
+            ),
+            "old-side record shape: {md}"
+        );
+    }
+
+    #[test]
+    fn structured_markdown_heading_absent_and_unresolvable_anchor() {
+        // change_block_file has an empty hunk heading → no `, in` clause.
+        let resolved = line_comment(1, "src/foo.rs", 2, Classification::Note, "n");
+        let md = review_markdown_structured(&[change_block_file()], &[resolved]).unwrap();
+        assert!(md.contains("### C1 [Note] new:2\n> new a\n"), "{md}");
+        assert!(
+            !md.contains(", in `"),
+            "no heading clause without a heading"
+        );
+
+        // A line number the current diff doesn't contain (diff rebuilt since
+        // the comment was written): record kept, quote omitted — not guessed.
+        let stale = line_comment(2, "src/foo.rs", 999, Classification::Note, "gone");
+        let md = review_markdown_structured(&[change_block_file()], &[stale]).unwrap();
+        assert!(md.contains("### C2 [Note] new:999\ngone\n"), "{md}");
+        assert!(!md.contains("> "), "no quote for an unresolvable anchor");
+    }
+
+    #[test]
+    fn structured_markdown_truncates_long_quotes() {
+        let mut f = sample_file();
+        f.hunks[0].lines[1].text = "x".repeat(300);
+        let c = line_comment(1, "src/foo.rs", 2, Classification::Issue, "long");
+        let md = review_markdown_structured(&[f], &[c]).unwrap();
+        let quote = md
+            .lines()
+            .find(|l| l.starts_with("> "))
+            .expect("quote line present");
+        // 200 content chars + the `…` marker.
+        assert_eq!(quote.chars().count(), 2 + HANDOFF_QUOTE_MAX + 1);
+        assert!(quote.ends_with('…'));
+    }
+
+    #[test]
+    fn structured_markdown_keeps_multi_repo_path_prefixes() {
+        let mut f = sample_file();
+        f.path = "web-app/src/foo.rs".into();
+        let c = line_comment(7, "web-app/src/foo.rs", 2, Classification::Issue, "x");
+        let md = review_markdown_structured(&[f], &[c]).unwrap();
+        assert!(md.contains("\n## web-app/src/foo.rs\n"), "{md}");
+        assert!(md.contains("### C7 [Issue] new:2\n"), "{md}");
+    }
+
+    #[test]
+    fn handoff_quote_trims_and_truncates() {
+        assert_eq!(handoff_quote("  let x = 1;   "), ">   let x = 1;\n");
+        let long = "y".repeat(HANDOFF_QUOTE_MAX + 50);
+        let q = handoff_quote(&long);
+        assert!(q.ends_with("…\n"));
+        assert_eq!(q.chars().count(), 2 + HANDOFF_QUOTE_MAX + 2);
     }
 
     #[test]

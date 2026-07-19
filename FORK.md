@@ -54,6 +54,20 @@ merges carry rename conflicts on the renamed identifiers, and an existing
 
 ### Features
 
+#### Code review v2 (July 2026)
+
+The built-in review view grows the annotate → agent-fixes → re-review loop:
+
+- **`Question` comment classification.** Tab cycle is now `Note → Issue →
+  Suggestion → Question → Praise`; `Question` asks the agent to answer
+  rather than change code.
+- **Structured agent handoff (new default).** `e` (Send→Agent) and `y`
+  (Copy) compile an in-band semantics preamble + one `### C<id> [Class]
+  <side>:<line>` record per comment, quoting the anchored diff line as a
+  grep-able locator (old side marked `(line was removed)`). The upstream
+  bullet format is preserved behind `[review] handoff = "legacy"`
+  (`docs/CONFIG.md`); the new `[review]` settings table is fork-only.
+
 #### Agent activity view (F9)
 
 *The first Friring feature (#1), redesigned in July 2026 into an

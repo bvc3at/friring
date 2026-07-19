@@ -777,6 +777,10 @@ pub struct App {
     /// global like [`Self::features`] so the settings panel / live reload can
     /// re-apply it without a restart.
     pub(crate) info_panel_position: crate::session::settings::InfoPanelPosition,
+    /// Code-review knobs (`[review]` in settings.toml) — copied out of the
+    /// global like [`Self::features`] so they apply live and tests can flip
+    /// them without touching the first-writer-wins global.
+    pub(crate) review_settings: crate::session::settings::ReviewSettings,
     pub(crate) show_info_panel: bool,
     /// Last content-area size pushed to the session PTYs. The `auto` info-pane
     /// dock can move between the left column and its own column when content
@@ -1166,6 +1170,7 @@ impl App {
             session_counter,
             features: crate::session::settings::global().features,
             info_panel_position: crate::session::settings::global().info_panel_position,
+            review_settings: crate::session::settings::global().review,
             show_info_panel: false,
             last_content_size: None,
             show_tasks_panel: false,
@@ -1348,6 +1353,7 @@ impl App {
     pub(crate) fn apply_live_settings(&mut self, settings: &crate::session::settings::Settings) {
         self.features = settings.features;
         self.info_panel_position = settings.info_panel_position;
+        self.review_settings = settings.review;
         self.enforce_feature_visibility();
         self.resize_sessions_to_content_area();
     }
@@ -2272,6 +2278,7 @@ impl App {
         let draft = crate::session::settings::Settings {
             features: self.features,
             info_panel_position: self.info_panel_position,
+            review: self.review_settings,
             ..crate::session::settings::global().clone()
         };
         self.modal = modals::Modal::Settings(modals::SettingsModal::new(draft));
