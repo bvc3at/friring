@@ -247,8 +247,13 @@ impl Harness {
     }
 
     /// Snapshot-sized, sessionless harness for the pinned-screen tests.
+    /// Keybindings are pinned to the non-macOS defaults: snapshots are
+    /// recorded once and checked on every platform, and the macOS-appended
+    /// Cmd alternates would otherwise fork the rendered help overlay per-OS.
     fn snapshot() -> Self {
-        Self::new(SNAP_COLS, SNAP_ROWS, 0)
+        let mut h = Self::new(SNAP_COLS, SNAP_ROWS, 0);
+        h.app.keybindings = crate::session::KeyBindings::defaults_for(false);
+        h
     }
 
     /// Wide harness on a spawnable [`FakeBackend`], with each session given a
