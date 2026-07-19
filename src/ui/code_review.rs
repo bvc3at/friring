@@ -10,7 +10,8 @@ use ratatui::Frame;
 
 use crate::app::code_review::{CodeReviewState, ComposeState, ReviewButton, ReviewRow};
 use crate::session::review::{
-    pair_hunk, Classification, CommentAnchor, DiffFile, DiffHunk, DiffLine, DiffLineKind, SidePair,
+    pair_hunk, Classification, CommentAnchor, DiffFile, DiffHunk, DiffLine, DiffLineKind,
+    FileStatus, SidePair,
 };
 use crate::ui::scrollbar::{self, ScrollbarGeom};
 use crate::ui::theme::Theme;
@@ -124,6 +125,9 @@ pub(crate) fn render(
         (Vec::new(), None)
     } else if state.comment_picker.is_some() {
         render_comment_picker(frame, diff_area, state);
+        (Vec::new(), None)
+    } else if state.info_popup.is_some() {
+        render_info_popup(frame, diff_area, state);
         (Vec::new(), None)
     } else {
         render_rows(frame, diff_area, state)
@@ -266,6 +270,124 @@ fn render_comment_picker(frame: &mut Frame, area: Rect, state: &CodeReviewState)
         ]));
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Render the read-only review-info popup (`i`) in place of the diff body:
+/// target + base per repo, file counts by status, aggregate `+`/`-`, the
+/// active filter/context, and the reviewed range's commits (already loaded
+/// for the target picker — no extra git call). `state.info_popup` is the
+/// scroll offset, clamped here to the content height (the app layer only
+/// saturates it upward).
+fn render_info_popup(frame: &mut Frame, area: Rect, state: &mut CodeReviewState) {
+    let Some(scroll) = state.info_popup else {
+        return;
+    };
+    let muted = Style::default().fg(Theme::text_muted());
+    let text = Style::default().fg(Theme::text_primary());
+    let accent = Style::default()
+        .fg(Theme::accent())
+        .add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        " Review info  (j/k scroll · Esc)",
+        muted,
+    ))];
+    let target = state.target.label(&state.repos, &state.commits);
+    lines.push(Line::from(vec![
+        Span::styled(" Target   ", accent),
+        Span::styled(target, text),
+    ]));
+    for repo in &state.repos {
+        let name = if repo.label.is_empty() {
+            "base".to_string()
+        } else {
+            format!("base ({})", repo.label)
+        };
+        let base = repo.base.as_deref().unwrap_or("(none)").to_string();
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {name}   "), accent),
+            Span::styled(base, text),
+        ]));
+    }
+
+    let (mut m, mut a, mut d, mut r, mut u) = (0, 0, 0, 0, 0);
+    for f in &state.files {
+        if f.untracked {
+            u += 1;
+            continue;
+        }
+        match f.status {
+            FileStatus::Modified => m += 1,
+            FileStatus::Added => a += 1,
+            FileStatus::Deleted => d += 1,
+            FileStatus::Renamed => r += 1,
+        }
+    }
+    let counts: String = [
+        (m, "modified"),
+        (a, "added"),
+        (d, "deleted"),
+        (r, "renamed"),
+        (u, "untracked"),
+    ]
+    .iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, label)| format!("{n} {label}"))
+    .collect::<Vec<_>>()
+    .join(" · ");
+    let (add, del) = state.totals();
+    lines.push(Line::from(vec![
+        Span::styled(" Files    ", accent),
+        Span::styled(format!("{} ({counts})", state.files.len()), text),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" Changes  ", accent),
+        Span::styled(format!("+{add} -{del}"), text),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" View     ", accent),
+        Span::styled(
+            format!(
+                "filter {} · context U{}",
+                state.filter.label().unwrap_or("all"),
+                state.context
+            ),
+            text,
+        ),
+    ]));
+
+    if !state.commits.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(" Commits in range ({})", state.commits.len()),
+            accent,
+        )));
+        for (ri, sha, subject) in &state.commits {
+            let tag = state
+                .repos
+                .get(*ri)
+                .filter(|_| state.multi)
+                .map(|r| format!("[{}] ", r.label))
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {sha} "), muted),
+                Span::styled(
+                    truncate(
+                        &format!("{tag}{subject}"),
+                        (area.width as usize).saturating_sub(11),
+                    ),
+                    text,
+                ),
+            ]));
+        }
+    }
+
+    let height = area.height as usize;
+    let max_scroll = lines.len().saturating_sub(height);
+    let scroll = scroll.min(max_scroll);
+    state.info_popup = Some(scroll);
+    let visible: Vec<Line> = lines.into_iter().skip(scroll).take(height).collect();
+    frame.render_widget(Paragraph::new(visible), area);
 }
 
 /// Render the windowed diff/comment rows + scrollbar. Returns row hitboxes
@@ -1710,6 +1832,7 @@ mod tests {
             filter: crate::app::code_review::ReviewFilter::default(),
             comment_picker: None,
             range: None,
+            info_popup: None,
             context: crate::app::code_review::DEFAULT_CONTEXT,
         };
         s.rebuild_rows();
@@ -2306,6 +2429,40 @@ mod tests {
         assert!(
             screen.contains("(new:1-2) span"),
             "comment row names its span: {screen}"
+        );
+    }
+
+    /// The `i` info popup replaces the diff body with the review's stats:
+    /// target, base, file counts, aggregate +/- , view settings, commits.
+    #[test]
+    fn info_popup_shows_target_files_and_commits() {
+        let mut state = demo_state();
+        state.commits = vec![(0, "abc1234".into(), "fix the widget".into())];
+        state.info_popup = Some(0);
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let _ = render(f, Rect::new(0, 0, 80, 20), &mut state, FocusLevel::Focused);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..20 {
+            for x in 0..80 {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(screen.contains("Review info"), "header: {screen}");
+        assert!(screen.contains("main"), "base branch shown: {screen}");
+        assert!(screen.contains("1 modified"), "file counts: {screen}");
+        assert!(screen.contains("+1 -1"), "aggregate totals: {screen}");
+        assert!(
+            screen.contains("filter all · context U3"),
+            "view settings: {screen}"
+        );
+        assert!(
+            screen.contains("abc1234 fix the widget"),
+            "commit list: {screen}"
         );
     }
 }

@@ -14082,6 +14082,28 @@ mod tests {
         );
     }
 
+    /// `i` opens the read-only review-info popup; j scrolls it (the renderer
+    /// clamps), Esc closes it without closing the review.
+    #[test]
+    fn review_info_popup_opens_scrolls_and_closes() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        app.code_reviews
+            .insert(sid, code_review::CodeReviewState::for_test(sid, 1));
+        app.focus = InputFocus::CodeReview;
+
+        app.handle_code_review_key(KeyCode::Char('i'), KeyModifiers::NONE);
+        assert_eq!(app.code_reviews[&sid].info_popup, Some(0));
+        app.handle_code_review_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.code_reviews[&sid].info_popup, Some(1));
+        app.handle_code_review_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.code_reviews[&sid].info_popup.is_none());
+        assert!(
+            app.code_reviews.contains_key(&sid),
+            "Esc closed the popup, not the review"
+        );
+    }
+
     /// Toggling a reviewed mark stores the current semantic fingerprint, so
     /// the next build can validate it.
     #[test]

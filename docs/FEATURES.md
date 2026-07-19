@@ -1026,6 +1026,13 @@ an all-comments popup (the target-picker overlay pattern): one row per
 comment (`C<id> [Class] <file>:<line> — body head`), ↑/↓ + Enter jumps,
 Esc closes.
 
+**Review info popup (`i`).** A read-only overlay over the diff body (the
+picker pattern): the target and each repo's resolved base, file counts by
+status (untracked counted apart), aggregate `+`/`-`, the active filter +
+context width, and the commit list of the reviewed range (reusing the
+commits already loaded for the target picker — no extra git call,
+repo-tagged in multi-repo). `j`/`k` scroll, Esc/`i` close.
+
 **File filter (`o`, both panes).** Cycles `All → Unreviewed → Commented`
 (`ReviewFilter`), narrowing the tree **and** the `}`/`{` file jumps — the
 diff body always shows every file, so filtering never changes what "the

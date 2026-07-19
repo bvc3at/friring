@@ -298,6 +298,11 @@ pub(crate) struct CodeReviewState {
     pub comment_picker: Option<CommentPickerState>,
     /// The in-progress range selection (`V`), if any (see [`RangeSelect`]).
     pub range: Option<RangeSelect>,
+    /// The review-info popup (`i`): `Some(scroll offset)` while open. A
+    /// read-only overlay (target + bases, file counts, filter/context, the
+    /// range's commits), so its only state is how far it's scrolled; the
+    /// renderer clamps the offset to the content.
+    pub info_popup: Option<usize>,
     /// Diff context lines (`git diff -U<n>`), cycled 3 → 10 → 25 with `=`/`+`.
     /// New-side line numbers are absolute regardless of context, so comment
     /// and mark anchors are unaffected by a context change — only how much
@@ -902,6 +907,7 @@ impl App {
             filter: ReviewFilter::default(),
             comment_picker: None,
             range: None,
+            info_popup: None,
             context: DEFAULT_CONTEXT,
         };
         // Install the loading state (the pane opens instantly with a
@@ -2256,6 +2262,27 @@ impl App {
             self.handle_comment_picker_key(code);
             return true;
         }
+        // The read-only info popup (`i`): j/k scroll, Esc/i/q close.
+        if self
+            .active_review()
+            .is_some_and(|cr| cr.info_popup.is_some())
+        {
+            if let Some(cr) = self.active_review_mut() {
+                match code {
+                    KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => {
+                        cr.info_popup = None;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        cr.info_popup = cr.info_popup.map(|s| s.saturating_add(1));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        cr.info_popup = cr.info_popup.map(|s| s.saturating_sub(1));
+                    }
+                    _ => {}
+                }
+            }
+            return true;
+        }
         let composing = self.active_review().is_some_and(|cr| cr.compose.is_some());
         if composing {
             self.handle_review_compose_key(code, mods);
@@ -2342,6 +2369,11 @@ impl App {
             KeyCode::Char('c') => self.cr_start_comment(false),
             KeyCode::Char('f') => self.cr_start_comment(true),
             KeyCode::Char('V') => self.cr_start_range(),
+            KeyCode::Char('i') => {
+                if let Some(cr) = self.active_review_mut() {
+                    cr.info_popup = Some(0);
+                }
+            }
             KeyCode::Char('s') => self.cr_start_summary(),
             KeyCode::Char('r') => self.cr_toggle_reviewed(false),
             KeyCode::Char('R') => self.cr_toggle_reviewed(true),
@@ -3038,6 +3070,7 @@ impl CodeReviewState {
             filter: ReviewFilter::default(),
             comment_picker: None,
             range: None,
+            info_popup: None,
             context: DEFAULT_CONTEXT,
         };
         s.rebuild_rows();
@@ -3114,6 +3147,7 @@ mod tests {
             filter: ReviewFilter::default(),
             comment_picker: None,
             range: None,
+            info_popup: None,
             context: DEFAULT_CONTEXT,
         };
         s.rebuild_rows();

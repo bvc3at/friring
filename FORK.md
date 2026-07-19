@@ -104,6 +104,8 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
 - **Search history (`↑`/`↓` in the find bar).** Committed searches recall
   per session (in-memory); match-stepping while typing moved to
   `Ctrl+N`/`Ctrl+P` to free the arrows.
+- **Review info popup (`i`).** Target + bases, file counts, `+`/`-`,
+  filter/context, and the range's commit list in one overlay.
 
 #### Agent activity view (F9)
 

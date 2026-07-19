@@ -2183,6 +2183,7 @@ fn open_minimal_review(h: &mut Harness) {
             filter: crate::app::code_review::ReviewFilter::default(),
             comment_picker: None,
             range: None,
+            info_popup: None,
             context: crate::app::code_review::DEFAULT_CONTEXT,
         },
     );
