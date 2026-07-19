@@ -479,6 +479,11 @@ e2e_demo_record() {
     local out_dir="$REPO_ROOT/target/agent-e2e/demos"
     mkdir -p "$out_dir"
 
+    # Mirror the three drive depths: apply the scenario's uncommitted workspace
+    # edit before recording (the boot already ran via `e2e_boot demo` in run.sh).
+    # Without this the claude-review-loop demo records an empty Working target.
+    scenario_prepare || return 1
+
     if [ -n "$SCENARIO_DEMO_THEME" ]; then
         sqlite3 "$XDG_DATA_HOME/friring-dev/friring.db" \
             "INSERT INTO metadata (key, value) VALUES ('active_theme', '$SCENARIO_DEMO_THEME')
