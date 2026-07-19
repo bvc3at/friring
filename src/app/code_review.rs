@@ -273,7 +273,19 @@ pub(crate) struct CodeReviewState {
     pub filter: ReviewFilter,
     /// The open all-comments popup (`@`), if any.
     pub comment_picker: Option<CommentPickerState>,
+    /// Diff context lines (`git diff -U<n>`), cycled 3 → 10 → 25 with `=`/`+`.
+    /// New-side line numbers are absolute regardless of context, so comment
+    /// and mark anchors are unaffected by a context change — only how much
+    /// surrounding code is visible.
+    pub context: u32,
 }
+
+/// git's default `-U` context-line count; the review's context cycle starts
+/// (and the title-bar `· U<n>` marker hides) here.
+pub(crate) const DEFAULT_CONTEXT: u32 = 3;
+
+/// The `=`/`+` context cycle: 3 → 10 → 25 → 3.
+const CONTEXT_CYCLE: [u32; 3] = [DEFAULT_CONTEXT, 10, 25];
 
 impl ReviewTarget {
     /// Display label for the picker / title, given the repos + loaded commits.
@@ -784,6 +796,7 @@ impl App {
             search: None,
             filter: ReviewFilter::default(),
             comment_picker: None,
+            context: DEFAULT_CONTEXT,
         };
         // Install the loading state (the pane opens instantly with a
         // "Building diff…" placeholder), load comments + marks through the
@@ -1188,6 +1201,7 @@ impl App {
         let repos = cr.repos.clone();
         let host = cr.host.clone();
         let multi = cr.multi;
+        let context = cr.context;
         if let Some(cr) = self.active_review_mut() {
             cr.loading = true;
             cr.target_picker = None;
@@ -1197,7 +1211,7 @@ impl App {
         let tx = self.review_build.start();
         tokio::task::spawn_blocking(move || {
             let _ = tx.send(build_review_retarget(
-                session_id, repos, host, multi, target,
+                session_id, repos, host, multi, target, context,
             ));
         });
     }
@@ -1220,6 +1234,7 @@ impl App {
         let host = cr.host.clone();
         let multi = cr.multi;
         let target = cr.target.clone();
+        let context = cr.context;
         if let Some(cr) = self.active_review_mut() {
             cr.loading = true;
         }
@@ -1227,8 +1242,32 @@ impl App {
         self.metrics.bump(|p| &mut p.review_builds_dispatched);
         let tx = self.review_build.start();
         tokio::task::spawn_blocking(move || {
-            let _ = tx.send(build_review_reload(session_id, repos, host, multi, target));
+            let _ = tx.send(build_review_reload(
+                session_id, repos, host, multi, target, context,
+            ));
         });
+    }
+
+    /// Cycle the diff context (`=`/`+`): 3 → 10 → 25 → 3 lines, rebuilding the
+    /// current target with `-U<n>`. New-side line numbers are absolute, so
+    /// comment/mark anchors are unaffected by a context change — only the
+    /// amount of surrounding code shifts.
+    pub(crate) fn cr_cycle_context(&mut self) {
+        if self.review_build.in_progress() {
+            self.set_info("A code-review build is already in progress…");
+            return;
+        }
+        let Some(cr) = self.active_review_mut() else {
+            return;
+        };
+        let i = CONTEXT_CYCLE
+            .iter()
+            .position(|&c| c == cr.context)
+            .unwrap_or(0);
+        cr.context = CONTEXT_CYCLE[(i + 1) % CONTEXT_CYCLE.len()];
+        let n = cr.context;
+        self.set_info(format!("Diff context: {n} lines"));
+        self.cr_reload();
     }
 
     /// Apply the target-picker entry at `idx` (a click), mirroring the keyboard
@@ -2024,6 +2063,7 @@ impl App {
             KeyCode::Char('w') => self.cr_toggle_wrap(),
             KeyCode::Char('t') => self.cr_open_target_picker(),
             KeyCode::Char('o') => self.cr_cycle_filter(),
+            KeyCode::Char('=') | KeyCode::Char('+') => self.cr_cycle_context(),
             KeyCode::Char('c') => self.cr_start_comment(false),
             KeyCode::Char('f') => self.cr_start_comment(true),
             KeyCode::Char('s') => self.cr_start_summary(),
@@ -2168,6 +2208,7 @@ fn build_review_open(
     session_base: Option<String>,
     host: Option<HostDef>,
 ) -> ReviewBuildResult {
+    let context = DEFAULT_CONTEXT;
     let start = std::time::Instant::now();
     for r in &mut repos {
         r.base = resolve_repo_base(session_base.as_deref(), &r.dir, host.as_ref());
@@ -2189,7 +2230,7 @@ fn build_review_open(
         ReviewTarget::Working
     };
     let multi = repos.len() > 1;
-    let files = build_files(&repos, &target, host.as_ref(), multi);
+    let files = build_files(&repos, &target, host.as_ref(), multi, context);
     ReviewBuildResult {
         session_id,
         elapsed_ms: start.elapsed().as_millis() as u64,
@@ -2210,9 +2251,10 @@ fn build_review_retarget(
     host: Option<HostDef>,
     multi: bool,
     target: ReviewTarget,
+    context: u32,
 ) -> ReviewBuildResult {
     let start = std::time::Instant::now();
-    let files = build_files(&repos, &target, host.as_ref(), multi);
+    let files = build_files(&repos, &target, host.as_ref(), multi, context);
     ReviewBuildResult {
         session_id,
         elapsed_ms: start.elapsed().as_millis() as u64,
@@ -2229,9 +2271,10 @@ fn build_review_reload(
     host: Option<HostDef>,
     multi: bool,
     target: ReviewTarget,
+    context: u32,
 ) -> ReviewBuildResult {
     let start = std::time::Instant::now();
-    let files = build_files(&repos, &target, host.as_ref(), multi);
+    let files = build_files(&repos, &target, host.as_ref(), multi, context);
     ReviewBuildResult {
         session_id,
         elapsed_ms: start.elapsed().as_millis() as u64,
@@ -2263,6 +2306,7 @@ fn build_files(
     target: &ReviewTarget,
     host: Option<&HostDef>,
     multi: bool,
+    context: u32,
 ) -> Vec<DiffFile> {
     let mut files: Vec<DiffFile> = Vec::new();
     for (i, repo) in repos.iter().enumerate() {
@@ -2270,13 +2314,13 @@ fn build_files(
             ReviewTarget::Branch => repo
                 .base
                 .as_deref()
-                .and_then(|b| crate::git::diff_against_on(host, &repo.dir, b)),
-            ReviewTarget::Working => crate::git::diff_working_on(host, &repo.dir),
-            ReviewTarget::Staged => crate::git::diff_staged_on(host, &repo.dir),
+                .and_then(|b| crate::git::diff_against_on(host, &repo.dir, b, context)),
+            ReviewTarget::Working => crate::git::diff_working_on(host, &repo.dir, context),
+            ReviewTarget::Staged => crate::git::diff_staged_on(host, &repo.dir, context),
             // A commit target belongs to exactly one repo; the others contribute
             // nothing.
             ReviewTarget::Commit { repo: ri, sha } if *ri == i => {
-                crate::git::show_commit_on(host, &repo.dir, sha)
+                crate::git::show_commit_on(host, &repo.dir, sha, context)
             }
             ReviewTarget::Commit { .. } => None,
         };
@@ -2682,6 +2726,7 @@ impl CodeReviewState {
             search: None,
             filter: ReviewFilter::default(),
             comment_picker: None,
+            context: DEFAULT_CONTEXT,
         };
         s.rebuild_rows();
         s
@@ -2755,6 +2800,7 @@ mod tests {
             search: None,
             filter: ReviewFilter::default(),
             comment_picker: None,
+            context: DEFAULT_CONTEXT,
         };
         s.rebuild_rows();
         s
@@ -3150,13 +3196,13 @@ mod tests {
             },
         ];
         // Multi-repo branch diff: both repos contribute, paths namespaced by repo.
-        let files = build_files(&repos, &ReviewTarget::Branch, None, true);
+        let files = build_files(&repos, &ReviewTarget::Branch, None, true, 3);
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"alpha/a.txt"), "got {paths:?}");
         assert!(paths.contains(&"beta/a.txt"), "got {paths:?}");
 
         // Single-repo (multi=false) leaves paths un-prefixed.
-        let single = build_files(&repos[..1], &ReviewTarget::Branch, None, false);
+        let single = build_files(&repos[..1], &ReviewTarget::Branch, None, false, 3);
         assert_eq!(
             single.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
             vec!["a.txt"]
@@ -3179,6 +3225,7 @@ mod tests {
             },
             None,
             true,
+            3,
         );
         let cpaths: Vec<&str> = commit_files.iter().map(|f| f.path.as_str()).collect();
         assert!(
@@ -3234,7 +3281,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let staged = build_files(&repos, &ReviewTarget::Staged, None, false);
+        let staged = build_files(&repos, &ReviewTarget::Staged, None, false, 3);
         let staged_text = text_of(&staged);
         assert!(staged_text.contains("staged"), "got: {staged_text}");
         assert!(
@@ -3242,9 +3289,59 @@ mod tests {
             "index only: {staged_text}"
         );
 
-        let working = build_files(&repos, &ReviewTarget::Working, None, false);
+        let working = build_files(&repos, &ReviewTarget::Working, None, false, 3);
         let working_text = text_of(&working);
         assert!(working_text.contains("unstaged"), "got: {working_text}");
+    }
+
+    /// The context parameter reaches git as `-U<n>`: a wider context yields
+    /// more hunk lines for the same one-line change.
+    #[test]
+    fn build_files_context_widens_hunks() {
+        use crate::git::git_program;
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let ok = git_program()
+                .args([
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        }
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        git(p, &["init", "-q"]);
+        let body: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(p.join("a.txt"), &body).unwrap();
+        git(p, &["add", "-A"]);
+        git(p, &["commit", "-q", "-m", "init"]);
+        std::fs::write(p.join("a.txt"), body.replace("line 20", "LINE 20")).unwrap();
+
+        let repos = vec![ReviewRepo {
+            label: String::new(),
+            dir: p.to_path_buf(),
+            base: None,
+        }];
+        let count = |ctx: u32| -> usize {
+            build_files(&repos, &ReviewTarget::Working, None, false, ctx)
+                .iter()
+                .flat_map(|f| f.hunks.iter())
+                .map(|h| h.lines.len())
+                .sum()
+        };
+        let (narrow, wide) = (count(3), count(25));
+        assert!(
+            wide > narrow,
+            "-U25 shows more context than -U3 ({wide} vs {narrow})"
+        );
     }
 
     /// The Working target synthesizes untracked files: text inline (all-added,
@@ -3287,7 +3384,7 @@ mod tests {
             dir: p.to_path_buf(),
             base: None,
         }];
-        let files = build_files(&repos, &ReviewTarget::Working, None, false);
+        let files = build_files(&repos, &ReviewTarget::Working, None, false, 3);
         let by_path = |p: &str| files.iter().find(|f| f.path == p);
 
         let new = by_path("new.txt").expect("untracked text file present");
@@ -3316,11 +3413,11 @@ mod tests {
         );
 
         // Multi-repo namespacing prefixes untracked paths like tracked ones.
-        let namespaced = build_files(&repos, &ReviewTarget::Working, None, true);
+        let namespaced = build_files(&repos, &ReviewTarget::Working, None, true, 3);
         assert!(namespaced.iter().any(|f| f.path == "repo/new.txt"));
 
         // Staged sees none of them.
-        let staged = build_files(&repos, &ReviewTarget::Staged, None, false);
+        let staged = build_files(&repos, &ReviewTarget::Staged, None, false, 3);
         assert!(staged.iter().all(|f| !f.untracked));
     }
 

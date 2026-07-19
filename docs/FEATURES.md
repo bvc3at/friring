@@ -856,6 +856,13 @@ reviewed-marks never collide across repos. Each repo resolves its own base
 branch); the commit target lists commits across all repos, repo-tagged, and a
 commit target scopes to its one repo.
 
+**Context expansion (`=` / `+`).** Cycles the diff context `3 → 10 → 25 →
+3` lines, rebuilding the current target with `-U<n>` through the same
+build worker (refused while a build is in flight). A non-default width
+shows in the title (`· U10`). Comment/mark anchors are unaffected —
+new-side line numbers are absolute regardless of context. Per-hunk
+GitHub-style incremental expansion is deliberately not offered.
+
 **Word-level intra-line diff.** Each aligned deletion/addition pair (the
 same positional `del[k] ↔ add[k]` pairing in both layouts) is token-diffed
 (`session::review::word_diff`: alphanumeric/`_` runs vs symbol runs,

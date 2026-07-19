@@ -13937,6 +13937,28 @@ mod tests {
         assert_eq!(app.code_reviews[&sid].selected_comment_id(), Some(1));
     }
 
+    /// `=` cycles the diff context 3 → 10 → 25 → 3 and rebuilds through the
+    /// shared worker; a cycle while a build is in flight is refused.
+    #[tokio::test]
+    async fn review_context_cycle_steps_and_dispatches_rebuild() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        app.code_reviews
+            .insert(sid, code_review::CodeReviewState::for_test(sid, 1));
+        assert_eq!(app.code_reviews[&sid].context, 3);
+
+        app.cr_cycle_context();
+        assert_eq!(app.code_reviews[&sid].context, 10);
+        assert!(
+            app.review_build.in_progress(),
+            "the cycle rebuilds the diff with -U<n>"
+        );
+
+        // Build in flight → the next cycle is refused, context unchanged.
+        app.cr_cycle_context();
+        assert_eq!(app.code_reviews[&sid].context, 10);
+    }
+
     /// Toggling a reviewed mark stores the current semantic fingerprint, so
     /// the next build can validate it.
     #[test]

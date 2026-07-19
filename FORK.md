@@ -92,6 +92,8 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
 - **Syntax highlighting in side-by-side.** Both halves of the paired layout
   now render through the same highlighter pipeline as the unified body
   (upstream painted them as plain tinted text).
+- **Context expansion (`=`/`+`).** Cycles `-U3 → -U10 → -U25`, shown as
+  `· U<n>` in the title.
 
 #### Agent activity view (F9)
 

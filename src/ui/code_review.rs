@@ -62,7 +62,14 @@ pub(crate) fn render(
 ) -> CodeReviewHits {
     let (add, del) = state.totals();
     let target = state.target.label(&state.repos, &state.commits);
-    let title = format!(" Code review · {target}  +{add} -{del} ");
+    // Surface a non-default context width (`=` cycle) so a widened diff can't
+    // be mistaken for the default view.
+    let ctx = if state.context == crate::app::code_review::DEFAULT_CONTEXT {
+        String::new()
+    } else {
+        format!(" · U{}", state.context)
+    };
+    let title = format!(" Code review · {target}{ctx}  +{add} -{del} ");
     // Right-aligned so the app-layer central-pane tab strip (Agent/Shell/Review)
     // overlaid on the left of this top border has room.
     let block = focus_block("", level)
@@ -1672,6 +1679,7 @@ mod tests {
             search: None,
             filter: crate::app::code_review::ReviewFilter::default(),
             comment_picker: None,
+            context: crate::app::code_review::DEFAULT_CONTEXT,
         };
         s.rebuild_rows();
         s
