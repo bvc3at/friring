@@ -99,16 +99,16 @@ pub fn remove_workspace_at(dir: &Path) -> io::Result<()> {
     };
     for entry in entries {
         let entry = entry?;
-        if !entry.file_type()?.is_symlink() {
+        if !is_workspace_link(&entry)? {
             return Err(io::Error::other(format!(
-                "refusing to remove {}: {} is not a symlink",
+                "refusing to remove {}: {} is not a workspace link",
                 dir.display(),
                 entry.file_name().to_string_lossy()
             )));
         }
     }
-    // Only-symlinks verified above; `remove_dir_all` unlinks them without
-    // following, so the member repos are untouched.
+    // Only workspace links verified above; `remove_dir_all` unlinks them
+    // without following, so the member repos are untouched.
     std::fs::remove_dir_all(dir)
 }
 
@@ -156,11 +156,9 @@ pub fn validate_custom_workspace_dir(dir: &Path) -> Result<(), String> {
         std::fs::read_dir(dir).map_err(|e| format!("Cannot read {}: {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("Cannot read {}: {e}", dir.display()))?;
-        let is_symlink = entry
-            .file_type()
-            .map_err(|e| format!("Cannot read {}: {e}", dir.display()))?
-            .is_symlink();
-        if !is_symlink {
+        let is_link =
+            is_workspace_link(&entry).map_err(|e| format!("Cannot read {}: {e}", dir.display()))?;
+        if !is_link {
             return Err(format!(
                 "{} is not empty (only a previous workspace can be reused)",
                 dir.display()
@@ -168,6 +166,29 @@ pub fn validate_custom_workspace_dir(dir: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Whether a workspace directory entry is a link friring created — safe to
+/// unlink because it never holds real content. A Unix symlink; on Windows a
+/// directory symlink **or** an NTFS junction (the `mklink /J` fallback in
+/// [`symlink`], which is a reparse point but *not* a symlink), so the
+/// symlink-only guards above accept a junction-built workspace for rebuild,
+/// reuse, and removal instead of refusing it as "real content".
+#[cfg(not(windows))]
+fn is_workspace_link(entry: &std::fs::DirEntry) -> io::Result<bool> {
+    Ok(entry.file_type()?.is_symlink())
+}
+
+#[cfg(windows)]
+fn is_workspace_link(entry: &std::fs::DirEntry) -> io::Result<bool> {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    if entry.file_type()?.is_symlink() {
+        return Ok(true);
+    }
+    // `DirEntry::metadata` does not traverse a reparse point, so these are the
+    // junction's own attributes, not its target's.
+    Ok((entry.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
 }
 
 /// The workspace directory path for `id` **without building or touching it** —

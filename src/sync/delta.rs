@@ -91,6 +91,7 @@ fn session_changed(old: &SharedSession, new: &SharedSession) -> bool {
         || old.agent_session_id != new.agent_session_id
         || old.cwd != new.cwd
         || old.additional_dirs != new.additional_dirs
+        || old.workspace_dir != new.workspace_dir
         || old.worktrees != new.worktrees
         || old.shell_backend_id != new.shell_backend_id
         || old.parent_session_id != new.parent_session_id
@@ -338,5 +339,27 @@ mod tests {
 
         assert!(!delta.is_empty());
         assert_eq!(delta.updated_sessions.len(), 1);
+    }
+
+    #[test]
+    fn session_changed_detects_workspace_dir_change() {
+        let session_id = SessionId::default();
+
+        let mut old_state = SharedState::new();
+        old_state.sessions.push(make_session(session_id, "S"));
+
+        let mut new_state = SharedState::new();
+        let mut s2 = make_session(session_id, "S");
+        s2.workspace_dir = Some(PathBuf::from("/home/dev/named-ws"));
+        new_state.sessions.push(s2);
+
+        let delta = StateDelta::compute(&old_state, &new_state);
+
+        assert!(!delta.is_empty());
+        assert_eq!(delta.updated_sessions.len(), 1);
+        assert_eq!(
+            delta.updated_sessions[0].workspace_dir,
+            Some(PathBuf::from("/home/dev/named-ws"))
+        );
     }
 }
