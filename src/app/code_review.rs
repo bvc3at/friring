@@ -2850,7 +2850,14 @@ fn human_size(bytes: u64) -> String {
 /// synthesize the all-added diff from the content.
 fn local_untracked_file(dir: &Path, rel: String) -> DiffFile {
     let full = dir.join(&rel);
-    let size = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
+    // symlink_metadata does not follow the link: an untracked symlink must not
+    // expose its target's bytes (git reviews the link string), and a FIFO or
+    // other special node would block std::fs::read and hang the build worker.
+    let md = std::fs::symlink_metadata(&full).ok();
+    if md.as_ref().is_some_and(|m| !m.file_type().is_file()) {
+        return untracked_placeholder(rel, "special file");
+    }
+    let size = md.map(|m| m.len()).unwrap_or(0);
     if size > UNTRACKED_MAX_BYTES {
         return untracked_placeholder(rel, &human_size(size));
     }
