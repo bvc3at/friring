@@ -2452,7 +2452,10 @@ confined to the active pane bounds.
   forwarded display — there the native clipboard is the **SSH
   host's** (macOS accepts NSPasteboard writes from an SSH login),
   so a "successful" native copy would land on a machine the user
-  is not looking at. Either way the copy falls back
+  is not looking at. (A loopback SSH — `ssh localhost`, detected
+  from a loopback server address in `$SSH_CONNECTION` — is the
+  exception: host and user are the same machine, so native is kept.)
+  Either way the copy falls back
   (`app::clipboard`) to whichever path actually reaches the
   user's terminal: **inside tmux** (`$TMUX` set),
   `tmux load-buffer -w -`, which has tmux

@@ -463,7 +463,9 @@ interplay with ADR-P12 in `docs/PERFORMANCE.md`.
   ran. An SSH session (`SSH_TTY`/`SSH_CONNECTION`) with no forwarded
   `DISPLAY`/`WAYLAND_DISPLAY` (which on X11 platforms would route the clipboard
   back to the user) now goes straight to the tmux/OSC 52 route
-  (`clipboard::native_clipboard_is_remote`). Paste keeps arboard only —
+  (`clipboard::native_clipboard_is_remote`) — except a loopback SSH
+  (`ssh localhost`, a loopback server address in `SSH_CONNECTION`), where host
+  and user are the same machine and native is kept. Paste keeps arboard only —
   terminals block OSC 52 *reads* — and the error points at the terminal's own
   paste key (bracketed paste still works); over SSH paste likewise refuses
   instead of silently pasting the *host's* clipboard.
