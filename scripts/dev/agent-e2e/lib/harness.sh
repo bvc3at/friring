@@ -83,6 +83,7 @@ e2e_scenario_load() {
     SCENARIO_DONE_PATTERN=""
     SCENARIO_PERF=0
     E2E_PERF_MARKS=""
+    scenario_prepare() { :; }
     scenario_assert_effects() { :; }
     scenario_assert_ui() { :; }
     # shellcheck disable=SC1091
@@ -511,6 +512,7 @@ e2e_demo_record() {
 e2e_protocol_smoke() {
     e2e_scenario_load "$1" || return 1
     e2e_boot protocol || return 1
+    scenario_prepare || return 1
     local bin out
     bin="$(agent_binary)"
     agent_print_args "$SCENARIO_PROMPT"
@@ -529,6 +531,7 @@ e2e_protocol_smoke() {
 e2e_interactive_smoke() {
     e2e_scenario_load "$1" || return 1
     e2e_boot protocol || return 1
+    scenario_prepare || return 1
     local bin
     bin="$(agent_binary)"
     tmux -L "$E2E_DRIVER_SOCKET" new-session -d -s "$E2E_DRIVER_SESSION" \
@@ -548,6 +551,10 @@ e2e_interactive_smoke() {
 e2e_scenario() {
     e2e_scenario_load "$1" || return 1
     e2e_boot test || return 1
+    # Post-boot workspace mutation (e2e_boot commits every workspace/ seed, so
+    # an *uncommitted* state — what a Working-target review shows — can only
+    # be made here). Runs before any keystroke in every drive depth.
+    scenario_prepare || return 1
     scenario_steps || return 1
     assert_stub_invariants || return 1
     scenario_assert_effects || return 1

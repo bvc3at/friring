@@ -112,6 +112,13 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
 - **Open in `$EDITOR` (`E`).** Suspends the TUI, opens the selected line
   in `$VISUAL`/`$EDITOR` (`+<line>` convention), and auto-reloads a
   Working-target diff on return. Local sessions only.
+- **Real-agent e2e grounding.** The `claude-review-loop` scenario
+  (`scripts/dev/agent-e2e/`) drives the whole loop against a real Claude
+  Code binary: annotate → `e` → the structured handoff must reach the
+  stubbed model API byte-intact (the fixture pins the C-id, class,
+  locator, and quoted anchor) → re-review nudge → reopen restores the
+  comment. The harness gained an optional `scenario_prepare()` hook for
+  post-boot workspace state (an uncommitted edit for the Working target).
 
 #### Agent activity view (F9)
 

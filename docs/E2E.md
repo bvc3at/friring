@@ -117,7 +117,11 @@ scripts/dev/agent-e2e/scenarios/<name>/
 
 `scenario.sh` sets `SCENARIO_*` vars (`AGENT`, `PROMPT`, `AGENT_READY`, `DONE_PATTERN`, …) and
 defines `scenario_steps()` plus `scenario_assert_effects()` (mode-independent: journal, files)
-and `scenario_assert_ui()` (pane/status). Steps use a small dual-mode vocabulary — `step_type`,
+and `scenario_assert_ui()` (pane/status). An optional `scenario_prepare()` runs after boot and
+before any keystroke, in every drive depth — it exists for workspace state the static seeds
+can't express: `e2e_boot` commits everything under `workspace/`, so an **uncommitted** edit
+(what a Working-target review shows — see `claude-review-loop`) can only be made there. Steps
+use a small dual-mode vocabulary — `step_type`,
 `step_key`, `step_wait_pane`, `step_wait_state`, `step_sleep` — that either drives the driver
 tmux and polls (test mode) or emits VHS tape lines (demo mode; `step_wait_pane` becomes
 `Wait+Screen@timeout /regex/`). Keep steps a flat list: no branching, loops, or variables — the
