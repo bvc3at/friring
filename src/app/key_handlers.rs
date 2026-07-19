@@ -1361,6 +1361,7 @@ impl App {
             self.new_session.spawn_worktrees.clear();
             self.new_session.spawn_name = None;
             self.new_session.saved_repo_picker = None;
+            self.new_session.workspace_dir = None;
             if let Some(pending) = self.pending_worktree_create.as_mut() {
                 if matches!(pending.agent_pick, super::AgentPick::Open) {
                     pending.agent_pick = super::AgentPick::Cancelled;
