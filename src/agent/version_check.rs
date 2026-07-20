@@ -1,7 +1,7 @@
 //! Update check: is a newer friring release available?
 //!
-//! This is the side-effect half of the **opt-in** version-deployment indicator
-//! (gated behind `[features] version_check`, off by default — see
+//! This is the side-effect half of the version-deployment indicator (gated
+//! behind `[features] version_check`, on by default — see
 //! [`crate::session::settings::FeatureFlags`]). It surfaces two ways:
 //!
 //! - **TUI** — a small "⬆ vX.Y.Z available" badge in the header. The draw loop
