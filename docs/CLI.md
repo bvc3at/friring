@@ -37,7 +37,10 @@ friring-cli session list --parent <lead-uuid> --json | jq  # direct children onl
   Tasks section of `docs/FEATURES.md`.
 - **`message`** (alias `msg`) — send / inbox / prune (the inter-session mailbox
   queue). See the Inter-Session Messages section of `docs/FEATURES.md`.
-- **`editor`** — open a session's working dirs in `$EDITOR`.
+- **`editor`** — open a session's working dirs in `$EDITOR`. `editor mode
+  <auto|terminal|gui>` chooses how `Ctrl+O` launches it: terminal editors get a
+  real TTY via a tmux popup or a TUI suspend, GUI editors spawn detached. See
+  the Editor Integration section of `docs/FEATURES.md`.
 - **`config`** — validate / show: strict-parses every config file, or prints the
   effective resolved config. See `docs/CONFIG.md`.
 - **`extension`** (alias `ext`) — install / uninstall / reinstall / list /

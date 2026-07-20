@@ -1011,6 +1011,7 @@ Live in the `metadata` table and apply immediately (no restart):
 |-----|---------|---------|
 | `active_theme` | `Ctrl+Y` / `F4` picker | TUI palette (fifteen built-ins) |
 | `editor_command` | `friring-cli editor set "<cmd>"` | what `Ctrl+O` runs |
+| `editor_mode` | `friring-cli editor mode <auto\|terminal\|gui>` | how `Ctrl+O` runs the editor: `auto` (default) detects terminal vs GUI and gives terminal editors a real TTY (tmux popup / TUI suspend); `terminal` forces the TTY path; `gui` forces detached |
 | `active_extensions` | `friring-cli extension activate/deactivate` | JSON array of active extensions to self-heal |
 | `builtin_hooks_optout` | `friring-cli extension deactivate hooks` | `1` when the user opted out of the auto-activated hooks extension |
 | `perf_snapshot` | the TUI, while perf timing is active (`FRIRING_PERF_LOG` or an open perf HUD) | JSON perf snapshot read by `friring-cli perf` (see `docs/PERFORMANCE.md`) |
