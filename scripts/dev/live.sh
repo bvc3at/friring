@@ -25,8 +25,9 @@
 #   scripts/dev/live.sh --shell        # a shell with the live env (dev friring-cli)
 #   scripts/dev/live.sh -- session list # run a friring-cli command live
 #
-# Requires: cargo, tmux >= 3.2; sqlite3 for the transactional DB backup
-# (falls back to a file copy).
+# Requires: cargo (unless --no-build), tmux >= 3.2, and sqlite3 — the DB backup
+# uses sqlite3's transactional `.backup`; there is no racy file-copy fallback,
+# so the recovery copy is always a coherent snapshot.
 
 set -euo pipefail
 
@@ -57,42 +58,49 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-command -v cargo >/dev/null || die "cargo not found"
 [ -n "${TBX_IN_SANDBOX:-}" ] && die "running inside a sandbox shell — its TMUX_TMPDIR would hide the real server"
 
 # No single-instance lock exists, so gate the handoff by hand: any client on
 # the release server (the release TUI's control-mode attach, or a manual
 # `tmux -L friring attach`) means the sessions are still owned elsewhere.
-clients="$(tmux -L "$LIVE_SOCKET" list-clients 2>/dev/null || true)"
-[ -z "$clients" ] || die "a client is attached to the '$LIVE_SOCKET' tmux server — quit the installed friring first"
+# Checked twice — now (fail fast, before a slow build) and again right before
+# launch, since the build/backup window is long enough for someone to reopen
+# the installed friring in between.
+require_no_clients() {
+    local clients
+    clients="$(tmux -L "$LIVE_SOCKET" list-clients 2>/dev/null || true)"
+    [ -z "$clients" ] || die "a client is attached to the '$LIVE_SOCKET' tmux server — quit the installed friring first"
+}
+require_no_clients
 
 if [ "$build" = "1" ]; then
+    command -v cargo >/dev/null || die "cargo not found"
     log "building friring (dev)"
     ( cd "$REPO_ROOT" && cargo build --bin friring --bin friring-cli >&2 )
 fi
 
-# Back up the DB before the dev binary's migrations touch it. Prefer sqlite3
-# .backup: the automation-heartbeat window keeps writing ticks even with no
-# TUI attached, and .backup is transactional where a plain copy is not.
+# Back up the DB before the dev binary's migrations touch it. sqlite3 `.backup`
+# is transactional — the automation-heartbeat window keeps writing ticks even
+# with no TUI attached, so a plain file copy could capture a torn WAL. Fail
+# closed rather than write an unusable "backup": the whole safety story here is
+# a restorable snapshot, and sqlite3 ships with macOS / is one package away.
 db="$DATA_DIR/friring.db"
 if [ -f "$db" ]; then
+    command -v sqlite3 >/dev/null || die "sqlite3 not found — needed for a consistent DB backup before live migrations (install it, or restore manually and use --no-build with care)"
     backup="$db.dev-live-$(date +%Y%m%d-%H%M%S).bak"
-    if command -v sqlite3 >/dev/null; then
-        sqlite3 "$db" ".backup '$backup'"
-    else
-        log "sqlite3 not found — falling back to a file copy (racy vs. heartbeat writes)"
-        cp "$db" "$backup"
-        for suffix in -wal -shm; do
-            [ -f "$db$suffix" ] && cp "$db$suffix" "$backup$suffix"
-        done
-    fi
+    sqlite3 "$db" ".backup '$backup'"
     log "DB backed up to $backup"
-    # Keep the newest $BACKUP_KEEP backups; the timestamp names sort by age.
+    # Keep the newest $BACKUP_KEEP backups; the timestamp names sort by age. A
+    # `.backup` snapshot is a single self-contained file (no -wal/-shm sidecars).
     find "$DATA_DIR" -maxdepth 1 -name 'friring.db.dev-live-*.bak' | sort -r |
         tail -n +$((BACKUP_KEEP + 1)) | while IFS= read -r old; do
-            rm -f "$old" "$old-wal" "$old-shm"
+            rm -f "$old"
         done
 fi
+
+# The build + backup above can take a while; make sure the installed friring
+# wasn't reopened in that window before we grab the panes.
+require_no_clients
 
 export FRIRING_SOCKET="$LIVE_SOCKET"
 export FRIRING_TMUX_SESSION="$LIVE_SESSION"
