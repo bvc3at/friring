@@ -11018,6 +11018,51 @@ mod tests {
         assert!(app.reload_requested());
     }
 
+    /// An ordinary quit (`Ctrl+Q`) and a session restart (`Ctrl+R`) must never
+    /// raise the reload flag — only `Ctrl+Alt+R` re-execs the binary. Guards
+    /// the flag against an accidental chord overlap.
+    #[test]
+    fn plain_quit_and_restart_do_not_request_reload() {
+        let mut app = app_with_sessions(1);
+        app.handle_key(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert!(app.should_quit);
+        assert!(!app.reload_requested(), "Ctrl+Q must not request reload");
+
+        let mut app = app_with_sessions(1);
+        app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert!(
+            !app.reload_requested(),
+            "Ctrl+R (session restart) must not request reload"
+        );
+    }
+
+    /// `ReloadApp` is a quit + re-exec, so — like `QuitApp` — it must escape the
+    /// input-capturing panes (review, activity, automation/task editors) that
+    /// otherwise swallow Ctrl/Alt chords before the global keybinding lookup.
+    #[test]
+    fn reload_chord_escapes_capture_panes() {
+        for focus in [
+            InputFocus::CodeReview,
+            InputFocus::ReviewFiles,
+            InputFocus::CcActivity,
+            InputFocus::CcActivityTree,
+            InputFocus::AutomationEditor,
+            InputFocus::AutomationRunHistory,
+            InputFocus::TaskEditor,
+        ] {
+            let mut app = app_with_sessions(1);
+            app.focus = focus;
+            app.handle_key(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            );
+            assert!(
+                app.reload_requested() && app.should_quit,
+                "reload chord was swallowed in {focus:?}"
+            );
+        }
+    }
+
     #[test]
     fn footer_quit_button_click_quits() {
         let mut app = app_with_sessions(1);
