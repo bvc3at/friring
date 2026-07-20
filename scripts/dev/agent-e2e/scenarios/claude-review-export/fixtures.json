@@ -1,0 +1,18 @@
+{
+  "responses": [
+    {
+      "name": "ambient",
+      "ambient": true,
+      "match": { "modelContains": "haiku" },
+      "reply": { "text": "ok" }
+    },
+    {
+      "name": "review-ack",
+      "match": { "promptContains": "Please fix this line before merging", "hasToolResult": false },
+      "delayMs": 150,
+      "reply": {
+        "text": "REVIEW-ACK-FROM-STUB — the compiled review reached the model through a real Claude Code submit."
+      }
+    }
+  ]
+}

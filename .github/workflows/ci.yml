@@ -448,7 +448,7 @@ jobs:
         # fails the job fast on a broken install — without it the suite would
         # SKIP (dev-machine semantics) and report a false green.
         run: |
-          npm install -g @anthropic-ai/claude-code@2.1.207
+          npm install -g @anthropic-ai/claude-code@2.1.215
           claude --version
       - name: Run real-agent e2e suite
         run: scripts/dev/agent-e2e/run.sh

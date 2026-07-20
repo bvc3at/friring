@@ -1,0 +1,26 @@
+{
+  "responses": [
+    {
+      "name": "ambient",
+      "ambient": true,
+      "match": { "modelContains": "haiku" },
+      "reply": { "text": "ok" }
+    },
+    {
+      "name": "import-seed",
+      "match": { "promptContains": "seed the transcript for import", "hasToolResult": false },
+      "delayMs": 100,
+      "reply": {
+        "text": "IMPORT-SEED-MARKER — this turn wrote the on-disk transcript the import flow picks up."
+      }
+    },
+    {
+      "name": "import-followup",
+      "match": { "promptContains": "follow up after import", "hasToolResult": false },
+      "delayMs": 100,
+      "reply": {
+        "text": "IMPORT-RESUMED-MARKER — the imported conversation resumed and continued against the stub."
+      }
+    }
+  ]
+}

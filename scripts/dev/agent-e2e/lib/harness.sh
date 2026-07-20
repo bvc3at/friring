@@ -112,6 +112,13 @@ e2e_boot() {
     # into the tmux server env and misattribute hook signals.
     unset FRIRING_SESSION FRIRING_SESSION_ID FRIRING_TASK FRIRING_METRICS_DIR FRIRING_SOCKET
 
+    # Hermeticity for the Ctrl+T shell pane: it launches the inherited $SHELL,
+    # which resolves its startup + history files relative to $HOME (sandboxed)
+    # — UNLESS one of these points at an absolute path outside it. Scrub them
+    # so the shell can only ever read/write inside the throwaway HOME (done
+    # before any tmux server starts, so panes never inherit them).
+    unset ZDOTDIR ENV BASH_ENV HISTFILE
+
     # FRIRING_E2E_BIN points perf runs at a release build — timing numbers
     # from an unoptimized debug binary are noise, not measurements.
     FRIRING_BIN="${FRIRING_E2E_BIN:-$REPO_ROOT/target/debug/friring}"
@@ -183,6 +190,16 @@ e2e_boot() {
         echo 'default = "'"$AGENT_NAME"'"'
         agent_agents_toml_entry
     } > "$cfg_dir/agents.toml"
+
+    # Hermeticity: a session flipping to Blocked would otherwise fire a REAL
+    # desktop notification on the host ([features] notifications defaults to
+    # true; macOS delivers via osascript/terminal-notifier). Tests must never
+    # touch the user's desktop. Scenarios that exercise settings behavior may
+    # rewrite this file, but must keep notifications off.
+    cat > "$cfg_dir/settings.toml" <<'EOF'
+[features]
+notifications = false
+EOF
 
     # Headless `session create` does NOT wire the built-in hooks extension
     # (only the TUI boot and the extension CLI verbs do), so activate it

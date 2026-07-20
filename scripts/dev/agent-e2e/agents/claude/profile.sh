@@ -32,7 +32,14 @@ AGENT_HAS_STATUS_HOOKS=1
 # Bypass is safe here: throwaway workspace, loopback-only egress, dead-proxy
 # for everything else. Shared by agents.toml and the bare-tmux/-p smokes so
 # all three drive depths launch the binary identically.
-AGENT_LAUNCH_ARGS=(--dangerously-skip-permissions)
+# SCENARIO_CLAUDE_PERMISSIONS=default drops the bypass so the permission
+# dialog (and its Notification hook -> blocked signal) is reachable — the
+# only way to e2e the real blocked path.
+if [ "${SCENARIO_CLAUDE_PERMISSIONS:-bypass}" = "default" ]; then
+    AGENT_LAUNCH_ARGS=()
+else
+    AGENT_LAUNCH_ARGS=(--dangerously-skip-permissions)
+fi
 
 # FRIRING_E2E_CLAUDE_BIN pins an exact binary (CI installs a pinned version);
 # otherwise whatever `claude` is on PATH.
@@ -100,6 +107,11 @@ agent_seed_config() {
 
 # Absolute path as command: agents.toml must not depend on PATH luck, and CI
 # pins the binary outside PATH. Name "claude" is load-bearing (hooks patch).
+# The *_args templates mirror the built-in seeded entry verbatim
+# (src/agent/agent_config.rs BUILTIN_AGENTS_TOML): a user agents.toml fully
+# replaces the built-ins, so without them the e2e claude would self-mint its
+# conversation id — breaking restart-resume, fork, conversation import, and
+# the F9 activity view (all of which key on `--session-id {id}` pinning).
 agent_agents_toml_entry() {
     local args="" a
     for a in "${AGENT_LAUNCH_ARGS[@]}"; do
@@ -110,5 +122,8 @@ agent_agents_toml_entry() {
 name = "claude"
 command = "$(agent_binary)"
 args = [${args%, }]
+resume_args = ["--resume", "{id}"]
+fork_args = ["--resume", "{id}", "--fork-session", "-n", "{name}"]
+new_session_args = ["--session-id", "{id}", "-n", "{name}"]
 EOF
 }

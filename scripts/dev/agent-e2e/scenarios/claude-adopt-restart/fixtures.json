@@ -1,0 +1,26 @@
+{
+  "responses": [
+    {
+      "name": "ambient",
+      "ambient": true,
+      "match": { "modelContains": "haiku" },
+      "reply": { "text": "ok" }
+    },
+    {
+      "name": "first-adoption",
+      "match": { "promptContains": "first adoption", "hasToolResult": false },
+      "delayMs": 150,
+      "reply": {
+        "text": "ADOPT-MARKER-ONE — streamed before the TUI quit; the relaunched TUI must still render it."
+      }
+    },
+    {
+      "name": "second-adoption",
+      "match": { "promptContains": "second adoption", "hasToolResult": false },
+      "delayMs": 150,
+      "reply": {
+        "text": "ADOPT-MARKER-TWO — streamed into the re-adopted pane after the TUI relaunch."
+      }
+    }
+  ]
+}

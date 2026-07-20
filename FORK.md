@@ -331,6 +331,22 @@ API-key or base-URL escape, so its scenarios refuse to run offline instead of
 faking a login. A missing *or unresponsive* agent binary skips only that
 agent's tests, so any subset of the CLIs stays green.
 
+The suite has since grown from agent smoke tests into a **core-feature e2e
+suite** (31 scenarios, 43 bats tests): tmux-persistence re-adoption, the real
+permission→blocked hook path, restart-resume / fork / conversation import
+(riding claude's `--session-id {id}` pinning — the harness `agents.toml`
+entry now mirrors the production templates), worktree sessions and `Ctrl+S`
+sync incl. the conflict handoff to the agent, code-review export, automations,
+tasks, inter-session messages, extension lifecycle with offline issue-sync,
+global search, the F9 activity view, both wizard flows, and the polish surface
+(themes, settings live-reload, keybinding editor, shell pane, soft delete,
+attention navigation). Two harness additions keep that hermetic: a
+**`scripted` agent profile** — a bash script registered through the ordinary
+`agents.toml` machinery (living proof of the agent-neutral registry) that
+echoes stdin back, giving fast model-free scenarios that never skip — and a
+seeded sandbox `settings.toml` (`[features] notifications = false`) so
+blocked-state tests can never fire a real desktop banner. See `docs/E2E.md`.
+
 #### Stub-driven demo recordings (`scripts/demo/`)
 
 The demo media are recorded against those same loopback stubs instead of real,

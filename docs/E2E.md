@@ -15,6 +15,16 @@ too); the **model API is stubbed locally**, so runs are deterministic, fully off
 The same stubs also drive the demo recordings — see `docs/DEVELOPMENT.md` § Demo video. See ADR-23
 in `docs/ARCHITECTURE.md` for the decision record.
 
+The suite covers the app's **core feature surface**, not just agent smoke: tmux-persistence
+re-adoption, hook-driven status incl. the real permission→blocked path, restart-resume / fork /
+conversation import (all riding claude's `--session-id {id}` pinning), worktree sessions and
+`Ctrl+S` sync incl. the conflict handoff, code-review export, automations, tasks, messages,
+extensions, global search, the F9 activity view, both wizard flows, and the polish surface
+(themes, settings live-reload, keybinding editor, shell pane, soft delete, attention
+navigation). Scenarios that need no model at all run on the **`scripted` agent** — a bash
+script registered through the ordinary `agents.toml` machinery (see Agent profiles below) —
+so they execute in seconds on any machine, real binary or not.
+
 ## The seam: stub the model at the HTTP boundary
 
 The stubs (`stub/*-stub.mjs`, zero-dependency node ≥ 18 sidecars — deliberately outside the Rust
@@ -91,6 +101,10 @@ test mode** (demo pacing only), so a scenario physically cannot lean on a fixed 
   the agent boots into a trust dialog instead of a usable UI), and the fresh `TMUX_TMPDIR` lives
   under `/tmp` rather than inside that root (the per-user `$TMPDIR` prefix overflows the ~104-byte
   AF_UNIX socket path limit).
+- The sandbox `settings.toml` is seeded with `[features] notifications = false` before the TUI
+  boots: a session flipping to Blocked would otherwise fire a **real desktop banner** on the
+  host (macOS delivers via osascript/terminal-notifier). Tests must never touch the user's
+  desktop; a scenario that rewrites `settings.toml` must keep notifications off.
 - Agent env (`ANTHROPIC_BASE_URL`, `CODEX_HOME`, `OPENCODE_CONFIG`, dummy tokens, telemetry
   kill-switches) is exported **before the first tmux command** — panes inherit the tmux *server*
   environment, which freezes at server start. That ordering is load-bearing; it is how the stub
@@ -134,8 +148,24 @@ functions or the harness, not in a grown-by-accident DSL.
 
 Scenario keystrokes go wherever the TUI routes them: an adopted session boots with **Terminal
 focus**, so plain typing lands in the agent pane; chords in the terminal-passthrough set are
-forwarded to the agent, and `Ctrl+H` returns focus to the session list for Friring-UI actions.
-Demo-able scenarios must stick to keys VHS knows (no F-keys; `C-x` → `Ctrl+X`).
+forwarded to the agent, and `Ctrl+H` cycles focus back to the session list for Friring-UI
+actions. Two focus facts scenarios keep tripping over: `Ctrl+H` is a focus *cycle*, not
+"go to list" — pressing it from list focus leaves the list — and a session created
+**externally while the TUI is already running** (mid-steps `friring-cli session create`) is
+adopted with the session list focused, unlike the pre-boot create; from there `Esc` (or
+`Enter` on the row) drops into the terminal. Assert focus from the pane when in doubt (footer
+focus pill / terminal pane title) instead of assuming it. Demo-able scenarios must stick to
+keys VHS knows (no F-keys; `C-x` → `Ctrl+X`).
+
+Steps run in the bats process with the full sandbox env, so a scenario may also drive
+`friring-cli`, `git`, and the two tmux servers directly from `scenario_steps` — that is how
+multi-session set-ups, external-instance mutations (the multi-instance-sync asserts), and the
+TUI-relaunch adoption test are built (`3>&-` on any call that can start a tmux server, like the
+harness's own). Where no pane string exists to wait on, a **bounded poll helper** mirroring
+`e2e_wait_pane` (fixed tries, small sleep, `e2e_die` on exhaustion) is the sanctioned escape
+hatch — never an open-loop sleep. Scenarios built on F-keys, mid-step CLI probes, or a TUI
+relaunch are **test-only**: they say so in their header comment and are simply never listed as
+demos; `SCENARIO_PRECREATE=0` + `step_resolve_session` remains the wizard-flow pattern.
 
 ## Agent profiles
 
@@ -169,7 +199,22 @@ errors on an agent that never signals.
 The Claude profile pins down what a new profile typically needs: `ANTHROPIC_AUTH_TOKEN` (Bearer;
 the API-key path prompts interactively), a seeded `.claude.json` with `hasCompletedOnboarding`,
 `bypassPermissionsModeAccepted` and per-workspace `hasTrustDialogAccepted`, and the
-nonessential-traffic kill switches.
+nonessential-traffic kill switches. Its `agents.toml` entry mirrors the production template
+verbatim (`new_session_args = ["--session-id", "{id}", "-n", "{name}"]`, `resume_args`,
+`fork_args`) — a user agents.toml **replaces** the built-ins, so without the templates the e2e
+claude would self-mint its conversation id and restart-resume, fork, conversation import, and
+the F9 activity view would all be untestable. `SCENARIO_CLAUDE_PERMISSIONS=default` in a
+scenario drops `--dangerously-skip-permissions` for that run — the only way to reach the real
+permission dialog and its Notification→blocked hook signal.
+
+The `scripted` profile is the deliberate outlier: its "binary" is a bash script written into
+the sandbox at boot that prints `SCRIPTED-READY mode=<new|resume|fork> id=… name=…` (the
+`{id}`/`{name}` templates, expanded — the registry e2e-tests itself) and then echoes stdin
+lines back as `GOT:<line>`, which cleanly separates "typed into the PTY" from "received by the
+agent". It declares the `anthropic` dialect with an empty `{"responses": []}` fixture file, so
+the strict-offline invariant doubles as proof the agent made zero model calls; `require_agent
+scripted` never skips (bash is always present), keeping the pure-UI scenarios green on any
+machine and in CI.
 
 ## Demo mode
 
@@ -260,13 +305,20 @@ it doesn't fail the run but is surfaced to `target/agent-e2e/unexpected-endpoint
 Everything below is proven empirically against the pinned versions; each agent's quirks live in
 its profile, not in the harness.
 
-**claude 2.1.207** — plain-HTTP loopback `ANTHROPIC_BASE_URL`; SSE streaming required; full
+**claude 2.1.215** — plain-HTTP loopback `ANTHROPIC_BASE_URL`; SSE streaming required; full
 tool-use loop (real `Write` executed, `tool_result` posted with the pinned id); `-p` and
 interactive modes; traffic is `HEAD /` + `POST /v1/messages?beta=true` only (no `count_tokens`,
 no side-model calls, with or without the nonessential-traffic switch, in these flows); the whole
 loop survives dead-proxied egress; interactive mode makes **no** model calls before the first
 prompt. The `❯` input-box glyph is the ready marker; the footer text varies by permission mode.
 `ANTHROPIC_MODEL` sets the model it sends *and* displays, so a fictional id renders in its header.
+Also proven on this version: `--session-id {id}` / `-n {name}` are accepted at spawn (the
+transcript lands under `projects/<slug>/<id>.jsonl`, which is what the restart / fork / import /
+activity scenarios ride); `--resume <id>` and `--resume <id> --fork-session` replay that
+transcript **locally with zero model calls** (the journal count is the assert); and in default
+permission mode a stubbed `Bash` tool_use raises the permission dialog — its Notification hook
+payload contains "permission" (→ `blocked`), the question line greps as "Do you want", and a
+plain `Enter` approves the pre-selected "Yes".
 
 **codex 0.144.4** — a custom `[model_providers.*]` needs **no login at all**: the ChatGPT auth flow
 only guards the built-in `openai` provider, and with no `env_key` codex sends no auth header (with
