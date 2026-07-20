@@ -72,6 +72,32 @@ fn local_session() -> String {
         .unwrap_or_else(|| TMUX_SESSION.to_string())
 }
 
+/// The friring state-locating env overrides currently set in this process
+/// (socket, group session, data dir, config dir — empty = unset). Forwarded
+/// into detached windows friring itself spawns in the *already-running* tmux
+/// server (the heartbeat keeper), so they resolve the same state as the friring
+/// that armed them rather than the server's stale launch-time environment.
+/// Chiefly matters under `scripts/dev/live.sh`, where a dev binary drives the
+/// release server: without this, a heartbeat it creates would tick the isolated
+/// `friring-dev` DB. Empty on a normal launch (no overrides), so the window is
+/// spawned exactly as before.
+fn live_env_overrides() -> Vec<(&'static str, String)> {
+    [
+        SOCKET_OVERRIDE_ENV,
+        SESSION_OVERRIDE_ENV,
+        crate::paths::DATA_DIR_OVERRIDE_ENV,
+        crate::paths::CONFIG_DIR_OVERRIDE_ENV,
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        std::env::var(key)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(|v| (key, v))
+    })
+    .collect()
+}
+
 /// Build a [`Command`] for the local multiplexer on the friring socket:
 /// `<DEFAULT_MUX> -L <TMUX_SOCKET> <args…>`. The headless one-shot helpers below
 /// (send/capture/spawn/kill/heartbeat) bypass the [`TmuxTransport`] seam — they
@@ -1598,17 +1624,28 @@ pub fn ensure_automation_heartbeat(cli_path: &Path) -> Result<()> {
         return Ok(());
     }
     let loop_cmd = heartbeat_loop_command(cli_path);
-    let status = local_mux_command(&[
-        "new-window",
-        "-d",
-        "-t",
-        &local_session(),
-        "-n",
-        HEARTBEAT_WINDOW,
-        &loop_cmd,
-    ])
-    .status()
-    .context("Failed to create automation heartbeat window")?;
+    let session = local_session();
+    // Forward the live-mode overrides so the keeper's `friring-cli` targets the
+    // same DB/socket as the friring that armed it, not the tmux server's
+    // launch-time env (see `live_env_overrides`). `-e` is honored by tmux; on
+    // psmux it is ignored, same as before this forwarding existed.
+    let mut args: Vec<String> = vec![
+        "new-window".into(),
+        "-d".into(),
+        "-t".into(),
+        session,
+        "-n".into(),
+        HEARTBEAT_WINDOW.into(),
+    ];
+    for (key, value) in live_env_overrides() {
+        args.push("-e".into());
+        args.push(format!("{key}={value}"));
+    }
+    args.push(loop_cmd);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let status = local_mux_command(&arg_refs)
+        .status()
+        .context("Failed to create automation heartbeat window")?;
     if !status.success() {
         bail!("tmux new-window (heartbeat) exited with status {status}");
     }
@@ -2052,6 +2089,50 @@ mod tests {
         assert_eq!(local_session(), TMUX_SESSION);
         std::env::remove_var(SESSION_OVERRIDE_ENV);
         assert_eq!(local_session(), TMUX_SESSION);
+    }
+
+    #[test]
+    fn live_env_overrides_collects_only_set_vars() {
+        // nextest isolates each test in its own process, so these env mutations
+        // can't race another test.
+        for key in [
+            SOCKET_OVERRIDE_ENV,
+            SESSION_OVERRIDE_ENV,
+            crate::paths::DATA_DIR_OVERRIDE_ENV,
+            crate::paths::CONFIG_DIR_OVERRIDE_ENV,
+        ] {
+            std::env::remove_var(key);
+        }
+        // No overrides → nothing forwarded (a normal launch spawns as before).
+        assert!(live_env_overrides().is_empty());
+
+        std::env::set_var(SOCKET_OVERRIDE_ENV, "friring");
+        std::env::set_var(SESSION_OVERRIDE_ENV, "friring");
+        std::env::set_var(crate::paths::DATA_DIR_OVERRIDE_ENV, "/live/data");
+        // Empty counts as unset, so it is not forwarded.
+        std::env::set_var(crate::paths::CONFIG_DIR_OVERRIDE_ENV, "");
+
+        let got = live_env_overrides();
+        assert_eq!(
+            got,
+            vec![
+                (SOCKET_OVERRIDE_ENV, "friring".to_string()),
+                (SESSION_OVERRIDE_ENV, "friring".to_string()),
+                (
+                    crate::paths::DATA_DIR_OVERRIDE_ENV,
+                    "/live/data".to_string()
+                ),
+            ]
+        );
+
+        for key in [
+            SOCKET_OVERRIDE_ENV,
+            SESSION_OVERRIDE_ENV,
+            crate::paths::DATA_DIR_OVERRIDE_ENV,
+            crate::paths::CONFIG_DIR_OVERRIDE_ENV,
+        ] {
+            std::env::remove_var(key);
+        }
     }
 
     #[test]
