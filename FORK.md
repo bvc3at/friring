@@ -565,6 +565,16 @@ fork.
   set up for the fork at the moment. The `changes` (paths-filter) job also grants
   `pull-requests: read`, which a **private** repo's default token lacks (public
   upstream doesn't need it).
+- **Linux CI/CD jobs run on the self-hosted `k3s-arc` runner.** Every
+  fork-active Linux job in `ci.yml` and `cd.yml` targets
+  `runs-on: [k3s-arc, ubuntu-latest]` — the `k3s-arc` label (an Actions Runner
+  Controller scale set on k3s) has priority, with `ubuntu-latest` kept in the
+  list (GitHub requires a runner carrying **both** labels, so the ARC runners
+  must also advertise `ubuntu-latest`). The upstream-only jobs stay on plain
+  `ubuntu-latest` — they never run on the fork and upstream has no `k3s-arc`
+  runner: `pages.yml`'s deploy, `ci.yml`'s `sonarqube`, and `cd.yml`'s
+  `publish-aur` / `publish-homebrew`. The Windows / macOS jobs and the release
+  build matrix are unchanged — a Linux ARC runner can't service them.
 
 ## Migration
 
