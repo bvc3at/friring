@@ -448,10 +448,17 @@ live sessions — and quitting hands them back to the installed release.
 
 `scripts/dev/live.sh` (`just dev-live`) packages the workflow: build, refuse
 while any client is attached to the release server (no single-instance lock
-exists — two TUIs would fight over the same panes), back up `friring.db`
-(transactional `sqlite3 .backup`; migrations are forward-only and a dev
-branch may bump `SCHEMA_VERSION`), then launch the dev TUI with the four
-overrides set and `target/debug` first on `PATH`.
+exists — two TUIs would fight over the same panes; the check repeats right
+before launch, since the build/backup window is wide enough to lose the race),
+back up `friring.db` (transactional `sqlite3 .backup`, **required** — a torn
+file copy can't be trusted as the recovery snapshot; migrations are
+forward-only and a dev branch may bump `SCHEMA_VERSION`), then launch the dev
+TUI with the four overrides set and `target/debug` first on `PATH`. The
+automation heartbeat that friring arms in the *already-running* release server
+(`ensure_automation_heartbeat`) now forwards the set `FRIRING_*` overrides into
+its window (`-e`), so a heartbeat created under dev-live ticks the live DB
+rather than the dev build's isolated default — a no-op on a normal launch where
+no overrides are set.
 
 `Ctrl+Alt+R` (`Action::ReloadApp`, fork-only) closes the loop in place:
 a normal quit followed by an `exec` of the on-disk binary — env (and so a
@@ -567,11 +574,13 @@ interplay with ADR-P12 in `docs/PERFORMANCE.md`.
   Upstream's schema migrations are forward-only and unguarded: a binary opening
   a DB whose stored `schema_version` is *higher* than its own ran no steps and
   proceeded anyway, deferring the breakage to whichever later query hit a
-  rebuilt/dropped column (or to silent bad data). The fork's `migrate`
-  (`src/storage/schema.rs`) now errors up front with the two ways out — upgrade
-  the binary or restore the pre-upgrade backup. Chiefly hit by relaunching the
-  release binary after a schema-bumping dev build ran on the real DB via
-  `scripts/dev/live.sh` (which backs the DB up first for exactly this reason).
+  rebuilt/dropped column (or to silent bad data). The fork's `initialize`
+  (`src/storage/schema.rs`, `reject_newer_schema`) now errors **before any
+  DDL** — so the `CREATE … IF NOT EXISTS` batch can't recreate a table the
+  newer schema dropped — with the two ways out: upgrade the binary or restore
+  the pre-upgrade backup. Chiefly hit by relaunching the release binary after a
+  schema-bumping dev build ran on the real DB via `scripts/dev/live.sh` (which
+  backs the DB up first for exactly this reason).
 
 - **Cancelled multi-repo flow no longer leaks `additional_dirs`.** The
   new-session-name cancel left the wizard's derived extra dirs populated, so

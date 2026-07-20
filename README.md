@@ -713,6 +713,7 @@ repos? Add `--add-repo PATH@main` (its own worktree per repo) or
 | `Ctrl+D` | Delete session | Vim: **d** = delete |
 | `Ctrl+O` | Open active session's working dirs in editor | **O**pen |
 | `Ctrl+R` | Restart active session | **R**estart |
+| `Ctrl+Alt+R` | Reload friring in place — quit + re-exec the on-disk binary, re-adopting sessions (plain quit on Windows) | **R**estart, one modifier up |
 | `Ctrl+F` | Fork active session | **F**ork |
 | `Ctrl+S` | Sync worktrees with their base branch | **S**ync |
 | `Ctrl+Z` | Undo session delete | **Z** = undo |
@@ -996,7 +997,18 @@ to install them, or install individually with `cargo install`.
 cargo build                          # Debug build
 cargo build --release                # Release build (LTO, stripped)
 cargo run                            # Run in dev mode
+just sandbox                         # Dev build in an isolated sandbox (never touches real state)
+just dev-live                        # Dev build against your REAL sessions (see below)
 ```
+
+Dev builds are isolated by default (own tmux socket/session + data dir). To
+verify a change against your **live** sessions, quit the installed friring, run
+`just dev-live` (it backs up the DB, refuses to run while the release TUI is
+attached, and points the dev build at your real socket/session/DB/config via
+`FRIRING_TMUX_SESSION` + the other `FRIRING_*` overrides), then `Ctrl+Alt+R` to
+hot-reload after each rebuild. Full workflow — including how to restore the DB
+backup if a schema-bumping branch migrates it — is in
+[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
 ### Testing
 

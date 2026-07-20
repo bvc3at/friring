@@ -33,7 +33,9 @@ prek install                   # install the git hooks
 ```
 
 You'll also need, from your package manager: `tmux >= 3.2`, `shellcheck`,
-`bats`, Node + npm (website linters), and `git`.
+`bats`, Node + npm (website linters), and `git`. `sqlite3` is required for
+live mode (`just dev-live`, § 3) — it takes a consistent DB backup before the
+dev build's migrations run; ships with macOS, one package away elsewhere.
 
 ## 2. Everyday tasks — `just`
 
@@ -49,6 +51,7 @@ You'll also need, from your package manager: `tmux >= 3.2`, `shellcheck`,
 | `just hooks-install` | `prek install` |
 | `just smoke` | black-box TUI smoke test |
 | `just sandbox*` | dev runtime sandbox (below) |
+| `just dev-live` | dev build against your **real** sessions (§ 3, Live mode) |
 
 Bare `cargo` still works for everything `just` wraps:
 
@@ -126,15 +129,34 @@ It works by overriding the dev build's compile-time isolation — the script
 exports `FRIRING_SOCKET` + `FRIRING_TMUX_SESSION` (both halves of the tmux
 identity: the socket picks the server, the session the window group) and
 `FRIRING_DATA_DIR` + `FRIRING_CONFIG_DIR` to the release locations, and puts
-`target/debug` first on `PATH`. Two guards run before launch: it refuses while
-any client is attached to the release tmux server (there is no single-instance
-lock — quit the installed friring first), and it backs up `friring.db`
-(`friring.db.dev-live-<timestamp>.bak`, newest five kept) because migrations
-are forward-only — if your branch bumps `SCHEMA_VERSION`, the migrated DB is
-the one thing the quit-and-relaunch round trip does **not** undo: the release
-binary will refuse it, and you restore the backup (or keep using the dev
-build). `--shell` / `-- <cli args>` mirror the sandbox script; `--no-build`
-skips the rebuild.
+`target/debug` first on `PATH`. Two guards run before launch (and the
+client check repeats right before the TUI starts, since the build + backup
+window is wide enough for someone to reopen the installed friring): it refuses
+while any client is attached to the release tmux server (there is no
+single-instance lock — quit the installed friring first), and it backs up
+`friring.db` with `sqlite3 .backup` (`friring.db.dev-live-<timestamp>.bak`,
+newest five kept) because migrations are forward-only — if your branch bumps
+`SCHEMA_VERSION`, the migrated DB is the one thing the quit-and-relaunch round
+trip does **not** undo: the release binary refuses a newer DB. **`sqlite3` is
+required** (a torn file copy could not be trusted as the recovery snapshot); if
+it is missing the launcher fails before touching anything. `--shell` /
+`-- <cli args>` mirror the sandbox script; `--no-build` skips the rebuild (and
+its `cargo` requirement).
+
+**Restoring the backup.** If the release binary later refuses the migrated DB
+(`schema is vN … a newer friring wrote it`), stop every friring process, then
+swap the snapshot back in. A `.backup` snapshot is a single self-contained
+file, so no `-wal`/`-shm` sidecars are involved:
+
+```bash
+tmux -L friring kill-server            # stop the heartbeat/agents writing to it
+cd "${XDG_DATA_HOME:-$HOME/.local/share}/friring"
+rm -f friring.db-wal friring.db-shm    # drop any WAL the dev build left behind
+cp friring.db.dev-live-<timestamp>.bak friring.db
+```
+
+Then relaunch the installed release. (Or just keep using the dev build until
+the branch ships — the migrated DB is fine for *it*.)
 
 While the dev TUI runs, iterate without leaving it: `cargo build` in another
 terminal (or a `Ctrl+T` shell pane), then press `Ctrl+Alt+R` — friring quits
