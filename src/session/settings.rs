@@ -47,6 +47,10 @@ pub struct Settings {
     /// per-session dedup).
     #[serde(default)]
     pub notifications: NotificationSettings,
+    /// Native code-review knobs (`[review]` table). Absent table = defaults
+    /// (structured handoff, idle nudge on).
+    #[serde(default)]
+    pub review: ReviewSettings,
 }
 
 /// Whole-feature switches (`[features]` in settings.toml). Each flag hides the
@@ -219,6 +223,43 @@ pub struct NotificationSettings {
     pub backend: NotificationBackend,
 }
 
+/// Which compiled-markdown shape the review handoff uses (`[review] handoff`)
+/// — both `e` (send to agent) and `y` (copy) go through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewHandoff {
+    /// v2: an in-band semantics preamble, stable `C<id>` headings, and quoted
+    /// anchor lines the agent can grep for.
+    #[default]
+    Structured,
+    /// The original bullet format (`## <path>` / `- **[Class]** (side:line)`),
+    /// for users whose agent prompts/workflows depend on it.
+    Legacy,
+}
+
+/// Knobs for the native code-review view (`[review]` table). All fields have
+/// defaults so an absent table behaves like before the table existed. Applied
+/// live (mirrored into `App` state on save/reload, like the UI feature flags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSettings {
+    /// Handoff markdown shape for `e` (send) and `y` (copy).
+    #[serde(default)]
+    pub handoff: ReviewHandoff,
+    /// Toast a re-review nudge ("Agent idle — F7 to re-review…") when a
+    /// session's agent goes idle after a review was sent to it.
+    #[serde(default = "default_true")]
+    pub nudge_on_idle: bool,
+}
+
+impl Default for ReviewSettings {
+    fn default() -> Self {
+        Self {
+            handoff: ReviewHandoff::Structured,
+            nudge_on_idle: true,
+        }
+    }
+}
+
 fn default_notification_min_interval_secs() -> u64 {
     5
 }
@@ -314,6 +355,7 @@ impl Default for Settings {
             info_panel_position: InfoPanelPosition::default(),
             features: FeatureFlags::default(),
             notifications: NotificationSettings::default(),
+            review: ReviewSettings::default(),
         }
     }
 }
@@ -625,6 +667,44 @@ mod tests {
         };
         live.into_iter().for_each(|flip| check(flip, false));
         restart.into_iter().for_each(|flip| check(flip, true));
+    }
+
+    #[test]
+    fn review_table_defaults_and_parses_each_handoff() {
+        let s: Settings = toml::from_str("").unwrap();
+        assert_eq!(s.review, ReviewSettings::default());
+        assert_eq!(s.review.handoff, ReviewHandoff::Structured);
+        assert!(s.review.nudge_on_idle);
+
+        for (raw, want) in [
+            ("structured", ReviewHandoff::Structured),
+            ("legacy", ReviewHandoff::Legacy),
+        ] {
+            let s: Settings = toml::from_str(&format!("[review]\nhandoff = \"{raw}\"\n")).unwrap();
+            assert_eq!(s.review.handoff, want, "handoff = {raw}");
+            assert!(s.review.nudge_on_idle, "untouched knobs keep their default");
+        }
+
+        let s: Settings = toml::from_str("[review]\nnudge_on_idle = false").unwrap();
+        assert!(!s.review.nudge_on_idle);
+        assert_eq!(s.review.handoff, ReviewHandoff::Structured);
+    }
+
+    #[test]
+    fn review_handoff_rejects_unknown_value() {
+        let err = toml::from_str::<Settings>("[review]\nhandoff = \"json\"").unwrap_err();
+        assert!(err.to_string().contains("handoff") || err.to_string().contains("variant"));
+    }
+
+    #[test]
+    fn review_settings_apply_live() {
+        // Mirrored into `App` state on save/reload like the live feature
+        // flags, so they must not register as a restart-only difference.
+        let base = Settings::default();
+        let mut moved = base.clone();
+        moved.review.handoff = ReviewHandoff::Legacy;
+        moved.review.nudge_on_idle = false;
+        assert!(!base.restart_only_differs(&moved));
     }
 
     #[test]

@@ -419,6 +419,10 @@ also_on_waiting     = false    # also fire when a session finishes (Working → 
 suppress_for_active = true     # skip the session you're currently viewing
 sound               = true     # play the OS default notification sound
 min_interval_secs   = 5        # per-session floor between notifications
+
+[review]
+handoff       = "structured"   # review handoff shape: structured | legacy
+nudge_on_idle = true           # toast a re-review nudge when the agent goes idle
 ```
 
 ### `[features]` — whole-feature switches
@@ -583,6 +587,27 @@ Notifications fire on the hooks-driven status transitions (see
 [Session status](#session-status)): always on `→ Blocked` (the agent needs
 you), and with `also_on_waiting = true` also on `Working → Done`.
 
+### `[review]` — native code-review knobs
+
+Knobs for the built-in code-review view (see `docs/FEATURES.md` § Code
+Review). Both apply **live** (panel save or file reload), like the UI
+feature flags.
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `handoff` | `"structured"` | markdown shape of the compiled review that `e` (Send→Agent) pastes and `y` copies: `structured` \| `legacy` |
+| `nudge_on_idle` | `true` | after a review was sent, toast "Agent idle — F7 to re-review, F5 to reload" when that session's agent finishes |
+
+`structured` (the default) is the v2 handoff: a short in-band semantics
+preamble (friring is agent-neutral, so no skill or system prompt can be
+assumed on the receiving CLI), one `### C<id> [Class] <side>:<line>` record
+per comment — `C<id>` is the comment's database id, stable across re-sends —
+with the anchored diff line quoted as a grep-able locator (old-side quotes
+are marked `(line was removed)`). `legacy` reproduces the original format
+(`"Please address the following code review:"` prefix, `## <path>` sections
+with `- **[Class]** (side:line)` bullets, `## Summary`) byte-for-byte, for
+agent prompts/workflows that depend on it.
+
 ## Session status
 
 Each session's state (Blocked / Working / Done / Idle / Error) is driven by
@@ -651,8 +676,11 @@ app_bg = "reset"             # keep the terminal's native background
 Colours accept anything ratatui parses: `#rrggbb`, ANSI names (`red`,
 `lightcyan`), indexed (`14`), or `reset`. The seeded file lists every
 overridable key — including the code-review diff colours `diff_added` /
-`diff_removed` (added/removed line foreground) and `diff_added_bg` /
-`diff_removed_bg` (the subtle full-row tint). Bad colours and built-in name
+`diff_removed` (added/removed line foreground), `diff_added_bg` /
+`diff_removed_bg` (the subtle full-row tint), and `diff_added_word_bg` /
+`diff_removed_word_bg` (the stronger per-token background the word-level
+intra-line diff paints over changed tokens; every preset derives them one
+saturation step brighter than the row tint). Bad colours and built-in name
 collisions degrade to startup warnings (the base colour / the built-in stays in
 effect).
 

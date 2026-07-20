@@ -54,6 +54,72 @@ merges carry rename conflicts on the renamed identifiers, and an existing
 
 ### Features
 
+#### Code review v2 (July 2026)
+
+The built-in review view grows the annotate → agent-fixes → re-review loop:
+
+- **`Question` comment classification.** Tab cycle is now `Note → Issue →
+  Suggestion → Question → Praise`; `Question` asks the agent to answer
+  rather than change code.
+- **Structured agent handoff (new default).** `e` (Send→Agent) and `y`
+  (Copy) compile an in-band semantics preamble + one `### C<id> [Class]
+  <side>:<line>` record per comment, quoting the anchored diff line as a
+  grep-able locator (old side marked `(line was removed)`). The upstream
+  bullet format is preserved behind `[review] handoff = "legacy"`
+  (`docs/CONFIG.md`); the new `[review]` settings table is fork-only.
+- **Manual reload (`F5` / `Ctrl+R`).** Rebuilds the current target in place
+  (upstream's only refresh was retarget/reopen), preserving the selection by
+  file.
+- **Self-invalidating reviewed marks.** Marks store a semantic fingerprint
+  of the marked content (schema **v42**, `review_marks.fingerprint`); every
+  completed build deletes marks whose file/hunk content changed and toasts a
+  summary — upstream marks could silently go stale.
+- **Staged-only target.** The `t` picker gains `Staged changes (index vs
+  HEAD)` (`git diff --cached`) between Working and Branch.
+- **Untracked files in the Working target.** Synthesized as all-added
+  entries with a `?` glyph (upstream's `git diff HEAD` never showed them);
+  oversized/binary files degrade to a placeholder row.
+- **Changed-files filter (`o`).** `All → Unreviewed → Commented`, scoping
+  the tree and the `}`/`{` jumps, with auto-advance to the next unreviewed
+  file on marking.
+- **Comment navigation.** `(`/`)` jump prev/next comment (wrapping,
+  unfolding folded files); `@` opens an all-comments popup with `C<id>`
+  rows.
+- **Word-level intra-line diff.** Changed tokens of an aligned del/add pair
+  get a stronger background (new theme keys `diff_added_word_bg` /
+  `diff_removed_word_bg`, derived per preset); 30% shared-token gate;
+  composes with syntax + search highlighting in both layouts.
+- **Syntax highlighting in side-by-side.** Both halves of the paired layout
+  now render through the same highlighter pipeline as the unified body
+  (upstream painted them as plain tinted text).
+- **Context expansion (`=`/`+`).** Cycles `-U3 → -U10 → -U25`, shown as
+  `· U<n>` in the title.
+- **Range comments (`V`).** `V` + `j`/`k` select a same-side, same-file
+  line span, `c` comments on it (schema **v43**,
+  `review_comments.line_end`); the handoff record reads `new:10-24` and
+  quotes the span's first + last lines with `> …` between.
+- **Binary diff placeholder.** A binary body renders an explanatory
+  `(binary file[, size])` row instead of upstream's bare `+0 -0` header
+  (size only where a local stat is free — the Working target).
+- **Search history (`↑`/`↓` in the find bar).** Committed searches recall
+  per session (in-memory); match-stepping while typing moved to
+  `Ctrl+N`/`Ctrl+P` to free the arrows.
+- **Review info popup (`i`).** Target + bases, file counts, `+`/`-`,
+  filter/context, and the range's commit list in one overlay.
+- **Re-review nudge.** After a review is sent, the agent's next
+  Working → idle edge toasts "F7 to re-review, F5 to reload" (once per
+  send; `[review] nudge_on_idle` opts out).
+- **Open in `$EDITOR` (`E`).** Suspends the TUI, opens the selected line
+  in `$VISUAL`/`$EDITOR` (`+<line>` convention), and auto-reloads a
+  Working-target diff on return. Local sessions only.
+- **Real-agent e2e grounding.** The `claude-review-loop` scenario
+  (`scripts/dev/agent-e2e/`) drives the whole loop against a real Claude
+  Code binary: annotate → `e` → the structured handoff must reach the
+  stubbed model API byte-intact (the fixture pins the C-id, class,
+  locator, and quoted anchor) → re-review nudge → reopen restores the
+  comment. The harness gained an optional `scenario_prepare()` hook for
+  post-boot workspace state (an uncommitted edit for the Working target).
+
 #### Agent activity view (F9)
 
 *The first Friring feature (#1), redesigned in July 2026 into an

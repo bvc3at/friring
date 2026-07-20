@@ -669,6 +669,19 @@ pub struct StatusMessage {
     pub created_at: std::time::Instant,
 }
 
+/// A pending `$VISUAL`/`$EDITOR` round-trip (the review's `E`). The app can't
+/// run the editor itself — the main loop owns the terminal — so it queues this
+/// request; the loop takes it ([`App::take_pending_editor`]), tears the TUI
+/// down, runs the editor to completion, rebuilds the terminal, and reports
+/// back via [`App::editor_closed`].
+pub struct EditorRequest {
+    pub program: String,
+    pub args: Vec<String>,
+    /// Reload the review diff after the editor exits — set for the Working
+    /// target only, where the edit changes what the diff shows.
+    pub reload_review: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputFocus {
     SessionList,
@@ -798,6 +811,10 @@ pub struct App {
     /// global like [`Self::features`] so the settings panel / live reload can
     /// re-apply it without a restart.
     pub(crate) info_panel_position: crate::session::settings::InfoPanelPosition,
+    /// Code-review knobs (`[review]` in settings.toml) — copied out of the
+    /// global like [`Self::features`] so they apply live and tests can flip
+    /// them without touching the first-writer-wins global.
+    pub(crate) review_settings: crate::session::settings::ReviewSettings,
     pub(crate) show_info_panel: bool,
     /// Last content-area size pushed to the session PTYs. The `auto` info-pane
     /// dock can move between the left column and its own column when content
@@ -813,6 +830,22 @@ pub struct App {
     /// sessions and returning keeps the review open. The active session's entry
     /// (if any) is reached via [`Self::active_review`] / [`Self::active_review_mut`].
     pub(crate) code_reviews: std::collections::HashMap<SessionId, code_review::CodeReviewState>,
+    /// Committed review-search queries per session, newest last — recalled
+    /// with `↑`/`↓` in the find bar. In-memory only (not persisted) and kept
+    /// outside [`CodeReviewState`](code_review::CodeReviewState) deliberately:
+    /// the review closes on every Send→Agent, and the history must survive
+    /// the reopen.
+    pub(crate) review_search_history: std::collections::HashMap<SessionId, Vec<String>>,
+    /// Sessions a review was sent to (`e`) that are being watched for the
+    /// agent finishing, mapped to the last status observed — when a watched
+    /// session leaves `Working`, a re-review nudge toast fires
+    /// (`[review] nudge_on_idle`) and the watch is consumed (one nudge per
+    /// send). Outside [`CodeReviewState`](code_review::CodeReviewState)
+    /// because Send→Agent closes the review view.
+    pub(crate) review_nudge_watch: std::collections::HashMap<SessionId, SessionStatus>,
+    /// A queued editor round-trip (see [`EditorRequest`]), drained by the main
+    /// loop each tick.
+    pub(crate) pending_editor: Option<EditorRequest>,
     /// Open agent-activity views (section navigator + content state), keyed by
     /// session — persisted per session like [`Self::code_reviews`], so switching
     /// sessions and returning keeps the view open. Reached via
@@ -1187,12 +1220,16 @@ impl App {
             session_counter,
             features: crate::session::settings::global().features,
             info_panel_position: crate::session::settings::global().info_panel_position,
+            review_settings: crate::session::settings::global().review,
             show_info_panel: false,
             last_content_size: None,
             show_tasks_panel: false,
             show_file_viewer: false,
             file_viewer: crate::ui::file_viewer::FileViewerState::new(),
             code_reviews: std::collections::HashMap::new(),
+            review_search_history: std::collections::HashMap::new(),
+            review_nudge_watch: std::collections::HashMap::new(),
+            pending_editor: None,
             cc_activities: std::collections::HashMap::new(),
             modal: modals::Modal::None,
             new_session: new_session_state::NewSessionWizardState::default(),
@@ -1369,6 +1406,7 @@ impl App {
     pub(crate) fn apply_live_settings(&mut self, settings: &crate::session::settings::Settings) {
         self.features = settings.features;
         self.info_panel_position = settings.info_panel_position;
+        self.review_settings = settings.review;
         self.enforce_feature_visibility();
         self.resize_sessions_to_content_area();
     }
@@ -2341,6 +2379,7 @@ impl App {
         let draft = crate::session::settings::Settings {
             features: self.features,
             info_panel_position: self.info_panel_position,
+            review: self.review_settings,
             ..crate::session::settings::global().clone()
         };
         self.modal = modals::Modal::Settings(modals::SettingsModal::new(draft));
@@ -4761,6 +4800,27 @@ impl App {
         self.tick_background();
     }
 
+    /// Drain the queued editor round-trip (the review's `E`), if any. Called
+    /// by the main loop, which owns the terminal teardown/rebuild around
+    /// running the editor.
+    pub fn take_pending_editor(&mut self) -> Option<EditorRequest> {
+        self.pending_editor.take()
+    }
+
+    /// Called by the main loop after an editor round-trip: the editor owned
+    /// the whole screen, so force a repaint; surface a spawn failure; and for
+    /// a Working-target trip reload the review so the edit shows.
+    pub fn editor_closed(&mut self, reload_review: bool, error: Option<String>) {
+        self.request_redraw();
+        if let Some(e) = error {
+            self.set_error(e);
+            return;
+        }
+        if reload_review && self.active_review().is_some() {
+            self.cr_reload();
+        }
+    }
+
     /// The deterministic half of [`Self::tick`]: everything that only reads
     /// state, polls already-running work, or writes through the in-process DB —
     /// no Tokio task is ever spawned here. Split out so the acceptance harness
@@ -5246,6 +5306,48 @@ impl App {
             self.request_redraw();
         }
         self.dispatch_status_notifications();
+        self.nudge_review_on_idle();
+    }
+
+    /// Toast a re-review nudge when a session whose review was sent (`e`,
+    /// [`Self::review_nudge_watch`]) finishes working — the moment to reopen
+    /// the review and check the agent's fixes. Fires once per send (the watch
+    /// entry is consumed), only after a `Working → Idle/Done` edge (the send
+    /// itself usually lands while the agent is still idle), and only when
+    /// `[review] nudge_on_idle` is on. No auto-rebuild — a hint only.
+    fn nudge_review_on_idle(&mut self) {
+        if self.review_nudge_watch.is_empty() {
+            return;
+        }
+        let statuses: std::collections::HashMap<SessionId, (SessionStatus, String)> = self
+            .sessions
+            .iter()
+            .map(|s| (s.info.id, (s.info.status, s.info.name.clone())))
+            .collect();
+        let active = self.active_session_id();
+        let mut fired: Option<String> = None;
+        self.review_nudge_watch.retain(|id, prev| {
+            // A deleted session's watch is dropped, bounding the map.
+            let Some((cur, name)) = statuses.get(id) else {
+                return false;
+            };
+            let finished = *prev == SessionStatus::Working
+                && matches!(cur, SessionStatus::Idle | SessionStatus::Done);
+            *prev = *cur;
+            if finished {
+                fired = Some(if active == Some(*id) {
+                    "Agent idle — F7 to re-review, F5 to reload".to_string()
+                } else {
+                    format!("Agent idle in {name} — F7 to re-review")
+                });
+            }
+            !finished
+        });
+        if let Some(msg) = fired {
+            if self.review_settings.nudge_on_idle {
+                self.set_info(msg);
+            }
+        }
     }
 
     /// Force [`Self::cached_hook_states`] to reload on the next status refresh.
@@ -13872,6 +13974,452 @@ mod tests {
         assert!(!cr.rows.is_empty(), "rows rebuilt from the delivered diff");
         assert_eq!(app.perf_counters().review_builds_applied, 1);
         assert!(!app.review_build.in_progress());
+    }
+
+    /// A completed build reconciles persisted "reviewed" marks against the
+    /// fresh diff: a matching fingerprint survives, a stale one is deleted from
+    /// the DB with a summary toast, and a legacy NULL row is treated as valid
+    /// once and backfilled with the computed fingerprint.
+    #[test]
+    fn review_build_reconciles_stale_marks_with_toast() {
+        use crate::session::review::{file_fingerprint, hunk_fingerprint};
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let built = code_review::CodeReviewState::for_test(sid, 2);
+        let fp0 = file_fingerprint(&built.files[0]);
+        app.db
+            .toggle_review_mark(sid, "src/f0.rs", None, &fp0)
+            .unwrap();
+        app.db
+            .toggle_review_mark(sid, "src/f1.rs", None, "stale-fp")
+            .unwrap();
+        app.db
+            .insert_review_mark_without_fingerprint(sid, "src/f0.rs", Some(0))
+            .unwrap();
+
+        let mut pending = code_review::CodeReviewState::for_test(sid, 0);
+        pending.loading = true;
+        let repos = built.repos.clone();
+        app.code_reviews.insert(sid, pending);
+        let tx = app.review_build.start();
+        tx.send(code_review::ReviewBuildResult {
+            session_id: sid,
+            elapsed_ms: 1,
+            kind: code_review::ReviewBuildKind::Open {
+                repos,
+                commits: Vec::new(),
+                target: code_review::ReviewTarget::Branch,
+                files: built.files.clone(),
+            },
+        })
+        .unwrap();
+        app.poll_review_build();
+
+        let mut marks = app.db.list_review_marks(sid).unwrap();
+        marks.sort();
+        assert_eq!(
+            marks,
+            vec![
+                ("src/f0.rs".to_string(), None, Some(fp0)),
+                // Legacy hunk row survived and got the computed fingerprint.
+                (
+                    "src/f0.rs".to_string(),
+                    Some(0),
+                    Some(hunk_fingerprint(&built.files[0].hunks[0])),
+                ),
+            ],
+            "stale f1 mark deleted; f0 marks intact"
+        );
+        // The view reloaded the reconciled marks.
+        let cr = &app.code_reviews[&sid];
+        assert!(cr.reviewed_files.contains("src/f0.rs"));
+        assert!(!cr.reviewed_files.contains("src/f1.rs"));
+        // The toast summarizes what was cleared.
+        let msg = app.status_message.as_ref().expect("toast fired");
+        assert!(
+            msg.text
+                .contains("1 reviewed mark cleared (content changed)"),
+            "got: {}",
+            msg.text
+        );
+    }
+
+    /// `F5` rebuilds the current target off-thread; applying the result keeps
+    /// the selection where it was when the rows still support it, and falls
+    /// back within bounds when the selected file vanished from the diff.
+    #[test]
+    fn review_reload_preserves_selection_and_survives_missing_file() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let state = code_review::CodeReviewState::for_test(sid, 2);
+        let files = state.files.clone();
+        let target = state.target.clone();
+        app.code_reviews.insert(sid, state);
+
+        // Select f1's diff line.
+        let pos = app.code_reviews[&sid]
+            .rows
+            .iter()
+            .position(|r| matches!(r, code_review::ReviewRow::Line(1, _, _)))
+            .unwrap();
+        app.code_reviews.get_mut(&sid).unwrap().selected = pos;
+
+        // Reload with the identical diff: the exact position is kept.
+        let tx = app.review_build.start();
+        tx.send(code_review::ReviewBuildResult {
+            session_id: sid,
+            elapsed_ms: 1,
+            kind: code_review::ReviewBuildKind::Reload {
+                target: target.clone(),
+                files: files.clone(),
+            },
+        })
+        .unwrap();
+        app.poll_review_build();
+        assert_eq!(app.code_reviews[&sid].selected, pos);
+
+        // Reload with f1 gone: the selection clamps into the new rows.
+        let tx = app.review_build.start();
+        tx.send(code_review::ReviewBuildResult {
+            session_id: sid,
+            elapsed_ms: 1,
+            kind: code_review::ReviewBuildKind::Reload {
+                target,
+                files: files[..1].to_vec(),
+            },
+        })
+        .unwrap();
+        app.poll_review_build();
+        let cr = &app.code_reviews[&sid];
+        assert!(cr.selected < cr.rows.len());
+    }
+
+    /// With the Unreviewed filter active, `}`/`{` skip reviewed files' headers
+    /// and marking a file reviewed auto-advances to the next unreviewed file.
+    #[test]
+    fn review_unreviewed_filter_scopes_jumps_and_auto_advances() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let mut state = code_review::CodeReviewState::for_test(sid, 3);
+        state.filter = code_review::ReviewFilter::Unreviewed;
+        state.reviewed_files.insert("src/f1.rs".into());
+        state.rebuild_rows();
+        app.code_reviews.insert(sid, state);
+
+        // `}` from f0's header skips reviewed f1 straight to f2.
+        app.cr_jump_file(true);
+        let cr = &app.code_reviews[&sid];
+        assert!(
+            matches!(cr.rows[cr.selected], code_review::ReviewRow::FileHeader(2)),
+            "landed on {:?}",
+            cr.rows[cr.selected]
+        );
+
+        // Marking f2 reviewed advances (wrapping) to f0 — the only file left.
+        app.cr_toggle_reviewed(false);
+        let cr = &app.code_reviews[&sid];
+        assert!(
+            matches!(cr.rows[cr.selected], code_review::ReviewRow::FileHeader(0)),
+            "auto-advanced to {:?}",
+            cr.rows[cr.selected]
+        );
+    }
+
+    /// `(`/`)` step comment rows across files, wrapping, and reach a comment
+    /// hidden inside a folded (reviewed) file by unfolding it; `@` opens the
+    /// popup and Enter jumps to the chosen comment.
+    #[test]
+    fn review_comment_navigation_wraps_and_unfolds() {
+        use crate::session::review::{Classification, CommentAnchor, ReviewComment, Side};
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let mut state = code_review::CodeReviewState::for_test(sid, 2);
+        let comment = |id: i64, file: &str| ReviewComment {
+            id,
+            session_id: sid,
+            anchor: CommentAnchor::Line {
+                file: file.into(),
+                side: Side::New,
+                line: 1,
+                line_end: None,
+            },
+            classification: Classification::Note,
+            body: format!("c{id}"),
+            created_at: 0,
+            updated_at: 0,
+        };
+        state.comments = vec![comment(1, "src/f0.rs"), comment(2, "src/f1.rs")];
+        // f1 is reviewed → folded, so its comment row is hidden until a jump
+        // targets it.
+        state.reviewed_files.insert("src/f1.rs".into());
+        state.rebuild_rows();
+        app.code_reviews.insert(sid, state);
+
+        // From the top: `)` lands on C1, then C2 (unfolding f1), then wraps to C1.
+        app.cr_jump_comment(true);
+        assert_eq!(app.code_reviews[&sid].selected_comment_id(), Some(1));
+        app.cr_jump_comment(true);
+        assert_eq!(app.code_reviews[&sid].selected_comment_id(), Some(2));
+        assert!(
+            !app.code_reviews[&sid].is_file_folded("src/f1.rs"),
+            "the jump unfolded the reviewed file"
+        );
+        app.cr_jump_comment(true);
+        assert_eq!(
+            app.code_reviews[&sid].selected_comment_id(),
+            Some(1),
+            "wraps past the end"
+        );
+        // `(` steps back (wrapping to the last).
+        app.cr_jump_comment(false);
+        assert_eq!(app.code_reviews[&sid].selected_comment_id(), Some(2));
+
+        // `@` popup: entries in display order, Enter jumps.
+        app.focus = InputFocus::CodeReview;
+        app.cr_open_comment_picker();
+        {
+            let cr = app.code_reviews.get_mut(&sid).unwrap();
+            let picker = cr.comment_picker.as_ref().unwrap();
+            assert_eq!(picker.entries, vec![1, 2]);
+        }
+        app.handle_code_review_key(KeyCode::Char('k'), KeyModifiers::NONE);
+        app.handle_code_review_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.code_reviews[&sid].comment_picker.is_none());
+        assert_eq!(app.code_reviews[&sid].selected_comment_id(), Some(1));
+    }
+
+    /// `=` cycles the diff context 3 → 10 → 25 → 3 and rebuilds through the
+    /// shared worker; a cycle while a build is in flight is refused.
+    #[tokio::test]
+    async fn review_context_cycle_steps_and_dispatches_rebuild() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        app.code_reviews
+            .insert(sid, code_review::CodeReviewState::for_test(sid, 1));
+        assert_eq!(app.code_reviews[&sid].context, 3);
+
+        app.cr_cycle_context();
+        assert_eq!(app.code_reviews[&sid].context, 10);
+        assert!(
+            app.review_build.in_progress(),
+            "the cycle rebuilds the diff with -U<n>"
+        );
+
+        // Build in flight → the next cycle is refused, context unchanged.
+        app.cr_cycle_context();
+        assert_eq!(app.code_reviews[&sid].context, 10);
+    }
+
+    /// The `V` range flow end to end through the key handler: start on a diff
+    /// line, `j` extends the span, `c` opens the compose box carrying a range
+    /// anchor; a fresh `V` + Esc cancels without composing.
+    #[test]
+    fn review_range_keys_extend_and_compose() {
+        use crate::session::review::{CommentAnchor, DiffLine, DiffLineKind, Side};
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let mut state = code_review::CodeReviewState::for_test(sid, 1);
+        // A second added line so a span exists (for_test files have one).
+        state.files[0].hunks[0].lines.push(DiffLine {
+            kind: DiffLineKind::Add,
+            old_no: None,
+            new_no: Some(2),
+            text: "y".into(),
+        });
+        state.rebuild_rows();
+        // Rows: 0 FileHeader, 1 HunkHeader, 2 Line(new:1), 3 Line(new:2).
+        state.selected = 2;
+        app.code_reviews.insert(sid, state);
+        app.focus = InputFocus::CodeReview;
+
+        app.handle_code_review_key(KeyCode::Char('V'), KeyModifiers::SHIFT);
+        assert!(app.code_reviews[&sid].range.is_some(), "V starts a range");
+        app.handle_code_review_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.code_reviews[&sid].selected, 3, "j extends the span");
+        // `j` at the file's last line stays put (same file only).
+        app.handle_code_review_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.code_reviews[&sid].selected, 3);
+
+        app.handle_code_review_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        let cr = &app.code_reviews[&sid];
+        assert!(cr.range.is_none(), "compose consumes the range");
+        assert_eq!(
+            cr.compose.as_ref().map(|c| c.anchor.clone()),
+            Some(CommentAnchor::Line {
+                file: "src/f0.rs".into(),
+                side: Side::New,
+                line: 1,
+                line_end: Some(2),
+            })
+        );
+
+        // Esc cancels a fresh range without opening the compose box.
+        app.handle_code_review_key(KeyCode::Esc, KeyModifiers::NONE);
+        app.handle_code_review_key(KeyCode::Char('V'), KeyModifiers::SHIFT);
+        assert!(app.code_reviews[&sid].range.is_some());
+        app.handle_code_review_key(KeyCode::Esc, KeyModifiers::NONE);
+        let cr = &app.code_reviews[&sid];
+        assert!(cr.range.is_none() && cr.compose.is_none());
+    }
+
+    /// Committed (`Tab`) searches join a per-session history that survives
+    /// closing the review; `↑`/`↓` in the find bar recall older/newer entries,
+    /// the first `↑` stashing the live query and `↓` past the newest restoring
+    /// it. Re-committing a query moves it to the newest slot.
+    #[test]
+    fn review_search_history_recall() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        app.code_reviews
+            .insert(sid, code_review::CodeReviewState::for_test(sid, 1));
+        app.focus = InputFocus::CodeReview;
+
+        fn commit_query(app: &mut App, q: &str) {
+            app.handle_code_review_key(KeyCode::Char('/'), KeyModifiers::NONE);
+            for c in q.chars() {
+                app.handle_code_review_key(KeyCode::Char(c), KeyModifiers::NONE);
+            }
+            app.handle_code_review_key(KeyCode::Tab, KeyModifiers::NONE);
+            app.handle_code_review_key(KeyCode::Esc, KeyModifiers::NONE);
+        }
+        commit_query(&mut app, "alpha");
+        commit_query(&mut app, "beta");
+        assert_eq!(app.review_search_history[&sid], ["alpha", "beta"]);
+        commit_query(&mut app, "alpha");
+        assert_eq!(
+            app.review_search_history[&sid],
+            ["beta", "alpha"],
+            "re-commit moves the query to the newest slot"
+        );
+
+        // The history outlives the review view itself (it closes on every
+        // Send→Agent).
+        app.close_code_review();
+        app.code_reviews
+            .insert(sid, code_review::CodeReviewState::for_test(sid, 1));
+        app.focus = InputFocus::CodeReview;
+
+        app.handle_code_review_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        app.handle_code_review_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        let query = |app: &App| {
+            app.code_reviews[&sid]
+                .search
+                .as_ref()
+                .unwrap()
+                .query
+                .clone()
+        };
+        app.handle_code_review_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(query(&app), "alpha", "↑ recalls the newest commit");
+        app.handle_code_review_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(query(&app), "beta");
+        app.handle_code_review_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(query(&app), "beta", "the oldest entry pins");
+        app.handle_code_review_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(query(&app), "alpha");
+        app.handle_code_review_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(
+            query(&app),
+            "x",
+            "↓ past the newest restores the live query"
+        );
+    }
+
+    /// `i` opens the read-only review-info popup; j scrolls it (the renderer
+    /// clamps), Esc closes it without closing the review.
+    #[test]
+    fn review_info_popup_opens_scrolls_and_closes() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        app.code_reviews
+            .insert(sid, code_review::CodeReviewState::for_test(sid, 1));
+        app.focus = InputFocus::CodeReview;
+
+        app.handle_code_review_key(KeyCode::Char('i'), KeyModifiers::NONE);
+        assert_eq!(app.code_reviews[&sid].info_popup, Some(0));
+        app.handle_code_review_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.code_reviews[&sid].info_popup, Some(1));
+        app.handle_code_review_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.code_reviews[&sid].info_popup.is_none());
+        assert!(
+            app.code_reviews.contains_key(&sid),
+            "Esc closed the popup, not the review"
+        );
+    }
+
+    /// A sent review watches its session: the first Working → Idle edge after
+    /// the send toasts a re-review nudge exactly once; `nudge_on_idle = false`
+    /// consumes the edge silently.
+    #[test]
+    fn review_nudge_fires_once_when_watched_agent_finishes() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        app.status_message = None;
+        app.review_nudge_watch.insert(sid, SessionStatus::Idle);
+
+        // The send usually lands while the agent is still idle — no edge yet.
+        app.nudge_review_on_idle();
+        assert!(app.status_message.is_none());
+
+        // Idle → Working: tracked, still no nudge.
+        app.sessions[0].info.status = SessionStatus::Working;
+        app.nudge_review_on_idle();
+        assert!(app.status_message.is_none());
+
+        // Working → Idle: the nudge fires and consumes the watch.
+        app.sessions[0].info.status = SessionStatus::Idle;
+        app.nudge_review_on_idle();
+        let msg = app.status_message.take().expect("nudge fired");
+        assert!(msg.text.contains("F7 to re-review"), "got: {}", msg.text);
+        assert!(app.review_nudge_watch.is_empty(), "one nudge per send");
+
+        // Later idle edges without a fresh send stay quiet.
+        app.sessions[0].info.status = SessionStatus::Working;
+        app.nudge_review_on_idle();
+        app.sessions[0].info.status = SessionStatus::Idle;
+        app.nudge_review_on_idle();
+        assert!(app.status_message.is_none());
+
+        // Setting off: the edge is consumed without a toast.
+        app.review_settings.nudge_on_idle = false;
+        app.review_nudge_watch.insert(sid, SessionStatus::Working);
+        app.nudge_review_on_idle();
+        assert!(app.status_message.is_none());
+        assert!(app.review_nudge_watch.is_empty());
+    }
+
+    /// `E` on a remote (SSH) session's review refuses the editor round-trip —
+    /// the editor runs on this machine, the files don't live here.
+    #[test]
+    fn review_editor_is_local_only() {
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let mut state = code_review::CodeReviewState::for_test(sid, 1);
+        state.host = Some(crate::session::HostDef::default());
+        state.selected = 2; // a Line row
+        app.code_reviews.insert(sid, state);
+        app.focus = InputFocus::CodeReview;
+
+        app.handle_code_review_key(KeyCode::Char('E'), KeyModifiers::SHIFT);
+        assert!(app.take_pending_editor().is_none());
+        let msg = app.status_message.take().expect("toast");
+        assert!(msg.text.contains("local only"), "got: {}", msg.text);
+    }
+
+    /// Toggling a reviewed mark stores the current semantic fingerprint, so
+    /// the next build can validate it.
+    #[test]
+    fn review_toggle_stores_fingerprint() {
+        use crate::session::review::file_fingerprint;
+        let mut app = app_with_sessions(1);
+        let sid = app.sessions[0].info.id;
+        let state = code_review::CodeReviewState::for_test(sid, 1);
+        let expect = file_fingerprint(&state.files[0]);
+        app.code_reviews.insert(sid, state);
+        // Selection starts on the file header; `r` marks the file.
+        app.cr_toggle_reviewed(false);
+        let marks = app.db.list_review_marks(sid).unwrap();
+        assert_eq!(marks, vec![("src/f0.rs".to_string(), None, Some(expect))]);
     }
 
     /// A build whose review was closed before delivery is dropped without

@@ -529,6 +529,31 @@ async fn run_loop(
             app.record_tick_time(start.elapsed());
         }
 
+        // An editor round-trip (the review's `E`): the app can only queue the
+        // request — this loop owns the terminal. Tear the TUI down (the same
+        // idempotent restore as shutdown), hand the real terminal to the
+        // editor until it exits, rebuild everything (alt screen, raw mode,
+        // mouse/paste, kitty flags), and clear so the next frame repaints in
+        // full. The app then surfaces errors / reloads the review.
+        if let Some(req) = app.take_pending_editor() {
+            restore_terminal();
+            let result = std::process::Command::new(&req.program)
+                .args(&req.args)
+                .status();
+            *terminal = ratatui::init();
+            enable_terminal_features()?;
+            push_keyboard_enhancement();
+            terminal.clear()?;
+            let error = match result {
+                Ok(status) if !status.success() => {
+                    Some(format!("{} exited with {status}", req.program))
+                }
+                Ok(_) => None,
+                Err(e) => Some(format!("Failed to launch {}: {e}", req.program)),
+            };
+            app.editor_closed(req.reload_review, error);
+        }
+
         if app.should_quit() {
             break;
         }

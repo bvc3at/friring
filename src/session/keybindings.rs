@@ -938,15 +938,22 @@ pub struct KeyBindings {
 
 impl Default for KeyBindings {
     fn default() -> Self {
-        let map = Action::all()
-            .iter()
-            .map(|a| (*a, a.default_chords()))
-            .collect();
-        Self { map }
+        Self::defaults_for(cfg!(target_os = "macos"))
     }
 }
 
 impl KeyBindings {
+    /// Defaults for an explicit platform. [`Default`] resolves the platform
+    /// via `cfg!`; snapshot tests pin `macos = false` so screens recorded on
+    /// CI don't fork per-OS over the appended Cmd alternates.
+    pub fn defaults_for(macos: bool) -> Self {
+        let map = Action::all()
+            .iter()
+            .map(|a| (*a, a.default_chords_for(macos)))
+            .collect();
+        Self { map }
+    }
+
     /// First chord for the given action (used by hint rendering).
     pub fn chord_for(&self, action: Action) -> Option<&KeyChord> {
         self.map.get(&action).and_then(|v| v.first())
@@ -1229,15 +1236,17 @@ mod tests {
         // Ctrl+J/Ctrl+K defer to the PTY in a focused terminal (Ctrl+J is the
         // LF byte a legacy terminal sends for Ctrl+Enter — it must reach the
         // agent as a newline), so cycling needs non-Ctrl-letter alternates
-        // that still dispatch there.
+        // that still dispatch there. Assert the leading pair rather than the
+        // whole list: `KeyBindings::default()` is platform-dependent and
+        // appends Cmd alternates on macOS (see `macos_defaults_are_additive_superset`).
         let kb = KeyBindings::default();
         assert_eq!(
-            kb.chords_for(Action::NextSession),
-            &[KeyChord::ctrl('j'), KeyChord::alt(KeyCode::Char('j'))]
+            kb.chords_for(Action::NextSession)[..2],
+            [KeyChord::ctrl('j'), KeyChord::alt(KeyCode::Char('j'))]
         );
         assert_eq!(
-            kb.chords_for(Action::PreviousSession),
-            &[KeyChord::ctrl('k'), KeyChord::alt(KeyCode::Char('k'))]
+            kb.chords_for(Action::PreviousSession)[..2],
+            [KeyChord::ctrl('k'), KeyChord::alt(KeyCode::Char('k'))]
         );
     }
 

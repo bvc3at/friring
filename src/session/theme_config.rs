@@ -59,6 +59,11 @@ pub struct ThemePalette {
     pub diff_removed: Color,
     pub diff_added_bg: Color,
     pub diff_removed_bg: Color,
+    /// Stronger per-token backgrounds for the word-level intra-line diff:
+    /// changed tokens within an aligned deletion/addition pair paint these
+    /// over the row tint, so the exact edit pops out of the changed line.
+    pub diff_added_word_bg: Color,
+    pub diff_removed_word_bg: Color,
 
     /// Background colour painted under the entire app (chrome + PTY cells
     /// that don't set their own bg). Use `Color::Reset` to keep the
@@ -336,6 +341,10 @@ pub struct CustomThemeDef {
     #[serde(default)]
     pub diff_removed_bg: Option<String>,
     #[serde(default)]
+    pub diff_added_word_bg: Option<String>,
+    #[serde(default)]
+    pub diff_removed_word_bg: Option<String>,
+    #[serde(default)]
     pub app_bg: Option<String>,
 }
 
@@ -373,7 +382,7 @@ impl CustomThemeDef {
     /// (`override_array_covers_every_color_field`) asserts it matches the
     /// struct's colour-field count, so a forgotten row can't silently make a
     /// colour un-overridable.
-    const COLOR_OVERRIDE_COUNT: usize = 31;
+    const COLOR_OVERRIDE_COUNT: usize = 33;
 
     /// Materialise the theme: base preset palette + overrides. Unparsable
     /// colours and an unknown base degrade to warnings, never to a hard
@@ -502,6 +511,16 @@ impl CustomThemeDef {
                 &self.diff_removed_bg,
                 &mut palette.diff_removed_bg,
             ),
+            (
+                "diff_added_word_bg",
+                &self.diff_added_word_bg,
+                &mut palette.diff_added_word_bg,
+            ),
+            (
+                "diff_removed_word_bg",
+                &self.diff_removed_word_bg,
+                &mut palette.diff_removed_word_bg,
+            ),
             ("app_bg", &self.app_bg, &mut palette.app_bg),
         ];
         for (field, value, slot) in fields {
@@ -565,6 +584,9 @@ fn default_palette() -> ThemePalette {
         diff_removed: Color::Red,
         diff_added_bg: Color::Indexed(22),
         diff_removed_bg: Color::Indexed(52),
+        // Word-diff bgs: one saturation step brighter than the row tint.
+        diff_added_word_bg: Color::Indexed(28),
+        diff_removed_word_bg: Color::Indexed(88),
 
         app_bg: Color::Reset,
 
@@ -638,6 +660,10 @@ impl PaletteSlots {
             diff_removed: self.red,
             diff_added_bg: blend_rgb(self.green, self.base_bg, 0.82),
             diff_removed_bg: blend_rgb(self.red, self.base_bg, 0.82),
+            // Word-diff bgs sit a strong step closer to the hue than the row
+            // tint (0.82 → 0.55), so a changed token pops inside a tinted row.
+            diff_added_word_bg: blend_rgb(self.green, self.base_bg, 0.55),
+            diff_removed_word_bg: blend_rgb(self.red, self.base_bg, 0.55),
             app_bg: self.base_bg,
             nerd_font_enabled: false,
         }

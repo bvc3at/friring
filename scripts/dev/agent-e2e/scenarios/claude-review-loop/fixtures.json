@@ -1,0 +1,21 @@
+{
+  "responses": [
+    {
+      "name": "ambient",
+      "ambient": true,
+      "match": { "modelContains": "haiku" },
+      "reply": { "text": "ok" }
+    },
+    {
+      "name": "review-handoff",
+      "match": {
+        "anyUserContains": "Code review — 1 comment. Semantics:",
+        "promptContains": "### C1 [Issue] new:1\n> def greet():\nUse a warmer greeting"
+      },
+      "delayMs": 100,
+      "reply": {
+        "text": "REVIEW-LOOP-DONE — C1: fixed. The structured handoff arrived with its C-id, class, side:line locator, and quoted anchor line byte-intact."
+      }
+    }
+  ]
+}

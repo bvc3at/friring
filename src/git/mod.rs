@@ -509,26 +509,99 @@ pub fn list_branches_on(host: Option<&HostDef>, repo_path: &Path) -> Result<Vec<
 
 /// Raw unified `git diff <base>..HEAD` output for a worktree, for the native
 /// code-review view, optionally on a remote `host` (via `ssh <dest> git …`).
-/// Returns `None` on failure (not a git dir, bad base, …); the caller falls
-/// back to a narrower range or surfaces a status.
+/// `context` is the `-U<n>` context-line count (the review's context cycle;
+/// git's default is 3). Returns `None` on failure (not a git dir, bad base,
+/// …); the caller falls back to a narrower range or surfaces a status.
 ///
 /// `--no-color` keeps the output parseable; the result is fed to
 /// [`crate::session::parse_unified_diff`].
-pub fn diff_against_on(host: Option<&HostDef>, worktree: &Path, base: &str) -> Option<String> {
+pub fn diff_against_on(
+    host: Option<&HostDef>,
+    worktree: &Path,
+    base: &str,
+    context: u32,
+) -> Option<String> {
     let range = format!("{base}..HEAD");
-    run_diff(host, worktree, &["diff", "--no-color", &range])
+    let u = format!("-U{context}");
+    run_diff(host, worktree, &["diff", "--no-color", &u, &range])
 }
 
 /// Raw unified diff of the worktree's **uncommitted** changes vs `HEAD`
 /// (staged + unstaged), for the review view's "working changes" target.
-pub fn diff_working_on(host: Option<&HostDef>, worktree: &Path) -> Option<String> {
-    run_diff(host, worktree, &["diff", "--no-color", "HEAD"])
+pub fn diff_working_on(host: Option<&HostDef>, worktree: &Path, context: u32) -> Option<String> {
+    let u = format!("-U{context}");
+    run_diff(host, worktree, &["diff", "--no-color", &u, "HEAD"])
+}
+
+/// Raw unified diff of the **staged** changes only (index vs `HEAD`), for the
+/// review view's "staged changes" target. Mirrors [`diff_working_on`].
+pub fn diff_staged_on(host: Option<&HostDef>, worktree: &Path, context: u32) -> Option<String> {
+    let u = format!("-U{context}");
+    run_diff(host, worktree, &["diff", "--no-color", &u, "--cached"])
+}
+
+/// Untracked (non-ignored) files in a worktree, worktree-relative — `git
+/// ls-files --others --exclude-standard`, for the review view's Working
+/// target. Empty on failure (not a git dir).
+pub fn list_untracked_on(host: Option<&HostDef>, worktree: &Path) -> Vec<String> {
+    run_diff(
+        host,
+        worktree,
+        &["ls-files", "--others", "--exclude-standard"],
+    )
+    .map(|out| {
+        out.lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// The all-added unified diff of a single **untracked** file (`git diff
+/// --no-index -- /dev/null <path>`), used by the Working target to show
+/// untracked content on a **remote** host, where the worktree file can't be
+/// read directly — the same transport as every other review git call.
+/// `--no-index` uses diff(1) exit semantics (1 = differences found), so plain
+/// success-checking would reject every hit.
+pub fn diff_untracked_on(
+    host: Option<&HostDef>,
+    worktree: &Path,
+    rel_path: &str,
+) -> Option<String> {
+    let args = [
+        "-c",
+        "core.quotepath=false",
+        "diff",
+        "--no-color",
+        "--no-index",
+        "--",
+        "/dev/null",
+        rel_path,
+    ];
+    let output = git_command(host, worktree, &args).output().ok()?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!("git diff --no-index {rel_path} failed: {}", stderr.trim());
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Raw unified diff of a single commit (`git show`), for the review view's
 /// per-commit target. `--format=` suppresses the log message, leaving the patch.
-pub fn show_commit_on(host: Option<&HostDef>, worktree: &Path, sha: &str) -> Option<String> {
-    run_diff(host, worktree, &["show", "--no-color", "--format=", sha])
+pub fn show_commit_on(
+    host: Option<&HostDef>,
+    worktree: &Path,
+    sha: &str,
+    context: u32,
+) -> Option<String> {
+    let u = format!("-U{context}");
+    run_diff(
+        host,
+        worktree,
+        &["show", "--no-color", &u, "--format=", sha],
+    )
 }
 
 /// List the commits in `<base>..HEAD` as `(short-sha, subject)`, newest first —

@@ -811,8 +811,10 @@ editor of choice can open them as a workspace.
 Friring ships a **native, built-in** tuicr-like review view (`Ctrl+X`, `F7`
 alternate; rebindable `Action::ToggleReview`, gated by `[features]
 code_review`): a GitHub-style continuous diff of the active session's worktree
-(`<base>..HEAD`) with classified comments (issue / suggestion / note /
-praise), per-file/hunk "reviewed" marks, and a review summary — rendered
+(`<base>..HEAD`) with classified comments (note / issue / suggestion /
+question / praise — Tab cycles them in the compose box, `Question` asks the
+agent to answer rather than change code), per-file/hunk "reviewed" marks,
+and a review summary — rendered
 directly by friring and persisted in SQLite. `Ctrl+X` is in
 `terminal_passthrough` (the emacs prefix key), so in a focused terminal it
 reaches the agent and `F7` opens the review.
@@ -840,14 +842,34 @@ jump hunks, matching tuicr.
 
 **Why selectable review targets?** Like tuicr (`-r`/`-w`/a commit), the
 diff can show the whole branch (`<base>..HEAD`), the uncommitted working
-changes (`git diff HEAD`), or a single commit (`git show`). `t` (or the
-Target footer button) opens an in-view picker listing Working, Branch, and
+changes (`git diff HEAD` + untracked files), the staged changes only
+(`git diff --cached`, index vs HEAD — review exactly what the next commit
+will contain), or a single commit (`git show`). `t` (or the Target footer
+button) opens an in-view picker listing Working, Staged, Branch, and
 each commit in the range; selecting one — keyboard ↑/↓/Enter **or a mouse
 click** (`render_target_picker` returns a `RowHitbox` per entry →
 `ClickAction::ReviewTarget(i)` → `App::cr_select_target`) — recomputes the
 diff (`ReviewTarget`, `build_target_diff`, `git::{diff_working_on,
-show_commit_on, list_commits_on}`). A session with no resolvable base
-defaults to the working-changes target, so even a bare checkout reviews.
+diff_staged_on, show_commit_on, list_commits_on}`). A session with no
+resolvable base defaults to the working-changes target, so even a bare
+checkout reviews.
+
+**Working = staged + unstaged + untracked.** `git diff HEAD` never shows
+untracked files, so the Working target synthesizes an all-added entry per
+untracked file (`git ls-files --others --exclude-standard`, honored over the
+same remote transport) with a distinct `?` glyph — a brand-new file is
+exactly what a review must not miss. Guards: files over 1 MiB and binary
+content (NUL sniff) degrade to a placeholder row (`(untracked file not
+shown: …)`) instead of a body; ignored files stay out. Untracked files are
+commentable and markable like any other file. Local worktrees read the file
+directly; remote ones go through `git diff --no-index` per file.
+
+**Binary diffs explain themselves.** The parser flags a `Binary files …
+differ` / `GIT binary patch` body (`DiffFile::binary`) and the build renders
+one info row under the header instead of a bare `+0 -0`: `(binary file,
+12 KiB)` where the size is free (a local Working target stats the worktree
+file), plain `(binary file)` in other targets — sizes there would cost an
+extra git subprocess per file.
 
 **Why review all repos at once?** A friring session can span several
 repositories (and flow opens a PR per repo), so a review that only saw the
@@ -860,6 +882,24 @@ reviewed-marks never collide across repos. Each repo resolves its own base
 branch); the commit target lists commits across all repos, repo-tagged, and a
 commit target scopes to its one repo.
 
+**Context expansion (`=` / `+`).** Cycles the diff context `3 → 10 → 25 →
+3` lines, rebuilding the current target with `-U<n>` through the same
+build worker (refused while a build is in flight). A non-default width
+shows in the title (`· U10`). Comment/mark anchors are unaffected —
+new-side line numbers are absolute regardless of context. Per-hunk
+GitHub-style incremental expansion is deliberately not offered.
+
+**Word-level intra-line diff.** Each aligned deletion/addition pair (the
+same positional `del[k] ↔ add[k]` pairing in both layouts) is token-diffed
+(`session::review::word_diff`: alphanumeric/`_` runs vs symbol runs,
+whitespace excluded, token-level LCS) and the changed tokens render with a
+stronger background (`diff_added_word_bg` / `diff_removed_word_bg`, see
+`docs/CONFIG.md` themes) so the exact edit pops out of the tinted line.
+Pairs sharing under 30% of their tokens (revdiff's gate) fall back to the
+whole-line tint — unrelated lines as confetti would read worse. Composes
+with syntax highlighting (word bg under token fg) and yields to
+search-match highlighting.
+
 **Why unified *and* side-by-side?** tuicr offers both (its `diff_view`);
 `v` toggles them. The side-by-side layout is **true paired** — a deletion
 (left) and its aligned addition (right) sit on the *same* screen row
@@ -871,17 +911,18 @@ stays row-granular), and which side a comment attaches to is resolved at
 compose time (`CodeReviewState::selected_anchor`) — keyboard defaults to New
 (the addition), a mouse click uses the column it hit (`App::cr_click_row` →
 `click_side`; left = Old, right = New). Alignment is positional
-(dependency-free, matching the heuristic syntax highlighter); token-level
-intra-line word diffs, and horizontal-scroll in the paired layout, remain
-follow-ups (wrap now works in both layouts — see below).
+(dependency-free, matching the heuristic syntax highlighter);
+horizontal-scroll in the paired layout remains a follow-up (wrap works in
+both layouts — see below).
 
 **Why syntax highlighting?** Plain diffs are hard to skim. A small,
 dependency-free lexer (`ui::syntax`) colours comments / strings / numbers
-/ keywords / type names from the theme palette, so code reads like code.
-Add/remove stays on the gutter `+`/`-` and the row tint, leaving the text
-free to carry syntax colour. It's heuristic + language-agnostic (no
-grammar engine, no heavy dependency); a grammar-aware upgrade is a
-follow-up.
+/ keywords / type names from the theme palette, so code reads like code —
+in the unified body and in each half of the paired layout (both render
+through the same `diff_body_spans`). Add/remove stays on the gutter
+`+`/`-` and the row tint, leaving the text free to carry syntax colour.
+It's heuristic + language-agnostic (no grammar engine, no heavy
+dependency); a grammar-aware upgrade is a follow-up.
 
 **Why mouse-first, no vim modal?** To match friring's own interaction
 model (clicks, buttons, scrollbars, wheel) rather than tuicr's heavy vim
@@ -897,6 +938,21 @@ above/below as room allows — a `ComposeState` sub-mode on
 happens where you're looking. "Mark reviewed" (`r` / `R` toggle a file /
 hunk, `✓`) works from **any** row in the file — line, hunk, header, or a
 comment — not just its header.
+
+**Range comments (`V`).** `V` on a diff line starts a range selection:
+`j`/`k` grow the span (tinted like an extended selection), `c` composes
+the comment for it, and Esc/`V` (or a mouse click, or any diff rebuild)
+cancels. A range lives on **one side of one file** — extension passes
+over rows with no number on the range's side (the deletions between two
+kept new-side lines, say) and stops at the file boundary, so every
+reachable endpoint is valid. The anchor persists as
+`line_no..=line_end` (nullable `line_end` on `review_comments`, schema
+v43); the comment row sits at the span's **last** line labelled with the
+full span (`(new:10-24)`), the compose header reads `lines new:10-24`,
+and the structured handoff record becomes
+`### C<id> [Class] new:10-24, in `\`heading\`` quoting the span's first
+and last lines with a `> …` elision between them (old-side ranges are
+marked `(lines were removed)`).
 
 **Why persist a base branch?** Reviewing `<base>..HEAD` needs the fork
 point, which friring didn't store. A write-once `sessions.base_branch`
@@ -918,10 +974,62 @@ view: switching to another session hides it and switching back restores
 it open + focused (`sync_review_focus` keeps the central-pane focus
 aligned). The file-viewer column toggles with it.
 
+**Manual reload (`F5` / `Ctrl+R` / the `Reload` footer button).** The diff
+is a snapshot; after the agent edits (the review → agent → re-review loop),
+`F5` rebuilds the **current** target through the same background build
+worker (`App::cr_reload`, refused with the usual toast while a build is in
+flight). Unlike a retarget — which resets to the top — a reload preserves
+your place: the exact row when it still belongs to the same file, else the
+previously selected file's header.
+
+**Open in `$EDITOR` (`E`).** Opens the selected row's file at its line in
+`$VISUAL` (falling back to `$EDITOR`; toast when neither is set), using the
+`+<line> <file>` convention — a deletion row opens at the nearest line
+still present on the new side. The app queues an `EditorRequest`; the
+**main loop** (which owns the terminal) tears the TUI down, runs the editor
+to completion, rebuilds the terminal + forces a full repaint, and a
+Working-target round-trip then auto-reloads the diff (other targets show
+committed content the edit can't change, so they open without reloading).
+Local sessions only — a remote session toasts `"Editor round-trip is local
+only"`.
+
+**Re-review nudge on agent idle.** Sending a review (`e`) watches that
+session (`App::review_nudge_watch`, seeded with its current status): when
+the agent later crosses a `Working → Idle/Done` edge — it finished
+addressing the review — a status toast nudges `"Agent idle — F7 to
+re-review, F5 to reload"` (session-named when it isn't the active one).
+One nudge per send, no auto-rebuild; `[review] nudge_on_idle = false`
+(`docs/CONFIG.md`) silences it.
+
+**Reviewed marks self-invalidate.** Every mark stores a **semantic
+fingerprint** of what was marked (`session::review::{file,hunk}_fingerprint`
+— an FNV-1a hash of the `+`/`-` line contents *with signs*, excluding `@@`
+positions and context, so a pure line-shift from an unrelated edit above
+keeps the mark while a content change drops it). On every completed build
+(open, retarget, reload) each stored mark is compared against the fresh
+diff: mismatches are **deleted** (not hidden) and summarized in one toast
+(`"3 reviewed marks cleared (content changed)"`); pre-v42 rows with no
+fingerprint are honored once and backfilled (`review_marks.fingerprint`,
+schema v42).
+
 **Export is the agent, not GitHub.** GitHub/GitLab submit is out of
 scope; the payoff of reviewing *inside* an orchestrator is closing the
 loop — `e` (Send→Agent) pastes the compiled review into the session's agent
-to address, and `y` (Copy) yields markdown. Diff data types (`DiffFile` /
+to address, and `y` (Copy) yields the same markdown. The default
+**structured handoff** (`[review] handoff = "structured"`, see
+`docs/CONFIG.md`) leads with a ~7-line in-band semantics preamble (friring
+is agent-neutral — no skill/system prompt can be assumed on the other CLI)
+and renders one `### C<id> [Class] <side>:<line>` record per comment: `C<id>`
+is the comment's SQLite id (stable across re-sends, so the agent can report
+per-comment outcomes), the enclosing hunk's section heading is appended as
+`, in `\`heading\``, and the anchored diff line is quoted as a `> ` locator
+(truncated to 200 chars). Quoted lines are **locators, not context** — line
+numbers rot as soon as the agent edits, so the verbatim content is the
+grep-able key; old-side anchors are marked `(line was removed)` since that
+content no longer exists in the tree. An anchor the current diff can't
+resolve (rebuilt since the comment was written) omits its quote rather than
+guessing. `handoff = "legacy"` reproduces the original bullet format
+byte-for-byte. Diff data types (`DiffFile` /
 `DiffHunk` / `DiffLine`, `Classification`, `CommentAnchor`, `ReviewComment`)
 and the unit-tested `parse_unified_diff` live in `session::review` (pure, so
 `ui` renders them without importing `git`); `git::diff_against{,_on}` runs
@@ -946,6 +1054,30 @@ the file/hunk reviewed mark, and `Esc` closes the review
 (`App::handle_review_files_key`, captured before the global lookup like the
 diff pane). Clicking a row jumps the diff (`ClickAction::ReviewFile` →
 `cr_jump_to_file`).
+
+**Comment navigation (`(` / `)` / `@`).** `)`/`(` jump to the next/previous
+comment row across files, wrapping — the jump is **fold-independent**
+(`comment_positions` orders comments without regard to folding), so a
+comment inside a folded reviewed file is reached by unfolding that file
+first (via the fold override, leaving its reviewed mark alone). `@` opens
+an all-comments popup (the target-picker overlay pattern): one row per
+comment (`C<id> [Class] <file>:<line> — body head`), ↑/↓ + Enter jumps,
+Esc closes.
+
+**Review info popup (`i`).** A read-only overlay over the diff body (the
+picker pattern): the target and each repo's resolved base, file counts by
+status (untracked counted apart), aggregate `+`/`-`, the active filter +
+context width, and the commit list of the reviewed range (reusing the
+commits already loaded for the target picker — no extra git call,
+repo-tagged in multi-repo). `j`/`k` scroll, Esc/`i` close.
+
+**File filter (`o`, both panes).** Cycles `All → Unreviewed → Commented`
+(`ReviewFilter`), narrowing the tree **and** the `}`/`{` file jumps — the
+diff body always shows every file, so filtering never changes what "the
+review" covers. The active filter shows in the tree header (`Changed files ·
+unreviewed`); an empty result renders a hint line, never a bare pane. In
+`Unreviewed`, marking a file reviewed auto-advances the selection to the
+next unreviewed file — the "work the list down" flow.
 
 ### Long lines: horizontal scroll & wrap
 
@@ -974,12 +1106,18 @@ headings, diff line bodies, comment bodies (case-insensitive literal
 substring) — via the pure `CodeReviewState::{row_text, search_matches}`. It
 **mirrors the file viewer's find**: a bar at the top shows the `/`-prefixed
 query, match position / count, and hints; typing is incremental (the selection
-jumps to the first match live), `Enter`/`↓`/`Ctrl+N` step next and
-`↑`/`Ctrl+P` previous while typing, `Tab` commits (the bar stays for
-highlighting), and after committing `n`/`N` step matches relative to the cursor
-(`cr_search_step` scans + wraps). `Esc` clears the search (a second `Esc`
-closes the review). Matched runs highlight in place with the shared
-`ui::highlight` emphasis. State is `CodeReviewState::search: Option<ReviewSearch>`,
+jumps to the first match live), `Enter`/`Ctrl+N` step next and `Ctrl+P`
+previous while typing, `Tab` commits (the bar stays for highlighting), and
+after committing `n`/`N` step matches relative to the cursor
+(`cr_search_step` scans + wraps). `↑`/`↓` in the bar recall **search
+history** — committed queries per session, newest first, in-memory only
+(`App::review_search_history`, capped at 50): the first `↑` stashes the
+live query, `↓` past the newest restores it (readline behavior), and any
+edit turns a recalled entry back into a live query. The history outlives
+the review view itself, which closes on every Send→Agent. `Esc` clears the
+search (a second `Esc` closes the review). Matched runs highlight in place
+with the shared `ui::highlight` emphasis. State is
+`CodeReviewState::search: Option<ReviewSearch>`,
 captured before the global keybinding lookup. Side-by-side rows navigate but
 aren't substring-highlighted (a v1 follow-up); folded (reviewed) files
 contribute only their header to the search until expanded.
@@ -998,14 +1136,14 @@ instantly (ADR-P8, `docs/PERFORMANCE.md`).
 
 ### v1 follow-ups
 
-Named, not silently dropped: range/multi-line comments; token-level intra-line
-word diffs on a paired row (v1 aligns whole lines positionally); grammar-aware
-syntax highlighting (v1's lexer is heuristic + language-agnostic); horizontal
-scroll in the **side-by-side** layout (wrap works there; paired rows pin
-`h_scroll = 0`); per-side search-match highlighting in side-by-side (v1
-navigates but doesn't substring-highlight paired rows); auto-revealing a
-horizontally-scrolled-off search match; and search-match highlight across a
-wrap-boundary seam.
+Named, not silently dropped: grammar-aware syntax highlighting (the lexer is
+heuristic + language-agnostic); horizontal scroll in the **side-by-side**
+layout (wrap works there; paired rows pin `h_scroll = 0`); per-side
+search-match highlighting in side-by-side (navigates but doesn't
+substring-highlight paired rows); auto-revealing a horizontally-scrolled-off
+search match; and search-match highlight across a wrap-boundary seam.
+(Range comments and word-level intra-line diffs, once on this list, have
+since landed.)
 
 ---
 

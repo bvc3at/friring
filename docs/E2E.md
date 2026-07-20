@@ -132,19 +132,22 @@ scripts/dev/agent-e2e/scenarios/<name>/
 
 `scenario.sh` sets `SCENARIO_*` vars (`AGENT`, `PROMPT`, `AGENT_READY`, `DONE_PATTERN`, …) and
 defines `scenario_steps()` plus `scenario_assert_effects()` (mode-independent: journal, files)
-and `scenario_assert_ui()` (pane/status). An optional `scenario_setup()` runs during boot —
-after the seed workspace exists, before the stub and agent config — for extra repos or dirs
-(`claude-named-workspace` uses it for a second member repo); it may also fill
-`SCENARIO_TRUST_DIRS` with launch dirs beyond `$E2E_WS` that the agent profile must pre-trust.
-`SCENARIO_PRECREATE=0` skips the headless `session create` so the steps can drive the
-new-session wizard itself; such a scenario calls `step_resolve_session <name>` once the wizard
-has spawned, which binds `E2E_SESSION_ID` for state waits and CLI probes (a no-op in demo mode,
-like `step_wait_state`). Steps use a small dual-mode vocabulary — `step_type`,
-`step_key`, `step_wait_pane`, `step_wait_state`, `step_sleep`, `step_resolve_session` — that
-either drives the driver tmux and polls (test mode) or emits VHS tape lines (demo mode;
-`step_wait_pane` becomes `Wait+Screen@timeout /regex/`). Keep steps a flat list: no branching,
-loops, or variables — the moment a scenario needs logic, that logic belongs in the assert
-functions or the harness, not in a grown-by-accident DSL.
+and `scenario_assert_ui()` (pane/status). Two optional boot hooks cover workspace state the
+static seeds can't express. `scenario_setup()` runs during boot — after the seed workspace
+exists, before the stub and agent config — for extra repos or dirs (`claude-named-workspace`
+uses it for a second member repo); it may also fill `SCENARIO_TRUST_DIRS` with launch dirs
+beyond `$E2E_WS` that the agent profile must pre-trust. `scenario_prepare()` runs later — after
+the full boot, before any keystroke, in every drive depth — for an **uncommitted** edit:
+`e2e_boot` commits everything under `workspace/`, so the working-tree change a Working-target
+review shows (see `claude-review-loop`) can only be made here. `SCENARIO_PRECREATE=0` skips the
+headless `session create` so the steps can drive the new-session wizard itself; such a scenario
+calls `step_resolve_session <name>` once the wizard has spawned, which binds `E2E_SESSION_ID`
+for state waits and CLI probes (a no-op in demo mode, like `step_wait_state`). Steps use a small
+dual-mode vocabulary — `step_type`, `step_key`, `step_wait_pane`, `step_wait_state`,
+`step_sleep`, `step_resolve_session` — that either drives the driver tmux and polls (test mode)
+or emits VHS tape lines (demo mode; `step_wait_pane` becomes `Wait+Screen@timeout /regex/`).
+Keep steps a flat list: no branching, loops, or variables — the moment a scenario needs logic,
+that logic belongs in the assert functions or the harness, not in a grown-by-accident DSL.
 
 Scenario keystrokes go wherever the TUI routes them: an adopted session boots with **Terminal
 focus**, so plain typing lands in the agent pane; chords in the terminal-passthrough set are

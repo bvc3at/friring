@@ -186,6 +186,12 @@ impl Theme {
     pub fn diff_removed_bg() -> Color {
         current().diff_removed_bg
     }
+    pub fn diff_added_word_bg() -> Color {
+        current().diff_added_word_bg
+    }
+    pub fn diff_removed_word_bg() -> Color {
+        current().diff_removed_word_bg
+    }
 
     // ── Selection ───────────────────────────────────────────────────────────
 

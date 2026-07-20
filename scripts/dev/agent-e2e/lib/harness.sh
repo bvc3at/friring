@@ -87,6 +87,7 @@ e2e_scenario_load() {
     # multi-repo workspace dir) fills this from scenario_setup().
     SCENARIO_TRUST_DIRS=()
     E2E_PERF_MARKS=""
+    scenario_prepare() { :; }
     # Optional boot hook: runs after the seed workspace exists but before the
     # stub / agent config, so a scenario can lay down extra repos or dirs.
     scenario_setup() { :; }
@@ -529,6 +530,11 @@ e2e_demo_record() {
     local out_dir="$REPO_ROOT/target/agent-e2e/demos"
     mkdir -p "$out_dir"
 
+    # Mirror the three drive depths: apply the scenario's uncommitted workspace
+    # edit before recording (the boot already ran via `e2e_boot demo` in run.sh).
+    # Without this the claude-review-loop demo records an empty Working target.
+    scenario_prepare || return 1
+
     if [ -n "$SCENARIO_DEMO_THEME" ]; then
         sqlite3 "$XDG_DATA_HOME/friring-dev/friring.db" \
             "INSERT INTO metadata (key, value) VALUES ('active_theme', '$SCENARIO_DEMO_THEME')
@@ -562,6 +568,7 @@ e2e_demo_record() {
 e2e_protocol_smoke() {
     e2e_scenario_load "$1" || return 1
     e2e_boot protocol || return 1
+    scenario_prepare || return 1
     local bin out
     bin="$(agent_binary)"
     agent_print_args "$SCENARIO_PROMPT"
@@ -580,6 +587,7 @@ e2e_protocol_smoke() {
 e2e_interactive_smoke() {
     e2e_scenario_load "$1" || return 1
     e2e_boot protocol || return 1
+    scenario_prepare || return 1
     local bin
     bin="$(agent_binary)"
     tmux -L "$E2E_DRIVER_SOCKET" new-session -d -s "$E2E_DRIVER_SESSION" \
@@ -599,6 +607,10 @@ e2e_interactive_smoke() {
 e2e_scenario() {
     e2e_scenario_load "$1" || return 1
     e2e_boot test || return 1
+    # Post-boot workspace mutation (e2e_boot commits every workspace/ seed, so
+    # an *uncommitted* state — what a Working-target review shows — can only
+    # be made here). Runs before any keystroke in every drive depth.
+    scenario_prepare || return 1
     scenario_steps || return 1
     assert_stub_invariants || return 1
     scenario_assert_effects || return 1

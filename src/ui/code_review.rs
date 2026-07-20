@@ -10,7 +10,8 @@ use ratatui::Frame;
 
 use crate::app::code_review::{CodeReviewState, ComposeState, ReviewButton, ReviewRow};
 use crate::session::review::{
-    pair_hunk, Classification, CommentAnchor, DiffFile, DiffHunk, DiffLine, DiffLineKind, SidePair,
+    pair_hunk, Classification, CommentAnchor, DiffFile, DiffHunk, DiffLine, DiffLineKind,
+    FileStatus, SidePair,
 };
 use crate::ui::scrollbar::{self, ScrollbarGeom};
 use crate::ui::theme::Theme;
@@ -29,11 +30,14 @@ pub(crate) struct CodeReviewHits {
     pub scrollbar: Option<ScrollbarGeom>,
 }
 
-/// Theme color for a classification badge.
+/// Theme color for a classification badge. Each class gets a distinct palette
+/// color so the badge reads at a glance (`Question` borrows the "working"
+/// yellow — attention-seeking without the alarm of `Issue`'s danger red).
 fn class_color(c: Classification) -> Color {
     match c {
         Classification::Issue => Theme::danger(),
         Classification::Suggestion => Theme::accent(),
+        Classification::Question => Theme::status_working(),
         Classification::Note => Theme::text_secondary(),
         Classification::Praise => Theme::status_done(),
     }
@@ -59,7 +63,14 @@ pub(crate) fn render(
 ) -> CodeReviewHits {
     let (add, del) = state.totals();
     let target = state.target.label(&state.repos, &state.commits);
-    let title = format!(" Code review · {target}  +{add} -{del} ");
+    // Surface a non-default context width (`=` cycle) so a widened diff can't
+    // be mistaken for the default view.
+    let ctx = if state.context == crate::app::code_review::DEFAULT_CONTEXT {
+        String::new()
+    } else {
+        format!(" · U{}", state.context)
+    };
+    let title = format!(" Code review · {target}{ctx}  +{add} -{del} ");
     // Right-aligned so the app-layer central-pane tab strip (Agent/Shell/Review)
     // overlaid on the left of this top border has room.
     let block = focus_block("", level)
@@ -111,6 +122,12 @@ pub(crate) fn render(
         (Vec::new(), None)
     } else if state.target_picker.is_some() {
         targets = render_target_picker(frame, diff_area, state);
+        (Vec::new(), None)
+    } else if state.comment_picker.is_some() {
+        render_comment_picker(frame, diff_area, state);
+        (Vec::new(), None)
+    } else if state.info_popup.is_some() {
+        render_info_popup(frame, diff_area, state);
         (Vec::new(), None)
     } else {
         render_rows(frame, diff_area, state)
@@ -181,6 +198,203 @@ fn render_target_picker(frame: &mut Frame, area: Rect, state: &CodeReviewState) 
     }
     frame.render_widget(Paragraph::new(lines), area);
     hits
+}
+
+/// Render the all-comments popup (`@`) in place of the diff body, mirroring
+/// [`render_target_picker`]: one row per comment — `C<id> [Class]
+/// <file>:<line> — <body head>` — with the selection windowed into view.
+fn render_comment_picker(frame: &mut Frame, area: Rect, state: &CodeReviewState) {
+    let Some(picker) = state.comment_picker.as_ref() else {
+        return;
+    };
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        " Comments  (↑/↓ select · Enter jump · Esc)",
+        Style::default().fg(Theme::text_muted()),
+    ))];
+    let height = (area.height as usize).saturating_sub(1);
+    // Window the entries so the selection stays visible in a long list.
+    let start = picker
+        .selected
+        .saturating_sub(height.saturating_sub(1))
+        .min(picker.entries.len().saturating_sub(height.max(1)));
+    for (i, id) in picker.entries.iter().enumerate().skip(start).take(height) {
+        let selected = i == picker.selected;
+        let marker = if selected { "▸ " } else { "  " };
+        let (loc, class, head) = match state.comment(*id) {
+            Some(c) => {
+                let loc = match &c.anchor {
+                    CommentAnchor::Line { file, .. } => {
+                        let label = c.anchor.line_label().unwrap_or_default();
+                        format!("{file}:{label}")
+                    }
+                    CommentAnchor::File { file } => format!("{file} (file)"),
+                    CommentAnchor::Review => "summary".to_string(),
+                };
+                let head: String = c
+                    .body
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect();
+                (loc, c.classification, head)
+            }
+            None => ("?".to_string(), Classification::default(), String::new()),
+        };
+        let style = if selected {
+            Style::default()
+                .fg(Theme::selection_fg())
+                .bg(Theme::selection_bg())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Theme::text_primary())
+        };
+        let badge_style = if selected {
+            style
+        } else {
+            Style::default()
+                .fg(class_color(class))
+                .add_modifier(Modifier::BOLD)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker}C{id} "), style),
+            Span::styled(format!("[{}] ", class.label()), badge_style),
+            Span::styled(
+                truncate(
+                    &format!("{loc} — {head}"),
+                    (area.width as usize).saturating_sub(12),
+                ),
+                style,
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Render the read-only review-info popup (`i`) in place of the diff body:
+/// target + base per repo, file counts by status, aggregate `+`/`-`, the
+/// active filter/context, and the reviewed range's commits (already loaded
+/// for the target picker — no extra git call). `state.info_popup` is the
+/// scroll offset, clamped here to the content height (the app layer only
+/// saturates it upward).
+fn render_info_popup(frame: &mut Frame, area: Rect, state: &mut CodeReviewState) {
+    let Some(scroll) = state.info_popup else {
+        return;
+    };
+    let muted = Style::default().fg(Theme::text_muted());
+    let text = Style::default().fg(Theme::text_primary());
+    let accent = Style::default()
+        .fg(Theme::accent())
+        .add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        " Review info  (j/k scroll · Esc)",
+        muted,
+    ))];
+    let target = state.target.label(&state.repos, &state.commits);
+    lines.push(Line::from(vec![
+        Span::styled(" Target   ", accent),
+        Span::styled(target, text),
+    ]));
+    for repo in &state.repos {
+        let name = if repo.label.is_empty() {
+            "base".to_string()
+        } else {
+            format!("base ({})", repo.label)
+        };
+        let base = repo.base.as_deref().unwrap_or("(none)").to_string();
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {name}   "), accent),
+            Span::styled(base, text),
+        ]));
+    }
+
+    let (mut m, mut a, mut d, mut r, mut u) = (0, 0, 0, 0, 0);
+    for f in &state.files {
+        if f.untracked {
+            u += 1;
+            continue;
+        }
+        match f.status {
+            FileStatus::Modified => m += 1,
+            FileStatus::Added => a += 1,
+            FileStatus::Deleted => d += 1,
+            FileStatus::Renamed => r += 1,
+        }
+    }
+    let counts: String = [
+        (m, "modified"),
+        (a, "added"),
+        (d, "deleted"),
+        (r, "renamed"),
+        (u, "untracked"),
+    ]
+    .iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, label)| format!("{n} {label}"))
+    .collect::<Vec<_>>()
+    .join(" · ");
+    let (add, del) = state.totals();
+    // The per-status breakdown is empty for an empty diff (0 files); drop the
+    // parenthetical then rather than render a bare "0 ()".
+    let files_line = if counts.is_empty() {
+        state.files.len().to_string()
+    } else {
+        format!("{} ({counts})", state.files.len())
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" Files    ", accent),
+        Span::styled(files_line, text),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" Changes  ", accent),
+        Span::styled(format!("+{add} -{del}"), text),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" View     ", accent),
+        Span::styled(
+            format!(
+                "filter {} · context U{}",
+                state.filter.label().unwrap_or("all"),
+                state.context
+            ),
+            text,
+        ),
+    ]));
+
+    if !state.commits.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(" Commits in range ({})", state.commits.len()),
+            accent,
+        )));
+        for (ri, sha, subject) in &state.commits {
+            let tag = state
+                .repos
+                .get(*ri)
+                .filter(|_| state.multi)
+                .map(|r| format!("[{}] ", r.label))
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {sha} "), muted),
+                Span::styled(
+                    truncate(
+                        &format!("{tag}{subject}"),
+                        (area.width as usize).saturating_sub(11),
+                    ),
+                    text,
+                ),
+            ]));
+        }
+    }
+
+    let height = area.height as usize;
+    let max_scroll = lines.len().saturating_sub(height);
+    let scroll = scroll.min(max_scroll);
+    state.info_popup = Some(scroll);
+    let visible: Vec<Line> = lines.into_iter().skip(scroll).take(height).collect();
+    frame.render_widget(Paragraph::new(visible), area);
 }
 
 /// Render the windowed diff/comment rows + scrollbar. Returns row hitboxes
@@ -365,17 +579,42 @@ fn row_visual_lines<'a>(
         ReviewRow::Line(fi, hi, li) => {
             let f = &state.files[*fi];
             let hunk = &f.hunks[*hi];
-            if state.side_by_side {
-                paired_diff_line(hunk, *li, width, num_w, wrap, &sel_style)
-            } else if wrap {
-                let l = &hunk.lines[*li];
-                unified_diff_line_wrapped(f, l, width, num_w, selected, query, &sel_style)
+            let mut out = if state.side_by_side {
+                paired_diff_line(
+                    f, hunk, *li, width, num_w, wrap, selected, query, &sel_style,
+                )
             } else {
                 let l = &hunk.lines[*li];
-                vec![unified_diff_line(
-                    f, l, width, num_w, selected, h_scroll, query, &sel_style,
-                )]
+                // Word-level highlight of the changed tokens vs the aligned
+                // counterpart line; empty for context / unrelated pairs. The
+                // selection bg owns a selected row, so no word bg there.
+                let word = word_ranges_for(hunk, *li);
+                let word_bg = (!selected && !word.is_empty()).then(|| match l.kind {
+                    DiffLineKind::Add => Theme::diff_added_word_bg(),
+                    _ => Theme::diff_removed_word_bg(),
+                });
+                if wrap {
+                    unified_diff_line_wrapped(
+                        f, l, width, num_w, selected, query, &word, word_bg, &sel_style,
+                    )
+                } else {
+                    vec![unified_diff_line(
+                        f, l, width, num_w, selected, h_scroll, query, &word, word_bg, &sel_style,
+                    )]
+                }
+            };
+            // An in-progress range selection (`V`) tints its covered rows with
+            // the selection bg (keeping each span's fg), so the growing span
+            // reads as an extended selection. The selected endpoint already
+            // carries the full selection style.
+            if !selected && state.row_in_range(i) {
+                for line in &mut out {
+                    for span in &mut line.spans {
+                        span.style = span.style.bg(Theme::selection_bg());
+                    }
+                }
             }
+            out
         }
         ReviewRow::Comment(id) | ReviewRow::Summary(id) => {
             vec![comment_line(state, *id, width, query, sel_style)]
@@ -415,7 +654,7 @@ fn file_header_line<'a>(
         .fg(Theme::accent_bright())
         .add_modifier(Modifier::BOLD);
     let lead = format!("{chevron} ");
-    let glyph = f.status.glyph().to_string();
+    let glyph = f.glyph().to_string();
     let mid = format!(" {}  ", f.path);
     let adds = format!("+{}", f.added_count());
     let dels = format!(" -{}", f.deleted_count());
@@ -497,7 +736,8 @@ fn hunk_header_line<'a>(
 
 /// A unified-diff line: a `old new ±` gutter plus the syntax-highlighted body,
 /// with the add/remove row tint (the gutter sign + tint carry the +/-, leaving
-/// the text free for syntax colour). The gutter stays pinned; the body is
+/// the text free for syntax colour). `word`/`word_bg` paint the word-level
+/// intra-line diff over changed tokens. The gutter stays pinned; the body is
 /// windowed to `[h_scroll, h_scroll + avail)` (horizontal scroll) and padded to
 /// `width`.
 #[allow(clippy::too_many_arguments)]
@@ -509,6 +749,8 @@ fn unified_diff_line<'a>(
     selected: bool,
     h_scroll: usize,
     query: Option<&str>,
+    word: &[(usize, usize)],
+    word_bg: Option<Color>,
     sel_style: &impl Fn(Style) -> Style,
 ) -> Line<'a> {
     let (sign, row_bg) = diff_row_bg(l.kind);
@@ -521,7 +763,7 @@ fn unified_diff_line<'a>(
         sel_style(bg(Style::default().fg(Theme::text_muted()))),
     )];
     spans.extend(diff_body_spans(
-        f, &l.text, h_scroll, avail, query, sel_style, &bg,
+        f, &l.text, h_scroll, avail, query, word, word_bg, sel_style, &bg,
     ));
     Line::from(spans)
 }
@@ -531,6 +773,7 @@ fn unified_diff_line<'a>(
 /// gutter-width prefix so the body stays left-aligned. The row tint + selection
 /// highlight cover every wrapped row (so a selected wrapped line reads as one
 /// block). Empty bodies still emit one row (matching the non-wrap path).
+#[allow(clippy::too_many_arguments)]
 fn unified_diff_line_wrapped<'a>(
     f: &DiffFile,
     l: &DiffLine,
@@ -538,6 +781,8 @@ fn unified_diff_line_wrapped<'a>(
     num_w: usize,
     selected: bool,
     query: Option<&str>,
+    word: &[(usize, usize)],
+    word_bg: Option<Color>,
     sel_style: &impl Fn(Style) -> Style,
 ) -> Vec<Line<'a>> {
     let (sign, row_bg) = diff_row_bg(l.kind);
@@ -566,6 +811,8 @@ fn unified_diff_line_wrapped<'a>(
             c * avail,
             avail,
             query,
+            word,
+            word_bg,
             sel_style,
             &bg,
         ));
@@ -675,16 +922,21 @@ fn paired_visual_count(hunk: &DiffHunk, li: usize, width: usize, num_w: usize) -
 
 /// Styled spans for a diff body windowed to `[start, start + avail)` chars,
 /// padded to `avail`. When the active search query hits the visible window the
-/// literal matches are highlighted over plain text (search clarity wins);
-/// otherwise the syntax-highlighted token stream is sliced to the window (the
-/// full line is tokenized for correctness, then windowed). Shared by the
-/// horizontal-scroll and wrap paths.
+/// literal matches are highlighted over plain text (search clarity wins — over
+/// syntax *and* the word-level diff); otherwise the syntax-highlighted token
+/// stream is sliced to the window (the full line is tokenized for correctness,
+/// then windowed) and the word-level diff ranges (`word`, absolute char
+/// ranges) paint `word_bg` under their tokens. Shared by the horizontal-scroll
+/// and wrap paths.
+#[allow(clippy::too_many_arguments)]
 fn diff_body_spans<'a>(
     f: &DiffFile,
     text: &str,
     start: usize,
     avail: usize,
     query: Option<&str>,
+    word: &[(usize, usize)],
+    word_bg: Option<Color>,
     sel_style: &impl Fn(Style) -> Style,
     bg: &impl Fn(Style) -> Style,
 ) -> Vec<Span<'a>> {
@@ -723,11 +975,12 @@ fn diff_body_spans<'a>(
             if piece.is_empty() {
                 continue;
             }
+            let piece_start = tok_start + skip;
             used += piece.chars().count();
-            spans.push(Span::styled(
-                piece,
-                sel_style(bg(Style::default().fg(tcolor))),
-            ));
+            // Word-diff bg over the syntax fg: split the piece at word-range
+            // boundaries so exactly the changed tokens carry the stronger bg.
+            let style = sel_style(bg(Style::default().fg(tcolor)));
+            spans.extend(word_split_spans(piece, piece_start, word, word_bg, style));
         }
     }
     // Pad so the row tint fills the available width.
@@ -740,6 +993,71 @@ fn diff_body_spans<'a>(
     spans
 }
 
+/// Split `piece` (whose first char sits at absolute char index `piece_start`
+/// of the full line) at the boundaries of the word-diff `ranges`, styling
+/// covered sub-slices with `word_bg` over `base`. With no ranges (or no bg)
+/// the piece stays one span.
+fn word_split_spans<'a>(
+    piece: String,
+    piece_start: usize,
+    ranges: &[(usize, usize)],
+    word_bg: Option<Color>,
+    base: Style,
+) -> Vec<Span<'a>> {
+    let Some(wbg) = word_bg else {
+        return vec![Span::styled(piece, base)];
+    };
+    let piece_end = piece_start + piece.chars().count();
+    let mut cuts = vec![piece_start, piece_end];
+    for &(s, e) in ranges {
+        if s > piece_start && s < piece_end {
+            cuts.push(s);
+        }
+        if e > piece_start && e < piece_end {
+            cuts.push(e);
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let chars: Vec<char> = piece.chars().collect();
+    cuts.windows(2)
+        .map(|w| {
+            let sub: String = chars[w[0] - piece_start..w[1] - piece_start]
+                .iter()
+                .collect();
+            let covered = ranges.iter().any(|&(s, e)| w[0] >= s && w[1] <= e);
+            let style = if covered { base.bg(wbg) } else { base };
+            Span::styled(sub, style)
+        })
+        .collect()
+}
+
+/// Char ranges of row `li`'s changed tokens vs its positionally aligned
+/// counterpart (`del[k] ↔ add[k]`, the same pairing the side-by-side layout
+/// draws — a `-` run followed by a `+` run pairs positionally in unified
+/// rendering too). Empty for context lines, unpaired halves, and unrelated
+/// pairs (see [`crate::session::review::word_diff`]'s 30% gate).
+fn word_ranges_for(hunk: &DiffHunk, li: usize) -> Vec<(usize, usize)> {
+    let line = &hunk.lines[li];
+    if line.kind == DiffLineKind::Context {
+        return Vec::new();
+    }
+    let pair = paired_row(hunk, li);
+    let (Some(o), Some(n)) = (pair.old, pair.new) else {
+        return Vec::new();
+    };
+    let Some((old_r, new_r)) =
+        crate::session::review::word_diff(&hunk.lines[o].text, &hunk.lines[n].text)
+    else {
+        return Vec::new();
+    };
+    if line.kind == DiffLineKind::Del {
+        old_r
+    } else {
+        new_r
+    }
+}
+
 fn comment_line<'a>(
     state: &CodeReviewState,
     id: i64,
@@ -750,7 +1068,20 @@ fn comment_line<'a>(
     let Some(c) = state.comment(id) else {
         return Line::from("");
     };
-    let badge = format!("  ▸ [{}] ", c.classification.label());
+    // A range comment sits at its span's last line, so the row names the whole
+    // span (`(new:10-24)`); a single-line comment sits right under its line
+    // and needs no locator.
+    let span = match &c.anchor {
+        CommentAnchor::Line {
+            line_end: Some(_), ..
+        } => c
+            .anchor
+            .line_label()
+            .map(|l| format!("({l}) "))
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    let badge = format!("  ▸ [{}] {span}", c.classification.label());
     let first = c.body.lines().next().unwrap_or("");
     let more = if c.body.lines().count() > 1 {
         " …"
@@ -805,47 +1136,48 @@ fn paired_body_width(width: usize, num_w: usize) -> usize {
 /// index; the [`SidePair`] it belongs to supplies both sides (a blank half-cell
 /// where a side is absent). The selection + comment anchor stay 1 row = 1
 /// selectable unit; which side a comment attaches to is resolved at compose
-/// time. Plain add/remove tinting (no syntax highlighting), matching the
-/// unified body's gutter-sign convention.
+/// time. Each half renders through [`diff_body_spans`], so syntax
+/// highlighting, the word-level diff bg, and search highlighting compose here
+/// exactly as in the unified body (add/remove stays on the tint + numbers,
+/// matching the gutter-sign convention).
 ///
 /// With `wrap` on, each half soft-wraps independently onto as many chunks as its
 /// text needs; the taller half drives the visual-row count (mirrored by
 /// [`paired_visual_count`]), and the shorter half pads with blank cells past its
 /// last chunk. Off, each half truncates to one row (the historical behavior).
+#[allow(clippy::too_many_arguments)]
 fn paired_diff_line<'a>(
+    f: &DiffFile,
     hunk: &DiffHunk,
     li: usize,
     width: usize,
     num_w: usize,
     wrap: bool,
+    selected: bool,
+    query: Option<&str>,
     sel_style: &impl Fn(Style) -> Style,
 ) -> Vec<Line<'a>> {
     let pair = paired_row(hunk, li);
     let half = width.saturating_sub(1) / 2;
     let body_w = paired_body_width(width, num_w);
     let prim = || Style::default().fg(Theme::text_primary());
-    let removed = || {
-        Style::default()
-            .fg(Theme::diff_removed())
-            .bg(Theme::diff_removed_bg())
-    };
-    let added = || {
-        Style::default()
-            .fg(Theme::diff_added())
-            .bg(Theme::diff_added_bg())
-    };
 
     let left = pair.old.map(|i| &hunk.lines[i]);
     let right = pair.new.map(|i| &hunk.lines[i]);
     // Each cell tints only when it carries a change (a context line pairs with
     // itself and stays plain on both sides); sel_style overrides bg on select.
-    let lstyle = match left {
-        Some(l) if l.kind == DiffLineKind::Del => removed(),
-        _ => prim(),
-    };
-    let rstyle = match right {
-        Some(l) if l.kind == DiffLineKind::Add => added(),
-        _ => prim(),
+    let ltint = matches!(left, Some(l) if l.kind == DiffLineKind::Del).then(Theme::diff_removed_bg);
+    let rtint = matches!(right, Some(l) if l.kind == DiffLineKind::Add).then(Theme::diff_added_bg);
+
+    // Word-level diff across the aligned pair (only a real del↔add pair has
+    // one); the selection bg owns a selected row, so no word bg there.
+    let (word_old, word_new) = match (left, right) {
+        (Some(l), Some(r))
+            if l.kind == DiffLineKind::Del && r.kind == DiffLineKind::Add && !selected =>
+        {
+            crate::session::review::word_diff(&l.text, &r.text).unwrap_or_default()
+        }
+        _ => Default::default(),
     };
 
     // How many chunks each present half needs (an absent half contributes none);
@@ -865,25 +1197,104 @@ fn paired_diff_line<'a>(
         .map(|c| {
             // A half renders its `c`-th chunk while it still has one; past that
             // (the shorter side, or an absent side) it pads blank + plain.
-            let (left_cell, ls) = if c < lchunks {
+            let mut spans: Vec<Span> = Vec::new();
+            if c < lchunks {
                 let l = left.expect("chunk count > 0 implies present");
-                (half_cell_chunk(l.old_no, &l.text, c, num_w, half), lstyle)
+                spans.extend(half_cell_spans(
+                    f,
+                    l.old_no,
+                    &l.text,
+                    c,
+                    num_w,
+                    half,
+                    ltint,
+                    query,
+                    &word_old,
+                    Theme::diff_removed_word_bg(),
+                    selected,
+                    sel_style,
+                ));
             } else {
-                (half_cell_chunk(None, "", 0, num_w, half), prim())
-            };
-            let (right_cell, rs) = if c < rchunks {
+                spans.push(Span::styled(
+                    half_cell_chunk(None, "", 0, num_w, half),
+                    sel_style(prim()),
+                ));
+            }
+            spans.push(Span::styled(
+                "│",
+                sel_style(Style::default().fg(Theme::text_muted())),
+            ));
+            if c < rchunks {
                 let r = right.expect("chunk count > 0 implies present");
-                (half_cell_chunk(r.new_no, &r.text, c, num_w, half), rstyle)
+                spans.extend(half_cell_spans(
+                    f,
+                    r.new_no,
+                    &r.text,
+                    c,
+                    num_w,
+                    half,
+                    rtint,
+                    query,
+                    &word_new,
+                    Theme::diff_added_word_bg(),
+                    selected,
+                    sel_style,
+                ));
             } else {
-                (half_cell_chunk(None, "", 0, num_w, half), prim())
-            };
-            Line::from(vec![
-                Span::styled(left_cell, sel_style(ls)),
-                Span::styled("│", sel_style(Style::default().fg(Theme::text_muted()))),
-                Span::styled(right_cell, sel_style(rs)),
-            ])
+                spans.push(Span::styled(
+                    half_cell_chunk(None, "", 0, num_w, half),
+                    sel_style(prim()),
+                ));
+            }
+            Line::from(spans)
         })
         .collect()
+}
+
+/// One present side-by-side half cell as styled spans: the right-aligned line
+/// number column (blank on continuation chunks), then the `c`-th `body_w`-wide
+/// slice of the body through [`diff_body_spans`] — so syntax highlighting, the
+/// word-level diff bg, and search-match highlighting compose in the paired
+/// layout exactly as in unified. Total width is exactly `cell_w`.
+#[allow(clippy::too_many_arguments)]
+fn half_cell_spans<'a>(
+    f: &DiffFile,
+    num: Option<u32>,
+    text: &str,
+    c: usize,
+    num_w: usize,
+    cell_w: usize,
+    tint: Option<Color>,
+    query: Option<&str>,
+    word: &[(usize, usize)],
+    word_bg_color: Color,
+    selected: bool,
+    sel_style: &impl Fn(Style) -> Style,
+) -> Vec<Span<'a>> {
+    let body_w = cell_w.saturating_sub(num_w + 1).max(1);
+    let n = if c == 0 {
+        num.map(|n| n.to_string()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let bg = row_bg_fn(tint, selected);
+    let word_bg = (!word.is_empty()).then_some(word_bg_color);
+    let mut spans = vec![Span::styled(
+        format!("{n:>num_w$} "),
+        sel_style(bg(Style::default().fg(Theme::text_muted()))),
+    )];
+    spans.extend(diff_body_spans(
+        f,
+        text,
+        c * body_w,
+        body_w,
+        query,
+        word,
+        word_bg,
+        sel_style,
+        &bg,
+    ));
+    spans
 }
 
 /// A fixed-width side-by-side half cell for wrap chunk `c`: the right-aligned
@@ -919,7 +1330,13 @@ pub(crate) fn render_files_list(
     state: &CodeReviewState,
     level: FocusLevel,
 ) -> Vec<RowHitbox> {
-    let block = focus_block(" Changed files ", level);
+    // The active filter is part of the header so the narrowed list can't be
+    // mistaken for "these are all the changes".
+    let title = match state.filter.label() {
+        Some(l) => format!(" Changed files · {l} "),
+        None => " Changed files ".to_string(),
+    };
+    let block = focus_block(&title, level);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 || state.files.is_empty() {
@@ -930,7 +1347,10 @@ pub(crate) fn render_files_list(
     let hint_row = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            truncate(" ↑↓ move · ↵ open · r seen · / find", inner.width as usize),
+            truncate(
+                " ↑↓ move · ↵ open · r seen · o filter · / find",
+                inner.width as usize,
+            ),
             Style::default().fg(Theme::text_muted()),
         ))),
         hint_row,
@@ -941,9 +1361,27 @@ pub(crate) fn render_files_list(
         return Vec::new();
     }
 
+    // An empty *filtered* list explains itself (the unfiltered list can't be
+    // empty here) — never a bare pane with no hint of why.
+    let visible = state.visible_file_indices();
+    if visible.is_empty() {
+        let what = state.filter.label().unwrap_or("matching");
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate(
+                    &format!(" No {what} files — o cycles the filter"),
+                    list.width as usize,
+                ),
+                Style::default().fg(Theme::text_muted()),
+            ))),
+            Rect::new(list.x, list.y, list.width, 1),
+        );
+        return Vec::new();
+    }
+
     // Render the files as a folder tree (directories as headers, files indented
     // beneath). `current_file()` is `None` on the summary section.
-    let tree = build_file_tree(&state.files);
+    let tree = build_file_tree(&state.files, &visible);
     let total = tree.len();
     let current_opt = state.current_file();
     let anchor = current_opt
@@ -1016,7 +1454,7 @@ fn file_row_line<'a>(
     let tint = |c: Color| if current { base } else { base.fg(c) };
     Line::from(vec![
         Span::styled(format!("{}{mark}", "  ".repeat(depth)), base),
-        Span::styled(f.status.glyph().to_string(), tint(status_color(f.status))),
+        Span::styled(f.glyph().to_string(), tint(status_color(f.status))),
         Span::styled(format!(" {name}  "), base),
         Span::styled(format!("+{}", f.added_count()), tint(Theme::diff_added())),
         Span::styled(
@@ -1033,15 +1471,15 @@ enum TreeRow {
     File { depth: usize, index: usize },
 }
 
-/// Build a folder tree from the diff files: group by directory (so files in the
+/// Build a folder tree from the diff files listed in `indices` (the
+/// filter-visible subset, in diff order): group by directory (so files in the
 /// same folder sit together under one header), preserving each file's original
 /// diff-file index for hit-testing. Multi-repo paths (`<repo>/<path>`) nest the
 /// repo as the top-level folder automatically.
-fn build_file_tree(files: &[crate::session::review::DiffFile]) -> Vec<TreeRow> {
-    let mut entries: Vec<(usize, Vec<&str>)> = files
+fn build_file_tree(files: &[crate::session::review::DiffFile], indices: &[usize]) -> Vec<TreeRow> {
+    let mut entries: Vec<(usize, Vec<&str>)> = indices
         .iter()
-        .enumerate()
-        .map(|(i, f)| (i, f.path.split('/').collect()))
+        .map(|&i| (i, files[i].path.split('/').collect()))
         .collect();
     // Sort by path segments so sibling files group under a shared directory.
     entries.sort_by(|a, b| a.1.cmp(&b.1));
@@ -1100,7 +1538,10 @@ fn render_compose(frame: &mut Frame, area: Rect, comp: &ComposeState) {
         return;
     }
     let target = match &comp.anchor {
-        CommentAnchor::Line { side, line, .. } => format!("line {}:{}", side.as_str(), line),
+        CommentAnchor::Line { line_end, .. } => {
+            let noun = if line_end.is_some() { "lines" } else { "line" };
+            format!("{noun} {}", comp.anchor.line_label().unwrap_or_default())
+        }
         CommentAnchor::File { file } => format!("file {file}"),
         CommentAnchor::Review => "review summary".to_string(),
     };
@@ -1199,6 +1640,7 @@ fn render_footer(
                 ButtonSpec::secondary("File").with_hint("·f"),
                 ButtonSpec::secondary("Summary").with_hint("·s"),
                 ButtonSpec::secondary("Reviewed").with_hint("·r"),
+                ButtonSpec::secondary("Reload").with_hint("·F5"),
                 ButtonSpec::secondary("Target").with_hint("·t"),
                 ButtonSpec::secondary(view_label).with_hint("·v"),
                 ButtonSpec::secondary(wrap_label).with_hint("·w"),
@@ -1212,6 +1654,7 @@ fn render_footer(
                 ReviewButton::FileComment,
                 ReviewButton::Summary,
                 ReviewButton::MarkReviewed,
+                ReviewButton::Reload,
                 ReviewButton::Target,
                 ReviewButton::ToggleView,
                 ReviewButton::ToggleWrap,
@@ -1298,7 +1741,7 @@ fn render_search_bar(frame: &mut Frame, area: Rect, state: &CodeReviewState) {
     };
     let caret = if s.editing { "█" } else { "" };
     let hint = if s.editing {
-        "   ↵/↓ next · ↑ prev · tab done · esc cancel"
+        "   ↵/^N next · ^P prev · ↑/↓ history · tab done · esc cancel"
     } else {
         "   n next · N prev · esc clear"
     };
@@ -1337,6 +1780,9 @@ mod tests {
             path: "src/a/very/deep/foo.rs".into(),
             old_path: None,
             status: FileStatus::Modified,
+            untracked: false,
+            binary: false,
+            note: None,
             hunks: vec![DiffHunk {
                 old_start: 1,
                 new_start: 1,
@@ -1390,6 +1836,11 @@ mod tests {
             host: None,
             target_picker: None,
             search: None,
+            filter: crate::app::code_review::ReviewFilter::default(),
+            comment_picker: None,
+            range: None,
+            info_popup: None,
+            context: crate::app::code_review::DEFAULT_CONTEXT,
         };
         s.rebuild_rows();
         s
@@ -1421,6 +1872,114 @@ mod tests {
                 .unwrap();
             }
         }
+    }
+
+    /// A state whose one change pair shares most tokens (`let x = old;` →
+    /// `let x = new;`), so the word-level diff highlights exactly `old`/`new`.
+    fn word_diff_state() -> CodeReviewState {
+        let mut s = demo_state();
+        s.files[0].hunks[0].lines[1].text = "let x = old;".into();
+        s.files[0].hunks[0].lines[2].text = "let x = new;".into();
+        // Park the selection on the file header so no diff row is
+        // selection-styled (the selection bg would override the word bg).
+        s.selected = 0;
+        s.rebuild_rows();
+        s
+    }
+
+    /// Cells painted with `bg` on row `y`, as a string of their symbols.
+    fn cells_with_bg(buf: &ratatui::buffer::Buffer, y: u16, w: u16, bg: Color) -> String {
+        (0..w)
+            .filter(|&x| buf[(x, y)].style().bg == Some(bg))
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    /// Unified: the changed token carries the stronger word bg; the shared
+    /// tokens keep the plain row tint.
+    #[test]
+    fn word_diff_highlights_changed_token_in_unified() {
+        let mut state = word_diff_state();
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| {
+            let _ = render(f, Rect::new(0, 0, 60, 20), &mut state, FocusLevel::Focused);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let (mut removed_hl, mut added_hl) = (String::new(), String::new());
+        for y in 0..20 {
+            removed_hl.push_str(&cells_with_bg(buf, y, 60, Theme::diff_removed_word_bg()));
+            added_hl.push_str(&cells_with_bg(buf, y, 60, Theme::diff_added_word_bg()));
+        }
+        assert_eq!(removed_hl, "old", "only the removed token gets the word bg");
+        assert_eq!(added_hl, "new", "only the added token gets the word bg");
+    }
+
+    /// Side-by-side: the same word-level highlight lands in each half cell —
+    /// and the halves now carry syntax colour (`let` as a keyword), proving
+    /// the highlighter runs there too.
+    #[test]
+    fn word_diff_and_syntax_compose_in_side_by_side() {
+        let mut state = word_diff_state();
+        state.side_by_side = true;
+        state.rebuild_rows();
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let _ = render(f, Rect::new(0, 0, 80, 20), &mut state, FocusLevel::Focused);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let (mut removed_hl, mut added_hl) = (String::new(), String::new());
+        let mut fg_colors: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for y in 0..20 {
+            removed_hl.push_str(&cells_with_bg(buf, y, 80, Theme::diff_removed_word_bg()));
+            added_hl.push_str(&cells_with_bg(buf, y, 80, Theme::diff_added_word_bg()));
+            let row: String = (0..80).map(|x| buf[(x, y)].symbol()).collect();
+            if row.contains("let x = old;") {
+                // Collect the distinct fg colours across the paired row's text:
+                // syntax highlighting must produce more than one.
+                for x in 0..80 {
+                    if buf[(x, y)].symbol() != " " {
+                        fg_colors.insert(format!("{:?}", buf[(x, y)].style().fg));
+                    }
+                }
+            }
+        }
+        assert_eq!(removed_hl, "old");
+        assert_eq!(added_hl, "new");
+        assert!(
+            fg_colors.len() > 1,
+            "syntax highlighting colours the paired halves: {fg_colors:?}"
+        );
+    }
+
+    /// Search-match highlighting wins over the word-diff bg (the match must
+    /// stay legible), per the search-first rule in `diff_body_spans`.
+    #[test]
+    fn search_highlight_wins_over_word_diff() {
+        let mut state = word_diff_state();
+        state.search = Some(crate::app::code_review::ReviewSearch {
+            query: "new".into(),
+            editing: false,
+            matches: Vec::new(),
+            hist_idx: None,
+            stash: String::new(),
+        });
+        state.refresh_search_matches();
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| {
+            let _ = render(f, Rect::new(0, 0, 60, 20), &mut state, FocusLevel::Focused);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let mut added_hl = String::new();
+        for y in 0..20 {
+            added_hl.push_str(&cells_with_bg(buf, y, 60, Theme::diff_added_word_bg()));
+        }
+        assert!(
+            added_hl.is_empty(),
+            "the matched line renders search emphasis, not word bg: {added_hl:?}"
+        );
     }
 
     /// True paired side-by-side draws a deletion and its aligned addition on the
@@ -1696,11 +2255,14 @@ mod tests {
             path: p.into(),
             old_path: None,
             status: FileStatus::Modified,
+            untracked: false,
+            binary: false,
+            note: None,
             hunks: Vec::new(),
         };
         // Out of path order on purpose — the tree sorts + groups by directory.
         let files = vec![mk("src/b.rs"), mk("top.rs"), mk("src/ui/a.rs")];
-        let tree = build_file_tree(&files);
+        let tree = build_file_tree(&files, &[0, 1, 2]);
         // Folder headers appear for `src` and `src/ui`; the top-level file has no
         // folder. Each file row carries its ORIGINAL index for click→jump.
         let folders: Vec<(usize, &str)> = tree
@@ -1755,6 +2317,8 @@ mod tests {
             query: "ctx".to_string(),
             editing: true,
             matches: state.search_matches("ctx"),
+            hist_idx: None,
+            stash: String::new(),
         });
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
@@ -1787,6 +2351,7 @@ mod tests {
                 file: "src/foo.rs".into(),
                 side: Side::New,
                 line: 2,
+                line_end: None,
             },
             classification: Classification::Issue,
             body: crate::app::modals::TextArea::new(),
@@ -1800,5 +2365,138 @@ mod tests {
             assert!(!hits.buttons.is_empty());
         })
         .unwrap();
+    }
+
+    /// An active `V` range tints its covered rows with the selection bg while
+    /// passing over side-mismatched rows, and a saved range comment's row
+    /// names its span (`(new:1-2)`).
+    #[test]
+    fn range_selection_tint_and_span_label() {
+        use crate::session::review::{Classification, CommentAnchor, ReviewComment, Side};
+        // demo_state rows: 0 FileHeader, 1 HunkHeader, 2 ctx(new:1),
+        // 3 del(old:2), 4 add(new:2). Range New from the ctx row to the add.
+        let mut state = demo_state();
+        state.range = Some(crate::app::code_review::RangeSelect {
+            start_row: 2,
+            side: Side::New,
+            file: "src/a/very/deep/foo.rs".into(),
+        });
+        state.selected = 4;
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let _ = render(f, Rect::new(0, 0, 80, 20), &mut state, FocusLevel::Focused);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let (mut ctx_tinted, mut old_tinted) = (false, false);
+        for y in 0..20 {
+            let row: String = (0..80).map(|x| buf[(x, y)].symbol()).collect();
+            let tinted = !cells_with_bg(buf, y, 80, Theme::selection_bg()).is_empty();
+            if row.contains("ctx") {
+                ctx_tinted = tinted;
+            }
+            if row.contains("old") {
+                old_tinted = tinted;
+            }
+        }
+        assert!(ctx_tinted, "the context row inside the span is tinted");
+        assert!(!old_tinted, "the old-side row between the endpoints is not");
+
+        // A persisted range comment interleaves at its span's end line and
+        // shows the span locator.
+        let mut state = demo_state();
+        state.comments = vec![ReviewComment {
+            id: 7,
+            session_id: SessionId::default(),
+            anchor: CommentAnchor::Line {
+                file: "src/a/very/deep/foo.rs".into(),
+                side: Side::New,
+                line: 1,
+                line_end: Some(2),
+            },
+            classification: Classification::Note,
+            body: "span".into(),
+            created_at: 0,
+            updated_at: 0,
+        }];
+        state.rebuild_rows();
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let _ = render(f, Rect::new(0, 0, 80, 20), &mut state, FocusLevel::Focused);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..20 {
+            for x in 0..80 {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(
+            screen.contains("(new:1-2) span"),
+            "comment row names its span: {screen}"
+        );
+    }
+
+    /// The `i` info popup replaces the diff body with the review's stats:
+    /// target, base, file counts, aggregate +/- , view settings, commits.
+    #[test]
+    fn info_popup_shows_target_files_and_commits() {
+        let mut state = demo_state();
+        state.commits = vec![(0, "abc1234".into(), "fix the widget".into())];
+        state.info_popup = Some(0);
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let _ = render(f, Rect::new(0, 0, 80, 20), &mut state, FocusLevel::Focused);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..20 {
+            for x in 0..80 {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(screen.contains("Review info"), "header: {screen}");
+        assert!(screen.contains("main"), "base branch shown: {screen}");
+        assert!(screen.contains("1 modified"), "file counts: {screen}");
+        assert!(screen.contains("+1 -1"), "aggregate totals: {screen}");
+        assert!(
+            screen.contains("filter all · context U3"),
+            "view settings: {screen}"
+        );
+        assert!(
+            screen.contains("abc1234 fix the widget"),
+            "commit list: {screen}"
+        );
+    }
+
+    /// An empty diff (0 files) drops the per-status parenthetical rather than
+    /// rendering a bare `0 ()`.
+    #[test]
+    fn info_popup_empty_diff_omits_empty_parenthetical() {
+        let mut state = demo_state();
+        state.files.clear();
+        state.rebuild_rows();
+        state.info_popup = Some(0);
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let _ = render(f, Rect::new(0, 0, 80, 20), &mut state, FocusLevel::Focused);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..20 {
+            for x in 0..80 {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(
+            !screen.contains("0 ()"),
+            "no bare empty parenthetical: {screen}"
+        );
     }
 }

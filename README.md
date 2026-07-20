@@ -353,10 +353,11 @@ themselves. `Enter` jumps to a result; `Esc` restores exactly what you had.
 ### Code Review
 
 A native, GitHub-style diff reviewer (`Ctrl+X`, `F7` alternate) — no external tool. Browse the
-branch (`<base>..HEAD`), a single commit, or the uncommitted changes; the
-changed files show as a **folder tree** with colored statuses, and the diff is
-syntax-highlighted. Leave classified comments (issue / suggestion / note /
-praise) and a summary, mark files reviewed (which **folds** them away
+branch (`<base>..HEAD`), a single commit, the staged changes, or all
+uncommitted changes (untracked files included); the changed files show as a
+**folder tree** with colored statuses, and the diff is syntax-highlighted. Leave
+classified comments (issue / suggestion / question / note / praise) and a
+summary, mark files reviewed (which **folds** them away
 tree-style), then send the whole review back to the agent to address. Reviews
 stay open **per session** as you switch around, like the shell view. Mouse- and
 keyboard-driven, with unified or side-by-side layout.

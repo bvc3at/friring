@@ -61,6 +61,11 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-tool-loop"
 }
 
+@test "e2e: claude review loop — annotate, structured handoff to the agent, re-review nudge" {
+    require_agent claude
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-review-loop"
+}
+
 @test "e2e: multi-repo wizard with a named workspace dir — spawn, symlink write, persistence, guarded delete" {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-named-workspace"
 }

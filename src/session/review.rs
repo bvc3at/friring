@@ -34,32 +34,39 @@ impl Side {
     }
 }
 
-/// A review comment's classification — the colored "type" badge. Mirrors
-/// tuicr's set (issue / suggestion / note / praise).
+/// A review comment's classification — the colored "type" badge. Extends
+/// tuicr's set (issue / suggestion / note / praise) with a first-class
+/// `Question`: explicit classification beats inferring questions from `??` in
+/// the comment text, and the structured handoff gives each class distinct
+/// semantics for the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Classification {
-    Issue,
-    Suggestion,
     #[default]
     Note,
+    Issue,
+    Suggestion,
+    Question,
     Praise,
 }
 
 impl Classification {
-    /// In selector / cycle order.
-    pub const ALL: [Classification; 4] = [
+    /// In selector / cycle order. Starts at the default (`Note`), so the first
+    /// Tab in the compose box lands on `Issue` — the most common escalation.
+    pub const ALL: [Classification; 5] = [
+        Classification::Note,
         Classification::Issue,
         Classification::Suggestion,
-        Classification::Note,
+        Classification::Question,
         Classification::Praise,
     ];
 
     /// Stable token used in storage and markdown export.
     pub fn as_str(self) -> &'static str {
         match self {
+            Classification::Note => "note",
             Classification::Issue => "issue",
             Classification::Suggestion => "suggestion",
-            Classification::Note => "note",
+            Classification::Question => "question",
             Classification::Praise => "praise",
         }
     }
@@ -67,9 +74,10 @@ impl Classification {
     /// Human-facing label.
     pub fn label(self) -> &'static str {
         match self {
+            Classification::Note => "Note",
             Classification::Issue => "Issue",
             Classification::Suggestion => "Suggestion",
-            Classification::Note => "Note",
+            Classification::Question => "Question",
             Classification::Praise => "Praise",
         }
     }
@@ -95,8 +103,16 @@ impl Classification {
 /// Where a review comment is anchored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommentAnchor {
-    /// A specific line on one side of a file's diff.
-    Line { file: String, side: Side, line: u32 },
+    /// A specific line — or a contiguous range of lines — on one side of a
+    /// file's diff. `line_end` (exclusive of `None`, strictly `> line`) turns
+    /// the anchor into a range `line..=line_end`; a range never spans sides or
+    /// files.
+    Line {
+        file: String,
+        side: Side,
+        line: u32,
+        line_end: Option<u32>,
+    },
     /// The file as a whole.
     File { file: String },
     /// The review as a whole — the summary.
@@ -117,19 +133,45 @@ impl CommentAnchor {
         matches!(self, CommentAnchor::File { file: f } if f == file)
     }
 
-    /// Whether this line-level comment anchors to a diff line in `file` with the
-    /// given old/new line numbers (matched against the comment's side).
+    /// Whether this line-level comment **displays at** the diff line in `file`
+    /// with the given old/new line numbers (matched against the comment's
+    /// side). A range comment displays at its *last* line — the comment
+    /// interleaves after the span it covers, like a reviewer note under the
+    /// quoted block.
     pub fn anchors_line(&self, file: &str, old_no: Option<u32>, new_no: Option<u32>) -> bool {
         match self {
             CommentAnchor::Line {
                 file: f,
                 side,
                 line,
-            } if f == file => match side {
-                Side::New => new_no == Some(*line),
-                Side::Old => old_no == Some(*line),
-            },
+                line_end,
+            } if f == file => {
+                let at = line_end.unwrap_or(*line);
+                match side {
+                    Side::New => new_no == Some(at),
+                    Side::Old => old_no == Some(at),
+                }
+            }
             _ => false,
+        }
+    }
+
+    /// The `side:line` locator of a line anchor (`"new:10"`, or `"new:10-24"`
+    /// for a range); `None` for file/review anchors. One formatter shared by
+    /// the comment rows, the `@` popup, the compose header, and both handoff
+    /// compilers, so the location never renders inconsistently.
+    pub fn line_label(&self) -> Option<String> {
+        match self {
+            CommentAnchor::Line {
+                side,
+                line,
+                line_end,
+                ..
+            } => Some(match line_end {
+                Some(end) => format!("{}:{line}-{end}", side.as_str()),
+                None => format!("{}:{line}", side.as_str()),
+            }),
+            _ => None,
         }
     }
 }
@@ -191,8 +233,9 @@ pub struct DiffHunk {
     pub lines: Vec<DiffLine>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FileStatus {
+    #[default]
     Modified,
     Added,
     Deleted,
@@ -210,13 +253,24 @@ impl FileStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiffFile {
     /// New path (or the old path for a deletion).
     pub path: String,
     /// Old path, when it differs from `path` (a rename).
     pub old_path: Option<String>,
     pub status: FileStatus,
+    /// An **untracked** working-tree file synthesized into the Working target
+    /// (not produced by `git diff`). Rendered with a `?` glyph so it reads
+    /// apart from a staged add.
+    pub untracked: bool,
+    /// The diff withheld this file's body as binary (`Binary files … differ`
+    /// / `GIT binary patch`). Set by the parser only; the app layer turns it
+    /// into an explanatory [`Self::note`] (with the worktree size when cheap).
+    pub binary: bool,
+    /// An explanatory row rendered under the file header when the body is
+    /// withheld (an oversized or binary untracked file, a binary diff).
+    pub note: Option<String>,
     pub hunks: Vec<DiffHunk>,
 }
 
@@ -236,6 +290,102 @@ impl DiffFile {
             .filter(|l| l.kind == DiffLineKind::Del)
             .count()
     }
+
+    /// The status glyph shown in the file header and the changed-files tree —
+    /// `?` for an untracked file (vs `A` for a staged add), else the git
+    /// status letter.
+    pub fn glyph(&self) -> &'static str {
+        if self.untracked {
+            "?"
+        } else {
+            self.status.glyph()
+        }
+    }
+}
+
+/// Synthesize the all-added [`DiffFile`] for an **untracked** working-tree
+/// file from its content: one hunk, every line an addition numbered from 1.
+/// Pure so the Working-target synthesis is unit-testable without git.
+pub fn untracked_file_from_content(path: String, content: &str) -> DiffFile {
+    let lines: Vec<DiffLine> = content
+        .lines()
+        .enumerate()
+        .map(|(i, l)| DiffLine {
+            kind: DiffLineKind::Add,
+            old_no: None,
+            new_no: Some(i as u32 + 1),
+            text: l.to_string(),
+        })
+        .collect();
+    let hunks = if lines.is_empty() {
+        Vec::new()
+    } else {
+        vec![DiffHunk {
+            old_start: 0,
+            new_start: 1,
+            header: String::new(),
+            lines,
+        }]
+    };
+    DiffFile {
+        path,
+        status: FileStatus::Added,
+        untracked: true,
+        hunks,
+        ..Default::default()
+    }
+}
+
+// ── Semantic fingerprints ────────────────────────────────────────────────────
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// 64-bit FNV-1a step. Hand-rolled (a dozen lines) rather than a dependency
+/// because the digest is **persisted** (`review_marks.fingerprint`) and must
+/// stay comparable across builds/platforms — `std`'s `DefaultHasher` algorithm
+/// is explicitly not stable across Rust releases.
+fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+/// Fold one hunk's **semantic content** into the hash: the `+`/`-` line bodies
+/// with their signs, excluding the `@@` positions and context lines — so a pure
+/// line-shift (an unrelated edit above the hunk) keeps a "reviewed" mark valid,
+/// while any change to what was actually added/removed invalidates it.
+fn fnv1a_hunk(mut h: u64, hunk: &DiffHunk) -> u64 {
+    for l in &hunk.lines {
+        let sign: &[u8] = match l.kind {
+            DiffLineKind::Add => b"+",
+            DiffLineKind::Del => b"-",
+            DiffLineKind::Context => continue,
+        };
+        h = fnv1a(h, sign);
+        h = fnv1a(h, l.text.as_bytes());
+        h = fnv1a(h, b"\n");
+    }
+    h
+}
+
+/// Semantic fingerprint of a single hunk (see `fnv1a_hunk`), hex-encoded for
+/// TEXT-column storage. Stored with hunk-level "reviewed" marks and compared on
+/// every diff rebuild to drop marks whose content changed.
+pub fn hunk_fingerprint(hunk: &DiffHunk) -> String {
+    format!("{:016x}", fnv1a_hunk(FNV_OFFSET, hunk))
+}
+
+/// Semantic fingerprint of a whole file's diff — every hunk's `+`/`-` content
+/// in order. Stored with file-level "reviewed" marks.
+pub fn file_fingerprint(file: &DiffFile) -> String {
+    let mut h = FNV_OFFSET;
+    for hunk in &file.hunks {
+        h = fnv1a_hunk(h, hunk);
+    }
+    format!("{h:016x}")
 }
 
 /// Parse `git diff` unified output into a list of [`DiffFile`]s. Tolerant of the
@@ -261,6 +411,9 @@ pub fn parse_unified_diff(input: &str) -> Vec<DiffFile> {
                 path,
                 old_path: None,
                 status: FileStatus::Modified,
+                untracked: false,
+                binary: false,
+                note: None,
                 hunks: Vec::new(),
             });
             continue;
@@ -318,6 +471,9 @@ fn apply_file_metadata(f: &mut DiffFile, line: &str, in_hunk: bool) -> bool {
     } else if let Some(p) = line.strip_prefix("rename to ") {
         f.status = FileStatus::Renamed;
         f.path = p.to_string();
+    } else if line.starts_with("Binary files ") || line == "GIT binary patch" {
+        // git withheld the body; the app layer renders an explanatory row.
+        f.binary = true;
     } else if let Some(p) = line.strip_prefix("--- ").filter(|_| !in_hunk) {
         let p = p.trim();
         if p != "/dev/null" {
@@ -404,6 +560,137 @@ fn parse_start(s: &str) -> u32 {
         .unwrap_or(0)
 }
 
+// ── Word-level intra-line diff ───────────────────────────────────────────────
+
+/// Token cap for [`word_diff`]'s LCS: past this the O(n·m) table stops paying
+/// for itself on machine-generated lines; whole-line tint is fine there.
+const WORD_DIFF_MAX_TOKENS: usize = 200;
+
+/// Minimum shared-token ratio for [`word_diff`] to highlight: below it the
+/// lines are essentially unrelated and a whole-line tint reads clearer than
+/// confetti (revdiff's 30% gate).
+const WORD_DIFF_MIN_COMMON: f32 = 0.30;
+
+/// Char-index ranges `[start, end)` of a line's tokens: maximal runs of
+/// alphanumeric/`_` chars vs. runs of other non-space chars. Whitespace runs
+/// separate tokens but are **not** tokens themselves — a shared space must not
+/// count toward the relatedness ratio (every pair of code lines shares
+/// spaces), nor deserve its own highlight.
+fn token_spans(line: &str) -> Vec<(usize, usize)> {
+    #[derive(PartialEq, Clone, Copy)]
+    enum Class {
+        Word,
+        Symbol,
+        Space,
+    }
+    let class = |ch: char| {
+        if ch.is_whitespace() {
+            Class::Space
+        } else if ch.is_alphanumeric() || ch == '_' {
+            Class::Word
+        } else {
+            Class::Symbol
+        }
+    };
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut run: Option<(Class, usize)> = None;
+    let mut end = 0usize;
+    for (i, ch) in line.chars().enumerate() {
+        let c = class(ch);
+        if run.map(|(rc, _)| rc) != Some(c) {
+            if let Some((rc, start)) = run {
+                if rc != Class::Space {
+                    spans.push((start, i));
+                }
+            }
+            run = Some((c, i));
+        }
+        end = i + 1;
+    }
+    if let Some((rc, start)) = run {
+        if rc != Class::Space {
+            spans.push((start, end));
+        }
+    }
+    spans
+}
+
+/// A line's changed-token char ranges (`[start, end)`), merged when adjacent.
+pub type WordRanges = Vec<(usize, usize)>;
+
+/// Word-level diff of an aligned deletion/addition pair: the char ranges (in
+/// each line) of the tokens **not** shared between them, per a token-level
+/// LCS. Returns `None` when the lines share fewer than 30% of their tokens
+/// (unrelated lines) or a side is over the token cap — the caller falls back
+/// to the whole-line tint. Adjacent changed tokens are merged into one range.
+/// Pure; rendering applies the stronger background over these ranges.
+pub fn word_diff(old: &str, new: &str) -> Option<(WordRanges, WordRanges)> {
+    let a = token_spans(old);
+    let b = token_spans(new);
+    if a.is_empty()
+        || b.is_empty()
+        || a.len() > WORD_DIFF_MAX_TOKENS
+        || b.len() > WORD_DIFF_MAX_TOKENS
+    {
+        return None;
+    }
+    let tok = |line: &str, (s, e): (usize, usize)| -> String {
+        line.chars().skip(s).take(e - s).collect()
+    };
+    let ta: Vec<String> = a.iter().map(|&r| tok(old, r)).collect();
+    let tb: Vec<String> = b.iter().map(|&r| tok(new, r)).collect();
+
+    // Classic LCS table over tokens (lines are short; the cap bounds it).
+    let (n, m) = (ta.len(), tb.len());
+    let mut dp = vec![vec![0u16; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if ta[i] == tb[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let lcs = dp[0][0] as usize;
+    let ratio = (2 * lcs) as f32 / (n + m) as f32;
+    if ratio < WORD_DIFF_MIN_COMMON {
+        return None;
+    }
+
+    // Walk the table marking which tokens are common on each side.
+    let mut common_a = vec![false; n];
+    let mut common_b = vec![false; m];
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if ta[i] == tb[j] {
+            common_a[i] = true;
+            common_b[j] = true;
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+
+    let changed = |spans: &[(usize, usize)], common: &[bool]| -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for (k, &range) in spans.iter().enumerate() {
+            if common[k] {
+                continue;
+            }
+            match out.last_mut() {
+                Some(last) if last.1 == range.0 => last.1 = range.1,
+                _ => out.push(range),
+            }
+        }
+        out
+    };
+    Some((changed(&a, &common_a), changed(&b, &common_b)))
+}
+
 // ── Side-by-side pairing ─────────────────────────────────────────────────────
 
 /// One visual row of the paired (true side-by-side) layout: the old-side and
@@ -472,9 +759,14 @@ mod tests {
             assert_eq!(Classification::parse(c.as_str()), Some(c));
         }
         assert_eq!(Classification::parse("bogus"), None);
+        // Full Tab cycle from the default: Note → Issue → Suggestion →
+        // Question → Praise → Note.
+        assert_eq!(Classification::Note.next(), Classification::Issue);
         assert_eq!(Classification::Issue.next(), Classification::Suggestion);
-        assert_eq!(Classification::Issue.prev(), Classification::Praise);
-        assert_eq!(Classification::Praise.next(), Classification::Issue);
+        assert_eq!(Classification::Suggestion.next(), Classification::Question);
+        assert_eq!(Classification::Question.next(), Classification::Praise);
+        assert_eq!(Classification::Praise.next(), Classification::Note);
+        assert_eq!(Classification::Note.prev(), Classification::Praise);
     }
 
     #[test]
@@ -491,6 +783,7 @@ mod tests {
             file: "a.rs".into(),
             side: Side::New,
             line: 5,
+            line_end: None,
         };
         // Matches only the new-side number on the right file.
         assert!(new_line.anchors_line("a.rs", None, Some(5)));
@@ -503,6 +796,7 @@ mod tests {
             file: "a.rs".into(),
             side: Side::Old,
             line: 5,
+            line_end: None,
         };
         assert!(old_line.anchors_line("a.rs", Some(5), None));
         assert!(!old_line.anchors_line("a.rs", None, Some(5)));
@@ -510,6 +804,37 @@ mod tests {
         // The review summary anchors to neither a file nor a line.
         assert!(!CommentAnchor::Review.anchors_file("a.rs"));
         assert!(!CommentAnchor::Review.anchors_line("a.rs", Some(1), Some(1)));
+    }
+
+    #[test]
+    fn range_anchor_displays_at_its_last_line_and_labels_the_span() {
+        let range = CommentAnchor::Line {
+            file: "a.rs".into(),
+            side: Side::New,
+            line: 10,
+            line_end: Some(24),
+        };
+        // The comment interleaves after the span it covers — the end line, not
+        // the start or any interior line.
+        assert!(range.anchors_line("a.rs", None, Some(24)));
+        assert!(!range.anchors_line("a.rs", None, Some(10)));
+        assert!(!range.anchors_line("a.rs", None, Some(17)));
+        assert_eq!(range.line_label().as_deref(), Some("new:10-24"));
+
+        let single = CommentAnchor::Line {
+            file: "a.rs".into(),
+            side: Side::Old,
+            line: 3,
+            line_end: None,
+        };
+        assert_eq!(single.line_label().as_deref(), Some("old:3"));
+        assert_eq!(
+            CommentAnchor::File {
+                file: "a.rs".into()
+            }
+            .line_label(),
+            None
+        );
     }
 
     #[test]
@@ -564,6 +889,44 @@ index 111..222 100644
             .unwrap();
         assert_eq!(added.new_no, Some(2));
         assert_eq!(added.old_no, None);
+    }
+
+    /// Binary diffs (`Binary files … differ`, or `GIT binary patch` under
+    /// `--binary`) flag the file instead of leaving a bare bodyless header.
+    #[test]
+    fn parses_binary_diffs_as_binary_flagged_files() {
+        let diff = "\
+diff --git a/img.png b/img.png
+index 111..222 100644
+Binary files a/img.png and b/img.png differ
+diff --git a/src/foo.rs b/src/foo.rs
+index 333..444 100644
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -1 +1 @@
+-a
++b
+";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 2);
+        assert!(files[0].binary, "binary marker line sets the flag");
+        assert!(files[0].hunks.is_empty());
+        assert!(!files[1].binary, "the text file is unaffected");
+        assert_eq!(files[1].hunks.len(), 1);
+
+        let diff = "\
+diff --git a/img.png b/img.png
+new file mode 100644
+index 000..222
+GIT binary patch
+literal 95
+zcmZ?wbh9u|oWO
+";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].binary);
+        assert_eq!(files[0].status, FileStatus::Added);
+        assert!(files[0].hunks.is_empty(), "the base85 body is skipped");
     }
 
     #[test]
@@ -733,6 +1096,153 @@ index 1..2 100644
             header: String::new(),
             lines,
         }
+    }
+
+    /// Build a one-hunk file from explicit (kind, text) lines at the given
+    /// hunk start, for fingerprint tests.
+    fn file_with(start: u32, lines: &[(DiffLineKind, &str)]) -> DiffFile {
+        let (mut o, mut n) = (start, start);
+        let lines = lines
+            .iter()
+            .map(|(kind, text)| {
+                let (old, new) = match kind {
+                    DiffLineKind::Del => {
+                        let v = (Some(o), None);
+                        o += 1;
+                        v
+                    }
+                    DiffLineKind::Add => {
+                        let v = (None, Some(n));
+                        n += 1;
+                        v
+                    }
+                    DiffLineKind::Context => {
+                        let v = (Some(o), Some(n));
+                        o += 1;
+                        n += 1;
+                        v
+                    }
+                };
+                DiffLine {
+                    kind: *kind,
+                    old_no: old,
+                    new_no: new,
+                    text: (*text).to_string(),
+                }
+            })
+            .collect();
+        DiffFile {
+            path: "f.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            untracked: false,
+            binary: false,
+            note: None,
+            hunks: vec![DiffHunk {
+                old_start: start,
+                new_start: start,
+                header: String::new(),
+                lines,
+            }],
+        }
+    }
+
+    #[test]
+    fn word_diff_marks_changed_tokens_only() {
+        // One token changed: only `bar`→`baz` ranges are reported.
+        let (o, n) = word_diff("let foo = bar;", "let foo = baz;").unwrap();
+        assert_eq!(o, vec![(10, 13)]);
+        assert_eq!(n, vec![(10, 13)]);
+
+        // Identical lines: related, but nothing changed.
+        let (o, n) = word_diff("same line", "same line").unwrap();
+        assert!(o.is_empty() && n.is_empty());
+
+        // Adjacent changed tokens merge into one range: `a.b` → `x_y`
+        // changes every token of a 5-token line pair sharing " = ".
+        let (o, n) = word_diff("q = a.b", "q = x_y").unwrap();
+        assert_eq!(o, vec![(4, 7)], "a + . + b merged");
+        assert_eq!(n, vec![(4, 7)], "x_y is one word token");
+    }
+
+    #[test]
+    fn word_diff_gates_unrelated_lines_and_degenerates() {
+        // No shared tokens at all → None (whole-line tint reads clearer).
+        assert!(word_diff("alpha beta", "gamma delta").is_none());
+        // An empty side has no tokens → None.
+        assert!(word_diff("", "something").is_none());
+        // Over the token cap → None (skip the quadratic LCS).
+        let long = "x ".repeat(300);
+        assert!(word_diff(&long, &long).is_none());
+    }
+
+    #[test]
+    fn token_spans_split_word_and_symbol_runs() {
+        // "ab(cd_e)" → "ab", "(", "cd_e", ")": `_` glues words, symbols run
+        // separately.
+        assert_eq!(
+            token_spans("ab(cd_e)"),
+            vec![(0, 2), (2, 3), (3, 7), (7, 8)]
+        );
+        // Whitespace separates tokens but is not one.
+        assert_eq!(token_spans("a b"), vec![(0, 1), (2, 3)]);
+        assert!(token_spans("").is_empty());
+        assert!(token_spans("   ").is_empty());
+    }
+
+    #[test]
+    fn untracked_file_synthesizes_all_added_lines() {
+        let f = untracked_file_from_content("notes.txt".into(), "alpha\nbeta\n");
+        assert_eq!(f.status, FileStatus::Added);
+        assert!(f.untracked);
+        assert_eq!(f.glyph(), "?", "untracked reads apart from a staged add");
+        assert_eq!(f.added_count(), 2);
+        assert_eq!(f.deleted_count(), 0);
+        let h = &f.hunks[0];
+        assert_eq!(h.lines[0].new_no, Some(1));
+        assert_eq!(h.lines[1].new_no, Some(2));
+        assert_eq!(h.lines[0].old_no, None);
+        assert_eq!(h.lines[1].text, "beta");
+
+        // Empty content → header only, no empty hunk.
+        let empty = untracked_file_from_content("empty.txt".into(), "");
+        assert!(empty.hunks.is_empty());
+        // A tracked add keeps its status glyph.
+        assert_eq!(
+            DiffFile {
+                status: FileStatus::Added,
+                ..Default::default()
+            }
+            .glyph(),
+            "A"
+        );
+    }
+
+    #[test]
+    fn fingerprint_survives_pure_line_shift() {
+        use DiffLineKind::*;
+        // The same +/- content at different positions with different context —
+        // an unrelated edit above the hunk must keep the mark valid.
+        let a = file_with(10, &[(Context, "ctx a"), (Del, "old"), (Add, "new")]);
+        let b = file_with(50, &[(Context, "other ctx"), (Del, "old"), (Add, "new")]);
+        assert_eq!(file_fingerprint(&a), file_fingerprint(&b));
+        assert_eq!(hunk_fingerprint(&a.hunks[0]), hunk_fingerprint(&b.hunks[0]));
+    }
+
+    #[test]
+    fn fingerprint_changes_with_content_and_sign() {
+        use DiffLineKind::*;
+        let base = file_with(1, &[(Del, "old"), (Add, "new")]);
+        // Changed added content.
+        let edited = file_with(1, &[(Del, "old"), (Add, "different")]);
+        assert_ne!(file_fingerprint(&base), file_fingerprint(&edited));
+        // Same texts with flipped signs must differ (the sign is hashed).
+        let flipped = file_with(1, &[(Add, "old"), (Del, "new")]);
+        assert_ne!(file_fingerprint(&base), file_fingerprint(&flipped));
+        // Two lines "ab"+"c" vs "a"+"bc" must differ (per-line separator).
+        let ab_c = file_with(1, &[(Add, "ab"), (Add, "c")]);
+        let a_bc = file_with(1, &[(Add, "a"), (Add, "bc")]);
+        assert_ne!(file_fingerprint(&ab_c), file_fingerprint(&a_bc));
     }
 
     #[test]
