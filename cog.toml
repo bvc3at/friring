@@ -7,8 +7,8 @@ branch_whitelist = ["main"]
 ignore_merge_commits = true
 
 # List of valid commit scopes ("fork" = fork-specific: FORK.md, migration,
-# divergences from upstream)
-scopes = ["api", "cli", "ui", "git", "core", "docs", "deps", "config", "mcp", "fork"]
+# divergences from upstream; "review" = the code-review subsystem)
+scopes = ["api", "cli", "ui", "git", "core", "docs", "deps", "config", "mcp", "fork", "review"]
 
 # Tag prefix for semantic versioning
 tag_prefix = "v"
