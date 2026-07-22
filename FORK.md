@@ -431,6 +431,43 @@ the anthropic stub's `/api/oauth/usage` route, fed with scripted numbers from
 `demo-content.json` — otherwise every clip films "not logged in". Details in
 `docs/DEVELOPMENT.md` § Demo video.
 
+#### Dev-live: run a dev build against the real sessions
+
+Upstream (and the fork's sandbox) keeps dev builds fully isolated: a
+`-dev`-versioned binary compiles to the `friring-dev` socket, `friring-dev`
+tmux group session and `friring-dev` data dir, so it can never see an
+installed release's live sessions. The fork adds the deliberate escape hatch
+for verifying a feature against real workloads: a `FRIRING_TMUX_SESSION` env
+override for the local group-session name (`local_session()`, mirroring
+`FRIRING_SOCKET` — both are needed: the socket picks the server, the session
+picks the window group `discover()` scans; remote hosts keep their
+`hosts.toml` names). Since quitting friring only detaches (tmux keeps every
+agent alive) and startup re-adopts by window name/pane id, pointing a dev
+binary at the release socket + session + data + config attaches it to all
+live sessions — and quitting hands them back to the installed release.
+
+`scripts/dev/live.sh` (`just dev-live`) packages the workflow: build, refuse
+while any client is attached to the release server (no single-instance lock
+exists — two TUIs would fight over the same panes; the check repeats right
+before launch, since the build/backup window is wide enough to lose the race),
+back up `friring.db` (transactional `sqlite3 .backup`, **required** — a torn
+file copy can't be trusted as the recovery snapshot; migrations are
+forward-only and a dev branch may bump `SCHEMA_VERSION`), then launch the dev
+TUI with the four overrides set and `target/debug` first on `PATH`. The
+automation heartbeat that friring arms in the *already-running* release server
+(`ensure_automation_heartbeat`) now forwards the set `FRIRING_*` overrides into
+its window (`-e`), so a heartbeat created under dev-live ticks the live DB
+rather than the dev build's isolated default — a no-op on a normal launch where
+no overrides are set.
+
+`Ctrl+Alt+R` (`Action::ReloadApp`, fork-only) closes the loop in place:
+a normal quit followed by an `exec` of the on-disk binary — env (and so a
+dev-live attach) carried over, sessions re-adopted by the new image without
+the terminal ever returning to the shell. Rebuild, hit the chord, and the
+running instance *is* the new build. Details in `docs/CONFIG.md` (env
+table), `docs/DEVELOPMENT.md` ("Live mode"), and `docs/FEATURES.md`
+("Reload friring in place").
+
 #### Terminal-first focus
 
 Upstream starts focused on the session list, and clicking a session row
@@ -532,6 +569,18 @@ Keys and flow are documented in `docs/FEATURES.md`; the back-navigation
 interplay with ADR-P12 in `docs/PERFORMANCE.md`.
 
 ### Behavior fixes
+
+- **A database written by a newer friring is refused, not silently opened.**
+  Upstream's schema migrations are forward-only and unguarded: a binary opening
+  a DB whose stored `schema_version` is *higher* than its own ran no steps and
+  proceeded anyway, deferring the breakage to whichever later query hit a
+  rebuilt/dropped column (or to silent bad data). The fork's `initialize`
+  (`src/storage/schema.rs`, `reject_newer_schema`) now errors **before any
+  DDL** — so the `CREATE … IF NOT EXISTS` batch can't recreate a table the
+  newer schema dropped — with the two ways out: upgrade the binary or restore
+  the pre-upgrade backup. Chiefly hit by relaunching the release binary after a
+  schema-bumping dev build ran on the real DB via `scripts/dev/live.sh` (which
+  backs the DB up first for exactly this reason).
 
 - **Cancelled multi-repo flow no longer leaks `additional_dirs`.** The
   new-session-name cancel left the wizard's derived extra dirs populated, so

@@ -51,6 +51,53 @@ const TMUX_SESSION: &str = if cfg!(dev_build) {
     "friring"
 };
 
+/// Env var overriding the **local** tmux group-session name.
+///
+/// The compile-time flavor split above is what keeps a dev build away from an
+/// installed release's sessions; this override is the deliberate escape hatch
+/// that lets a dev binary adopt the release server's live sessions —
+/// `scripts/dev/live.sh` sets it together with [`SOCKET_OVERRIDE_ENV`] (both
+/// are needed: the socket picks the server, the session picks the window group
+/// `discover()` scans). Remote hosts are unaffected (their session name comes
+/// from `hosts.toml`).
+pub const SESSION_OVERRIDE_ENV: &str = "FRIRING_TMUX_SESSION";
+
+/// The local group-session name: [`SESSION_OVERRIDE_ENV`] when set and
+/// non-empty, else the compile-time default. Empty counts as unset, matching
+/// [`local_socket`].
+fn local_session() -> String {
+    std::env::var(SESSION_OVERRIDE_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| TMUX_SESSION.to_string())
+}
+
+/// The friring state-locating env overrides currently set in this process
+/// (socket, group session, data dir, config dir — empty = unset). Forwarded
+/// into detached windows friring itself spawns in the *already-running* tmux
+/// server (the heartbeat keeper), so they resolve the same state as the friring
+/// that armed them rather than the server's stale launch-time environment.
+/// Chiefly matters under `scripts/dev/live.sh`, where a dev binary drives the
+/// release server: without this, a heartbeat it creates would tick the isolated
+/// `friring-dev` DB. Empty on a normal launch (no overrides), so the window is
+/// spawned exactly as before.
+fn live_env_overrides() -> Vec<(&'static str, String)> {
+    [
+        SOCKET_OVERRIDE_ENV,
+        SESSION_OVERRIDE_ENV,
+        crate::paths::DATA_DIR_OVERRIDE_ENV,
+        crate::paths::CONFIG_DIR_OVERRIDE_ENV,
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        std::env::var(key)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(|v| (key, v))
+    })
+    .collect()
+}
+
 /// Build a [`Command`] for the local multiplexer on the friring socket:
 /// `<DEFAULT_MUX> -L <TMUX_SOCKET> <args…>`. The headless one-shot helpers below
 /// (send/capture/spawn/kill/heartbeat) bypass the [`TmuxTransport`] seam — they
@@ -117,7 +164,7 @@ pub(crate) fn shell_window_name(session_name: &str) -> String {
 /// `tb-foo-bar` exist — `send-keys`/`capture-pane` then fails with
 /// "ambiguous window" and the caller's text is silently dropped.
 fn window_target(session_name: &str) -> String {
-    format!("{TMUX_SESSION}:={}", agent_window_name(session_name))
+    format!("{}:={}", local_session(), agent_window_name(session_name))
 }
 
 /// Minimum tmux version required.
@@ -589,7 +636,7 @@ impl TmuxBackend {
         Self {
             transport: TmuxTransport::Local,
             socket: local_socket(),
-            session: TMUX_SESSION.to_string(),
+            session: local_session(),
             name: "local-tmux".to_string(),
             control: Mutex::new(None),
         }
@@ -1476,9 +1523,14 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 60;
 /// List the window names in the friring tmux session (empty if the server is
 /// not running).
 fn list_window_names() -> Vec<String> {
-    let Ok(out) =
-        local_mux_command(&["list-windows", "-t", TMUX_SESSION, "-F", "#{window_name}"]).output()
-    else {
+    let Ok(out) = local_mux_command(&[
+        "list-windows",
+        "-t",
+        &local_session(),
+        "-F",
+        "#{window_name}",
+    ])
+    .output() else {
         return Vec::new();
     };
     if !out.status.success() {
@@ -1572,17 +1624,28 @@ pub fn ensure_automation_heartbeat(cli_path: &Path) -> Result<()> {
         return Ok(());
     }
     let loop_cmd = heartbeat_loop_command(cli_path);
-    let status = local_mux_command(&[
-        "new-window",
-        "-d",
-        "-t",
-        TMUX_SESSION,
-        "-n",
-        HEARTBEAT_WINDOW,
-        &loop_cmd,
-    ])
-    .status()
-    .context("Failed to create automation heartbeat window")?;
+    let session = local_session();
+    // Forward the live-mode overrides so the keeper's `friring-cli` targets the
+    // same DB/socket as the friring that armed it, not the tmux server's
+    // launch-time env (see `live_env_overrides`). `-e` is honored by tmux; on
+    // psmux it is ignored, same as before this forwarding existed.
+    let mut args: Vec<String> = vec![
+        "new-window".into(),
+        "-d".into(),
+        "-t".into(),
+        session,
+        "-n".into(),
+        HEARTBEAT_WINDOW.into(),
+    ];
+    for (key, value) in live_env_overrides() {
+        args.push("-e".into());
+        args.push(format!("{key}={value}"));
+    }
+    args.push(loop_cmd);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let status = local_mux_command(&arg_refs)
+        .status()
+        .context("Failed to create automation heartbeat window")?;
     if !status.success() {
         bail!("tmux new-window (heartbeat) exited with status {status}");
     }
@@ -1712,7 +1775,7 @@ pub fn spawn_window(
         "new-window",
         "-d",
         "-t",
-        &format!("{TMUX_SESSION}:"),
+        &format!("{}:", local_session()),
         "-n",
         &window_name,
     ]);
@@ -2004,6 +2067,72 @@ mod tests {
         assert_eq!(local_socket(), TMUX_SOCKET);
         std::env::remove_var(SOCKET_OVERRIDE_ENV);
         assert_eq!(local_socket(), TMUX_SOCKET);
+    }
+
+    #[test]
+    fn local_session_honors_env_override() {
+        // nextest runs one process per test, so env mutation can't race other
+        // tests reading `local_session()`.
+        std::env::set_var(SESSION_OVERRIDE_ENV, "friring-live-test");
+        assert_eq!(local_session(), "friring-live-test");
+        assert_eq!(TmuxBackend::local().session, "friring-live-test");
+        // The remote fallback stays on the compile-time flavor: a local
+        // live-attach override must not leak into `hosts.toml` defaults.
+        let host = crate::session::HostDef {
+            name: "devbox".into(),
+            destination: "me@devbox".into(),
+            ..Default::default()
+        };
+        assert_eq!(TmuxBackend::from_host(&host).session, TMUX_SESSION);
+        // Empty counts as unset, matching `local_socket()`.
+        std::env::set_var(SESSION_OVERRIDE_ENV, "");
+        assert_eq!(local_session(), TMUX_SESSION);
+        std::env::remove_var(SESSION_OVERRIDE_ENV);
+        assert_eq!(local_session(), TMUX_SESSION);
+    }
+
+    #[test]
+    fn live_env_overrides_collects_only_set_vars() {
+        // nextest isolates each test in its own process, so these env mutations
+        // can't race another test.
+        for key in [
+            SOCKET_OVERRIDE_ENV,
+            SESSION_OVERRIDE_ENV,
+            crate::paths::DATA_DIR_OVERRIDE_ENV,
+            crate::paths::CONFIG_DIR_OVERRIDE_ENV,
+        ] {
+            std::env::remove_var(key);
+        }
+        // No overrides → nothing forwarded (a normal launch spawns as before).
+        assert!(live_env_overrides().is_empty());
+
+        std::env::set_var(SOCKET_OVERRIDE_ENV, "friring");
+        std::env::set_var(SESSION_OVERRIDE_ENV, "friring");
+        std::env::set_var(crate::paths::DATA_DIR_OVERRIDE_ENV, "/live/data");
+        // Empty counts as unset, so it is not forwarded.
+        std::env::set_var(crate::paths::CONFIG_DIR_OVERRIDE_ENV, "");
+
+        let got = live_env_overrides();
+        assert_eq!(
+            got,
+            vec![
+                (SOCKET_OVERRIDE_ENV, "friring".to_string()),
+                (SESSION_OVERRIDE_ENV, "friring".to_string()),
+                (
+                    crate::paths::DATA_DIR_OVERRIDE_ENV,
+                    "/live/data".to_string()
+                ),
+            ]
+        );
+
+        for key in [
+            SOCKET_OVERRIDE_ENV,
+            SESSION_OVERRIDE_ENV,
+            crate::paths::DATA_DIR_OVERRIDE_ENV,
+            crate::paths::CONFIG_DIR_OVERRIDE_ENV,
+        ] {
+            std::env::remove_var(key);
+        }
     }
 
     #[test]

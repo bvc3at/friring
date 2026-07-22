@@ -63,7 +63,8 @@ rumdl check .                        # markdown lint (.rumdl.toml)
 cargo test --test architecture_rules # module-boundary enforcement (below)
 ```
 
-Full dev environment, the isolated sandbox (`scripts/dev/sandbox.sh`), the e2e
+Full dev environment, the isolated sandbox (`scripts/dev/sandbox.sh`), live
+mode (`just dev-live` — the dev build against your **real** sessions), the e2e
 harnesses, and demo recording live in **`docs/DEVELOPMENT.md`**.
 
 ## Architecture (do not break)

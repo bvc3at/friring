@@ -625,6 +625,8 @@ impl App {
                 crate::session::Action::FocusForward
                     | crate::session::Action::FocusBackward
                     | crate::session::Action::QuitApp
+                    // `ReloadApp` (quit + re-exec) escapes like `QuitApp`.
+                    | crate::session::Action::ReloadApp
             )
         );
         if passthrough {

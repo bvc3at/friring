@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version. Incremented when schema changes.
 ///
@@ -38,6 +38,13 @@ pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
     // Must come first: the WAL pragma below itself needs the write lock.
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    // Refuse a DB from a *newer* binary BEFORE any DDL runs: the
+    // `CREATE TABLE/INDEX IF NOT EXISTS` batch below would recreate a table a
+    // newer schema had dropped, and a column a newer schema removed would
+    // otherwise surface as a generic `no such column` mid-session instead of
+    // this actionable error. Only an existing DB is checked (a fresh one has no
+    // metadata yet and falls through to normal setup).
+    reject_newer_schema(conn)?;
     conn.execute_batch("PRAGMA journal_mode = WAL;")?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     // Performance pragmas (safe under WAL):
@@ -246,6 +253,50 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
 
     migrate(conn)?;
 
+    Ok(())
+}
+
+/// Refuse to open a database written by a *newer* friring. Migrations are
+/// forward-only, so nothing can downgrade a newer schema, and reading it with
+/// an older binary risks a query error mid-session (a rebuilt/dropped column)
+/// or silent bad data. Run before any DDL (see [`initialize`]) so the guard
+/// fires before `CREATE … IF NOT EXISTS` can mutate the file. A DB without a
+/// `metadata` table is treated as fresh (version 0) and allowed. Typically hit
+/// by relaunching a release binary after a schema-bumping dev build ran against
+/// the real DB — `scripts/dev/live.sh` makes a restorable backup first.
+fn reject_newer_schema(conn: &Connection) -> rusqlite::Result<()> {
+    let has_metadata = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_metadata {
+        return Ok(());
+    }
+    let version: u32 = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'schema_version'",
+            [],
+            |row| {
+                let val: String = row.get(0)?;
+                Ok(val.parse().unwrap_or(0))
+            },
+        )
+        .optional()?
+        .unwrap_or(0);
+    if version > SCHEMA_VERSION {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some(format!(
+                "database schema is v{version} but this binary supports up to \
+                 v{SCHEMA_VERSION} — a newer friring wrote it; upgrade this \
+                 binary or restore the pre-upgrade DB backup"
+            )),
+        ));
+    }
     Ok(())
 }
 
@@ -1258,6 +1309,65 @@ mod tests {
         assert!(!tables.contains(&"mcp_servers".to_string()));
         assert!(!tables.contains(&"skills".to_string()));
         assert!(!tables.contains(&"profiles".to_string()));
+    }
+
+    /// Snapshot of every object in `sqlite_master` (name + exact DDL), used to
+    /// prove `initialize` leaves an incompatible newer DB byte-for-byte intact.
+    fn schema_snapshot(conn: &Connection) -> Vec<(String, String)> {
+        conn.prepare("SELECT name, COALESCE(sql, '') FROM sqlite_master ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn initialize_refuses_newer_schema_without_touching_it() {
+        // Exercise the production open path (`initialize`, which runs the full
+        // DDL batch) on a *file* DB, not `migrate` in isolation — the guard has
+        // to fire before that batch can recreate a dropped table.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("newer.db");
+
+        // Seed a current schema, then forge a newer version plus a future-shaped
+        // table the current binary knows nothing about.
+        {
+            let conn = Connection::open(&path).unwrap();
+            initialize(&conn).unwrap();
+            conn.execute(
+                "UPDATE metadata SET value = ?1 WHERE key = 'schema_version'",
+                [(SCHEMA_VERSION + 1).to_string()],
+            )
+            .unwrap();
+            conn.execute_batch("CREATE TABLE zzz_future_only (x TEXT);")
+                .unwrap();
+        }
+
+        let before = {
+            let conn = Connection::open(&path).unwrap();
+            schema_snapshot(&conn)
+        };
+
+        // Reopening refuses with an actionable, version-naming error.
+        let conn = Connection::open(&path).unwrap();
+        let err = initialize(&conn).unwrap_err().to_string();
+        assert!(
+            err.contains("newer friring") && err.contains(&(SCHEMA_VERSION + 1).to_string()),
+            "expected the newer-DB refusal naming the version, got: {err}"
+        );
+
+        // Nothing was created, dropped, or rewritten — the newer binary can
+        // still open its own DB, and the stored version is untouched.
+        assert_eq!(schema_snapshot(&conn), before);
+        let stored: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, (SCHEMA_VERSION + 1).to_string());
     }
 
     #[test]
