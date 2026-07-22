@@ -316,6 +316,37 @@ mod tests {
         assert_eq!(c.subagents, 1);
         assert_eq!(c.other, 1);
         assert_eq!(c.total(), 8);
+        assert_eq!(c.prompts, 0);
+        assert_eq!(c.failed, 0);
+    }
+
+    #[test]
+    fn counts_separate_prompts_skip_minor_and_track_failures() {
+        let with = |kind, ok: Option<bool>, minor: bool| ActivityEvent {
+            ts_ms: None,
+            kind,
+            detail: "x".into(),
+            note: None,
+            result_head: None,
+            ok,
+            origin: None,
+            minor,
+            dur_ms: None,
+        };
+        let events = [
+            with(ActionKind::Prompt, None, false), // a turn, not an action
+            with(ActionKind::Command, Some(true), false), // ok command
+            with(ActionKind::Command, Some(false), false), // failed command → failed++
+            with(ActionKind::Read, Some(false), true), // minor + failed → ignored
+            with(ActionKind::Edit, None, false),   // no outcome recorded
+        ];
+        let c = ActivityCounts::tally(&events);
+        assert_eq!(c.prompts, 1, "prompts tallied apart");
+        assert_eq!(c.commands, 2);
+        assert_eq!(c.edits, 1);
+        assert_eq!(c.reads, 0, "minor bookkeeping is excluded from tiles");
+        assert_eq!(c.failed, 1, "only the non-minor failure counts");
+        assert_eq!(c.total(), 3, "prompts and minor rows are not actions");
     }
 
     #[test]

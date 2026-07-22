@@ -633,14 +633,17 @@ fn scan_claude(
             src.scan.ingest(chunk)
         })
         .unwrap_or_else(|| {
-            // Shrunk (rotated/rewritten): reset the streaming parser and re-ingest.
+            // Shrunk (rotated/rewritten/cleared): reset the streaming parser and
+            // re-ingest. The reset itself is a change — the prior events are now
+            // gone — so force a merge rebuild even when the rewrite is empty and
+            // the re-ingest reads nothing, else `merged` would keep stale rows.
             src.scan = ClaudeScan::default();
             src.offset = 0;
             src.backfilling = false;
-            tail_source(&path, sig, &mut src.offset, &mut src.backfilling, |chunk| {
+            let _ = tail_source(&path, sig, &mut src.offset, &mut src.backfilling, |chunk| {
                 src.scan.ingest(chunk)
-            })
-            .unwrap_or(false)
+            });
+            true
         });
     }
     changed |= sync_claude_subs(src, subs);
@@ -683,17 +686,19 @@ fn sync_claude_subs(src: &mut ClaudeSource, subs: &[(PathBuf, String)]) -> bool 
             |chunk| tail.scan.ingest(chunk),
         )
         .unwrap_or_else(|| {
+            // Shrink resets this tail — a change even if the re-ingest is empty
+            // (see the main-transcript path), so the merge drops its stale rows.
             tail.scan = ClaudeScan::default();
             tail.offset = 0;
             tail.backfilling = false;
-            tail_source(
+            let _ = tail_source(
                 path,
                 &mut tail.sig,
                 &mut tail.offset,
                 &mut tail.backfilling,
                 |chunk| tail.scan.ingest(chunk),
-            )
-            .unwrap_or(false)
+            );
+            true
         });
         changed |= ingested;
     }
@@ -794,7 +799,11 @@ fn scan_vibe(src: &mut VibeSource, sig: &mut u64, root: Option<&Path>, dirs: &[S
     let messages = dir.join("messages.jsonl");
     let meta_path = dir.join("meta.json");
     let new_sig = stat_signature(&[&messages, &meta_path]);
-    if new_sig == *sig {
+    // While a large transcript is still draining, keep scanning even on an
+    // unchanged signature — else the outer gate would strand the backlog and
+    // the loader would never resolve (the inner per-call sig is fresh-zero, so
+    // only this gate protects the pass).
+    if new_sig == *sig && !src.backfilling {
         return false;
     }
     // meta.json is small and atomically replaced — re-parse on any change.
@@ -1303,7 +1312,14 @@ fn turns_line(c: &ActivityCounts, events: &[ActivityEvent]) -> Option<String> {
         1 => parts.push("1 turn".to_string()),
         n => parts.push(format!("{n} turns")),
     }
-    if let Some(ts) = events.iter().rev().find_map(|e| e.ts_ms) {
+    // The last *action* — not a turn marker or bookkeeping row — so a freshly
+    // submitted prompt can't misreport when the agent last did work.
+    if let Some(ts) = events
+        .iter()
+        .rev()
+        .filter(|e| e.kind != ActionKind::Prompt && !e.minor)
+        .find_map(|e| e.ts_ms)
+    {
         parts.push(format!("last action {}", fmt_time(ts)));
     }
     (!parts.is_empty()).then(|| format!(" {}", parts.join(" · ")))
@@ -1622,7 +1638,7 @@ mod tests {
             concat!(
                 r#"{"type":"user","timestamp":"2026-07-08T12:00:00.000Z","message":{"role":"user","content":"Fix the tests"}}"#,
                 "\n",
-                r#"{"type":"assistant","timestamp":"2026-07-08T12:00:01.000Z","message":{"id":"m1","usage":{"output_tokens":20,"cache_read_input_tokens":200},"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+                r#"{"type":"assistant","timestamp":"2026-07-08T12:00:01.000Z","message":{"id":"m1","usage":{"output_tokens":20,"input_tokens":3,"cache_read_input_tokens":200,"cache_creation_input_tokens":40},"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
                 "\n",
                 r#"{"type":"assistant","timestamp":"2026-07-08T12:00:02.000Z","message":{"content":[{"type":"tool_use","id":"t2","name":"Task","input":{"description":"Explore backend","subagent_type":"Explore"}}]}}"#,
                 "\n",
@@ -1636,7 +1652,7 @@ mod tests {
                 // The subagent's task prompt must NOT become a turn marker.
                 r#"{"type":"user","timestamp":"2026-07-08T12:00:03.000Z","message":{"role":"user","content":"Explore the backend"}}"#,
                 "\n",
-                r#"{"type":"assistant","timestamp":"2026-07-08T12:00:04.000Z","message":{"id":"sm1","usage":{"output_tokens":10,"cache_read_input_tokens":100},"content":[{"type":"tool_use","id":"s1","name":"Read","input":{"file_path":"/repo/b.rs"}}]}}"#,
+                r#"{"type":"assistant","timestamp":"2026-07-08T12:00:04.000Z","message":{"id":"sm1","usage":{"output_tokens":10,"input_tokens":2,"cache_read_input_tokens":100,"cache_creation_input_tokens":5},"content":[{"type":"tool_use","id":"s1","name":"Read","input":{"file_path":"/repo/b.rs"}}]}}"#,
                 "\n",
             ),
         )
@@ -1672,7 +1688,9 @@ mod tests {
         };
         let meta = act.meta();
         assert_eq!(meta.output_tokens, Some(30), "main 20 + subagent 10");
+        assert_eq!(meta.input_tokens, Some(5), "main 3 + subagent 2");
         assert_eq!(meta.cache_read_tokens, Some(300), "main 200 + sub 100");
+        assert_eq!(meta.cache_write_tokens, Some(45), "main 40 + subagent 5");
         let ProviderScan::Claude(mut src) = act.scan else {
             unreachable!()
         };
@@ -1959,5 +1977,216 @@ mod tests {
             panic!("event block");
         };
         assert_eq!(last.detail, "/a.rs");
+    }
+
+    #[test]
+    fn timeline_folding_covers_searches_minor_and_boundaries() {
+        let mk = |kind, detail: &str, origin: Option<&str>, minor: bool| ActivityEvent {
+            ts_ms: None,
+            kind,
+            detail: detail.into(),
+            note: None,
+            result_head: None,
+            ok: None,
+            origin: origin.map(String::from),
+            minor,
+            dur_ms: None,
+        };
+        // Searches fold; a changed detail breaks the run; bookkeeping (minor)
+        // folds; and a differing origin is a separate run even at equal detail.
+        let events = vec![
+            mk(ActionKind::Search, "fn main", None, false),
+            mk(ActionKind::Search, "fn main", None, false),
+            mk(ActionKind::Search, "fn other", None, false), // detail changed → new row
+            mk(ActionKind::Other, "TodoWrite", None, true),
+            mk(ActionKind::Other, "TodoWrite", None, true), // minor run folds
+            mk(ActionKind::Read, "/a.rs", None, false),
+            mk(ActionKind::Read, "/a.rs", Some("sub"), false), // origin differs → separate
+        ];
+        let details: Vec<String> = timeline_blocks(&events)
+            .iter()
+            .map(|b| match b {
+                TranscriptBlock::Event(e) => e.detail.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            details,
+            vec![
+                "fn main  ×2".to_string(),
+                "fn other".to_string(),
+                "TodoWrite  ×2".to_string(),
+                "/a.rs".to_string(),
+                "/a.rs".to_string(), // not folded across the origin boundary
+            ]
+        );
+    }
+
+    #[test]
+    fn turns_line_last_action_ignores_prompts_and_minor() {
+        let ev = |kind, ts: u64, minor: bool| ActivityEvent {
+            ts_ms: Some(ts),
+            kind,
+            detail: "x".into(),
+            note: None,
+            result_head: None,
+            ok: None,
+            origin: None,
+            minor,
+            dur_ms: None,
+        };
+        // A command at T, then a bookkeeping row and a fresh prompt after it —
+        // "last action" must report the command's time, not the later rows.
+        let base = 1_783_512_000_000;
+        let events = vec![
+            ev(ActionKind::Command, base, false),
+            ev(ActionKind::Other, base + 60_000, true), // minor
+            ev(ActionKind::Prompt, base + 120_000, false),
+        ];
+        let counts = ActivityCounts::tally(&events);
+        let line = turns_line(&counts, &events).expect("a turn was counted");
+        assert!(line.contains("1 turn"), "{line}");
+        assert!(
+            line.contains(&format!("last action {}", fmt_time(base))),
+            "last action must be the command, not the prompt/minor: {line}"
+        );
+    }
+
+    #[test]
+    fn scan_claude_clears_merged_events_on_empty_rewrite() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let projects = tmp.path().join("projects");
+        let slug = projects.join("-repo-a");
+        std::fs::create_dir_all(&slug).expect("mkdir");
+        let transcript = slug.join("sid-1.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#
+                .to_string()
+                + "\n",
+        )
+        .expect("write");
+        let mut src = ClaudeSource::default();
+        let mut sig = 0u64;
+        assert!(scan_claude(
+            &mut src,
+            &mut sig,
+            Some(&projects),
+            Some("sid-1"),
+            &[]
+        ));
+        assert_eq!(src.merged.len(), 1);
+
+        // The transcript is cleared (rotation / deletion / truncate): the merged
+        // stream must drop the vanished event, not keep displaying it.
+        std::fs::write(&transcript, "").expect("truncate to empty");
+        assert!(
+            scan_claude(&mut src, &mut sig, Some(&projects), Some("sid-1"), &[]),
+            "an emptying rewrite is a change"
+        );
+        assert!(src.scan.events.is_empty());
+        assert!(
+            src.merged.is_empty(),
+            "stale events must not survive an empty rewrite"
+        );
+    }
+
+    #[test]
+    fn scan_vibe_drains_large_backfill_across_unchanged_passes() {
+        // A backlog larger than INGEST_CHUNK must keep draining over successive
+        // passes even though the file never changes again — regression for the
+        // outer signature gate stranding the tail (the loader would hang).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("session");
+        let dir = root.join("session_20260712_100000_aaaaaaaa");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"session_id":"s","environment":{"working_directory":"/repo/a"}}"#,
+        )
+        .expect("meta");
+        let line = r#"{"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"bash","arguments":"{\"command\": \"ls\"}"},"type":"function"}]}"#
+            .to_string()
+            + "\n";
+        let repeats = (INGEST_CHUNK as usize / line.len()) + 500;
+        std::fs::write(dir.join("messages.jsonl"), line.repeat(repeats)).expect("messages");
+        let file_len = std::fs::metadata(dir.join("messages.jsonl")).unwrap().len();
+
+        let dirs = vec!["/repo/a".to_string()];
+        let mut src = VibeSource::default();
+        let mut sig = 0u64;
+        assert!(scan_vibe(&mut src, &mut sig, Some(&root), &dirs));
+        assert!(src.backfilling, "one pass cannot drain a >8 MiB transcript");
+        assert!(src.offset < file_len);
+
+        let mut passes = 0;
+        while src.backfilling && passes < 8 {
+            scan_vibe(&mut src, &mut sig, Some(&root), &dirs);
+            passes += 1;
+        }
+        assert!(
+            !src.backfilling,
+            "unchanged-file passes must keep draining the backlog"
+        );
+        assert_eq!(src.offset, file_len, "every byte was eventually ingested");
+        assert_eq!(src.scan.events.len(), repeats);
+    }
+
+    #[test]
+    fn claude_sub_sources_lists_standalone_and_workflow_agents() {
+        use crate::session::{CcActivity, CcAgent, CcAgentState, CcRunStatus, CcWorkflow};
+        let agent = |id: &str, path: &str, label: Option<&str>, atype: &str| CcAgent {
+            agent_id: id.into(),
+            transcript_path: PathBuf::from(path),
+            agent_type: atype.into(),
+            description: None,
+            label: label.map(String::from),
+            phase_title: None,
+            state: CcAgentState::Done,
+            mtime_ns: 0,
+            size: 0,
+            tokens: None,
+            tool_calls: None,
+            last_tool: None,
+            model: None,
+        };
+        let mut info = SessionInfo::new("s".into());
+        info.cc_activity = Some(CcActivity {
+            subagents: vec![agent(
+                "a1",
+                "/p/sid/subagents/agent-a1.jsonl",
+                None,
+                "Explore",
+            )],
+            workflows: vec![CcWorkflow {
+                run_id: "wf_1".into(),
+                name: None,
+                dir: PathBuf::from("/p/sid/subagents/workflows/wf_1"),
+                status: CcRunStatus::Completed,
+                phases: Vec::new(),
+                agents: vec![agent(
+                    "w1",
+                    "/p/sid/subagents/workflows/wf_1/agent-w1.jsonl",
+                    Some("fixer"),
+                    "general-purpose",
+                )],
+                summary: None,
+                tempo: None,
+                needs: None,
+            }],
+        });
+        let subs = claude_sub_sources(&info);
+        // Both a standalone subagent AND a workflow-spawned agent become tail
+        // sources (the latter was the "workflow events disappear" gap); the
+        // completion label wins over agent_type as the origin.
+        assert_eq!(subs.len(), 2);
+        assert!(subs.contains(&(
+            PathBuf::from("/p/sid/subagents/agent-a1.jsonl"),
+            "Explore".to_string()
+        )));
+        assert!(subs.contains(&(
+            PathBuf::from("/p/sid/subagents/workflows/wf_1/agent-w1.jsonl"),
+            "fixer".to_string()
+        )));
     }
 }

@@ -59,7 +59,9 @@ fn tone_style(tone: Tone) -> Style {
 }
 
 /// Overview stat tiles: `⟨glyph⟩ ⟨value⟩ ⟨label⟩`, triple-spaced, wrapped by
-/// whole tiles so nothing ever clips at the pane edge.
+/// whole tiles so nothing ever clips at the pane edge. A lone tile wider than
+/// the pane is emitted with its label dropped (glyph + value alone), so even a
+/// very narrow pane stays within `width`.
 fn tiles_lines(tiles: &[StatTile], width: usize) -> Vec<Line<'static>> {
     let tile_width = |t: &StatTile| 2 + t.value.chars().count() + 1 + t.label.len();
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -84,8 +86,13 @@ fn tiles_lines(tiles: &[StatTile], width: usize) -> Vec<Line<'static>> {
             t.value.clone(),
             Style::default().add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(format!(" {}", t.label), dim()));
-        used += w;
+        // Drop the label if this lone tile would otherwise overrun the pane.
+        if used + w <= width {
+            spans.push(Span::styled(format!(" {}", t.label), dim()));
+            used += w;
+        } else {
+            used += 2 + t.value.chars().count();
+        }
     }
     if spans.len() > 1 {
         out.push(Line::from(spans));
@@ -100,7 +107,13 @@ fn tiles_lines(tiles: &[StatTile], width: usize) -> Vec<Line<'static>> {
 fn spark_lines(spark: &SparkRow, width: usize) -> Vec<Line<'static>> {
     const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let labels = 1 + spark.start.chars().count() + 1 + 1 + spark.end.chars().count();
-    let avail = width.saturating_sub(labels).max(8).min(spark.buckets.len());
+    // Size the glyph run strictly from the space left beside the labels (no
+    // minimum) so a narrow pane downsamples instead of overrunning. When the
+    // labels alone don't fit, drop the whole spark to a wrapped caption line.
+    let avail = width.saturating_sub(labels).min(spark.buckets.len());
+    if avail < 2 {
+        return caption_only(&spark.caption, width);
+    }
     let buckets = downsample_max(&spark.buckets, avail);
     let max = buckets.iter().copied().max().unwrap_or(0).max(1);
     let glyph_run: String = buckets
@@ -124,11 +137,15 @@ fn spark_lines(spark: &SparkRow, width: usize) -> Vec<Line<'static>> {
         line.push(Span::styled(caption, dim()));
         vec![Line::from(line)]
     } else {
-        vec![
-            Line::from(line),
-            Line::from(Span::styled(format!(" {}", spark.caption), dim())),
-        ]
+        let mut out = vec![Line::from(line)];
+        out.extend(caption_only(&spark.caption, width));
+        out
     }
+}
+
+/// The sparkline caption on its own line(s), wrapped to `width`.
+fn caption_only(caption: &str, width: usize) -> Vec<Line<'static>> {
+    body_lines(&format!(" {caption}"), dim(), true, 0, width, None)
 }
 
 /// Max-pool `buckets` into `cells` slots (peaks survive a squeeze).
@@ -481,8 +498,9 @@ fn event_lines(
         format!("{:<5} ", e.kind.tag()),
         if e.minor { dim() } else { event_style(e.kind) },
     ));
-    // Build the suffixes first so the detail budget accounts for their exact
-    // width — the ✗ / ▸ markers must never fall off the pane edge.
+    // Suffixes in DROP order (lowest priority first): a tight row sheds the
+    // duration then the origin before the failure/fold markers, so ✗ / ▸ — the
+    // load-bearing signals — stay on the row and it never runs past the edge.
     let has_body = e.note.is_some() || e.result_head.is_some() || e.origin.is_some();
     let mut suffixes: Vec<Span<'static>> = Vec::new();
     if let Some(d) = e.dur_ms.filter(|&d| d >= 1000) {
@@ -497,19 +515,34 @@ fn event_lines(
     if has_body && !expanded {
         suffixes.push(Span::styled(" ▸", dim()));
     }
-    let suffix_width: usize = suffixes.iter().map(|s| s.content.chars().count()).sum();
-    header.push(Span::styled(
-        truncate(
-            &first_line(&e.detail),
-            width.saturating_sub(used + suffix_width).max(16),
-        ),
-        base,
-    ));
-    header.extend(suffixes);
+    let span_w = |ss: &[Span]| ss.iter().map(|s| s.content.chars().count()).sum::<usize>();
+    // Drop from the low-priority front until the fixed prefix plus the kept
+    // suffixes fit; the detail then yields the remaining columns (or is omitted).
+    let mut start = 0;
+    while start < suffixes.len() && used + span_w(&suffixes[start..]) > width {
+        start += 1;
+    }
+    let kept = suffixes.split_off(start);
+    let detail_budget = width.saturating_sub(used + span_w(&kept));
+    if detail_budget > 0 {
+        header.push(Span::styled(
+            truncate(&first_line(&e.detail), detail_budget),
+            base,
+        ));
+    }
+    header.extend(kept);
     let mut out = vec![Line::from(header)];
     if expanded {
         if let Some(o) = &e.origin {
-            out.push(Line::from(Span::styled(format!("  · in {o}"), dim())));
+            // Wrapped like any body text so a long workflow label can't clip.
+            out.extend(body_lines(
+                &format!("· in {o}"),
+                dim(),
+                wrap,
+                h,
+                width,
+                query,
+            ));
         }
         if let Some(n) = &e.note {
             out.extend(body_lines(n, dim(), wrap, h, width, query));
@@ -532,12 +565,13 @@ fn turn_header_line(e: &ActivityEvent, width: usize) -> Line<'static> {
         used += 9;
         spans.push(Span::styled(format!("{} ", fmt_time(ts)), dim()));
     }
-    let text = truncate(
-        &first_line(&e.detail),
-        width.saturating_sub(used + 6).max(12),
-    );
+    // No minimum floor — the prompt yields to the pane width so the header
+    // never runs past the edge; the dash fill only draws in leftover space.
+    let text = truncate(&first_line(&e.detail), width.saturating_sub(used));
     used += text.chars().count();
-    spans.push(Span::styled(text, accent().add_modifier(Modifier::BOLD)));
+    if !text.is_empty() {
+        spans.push(Span::styled(text, accent().add_modifier(Modifier::BOLD)));
+    }
     if width > used + 2 {
         spans.push(Span::styled(
             format!(" {}", "─".repeat(width - used - 2)),
@@ -801,8 +835,13 @@ fn tree_row_line(state: &CcActivityState, row: &CcTreeRow, selected: bool) -> Li
 
 #[cfg(test)]
 mod tests {
-    use super::{downsample_max, match_byte_positions, tiles_lines};
-    use crate::app::cc_activity::{StatTile, Tone};
+    use super::{
+        downsample_max, event_lines, match_byte_positions, spark_lines, tiles_lines,
+        turn_header_line,
+    };
+    use crate::app::cc_activity::{SparkRow, StatTile, Tone};
+    use crate::session::activity::{ActionKind, ActivityEvent};
+    use ratatui::text::Line;
 
     fn tile(value: &str, label: &'static str) -> StatTile {
         StatTile {
@@ -810,6 +849,88 @@ mod tests {
             value: value.into(),
             label,
             tone: Tone::Accent,
+        }
+    }
+
+    /// Terminal columns a rendered line occupies (char count, matching the
+    /// budgeting the renderer itself uses).
+    fn line_width(line: &Line) -> usize {
+        line.spans.iter().map(|s| s.content.chars().count()).sum()
+    }
+
+    #[test]
+    fn spark_lines_never_exceed_width() {
+        let spark = SparkRow {
+            start: "14:00".into(),
+            end: "14:42".into(),
+            buckets: (0..32).map(|i| (i % 7) as u64).collect(),
+            caption: "47 events · 42m".into(),
+        };
+        for width in 1..=60usize {
+            for line in spark_lines(&spark, width) {
+                assert!(
+                    line_width(&line) <= width,
+                    "spark line {:?} exceeds width {width}",
+                    line
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn event_and_turn_rows_never_exceed_width_and_keep_markers() {
+        // A maximal-suffix timeline row: gutter, timestamp, duration, a long
+        // origin, a failure marker, and a fold marker.
+        let ev = ActivityEvent {
+            ts_ms: Some(1_783_512_000_000),
+            kind: ActionKind::Command,
+            detail: "cargo nextest run --all --workspace --no-fail-fast".into(),
+            note: Some("n".into()),
+            result_head: Some("boom".into()),
+            ok: Some(false),
+            origin: Some("a-rather-long-workflow-agent-label".into()),
+            minor: false,
+            dur_ms: Some(63_000),
+        };
+        // Fit is guaranteed once the fixed prefix (gutter+timestamp+tag ≈ 21)
+        // fits; below that even the prefix can't, which is outside any real pane.
+        for width in 21..=80usize {
+            for line in event_lines(&ev, false, true, true, 0, width, None) {
+                assert!(
+                    line_width(&line) <= width,
+                    "event line exceeds width {width}: {line:?}"
+                );
+            }
+        }
+        // At any realistic pane width the failure + fold markers survive the
+        // budgeting (that is the whole point of the priority drop).
+        for width in 40..=80usize {
+            let lines = event_lines(&ev, false, true, true, 0, width, None);
+            let flat: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                flat.contains('✗'),
+                "failure marker dropped at width {width}"
+            );
+            assert!(flat.contains('▸'), "fold marker dropped at width {width}");
+        }
+
+        let prompt = ActivityEvent {
+            ts_ms: Some(1_783_512_000_000),
+            kind: ActionKind::Prompt,
+            detail: "Refactor the activity view and make every widget fit the pane".into(),
+            note: None,
+            result_head: None,
+            ok: None,
+            origin: None,
+            minor: false,
+            dur_ms: None,
+        };
+        for width in 12..=80usize {
+            let line = turn_header_line(&prompt, width);
+            assert!(
+                line_width(&line) <= width,
+                "turn header exceeds width {width}: {line:?}"
+            );
         }
     }
 
