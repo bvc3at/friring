@@ -715,7 +715,12 @@ fn sync_claude_subs(src: &mut ClaudeSource, subs: &[(PathBuf, String)]) -> bool 
 fn rebuild_merged(src: &mut ClaudeSource) {
     let mut all: Vec<(u64, ActivityEvent)> = Vec::new();
     let mut push_stream = |events: &[ActivityEvent], origin: Option<&str>| {
-        let mut last = 0u64;
+        // Seed with the stream's first real timestamp so *leading* unstamped
+        // events inherit it (sort just ahead of their neighbours) rather than
+        // falling to 0 and jumping to the front of the whole merged stream. A
+        // stream with no timestamps at all keeps its append order via the
+        // stable sort.
+        let mut last = events.iter().find_map(|e| e.ts_ms).unwrap_or(0);
         for e in events {
             if origin.is_some() && e.kind == ActionKind::Prompt {
                 continue;
@@ -2188,5 +2193,47 @@ mod tests {
             PathBuf::from("/p/sid/subagents/workflows/wf_1/agent-w1.jsonl"),
             "fixer".to_string()
         )));
+    }
+
+    #[test]
+    fn rebuild_merged_keeps_leading_unstamped_events_with_their_stream() {
+        let ev_ts = |kind, detail: &str, ts: Option<u64>| ActivityEvent {
+            ts_ms: ts,
+            kind,
+            detail: detail.into(),
+            note: None,
+            result_head: None,
+            ok: None,
+            origin: None,
+            minor: false,
+            dur_ms: None,
+        };
+        let mut src = ClaudeSource::default();
+        src.scan.events = vec![
+            ev_ts(ActionKind::Command, "cargo test", Some(100)),
+            ev_ts(ActionKind::Edit, "/a.rs", Some(300)),
+        ];
+        // A subagent stream whose FIRST event carries no timestamp, followed by
+        // one stamped at 200 — the leading unstamped read must sort with its
+        // stream (near 200), not jump to the front of the merged stream.
+        let mut sub = SubTail {
+            scan: ClaudeScan::default(),
+            sig: 0,
+            offset: 0,
+            backfilling: false,
+            origin: "Explore".to_string(),
+        };
+        sub.scan.events = vec![
+            ev_ts(ActionKind::Read, "/b.rs", None),
+            ev_ts(ActionKind::Search, "fn main", Some(200)),
+        ];
+        src.subs.insert(PathBuf::from("/sub/agent-x.jsonl"), sub);
+        rebuild_merged(&mut src);
+        let order: Vec<&str> = src.merged.iter().map(|e| e.detail.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["cargo test", "/b.rs", "fn main", "/a.rs"],
+            "leading unstamped subagent event must not sort ahead of the main stream"
+        );
     }
 }
