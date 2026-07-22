@@ -281,9 +281,6 @@ _vhs_key() {
         Enter|Escape|Tab|Space|Up|Down|Left|Right|PageUp|PageDown|Backspace|Delete) echo "$1" ;;
         # Uppercase the letter: VHS's canonical chord form is `Ctrl+N`.
         C-?) echo "Ctrl+$(printf '%s' "${1#C-}" | tr '[:lower:]' '[:upper:]')" ;;
-        # A bare digit (section jumps) is plain typed input to VHS.
-        [0-9]) printf 'Type "%s"\n' "$1" ;;
-        # VHS has no function-key command — F-key scenarios are test-only.
         *) return 1 ;;
     esac
 }

@@ -70,11 +70,6 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-named-workspace"
 }
 
-@test "e2e: F9 activity view renders the dashboard + turn timeline from a stubbed turn" {
-    require_agent claude
-    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-activity"
-}
-
 @test "perf: claude flood turn through Friring publishes a perf report" {
     require_agent claude
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-perf-flood"

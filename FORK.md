@@ -237,8 +237,9 @@ rather than in `docs/FEATURES.md`):
   the July 2026 multi-agent redesign; and (July 2026 UI redesign) subagent /
   workflow event streams merged into the Timeline, chunked async backfill of
   large transcripts replacing the 8 MiB clip, user-prompt turn markers, and
-  the dashboard Overview — with an agent-e2e scenario (`claude-activity`)
-  driving F9 against a stubbed turn.
+  the dashboard Overview — covered end-to-end by the `claude-activity-view`
+  agent-e2e scenario (dashboard tiles + turn-grouped timeline over a stubbed
+  turn).
 
 #### Import an existing Claude Code conversation (`i` in the session list)
 

@@ -41,7 +41,9 @@ scenario_steps() {
     # "No activity captured yet." for a beat — the waits absorb that.
     step_key F9
     step_wait_pane " Activity · Overview " 20
-    step_wait_pane "provider claude-code" 20
+    # Redesigned Overview: identity line is "<agent> · <provider-id> · …", the
+    # edit count is a stat tile ("✎ 1 edits"), and the prompt-derived title.
+    step_wait_pane "claude · claude-code" 20
     step_wait_pane "1 edits" 20
     step_wait_pane "Title: Create activity-proof.txt" 20
 
@@ -49,6 +51,10 @@ scenario_steps() {
     # so tag.*path proves ONE row carries both the edit tag and the file.
     step_type "2"
     step_wait_pane "edit.*activity-proof.txt" 15
+    # The redesigned Timeline groups events under a "▶" prompt turn header, with
+    # the turn's actions in a "│" gutter beneath it.
+    step_wait_pane "▶" 15
+    step_wait_pane "│" 15
     step_type "4"
     step_wait_pane "Edited (1)" 15
     step_wait_pane "activity-proof.txt.*✎1" 15
