@@ -1050,6 +1050,11 @@ impl Session {
         self.input_tx = state.input_tx;
         self.exited = state.exited;
         self.last_output_at = state.last_output_at;
+        // Adopt the fresh reader loop's clipboard queue (and reset the drain
+        // gate): keeping the old pane's queue would silently drop every OSC 52
+        // copy the restarted pane makes.
+        self.osc52 = state.osc52;
+        self.last_drained_osc52_gen = 0;
         self.env = config.env.clone();
         self.info.backend_id = Some(self.backend_id.clone());
         if !config.agent.is_empty() {

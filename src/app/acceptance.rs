@@ -85,6 +85,11 @@ fn init_git_repo(dir: &Path, dirty: bool) {
 /// tests must be `#[tokio::test]`.
 struct FakeBackend {
     spawnable: bool,
+    /// Bytes every `spawn` returns as the pane's output stream (then EOF).
+    /// The seam for exercising the real reader-loop wiring — bytes fed here
+    /// travel the same `spawn_blocking` read → scanner → parser path a PTY's
+    /// output does, which `feed_output_for_test` bypasses.
+    spawn_output: Vec<u8>,
     /// Pushable remote-hook status events, drained by
     /// [`SessionBackend::take_hook_state_events`] — lets a test drive the
     /// remote-session status path without a control-mode connection.
@@ -96,6 +101,7 @@ impl FakeBackend {
     fn stub() -> Self {
         Self {
             spawnable: false,
+            spawn_output: Vec::new(),
             hook_events: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -104,7 +110,16 @@ impl FakeBackend {
     fn spawnable() -> Self {
         Self {
             spawnable: true,
+            spawn_output: Vec::new(),
             hook_events: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Spawnable, with each spawned pane emitting `output` before EOF.
+    fn spawnable_with_output(output: &[u8]) -> Self {
+        Self {
+            spawn_output: output.to_vec(),
+            ..Self::spawnable()
         }
     }
 
@@ -140,7 +155,7 @@ impl SessionBackend for FakeBackend {
         anyhow::ensure!(self.spawnable, "inert fake backend does not spawn");
         Ok(crate::agent::backend::SpawnedSession {
             backend_id: "fake:0".into(),
-            output: Box::new(std::io::empty()),
+            output: Box::new(std::io::Cursor::new(self.spawn_output.clone())),
             input: Box::new(std::io::sink()),
         })
     }
@@ -1774,6 +1789,52 @@ async fn ctrl_r_restart_preserves_friring_identity_env() {
         Some(&agent_session_id),
         "the agent conversation id survives the restart"
     );
+}
+
+#[tokio::test]
+async fn ctrl_r_restart_rewires_osc52_capture_to_the_new_pane() {
+    // Restart swaps in a fresh reader loop with its own clipboard queue; the
+    // session must adopt that queue (and reset its drain gate) or every
+    // in-pane OSC 52 copy after a restart is silently lost. Driven through the
+    // real reader-loop wiring — the `feed_output_for_test` seam pushes into
+    // whatever queue the session already holds, so it cannot catch a restart
+    // left pointing at the dead pane's queue.
+    let mut h = Harness::with_backend(
+        STD_COLS,
+        STD_ROWS,
+        1,
+        Arc::new(FakeBackend::spawnable_with_output(
+            b"\x1b]52;c;aGVsbG8=\x07", // OSC 52 copy of "hello"
+        )),
+    );
+    h.app.sessions[0].info.agent_session_id = Some("agent-0".into());
+    h.app.captured_clipboard = Some(Vec::new());
+
+    h.ctrl('r'); // RestartSession — respawns through the fake backend
+
+    // The new pane's output arrives via a `spawn_blocking` reader thread;
+    // bounded-poll the deterministic tick until the copy lands (~2 s cap).
+    for _ in 0..100 {
+        if !h.app.captured_clipboard.as_ref().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        h.tick();
+    }
+    assert_eq!(
+        h.app.captured_clipboard.as_deref(),
+        Some(&["hello".to_string()][..]),
+        "the restarted pane's OSC 52 copy reaches the clipboard exactly once"
+    );
+    assert_eq!(
+        h.app.status_message.as_ref().map(|m| m.text.as_str()),
+        Some("Copied from session-0"),
+        "the toast names the originating session"
+    );
+
+    // Drained: another tick must not copy again.
+    h.tick();
+    assert_eq!(h.app.captured_clipboard.as_ref().unwrap().len(), 1);
 }
 
 #[tokio::test]
