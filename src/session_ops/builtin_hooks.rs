@@ -33,6 +33,7 @@ pub(crate) const CODEX_HOOKS: &str = include_str!("../../extensions/hooks/codex-
 pub(crate) const VIBE_HOOKS: &str = include_str!("../../extensions/hooks/vibe-hooks.toml");
 pub(crate) const COPILOT_HOOKS: &str = include_str!("../../extensions/hooks/copilot-hooks.json");
 pub(crate) const PI_STATUS: &str = include_str!("../../extensions/hooks/pi-status.ts");
+pub(crate) const OMP_STATUS: &str = include_str!("../../extensions/hooks/omp-status.ts");
 
 /// How a remote host's rewritten hook commands report state — which
 /// multiplexer binary sets the pane user option.
@@ -261,6 +262,7 @@ fn materialize_source() -> Result<PathBuf, String> {
         ("vibe-hooks.toml", VIBE_HOOKS),
         ("copilot-hooks.json", COPILOT_HOOKS),
         ("pi-status.ts", PI_STATUS),
+        ("omp-status.ts", OMP_STATUS),
     ];
     for (name, contents) in writes {
         let path = dir.join(name);
@@ -402,6 +404,7 @@ mod tests {
             ("vibe-hooks.toml", VIBE_HOOKS),
             ("copilot-hooks.json", COPILOT_HOOKS),
             ("pi-status.ts", PI_STATUS),
+            ("omp-status.ts", OMP_STATUS),
             ("extension.toml", MANIFEST), // aider's literal --notifications-command arg
         ] {
             // Key on the invocation-with-flags form (`friring-cli session
@@ -505,6 +508,11 @@ mod tests {
         // file uninstall, see `is_user_modified`).
         assert!(PI_STATUS.contains("friring-cli session signal"));
         assert!(PI_STATUS.contains("friring `extension install`"));
+        // The omp payload mirrors pi's shape but recognizes OMP's `ask` tool (and
+        // upstream pi's `ask_user_question`) as the blocking edge.
+        assert!(OMP_STATUS.contains("friring-cli session signal"));
+        assert!(OMP_STATUS.contains("friring `extension install`"));
+        assert!(OMP_STATUS.contains("\"ask\""));
     }
 
     #[test]
