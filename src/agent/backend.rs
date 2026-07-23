@@ -158,7 +158,7 @@ static OSC52_SEQ: AtomicU64 = AtomicU64::new(0);
 /// stack on the next tick. Generation-gated like `TermSignals::meta_gen`
 /// (ADR-P10): the every-tick, nothing-new poll pays one atomic load per pane,
 /// never a lock. Each queued copy carries a global capture sequence
-/// ([`OSC52_SEQ`]) so cross-pane draining can restore capture order.
+/// (`OSC52_SEQ`) so cross-pane draining can restore capture order.
 #[derive(Default)]
 pub struct PaneClipboard {
     queue: Mutex<VecDeque<(u64, String)>>,
