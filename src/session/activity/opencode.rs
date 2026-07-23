@@ -211,6 +211,8 @@ fn base(kind: ActionKind, detail: String, note: Option<String>) -> ActivityEvent
         result_head: None,
         ok: None,
         origin: None,
+        minor: false,
+        dur_ms: None,
     }
 }
 
@@ -237,6 +239,7 @@ pub fn session_meta(
         output_tokens: output_tokens
             .and_then(|t| u64::try_from(t).ok())
             .filter(|&t| t > 0),
+        ..Default::default()
     }
 }
 

@@ -32,6 +32,10 @@ pub mod vibe;
 /// dedicated category (its tool name goes in [`ActivityEvent::detail`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActionKind {
+    /// A user prompt — the timeline's turn marker, not an agent action.
+    /// Excluded from [`ActivityCounts::total`] and from subagent-origin
+    /// streams (a subagent's task prompt is not a conversation turn).
+    Prompt,
     /// A shell command the agent executed.
     Command,
     /// A file the agent edited, wrote, or patched.
@@ -53,6 +57,7 @@ impl ActionKind {
     /// Stable one-word label (column headers, filter footer).
     pub fn label(self) -> &'static str {
         match self {
+            ActionKind::Prompt => "prompt",
             ActionKind::Command => "command",
             ActionKind::Edit => "edit",
             ActionKind::Read => "read",
@@ -62,6 +67,23 @@ impl ActionKind {
             ActionKind::Subagent => "subagent",
             ActionKind::Mcp => "mcp",
             ActionKind::Other => "other",
+        }
+    }
+
+    /// Short fixed-width tag prefixing an event row (timeline, overview
+    /// recent list).
+    pub fn tag(self) -> &'static str {
+        match self {
+            ActionKind::Prompt => "▶",
+            ActionKind::Command => "$",
+            ActionKind::Edit => "edit",
+            ActionKind::Read => "read",
+            ActionKind::Search => "grep",
+            ActionKind::WebSearch => "web",
+            ActionKind::WebFetch => "fetch",
+            ActionKind::Subagent => "agent",
+            ActionKind::Mcp => "mcp",
+            ActionKind::Other => "tool",
         }
     }
 }
@@ -90,6 +112,12 @@ pub struct ActivityEvent {
     /// happened inside a subagent (the label names it as well as the source
     /// allows).
     pub origin: Option<String>,
+    /// Bookkeeping actions (todo churn, output polling) — shown dim and
+    /// excluded from the per-kind tallies so counts stay signal.
+    pub minor: bool,
+    /// Wall-clock duration until the action's result landed, when both ends
+    /// are timestamped.
+    pub dur_ms: Option<u64>,
 }
 
 /// Cap for [`ActivityEvent::result_head`], applied at parse time so a huge
@@ -119,6 +147,30 @@ pub struct ActivityMeta {
     pub model: Option<String>,
     /// Cumulative output tokens, when per-message usage is recorded.
     pub output_tokens: Option<u64>,
+    /// Cumulative non-cached input tokens.
+    pub input_tokens: Option<u64>,
+    /// Cumulative cache-read input tokens.
+    pub cache_read_tokens: Option<u64>,
+    /// Cumulative cache-creation (write) input tokens.
+    pub cache_write_tokens: Option<u64>,
+}
+
+impl ActivityMeta {
+    /// Fold `other`'s token tallies into this meta (identity fields keep
+    /// self's) — how a session's total absorbs its subagent/workflow
+    /// transcripts. `None + Some(n) = Some(n)`, so a stream that never
+    /// records a field doesn't zero the sum.
+    pub fn add_tokens(&mut self, other: &ActivityMeta) {
+        let add = |a: &mut Option<u64>, b: Option<u64>| {
+            if let Some(n) = b {
+                *a = Some(a.unwrap_or(0) + n);
+            }
+        };
+        add(&mut self.output_tokens, other.output_tokens);
+        add(&mut self.input_tokens, other.input_tokens);
+        add(&mut self.cache_read_tokens, other.cache_read_tokens);
+        add(&mut self.cache_write_tokens, other.cache_write_tokens);
+    }
 }
 
 /// Per-kind tallies over an event stream — drives the navigator counts and
@@ -132,13 +184,31 @@ pub struct ActivityCounts {
     pub web: usize,
     pub subagents: usize,
     pub other: usize,
+    /// User turns ([`ActionKind::Prompt`]) — not actions, tallied apart.
+    pub prompts: usize,
+    /// Actions whose result reported failure (`ok == Some(false)`).
+    pub failed: usize,
 }
 
 impl ActivityCounts {
+    /// Tally per-kind action counts. Prompts count as turns, not actions;
+    /// minor (bookkeeping) events are skipped entirely so the counts read as
+    /// work done.
     pub fn tally(events: &[ActivityEvent]) -> Self {
         let mut c = Self::default();
         for e in events {
+            if e.kind == ActionKind::Prompt {
+                c.prompts += 1;
+                continue;
+            }
+            if e.minor {
+                continue;
+            }
+            if e.ok == Some(false) {
+                c.failed += 1;
+            }
             match e.kind {
+                ActionKind::Prompt => {} // tallied above
                 ActionKind::Command => c.commands += 1,
                 ActionKind::Edit => c.edits += 1,
                 ActionKind::Read => c.reads += 1,
@@ -221,6 +291,8 @@ mod tests {
             result_head: None,
             ok: None,
             origin: None,
+            minor: false,
+            dur_ms: None,
         }
     }
 
@@ -244,6 +316,37 @@ mod tests {
         assert_eq!(c.subagents, 1);
         assert_eq!(c.other, 1);
         assert_eq!(c.total(), 8);
+        assert_eq!(c.prompts, 0);
+        assert_eq!(c.failed, 0);
+    }
+
+    #[test]
+    fn counts_separate_prompts_skip_minor_and_track_failures() {
+        let with = |kind, ok: Option<bool>, minor: bool| ActivityEvent {
+            ts_ms: None,
+            kind,
+            detail: "x".into(),
+            note: None,
+            result_head: None,
+            ok,
+            origin: None,
+            minor,
+            dur_ms: None,
+        };
+        let events = [
+            with(ActionKind::Prompt, None, false), // a turn, not an action
+            with(ActionKind::Command, Some(true), false), // ok command
+            with(ActionKind::Command, Some(false), false), // failed command → failed++
+            with(ActionKind::Read, Some(false), true), // minor + failed → ignored
+            with(ActionKind::Edit, None, false),   // no outcome recorded
+        ];
+        let c = ActivityCounts::tally(&events);
+        assert_eq!(c.prompts, 1, "prompts tallied apart");
+        assert_eq!(c.commands, 2);
+        assert_eq!(c.edits, 1);
+        assert_eq!(c.reads, 0, "minor bookkeeping is excluded from tiles");
+        assert_eq!(c.failed, 1, "only the non-minor failure counts");
+        assert_eq!(c.total(), 3, "prompts and minor rows are not actions");
     }
 
     #[test]

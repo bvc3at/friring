@@ -13,7 +13,9 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::app::activity::{fmt_time, Section};
-use crate::app::cc_activity::{CcActivityState, CcNodeRef, CcRow, CcTreeRow};
+use crate::app::cc_activity::{
+    CcActivityState, CcNodeRef, CcRow, CcTreeRow, SparkRow, StatTile, Tone,
+};
 use crate::session::activity::{ActionKind, ActivityEvent};
 use crate::session::{CcAgent, CcAgentState, CcRunStatus, TranscriptBlock};
 use crate::ui::scrollbar::{self, ScrollbarGeom};
@@ -44,6 +46,124 @@ fn danger() -> Style {
 
 fn agent_label(a: &CcAgent) -> String {
     a.label.clone().unwrap_or_else(|| a.agent_type.clone())
+}
+
+fn tone_style(tone: Tone) -> Style {
+    match tone {
+        Tone::Accent => accent(),
+        Tone::Working => Style::default().fg(Theme::status_working()),
+        Tone::Done => Style::default().fg(Theme::status_done()),
+        Tone::Danger => danger(),
+        Tone::Normal => normal(),
+    }
+}
+
+/// Overview stat tiles: `⟨glyph⟩ ⟨value⟩ ⟨label⟩`, triple-spaced, wrapped by
+/// whole tiles so nothing ever clips at the pane edge. A lone tile wider than
+/// the pane is emitted with its label dropped (glyph + value alone), so even a
+/// very narrow pane stays within `width`.
+fn tiles_lines(tiles: &[StatTile], width: usize) -> Vec<Line<'static>> {
+    let tile_width = |t: &StatTile| 2 + t.value.chars().count() + 1 + t.label.len();
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    let mut used = 1usize;
+    for t in tiles {
+        let w = tile_width(t);
+        let sep = usize::from(spans.len() > 1) * 3;
+        if used + sep + w > width && spans.len() > 1 {
+            out.push(Line::from(std::mem::take(&mut spans)));
+            spans.push(Span::raw(" "));
+            used = 1;
+        } else if sep > 0 {
+            spans.push(Span::raw("   "));
+            used += 3;
+        }
+        spans.push(Span::styled(
+            format!("{} ", t.glyph),
+            tone_style(t.tone).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            t.value.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        // Drop the label if this lone tile would otherwise overrun the pane.
+        if used + w <= width {
+            spans.push(Span::styled(format!(" {}", t.label), dim()));
+            used += w;
+        } else {
+            used += 2 + t.value.chars().count();
+        }
+    }
+    if spans.len() > 1 {
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+/// The Overview sparkline: `HH:MM ▁▂▅█… HH:MM  caption`. The bucket run is
+/// max-pooled down to the width left beside the time labels, and the caption
+/// drops to its own line when it doesn't fit — the row always stays inside
+/// the pane.
+fn spark_lines(spark: &SparkRow, width: usize) -> Vec<Line<'static>> {
+    const GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let labels = 1 + spark.start.chars().count() + 1 + 1 + spark.end.chars().count();
+    // Size the glyph run strictly from the space left beside the labels (no
+    // minimum) so a narrow pane downsamples instead of overrunning. When the
+    // labels alone don't fit, drop the whole spark to a wrapped caption line.
+    let avail = width.saturating_sub(labels).min(spark.buckets.len());
+    if avail < 2 {
+        return caption_only(&spark.caption, width);
+    }
+    let buckets = downsample_max(&spark.buckets, avail);
+    let max = buckets.iter().copied().max().unwrap_or(0).max(1);
+    let glyph_run: String = buckets
+        .iter()
+        .map(|&v| {
+            if v == 0 {
+                ' '
+            } else {
+                // Scale 1..=max onto the 8 glyph levels, non-zero floor.
+                GLYPHS[((v * 8).div_ceil(max) as usize).clamp(1, 8) - 1]
+            }
+        })
+        .collect();
+    let mut line = vec![
+        Span::styled(format!(" {} ", spark.start), dim()),
+        Span::styled(glyph_run, accent()),
+        Span::styled(format!(" {}", spark.end), dim()),
+    ];
+    let caption = format!("  {}", spark.caption);
+    if labels + avail + caption.chars().count() <= width {
+        line.push(Span::styled(caption, dim()));
+        vec![Line::from(line)]
+    } else {
+        let mut out = vec![Line::from(line)];
+        out.extend(caption_only(&spark.caption, width));
+        out
+    }
+}
+
+/// The sparkline caption on its own line(s), wrapped to `width`.
+fn caption_only(caption: &str, width: usize) -> Vec<Line<'static>> {
+    body_lines(&format!(" {caption}"), dim(), true, 0, width, None)
+}
+
+/// Max-pool `buckets` into `cells` slots (peaks survive a squeeze).
+fn downsample_max(buckets: &[u64], cells: usize) -> Vec<u64> {
+    if cells == 0 || buckets.len() <= cells {
+        return buckets.to_vec();
+    }
+    (0..cells)
+        .map(|i| {
+            let lo = i * buckets.len() / cells;
+            let hi = ((i + 1) * buckets.len() / cells).max(lo + 1);
+            buckets[lo..hi.min(buckets.len())]
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0)
+        })
+        .collect()
 }
 
 fn state_style(s: CcAgentState) -> Style {
@@ -255,7 +375,10 @@ fn row_visual_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = match &state.rows[i] {
         CcRow::Info(s) => vec![styled(s, dim(), width)],
+        CcRow::Header(s) => vec![styled(s, dim().add_modifier(Modifier::BOLD), width)],
         CcRow::Text(s) => body_lines(s, normal(), state.wrap, state.h_scroll, width, query),
+        CcRow::Tiles(tiles) => tiles_lines(tiles, width),
+        CcRow::Spark(spark) => spark_lines(spark, width),
         CcRow::Block(bi) => block_lines(state, *bi, width, query),
     };
     if lines.is_empty() {
@@ -331,44 +454,95 @@ fn block_lines(
         // therefore read inverted for this variant.
         TranscriptBlock::Event(e) => {
             let expanded = collapsed;
-            event_lines(e, expanded, wrap, h, width, query)
+            let timeline = matches!(&state.open, Some(CcNodeRef::Section(Section::Timeline)));
+            event_lines(e, expanded, timeline, wrap, h, width, query)
         }
     }
 }
 
 /// The one-line header (+ optional expanded body) of a normalized activity
-/// event: `HH:MM:SS  tag  detail`, error-marked when the action failed.
+/// event: `HH:MM:SS  tag  detail`, error-marked when the action failed. On
+/// the Timeline, a [`ActionKind::Prompt`] event renders as a turn header and
+/// every other row sits in a turn gutter (`│`, deepened to `└` for
+/// subagent-origin work); minor (bookkeeping) rows render dim.
 fn event_lines(
     e: &ActivityEvent,
     expanded: bool,
+    timeline: bool,
     wrap: bool,
     h: usize,
     width: usize,
     query: Option<&str>,
 ) -> Vec<Line<'static>> {
+    if e.kind == ActionKind::Prompt {
+        return vec![turn_header_line(e, width)];
+    }
+    let base = if e.minor { dim() } else { normal() };
+    let mut used = 0usize;
     let mut header: Vec<Span<'static>> = Vec::new();
+    if timeline {
+        let gutter = if e.origin.is_some() {
+            "│   └ "
+        } else {
+            "│ "
+        };
+        used += gutter.chars().count();
+        header.push(Span::styled(gutter, dim()));
+    }
     if let Some(ts) = e.ts_ms {
+        used += 9;
         header.push(Span::styled(format!("{} ", fmt_time(ts)), dim()));
     }
+    used += 6;
     header.push(Span::styled(
-        format!("{:<5} ", event_tag(e.kind)),
-        event_style(e.kind),
+        format!("{:<5} ", e.kind.tag()),
+        if e.minor { dim() } else { event_style(e.kind) },
     ));
-    header.push(Span::styled(
-        truncate(&first_line(&e.detail), width.saturating_sub(16).max(20)),
-        normal(),
-    ));
-    if e.ok == Some(false) {
-        header.push(Span::styled(" ✗", danger()));
-    }
+    // Suffixes in DROP order (lowest priority first): a tight row sheds the
+    // duration then the origin before the failure/fold markers, so ✗ / ▸ — the
+    // load-bearing signals — stay on the row and it never runs past the edge.
     let has_body = e.note.is_some() || e.result_head.is_some() || e.origin.is_some();
-    if has_body && !expanded {
-        header.push(Span::styled(" ▸", dim()));
+    let mut suffixes: Vec<Span<'static>> = Vec::new();
+    if let Some(d) = e.dur_ms.filter(|&d| d >= 1000) {
+        suffixes.push(Span::styled(format!(" · {}", fmt_dur(d)), dim()));
     }
+    if let Some(o) = &e.origin {
+        suffixes.push(Span::styled(format!(" · {}", truncate(o, 24)), dim()));
+    }
+    if e.ok == Some(false) {
+        suffixes.push(Span::styled(" ✗", danger()));
+    }
+    if has_body && !expanded {
+        suffixes.push(Span::styled(" ▸", dim()));
+    }
+    let span_w = |ss: &[Span]| ss.iter().map(|s| s.content.chars().count()).sum::<usize>();
+    // Drop from the low-priority front until the fixed prefix plus the kept
+    // suffixes fit; the detail then yields the remaining columns (or is omitted).
+    let mut start = 0;
+    while start < suffixes.len() && used + span_w(&suffixes[start..]) > width {
+        start += 1;
+    }
+    let kept = suffixes.split_off(start);
+    let detail_budget = width.saturating_sub(used + span_w(&kept));
+    if detail_budget > 0 {
+        header.push(Span::styled(
+            truncate(&first_line(&e.detail), detail_budget),
+            base,
+        ));
+    }
+    header.extend(kept);
     let mut out = vec![Line::from(header)];
     if expanded {
         if let Some(o) = &e.origin {
-            out.push(Line::from(Span::styled(format!("  · in {o}"), dim())));
+            // Wrapped like any body text so a long workflow label can't clip.
+            out.extend(body_lines(
+                &format!("· in {o}"),
+                dim(),
+                wrap,
+                h,
+                width,
+                query,
+            ));
         }
         if let Some(n) = &e.note {
             out.extend(body_lines(n, dim(), wrap, h, width, query));
@@ -382,24 +556,44 @@ fn event_lines(
     out
 }
 
-/// Short fixed-width kind tag prefixing an event's header line.
-fn event_tag(kind: ActionKind) -> &'static str {
-    match kind {
-        ActionKind::Command => "$",
-        ActionKind::Edit => "edit",
-        ActionKind::Read => "read",
-        ActionKind::Search => "grep",
-        ActionKind::WebSearch => "web",
-        ActionKind::WebFetch => "fetch",
-        ActionKind::Subagent => "agent",
-        ActionKind::Mcp => "mcp",
-        ActionKind::Other => "tool",
+/// A Timeline turn header: `▶ HH:MM:SS "prompt…" ───`, dash-filled to the
+/// pane edge so turns read as visual breaks in the stream.
+fn turn_header_line(e: &ActivityEvent, width: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = vec![Span::styled("▶ ", accent())];
+    let mut used = 2usize;
+    if let Some(ts) = e.ts_ms {
+        used += 9;
+        spans.push(Span::styled(format!("{} ", fmt_time(ts)), dim()));
+    }
+    // No minimum floor — the prompt yields to the pane width so the header
+    // never runs past the edge; the dash fill only draws in leftover space.
+    let text = truncate(&first_line(&e.detail), width.saturating_sub(used));
+    used += text.chars().count();
+    if !text.is_empty() {
+        spans.push(Span::styled(text, accent().add_modifier(Modifier::BOLD)));
+    }
+    if width > used + 2 {
+        spans.push(Span::styled(
+            format!(" {}", "─".repeat(width - used - 2)),
+            dim(),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Compact call→result duration: `12s`, `1m03s`.
+fn fmt_dur(ms: u64) -> String {
+    let s = ms / 1000;
+    if s < 60 {
+        format!("{s}s")
+    } else {
+        format!("{}m{:02}s", s / 60, s % 60)
     }
 }
 
 fn event_style(kind: ActionKind) -> Style {
     match kind {
-        ActionKind::Command => accent(),
+        ActionKind::Prompt | ActionKind::Command => accent(),
         ActionKind::Edit => Style::default().fg(Theme::status_working()),
         ActionKind::WebSearch | ActionKind::WebFetch => Style::default().fg(Theme::status_done()),
         _ => dim().add_modifier(Modifier::BOLD),
@@ -641,7 +835,125 @@ fn tree_row_line(state: &CcActivityState, row: &CcTreeRow, selected: bool) -> Li
 
 #[cfg(test)]
 mod tests {
-    use super::match_byte_positions;
+    use super::{
+        downsample_max, event_lines, match_byte_positions, spark_lines, tiles_lines,
+        turn_header_line,
+    };
+    use crate::app::cc_activity::{SparkRow, StatTile, Tone};
+    use crate::session::activity::{ActionKind, ActivityEvent};
+    use ratatui::text::Line;
+
+    fn tile(value: &str, label: &'static str) -> StatTile {
+        StatTile {
+            glyph: "$",
+            value: value.into(),
+            label,
+            tone: Tone::Accent,
+        }
+    }
+
+    /// Terminal columns a rendered line occupies (char count, matching the
+    /// budgeting the renderer itself uses).
+    fn line_width(line: &Line) -> usize {
+        line.spans.iter().map(|s| s.content.chars().count()).sum()
+    }
+
+    #[test]
+    fn spark_lines_never_exceed_width() {
+        let spark = SparkRow {
+            start: "14:00".into(),
+            end: "14:42".into(),
+            buckets: (0..32).map(|i| (i % 7) as u64).collect(),
+            caption: "47 events · 42m".into(),
+        };
+        for width in 1..=60usize {
+            for line in spark_lines(&spark, width) {
+                assert!(
+                    line_width(&line) <= width,
+                    "spark line {:?} exceeds width {width}",
+                    line
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn event_and_turn_rows_never_exceed_width_and_keep_markers() {
+        // A maximal-suffix timeline row: gutter, timestamp, duration, a long
+        // origin, a failure marker, and a fold marker.
+        let ev = ActivityEvent {
+            ts_ms: Some(1_783_512_000_000),
+            kind: ActionKind::Command,
+            detail: "cargo nextest run --all --workspace --no-fail-fast".into(),
+            note: Some("n".into()),
+            result_head: Some("boom".into()),
+            ok: Some(false),
+            origin: Some("a-rather-long-workflow-agent-label".into()),
+            minor: false,
+            dur_ms: Some(63_000),
+        };
+        // Fit is guaranteed once the fixed prefix (gutter+timestamp+tag ≈ 21)
+        // fits; below that even the prefix can't, which is outside any real pane.
+        for width in 21..=80usize {
+            for line in event_lines(&ev, false, true, true, 0, width, None) {
+                assert!(
+                    line_width(&line) <= width,
+                    "event line exceeds width {width}: {line:?}"
+                );
+            }
+        }
+        // At any realistic pane width the failure + fold markers survive the
+        // budgeting (that is the whole point of the priority drop).
+        for width in 40..=80usize {
+            let lines = event_lines(&ev, false, true, true, 0, width, None);
+            let flat: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                flat.contains('✗'),
+                "failure marker dropped at width {width}"
+            );
+            assert!(flat.contains('▸'), "fold marker dropped at width {width}");
+        }
+
+        let prompt = ActivityEvent {
+            ts_ms: Some(1_783_512_000_000),
+            kind: ActionKind::Prompt,
+            detail: "Refactor the activity view and make every widget fit the pane".into(),
+            note: None,
+            result_head: None,
+            ok: None,
+            origin: None,
+            minor: false,
+            dur_ms: None,
+        };
+        for width in 12..=80usize {
+            let line = turn_header_line(&prompt, width);
+            assert!(
+                line_width(&line) <= width,
+                "turn header exceeds width {width}: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tiles_wrap_by_whole_tiles_never_clipping() {
+        let tiles = vec![tile("23", "cmds"), tile("11", "edits"), tile("47", "reads")];
+        // Wide pane: one line. Each tile is 2+2+1+len(label) wide, +3 gaps.
+        assert_eq!(tiles_lines(&tiles, 80).len(), 1);
+        // Narrow pane: tiles flow onto following lines, whole.
+        let narrow = tiles_lines(&tiles, 14);
+        assert!(narrow.len() > 1, "tiles must wrap, not clip");
+        for line in &narrow {
+            let w: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert!(w <= 14, "no wrapped tile line may exceed the width: {w}");
+        }
+    }
+
+    #[test]
+    fn downsample_max_keeps_peaks() {
+        assert_eq!(downsample_max(&[1, 9, 1, 1, 5, 1], 3), vec![9, 1, 5]);
+        // Fewer buckets than cells → untouched.
+        assert_eq!(downsample_max(&[3, 4], 8), vec![3, 4]);
+    }
 
     #[test]
     fn match_byte_positions_finds_all_case_insensitive() {

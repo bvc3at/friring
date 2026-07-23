@@ -136,6 +136,22 @@ sessions only.
   counts; the central pane renders the selection. Event rows are compact
   one-liners (`Enter` expands note + result head); the same fold / `/` find /
   wrap / live-tail engine as transcripts.
+- **Overview dashboard** (July 2026 UI redesign): identity line (agent ·
+  provider · model), a full token line (`in · out · cache r / w`, folding in
+  every subagent/workflow transcript's usage), a stat-tile row (`$ ✎ ⊙ ⌕ ⚲ ⚙`
+  counts, a `✗ failed` tile only on failure), an events-over-session
+  sparkline with a turns/last-action line, the hottest files, the
+  most-repeated commands, the newest few actions, the last error with its
+  result head, and a `⟳ indexing history…` loader while a large source
+  backfills. Every widget fits the pane: tiles wrap by whole tiles, the
+  sparkline max-pools down to the available width, event-row markers are
+  width-budgeted, and text wrap is on by default (`w` toggles).
+- **Turn-grouped Timeline** (same redesign): each user prompt renders as a
+  dash-filled turn header (`▶ HH:MM:SS "prompt" ───`), the turn's events sit
+  in a `│` gutter — subagent-origin work nested as `└` with a dim origin
+  badge — consecutive read/search/bookkeeping repeats fold to one `×N` row,
+  and rows carry call→result durations. Bookkeeping tools (TodoWrite,
+  TaskOutput, …) are kept as dim **minor** rows instead of being dropped.
 - **Providers.** Every supported CLI gets a provider: pure record→event
   parsers in `session::activity::<provider>` plus discovery/tailing glue in
   `app::activity::<provider>`, dispatched by the **command basename** of the
@@ -174,7 +190,15 @@ rather than in `docs/FEATURES.md`):
   DB field would bump `PRAGMA data_version`). `App::activity` holds each
   session's **normalized event accumulator** (`ActivityEvent` stream + meta),
   filled by a second ~1 s scan (offset half a cadence from the first) whose
-  per-session state *moves* into the `spawn_blocking` pass and back.
+  per-session state *moves* into the `spawn_blocking` pass and back. The
+  Claude accumulator also tails every **subagent / workflow transcript** the
+  tree scan indexed, merging all streams by timestamp (origin-labelled,
+  subagent task prompts dropped) so delegated work reaches the Timeline.
+  History is never clipped for append-only sources: a huge transcript
+  backfills front-to-back in 8 MiB chunks, one per pass, surfaced as a
+  loader (`SessionActivity::backfilling`); only snapshot/DB sources keep
+  (raised) caps — cursor 32 MiB tail-window, crush 50k / opencode 100k /
+  goose 50k rows, codex 45 discovery day-shards.
   `App::cc_activities` is the **open-view** UI state (navigator rows,
   selection, scroll, wrap, folds); the selected agent's transcript is parsed
   **on demand** and re-read on growth for live-tail.
@@ -202,17 +226,20 @@ rather than in `docs/FEATURES.md`):
   isolated per provider because every agent's on-disk layout is undocumented
   and version-specific (Claude verified against v2.1.201–2.1.206), degrading
   to partial data rather than an error.
-- **Follow-ups** (named, not silently dropped): event streams from Claude
-  subagent/daemon-worker transcripts (main transcript only today, sidechain
-  lines aside); hook-injected capture for `agy` (encrypted store) and a
-  session-keyed reader for `amp`; markdown rendering of thinking/text
-  (blocked on `ui::markdown` not being width-aware); async parse of very
-  large transcripts; parsing an in-process run's workflow `scripts/*.js` for
-  live phase names; baking the session id into per-session hook commands so a
+- **Follow-ups** (named, not silently dropped): hook-injected capture for
+  `agy` (encrypted store) and a session-keyed reader for `amp`; markdown
+  rendering of thinking/text (blocked on `ui::markdown` not being
+  width-aware); parsing an in-process run's workflow `scripts/*.js` for live
+  phase names; baking the session id into per-session hook commands so a
   daemon worker also reports `working`/`blocked`/`done` **status**; and remote
   (`ssh:`/`wsl:`) support. **Done since v1:** daemon-worker attribution + live
   overview, per-session `--settings` for exact attribution, find-in-transcript,
-  the July 2026 multi-agent redesign.
+  the July 2026 multi-agent redesign; and (July 2026 UI redesign) subagent /
+  workflow event streams merged into the Timeline, chunked async backfill of
+  large transcripts replacing the 8 MiB clip, user-prompt turn markers, and
+  the dashboard Overview — covered end-to-end by the `claude-activity-view`
+  agent-e2e scenario (dashboard tiles + turn-grouped timeline over a stubbed
+  turn).
 
 #### Import an existing Claude Code conversation (`i` in the session list)
 

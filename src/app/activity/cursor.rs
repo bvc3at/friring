@@ -80,11 +80,11 @@ pub(super) fn scan_cursor(
     *sig = new_sig;
     // Full re-parse from a fresh scanner — the transcript is a regenerated
     // snapshot, not append-only, so a stale prefix must never be reused. The
-    // tail-clip cap keeps a months-old transcript bounded (oldest lines
+    // tail-window cap keeps a months-old transcript bounded (oldest lines
     // dropped, surfaced via `truncated`).
     let mut scan = CursorScan::default();
     let mut truncated = false;
-    if let Some((chunk, _, clipped)) = super::read_new_lines(&path, 0, super::INITIAL_INGEST_MAX) {
+    if let Some((chunk, clipped)) = super::read_tail_window(&path, super::SNAPSHOT_INGEST_MAX) {
         truncated = clipped;
         scan.ingest(&chunk);
     }
@@ -338,7 +338,7 @@ mod tests {
         // Build a transcript larger than the ingest cap so the initial read
         // clips from the tail.
         let line = format!("{SHELL_LS}\n");
-        let repeats = (super::super::INITIAL_INGEST_MAX as usize / line.len()) + 100;
+        let repeats = (super::super::SNAPSHOT_INGEST_MAX as usize / line.len()) + 100;
         let body = line.repeat(repeats);
         write_transcript(root, "/repo/a", "chat-1111", &body);
 

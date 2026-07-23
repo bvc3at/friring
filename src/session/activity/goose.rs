@@ -157,6 +157,8 @@ fn classify(name: &str, input: Option<&serde_json::Value>) -> Option<ActivityEve
         result_head: None,
         ok: None,
         origin: None,
+        minor: false,
+        dur_ms: None,
     })
 }
 
@@ -241,6 +243,7 @@ pub fn session_meta(
         title: pick_title(name, user_set_name, description),
         model: model_config_json.and_then(model_name),
         output_tokens: output_tokens.and_then(|t| u64::try_from(t).ok()),
+        ..Default::default()
     }
 }
 

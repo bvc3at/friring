@@ -367,6 +367,8 @@ fn event(kind: ActionKind, detail: String, note: Option<String>) -> ActivityEven
         result_head: None,
         ok: None,
         origin: None,
+        minor: false,
+        dur_ms: None,
     }
 }
 
@@ -398,6 +400,7 @@ pub fn parse_manifest(s: &str) -> ClineMeta {
             output_tokens: v
                 .pointer("/metadata/usage/outputTokens")
                 .and_then(|t| t.as_u64()),
+            ..Default::default()
         },
         session_id: str_at(&v, "session_id"),
         cwd: str_at(&v, "cwd"),

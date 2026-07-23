@@ -393,6 +393,8 @@ impl CodexScan {
             result_head: None,
             ok: None,
             origin: self.origin.clone(),
+            minor: false,
+            dur_ms: None,
         });
         if let Some(id) = call_id {
             self.pending.entry(id.to_string()).or_default().push(idx);

@@ -19,9 +19,13 @@ use super::{head, ActionKind, ActivityEvent, ActivityMeta, RESULT_HEAD_MAX};
 /// Cap for compact-input notes (`Other`/`Mcp` events).
 const NOTE_MAX: usize = 160;
 
-/// Pure-bookkeeping tools that record no action on the world — skipped
-/// entirely so the timeline shows work, not plan churn.
-const SKIPPED_TOOLS: &[&str] = &[
+/// Cap for a turn marker's prompt head ([`ActionKind::Prompt`] `detail`).
+const PROMPT_MAX: usize = 200;
+
+/// Pure-bookkeeping tools that record no action on the world — kept on the
+/// timeline as **minor** (dim) rows so the record is complete without the
+/// plan churn drowning out real work.
+const MINOR_TOOLS: &[&str] = &[
     "TodoWrite",
     "BashOutput",
     "TaskOutput",
@@ -44,7 +48,17 @@ pub struct ClaudeScan {
     /// `message.id` with cumulative `usage` — track the last id and what it
     /// contributed so re-seen ids replace rather than double-count.
     last_msg_id: Option<String>,
-    last_usage_added: u64,
+    last_usage_added: UsageAdded,
+}
+
+/// What the last-seen message id contributed to each token tally (so a
+/// re-logged id replaces its contribution instead of double-counting).
+#[derive(Debug, Clone, Copy, Default)]
+struct UsageAdded {
+    output: u64,
+    input: u64,
+    cache_read: u64,
+    cache_write: u64,
 }
 
 impl ClaudeScan {
@@ -95,14 +109,12 @@ impl ClaudeScan {
             let Some(name) = str_field(block, "name") else {
                 continue;
             };
-            if SKIPPED_TOOLS.contains(&name.as_str()) {
-                continue;
-            }
             let Some(mut event) = classify(&name, block.get("input")) else {
                 continue;
             };
             event.ts_ms = ts;
             event.origin = origin.clone();
+            event.minor = MINOR_TOOLS.contains(&name.as_str());
             if let Some(id) = str_field(block, "id") {
                 self.pending.insert(id, self.events.len());
             }
@@ -111,11 +123,24 @@ impl ClaudeScan {
     }
 
     fn ingest_user(&mut self, entry: &serde_json::Value) {
-        // Title fallback: the first real typed prompt (a `summary` line wins).
-        if self.meta.title.is_none() {
-            if let Some(t) = crate::session::cc_activity::user_prompt_text(entry) {
+        let ts = ts_ms(entry);
+        // A real typed prompt is a turn marker on the timeline; the first one
+        // doubles as the title fallback (a `summary` line wins).
+        if let Some(t) = crate::session::cc_activity::user_prompt_text(entry) {
+            if self.meta.title.is_none() {
                 self.meta.title = Some(head(&t, NOTE_MAX));
             }
+            self.events.push(ActivityEvent {
+                ts_ms: ts,
+                kind: ActionKind::Prompt,
+                detail: head(&t, PROMPT_MAX),
+                note: None,
+                result_head: None,
+                ok: None,
+                origin: None,
+                minor: false,
+                dur_ms: None,
+            });
         }
         let Some(arr) = entry.pointer("/message/content").and_then(|c| c.as_array()) else {
             return;
@@ -140,6 +165,10 @@ impl ClaudeScan {
                     .and_then(|e| e.as_bool())
                     .unwrap_or(false),
             );
+            // Call → result wall-clock spread, when both lines are stamped.
+            event.dur_ms = ts
+                .zip(event.ts_ms)
+                .map(|(result, call)| result.saturating_sub(call));
             let mut text = crate::session::cc_activity::normalize_tool_result(block.get("content"));
             if text.trim().is_empty() {
                 // Bash results often carry the useful text in the richer
@@ -159,22 +188,54 @@ impl ClaudeScan {
     }
 
     fn accumulate_usage(&mut self, message: &serde_json::Value) {
-        let Some(out_tokens) = message
-            .pointer("/usage/output_tokens")
-            .and_then(|t| t.as_u64())
-        else {
+        let Some(usage) = message.get("usage") else {
             return;
         };
+        // `output_tokens` is the sentinel for a real usage record — synthetic
+        // lines without it carry no tallies worth counting.
+        if usage
+            .get("output_tokens")
+            .and_then(|t| t.as_u64())
+            .is_none()
+        {
+            return;
+        }
+        let read = |key: &str| usage.get(key).and_then(|t| t.as_u64()).unwrap_or(0);
+        let fresh = UsageAdded {
+            output: read("output_tokens"),
+            input: read("input_tokens"),
+            cache_read: read("cache_read_input_tokens"),
+            cache_write: read("cache_creation_input_tokens"),
+        };
         let id = str_field(message, "id");
-        let total = self.meta.output_tokens.unwrap_or(0);
-        if id.is_some() && id == self.last_msg_id {
-            // Same API message re-logged with updated cumulative usage.
-            self.meta.output_tokens = Some(total - self.last_usage_added + out_tokens);
-        } else {
-            self.meta.output_tokens = Some(total + out_tokens);
+        // Same API message re-logged with updated cumulative usage: replace
+        // its prior contribution instead of double-counting.
+        let same = id.is_some() && id == self.last_msg_id;
+        let apply = |slot: &mut Option<u64>, added: u64, new: u64| {
+            let total = slot.unwrap_or(0);
+            *slot = Some(if same {
+                total - added + new
+            } else {
+                total + new
+            });
+        };
+        let prior = self.last_usage_added;
+        apply(&mut self.meta.output_tokens, prior.output, fresh.output);
+        apply(&mut self.meta.input_tokens, prior.input, fresh.input);
+        apply(
+            &mut self.meta.cache_read_tokens,
+            prior.cache_read,
+            fresh.cache_read,
+        );
+        apply(
+            &mut self.meta.cache_write_tokens,
+            prior.cache_write,
+            fresh.cache_write,
+        );
+        if !same {
             self.last_msg_id = id;
         }
-        self.last_usage_added = out_tokens;
+        self.last_usage_added = fresh;
     }
 }
 
@@ -214,6 +275,8 @@ fn classify(name: &str, input: Option<&serde_json::Value>) -> Option<ActivityEve
         result_head: None,
         ok: None,
         origin: None,
+        minor: false,
+        dur_ms: None,
     })
 }
 
@@ -289,7 +352,8 @@ mod tests {
                 ActionKind::WebFetch,
                 ActionKind::Subagent,
                 ActionKind::Search,
-                ActionKind::Mcp, // TodoWrite skipped
+                ActionKind::Other, // TodoWrite — kept, as a minor row
+                ActionKind::Mcp,
             ]
         );
         assert_eq!(s.events[0].detail, "cargo test");
@@ -297,8 +361,59 @@ mod tests {
         assert_eq!(s.events[0].ts_ms, Some(1783512000000)); // 2026-07-08T12:00Z
         assert_eq!(s.events[1].detail, "/a.rs");
         assert_eq!(s.events[5].note.as_deref(), Some("Explore"));
-        assert_eq!(s.events[7].detail, "github:create_issue");
-        assert!(s.events[7].note.as_deref().unwrap().contains("bug"));
+        assert!(s.events[7].minor, "bookkeeping tools are minor");
+        assert_eq!(s.events[7].detail, "TodoWrite");
+        assert!(!s.events[0].minor);
+        assert_eq!(s.events[8].detail, "github:create_issue");
+        assert!(s.events[8].note.as_deref().unwrap().contains("bug"));
+    }
+
+    #[test]
+    fn user_prompts_become_turn_markers() {
+        let mut s = ClaudeScan::default();
+        s.ingest(concat!(
+            r#"{"type":"user","timestamp":"2026-07-08T12:00:00.000Z","message":{"role":"user","content":"Fix the failing tests"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            "\n",
+            // A tool_result-only user line is not a turn.
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+            "\n",
+            // Harness plumbing (meta envelope) is not a turn either.
+            r#"{"type":"user","message":{"role":"user","content":"<system-reminder>noise</system-reminder>"}}"#,
+        ));
+        let prompts: Vec<&ActivityEvent> = s
+            .events
+            .iter()
+            .filter(|e| e.kind == ActionKind::Prompt)
+            .collect();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].detail, "Fix the failing tests");
+        assert_eq!(prompts[0].ts_ms, Some(1783512000000));
+        // The turn marker precedes the command it triggered.
+        assert_eq!(s.events[0].kind, ActionKind::Prompt);
+        assert_eq!(s.events[1].kind, ActionKind::Command);
+    }
+
+    #[test]
+    fn result_timestamps_yield_durations() {
+        let mut s = ClaudeScan::default();
+        s.ingest(
+            r#"{"type":"assistant","timestamp":"2026-07-08T12:00:00.000Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo build"}}]}}"#,
+        );
+        s.ingest(
+            r#"{"type":"user","timestamp":"2026-07-08T12:00:12.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"done"}]}}"#,
+        );
+        assert_eq!(s.events[0].dur_ms, Some(12_000));
+        // No timestamps → no duration, never a panic.
+        let mut bare = ClaudeScan::default();
+        bare.ingest(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+        );
+        bare.ingest(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"x"}]}}"#,
+        );
+        assert_eq!(bare.events[0].dur_ms, None);
     }
 
     #[test]
@@ -351,20 +466,48 @@ mod tests {
         s.ingest(concat!(
             r#"{"type":"user","message":{"role":"user","content":"Fix the flaky test"}}"#,
             "\n",
-            r#"{"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8","usage":{"output_tokens":10},"content":[{"type":"text","text":"ok"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8","usage":{"output_tokens":10,"input_tokens":4,"cache_read_input_tokens":100,"cache_creation_input_tokens":50},"content":[{"type":"text","text":"ok"}]}}"#,
             "\n",
-            r#"{"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8","usage":{"output_tokens":25},"content":[{"type":"text","text":"more"}]}}"#,
+            r#"{"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8","usage":{"output_tokens":25,"input_tokens":4,"cache_read_input_tokens":100,"cache_creation_input_tokens":50},"content":[{"type":"text","text":"more"}]}}"#,
             "\n",
-            r#"{"type":"assistant","message":{"id":"m2","usage":{"output_tokens":5},"content":[]}}"#,
+            r#"{"type":"assistant","message":{"id":"m2","usage":{"output_tokens":5,"input_tokens":2,"cache_read_input_tokens":30},"content":[]}}"#,
         ));
         assert_eq!(s.meta.title.as_deref(), Some("Fix the flaky test"));
         assert_eq!(s.meta.model.as_deref(), Some("claude-opus-4-8"));
-        // m1 counted once at its final value (25), plus m2's 5.
+        // m1 counted once at its final value, plus m2 — for every tally.
         assert_eq!(s.meta.output_tokens, Some(30));
+        assert_eq!(s.meta.input_tokens, Some(6));
+        assert_eq!(s.meta.cache_read_tokens, Some(130));
+        assert_eq!(s.meta.cache_write_tokens, Some(50));
 
         // A summary line overrides the prompt-derived title.
         s.ingest(r#"{"type":"summary","summary":"Flaky test fix"}"#);
         assert_eq!(s.meta.title.as_deref(), Some("Flaky test fix"));
+    }
+
+    #[test]
+    fn add_tokens_folds_subagent_meta_into_the_session_total() {
+        let mut main = ActivityMeta {
+            title: Some("t".into()),
+            output_tokens: Some(10),
+            input_tokens: Some(1),
+            ..Default::default()
+        };
+        let sub = ActivityMeta {
+            output_tokens: Some(5),
+            cache_read_tokens: Some(70),
+            ..Default::default()
+        };
+        main.add_tokens(&sub);
+        assert_eq!(main.output_tokens, Some(15));
+        assert_eq!(main.input_tokens, Some(1));
+        assert_eq!(main.cache_read_tokens, Some(70), "None + Some sums");
+        assert_eq!(main.cache_write_tokens, None, "absent stays absent");
+        assert_eq!(
+            main.title.as_deref(),
+            Some("t"),
+            "identity fields keep self's"
+        );
     }
 
     #[test]

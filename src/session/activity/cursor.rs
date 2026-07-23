@@ -169,6 +169,8 @@ fn classify(name: &str, input: Option<&serde_json::Value>) -> Option<ActivityEve
         result_head: None,
         ok: None,
         origin: None,
+        minor: false,
+        dur_ms: None,
     })
 }
 

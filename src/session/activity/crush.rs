@@ -143,6 +143,8 @@ impl CrushScan {
                 .and_then(|c| c.as_i64())
                 .map(|c| c == 0),
             origin: None,
+            minor: false,
+            dur_ms: None,
         };
         if let Some(output) = data.get("output").and_then(|o| o.as_str()) {
             let output = output.trim();
@@ -223,6 +225,8 @@ fn classify(name: &str, input: &serde_json::Value) -> Option<ActivityEvent> {
         result_head: None,
         ok: None,
         origin: None,
+        minor: false,
+        dur_ms: None,
     })
 }
 
@@ -243,6 +247,7 @@ pub fn session_meta(title: Option<&str>, completion_tokens: Option<i64>) -> Acti
         title: title.map(str::to_string).filter(|t| !t.trim().is_empty()),
         model: None,
         output_tokens: completion_tokens.and_then(|t| u64::try_from(t).ok()),
+        ..Default::default()
     }
 }
 

@@ -705,6 +705,7 @@ repos? Add `--add-repo PATH@main` (its own worktree per repo) or
 | `Ctrl+J` / `Alt+J` | Select next session (`Ctrl+J` defers to the agent in a focused terminal — it doubles as a legacy `Ctrl+Enter`; use `Alt+J` there) | Vim: **j** = down |
 | `Ctrl+K` / `Alt+K` | Select previous session (`Ctrl+K` defers likewise; use `Alt+K` in a focused terminal) | Vim: **k** = up |
 | `Ctrl+L` | Focus next pane (cycle forward) | Vim: **l** = right |
+| `F9` | Toggle agent activity view (per-session retrospective: dashboard + turn timeline) | Retrospective |
 | `F10` | Jump to next blocked session (wraps, focuses terminal) | Attention |
 | `Ctrl+6` / `Ctrl+^` | Toggle between the two most recent sessions | vim alternate buffer |
 | `Alt+A` | Number blocked sessions; a digit jumps to that one | Attention |

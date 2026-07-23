@@ -47,7 +47,7 @@ pub(super) struct CopilotSource {
     workspace: CopilotWorkspace,
     dir: Option<PathBuf>,
     offset: u64,
-    pub(super) truncated: bool,
+    pub(super) backfilling: bool,
     /// Hash of the session-state subdir names at the last discovery — the cheap
     /// rebind trigger (a new session dir appearing flips it without re-reading
     /// any `workspace.yaml`).
@@ -103,7 +103,10 @@ pub(super) fn scan_copilot(
     let events = dir.join("events.jsonl");
     let workspace = dir.join("workspace.yaml");
     let new_sig = super::stat_signature(&[&events, &workspace]);
-    if new_sig == *sig {
+    // Keep draining a large backlog even when the signature is unchanged; the
+    // inner per-call sig is fresh-zero, so only this gate guards the pass and
+    // would otherwise strand the remaining chunks (see scan_vibe).
+    if new_sig == *sig && !src.backfilling {
         return false;
     }
     // workspace.yaml is tiny and atomically replaced — re-parse on any change.
@@ -117,7 +120,7 @@ pub(super) fn scan_copilot(
         &events,
         &mut ev_sig,
         &mut src.offset,
-        &mut src.truncated,
+        &mut src.backfilling,
         |chunk| src.scan.ingest(chunk),
     )
     .is_none()
@@ -125,12 +128,12 @@ pub(super) fn scan_copilot(
         // Compaction/rewind rewrote events.jsonl in full — reset + re-ingest.
         src.scan = CopilotScan::default();
         src.offset = 0;
-        src.truncated = false;
+        src.backfilling = false;
         let _ = super::tail_source(
             &events,
             &mut ev_sig,
             &mut src.offset,
-            &mut src.truncated,
+            &mut src.backfilling,
             |chunk| src.scan.ingest(chunk),
         );
     }
@@ -238,6 +241,41 @@ mod tests {
             Some(PathBuf::from("/env/copilot/session-state"))
         );
         std::env::remove_var("COPILOT_HOME");
+    }
+
+    #[test]
+    fn scan_copilot_drains_large_backfill_across_unchanged_passes() {
+        // A backlog larger than INGEST_CHUNK must keep draining across passes
+        // even though the file is never touched again — regression for the outer
+        // signature gate stranding the tail (mirrors scan_vibe).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("session-state");
+        let line = tool_start("c1", "bash", r#"{"command":"ls"}"#) + "\n";
+        let repeats = (super::super::INGEST_CHUNK as usize / line.len()) + 500;
+        let dir = write_session(
+            &root,
+            "e57ef7a5-9452-4a54-b182-8d18f1058e94",
+            "/repo/a",
+            "2026-07-12T10:00:00.000Z",
+            &line.repeat(repeats),
+        );
+        let file_len = std::fs::metadata(dir.join("events.jsonl")).unwrap().len();
+
+        let dirs = vec!["/repo/a".to_string()];
+        let mut src = CopilotSource::default();
+        let mut sig = 0u64;
+        assert!(scan_copilot(&mut src, &mut sig, Some(&root), None, &dirs));
+        assert!(src.backfilling, "one pass cannot drain a >8 MiB backlog");
+        assert!(src.offset < file_len);
+
+        let mut passes = 0;
+        while src.backfilling && passes < 8 {
+            scan_copilot(&mut src, &mut sig, Some(&root), None, &dirs);
+            passes += 1;
+        }
+        assert!(!src.backfilling, "the outer gate must not strand the tail");
+        assert_eq!(src.offset, file_len, "every byte was eventually ingested");
+        assert_eq!(src.scan.events.len(), repeats);
     }
 
     #[test]

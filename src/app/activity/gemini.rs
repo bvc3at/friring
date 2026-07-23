@@ -47,7 +47,7 @@ pub(in crate::app) struct GeminiSource {
     chats_dir: Option<PathBuf>,
     file: Option<PathBuf>,
     offset: u64,
-    pub(super) truncated: bool,
+    pub(super) backfilling: bool,
     newest_seen: Option<OsString>,
 }
 
@@ -94,15 +94,15 @@ pub(in crate::app) fn scan_gemini(
     let Some(file) = src.file.clone() else {
         return false;
     };
-    tail_source(&file, sig, &mut src.offset, &mut src.truncated, |chunk| {
+    tail_source(&file, sig, &mut src.offset, &mut src.backfilling, |chunk| {
         src.scan.ingest(chunk)
     })
     .unwrap_or_else(|| {
         // Shrunk (rewritten): reset the streaming parser and re-ingest.
         src.scan = GeminiScan::default();
         src.offset = 0;
-        src.truncated = false;
-        tail_source(&file, sig, &mut src.offset, &mut src.truncated, |chunk| {
+        src.backfilling = false;
+        tail_source(&file, sig, &mut src.offset, &mut src.backfilling, |chunk| {
             src.scan.ingest(chunk)
         })
         .unwrap_or(false)

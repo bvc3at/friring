@@ -214,6 +214,8 @@ fn classify(name: &str, arguments: Option<&serde_json::Value>) -> Option<Activit
         result_head: None,
         ok: None,
         origin: None,
+        minor: false,
+        dur_ms: None,
     })
 }
 

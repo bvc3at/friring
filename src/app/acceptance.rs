@@ -1309,6 +1309,8 @@ fn activity_sections_render_seeded_events() {
         result_head: Some("output head".into()),
         ok,
         origin: None,
+        minor: false,
+        dur_ms: None,
     };
     let mut h = Harness::spawnable(1);
     let sid = h.app.sessions[0].info.id;
@@ -1333,10 +1335,13 @@ fn activity_sections_render_seeded_events() {
         assert_eq!(ca.counts.commands, 2);
         assert_eq!(ca.counts.total(), 5);
         assert_eq!(ca.files_count, 1, "edit+read of one path aggregate");
-        assert!(ca
-            .rows
-            .iter()
-            .any(|r| matches!(r, super::cc_activity::CcRow::Text(s) if s.contains("5 actions"))));
+        // The dashboard's tile row carries the per-kind counts.
+        assert!(ca.rows.iter().any(|r| matches!(
+            r,
+            super::cc_activity::CcRow::Tiles(t)
+                if t.iter().any(|x| x.label == "cmds" && x.value == "2")
+                    && t.iter().any(|x| x.label == "failed" && x.value == "1")
+        )));
     }
 
     // Timeline shows every event; Commands filters to the two commands.
@@ -1394,10 +1399,9 @@ fn activity_sections_render_seeded_events() {
     h.key(KeyCode::Char('4'), KeyModifiers::NONE);
     {
         let ca = h.app.active_cc_activity().unwrap();
-        assert!(ca
-            .rows
-            .iter()
-            .any(|r| matches!(r, super::cc_activity::CcRow::Info(s) if s.contains("Edited (1)"))));
+        assert!(ca.rows.iter().any(
+            |r| matches!(r, super::cc_activity::CcRow::Header(s) if s.contains("Edited (1)"))
+        ));
         assert!(ca.rows.iter().any(
             |r| matches!(r, super::cc_activity::CcRow::Text(s) if s.contains("/repo/src/a.rs"))
         ));
@@ -1407,6 +1411,70 @@ fn activity_sections_render_seeded_events() {
     h.key(KeyCode::Char('5'), KeyModifiers::NONE);
     assert_eq!(h.app.active_cc_activity().unwrap().rows.len(), 1);
     h.render();
+}
+
+#[test]
+fn activity_timeline_groups_turns_folds_runs_and_badges_subagents() {
+    use super::activity::{ProviderKind, Section, SessionActivity};
+    use crate::session::activity::{ActionKind, ActivityEvent};
+
+    let ev = |kind, detail: &str, origin: Option<&str>| ActivityEvent {
+        ts_ms: Some(1_783_512_000_000),
+        kind,
+        detail: detail.into(),
+        note: None,
+        result_head: None,
+        ok: Some(true),
+        origin: origin.map(String::from),
+        minor: false,
+        dur_ms: Some(12_000),
+    };
+    let mut h = Harness::spawnable(1);
+    let sid = h.app.sessions[0].info.id;
+    h.app.activity.insert(
+        sid,
+        SessionActivity::seeded(
+            ProviderKind::Claude,
+            vec![
+                ev(ActionKind::Prompt, "Fix the failing tests", None),
+                ev(ActionKind::Command, "cargo nextest run", None),
+                ev(ActionKind::Read, "/repo/src/a.rs", None),
+                ev(ActionKind::Read, "/repo/src/a.rs", None),
+                ev(ActionKind::Read, "/repo/src/a.rs", None),
+                ev(ActionKind::Command, "cargo fmt", Some("fix-tests")),
+            ],
+        ),
+    );
+
+    h.key(KeyCode::F(9), KeyModifiers::NONE);
+    h.key(KeyCode::Char('2'), KeyModifiers::NONE);
+    {
+        let ca = h.app.active_cc_activity().unwrap();
+        assert_eq!(
+            ca.open,
+            Some(super::cc_activity::CcNodeRef::Section(Section::Timeline))
+        );
+        // Prompt + command + folded read run + subagent command = 4 rows.
+        assert_eq!(ca.rows.len(), 4);
+    }
+    let frame = h.render();
+    // The prompt renders as a dash-filled turn header…
+    assert!(
+        frame.contains("▶") && frame.contains("Fix the failing tests"),
+        "turn header renders the prompt: {frame}"
+    );
+    // …events sit in the turn gutter, with the read run folded…
+    assert!(frame.contains("│"), "timeline rows carry the turn gutter");
+    assert!(
+        frame.contains("×3"),
+        "the repeated read folds to one ×3 row"
+    );
+    // …the subagent's work is nested and origin-badged, with its duration.
+    assert!(
+        frame.contains("└") && frame.contains("fix-tests"),
+        "subagent-origin work is nested with its origin badge: {frame}"
+    );
+    assert!(frame.contains("12s"), "call→result duration renders");
 }
 
 #[test]

@@ -135,6 +135,8 @@ fn classify(name: &str, args: &serde_json::Value) -> Option<ActivityEvent> {
         result_head: None,
         ok: None,
         origin: None,
+        minor: false,
+        dur_ms: None,
     })
 }
 
@@ -173,6 +175,7 @@ pub fn parse_meta(s: &str) -> VibeMeta {
             output_tokens: v
                 .pointer("/stats/session_completion_tokens")
                 .and_then(|t| t.as_u64()),
+            ..Default::default()
         },
         session_id: str_at("/session_id"),
         parent_session_id: str_at("/parent_session_id"),

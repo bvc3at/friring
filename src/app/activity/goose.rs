@@ -22,7 +22,7 @@ use crate::session::activity::ActivityMeta;
 /// of thousands of rows, so only the most recent are ingested and older turns
 /// are surfaced as [`GooseSource::truncated`]. Rows are pulled newest-first then
 /// restored to chronological order, so clipping drops the oldest.
-const MESSAGE_CAP: i64 = 10_000;
+const MESSAGE_CAP: i64 = 50_000;
 
 /// goose scan state: the streaming parser (rebuilt on each re-parse), the
 /// session's activity metadata, and whether older turns were clipped.
