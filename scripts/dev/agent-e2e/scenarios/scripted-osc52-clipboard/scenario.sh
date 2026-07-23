@@ -39,6 +39,18 @@ scenario_setup() {
     export SSH_TTY=/dev/e2e-fake-tty
     export SSH_CONNECTION="10.0.0.9 11111 10.0.0.10 22"
     unset DISPLAY WAYLAND_DISPLAY
+
+    # Seed the cmd+c Copy binding so the super+c legs are platform-neutral:
+    # cmd+c is a macOS-only *compile-time* default (Action::default_chords),
+    # and this suite's CI runner is Linux — where the built-in defaults carry
+    # no Cmd chords, so an unseeded super+c would be swallowed as an unbound
+    # chord and legs 4/5 would test nothing (and time out). Membership of
+    # cmd+c/cmd+v in the macOS default set is unit-tested separately
+    # (`macos_clipboard_actions_carry_cmd_alternates`). A partial map only
+    # overrides Copy; every other action keeps its default.
+    mkdir -p "$XDG_CONFIG_HOME/friring-dev"
+    printf '{"Copy": ["ctrl+c", "cmd+c"]}\n' \
+        > "$XDG_CONFIG_HOME/friring-dev/keybindings.json"
 }
 
 # Bounded poll (the sanctioned e2e_wait_pane mirror) of the driver server's
