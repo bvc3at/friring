@@ -6401,6 +6401,17 @@ impl App {
             return;
         }
 
+        // Resolve the active session's host (an SSH/WSL `HostDef`, or `None`
+        // for a local session) so every git subcommand runs on the host that
+        // actually owns the worktree — a remote worktree path doesn't exist
+        // locally, so syncing it locally failed with "no such file or
+        // directory".
+        let host = self
+            .active_session()
+            .and_then(|s| s.info.remote_host.as_deref())
+            .and_then(|name| self.hosts.get(name))
+            .cloned();
+
         let worktree_sessions: Vec<_> = self
             .active_session()
             .into_iter()
@@ -6440,6 +6451,7 @@ impl App {
             worktrees: worktree_sessions,
             queue: Vec::new(),
             chosen: std::collections::HashMap::new(),
+            host,
         });
         self.set_status(StatusLevel::Info, "Preparing sync...");
     }
@@ -6570,6 +6582,7 @@ impl App {
 
         for (repo, worktrees) in by_repo {
             let tx = tx.clone();
+            let host = run.host.clone();
             // The picked (or single non-origin) base remote; `None` derives
             // the rebase target per-worktree (upstream → origin/HEAD →
             // origin/main → origin/master). The resolved ref rides back on
@@ -6577,7 +6590,8 @@ impl App {
             let remote = run.chosen.get(&repo).cloned();
             std::thread::spawn(move || {
                 for (session_id, worktree_path) in worktrees {
-                    let result = git::sync_worktree(&worktree_path, remote.as_deref());
+                    let result =
+                        git::sync_worktree_on(host.as_ref(), &worktree_path, remote.as_deref());
                     let _ = tx.send((session_id, result));
                 }
             });
@@ -14472,6 +14486,7 @@ mod tests {
             )],
             queue: Vec::new(),
             chosen: HashMap::new(),
+            host: None,
         });
         let tx = app.worktree_sync.remotes_load.start();
         tx.send(vec![(repo, vec!["origin".to_string()])]).unwrap();
@@ -14498,6 +14513,7 @@ mod tests {
             )],
             queue: Vec::new(),
             chosen: HashMap::new(),
+            host: None,
         });
         let tx = app.worktree_sync.remotes_load.start();
         tx.send(vec![(repo, vec!["fork".to_string(), "origin".to_string()])])
@@ -14530,6 +14546,7 @@ mod tests {
             )],
             queue: Vec::new(),
             chosen: HashMap::new(),
+            host: None,
         });
         let tx = app.worktree_sync.remotes_load.start();
         tx.send(vec![(repo, vec!["fork".to_string(), "origin".to_string()])])
@@ -14557,6 +14574,7 @@ mod tests {
             )],
             queue: vec![(repo.clone(), vec!["fork".to_string(), "origin".to_string()])],
             chosen: HashMap::new(),
+            host: None,
         });
         app.modal = modals::Modal::SyncBasePicker(modals::SyncBasePickerModal {
             repo_name: "pick-remote-repo".to_string(),
@@ -14588,6 +14606,7 @@ mod tests {
             )],
             queue: Vec::new(),
             chosen: HashMap::new(),
+            host: None,
         });
 
         app.confirm_sync_base("origin".to_string());
@@ -14612,6 +14631,7 @@ mod tests {
             )],
             queue: vec![(repo, vec!["fork".to_string(), "origin".to_string()])],
             chosen: HashMap::new(),
+            host: None,
         });
         app.modal = modals::Modal::SyncBasePicker(modals::SyncBasePickerModal {
             repo_name: "cancel-remote-repo".to_string(),
@@ -14651,6 +14671,7 @@ mod tests {
             ],
             queue: vec![(repo_a, remotes.clone()), (repo_b.clone(), remotes.clone())],
             chosen: HashMap::new(),
+            host: None,
         });
         app.modal = modals::Modal::SyncBasePicker(modals::SyncBasePickerModal {
             repo_name: "queue-repo-a".to_string(),

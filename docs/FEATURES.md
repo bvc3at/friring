@@ -2508,6 +2508,14 @@ git branch itself keeps the `/`.
 default branch. The operation runs in the background — the TUI
 stays responsive throughout.
 
+For a **remote** session (SSH/WSL) the worktree lives on the host,
+not on the local machine, so every git subcommand runs *on the host*
+via the same transport-neutral launcher the rest of git uses
+(`git::sync_worktree_on(host, …)` → `git_command(host, …)` → `ssh …`
+/ `wsl.exe …`). Syncing locally would fail with "no such file or
+directory" because the remote worktree path doesn't exist here. Local
+sessions pass `host = None` and are unchanged.
+
 ### Algorithm
 
 Sessions are grouped by repository path so that worktrees sharing
@@ -2517,7 +2525,9 @@ lock contention). Different repositories sync in parallel.
 Per-worktree steps:
 
 1. **Clean stale index locks** — removes `.git/index.lock` from
-   crashed git processes (see below).
+   crashed git processes (see below). **Local worktrees only** — the
+   sweep stats the local filesystem (`/proc`, mtime), so it is skipped
+   for a remote host.
 2. **Stash** — saves uncommitted changes so rebase can proceed on
    a clean tree.
 3. **Fetch** — `git fetch` from the base remote (see below;
