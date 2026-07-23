@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{
@@ -11,6 +11,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::{debug, error};
 
+use crate::agent::osc52::Osc52Scanner;
 use crate::agent::provider::AgentProvider;
 use crate::session::{SessionConfig, SessionInfo};
 
@@ -145,6 +146,59 @@ impl vt100::Callbacks for TermSignals {
 /// [`TermSignals`]. The captured `Screen` is callback-independent, so
 /// rendering is unaffected.
 pub type SessionParser = vt100::Parser<TermSignals>;
+
+/// Process-wide monotonic capture sequence, stamped on every OSC 52 copy so
+/// the app can re-order copies drained from different panes back into the order
+/// they were captured (pane-by-pane draining alone would apply a later pane's
+/// older copy last — see [`crate::app::App::drain_pane_clipboard_copies`]).
+static OSC52_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Clipboard writes captured from a pane's output stream (OSC 52 — see
+/// [`crate::agent::osc52`]), queued for the app to route through its clipboard
+/// stack on the next tick. Generation-gated like `TermSignals::meta_gen`
+/// (ADR-P10): the every-tick, nothing-new poll pays one atomic load per pane,
+/// never a lock. Each queued copy carries a global capture sequence
+/// (`OSC52_SEQ`) so cross-pane draining can restore capture order.
+#[derive(Default)]
+pub struct PaneClipboard {
+    queue: Mutex<VecDeque<(u64, String)>>,
+    /// Bumped **after** each push (`Release`), so an observer that sees the new
+    /// generation also sees the queued value.
+    gen: AtomicU64,
+}
+
+impl PaneClipboard {
+    /// Cap on undrained copies. Drop-oldest: with clipboard writes, the
+    /// *newest* is the one that must end up winning, so a pane spamming OSC 52
+    /// between ticks loses its stale copies, never its latest.
+    const CAP: usize = 8;
+
+    fn push(&self, text: String) {
+        let seq = OSC52_SEQ.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut q) = self.queue.lock() {
+            if q.len() >= Self::CAP {
+                q.pop_front();
+            }
+            q.push_back((seq, text));
+        }
+        self.gen.fetch_add(1, Ordering::Release);
+    }
+
+    /// Drain copies queued since the caller's `last_seen` generation, oldest
+    /// first (each paired with its global capture sequence); empty — without
+    /// locking — when nothing new arrived.
+    fn drain_new(&self, last_seen: &mut u64) -> Vec<(u64, String)> {
+        let gen = self.gen.load(Ordering::Acquire);
+        if gen == *last_seen {
+            return Vec::new();
+        }
+        *last_seen = gen;
+        self.queue
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default()
+    }
+}
 
 /// Metadata returned when discovering existing sessions from the backend.
 #[derive(Clone)]
@@ -323,6 +377,7 @@ struct WiredState {
     attention_at: Arc<AtomicU64>,
     notification: Arc<Mutex<Option<String>>>,
     meta_gen: Arc<AtomicU64>,
+    osc52: Arc<PaneClipboard>,
 }
 
 /// A companion shell pane running alongside an agent session.
@@ -337,6 +392,11 @@ pub struct ShellPane {
     /// Captured OSC title for the shell pane (unused; kept for symmetry).
     #[allow(dead_code)]
     last_title: Arc<Mutex<Option<String>>>,
+    /// OSC 52 clipboard writes from the shell pane, drained through
+    /// [`Session::drain_osc52_copies`].
+    osc52: Arc<PaneClipboard>,
+    /// The [`PaneClipboard`] generation last drained.
+    last_drained_osc52_gen: u64,
 }
 
 impl ShellPane {
@@ -355,7 +415,9 @@ impl ShellPane {
 
     /// Shell twin of [`Session::feed_output_for_test`]: bump `last_output_at`
     /// and run the bytes through the vt100 parser, driving the same state the
-    /// reader loop's `%output` path drives.
+    /// reader loop's `%output` path drives. OSC 52 sequences are captured like
+    /// the reader loop does, but per call — a sequence must complete within
+    /// one feed (the live scanner persists across reads).
     #[cfg(test)]
     pub fn feed_output_for_test(&self, bytes: &[u8]) {
         // Strictly-increasing bump, unlike the reader loop's plain `now_millis()`
@@ -364,6 +426,9 @@ impl ShellPane {
         let prev = self.last_output_at.load(Ordering::Relaxed);
         self.last_output_at
             .store(now_millis().max(prev + 1), Ordering::Relaxed);
+        for copy in Osc52Scanner::default().scan(bytes) {
+            self.osc52.push(copy);
+        }
         if let Ok(mut p) = self.parser.lock() {
             p.process(bytes);
         }
@@ -378,6 +443,8 @@ impl ShellPane {
             exited: state.exited,
             last_output_at: state.last_output_at,
             last_title: state.last_title,
+            osc52: state.osc52,
+            last_drained_osc52_gen: 0,
         }
     }
 }
@@ -414,6 +481,11 @@ pub struct Session {
     /// The generation last consumed by [`Self::sync_agent_meta`]. Starts at
     /// `u64::MAX` so the first tick always syncs.
     last_synced_meta_gen: u64,
+    /// OSC 52 clipboard writes captured from the agent pane's output stream,
+    /// awaiting the app's per-tick [`Self::drain_osc52_copies`].
+    osc52: Arc<PaneClipboard>,
+    /// The [`PaneClipboard`] generation last drained.
+    last_drained_osc52_gen: u64,
     /// `now_millis()` of the last attention acknowledgement (set while the
     /// session is the active one). Attention is pending when
     /// `attention_at > attention_ack_at`.
@@ -550,6 +622,7 @@ impl Session {
 
         let exited = Arc::new(AtomicBool::new(false));
         let last_output_at = Arc::new(AtomicU64::new(initial_output_at(io.mode)));
+        let osc52 = Arc::new(PaneClipboard::default());
 
         let (input_tx, input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
         tokio::spawn(Self::writer_loop(io.input, input_rx));
@@ -557,8 +630,15 @@ impl Session {
         let parser_clone = Arc::clone(&parser);
         let exited_clone = Arc::clone(&exited);
         let last_output_clone = Arc::clone(&last_output_at);
+        let osc52_clone = Arc::clone(&osc52);
         tokio::task::spawn_blocking(move || {
-            Self::reader_loop(io.output, parser_clone, exited_clone, last_output_clone);
+            Self::reader_loop(
+                io.output,
+                parser_clone,
+                exited_clone,
+                last_output_clone,
+                osc52_clone,
+            );
         });
 
         let state = WiredState {
@@ -570,6 +650,7 @@ impl Session {
             attention_at,
             notification,
             meta_gen,
+            osc52,
         };
         (state, io.backend_id)
     }
@@ -599,6 +680,8 @@ impl Session {
             notification: state.notification,
             meta_gen: state.meta_gen,
             last_synced_meta_gen: u64::MAX,
+            osc52: state.osc52,
+            last_drained_osc52_gen: 0,
             attention_ack_at: 0,
             shell_pane: None,
             env,
@@ -668,6 +751,8 @@ impl Session {
             notification,
             meta_gen,
             last_synced_meta_gen: u64::MAX,
+            osc52: Arc::default(),
+            last_drained_osc52_gen: 0,
             attention_ack_at: 0,
             shell_pane: None,
             env,
@@ -692,6 +777,7 @@ impl Session {
         parser: Arc<Mutex<SessionParser>>,
         exited: Arc<AtomicBool>,
         last_output_at: Arc<AtomicU64>,
+        osc52: Arc<PaneClipboard>,
     ) {
         let mut buf = [0u8; 4096];
         // Bytes of a trailing, not-yet-complete UTF-8 character held back from
@@ -702,6 +788,11 @@ impl Session {
         // byte (e.g. a newline), misplacing later output — so we never hand it a
         // truncated tail. `carry` is at most 3 bytes (a 4-byte char missing one).
         let mut carry: Vec<u8> = Vec::new();
+        // Clipboard writes (OSC 52) are extracted here, from the same chunks
+        // the parser gets — the parser can't surface them itself (its OSC
+        // buffer truncates at 1 KiB; see `agent::osc52`). The stream is left
+        // untouched: vt100 ignores the sequence harmlessly.
+        let mut scanner = Osc52Scanner::default();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
@@ -715,6 +806,9 @@ impl Session {
                     let ready = utf8_ready_prefix_len(&data);
                     carry = data.split_off(ready);
                     if !data.is_empty() {
+                        for copy in scanner.scan(&data) {
+                            osc52.push(copy);
+                        }
                         if let Ok(mut p) = parser.lock() {
                             p.process(&data);
                         }
@@ -729,6 +823,9 @@ impl Session {
         // Stream ended (EOF or error): flush any leftover partial UTF-8 sequence,
         // since no more bytes are coming to complete it.
         if !carry.is_empty() {
+            for copy in scanner.scan(&carry) {
+                osc52.push(copy);
+            }
             if let Ok(mut p) = parser.lock() {
                 p.process(&carry);
             }
@@ -842,6 +939,22 @@ impl Session {
         Some((self.agent_title(), self.notification()))
     }
 
+    /// Clipboard writes captured from this session's panes (agent + shell)
+    /// since the last drain, each paired with its global capture sequence —
+    /// programs inside a pane setting the clipboard via OSC 52 (Claude Code's
+    /// `/copy`, nvim's OSC 52 provider, …; see [`crate::agent::osc52`]). The
+    /// app sorts by that sequence across sessions and routes each through the
+    /// same clipboard stack as every other copy surface. Gen-gated like
+    /// [`Self::sync_agent_meta`]: the every-tick, nothing-new case is one
+    /// atomic load per pane (ADR-P10).
+    pub fn drain_osc52_copies(&mut self) -> Vec<(u64, String)> {
+        let mut copies = self.osc52.drain_new(&mut self.last_drained_osc52_gen);
+        if let Some(shell) = self.shell_pane.as_mut() {
+            copies.extend(shell.osc52.drain_new(&mut shell.last_drained_osc52_gen));
+        }
+        copies
+    }
+
     /// Simulate a reader-thread title/notification write for the ADR-P10
     /// perf tests (mirrors [`Self::mark_exited_for_test`]).
     #[cfg(test)]
@@ -947,6 +1060,11 @@ impl Session {
         self.input_tx = state.input_tx;
         self.exited = state.exited;
         self.last_output_at = state.last_output_at;
+        // Adopt the fresh reader loop's clipboard queue (and reset the drain
+        // gate): keeping the old pane's queue would silently drop every OSC 52
+        // copy the restarted pane makes.
+        self.osc52 = state.osc52;
+        self.last_drained_osc52_gen = 0;
         self.env = config.env.clone();
         self.info.backend_id = Some(self.backend_id.clone());
         if !config.agent.is_empty() {
@@ -1116,6 +1234,8 @@ impl Session {
             notification,
             meta_gen,
             last_synced_meta_gen: u64::MAX,
+            osc52: Arc::default(),
+            last_drained_osc52_gen: 0,
             attention_ack_at: 0,
             shell_pane: None,
             env: HashMap::new(),
@@ -1128,7 +1248,9 @@ impl Session {
     /// would: bump `last_output_at` and run the bytes through the vt100 parser
     /// (firing `TermSignals` callbacks). This is the test seam for everything
     /// downstream of PTY output — terminal rendering, the output-change redraw
-    /// detector, OSC title/bell signals, and buffer-content search.
+    /// detector, OSC title/bell signals, buffer-content search, and OSC 52
+    /// clipboard capture (per call: a sequence must complete within one feed;
+    /// the live reader's scanner persists across reads).
     #[cfg(test)]
     pub fn feed_output_for_test(&self, bytes: &[u8]) {
         // Strictly-increasing bump: two feeds within the same millisecond must
@@ -1136,6 +1258,9 @@ impl Session {
         let prev = self.last_output_at.load(Ordering::Relaxed);
         self.last_output_at
             .store(now_millis().max(prev + 1), Ordering::Relaxed);
+        for copy in Osc52Scanner::default().scan(bytes) {
+            self.osc52.push(copy);
+        }
         if let Ok(mut p) = self.parser.lock() {
             p.process(bytes);
         }
@@ -1145,6 +1270,25 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_clipboard_drops_oldest_and_drains_gen_gated() {
+        let pc = PaneClipboard::default();
+        let mut seen = 0;
+        assert!(pc.drain_new(&mut seen).is_empty());
+        for i in 0..PaneClipboard::CAP + 3 {
+            pc.push(format!("c{i}"));
+        }
+        let copies = pc.drain_new(&mut seen);
+        // Drop-oldest under the cap: the newest write must survive to win the
+        // clipboard.
+        assert_eq!(copies.len(), PaneClipboard::CAP);
+        assert_eq!(
+            copies.last().unwrap().1,
+            format!("c{}", PaneClipboard::CAP + 2)
+        );
+        assert!(pc.drain_new(&mut seen).is_empty());
+    }
 
     #[test]
     fn input_channel_overflow_fails_fast_without_blocking() {

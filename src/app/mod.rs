@@ -952,6 +952,12 @@ pub struct App {
     /// Linux. `None` when no display server is reachable (SSH/tmux/WSL) —
     /// copies then fall back to OSC 52 (see [`Self::set_clipboard_text`]).
     clipboard: Option<arboard::Clipboard>,
+    /// Test-only capture: when `Some`, [`Self::set_clipboard_text`] records
+    /// the text here and reports a native success instead of writing anywhere
+    /// real — a test copy must never reach the developer's actual clipboard
+    /// (or spawn `tmux load-buffer` against their real server).
+    #[cfg(test)]
+    pub(crate) captured_clipboard: Option<Vec<String>>,
     /// Persistent list state for the session section (preserves scroll offset).
     pub(crate) session_list_state: ratatui::widgets::ListState,
     /// Automations-pane UI state (cached list, selection, run history, editor).
@@ -1273,6 +1279,8 @@ impl App {
             mouse_hover: None,
             selected_text_cache: None,
             clipboard: arboard::Clipboard::new().ok(),
+            #[cfg(test)]
+            captured_clipboard: None,
             session_list_state: ratatui::widgets::ListState::default(),
             automation_ui: automation_state::AutomationUiState::default(),
             task_ui: task_state::TaskUiState::default(),
@@ -3541,6 +3549,13 @@ impl App {
     /// is dropped by tmux's default `set-clipboard external`, so the escape
     /// must come from tmux itself; outside tmux, raw OSC 52 to stdout.
     pub(crate) fn set_clipboard_text(&mut self, text: &str) -> Result<ClipboardVia, String> {
+        // Test capture: recorded, never written anywhere real (see the field).
+        #[cfg(test)]
+        if let Some(captured) = &mut self.captured_clipboard {
+            captured.push(text.to_string());
+            return Ok(ClipboardVia::Native);
+        }
+
         // 1. Native display-server clipboard — unless it is the SSH host's:
         //    on macOS, NSPasteboard accepts writes from an SSH login, so the
         //    copy would "succeed" onto a machine the user isn't looking at
@@ -3598,6 +3613,37 @@ impl App {
                 self.set_status(StatusLevel::Info, via.toast("Copied to clipboard"));
             }
             Err(e) => self.set_error(e),
+        }
+    }
+
+    /// Route clipboard writes captured from pane output streams (OSC 52 —
+    /// Claude Code's `/copy`, nvim's OSC 52 provider, anything in an agent or
+    /// shell pane; see `agent::osc52`) through the same clipboard stack as
+    /// every other copy surface. In a normal terminal the emulator would honor
+    /// the pane's escape itself; here friring *is* that pane's terminal, so it
+    /// forwards the copy to wherever the user's clipboard actually is (native,
+    /// or the tmux/OSC 52 route over SSH). Any session's panes may copy —
+    /// standard OSC 52 semantics, background panes included — so the toast
+    /// names the originating session. Applied in capture order across panes
+    /// (each copy carries a global sequence): the newest write is applied last
+    /// and wins the clipboard, like it would in a terminal — draining pane by
+    /// pane would otherwise let a later pane's older copy win.
+    fn drain_pane_clipboard_copies(&mut self) {
+        let mut copies: Vec<(u64, String, String)> = Vec::new();
+        for session in self.sessions.iter_mut() {
+            let name = session.info.name.clone();
+            for (seq, text) in session.drain_osc52_copies() {
+                copies.push((seq, name.clone(), text));
+            }
+        }
+        copies.sort_by_key(|(seq, _, _)| *seq);
+        for (_, name, text) in copies {
+            match self.set_clipboard_text(&text) {
+                Ok(via) => {
+                    self.set_status(StatusLevel::Info, via.toast(&format!("Copied from {name}")));
+                }
+                Err(e) => self.set_error(e),
+            }
         }
     }
 
@@ -4841,6 +4887,10 @@ impl App {
         self.poll_global_search_file_index();
 
         self.refresh_session_statuses();
+
+        // Forward clipboard writes panes made via OSC 52 (e.g. an agent's
+        // `/copy`) to the user's clipboard.
+        self.drain_pane_clipboard_copies();
 
         // Catch layout drift the event loop can't see (the auto info-pane dock
         // moving as content changes) and re-push PTY sizes.
@@ -8908,6 +8958,105 @@ mod tests {
         );
     }
 
+    /// Cmd+C through the full key pipeline copies the active selection —
+    /// the macOS alternate for Ctrl+C. Bound explicitly (not via defaults)
+    /// so the test is platform-independent; the macOS default set carrying
+    /// `cmd+c` is asserted in `session::keybindings`.
+    #[test]
+    fn cmd_c_copies_active_selection() {
+        let mut app = app_with_sessions(1);
+        app.captured_clipboard = Some(Vec::new());
+        app.keybindings.rebind(
+            crate::session::Action::Copy,
+            crate::session::KeyChord::cmd('c'),
+        );
+        app.focus = InputFocus::Terminal;
+        app.text_selection = Some(Selection::new(
+            TermPos { row: 0, col: 0 },
+            PaneBounds::from_rect(ratatui::layout::Rect::new(0, 0, 80, 24)),
+        ));
+        app.selected_text_cache = Some("copied text".into());
+
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::SUPER);
+
+        assert_eq!(
+            app.captured_clipboard.as_deref(),
+            Some(&["copied text".to_string()][..])
+        );
+        assert!(app.text_selection.is_none(), "copy consumes the selection");
+        assert_eq!(
+            app.status_message.as_ref().map(|m| m.text.as_str()),
+            Some("Copied to clipboard")
+        );
+    }
+
+    /// Cmd+C with no selection is inert in a focused terminal: no copy, and
+    /// nothing reaches the PTY — neither a SIGINT byte nor a stray literal
+    /// `c`. (Ctrl+C's no-selection fallthrough to SIGINT is the next test.)
+    #[test]
+    fn cmd_c_without_selection_sends_nothing_to_the_pty() {
+        use tokio::sync::mpsc::error::TryRecvError;
+        let backend_arc = stub_backend_arc();
+        let provider = stub_provider();
+        let mut app = App::new(
+            24,
+            120,
+            BackendRegistry::new(backend_arc.clone()),
+            stub_agents(),
+            test_db(),
+        );
+        let (session, mut input_rx) = Session::stub_with_input_rx("s", &backend_arc, &provider);
+        app.sessions.push(session);
+        app.active_index = 0;
+        app.captured_clipboard = Some(Vec::new());
+        app.keybindings.rebind(
+            crate::session::Action::Copy,
+            crate::session::KeyChord::cmd('c'),
+        );
+        app.focus = InputFocus::Terminal;
+
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::SUPER);
+
+        assert!(
+            matches!(input_rx.try_recv(), Err(TryRecvError::Empty)),
+            "Cmd+C must not forward anything to the PTY"
+        );
+        assert!(
+            app.captured_clipboard.as_ref().unwrap().is_empty(),
+            "nothing to copy without a selection"
+        );
+    }
+
+    /// The regression guard in the other direction: with the default
+    /// bindings, Ctrl+C with no selection keeps its interrupt meaning — the
+    /// Copy binding falls through and the PTY receives the SIGINT byte.
+    #[test]
+    fn ctrl_c_without_selection_still_interrupts_the_pty() {
+        let backend_arc = stub_backend_arc();
+        let provider = stub_provider();
+        let mut app = App::new(
+            24,
+            120,
+            BackendRegistry::new(backend_arc.clone()),
+            stub_agents(),
+            test_db(),
+        );
+        let (session, mut input_rx) = Session::stub_with_input_rx("s", &backend_arc, &provider);
+        app.sessions.push(session);
+        app.active_index = 0;
+        app.captured_clipboard = Some(Vec::new());
+        app.focus = InputFocus::Terminal;
+
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            input_rx.try_recv().ok(),
+            Some(vec![0x03]),
+            "Ctrl+C without a selection must reach the PTY as SIGINT"
+        );
+        assert!(app.captured_clipboard.as_ref().unwrap().is_empty());
+    }
+
     /// Inside a modal text input, readline `Ctrl+W` (delete word) and `Ctrl+U`
     /// (kill to line start) edit the text like a terminal — and never insert a
     /// literal `w`/`u`, nor fire the global `FocusTasks`/`OpenRestoreSessions`
@@ -12759,6 +12908,51 @@ mod tests {
 
         let counter = app.db.get_session_counter().unwrap();
         assert_eq!(counter, 42);
+    }
+
+    #[test]
+    fn pane_osc52_copies_drain_once_in_stream_order() {
+        // A pane program's OSC 52 write (e.g. `/copy`) is captured from the
+        // output stream and drained exactly once for the app to route through
+        // the clipboard stack.
+        let backend_arc = stub_backend_arc();
+        let provider = stub_provider();
+        let mut session = Session::stub("s", &backend_arc, &provider);
+        session.feed_output_for_test(b"out\x1b]52;c;aGVsbG8=\x07");
+        session.feed_output_for_test(b"\x1b]52;c;d29ybGQ=\x07");
+        let texts: Vec<String> = session
+            .drain_osc52_copies()
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(texts, ["hello", "world"]);
+        assert!(session.drain_osc52_copies().is_empty());
+    }
+
+    /// The tick end of the `/copy` chain: a pane's OSC 52 write — in the
+    /// exact tmux-passthrough-wrapped shape Claude Code emits under `$TMUX` —
+    /// is routed through the clipboard stack with a toast naming the
+    /// originating session, exactly once.
+    #[test]
+    fn tick_routes_pane_osc52_copy_to_clipboard_with_attribution() {
+        let mut app = app_with_sessions(1);
+        app.captured_clipboard = Some(Vec::new());
+        app.sessions[0].feed_output_for_test(b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8gd29ybGQ=\x07\x1b\\");
+
+        app.tick_core();
+
+        assert_eq!(
+            app.captured_clipboard.as_deref(),
+            Some(&["hello world".to_string()][..])
+        );
+        assert_eq!(
+            app.status_message.as_ref().map(|m| m.text.as_str()),
+            Some("Copied from test-session")
+        );
+
+        // Drained: another tick must not copy again.
+        app.tick_core();
+        assert_eq!(app.captured_clipboard.as_ref().unwrap().len(), 1);
     }
 
     #[test]

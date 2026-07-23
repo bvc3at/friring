@@ -694,8 +694,8 @@ repos? Add `--add-repo PATH@main` (its own worktree per repo) or
 |-----|--------|----------|
 | `Ctrl+Q` | Quit (detach sessions) | **Q**uit |
 | `Ctrl+N` | New session (opens repo picker) | **N**ew |
-| `Ctrl+C` | Copy selection / SIGINT (terminal) | **C**opy |
-| `Ctrl+V` | Paste from clipboard | Paste |
+| `Ctrl+C` / `Cmd+C` | Copy selection / SIGINT (terminal; `Cmd+C` never SIGINTs) | **C**opy |
+| `Ctrl+V` / `Cmd+V` | Paste from clipboard | Paste |
 | `Ctrl+P` | Automations (list/new/edit/toggle/run/delete) | **P**rogram |
 | `Ctrl+/` / `Shift Shift` | Global search (sessions/tasks/automations/files) | **/** = search; JetBrains double-shift |
 | `Ctrl+W` / `F5` | Toggle tasks panel (todo list) | **W**ork items |
@@ -730,9 +730,18 @@ Every chord above is rebindable from the `F1` editor (or by editing
 `~/.config/friring/keybindings.json`). `Shift+J`/`Shift+K`/`Shift+S`
 reorder or sort the session list only while it is focused.
 
+Programs running **inside** a pane can copy too: an OSC 52 clipboard
+write (e.g. Claude Code's `/copy`, nvim's OSC 52 provider), plain or
+tmux-passthrough-wrapped, is routed to the clipboard you actually see
+(native locally; tmux / OSC 52 over SSH) with a toast naming the
+originating session. Clipboard read *queries* are never answered.
+
 **macOS:** in kitty-protocol terminals (iTerm2 3.5+, kitty, WezTerm,
 Ghostty) the Command key works as a modifier — `Cmd+J`/`Cmd+Shift+J`
-switch sessions and `Cmd+L`/`Cmd+Shift+L` cycle panes by default, and
+switch sessions, `Cmd+L`/`Cmd+Shift+L` cycle panes, and
+`Cmd+C`/`Cmd+V` copy the selection / paste by default (`Cmd+C` needs a
+terminal that forwards the chord when it has no selection of its own,
+like Ghostty; unlike `Ctrl+C` it never doubles as SIGINT), and
 any action can be rebound to a `cmd+…` chord from the F1 editor.
 Terminal.app delivers no Cmd chords; everything else works there. The
 in-terminal `Alt+J`/`Alt+K` alternates need Option mapped to Alt/Meta

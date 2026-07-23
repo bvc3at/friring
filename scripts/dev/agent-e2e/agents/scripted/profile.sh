@@ -17,7 +17,13 @@
 # The script prints one READY line (mode + expanded placeholders), then
 # echoes every stdin line back prefixed `GOT:` — which lets a scenario tell
 # "text typed into the PTY" apart from "text the agent received" (terminal
-# echo shows the former, the GOT: line proves the latter).
+# echo shows the former, the GOT: line proves the latter). Two command
+# lines are special-cased (before the echo, which still happens): a
+# `copy-plain:<text>` / `copy-wrapped:<text>` line makes the script emit
+# <text> as an OSC 52 clipboard write — bare, or wrapped in the tmux DCS
+# passthrough the way real agents' copy commands emit it under `$TMUX` —
+# so a scenario can e2e the in-pane copy path with plaintext steps
+# (see scripted-osc52-clipboard).
 #
 # No model traffic: the anthropic stub is booted (harness contract) but the
 # scenario's fixtures.json is just `{"responses": []}` — the strict-offline
@@ -72,6 +78,22 @@ agent_seed_config() {
 # template expansion, then echo stdin lines back with a GOT: prefix.
 printf 'SCRIPTED-READY mode=%s id=%s name=%s\n' "${1:-none}" "${2:-}" "${3:-}"
 while IFS= read -r line; do
+    case "$line" in
+        # Clipboard probes (scripted-osc52-clipboard): emit the rest of the
+        # line as an OSC 52 clipboard write, the escape a real agent's copy
+        # command writes to its tty. `copy-wrapped:` uses the tmux DCS
+        # passthrough with the inner ESCs doubled — the exact shape Claude
+        # Code's /copy emits when it sees $TMUX (which every friring pane
+        # does). Encoded here (base64 is in coreutils/macOS alike; the
+        # payloads are short, so GNU's 76-col wrapping never triggers) so
+        # scenario steps stay plaintext. The GOT: echo below still fires.
+        copy-plain:*)
+            printf '\033]52;c;%s\007' \
+                "$(printf %s "${line#copy-plain:}" | base64)" ;;
+        copy-wrapped:*)
+            printf '\033Ptmux;\033\033]52;c;%s\007\033\\' \
+                "$(printf %s "${line#copy-wrapped:}" | base64)" ;;
+    esac
     printf 'GOT:%s\n' "$line"
 done
 EOF
