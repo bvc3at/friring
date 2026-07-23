@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use super::activity::ProviderKind;
 
 /// Placeholder substituted with a session id in resume/fork/new-session groups.
-const ID_PLACEHOLDER: &str = "{id}";
+/// Exposed so `session_ops` can reconstruct a path-pinned agent's session file
+/// (omp) using the *same* token [`AgentDef::build_args`] substitutes.
+pub const ID_PLACEHOLDER: &str = "{id}";
 
 /// Placeholder substituted with the friring session name in resume/fork/
 /// new-session groups, for agents whose CLI can name a session at launch

@@ -113,11 +113,20 @@ one-way). `friring-cli --json config paths` is the machine form.
 ## agents.toml
 
 Declares the launchable coding agents. Seeded with the built-ins
-(`claude`, `codex`, `antigravity`, `opencode`, `aider`, `copilot`, `vibe`, `pi`) on
-first run; edit or add `[[agents]]` entries to support any CLI — no
+(`claude`, `codex`, `antigravity`, `opencode`, `aider`, `copilot`, `vibe`, `pi`,
+`omp`) on first run; edit or add `[[agents]]` entries to support any CLI — no
 recompile. A malformed `[[agents]]` entry is skipped (with a toast
 naming it) and the rest still load; only a document-level syntax error
 falls back to the built-ins. Either way the error is shown.
+
+The file is **seeded once** and never rewritten — so it stays yours to
+edit, but a friring **update that adds a new built-in agent does not
+merge it into an existing `agents.toml`**. To pick up a newly-bundled
+agent, add its `[[agents]]` block by hand (copy it from this file's
+built-in list) or delete `agents.toml` to re-seed the full set. The
+matching status hook is wired automatically once the agent's config dir
+exists — the built-in hooks extension self-heals on every startup/tick,
+independent of `agents.toml`.
 
 ```toml
 config_version = 1
@@ -188,7 +197,18 @@ per_path = "[projects.\"{path}\"]\ntrust_level = \"trusted\""
 # `content` only, because two JSON documents cannot be concatenated.
 ```
 
-`{id}` is substituted with the friring-generated session UUID. Groups
+`{id}` is substituted with the friring-generated session UUID. `{home}`
+is substituted with the resolved home dir at spawn time (the remote home
+for an SSH/WSL host) — for an agent that wants a session *file path*
+rather than a bare id. The built-in `omp` (Oh My Pi) uses it: it generates
+its own internal id and won't take friring's, but its `--session <path>`
+creates a fresh session at a missing path, so friring maps its UUID to a
+deterministic `--session {home}/.omp/agent/sessions/friring-{id}.jsonl`
+(creation) / `--resume` the same (restart). `{home}` is expanded by
+friring, not the shell — args are POSIX-quoted, so a literal `~` would
+never expand. `omp` ships no `fork_args`, so `Ctrl+F` starts a fresh
+session (OMP has no way to pin a fork's target file to a friring UUID).
+Groups
 are emitted only when their driving value exists; precedence is
 fork > resume > new-session. `args` is always passed. **No model is
 ever passed** — each agent uses its own default config, so bake
@@ -231,9 +251,15 @@ fork reuses the parent's cwd. `resume_latest` only changes *when* the
 resume group fires (`session_ops::resume_trigger_for`): for the id-less
 agents restart triggers resume whenever a conversation is there to resume,
 which is what `[agents.<name>.transcript]` below answers, and claude
-defers to the same check. Caveats: an agent with no `fork_args`
-(`antigravity`, `aider`, `copilot` — none of these CLIs fork) starts
-fresh on `Ctrl+F`; and a multi-repo fork of a cwd-scoped agent lands in a
+defers to the same check. **`omp`** (Oh My Pi) is a third kind: neither
+id-pinned nor `resume_latest`, it resumes iff the deterministic JSONL its
+`new_session_args` name exists on disk (`session_file_template` — keyed on
+a `new_session_args` token that is a path *and* carries `{id}`, not on the
+agent name; a declared `[agents.<name>.transcript]` still wins). A
+remote-omp restart can't stat the host file from the UI thread, so it
+starts fresh. Caveats: an agent with no `fork_args` (`antigravity`,
+`aider`, `copilot`, `omp` — none of these CLIs fork, or `omp` can't pin a
+fork target) starts fresh on `Ctrl+F`; and a multi-repo fork of a cwd-scoped agent lands in a
 fresh symlink workspace, so `--last`/`--continue` finds no parent session
 (a multi-repo *restart* still resumes — it reuses the same workspace dir).
 
@@ -420,7 +446,7 @@ The seeded file also ships two commented, copy-pasteable templates
 below the built-ins — **Add your own agent** (every field annotated)
 and **Pin a model** (a `claude-opus` variant baking `--model opus`
 into `args`). Both stay commented, so a fresh install still resolves
-to exactly the seven built-ins.
+to exactly the nine built-ins.
 
 ## hosts.toml
 
@@ -990,6 +1016,7 @@ config dir:
 | vibe | `~/.vibe/hooks.toml` | managed file (refused if you already have one) |
 | antigravity | `~/.gemini/settings.json` | reversible JSON-merge of friring's entries |
 | pi | `~/.pi/agent/extensions/friring-status.ts` | managed extension file (refused if you already have one) |
+| omp | `~/.omp/agent/extensions/friring-status.ts` | managed extension file (refused if you already have one) |
 
 The home dir is `~/.config/friring/hooks` on a release build and
 `~/.config/friring-dev/hooks` on a dev build. Because claude *merges* the

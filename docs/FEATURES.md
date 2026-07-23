@@ -543,7 +543,7 @@ conversation friring creates appears under the same name in claude's own
 
 The set of available agents is **data**, not code. On first run
 Friring seeds `~/.config/friring/agents.toml` with built-in
-definitions for claude, codex, antigravity, opencode, aider, vibe, and pi
+definitions for claude, codex, antigravity, opencode, aider, vibe, pi, and omp
 (`agent::agent_config::load_or_seed`). Editing the file — adding an
 `[[agents]]` entry or tweaking an existing one — extends the agent
 picker with no recompile.
@@ -2364,8 +2364,13 @@ into antigravity's shared `~/.gemini/settings.json` (`PreToolUse` → working,
 `~/.pi/agent/extensions/friring-status.ts` for the pi.dev CLI (`pi`)
 (idle/working/done + blocked; **experimental** — pi has no claude-style
 Stop/permission hook, so `blocked` is inferred only from a structured
-`ask_user_question` tool call). Remote pi sessions are provisioned like the
-other config-dir agents; a psmux/Windows host shows `Hooks: degraded`. Opt out with
+`ask_user_question` tool call), and an `[[external_files]]` drops a managed
+TypeScript extension into `~/.omp/agent/extensions/friring-status.ts` for the
+Oh My Pi CLI (`omp`) (idle/working/done + blocked; **experimental**, verified
+against OMP 17.0.6 — mirrors pi but its structured user-question tool is named
+`ask`, so `blocked` fires on **either** `ask` or `ask_user_question`). Remote
+pi/omp sessions are provisioned like the other config-dir agents; a
+psmux/Windows host shows `Hooks: degraded`. Opt out with
 `friring-cli extension deactivate hooks` (records a `builtin_hooks_optout`
 metadata flag so self-heal won't resurrect it); `activate`/`install hooks`
 clears it. (See *Status internals*
