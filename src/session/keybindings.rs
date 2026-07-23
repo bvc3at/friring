@@ -406,10 +406,11 @@ impl Action {
     /// cross-platform chords (the primaries — and so the rendered hints —
     /// are identical on every platform). The Cmd set is deliberately tiny:
     /// macOS terminals claim most of the Cmd namespace at the GUI level
-    /// (Cmd+Q/W/N/T/C/V/F, Cmd+K clears, Cmd+H hides, Cmd+digits switch
-    /// tabs), and only kitty-protocol terminals deliver Cmd at all — so we
-    /// add one coherent pattern (Cmd mirrors the Ctrl primary, Shift
-    /// reverses) on letters no major terminal claims.
+    /// (Cmd+Q/W/N/T/F, Cmd+K clears, Cmd+H hides, Cmd+digits switch tabs),
+    /// and only kitty-protocol terminals deliver Cmd at all — so we add one
+    /// coherent pattern (Cmd mirrors the Ctrl primary, Shift reverses) on
+    /// letters no major terminal claims, plus Cmd+C/Cmd+V, where the
+    /// terminal's claim and ours are the same action (see the match below).
     pub fn default_chords_for(self, macos: bool) -> Vec<KeyChord> {
         let mut chords = match self {
             Action::QuitApp => vec![KeyChord::ctrl('q')],
@@ -580,6 +581,20 @@ impl Action {
                 Action::FocusForward => chords.push(KeyChord::cmd('l')),
                 // Cmd+H is OS-level Hide — Shift-reverse again.
                 Action::FocusBackward => chords.push(KeyChord::cmd_shift('l')),
+                // Cmd+C/Cmd+V are the one deliberate overlap with a
+                // terminal-claimed chord, because both layers mean the same
+                // thing. Under friring's mouse capture the terminal never has
+                // its own selection, so a terminal that forwards an
+                // unperformable copy (e.g. Ghostty's `performable:` default)
+                // delivers Cmd+C here — where it must mean copy too, not fall
+                // to the PTY. Terminals that do consume them behave
+                // equivalently (their copy/their paste arrives as a bracketed
+                // paste), so the binding is never in conflict, just unreachable.
+                // Unlike Ctrl+C this can never collide with SIGINT: SUPER
+                // chords are commands only and are never forwarded to the PTY
+                // (`agent::input::key_to_bytes`).
+                Action::Copy => chords.push(KeyChord::cmd('c')),
+                Action::Paste => chords.push(KeyChord::cmd('v')),
                 _ => {}
             }
         }
@@ -1788,6 +1803,20 @@ mod tests {
         let kb = KeyBindings { map };
         let warnings = kb.conflict_warnings();
         assert!(warnings.is_empty(), "macOS defaults conflict: {warnings:?}");
+    }
+
+    #[test]
+    fn macos_clipboard_actions_carry_cmd_alternates() {
+        // Cmd+C/Cmd+V reach us only from terminals that forward an
+        // unperformable copy/paste (e.g. Ghostty's `performable:` defaults
+        // with no terminal-side selection); the Ctrl primaries stay first so
+        // the rendered hints are identical across platforms.
+        for (action, c) in [(Action::Copy, 'c'), (Action::Paste, 'v')] {
+            let macos = action.default_chords_for(true);
+            assert_eq!(macos.first(), Some(&KeyChord::ctrl(c)), "{action:?}");
+            assert!(macos.contains(&KeyChord::cmd(c)), "{action:?}: {macos:?}");
+            assert!(!action.default_chords_for(false).contains(&KeyChord::cmd(c)));
+        }
     }
 
     #[test]

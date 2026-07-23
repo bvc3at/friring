@@ -6,6 +6,7 @@ pub mod generic;
 pub mod host_config;
 pub mod input;
 pub mod json_merge;
+pub mod osc52;
 pub mod provider;
 pub mod registry;
 pub mod self_update;

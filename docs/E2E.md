@@ -20,10 +20,12 @@ re-adoption, hook-driven status incl. the real permission→blocked path, restar
 conversation import (all riding claude's `--session-id {id}` pinning), worktree sessions and
 `Ctrl+S` sync incl. the conflict handoff, code-review export, automations, tasks, messages,
 extensions, global search, the F9 activity view, both wizard flows, and the polish surface
-(themes, settings live-reload, keybinding editor, shell pane, soft delete, attention
-navigation). Scenarios that need no model at all run on the **`scripted` agent** — a bash
-script registered through the ordinary `agents.toml` machinery (see Agent profiles below) —
-so they execute in seconds on any machine, real binary or not.
+(themes, settings live-reload, keybinding editor, shell pane, clipboard — in-pane OSC 52
+copies asserted against a sandboxed outer clipboard, plus raw kitty-protocol Cmd+C
+injection — soft delete, attention navigation). Scenarios that need no model at all run on
+the **`scripted` agent** — a bash script registered through the ordinary `agents.toml`
+machinery (see Agent profiles below) — so they execute in seconds on any machine, real
+binary or not.
 
 ## The seam: stub the model at the HTTP boundary
 

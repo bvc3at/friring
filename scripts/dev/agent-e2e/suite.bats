@@ -180,6 +180,11 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-shell-pane"
 }
 
+@test "e2e: OSC 52 copies from agent + shell panes land in the outer clipboard; Cmd+C dispatches Copy" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-osc52-clipboard"
+}
+
 @test "e2e: wizard back-navigation and the always-type repo palette (path mode, Tab completion)" {
     require_agent scripted
     e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-wizard-backnav"

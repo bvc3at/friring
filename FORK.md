@@ -566,6 +566,40 @@ interplay with ADR-P12 in `docs/PERFORMANCE.md`.
   paste key (bracketed paste still works); over SSH paste likewise refuses
   instead of silently pasting the *host's* clipboard.
 
+- **In-pane OSC 52 copies reach the user's clipboard.** A program inside a
+  pane that sets the clipboard via OSC 52 — Claude Code's `/copy`, nvim's
+  OSC 52 provider — copied nothing, twice over: seeing `$TMUX`, Claude Code
+  wraps the escape in the tmux DCS passthrough (`ESC P tmux ;` + inner ESCs
+  doubled), which tmux's default `allow-passthrough off` silently discards;
+  and even unwrapped, friring is that pane's "terminal", and the vt100
+  parser ignores the escape (nor can its `unhandled_osc` callback carry it —
+  vte truncates OSC payloads at 1 KiB, which would corrupt any real copy).
+  The fork scans the raw pane byte stream *before* the parser
+  (`agent::osc52`, an incremental scanner robust to `%output` chunk splits,
+  parsing both the plain and the passthrough-wrapped forms; the control-mode
+  stream carries the escape raw, whatever the inner tmux's `set-clipboard` /
+  `allow-passthrough` say) and routes each completed payload through the same
+  `App::set_clipboard_text` stack as every other copy surface (so it lands
+  native locally, or via tmux/OSC 52 over SSH — agent and shell panes, local
+  or remote sessions alike), with a `Copied from <session>` toast naming the
+  originating pane. Clipboard *queries* (`52;<sel>;?`) are dropped, never
+  answered; payloads over 8 MiB of base64 are dropped whole rather than
+  truncated. Per-pane queues are generation-gated (ADR-P10: the every-tick
+  nothing-new poll is one atomic load) and drop-oldest at 8 so a spamming
+  pane can't grow memory — the newest copy is the one that must win.
+
+- **`Cmd+C` / `Cmd+V` are macOS default chords for Copy/Paste.** `Ctrl+C`
+  doubles as SIGINT (no-selection case), which upstream accepts as the only
+  copy chord; the fork appends `Cmd+C`/`Cmd+V` to the macOS default set
+  (`Action::default_chords_for`, alongside the existing `Cmd+J`/`Cmd+L`
+  family) so copying doesn't share a key with interrupting. They reach
+  friring only from terminals that forward unconsumed Cmd chords (Ghostty's
+  `performable:` defaults forward `Cmd+C` whenever the emulator has no
+  selection of its own — always, under friring's mouse capture); where the
+  emulator consumes them its copy/paste semantics still apply, so the chords
+  are never in conflict. `Cmd+C` with no selection is swallowed (SUPER never
+  forwards to the PTY) — it can't SIGINT the agent.
+
 - **Modifier-Enter inserts a newline in the agent instead of switching
   sessions.** A legacy terminal (Windows Terminal, or anything behind an outer
   tmux, which strips the kitty protocol) encodes `Ctrl+Enter` as the LF byte,

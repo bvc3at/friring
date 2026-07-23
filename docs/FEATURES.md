@@ -564,8 +564,8 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 |-----|---------|--------|----------|
 | `Ctrl+Q` | Global | Quit Friring (detach sessions) | **Q**uit |
 | `Ctrl+N` | Global | New session (opens repo picker) | **N**ew |
-| `Ctrl+C` | Terminal | Copy selection, or send SIGINT if none | **C**opy |
-| `Ctrl+V` | Terminal | Paste from clipboard into PTY | Paste |
+| `Ctrl+C` / `Cmd+C` | Terminal | Copy selection, or send SIGINT if none (`Cmd+C` never SIGINTs; macOS, needs a terminal that forwards it — see [macOS](#macos)) | **C**opy |
+| `Ctrl+V` / `Cmd+V` | Terminal | Paste from clipboard into PTY | Paste |
 | `Ctrl+P` | Global | Automations (scheduled agent runs) | **P**rogram |
 | `Ctrl+W` / `F5` | Global | Toggle tasks panel (todo list) | Work items |
 | `Ctrl+/` / `Shift Shift` | Global | Global search across every scope | **/** = search; JetBrains double-shift |
@@ -721,21 +721,30 @@ exists). Beyond that:
   is canonical) or capture a Cmd chord live in the F1 editor. Supported by
   iTerm2 3.5+, kitty, WezTerm, and Ghostty; Terminal.app lacks the protocol,
   so Cmd chords never arrive there (everything else degrades gracefully).
-  Note the emulator consumes its own Cmd shortcuts (`Cmd+Q/W/N/T/C/V`,
+  Note the emulator consumes its own Cmd shortcuts (`Cmd+Q/W/N/T`,
   `Cmd+K` clear, `Cmd+H` hide, `Cmd+digit` tabs) before Friring can
   see them — only unclaimed chords are bindable.
-- **macOS default alternates.** On macOS builds four Cmd chords are
+- **macOS default alternates.** On macOS builds six Cmd chords are
   appended after the Ctrl primaries via `Action::default_chords_for(macos)`
   (the `cfg!(target_os = "macos")` decision lives in `default_chords()`;
   Linux defaults are byte-identical): `Cmd+J` / `Cmd+Shift+J` select the
-  next/previous session and `Cmd+L` / `Cmd+Shift+L` cycle pane focus
-  forward/backward. The pattern is "Cmd mirrors the Ctrl primary, Shift
-  reverses" — `Cmd+K` and `Cmd+H` themselves are unusable (see above).
+  next/previous session, `Cmd+L` / `Cmd+Shift+L` cycle pane focus
+  forward/backward, and `Cmd+C` / `Cmd+V` copy the selection / paste. The
+  pattern is "Cmd mirrors the Ctrl primary, Shift reverses" — `Cmd+K` and
+  `Cmd+H` themselves are unusable (see above). `Cmd+C`/`Cmd+V` are the one
+  deliberate overlap with emulator-claimed chords, because both layers mean
+  the same action: under Friring's mouse capture the emulator never has its
+  own selection, so a terminal that forwards an unperformable copy (Ghostty's
+  `performable:` defaults; kitty/WezTerm/iTerm2 need the user to unbind or
+  pass the chord through) delivers `Cmd+C` here, where it copies the Friring
+  selection — and unlike `Ctrl+C` it can never double as SIGINT. Where the
+  emulator does consume them, nothing changes: its copy copies *its* (empty)
+  selection, its paste arrives as a bracketed paste.
 - **Unbound Cmd chords are swallowed**, never forwarded to the PTY
   (`agent::input::key_to_bytes` returns `None` for SUPER): injecting the
   bare letter into the agent would corrupt its input.
 - **F-keys** (`F1`–`F5` alternates) require `Fn` on Mac laptops
-  unless function keys are set to standard; `Cmd+V` already pastes
+  unless function keys are set to standard; `Cmd+V` also pastes
   through the terminal's native paste → bracketed paste path.
 
 ---
@@ -2600,8 +2609,10 @@ confined to the active pane bounds.
 
 - **Mouse drag**: Select text (anchor at press, cursor follows
   drag).
-- **`Ctrl+C`** (with active selection): Copies selected text to
-  the system clipboard via `arboard`. Trailing whitespace is
+- **`Ctrl+C` / `Cmd+C`** (with active selection): Copies selected text to
+  the system clipboard via `arboard`. (`Cmd+C` is a macOS default
+  alternate that can never double as SIGINT; it needs a terminal that
+  forwards the chord — see [macOS](#macos).) Trailing whitespace is
   trimmed per line. The native path is skipped whenever it cannot
   reach the user: no display server (`arboard` needs X11/Wayland —
   unavailable under a display-less tmux or in WSL without WSLg),
@@ -2624,7 +2635,9 @@ confined to the active pane bounds.
   whose toast says `(OSC 52)` since it is fire-and-forget (a terminal
   without OSC 52 support ignores it silently).
 - **`Ctrl+C`** (no selection): Forwarded to the terminal as SIGINT.
-- **`Ctrl+V`**: Pastes from the system clipboard. When a modal text
+  (`Cmd+C` with no selection does nothing — SUPER chords are never
+  forwarded to the PTY.)
+- **`Ctrl+V` / `Cmd+V`**: Pastes from the system clipboard. When a modal text
   input (worktree/session name, repo-picker path or search,
   automation editor) or an in-pane editor (task/automation) is
   focused, the text is inserted into that field instead of the PTY
@@ -2642,6 +2655,33 @@ confined to the active pane bounds.
 Selection is highlighted in the terminal render buffer using
 inverted colors. The clipboard handle is kept alive for the app
 lifetime to avoid Linux-specific "dropped too quickly" issues.
+
+### In-pane copies (OSC 52 from programs)
+
+Programs running *inside* a pane set the clipboard by emitting OSC 52
+(`ESC ] 52 ; <sel> ; <base64>`): Claude Code's `/copy`, nvim's OSC 52
+clipboard provider, a `tmux set-clipboard` inside the pane, and
+friends. In a normal terminal the emulator honors that escape; under
+friring the pane's "terminal" is the vt100 parser, which ignores it —
+and can't be taught to surface it, because its OSC buffer truncates at
+1 KiB, which would corrupt any real copy. Worse, an emitter that sees
+`$TMUX` set (every friring pane) may wrap the escape in the tmux DCS
+passthrough (`ESC P tmux ;` + inner ESCs doubled — Claude Code's
+`/copy` does), which tmux's default `allow-passthrough off` silently
+discards. So the raw pane stream is scanned *before* the parser
+(`agent::osc52`, fed from the tmux control-mode `%output` bytes, which
+carry the escape raw — plain or passthrough-wrapped — regardless of
+the inner tmux's `set-clipboard`/`allow-passthrough` settings), and
+every completed payload is
+routed through the same `App::set_clipboard_text` stack as `Ctrl+C` —
+native, or the tmux/OSC 52 fallbacks over SSH — with a
+`Copied from <session>` toast naming the originating session (any
+pane may copy, background ones included — standard OSC 52 semantics;
+agent and shell panes both count, local or remote). Clipboard *query*
+payloads (`52;<sel>;?`) are dropped, never answered — answering would
+leak the clipboard to whatever runs in the pane. Oversized payloads
+(> 8 MiB base64) are dropped whole; a truncated copy would be worse
+than a failed one.
 
 ---
 
