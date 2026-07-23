@@ -11,7 +11,7 @@ use std::sync::mpsc;
 
 use super::background;
 use crate::git;
-use crate::session::SessionId;
+use crate::session::{HostDef, SessionId};
 
 /// A Ctrl+S run parked between the keypress and the actual sync threads: the
 /// remote listing runs off-thread first (no git on the UI thread, the ADR-P12
@@ -27,6 +27,10 @@ pub(crate) struct PendingSyncRun {
     pub(crate) queue: Vec<(PathBuf, Vec<String>)>,
     /// Chosen/derived base remote per repo. Absent = the default origin chain.
     pub(crate) chosen: HashMap<PathBuf, String>,
+    /// The host owning these worktrees (`None` = local), captured with them:
+    /// resolving it at launch time instead would let a session switch while
+    /// the picker is open point the run at the wrong machine.
+    pub(crate) host: Option<HostDef>,
 }
 
 /// State for the worktree-to-main git sync (`Ctrl+S`): a background thread
