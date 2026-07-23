@@ -3619,16 +3619,20 @@ impl App {
     /// forwards the copy to wherever the user's clipboard actually is (native,
     /// or the tmux/OSC 52 route over SSH). Any session's panes may copy —
     /// standard OSC 52 semantics, background panes included — so the toast
-    /// names the originating session. Applied oldest-first: the newest write
-    /// wins the clipboard, like it would in a terminal.
+    /// names the originating session. Applied in capture order across panes
+    /// (each copy carries a global sequence): the newest write is applied last
+    /// and wins the clipboard, like it would in a terminal — draining pane by
+    /// pane would otherwise let a later pane's older copy win.
     fn drain_pane_clipboard_copies(&mut self) {
-        let mut copies: Vec<(String, String)> = Vec::new();
+        let mut copies: Vec<(u64, String, String)> = Vec::new();
         for session in self.sessions.iter_mut() {
-            for text in session.drain_osc52_copies() {
-                copies.push((session.info.name.clone(), text));
+            let name = session.info.name.clone();
+            for (seq, text) in session.drain_osc52_copies() {
+                copies.push((seq, name.clone(), text));
             }
         }
-        for (name, text) in copies {
+        copies.sort_by_key(|(seq, _, _)| *seq);
+        for (_, name, text) in copies {
             match self.set_clipboard_text(&text) {
                 Ok(via) => {
                     self.set_status(StatusLevel::Info, via.toast(&format!("Copied from {name}")));
@@ -12844,7 +12848,12 @@ mod tests {
         let mut session = Session::stub("s", &backend_arc, &provider);
         session.feed_output_for_test(b"out\x1b]52;c;aGVsbG8=\x07");
         session.feed_output_for_test(b"\x1b]52;c;d29ybGQ=\x07");
-        assert_eq!(session.drain_osc52_copies(), ["hello", "world"]);
+        let texts: Vec<String> = session
+            .drain_osc52_copies()
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(texts, ["hello", "world"]);
         assert!(session.drain_osc52_copies().is_empty());
     }
 

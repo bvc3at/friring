@@ -147,14 +147,21 @@ impl vt100::Callbacks for TermSignals {
 /// rendering is unaffected.
 pub type SessionParser = vt100::Parser<TermSignals>;
 
+/// Process-wide monotonic capture sequence, stamped on every OSC 52 copy so
+/// the app can re-order copies drained from different panes back into the order
+/// they were captured (pane-by-pane draining alone would apply a later pane's
+/// older copy last — see [`crate::app::App::drain_pane_clipboard_copies`]).
+static OSC52_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Clipboard writes captured from a pane's output stream (OSC 52 — see
 /// [`crate::agent::osc52`]), queued for the app to route through its clipboard
 /// stack on the next tick. Generation-gated like `TermSignals::meta_gen`
 /// (ADR-P10): the every-tick, nothing-new poll pays one atomic load per pane,
-/// never a lock.
+/// never a lock. Each queued copy carries a global capture sequence
+/// ([`OSC52_SEQ`]) so cross-pane draining can restore capture order.
 #[derive(Default)]
 pub struct PaneClipboard {
-    queue: Mutex<VecDeque<String>>,
+    queue: Mutex<VecDeque<(u64, String)>>,
     /// Bumped **after** each push (`Release`), so an observer that sees the new
     /// generation also sees the queued value.
     gen: AtomicU64,
@@ -167,18 +174,20 @@ impl PaneClipboard {
     const CAP: usize = 8;
 
     fn push(&self, text: String) {
+        let seq = OSC52_SEQ.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut q) = self.queue.lock() {
             if q.len() >= Self::CAP {
                 q.pop_front();
             }
-            q.push_back(text);
+            q.push_back((seq, text));
         }
         self.gen.fetch_add(1, Ordering::Release);
     }
 
     /// Drain copies queued since the caller's `last_seen` generation, oldest
-    /// first; empty — without locking — when nothing new arrived.
-    fn drain_new(&self, last_seen: &mut u64) -> Vec<String> {
+    /// first (each paired with its global capture sequence); empty — without
+    /// locking — when nothing new arrived.
+    fn drain_new(&self, last_seen: &mut u64) -> Vec<(u64, String)> {
         let gen = self.gen.load(Ordering::Acquire);
         if gen == *last_seen {
             return Vec::new();
@@ -931,13 +940,14 @@ impl Session {
     }
 
     /// Clipboard writes captured from this session's panes (agent + shell)
-    /// since the last drain, oldest first — programs inside a pane setting the
-    /// clipboard via OSC 52 (Claude Code's `/copy`, nvim's OSC 52 provider, …;
-    /// see [`crate::agent::osc52`]). The app routes each through the same
-    /// clipboard stack as every other copy surface. Gen-gated like
+    /// since the last drain, each paired with its global capture sequence —
+    /// programs inside a pane setting the clipboard via OSC 52 (Claude Code's
+    /// `/copy`, nvim's OSC 52 provider, …; see [`crate::agent::osc52`]). The
+    /// app sorts by that sequence across sessions and routes each through the
+    /// same clipboard stack as every other copy surface. Gen-gated like
     /// [`Self::sync_agent_meta`]: the every-tick, nothing-new case is one
     /// atomic load per pane (ADR-P10).
-    pub fn drain_osc52_copies(&mut self) -> Vec<String> {
+    pub fn drain_osc52_copies(&mut self) -> Vec<(u64, String)> {
         let mut copies = self.osc52.drain_new(&mut self.last_drained_osc52_gen);
         if let Some(shell) = self.shell_pane.as_mut() {
             copies.extend(shell.osc52.drain_new(&mut shell.last_drained_osc52_gen));
@@ -1274,8 +1284,8 @@ mod tests {
         // clipboard.
         assert_eq!(copies.len(), PaneClipboard::CAP);
         assert_eq!(
-            copies.last().unwrap(),
-            &format!("c{}", PaneClipboard::CAP + 2)
+            copies.last().unwrap().1,
+            format!("c{}", PaneClipboard::CAP + 2)
         );
         assert!(pc.drain_new(&mut seen).is_empty());
     }

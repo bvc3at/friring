@@ -1866,6 +1866,34 @@ async fn ctrl_t_opens_shell_pane_on_spawnable_backend() {
 }
 
 #[tokio::test]
+async fn cross_pane_osc52_copies_apply_in_capture_order() {
+    // A session drains its agent pane before its shell pane, so a shell copy
+    // captured *earlier* than an agent copy would, without a capture sequence,
+    // be applied last and win the clipboard — an inversion. Capture the shell
+    // copy first, the agent copy second, and the newer (agent) copy must win.
+    let mut h = Harness::spawnable(1);
+    h.ctrl('t'); // ToggleShell — spawn the shell pane
+    assert!(h.app.sessions[0].shell_pane.is_some());
+    h.app.captured_clipboard = Some(Vec::new());
+
+    // Shell pane copies first (older), agent pane second (newer).
+    h.app.sessions[0]
+        .shell_pane
+        .as_ref()
+        .unwrap()
+        .feed_output_for_test(b"\x1b]52;c;b2xkZXI=\x07"); // "older"
+    h.app.sessions[0].feed_output_for_test(b"\x1b]52;c;bmV3ZXI=\x07"); // "newer"
+
+    h.tick();
+
+    assert_eq!(
+        h.app.captured_clipboard.as_deref(),
+        Some(&["older".to_string(), "newer".to_string()][..]),
+        "copies apply oldest-first across panes, so the newer agent copy wins"
+    );
+}
+
+#[tokio::test]
 async fn central_tab_strip_switches_agent_and_shell_views() {
     // The top-border tab strip is mouse-driven: clicking Shell flips to the
     // shell view (spawning the pane), clicking Agent flips back.
