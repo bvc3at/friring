@@ -63,11 +63,12 @@ scenario_steps() {
     step_wait_pane "nav-c" 15
 
     # Alt+2 = jump to the 2nd session in rendered order (ws group first,
-    # then ws-b: A, nav-b, nav-c). The terminal pane title flips to the new
-    # active session, and Terminal focus means plain typing lands on
-    # nav-b's PTY — the GOT: echo proves the input reached *that* script.
+    # then ws-b: A, nav-b, nav-c). The header badge names the new active
+    # session (the pane title carries the agent, not the name), and Terminal
+    # focus means plain typing lands on nav-b's PTY — the GOT: echo proves the
+    # input reached *that* script.
     step_key M-2
-    step_wait_pane " nav-b (scripted)" 15
+    step_wait_pane "nav-b  ◐" 15
     step_type "hello-b"
     step_key Enter
     step_wait_pane "GOT:hello-b" 15
@@ -75,9 +76,9 @@ scenario_steps() {
     # Alt+1 back to A, then Ctrl+6 (alternate toggle) back to nav-b — the
     # toggle target is the session we just left.
     step_key M-1
-    step_wait_pane " scripted-multi-nav (scripted)" 15
+    step_wait_pane "$E2E_SCENARIO_NAME  ◐" 15
     step_key C-6
-    step_wait_pane " nav-b (scripted)" 15
+    step_wait_pane "nav-b  ◐" 15
 
     # Headless send/capture on nav-c: text reaches a PTY the TUI never
     # focused, and the echo is read back without the TUI in the loop.
@@ -89,7 +90,7 @@ scenario_steps() {
     # its active session on the next poll (~250ms).
     friring-cli session focus "$E2E_SESSION_ID" >/dev/null \
         || e2e_die "session focus failed" || return 1
-    step_wait_pane " scripted-multi-nav (scripted)" 15
+    step_wait_pane "$E2E_SCENARIO_NAME  ◐" 15
 }
 
 scenario_assert_effects() {
@@ -104,5 +105,5 @@ scenario_assert_effects() {
 
 scenario_assert_ui() {
     # The CLI focus won: the scenario session is active again.
-    assert_pane_contains " scripted-multi-nav (scripted)"
+    assert_pane_contains "$E2E_SCENARIO_NAME  ◐"
 }

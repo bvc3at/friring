@@ -3,7 +3,7 @@
 # Scenario: the Ctrl+T shell pane — a real $SHELL in a `tbs-` window on the
 # agent tmux server, toggled beside the agent view and tracked per session.
 # Ctrl+T is deliberately NOT in the terminal-passthrough set, so it must work
-# straight from Terminal focus: the pane title flips to ` {name} (shell) `,
+# straight from Terminal focus: the pane title's agent field flips to `shell`,
 # typed input reaches the shell's stdin (proved by an echoed marker — shell
 # prompts vary with the harness $SHELL, so only our own marker is stable),
 # and the shell/agent view choice is per session: switching to a second
@@ -39,9 +39,11 @@ scenario_steps() {
     step_wait_pane "shell-peer" 15
 
     # Ctrl+T straight from Terminal focus: the title flips to the shell view
-    # and a tbs- window appears on the agent server.
+    # and a tbs- window appears on the agent server. The pane title no longer
+    # names the session (the header badge does), so which VIEW is showing reads
+    # from its agent field, and which SESSION is active from the badge.
     step_key C-t
-    step_wait_pane " scripted-shell-pane (shell) " 30
+    step_wait_pane " shell \[" 30
     shell_window_exists || e2e_die "no tbs- window after Ctrl+T" || return 1
 
     # A real shell, not a viewer: typing lands on its stdin. The echo OUTPUT
@@ -55,14 +57,16 @@ scenario_steps() {
     # Per-session tracking: shell-peer never toggled, so it shows its agent
     # view; back on the first session the shell view must still be selected.
     step_key M-2
-    step_wait_pane " shell-peer (scripted)" 15
+    step_wait_pane "shell-peer  ◐" 15
+    step_wait_pane " scripted \[" 15
     step_key M-1
-    step_wait_pane " scripted-shell-pane (shell) " 15
+    step_wait_pane "scripted-shell-pane  ◐" 15
+    step_wait_pane " shell \[" 15
 
     # Toggle back to the agent view (the shell window must survive — see
     # scenario_assert_effects).
     step_key C-t
-    step_wait_pane " scripted-shell-pane (scripted)" 15
+    step_wait_pane " scripted \[" 15
 }
 
 scenario_assert_effects() {
@@ -73,5 +77,6 @@ scenario_assert_effects() {
 }
 
 scenario_assert_ui() {
-    assert_pane_contains " scripted-shell-pane (scripted)"
+    assert_pane_contains "scripted-shell-pane  ◐"
+    assert_pane_contains " scripted ["
 }

@@ -52,10 +52,11 @@ scenario_steps() {
     step_wait_pane "$E2E_SCENARIO_NAME-fork" 15
     step_key Enter
 
-    # Child spawns and becomes active: its terminal pane title first (so the
+    # Child spawns and becomes active: the header badge names it first (so the
     # replay wait below can't be satisfied by the PARENT's pane, which shows
     # the same marker), then the replayed base turn, then a fresh input box.
-    step_wait_pane " $E2E_SCENARIO_NAME-fork (claude)" 60
+    # The badge, not the pane title, is what identifies the active session.
+    step_wait_pane "$E2E_SCENARIO_NAME-fork  ◐" 60
     step_wait_pane "FORK-BASE-MARKER" 120
     step_wait_pane "$SCENARIO_AGENT_READY" 120
 

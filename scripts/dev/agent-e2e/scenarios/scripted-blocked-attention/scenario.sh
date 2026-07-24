@@ -58,12 +58,16 @@ scenario_steps() {
     step_wait_pane "Blocked" 15
 
     # F10 walks the blocked queue in rendered order: A (Idle, active) is
-    # skipped, first stop att-b, second stop att-c. The terminal pane title
-    # is the proof the jump switched the ACTIVE session, not just selection.
+    # skipped, first stop att-b, second stop att-c. The header badge is the
+    # proof the jump switched the ACTIVE session, not just selection; the pane
+    # title (which no longer names the session) proves that session is the
+    # blocked one.
     step_key F10
-    step_wait_pane " att-b (scripted) \[Blocked\]" 15
+    step_wait_pane "att-b  ◐" 15
+    step_wait_pane " scripted \[Blocked\]" 15
     step_key F10
-    step_wait_pane " att-c (scripted) \[Blocked\]" 15
+    step_wait_pane "att-c  ◐" 15
+    step_wait_pane " scripted \[Blocked\]" 15
 
     # Alt+A digit jump: the overlay sticks (legacy-terminal chord), then a
     # digit addresses the Nth *blocked* session — 1 = att-b, even though
@@ -71,7 +75,8 @@ scenario_steps() {
     # the session list).
     step_key M-a
     step_type "1"
-    step_wait_pane " att-b (scripted) \[Blocked\]" 15
+    step_wait_pane "att-b  ◐" 15
+    step_wait_pane " scripted \[Blocked\]" 15
 
     # Unblock att-b the same headless way (a Stop hook would signal done):
     # the badge count must drop, and F10 from the now-done att-b must land
@@ -80,7 +85,8 @@ scenario_steps() {
         || e2e_die "signal done att-b failed" || return 1
     step_wait_pane "◆1" 15
     step_key F10
-    step_wait_pane " att-c (scripted) \[Blocked\]" 15
+    step_wait_pane "att-c  ◐" 15
+    step_wait_pane " scripted \[Blocked\]" 15
 }
 
 scenario_assert_effects() {
@@ -103,5 +109,6 @@ scenario_assert_effects() {
 scenario_assert_ui() {
     # End state: one blocked session left, and it is the active one.
     assert_pane_contains "◆1"
-    assert_pane_contains " att-c (scripted) [Blocked]"
+    assert_pane_contains "att-c  ◐"
+    assert_pane_contains " scripted [Blocked]"
 }

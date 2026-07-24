@@ -107,5 +107,6 @@ scenario_assert_effects() {
 }
 
 scenario_assert_ui() {
-    assert_pane_contains " $SCENARIO_SESSION_NAME (scripted)"
+    assert_pane_contains "$SCENARIO_SESSION_NAME  ◐"
+    assert_pane_contains " scripted ["
 }

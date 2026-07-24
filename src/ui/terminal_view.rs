@@ -10,11 +10,78 @@ use tui_term::widget::{Cursor, PseudoTerminal};
 use super::focus_block;
 use super::scrollbar::{self, ScrollbarGeom};
 use super::theme::Theme;
-use super::FocusLevel;
+use super::{truncate_ellipsis, FocusLevel};
 use crate::session::SessionInfo;
+
+/// Shortest branch fragment still worth a field: `fix…` separates `fix/x` from
+/// `feat/x`, where a one- or two-char stub reads as noise. Under this the
+/// branch is dropped whole rather than shown as a nub.
+const MIN_BRANCH_COLS: usize = 4;
+
+/// Build the pane's right-aligned info title, fitted into `budget` columns.
+///
+/// The session name is deliberately absent: the header badge already carries it
+/// (`app::view::render_header`) one row up and right-aligned to the same edge,
+/// so repeating it here said nothing new — and it was the field that ran under
+/// the tab strip first. What remains is what the header can't say: which agent
+/// (or the shell), which worktree, and what the session is doing.
+///
+/// `budget` is measured against *this* frame's fields rather than a worst-case
+/// `[Unreachable]`, so a short status hands its columns back to the branch.
+/// Fields shed cheapest-first: the agent name goes before the branch is cut to
+/// a stub, since which worktree the pane sits in matters more than which CLI
+/// drives it — and the agent is on the session row and in the info panel too.
+fn pane_title(info: &SessionInfo, is_shell: bool, scroll_offset: usize, budget: usize) -> String {
+    let cols = |s: &str| s.chars().count();
+    let agent = if is_shell {
+        "shell"
+    } else {
+        info.agent.as_str()
+    };
+    // Status and the scrollback marker never shed: they're the two fields that
+    // move on their own, and nothing else on this row reports them.
+    let tail = if scroll_offset > 0 {
+        format!(" [{}] [{scroll_offset}\u{2191}] ", info.status)
+    } else {
+        format!(" [{}] ", info.status)
+    };
+    let assemble = |head: Option<&str>, branch: Option<&str>| {
+        let mut out = String::new();
+        if let Some(head) = head {
+            out.push(' ');
+            out.push_str(head);
+        }
+        if let Some(branch) = branch {
+            out.push_str(" [");
+            out.push_str(branch);
+            out.push(']');
+        }
+        out.push_str(&tail);
+        out
+    };
+
+    if let Some(branch) = info.worktrees.first().map(|wt| wt.branch.as_str()) {
+        for head in [Some(agent), None] {
+            let room = budget.saturating_sub(cols(&assemble(head, Some(""))));
+            if room > 0 && room >= MIN_BRANCH_COLS.min(cols(branch)) {
+                return assemble(head, Some(&truncate_ellipsis(branch, room)));
+            }
+        }
+    }
+    for candidate in [assemble(Some(agent), None), assemble(None, None)] {
+        if cols(&candidate) <= budget {
+            return candidate;
+        }
+    }
+    String::new()
+}
 
 /// Render the terminal pane. Returns the scrollbar geometry when scrollback is
 /// present (so the caller can record it as a drag target), else `None`.
+///
+/// `tabs_width` is the span the app layer's tab strip occupies on this pane's
+/// top border (`app::view::central_tabs_width`), which the title budgets
+/// around.
 pub fn render_terminal(
     frame: &mut Frame,
     area: Rect,
@@ -22,6 +89,7 @@ pub fn render_terminal(
     info: &SessionInfo,
     level: FocusLevel,
     is_shell: bool,
+    tabs_width: u16,
 ) -> Option<ScrollbarGeom> {
     let scroll_offset = parser.screen().scrollback();
 
@@ -33,29 +101,18 @@ pub fn render_terminal(
         max
     };
 
-    let title = {
-        let base = if is_shell {
-            format!(" {} (shell) ", info.name)
-        } else if let Some(wt) = info.worktrees.first() {
-            format!(
-                " {} ({}) [{}] [{}] ",
-                info.name, info.agent, wt.branch, info.status
-            )
-        } else {
-            format!(" {} ({}) [{}] ", info.name, info.agent, info.status)
-        };
-        if scroll_offset > 0 {
-            // Insert scroll indicator before the trailing space
-            let trimmed = base.trim_end();
-            format!("{trimmed} [{scroll_offset}\u{2191}] ")
-        } else {
-            base
-        }
-    };
-
     // The session-info title is right-aligned so the central-pane tab strip
-    // (Agent/Shell/Review), overlaid on the left of this same top border by the
-    // app layer, has room.
+    // (Agent/Review/Shell/Activity), overlaid on the left of this same top
+    // border by the app layer, has room. Its budget is what the strip leaves
+    // between itself and the pane's right border — the two rounded corners plus
+    // `tabs_width` — so a long branch shortens instead of running under the
+    // pills. The title's own leading space keeps a gap after the last pill.
+    let title = pane_title(
+        info,
+        is_shell,
+        scroll_offset,
+        usize::from(area.width.saturating_sub(tabs_width).saturating_sub(2)),
+    );
     let block = focus_block("", level)
         .title_top(Line::from(Span::styled(title, super::title_style(level))).right_aligned());
 
@@ -150,6 +207,149 @@ pub fn render_empty_terminal(frame: &mut Frame, area: Rect) {
     }
 }
 
+#[cfg(test)]
+mod title_tests {
+    use std::path::PathBuf;
+
+    use super::pane_title;
+    use crate::session::{SessionInfo, SessionStatus, WorktreeInfo};
+
+    fn info(agent: &str, branch: Option<&str>, status: SessionStatus) -> SessionInfo {
+        let mut info = SessionInfo::new("fix/displaying-top-status".to_string());
+        info.agent = agent.to_string();
+        info.status = status;
+        if let Some(branch) = branch {
+            info.worktrees.push(WorktreeInfo {
+                repo_path: PathBuf::from("/repo"),
+                worktree_path: PathBuf::from("/wt"),
+                branch: branch.to_string(),
+            });
+        }
+        info
+    }
+
+    fn cols(s: &str) -> usize {
+        s.chars().count()
+    }
+
+    #[test]
+    fn shows_agent_branch_and_status_when_it_all_fits() {
+        let info = info("claude", Some("feat/x"), SessionStatus::Idle);
+        assert_eq!(pane_title(&info, false, 0, 80), " claude [feat/x] [Idle] ");
+    }
+
+    #[test]
+    fn never_repeats_the_session_name_the_header_badge_owns() {
+        // The whole point of the field set: `app::view::render_header` already
+        // shows the active session's name one row up, right-aligned to the same
+        // edge. A wide pane must not bring it back.
+        let info = info("claude", Some("feat/x"), SessionStatus::Idle);
+        assert!(!pane_title(&info, false, 0, 200).contains(&info.name));
+    }
+
+    #[test]
+    fn shell_view_replaces_the_agent_with_shell() {
+        let info = info("claude", Some("feat/x"), SessionStatus::Working);
+        assert_eq!(pane_title(&info, true, 0, 80), " shell [feat/x] [Working] ");
+    }
+
+    #[test]
+    fn scrollback_marker_rides_after_the_status() {
+        let info = info("claude", None, SessionStatus::Idle);
+        assert_eq!(
+            pane_title(&info, false, 12, 80),
+            " claude [Idle] [12\u{2191}] "
+        );
+    }
+
+    #[test]
+    fn omits_the_branch_field_for_a_session_without_a_worktree() {
+        let info = info("codex", None, SessionStatus::Done);
+        assert_eq!(pane_title(&info, false, 0, 80), " codex [Done] ");
+    }
+
+    #[test]
+    fn truncates_a_long_branch_to_the_budget() {
+        let info = info(
+            "claude",
+            Some("fix/displaying-top-status"),
+            SessionStatus::Idle,
+        );
+        let title = pane_title(&info, false, 0, 30);
+        assert_eq!(cols(&title), 30, "fills the budget exactly: {title:?}");
+        assert!(title.contains('\u{2026}'), "branch was cut: {title:?}");
+        assert!(title.ends_with(" [Idle] "), "status survives: {title:?}");
+    }
+
+    #[test]
+    fn sheds_the_agent_before_cutting_the_branch_to_a_stub() {
+        let info = info(
+            "claude",
+            Some("fix/displaying-top-status"),
+            SessionStatus::Idle,
+        );
+        // 24 columns still leave the branch 6 alongside the agent — legible, so
+        // both stay rather than flip-flopping the agent out at every width.
+        assert_eq!(
+            pane_title(&info, false, 0, 24),
+            " claude [fix/d\u{2026}] [Idle] "
+        );
+        // 20 would cut it to 2. The agent goes instead: which worktree the pane
+        // sits in outranks which CLI drives it.
+        assert_eq!(
+            pane_title(&info, false, 0, 20),
+            " [fix/disp\u{2026}] [Idle] "
+        );
+    }
+
+    #[test]
+    fn drops_the_branch_once_no_legible_fragment_fits() {
+        // `codex` is one column narrower than the ` [x…] ` chrome it displaces,
+        // so 14 columns hold the agent but no readable branch at all.
+        let info = info(
+            "codex",
+            Some("fix/displaying-top-status"),
+            SessionStatus::Idle,
+        );
+        assert_eq!(pane_title(&info, false, 0, 14), " codex [Idle] ");
+    }
+
+    #[test]
+    fn degrades_to_status_only_then_to_nothing() {
+        let info = info("claude", Some("feat/x"), SessionStatus::Idle);
+        assert_eq!(pane_title(&info, false, 0, 9), " [Idle] ");
+        assert_eq!(pane_title(&info, false, 0, 3), "");
+    }
+
+    #[test]
+    fn a_longer_status_never_overflows_the_budget() {
+        // The fit is measured per frame, not against a worst-case `[Unreachable]`
+        // — so `Idle` buys the branch its columns back, and the widest status
+        // still can't push the title under the tab strip.
+        let statuses = [
+            SessionStatus::Idle,
+            SessionStatus::Working,
+            SessionStatus::Blocked,
+            SessionStatus::Done,
+            SessionStatus::Error,
+            SessionStatus::Unreachable,
+        ];
+        for status in statuses {
+            let info = info("claude", Some("fix/displaying-top-status"), status);
+            for budget in 0..60 {
+                for scroll in [0, 7, 1234] {
+                    let title = pane_title(&info, false, scroll, budget);
+                    assert!(
+                        cols(&title) <= budget,
+                        "{status} title {title:?} ({} cols) overflows budget {budget}",
+                        cols(&title)
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Property/fuzz tests proving the **rendering** path is transparent: whatever
 /// the vt100 model holds is exactly what lands in the frame buffer, and no raw
 /// control byte ever leaks into a rendered cell. Complements the transport
@@ -206,6 +406,7 @@ mod render_proptests {
                 &info,
                 FocusLevel::Focused,
                 false,
+                0,
             );
         })
         .unwrap();

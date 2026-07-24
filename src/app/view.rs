@@ -39,6 +39,16 @@ struct CentralTabCell {
     active: bool,
 }
 
+/// Columns the tab strip occupies on the pane's top border, measured from the
+/// pane's left corner out to the last pill's right edge — the span a
+/// right-aligned title sharing that border must keep clear. `0` when no strip
+/// was laid out (both alternate views feature-gated off, or no session).
+fn central_tabs_width(area: Rect, cells: &[CentralTabCell]) -> u16 {
+    cells.last().map_or(0, |cell| {
+        (cell.rect.x + cell.rect.width).saturating_sub(area.x + 1)
+    })
+}
+
 /// Owned info-panel inputs (built per frame by `App::info_panel_data`): the
 /// feature-gated upcoming-automation entries and the resolved parent-session
 /// name.
@@ -703,7 +713,7 @@ impl App {
         } else if self.active_cc_activity().is_some() {
             self.render_cc_activity_pane(frame, terminal);
         } else {
-            self.render_terminal_pane(frame, terminal);
+            self.render_terminal_pane(frame, terminal, central_tabs_width(terminal, &tabs));
         }
         // Drawn last so it overlays the pane's top border (the right-aligned
         // session-info title leaves the left free for the tabs).
@@ -762,8 +772,10 @@ impl App {
     }
 
     /// Render the active session's terminal (or shell view) into the central
-    /// pane — the default when no overlay/review owns it.
-    fn render_terminal_pane(&mut self, frame: &mut Frame, terminal: Rect) {
+    /// pane — the default when no overlay/review owns it. `tabs_width` is the
+    /// span the tab strip reserves on the top border, which the pane's
+    /// right-aligned title fits itself around.
+    fn render_terminal_pane(&mut self, frame: &mut Frame, terminal: Rect, tabs_width: u16) {
         let terminal_focus = if self.focus == InputFocus::Terminal {
             crate::ui::FocusLevel::Focused
         } else {
@@ -799,6 +811,7 @@ impl App {
                     &session.info,
                     terminal_focus,
                     is_shell_view,
+                    tabs_width,
                 )
             } else {
                 None
@@ -818,9 +831,10 @@ impl App {
     /// in), and whether it's the active view. Packing mirrors `render_button_bar`
     /// (` label ` chip = label+2 wide, one-space gaps) so the recorded hitboxes
     /// match the pills `draw_central_tabs` paints. Shell/Review are gated by
-    /// their feature flags; cells stop before the pane's right edge (they can
-    /// still paint over the right-aligned session-info title on a pane barely
-    /// wide enough for the pills — the tabs win, they're the interactive part).
+    /// their feature flags; cells stop before the pane's right edge, and the
+    /// pane's right-aligned info title budgets itself around the strip
+    /// ([`central_tabs_width`]) — so the two share the border instead of
+    /// colliding, however long the branch or narrow the pane.
     fn central_tab_cells(&self, area: Rect) -> Vec<CentralTabCell> {
         // No tabs on the empty "No Session" screen, or when the pane is too
         // narrow to hold even one.

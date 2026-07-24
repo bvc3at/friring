@@ -2111,8 +2111,13 @@ git branch itself keeps the `/`.
 
 ### UI indicators
 
-- **Terminal title**: Worktree sessions show the branch in the
-  title bar: `my-session [feature/foo] [Running]`.
+- **Terminal title**: the central pane's top border carries the agent, the
+  branch, and the session status, right-aligned: `claude [feature/foo]
+  [Working]` (`shell` replaces the agent in the shell view). The session name
+  is not repeated here — the header badge above it already shows it. The title
+  fits itself into whatever the tab strip leaves on that border: a long branch
+  truncates to `[feature/fo…]`, then drops (with the agent shed first) rather
+  than running under the tabs.
 - **Session list**: Branch name appears next to worktree sessions
   with a green `[branch]` badge.
 - **Info panel**: Shows a "Worktree" section with branch name and
