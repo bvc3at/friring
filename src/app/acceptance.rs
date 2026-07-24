@@ -2089,7 +2089,10 @@ async fn pane_title_never_runs_under_the_central_tab_strip() {
         // the strip's right edge to the pane corner (border fill first, then the
         // title): whatever survives the fit must be a whole field set, never the
         // tail of a longer one. Too narrow for even the status and the title
-        // yields entirely, leaving the strip the whole border.
+        // yields entirely, leaving the strip the whole border — which is why 60
+        // and 80 columns are the intentional status-only/empty fallback. From
+        // 100 up the branch must survive, as a truncated fragment at 100 and
+        // whole once the pane is wide enough.
         let buffer = h.terminal.backend().buffer();
         let border = pane.x + pane.width - 1;
         let visible: String = (tabs_end..border)
@@ -2101,8 +2104,12 @@ async fn pane_title_never_runs_under_the_central_tab_strip() {
             "at {cols} cols the title is a clipped remnant: {title:?}"
         );
         assert!(
-            cols < STD_COLS || title.contains("[fix/"),
+            cols < 100 || title.contains("[fix/"),
             "at {cols} cols there is room for the branch field: {title:?}"
+        );
+        assert!(
+            cols != 100 || title.contains('\u{2026}'),
+            "at {cols} cols the branch is truncated, not dropped: {title:?}"
         );
     }
 }
