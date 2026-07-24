@@ -344,6 +344,27 @@ mod title_tests {
                         "{status} title {title:?} ({} cols) overflows budget {budget}",
                         cols(&title)
                     );
+                    // The never-shed fields are exactly what a non-empty title
+                    // ends with, and they fit whenever the title exists at all:
+                    // every wider candidate costs the tail plus chrome.
+                    let tail = if scroll > 0 {
+                        format!(" [{status}] [{scroll}\u{2191}] ")
+                    } else {
+                        format!(" [{status}] ")
+                    };
+                    if budget >= cols(&tail) {
+                        assert!(
+                            title.ends_with(&tail),
+                            "{status} title {title:?} lost the status/scrollback tail \
+                             at budget {budget} (scroll {scroll})"
+                        );
+                    } else {
+                        assert!(
+                            title.is_empty(),
+                            "{status} title {title:?} kept a partial tail at budget \
+                             {budget} (scroll {scroll})"
+                        );
+                    }
                 }
             }
         }
