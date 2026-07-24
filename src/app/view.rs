@@ -42,7 +42,7 @@ struct CentralTabCell {
 /// Columns the tab strip occupies on the pane's top border, measured from the
 /// pane's left corner out to the last pill's right edge — the span a
 /// right-aligned title sharing that border must keep clear. `0` when no strip
-/// was laid out (both alternate views feature-gated off, or no session).
+/// was laid out (all alternate views feature-gated off, or no session).
 fn central_tabs_width(area: Rect, cells: &[CentralTabCell]) -> u16 {
     cells.last().map_or(0, |cell| {
         (cell.rect.x + cell.rect.width).saturating_sub(area.x + 1)
