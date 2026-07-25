@@ -396,6 +396,76 @@ impl Action {
         )
     }
 
+    /// The key pressed **after** the leader to run this action, or `None` for
+    /// actions the leader deliberately does not cover.
+    ///
+    /// Each key mirrors the letter of the action's own `Ctrl` chord (`Ctrl+N`
+    /// new session → `<leader> n`), so the leader table is learnable as "your
+    /// chords, one key later" rather than a second vocabulary. Four cases can't
+    /// mirror and are resolved here:
+    ///
+    /// - **`r`** goes to `RestartSession` (bare `Ctrl+R`); `ReloadApp`
+    ///   (`Ctrl+Alt+R`) takes `Shift+R` — one modifier up in the direct chord,
+    ///   one shift up here, and the bigger hammer gets the bigger key.
+    /// - **Digits** belong to session selection, so `LastSession` (`Ctrl+6`)
+    ///   moves to `Tab` — zellij's last-tab key, and adjacent to tmux's
+    ///   `prefix l` for last-window.
+    /// - **F-key-only actions** have no letter to mirror: `ToggleCcActivity`
+    ///   (`F9`) → `v` (acti**v**ity), `NextBlockedSession` (`F10`) → `]` (a
+    ///   "next" bracket), `TogglePerfHud` (`F12`) → `~` (tmux's
+    ///   show-messages key — a diagnostic surface, like this one).
+    /// - **`Copy`/`Paste` are excluded.** They are routed ahead of every modal
+    ///   (see `handle_priority_key`) precisely so paste reaches text inputs and
+    ///   copy works from inside a modal; a leader route would only work in the
+    ///   places they are least needed, which is a trap rather than a shortcut.
+    ///
+    /// Scoped actions (session-list / file-viewer / terminal nav) return `None`
+    /// too: they already fire on single letters while their pane is focused, so
+    /// they never needed the leader's key space.
+    pub fn prefix_key(self) -> Option<KeyChord> {
+        use Action::*;
+        let chord = match self {
+            // ── Navigation ──────────────────────────────────────────────
+            NextSession => KeyChord::plain('j'),
+            PreviousSession => KeyChord::plain('k'),
+            FocusBackward => KeyChord::plain('h'),
+            FocusForward => KeyChord::plain('l'),
+            LastSession => KeyChord::key(KeyCode::Tab),
+            NextBlockedSession => KeyChord::plain(']'),
+            // `a` for **a**ttention. This is the second-level session table:
+            // it opens the blocked-only overlay, whose `1`–`9` then select —
+            // so `<leader> a 3` is "the third session that needs me".
+            JumpToBlocked => KeyChord::plain('a'),
+            // ── Sessions ────────────────────────────────────────────────
+            NewSession => KeyChord::plain('n'),
+            DeleteSession => KeyChord::plain('d'),
+            RestartSession => KeyChord::plain('r'),
+            ForkSession => KeyChord::plain('f'),
+            UndoDelete => KeyChord::plain('z'),
+            OpenRestoreSessions => KeyChord::plain('u'),
+            OpenAutomations => KeyChord::plain('p'),
+            FocusTasks => KeyChord::plain('w'),
+            // ── Project ─────────────────────────────────────────────────
+            OpenInEditor => KeyChord::plain('o'),
+            StartSync => KeyChord::plain('s'),
+            // ── UI ──────────────────────────────────────────────────────
+            QuitApp => KeyChord::plain('q'),
+            ReloadApp => KeyChord::normalized(KeyModifiers::SHIFT, KeyCode::Char('r')),
+            ToggleShell => KeyChord::plain('t'),
+            ToggleReview => KeyChord::plain('x'),
+            ToggleCcActivity => KeyChord::plain('v'),
+            ToggleHelp => KeyChord::plain('g'),
+            ToggleInfoPanel => KeyChord::plain('b'),
+            ToggleFileViewer => KeyChord::plain('e'),
+            OpenThemePicker => KeyChord::plain('y'),
+            GlobalSearch => KeyChord::plain('/'),
+            OpenSettings => KeyChord::plain(','),
+            TogglePerfHud => KeyChord::plain('~'),
+            _ => return None,
+        };
+        Some(chord)
+    }
+
     /// Default key chord(s) bound to this action for the platform we were
     /// compiled for. `cfg!(target_os)` is decided at exactly this one
     /// callsite; everything else goes through [`Action::default_chords_for`]
@@ -742,6 +812,136 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
             ],
         ),
     ]
+}
+
+/// The which-key overlay's sections, in render order. Single source of truth
+/// for both the overlay renderer and [`prefix_entries`], so what the overlay
+/// advertises and what the leader actually dispatches can never drift.
+///
+/// Ordered by what the leader is *for*: session selection first (the reason
+/// the feature exists), then panes, then session management, then the app.
+pub fn prefix_sections() -> Vec<(&'static str, Vec<PrefixEntry>)> {
+    use Action::*;
+    use PrefixEntry::{Action as A, SendLiteral, SessionDigits};
+    vec![
+        (
+            "Go to session",
+            vec![
+                SessionDigits,
+                A(JumpToBlocked),
+                A(NextSession),
+                A(PreviousSession),
+                A(LastSession),
+                A(NextBlockedSession),
+            ],
+        ),
+        (
+            "Panels",
+            vec![
+                A(FocusBackward),
+                A(FocusForward),
+                A(ToggleInfoPanel),
+                A(ToggleFileViewer),
+                A(FocusTasks),
+                A(ToggleShell),
+                A(OpenAutomations),
+            ],
+        ),
+        (
+            "Sessions",
+            vec![
+                A(NewSession),
+                A(DeleteSession),
+                A(RestartSession),
+                A(ForkSession),
+                A(UndoDelete),
+                A(OpenRestoreSessions),
+            ],
+        ),
+        (
+            "Project",
+            vec![A(OpenInEditor), A(StartSync), A(ToggleReview), A(ToggleCcActivity)],
+        ),
+        (
+            "App",
+            vec![
+                A(ToggleHelp),
+                A(GlobalSearch),
+                A(OpenSettings),
+                A(OpenThemePicker),
+                A(TogglePerfHud),
+                A(ReloadApp),
+                A(QuitApp),
+                SendLiteral,
+            ],
+        ),
+    ]
+}
+
+/// Every leader entry, flattened out of [`prefix_sections`].
+pub fn prefix_entries() -> Vec<PrefixEntry> {
+    prefix_sections()
+        .into_iter()
+        .flat_map(|(_, entries)| entries)
+        .collect()
+}
+
+/// How the tmux-style prefix (leader) key participates in dispatch.
+///
+/// The leader exists because friring has run out of key space: every bare
+/// `Ctrl+<letter>` is bound or reserved (see [`Action::default_chords_for`]),
+/// and `F1`–`F10`/`F12` are spent too, so new commands had nowhere to live and
+/// the agent CLI in a focused terminal kept losing chords it wanted
+/// (`Ctrl+L` clear-screen, `Ctrl+Z` suspend, `Ctrl+V` image-paste, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrefixMode {
+    /// No leader at all — direct chords only. Friring's pre-leader behaviour.
+    Off,
+    /// Direct chords *and* the leader both dispatch. The default: nothing the
+    /// user already knows stops working, the leader is added alongside.
+    #[default]
+    Both,
+    /// The leader is the only way in — direct chords are disabled entirely.
+    /// This is the mode that pays for the feature: with no global `Ctrl`
+    /// chords, [`Action::terminal_passthrough`] becomes moot and every bare
+    /// `Ctrl+<letter>` reaches the agent CLI untouched.
+    PrefixOnly,
+}
+
+impl PrefixMode {
+    /// Whether the leader key is live in this mode.
+    pub fn prefix_enabled(self) -> bool {
+        !matches!(self, PrefixMode::Off)
+    }
+
+    /// Whether a direct (unprefixed) chord may still dispatch a global action.
+    /// False in [`PrefixOnly`](PrefixMode::PrefixOnly), which is what hands the
+    /// `Ctrl` namespace back to the agent.
+    pub fn direct_enabled(self) -> bool {
+        !matches!(self, PrefixMode::PrefixOnly)
+    }
+}
+
+/// One row of the which-key overlay. Most rows are plain [`Action`]s, but the
+/// session-selection layer the leader unlocks has no `Action` behind it (it
+/// takes a digit argument), so it is modelled here rather than faked as one.
+///
+/// There is no separate "sub-prefix" variant: the second-level table the
+/// leader unlocks — `<leader> a <0-9>` for blocked sessions — is already
+/// [`Action::JumpToBlocked`], which opens a numbered overlay whose digits
+/// select. Modelling it twice would put two rows on one key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixEntry {
+    /// A leader key that dispatches an action.
+    Action(Action),
+    /// `<leader> 0`–`9` — jump to the Nth session in rendered order.
+    SessionDigits,
+    /// `<leader> <leader>` — send the prefix's own byte to the agent. The
+    /// universal convention (tmux `send-prefix`, screen `C-a a`, nvim
+    /// `CTRL-\ CTRL-\`, ssh `~~`); it is what makes friring usable inside
+    /// itself and keeps the leader byte reachable by the inner CLI.
+    SendLiteral,
 }
 
 /// A key chord: modifiers + key code.
@@ -1474,6 +1674,80 @@ mod tests {
     ///
     /// The match below is exhaustive: adding a new `Action` variant
     /// without updating both this match AND `Action::all()` is a
+    /// Every leader key is unique. The which-key overlay is only trustworthy
+    /// if one key means one thing, and the table is hand-assigned (mirroring
+    /// each action's `Ctrl` letter, with four documented exceptions), so a
+    /// future action that reuses a letter would otherwise shadow an existing
+    /// row silently — the overlay would list both and only one would fire.
+    #[test]
+    fn prefix_keys_are_unique() {
+        let mut seen: HashMap<KeyChord, Action> = HashMap::new();
+        for action in Action::all() {
+            let Some(chord) = action.prefix_key() else {
+                continue;
+            };
+            if let Some(prev) = seen.insert(chord, *action) {
+                panic!(
+                    "leader key `{}` is bound to both {prev:?} and {action:?}",
+                    chord.display()
+                );
+            }
+        }
+    }
+
+    /// The digit keys stay reserved for session selection — the headline
+    /// feature the leader unlocks. An action claiming a digit would shadow
+    /// `<leader> 3` = "jump to session 3".
+    #[test]
+    fn prefix_keys_never_claim_a_digit() {
+        for action in Action::all() {
+            if let Some(chord) = action.prefix_key() {
+                assert!(
+                    !matches!(chord.code, KeyCode::Char(c) if c.is_ascii_digit()),
+                    "{action:?} claims digit `{}`, reserved for session jumps",
+                    chord.display()
+                );
+            }
+        }
+    }
+
+    /// The overlay advertises exactly what dispatches. Every action reachable
+    /// by the leader appears in [`prefix_sections`], and every action listed
+    /// there actually has a leader key — so a row can never be undiscoverable
+    /// or dead.
+    #[test]
+    fn prefix_sections_match_the_leader_table() {
+        let listed: Vec<Action> = prefix_entries()
+            .into_iter()
+            .filter_map(|e| match e {
+                PrefixEntry::Action(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+        for action in &listed {
+            assert!(
+                action.prefix_key().is_some(),
+                "{action:?} is in prefix_sections() but has no leader key"
+            );
+        }
+        for action in Action::all() {
+            if action.prefix_key().is_some() {
+                assert!(
+                    listed.contains(action),
+                    "{action:?} has a leader key but no row in prefix_sections()"
+                );
+            }
+        }
+    }
+
+    /// Copy/Paste are deliberately absent: they are routed ahead of every
+    /// modal so paste reaches text inputs, which a leader route cannot do.
+    #[test]
+    fn clipboard_actions_have_no_leader_key() {
+        assert!(Action::Copy.prefix_key().is_none());
+        assert!(Action::Paste.prefix_key().is_none());
+    }
+
     /// compile error (non-exhaustive match) OR a test failure (length
     /// mismatch). This is the last guard preventing a variant from
     /// silently disappearing from the help overlay.

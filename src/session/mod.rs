@@ -28,7 +28,10 @@ pub use host_def::{
     is_remote_backend, is_ssh_backend, is_wsl_backend, HostDef, HostKind, HostRegistry,
     SSH_BACKEND_PREFIX, WSL_BACKEND_PREFIX,
 };
-pub use keybindings::{compact_shortcut, Action, KeyBindings, KeyChord, KeyContext};
+pub use keybindings::{
+    compact_shortcut, prefix_entries, prefix_sections, Action, KeyBindings, KeyChord, KeyContext,
+    PrefixEntry, PrefixMode,
+};
 pub use message::SessionMessage;
 pub use review::{
     parse_unified_diff, Classification, CommentAnchor, DiffFile, DiffHunk, DiffLine, DiffLineKind,
