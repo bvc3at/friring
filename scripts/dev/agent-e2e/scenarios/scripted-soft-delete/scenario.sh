@@ -106,10 +106,10 @@ scenario_steps() {
     del_wait_modal_gone 30
 
     # The restored session is active with Terminal focus (restore sets both),
-    # so its pane title must render — the session still has a live terminal.
-    # Suffix match: the right-aligned title loses the head of this long name
-    # to the tab bar at 120 cols ("…F9 cripted-soft-delete (scripted)").
-    step_wait_pane "soft-delete (scripted)" 15
+    # so the header badge names it again and its pane title renders — the
+    # session still has a live terminal.
+    step_wait_pane "$E2E_SCENARIO_NAME  ◐" 15
+    step_wait_pane " scripted \[" 15
 }
 
 scenario_assert_effects() {
@@ -133,7 +133,8 @@ scenario_assert_effects() {
 }
 
 scenario_assert_ui() {
-    # The restored session renders as the active terminal pane title (suffix:
-    # the tab bar truncates the head of the long name at 120 cols).
-    assert_pane_contains "soft-delete (scripted)"
+    # The restored session is the active one (header badge) and its terminal
+    # pane renders (title).
+    assert_pane_contains "$E2E_SCENARIO_NAME  ◐"
+    assert_pane_contains " scripted ["
 }

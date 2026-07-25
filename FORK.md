@@ -700,6 +700,23 @@ interplay with ADR-P12 in `docs/PERFORMANCE.md`.
   the worktree directory flattens `/` to `-` and tmux window names sanitize
   separately (`session_name_to_branch` in `src/app/key_handlers.rs`).
 
+- **The central pane's title no longer collides with its tab strip.** Upstream
+  right-aligns ` {name} ({agent}) [{branch}] [{status}] ` on the same top
+  border the Agent/Review/Shell/Activity pills are painted over, and paints the
+  pills last — so on a narrow pane, or with the session name and branch that a
+  worktree session usually shares, the tabs simply overwrote the title's head
+  (an e2e scenario had to anchor its waits on the name's *tail* for this
+  reason). Two changes in `ui::terminal_view::pane_title`: the **session name
+  is gone** from this title (the header badge one row up, right-aligned to the
+  same edge, already shows the active session — the pane title now carries only
+  what the header can't: `claude [branch] [Idle]`, or `shell` in the shell
+  view), and what remains is **fitted to the columns the strip leaves**
+  (`app::view::central_tabs_width`). The fit is measured per frame rather than
+  against a worst-case `[Unreachable]`, so a short status hands its columns back
+  to the branch; over budget, the branch truncates (`[fix/displa…]`), then the
+  agent sheds, then the branch drops — status and the scrollback marker are
+  never dropped.
+
 ### Performance
 
 - **Shell-tab keystrokes echo immediately.** The demand-driven render loop's

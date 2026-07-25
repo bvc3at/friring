@@ -2045,6 +2045,76 @@ async fn central_tab_strip_renders_labels_and_shortcuts() {
 }
 
 #[tokio::test]
+async fn pane_title_never_runs_under_the_central_tab_strip() {
+    // The tab pills and the session-info title share the pane's top border, and
+    // the pills are painted last — so a title too long for what they leave used
+    // to lose its head under them (worst on a worktree session, whose branch is
+    // usually as long as its name). The title now budgets itself around the
+    // strip: it must start at or after the last pill, at every width.
+    let mut h = Harness::spawnable(1);
+    h.app.sessions[0]
+        .info
+        .worktrees
+        .push(crate::session::WorktreeInfo {
+            repo_path: std::path::PathBuf::from("/repo"),
+            worktree_path: std::path::PathBuf::from("/wt"),
+            branch: "fix/displaying-top-status-in-the-central-pane".to_string(),
+        });
+
+    for cols in [60, 80, 100, STD_COLS, 160] {
+        h.resize(cols, STD_ROWS);
+        h.render();
+        let pane = h
+            .app
+            .click_targets
+            .iter()
+            .find_map(|t| match t.action {
+                ClickAction::FocusPane(InputFocus::Terminal) => Some(t.rect),
+                _ => None,
+            })
+            .expect("terminal pane hitbox recorded");
+        let tabs_end = h
+            .app
+            .click_targets
+            .iter()
+            .filter_map(|t| match t.action {
+                ClickAction::CentralTab(_) => Some(t.rect.x + t.rect.width),
+                _ => None,
+            })
+            .max()
+            .expect("tab strip rendered");
+
+        // The pills are painted *over* the title, so an overlap is invisible as
+        // such — it shows up as a title missing its head. Read the border from
+        // the strip's right edge to the pane corner (border fill first, then the
+        // title): whatever survives the fit must be a whole field set, never the
+        // tail of a longer one. Too narrow for even the status and the title
+        // yields entirely, leaving the strip the whole border — which is why 60
+        // and 80 columns are the intentional status-only/empty fallback. From
+        // 100 up the branch must survive, as a truncated fragment at 100 and
+        // whole once the pane is wide enough.
+        let buffer = h.terminal.backend().buffer();
+        let border = pane.x + pane.width - 1;
+        let visible: String = (tabs_end..border)
+            .map(|x| buffer[(x, pane.y)].symbol())
+            .collect();
+        let title = visible.trim_start_matches('─');
+        assert!(
+            title.is_empty() || (title.starts_with(' ') && title.ends_with("] ")),
+            "at {cols} cols the title is a clipped remnant: {title:?}"
+        );
+        assert!(
+            cols < 100 || title.contains("[fix/"),
+            "at {cols} cols there is room for the branch field: {title:?}"
+        );
+        assert!(
+            cols != 100 || title.contains('\u{2026}'),
+            "at {cols} cols the branch is truncated, not dropped: {title:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn central_tab_strip_omits_feature_gated_tabs() {
     // Shell/Review tabs are gated by their feature flags. With both off, only
     // the Agent pill would remain — a tab strip you can't switch away from — so

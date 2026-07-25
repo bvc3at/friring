@@ -56,15 +56,15 @@ scenario_steps() {
 
     # Restore a valid file: the earlier reload toast was overwritten by the
     # Ctrl+T and ERROR toasts, so this wait can only match the new reload.
-    # Ctrl+T is un-gated again: shell pane opens (title flips to "(shell)"),
-    # then toggle back to the agent view.
+    # Ctrl+T is un-gated again: shell pane opens (the title's agent field flips
+    # to "shell"), then toggle back to the agent view.
     printf '%s\n' "$SCENARIO_RESTORED_SETTINGS" \
         > "$XDG_CONFIG_HOME/friring-dev/settings.toml"
     step_wait_pane "settings.toml reloaded" 15
     step_key C-t
-    step_wait_pane "(shell)" 15
+    step_wait_pane " shell \[" 15
     step_key C-t
-    step_wait_pane "(scripted)" 15
+    step_wait_pane " scripted \[" 15
 
     # Perf HUD overlay on top of the agent view; closing is asserted (with a
     # bounded poll) in scenario_assert_ui — nothing new appears to wait on.
@@ -100,6 +100,6 @@ scenario_assert_ui() {
     ! e2e_pane | grep -qF " Perf " \
         || e2e_die "perf HUD box still rendered after second F12" || return 1
     # Back on the agent view (not the shell), with the picked theme badge up.
-    assert_pane_contains "(scripted)"
+    assert_pane_contains " scripted ["
     assert_pane_contains "◐ Catppuccin Mocha"
 }

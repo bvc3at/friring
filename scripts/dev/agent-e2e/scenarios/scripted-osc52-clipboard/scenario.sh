@@ -81,9 +81,9 @@ scenario_steps() {
     # let the remaining steps run (errexit is suppressed inside
     # `scenario_steps || return 1`) — a later green wait could then mask it.
     #
-    # Title waits are anchored on the NAME'S TAIL ("clipboard (shell) "):
-    # this scenario's long session name collides with the central pane's tab
-    # bar, which clips the title's head, never its tail.
+    # Title waits anchor on the pane title's agent field, which is what flips
+    # between the agent and shell views; the session's own name lives in the
+    # header badge, not the title.
     step_wait_pane "SCRIPTED-READY mode=new" 60 || return 1
 
     # 1. The Claude Code /copy shape: tmux-passthrough-wrapped OSC 52 from
@@ -106,12 +106,12 @@ scenario_steps() {
     #    escape (the typed command itself is plain text; the shell expands
     #    the \033). Payload is pre-encoded ("SHELL-CLIP-E2E").
     step_key C-t
-    step_wait_pane "clipboard (shell) " 30 || return 1
+    step_wait_pane " shell \[" 30 || return 1
     step_type "printf '\\033]52;c;U0hFTEwtQ0xJUC1FMkU=\\007'"
     step_key Enter
     wait_driver_clipboard "SHELL-CLIP-E2E" || return 1
     step_key C-t
-    step_wait_pane "clipboard (scripted)" 15 || return 1
+    step_wait_pane " scripted \[" 15 || return 1
 
     # 4. Cmd+C dispatches Copy: with the session list focused and no
     #    selection, Copy copies the current status message. Refresh the toast
@@ -148,6 +148,6 @@ scenario_assert_effects() {
 }
 
 scenario_assert_ui() {
-    # Tail-anchored like the title waits above (the tab bar clips the head).
-    assert_pane_contains "clipboard (scripted)"
+    # Ends on the agent view, not the shell (see the title waits above).
+    assert_pane_contains " scripted ["
 }

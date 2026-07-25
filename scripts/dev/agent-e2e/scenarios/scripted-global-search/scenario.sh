@@ -111,7 +111,8 @@ scenario_assert_ui() {
         && { e2e_die "global-search popup still open after Enter
 --- pane ---
 $(e2e_pane)"; return 1; }
-    # No leading " scripted-": at 120 cols the terminal-pane title clips the
-    # long session name from the left ("…ipted-global-search (scripted)").
-    assert_pane_contains "global-search (scripted)"
+    # The jumped-to session is the active one (header badge — the pane title
+    # carries the agent, not the name) and its terminal pane renders.
+    assert_pane_contains "$E2E_SCENARIO_NAME  ◐"
+    assert_pane_contains " scripted ["
 }
