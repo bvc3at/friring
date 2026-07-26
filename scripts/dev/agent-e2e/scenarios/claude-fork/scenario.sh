@@ -1,8 +1,8 @@
 # shellcheck shell=bash
 #
-# Scenario: session fork (Ctrl+F) + parent linkage, end to end. Turn 1 runs
-# in the precreated parent; Ctrl+F (from list focus — C-f is terminal-
-# passthrough) opens the pre-filled "Fork — Name" modal, and accepting it
+# Scenario: session fork (<leader> f) + parent linkage, end to end. Turn 1
+# runs in the precreated parent; `<leader> f` opens the pre-filled
+# "Fork — Name" modal, and accepting it
 # spawns a child that records parent_session_id, nests under the parent in
 # the sidebar (└ prefix), and launches claude through the fork template
 # (--resume <parent-id> --fork-session -n <name>). The fork REPLAYS the
@@ -43,10 +43,13 @@ scenario_steps() {
     [ -n "$E2E_PARENT_AGENT_ID" ] && [ "$E2E_PARENT_AGENT_ID" != "null" ] \
         || e2e_die "parent has no agent_session_id" || return 1
 
-    # Ctrl+F is terminal-passthrough, so it must reach the app, not claude —
-    # leave for the session list first (Ctrl+H), then fork.
+    # `Ctrl+F` is the leader now, so fork is `<leader> f` — the same letter,
+    # one key later. The leader arms from any pane, so the earlier hop to the
+    # session list (Ctrl+H) is no longer needed to reach it, but it is kept so
+    # the modal opens from the same focus this scenario has always used.
     step_key C-h
     step_key C-f
+    step_key f
     step_wait_pane "Fork — Name" 30
     # The modal pre-fills "<parent-name>-fork"; accept it unchanged.
     step_wait_pane "$E2E_SCENARIO_NAME-fork" 15

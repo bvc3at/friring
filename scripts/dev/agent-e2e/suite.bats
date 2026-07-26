@@ -90,7 +90,7 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-restart-resume"
 }
 
-@test "e2e: Ctrl+F forks claude — parent link, sidebar nesting, forked conversation continues" {
+@test "e2e: <leader> f forks claude — parent link, sidebar nesting, forked conversation continues" {
     require_agent claude
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-fork"
 }

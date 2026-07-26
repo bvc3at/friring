@@ -51,6 +51,15 @@ scenario_steps() {
     step_key Escape
     leader_wait_pane_gone "go to session N" 50
 
+    # 2b. `prefix2` (F12) arms the same table. Worth asserting through the real
+    #     transport rather than only in-process: F-keys are terminfo-dependent
+    #     in a way a bare `Ctrl+<letter>` is not, and prefix2 is the documented
+    #     escape hatch for anyone whose outer multiplexer eats the primary.
+    step_key F12
+    step_wait_pane "go to session N" 15
+    step_key Escape
+    leader_wait_pane_gone "go to session N" 50
+
     # 3. `<leader> b` opens the info panel. " Info ─" is the panel's border
     #    title; a bare " Info " would false-match the footer hint.
     step_key C-f
