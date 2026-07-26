@@ -2282,6 +2282,45 @@ fn leader_digit_jumps_to_that_session_and_lands_in_the_terminal() {
         InputFocus::Terminal,
         "a jump lands in the terminal, like the Alt overlay"
     );
+
+    // The digits number the list as *rendered*, so a manual reorder moves them.
+    h.app.focus = InputFocus::SessionList;
+    h.app.set_active_index(0);
+    h.shift('j'); // move sessions[0] below sessions[1]
+    assert_eq!(h.app.render_order_indices(), vec![1, 0, 2]);
+    h.leader(KeyCode::Char('1'));
+    assert_eq!(
+        h.app.active_index, 1,
+        "<leader> 1 is the top rendered row, not sessions[0]"
+    );
+}
+
+/// The second-level route: `<leader> a` opens the blocked-only numbering and
+/// a plain digit picks the Nth *blocked* session — a different numbering from
+/// the all-session digits above.
+#[test]
+fn leader_a_then_digit_jumps_to_the_nth_blocked_session() {
+    let mut h = Harness::standard(4);
+    h.app.sessions[1].info.status = SessionStatus::Blocked;
+    h.app.sessions[3].info.status = SessionStatus::Blocked;
+    h.app.focus = InputFocus::SessionList;
+
+    h.leader(KeyCode::Char('a'));
+    h.key(KeyCode::Char('2'), KeyModifiers::NONE);
+    assert_eq!(
+        h.app.active_index, 3,
+        "<leader> a 2 selects the 2nd blocked session, not the 2nd row"
+    );
+    assert_eq!(h.app.focus, InputFocus::Terminal);
+
+    h.leader(KeyCode::Char('a'));
+    h.key(KeyCode::Char('9'), KeyModifiers::NONE);
+    assert_eq!(h.app.active_index, 3, "an out-of-range digit moves nothing");
+    assert!(h
+        .app
+        .status_message
+        .as_ref()
+        .is_some_and(|m| m.text.contains("No blocked session #9")));
 }
 
 #[test]
