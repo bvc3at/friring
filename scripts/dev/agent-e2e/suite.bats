@@ -205,6 +205,11 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-info-keybind"
 }
 
+@test "e2e: leader key arms through nested tmux, dispatches, and never leaks to the PTY" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-leader-key"
+}
+
 @test "protocol: codex exec completes a stubbed text turn (no Friring)" {
     require_agent codex
     e2e_protocol_smoke "$AGENT_E2E_DIR/scenarios/codex-text-turn"
