@@ -9142,6 +9142,79 @@ mod tests {
         assert!(app.captured_clipboard.as_ref().unwrap().is_empty());
     }
 
+    /// An `App` with one session, focused terminal, plus the receiving end of
+    /// that session's PTY input channel — the seam for asserting exactly which
+    /// bytes a key does (or doesn't) forward to the agent.
+    fn app_with_pty_input_rx() -> (App, tokio::sync::mpsc::Receiver<Vec<u8>>) {
+        let backend_arc = stub_backend_arc();
+        let provider = stub_provider();
+        let mut app = App::new(
+            24,
+            120,
+            BackendRegistry::new(backend_arc.clone()),
+            stub_agents(),
+            test_db(),
+        );
+        let (session, input_rx) = Session::stub_with_input_rx("s", &backend_arc, &provider);
+        app.sessions.push(session);
+        app.active_index = 0;
+        app.focus = InputFocus::Terminal;
+        (app, input_rx)
+    }
+
+    /// tmux's `send-prefix`: `<leader> <leader>` hands the leader's own bytes
+    /// to the agent, without which the chord would be permanently unreachable
+    /// by the CLI running inside the pane.
+    #[test]
+    fn leader_twice_sends_the_leader_byte_to_the_pty() {
+        let (mut app, mut input_rx) = app_with_pty_input_rx();
+
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert!(app.prefix_state.is_armed());
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            input_rx.try_recv().ok(),
+            Some(vec![0x01]),
+            "the second leader press reaches the agent as Ctrl+A"
+        );
+        assert!(!app.prefix_state.is_armed(), "and it disarms");
+    }
+
+    /// A mistyped leader sequence must be swallowed, not injected: an unbound
+    /// key after the leader reports instead of typing into the agent's prompt.
+    #[test]
+    fn leader_then_unbound_key_sends_nothing_to_the_pty() {
+        use tokio::sync::mpsc::error::TryRecvError;
+        let (mut app, mut input_rx) = app_with_pty_input_rx();
+
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        app.handle_key(KeyCode::Char('§'), KeyModifiers::NONE);
+
+        assert!(
+            matches!(input_rx.try_recv(), Err(TryRecvError::Empty)),
+            "an unbound leader key must not reach the PTY"
+        );
+        assert!(!app.prefix_state.is_armed());
+    }
+
+    /// The point of `prefix-only`: a global chord no longer dispatches, so its
+    /// bytes go where the agent CLI can use them.
+    #[test]
+    fn prefix_only_lets_a_blocked_global_chord_reach_the_pty() {
+        let (mut app, mut input_rx) = app_with_pty_input_rx();
+        app.prefix_settings.mode = crate::session::PrefixMode::PrefixOnly;
+
+        app.handle_key(KeyCode::Char('b'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            input_rx.try_recv().ok(),
+            Some(vec![0x02]),
+            "Ctrl+B reaches the agent instead of toggling a panel"
+        );
+        assert!(!app.show_info_panel);
+    }
+
     /// Inside a modal text input, readline `Ctrl+W` (delete word) and `Ctrl+U`
     /// (kill to line start) edit the text like a terminal — and never insert a
     /// literal `w`/`u`, nor fire the global `FocusTasks`/`OpenRestoreSessions`
