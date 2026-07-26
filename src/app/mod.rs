@@ -4707,11 +4707,19 @@ impl App {
     }
 
     /// Which jump overlay the session list should paint this frame:
-    /// `Some(true)` = blocked-only numbering (`Alt+A`), `Some(false)` = all
-    /// sessions (Alt held past the delay), `None` = no overlay.
+    /// `Some(true)` = blocked-only numbering (`Alt+A`, or `<leader> a`),
+    /// `Some(false)` = all sessions (Alt held past the delay, or an armed
+    /// leader), `None` = no overlay.
+    ///
+    /// The armed leader paints the same numbers as the Alt-hold: `<leader> 1`
+    /// is otherwise a documentation-only route, and a which-key row reading
+    /// "go to session N" is useless without knowing which N is which.
     pub(crate) fn jump_overlay_blocked_only(&self) -> Option<bool> {
         if self.blocked_jump.is_some() {
             return Some(true);
+        }
+        if self.prefix_state.is_armed() {
+            return Some(false);
         }
         let delay_elapsed = self
             .alt_held_since

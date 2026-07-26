@@ -2236,6 +2236,67 @@ fn hint_delay_hides_the_overlay_but_not_the_armed_badge() {
     );
 }
 
+/// Review finding D1: the capture panes consumed every Ctrl chord outside
+/// their escape list, so the leader could not arm from the code-review or
+/// activity views at all. It now runs ahead of them — a leader that only works
+/// in some panes isn't a leader.
+#[test]
+fn leader_arms_from_the_code_review_pane() {
+    let mut h = Harness::standard(1);
+    h.app.focus = InputFocus::CodeReview;
+    h.ctrl('a');
+    assert!(
+        h.app.prefix_state.is_armed(),
+        "the leader arms even where the pane captures Ctrl chords"
+    );
+    h.key(KeyCode::Char('b'), KeyModifiers::NONE);
+    assert!(h.app.show_info_panel, "and its table dispatches");
+}
+
+/// …but a text-entry submode still owns the chord: there the leader key is a
+/// line-editing key in the field being typed into.
+#[test]
+fn leader_yields_to_a_text_entry_submode() {
+    let mut h = Harness::standard(1);
+    h.app.show_file_viewer = true;
+    h.app.focus = InputFocus::FileViewer;
+    h.app.file_viewer.search_active = true;
+    h.ctrl('a');
+    assert!(
+        !h.app.prefix_state.is_armed(),
+        "typing in a search field keeps Ctrl+A as beginning-of-line"
+    );
+}
+
+/// Review finding D2: `prefix-only` promises every bare `Ctrl+<letter>`
+/// reaches the agent, but the clipboard route ran ahead of the gate — so
+/// `Ctrl+V` (image paste in Claude Code and Codex) never got there.
+#[test]
+fn prefix_only_lets_the_terminal_keep_its_clipboard_chords() {
+    let mut h = Harness::standard(1);
+    h.app.prefix_settings.mode = crate::session::PrefixMode::PrefixOnly;
+    h.app.focus = InputFocus::Terminal;
+    assert!(
+        !h.app
+            .handle_priority_key_for_test(KeyCode::Char('v'), KeyModifiers::CONTROL),
+        "Ctrl+V falls through to the PTY in prefix-only"
+    );
+}
+
+/// The gate is narrow: friring's own text inputs still receive paste, since
+/// Copy/Paste deliberately have no leader route.
+#[test]
+fn prefix_only_still_pastes_into_friring_inputs() {
+    let mut h = Harness::standard(1);
+    h.app.prefix_settings.mode = crate::session::PrefixMode::PrefixOnly;
+    h.app.focus = InputFocus::SessionList;
+    assert!(
+        h.app
+            .handle_priority_key_for_test(KeyCode::Char('v'), KeyModifiers::CONTROL),
+        "outside a terminal, paste is still friring's"
+    );
+}
+
 /// `[prefix]` applies live like the other mirrored settings, and turning the
 /// leader off clears any armed state rather than stranding the overlay.
 #[test]

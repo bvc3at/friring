@@ -159,6 +159,17 @@ impl App {
         // Any key press clears text selection (but the key still performs its action)
         self.text_selection = None;
 
+        // The leader key, routed **ahead of every capture pane**. Those panes
+        // consume all Ctrl chords outside their small escape lists, so with the
+        // leader behind them it could not arm at all from the code-review or
+        // activity views — the leader has to be the one key that always works,
+        // or it isn't a leader. The exception is a text-entry submode
+        // (`text_entry_owns_keys`), where the leader chord is a line-editing
+        // key in the field being typed into.
+        if !self.text_entry_owns_keys() && self.handle_prefix_key(code, mods) {
+            return;
+        }
+
         // The in-pane automation editor / run-history capture input like the
         // overlay modal (see `handle_automation_pane_capture`).
         if self.handle_automation_pane_capture(code, mods) {
@@ -195,15 +206,6 @@ impl App {
         // the modal/capture gates so typed digits still reach text inputs,
         // before the lookup + pane handlers so they can't leak into the PTY.
         if self.handle_session_jump_key(code, mods) {
-            return;
-        }
-
-        // The leader key: when armed, this key resolves against the leader
-        // table instead of anything below. Routed after the capture panes (so
-        // the review / activity views keep their own keymaps) but before the
-        // keybinding lookup, so an armed leader always wins over a direct
-        // chord and over the PTY.
-        if self.handle_prefix_key(code, mods) {
             return;
         }
 
@@ -327,6 +329,34 @@ impl App {
         }
     }
 
+    /// Whether a text-entry submode currently owns every keystroke, so the
+    /// leader must not steal from it: in a field being typed into, the leader
+    /// chord is a line-editing key (`Ctrl+A` is beginning-of-line) and the
+    /// user is composing text, not issuing commands.
+    ///
+    /// Modals and the global-search popup are already handled before the
+    /// leader runs, so this only needs to cover the in-pane editors and the
+    /// search/compose sub-modes of the capture panes.
+    fn text_entry_owns_keys(&self) -> bool {
+        if matches!(
+            self.focus,
+            InputFocus::AutomationEditor | InputFocus::TaskEditor
+        ) {
+            return true;
+        }
+        if self.focus == InputFocus::FileViewer && self.file_viewer.search_active {
+            return true;
+        }
+        let review_typing = self.active_review().is_some_and(|cr| {
+            cr.compose.is_some() || cr.search.as_ref().is_some_and(|s| s.editing)
+        });
+        if review_typing {
+            return true;
+        }
+        self.active_cc_activity()
+            .is_some_and(|cc| cc.search.as_ref().is_some_and(|s| s.editing))
+    }
+
     /// The tmux-style leader key. Returns `true` if the key was consumed.
     ///
     /// Two jobs, split by [`PrefixState`](super::PrefixState):
@@ -406,6 +436,17 @@ impl App {
 
     /// Help-overlay dismissal and clipboard chords, routed ahead of modal
     /// handlers. Returns `true` if the key was consumed.
+    /// Test hook for [`Self::handle_priority_key`]'s consume/fall-through
+    /// decision, which is otherwise only observable through a real clipboard.
+    #[cfg(test)]
+    pub(crate) fn handle_priority_key_for_test(
+        &mut self,
+        code: KeyCode,
+        mods: KeyModifiers,
+    ) -> bool {
+        self.handle_priority_key(code, mods)
+    }
+
     fn handle_priority_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
         // The interactive help/keybinding editor captures all input — routed
         // ahead of the global keybinding lookup so a chord being captured
@@ -414,11 +455,25 @@ impl App {
             return self.handle_help_key(code, mods);
         }
 
+        // In `prefix-only` a focused terminal keeps its whole `Ctrl` namespace,
+        // clipboard chords included: `Ctrl+V` is image-paste in Claude Code and
+        // Codex and `Ctrl+C` is their interrupt, so intercepting them here
+        // would break the very thing that mode exists to fix. The gate is
+        // narrow on purpose — only a focused terminal, so paste still reaches
+        // friring's own modals, search field and in-pane editors, which have no
+        // other way to receive it (`Copy`/`Paste` deliberately have no leader
+        // key). Reaching friring's clipboard *in* the terminal is then the
+        // terminal emulator's job (`Cmd+V`/`Ctrl+Shift+V`), as it is for any
+        // full-screen TUI.
+        let terminal_owns_clipboard =
+            !self.prefix_settings.mode.direct_enabled() && self.focus == InputFocus::Terminal;
+
         // Clipboard chords (Copy/Paste) are user-rebindable global actions but
         // routed here, ahead of modal handlers, so Paste reaches modal/terminal
         // text inputs and Copy works from inside any modal. Resolved via the
         // (global) keybindings so a user's rebind takes effect.
         match self.keybindings.lookup(code, mods) {
+            _ if terminal_owns_clipboard => return false,
             // Paste always consumes — `paste_from_clipboard` knows whether a
             // modal text input is open and routes the text accordingly.
             Some(crate::session::Action::Paste) => {

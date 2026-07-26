@@ -985,13 +985,19 @@ fn build_session_line<'a>(
     };
 
     // The jump digit takes the status dot's leading pad column, so the
-    // overlay appearing/disappearing never shifts the row.
+    // overlay appearing/disappearing never shifts the row. It is painted
+    // reverse-video (accent *background*, text knocked out) rather than as a
+    // coloured glyph: a bare digit abutting the status dot reads as part of
+    // the row's content, while a solid chip reads as a label stuck on top of
+    // it — the same treatment as the armed-leader badge in the footer, so the
+    // leader's two surfaces look like one system.
     let mut spans = match jump_digit {
         Some(d) => vec![
             Span::styled(
                 d.to_string(),
                 Style::default()
-                    .fg(Theme::accent())
+                    .bg(Theme::accent())
+                    .fg(Theme::modal_bg())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
