@@ -567,6 +567,14 @@ perf HUD). `Copy`/`Paste` are deliberately **not** on the leader — they are
 routed ahead of every modal so paste reaches text inputs, which a leader route
 cannot do.
 
+**Reordering by distance.** `<leader> K` then `1`–`9` moves the active session
+that many places toward the top; `<leader> J` moves it down. Rows shift around
+it — nothing is swapped — and the distance clamps at the ends rather than
+erroring, since a generous digit means "as far as it goes". While the move is
+pending the session list **renumbers by distance from the active session**, so
+the digit you read is the digit you need; the footer badge reads
+`move up 1-9`. Any non-digit cancels.
+
 **What the leader unlocks: session selection by number.** `<leader> 1`–`9`
 jumps straight to that session, and `<leader> a` then a digit jumps to the
 *Nth blocked* session. Unlike `Alt+1`–`9` this works everywhere — GNOME

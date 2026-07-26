@@ -335,7 +335,75 @@ impl Default for PrefixSettings {
     }
 }
 
+/// Leader chords that are a bad idea, and why — reported at config load so a
+/// user learns *before* the key silently fails to arrive, rather than by
+/// filing a bug. Mirrors what Claude Code does for its own keybindings, which
+/// validates against multiplexer conflicts and warns.
+///
+/// These are warnings, never errors: the user's config wins. Someone who has
+/// deliberately unbound their outer tmux prefix is entitled to `Ctrl+B`.
+const RISKY_PREFIX_CHORDS: &[(&str, &str)] = &[
+    (
+        "ctrl+b",
+        "tmux's default prefix — an outer tmux consumes it before friring sees it",
+    ),
+    (
+        "ctrl+a",
+        "GNU screen's prefix, the most common tmux rebind, and beginning-of-line \
+         in every agent CLI",
+    ),
+    (
+        "ctrl+c",
+        "SIGINT, and reserved/unrebindable in Claude Code and Codex",
+    ),
+    (
+        "ctrl+d",
+        "EOF, and reserved/unrebindable in Claude Code and Codex",
+    ),
+    ("ctrl+z", "SIGTSTP — the shell suspends friring instead"),
+    (
+        "ctrl+q",
+        "XON flow control, a near-miss for Cmd+Q (quit) on macOS, and it kills \
+         the terminal in WSL",
+    ),
+    (
+        "ctrl+s",
+        "XOFF flow control — freezes output when a layer of the stack is not in raw mode",
+    ),
+];
+
 impl PrefixSettings {
+    /// Config-load warnings for a leader chord the user is likely to regret.
+    /// Empty for the shipped defaults.
+    pub fn warnings(&self) -> Vec<String> {
+        if !self.mode.prefix_enabled() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (field, raw) in [("key", &self.key), ("key2", &self.key2)] {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Some(chord) = KeyChord::parse(trimmed) else {
+                out.push(format!(
+                    "settings.toml: [prefix] {field} = \"{trimmed}\" is not a valid chord; ignored"
+                ));
+                continue;
+            };
+            let canonical = chord.display();
+            if let Some((_, why)) = RISKY_PREFIX_CHORDS
+                .iter()
+                .find(|(risky, _)| *risky == canonical)
+            {
+                out.push(format!(
+                    "settings.toml: [prefix] {field} = \"{canonical}\" — {why}"
+                ));
+            }
+        }
+        out
+    }
+
     /// The parsed leader chords, primary first, skipping unset/unparseable
     /// entries. Empty when the mode is `off` — callers can treat "no leader
     /// chords" as "the leader is not live" without also checking the mode.
@@ -504,6 +572,46 @@ mod tests {
         // `off` means no leader at all — including `key2`, which is what gives
         // F12 back to the perf HUD.
         assert!(off.prefix.chords().is_empty());
+    }
+
+    #[test]
+    fn shipped_prefix_defaults_warn_about_nothing() {
+        assert!(PrefixSettings::default().warnings().is_empty());
+    }
+
+    #[test]
+    fn risky_prefix_rebinds_are_reported_by_name() {
+        let s: Settings = toml::from_str("[prefix]\nkey = \"ctrl+b\"").unwrap();
+        let w = s.prefix.warnings();
+        assert_eq!(w.len(), 1, "got: {w:?}");
+        assert!(w[0].contains("ctrl+b") && w[0].contains("tmux"), "{}", w[0]);
+
+        // Both slots are checked, and the chord is canonicalised first so
+        // `CTRL+Z` and `ctrl+z` warn identically.
+        let s: Settings = toml::from_str("[prefix]\nkey = \"ctrl+f\"\nkey2 = \"CTRL+Z\"").unwrap();
+        let w = s.prefix.warnings();
+        assert_eq!(w.len(), 1, "got: {w:?}");
+        assert!(
+            w[0].contains("key2") && w[0].contains("SIGTSTP"),
+            "{}",
+            w[0]
+        );
+    }
+
+    #[test]
+    fn an_unparseable_prefix_chord_warns_rather_than_failing_silently() {
+        let s: Settings = toml::from_str("[prefix]\nkey = \"ctrl+nonsense\"").unwrap();
+        let w = s.prefix.warnings();
+        assert_eq!(w.len(), 1, "got: {w:?}");
+        assert!(w[0].contains("not a valid chord"), "{}", w[0]);
+    }
+
+    /// `mode = "off"` means the chords are inert, so warning about them would
+    /// be noise.
+    #[test]
+    fn prefix_warnings_are_silent_when_the_leader_is_off() {
+        let s: Settings = toml::from_str("[prefix]\nmode = \"off\"\nkey = \"ctrl+b\"").unwrap();
+        assert!(s.prefix.warnings().is_empty());
     }
 
     #[test]

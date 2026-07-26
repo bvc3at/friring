@@ -163,7 +163,13 @@ pub fn load_or_seed_with_warnings() -> (Settings, Vec<String>) {
                 &contents,
                 "settings.toml",
             ) {
-                Ok((settings, warnings)) => (settings, warnings),
+                Ok((settings, mut warnings)) => {
+                    // Leader-chord conflicts are reported here rather than at
+                    // parse time: they are semantic, not syntactic — the value
+                    // is a perfectly valid chord that happens to be a bad one.
+                    warnings.extend(settings.prefix.warnings());
+                    (settings, warnings)
+                }
                 Err(e) => (
                     Settings::default(),
                     vec![format!(

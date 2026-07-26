@@ -638,6 +638,14 @@ The tmux-style leader (see `docs/FEATURES.md` § The leader key). Applies
 leader. The trade is that `F12` no longer toggles the perf HUD while the leader
 is on; that moved to `<leader> m`. Set `key2 = ""` to reverse it.
 
+friring **warns at startup** if `key` or `key2` is set to a chord that is
+likely to fail or surprise — `ctrl+b` (an outer tmux eats it), `ctrl+a` (screen's
+prefix, and beginning-of-line in every agent CLI), `ctrl+c`/`ctrl+d` (reserved
+and unrebindable in Claude Code and Codex), `ctrl+z` (SIGTSTP), `ctrl+q`
+(XON, a `Cmd+Q` near-miss on macOS, and it kills the terminal in WSL), or
+`ctrl+s` (XOFF). These are warnings, never errors: your config wins, and the
+warning is silent when `mode = "off"`.
+
 Both leaders accept the same chord syntax as
 [`keybindings.json`](#keybindingsjson). An unparseable entry is skipped rather
 than fatal, so a typo in `key` still leaves you `key2` to get in with.

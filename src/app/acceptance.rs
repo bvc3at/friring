@@ -2237,6 +2237,84 @@ fn hint_delay_hides_the_overlay_but_not_the_armed_badge() {
     );
 }
 
+/// `<leader> K` then a digit moves the active session that many places toward
+/// the top, shifting the rows it passes rather than swapping with one.
+#[test]
+fn leader_shift_k_moves_the_session_up_by_the_digit() {
+    let mut h = Harness::standard(4);
+    h.app.set_active_index(3);
+    let moved = h.app.sessions[3].info.id;
+
+    h.leader(KeyCode::Char('K'));
+    assert!(
+        matches!(
+            h.app.prefix_state,
+            crate::app::PrefixState::AwaitingMove { up: true }
+        ),
+        "the gesture waits for its distance"
+    );
+    h.key(KeyCode::Char('2'), KeyModifiers::NONE);
+
+    let order = h.app.render_order_indices();
+    let pos = order
+        .iter()
+        .position(|&i| h.app.sessions[i].info.id == moved)
+        .unwrap();
+    assert_eq!(pos, 1, "moved two places up, from index 3 to 1");
+    assert!(
+        matches!(h.app.prefix_state, crate::app::PrefixState::Idle),
+        "and the gesture ends"
+    );
+}
+
+/// The distance clamps at the end of the list rather than erroring — a
+/// generous digit means "as far as it goes".
+#[test]
+fn leader_move_clamps_at_the_end_of_the_list() {
+    let mut h = Harness::standard(3);
+    h.app.set_active_index(2);
+    let moved = h.app.sessions[2].info.id;
+    h.leader(KeyCode::Char('K'));
+    h.key(KeyCode::Char('9'), KeyModifiers::NONE);
+    let order = h.app.render_order_indices();
+    let pos = order
+        .iter()
+        .position(|&i| h.app.sessions[i].info.id == moved)
+        .unwrap();
+    assert_eq!(pos, 0, "clamped to the top");
+}
+
+/// While the move is pending the list numbers rows by *distance* from the
+/// active session, not by absolute position — otherwise the digit the user
+/// reads would not be the digit they need.
+#[test]
+fn pending_move_numbers_rows_by_distance() {
+    let mut h = Harness::standard(3);
+    h.app.set_active_index(2);
+    h.leader(KeyCode::Char('K'));
+    assert_eq!(
+        h.app.jump_numbering(),
+        Some(crate::app::JumpNumbering::MoveDistance { from: 2, up: true })
+    );
+    assert_eq!(
+        h.app.jump_overlay_blocked_only(),
+        None,
+        "a move is neither the all-sessions nor the blocked numbering"
+    );
+}
+
+/// A non-digit cancels the pending move without reordering anything.
+#[test]
+fn a_non_digit_cancels_a_pending_move() {
+    let mut h = Harness::standard(3);
+    h.app.set_active_index(2);
+    let before = h.app.render_order_indices();
+    h.leader(KeyCode::Char('J'));
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(matches!(h.app.prefix_state, crate::app::PrefixState::Idle));
+    assert_eq!(h.app.render_order_indices(), before, "nothing moved");
+}
+
 /// GNU screen's convention: the leader table accepts its keys with `Ctrl`
 /// still held, so a whole sequence can be typed without releasing the
 /// modifier.

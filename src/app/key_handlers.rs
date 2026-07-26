@@ -379,6 +379,22 @@ impl App {
         let pressed = crate::session::KeyChord::normalized(mods, code);
         let is_leader = leaders.contains(&pressed);
 
+        // Waiting for a move distance: a digit performs the move, anything
+        // else cancels. Checked before the arm/dispatch logic so the digit is
+        // never mistaken for a session jump.
+        if let super::PrefixState::AwaitingMove { up } = self.prefix_state {
+            self.prefix_state = super::PrefixState::Idle;
+            self.prefix_hint_redraw_requested = false;
+            self.request_redraw();
+            if let KeyCode::Char(c) = code {
+                if let Some(d) = c.to_digit(10).filter(|d| *d > 0) {
+                    self.move_active_session_by(d as usize, up);
+                    return true;
+                }
+            }
+            return true;
+        }
+
         if !self.prefix_state.is_armed() {
             if is_leader {
                 self.prefix_state = super::PrefixState::Armed {
@@ -418,6 +434,17 @@ impl App {
         if let KeyCode::Char(c) = code {
             if c.is_ascii_digit() {
                 self.jump_to_digit(c, false);
+                return true;
+            }
+        }
+
+        // `<leader> K` / `<leader> J` — arm the move gesture and wait for its
+        // distance digit, re-numbering the list as distances from the active
+        // session.
+        for up in [true, false] {
+            if pressed == crate::session::keybindings::move_session_key(up) {
+                self.prefix_state = super::PrefixState::AwaitingMove { up };
+                self.request_redraw();
                 return true;
             }
         }

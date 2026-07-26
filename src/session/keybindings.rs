@@ -835,6 +835,8 @@ pub fn prefix_sections() -> Vec<(&'static str, Vec<PrefixEntry>)> {
             vec![
                 SessionDigits,
                 A(JumpToBlocked),
+                PrefixEntry::MoveSession { up: true },
+                PrefixEntry::MoveSession { up: false },
                 A(NextSession),
                 A(PreviousSession),
                 A(LastSession),
@@ -887,6 +889,16 @@ pub fn prefix_sections() -> Vec<(&'static str, Vec<PrefixEntry>)> {
             ],
         ),
     ]
+}
+
+/// The chord that starts a move-session gesture: `Shift+K` toward the top,
+/// `Shift+J` toward the bottom. Shifted twins of the `j`/`k` session-cycling
+/// keys, matching the session list's own `Shift+J`/`Shift+K` reordering.
+pub fn move_session_key(up: bool) -> KeyChord {
+    KeyChord::normalized(
+        KeyModifiers::SHIFT,
+        KeyCode::Char(if up { 'k' } else { 'j' }),
+    )
 }
 
 /// The action a key runs when pressed after the leader, if any. Reverse of
@@ -951,6 +963,13 @@ pub enum PrefixEntry {
     /// not a target: the overlay numbers from 1, matching the Alt-held jump
     /// overlay, and `jump_to_digit` reports "No session #0" for it.
     SessionDigits,
+    /// `<leader> K` / `<leader> J` then `1`–`9` — move the active session that
+    /// many places toward the top / bottom. Two-level like the digit jump, and
+    /// for the same reason: the digit is an argument, not a command.
+    MoveSession {
+        /// Toward the top of the list.
+        up: bool,
+    },
     /// `<leader> <leader>` — send the prefix's own byte to the agent. The
     /// universal convention (tmux `send-prefix`, screen `C-a a`, nvim
     /// `CTRL-\ CTRL-\`, ssh `~~`); it is what makes friring usable inside

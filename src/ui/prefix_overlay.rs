@@ -103,6 +103,14 @@ fn rows_for(entries: &[PrefixEntry], leader: &KeyChord) -> Vec<Row> {
                 key: "1-9".into(),
                 label: "go to session N",
             }),
+            PrefixEntry::MoveSession { up } => Some(Row {
+                key: crate::session::keybindings::move_session_key(*up).display(),
+                label: if *up {
+                    "move up 1-9…"
+                } else {
+                    "move down 1-9…"
+                },
+            }),
             PrefixEntry::SendLiteral => Some(Row {
                 key: leader.display(),
                 label: "send key to agent",

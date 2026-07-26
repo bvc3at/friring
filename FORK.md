@@ -91,6 +91,13 @@ Code and Codex, `Ctrl+G` external editor).
   needed through ssh + tmux), and a slip to `Cmd+F` opens a find bar rather
   than quitting the terminal. `ForkSession` keeps `Ctrl+F` as its direct chord
   for `mode = "off"`, and is `<leader> f` otherwise.
+- **Reordering by distance.** `<leader> K`/`<leader> J` then `1`–`9` moves the
+  active session that many places up/down, renumbering the list by distance
+  while the gesture is pending. Upstream reorders one row at a time
+  (`Shift+J`/`Shift+K`), which is still there.
+- **Startup warnings for risky leader rebinds** — `ctrl+b`, `ctrl+a`,
+  `ctrl+c`, `ctrl+d`, `ctrl+z`, `ctrl+q`, `ctrl+s` each report why they will
+  misbehave. Warnings only; the user's config wins.
 - The `[prefix]` settings table (`docs/CONFIG.md`) is fork-only.
 
 #### Code review v2 (July 2026)

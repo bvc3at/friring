@@ -1110,6 +1110,13 @@ const JUMP_OVERLAY_DELAY_MS: u64 = 150;
 pub(crate) enum PrefixState {
     /// No leader pending; keys dispatch normally.
     Idle,
+    /// `<leader> K` / `<leader> J` was pressed and we are waiting for the
+    /// digit that says *how far* to move the active session. A second-level
+    /// pending state rather than an action, because the digit is an argument.
+    AwaitingMove {
+        /// Toward the top of the list (`K`) rather than the bottom (`J`).
+        up: bool,
+    },
     /// The leader was pressed; the next key resolves against the leader table.
     /// Carries the arm time so the which-key overlay can honour
     /// `prefix.hint_delay_ms` (0 = show immediately, the default), and the
@@ -1125,6 +1132,24 @@ impl PrefixState {
     pub(crate) fn is_armed(self) -> bool {
         matches!(self, PrefixState::Armed { .. })
     }
+}
+
+/// How the session list numbers its rows this frame.
+///
+/// The digits are an *argument* to whatever gesture is pending, so the
+/// numbering has to follow the gesture rather than being one fixed scheme:
+/// after `<leader>` a digit picks a session, after `<leader> K` the same digit
+/// means "this many rows up". Painting the wrong scheme would be worse than
+/// painting none — the user would move a session they meant to jump to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JumpNumbering {
+    /// Every session, numbered from the top (Alt held, or an armed leader).
+    All,
+    /// Only `Blocked` sessions (`Alt+A` / `<leader> a`).
+    Blocked,
+    /// Rows in one direction from `from`, numbered by *distance* — so the row
+    /// labelled `3` is where `<leader> K 3` lands the session.
+    MoveDistance { from: usize, up: bool },
 }
 
 /// Map a session's persisted hook state to its rendered [`SessionStatus`]. Pure
@@ -4715,19 +4740,68 @@ impl App {
     /// is otherwise a documentation-only route, and a which-key row reading
     /// "go to session N" is useless without knowing which N is which.
     pub(crate) fn jump_overlay_blocked_only(&self) -> Option<bool> {
+        match self.jump_numbering()? {
+            JumpNumbering::Blocked => Some(true),
+            JumpNumbering::All => Some(false),
+            JumpNumbering::MoveDistance { .. } => None,
+        }
+    }
+
+    /// The numbering scheme the session list should paint this frame, if any.
+    /// See [`JumpNumbering`] for why this follows the pending gesture.
+    pub(crate) fn jump_numbering(&self) -> Option<JumpNumbering> {
+        if let PrefixState::AwaitingMove { up } = self.prefix_state {
+            return Some(JumpNumbering::MoveDistance {
+                from: self.active_index,
+                up,
+            });
+        }
         if self.blocked_jump.is_some() {
-            return Some(true);
+            return Some(JumpNumbering::Blocked);
         }
         if self.prefix_state.is_armed() {
-            return Some(false);
+            return Some(JumpNumbering::All);
         }
         let delay_elapsed = self
             .alt_held_since
             .is_some_and(|t| t.elapsed().as_millis() as u64 >= JUMP_OVERLAY_DELAY_MS);
         if self.alt_held && delay_elapsed {
-            return Some(false);
+            return Some(JumpNumbering::All);
         }
         None
+    }
+
+    /// Move the active session `distance` places toward the top (`up`) or
+    /// bottom of the rendered order, shifting the sessions it passes rather
+    /// than swapping with one. Clamps at the ends: asking to move further than
+    /// the list allows lands it first/last rather than reporting an error,
+    /// which is what a user typing a generous digit means.
+    pub(crate) fn move_active_session_by(&mut self, distance: usize, up: bool) {
+        if distance == 0 || self.sessions.is_empty() {
+            return;
+        }
+        let order = self.render_order_indices();
+        let Some(pos) = order.iter().position(|&i| i == self.active_index) else {
+            return;
+        };
+        let target = if up {
+            pos.saturating_sub(distance)
+        } else {
+            (pos + distance).min(order.len() - 1)
+        };
+        if target == pos {
+            self.set_status(
+                StatusLevel::Info,
+                format!("Already at the {}", if up { "top" } else { "bottom" }),
+            );
+            return;
+        }
+        // Reuse the single-step reorder so grouping/nesting rules stay in one
+        // place: repeating it is O(distance) on a list capped at 9 moves.
+        let steps = pos.abs_diff(target);
+        for _ in 0..steps {
+            self.move_active_session(!up);
+        }
     }
 
     /// The leader chord to title the which-key overlay with, or `None` when
