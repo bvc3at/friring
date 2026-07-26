@@ -312,6 +312,12 @@ impl Harness {
         self.key(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    /// Arm the leader (`Ctrl+A` by default) and press `code` after it.
+    fn leader(&mut self, code: KeyCode) -> &mut Self {
+        self.ctrl('a');
+        self.key(code, KeyModifiers::NONE)
+    }
+
     /// A bare function key (`F1`…`F5`).
     fn func(&mut self, n: u8) -> &mut Self {
         self.key(KeyCode::F(n), KeyModifiers::NONE)
@@ -2144,32 +2150,141 @@ async fn info_panel_hides_automations_when_feature_off() {
 // tick-driven counters (`status_refreshes`) and the redraw-skip accounting live
 // in the `#[tokio::test]` units in `super::tests`.
 
+// ── Leader key ──────────────────────────────────────────────────────────────
+
 #[test]
-fn perf_hud_toggles_with_f12_and_activates_timing() {
+fn leader_arms_and_a_bound_key_runs_the_action() {
+    let mut h = Harness::standard(2);
+    assert!(!h.app.prefix_state.is_armed());
+    h.ctrl('a');
+    assert!(h.app.prefix_state.is_armed(), "Ctrl+A arms the leader");
+    h.render(); // the which-key overlay paints without disturbing the panes
+    h.key(KeyCode::Char('b'), KeyModifiers::NONE);
+    assert!(!h.app.prefix_state.is_armed(), "the key disarms");
+    assert!(h.app.show_info_panel, "<leader> b toggles the info panel");
+}
+
+#[test]
+fn leader_digit_jumps_to_that_session_and_lands_in_the_terminal() {
+    let mut h = Harness::standard(3);
+    h.app.focus = InputFocus::SessionList;
+    h.leader(KeyCode::Char('2'));
+    assert_eq!(h.app.active_index, 1, "<leader> 2 selects the 2nd session");
+    assert_eq!(
+        h.app.focus,
+        InputFocus::Terminal,
+        "a jump lands in the terminal, like the Alt overlay"
+    );
+}
+
+#[test]
+fn leader_out_of_range_digit_reports_instead_of_guessing() {
+    let mut h = Harness::standard(2);
+    h.leader(KeyCode::Char('9'));
+    assert_eq!(h.app.active_index, 0, "no session moved");
+    assert!(h
+        .app
+        .status_message
+        .as_ref()
+        .is_some_and(|m| m.text.contains("No session #9")));
+}
+
+#[test]
+fn leader_esc_cancels_without_running_anything() {
+    let mut h = Harness::standard(1);
+    h.ctrl('a');
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(!h.app.prefix_state.is_armed());
+    assert!(!h.app.show_info_panel, "nothing was dispatched");
+}
+
+/// An unbound key after the leader must not reach the PTY: a leader press
+/// plus a typo would otherwise inject a stray character into the agent.
+#[test]
+fn leader_unbound_key_reports_and_disarms() {
+    let mut h = Harness::standard(1);
+    h.leader(KeyCode::Char('§'));
+    assert!(!h.app.prefix_state.is_armed());
+    assert!(h
+        .app
+        .status_message
+        .as_ref()
+        .is_some_and(|m| m.text.contains("No leader binding")));
+}
+
+/// `F12` is the second leader, so it arms rather than toggling the perf HUD.
+#[test]
+fn second_leader_f12_arms_like_the_primary() {
+    let mut h = Harness::standard(1);
+    h.key(KeyCode::F(12), KeyModifiers::NONE);
+    assert!(h.app.prefix_state.is_armed(), "F12 is prefix2");
+    assert!(!h.app.show_perf_hud, "F12 no longer toggles the HUD");
+    h.key(KeyCode::Char('b'), KeyModifiers::NONE);
+    assert!(h.app.show_info_panel, "and its table is the same one");
+}
+
+/// `mode = "off"` restores the pre-leader behaviour exactly: `Ctrl+A` is inert
+/// and `F12` goes back to the perf HUD.
+#[test]
+fn prefix_mode_off_disables_the_leader_and_returns_f12() {
+    let mut h = Harness::standard(1);
+    h.app.prefix_settings.mode = crate::session::PrefixMode::Off;
+    h.ctrl('a');
+    assert!(!h.app.prefix_state.is_armed(), "Ctrl+A is inert when off");
+    h.key(KeyCode::F(12), KeyModifiers::NONE);
+    assert!(h.app.show_perf_hud, "F12 is the perf HUD again");
+}
+
+/// The mode that pays for the feature: no global `Ctrl` chord dispatches, so
+/// the whole namespace reaches the agent CLI. Pane-scoped keys still work.
+#[test]
+fn prefix_only_mode_blocks_direct_global_chords_but_keeps_scoped_ones() {
+    let mut h = Harness::standard(2);
+    h.app.prefix_settings.mode = crate::session::PrefixMode::PrefixOnly;
+
+    h.ctrl('b');
+    assert!(!h.app.show_info_panel, "Ctrl+B no longer toggles the panel");
+
+    // …but the leader still reaches it.
+    h.leader(KeyCode::Char('b'));
+    assert!(h.app.show_info_panel, "<leader> b still works");
+
+    // A pane-scoped single letter is untouched — it was never contested.
+    h.app.focus = InputFocus::SessionList;
+    h.app.set_active_index(0);
+    h.key(KeyCode::Char('j'), KeyModifiers::NONE);
+    assert_eq!(h.app.active_index, 1, "session-list j still navigates");
+}
+
+/// The perf HUD moved off `F12` when `F12` became the second leader (see
+/// `PrefixSettings::key2`), so it is reached as `<leader> m` — the only
+/// route once the leader is on, which is the documented cost of `key2`.
+#[test]
+fn perf_hud_toggles_with_leader_m_and_activates_timing() {
     let mut h = Harness::standard(1);
     assert!(!h.app.perf_timing_active(), "timing is off by default");
-    h.key(KeyCode::F(12), KeyModifiers::NONE);
-    assert!(h.app.show_perf_hud, "F12 opens the perf HUD");
+    h.leader(KeyCode::Char('m'));
+    assert!(h.app.show_perf_hud, "<leader> m opens the perf HUD");
     assert!(
         h.app.perf_timing_active(),
         "an open HUD switches timing collection on"
     );
     h.render(); // the overlay renders without disturbing the panes
-    h.key(KeyCode::F(12), KeyModifiers::NONE);
-    assert!(!h.app.show_perf_hud, "F12 closes it again");
+    h.leader(KeyCode::Char('m'));
+    assert!(!h.app.show_perf_hud, "<leader> m closes it again");
 }
 
 #[test]
 fn perf_hud_feature_flag_disables_toggle_and_closes_overlay() {
     let mut h = Harness::standard(1);
-    h.key(KeyCode::F(12), KeyModifiers::NONE);
+    h.leader(KeyCode::Char('m'));
     assert!(h.app.show_perf_hud);
     // Disabling the live flag tears the overlay down and blocks the chord.
     let mut settings = crate::session::settings::Settings::default();
     settings.features.perf_hud = false;
     h.app.apply_live_settings(&settings);
     assert!(!h.app.show_perf_hud, "disabling the flag closes the HUD");
-    h.key(KeyCode::F(12), KeyModifiers::NONE);
+    h.leader(KeyCode::Char('m'));
     assert!(!h.app.show_perf_hud, "the chord toasts instead of toggling");
 }
 

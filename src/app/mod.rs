@@ -819,6 +819,12 @@ pub struct App {
     /// global like [`Self::features`] so they apply live and tests can flip
     /// them without touching the first-writer-wins global.
     pub(crate) review_settings: crate::session::settings::ReviewSettings,
+    /// Leader-key settings (`[prefix]` in settings.toml) — copied out of the
+    /// global like [`Self::features`] so the settings panel applies them live
+    /// and tests can switch modes without touching the process-wide global.
+    pub(crate) prefix_settings: crate::session::settings::PrefixSettings,
+    /// Whether the leader is armed (see [`PrefixState`]).
+    pub(crate) prefix_state: PrefixState,
     pub(crate) show_info_panel: bool,
     /// Last content-area size pushed to the session PTYs. The `auto` info-pane
     /// dock can move between the left column and its own column when content
@@ -1088,6 +1094,30 @@ const WORKING_OUTPUT_STALE_MS: u64 = 10_000;
 /// immediate. See [`App::jump_overlay_blocked_only`] / [`App::set_alt_held`].
 const JUMP_OVERLAY_DELAY_MS: u64 = 150;
 
+/// Whether the leader key is armed, and since when.
+///
+/// Deliberately **has no timeout**. tmux waits indefinitely after its prefix;
+/// WezTerm expires its LEADER after 1s and opencode after 2s, which over SSH
+/// (friring's normal deployment) turns "I pressed the leader then paused to
+/// read the overlay" into "my keystroke went to the agent". The armed state
+/// ends only on a key press — a bound key, a cancel, or an unbound key that
+/// reports and disarms. See `App::handle_prefix_key`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefixState {
+    /// No leader pending; keys dispatch normally.
+    Idle,
+    /// The leader was pressed; the next key resolves against the leader table.
+    /// Carries the arm time so the which-key overlay can honour
+    /// `prefix.hint_delay_ms` (0 = show immediately, the default).
+    Armed { since: std::time::Instant },
+}
+
+impl PrefixState {
+    pub(crate) fn is_armed(self) -> bool {
+        matches!(self, PrefixState::Armed { .. })
+    }
+}
+
 /// Map a session's persisted hook state to its rendered [`SessionStatus`]. Pure
 /// so it's unit-testable without an `App`/DB. `exited` forces `Idle` (a crashed/
 /// finished process); `just_seen` is `true` when the user just moved focus off a
@@ -1232,6 +1262,8 @@ impl App {
             features: crate::session::settings::global().features,
             info_panel_position: crate::session::settings::global().info_panel_position,
             review_settings: crate::session::settings::global().review,
+            prefix_settings: crate::session::settings::global().prefix.clone(),
+            prefix_state: PrefixState::Idle,
             show_info_panel: false,
             last_content_size: None,
             show_tasks_panel: false,
@@ -2393,6 +2425,7 @@ impl App {
             features: self.features,
             info_panel_position: self.info_panel_position,
             review: self.review_settings,
+            prefix: self.prefix_settings.clone(),
             ..crate::session::settings::global().clone()
         };
         self.modal = modals::Modal::Settings(modals::SettingsModal::new(draft));

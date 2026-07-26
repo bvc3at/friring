@@ -477,7 +477,10 @@ mod tests {
     fn prefix_mode_parses_kebab_case_and_off_disables_both_leaders() {
         let s: Settings = toml::from_str("[prefix]\nmode = \"prefix-only\"").unwrap();
         assert_eq!(s.prefix.mode, PrefixMode::PrefixOnly);
-        assert!(!s.prefix.mode.direct_enabled(), "Ctrl goes back to the agent");
+        assert!(
+            !s.prefix.mode.direct_enabled(),
+            "Ctrl goes back to the agent"
+        );
 
         let off: Settings = toml::from_str("[prefix]\nmode = \"off\"").unwrap();
         // `off` means no leader at all — including `key2`, which is what gives

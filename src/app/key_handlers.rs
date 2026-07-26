@@ -198,6 +198,15 @@ impl App {
             return;
         }
 
+        // The leader key: when armed, this key resolves against the leader
+        // table instead of anything below. Routed after the capture panes (so
+        // the review / activity views keep their own keymaps) but before the
+        // keybinding lookup, so an armed leader always wins over a direct
+        // chord and over the PTY.
+        if self.handle_prefix_key(code, mods) {
+            return;
+        }
+
         // Keybinding lookup, scoped to the focused pane: global actions plus
         // any scoped to the current context (file viewer, session list,
         // terminal). Some readline/shell chords (Ctrl+A/E/W/U/R/D/…) defer to
@@ -208,10 +217,17 @@ impl App {
         // friring command working even in the terminal.
         let context = self.focus_key_context();
         if let Some(action) = self.keybindings.lookup_in(context, code, mods) {
+            // In `prefix-only` the leader is the sole route to a **global**
+            // command — that is what hands the whole `Ctrl+<letter>` namespace
+            // back to the agent CLI. Pane-scoped actions (session-list `j`/`k`,
+            // file-viewer nav) are untouched: they are single letters inside a
+            // focused pane and were never part of the contested space.
+            let direct_blocked = !self.prefix_settings.mode.direct_enabled()
+                && action.context() == crate::session::KeyContext::Global;
             let defer_to_pty = self.focus == InputFocus::Terminal
                 && action.terminal_passthrough()
                 && is_ctrl_letter_chord(code, mods);
-            if !defer_to_pty && self.dispatch_action(action) {
+            if !direct_blocked && !defer_to_pty && self.dispatch_action(action) {
                 return;
             }
         }
@@ -309,6 +325,80 @@ impl App {
             // before the lookup, so they stay on Global here.
             _ => KeyContext::Global,
         }
+    }
+
+    /// The tmux-style leader key. Returns `true` if the key was consumed.
+    ///
+    /// Two jobs, split by [`PrefixState`](super::PrefixState):
+    /// - **Idle** — arm on the leader chord (or the second leader), consuming
+    ///   it. Any other key is left alone for the handlers below.
+    /// - **Armed** — resolve this key against the leader table. Every path
+    ///   disarms first, so no branch can leave the leader stuck armed.
+    ///
+    /// Order matters inside the armed branch: the leader itself sends its own
+    /// byte (so the inner agent can still receive it), then cancel, then
+    /// digits (session selection is the feature the leader exists for), then
+    /// the action table. An unrecognised key reports rather than falling
+    /// through to the PTY — a leader press followed by a typo would otherwise
+    /// inject a stray character into the agent's prompt.
+    fn handle_prefix_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
+        let leaders = self.prefix_settings.chords();
+        if leaders.is_empty() {
+            return false;
+        }
+        let pressed = crate::session::KeyChord::normalized(mods, code);
+        let is_leader = leaders.contains(&pressed);
+
+        if !self.prefix_state.is_armed() {
+            if is_leader {
+                self.prefix_state = super::PrefixState::Armed {
+                    since: clock::now(),
+                };
+                self.request_redraw();
+                return true;
+            }
+            return false;
+        }
+
+        self.prefix_state = super::PrefixState::Idle;
+        self.request_redraw();
+
+        // `<leader> <leader>` → send the leader's own byte to the agent. The
+        // tmux `send-prefix` convention; without it the leader chord would be
+        // permanently unreachable by the inner CLI (and friring unusable
+        // inside itself). Only meaningful with a terminal focused — elsewhere
+        // there is nothing to send to, so it just disarms.
+        if is_leader {
+            if self.focus == InputFocus::Terminal {
+                self.handle_terminal_key(code, mods);
+            }
+            return true;
+        }
+
+        // Esc / Ctrl+C back out without running anything.
+        if code == KeyCode::Esc || (mods == KeyModifiers::CONTROL && code == KeyCode::Char('c')) {
+            return true;
+        }
+
+        // `<leader> 1`–`9` — jump to the Nth session in rendered order. Same
+        // numbering the Alt-held overlay paints, so the two routes agree.
+        if let KeyCode::Char(c) = code {
+            if c.is_ascii_digit() {
+                self.jump_to_digit(c, false);
+                return true;
+            }
+        }
+
+        if let Some(action) = crate::session::keybindings::action_for_prefix_key(pressed) {
+            self.dispatch_action(action);
+            return true;
+        }
+
+        self.set_status(
+            super::StatusLevel::Info,
+            format!("No leader binding for `{}`", pressed.display()),
+        );
+        true
     }
 
     /// Help-overlay dismissal and clipboard chords, routed ahead of modal

@@ -412,8 +412,14 @@ impl Action {
     ///   `prefix l` for last-window.
     /// - **F-key-only actions** have no letter to mirror: `ToggleCcActivity`
     ///   (`F9`) → `v` (acti**v**ity), `NextBlockedSession` (`F10`) → `]` (a
-    ///   "next" bracket), `TogglePerfHud` (`F12`) → `~` (tmux's
-    ///   show-messages key — a diagnostic surface, like this one).
+    ///   "next" bracket), `TogglePerfHud` (`F12`) → `m` (**m**etrics).
+    ///
+    /// Every key here is reachable **unshifted** on a US layout, except the
+    /// deliberate `Shift+R`. That is a hard constraint, not a preference:
+    /// [`KeyChord::normalized`] folds `Shift` into the chord for letters only,
+    /// so a shifted punctuation key (`~`, `!`, `?`) arrives as
+    /// `Shift`+*that char* on some terminals and as the bare char on others,
+    /// and the lookup would miss half the time.
     /// - **`Copy`/`Paste` are excluded.** They are routed ahead of every modal
     ///   (see `handle_priority_key`) precisely so paste reaches text inputs and
     ///   copy works from inside a modal; a leader route would only work in the
@@ -460,7 +466,7 @@ impl Action {
             OpenThemePicker => KeyChord::plain('y'),
             GlobalSearch => KeyChord::plain('/'),
             OpenSettings => KeyChord::plain(','),
-            TogglePerfHud => KeyChord::plain('~'),
+            TogglePerfHud => KeyChord::plain('m'),
             _ => return None,
         };
         Some(chord)
@@ -860,7 +866,12 @@ pub fn prefix_sections() -> Vec<(&'static str, Vec<PrefixEntry>)> {
         ),
         (
             "Project",
-            vec![A(OpenInEditor), A(StartSync), A(ToggleReview), A(ToggleCcActivity)],
+            vec![
+                A(OpenInEditor),
+                A(StartSync),
+                A(ToggleReview),
+                A(ToggleCcActivity),
+            ],
         ),
         (
             "App",
@@ -876,6 +887,15 @@ pub fn prefix_sections() -> Vec<(&'static str, Vec<PrefixEntry>)> {
             ],
         ),
     ]
+}
+
+/// The action a key runs when pressed after the leader, if any. Reverse of
+/// [`Action::prefix_key`]; unique by the `prefix_keys_are_unique` test.
+pub fn action_for_prefix_key(chord: KeyChord) -> Option<Action> {
+    Action::all()
+        .iter()
+        .copied()
+        .find(|a| a.prefix_key() == Some(chord))
 }
 
 /// Every leader entry, flattened out of [`prefix_sections`].
@@ -1692,6 +1712,28 @@ mod tests {
                     chord.display()
                 );
             }
+        }
+    }
+
+    /// No leader key needs `Shift` unless it is a letter.
+    /// [`KeyChord::normalized`] folds `Shift` into the chord for letters only,
+    /// so a shifted punctuation key (`~`, `!`, `?`) reaches the lookup as
+    /// `Shift`+char on terminals that report the modifier and as a bare char
+    /// on those that don't — matching on one and missing on the other.
+    #[test]
+    fn prefix_keys_avoid_shifted_punctuation() {
+        for action in Action::all() {
+            let Some(chord) = action.prefix_key() else {
+                continue;
+            };
+            if !chord.mods.contains(KeyModifiers::SHIFT) {
+                continue;
+            }
+            assert!(
+                matches!(chord.code, KeyCode::Char(c) if c.is_ascii_alphabetic()),
+                "{action:?} uses shifted non-letter `{}`, which terminals encode inconsistently",
+                chord.display()
+            );
         }
     }
 
