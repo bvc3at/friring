@@ -114,15 +114,32 @@ function frameDelays(buf) {
 // safe to use — freezedetect's weakness is mistaking typing for a freeze, and
 // nothing is being typed at t=0.
 //
-// Returns null when ffmpeg is unavailable, so a quick local run still works;
-// the recorder and CI both have it.
+// Returns null when ffmpeg is not INSTALLED, so a quick local run still works;
+// the recorder and CI both have it, and the caller says loudly that the metric
+// went unmeasured.
+//
+// ffmpeg being absent and ffmpeg *failing* are deliberately not the same thing.
+// A spawn error means the tool is missing — degrade and warn. A non-zero exit
+// means ffmpeg is right there and could not read the clip: a truncated or
+// corrupt gif, or a filter that no longer behaves as this code assumes. That is
+// the very condition the gate exists to catch, so it must not quietly become a
+// warning about a missing tool. Fail.
 function openingHold(file) {
   const r = spawnSync(
     'ffmpeg',
     ['-hide_banner', '-i', file, '-vf', 'freezedetect=n=-60dB:d=0.2', '-map', '0:v', '-f', 'null', '-'],
     { encoding: 'utf8' }
   );
-  if (r.error || r.status !== 0) return null;
+  // ENOENT is "not installed". Anything else (EACCES, a process limit) is a
+  // problem with this machine rather than a reason to skip a budget.
+  if (r.error) {
+    if (r.error.code === 'ENOENT') return null;
+    throw r.error;
+  }
+  if (r.status !== 0) {
+    const tail = (r.stderr || '').trim().split('\n').slice(-3).join('\n  ');
+    throw new Error(`${file}: ffmpeg could not analyse this clip (exit ${r.status})\n  ${tail}`);
+  }
   const log = r.stderr || '';
   const start = /freeze_start: ([0-9.]+)/.exec(log);
   const dur = /freeze_duration: ([0-9.]+)/.exec(log);
@@ -196,7 +213,15 @@ if (!files.length) {
   process.exit(2);
 }
 
-const results = files.map(measure);
+// An unreadable clip is a failure, not a crash report: this runs as a gate, and
+// a stack trace buries the one line naming the file that could not be measured.
+let results;
+try {
+  results = files.map(measure);
+} catch (e) {
+  console.error(`error: ${e.message}`);
+  process.exit(1);
+}
 
 if (asJson) {
   console.log(JSON.stringify({ budget: BUDGET, results }, null, 2));
