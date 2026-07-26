@@ -2171,10 +2171,23 @@ fn which_key_overlay_paints_while_armed() {
     let mut h = Harness::standard(1);
     h.ctrl('a');
     let armed = h.render();
-    assert!(
-        armed.contains("go to session N"),
-        "the armed overlay lists the session-jump row:\n{armed}"
-    );
+    // One label per section: at the standard 120 columns the groups don't all
+    // fit side by side, so this is what catches a layout that silently drops
+    // the ones that wrapped.
+    for label in [
+        "go to session N",
+        "info panel",
+        "new session",
+        "code review",
+        "quit",
+        "perf HUD",
+        "send key to agent",
+    ] {
+        assert!(
+            armed.contains(label),
+            "the armed overlay lists `{label}`:\n{armed}"
+        );
+    }
     assert!(
         armed.contains("ctrl+a"),
         "and titles itself with the leader"

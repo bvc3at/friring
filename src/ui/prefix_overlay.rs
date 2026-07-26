@@ -34,6 +34,20 @@ struct Row {
     label: &'static str,
 }
 
+/// One section rendered as a column: its title and its rows.
+type Column = (&'static str, Vec<Row>);
+
+/// Height of one band of side-by-side columns: its tallest column's rows plus
+/// the section title above them.
+fn band_height(band: &[Column]) -> u16 {
+    band.iter().map(|(_, rows)| rows.len()).max().unwrap_or(0) as u16 + 1
+}
+
+/// Height of every band stacked, with one blank separator line between them.
+fn stacked_height(bands: &[&[Column]]) -> u16 {
+    bands.iter().map(|b| band_height(b)).sum::<u16>() + bands.len().saturating_sub(1) as u16
+}
+
 /// The human label for an action in the leader table. Deliberately terser than
 /// the F1 help text — these are scanned in a grid while a key is held pending,
 /// not read as documentation.
@@ -99,13 +113,13 @@ fn rows_for(entries: &[PrefixEntry], leader: &KeyChord) -> Vec<Row> {
 
 /// Render the overlay centred in `area` (the full frame).
 ///
-/// Degrades rather than disappearing on a small terminal: columns are dropped
-/// to fit the available width, and the whole overlay is skipped only when even
-/// one column cannot fit. A leader that armed with no visible feedback would
-/// look like a frozen app.
+/// Degrades rather than disappearing on a small terminal: groups that don't fit
+/// side by side wrap onto stacked bands, and the whole overlay is skipped only
+/// when even one column cannot fit. A leader that armed with no visible
+/// feedback would look like a frozen app.
 pub(crate) fn render_prefix_overlay(frame: &mut Frame, area: Rect, leader: &KeyChord) {
     let sections = crate::session::prefix_sections();
-    let columns: Vec<(&'static str, Vec<Row>)> = sections
+    let columns: Vec<Column> = sections
         .iter()
         .map(|(title, entries)| (*title, rows_for(entries, leader)))
         .filter(|(_, rows)| !rows.is_empty())
@@ -122,13 +136,19 @@ pub(crate) fn render_prefix_overlay(frame: &mut Frame, area: Rect, leader: &KeyC
         return;
     }
 
-    // Tallest column decides the box height: title + rows, plus a blank
-    // separator between stacked groups when they wrap onto extra rows.
-    let rows_per_col = columns.iter().map(|(_, r)| r.len()).max().unwrap_or(0);
-    let banded: Vec<&(&'static str, Vec<Row>)> = columns.iter().take(shown).collect();
-    let inner_h = (rows_per_col + 2) as u16; // + section title + spacer
+    // The leftovers wrap onto further bands rather than being dropped: the
+    // overlay's whole job is to list *everything* reachable from the leader,
+    // so a narrow terminal must cost height, not entries.
+    let mut bands: Vec<&[Column]> = columns.chunks(fit).collect();
+    let max_h = area.height.saturating_sub(MARGIN);
+    // Still too tall: shed trailing bands, so what survives is whole groups
+    // rather than half of one.
+    while bands.len() > 1 && stacked_height(&bands) + 2 > max_h {
+        bands.pop();
+    }
+    let inner_h = stacked_height(&bands);
     let w = (COL_WIDTH * shown as u16 + 2).min(area.width.saturating_sub(MARGIN * 2));
-    let h = (inner_h + 2).min(area.height.saturating_sub(MARGIN));
+    let h = (inner_h + 2).min(max_h);
     if w < COL_WIDTH || h < 5 {
         return;
     }
@@ -158,33 +178,38 @@ pub(crate) fn render_prefix_overlay(frame: &mut Frame, area: Rect, leader: &KeyC
 
     // Paint column by column so each keeps its own width regardless of how
     // many rows its neighbours have.
-    for (i, (title, rows)) in banded.iter().enumerate() {
-        let col_x = inner.x + i as u16 * COL_WIDTH;
-        if col_x >= inner.right() {
+    let mut band_y = inner.y;
+    for band in &bands {
+        let h = band_height(band).min(inner.bottom().saturating_sub(band_y));
+        if h == 0 {
             break;
         }
-        let col_w = COL_WIDTH.min(inner.right() - col_x);
-        let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-            *title,
-            Style::default()
-                .fg(Theme::text_muted())
-                .add_modifier(Modifier::BOLD),
-        ))];
-        for r in rows.iter() {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{:>5} ", r.key),
-                    Style::default()
-                        .fg(Theme::accent())
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(r.label, Style::default().fg(Theme::text_primary())),
-            ]));
+        for (i, (title, rows)) in band.iter().enumerate() {
+            let col_x = inner.x + i as u16 * COL_WIDTH;
+            if col_x >= inner.right() {
+                break;
+            }
+            let col_w = COL_WIDTH.min(inner.right() - col_x);
+            let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+                *title,
+                Style::default()
+                    .fg(Theme::text_muted())
+                    .add_modifier(Modifier::BOLD),
+            ))];
+            for r in rows.iter() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:>5} ", r.key),
+                        Style::default()
+                            .fg(Theme::accent())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(r.label, Style::default().fg(Theme::text_primary())),
+                ]));
+            }
+            frame.render_widget(Paragraph::new(lines), Rect::new(col_x, band_y, col_w, h));
         }
-        frame.render_widget(
-            Paragraph::new(lines),
-            Rect::new(col_x, inner.y, col_w, inner.height),
-        );
+        band_y += h + 1; // blank separator between stacked bands
     }
 }
 
