@@ -63,7 +63,12 @@ Sleep 400ms
 Enter
 Sleep 450ms
 
-# Session-name prompt: type a name, then confirm.
+# Session-name prompt. The field arrives PRE-FILLED with the chosen repo's
+# basename, so clear it first or the two concatenate — the clip this replaces
+# shipped a session called `orbital-hvacaurora-forecast`. More Backspaces than
+# the prefill is long; the extras are no-ops on an empty field.
+Backspace 16
+Sleep 250ms
 Type "aurora-forecast"
 Sleep 500ms
 Enter
@@ -76,9 +81,15 @@ Down
 Sleep 350ms
 Enter
 
-# The new session appears in the list and its agent boots — a real CLI painting
-# on camera, so its duration is the machine's, not the demo's. Wait for the pane
-# to settle instead of guessing: the 3s guess this replaces filmed as a frozen
-# frame right at the end of the clip, where a viewer is most likely to bail.
-Wait Stable
+# End on the new session appearing in the list — the payoff of a
+# session-creation clip — and deliberately do not film its agent booting.
+#
+# `Wait Stable` is wrong here and was measurably wrong: this beat happens in two
+# stages (the picker closes and the row appears, then ~3.5s later the agent CLI
+# paints), so a settle window resolves on the first stage and the clip ended on
+# a blank terminal. Waiting for the boot instead would film 3.5s of that blank
+# pane, which no settle window can shorten. The row is written as soon as the
+# session exists, so this marker lands in ~0.3s. It cannot match early: the name
+# is not on screen once the name modal closes.
+Wait /aurora-forecast/
 Sleep 500ms

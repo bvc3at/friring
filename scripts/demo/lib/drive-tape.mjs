@@ -18,8 +18,8 @@
 //                          before recording starts
 //   Type "<text>"          typed character-by-character (see TYPING_SPEED_MS)
 //   Sleep <n>s|<n>ms       real sleep — this is the demo's pacing
-//   Wait /<re>/ [<n>]      poll the pane until it matches — waiting on the APP
-//   Wait Stable [<n>]      poll the pane until it stops changing
+//   Wait /<re>/ [<timeout>]          until the pane matches — waiting on the APP
+//   Wait Stable [<quiet>] [<timeout>]  until the pane stops changing
 //   Enter/Tab/Space/…      a single key
 //   Ctrl+<X>               a chord
 //
@@ -55,14 +55,18 @@ if (!tapePath || !fs.existsSync(tapePath)) {
 // glitch rather than someone using the tool. VHS's own default is 50ms.
 const TYPING_SPEED_MS = Number(process.env.DEMO_TYPING_SPEED_MS || 50);
 
-// `Wait` polling. The quiet period is what counts as "the screen stopped
-// moving": comfortably longer than the gap between two friring repaints, far
-// shorter than any pause a viewer would register as a beat.
 const WAIT_POLL_MS = 50;
-// Long enough to bridge the gap between a real agent CLI being spawned and it
-// writing its first byte — a shorter window resolves in that gap and calls a
-// blank pane "settled". Still well inside the per-pause budget, so a Wait that
-// ends a beat does not itself read as a stall.
+// Default settle window for `Wait Stable` — the DEFAULT, not the answer.
+//
+// "The screen stopped changing" is a proxy for "the app is ready", and the two
+// come apart on any beat that happens in stages: repaint, pause, repaint again.
+// If the pause between stages outlasts this window the wait resolves on the
+// intermediate screen. No value is safe for every beat — a modal closing settles
+// in well under 250ms, while the gap between a session appearing and its agent
+// CLI writing its first byte has measured 3.5s — which is why the window is a
+// per-beat argument (`Wait Stable 800ms`) and why a marker (`Wait /<re>/`) is
+// the better tool whenever the beat has one. 250ms suits the common case: a
+// modal or picker that repaints once and is done.
 const WAIT_STABLE_QUIET_MS = 250;
 const WAIT_TIMEOUT_MS = 10_000;
 
@@ -125,11 +129,27 @@ function parse(src) {
       steps.push({ kind: 'sleep', ms: m[2] === 'ms' ? n : n * 1000 });
       return;
     }
-    if ((m = line.match(/^Wait\s+(?:\/((?:[^/\\]|\\.)+)\/|(Stable))(?:\s+([\d.]+)(ms|s)?)?$/))) {
-      const t = m[3] === undefined ? WAIT_TIMEOUT_MS : Number(m[3]) * (m[4] === 'ms' ? 1 : 1000);
-      steps.push(
-        m[2] ? { kind: 'stable', timeoutMs: t, lineNo } : { kind: 'match', re: m[1], timeoutMs: t, lineNo }
-      );
+    // `Wait Stable [<quiet>] [<timeout>]` — the FIRST number is the settle
+    // window, not the deadline, because that is the knob a beat actually needs
+    // tuning (see waitForStable). `Wait /re/ [<timeout>]` takes a deadline,
+    // because a marker is exact and the only question is how long to allow.
+    const dur = (v, u) => Number(v) * (u === 'ms' ? 1 : 1000);
+    if ((m = line.match(/^Wait\s+Stable(?:\s+([\d.]+)(ms|s)?)?(?:\s+([\d.]+)(ms|s)?)?$/))) {
+      steps.push({
+        kind: 'stable',
+        quietMs: m[1] === undefined ? WAIT_STABLE_QUIET_MS : dur(m[1], m[2]),
+        timeoutMs: m[3] === undefined ? WAIT_TIMEOUT_MS : dur(m[3], m[4]),
+        lineNo,
+      });
+      return;
+    }
+    if ((m = line.match(/^Wait\s+\/((?:[^/\\]|\\.)+)\/(?:\s+([\d.]+)(ms|s)?)?$/))) {
+      steps.push({
+        kind: 'match',
+        re: m[1],
+        timeoutMs: m[2] === undefined ? WAIT_TIMEOUT_MS : dur(m[2], m[3]),
+        lineNo,
+      });
       return;
     }
     if ((m = line.match(/^Ctrl\+(\w)$/i))) {
@@ -267,7 +287,7 @@ async function waitForStable(step, baseline) {
     const now = capturePane();
     quiet = now === last ? quiet + WAIT_POLL_MS : 0;
     last = now;
-    if (quiet >= WAIT_STABLE_QUIET_MS) return waited;
+    if (quiet >= step.quietMs) return waited;
   }
   return waitTimedOut(step, 'Stable');
 }
@@ -275,8 +295,13 @@ async function waitForStable(step, baseline) {
 // What each Wait actually cost. This is the number that tells you whether a
 // beat is slow because the demo asked it to be or because the app is.
 const waits = [];
+// Waits that were still going when the tape moved on — see the audit below.
+const early = [];
 
 let stableBaseline = null;
+// Set when a Wait has just resolved: the screen it settled on, so the NEXT
+// sleep can check whether it stayed settled.
+let audit = null;
 
 for (let i = 0; i < tape.steps.length; i++) {
   const step = tape.steps[i];
@@ -284,19 +309,36 @@ for (let i = 0; i < tape.steps.length; i++) {
   if (tape.steps[i + 1]?.kind === 'stable') stableBaseline = capturePane();
   if (step.kind === 'sleep') {
     await sleep(step.ms);
+    // Audit the preceding Wait, for free. No key was sent during that sleep, so
+    // anything that moved on screen was the app still working — which means the
+    // Wait resolved on an intermediate screen, not on readiness. Quiet is only
+    // ever a proxy: a beat that repaints, pauses longer than the settle window,
+    // then repaints again (a modal closing, then an agent CLI painting) will
+    // satisfy it early, and the clip films the half-done state. This cannot
+    // prove a Wait was right, but it catches the case that matters at zero cost
+    // in runtime. A warning, not an error: on the multi-session view the live
+    // agent panes repaint on their own, so movement here is not always a defect.
+    if (audit) {
+      if (capturePane() !== audit.pane) early.push(audit);
+      audit = null;
+    }
   } else if (step.kind === 'key') {
+    audit = null;
     sendKey(step.key);
   } else if (step.kind === 'type') {
+    audit = null;
     for (const ch of step.text) {
       sendLiteral(ch);
       await sleep(TYPING_SPEED_MS);
     }
   } else if (step.kind === 'match') {
     waits.push([step.lineNo, `/${step.re}/`, await waitForMatch(step)]);
+    audit = { lineNo: step.lineNo, what: `/${step.re}/`, pane: capturePane() };
   } else if (step.kind === 'stable') {
     const base = stableBaseline;
     stableBaseline = null;
     waits.push([step.lineNo, 'Stable', await waitForStable(step, base)]);
+    audit = { lineNo: step.lineNo, what: `Stable ${step.quietMs}ms`, pane: capturePane() };
   }
 }
 
@@ -305,5 +347,14 @@ if (waits.length) {
   console.error(
     `${tapePath}: ${waits.length} Wait(s), ${(total / 1000).toFixed(2)}s total — ` +
       waits.map(([ln, what, ms]) => `L${ln} ${what} ${ms}ms`).join(', ')
+  );
+}
+for (const e of early) {
+  console.error(
+    `${tapePath}:${e.lineNo}: note: the screen was still changing after ` +
+      `\`Wait ${e.what}\` resolved, so the next beat filmed a screen the app had ` +
+      `not finished with. Intended when the tape deliberately stops short of a ` +
+      `later stage (not filming an agent boot, say); otherwise widen the settle ` +
+      `window (\`Wait Stable <quiet>\`) or wait on a marker (\`Wait /<re>/\`).`
   );
 }

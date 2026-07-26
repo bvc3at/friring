@@ -427,20 +427,39 @@ Consequences worth knowing when editing a tape or the recorder:
   building its list, a forked agent CLI booting — use `Wait`, which polls
   `tmux capture-pane` and continues the moment the screen says it is ready:
 
-  - `Wait /<regex>/ [timeout]` — until the pane matches. Prefer this when a
-    marker exists; `agent_ready_marker()` in `record.sh` has one per agent
-    (`claude` → `❯`, `codex` → `›`, `opencode` → `Build ·`).
-  - `Wait Stable [timeout]` — until the pane *changes* and then goes quiet.
-    Both halves matter: waiting only for quiet resolves inside the gap before
-    the app reacts and calls the old screen settled.
+  - `Wait /<regex>/ [<timeout>]` — until the pane matches. Prefer this whenever
+    the beat has a marker; `agent_ready_marker()` in `record.sh` has one per
+    agent (`claude` → `❯`, `codex` → `›`, `opencode` → `Build ·`).
+  - `Wait Stable [<quiet>] [<timeout>]` — until the pane *changes* and then
+    holds still for `quiet` (default 250ms). Both halves matter: waiting only
+    for quiet resolves inside the gap before the app reacts and calls the old
+    screen settled.
 
-  Two limits, both learned the hard way. `capture-pane` returns **text without
-  styling**, so `Wait Stable` cannot see a colour-only repaint (committing a
-  theme) — use a plain `Sleep`. And it needs the screen to actually go quiet,
-  which the multi-session view never does for long because live agent panes
-  repaint themselves; on that screen it measures seconds. A `Wait` that never
-  resolves is a hard error, deliberately: a beat that changes nothing is a bug
-  in the tape, and the old lenient behaviour filmed the wait as a frozen frame.
+  Limits, all of them learned by shipping a clip that was wrong:
+
+  - **Quiet is a proxy for readiness, and they come apart.** A beat that
+    repaints, pauses longer than the settle window, then repaints again — a
+    picker closing, then an agent CLI painting 3.5s later — satisfies `Wait
+    Stable` on the intermediate screen. Hence the per-beat `<quiet>` argument,
+    and hence preferring a marker. The driver detects this for free and prints a
+    `note:` naming the line: no key is sent during the `Sleep` after a wait, so
+    anything that moves there was the app still working. It is a note, not an
+    error — it is *expected* when a tape deliberately stops short of a later
+    stage, which `fork.tape` and `session-creation.tape` both do rather than
+    film seconds of blank terminal.
+  - **A settle window is dwell.** `Wait Stable <quiet>` ends by definition on
+    `quiet` ms of unchanged screen, and the `Sleep` after it lands on that same
+    frame, so `quiet + Sleep` is one held frame and must stay under the budget.
+    Worse, every poll spawns `tmux`, so the wall-clock cost overshoots the
+    nominal figure under load — a 600ms window rendered a 1.04s held frame.
+  - `capture-pane` returns **text without styling**, so `Wait Stable` cannot see
+    a colour-only repaint (committing a theme) — use a plain `Sleep`.
+  - It needs the screen to actually go quiet, which the multi-session view never
+    does for long because live agent panes repaint themselves; there it measures
+    seconds.
+  - A `Wait` that never resolves is a hard error, deliberately: a beat that
+    changes nothing is a bug in the tape, and the earlier lenient behaviour
+    filmed the wait as a frozen frame instead of saying so.
 - **Every clip is held to a pacing budget** (`lib/check-pacing.mjs`), enforced by
   the recorder before a take is allowed to replace good media, and again in CI.
   A held frame may not exceed 1.0s (0.5s is the target) and the opening may not

@@ -475,11 +475,18 @@ it pressed `Up` eight times through a list with four entries above the cursor.
 
 What changed:
 
-- **`Wait /<re>/` and `Wait Stable`** in the tape driver, replacing the
-  "leave it the time it needs" sleeps. Measured against the guesses they
+- **`Wait /<re>/` and `Wait Stable [<quiet>]`** in the tape driver, replacing
+  the "leave it the time it needs" sleeps. Measured against the guesses they
   replace: a forked agent CLI paints in **0.3–0.4s**, not the scripted 3.5s.
   This mirrors what `record.sh` already did for its own pre-play step, which
   has synced on pane markers rather than fixed sleeps all along.
+  Stability is only a proxy for readiness — a beat that repaints, pauses, then
+  repaints again satisfies it early — so the settle window is a per-beat
+  argument, and the driver prints a note naming any wait whose screen kept
+  moving afterwards. That check costs nothing (no key is sent during the `Sleep`
+  after a wait, so movement there is the app) and it immediately caught a
+  shipped clip: `friring-session-creation` was ending on a blank terminal
+  because its wait settled while the agent was still booting.
 - **The opening is polled, not slept.** `record.sh` waits for the attached
   client to paint one settled frame instead of a blind `sleep 1`, and the tapes
   dropped their settle beats: ~2.3s → ~0.4s. The floor is ~0.35s (the poll plus
@@ -497,11 +504,14 @@ What changed:
   tape that died half-way still rendered and shipped — a clean recording of the
   first half of a demo, which is not visibly broken.
 
-Result across nine clips: 202.2s → 85.1s, dead air 91.5% → within budget, worst
-held frame 3.81s → 0.94s, opening 2.3s → ~0.4s. Two dead keypresses were found
-and removed on the way (`theme.tape`'s four no-op `Up`s; `file-manager.tape`
-pressing `Enter` on a file, which resolves to `open_file_in_editor` and so
-renders nothing in-pane).
+Result across nine clips: 202.2s → 84.9s, dead air 91.5% → within budget, worst
+held frame 3.81s → 0.86s, opening 2.3s → ~0.4s. Several content bugs surfaced on
+the way, all of which had been shipping unnoticed because the media was never
+re-recorded: two dead keypresses (`theme.tape`'s four no-op `Up`s;
+`file-manager.tape` pressing `Enter` on a file, which resolves to
+`open_file_in_editor` and so renders nothing in-pane), and a session-name field
+that is now pre-filled with the repo basename, so tapes that typed a name over
+it produced sessions called `orbital-hvacaurora-forecast`.
 
 **`agents.tape` (the hero) is not yet re-recorded** — see
 `docs/DEVELOPMENT.md` § Demo video. Two stale beats in it were fixed (its repo

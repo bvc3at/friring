@@ -16,6 +16,19 @@
 # a sleep long enough to cover a cold boot is frozen screen on a warm one, and
 # that is what previously put two 3.5s holds — 5.2s of a 22s clip — on frames
 # where not a single pixel changed.
+#
+# They keep the DEFAULT settle window, and the driver's "screen was still
+# changing" note on these two lines is expected rather than a defect: the later
+# stage it is reporting is the forked agent painting, which this clip
+# deliberately does not film. The beats after here are session-list navigation
+# that does not depend on that pane, and waiting for it would add seconds of
+# blank terminal.
+#
+# Widening the window was tried and is worse. A settle window IS dwell — a wait
+# ends by definition on `quiet` ms of unchanged screen and the Sleep after it
+# lands on that same frame — and because every poll spawns tmux, its wall-clock
+# cost overshoots the nominal figure under load. At 600ms this beat rendered a
+# 1.04s held frame and the take was refused twice.
 
 Output docs/media/friring-fork.gif
 Output docs/media/friring-fork.mp4
