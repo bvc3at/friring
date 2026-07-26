@@ -43,6 +43,7 @@ jobs:
       website: ${{ steps.filter.outputs.website || steps.all.outputs.all }}
       install_sh: ${{ steps.filter.outputs.install_sh || steps.all.outputs.all }}
       install_ps: ${{ steps.filter.outputs.install_ps || steps.all.outputs.all }}
+      media: ${{ steps.filter.outputs.media || steps.all.outputs.all }}
       agent_e2e: ${{ steps.filter.outputs.agent_e2e || steps.all.outputs.all }}
     steps:
       # A merge queue entry already contains exactly the PR's changes; validate
@@ -90,6 +91,10 @@ jobs:
             install_ps:
               - 'scripts/install.ps1'
               - 'scripts/install.Tests.ps1'
+              - '.github/workflows/ci.yml'
+            media:
+              - 'docs/media/**'
+              - 'scripts/demo/**'
               - '.github/workflows/ci.yml'
             agent_e2e:
               - 'scripts/dev/agent-e2e/**'
@@ -287,6 +292,24 @@ jobs:
         with:
           report-type: annotations
 
+  # Fork (Friring): the demo media is recorded by hand on a workstation, so
+  # nothing else would notice a clip that regressed into holding a frozen frame
+  # for seconds — the failure is invisible in a diff (the gif is binary) and
+  # invisible in a review (nobody plays ten gifs). Measure it instead.
+  demo-pacing:
+    name: Demo Pacing Budget
+    needs: changes
+    if: needs.changes.outputs.media == 'true'
+    runs-on: k3s-arc
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      # Only the opening-hold metric shells out to ffmpeg; the rest is read
+      # straight from the gifs' own frame delays.
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Check demo pacing budget
+        run: node scripts/demo/lib/check-pacing.mjs docs/media/*.gif
+
   install-script:
     name: Install Script Tests
     needs: changes
@@ -473,6 +496,7 @@ jobs:
       - docs
       - conventional-commits
       - markdown-lint
+      - demo-pacing
       - install-script
       - install-script-ps
       - shellcheck

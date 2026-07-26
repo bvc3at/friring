@@ -422,6 +422,31 @@ Consequences worth knowing when editing a tape or the recorder:
   (`lib/trim-cast.mjs`), so every clip ends on the last live TUI frame.
 - `agg --idle-time-limit` is set far above any beat in the tapes; it would
   otherwise silently compress the very pauses the tapes exist to script.
+- **`Sleep` is the viewer's time; `Wait` is the app's.** Use `Sleep` only for a
+  beat someone is meant to read. When the tape is waiting on the app — a picker
+  building its list, a forked agent CLI booting — use `Wait`, which polls
+  `tmux capture-pane` and continues the moment the screen says it is ready:
+
+  - `Wait /<regex>/ [timeout]` — until the pane matches. Prefer this when a
+    marker exists; `agent_ready_marker()` in `record.sh` has one per agent
+    (`claude` → `❯`, `codex` → `›`, `opencode` → `Build ·`).
+  - `Wait Stable [timeout]` — until the pane *changes* and then goes quiet.
+    Both halves matter: waiting only for quiet resolves inside the gap before
+    the app reacts and calls the old screen settled.
+
+  Two limits, both learned the hard way. `capture-pane` returns **text without
+  styling**, so `Wait Stable` cannot see a colour-only repaint (committing a
+  theme) — use a plain `Sleep`. And it needs the screen to actually go quiet,
+  which the multi-session view never does for long because live agent panes
+  repaint themselves; on that screen it measures seconds. A `Wait` that never
+  resolves is a hard error, deliberately: a beat that changes nothing is a bug
+  in the tape, and the old lenient behaviour filmed the wait as a frozen frame.
+- **Every clip is held to a pacing budget** (`lib/check-pacing.mjs`), enforced by
+  the recorder before a take is allowed to replace good media, and again in CI.
+  A held frame may not exceed 1.0s (0.5s is the target) and the opening may not
+  exceed 0.75s. Runtime is deliberately *not* budgeted — a clip may be as long
+  as it earns. See `FORK.md` § Demo pacing budget for the measurements behind
+  the numbers.
 - The GIF keeps **variable** frame delays — that is where the exact pacing
   lives, so never re-encode it. The MP4 is derived from it with ffmpeg's
   `fps` filter, which re-times to a constant rate for players that need one

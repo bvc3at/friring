@@ -18,8 +18,19 @@
 //                          before recording starts
 //   Type "<text>"          typed character-by-character (see TYPING_SPEED_MS)
 //   Sleep <n>s|<n>ms       real sleep — this is the demo's pacing
+//   Wait /<re>/ [<n>]      poll the pane until it matches — waiting on the APP
+//   Wait Stable [<n>]      poll the pane until it stops changing
 //   Enter/Tab/Space/…      a single key
 //   Ctrl+<X>               a chord
+//
+// `Sleep` and `Wait` look interchangeable and are not. Sleep is viewer pacing:
+// time deliberately spent on a frame the viewer is meant to read. Wait is the
+// app being slow: a session booting, an agent painting its first screen. Only
+// Sleep belongs in a demo's timing budget — a Sleep long enough to cover a
+// boot on a slow machine films as a frozen screen on a fast one, which is how
+// the media accumulated multi-second dead holds that no beat asked for. Wait
+// ends the instant the pane proves the app is ready, so the clip carries the
+// real latency and nothing more.
 //
 // Usage:
 //   drive-tape.mjs <tape> --socket <name> --session <name> [--print-outputs]
@@ -43,6 +54,17 @@ if (!tapePath || !fs.existsSync(tapePath)) {
 // VHS types one character at a time; a whole line pasted at once reads as a
 // glitch rather than someone using the tool. VHS's own default is 50ms.
 const TYPING_SPEED_MS = Number(process.env.DEMO_TYPING_SPEED_MS || 50);
+
+// `Wait` polling. The quiet period is what counts as "the screen stopped
+// moving": comfortably longer than the gap between two friring repaints, far
+// shorter than any pause a viewer would register as a beat.
+const WAIT_POLL_MS = 50;
+// Long enough to bridge the gap between a real agent CLI being spawned and it
+// writing its first byte — a shorter window resolves in that gap and calls a
+// blank pane "settled". Still well inside the per-pause budget, so a Wait that
+// ends a beat does not itself read as a stall.
+const WAIT_STABLE_QUIET_MS = 250;
+const WAIT_TIMEOUT_MS = 10_000;
 
 // VHS key name -> tmux send-keys key name. Only the ones the tapes use.
 const KEYS = {
@@ -103,6 +125,13 @@ function parse(src) {
       steps.push({ kind: 'sleep', ms: m[2] === 'ms' ? n : n * 1000 });
       return;
     }
+    if ((m = line.match(/^Wait\s+(?:\/((?:[^/\\]|\\.)+)\/|(Stable))(?:\s+([\d.]+)(ms|s)?)?$/))) {
+      const t = m[3] === undefined ? WAIT_TIMEOUT_MS : Number(m[3]) * (m[4] === 'ms' ? 1 : 1000);
+      steps.push(
+        m[2] ? { kind: 'stable', timeoutMs: t, lineNo } : { kind: 'match', re: m[1], timeoutMs: t, lineNo }
+      );
+      return;
+    }
     if ((m = line.match(/^Ctrl\+(\w)$/i))) {
       steps.push({ kind: 'key', key: `C-${m[1].toLowerCase()}` });
       return;
@@ -134,6 +163,11 @@ if (has('print-set')) {
 // against it: the recording is a real-time capture of real processes, so a
 // clip that runs wildly long (a stall) or short (a truncated cast) is broken
 // media that must not ship quietly.
+//
+// `Wait` counts as zero. Its duration is whatever the app takes, which is the
+// very thing this number cannot predict — folding in a guess would just move
+// the guess from the tape to here. The recorder's slack absorbs the real wait,
+// and check-pacing.mjs is what actually polices the rendered result.
 if (has('print-duration')) {
   const ms = tape.steps.reduce(
     (t, s) =>
@@ -160,6 +194,75 @@ function tmux(args) {
 const sendKey = (key) => tmux(['send-keys', '-t', session, key]);
 const sendLiteral = (text) => tmux(['send-keys', '-t', session, '-l', '--', text]);
 
+// The pane as text. Styling is not captured, so a blinking cursor or a repaint
+// of identical content reads as "unchanged" — which is exactly the notion of
+// stability `Wait Stable` wants.
+const capturePane = () =>
+  spawnSync('tmux', ['-L', socket, 'capture-pane', '-p', '-t', session], {
+    encoding: 'utf8',
+  }).stdout ?? '';
+
+// A wait that never resolves means the beat it was guarding never happened, so
+// every later keystroke lands somewhere unintended and the clip films the wrong
+// thing. Fail closed, like every other recorder check.
+function waitTimedOut(step, what) {
+  throw new Error(
+    `${tapePath}:${step.lineNo}: Wait ${what} did not resolve within ${step.timeoutMs}ms`
+  );
+}
+
+async function waitForMatch(step) {
+  const re = new RegExp(step.re);
+  for (let waited = 0; waited <= step.timeoutMs; waited += WAIT_POLL_MS) {
+    if (re.test(capturePane())) return waited;
+    await sleep(WAIT_POLL_MS);
+  }
+  return waitTimedOut(step, `/${step.re}/`);
+}
+
+// Two phases, and the first one is the point: wait for the screen to START
+// responding, then for it to stop. Quiet alone is not readiness — the gap
+// between a keystroke being sent and the app reacting is itself quiet, so a
+// single-phase version resolves inside that gap and calls the OLD screen
+// settled. That is not a theoretical failure: it filmed a file-open beat before
+// the file had painted, and it would have let the agent-boot beats film an
+// empty pane.
+async function waitForStable(step) {
+  const before = capturePane();
+  let waited = 0;
+  let changed = false;
+  while (waited < step.timeoutMs) {
+    await sleep(WAIT_POLL_MS);
+    waited += WAIT_POLL_MS;
+    if (capturePane() !== before) {
+      changed = true;
+      break;
+    }
+  }
+  // Deliberately NOT lenient. An earlier version gave up after a grace period
+  // and carried on, which quietly filmed the grace as a held frame and let the
+  // following keys land on a screen that was not ready — the exact failure this
+  // directive exists to prevent, reintroduced as its fallback. If the beat
+  // changes nothing the tape is wrong (or the change is colour-only, which
+  // capture-pane cannot see: use a plain Sleep for those). Say so.
+  if (!changed) return waitTimedOut(step, 'Stable (nothing on screen changed)');
+  let last = capturePane();
+  let quiet = 0;
+  while (waited < step.timeoutMs) {
+    await sleep(WAIT_POLL_MS);
+    waited += WAIT_POLL_MS;
+    const now = capturePane();
+    quiet = now === last ? quiet + WAIT_POLL_MS : 0;
+    last = now;
+    if (quiet >= WAIT_STABLE_QUIET_MS) return waited;
+  }
+  return waitTimedOut(step, 'Stable');
+}
+
+// What each Wait actually cost. This is the number that tells you whether a
+// beat is slow because the demo asked it to be or because the app is.
+const waits = [];
+
 for (const step of tape.steps) {
   if (step.kind === 'sleep') {
     await sleep(step.ms);
@@ -170,5 +273,17 @@ for (const step of tape.steps) {
       sendLiteral(ch);
       await sleep(TYPING_SPEED_MS);
     }
+  } else if (step.kind === 'match') {
+    waits.push([step.lineNo, `/${step.re}/`, await waitForMatch(step)]);
+  } else if (step.kind === 'stable') {
+    waits.push([step.lineNo, 'Stable', await waitForStable(step)]);
   }
+}
+
+if (waits.length) {
+  const total = waits.reduce((t, [, , ms]) => t + ms, 0);
+  console.error(
+    `${tapePath}: ${waits.length} Wait(s), ${(total / 1000).toFixed(2)}s total — ` +
+      waits.map(([ln, what, ms]) => `L${ln} ${what} ${ms}ms`).join(', ')
+  );
 }

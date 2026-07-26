@@ -1,0 +1,222 @@
+#!/usr/bin/env node
+// Hold a rendered demo gif to a pacing budget.
+//
+// The demos are autoplaying, silent, scrubber-less and looping. Nobody chose to
+// watch one, so the thing that loses a viewer is not length — it is a frame that
+// sits there. Published retention work is blunt about the asymmetry: viewers
+// abandon a video they are WAITING on roughly 3x faster than one they are
+// watching, and abandonment is near zero for the first ~2s of playback and then
+// climbs steadily. A held frame reads as "this gif is broken", and the opening
+// frame is where that judgement gets made.
+//
+// So this measures stalls, not runtime. A clip may be as long as it earns.
+//
+// ---------------------------------------------------------------------------
+// Method: a gif frame's own delay IS how long that frame is held.
+//
+// agg emits one frame per screen change and merges identical repaints into it
+// (record.sh relies on the same property), so the delay stored in each Graphic
+// Control Extension is exactly the dwell on that image. That makes the headline
+// metric exact: no decoding, no pixel threshold to calibrate, no false positive
+// on a clip that happens to be mostly text.
+//
+// The pixel-difference alternative (ffmpeg freezedetect) was tried and is NOT
+// used to gate. On a lossless gif it reproduces this file's numbers closely, but
+// it cannot separate a stall from typing: one typed glyph changes ~240 pixels of
+// a 2.08Mpx frame, and a stall in which a clock digit ticked changes ~290 — the
+// same magnitude. Only the RATE of change distinguishes them, which freezedetect
+// does not model, so it reports multi-second "freezes" over passages that are
+// visibly someone typing. Frame delay has no such blind spot: a frame boundary
+// means the screen changed, full stop.
+//
+// The one exception is the OPENING hold, which is measured with freezedetect
+// after all — see openingHold() for why frame delay cannot see it and why
+// freezedetect's blind spot does not apply there.
+//
+// Usage: check-pacing.mjs <file.gif> [...] [--json]
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+
+// The budget. `pause` is the one that matters; the rest are guard rails.
+const BUDGET = {
+  // A beat the viewer spends reading. Anything past this is the demo waiting on
+  // itself — which, after `Wait` landed in drive-tape.mjs, no beat needs to do.
+  pauseTarget: 0.5,
+  pauseMax: 1.0,
+  // The first frame is the README preview and the whole of a scroller's
+  // impression. It is not a place to settle; the recorder polls for the attach
+  // repaint precisely so this can be short.
+  //
+  // 0.5s is the target, but the CAP is 0.75s and that gap is not slack — it is
+  // measured. Even with nothing scripted, the opening carries the attach-settle
+  // poll plus node's own startup before drive-tape.mjs can send its first key,
+  // and asciinema is filming through all of it. Across takes that floor lands
+  // between 0.35s and 0.57s, so gating on 0.5 would fail runs that are as fast
+  // as the recorder can go.
+  openingTarget: 0.5,
+  opening: 0.75,
+  // GitHub refuses to render an image over 10MB, and a gif that fails to paint
+  // is the "waiting" case that costs the most.
+  bytesWarn: 5 * 1024 * 1024,
+  bytesMax: 10 * 1024 * 1024,
+};
+
+// Per-frame delays, in seconds, from the gif's Graphic Control Extensions.
+// GCE layout: 21 F9 04 <flags> <delay-lo> <delay-hi> <transparent-idx> 00.
+function frameDelays(buf) {
+  const delays = [];
+  for (let i = 0; i < buf.length - 8; i++) {
+    if (buf[i] === 0x21 && buf[i + 1] === 0xf9 && buf[i + 2] === 0x04) {
+      delays.push((buf[i + 4] | (buf[i + 5] << 8)) / 100);
+    }
+  }
+  return delays;
+}
+
+// How long the clip sits on its first image before anything moves.
+//
+// This is the one metric frame delay gets wrong. A static opening is not
+// necessarily ONE gif frame: if a single character ticks inside it (a clock, a
+// gauge), agg splits it into several, and each individual delay looks modest
+// while the viewer sees 2.3s of nothing. Pixels are needed, and here they are
+// safe to use — freezedetect's weakness is mistaking typing for a freeze, and
+// nothing is being typed at t=0.
+//
+// Returns null when ffmpeg is unavailable, so a quick local run still works;
+// the recorder and CI both have it.
+function openingHold(file) {
+  const r = spawnSync(
+    'ffmpeg',
+    ['-hide_banner', '-i', file, '-vf', 'freezedetect=n=-60dB:d=0.2', '-map', '0:v', '-f', 'null', '-'],
+    { encoding: 'utf8' }
+  );
+  if (r.error || r.status !== 0) return null;
+  const log = r.stderr || '';
+  const start = /freeze_start: ([0-9.]+)/.exec(log);
+  const dur = /freeze_duration: ([0-9.]+)/.exec(log);
+  if (!start || !dur) return 0;
+  // A first freeze that begins later than a frame or two in means the clip is
+  // already moving at t=0 — there is no opening hold to report.
+  if (Number(start[1]) > 0.3) return 0;
+  return Number(start[1]) + Number(dur[1]);
+}
+
+function measure(file) {
+  const buf = fs.readFileSync(file);
+  const delays = frameDelays(buf);
+  if (!delays.length) throw new Error(`${file}: no gif frames found — not a gif?`);
+
+  const duration = delays.reduce((a, d) => a + d, 0);
+  // Where each frame starts, so a violation can be pointed at.
+  let t = 0;
+  const frames = delays.map((d) => {
+    const start = t;
+    t += d;
+    return { start, delay: d };
+  });
+  const worst = frames.reduce((a, f) => (f.delay > a.delay ? f : a), frames[0]);
+  const overTarget = frames.filter((f) => f.delay > BUDGET.pauseTarget);
+
+  return {
+    file,
+    bytes: buf.length,
+    duration,
+    frameCount: frames.length,
+    // How much of the clip is new information rather than a held image.
+    framesPerSecond: frames.length / duration,
+    opening: openingHold(file),
+    trailing: frames[frames.length - 1].delay,
+    worstPause: worst.delay,
+    worstPauseAt: worst.start,
+    overTarget: overTarget.map((f) => ({ at: f.start, delay: f.delay })),
+    // Time spent on frames held longer than a beat needs.
+    stalledSeconds: overTarget.reduce((a, f) => a + f.delay, 0),
+  };
+}
+
+function violations(m) {
+  const out = [];
+  if (m.worstPause > BUDGET.pauseMax) {
+    out.push(
+      `held frame of ${m.worstPause.toFixed(2)}s at ${m.worstPauseAt.toFixed(2)}s ` +
+        `(max ${BUDGET.pauseMax}s)`
+    );
+  }
+  if (m.opening !== null && m.opening > BUDGET.opening) {
+    out.push(
+      `opens on ${m.opening.toFixed(2)}s of held frame ` +
+        `(target ${BUDGET.openingTarget}s, max ${BUDGET.opening}s)`
+    );
+  }
+  if (m.bytes > BUDGET.bytesMax) {
+    out.push(
+      `${(m.bytes / 1024 / 1024).toFixed(1)}MB exceeds GitHub's 10MB image limit`
+    );
+  }
+  return out;
+}
+
+const args = process.argv.slice(2);
+const asJson = args.includes('--json');
+const files = args.filter((a) => !a.startsWith('--'));
+if (!files.length) {
+  console.error('usage: check-pacing.mjs <file.gif> [...] [--json]');
+  process.exit(2);
+}
+
+const results = files.map(measure);
+
+if (asJson) {
+  console.log(JSON.stringify({ budget: BUDGET, results }, null, 2));
+} else {
+  const w = Math.max(...results.map((r) => path.basename(r.file).length));
+  console.log(
+    `${'clip'.padEnd(w)}  ${'dur'.padStart(6)} ${'fps'.padStart(5)} ` +
+      `${'open'.padStart(5)} ${'worst'.padStart(6)} ${'at'.padStart(6)} ${'size'.padStart(6)}`
+  );
+  for (const r of results) {
+    console.log(
+      `${path.basename(r.file).padEnd(w)}  ${r.duration.toFixed(2).padStart(6)} ` +
+        `${r.framesPerSecond.toFixed(1).padStart(5)} ` +
+        `${(r.opening === null ? 'n/a' : r.opening.toFixed(2)).padStart(5)} ` +
+        `${r.worstPause.toFixed(2).padStart(6)} ${r.worstPauseAt.toFixed(2).padStart(6)} ` +
+        `${(r.bytes / 1024 / 1024).toFixed(1) + 'M'}`.padStart(7)
+    );
+  }
+}
+
+// Never let a missing tool quietly turn a gate into a no-op: an unchecked
+// budget that prints nothing is indistinguishable from a passing one.
+if (results.some((r) => r.opening === null)) {
+  console.error(
+    '\nwarning: ffmpeg unavailable — opening-hold NOT checked on any clip.\n' +
+      '  The held-frame and size budgets still applied. Install ffmpeg to check\n' +
+      '  the opening (it is the one metric a gif\'s frame delays cannot express:\n' +
+      '  a static opening split by one ticking character looks like several\n' +
+      '  short frames).'
+  );
+}
+
+let failed = 0;
+for (const r of results) {
+  const bad = violations(r);
+  if (bad.length) {
+    failed++;
+    console.error(`\nerror: ${r.file}`);
+    for (const b of bad) console.error(`  ${b}`);
+    // The tape line to go fix is the one whose Sleep matches this timestamp.
+    if (r.overTarget.length > 1) {
+      const rest = r.overTarget
+        .filter((f) => f.delay <= BUDGET.pauseMax)
+        .map((f) => `${f.delay.toFixed(2)}s@${f.at.toFixed(1)}s`);
+      if (rest.length) console.error(`  also over ${BUDGET.pauseTarget}s: ${rest.join(', ')}`);
+    }
+  } else if (r.bytes > BUDGET.bytesWarn) {
+    console.error(
+      `warning: ${r.file} is ${(r.bytes / 1024 / 1024).toFixed(1)}MB ` +
+        `(GitHub's limit is 10MB)`
+    );
+  }
+}
+process.exit(failed ? 1 : 0);
