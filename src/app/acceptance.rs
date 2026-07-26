@@ -2412,6 +2412,11 @@ fn prefix_mode_off_disables_the_leader_and_returns_f12() {
     assert!(!h.app.prefix_state.is_armed(), "Ctrl+A is inert when off");
     h.key(KeyCode::F(12), KeyModifiers::NONE);
     assert!(h.app.show_perf_hud, "F12 is the perf HUD again");
+    h.ctrl('b');
+    assert!(
+        h.app.show_info_panel,
+        "direct global chords still dispatch when the leader is off"
+    );
 }
 
 /// The mode that pays for the feature: no global `Ctrl` chord dispatches, so
