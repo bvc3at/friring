@@ -2250,6 +2250,27 @@ fn prefix_settings_apply_live_and_off_disarms() {
     assert!(h.app.prefix_state.is_armed(), "the new leader arms");
 }
 
+/// A rebind while the *old* leader is armed disarms too: still armed, the
+/// new leader's first press would read as `<leader> <leader>` and go to the
+/// agent instead of arming.
+#[test]
+fn prefix_rebind_while_armed_disarms_so_the_new_leader_arms() {
+    let mut h = Harness::standard(1);
+    h.ctrl('a');
+    assert!(h.app.prefix_state.is_armed());
+
+    let mut settings = crate::session::settings::Settings::default();
+    settings.prefix.key = "ctrl+o".into();
+    h.app.apply_live_settings(&settings);
+    assert!(
+        !h.app.prefix_state.is_armed(),
+        "a rebind clears the state armed against the old leader"
+    );
+
+    h.ctrl('o');
+    assert!(h.app.prefix_state.is_armed(), "the new leader arms");
+}
+
 #[test]
 fn leader_digit_jumps_to_that_session_and_lands_in_the_terminal() {
     let mut h = Harness::standard(3);
