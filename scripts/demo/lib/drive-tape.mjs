@@ -227,8 +227,15 @@ async function waitForMatch(step) {
 // settled. That is not a theoretical failure: it filmed a file-open beat before
 // the file had painted, and it would have let the agent-boot beats film an
 // empty pane.
-async function waitForStable(step) {
-  const before = capturePane();
+//
+// `baseline` is the pane captured BEFORE the beat this wait guards, because
+// send-keys and capture-pane are two separate process spawns: a repaint that
+// completes inside that window is already on screen by the time a self-captured
+// baseline is taken, so the change phase would see nothing and reject a take
+// that was in fact correct — just fast. Falls back to capturing here so a tape
+// may still open on `Wait Stable`.
+async function waitForStable(step, baseline) {
+  const before = baseline ?? capturePane();
   let waited = 0;
   let changed = false;
   while (waited < step.timeoutMs) {
@@ -263,7 +270,12 @@ async function waitForStable(step) {
 // beat is slow because the demo asked it to be or because the app is.
 const waits = [];
 
-for (const step of tape.steps) {
+let stableBaseline = null;
+
+for (let i = 0; i < tape.steps.length; i++) {
+  const step = tape.steps[i];
+  // See waitForStable: the "before" screen has to be read before the beat runs.
+  if (tape.steps[i + 1]?.kind === 'stable') stableBaseline = capturePane();
   if (step.kind === 'sleep') {
     await sleep(step.ms);
   } else if (step.kind === 'key') {
@@ -276,7 +288,9 @@ for (const step of tape.steps) {
   } else if (step.kind === 'match') {
     waits.push([step.lineNo, `/${step.re}/`, await waitForMatch(step)]);
   } else if (step.kind === 'stable') {
-    waits.push([step.lineNo, 'Stable', await waitForStable(step)]);
+    const base = stableBaseline;
+    stableBaseline = null;
+    waits.push([step.lineNo, 'Stable', await waitForStable(step, base)]);
   }
 }
 
