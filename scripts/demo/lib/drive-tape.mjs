@@ -196,11 +196,17 @@ const sendLiteral = (text) => tmux(['send-keys', '-t', session, '-l', '--', text
 
 // The pane as text. Styling is not captured, so a blinking cursor or a repaint
 // of identical content reads as "unchanged" — which is exactly the notion of
-// stability `Wait Stable` wants.
-const capturePane = () =>
-  spawnSync('tmux', ['-L', socket, 'capture-pane', '-p', '-t', session], {
+// stability `Wait Stable` wants. A failed capture, on the other hand, must not
+// be swallowed: tmux prints nothing on stdout when the pane is gone, and an
+// empty string that never changes again is precisely what `Wait Stable` calls
+// settled — a dead session would satisfy the wait instead of failing the take.
+function capturePane() {
+  const r = spawnSync('tmux', ['-L', socket, 'capture-pane', '-p', '-t', session], {
     encoding: 'utf8',
-  }).stdout ?? '';
+  });
+  if (r.error || r.status !== 0) throw new Error(`tmux capture-pane -t ${session} failed`);
+  return r.stdout ?? '';
+}
 
 // A wait that never resolves means the beat it was guarding never happened, so
 // every later keystroke lands somewhere unintended and the clip films the wrong
