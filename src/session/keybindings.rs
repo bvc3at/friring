@@ -1690,10 +1690,6 @@ mod tests {
         }
     }
 
-    /// Compile-time check that `Action::all()` lists every variant.
-    ///
-    /// The match below is exhaustive: adding a new `Action` variant
-    /// without updating both this match AND `Action::all()` is a
     /// Every leader key is unique. The which-key overlay is only trustworthy
     /// if one key means one thing, and the table is hand-assigned (mirroring
     /// each action's `Ctrl` letter, with four documented exceptions), so a
@@ -1790,6 +1786,10 @@ mod tests {
         assert!(Action::Paste.prefix_key().is_none());
     }
 
+    /// Compile-time check that `Action::all()` lists every variant.
+    ///
+    /// The match below is exhaustive: adding a new `Action` variant
+    /// without updating both this match AND `Action::all()` is a
     /// compile error (non-exhaustive match) OR a test failure (length
     /// mismatch). This is the last guard preventing a variant from
     /// silently disappearing from the help overlay.
