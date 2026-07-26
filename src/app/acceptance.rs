@@ -2220,6 +2220,20 @@ fn hint_delay_hides_the_overlay_but_not_the_armed_badge() {
         painted.contains("ctrl+a"),
         "the footer badge still shows it"
     );
+
+    // Once the delay is out the overlay appears on its own — and the armed
+    // state itself never expires, only a key press clears it.
+    h.advance(std::time::Duration::from_millis(5_001));
+    assert!(h.app.prefix_hint_chord().is_some());
+    let painted = h.render();
+    assert!(
+        painted.contains("go to session N"),
+        "the overlay appears once the delay elapses:\n{painted}"
+    );
+    assert!(
+        h.app.prefix_state.is_armed(),
+        "the delay does not time the leader out"
+    );
 }
 
 /// `[prefix]` applies live like the other mirrored settings, and turning the
