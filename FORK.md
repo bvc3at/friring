@@ -63,7 +63,7 @@ are spent, and several chords friring holds are ones the inner agent CLI wants
 back (`Ctrl+L` clear-screen, `Ctrl+Z` suspend, `Ctrl+V` image-paste in Claude
 Code and Codex, `Ctrl+G` external editor).
 
-- **`Ctrl+A` leader + which-key overlay.** Arming paints a grouped table of
+- **`Ctrl+F` leader + which-key overlay.** Arming paints a grouped table of
   everything reachable; the next key runs it. No timeout (tmux semantics —
   friring is normally driven over SSH, where a timeout would misroute a paused
   keystroke into the agent). `Esc`/`Ctrl+C` cancels, and an armed badge shows
@@ -78,11 +78,19 @@ Code and Codex, `Ctrl+G` external editor).
   disables direct **global** chords so every bare `Ctrl+<letter>` reaches the
   agent CLI untouched. Pane-scoped keys are unaffected in all modes.
 - **`<leader> <leader>` sends the leader's byte** to the agent (tmux
-  `send-prefix`), so `Ctrl+A` stays reachable by the inner CLI.
-- **`prefix2` (`F12` by default)** covers the leader's one real cost: a user
-  who rebound their *outer* tmux to `C-a` never delivers `Ctrl+A` here. The
+  `send-prefix`), so `Ctrl+F` stays reachable by the inner CLI. The table also
+  accepts its keys with `Ctrl` held (`<leader> C-b` == `<leader> b`), as GNU
+  screen does.
+- **`prefix2` (`F12` by default)** is the layout-independent second door. The
   trade is that `F12` stops toggling the perf HUD while the leader is on —
   that moved to `<leader> m`. `key2 = ""` reverses it.
+- **`Ctrl+F` was chosen** because every program that claims it claims it for
+  something with a non-`Ctrl` route: Claude Code leaves it unbound, and Codex /
+  aider / opencode bind it only to cursor-right, co-bound to `→`. It is also
+  home-row on QWERTY/QWERTZ/AZERTY/Nordic, plain C0 (`0x06`, no kitty protocol
+  needed through ssh + tmux), and a slip to `Cmd+F` opens a find bar rather
+  than quitting the terminal. `ForkSession` keeps `Ctrl+F` as its direct chord
+  for `mode = "off"`, and is `<leader> f` otherwise.
 - The `[prefix]` settings table (`docs/CONFIG.md`) is fork-only.
 
 #### Code review v2 (July 2026)

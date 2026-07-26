@@ -422,7 +422,19 @@ impl App {
             }
         }
 
-        if let Some(action) = crate::session::keybindings::action_for_prefix_key(pressed) {
+        // Resolve the leader table, accepting the key with Ctrl still held as
+        // the same entry. GNU screen ships exactly this: "all commands that are
+        // bound to lower-case letters are also bound to their control character
+        // counterparts", so `C-f C-b` works as well as `C-f b`. For a key
+        // pressed dozens of times an hour, not having to release the modifier
+        // mid-sequence is free ergonomics.
+        let resolved = crate::session::keybindings::action_for_prefix_key(pressed).or_else(|| {
+            let bare = crate::session::KeyChord::normalized(mods & !KeyModifiers::CONTROL, code);
+            (bare != pressed)
+                .then(|| crate::session::keybindings::action_for_prefix_key(bare))
+                .flatten()
+        });
+        if let Some(action) = resolved {
             self.dispatch_action(action);
             return true;
         }

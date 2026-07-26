@@ -690,7 +690,7 @@ repos? Add `--add-repo PATH@main` (its own worktree per repo) or
 
 ### Leader key
 
-`<leader>` is `Ctrl+A`, with `F12` as a second leader for when your outer
+`<leader>` is `Ctrl+F`, with `F12` as a second leader for when your outer
 tmux already owns `C-a`. Pressing it arms friring and paints a which-key
 overlay listing every command reachable from it; the next key runs one.
 `<leader> 1`–`9` jumps to that session in the list's rendered order,

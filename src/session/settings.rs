@@ -53,7 +53,7 @@ pub struct Settings {
     /// (structured handoff, idle nudge on).
     #[serde(default)]
     pub review: ReviewSettings,
-    /// Leader-key settings (`[prefix]` table). Absent table = `Ctrl+A` leader
+    /// Leader-key settings (`[prefix]` table). Absent table = `Ctrl+F` leader
     /// alongside the direct chords, `F12` as the second leader.
     #[serde(default)]
     pub prefix: PrefixSettings,
@@ -274,12 +274,30 @@ pub struct PrefixSettings {
     /// Whether the leader is live, and whether direct chords still dispatch.
     #[serde(default)]
     pub mode: PrefixMode,
-    /// The leader chord. `Ctrl+A` is friring's only unbound bare
-    /// `Ctrl+<letter>` (every other one is taken — see
-    /// `Action::default_chords_for`), so adopting it as leader displaces
-    /// nothing. Its cost is real and documented: users who rebind their
-    /// *outer* tmux to `C-a` never deliver it here, which is what
-    /// [`key2`](Self::key2) exists for.
+    /// The leader chord.
+    ///
+    /// `Ctrl+F` is chosen for one property no other candidate has: **every
+    /// program that claims it, claims it for something that already has a
+    /// non-`Ctrl` route.** Claude Code leaves it unbound entirely; Codex,
+    /// aider and opencode bind it only to cursor-right, co-bound to `→`. That
+    /// makes it the cheapest collision available — unlike `Ctrl+R`
+    /// (reverse-i-search, no alternative), `Ctrl+C`/`Ctrl+D` (reserved and
+    /// unrebindable in both major agents), or `Ctrl+G` (external editor in
+    /// Claude Code *and* Codex).
+    ///
+    /// It also survives the constraints that eliminate the obvious
+    /// alternatives: `f` is the left-index home key on QWERTY, QWERTZ, AZERTY
+    /// and Nordic alike (`Ctrl+\`, `Ctrl+]`, `Ctrl+^` need AltGr or a dead key
+    /// on German/French/Nordic); byte `0x06` is plain C0, so it needs no
+    /// kitty-protocol negotiation through terminal → ssh → tmux; and a slip to
+    /// `Cmd+F` opens a find bar rather than quitting the terminal, which is
+    /// what rules out `Ctrl+Q` next to `Cmd+Q`.
+    ///
+    /// No multiplexer has ever claimed it, so there is no ambiguity about
+    /// which layer answered when friring is nested inside a `C-a`/`C-b` tmux.
+    /// The cost is that `Ctrl+F` reads as "find" to most people — hence
+    /// `<leader> /` for search — and that vim/less page-forward is shadowed
+    /// inside a pane, which `<leader> <leader>` exists to recover.
     #[serde(default = "default_prefix_key")]
     pub key: String,
     /// Second leader, tmux's `prefix2`. `F12` by default because it is
@@ -299,7 +317,7 @@ pub struct PrefixSettings {
 }
 
 fn default_prefix_key() -> String {
-    "ctrl+a".into()
+    "ctrl+f".into()
 }
 
 fn default_prefix_key2() -> String {
@@ -463,13 +481,13 @@ mod tests {
     }
 
     #[test]
-    fn prefix_defaults_to_ctrl_a_plus_f12_alongside_direct_chords() {
+    fn prefix_defaults_to_ctrl_f_plus_f12_alongside_direct_chords() {
         let s: Settings = toml::from_str("").unwrap();
         assert_eq!(s.prefix.mode, PrefixMode::Both);
         assert_eq!(s.prefix.hint_delay_ms, 0, "the overlay is the feature");
         assert_eq!(
             s.prefix.chords(),
-            vec![KeyChord::ctrl('a'), KeyChord::function(12)]
+            vec![KeyChord::ctrl('f'), KeyChord::function(12)]
         );
     }
 
@@ -491,7 +509,7 @@ mod tests {
     #[test]
     fn empty_prefix_key2_drops_the_second_leader() {
         let s: Settings = toml::from_str("[prefix]\nkey2 = \"\"").unwrap();
-        assert_eq!(s.prefix.chords(), vec![KeyChord::ctrl('a')]);
+        assert_eq!(s.prefix.chords(), vec![KeyChord::ctrl('f')]);
     }
 
     #[test]

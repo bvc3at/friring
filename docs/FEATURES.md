@@ -542,7 +542,7 @@ PTY, and the shadowed readline bindings (`M-digit` argument prefixes,
 fixed. Some terminal emulators claim `Alt+digit` for their own tabs —
 their setting wins; rebind or disable it there.
 
-### The leader key (`Ctrl+A`)
+### The leader key (`Ctrl+F`)
 
 The Ctrl namespace ran out. Every bare `Ctrl+<letter>` is bound or reserved,
 `F1`–`F10` and `F12` are spent, and the chords friring *does* hold are ones the
@@ -550,7 +550,7 @@ inner agent CLI wants back — `Ctrl+L` (clear screen), `Ctrl+Z` (suspend),
 `Ctrl+V` (image paste in Claude Code and Codex), `Ctrl+G` (external editor).
 A tmux-style leader solves both: one key buys a whole fresh namespace.
 
-Press `Ctrl+A` and a **which-key overlay** lists everything reachable, grouped
+Press `Ctrl+F` and a **which-key overlay** lists everything reachable, grouped
 by what it does; the next key runs it. The armed state also shows as a badge in
 the footer. Nothing times out — tmux waits indefinitely after its prefix, and
 so do we, because friring is normally driven over SSH where a 1-second timeout
@@ -576,8 +576,11 @@ Alt route is unavailable to a large share of users by default.
 
 `<leader> <leader>` sends the leader's own byte to the agent — the universal
 convention (tmux `send-prefix`, screen `C-a a`, nvim `CTRL-\ CTRL-\`, ssh
-`~~`). Without it `Ctrl+A` would be permanently unreachable by the inner CLI,
-and friring unusable inside itself.
+`~~`). Without it `Ctrl+F` would be permanently unreachable by the inner CLI,
+and friring unusable inside itself. The leader table also accepts its keys with
+`Ctrl` still held — `<leader> Ctrl+B` works like `<leader> b` — so a sequence
+never requires releasing the modifier mid-way (GNU screen ships the same
+convention).
 
 **Three modes** (`[prefix] mode` in `settings.toml`):
 
@@ -587,14 +590,40 @@ and friring unusable inside itself.
 | `both` *(default)* | Direct chords **and** the leader. Nothing you already know stops working. |
 | `prefix-only` | Direct global chords are disabled; the leader is the only way in. This is the mode that pays for the feature — with no global `Ctrl` chords, every bare `Ctrl+<letter>` reaches the agent CLI untouched. Pane-scoped keys (session-list `j`/`k`, file-viewer nav) are unaffected. |
 
-**Why `Ctrl+A`?** It was friring's only unbound bare `Ctrl+<letter>`, so
-adopting it displaced nothing. Its cost is real and worth stating: it is
-`beginning-of-line` in every agent CLI, and it is the most common tmux prefix
-rebind — a user who moved their *outer* tmux to `C-a` never delivers it here.
-That is what `prefix.key2` exists for: `F12` by default, layout-independent,
-and unaffected by an outer multiplexer. Both are rebindable, and every leader
-key is reachable unshifted on a US layout (except the deliberate `Shift+R`),
-because terminals encode shifted punctuation inconsistently.
+**Why `Ctrl+F`?** Because of one property no other candidate has: **every
+program that claims it, claims it for something that already has a non-`Ctrl`
+route.** Claude Code leaves `Ctrl+F` unbound entirely; Codex, aider and
+opencode bind it only to cursor-right, co-bound to `→`. That is the cheapest
+collision available — unlike `Ctrl+R` (reverse-i-search, no alternative),
+`Ctrl+C`/`Ctrl+D` (reserved and unrebindable in both major agents), or
+`Ctrl+G` (external editor in Claude Code *and* Codex).
+
+It also survives the constraints that eliminate the obvious alternatives:
+
+- **Ergonomics.** `f` is the left-index home key — the resting position, a
+  different finger from the modifier.
+- **Layout.** Home row on QWERTY, QWERTZ, **AZERTY** and Nordic alike.
+  `Ctrl+\`, `Ctrl+]` and `Ctrl+^` need AltGr or a dead key on German, French
+  and Nordic layouts; `Ctrl+/` is `Ctrl+Shift+7` on German *and* emits the same
+  byte as `Ctrl+_` and `Ctrl+7`.
+- **Transport.** Byte `0x06` is plain C0 — no kitty-protocol negotiation
+  through terminal → ssh → tmux, unlike `Ctrl+;` or `Ctrl+Enter`, which a
+  legacy terminal cannot express at all.
+- **No destructive near-miss.** A slip to `Cmd+F` opens a find bar. This is
+  what rules out `Ctrl+Q`, which sits under `Cmd+Q`.
+- **No multiplexer has ever claimed it**, so there is never ambiguity about
+  which layer answered when friring is nested inside a `C-a`/`C-b` tmux.
+
+Its costs, stated plainly: `Ctrl+F` reads as "find" to most people (hence
+`<leader> /` for search), and vim/less page-forward is shadowed inside a pane —
+which is what `<leader> <leader>` exists to recover. `ForkSession` keeps
+`Ctrl+F` as its direct chord and is reachable as `<leader> f`; when the leader
+is off, the direct chord takes over again.
+
+`prefix.key2` (`F12` by default) is the second door: layout-independent, and
+unaffected by an outer multiplexer. Both are rebindable, and every leader key
+is reachable unshifted (except the deliberate `Shift+R`), because terminals
+encode shifted punctuation inconsistently.
 
 ### Focus model: terminal-first
 
@@ -696,7 +725,7 @@ action's defaults, and `Shift+D` resets every action at once (removing the
 override file). If the chord conflicts it is reassigned from the other action
 and a status toast reports the move. Changes persist immediately to
 `~/.config/friring/keybindings.json` (`Action` name → chord strings, e.g.
-`{ "QuitApp": ["ctrl+a"] }`) and take effect on the next keystroke — no
+`{ "QuitApp": ["ctrl+q"] }`) and take effect on the next keystroke — no
 restart. The file can also be hand-edited directly.
 
 **Context-scoped keys.** Each action belongs to a `KeyContext` — `Global`,

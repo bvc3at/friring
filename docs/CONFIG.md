@@ -432,7 +432,7 @@ nudge_on_idle = true           # toast a re-review nudge when the agent goes idl
 
 [prefix]
 mode          = "both"         # leader key: off | both | prefix-only
-key           = "ctrl+a"       # the leader
+key           = "ctrl+f"       # the leader
 key2          = "f12"          # second leader ("" disables, freeing F12)
 hint_delay_ms = 0              # 0 = show the which-key overlay immediately
 ```
@@ -628,7 +628,7 @@ The tmux-style leader (see `docs/FEATURES.md` § The leader key). Applies
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `mode` | `"both"` | `off` (no leader — pre-leader behaviour, `F12` is the perf HUD again) \| `both` (direct chords *and* the leader) \| `prefix-only` (direct **global** chords disabled, handing every bare `Ctrl+<letter>` back to the agent CLI; pane-scoped keys still work) |
-| `key` | `"ctrl+a"` | the leader chord, in `keybindings.json` notation |
+| `key` | `"ctrl+f"` | the leader chord, in `keybindings.json` notation |
 | `key2` | `"f12"` | second leader, tmux's `prefix2`. Set to `""` to disable — which also gives `F12` back to the perf HUD |
 | `hint_delay_ms` | `0` | delay before the which-key overlay appears. `0` shows it immediately; raise it only if you know the table by heart, since the overlay *is* the leader's discoverability |
 

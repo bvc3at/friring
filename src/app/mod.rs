@@ -9177,14 +9177,14 @@ mod tests {
     fn leader_twice_sends_the_leader_byte_to_the_pty() {
         let (mut app, mut input_rx) = app_with_pty_input_rx();
 
-        app.handle_key(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL);
         assert!(app.prefix_state.is_armed());
-        app.handle_key(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL);
 
         assert_eq!(
             input_rx.try_recv().ok(),
-            Some(vec![0x01]),
-            "the second leader press reaches the agent as Ctrl+A"
+            Some(vec![0x06]),
+            "the second leader press reaches the agent as Ctrl+F"
         );
         assert!(!app.prefix_state.is_armed(), "and it disarms");
     }
@@ -9196,7 +9196,7 @@ mod tests {
         use tokio::sync::mpsc::error::TryRecvError;
         let (mut app, mut input_rx) = app_with_pty_input_rx();
 
-        app.handle_key(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL);
         app.handle_key(KeyCode::Char('§'), KeyModifiers::NONE);
 
         assert!(
@@ -12417,8 +12417,8 @@ mod tests {
     fn delayed_which_key_hint_requests_one_redraw_not_one_per_tick() {
         let mut app = app_with_sessions(1);
         app.prefix_settings.hint_delay_ms = 500;
-        app.handle_key(KeyCode::Char('a'), KeyModifiers::CONTROL);
-        assert!(app.prefix_state.is_armed(), "Ctrl+A arms the leader");
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(app.prefix_state.is_armed(), "Ctrl+F arms the leader");
         app.mark_redrawn();
 
         app.tick_prefix_hint();

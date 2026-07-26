@@ -312,9 +312,9 @@ impl Harness {
         self.key(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
-    /// Arm the leader (`Ctrl+A` by default) and press `code` after it.
+    /// Arm the leader (`Ctrl+F` by default) and press `code` after it.
     fn leader(&mut self, code: KeyCode) -> &mut Self {
-        self.ctrl('a');
+        self.ctrl('f');
         self.key(code, KeyModifiers::NONE)
     }
 
@@ -1580,14 +1580,15 @@ fn tasks_panel_new_task_opens_editor() {
 // ── Fork ─────────────────────────────────────────────────────────────────────
 
 #[test]
-fn ctrl_f_fork_opens_session_name_prompt() {
+fn leader_f_fork_opens_session_name_prompt() {
     // Fork pre-fills the session-name modal with "<name>-fork" before spawning,
-    // so it is observable without a real backend.
+    // so it is observable without a real backend. `Ctrl+F` itself is the leader
+    // now, so fork is reached as `<leader> f` — the same letter, one key later.
     let mut h = Harness::standard(1);
-    h.ctrl('f'); // ForkSession
+    h.leader(KeyCode::Char('f'));
     assert!(
         matches!(h.app.modal, modals::Modal::SessionName(_)),
-        "Ctrl+F opens the session-name prompt for the fork"
+        "<leader> f opens the session-name prompt for the fork"
     );
 }
 
@@ -2156,8 +2157,8 @@ async fn info_panel_hides_automations_when_feature_off() {
 fn leader_arms_and_a_bound_key_runs_the_action() {
     let mut h = Harness::standard(2);
     assert!(!h.app.prefix_state.is_armed());
-    h.ctrl('a');
-    assert!(h.app.prefix_state.is_armed(), "Ctrl+A arms the leader");
+    h.ctrl('f');
+    assert!(h.app.prefix_state.is_armed(), "Ctrl+F arms the leader");
     h.render(); // the which-key overlay paints without disturbing the panes
     h.key(KeyCode::Char('b'), KeyModifiers::NONE);
     assert!(!h.app.prefix_state.is_armed(), "the key disarms");
@@ -2169,7 +2170,7 @@ fn leader_arms_and_a_bound_key_runs_the_action() {
 #[test]
 fn which_key_overlay_paints_while_armed() {
     let mut h = Harness::standard(1);
-    h.ctrl('a');
+    h.ctrl('f');
     let armed = h.render();
     // One label per section: at the standard 120 columns the groups don't all
     // fit side by side, so this is what catches a layout that silently drops
@@ -2189,7 +2190,7 @@ fn which_key_overlay_paints_while_armed() {
         );
     }
     assert!(
-        armed.contains("ctrl+a"),
+        armed.contains("ctrl+f"),
         "and titles itself with the leader"
     );
 
@@ -2208,7 +2209,7 @@ fn which_key_overlay_paints_while_armed() {
 fn hint_delay_hides_the_overlay_but_not_the_armed_badge() {
     let mut h = Harness::standard(1);
     h.app.prefix_settings.hint_delay_ms = 5_000;
-    h.ctrl('a');
+    h.ctrl('f');
     assert!(h.app.prefix_state.is_armed());
     assert!(
         h.app.prefix_hint_chord().is_none(),
@@ -2217,7 +2218,7 @@ fn hint_delay_hides_the_overlay_but_not_the_armed_badge() {
     let painted = h.render();
     assert!(!painted.contains("go to session N"), "overlay is hidden");
     assert!(
-        painted.contains("ctrl+a"),
+        painted.contains("ctrl+f"),
         "the footer badge still shows it"
     );
 
@@ -2236,6 +2237,36 @@ fn hint_delay_hides_the_overlay_but_not_the_armed_badge() {
     );
 }
 
+/// GNU screen's convention: the leader table accepts its keys with `Ctrl`
+/// still held, so a whole sequence can be typed without releasing the
+/// modifier.
+#[test]
+fn leader_accepts_its_keys_with_ctrl_still_held() {
+    let mut h = Harness::standard(1);
+    h.ctrl('f');
+    h.ctrl('b');
+    assert!(
+        h.app.show_info_panel,
+        "<leader> Ctrl+B works like <leader> b"
+    );
+    assert!(!h.app.prefix_state.is_armed());
+}
+
+/// …but the leader pressed twice still means "send the literal byte", which
+/// must win over the Ctrl-held resolution above.
+#[test]
+fn double_leader_still_sends_the_literal_byte() {
+    let mut h = Harness::standard(1);
+    h.app.focus = InputFocus::Terminal;
+    h.ctrl('f');
+    h.ctrl('f');
+    assert!(!h.app.prefix_state.is_armed());
+    assert!(
+        !h.app.show_info_panel,
+        "the second leader press is not a table lookup"
+    );
+}
+
 /// Review finding D1: the capture panes consumed every Ctrl chord outside
 /// their escape list, so the leader could not arm from the code-review or
 /// activity views at all. It now runs ahead of them — a leader that only works
@@ -2244,7 +2275,7 @@ fn hint_delay_hides_the_overlay_but_not_the_armed_badge() {
 fn leader_arms_from_the_code_review_pane() {
     let mut h = Harness::standard(1);
     h.app.focus = InputFocus::CodeReview;
-    h.ctrl('a');
+    h.ctrl('f');
     assert!(
         h.app.prefix_state.is_armed(),
         "the leader arms even where the pane captures Ctrl chords"
@@ -2261,7 +2292,7 @@ fn leader_yields_to_a_text_entry_submode() {
     h.app.show_file_viewer = true;
     h.app.focus = InputFocus::FileViewer;
     h.app.file_viewer.search_active = true;
-    h.ctrl('a');
+    h.ctrl('f');
     assert!(
         !h.app.prefix_state.is_armed(),
         "typing in a search field keeps Ctrl+A as beginning-of-line"
@@ -2302,7 +2333,7 @@ fn prefix_only_still_pastes_into_friring_inputs() {
 #[test]
 fn prefix_settings_apply_live_and_off_disarms() {
     let mut h = Harness::standard(1);
-    h.ctrl('a');
+    h.ctrl('f');
     assert!(h.app.prefix_state.is_armed());
 
     let mut settings = crate::session::settings::Settings::default();
@@ -2331,7 +2362,7 @@ fn prefix_settings_apply_live_and_off_disarms() {
 #[test]
 fn prefix_rebind_while_armed_disarms_so_the_new_leader_arms() {
     let mut h = Harness::standard(1);
-    h.ctrl('a');
+    h.ctrl('f');
     assert!(h.app.prefix_state.is_armed());
 
     let mut settings = crate::session::settings::Settings::default();
@@ -2413,7 +2444,7 @@ fn leader_out_of_range_digit_reports_instead_of_guessing() {
 #[test]
 fn leader_esc_cancels_without_running_anything() {
     let mut h = Harness::standard(1);
-    h.ctrl('a');
+    h.ctrl('f');
     h.key(KeyCode::Esc, KeyModifiers::NONE);
     assert!(!h.app.prefix_state.is_armed());
     assert!(!h.app.show_info_panel, "nothing was dispatched");
@@ -2425,7 +2456,7 @@ fn leader_esc_cancels_without_running_anything() {
 #[test]
 fn leader_ctrl_c_cancels_without_running_anything() {
     let mut h = Harness::standard(1);
-    h.ctrl('a');
+    h.ctrl('f');
     h.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
     assert!(!h.app.prefix_state.is_armed());
     assert!(!h.app.show_info_panel, "nothing was dispatched");
@@ -2463,14 +2494,22 @@ fn second_leader_f12_arms_like_the_primary() {
     assert!(h.app.show_info_panel, "and its table is the same one");
 }
 
-/// `mode = "off"` restores the pre-leader behaviour exactly: `Ctrl+A` is inert
+/// `mode = "off"` restores the pre-leader behaviour exactly: `Ctrl+F` is inert
 /// and `F12` goes back to the perf HUD.
 #[test]
 fn prefix_mode_off_disables_the_leader_and_returns_f12() {
     let mut h = Harness::standard(1);
     h.app.prefix_settings.mode = crate::session::PrefixMode::Off;
-    h.ctrl('a');
-    assert!(!h.app.prefix_state.is_armed(), "Ctrl+A is inert when off");
+    h.ctrl('f');
+    assert!(
+        !h.app.prefix_state.is_armed(),
+        "Ctrl+F does not arm when the leader is off"
+    );
+    assert!(
+        matches!(h.app.modal, modals::Modal::SessionName(_)),
+        "it is ForkSession's direct chord again"
+    );
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
     h.key(KeyCode::F(12), KeyModifiers::NONE);
     assert!(h.app.show_perf_hud, "F12 is the perf HUD again");
     h.ctrl('b');

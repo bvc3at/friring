@@ -90,7 +90,7 @@ fn action_label(action: Action) -> &'static str {
 
 /// Turn one section's entries into printable rows. `leader` is the armed
 /// chord, needed for the send-literal row (which shows the actual key the
-/// user configured, not a hardcoded `Ctrl+A`).
+/// user configured, not a hardcoded `Ctrl+F`).
 fn rows_for(entries: &[PrefixEntry], leader: &KeyChord) -> Vec<Row> {
     entries
         .iter()
@@ -222,7 +222,7 @@ mod tests {
     /// which-key overlay is worse than no row at all.
     #[test]
     fn every_leader_row_has_a_label() {
-        let leader = KeyChord::ctrl('a');
+        let leader = KeyChord::ctrl('f');
         for (title, entries) in prefix_sections() {
             for row in rows_for(&entries, &leader) {
                 assert!(
@@ -236,7 +236,7 @@ mod tests {
     }
 
     /// The send-literal row shows the *configured* leader, so a user who
-    /// rebound it doesn't read a stale `ctrl+a`.
+    /// rebound it doesn't read a stale `ctrl+f`.
     #[test]
     fn send_literal_row_reflects_the_configured_leader() {
         let rows = rows_for(&[PrefixEntry::SendLiteral], &KeyChord::function(12));
