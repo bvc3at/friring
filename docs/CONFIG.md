@@ -16,7 +16,7 @@ development checkout never touches your real setup.
 |------|--------|-----------|------|---------|
 | `~/.config/friring/agents.toml` | TOML | you | **live** (mtime poll) | coding-agent CLI definitions |
 | `~/.config/friring/hosts.toml` | TOML | you | startup | remote SSH hosts + local WSL distros |
-| `~/.config/friring/settings.toml` | TOML | you + `Ctrl+,` panel | **live** (feature flags) / startup (rest) | tuning knobs + feature flags |
+| `~/.config/friring/settings.toml` | TOML | you + `Ctrl+,` panel | **live** (feature flags, `[prefix]`) / startup (rest) | tuning knobs + feature flags |
 | `~/.config/friring/themes.toml` | TOML | you | startup | custom theme palettes |
 | `~/.config/friring/keybindings.json` | JSON | F1 editor (or you) | **live** (mtime poll) | key chord overrides |
 | `~/.config/friring/extensions/<name>.toml` | TOML | `friring-cli extension install` | startup + tick | extension manifests (self-healed resources) |
@@ -27,8 +27,9 @@ development checkout never touches your real setup.
 the TUI polls their mtime (~1/s) and applies edits with a confirmation
 toast — no restart. For `settings.toml` only the **feature flags that
 gate UI panels** (`tasks`, `file_viewer`, `info_panel`, `global_search`,
-`shell_pane`, `code_review`, `cc_activity`, `perf_hud`, `soft_delete`)
-and `info_panel_position`
+`shell_pane`, `code_review`, `cc_activity`, `perf_hud`, `soft_delete`),
+`info_panel_position`, and the [`[prefix]`](#prefix--the-leader-key)
+leader-key table
 apply live; the restart-only values stay published through a write-once
 global (so they can't drift mid-frame),
 and the reload toast says when a restart is needed. `hosts.toml` (SSH
@@ -37,14 +38,15 @@ backends register at startup) and `themes.toml` need a restart.
 `settings.toml` can also be edited from the TUI: **`Ctrl+,`** (alt `F6`)
 opens a **Settings panel** listing every knob. It writes the file back
 **preserving its comments**, and feature flags that gate UI panels (plus
-`info_panel_position`) apply **live** on save; the rest (`mouse`,
+`info_panel_position` and `[prefix]`) apply **live** on save; the rest (`mouse`,
 `notifications`, `automations`, `version_check`, `auto_update`, the four
 editable `[notifications]` knobs, and the numeric scalars) take effect on
 the next launch — the panel marks those rows
 with `⟳` and toasts a restart note. The panel exposes only the four
 editable notification knobs (`also_on_waiting`, `suppress_for_active`,
-`sound`, `min_interval_secs`); `[notifications] backend` is **not** in
-the panel — set it only by hand-editing `settings.toml`. Hand-editing
+`sound`, `min_interval_secs`); `[notifications] backend` and the
+`[prefix]` leader-key fields are **not** panel rows — set those only by
+hand-editing `settings.toml` (they still apply live). Hand-editing
 the file (or the panel in another instance) is picked up the same way,
 via the live mtime poll.
 
