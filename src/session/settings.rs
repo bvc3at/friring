@@ -100,8 +100,10 @@ pub struct FeatureFlags {
     /// compatibility with the view's Claude-only v1.
     #[serde(default = "default_true")]
     pub cc_activity: bool,
-    /// Perf HUD overlay (`<leader> m`): live perf counters + frame/tick timing. Opening
-    /// it also turns on wall-clock timing collection (see docs/PERFORMANCE.md).
+    /// Perf HUD overlay — `<leader> m`, or `F12` when `[prefix] mode = "off"`
+    /// (with the leader on, `F12` is the second leader). Live perf counters +
+    /// frame/tick timing; opening it also turns on wall-clock timing
+    /// collection (see docs/PERFORMANCE.md).
     #[serde(default = "default_true")]
     pub perf_hud: bool,
     /// Mouse support: terminal mouse capture plus all click/scroll/hover
@@ -267,8 +269,8 @@ impl Default for ReviewSettings {
 }
 
 /// Leader-key settings (`[prefix]` table). All fields have defaults so an
-/// absent table gives the shipped behaviour: `Ctrl+A` as leader, alongside the
-/// direct chords.
+/// absent table gives the shipped behaviour: `Ctrl+F` as leader with `F12` as
+/// the second leader, alongside the direct chords.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrefixSettings {
     /// Whether the leader is live, and whether direct chords still dispatch.
