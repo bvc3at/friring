@@ -33,65 +33,63 @@ Show
 # terminal it would be sent to the agent's PTY instead of toggling the panel.
 # Ctrl+H (focus previous pane) is a navigation chord that is never passed
 # through, so it reliably moves focus to the session list first.
-Sleep 1200ms
 Ctrl+H
-Sleep 400ms
+Sleep 300ms
 
 # Sessions are pre-seeded, plus a few tasks and an automation to search across.
 # Surface the tasks panel first so its matches highlight live during the search.
 Ctrl+W
-Sleep 800ms
+Sleep 450ms
 Escape
-Sleep 500ms
+Sleep 300ms
 
 # Open global search (Ctrl+A): a non-modal strip docks along the bottom and
 # searches EVERY scope at once — sessions, tasks, automations, and files.
 Ctrl+A
-Sleep 1000ms
+Sleep 500ms
 
 # Type a query. `carbo` fuzzy-matches across every scope at once — the
 # carbon-drawdown session, the carbon-capture task, and the carbon-drift-watch
 # automation — so the grouped results span all three. Matches highlight live in
 # the panels themselves (accent + bold + underline on matching rows, the rest
 # dimmed); the strip shows per-scope counts and a grouped result list.
+#
+# The session buffer-content scan lands after a short debounce, so this dwell
+# has to outlast it — one of the few here doing more than letting the eye
+# settle. Shortening it films the results arriving after the beat has moved on.
 Type "carbo"
-Sleep 1600ms
+Sleep 700ms
 
 # Move the selection through the grouped results; the owning panel previews the
 # selected row (its cursor moves) while focus stays in the strip.
 Down
-Sleep 600ms
-Down
-Sleep 600ms
-Down
-Sleep 800ms
-
-# Refine the query — counts and highlights update on every keystroke (the
-# session buffer-content scan kicks in after a short debounce).
-Backspace
-Backspace
-Backspace
-Backspace
-Backspace
 Sleep 400ms
+Down
+Sleep 400ms
+Down
+Sleep 450ms
+
+# Refine the query — counts and highlights update on every keystroke.
+Backspace
+Backspace
+Backspace
+Backspace
+Backspace
+Sleep 300ms
 Type "drift"
-Sleep 1400ms
+Sleep 700ms
 
 # Enter jumps to the selected result and focuses its pane (here, a session's
 # terminal). Esc would instead restore the exact pre-search state.
 Enter
-Sleep 1500ms
+Sleep 700ms
 
 # Open it once more to show a task jump, then cancel with Esc (state restored).
 Ctrl+A
-Sleep 800ms
+Sleep 450ms
 Type "habitat"
-Sleep 1300ms
+Sleep 650ms
 Down
-Sleep 800ms
+Sleep 450ms
 Escape
-Sleep 1100ms
-
-# Final beat; the recorder then stops filming (detach) and quits the TUI
-# off-camera - see record.sh.
-Sleep 1000ms
+Sleep 500ms

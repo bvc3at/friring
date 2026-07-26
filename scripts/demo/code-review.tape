@@ -35,31 +35,30 @@ Show
 # the session list first (Ctrl+H), then Ctrl+X (default ToggleReview) opens the
 # native code-review view: a continuous diff of the branch (<base>..HEAD) in the
 # centre, the changed-files list in the right column, an action bar across the
-# bottom.
-Sleep 1200ms
+# bottom. That is the densest single frame in the clip, so it holds longest.
 Ctrl+H
-Sleep 400ms
+Sleep 300ms
 Ctrl+X
-Sleep 1800ms
+Sleep 900ms
 
 # Scroll the diff — added lines (green) and the file/hunk headers read clearly;
 # the changed-files list tracks the current file.
 Type "j"
-Sleep 350ms
+Sleep 300ms
 Type "j"
-Sleep 350ms
+Sleep 300ms
 Type "j"
-Sleep 800ms
+Sleep 450ms
 
 # `}` jumps to the next changed file; the files list highlight follows.
 Type "}"
-Sleep 1100ms
+Sleep 600ms
 
 # `v` toggles side-by-side (old | new), then back to unified.
 Type "v"
-Sleep 1500ms
+Sleep 800ms
 Type "v"
-Sleep 1000ms
+Sleep 500ms
 
 # Move onto a changed line, then comment: `c` opens an inline compose box; type
 # a note, Tab cycles its classification (issue / suggestion / note / praise),
@@ -67,32 +66,31 @@ Sleep 1000ms
 Type "j"
 Sleep 300ms
 Type "j"
-Sleep 600ms
+Sleep 400ms
 Type "c"
-Sleep 900ms
+Sleep 500ms
 Type "Use checked_add to surface overflow"
-Sleep 600ms
+Sleep 400ms
 Tab
-Sleep 450ms
+Sleep 300ms
 Tab
-Sleep 650ms
+Sleep 400ms
 Ctrl+S
-Sleep 1500ms
+Sleep 800ms
 
 # `r` marks the current file reviewed (a ✓ in the list + header).
 Type "r"
-Sleep 1100ms
+Sleep 550ms
 
 # `t` opens the review-target picker: working changes, the whole branch, or a
 # single commit — like tuicr's -w / -r / commit targets.
 Type "t"
-Sleep 1200ms
+Sleep 600ms
 Type "j"
-Sleep 900ms
+Sleep 450ms
 Escape
-Sleep 800ms
+Sleep 400ms
 
-# Esc closes the review back to the agent terminal. Final beat; the recorder
-# then stops filming (detach) and quits the TUI off-camera - see record.sh.
+# Esc closes the review back to the agent terminal.
 Escape
-Sleep 1000ms
+Sleep 400ms

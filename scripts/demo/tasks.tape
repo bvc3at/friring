@@ -8,6 +8,10 @@
 # Requires: asciinema + agg + ffmpeg (see record.sh). The tape driver has no
 # function-key commands, so this uses Ctrl-key bindings + j/k / Tab / arrows
 # only (the tasks panel toggles with Ctrl+W, the F5 alternative).
+#
+# The typed beats here are the clip's best material: typing is continuous
+# motion, so the long `Type` runs cost runtime but never dead air. The dwells
+# around them are what gets kept short.
 
 Output docs/media/tasks-demo.gif
 Output docs/media/tasks-demo.mp4
@@ -32,69 +36,64 @@ Show
 # terminal it would be sent to the agent's PTY instead of toggling the panel.
 # Ctrl+H (focus previous pane) is a navigation chord that is never passed
 # through, so it reliably moves focus to the session list first.
-Sleep 1200ms
 Ctrl+H
-Sleep 400ms
+Sleep 300ms
 
 # Sessions are pre-seeded (incl. a task with a markdown description). Open AND
 # focus the tasks panel — a toggleable right-side column between the terminal
 # and the file viewer (Ctrl+W, the F5 alternative). The central pane shows the
 # selected task full-screen: its title, metadata, and rendered-markdown body.
 Ctrl+W
-Sleep 1400ms
+Sleep 700ms
 
 # j/k move through the list; the central preview follows the selection.
 Type "j"
-Sleep 800ms
+Sleep 450ms
 Type "k"
-Sleep 1000ms
+Sleep 450ms
 
 # Create a task right from the panel (`n`, like Ctrl+N for a session). The
 # editor opens full-screen in the central pane — one screen, no popup.
 Type "n"
-Sleep 900ms
+Sleep 500ms
 
 # Title it (the Title field is focused first).
 Type "Add integration tests"
-Sleep 700ms
+Sleep 400ms
 
 # Tab to the multi-line Description: Enter inserts newlines, so you can write
 # real markdown. Ctrl+S saves from any field.
 Tab
-Sleep 500ms
+Sleep 300ms
 Type "## Acceptance"
 Enter
 Type "- cover the **parser** edge cases"
 Enter
 Type "- add a CI gate"
-Sleep 900ms
-Ctrl+S
-Sleep 1400ms
+Sleep 500ms
 
-# Back in the panel, the preview renders that markdown full-screen. The footer
-# advertises the actions: e edit · r run · Space status · n new · d del.
-Sleep 1000ms
+# Saving returns to the panel, where the preview renders that markdown
+# full-screen and the footer advertises the actions: e edit · r run · Space
+# status · n new · d del. Two beats' worth of new content on one frame.
+Ctrl+S
+Sleep 800ms
 
 # Space cycles the selected task's status in place (todo -> in progress -> done).
 Space
-Sleep 900ms
+Sleep 450ms
 
 # `r` runs the task: a trigger-time picker offers Send -> a running session or
 # Spawn a new one — the action is chosen now, not configured up front.
 Type "r"
-Sleep 1400ms
+Sleep 700ms
 
 # Pick the first option (Send to a session) and run it; the task advances to
 # in-progress.
 Enter
-Sleep 1400ms
+Sleep 700ms
 
 # Esc returns focus to the session list; Ctrl+W hides the panel again.
 Escape
-Sleep 800ms
+Sleep 400ms
 Ctrl+W
-Sleep 1000ms
-
-# Final beat; the recorder then stops filming (detach) and quits the TUI
-# off-camera - see record.sh.
-Sleep 1000ms
+Sleep 400ms

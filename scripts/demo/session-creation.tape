@@ -29,61 +29,56 @@ Enter
 Sleep 2s
 Show
 
-# The agent CLIs are pre-played and fully rendered; a short settle beat.
-Sleep 1200ms
-
 # Open the repo picker (Ctrl+N). The sample repo is already bookmarked (the
 # seeded sessions registered it) and now shows by basename, not full path.
 Ctrl+N
-Sleep 1200ms
+Sleep 600ms
 
 # Focus the path input (Tab) and type a PARENT folder containing several repos.
 Tab
-Sleep 400ms
+Sleep 300ms
 Type "~/projects"
-Sleep 800ms
+Sleep 500ms
 
 # Ctrl+P imports it as a parent: its git sub-dirs are listed (by basename),
 # nested under a collapsible "▾ projects (parent)" header — and the folder is
-# re-scanned on every open, so new repos appear automatically.
+# re-scanned on every open, so new repos appear automatically. A whole tree
+# arrives here, so this is one of the few beats with something to actually read.
 Ctrl+P
-Sleep 1500ms
+Sleep 800ms
 
 # Space on the header folds the tree (▸), then unfolds it (▾) again.
 Space
-Sleep 900ms
+Sleep 450ms
 Space
-Sleep 900ms
+Sleep 450ms
 
 # Move to a child repo and select it (Down to move, Space to check).
 Down
-Sleep 400ms
+Sleep 300ms
 Space
-Sleep 900ms
+Sleep 400ms
 
 # Confirm the selection (Enter).
 Enter
-Sleep 900ms
+Sleep 450ms
 
 # Session-name prompt: type a name, then confirm.
 Type "aurora-forecast"
-Sleep 800ms
+Sleep 500ms
 Enter
-Sleep 900ms
+Sleep 450ms
 
 # Agent picker (shown because several agents are registered): choose one.
-Sleep 500ms
 Down
-Sleep 450ms
+Sleep 300ms
 Down
-Sleep 550ms
+Sleep 350ms
 Enter
-Sleep 900ms
 
-# The new session appears in the list and its agent boots (a real CLI painting
-# on camera — leave it the time it needs).
-Sleep 3s
-
-# Final beat; the recorder then stops filming (detach) and quits the TUI
-# off-camera - see record.sh.
-Sleep 1000ms
+# The new session appears in the list and its agent boots — a real CLI painting
+# on camera, so its duration is the machine's, not the demo's. Wait for the pane
+# to settle instead of guessing: the 3s guess this replaces filmed as a frozen
+# frame right at the end of the clip, where a viewer is most likely to bail.
+Wait Stable
+Sleep 500ms
