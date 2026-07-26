@@ -64,11 +64,42 @@ const BUDGET = {
 
 // Per-frame delays, in seconds, from the gif's Graphic Control Extensions.
 // GCE layout: 21 F9 04 <flags> <delay-lo> <delay-hi> <transparent-idx> 00.
+//
+// The delays are read by walking the stream's real block boundaries rather than
+// by scanning for that byte pattern: LZW image data is arbitrary bytes, so
+// `21 F9 04` occurs inside a compressed sub-block often enough to matter at
+// these file sizes, and a phantom GCE takes its delay from two unrelated bytes
+// — almost always well over the cap, i.e. a "held frame" that never happened
+// rejecting a good take.
 function frameDelays(buf) {
   const delays = [];
-  for (let i = 0; i < buf.length - 8; i++) {
-    if (buf[i] === 0x21 && buf[i + 1] === 0xf9 && buf[i + 2] === 0x04) {
-      delays.push((buf[i + 4] | (buf[i + 5] << 8)) / 100);
+  // A sub-block chain: a length byte, that many bytes of payload, until 0.
+  const skipSubBlocks = (p) => {
+    while (buf[p]) p += 1 + buf[p];
+    return p + 1;
+  };
+  const colorTableBytes = (packed) => (packed & 0x80 ? 3 * 2 ** ((packed & 0x07) + 1) : 0);
+
+  // Header, then the logical screen descriptor (packed flags at byte 10) and
+  // the global colour table it may declare.
+  let p = 6 + 7 + colorTableBytes(buf[10]);
+  for (;;) {
+    const block = buf[p++];
+    if (block === 0x3b) break; // trailer
+    if (block === 0x21) {
+      const label = buf[p++];
+      // p now sits on the block-size byte, so the delay is at +2 / +3.
+      if (label === 0xf9) delays.push((buf[p + 2] | (buf[p + 3] << 8)) / 100);
+      p = skipSubBlocks(p);
+    } else if (block === 0x2c) {
+      p += 8; // image position and size
+      const packed = buf[p++];
+      p += colorTableBytes(packed) + 1; // local colour table, LZW min code size
+      p = skipSubBlocks(p);
+    } else {
+      // Truncated, or not a gif. Fail loudly rather than report the frames that
+      // happened to parse before the confusion.
+      throw new Error(`unexpected gif block 0x${(block ?? 0).toString(16)} at byte ${p - 1}`);
     }
   }
   return delays;
