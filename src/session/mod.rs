@@ -29,8 +29,8 @@ pub use host_def::{
     SSH_BACKEND_PREFIX, WSL_BACKEND_PREFIX,
 };
 pub use keybindings::{
-    compact_shortcut, prefix_entries, prefix_sections, Action, KeyBindings, KeyChord, KeyContext,
-    PrefixEntry, PrefixMode,
+    compact_shortcut, prefix_sections, Action, KeyBindings, KeyChord, KeyContext, PrefixEntry,
+    PrefixMode,
 };
 pub use message::SessionMessage;
 pub use review::{

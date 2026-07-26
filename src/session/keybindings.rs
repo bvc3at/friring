@@ -820,9 +820,9 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
     ]
 }
 
-/// The which-key overlay's sections, in render order. Single source of truth
-/// for both the overlay renderer and [`prefix_entries`], so what the overlay
-/// advertises and what the leader actually dispatches can never drift.
+/// The which-key overlay's sections, in render order. What the overlay
+/// advertises and what [`action_for_prefix_key`] dispatches can never drift:
+/// `prefix_sections_match_the_leader_table` ties the two together.
 ///
 /// Ordered by what the leader is *for*: session selection first (the reason
 /// the feature exists), then panes, then session management, then the app.
@@ -896,14 +896,6 @@ pub fn action_for_prefix_key(chord: KeyChord) -> Option<Action> {
         .iter()
         .copied()
         .find(|a| a.prefix_key() == Some(chord))
-}
-
-/// Every leader entry, flattened out of [`prefix_sections`].
-pub fn prefix_entries() -> Vec<PrefixEntry> {
-    prefix_sections()
-        .into_iter()
-        .flat_map(|(_, entries)| entries)
-        .collect()
 }
 
 /// How the tmux-style prefix (leader) key participates in dispatch.
@@ -1755,8 +1747,9 @@ mod tests {
     /// or dead.
     #[test]
     fn prefix_sections_match_the_leader_table() {
-        let listed: Vec<Action> = prefix_entries()
+        let listed: Vec<Action> = prefix_sections()
             .into_iter()
+            .flat_map(|(_, entries)| entries)
             .filter_map(|e| match e {
                 PrefixEntry::Action(a) => Some(a),
                 _ => None,
