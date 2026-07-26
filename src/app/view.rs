@@ -12,6 +12,7 @@ use ratatui::{
     Frame,
 };
 
+use crate::app::PrefixState;
 use crate::session::{KeyBindings, KeyChord, SessionInfo};
 use crate::ui::selection;
 use crate::ui::theme::Theme;
@@ -118,6 +119,12 @@ impl App {
                     session_count: self.sessions.len(),
                 },
             );
+        }
+        // Above the perf HUD: while the leader is armed the which-key table is
+        // the only thing the next keystroke can act on, so nothing should
+        // obscure it.
+        if let Some(leader) = self.prefix_hint_chord() {
+            crate::ui::prefix_overlay::render_prefix_overlay(frame, frame.area(), &leader);
         }
         self.repaint_theme_background(frame);
         self.apply_hover_highlight(frame);
@@ -928,6 +935,10 @@ impl App {
             InputFocus::CcActivityTree => "Activity nav",
         };
         status_bar::FooterState {
+            prefix_armed: match self.prefix_state {
+                PrefixState::Armed { chord, .. } => Some(chord.display()),
+                PrefixState::Idle => None,
+            },
             session_count: self.sessions.len(),
             blocked_count: self
                 .sessions

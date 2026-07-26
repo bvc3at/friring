@@ -2164,6 +2164,51 @@ fn leader_arms_and_a_bound_key_runs_the_action() {
     assert!(h.app.show_info_panel, "<leader> b toggles the info panel");
 }
 
+/// The which-key overlay paints as soon as the leader arms (`hint_delay_ms`
+/// defaults to 0) and disappears once a key resolves it.
+#[test]
+fn which_key_overlay_paints_while_armed() {
+    let mut h = Harness::standard(1);
+    h.ctrl('a');
+    let armed = h.render();
+    assert!(
+        armed.contains("go to session N"),
+        "the armed overlay lists the session-jump row:\n{armed}"
+    );
+    assert!(
+        armed.contains("ctrl+a"),
+        "and titles itself with the leader"
+    );
+
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+    let idle = h.render();
+    assert!(
+        !idle.contains("go to session N"),
+        "and vanishes once disarmed:\n{idle}"
+    );
+}
+
+/// A non-zero `hint_delay_ms` keeps the overlay hidden immediately after
+/// arming — but the footer badge still shows the pending state, so the app
+/// never looks frozen.
+#[test]
+fn hint_delay_hides_the_overlay_but_not_the_armed_badge() {
+    let mut h = Harness::standard(1);
+    h.app.prefix_settings.hint_delay_ms = 5_000;
+    h.ctrl('a');
+    assert!(h.app.prefix_state.is_armed());
+    assert!(
+        h.app.prefix_hint_chord().is_none(),
+        "the overlay waits out the delay"
+    );
+    let painted = h.render();
+    assert!(!painted.contains("go to session N"), "overlay is hidden");
+    assert!(
+        painted.contains("ctrl+a"),
+        "the footer badge still shows it"
+    );
+}
+
 #[test]
 fn leader_digit_jumps_to_that_session_and_lands_in_the_terminal() {
     let mut h = Harness::standard(3);

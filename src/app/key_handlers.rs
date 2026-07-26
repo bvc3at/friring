@@ -353,6 +353,7 @@ impl App {
             if is_leader {
                 self.prefix_state = super::PrefixState::Armed {
                     since: clock::now(),
+                    chord: pressed,
                 };
                 self.request_redraw();
                 return true;

@@ -91,6 +91,11 @@ pub struct FooterState<'a> {
     pub info_panel_enabled: bool,
     /// Live keybindings, so each footer pill can show its (rebindable) shortcut.
     pub keybindings: &'a KeyBindings,
+    /// The armed leader chord, if the leader is pending a second key. Shown as
+    /// a badge so the armed state is visible even when the which-key overlay
+    /// is delayed (`prefix.hint_delay_ms`) — an armed leader with no feedback
+    /// anywhere reads as a frozen app.
+    pub prefix_armed: Option<String>,
 }
 
 /// The clickable footer buttons, in render order, paired with the `Action` each
@@ -159,6 +164,20 @@ pub fn render_footer(
         format!(" {} ", state.focus_label),
         Theme::focused_title(),
     )];
+    // An armed leader replaces nothing — it prepends, so the badge sits where
+    // the eye already is and the pending state is unmissable.
+    if let Some(chord) = &state.prefix_armed {
+        spans.insert(
+            0,
+            Span::styled(
+                format!(" {chord} "),
+                Style::default()
+                    .bg(Theme::accent())
+                    .fg(Theme::modal_bg())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+    }
     push_idle_counts(&mut spans, state);
     push_shortcut_hints(&mut spans);
 
@@ -405,6 +424,7 @@ mod tests {
 
     fn footer_state(file_viewer_open: bool) -> FooterState<'static> {
         FooterState {
+            prefix_armed: None,
             session_count: 1,
             blocked_count: 0,
             status: None,

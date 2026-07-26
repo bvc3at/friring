@@ -1108,8 +1108,13 @@ pub(crate) enum PrefixState {
     Idle,
     /// The leader was pressed; the next key resolves against the leader table.
     /// Carries the arm time so the which-key overlay can honour
-    /// `prefix.hint_delay_ms` (0 = show immediately, the default).
-    Armed { since: std::time::Instant },
+    /// `prefix.hint_delay_ms` (0 = show immediately, the default), and the
+    /// chord that armed it so the overlay titles itself with the key the user
+    /// actually pressed rather than always the primary.
+    Armed {
+        since: std::time::Instant,
+        chord: crate::session::KeyChord,
+    },
 }
 
 impl PrefixState {
@@ -4701,6 +4706,34 @@ impl App {
         None
     }
 
+    /// The leader chord to title the which-key overlay with, or `None` when
+    /// the overlay should stay hidden — either the leader isn't armed, or
+    /// `prefix.hint_delay_ms` hasn't elapsed yet (it defaults to 0, so the
+    /// overlay is normally immediate).
+    pub(crate) fn prefix_hint_chord(&self) -> Option<crate::session::KeyChord> {
+        let PrefixState::Armed { since, chord } = self.prefix_state else {
+            return None;
+        };
+        let delay = self.prefix_settings.hint_delay_ms;
+        if delay > 0 && clock::elapsed_since(since) < std::time::Duration::from_millis(delay) {
+            return None;
+        }
+        Some(chord)
+    }
+
+    /// Tick hook for a *non-zero* `hint_delay_ms`: like the Alt-hold overlay,
+    /// the which-key box then appears on a timer rather than an input event,
+    /// so nothing else would mark the frame dirty while the user waits. A zero
+    /// delay (the default) paints on the arming keypress and never reaches here.
+    fn tick_prefix_hint(&mut self) {
+        if self.prefix_state.is_armed()
+            && self.prefix_settings.hint_delay_ms > 0
+            && self.prefix_hint_chord().is_some()
+        {
+            self.request_redraw();
+        }
+    }
+
     /// Tick hook: the Alt-hold overlay appears on a *timer*, not an input
     /// event, so the frame where the delay elapses must be requested here —
     /// nothing else marks the UI dirty while the user just holds Alt.
@@ -4915,6 +4948,7 @@ impl App {
         self.metrics.tick_count = self.metrics.tick_count.wrapping_add(1);
 
         self.tick_jump_overlay();
+        self.tick_prefix_hint();
 
         self.tick_global_search_content();
         self.poll_global_search_file_index();
