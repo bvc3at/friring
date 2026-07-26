@@ -2358,6 +2358,25 @@ fn leader_esc_cancels_without_running_anything() {
     assert!(!h.app.show_info_panel, "nothing was dispatched");
 }
 
+/// Ctrl+C is the other cancel, and the one at risk: the priority Copy route
+/// runs ahead of the leader, so it must not swallow the cancel — nor report
+/// the sequence as a miss.
+#[test]
+fn leader_ctrl_c_cancels_without_running_anything() {
+    let mut h = Harness::standard(1);
+    h.ctrl('a');
+    h.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert!(!h.app.prefix_state.is_armed());
+    assert!(!h.app.show_info_panel, "nothing was dispatched");
+    assert!(
+        !h.app
+            .status_message
+            .as_ref()
+            .is_some_and(|m| m.text.contains("No leader binding")),
+        "a cancel is not a missed binding"
+    );
+}
+
 /// An unbound key after the leader must not reach the PTY: a leader press
 /// plus a typo would otherwise inject a stray character into the agent.
 #[test]
