@@ -542,6 +542,60 @@ PTY, and the shadowed readline bindings (`M-digit` argument prefixes,
 fixed. Some terminal emulators claim `Alt+digit` for their own tabs —
 their setting wins; rebind or disable it there.
 
+### The leader key (`Ctrl+A`)
+
+The Ctrl namespace ran out. Every bare `Ctrl+<letter>` is bound or reserved,
+`F1`–`F10` and `F12` are spent, and the chords friring *does* hold are ones the
+inner agent CLI wants back — `Ctrl+L` (clear screen), `Ctrl+Z` (suspend),
+`Ctrl+V` (image paste in Claude Code and Codex), `Ctrl+G` (external editor).
+A tmux-style leader solves both: one key buys a whole fresh namespace.
+
+Press `Ctrl+A` and a **which-key overlay** lists everything reachable, grouped
+by what it does; the next key runs it. The armed state also shows as a badge in
+the footer. Nothing times out — tmux waits indefinitely after its prefix, and
+so do we, because friring is normally driven over SSH where a 1-second timeout
+(WezTerm's default) turns "I paused to read the overlay" into "my keystroke
+went to the agent". `Esc` or `Ctrl+C` backs out.
+
+Leader keys **mirror each action's own `Ctrl` letter** — `Ctrl+N` new session
+becomes `<leader> n` — so the table is learnable as "your chords, one key
+later" rather than a second vocabulary. Four cases can't mirror: `r` goes to
+`RestartSession` (bare `Ctrl+R`) with `Shift+R` for `ReloadApp`; `LastSession`
+moves to `Tab` because digits belong to session selection; and the F-key-only
+actions take `v` (acti**v**ity), `]` (next blocked) and `m` (**m**etrics /
+perf HUD). `Copy`/`Paste` are deliberately **not** on the leader — they are
+routed ahead of every modal so paste reaches text inputs, which a leader route
+cannot do.
+
+**What the leader unlocks: session selection by number.** `<leader> 1`–`9`
+jumps straight to that session, and `<leader> a` then a digit jumps to the
+*Nth blocked* session. Unlike `Alt+1`–`9` this works everywhere — GNOME
+Terminal, Konsole, Tilix, xfce4 and Ghostty-on-Linux all bind `Alt+<digit>` to
+their own tabs, and macOS terminals ship with Option-as-Meta **off**, so the
+Alt route is unavailable to a large share of users by default.
+
+`<leader> <leader>` sends the leader's own byte to the agent — the universal
+convention (tmux `send-prefix`, screen `C-a a`, nvim `CTRL-\ CTRL-\`, ssh
+`~~`). Without it `Ctrl+A` would be permanently unreachable by the inner CLI,
+and friring unusable inside itself.
+
+**Three modes** (`[prefix] mode` in `settings.toml`):
+
+| Mode | Behaviour |
+|---|---|
+| `off` | No leader at all — the pre-leader behaviour exactly. `F12` goes back to the perf HUD. |
+| `both` *(default)* | Direct chords **and** the leader. Nothing you already know stops working. |
+| `prefix-only` | Direct global chords are disabled; the leader is the only way in. This is the mode that pays for the feature — with no global `Ctrl` chords, every bare `Ctrl+<letter>` reaches the agent CLI untouched. Pane-scoped keys (session-list `j`/`k`, file-viewer nav) are unaffected. |
+
+**Why `Ctrl+A`?** It was friring's only unbound bare `Ctrl+<letter>`, so
+adopting it displaced nothing. Its cost is real and worth stating: it is
+`beginning-of-line` in every agent CLI, and it is the most common tmux prefix
+rebind — a user who moved their *outer* tmux to `C-a` never delivers it here.
+That is what `prefix.key2` exists for: `F12` by default, layout-independent,
+and unaffected by an outer multiplexer. Both are rebindable, and every leader
+key is reachable unshifted on a US layout (except the deliberate `Shift+R`),
+because terminals encode shifted punctuation inconsistently.
+
 ### Focus model: terminal-first
 
 The terminal is where keystrokes belong; the session list is a glanceable
@@ -594,7 +648,7 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `F1` / `Ctrl+G` | Global | Keybindings help + interactive editor | Universal help |
 | `Ctrl+B` / `F2` | Global | Toggle info panel | **B**rowse info |
 | `Ctrl+E` / `F3` | Global | Toggle file viewer | **E**xplore files |
-| `F12` | Global | Toggle perf HUD (live counters + frame/tick timing) | Diagnostics |
+| `<leader> m` | Global | Toggle perf HUD (live counters + frame/tick timing). `F12` when `[prefix] mode = "off"`; otherwise `F12` is the second leader | **M**etrics |
 | `Shift+J` | Session list | Move selected session down | Reorder |
 | `Shift+K` | Session list | Move selected session up | Reorder |
 | `Shift+S` | Session list | Sort sessions alphabetically within repo groups | **S**ort |

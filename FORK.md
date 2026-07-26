@@ -54,6 +54,37 @@ merges carry rename conflicts on the renamed identifiers, and an existing
 
 ### Features
 
+#### tmux-style leader key (July 2026)
+
+Upstream dispatches every global command from a direct `Ctrl+<letter>` chord
+and has no prefix/leader concept. The fork adds one, because that namespace is
+exhausted: every bare `Ctrl+<letter>` is bound or reserved, `F1`–`F10`/`F12`
+are spent, and several chords friring holds are ones the inner agent CLI wants
+back (`Ctrl+L` clear-screen, `Ctrl+Z` suspend, `Ctrl+V` image-paste in Claude
+Code and Codex, `Ctrl+G` external editor).
+
+- **`Ctrl+A` leader + which-key overlay.** Arming paints a grouped table of
+  everything reachable; the next key runs it. No timeout (tmux semantics —
+  friring is normally driven over SSH, where a timeout would misroute a paused
+  keystroke into the agent). `Esc`/`Ctrl+C` cancels, and an armed badge shows
+  in the footer.
+- **Session selection by number.** `<leader> 1`–`9` jumps to that session and
+  `<leader> a` + digit to the Nth *blocked* one — a route that works where
+  upstream's `Alt+1`–`9` cannot, since GNOME Terminal / Konsole / Tilix /
+  xfce4 / Ghostty-Linux all claim `Alt+<digit>` for their own tabs and macOS
+  terminals ship Option-as-Meta off.
+- **Three modes** (`[prefix] mode`): `off` reproduces upstream exactly, `both`
+  (default) adds the leader alongside the direct chords, and `prefix-only`
+  disables direct **global** chords so every bare `Ctrl+<letter>` reaches the
+  agent CLI untouched. Pane-scoped keys are unaffected in all modes.
+- **`<leader> <leader>` sends the leader's byte** to the agent (tmux
+  `send-prefix`), so `Ctrl+A` stays reachable by the inner CLI.
+- **`prefix2` (`F12` by default)** covers the leader's one real cost: a user
+  who rebound their *outer* tmux to `C-a` never delivers `Ctrl+A` here. The
+  trade is that `F12` stops toggling the perf HUD while the leader is on —
+  that moved to `<leader> m`. `key2 = ""` reverses it.
+- The `[prefix]` settings table (`docs/CONFIG.md`) is fork-only.
+
 #### Code review v2 (July 2026)
 
 The built-in review view grows the annotate → agent-fixes → re-review loop:

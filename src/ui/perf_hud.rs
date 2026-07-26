@@ -1,6 +1,6 @@
 //! Perf HUD overlay: a small right-anchored box with the live perf counters,
 //! frame/tick timing percentiles, and the most recent slow ops. Toggled by
-//! `Action::TogglePerfHud` (F12); opening it also switches on wall-clock
+//! `Action::TogglePerfHud` (`<leader> m`); opening it also switches on wall-clock
 //! timing collection (`App::perf_timing_active`). Unlike a modal it never dims
 //! or captures input — it floats above the normal panes so the app stays fully
 //! drivable while the numbers update (~4 fps via the forced-redraw floor).

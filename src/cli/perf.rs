@@ -2,7 +2,7 @@
 //!
 //! The TUI writes a JSON snapshot (counters, frame/tick timing percentiles,
 //! slow ops, startup phase breakdown) into the SQLite `metadata` table while
-//! perf timing is active — `FRIRING_PERF_LOG=1` or an open perf HUD (F12).
+//! perf timing is active — `FRIRING_PERF_LOG=1` or an open perf HUD (`<leader> m`).
 //! This command prints the latest one, so a running instance can be inspected
 //! from outside without tailing `friring.log`. See `docs/PERFORMANCE.md`.
 
@@ -14,7 +14,7 @@ use super::output::{kv, CommandOutput};
 
 /// Human hint shown when no snapshot exists (or it can't be parsed).
 const NO_SNAPSHOT_HINT: &str = "No perf snapshot published. Run the TUI with FRIRING_PERF_LOG=1 \
-     or open its perf HUD (F12), then retry.";
+     or open its perf HUD (<leader> m), then retry.";
 
 /// Run the `perf` command: print the last published snapshot.
 pub fn run(db: &Database) -> Result<CommandOutput, String> {

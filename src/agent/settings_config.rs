@@ -56,7 +56,7 @@ config_version = 1
 # shell_pane = true       # Ctrl+T per-session shell
 # code_review = true      # native code-review view (diff + comments)
 # cc_activity = true      # Claude Code workflow/subagent activity view (F9)
-# perf_hud = true         # F12 perf HUD overlay (live counters + timing)
+# perf_hud = true         # <leader> m perf HUD overlay (live counters + timing)
 # mouse = true            # mouse capture: clicks, wheel, drag-select, hover
 # notifications = true    # OS desktop notifications when a session needs attention
 # soft_delete = true      # Ctrl+D soft-deletes (Ctrl+Z undo); false = hard delete after a prompt

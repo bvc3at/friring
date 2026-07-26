@@ -427,6 +427,12 @@ min_interval_secs   = 5        # per-session floor between notifications
 [review]
 handoff       = "structured"   # review handoff shape: structured | legacy
 nudge_on_idle = true           # toast a re-review nudge when the agent goes idle
+
+[prefix]
+mode          = "both"         # leader key: off | both | prefix-only
+key           = "ctrl+a"       # the leader
+key2          = "f12"          # second leader ("" disables, freeing F12)
+hint_delay_ms = 0              # 0 = show the which-key overlay immediately
 ```
 
 ### `[features]` — whole-feature switches
@@ -453,7 +459,7 @@ no results. Data is never touched, so re-enabling a flag is lossless.
 | `shell_pane` | `true` | per-session shell toggle (`Ctrl+T`) |
 | `code_review` | `true` | native code-review view (diff + comments, `Ctrl+X`) |
 | `cc_activity` | `true` | agent activity view (`F9`): per-session retrospective (commands / edits / reads / web / subagents) across supported agent CLIs, incl. the Claude workflow/subagent tree + conversation import; local sessions only (see `FORK.md`) |
-| `perf_hud` | `true` | perf HUD overlay (`F12`): live perf counters + frame/tick timing (see `docs/PERFORMANCE.md`) |
+| `perf_hud` | `true` | perf HUD overlay (`<leader> m`, or `F12` when `[prefix] mode = "off"`): live perf counters + frame/tick timing (see `docs/PERFORMANCE.md`) |
 | `mouse` | `true` | mouse capture: clicks, wheel, drag-select, hover, scrollbars |
 | `notifications` | `true` | OS desktop notifications when a session needs attention |
 | `soft_delete` | `true` | TUI `Ctrl+D` soft-deletes (Ctrl+Z undo); off = hard delete after a confirmation prompt |
@@ -611,6 +617,28 @@ are marked `(line was removed)`). `legacy` reproduces the original format
 (`"Please address the following code review:"` prefix, `## <path>` sections
 with `- **[Class]** (side:line)` bullets, `## Summary`) byte-for-byte, for
 agent prompts/workflows that depend on it.
+
+### `[prefix]` — the leader key
+
+The tmux-style leader (see `docs/FEATURES.md` § The leader key). Applies
+**live** on panel save or file reload.
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `mode` | `"both"` | `off` (no leader — pre-leader behaviour, `F12` is the perf HUD again) \| `both` (direct chords *and* the leader) \| `prefix-only` (direct **global** chords disabled, handing every bare `Ctrl+<letter>` back to the agent CLI; pane-scoped keys still work) |
+| `key` | `"ctrl+a"` | the leader chord, in `keybindings.json` notation |
+| `key2` | `"f12"` | second leader, tmux's `prefix2`. Set to `""` to disable — which also gives `F12` back to the perf HUD |
+| `hint_delay_ms` | `0` | delay before the which-key overlay appears. `0` shows it immediately; raise it only if you know the table by heart, since the overlay *is* the leader's discoverability |
+
+`key2` defaults to `F12` for two reasons: it is layout-independent (chords like
+`Ctrl+\` or `Ctrl+]` need AltGr on DE/FR/Nordic keyboards), and it survives an
+**outer** tmux that has claimed `Ctrl+A` — the one real cost of the default
+leader. The trade is that `F12` no longer toggles the perf HUD while the leader
+is on; that moved to `<leader> m`. Set `key2 = ""` to reverse it.
+
+Both leaders accept the same chord syntax as
+[`keybindings.json`](#keybindingsjson). An unparseable entry is skipped rather
+than fatal, so a typo in `key` still leaves you `key2` to get in with.
 
 ## Session status
 

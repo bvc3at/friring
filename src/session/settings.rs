@@ -100,7 +100,7 @@ pub struct FeatureFlags {
     /// compatibility with the view's Claude-only v1.
     #[serde(default = "default_true")]
     pub cc_activity: bool,
-    /// Perf HUD overlay (F12): live perf counters + frame/tick timing. Opening
+    /// Perf HUD overlay (`<leader> m`): live perf counters + frame/tick timing. Opening
     /// it also turns on wall-clock timing collection (see docs/PERFORMANCE.md).
     #[serde(default = "default_true")]
     pub perf_hud: bool,
