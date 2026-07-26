@@ -947,7 +947,9 @@ impl PrefixMode {
 pub enum PrefixEntry {
     /// A leader key that dispatches an action.
     Action(Action),
-    /// `<leader> 0`–`9` — jump to the Nth session in rendered order.
+    /// `<leader> 1`–`9` — jump to the Nth session in rendered order. `0` is
+    /// not a target: the overlay numbers from 1, matching the Alt-held jump
+    /// overlay, and `jump_to_digit` reports "No session #0" for it.
     SessionDigits,
     /// `<leader> <leader>` — send the prefix's own byte to the agent. The
     /// universal convention (tmux `send-prefix`, screen `C-a a`, nvim
