@@ -159,6 +159,17 @@ impl App {
         // Any key press clears text selection (but the key still performs its action)
         self.text_selection = None;
 
+        // The leader key, routed **ahead of every capture pane**. Those panes
+        // consume all Ctrl chords outside their small escape lists, so with the
+        // leader behind them it could not arm at all from the code-review or
+        // activity views — the leader has to be the one key that always works,
+        // or it isn't a leader. The exception is a text-entry submode
+        // (`text_entry_owns_keys`), where the leader chord is a line-editing
+        // key in the field being typed into.
+        if !self.text_entry_owns_keys() && self.handle_prefix_key(code, mods) {
+            return;
+        }
+
         // The in-pane automation editor / run-history capture input like the
         // overlay modal (see `handle_automation_pane_capture`).
         if self.handle_automation_pane_capture(code, mods) {
@@ -208,10 +219,17 @@ impl App {
         // friring command working even in the terminal.
         let context = self.focus_key_context();
         if let Some(action) = self.keybindings.lookup_in(context, code, mods) {
+            // In `prefix-only` the leader is the sole route to a **global**
+            // command — that is what hands the whole `Ctrl+<letter>` namespace
+            // back to the agent CLI. Pane-scoped actions (session-list `j`/`k`,
+            // file-viewer nav) are untouched: they are single letters inside a
+            // focused pane and were never part of the contested space.
+            let direct_blocked = !self.prefix_settings.mode.direct_enabled()
+                && action.context() == crate::session::KeyContext::Global;
             let defer_to_pty = self.focus == InputFocus::Terminal
                 && action.terminal_passthrough()
                 && is_ctrl_letter_chord(code, mods);
-            if !defer_to_pty && self.dispatch_action(action) {
+            if !direct_blocked && !defer_to_pty && self.dispatch_action(action) {
                 return;
             }
         }
@@ -311,8 +329,163 @@ impl App {
         }
     }
 
+    /// Whether a text-entry submode currently owns every keystroke, so the
+    /// leader must not steal from it: in a field being typed into, the leader
+    /// chord is a line-editing key (`Ctrl+A` is beginning-of-line) and the
+    /// user is composing text, not issuing commands.
+    ///
+    /// Modals and the global-search popup are already handled before the
+    /// leader runs, so this only needs to cover the in-pane editors and the
+    /// search/compose sub-modes of the capture panes.
+    fn text_entry_owns_keys(&self) -> bool {
+        if matches!(
+            self.focus,
+            InputFocus::AutomationEditor | InputFocus::TaskEditor
+        ) {
+            return true;
+        }
+        if self.focus == InputFocus::FileViewer && self.file_viewer.search_active {
+            return true;
+        }
+        let review_typing = self.active_review().is_some_and(|cr| {
+            cr.compose.is_some() || cr.search.as_ref().is_some_and(|s| s.editing)
+        });
+        if review_typing {
+            return true;
+        }
+        self.active_cc_activity()
+            .is_some_and(|cc| cc.search.as_ref().is_some_and(|s| s.editing))
+    }
+
+    /// The tmux-style leader key. Returns `true` if the key was consumed.
+    ///
+    /// Two jobs, split by [`PrefixState`](super::PrefixState):
+    /// - **Idle** — arm on the leader chord (or the second leader), consuming
+    ///   it. Any other key is left alone for the handlers below.
+    /// - **Armed** — resolve this key against the leader table. Every path
+    ///   disarms first, so no branch can leave the leader stuck armed.
+    ///
+    /// Order matters inside the armed branch: the leader itself sends its own
+    /// byte (so the inner agent can still receive it), then cancel, then
+    /// digits (session selection is the feature the leader exists for), then
+    /// the action table. An unrecognised key reports rather than falling
+    /// through to the PTY — a leader press followed by a typo would otherwise
+    /// inject a stray character into the agent's prompt.
+    fn handle_prefix_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
+        let leaders = self.prefix_settings.chords();
+        if leaders.is_empty() {
+            return false;
+        }
+        let pressed = crate::session::KeyChord::normalized(mods, code);
+        let is_leader = leaders.contains(&pressed);
+
+        // Waiting for a move distance: a digit performs the move, anything
+        // else cancels. Checked before the arm/dispatch logic so the digit is
+        // never mistaken for a session jump.
+        if let super::PrefixState::AwaitingMove { up } = self.prefix_state {
+            self.prefix_state = super::PrefixState::Idle;
+            self.prefix_hint_redraw_requested = false;
+            self.request_redraw();
+            if let KeyCode::Char(c) = code {
+                if let Some(d) = c.to_digit(10).filter(|d| *d > 0) {
+                    self.move_active_session_by(d as usize, up);
+                    return true;
+                }
+            }
+            return true;
+        }
+
+        if !self.prefix_state.is_armed() {
+            if is_leader {
+                self.prefix_state = super::PrefixState::Armed {
+                    since: clock::now(),
+                    chord: pressed,
+                };
+                self.prefix_hint_redraw_requested = false;
+                self.request_redraw();
+                return true;
+            }
+            return false;
+        }
+
+        self.prefix_state = super::PrefixState::Idle;
+        self.prefix_hint_redraw_requested = false;
+        self.request_redraw();
+
+        // `<leader> <leader>` → send the leader's own byte to the agent. The
+        // tmux `send-prefix` convention; without it the leader chord would be
+        // permanently unreachable by the inner CLI (and friring unusable
+        // inside itself). Only meaningful with a terminal focused — elsewhere
+        // there is nothing to send to, so it just disarms.
+        if is_leader {
+            if self.focus == InputFocus::Terminal {
+                self.handle_terminal_key(code, mods);
+            }
+            return true;
+        }
+
+        // Esc / Ctrl+C back out without running anything.
+        if code == KeyCode::Esc || (mods == KeyModifiers::CONTROL && code == KeyCode::Char('c')) {
+            return true;
+        }
+
+        // `<leader> 1`–`9` — jump to the Nth session in rendered order. Same
+        // numbering the Alt-held overlay paints, so the two routes agree.
+        if let KeyCode::Char(c) = code {
+            if c.is_ascii_digit() {
+                self.jump_to_digit(c, false);
+                return true;
+            }
+        }
+
+        // `<leader> K` / `<leader> J` — arm the move gesture and wait for its
+        // distance digit, re-numbering the list as distances from the active
+        // session.
+        for up in [true, false] {
+            if pressed == crate::session::keybindings::move_session_key(up) {
+                self.prefix_state = super::PrefixState::AwaitingMove { up };
+                self.request_redraw();
+                return true;
+            }
+        }
+
+        // Resolve the leader table, accepting the key with Ctrl still held as
+        // the same entry. GNU screen ships exactly this: "all commands that are
+        // bound to lower-case letters are also bound to their control character
+        // counterparts", so `C-f C-b` works as well as `C-f b`. For a key
+        // pressed dozens of times an hour, not having to release the modifier
+        // mid-sequence is free ergonomics.
+        let resolved = crate::session::keybindings::action_for_prefix_key(pressed).or_else(|| {
+            let bare = crate::session::KeyChord::normalized(mods & !KeyModifiers::CONTROL, code);
+            (bare != pressed)
+                .then(|| crate::session::keybindings::action_for_prefix_key(bare))
+                .flatten()
+        });
+        if let Some(action) = resolved {
+            self.dispatch_action(action);
+            return true;
+        }
+
+        self.set_status(
+            super::StatusLevel::Info,
+            format!("No leader binding for `{}`", pressed.display()),
+        );
+        true
+    }
+
     /// Help-overlay dismissal and clipboard chords, routed ahead of modal
     /// handlers. Returns `true` if the key was consumed.
+    /// Test hook for [`Self::handle_priority_key`]'s consume/fall-through
+    /// decision, which is otherwise only observable through a real clipboard.
+    #[cfg(test)]
+    pub(crate) fn handle_priority_key_for_test(
+        &mut self,
+        code: KeyCode,
+        mods: KeyModifiers,
+    ) -> bool {
+        self.handle_priority_key(code, mods)
+    }
+
     fn handle_priority_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
         // The interactive help/keybinding editor captures all input — routed
         // ahead of the global keybinding lookup so a chord being captured
@@ -321,11 +494,25 @@ impl App {
             return self.handle_help_key(code, mods);
         }
 
+        // In `prefix-only` a focused terminal keeps its whole `Ctrl` namespace,
+        // clipboard chords included: `Ctrl+V` is image-paste in Claude Code and
+        // Codex and `Ctrl+C` is their interrupt, so intercepting them here
+        // would break the very thing that mode exists to fix. The gate is
+        // narrow on purpose — only a focused terminal, so paste still reaches
+        // friring's own modals, search field and in-pane editors, which have no
+        // other way to receive it (`Copy`/`Paste` deliberately have no leader
+        // key). Reaching friring's clipboard *in* the terminal is then the
+        // terminal emulator's job (`Cmd+V`/`Ctrl+Shift+V`), as it is for any
+        // full-screen TUI.
+        let terminal_owns_clipboard =
+            !self.prefix_settings.mode.direct_enabled() && self.focus == InputFocus::Terminal;
+
         // Clipboard chords (Copy/Paste) are user-rebindable global actions but
         // routed here, ahead of modal handlers, so Paste reaches modal/terminal
         // text inputs and Copy works from inside any modal. Resolved via the
         // (global) keybindings so a user's rebind takes effect.
         match self.keybindings.lookup(code, mods) {
+            _ if terminal_owns_clipboard => return false,
             // Paste always consumes — `paste_from_clipboard` knows whether a
             // modal text input is open and routes the text accordingly.
             Some(crate::session::Action::Paste) => {

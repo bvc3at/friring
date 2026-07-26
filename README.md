@@ -688,6 +688,24 @@ repos? Add `--add-repo PATH@main` (its own worktree per repo) or
 
 ## Keybindings
 
+### Leader key
+
+`<leader>` is `Ctrl+F`, with `F12` as a second leader for when your outer
+tmux already owns `C-a`. Pressing it arms friring and paints a which-key
+overlay listing every command reachable from it; the next key runs one.
+`<leader> 1`–`9` jumps to that session in the list's rendered order,
+`<leader> a` then a digit reaches the Nth *blocked* session, and
+`<leader> <leader>` sends the leader's own bytes to the focused agent.
+`Esc` or `Ctrl+C` cancels a pending leader without running anything.
+
+`[prefix] mode` in `settings.toml` chooses how much of dispatch it owns:
+`off` (no leader at all — `F12` goes back to the perf HUD), `both`
+(default — the leader *and* the direct chords below), or `prefix-only`
+(the leader only, which hands the whole `Ctrl+<letter>` namespace back to
+the agent CLI running in the pane). The leader chords, the mode, and the
+overlay delay are configurable — see [docs/CONFIG.md](docs/CONFIG.md)
+(`[prefix]`) and [docs/FEATURES.md](docs/FEATURES.md) (The leader key).
+
 ### Global Keys
 
 | Key | Action | Mnemonic |
@@ -724,7 +742,7 @@ repos? Add `--add-repo PATH@main` (its own worktree per repo) or
 | `F1` / `Ctrl+G` | Keybindings help + interactive editor | Universal |
 | `Ctrl+B` / `F2` | Toggle info panel | **B**rief |
 | `Ctrl+E` / `F3` | Toggle file viewer | **E**xplorer |
-| `F12` | Toggle perf HUD (live counters + frame/tick timing) | Diagnostics |
+| `<leader> m` | Toggle perf HUD (live counters + frame/tick timing) | **M**etrics |
 
 Every chord above is rebindable from the `F1` editor (or by editing
 `~/.config/friring/keybindings.json`). `Shift+J`/`Shift+K`/`Shift+S`

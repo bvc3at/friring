@@ -16,7 +16,7 @@ development checkout never touches your real setup.
 |------|--------|-----------|------|---------|
 | `~/.config/friring/agents.toml` | TOML | you | **live** (mtime poll) | coding-agent CLI definitions |
 | `~/.config/friring/hosts.toml` | TOML | you | startup | remote SSH hosts + local WSL distros |
-| `~/.config/friring/settings.toml` | TOML | you + `Ctrl+,` panel | **live** (feature flags) / startup (rest) | tuning knobs + feature flags |
+| `~/.config/friring/settings.toml` | TOML | you + `Ctrl+,` panel | **live** (feature flags, `[prefix]`) / startup (rest) | tuning knobs + feature flags |
 | `~/.config/friring/themes.toml` | TOML | you | startup | custom theme palettes |
 | `~/.config/friring/keybindings.json` | JSON | F1 editor (or you) | **live** (mtime poll) | key chord overrides |
 | `~/.config/friring/extensions/<name>.toml` | TOML | `friring-cli extension install` | startup + tick | extension manifests (self-healed resources) |
@@ -27,8 +27,9 @@ development checkout never touches your real setup.
 the TUI polls their mtime (~1/s) and applies edits with a confirmation
 toast — no restart. For `settings.toml` only the **feature flags that
 gate UI panels** (`tasks`, `file_viewer`, `info_panel`, `global_search`,
-`shell_pane`, `code_review`, `cc_activity`, `perf_hud`, `soft_delete`)
-and `info_panel_position`
+`shell_pane`, `code_review`, `cc_activity`, `perf_hud`, `soft_delete`),
+`info_panel_position`, and the [`[prefix]`](#prefix--the-leader-key)
+leader-key table
 apply live; the restart-only values stay published through a write-once
 global (so they can't drift mid-frame),
 and the reload toast says when a restart is needed. `hosts.toml` (SSH
@@ -37,14 +38,15 @@ backends register at startup) and `themes.toml` need a restart.
 `settings.toml` can also be edited from the TUI: **`Ctrl+,`** (alt `F6`)
 opens a **Settings panel** listing every knob. It writes the file back
 **preserving its comments**, and feature flags that gate UI panels (plus
-`info_panel_position`) apply **live** on save; the rest (`mouse`,
+`info_panel_position` and `[prefix]`) apply **live** on save; the rest (`mouse`,
 `notifications`, `automations`, `version_check`, `auto_update`, the four
 editable `[notifications]` knobs, and the numeric scalars) take effect on
 the next launch — the panel marks those rows
 with `⟳` and toasts a restart note. The panel exposes only the four
 editable notification knobs (`also_on_waiting`, `suppress_for_active`,
-`sound`, `min_interval_secs`); `[notifications] backend` is **not** in
-the panel — set it only by hand-editing `settings.toml`. Hand-editing
+`sound`, `min_interval_secs`); `[notifications] backend` and the
+`[prefix]` leader-key fields are **not** panel rows — set those only by
+hand-editing `settings.toml` (they still apply live). Hand-editing
 the file (or the panel in another instance) is picked up the same way,
 via the live mtime poll.
 
@@ -427,6 +429,12 @@ min_interval_secs   = 5        # per-session floor between notifications
 [review]
 handoff       = "structured"   # review handoff shape: structured | legacy
 nudge_on_idle = true           # toast a re-review nudge when the agent goes idle
+
+[prefix]
+mode          = "both"         # leader key: off | both | prefix-only
+key           = "ctrl+f"       # the leader
+key2          = "f12"          # second leader ("" disables, freeing F12)
+hint_delay_ms = 0              # 0 = show the which-key overlay immediately
 ```
 
 ### `[features]` — whole-feature switches
@@ -453,7 +461,7 @@ no results. Data is never touched, so re-enabling a flag is lossless.
 | `shell_pane` | `true` | per-session shell toggle (`Ctrl+T`) |
 | `code_review` | `true` | native code-review view (diff + comments, `Ctrl+X`) |
 | `cc_activity` | `true` | agent activity view (`F9`): per-session retrospective (commands / edits / reads / web / subagents) across supported agent CLIs, incl. the Claude workflow/subagent tree + conversation import; local sessions only (see `FORK.md`) |
-| `perf_hud` | `true` | perf HUD overlay (`F12`): live perf counters + frame/tick timing (see `docs/PERFORMANCE.md`) |
+| `perf_hud` | `true` | perf HUD overlay (`<leader> m`, or `F12` when `[prefix] mode = "off"`): live perf counters + frame/tick timing (see `docs/PERFORMANCE.md`) |
 | `mouse` | `true` | mouse capture: clicks, wheel, drag-select, hover, scrollbars |
 | `notifications` | `true` | OS desktop notifications when a session needs attention |
 | `soft_delete` | `true` | TUI `Ctrl+D` soft-deletes (Ctrl+Z undo); off = hard delete after a confirmation prompt |
@@ -611,6 +619,36 @@ are marked `(line was removed)`). `legacy` reproduces the original format
 (`"Please address the following code review:"` prefix, `## <path>` sections
 with `- **[Class]** (side:line)` bullets, `## Summary`) byte-for-byte, for
 agent prompts/workflows that depend on it.
+
+### `[prefix]` — the leader key
+
+The tmux-style leader (see `docs/FEATURES.md` § The leader key). Applies
+**live** on panel save or file reload.
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `mode` | `"both"` | `off` (no leader — pre-leader behaviour, `F12` is the perf HUD again) \| `both` (direct chords *and* the leader) \| `prefix-only` (direct **global** chords disabled, handing every bare `Ctrl+<letter>` back to the agent CLI; pane-scoped keys still work) |
+| `key` | `"ctrl+f"` | the leader chord, in `keybindings.json` notation |
+| `key2` | `"f12"` | second leader, tmux's `prefix2`. Set to `""` to disable — which also gives `F12` back to the perf HUD |
+| `hint_delay_ms` | `0` | delay before the which-key overlay appears. `0` shows it immediately; raise it only if you know the table by heart, since the overlay *is* the leader's discoverability |
+
+`key2` defaults to `F12` for two reasons: it is layout-independent (chords like
+`Ctrl+\` or `Ctrl+]` need AltGr on DE/FR/Nordic keyboards), and it survives an
+**outer** tmux that has claimed `Ctrl+A` — the one real cost of the default
+leader. The trade is that `F12` no longer toggles the perf HUD while the leader
+is on; that moved to `<leader> m`. Set `key2 = ""` to reverse it.
+
+friring **warns at startup** if `key` or `key2` is set to a chord that is
+likely to fail or surprise — `ctrl+b` (an outer tmux eats it), `ctrl+a` (screen's
+prefix, and beginning-of-line in every agent CLI), `ctrl+c`/`ctrl+d` (reserved
+and unrebindable in Claude Code and Codex), `ctrl+z` (SIGTSTP), `ctrl+q`
+(XON, a `Cmd+Q` near-miss on macOS, and it kills the terminal in WSL), or
+`ctrl+s` (XOFF). These are warnings, never errors: your config wins, and the
+warning is silent when `mode = "off"`.
+
+Both leaders accept the same chord syntax as
+[`keybindings.json`](#keybindingsjson). An unparseable entry is skipped rather
+than fatal, so a typo in `key` still leaves you `key2` to get in with.
 
 ## Session status
 

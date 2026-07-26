@@ -819,6 +819,16 @@ pub struct App {
     /// global like [`Self::features`] so they apply live and tests can flip
     /// them without touching the first-writer-wins global.
     pub(crate) review_settings: crate::session::settings::ReviewSettings,
+    /// Leader-key settings (`[prefix]` in settings.toml) — copied out of the
+    /// global like [`Self::features`] so the settings panel applies them live
+    /// and tests can switch modes without touching the process-wide global.
+    pub(crate) prefix_settings: crate::session::settings::PrefixSettings,
+    /// Whether the leader is armed (see [`PrefixState`]).
+    pub(crate) prefix_state: PrefixState,
+    /// Whether the redraw for `prefix.hint_delay_ms` elapsing was already
+    /// requested. The armed state never times out, so without this latch the
+    /// tick would re-request a frame forever (see [`Self::tick_prefix_hint`]).
+    prefix_hint_redraw_requested: bool,
     pub(crate) show_info_panel: bool,
     /// Last content-area size pushed to the session PTYs. The `auto` info-pane
     /// dock can move between the left column and its own column when content
@@ -1088,6 +1098,60 @@ const WORKING_OUTPUT_STALE_MS: u64 = 10_000;
 /// immediate. See [`App::jump_overlay_blocked_only`] / [`App::set_alt_held`].
 const JUMP_OVERLAY_DELAY_MS: u64 = 150;
 
+/// Whether the leader key is armed, and since when.
+///
+/// Deliberately **has no timeout**. tmux waits indefinitely after its prefix;
+/// WezTerm expires its LEADER after 1s and opencode after 2s, which over SSH
+/// (friring's normal deployment) turns "I pressed the leader then paused to
+/// read the overlay" into "my keystroke went to the agent". The armed state
+/// ends only on a key press — a bound key, a cancel, or an unbound key that
+/// reports and disarms. See `App::handle_prefix_key`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefixState {
+    /// No leader pending; keys dispatch normally.
+    Idle,
+    /// `<leader> K` / `<leader> J` was pressed and we are waiting for the
+    /// digit that says *how far* to move the active session. A second-level
+    /// pending state rather than an action, because the digit is an argument.
+    AwaitingMove {
+        /// Toward the top of the list (`K`) rather than the bottom (`J`).
+        up: bool,
+    },
+    /// The leader was pressed; the next key resolves against the leader table.
+    /// Carries the arm time so the which-key overlay can honour
+    /// `prefix.hint_delay_ms` (0 = show immediately, the default), and the
+    /// chord that armed it so the overlay titles itself with the key the user
+    /// actually pressed rather than always the primary.
+    Armed {
+        since: std::time::Instant,
+        chord: crate::session::KeyChord,
+    },
+}
+
+impl PrefixState {
+    pub(crate) fn is_armed(self) -> bool {
+        matches!(self, PrefixState::Armed { .. })
+    }
+}
+
+/// How the session list numbers its rows this frame.
+///
+/// The digits are an *argument* to whatever gesture is pending, so the
+/// numbering has to follow the gesture rather than being one fixed scheme:
+/// after `<leader>` a digit picks a session, after `<leader> K` the same digit
+/// means "this many rows up". Painting the wrong scheme would be worse than
+/// painting none — the user would move a session they meant to jump to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JumpNumbering {
+    /// Every session, numbered from the top (Alt held, or an armed leader).
+    All,
+    /// Only `Blocked` sessions (`Alt+A` / `<leader> a`).
+    Blocked,
+    /// Rows in one direction from `from`, numbered by *distance* — so the row
+    /// labelled `3` is where `<leader> K 3` lands the session.
+    MoveDistance { from: usize, up: bool },
+}
+
 /// Map a session's persisted hook state to its rendered [`SessionStatus`]. Pure
 /// so it's unit-testable without an `App`/DB. `exited` forces `Idle` (a crashed/
 /// finished process); `just_seen` is `true` when the user just moved focus off a
@@ -1232,6 +1296,9 @@ impl App {
             features: crate::session::settings::global().features,
             info_panel_position: crate::session::settings::global().info_panel_position,
             review_settings: crate::session::settings::global().review,
+            prefix_settings: crate::session::settings::global().prefix.clone(),
+            prefix_state: PrefixState::Idle,
+            prefix_hint_redraw_requested: false,
             show_info_panel: false,
             last_content_size: None,
             show_tasks_panel: false,
@@ -1420,6 +1487,17 @@ impl App {
         self.features = settings.features;
         self.info_panel_position = settings.info_panel_position;
         self.review_settings = settings.review;
+        let old_leaders = self.prefix_settings.chords();
+        self.prefix_settings = settings.prefix.clone();
+        // A leader set that changed — rebound, or emptied by `mode = off` —
+        // must not leave the old armed state behind. Armed against the *new*
+        // leader, `handle_prefix_key` would read its first press as
+        // `<leader> <leader>` and send its bytes to the agent; emptied, no key
+        // could clear the overlay and the footer badge at all.
+        if old_leaders != self.prefix_settings.chords() {
+            self.prefix_state = PrefixState::Idle;
+            self.prefix_hint_redraw_requested = false;
+        }
         self.enforce_feature_visibility();
         self.resize_sessions_to_content_area();
     }
@@ -2393,6 +2471,7 @@ impl App {
             features: self.features,
             info_panel_position: self.info_panel_position,
             review: self.review_settings,
+            prefix: self.prefix_settings.clone(),
             ..crate::session::settings::global().clone()
         };
         self.modal = modals::Modal::Settings(modals::SettingsModal::new(draft));
@@ -4653,19 +4732,106 @@ impl App {
     }
 
     /// Which jump overlay the session list should paint this frame:
-    /// `Some(true)` = blocked-only numbering (`Alt+A`), `Some(false)` = all
-    /// sessions (Alt held past the delay), `None` = no overlay.
+    /// `Some(true)` = blocked-only numbering (`Alt+A`, or `<leader> a`),
+    /// `Some(false)` = all sessions (Alt held past the delay, or an armed
+    /// leader), `None` = no overlay.
+    ///
+    /// The armed leader paints the same numbers as the Alt-hold: `<leader> 1`
+    /// is otherwise a documentation-only route, and a which-key row reading
+    /// "go to session N" is useless without knowing which N is which.
     pub(crate) fn jump_overlay_blocked_only(&self) -> Option<bool> {
+        match self.jump_numbering()? {
+            JumpNumbering::Blocked => Some(true),
+            JumpNumbering::All => Some(false),
+            JumpNumbering::MoveDistance { .. } => None,
+        }
+    }
+
+    /// The numbering scheme the session list should paint this frame, if any.
+    /// See [`JumpNumbering`] for why this follows the pending gesture.
+    pub(crate) fn jump_numbering(&self) -> Option<JumpNumbering> {
+        if let PrefixState::AwaitingMove { up } = self.prefix_state {
+            return Some(JumpNumbering::MoveDistance {
+                from: self.active_index,
+                up,
+            });
+        }
         if self.blocked_jump.is_some() {
-            return Some(true);
+            return Some(JumpNumbering::Blocked);
+        }
+        if self.prefix_state.is_armed() {
+            return Some(JumpNumbering::All);
         }
         let delay_elapsed = self
             .alt_held_since
             .is_some_and(|t| t.elapsed().as_millis() as u64 >= JUMP_OVERLAY_DELAY_MS);
         if self.alt_held && delay_elapsed {
-            return Some(false);
+            return Some(JumpNumbering::All);
         }
         None
+    }
+
+    /// Move the active session `distance` places toward the top (`up`) or
+    /// bottom of the rendered order, shifting the sessions it passes rather
+    /// than swapping with one. Clamps at the ends: asking to move further than
+    /// the list allows lands it first/last rather than reporting an error,
+    /// which is what a user typing a generous digit means.
+    pub(crate) fn move_active_session_by(&mut self, distance: usize, up: bool) {
+        if distance == 0 || self.sessions.is_empty() {
+            return;
+        }
+        let order = self.render_order_indices();
+        let Some(pos) = order.iter().position(|&i| i == self.active_index) else {
+            return;
+        };
+        let target = if up {
+            pos.saturating_sub(distance)
+        } else {
+            (pos + distance).min(order.len() - 1)
+        };
+        if target == pos {
+            self.set_status(
+                StatusLevel::Info,
+                format!("Already at the {}", if up { "top" } else { "bottom" }),
+            );
+            return;
+        }
+        // Reuse the single-step reorder so grouping/nesting rules stay in one
+        // place: repeating it is O(distance) on a list capped at 9 moves.
+        let steps = pos.abs_diff(target);
+        for _ in 0..steps {
+            self.move_active_session(!up);
+        }
+    }
+
+    /// The leader chord to title the which-key overlay with, or `None` when
+    /// the overlay should stay hidden — either the leader isn't armed, or
+    /// `prefix.hint_delay_ms` hasn't elapsed yet (it defaults to 0, so the
+    /// overlay is normally immediate).
+    pub(crate) fn prefix_hint_chord(&self) -> Option<crate::session::KeyChord> {
+        let PrefixState::Armed { since, chord } = self.prefix_state else {
+            return None;
+        };
+        let delay = self.prefix_settings.hint_delay_ms;
+        if delay > 0 && clock::elapsed_since(since) < std::time::Duration::from_millis(delay) {
+            return None;
+        }
+        Some(chord)
+    }
+
+    /// Tick hook for a *non-zero* `hint_delay_ms`: like the Alt-hold overlay,
+    /// the which-key box then appears on a timer rather than an input event,
+    /// so nothing else would mark the frame dirty while the user waits. A zero
+    /// delay (the default) paints on the arming keypress and never reaches here.
+    fn tick_prefix_hint(&mut self) {
+        if self.prefix_state.is_armed()
+            && self.prefix_settings.hint_delay_ms > 0
+            && !self.prefix_hint_redraw_requested
+            && self.prefix_hint_chord().is_some()
+        {
+            self.prefix_hint_redraw_requested = true;
+            self.request_redraw();
+        }
     }
 
     /// Tick hook: the Alt-hold overlay appears on a *timer*, not an input
@@ -4882,6 +5048,7 @@ impl App {
         self.metrics.tick_count = self.metrics.tick_count.wrapping_add(1);
 
         self.tick_jump_overlay();
+        self.tick_prefix_hint();
 
         self.tick_global_search_content();
         self.poll_global_search_file_index();
@@ -9057,6 +9224,79 @@ mod tests {
         assert!(app.captured_clipboard.as_ref().unwrap().is_empty());
     }
 
+    /// An `App` with one session, focused terminal, plus the receiving end of
+    /// that session's PTY input channel — the seam for asserting exactly which
+    /// bytes a key does (or doesn't) forward to the agent.
+    fn app_with_pty_input_rx() -> (App, tokio::sync::mpsc::Receiver<Vec<u8>>) {
+        let backend_arc = stub_backend_arc();
+        let provider = stub_provider();
+        let mut app = App::new(
+            24,
+            120,
+            BackendRegistry::new(backend_arc.clone()),
+            stub_agents(),
+            test_db(),
+        );
+        let (session, input_rx) = Session::stub_with_input_rx("s", &backend_arc, &provider);
+        app.sessions.push(session);
+        app.active_index = 0;
+        app.focus = InputFocus::Terminal;
+        (app, input_rx)
+    }
+
+    /// tmux's `send-prefix`: `<leader> <leader>` hands the leader's own bytes
+    /// to the agent, without which the chord would be permanently unreachable
+    /// by the CLI running inside the pane.
+    #[test]
+    fn leader_twice_sends_the_leader_byte_to_the_pty() {
+        let (mut app, mut input_rx) = app_with_pty_input_rx();
+
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(app.prefix_state.is_armed());
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            input_rx.try_recv().ok(),
+            Some(vec![0x06]),
+            "the second leader press reaches the agent as Ctrl+F"
+        );
+        assert!(!app.prefix_state.is_armed(), "and it disarms");
+    }
+
+    /// A mistyped leader sequence must be swallowed, not injected: an unbound
+    /// key after the leader reports instead of typing into the agent's prompt.
+    #[test]
+    fn leader_then_unbound_key_sends_nothing_to_the_pty() {
+        use tokio::sync::mpsc::error::TryRecvError;
+        let (mut app, mut input_rx) = app_with_pty_input_rx();
+
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        app.handle_key(KeyCode::Char('§'), KeyModifiers::NONE);
+
+        assert!(
+            matches!(input_rx.try_recv(), Err(TryRecvError::Empty)),
+            "an unbound leader key must not reach the PTY"
+        );
+        assert!(!app.prefix_state.is_armed());
+    }
+
+    /// The point of `prefix-only`: a global chord no longer dispatches, so its
+    /// bytes go where the agent CLI can use them.
+    #[test]
+    fn prefix_only_lets_a_blocked_global_chord_reach_the_pty() {
+        let (mut app, mut input_rx) = app_with_pty_input_rx();
+        app.prefix_settings.mode = crate::session::PrefixMode::PrefixOnly;
+
+        app.handle_key(KeyCode::Char('b'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            input_rx.try_recv().ok(),
+            Some(vec![0x02]),
+            "Ctrl+B reaches the agent instead of toggling a panel"
+        );
+        assert!(!app.show_info_panel);
+    }
+
     /// Inside a modal text input, readline `Ctrl+W` (delete word) and `Ctrl+U`
     /// (kill to line start) edit the text like a terminal — and never insert a
     /// literal `w`/`u`, nor fire the global `FocusTasks`/`OpenRestoreSessions`
@@ -12242,6 +12482,35 @@ mod tests {
         assert_eq!(app.jump_overlay_blocked_only(), Some(false));
         app.update(AppMessage::AltHeld(false));
         assert_eq!(app.jump_overlay_blocked_only(), None);
+    }
+
+    /// A delayed which-key overlay costs exactly one frame. The armed state
+    /// never times out, so a tick that kept re-requesting would pin the app at
+    /// the event loop's 10 ms poll rate for as long as the leader stays armed.
+    #[test]
+    fn delayed_which_key_hint_requests_one_redraw_not_one_per_tick() {
+        let mut app = app_with_sessions(1);
+        app.prefix_settings.hint_delay_ms = 500;
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        assert!(app.prefix_state.is_armed(), "Ctrl+F arms the leader");
+        app.mark_redrawn();
+
+        app.tick_prefix_hint();
+        assert!(!app.should_redraw(), "nothing to paint before the delay");
+
+        clock::advance(std::time::Duration::from_millis(501));
+        app.tick_prefix_hint();
+        assert!(
+            app.should_redraw(),
+            "the overlay's first frame is requested"
+        );
+
+        app.mark_redrawn();
+        app.tick_prefix_hint();
+        assert!(
+            !app.should_redraw(),
+            "an armed leader must not request a frame every tick"
+        );
     }
 
     #[test]

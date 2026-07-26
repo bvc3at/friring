@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use super::keybindings::{KeyChord, PrefixMode};
+
 /// Settings loaded from `settings.toml`. Every field has a default, so
 /// an absent file (the common case) behaves exactly like before the file
 /// existed. Unknown keys are tolerated but reported: the loader names every
@@ -51,6 +53,10 @@ pub struct Settings {
     /// (structured handoff, idle nudge on).
     #[serde(default)]
     pub review: ReviewSettings,
+    /// Leader-key settings (`[prefix]` table). Absent table = `Ctrl+F` leader
+    /// alongside the direct chords, `F12` as the second leader.
+    #[serde(default)]
+    pub prefix: PrefixSettings,
 }
 
 /// Whole-feature switches (`[features]` in settings.toml). Each flag hides the
@@ -94,8 +100,10 @@ pub struct FeatureFlags {
     /// compatibility with the view's Claude-only v1.
     #[serde(default = "default_true")]
     pub cc_activity: bool,
-    /// Perf HUD overlay (F12): live perf counters + frame/tick timing. Opening
-    /// it also turns on wall-clock timing collection (see docs/PERFORMANCE.md).
+    /// Perf HUD overlay — `<leader> m`, or `F12` when `[prefix] mode = "off"`
+    /// (with the leader on, `F12` is the second leader). Live perf counters +
+    /// frame/tick timing; opening it also turns on wall-clock timing
+    /// collection (see docs/PERFORMANCE.md).
     #[serde(default = "default_true")]
     pub perf_hud: bool,
     /// Mouse support: terminal mouse capture plus all click/scroll/hover
@@ -260,6 +268,159 @@ impl Default for ReviewSettings {
     }
 }
 
+/// Leader-key settings (`[prefix]` table). All fields have defaults so an
+/// absent table gives the shipped behaviour: `Ctrl+F` as leader with `F12` as
+/// the second leader, alongside the direct chords.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrefixSettings {
+    /// Whether the leader is live, and whether direct chords still dispatch.
+    #[serde(default)]
+    pub mode: PrefixMode,
+    /// The leader chord.
+    ///
+    /// `Ctrl+F` is chosen for one property no other candidate has: **every
+    /// program that claims it, claims it for something that already has a
+    /// non-`Ctrl` route.** Claude Code leaves it unbound entirely; Codex,
+    /// aider and opencode bind it only to cursor-right, co-bound to `→`. That
+    /// makes it the cheapest collision available — unlike `Ctrl+R`
+    /// (reverse-i-search, no alternative), `Ctrl+C`/`Ctrl+D` (reserved and
+    /// unrebindable in both major agents), or `Ctrl+G` (external editor in
+    /// Claude Code *and* Codex).
+    ///
+    /// It also survives the constraints that eliminate the obvious
+    /// alternatives: `f` is the left-index home key on QWERTY, QWERTZ, AZERTY
+    /// and Nordic alike (`Ctrl+\`, `Ctrl+]`, `Ctrl+^` need AltGr or a dead key
+    /// on German/French/Nordic); byte `0x06` is plain C0, so it needs no
+    /// kitty-protocol negotiation through terminal → ssh → tmux; and a slip to
+    /// `Cmd+F` opens a find bar rather than quitting the terminal, which is
+    /// what rules out `Ctrl+Q` next to `Cmd+Q`.
+    ///
+    /// No multiplexer has ever claimed it, so there is no ambiguity about
+    /// which layer answered when friring is nested inside a `C-a`/`C-b` tmux.
+    /// The cost is that `Ctrl+F` reads as "find" to most people — hence
+    /// `<leader> /` for search — and that vim/less page-forward is shadowed
+    /// inside a pane, which `<leader> <leader>` exists to recover.
+    #[serde(default = "default_prefix_key")]
+    pub key: String,
+    /// Second leader, tmux's `prefix2`. `F12` by default because it is
+    /// layout-independent (`Ctrl+\`/`Ctrl+]`-style chords need AltGr on
+    /// DE/FR/Nordic keyboards) and survives an outer tmux that has claimed the
+    /// primary. Set to `""` to disable — which also gives `F12` back to the
+    /// perf HUD. Only consulted when [`mode`](Self::mode) is not `off`.
+    #[serde(default = "default_prefix_key2")]
+    pub key2: String,
+    /// Delay in ms before the which-key overlay appears once the leader is
+    /// armed. `0` (the default) shows it immediately: the overlay *is* the
+    /// feature's discoverability, and a delay only hides it from the users who
+    /// need it. Raise it if you know the table by heart and want a quiet
+    /// screen while typing a chord quickly.
+    #[serde(default)]
+    pub hint_delay_ms: u64,
+}
+
+fn default_prefix_key() -> String {
+    "ctrl+f".into()
+}
+
+fn default_prefix_key2() -> String {
+    "f12".into()
+}
+
+impl Default for PrefixSettings {
+    fn default() -> Self {
+        Self {
+            mode: PrefixMode::default(),
+            key: default_prefix_key(),
+            key2: default_prefix_key2(),
+            hint_delay_ms: 0,
+        }
+    }
+}
+
+/// Leader chords that are a bad idea, and why — reported at config load so a
+/// user learns *before* the key silently fails to arrive, rather than by
+/// filing a bug. Mirrors what Claude Code does for its own keybindings, which
+/// validates against multiplexer conflicts and warns.
+///
+/// These are warnings, never errors: the user's config wins. Someone who has
+/// deliberately unbound their outer tmux prefix is entitled to `Ctrl+B`.
+const RISKY_PREFIX_CHORDS: &[(&str, &str)] = &[
+    (
+        "ctrl+b",
+        "tmux's default prefix — an outer tmux consumes it before friring sees it",
+    ),
+    (
+        "ctrl+a",
+        "GNU screen's prefix, the most common tmux rebind, and beginning-of-line \
+         in every agent CLI",
+    ),
+    (
+        "ctrl+c",
+        "SIGINT, and reserved/unrebindable in Claude Code and Codex",
+    ),
+    (
+        "ctrl+d",
+        "EOF, and reserved/unrebindable in Claude Code and Codex",
+    ),
+    ("ctrl+z", "SIGTSTP — the shell suspends friring instead"),
+    (
+        "ctrl+q",
+        "XON flow control, a near-miss for Cmd+Q (quit) on macOS, and it kills \
+         the terminal in WSL",
+    ),
+    (
+        "ctrl+s",
+        "XOFF flow control — freezes output when a layer of the stack is not in raw mode",
+    ),
+];
+
+impl PrefixSettings {
+    /// Config-load warnings for a leader chord the user is likely to regret.
+    /// Empty for the shipped defaults.
+    pub fn warnings(&self) -> Vec<String> {
+        if !self.mode.prefix_enabled() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (field, raw) in [("key", &self.key), ("key2", &self.key2)] {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Some(chord) = KeyChord::parse(trimmed) else {
+                out.push(format!(
+                    "settings.toml: [prefix] {field} = \"{trimmed}\" is not a valid chord; ignored"
+                ));
+                continue;
+            };
+            let canonical = chord.display();
+            if let Some((_, why)) = RISKY_PREFIX_CHORDS
+                .iter()
+                .find(|(risky, _)| *risky == canonical)
+            {
+                out.push(format!(
+                    "settings.toml: [prefix] {field} = \"{canonical}\" — {why}"
+                ));
+            }
+        }
+        out
+    }
+
+    /// The parsed leader chords, primary first, skipping unset/unparseable
+    /// entries. Empty when the mode is `off` — callers can treat "no leader
+    /// chords" as "the leader is not live" without also checking the mode.
+    pub fn chords(&self) -> Vec<KeyChord> {
+        if !self.mode.prefix_enabled() {
+            return Vec::new();
+        }
+        [&self.key, &self.key2]
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .filter_map(|s| KeyChord::parse(s))
+            .collect()
+    }
+}
+
 fn default_notification_min_interval_secs() -> u64 {
     5
 }
@@ -356,6 +517,7 @@ impl Default for Settings {
             features: FeatureFlags::default(),
             notifications: NotificationSettings::default(),
             review: ReviewSettings::default(),
+            prefix: PrefixSettings::default(),
         }
     }
 }
@@ -386,6 +548,88 @@ mod tests {
         assert_eq!(s.two_panel_min_cols, 80);
         assert_eq!(s.three_panel_min_cols, 120);
         assert_eq!(s.audit_retention_days, 90);
+    }
+
+    #[test]
+    fn prefix_defaults_to_ctrl_f_plus_f12_alongside_direct_chords() {
+        let s: Settings = toml::from_str("").unwrap();
+        assert_eq!(s.prefix.mode, PrefixMode::Both);
+        assert_eq!(s.prefix.hint_delay_ms, 0, "the overlay is the feature");
+        assert_eq!(
+            s.prefix.chords(),
+            vec![KeyChord::ctrl('f'), KeyChord::function(12)]
+        );
+    }
+
+    #[test]
+    fn prefix_mode_parses_kebab_case_and_off_disables_both_leaders() {
+        let s: Settings = toml::from_str("[prefix]\nmode = \"prefix-only\"").unwrap();
+        assert_eq!(s.prefix.mode, PrefixMode::PrefixOnly);
+        assert!(
+            !s.prefix.mode.direct_enabled(),
+            "Ctrl goes back to the agent"
+        );
+
+        let off: Settings = toml::from_str("[prefix]\nmode = \"off\"").unwrap();
+        // `off` means no leader at all — including `key2`, which is what gives
+        // F12 back to the perf HUD.
+        assert!(off.prefix.chords().is_empty());
+    }
+
+    #[test]
+    fn shipped_prefix_defaults_warn_about_nothing() {
+        assert!(PrefixSettings::default().warnings().is_empty());
+    }
+
+    #[test]
+    fn risky_prefix_rebinds_are_reported_by_name() {
+        let s: Settings = toml::from_str("[prefix]\nkey = \"ctrl+b\"").unwrap();
+        let w = s.prefix.warnings();
+        assert_eq!(w.len(), 1, "got: {w:?}");
+        assert!(w[0].contains("ctrl+b") && w[0].contains("tmux"), "{}", w[0]);
+
+        // Both slots are checked, and the chord is canonicalised first so
+        // `CTRL+Z` and `ctrl+z` warn identically.
+        let s: Settings = toml::from_str("[prefix]\nkey = \"ctrl+f\"\nkey2 = \"CTRL+Z\"").unwrap();
+        let w = s.prefix.warnings();
+        assert_eq!(w.len(), 1, "got: {w:?}");
+        assert!(
+            w[0].contains("key2") && w[0].contains("SIGTSTP"),
+            "{}",
+            w[0]
+        );
+    }
+
+    #[test]
+    fn an_unparseable_prefix_chord_warns_rather_than_failing_silently() {
+        let s: Settings = toml::from_str("[prefix]\nkey = \"ctrl+nonsense\"").unwrap();
+        let w = s.prefix.warnings();
+        assert_eq!(w.len(), 1, "got: {w:?}");
+        assert!(w[0].contains("not a valid chord"), "{}", w[0]);
+    }
+
+    /// `mode = "off"` means the chords are inert, so warning about them would
+    /// be noise.
+    #[test]
+    fn prefix_warnings_are_silent_when_the_leader_is_off() {
+        let s: Settings = toml::from_str("[prefix]\nmode = \"off\"\nkey = \"ctrl+b\"").unwrap();
+        assert!(s.prefix.warnings().is_empty());
+    }
+
+    #[test]
+    fn empty_prefix_key2_drops_the_second_leader() {
+        let s: Settings = toml::from_str("[prefix]\nkey2 = \"\"").unwrap();
+        assert_eq!(s.prefix.chords(), vec![KeyChord::ctrl('f')]);
+    }
+
+    #[test]
+    fn unparseable_prefix_key_is_skipped_not_fatal() {
+        let s: Settings = toml::from_str("[prefix]\nkey = \"ctrl+nonsense\"").unwrap();
+        assert_eq!(
+            s.prefix.chords(),
+            vec![KeyChord::function(12)],
+            "a typo in the primary must still leave the user a way in"
+        );
     }
 
     #[test]

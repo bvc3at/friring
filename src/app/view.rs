@@ -12,6 +12,7 @@ use ratatui::{
     Frame,
 };
 
+use crate::app::PrefixState;
 use crate::session::{KeyBindings, KeyChord, SessionInfo};
 use crate::ui::selection;
 use crate::ui::theme::Theme;
@@ -128,6 +129,12 @@ impl App {
                     session_count: self.sessions.len(),
                 },
             );
+        }
+        // Above the perf HUD: while the leader is armed the which-key table is
+        // the only thing the next keystroke can act on, so nothing should
+        // obscure it.
+        if let Some(leader) = self.prefix_hint_chord() {
+            crate::ui::prefix_overlay::render_prefix_overlay(frame, frame.area(), &leader);
         }
         self.repaint_theme_background(frame);
         self.apply_hover_highlight(frame);
@@ -321,9 +328,36 @@ impl App {
         // rows. Must stay consistent with `App::session_jump_targets` — same
         // order, same predicate — so the painted digit is the one a keypress
         // jumps to.
-        let jump_digits: Vec<Option<char>> = match self.jump_overlay_blocked_only() {
+        let jump_digits: Vec<Option<char>> = match self.jump_numbering() {
             None => vec![None; ordered.sessions.len()],
-            Some(blocked_only) => {
+            // Distance numbering for a pending move: rows are counted outward
+            // from the active session in the move direction, so the row
+            // labelled `3` is exactly where `<leader> K 3` lands it.
+            Some(crate::app::JumpNumbering::MoveDistance { from, up }) => {
+                let anchor = ordered.sessions.iter().position(|info| {
+                    self.sessions
+                        .get(from)
+                        .is_some_and(|s| s.info.id == info.id)
+                });
+                ordered
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        let anchor = anchor?;
+                        let d = if up {
+                            anchor.checked_sub(i)?
+                        } else {
+                            i.checked_sub(anchor)?
+                        };
+                        (1..=9)
+                            .contains(&d)
+                            .then(|| char::from_digit(d as u32, 10))?
+                    })
+                    .collect()
+            }
+            Some(numbering) => {
+                let blocked_only = numbering == crate::app::JumpNumbering::Blocked;
                 let mut n = 0u32;
                 ordered
                     .sessions
@@ -942,6 +976,16 @@ impl App {
             InputFocus::CcActivityTree => "Activity nav",
         };
         status_bar::FooterState {
+            prefix_armed: match self.prefix_state {
+                PrefixState::Armed { chord, .. } => Some(chord.display()),
+                // Name the pending argument, not the chord: "move up 1-9" says
+                // what the next keystroke does, which is the whole point of the
+                // badge in a state that paints no which-key overlay.
+                PrefixState::AwaitingMove { up } => {
+                    Some(if up { "move up 1-9" } else { "move down 1-9" }.to_string())
+                }
+                PrefixState::Idle => None,
+            },
             session_count: self.sessions.len(),
             blocked_count: self
                 .sessions

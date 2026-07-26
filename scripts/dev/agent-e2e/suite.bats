@@ -90,7 +90,7 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-restart-resume"
 }
 
-@test "e2e: Ctrl+F forks claude — parent link, sidebar nesting, forked conversation continues" {
+@test "e2e: <leader> f forks claude — parent link, sidebar nesting, forked conversation continues" {
     require_agent claude
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-fork"
 }
@@ -203,6 +203,11 @@ teardown() {
 @test "e2e: info panel, seeded keybinding override, F1 rebind persisting to keybindings.json" {
     require_agent scripted
     e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-info-keybind"
+}
+
+@test "e2e: leader key arms through nested tmux, dispatches, and never leaks to the PTY" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-leader-key"
 }
 
 @test "protocol: codex exec completes a stubbed text turn (no Friring)" {

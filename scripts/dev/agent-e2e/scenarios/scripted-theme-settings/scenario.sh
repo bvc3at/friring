@@ -7,14 +7,14 @@
 # [features] flags really gate chords (Ctrl+T refuses with a toast while
 # shell_pane = false); a *broken* settings.toml degrades to an ERROR toast
 # while the TUI keeps routing keys to the agent PTY (never-crash); and the
-# F12 perf HUD opens/closes as a pure overlay. The scripted agent keeps it
+# The <leader> m perf HUD opens/closes as a pure overlay. The scripted agent keeps it
 # hermetic — every settings.toml written here keeps notifications = false so
 # a test can never fire a real desktop banner.
 #
-# Test-mode only (writes config files mid-steps, uses F12); not demo-able.
+# Test-mode only (writes config files mid-steps, uses the leader); not demo-able.
 #
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
-SCENARIO_SUMMARY="Theme pick persists; settings.toml live-reload gates Ctrl+T; invalid TOML toasts, never crashes; F12 perf HUD toggles"
+SCENARIO_SUMMARY="Theme pick persists; settings.toml live-reload gates Ctrl+T; invalid TOML toasts, never crashes; <leader> m perf HUD toggles"
 SCENARIO_AGENT="scripted"
 
 # The exact file the scenario leaves behind — steps write it, the effects
@@ -68,9 +68,12 @@ scenario_steps() {
 
     # Perf HUD overlay on top of the agent view; closing is asserted (with a
     # bounded poll) in scenario_assert_ui — nothing new appears to wait on.
-    step_key F12
+    # `F12` is the second leader now, so the HUD is `<leader> m`.
+    step_key C-f
+    step_key m
     step_wait_pane "idle skips" 15
-    step_key F12
+    step_key C-f
+    step_key m
 }
 
 scenario_assert_effects() {
@@ -89,16 +92,16 @@ scenario_assert_effects() {
 }
 
 scenario_assert_ui() {
-    # The HUD close is one repaint away from the final F12; poll bounded
+    # The HUD close is one repaint away from the final <leader> m; poll bounded
     # instead of asserting a single racy frame.
     for _ in $(seq 1 30); do
         e2e_pane | grep -qF "idle skips" || break
         sleep 0.1
     done
     ! e2e_pane | grep -qF "idle skips" \
-        || e2e_die "perf HUD counters still rendered after second F12" || return 1
+        || e2e_die "perf HUD counters still rendered after the second <leader> m" || return 1
     ! e2e_pane | grep -qF " Perf " \
-        || e2e_die "perf HUD box still rendered after second F12" || return 1
+        || e2e_die "perf HUD box still rendered after the second <leader> m" || return 1
     # Back on the agent view (not the shell), with the picked theme badge up.
     assert_pane_contains " scripted ["
     assert_pane_contains "◐ Catppuccin Mocha"

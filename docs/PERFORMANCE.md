@@ -478,7 +478,7 @@ only** and never CI-asserted (the counters remain the sole regression gate):
   **deltas** for the window (`PerfCounters::delta`), frame/tick p50/p95/max,
   and the window's slow ops — then resets the per-window timing state. The
   one-shot `startup` line is unchanged.
-- **The perf HUD** (`src/ui/perf_hud.rs`, F12, `[features] perf_hud`): a
+- **The perf HUD** (`src/ui/perf_hud.rs`, `<leader> m`, `[features] perf_hud`): a
   floating, non-modal overlay with the same counters/percentiles/slow-ops,
   refreshed by the existing 250 ms forced-redraw floor.
 - **External inspection**: while timing is active the TUI also publishes a
@@ -652,7 +652,7 @@ appear until the next open) for a keystroke path with zero I/O.
 | Break down startup time | Read the `startup` phase fields (`config_init_ms`/`db_open_ms`/`theme_activate_ms`/`extension_heal_ms`/`app_new_ms`/`restore_ms`/`heartbeat_ms`) + the `restore_discover`/`restore_adopt` lines |
 | Watch steady-state cost | `FRIRING_PERF_LOG=1 friring`, read the `perf_window` lines (~10 s cadence: counter deltas + frame/tick percentiles + slow ops) |
 | Attribute an interactive stall | Look for `slow op` warnings in `friring.log` (named op + ms), or the slow-op list in `perf_window` |
-| Watch perf live in the TUI | Press `F12` (perf HUD overlay; `[features] perf_hud`) |
+| Watch perf live in the TUI | Press `<leader> m` (perf HUD overlay; `[features] perf_hud`) |
 | Inspect a running TUI from outside | `friring-cli perf` (needs FRIRING_PERF_LOG or an open HUD in that TUI) |
 | Verify the status-hook cache (ADR-P6) | `cargo nextest run -E 'test(perf_hook_states)'`; `hook_state_loads` stays flat while idle, +1 per external `session signal` |
 | See binary size | Check the `Binary Size` CI job summary, or `cargo bloat --release --crates` |

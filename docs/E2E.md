@@ -221,6 +221,15 @@ the strict-offline invariant doubles as proof the agent made zero model calls; `
 scripted` never skips (bash is always present), keeping the pure-UI scenarios green on any
 machine and in CI.
 
+That `GOT:` echo is what makes the keyboard scenarios meaningful rather than decorative. The
+leader-key scenario (`scripted-leader-key`) uses it to assert a *negative*: after a mistyped
+leader sequence the echoed line must be exactly the probe, proving the swallowed key never
+reached the agent's prompt. It is also the only place the leader chord is tested through the
+real transport — the acceptance tests drive `App::update` directly, so they prove the state
+machine but not that `Ctrl+F` (byte `0x06`) survives driver-tmux → friring → session-tmux.
+That distinction is not theoretical: opencode's `ctrl+x` leader is documented as arriving as a
+literal `^X` under tmux (sst/opencode#4097).
+
 ## Demo mode
 
 `run.sh --demo <scenario>` boots the *same* hermetic env + stub (env inheritance mirrors
