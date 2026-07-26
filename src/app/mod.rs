@@ -825,6 +825,10 @@ pub struct App {
     pub(crate) prefix_settings: crate::session::settings::PrefixSettings,
     /// Whether the leader is armed (see [`PrefixState`]).
     pub(crate) prefix_state: PrefixState,
+    /// Whether the redraw for `prefix.hint_delay_ms` elapsing was already
+    /// requested. The armed state never times out, so without this latch the
+    /// tick would re-request a frame forever (see [`Self::tick_prefix_hint`]).
+    prefix_hint_redraw_requested: bool,
     pub(crate) show_info_panel: bool,
     /// Last content-area size pushed to the session PTYs. The `auto` info-pane
     /// dock can move between the left column and its own column when content
@@ -1269,6 +1273,7 @@ impl App {
             review_settings: crate::session::settings::global().review,
             prefix_settings: crate::session::settings::global().prefix.clone(),
             prefix_state: PrefixState::Idle,
+            prefix_hint_redraw_requested: false,
             show_info_panel: false,
             last_content_size: None,
             show_tasks_panel: false,
@@ -1464,6 +1469,7 @@ impl App {
         // and the footer badge with no key able to clear it.
         if !self.prefix_settings.mode.prefix_enabled() {
             self.prefix_state = PrefixState::Idle;
+            self.prefix_hint_redraw_requested = false;
         }
         self.enforce_feature_visibility();
         self.resize_sessions_to_content_area();
@@ -4736,8 +4742,10 @@ impl App {
     fn tick_prefix_hint(&mut self) {
         if self.prefix_state.is_armed()
             && self.prefix_settings.hint_delay_ms > 0
+            && !self.prefix_hint_redraw_requested
             && self.prefix_hint_chord().is_some()
         {
+            self.prefix_hint_redraw_requested = true;
             self.request_redraw();
         }
     }
@@ -12317,6 +12325,35 @@ mod tests {
         assert_eq!(app.jump_overlay_blocked_only(), Some(false));
         app.update(AppMessage::AltHeld(false));
         assert_eq!(app.jump_overlay_blocked_only(), None);
+    }
+
+    /// A delayed which-key overlay costs exactly one frame. The armed state
+    /// never times out, so a tick that kept re-requesting would pin the app at
+    /// the event loop's 10 ms poll rate for as long as the leader stays armed.
+    #[test]
+    fn delayed_which_key_hint_requests_one_redraw_not_one_per_tick() {
+        let mut app = app_with_sessions(1);
+        app.prefix_settings.hint_delay_ms = 500;
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert!(app.prefix_state.is_armed(), "Ctrl+A arms the leader");
+        app.mark_redrawn();
+
+        app.tick_prefix_hint();
+        assert!(!app.should_redraw(), "nothing to paint before the delay");
+
+        clock::advance(std::time::Duration::from_millis(501));
+        app.tick_prefix_hint();
+        assert!(
+            app.should_redraw(),
+            "the overlay's first frame is requested"
+        );
+
+        app.mark_redrawn();
+        app.tick_prefix_hint();
+        assert!(
+            !app.should_redraw(),
+            "an armed leader must not request a frame every tick"
+        );
     }
 
     #[test]

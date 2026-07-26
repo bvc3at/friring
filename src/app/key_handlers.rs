@@ -355,6 +355,7 @@ impl App {
                     since: clock::now(),
                     chord: pressed,
                 };
+                self.prefix_hint_redraw_requested = false;
                 self.request_redraw();
                 return true;
             }
@@ -362,6 +363,7 @@ impl App {
         }
 
         self.prefix_state = super::PrefixState::Idle;
+        self.prefix_hint_redraw_requested = false;
         self.request_redraw();
 
         // `<leader> <leader>` → send the leader's own byte to the agent. The
