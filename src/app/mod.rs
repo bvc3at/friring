@@ -1457,6 +1457,14 @@ impl App {
         self.features = settings.features;
         self.info_panel_position = settings.info_panel_position;
         self.review_settings = settings.review;
+        self.prefix_settings = settings.prefix.clone();
+        // A reload that turns the leader off (or rebinds it) must not strand an
+        // armed state: `handle_prefix_key` early-returns once there are no
+        // leader chords, so a leftover `Armed` would keep painting the overlay
+        // and the footer badge with no key able to clear it.
+        if !self.prefix_settings.mode.prefix_enabled() {
+            self.prefix_state = PrefixState::Idle;
+        }
         self.enforce_feature_visibility();
         self.resize_sessions_to_content_area();
     }

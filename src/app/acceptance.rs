@@ -2209,6 +2209,34 @@ fn hint_delay_hides_the_overlay_but_not_the_armed_badge() {
     );
 }
 
+/// `[prefix]` applies live like the other mirrored settings, and turning the
+/// leader off clears any armed state rather than stranding the overlay.
+#[test]
+fn prefix_settings_apply_live_and_off_disarms() {
+    let mut h = Harness::standard(1);
+    h.ctrl('a');
+    assert!(h.app.prefix_state.is_armed());
+
+    let mut settings = crate::session::settings::Settings::default();
+    settings.prefix.mode = crate::session::PrefixMode::Off;
+    h.app.apply_live_settings(&settings);
+
+    assert_eq!(h.app.prefix_settings.mode, crate::session::PrefixMode::Off);
+    assert!(
+        !h.app.prefix_state.is_armed(),
+        "turning the leader off must clear the armed state, not strand it"
+    );
+    let painted = h.render();
+    assert!(!painted.contains("go to session N"), "overlay is gone");
+
+    // And a live rebind takes effect without a restart.
+    let mut settings = crate::session::settings::Settings::default();
+    settings.prefix.key = "ctrl+o".into();
+    h.app.apply_live_settings(&settings);
+    h.ctrl('o');
+    assert!(h.app.prefix_state.is_armed(), "the new leader arms");
+}
+
 #[test]
 fn leader_digit_jumps_to_that_session_and_lands_in_the_terminal() {
     let mut h = Harness::standard(3);
