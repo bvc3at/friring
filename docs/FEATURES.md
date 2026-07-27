@@ -1611,8 +1611,9 @@ it opens as raw `cron`.
 read-only overlay showing what the **next fire would do**, without firing it:
 the resolved schedule and its next occurrence in the automation's timezone, the
 resolved send target or spawn parameters (session name, worktree branch, agent,
-host), and every prompt step in delivery order with the wait between them. Any
-key dismisses it.
+host), and every prompt step in delivery order with the wait between them.
+`Esc`, `Enter` or `q` dismisses it; other keys are ignored, so a stray
+keystroke can't drop a plan mid-read.
 
 `friring-cli automation dry-run <id>` prints the same plan — both call
 `session::automation::dry_run_plan`, so the terminal and the TUI can't drift.
