@@ -299,11 +299,14 @@ never cascades to its workers.
 
 ### Automations
 
-Named, scheduled agent runs — one-shot or recurring (cron, with
-`hourly`/`daily`/`weekdays`/`weekly` presets) that **send** a prompt to a
-running session or **spawn** a fresh one. The editor needs no cron
-knowledge, and they fire even when the TUI is closed via a tmux heartbeat
-keeper.
+Named, scheduled runs — one-shot or recurring (cron, with
+`hourly`/`daily`/`weekdays`/`weekly` presets) that **send** prompts to a
+running session, **spawn** a session (locally or on a remote host, reusing
+one or fresh per fire) to prompt, or **exec** a shell command on a timeout.
+Prompts are an ordered list, each its own submission, so an agent can be
+configured before it works. Preview the next fire with a dry run, and move
+automations between machines as TOML. The editor needs no cron knowledge,
+and they fire even when the TUI is closed via a tmux heartbeat keeper.
 
 [CLI →](#automations-alias-auto)
 
