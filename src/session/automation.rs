@@ -123,9 +123,10 @@ impl Automation {
     ///
     /// [`SpawnSessionMode::Reuse`] always yields `auto-<id>`, so later fires land
     /// in the same conversation. [`SpawnSessionMode::Fresh`] appends a
-    /// timestamp derived from the fire time (`auto-<id>-<YYYYmmdd-HHMMSS>`, UTC)
-    /// so each run starts clean; claim-based firing makes that unique without a
-    /// counter, since two fires can never share a millisecond-level claim.
+    /// timestamp derived from the fire time (`auto-<id>-<YYYYmmdd-HHMMSS-mmm>`,
+    /// UTC) so each run starts clean; claim-based firing makes that unique
+    /// without a counter, since two fires can never share a millisecond-level
+    /// claim — which is why the suffix carries milliseconds too.
     pub fn session_name(&self, fire_millis: u64) -> String {
         match self.action.spawn_session_mode() {
             SpawnSessionMode::Reuse => format!("auto-{}", self.id),
@@ -136,12 +137,14 @@ impl Automation {
     }
 }
 
-/// Format a fire timestamp as the `YYYYmmdd-HHMMSS` suffix of a fresh-session
-/// name. UTC keeps the suffix stable across DST and host timezone changes.
+/// Format a fire timestamp as the `YYYYmmdd-HHMMSS-mmm` suffix of a
+/// fresh-session name. UTC keeps the suffix stable across DST and host timezone
+/// changes; the millisecond component matches the resolution of the claim that
+/// produced the fire, so two claims inside one second can't derive one name.
 fn fire_suffix(fire_millis: u64) -> String {
     Utc.timestamp_millis_opt(fire_millis as i64)
         .single()
-        .map(|dt| dt.format("%Y%m%d-%H%M%S").to_string())
+        .map(|dt| format!("{}-{:03}", dt.format("%Y%m%d-%H%M%S"), fire_millis % 1000))
         .unwrap_or_else(|| fire_millis.to_string())
 }
 
@@ -998,7 +1001,7 @@ mod tests {
     #[test]
     fn fresh_mode_stamps_the_session_and_branch_per_fire() {
         let auto = sample(spawn(SpawnSessionMode::Fresh));
-        assert_eq!(auto.session_name(MON_2024), "auto-3-20240101-000000");
+        assert_eq!(auto.session_name(MON_2024), "auto-3-20240101-000000-000");
         // A later fire lands on a different session...
         assert_ne!(
             auto.session_name(MON_2024),
@@ -1007,11 +1010,28 @@ mod tests {
         // ...and its own branch, so two live runs never share a worktree.
         assert_eq!(
             spawn_branch_for("auto/nightly", SpawnSessionMode::Fresh, MON_2024),
-            "auto/nightly-20240101-000000"
+            "auto/nightly-20240101-000000-000"
         );
         assert_eq!(
             spawn_branch_for("auto/nightly", SpawnSessionMode::Reuse, MON_2024),
             "auto/nightly"
+        );
+    }
+
+    #[test]
+    fn fresh_names_stay_distinct_within_one_second() {
+        // A manual `automation run` landing right after a scheduled fire (or a
+        // 6-field seconds cron) claims twice inside the same second; the derived
+        // names must not collide, or the second fire would silently reuse the
+        // first run's session and worktree.
+        let auto = sample(spawn(SpawnSessionMode::Fresh));
+        assert_ne!(
+            auto.session_name(MON_2024 + 100),
+            auto.session_name(MON_2024 + 900)
+        );
+        assert_ne!(
+            spawn_branch_for("auto/nightly", SpawnSessionMode::Fresh, MON_2024 + 100),
+            spawn_branch_for("auto/nightly", SpawnSessionMode::Fresh, MON_2024 + 900)
         );
     }
 

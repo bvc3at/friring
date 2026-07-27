@@ -1351,9 +1351,10 @@ step 3   Summarize my email history and file anything actionable.
   - `reuse` (default, and the pre-v44 behavior) — one session named
     `auto-<id>`, reused on every fire including after a TUI restart, where it
     is restored from the database by name. Runs pile into one conversation.
-  - `fresh` — a new session per fire, named `auto-<id>-<YYYYmmdd-HHMMSS>` (UTC
-    fire stamp; claim-based firing makes it unique without a counter). When a
-    worktree branch is configured the branch is stamped the same way, because
+  - `fresh` — a new session per fire, named `auto-<id>-<YYYYmmdd-HHMMSS-mmm>`
+    (UTC fire stamp, milliseconds included so two claims inside one second can't
+    derive one name). When a worktree branch is configured it is stamped the
+    same way, because
     `create_or_attach_worktree` is idempotent and would otherwise hand the
     second live run the first run's checkout. A fresh automation is **capped at
     5 concurrently-open sessions** (`MAX_LIVE_FRESH_SESSIONS`): past that, a
