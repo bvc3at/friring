@@ -1349,6 +1349,11 @@ fn automation_to_json(a: &Automation) -> Value {
 /// schedules nor arms the heartbeat, so the CLI must not arm it either (it
 /// would spawn a keeper window that can never fire anything).
 pub(crate) fn arm_heartbeat() {
+    // Never touch a real multiplexer from the crate's own unit tests: arming
+    // creates a *persistent* keeper window on the developer's live server.
+    if cfg!(test) {
+        return;
+    }
     if !crate::session::settings::global().features.automations {
         return;
     }
@@ -1682,7 +1687,7 @@ mod tests {
                     session_mode: Some("fresh".into()),
                     ..ActionArgs::default()
                 },
-                disabled: false,
+                disabled: true,
             },
         )
         .unwrap();
@@ -1854,7 +1859,7 @@ mod tests {
                     command: Some("true".into()),
                     ..ActionArgs::default()
                 },
-                disabled: false,
+                disabled: true,
             },
         )
         .unwrap();
@@ -1971,7 +1976,7 @@ mod tests {
                     command: Some("sync.sh".into()),
                     ..ActionArgs::default()
                 },
-                disabled: false,
+                disabled: true,
             },
         )
         .unwrap();
