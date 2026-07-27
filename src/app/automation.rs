@@ -462,9 +462,9 @@ impl App {
             Vec::new()
         } else {
             match m.build_steps() {
-                Some(steps) => steps,
-                None => {
-                    self.set_error("Prompt cannot be empty");
+                Ok(steps) => steps,
+                Err(e) => {
+                    self.set_error(e);
                     return false;
                 }
             }

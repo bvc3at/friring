@@ -1002,20 +1002,35 @@ impl AutomationEditorModal {
     }
 
     /// The prompt steps as they would be persisted: trimmed text, parsed
-    /// per-step delays, and blank trailing steps dropped. `None` when nothing
-    /// survives (an all-blank prompt), which the caller reports as a validation
-    /// error.
-    pub fn build_steps(&self) -> Option<Vec<crate::session::PromptStep>> {
-        let steps: Vec<crate::session::PromptStep> = self
-            .steps
-            .iter()
-            .filter(|s| !s.text.value().trim().is_empty())
-            .map(|s| crate::session::PromptStep {
+    /// per-step delays, and blank trailing steps dropped. Returns a user-facing
+    /// error when nothing survives (an all-blank prompt) or a delay was typed
+    /// but doesn't parse — a mistyped delay must not silently become "default".
+    pub fn build_steps(&self) -> Result<Vec<crate::session::PromptStep>, String> {
+        let mut steps: Vec<crate::session::PromptStep> = Vec::new();
+        for (i, s) in self.steps.iter().enumerate() {
+            if s.text.value().trim().is_empty() {
+                continue;
+            }
+            let delay = s.delay.value().trim();
+            let delay_ms = if delay.is_empty() {
+                None
+            } else {
+                Some(delay.parse::<u64>().map_err(|_| {
+                    format!(
+                        "Step {} delay must be a whole number of milliseconds",
+                        i + 1
+                    )
+                })?)
+            };
+            steps.push(crate::session::PromptStep {
                 text: s.text.value().trim().to_string(),
-                delay_ms: s.delay.value().trim().parse().ok(),
-            })
-            .collect();
-        (!steps.is_empty()).then_some(steps)
+                delay_ms,
+            });
+        }
+        if steps.is_empty() {
+            return Err("Prompt cannot be empty".to_string());
+        }
+        Ok(steps)
     }
 
     /// Move focus to the next visible field (wraps).
@@ -3111,7 +3126,18 @@ mod tests {
         // An all-blank prompt yields nothing, so the caller can reject the save.
         let mut m = AutomationEditorModal::default();
         m.prompt_mut().set("   ");
-        assert!(m.build_steps().is_none());
+        assert!(m.build_steps().is_err());
+    }
+
+    #[test]
+    fn build_steps_rejects_an_unparsable_delay() {
+        let mut m = AutomationEditorModal::default();
+        m.prompt_mut().set("go");
+        m.current_step_mut().delay.set("20O0"); // a typo, not a number
+        let err = m
+            .build_steps()
+            .expect_err("a bad delay must not be dropped");
+        assert!(err.contains("whole number"), "unexpected error: {err}");
     }
 
     #[test]
