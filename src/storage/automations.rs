@@ -348,8 +348,8 @@ impl Database {
     /// otherwise show as running forever.
     ///
     /// The cutoff is **per run**: a row is only touched once it has outlived its
-    /// own automation's `action_timeout_secs` (the default when unset) plus
-    /// [`REAP_GRACE_MS`]. No authoring path caps that timeout, so a shared
+    /// own automation's `action_timeout_secs` (the default when unset) plus a
+    /// grace period (`REAP_GRACE_MS`). No authoring path caps that timeout, so a shared
     /// cutoff would reap a healthy hour-long exec 15 minutes in — and another
     /// friring instance (or a concurrent headless `tick`) may own that row right
     /// now. Returns the rows reaped.
