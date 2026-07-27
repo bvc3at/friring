@@ -1550,6 +1550,12 @@ impl MuxTarget {
         self.transport.tmux_command(&self.socket, args)
     }
 
+    /// Whether the multiplexer on *this target's* host is psmux — which decides
+    /// the shell dialect of any `run-shell` script we schedule there.
+    fn uses_psmux(&self) -> bool {
+        self.transport.uses_psmux()
+    }
+
     /// The `session:=window` target for a friring agent session on this server
     /// (see [`window_target`] for why the `=` matters).
     fn window_target(&self, session_name: &str) -> String {
@@ -1692,12 +1698,27 @@ pub fn send_prompt_steps_after_delay(
 
 /// Build the `run-shell` script that pastes each step, waits a beat so the
 /// bracketed paste is consumed, presses Enter, then sleeps the step's settle
-/// delay before the next one. `run-shell` executes the script via the target
-/// server's shell, so the syntax is platform-specific.
+/// delay before the next one.
 ///
-/// POSIX path (`tmux` on Linux/macOS): a plain `sh` one-liner.
-#[cfg(not(windows))]
+/// `run-shell` is executed by the **target** server's shell, so the syntax
+/// follows that host's multiplexer, not the OS friring was built for: a Unix
+/// friring driving a psmux host needs the PowerShell form, and a Windows
+/// friring driving a WSL/SSH tmux host needs the `sh` form. `run-shell -b` only
+/// confirms scheduling, so getting this wrong is a silent no-op.
 fn deferred_prompt_script(
+    target: &MuxTarget,
+    window: &str,
+    steps: &[crate::session::PromptStep],
+) -> String {
+    if target.uses_psmux() {
+        deferred_prompt_script_powershell(target, window, steps)
+    } else {
+        deferred_prompt_script_posix(target, window, steps)
+    }
+}
+
+/// POSIX path (`tmux` on Linux/macOS/WSL): a plain `sh` one-liner.
+fn deferred_prompt_script_posix(
     target: &MuxTarget,
     window: &str,
     steps: &[crate::session::PromptStep],
@@ -1727,11 +1748,10 @@ fn deferred_prompt_script(
     parts.join("; ")
 }
 
-/// Windows path (`psmux`): psmux's `run-shell` is not a POSIX shell, so drive the
-/// sequence through PowerShell explicitly (`Start-Sleep` for the sub-second beat).
+/// psmux path: psmux's `run-shell` is not a POSIX shell, so drive the sequence
+/// through PowerShell explicitly (`Start-Sleep` for the sub-second beat).
 /// PowerShell single-quoted literals escape an embedded `'` by doubling it.
-#[cfg(windows)]
-fn deferred_prompt_script(
+fn deferred_prompt_script_powershell(
     target: &MuxTarget,
     window: &str,
     steps: &[crate::session::PromptStep],
@@ -1759,7 +1779,6 @@ fn deferred_prompt_script(
 /// framing and run the remainder as separate commands — after `run-shell -b`
 /// had already reported the scheduling a success. Base64 has no character that
 /// can escape the argument.
-#[cfg(windows)]
 fn powershell_encoded_command(script: &str) -> String {
     let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     format!(
@@ -1769,7 +1788,6 @@ fn powershell_encoded_command(script: &str) -> String {
 }
 
 /// Standard-alphabet base64 (RFC 4648) with `=` padding.
-#[cfg(windows)]
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -1796,7 +1814,6 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 /// Format a millisecond delay as a POSIX `sleep` argument (`sleep 1.2`), which
 /// takes fractional seconds on every shell friring's `run-shell` scripts run in.
-#[cfg(not(windows))]
 fn format_secs(ms: u64) -> String {
     format!("{}.{:03}", ms / 1000, ms % 1000)
 }
@@ -2100,11 +2117,38 @@ mod tests {
         decode_octal, format_send_keys, parse_notification, shell_escape,
     };
 
-    #[cfg(not(windows))]
+    /// A target whose host runs POSIX tmux (a WSL distro), whatever OS this
+    /// build runs on — the script dialect follows the target, not the builder.
+    fn posix_target() -> MuxTarget {
+        MuxTarget {
+            transport: TmuxTransport::Wsl {
+                distro: "Ubuntu".into(),
+                mux: "tmux".into(),
+            },
+            socket: "friring".into(),
+            session: "friring".into(),
+            mux: "tmux".into(),
+        }
+    }
+
+    /// A target whose host runs psmux (a Windows box over SSH).
+    fn psmux_target() -> MuxTarget {
+        MuxTarget {
+            transport: TmuxTransport::Ssh {
+                destination: "winbox".into(),
+                ssh_opts: Vec::new(),
+                mux: "psmux".into(),
+            },
+            socket: "friring".into(),
+            session: "friring".into(),
+            mux: "psmux".into(),
+        }
+    }
+
     #[test]
     fn deferred_prompt_script_sends_each_step_separately() {
         use crate::session::PromptStep;
-        let target = MuxTarget::local();
+        let target = posix_target();
         let steps = vec![
             PromptStep {
                 text: "/model opus".into(),
@@ -2126,11 +2170,10 @@ mod tests {
         assert_eq!(script.matches("sleep 1.200").count(), 0);
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn deferred_prompt_script_preserves_arbitrary_prompt_bytes() {
         use crate::session::PromptStep;
-        let target = MuxTarget::local();
+        let target = posix_target();
         // A single-quoted shell word carries newlines and quotes verbatim; the
         // control-mode escaper would have flattened the newline into a space.
         let text = "line one\nline two 'quoted' \"dquoted\"";
@@ -2140,7 +2183,6 @@ mod tests {
         assert!(script.contains(r#""dquoted""#), "got {script}");
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn deferred_prompt_script_targets_the_hosts_own_mux() {
         use crate::session::{HostDef, PromptStep};
@@ -2158,6 +2200,46 @@ mod tests {
         assert_eq!(window, "remote-group:=tb-auto-1");
         let script = deferred_prompt_script(&target, &window, &[PromptStep::new("go")]);
         assert!(script.contains("remote-group:=tb-auto-1"), "got {script}");
+    }
+
+    #[test]
+    fn deferred_prompt_script_follows_the_target_host_not_the_build_os() {
+        use crate::session::PromptStep;
+        // A prompt carrying the two characters that used to break the outer
+        // `-Command "…"` framing.
+        let steps = [PromptStep::new("say \"hi\"\nthen go")];
+
+        let ps = deferred_prompt_script_powershell(&psmux_target(), "friring:=tb-auto-1", &steps);
+        assert_eq!(
+            deferred_prompt_script(&psmux_target(), "friring:=tb-auto-1", &steps),
+            ps,
+            "a psmux target must get the PowerShell form"
+        );
+        // Base64 framing: nothing in the prompt can escape the argument.
+        let encoded = ps
+            .strip_prefix("powershell -NoProfile -EncodedCommand ")
+            .unwrap_or_else(|| panic!("got {ps}"));
+        assert!(
+            encoded
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')),
+            "got {ps}"
+        );
+
+        // A POSIX target gets the `sh` form even from a Windows build.
+        let sh = deferred_prompt_script(&posix_target(), "friring:=tb-auto-1", &steps);
+        assert!(sh.starts_with("tmux -L friring send-keys"), "got {sh}");
+        assert!(sh.contains("sleep 0.2"), "got {sh}");
+    }
+
+    #[test]
+    fn base64_encode_matches_the_powershell_encoding() {
+        // What `powershell -EncodedCommand` expects: base64 of UTF-16LE.
+        let utf16le: Vec<u8> = "hi".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(base64_encode(&utf16le), "aABpAA==");
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_encode(b""), "");
     }
 
     #[test]

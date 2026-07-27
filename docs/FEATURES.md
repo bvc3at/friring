@@ -1389,8 +1389,10 @@ They now take a **`MuxTarget`** (`agent::tmux`) — a `TmuxTransport` + socket +
 group session + the host's own multiplexer binary — resolved from the action's
 host, so both paths reach the right server. The `run-shell` script the deferred
 delivery schedules is executed by *that* host's tmux, so it names that host's
-socket and binary. An unknown host name is an error **before** the spawn, never
-a session nothing will ever prompt.
+socket and binary — and is written in that host's shell dialect (`sh` for tmux,
+PowerShell for a `multiplexer = "psmux"` host), chosen from the target rather
+than the OS friring was built for. An unknown host name is an error **before**
+the spawn, never a session nothing will ever prompt.
 
 The TUI path needed only `config.backend` threaded through
 `App::spawn_and_prompt`: `session.send_input(...)` already routes over the
