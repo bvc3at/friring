@@ -527,29 +527,33 @@ fn apply_action_overrides(
             extra_repos,
             host,
             session_mode,
-        } => AutomationAction::Spawn {
-            repo_path: args
-                .repo
-                .as_ref()
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| repo_path.clone()),
-            worktree_branch: override_optional(worktree_branch, &args.worktree),
-            base_branch: override_optional(base_branch, &args.base),
-            agent: override_optional(agent, &args.agent),
-            // An empty list means "not supplied" — clearing extras is done by
-            // switching the action, not by an ambiguous empty flag.
-            extra_repos: if args.add_repo.is_empty() && args.add_dir.is_empty() {
-                extra_repos.clone()
-            } else {
-                super::parse_extra_repos(&args.add_repo, &args.add_dir)
-            },
-            host: override_optional(host, &args.host),
-            session_mode: args
-                .session_mode
-                .as_deref()
-                .map(crate::session::SpawnSessionMode::from_str_or_default)
-                .unwrap_or(*session_mode),
-        },
+        } => {
+            // Validate the *resulting* selectors: an override can introduce an
+            // unknown agent/host just as `create` can.
+            let agent = override_optional(agent, &args.agent);
+            let host = override_optional(host, &args.host);
+            validate_spawn_selectors(agent.as_deref(), host.as_deref())?;
+            AutomationAction::Spawn {
+                repo_path: args
+                    .repo
+                    .as_ref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| repo_path.clone()),
+                worktree_branch: override_optional(worktree_branch, &args.worktree),
+                base_branch: override_optional(base_branch, &args.base),
+                agent,
+                // An empty list means "not supplied" — clearing extras is done by
+                // switching the action, not by an ambiguous empty flag.
+                extra_repos: if args.add_repo.is_empty() && args.add_dir.is_empty() {
+                    extra_repos.clone()
+                } else {
+                    super::parse_extra_repos(&args.add_repo, &args.add_dir)
+                },
+                host,
+                session_mode: parse_session_mode(args.session_mode.as_deref())?
+                    .unwrap_or(*session_mode),
+            }
+        }
         AutomationAction::Exec {
             command,
             timeout_secs,
@@ -941,6 +945,57 @@ fn load(db: &Database, id: i64) -> Result<Automation, String> {
         .ok_or_else(|| format!("Automation not found: {id}"))
 }
 
+/// Reject a spawn naming an agent or host that isn't configured.
+///
+/// Neither is checked downstream: `session_ops::resolve_agent_def` falls back to
+/// the registry default for an unknown name, so a typo would silently launch the
+/// wrong agent on every fire. The TUI editor performs exactly these checks.
+/// (`crate::agent::…` is reached by fully-qualified path only — `cli` may not
+/// `use` it; see `tests/architecture_rules.rs`.)
+fn validate_spawn_selectors(agent: Option<&str>, host: Option<&str>) -> Result<(), String> {
+    if let Some(name) = agent.map(str::trim).filter(|a| !a.is_empty()) {
+        let registry = crate::agent::agent_config::load_or_seed();
+        if !registry.names().contains(&name) {
+            return Err(format!(
+                "Unknown agent '{name}'. Configure it in agents.toml. Available: [{}]",
+                registry.names().join(", ")
+            ));
+        }
+    }
+    if let Some(name) = host.map(str::trim).filter(|h| !h.is_empty()) {
+        let registry = crate::agent::host_config::load_all();
+        if registry.get(name).is_none() {
+            return Err(format!(
+                "Unknown host '{name}'. Configure it in hosts.toml. Available: [{}]",
+                registry.names().join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse an authoring-path `--session-mode` / manifest `session_mode` strictly.
+///
+/// [`SpawnSessionMode::from_str_or_default`](crate::session::SpawnSessionMode::from_str_or_default)
+/// maps anything unknown to `Reuse`, which is right when decoding a stored
+/// column (a pre-v44 `NULL` must keep the old behavior) but wrong when a user
+/// types `--session-mode frehs` and gets silently reused sessions.
+fn parse_session_mode(
+    raw: Option<&str>,
+) -> Result<Option<crate::session::SpawnSessionMode>, String> {
+    use crate::session::SpawnSessionMode;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "reuse" => Ok(Some(SpawnSessionMode::Reuse)),
+        "fresh" => Ok(Some(SpawnSessionMode::Fresh)),
+        other => Err(format!(
+            "invalid session mode `{other}` (use reuse or fresh)"
+        )),
+    }
+}
+
 /// Resolve the action from the flags — exactly one of `--session` /
 /// `--session-name` (send), `--repo` (spawn), or `--command` (exec).
 fn resolve_action(args: &ActionArgs, db: &Database) -> Result<AutomationAction, String> {
@@ -970,15 +1025,7 @@ fn resolve_action(args: &ActionArgs, db: &Database) -> Result<AutomationAction, 
     }
     if let Some(repo) = &args.repo {
         // Fail here rather than at fire time, hours later, in an error run.
-        if let Some(host) = args.host.as_deref().filter(|h| !h.is_empty()) {
-            let registry = crate::agent::host_config::load_all();
-            if registry.get(host).is_none() {
-                return Err(format!(
-                    "Unknown host '{host}'. Configure it in hosts.toml. Available: [{}]",
-                    registry.names().join(", ")
-                ));
-            }
-        }
+        validate_spawn_selectors(args.agent.as_deref(), args.host.as_deref())?;
         return Ok(AutomationAction::Spawn {
             repo_path: repo.into(),
             worktree_branch: args.worktree.clone(),
@@ -986,11 +1033,7 @@ fn resolve_action(args: &ActionArgs, db: &Database) -> Result<AutomationAction, 
             agent: args.agent.clone(),
             extra_repos: super::parse_extra_repos(&args.add_repo, &args.add_dir),
             host: args.host.clone().filter(|h| !h.is_empty()),
-            session_mode: args
-                .session_mode
-                .as_deref()
-                .map(crate::session::SpawnSessionMode::from_str_or_default)
-                .unwrap_or_default(),
+            session_mode: parse_session_mode(args.session_mode.as_deref())?.unwrap_or_default(),
         });
     }
     match (&args.session, &args.session_name) {
@@ -1106,6 +1149,12 @@ fn manifest_to_new_automation(
     }
     let schedule = parse_trigger(&decl.trigger, None, None)?;
     let action = decl.to_action(None)?;
+    // A manifest is authored by hand as often as it is exported, so its spawn
+    // selectors get the same check `create`/`edit` apply.
+    if let AutomationAction::Spawn { agent, host, .. } = &action {
+        parse_session_mode(decl.session_mode.as_deref())?;
+        validate_spawn_selectors(agent.as_deref(), host.as_deref())?;
+    }
     let steps = decl.steps();
     if steps.is_empty() && !matches!(action, AutomationAction::Exec { .. }) {
         return Err(format!("automation '{}' has no prompt", decl.name));
@@ -1696,6 +1745,98 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("timezone"), "got {err}");
+    }
+
+    /// A spawn `create` with the given action flags, for the negative tests.
+    fn spawn_create(name: &str, action: ActionArgs) -> CreateArgs {
+        CreateArgs {
+            name: name.into(),
+            trigger: "daily".into(),
+            time: None,
+            weekday: None,
+            timezone: None,
+            prompts: vec!["go".into()],
+            step_delay: None,
+            action,
+            disabled: true,
+        }
+    }
+
+    #[test]
+    fn create_rejects_an_unknown_agent() {
+        let db = Database::open_in_memory().unwrap();
+        let err = create_automation(
+            &db,
+            spawn_create(
+                "n",
+                ActionArgs {
+                    repo: Some("/repo".into()),
+                    agent: Some("not-a-real-agent".into()),
+                    ..ActionArgs::default()
+                },
+            ),
+        )
+        .unwrap_err();
+        assert!(err.contains("Unknown agent"), "got {err}");
+        assert!(db.list_automations().unwrap().is_empty(), "nothing saved");
+    }
+
+    #[test]
+    fn create_rejects_an_unknown_session_mode() {
+        let db = Database::open_in_memory().unwrap();
+        let err = create_automation(
+            &db,
+            spawn_create(
+                "n",
+                ActionArgs {
+                    repo: Some("/repo".into()),
+                    session_mode: Some("frehs".into()),
+                    ..ActionArgs::default()
+                },
+            ),
+        )
+        .unwrap_err();
+        assert!(err.contains("session mode"), "got {err}");
+        assert!(db.list_automations().unwrap().is_empty(), "nothing saved");
+    }
+
+    #[test]
+    fn edit_rejects_an_unknown_host_and_leaves_the_row_alone() {
+        let db = Database::open_in_memory().unwrap();
+        create_automation(
+            &db,
+            spawn_create(
+                "nightly",
+                ActionArgs {
+                    repo: Some("/repo".into()),
+                    ..ActionArgs::default()
+                },
+            ),
+        )
+        .unwrap();
+        let before = db.list_automations().unwrap()[0].clone();
+        let err = edit_automation(
+            &db,
+            before.id,
+            EditArgs {
+                name: None,
+                trigger: None,
+                time: None,
+                weekday: None,
+                timezone: None,
+                prompts: Vec::new(),
+                step_delay: None,
+                action: ActionArgs {
+                    host: Some("no-such-host".into()),
+                    ..ActionArgs::default()
+                },
+                enabled: false,
+                disabled: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("Unknown host"), "got {err}");
+        assert_eq!(db.get_automation(before.id).unwrap().unwrap(), before);
     }
 
     #[test]
