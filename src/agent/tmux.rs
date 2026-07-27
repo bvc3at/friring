@@ -1485,16 +1485,128 @@ fn bracketed_paste(text: &str) -> String {
     format!("\x1b[200~{text}\x1b[201~")
 }
 
+/// Which multiplexer server the headless one-shot helpers below talk to.
+///
+/// Those helpers ([`window_exists_on`], [`send_prompt_now_on`],
+/// [`send_prompt_steps_after_delay`]) used to hardcode a local-only tmux
+/// command builder, which made every headless automation local-only: a
+/// `Spawn` on a remote host created the session over SSH and then typed its
+/// prompt into a window that only exists on the *other* machine's server. This
+/// bundles the [`TmuxTransport`] + socket + group session so the same helpers
+/// reach either server, matching what [`TmuxBackend::from_host`] does for the
+/// interactive path.
+#[derive(Debug, Clone)]
+pub struct MuxTarget {
+    transport: TmuxTransport,
+    socket: String,
+    session: String,
+    /// The multiplexer binary **on the target host**. `run-shell` scripts are
+    /// executed by that host's server, so they must name its binary, not ours.
+    mux: String,
+}
+
+impl MuxTarget {
+    /// friring's own local server (`tmux -L friring`).
+    pub fn local() -> Self {
+        Self {
+            transport: TmuxTransport::Local,
+            socket: local_socket(),
+            session: local_session(),
+            mux: DEFAULT_MUX.to_string(),
+        }
+    }
+
+    /// The server on a configured remote/WSL host, reached the same way
+    /// [`TmuxBackend::from_host`] reaches it.
+    pub fn for_host(host: &crate::session::HostDef) -> Self {
+        let backend = TmuxBackend::from_host(host);
+        Self {
+            transport: backend.transport,
+            socket: backend.socket,
+            session: backend.session,
+            mux: host.mux(),
+        }
+    }
+
+    /// Resolve a `hosts.toml` host name; `None` or empty = [`local`](Self::local).
+    /// Errors when the name isn't configured, so a remote automation fails
+    /// loudly instead of silently firing at the local server.
+    pub fn resolve(host_name: Option<&str>) -> Result<Self> {
+        let Some(name) = host_name.filter(|n| !n.is_empty()) else {
+            return Ok(Self::local());
+        };
+        let registry = crate::agent::host_config::load_all();
+        match registry.get(name) {
+            Some(host) => Ok(Self::for_host(host)),
+            None => bail!(
+                "Unknown host '{name}'. Configure it in hosts.toml. Available: [{}]",
+                registry.names().join(", ")
+            ),
+        }
+    }
+
+    /// Resolve the server a **session** lives on, from its persisted
+    /// `backend_type` (`local-tmux`/`tmux` = local, `ssh:<host>` /
+    /// `wsl:<host>` = that host).
+    ///
+    /// This is what lets a headless `send` reach a session the user started on a
+    /// remote host. Hardcoding the local server here made the TUI and the
+    /// headless tick disagree about the same automation: the TUI delivered over
+    /// the session's backend and reported success, while the tick found no local
+    /// window and recorded a skip.
+    ///
+    /// A backend naming a host that is no longer in `hosts.toml` is an error,
+    /// not a fallback to local — delivering someone's prompt to the wrong
+    /// machine is worse than a failed run.
+    pub fn for_backend(backend_type: &str) -> Result<Self> {
+        if !crate::session::is_remote_backend(backend_type) {
+            return Ok(Self::local());
+        }
+        let registry = crate::agent::host_config::load_all();
+        match registry.get_by_backend(backend_type) {
+            Some(host) => Ok(Self::for_host(host)),
+            None => bail!(
+                "Session backend '{backend_type}' names a host that is not in hosts.toml. \
+                 Available: [{}]",
+                registry.names().join(", ")
+            ),
+        }
+    }
+
+    /// Build a one-shot multiplexer command against this target.
+    fn command(&self, args: &[&str]) -> Command {
+        self.transport.tmux_command(&self.socket, args)
+    }
+
+    /// Whether the multiplexer on *this target's* host is psmux — which decides
+    /// the shell dialect of any `run-shell` script we schedule there.
+    fn uses_psmux(&self) -> bool {
+        self.transport.uses_psmux()
+    }
+
+    /// The `session:=window` target for a friring agent session on this server
+    /// (see [`window_target`] for why the `=` matters).
+    fn window_target(&self, session_name: &str) -> String {
+        format!("{}:={}", self.session, agent_window_name(session_name))
+    }
+}
+
+/// Send text immediately to a session pane on friring's local server.
+pub fn send_prompt_now(session_name: &str, text: &str) -> Result<()> {
+    send_prompt_now_on(&MuxTarget::local(), session_name, text)
+}
+
 /// Send text immediately to a session pane (no scheduling), followed by Enter.
 ///
-/// Targets the tmux window named `tb-<session_name>` in the friring tmux
-/// session and uses a "paste text → brief delay → press Enter" sequence so the
-/// target app has time to process the pasted input.
-pub fn send_prompt_now(session_name: &str, text: &str) -> Result<()> {
-    let target = window_target(session_name);
+/// Targets the tmux window named `tb-<session_name>` in `target`'s group session
+/// and uses a "paste text → brief delay → press Enter" sequence so the target
+/// app has time to process the pasted input.
+pub fn send_prompt_now_on(target: &MuxTarget, session_name: &str, text: &str) -> Result<()> {
+    let window = target.window_target(session_name);
     let payload = bracketed_paste(text);
 
-    let status = local_mux_command(&["send-keys", "-t", &target, "-l", &payload])
+    let status = target
+        .command(&["send-keys", "-t", &window, "-l", &payload])
         .status()
         .context("Failed to run tmux send-keys for prompt text")?;
     if !status.success() {
@@ -1503,11 +1615,31 @@ pub fn send_prompt_now(session_name: &str, text: &str) -> Result<()> {
 
     std::thread::sleep(SEND_KEYS_ENTER_DELAY);
 
-    let status = local_mux_command(&["send-keys", "-t", &target, "Enter"])
+    let status = target
+        .command(&["send-keys", "-t", &window, "Enter"])
         .status()
         .context("Failed to run tmux send-keys for Enter")?;
     if !status.success() {
         bail!("tmux send-keys (Enter) exited with status {status}");
+    }
+    Ok(())
+}
+
+/// Deliver an ordered list of prompt steps to a session pane, right now.
+///
+/// Each step is its own paste + Enter with the step's settle delay in between —
+/// a multi-line bracketed paste would submit as a *single* prompt, which is
+/// exactly what a `/model x` → `/effort y` → "do the work" sequence must not do.
+pub fn send_prompt_steps_now(
+    target: &MuxTarget,
+    session_name: &str,
+    steps: &[crate::session::PromptStep],
+) -> Result<()> {
+    for (i, step) in steps.iter().enumerate() {
+        send_prompt_now_on(target, session_name, &step.text)?;
+        if i + 1 < steps.len() {
+            std::thread::sleep(std::time::Duration::from_millis(step.delay()));
+        }
     }
     Ok(())
 }
@@ -1520,17 +1652,19 @@ const HEARTBEAT_WINDOW: &str = "automation-heartbeat";
 /// How often the heartbeat keeper invokes `automation tick`.
 const HEARTBEAT_INTERVAL_SECS: u64 = 60;
 
-/// List the window names in the friring tmux session (empty if the server is
+/// List the window names in `target`'s group session (empty if that server is
 /// not running).
-fn list_window_names() -> Vec<String> {
-    let Ok(out) = local_mux_command(&[
-        "list-windows",
-        "-t",
-        &local_session(),
-        "-F",
-        "#{window_name}",
-    ])
-    .output() else {
+fn list_window_names_on(target: &MuxTarget) -> Vec<String> {
+    let Ok(out) = target
+        .command(&[
+            "list-windows",
+            "-t",
+            &target.session,
+            "-F",
+            "#{window_name}",
+        ])
+        .output()
+    else {
         return Vec::new();
     };
     if !out.status.success() {
@@ -1542,25 +1676,46 @@ fn list_window_names() -> Vec<String> {
         .collect()
 }
 
-/// Whether the agent window `tb-<session_name>` currently exists in the friring
-/// tmux server. Used by the headless dispatcher to skip `send` automations
+/// List the window names in the friring **local** tmux session.
+fn list_window_names() -> Vec<String> {
+    list_window_names_on(&MuxTarget::local())
+}
+
+/// Whether the agent window `tb-<session_name>` currently exists on friring's
+/// local server. Used by the headless dispatcher to skip `send` automations
 /// whose target session is no longer running rather than failing into a dead
 /// pane.
 pub fn window_exists(session_name: &str) -> bool {
-    let want = agent_window_name(session_name);
-    list_window_names().contains(&want)
+    window_exists_on(&MuxTarget::local(), session_name)
 }
 
-/// Schedule a one-shot prompt delivery into a session's window after
-/// `delay_secs`, via a detached `tmux run-shell` timer.
+/// Whether the agent window `tb-<session_name>` currently exists on `target`'s
+/// server.
+pub fn window_exists_on(target: &MuxTarget, session_name: &str) -> bool {
+    let want = agent_window_name(session_name);
+    list_window_names_on(target).contains(&want)
+}
+
+/// Schedule delivery of an ordered prompt-step list into a session's window
+/// after `delay_secs`, via a single detached `run-shell` timer on `target`'s
+/// server.
 ///
-/// Used by the headless automation dispatcher to deliver a Spawn automation's
-/// prompt once the freshly launched agent CLI has had time to boot — offline
-/// there is no TUI deferred-input queue to lean on. Local-tmux scoped.
-pub fn send_prompt_after_delay(session_name: &str, text: &str, delay_secs: u64) -> Result<()> {
-    let target = window_target(session_name);
-    let script = deferred_prompt_script(&target, text);
-    let status = local_mux_command(&["run-shell", "-b", "-d", &delay_secs.to_string(), &script])
+/// Used by the headless automation dispatcher to deliver a `Spawn` automation's
+/// prompts once the freshly launched agent CLI has had time to boot — offline
+/// there is no TUI deferred-input queue to lean on. One script drives the whole
+/// sequence so the inter-step settle delays keep sub-second precision (tmux's
+/// `run-shell -d` only takes whole seconds) and a single scheduling failure
+/// can't leave half a sequence queued.
+pub fn send_prompt_steps_after_delay(
+    target: &MuxTarget,
+    session_name: &str,
+    steps: &[crate::session::PromptStep],
+    delay_secs: u64,
+) -> Result<()> {
+    let window = target.window_target(session_name);
+    let script = deferred_prompt_script(target, &window, steps);
+    let status = target
+        .command(&["run-shell", "-b", "-d", &delay_secs.to_string(), &script])
         .status()
         .context("Failed to schedule tmux run-shell for deferred prompt")?;
     if !status.success() {
@@ -1569,38 +1724,126 @@ pub fn send_prompt_after_delay(session_name: &str, text: &str, delay_secs: u64) 
     Ok(())
 }
 
-/// Build the `run-shell` script that pastes the prompt, waits a beat so the
-/// bracketed paste is consumed, then presses Enter. `run-shell` executes the
-/// script via the multiplexer server's shell, so the syntax is platform-specific.
+/// Build the `run-shell` script that pastes each step, waits a beat so the
+/// bracketed paste is consumed, presses Enter, then sleeps the step's settle
+/// delay before the next one.
 ///
-/// POSIX path (`tmux` on Linux/macOS): a plain `sh` one-liner.
-#[cfg(not(windows))]
-fn deferred_prompt_script(target: &str, text: &str) -> String {
-    let escaped_target = shell_escape(target);
-    let socket = local_socket();
-    // Bracketed-paste wrap (see `bracketed_paste`) so multi-line prompts don't
-    // submit early; `-l` makes the multiplexer deliver the bytes literally.
-    let escaped_text = shell_escape(&bracketed_paste(text));
+/// `run-shell` is executed by the **target** server's shell, so the syntax
+/// follows that host's multiplexer, not the OS friring was built for: a Unix
+/// friring driving a psmux host needs the PowerShell form, and a Windows
+/// friring driving a WSL/SSH tmux host needs the `sh` form. `run-shell -b` only
+/// confirms scheduling, so getting this wrong is a silent no-op.
+fn deferred_prompt_script(
+    target: &MuxTarget,
+    window: &str,
+    steps: &[crate::session::PromptStep],
+) -> String {
+    if target.uses_psmux() {
+        deferred_prompt_script_powershell(target, window, steps)
+    } else {
+        deferred_prompt_script_posix(target, window, steps)
+    }
+}
+
+/// POSIX path (`tmux` on Linux/macOS/WSL): a plain `sh` one-liner.
+fn deferred_prompt_script_posix(
+    target: &MuxTarget,
+    window: &str,
+    steps: &[crate::session::PromptStep],
+) -> String {
+    let escaped_window = shell_escape(window);
+    let (mux, socket) = (&target.mux, &target.socket);
+    let mut parts: Vec<String> = Vec::new();
+    for (i, step) in steps.iter().enumerate() {
+        // Bracketed-paste wrap (see `bracketed_paste`) so multi-line prompts
+        // don't submit early; `-l` delivers the bytes literally. Quoted with
+        // `posix_quote`, not `control_mode::shell_escape`: the latter also
+        // strips newlines (tmux control mode is line-delimited), which a
+        // single-quoted argument in a shell *script* has no need of — and
+        // stripping them would flatten a multi-line prompt step.
+        let escaped_text = crate::shell::posix_quote(&bracketed_paste(&step.text));
+        parts.push(format!(
+            "{mux} -L {socket} send-keys -t {escaped_window} -l {escaped_text}"
+        ));
+        parts.push("sleep 0.2".to_string());
+        parts.push(format!(
+            "{mux} -L {socket} send-keys -t {escaped_window} Enter"
+        ));
+        if i + 1 < steps.len() {
+            parts.push(format!("sleep {}", format_secs(step.delay())));
+        }
+    }
+    parts.join("; ")
+}
+
+/// psmux path: psmux's `run-shell` is not a POSIX shell, so drive the sequence
+/// through PowerShell explicitly (`Start-Sleep` for the sub-second beat).
+/// PowerShell single-quoted literals escape an embedded `'` by doubling it.
+fn deferred_prompt_script_powershell(
+    target: &MuxTarget,
+    window: &str,
+    steps: &[crate::session::PromptStep],
+) -> String {
+    let w = ps_single_quote(window);
+    let (mux, socket) = (&target.mux, &target.socket);
+    let mut parts: Vec<String> = Vec::new();
+    for (i, step) in steps.iter().enumerate() {
+        let body = ps_single_quote(&bracketed_paste(&step.text));
+        parts.push(format!("{mux} -L {socket} send-keys -t {w} -l {body}"));
+        parts.push("Start-Sleep -Milliseconds 200".to_string());
+        parts.push(format!("{mux} -L {socket} send-keys -t {w} Enter"));
+        if i + 1 < steps.len() {
+            parts.push(format!("Start-Sleep -Milliseconds {}", step.delay()));
+        }
+    }
+    powershell_encoded_command(&parts.join("; "))
+}
+
+/// Frame a PowerShell script as `-EncodedCommand` (base64 of UTF-16LE, what
+/// PowerShell expects).
+///
+/// The script embeds arbitrary prompt text, so it cannot ride inside a
+/// double-quoted `-Command "…"`: one `"` or newline in a prompt would end the
+/// framing and run the remainder as separate commands — after `run-shell -b`
+/// had already reported the scheduling a success. Base64 has no character that
+/// can escape the argument.
+fn powershell_encoded_command(script: &str) -> String {
+    let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     format!(
-        "{DEFAULT_MUX} -L {socket} send-keys -t {escaped_target} -l {escaped_text}; \
-         sleep 0.2; \
-         {DEFAULT_MUX} -L {socket} send-keys -t {escaped_target} Enter"
+        "powershell -NoProfile -EncodedCommand {}",
+        base64_encode(&utf16le)
     )
 }
 
-/// Windows path (`psmux`): psmux's `run-shell` is not a POSIX shell, so drive the
-/// sequence through PowerShell explicitly (`Start-Sleep` for the sub-second beat).
-/// PowerShell single-quoted literals escape an embedded `'` by doubling it.
-#[cfg(windows)]
-fn deferred_prompt_script(target: &str, text: &str) -> String {
-    let t = ps_single_quote(target);
-    let socket = local_socket();
-    let body = ps_single_quote(&bracketed_paste(text));
-    format!(
-        "powershell -NoProfile -Command \"{DEFAULT_MUX} -L {socket} send-keys -t {t} -l {body}; \
-         Start-Sleep -Milliseconds 200; \
-         {DEFAULT_MUX} -L {socket} send-keys -t {t} Enter\""
-    )
+/// Standard-alphabet base64 (RFC 4648) with `=` padding.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b1 = *chunk.first().unwrap_or(&0) as u32;
+        let b2 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b3 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b1 << 16) | (b2 << 8) | b3;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Format a millisecond delay as a POSIX `sleep` argument (`sleep 1.2`), which
+/// takes fractional seconds on every shell friring's `run-shell` scripts run in.
+fn format_secs(ms: u64) -> String {
+    format!("{}.{:03}", ms / 1000, ms % 1000)
 }
 
 /// Wrap `s` in a PowerShell single-quoted literal, doubling embedded quotes.
@@ -1901,6 +2144,165 @@ mod tests {
     use crate::agent::control_mode::{
         decode_octal, format_send_keys, parse_notification, shell_escape,
     };
+
+    /// A target whose host runs POSIX tmux (a WSL distro), whatever OS this
+    /// build runs on — the script dialect follows the target, not the builder.
+    fn posix_target() -> MuxTarget {
+        MuxTarget {
+            transport: TmuxTransport::Wsl {
+                distro: "Ubuntu".into(),
+                mux: "tmux".into(),
+            },
+            socket: "friring".into(),
+            session: "friring".into(),
+            mux: "tmux".into(),
+        }
+    }
+
+    /// A target whose host runs psmux (a Windows box over SSH).
+    fn psmux_target() -> MuxTarget {
+        MuxTarget {
+            transport: TmuxTransport::Ssh {
+                destination: "winbox".into(),
+                ssh_opts: Vec::new(),
+                mux: "psmux".into(),
+            },
+            socket: "friring".into(),
+            session: "friring".into(),
+            mux: "psmux".into(),
+        }
+    }
+
+    #[test]
+    fn deferred_prompt_script_sends_each_step_separately() {
+        use crate::session::PromptStep;
+        let target = posix_target();
+        let steps = vec![
+            PromptStep {
+                text: "/model opus".into(),
+                delay_ms: Some(2_000),
+            },
+            PromptStep::new("summarize my inbox"),
+        ];
+        let script = deferred_prompt_script(&target, "friring:=tb-auto-1", &steps);
+
+        // Each step is its own paste + Enter — a single multi-line paste would
+        // submit as one prompt, which is the whole point of steps.
+        assert_eq!(script.matches("send-keys").count(), 4);
+        assert!(script.contains("/model opus"));
+        assert!(script.contains("summarize my inbox"));
+        // The step's settle delay sits between them, at sub-second precision
+        // (tmux's own `run-shell -d` only takes whole seconds).
+        assert!(script.contains("sleep 2.000"), "got {script}");
+        // The last step has no trailing settle — nothing waits on it.
+        assert_eq!(script.matches("sleep 1.200").count(), 0);
+    }
+
+    #[test]
+    fn deferred_prompt_script_preserves_arbitrary_prompt_bytes() {
+        use crate::session::PromptStep;
+        let target = posix_target();
+        // A single-quoted shell word carries newlines and quotes verbatim; the
+        // control-mode escaper would have flattened the newline into a space.
+        let text = "line one\nline two 'quoted' \"dquoted\"";
+        let script =
+            deferred_prompt_script(&target, "friring:=tb-auto-1", &[PromptStep::new(text)]);
+        assert!(script.contains("line one\nline two"), "got {script}");
+        assert!(script.contains(r#""dquoted""#), "got {script}");
+    }
+
+    #[test]
+    fn mux_target_for_backend_maps_a_session_to_its_own_server() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let hosts = crate::agent::host_config::hosts_config_path().unwrap();
+        std::fs::create_dir_all(hosts.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hosts,
+            "[[hosts]]\nname = \"devbox\"\ndestination = \"me@devbox\"\nsession = \"remote\"\n",
+        )
+        .unwrap();
+
+        // A local session keeps the local server.
+        for local in ["", "local-tmux", "tmux"] {
+            let t = MuxTarget::for_backend(local).unwrap();
+            assert!(!t.transport.is_remote(), "{local} should stay local");
+        }
+        // A remote one resolves to its host's transport and group session.
+        let t = MuxTarget::for_backend("ssh:devbox").unwrap();
+        assert!(t.transport.is_remote());
+        assert_eq!(t.window_target("s"), "remote:=tb-s");
+        // A backend naming a host that is gone is an error, never a silent
+        // fallback that would type the prompt into the wrong machine.
+        let err = MuxTarget::for_backend("ssh:ghost").unwrap_err().to_string();
+        assert!(err.contains("ghost"), "got {err}");
+    }
+
+    #[test]
+    fn deferred_prompt_script_targets_the_hosts_own_mux() {
+        use crate::session::{HostDef, PromptStep};
+        let host = HostDef {
+            name: "devbox".into(),
+            destination: "me@devbox".into(),
+            socket: Some("friring".into()),
+            session: Some("remote-group".into()),
+            ..HostDef::default()
+        };
+        let target = MuxTarget::for_host(&host);
+        // `run-shell` runs on the *remote* server, so the script must name that
+        // host's socket/session, not ours.
+        let window = target.window_target("auto-1");
+        assert_eq!(window, "remote-group:=tb-auto-1");
+        let script = deferred_prompt_script(&target, &window, &[PromptStep::new("go")]);
+        assert!(script.contains("remote-group:=tb-auto-1"), "got {script}");
+    }
+
+    #[test]
+    fn deferred_prompt_script_follows_the_target_host_not_the_build_os() {
+        use crate::session::PromptStep;
+        // A prompt carrying the two characters that used to break the outer
+        // `-Command "…"` framing.
+        let steps = [PromptStep::new("say \"hi\"\nthen go")];
+
+        let ps = deferred_prompt_script_powershell(&psmux_target(), "friring:=tb-auto-1", &steps);
+        assert_eq!(
+            deferred_prompt_script(&psmux_target(), "friring:=tb-auto-1", &steps),
+            ps,
+            "a psmux target must get the PowerShell form"
+        );
+        // Base64 framing: nothing in the prompt can escape the argument.
+        let encoded = ps
+            .strip_prefix("powershell -NoProfile -EncodedCommand ")
+            .unwrap_or_else(|| panic!("got {ps}"));
+        assert!(
+            encoded
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')),
+            "got {ps}"
+        );
+
+        // A POSIX target gets the `sh` form even from a Windows build.
+        let sh = deferred_prompt_script(&posix_target(), "friring:=tb-auto-1", &steps);
+        assert!(sh.starts_with("tmux -L friring send-keys"), "got {sh}");
+        assert!(sh.contains("sleep 0.2"), "got {sh}");
+    }
+
+    #[test]
+    fn base64_encode_matches_the_powershell_encoding() {
+        // What `powershell -EncodedCommand` expects: base64 of UTF-16LE.
+        let utf16le: Vec<u8> = "hi".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(base64_encode(&utf16le), "aABpAA==");
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_encode(b""), "");
+    }
+
+    #[test]
+    fn format_secs_renders_sub_second_delays() {
+        assert_eq!(format_secs(1_200), "1.200");
+        assert_eq!(format_secs(500), "0.500");
+        assert_eq!(format_secs(2_000), "2.000");
+    }
 
     // The control-mode primitives are re-exported through this module. Their
     // behavior is covered exhaustively in `control_mode`'s own test module;

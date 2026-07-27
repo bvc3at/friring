@@ -845,6 +845,68 @@ session_ref = "flow"           # must match a [[sessions]] name above
 prompt = "tick"
 ```
 
+### `[[automations]]` grammar
+
+The same block is what `friring-cli automation export` writes and
+`automation import` reads, so an exported automation pastes into an
+`extension.toml` unchanged. Each entry selects **exactly one** action flavour;
+setting several (or none) is a load-time error.
+
+| Key | Flavour | Meaning |
+|---|---|---|
+| `name` | — | identity: an existing automation of this name is reused, not duplicated |
+| `trigger` | — | `hourly` / `daily` / `weekdays` / `weekly` / `cron:<expr>` / `at:<ms>` |
+| `timezone` | — | IANA name the schedule is evaluated in (omitted = system local) |
+| `enabled` | — | start disabled with `false` (omitted = enabled) |
+| `session_ref` | send | an extension's `[[sessions]]` name; on **import**, a plain session name re-resolved per fire |
+| `session_id` | send | an exact session UUID (what `export` writes for an id-targeted automation) |
+| `repo` | spawn | repository to run a new session in |
+| `worktree` / `base` | spawn | worktree branch and its fork point |
+| `agent` / `host` | spawn | `agents.toml` / `hosts.toml` names |
+| `session_mode` | spawn | `reuse` (default) or `fresh` per fire |
+| `extra_repos` | spawn | multi-repo members (`repo_path`, `worktree`, `base_branch`) |
+| `command` | exec | shell command run headlessly; `{home}` is substituted |
+| `timeout_secs` | exec | kill deadline (omitted = 900 s) |
+| `prompt` | send/spawn | the single-step form |
+| `prompts` | send/spawn | ordered steps, each its own paste + Enter |
+| `step_delay_ms` | send/spawn | settle time between *every* gap (omitted = 1200) |
+| `steps` | send/spawn | `[[automations.steps]]` tables — ordered `text` + optional per-step `delay_ms` |
+
+`prompt`, `prompts` and `steps` are three spellings of the same list and are
+mutually exclusive; a prompt alongside `command` is rejected — an exec has no
+agent to prompt, so it would be silently dropped.
+
+Reach for `steps` only when the gaps differ. `prompts` + `step_delay_ms` applies
+one delay to every gap, which is what most sequences want:
+
+```toml
+[[automations]]
+name = "inbox-triage"
+trigger = "weekdays"
+repo = "/home/me/app"
+
+# A slash command's popup needs longer to settle than a plain prompt does.
+[[automations.steps]]
+text = "/model opus"
+delay_ms = 2000
+[[automations.steps]]
+text = "Summarize my inbox."
+```
+
+```toml
+# A spawn automation with slash-command setup before the real work.
+[[automations]]
+name = "inbox-triage"
+trigger = "weekdays"
+timezone = "Europe/Zurich"
+repo = "~/code/app"
+worktree = "auto/inbox"
+agent = "claude"
+session_mode = "fresh"
+prompts = ["/model opus", "/effort high", "Summarize my inbox."]
+step_delay_ms = 1500
+```
+
 Manage extensions with the CLI:
 
 ```bash

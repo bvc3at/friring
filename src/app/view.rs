@@ -1288,6 +1288,18 @@ impl App {
             return Some(((fields, None), buttons));
         }
 
+        // Automation dry-run overlay (read-only, no click targets).
+        if let super::modals::Modal::AutomationDryRun(ref d) = self.modal {
+            crate::ui::automation_dry_run_modal::render_automation_dry_run_modal(
+                frame,
+                &crate::ui::automation_dry_run_modal::AutomationDryRunState {
+                    name: &d.name,
+                    rows: &d.rows,
+                },
+            );
+            return None;
+        }
+
         // Automations list modal
         if let super::modals::Modal::AutomationsList(ref al) = self.modal {
             return Some(self.render_automations_list_modal(frame, al));
@@ -1708,9 +1720,10 @@ fn task_linkage(task: &crate::session::Task) -> String {
         // `None`, and the automation-only `Exec` (a task never carries one), are
         // plain local todos with no agent linkage to show.
         None | Some(AutomationAction::Exec { .. }) => "local todo".to_string(),
-        Some(AutomationAction::Send { session_id }) => {
-            format!("send → {}", short_session_id(session_id))
-        }
+        Some(AutomationAction::Send { target }) => match target {
+            crate::session::SendTarget::Id(id) => format!("send → {}", short_session_id(id)),
+            crate::session::SendTarget::Name(name) => format!("send → {name}"),
+        },
         Some(AutomationAction::Spawn {
             repo_path,
             worktree_branch,

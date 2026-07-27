@@ -1295,31 +1295,161 @@ A schedule is either:
 the dispatcher's scan key. After each fire it is recomputed; a
 spent one-shot clears it and disables the automation.
 
+### Prompt steps
+
+An automation delivers an **ordered list of prompts**, not one string. Each
+step is a *separate* bracketed paste followed by its own Enter, with a settle
+delay in between. This is not cosmetic: a bracketed paste containing newlines
+submits as **one** prompt, so the headline use case — configure the agent, then
+give it work — only works as separate submissions:
+
+```text
+step 1   /model opus
+step 2   /effort high
+step 3   Summarize my email history and file anything actionable.
+```
+
+- **Settle delay.** The gap has to outlast the agent CLI reacting to the
+  previous submission — above all a slash command, which opens an autocomplete
+  popup that must close before the next paste lands (otherwise step 2 is typed
+  into step 1's filter). The default is **1200 ms**
+  (`session::automation::DEFAULT_STEP_DELAY_MS`), overridable per step (the
+  delay is stored *after* the step it follows; the last step's is never waited
+  on). The TUI editor, the stored model and the `[[automations.steps]]` manifest
+  form all carry a genuine per-step value; `--step-delay` is the one coarse
+  surface, applying a single value to every gap.
+- **Storage.** The list is JSON in the `prompt_steps` column (schema **v44**),
+  `NULL` for a plain single-prompt automation — which keeps living in the
+  existing `prompt` column, byte-identical to what a pre-v44 friring wrote
+  (the `action_extra_repos` precedent). A multi-step automation *also* writes
+  step 1 into `prompt`, so an older binary reading the row still finds a usable
+  prompt. `Automation::steps()` is the single accessor every firing path uses,
+  so single- and multi-step automations are one code path.
+- **Delivery.** In the TUI, `App::send_prompt_steps_to_session` schedules
+  paste/Enter pairs on the `deferred_inputs` tick queue (~10 ms per tick).
+  Headless, `agent::tmux::send_prompt_steps_after_delay` emits the whole
+  sequence as **one** `tmux run-shell` script with `sleep`s between steps —
+  one script keeps sub-second delays (tmux's `run-shell -d` takes whole
+  seconds only) and means a scheduling failure can't leave half a sequence
+  queued.
+- **Authoring.** Repeat `--prompt` on the CLI (`--step-delay <ms>` sets the
+  gap), use the editor's `step` selector, or list `prompts = [...]` in a
+  manifest.
+
 ### Actions
 
-- **send** — bracketed-paste the prompt into the target session,
-  followed by a deferred Enter. Skipped (and logged as such) if the
-  target session is not currently running.
-- **spawn** — create a session named `auto-<id>` (reusing it on
-  later fires, including after a TUI restart where it is restored
-  by name), optionally on a worktree off a base branch, with the
-  chosen agent. The prompt is delivered after a short boot delay so
-  the agent CLI has time to start. Worktree provisioning is
-  **idempotent** (`git::create_or_attach_worktree`): if the session
-  was closed but its worktree/branch still exist, a later fire
-  reuses them rather than failing with "branch already exists".
+- **send** — deliver the prompt steps into an existing session. The target is
+  either a session **id** (exact, but force-deleting the session disables the
+  automation) or a session **name** (`--session-name`), re-resolved on every
+  fire so it survives the session being closed and recreated. Skipped (and
+  logged as such) if no matching session is running. Delivery follows the
+  target session's **own** backend, so a session running on a remote host is
+  reached there (`MuxTarget::for_backend`); a backend naming a host that is no
+  longer in `hosts.toml` is an error run, never a delivery to the wrong
+  machine.
+- **spawn** — create a session, optionally on a worktree off a base branch,
+  with the chosen agent, optionally on a remote **host**. The steps are
+  delivered after a short boot delay so the agent CLI has time to start.
+  Worktree provisioning is **idempotent**
+  (`git::create_or_attach_worktree`): if the session was closed but its
+  worktree/branch still exist, a later fire reuses them rather than failing
+  with "branch already exists". Two session modes:
+  - `reuse` (default, and the pre-v44 behavior) — one session named
+    `auto-<id>`, reused on every fire including after a TUI restart, where it
+    is restored from the database by name. Runs pile into one conversation.
+  - `fresh` — a new session per fire, named `auto-<id>-<YYYYmmdd-HHMMSS-mmm>`
+    (UTC fire stamp, milliseconds included so two claims inside one second can't
+    derive one name). When a worktree branch is configured it is stamped the
+    same way, because
+    `create_or_attach_worktree` is idempotent and would otherwise hand the
+    second live run the first run's checkout. A fresh automation is **capped at
+    5 concurrently-open sessions** (`MAX_LIVE_FRESH_SESSIONS`): past that, a
+    fire is skipped with a run explaining why, so an hourly job can't
+    accumulate sessions and worktrees unboundedly.
 - **exec** — run a shell command headlessly (`sh -c`, or `cmd /C` on
   Windows) with **no** agent or session; its exit status + tail-truncated
   output land in the run history. This is the deterministic scheduled-job
   action (the task-integration sync extensions use it). The shared runner is
-  `session_ops::run_exec_command` (called by both the headless `automation
-  tick` and the TUI `App::fire_automation`); the command is stored in the
-  `action_command` column (schema **v36**, on both `tasks` and `automations`).
+  `session_ops::run_exec_command_with_timeout`; the command is stored in the
+  `action_command` column (schema **v36**, on both `tasks` and `automations`),
+  its kill deadline in `action_timeout_secs` (**v44**, default 900 s).
   Author one with `friring-cli automation create --command "<shell>"`
-  (mutually exclusive with `--session`/`--repo`), in the TUI editor (the
-  action selector cycles Send → Spawn → Exec), or from an extension manifest
-  (`[[automations]]` with a `command` field). `Task.action` shares the
+  (mutually exclusive with `--session`/`--session-name`/`--repo`), in the TUI
+  editor (the action selector cycles Send → Spawn → Exec), or from an extension
+  manifest (`[[automations]]` with a `command` field). `Task.action` shares the
   `AutomationAction` enum but tasks never carry an `Exec` (automation-only).
+
+### Remote hosts
+
+A `spawn` automation can target any host from `hosts.toml`
+(`--host <name>`, or the editor's `host` selector; omitted = local). The
+whole fire happens there: `session_ops::spawn` resolves the host into an
+`ssh:<host>` / `wsl:<host>` backend, so the session, the tmux window **and**
+the prompt delivery land on that machine.
+
+**A remote spawn runs in the repo root, not a worktree.** Saving a host together
+with a worktree branch (or a worktree extra-repo) is **rejected**, as is a `~`
+in a remote path. The reason is the TUI: `App::spawn_and_prompt` provisions
+through the local `git::create_or_attach_worktree` and expands `~` against the
+local home, so a remote worktree spawn would build the checkout on the wrong
+machine and hand the remote session a path that does not exist there. The
+headless path could do it (`create_worktree_on` is host-aware), but an
+automation that works from `automation tick` and quietly misbehaves from the TUI
+is worse than one that is refused up front — the three firing paths are supposed
+to be indistinguishable. Use an absolute path on the host and attach extra repos
+as plain directories. `session_ops::validate_spawn_action` is the single check,
+called by the editor, `automation create`/`edit`, `automation import`, and
+extension activation alike.
+
+Getting delivery right was the actual work. The headless one-shot helpers
+(`window_exists`, `send_prompt_now`, the deferred-prompt timer) used to hardcode
+`local_mux_command`, which made a remote automation spawn a session and then
+type its prompt into a window that only exists on the *other* machine's server.
+They now take a **`MuxTarget`** (`agent::tmux`) — a `TmuxTransport` + socket +
+group session + the host's own multiplexer binary — resolved from the action's
+host, so both paths reach the right server. The `run-shell` script the deferred
+delivery schedules is executed by *that* host's tmux, so it names that host's
+socket and binary — and is written in that host's shell dialect (`sh` for tmux,
+PowerShell for a `multiplexer = "psmux"` host), chosen from the target rather
+than the OS friring was built for. An unknown host name is an error **before**
+the spawn, never a session nothing will ever prompt.
+
+The TUI path needed only `config.backend` threaded through
+`App::spawn_and_prompt`: `session.send_input(...)` already routes over the
+session's backend.
+
+### Exec runs off the tick thread
+
+`process_automations` runs inside `tick_core`, so running a shell command
+inline froze the render loop for as long as the command took. An `exec` fire
+now:
+
+1. records a run with the new **`running`** status (`AutomationRunStatus`,
+   schema v44 adds `automation_runs.finished_at`),
+2. hands the command to a worker (a detached thread in the TUI, inline in the
+   headless `tick` — a `tick` process that detached would exit and strand the
+   row), and
+3. **updates that same row** with the final status/detail when the command
+   exits. One fire keeps exactly one history entry; a long command shows as
+   `running` in the history panel while it works.
+
+The command is killed at its deadline (`--timeout`, default 900 s), with its
+stdout/stderr drained on separate threads — polling the deadline while the
+child fills a pipe buffer would deadlock. The kill takes the **whole process
+tree**: the child is spawned into its own process group (`taskkill /T` on
+Windows), because signalling only the `sh -c` leaves a backgrounded worker
+(`worker & wait`) running *and* holding the pipe write-ends, so the read would
+block for the grandchild's full lifetime — far past the deadline, with the run
+row still `running`. Collecting the drained output is itself bounded (2 s grace)
+so a descendant that escapes the group still cannot pin the worker.
+
+A `running` row whose worker died
+with its process (a crash) is closed out as `interrupted` by
+`Database::reap_orphaned_automation_runs` — on the next TUI startup, and on
+every headless `automation tick`, so a keeper-only install closes them out too.
+The cutoff is per run — its own automation's timeout plus a grace period — so
+neither a concurrent instance's healthy run nor a legitimately hour-long command
+is ever yanked out from under it.
 
 ### Execution model
 
@@ -1352,12 +1482,12 @@ claim-then-act (at-most-once): a crash between claim and side effect
 loses a run rather than duplicating one.
 
 **Headless send vs spawn.** `send` types into the still-alive tmux
-window (`send_prompt_now`). `spawn` creates the session headlessly
-(`spawn_session_headless`); the prompt is delivered via a short
+window (`send_prompt_steps_now`). `spawn` creates the session headlessly
+(`spawn_session_headless`); the prompt steps are delivered via a short
 deferred `tmux run-shell` timer once the agent boots, and the TUI
-adopts the `auto-<id>` session by name on its next startup. All of
-this is local-tmux scoped today; a future remote/SSH `SessionBackend`
-would plug into the same dispatch seam.
+adopts the `auto-<id>` session by name on its next startup. Both go through
+the action's `MuxTarget`, so a remote spawn talks to its host's tmux server
+rather than the local one (see Remote hosts above).
 
 ### Automations pane
 
@@ -1373,8 +1503,9 @@ session — and the ends wrap too: `j` past the last automation loops to the
 **top** of the session list, and `k` above the first session loops to the
 **last** automation. It is **not** a separate stop in the `Ctrl+H`/`Ctrl+L`
 cycle (which treats it like the session list). Once focused: `j`/`k` select,
-`Space` toggle enabled, `r` run-now, `d` (or `Ctrl+D`) delete, and
-**`Ctrl+N`/`n` create a new automation** (works even on an empty pane).
+`Space` toggle enabled, `r` run-now, `p` dry-run preview, `d` (or `Ctrl+D`)
+delete, and **`Ctrl+N`/`n` create a new automation** (works even on an empty
+pane).
 
 The pane behaves **exactly like the session list**, with the
 central pane as its terminal-equivalent: while the pane is focused,
@@ -1390,7 +1521,9 @@ editor (the global file-viewer binding is suppressed there).
 The scoped automation's **run history** (`db::list_automation_runs`, cached
 in `App::cached_automation_runs`) is shown beneath the editor: each row reads
 `<status> <clock time> <relative age> <detail>` with the status
-(`ok`/`error`/`skipped`) colour-coded and bold. Press `Ctrl+L` again (from
+(`ok`/`error`/`skipped`/`running`) colour-coded and bold. A `running` row is
+an `exec` command still in flight — it is rewritten in place when the command
+exits. Press `Ctrl+L` again (from
 the editor) to focus the history panel (`InputFocus::AutomationRunHistory`),
 then `j`/`k` to move the cursor over runs (`App::automation_run_index`); the
 panel footer shows its shortcuts — **`r` runs the automation now**, **`Enter`
@@ -1421,7 +1554,7 @@ same editor as a centered overlay (`Modal::AutomationEditor`), both sharing
 
 `Ctrl+P` opens the same set over the full list (a modal, available
 at any width). Keys: `n` new, `e`/`Enter` edit, `Space` toggle
-enabled, `r` run-now, `d` delete, `Esc` close.
+enabled, `r` run-now, `p` dry-run preview, `d` delete, `Esc` close.
 
 The editor avoids typing schedules by hand. **Trigger** is a
 selector cycled with `←/→` — `once`, `hourly`, `daily`,
@@ -1433,22 +1566,77 @@ selector cycled with `←/→` — `once`, `hourly`, `daily`,
 - `weekly` → a **Weekday** selector + Hour/Minute.
 - `cron` → a raw expression field for power users.
 
-**Action** is a `‹ send ›`/`‹ spawn ›`/`‹ exec ›` selector. For **send**, a
-**Target** selector (also cycled with `←/→`) lets you pick which
-running session receives the prompt — it defaults to the active
-session and lists every session; saving is rejected if none exist.
-For **spawn**, the **Repo**/**Worktree**/**Agent** text fields
-appear instead (a leading `~` in the repo path is expanded). For **exec**,
-a single **Command** field replaces them (no agent/session).
+**Timezone** is a free-text IANA name, but it is **validated on save**: an
+unrecognized name used to fall through to system local time silently, turning a
+typo into an automation that fires hours off with no signal.
 
-`Hour`/`Minute`/`Weekday`/`Action`/`Target` are steppers/selectors
-(`←/→` adjust, wrapping); `Tab`/`↑↓` move between fields; `Space`
-also adjusts the focused selector/stepper; `^E` toggles enabled;
+**Action** is a `‹ send ›`/`‹ spawn ›`/`‹ exec ›` selector, and the rest of the
+form follows it:
+
+- **send** → a **Target** selector (cycled with `←/→`) picks which running
+  session receives the prompt; it defaults to the active session and lists every
+  session. Saving is rejected if none exist. (Targeting a session by *name*
+  rather than id is CLI-only — `--session-name`.)
+- **spawn** → **Repo**, **Worktree**, **Base** (fork point, default `main`),
+  **Agent**, **Host**, **Session**, **+repos**, **+dirs**. A leading `~` in any
+  path is expanded. **Agent** and **Host** are selectors over the live
+  registries (`agents.toml` / `hosts.toml`) rather than free text, so a typo
+  is impossible and an unknown name is a **save-time** error instead of a
+  fire-time one hours later; an agent an automation still names but the
+  registry no longer has is kept in the list rather than silently reset.
+  **Session** cycles `reuse` / `fresh per fire`. **+repos** and **+dirs** are
+  comma-separated multi-repo lists using the CLI's grammar (`path[@base]`
+  worktree extras, plain paths attached as-is).
+- **exec** → **Command** plus a **Timeout** in seconds (blank = the 900 s
+  default). No agent, no session, no prompt.
+
+Below the action come the prompt steps: a **step** selector showing `2/3`, an
+optional **wait** field (the settle delay after this step, shown only when
+there is more than one), and the **prompt** text for the selected step. On the
+`step` row: `←/→` walk the list, `n` adds a step after the current one, `d`
+removes it, `[`/`]` reorder. Blank steps are dropped on save.
+
+`Hour`/`Minute`/`Weekday`/`Action`/`Target`/`Agent`/`Host`/`Session`/`Step` are
+steppers/selectors (`←/→` adjust, wrapping); `Tab`/`↑↓` move between fields;
+`Space` also adjusts the focused selector/stepper; `^E` toggles enabled;
 `Enter` saves. A live **next:** line previews when the automation
 will fire (or shows the validation error for the current input).
 Editing an existing automation reverse-maps its cron back into the
 structured fields where it matches a known preset shape; otherwise
 it opens as raw `cron`.
+
+### Dry run
+
+`p` on a selected automation (in the pane or the `Ctrl+P` list) opens a
+read-only overlay showing what the **next fire would do**, without firing it:
+the resolved schedule and its next occurrence in the automation's timezone, the
+resolved send target or spawn parameters (session name, worktree branch, agent,
+host), and every prompt step in delivery order with the wait between them.
+`Esc`, `Enter` or `q` dismisses it; other keys are ignored, so a stray
+keystroke can't drop a plan mid-read.
+
+`friring-cli automation dry-run <id>` prints the same plan — both call
+`session::automation::dry_run_plan`, so the terminal and the TUI can't drift.
+
+### Export / import
+
+`friring-cli automation export [--id N]` prints automations as a TOML
+`[[automations]]` document, and `automation import <file> [--replace]` creates
+them back. The grammar is deliberately the **same one extension manifests use**
+for their automations (`session::extension_def::ExtensionAutomation`), extended
+rather than forked, so an exported block pastes into an `extension.toml`
+unchanged — see `docs/CONFIG.md`.
+
+Export writes the **narrowest form that round-trips faithfully**: `prompt` for a
+single step, `prompts` + one `step_delay_ms` when every gap is the same, and the
+per-step `[[automations.steps]]` table only when the delays differ. So an
+exported single-step automation stays byte-identical to a hand-written entry,
+and heterogeneous delays (500 ms then 2000 ms) survive instead of flattening.
+
+Import matches on **name** (an extension's identity for its automations too): an
+existing automation is skipped unless `--replace`. A `session_ref` imports as a
+**name** target rather than a session UUID, so a transferred automation doesn't
+carry another machine's session id.
 
 ### Persistence
 
@@ -1457,16 +1645,81 @@ Automations live in the `automations` SQLite table (`name`,
 `action_kind` plus action columns, `prompt`, timestamps,
 `last_run_at`, `next_run_at`), with a partial index on
 `next_run_at` (where enabled and non-null) for the due-scan. Each
-fire appends to `automation_runs` (`status` = success/skipped/error
-plus a free-text `detail`) for history.
+fire appends to `automation_runs` (`status` =
+success/skipped/error/running plus a free-text `detail` and a
+`finished_at` stamp) for history.
+
+Schema **v44** widened the model in one migration. Every column it adds is
+nullable with no default, so a pre-v44 row decodes to exactly its old behavior
+— an id `Send` target, a local single-session `Spawn`, an `Exec` on the default
+timeout, one prompt step:
+
+| Column | Table(s) | Meaning when `NULL` |
+|---|---|---|
+| `action_target_name` | `tasks`, `automations` | send by id (`target_session`) |
+| `action_host` | `tasks`, `automations` | spawn locally |
+| `action_session_mode` | `tasks`, `automations` | `reuse` one session |
+| `action_timeout_secs` | `tasks`, `automations` | the default exec timeout |
+| `prompt_steps` | `automations` | one step, from `prompt` |
+| `finished_at` | `automation_runs` | the run never recorded one |
+
+The four `action_*` columns land on **both** tables because `tasks` and
+`automations` share one action-column group (`storage::ActionColumns`) — a
+column missing on either side would break the shared encoder.
 
 ### Headless access (`friring-cli`)
 
 `friring-cli automation` (alias `auto`) provides
-`create`/`list`/`show`/`edit`/`remove`/`run`/`runs`/`tick` without
-the TUI, sharing the same tables. `run` marks an automation due;
+`create`/`list`/`show`/`dry-run`/`export`/`import`/`edit`/`remove`/`run`/`runs`/`tick`
+without the TUI, sharing the same tables. `run` marks an automation due;
 `tick` fires all currently-due automations headlessly (this is what
 the tmux keeper and the optional OS timers invoke).
+
+`edit` takes the **same action flags as `create`** (a shared `ActionArgs`
+group), so an action is editable in place instead of delete-and-recreate:
+supplying `--session`/`--session-name`/`--repo`/`--command` *switches* the
+action kind outright, while the rest amend the current one field by field
+(`--agent x` on a spawn leaves its repo and worktree alone; an empty string
+clears an optional field). See `docs/CLI.md` for the full flag list.
+
+### Design note: chaining (not implemented)
+
+Automation→automation dependencies were considered and **deliberately left
+out**. The recorded reasoning, so it isn't re-litigated from scratch:
+
+**What chaining would have to answer.** A `depends_on` edge is the easy part.
+The hard parts are all semantics:
+
+1. *Data flow.* Does `exec` stdout feed the next automation's prompt? That
+   means a templating language (`{{prev.stdout}}`), a size cap, and a decision
+   about what a `spawn` "outputs" at all — an agent session has no exit code and
+   no completion event the scheduler can see. Without agent completion, B can
+   only be chained to "A was *dispatched*", which is not what anyone means.
+2. *Failure edges.* `on_success` / `on_error` / `always` multiplies the run
+   model: B's own schedule now competes with A's trigger, and `next_run_at` —
+   the single scan key the whole dispatcher is built on — stops describing when
+   B runs.
+3. *Cycles.* Rejecting them needs a graph walk on every save and on every
+   import, in three authoring paths (TUI, CLI, manifest).
+4. *At-most-once.* The claim CAS is per-row. A chained fire has no `next_run_at`
+   to compare-and-swap against, so it needs a second, different exactly-once
+   mechanism — the one invariant this subsystem most needs to keep.
+
+**Why it doesn't earn that.** Multi-step prompts already cover the case chaining
+was wanted for: "configure the agent, then give it work, then have it file the
+result" is one automation with three steps, delivered in order to one session,
+with no new persistence, no new firing path, and no new exactly-once problem.
+The genuinely-remaining case — "run B only if A succeeded" — is a *shell*
+concern, and `exec` already runs a shell: `a.sh && b.sh` chains with real exit
+codes, real data flow, and semantics every user already knows.
+
+**If it is ever revisited**, the cheapest honest version is a `then` list on
+`Exec` only (where an exit code exists), fired inline by the same worker that
+already owns the run, recorded as one run with a multi-step detail — no new
+scheduler state, no new claim mechanism, no agent-completion problem. Anything
+covering `Spawn` needs agent-completion signalling (the hooks pipeline that
+drives session status) first, and that is a much larger feature than a
+dependency edge.
 
 ---
 

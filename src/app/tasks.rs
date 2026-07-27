@@ -62,7 +62,7 @@ impl App {
     /// single source of truth for both the details panel and the *open* key.
     pub(crate) fn task_related_session_indices(&self, task: &crate::session::Task) -> Vec<usize> {
         let send_target = match &task.action {
-            Some(crate::session::AutomationAction::Send { session_id }) => Some(*session_id),
+            Some(crate::session::AutomationAction::Send { target }) => target.id(),
             _ => None,
         };
         let linked = self.task_ui.task_session_links.get(&task.id).copied();

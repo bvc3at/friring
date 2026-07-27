@@ -299,7 +299,12 @@ fn run_task(db: &Database, task: &Task) -> Result<Value, String> {
     let prompt = task.agent_prompt();
     match &task.action {
         None => Ok(json!({ "skipped": "task is not connected to an agent", "id": task.id })),
-        Some(AutomationAction::Send { session_id }) => {
+        Some(AutomationAction::Send { target }) => {
+            // A task's send target is always an id (the TUI/CLI author it that
+            // way); a name target would have no session to resolve here.
+            let session_id = &target
+                .id()
+                .ok_or_else(|| "task send target has no session id".to_string())?;
             let name = db
                 .get_session_name(*session_id)
                 .map_err(|e| format!("get_session_name: {e}"))?
@@ -318,6 +323,8 @@ fn run_task(db: &Database, task: &Task) -> Result<Value, String> {
             base_branch,
             agent,
             extra_repos,
+            host,
+            ..
         }) => {
             let name = task.spawn_session_name();
             // Reuse an existing session window (re-trigger / restored session).
@@ -342,7 +349,7 @@ fn run_task(db: &Database, task: &Task) -> Result<Value, String> {
                 base_branch: base_branch.clone(),
                 agent: agent.clone(),
                 agent_session_id: None,
-                host: None,
+                host: host.clone(),
                 parent_session_id: None,
                 task_id: Some(task.id),
                 extra_repos: extra_repos.clone(),
@@ -429,15 +436,19 @@ fn resolve_action(
         (Some(_), None) if !extra_repos.is_empty() => {
             Err("--add-repo/--add-dir apply to --repo (spawn), not --session (send)".into())
         }
-        (Some(s), None) => Ok(Some(AutomationAction::Send {
-            session_id: action::resolve_send_target(db, &s)?,
-        })),
+        (Some(s), None) => Ok(Some(AutomationAction::send_to(
+            action::resolve_send_target(db, &s)?,
+        ))),
         (None, Some(r)) => Ok(Some(AutomationAction::Spawn {
             repo_path: r.into(),
             worktree_branch: worktree,
             base_branch: base,
             agent,
             extra_repos,
+            // The task CLI has no host/session-mode flags: a task spawn is
+            // local and one-shot, so the automation defaults are correct.
+            host: None,
+            session_mode: crate::session::SpawnSessionMode::default(),
         })),
     }
 }
@@ -491,9 +502,7 @@ mod tests {
     fn action_label_distinguishes_send_spawn_and_none() {
         assert_eq!(action::action_label(None), "-");
         assert_eq!(
-            action::action_label(Some(&AutomationAction::Send {
-                session_id: SessionId::default(),
-            })),
+            action::action_label(Some(&AutomationAction::send_to(SessionId::default()))),
             "send"
         );
         assert_eq!(
@@ -503,6 +512,8 @@ mod tests {
                 base_branch: None,
                 agent: None,
                 extra_repos: Vec::new(),
+                host: None,
+                session_mode: Default::default(),
             })),
             "spawn"
         );

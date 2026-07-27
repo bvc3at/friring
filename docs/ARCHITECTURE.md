@@ -193,6 +193,14 @@ when `tick()` polls `try_recv()`:
   continuation applied on completion. Programmatic spawns
   (automations/tasks, restore) stay **synchronous** — they read the new
   session's id straight back, so they cannot defer it to a later tick.
+- **Automation `exec`** — the one deliberate exception to the shape: the
+  tick records a `running` run row and hands the command to a *detached*
+  `std::thread` that opens its own `Database` connection and closes the row
+  out itself, because the run outlives the tick that started it and no
+  result has to reach the model. (The headless `automation tick` runs it
+  inline instead — a short-lived process that detached would exit and
+  strand the row.) A worker that dies with its process is recovered by
+  `reap_orphaned_automation_runs`; see `docs/FEATURES.md`.
 
 **Rejected**:
 
@@ -346,10 +354,22 @@ A live keeper window both runs the heartbeat and keeps the tmux
 server alive (a bare pending `run-shell` job does not), so even
 spawn-only automations fire with no other sessions. Claim-first
 ordering gives at-most-once semantics (a crash loses a run rather
-than double-firing), the right default for agent prompts. tmux is
-local-only; the send/spawn dispatch sits behind a seam so a future
-remote/SSH `SessionBackend` (ADR-2) slots in without changing the
-scheduler.
+than double-firing), the right default for agent prompts.
+
+Dispatch is **host-aware**: a `spawn` action resolves its `hosts.toml`
+host into an `agent::tmux::MuxTarget` (transport + socket + group
+session + that host's multiplexer binary), used for both the headless
+window lookup and the deferred prompt delivery, so a remote automation
+creates its session *and* is prompted on the right machine (an unknown
+host is an error before the spawn, never a silent local one). A
+*reused* spawn session is delivered over the backend it was created
+on. A `send` follows the **target session's own** `backend_type`
+(`MuxTarget::for_backend`), so a session started on a remote host is
+reached there rather than typed at the local server — and the TUI and
+the headless tick agree about the same automation instead of the
+outcome depending on which firer won the claim. A backend naming a
+host that is no longer in `hosts.toml` is an error run, never a
+delivery to the wrong machine.
 
 **Rejected**:
 

@@ -95,6 +95,10 @@ const HOOK_VERSION_CHECK_TICKS: u64 = 10;
 /// At ~10ms per tick, 10 ticks ≈ 100ms — enough for the app to process the pasted text.
 const DEFERRED_INPUT_DELAY_TICKS: u64 = 10;
 
+/// Nominal milliseconds per tick, for converting a wall-clock delay (a prompt
+/// step's settle time) into the tick offsets `deferred_inputs` schedules on.
+const TICK_MS: u64 = 10;
+
 /// How often to refresh system metrics (in ticks). At ~10ms per tick, 100 ≈ 1 second.
 const METRICS_REFRESH_TICKS: u64 = 100;
 
@@ -465,6 +469,25 @@ pub use modals::{AutomationActionKind, AutomationField, TaskField, TriggerKind};
 /// Ticks (~10 ms each) to wait after spawning a session before pasting its
 /// automation prompt, giving the agent CLI time to come up (~3 s).
 const AGENT_BOOT_DELAY_TICKS: u64 = 300;
+
+/// Everything [`App::spawn_and_prompt`] needs to spawn (or reuse) a named
+/// session and deliver its prompt steps.
+pub(crate) struct SpawnPromptRequest<'a> {
+    /// Session name; an existing session of this name is reused.
+    pub name: String,
+    pub repo_path: &'a std::path::Path,
+    /// `None` = run in the repo root; `Some` = create/attach a worktree branch.
+    pub worktree_branch: Option<&'a str>,
+    /// Base branch for a new worktree (default `main`).
+    pub base_branch: Option<&'a str>,
+    /// Agent name; `None` = registry default.
+    pub agent: Option<&'a str>,
+    /// `hosts.toml` host to spawn on; `None` = local.
+    pub host: Option<&'a str>,
+    pub extra_repos: &'a [crate::session::ExtraRepo],
+    /// Ordered prompt steps, each delivered as its own paste + Enter.
+    pub steps: &'a [crate::session::PromptStep],
+}
 
 pub enum AppMessage {
     KeyPress(KeyCode, KeyModifiers),
@@ -7489,55 +7512,80 @@ impl App {
     /// already running, or [`AGENT_BOOT_DELAY_TICKS`] for one just spawned so
     /// its agent CLI has time to come up.
     fn send_prompt_to_session(&mut self, session_id: SessionId, text: &str, boot_delay_ticks: u64) {
-        let mut paste = b"\x1b[200~".to_vec();
-        paste.extend_from_slice(text.as_bytes());
-        paste.extend_from_slice(b"\x1b[201~");
-
-        if boot_delay_ticks == 0 {
-            let Some(session) = self.sessions.iter().find(|s| s.info.id == session_id) else {
-                return;
-            };
-            if let Err(e) = session.send_input(paste) {
-                error!("Failed to send prompt to session {session_id}: {e}");
-                return;
-            }
-            self.deferred_inputs.push((
-                session_id,
-                b"\r".to_vec(),
-                self.metrics.tick_count + DEFERRED_INPUT_DELAY_TICKS,
-            ));
-        } else {
-            // Defer both paste and Enter so the freshly spawned agent can boot.
-            let paste_at = self.metrics.tick_count + boot_delay_ticks;
-            self.deferred_inputs.push((session_id, paste, paste_at));
-            self.deferred_inputs.push((
-                session_id,
-                b"\r".to_vec(),
-                paste_at + DEFERRED_INPUT_DELAY_TICKS,
-            ));
-        }
+        let _ = self.send_prompt_steps_to_session(
+            session_id,
+            &[crate::session::PromptStep::new(text)],
+            boot_delay_ticks,
+        );
     }
 
-    /// Spawn (or reuse) a named session — optionally on a fresh worktree — and
-    /// queue `prompt` into it. The session is named `name`; a recurring caller
-    /// reuses that session on later invocations (and after a TUI restart, where
-    /// it is restored from the database by name). Shared by automations
-    /// (`auto-<id>`) and tasks (`<title> · #<id>`).
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_and_prompt(
+    /// Deliver an ordered list of prompt steps to a session, each as its own
+    /// bracketed paste + Enter separated by that step's settle delay.
+    ///
+    /// One paste carrying newlines submits as a *single* prompt, so a sequence
+    /// like `/model x` → `/effort y` → "do the work" only works as separate
+    /// submissions; the gap also lets a slash command's autocomplete popup close
+    /// before the next paste lands. `boot_delay_ticks` delays the *first* step
+    /// (0 = send it inline to an already-running session).
+    ///
+    /// Only the inline leg can report: a deferred step is written by a later
+    /// tick, long after this returns. `Err` therefore means the caller's very
+    /// first delivery attempt failed, which an automation records as an error
+    /// run instead of a success.
+    fn send_prompt_steps_to_session(
         &mut self,
-        name: String,
-        repo_path: &std::path::Path,
-        worktree_branch: Option<&str>,
-        base_branch: Option<&str>,
-        agent: Option<&str>,
-        extra_repos: &[crate::session::ExtraRepo],
-        prompt: &str,
-    ) -> Result<SessionId, String> {
+        session_id: SessionId,
+        steps: &[crate::session::PromptStep],
+        boot_delay_ticks: u64,
+    ) -> Result<(), String> {
+        let mut offset = boot_delay_ticks;
+        for step in steps {
+            let mut paste = b"\x1b[200~".to_vec();
+            paste.extend_from_slice(step.text.as_bytes());
+            paste.extend_from_slice(b"\x1b[201~");
+
+            if offset == 0 {
+                let Some(session) = self.sessions.iter().find(|s| s.info.id == session_id) else {
+                    return Err(format!("session {session_id} is no longer open"));
+                };
+                if let Err(e) = session.send_input(paste) {
+                    error!("Failed to send prompt to session {session_id}: {e}");
+                    return Err(format!("failed to send prompt to {session_id}: {e}"));
+                }
+            } else {
+                self.deferred_inputs
+                    .push((session_id, paste, self.metrics.tick_count + offset));
+            }
+            let enter_at = offset + DEFERRED_INPUT_DELAY_TICKS;
+            self.deferred_inputs.push((
+                session_id,
+                b"\r".to_vec(),
+                self.metrics.tick_count + enter_at,
+            ));
+            offset = enter_at + step.delay().div_ceil(TICK_MS);
+        }
+        Ok(())
+    }
+
+    /// A "spawn (or reuse) a named session and prompt it" request — the shared
+    /// shape behind automations (`auto-<id>`) and tasks (`<title> · #<id>`).
+    /// A struct rather than a parameter list because the two callers differ in
+    /// several optional fields (host, worktree, extras, step count).
+    fn spawn_and_prompt(&mut self, req: SpawnPromptRequest<'_>) -> Result<SessionId, String> {
+        let SpawnPromptRequest {
+            name,
+            repo_path,
+            worktree_branch,
+            base_branch,
+            agent,
+            host,
+            extra_repos,
+            steps,
+        } = req;
         // Reuse an existing session (this run or restored after restart).
         if let Some(existing) = self.sessions.iter().find(|s| s.info.name == name) {
             let id = existing.info.id;
-            self.send_prompt_to_session(id, prompt, 0);
+            let _ = self.send_prompt_steps_to_session(id, steps, 0);
             return Ok(id);
         }
 
@@ -7592,6 +7640,10 @@ impl App {
             .unwrap_or_else(|| repo_path.to_path_buf());
         let mut config = SessionConfig {
             cwd: Some(cwd),
+            // A remote spawn runs on the host's backend (`ssh:<host>` /
+            // `wsl:<host>`), which is also what routes `send_input` — so the
+            // prompt steps below reach the right machine.
+            backend: self.backend_name_for_host(host)?,
             ..SessionConfig::default()
         };
         if let Some(a) = agent {
@@ -7606,8 +7658,24 @@ impl App {
             .find(|s| s.info.name == name)
             .ok_or_else(|| "session spawn failed".to_string())?;
         let id = session.info.id;
-        self.send_prompt_to_session(id, prompt, AGENT_BOOT_DELAY_TICKS);
+        let _ = self.send_prompt_steps_to_session(id, steps, AGENT_BOOT_DELAY_TICKS);
         Ok(id)
+    }
+
+    /// The backend name for a `hosts.toml` host — `None` for a local spawn.
+    /// Errors when the host isn't configured, so a mistyped host fails at the
+    /// fire (with a recorded error run) rather than silently spawning locally.
+    fn backend_name_for_host(&self, host: Option<&str>) -> Result<Option<String>, String> {
+        let Some(name) = host.filter(|h| !h.is_empty()) else {
+            return Ok(None);
+        };
+        match self.hosts.get(name) {
+            Some(h) => Ok(Some(h.backend_name())),
+            None => Err(format!(
+                "Unknown host '{name}'. Configure it in hosts.toml. Available: [{}]",
+                self.hosts.names().join(", ")
+            )),
+        }
     }
 
     // ---- Tasks (right-side panel) ----------------------------------------
@@ -8949,14 +9017,13 @@ mod tests {
             enabled: true,
             schedule: AutomationSchedule::Once { at: 0 },
             timezone: None,
-            action: AutomationAction::Send {
-                session_id: SessionId::default(),
-            },
+            action: AutomationAction::send_to(SessionId::default()),
             prompt: "p".into(),
             created_at: 0,
             updated_at: 0,
             last_run_at: None,
             next_run_at: None,
+            prompt_steps: Vec::new(),
         };
         let mut app = App::new(24, 80, stub_backend(), stub_agents(), test_db());
 
@@ -8999,14 +9066,13 @@ mod tests {
             enabled: true,
             schedule: AutomationSchedule::Once { at: 0 },
             timezone: None,
-            action: AutomationAction::Send {
-                session_id: SessionId::default(),
-            },
+            action: AutomationAction::send_to(SessionId::default()),
             prompt: "p".into(),
             created_at: 0,
             updated_at: 0,
             last_run_at: None,
             next_run_at: None,
+            prompt_steps: Vec::new(),
         };
         let mut app = app_with_sessions(2);
         app.automation_ui.cached_automations = vec![make(1, "a"), make(2, "b")];
@@ -9983,14 +10049,13 @@ mod tests {
                 enabled: true,
                 schedule: crate::session::AutomationSchedule::Once { at: 0 },
                 timezone: None,
-                action: crate::session::AutomationAction::Send {
-                    session_id: SessionId::default(),
-                },
+                action: crate::session::AutomationAction::send_to(SessionId::default()),
                 prompt: "p".into(),
                 created_at: 0,
                 updated_at: 0,
                 last_run_at: None,
                 next_run_at: Some(now + 3_600_000),
+                prompt_steps: Vec::new(),
             })
             .collect();
 
@@ -10155,9 +10220,7 @@ mod tests {
         // Give it an action out-of-band (as the CLI would), then edit the title
         // through the editor: the action must survive.
         let mut t = app.db.get_task(id).unwrap().unwrap();
-        t.action = Some(AutomationAction::Send {
-            session_id: app.sessions[0].info.id,
-        });
+        t.action = Some(AutomationAction::send_to(app.sessions[0].info.id));
         app.db.update_task(&t).unwrap();
         app.refresh_tasks();
 
@@ -12007,11 +12070,10 @@ mod tests {
             enabled: true,
             schedule: crate::session::AutomationSchedule::Once { at: 0 },
             timezone: None,
-            action: crate::session::AutomationAction::Send {
-                session_id: SessionId::default(),
-            },
+            action: crate::session::AutomationAction::send_to(SessionId::default()),
             prompt: "go".into(),
             next_run_at: None,
+            prompt_steps: Vec::new(),
         };
         let aid = app.db.create_automation(&new).unwrap();
         app.refresh_automations();
@@ -12048,11 +12110,10 @@ mod tests {
             enabled: true,
             schedule: crate::session::AutomationSchedule::Once { at: 0 },
             timezone: None,
-            action: crate::session::AutomationAction::Send {
-                session_id: SessionId::default(),
-            },
+            action: crate::session::AutomationAction::send_to(SessionId::default()),
             prompt: "go".into(),
             next_run_at: None,
+            prompt_steps: Vec::new(),
         };
         app.db.create_automation(&new).unwrap();
         app.refresh_automations();
@@ -12078,11 +12139,10 @@ mod tests {
             enabled: true,
             schedule: crate::session::AutomationSchedule::Once { at: 1 },
             timezone: None,
-            action: crate::session::AutomationAction::Send {
-                session_id: SessionId::default(),
-            },
+            action: crate::session::AutomationAction::send_to(SessionId::default()),
             prompt: "go".into(),
             next_run_at: Some(1),
+            prompt_steps: Vec::new(),
         };
         app.db.create_automation(&new).unwrap();
         let now = crate::sync::current_time_millis();
@@ -12621,9 +12681,12 @@ mod tests {
                 base_branch: None,
                 agent: None,
                 extra_repos: Vec::new(),
+                host: None,
+                session_mode: Default::default(),
             },
             prompt: "do stuff".to_string(),
             next_run_at: None,
+            prompt_steps: Vec::new(),
         };
         app.db.create_automation(&new).unwrap();
         app.refresh_automations();
@@ -12817,6 +12880,72 @@ mod tests {
         let autos = app.db.list_automations().unwrap();
         assert_eq!(autos.len(), 1);
         assert_eq!(autos[0].name, "renamed");
+    }
+
+    #[test]
+    fn editing_in_pane_persists_the_edited_prompt_steps() {
+        let mut app = app_with_sessions(1);
+        add_test_automation(&mut app, "a");
+        app.focus = InputFocus::Automations;
+        app.automation_ui.automation_panel_index = 0;
+        app.sync_automation_editor();
+        app.focus = InputFocus::AutomationEditor;
+        // Turn the single-step automation into a two-step one with a custom
+        // settle delay between the steps.
+        if let Some(ed) = app.automation_ui.automation_editor.as_mut() {
+            ed.steps[0].text.set("/model opus");
+            ed.steps[0].delay.set("1500");
+            ed.add_step();
+            ed.steps[1].text.set("do the work");
+            ed.field = AutomationField::Name;
+        }
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        let id = app.db.list_automations().unwrap()[0].id;
+        let saved = app.db.get_automation(id).unwrap().expect("row present");
+        let texts: Vec<&str> = saved.prompt_steps.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["/model opus", "do the work"]);
+        assert_eq!(saved.prompt_steps[0].delay_ms, Some(1500));
+        assert_eq!(saved.prompt_steps[1].delay_ms, None);
+    }
+
+    #[test]
+    fn editing_a_send_by_name_automation_keeps_its_target() {
+        let mut app = app_with_sessions(1);
+        let new = crate::storage::automations::NewAutomation {
+            name: "by-name".to_string(),
+            enabled: true,
+            schedule: AutomationSchedule::Cron {
+                expr: "0 9 * * *".to_string(),
+            },
+            timezone: None,
+            action: AutomationAction::Send {
+                target: crate::session::SendTarget::Name("inbox".to_string()),
+            },
+            prompt: "ping".to_string(),
+            next_run_at: None,
+            prompt_steps: Vec::new(),
+        };
+        let id = app.db.create_automation(&new).unwrap();
+        app.refresh_automations();
+        app.focus = InputFocus::Automations;
+        app.automation_ui.automation_panel_index = 0;
+        app.sync_automation_editor();
+        app.focus = InputFocus::AutomationEditor;
+        // The target selector only offers running sessions, so "inbox" isn't in
+        // it — renaming must not retarget the automation at the first session.
+        if let Some(ed) = app.automation_ui.automation_editor.as_mut() {
+            ed.field = AutomationField::Name;
+            ed.name.set("renamed");
+        }
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        let saved = app.db.get_automation(id).unwrap().expect("row present");
+        assert_eq!(saved.name, "renamed");
+        assert_eq!(
+            saved.action,
+            AutomationAction::Send {
+                target: crate::session::SendTarget::Name("inbox".to_string()),
+            }
+        );
     }
 
     #[test]
@@ -13047,11 +13176,11 @@ mod tests {
         let mut app = app_with_sessions(0);
         let mut m = modals::AutomationEditorModal::default();
         m.name.set("t");
-        m.prompt.set("hi");
+        m.prompt_mut().set("hi");
         m.action = AutomationActionKind::Spawn;
         m.trigger_kind = TriggerKind::Daily; // yields a future next_run
         m.repo.set("~/Repositories/friring");
-        app.modal = modals::Modal::AutomationEditor(m);
+        app.modal = modals::Modal::AutomationEditor(Box::new(m));
 
         app.submit_automation_editor();
 
@@ -13099,7 +13228,7 @@ mod tests {
                 panic!("expected the automation editor");
             };
             m.name.set("ping");
-            m.prompt.set("hi");
+            m.prompt_mut().set("hi");
             m.trigger_kind = TriggerKind::Daily;
             m.field = AutomationField::Target;
             m.adjust(1); // index 1 -> 2
@@ -13110,7 +13239,7 @@ mod tests {
         let autos = app.db.list_automations().unwrap();
         assert_eq!(autos.len(), 1);
         match &autos[0].action {
-            AutomationAction::Send { session_id } => assert_eq!(*session_id, expected_id),
+            AutomationAction::Send { target } => assert_eq!(target.id(), Some(expected_id)),
             other => panic!("expected a send action, got {other:?}"),
         }
     }
@@ -13124,7 +13253,7 @@ mod tests {
                 panic!("expected the automation editor");
             };
             m.name.set("x");
-            m.prompt.set("y");
+            m.prompt_mut().set("y");
             m.trigger_kind = TriggerKind::Daily;
             // action defaults to Send, but there are no sessions to target.
         }
@@ -15501,6 +15630,70 @@ mod tests {
         app.drain_deferred_inputs();
         assert_eq!(app.deferred_inputs.len(), 1);
         assert_eq!(app.deferred_inputs[0].2, 20);
+    }
+
+    #[test]
+    fn dry_run_overlay_closes_only_on_its_dismissal_keys() {
+        let mut app = App::new(24, 80, stub_backend(), stub_agents(), test_db());
+        let open = |app: &mut App| {
+            app.modal = modals::Modal::AutomationDryRun(modals::AutomationDryRunModal {
+                name: "inbox".into(),
+                rows: vec![("action".into(), "spawn".into())],
+            });
+        };
+
+        // A stray keystroke must not dismiss a plan the user is still reading —
+        // and j/k have to stay free for a future scrolling pass.
+        open(&mut app);
+        for code in [KeyCode::Char('j'), KeyCode::Char('x'), KeyCode::Down] {
+            app.handle_modal_key_if_open(code, KeyModifiers::NONE);
+            assert!(
+                matches!(app.modal, modals::Modal::AutomationDryRun(_)),
+                "{code:?} should not close the overlay"
+            );
+        }
+        // The keys the overlay's own hint advertises do close it.
+        for code in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('q')] {
+            open(&mut app);
+            app.handle_modal_key_if_open(code, KeyModifiers::NONE);
+            assert!(
+                matches!(app.modal, modals::Modal::None),
+                "{code:?} should close the overlay"
+            );
+        }
+    }
+
+    #[test]
+    fn send_prompt_steps_schedules_one_paste_and_enter_per_step() {
+        use crate::session::PromptStep;
+        let mut app = App::new(24, 80, stub_backend(), stub_agents(), test_db());
+        let id = SessionId::default();
+        app.metrics.tick_count = 100;
+        let steps = vec![
+            PromptStep {
+                text: "/model opus".into(),
+                delay_ms: Some(1_000),
+            },
+            PromptStep::new("go"),
+        ];
+        // A boot delay defers everything, so the whole schedule is inspectable.
+        let _ = app.send_prompt_steps_to_session(id, &steps, AGENT_BOOT_DELAY_TICKS);
+
+        assert_eq!(app.deferred_inputs.len(), 4, "paste + Enter per step");
+        let at = |i: usize| app.deferred_inputs[i].2 - 100;
+        // Step 1 pastes after the boot delay, Enter one beat later.
+        assert_eq!(at(0), AGENT_BOOT_DELAY_TICKS);
+        assert_eq!(at(1), AGENT_BOOT_DELAY_TICKS + DEFERRED_INPUT_DELAY_TICKS);
+        // Step 2 waits out step 1's settle delay (1000 ms = 100 ticks) so the
+        // slash command's autocomplete can close before the next paste lands.
+        assert_eq!(at(2), at(1) + 1_000 / TICK_MS);
+        assert_eq!(at(3), at(2) + DEFERRED_INPUT_DELAY_TICKS);
+        // Each paste is bracketed on its own — one multi-line paste would
+        // submit as a single prompt.
+        let paste = String::from_utf8_lossy(&app.deferred_inputs[0].1).into_owned();
+        assert!(paste.starts_with("\x1b[200~") && paste.ends_with("\x1b[201~"));
+        assert!(paste.contains("/model opus"));
+        assert_eq!(app.deferred_inputs[1].1, b"\r".to_vec());
     }
 
     #[test]

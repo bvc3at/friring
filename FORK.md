@@ -641,6 +641,89 @@ flow away. The fork rebuilds the flow:
 Keys and flow are documented in `docs/FEATURES.md`; the back-navigation
 interplay with ADR-P12 in `docs/PERFORMANCE.md`.
 
+#### Automations that can stand up a real agent (July 2026)
+
+Upstream's automations are a thin scheduler: a timestamp fires one action that
+delivers one static string, locally. That is too weak for the headline use case
+— standing up a fresh, correctly-configured agent to do real work on a
+schedule. The fork widens the model in one migration (schema **v44**, every
+column nullable so pre-v44 rows keep their exact old behavior):
+
+- **Multi-step prompts.** `send` and `spawn` deliver an *ordered list* of
+  prompts, each its own paste + Enter with a settle delay between them, so a
+  scheduled agent can be configured before it gets work (`/model opus` →
+  `/effort high` → the real prompt). Upstream can only send one string, and a
+  multi-line one submits as a single message, so slash-command setup was
+  impossible. Stored as JSON in `prompt_steps` (`NULL` = the single legacy
+  `prompt` column); the default settle delay is 1200 ms, overridable per step.
+  Headless delivery emits the whole sequence as one `tmux run-shell` script, so
+  the sub-second gaps survive (`run-shell -d` takes whole seconds only).
+- **Remote hosts.** A `spawn` automation takes a `hosts.toml` host, so the
+  session, the tmux window and the prompt delivery all land there. A remote
+  spawn runs in the repo root: a host combined with a worktree branch, a
+  worktree extra-repo, or a `~` path is rejected at save, because the TUI
+  provisions worktrees through the local git helper and would build the
+  checkout on the wrong machine. Upstream
+  hard-codes `host: None` and its headless prompt helpers hard-code
+  `local_mux_command`, so a remote automation would have spawned a session and
+  typed into a window on the wrong machine. The fork routes those helpers
+  through a `MuxTarget` (transport + socket + group session + the host's own
+  multiplexer binary), resolved from the action's host; an unknown host errors
+  *before* the spawn.
+- **Fresh session per fire.** `session_mode = fresh` spawns
+  `auto-<id>-<UTC stamp>` per run instead of piling every run into one
+  `auto-<id>` conversation, stamping the worktree branch the same way (else two
+  live runs share one checkout, since `create_or_attach_worktree` is
+  idempotent) and capping concurrently-open sessions at 5 so a short cron can't
+  accumulate them unboundedly. `reuse` remains the default and matches upstream.
+- **Send follows the session's own backend.** Delivery resolves the target
+  session's `backend_type`, so an automation can prompt a session running on a
+  remote host — and the TUI and the headless tick agree about it. Upstream (and
+  this fork's first pass) hardcoded the local multiplexer headlessly, so the
+  same automation succeeded from the TUI and recorded a skip from the keeper,
+  depending only on which firer won the claim.
+- **Send by session name.** A `Send` target is an id *or* a name, re-resolved
+  per fire. Upstream's hard UUID dies with the session (force-deleting it
+  disables the automation); the name form survives a close-and-recreate — the
+  behavior upstream already grants extension-declared automations via re-linking
+  but not user-authored ones.
+- **Exec off the tick thread, with a process-tree deadline.** Upstream runs an
+  `exec` automation's command synchronously inside `tick_core`, so a hung
+  command freezes the whole render loop. The fork records a `running` run, hands
+  the command to a worker, and updates that same row when it exits — one history entry per fire, visible
+  while it works. Commands are killed at a deadline (`--timeout`, default
+  900 s) — the whole process group, not just the shell, since a backgrounded
+  worker would otherwise outlive the deadline while holding the pipes open —
+  with output drained to a bounded tail on separate threads, and a
+  `running` row orphaned by a crash is reaped — on the next startup and on every
+  headless tick — once it outlives its own command's timeout.
+- **The editor reaches the whole model.** Upstream's editor exposes repo /
+  worktree / agent as free text and can't set a base branch, extra repos, a
+  host, a session mode or an exec timeout at all. The fork makes **agent** and
+  **host** selectors over the live registries (an unknown name is a save-time
+  error, not a fire-time one), validates the **timezone** (upstream silently
+  falls back to system local on a typo, so the automation fires hours off), and
+  adds base branch, multi-repo, session mode, exec timeout, and the prompt-step
+  editor.
+- **CLI parity + dry run + export.** `automation edit` takes the same action
+  flags as `create` (upstream can only edit name/trigger/prompt/enabled —
+  changing an action meant delete-and-recreate). `automation dry-run` and the
+  TUI's `p` overlay show what the next fire *would* do without firing;
+  `automation export`/`import` round-trip through the existing
+  `[[automations]]` manifest grammar, which the fork widened (spawn actions,
+  prompt steps with an optional per-step `[[automations.steps]]` table, host,
+  timezone, enabled) rather than forking into a second format; export picks the
+  narrowest form that survives a round trip.
+
+Behaviour is identical across all three firing paths (TUI tick, headless
+`automation tick`, OS timer) and claim-based at-most-once firing is untouched.
+Details in `docs/FEATURES.md` § Automations, the manifest grammar in
+`docs/CONFIG.md`, the flags in `docs/CLI.md`.
+
+Deliberately **not** built: automation→automation chaining. See the design note
+at the end of `docs/FEATURES.md` § Automations for why multi-step prompts
+already cover the case it was meant to serve.
+
 ### Behavior fixes
 
 - **A database written by a newer friring is refused, not silently opened.**

@@ -26,48 +26,183 @@ use std::collections::HashMap;
 
 use crate::session::{AutomationRunStatus, SessionConfig};
 
+/// Reject a `Spawn` automation that cannot fire as authored.
+///
+/// Takes the finished action rather than loose fields so every authoring path —
+/// the TUI editor, `automation create`/`edit`, `automation import`, and
+/// extension activation — enforces exactly the same rule by making one call. A
+/// per-site field check is how the paths drifted apart in the first place.
+///
+/// Non-`Spawn` actions are a no-op.
+///
+/// (`crate::agent::…` is reached by fully-qualified path only — `session_ops`
+/// may not `use` it; see `tests/architecture_rules.rs`.)
+pub fn validate_spawn_action(action: &crate::session::AutomationAction) -> Result<(), String> {
+    let crate::session::AutomationAction::Spawn {
+        repo_path,
+        worktree_branch,
+        agent,
+        extra_repos,
+        host,
+        ..
+    } = action
+    else {
+        return Ok(());
+    };
+    validate_spawn_selectors(agent.as_deref(), host.as_deref())?;
+
+    let Some(host) = host.as_deref().filter(|h| !h.is_empty()) else {
+        return Ok(());
+    };
+    // Worktree provisioning for a remote spawn is not supported. The TUI fires
+    // through the local `git::create_or_attach_worktree`, so it would create the
+    // checkout on the wrong machine and hand the remote session a path that does
+    // not exist there. Rejecting at save keeps every firing path agreeing on
+    // what an automation does, rather than having it work headlessly and quietly
+    // misbehave from the TUI.
+    if worktree_branch.is_some() {
+        return Err(format!(
+            "a spawn on host '{host}' cannot use a worktree branch — remote worktree \
+             provisioning is unsupported; drop the worktree to run in the repo root"
+        ));
+    }
+    if extra_repos.iter().any(|e| e.worktree) {
+        return Err(format!(
+            "a spawn on host '{host}' cannot use worktree extra-repos — remote worktree \
+             provisioning is unsupported; attach them as plain directories instead"
+        ));
+    }
+    // `~` is expanded against the *local* home before the row is stored, which
+    // silently points a remote spawn at a path belonging to this machine's user.
+    let home_relative = |p: &std::path::Path| {
+        let s = p.to_string_lossy();
+        s == "~" || s.starts_with("~/")
+    };
+    if home_relative(repo_path) || extra_repos.iter().any(|e| home_relative(&e.repo_path)) {
+        return Err(format!(
+            "a spawn on host '{host}' needs absolute paths — `~` resolves to this \
+             machine's home, not the host's"
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a spawn naming an agent or host that isn't configured.
+///
+/// Prefer [`validate_spawn_action`], which applies this plus the remote-spawn
+/// rules to a finished action.
+///
+/// Neither is checked downstream: agent resolution falls back to the
+/// registry default for an unknown name, so a typo would silently launch the
+/// wrong agent on every fire, and an unknown host only surfaces when the fire
+/// tries to reach it. Lives here rather than in `cli` so the CLI authoring
+/// paths and extension activation ([`ensure_extension`]) enforce the same rule
+/// — a manifest is as much an authoring path as a flag.
+///
+/// (`crate::agent::…` is reached by fully-qualified path only — `session_ops`
+/// may not `use` it; see `tests/architecture_rules.rs`.)
+pub fn validate_spawn_selectors(agent: Option<&str>, host: Option<&str>) -> Result<(), String> {
+    if let Some(name) = agent.map(str::trim).filter(|a| !a.is_empty()) {
+        let registry = crate::agent::agent_config::load_or_seed();
+        if !registry.names().contains(&name) {
+            return Err(format!(
+                "Unknown agent '{name}'. Configure it in agents.toml. Available: [{}]",
+                registry.names().join(", ")
+            ));
+        }
+    }
+    if let Some(name) = host.map(str::trim).filter(|h| !h.is_empty()) {
+        let registry = crate::agent::host_config::load_all();
+        if registry.get(name).is_none() {
+            return Err(format!(
+                "Unknown host '{name}'. Configure it in hosts.toml. Available: [{}]",
+                registry.names().join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Run an `Exec` automation's shell command headlessly (`sh -c`, or `cmd /C` on
 /// Windows) and report its outcome for the run history. No session/agent is
 /// involved — this is the deterministic-scheduled-job path shared by the TUI and
 /// the headless `automation tick`. stdout+stderr are tail-truncated so a chatty
 /// command can't bloat the history.
-pub fn run_exec_command(command: &str) -> (AutomationRunStatus, String) {
-    use std::process::Command;
-    let result = if cfg!(windows) {
-        Command::new("cmd").args(["/C", command]).output()
+///
+/// The command is killed after `timeout_secs`
+/// ([`DEFAULT_EXEC_TIMEOUT_SECS`](crate::session::automation::DEFAULT_EXEC_TIMEOUT_SECS)
+/// when `None`), so a hung job releases its run row instead of sitting
+/// `Running` forever.
+pub fn run_exec_command_with_timeout(
+    command: &str,
+    timeout_secs: Option<u64>,
+) -> (AutomationRunStatus, String) {
+    use std::process::{Command, Stdio};
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", command]);
+        c
     } else {
-        Command::new("sh").args(["-c", command]).output()
+        let mut c = Command::new("sh");
+        c.args(["-c", command]);
+        c
     };
-    let out = match result {
-        Ok(out) => out,
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Put the child in its own process group so the deadline can kill the whole
+    // tree, not just the shell. `sh -c 'worker & wait'` otherwise survives:
+    // killing `sh` alone leaves the grandchild running *and* holding the pipe
+    // write-ends, so the reads below would block until it exits on its own.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd.spawn();
+    let mut child = match child {
+        Ok(c) => c,
         Err(e) => return (AutomationRunStatus::Error, format!("spawn failed: {e}")),
     };
-    // Keep the last 500 chars of each stream. Single pass via a capped ring so a
-    // huge stream isn't walked twice (count + skip) or materialized in full.
-    const TAIL_CHARS: usize = 500;
-    let tail = |s: &[u8]| -> String {
-        let t = String::from_utf8_lossy(s);
-        let t = t.trim();
-        let mut ring: std::collections::VecDeque<char> =
-            std::collections::VecDeque::with_capacity(TAIL_CHARS + 1);
-        for c in t.chars() {
-            if ring.len() == TAIL_CHARS {
-                ring.pop_front();
-            }
-            ring.push_back(c);
-        }
-        ring.into_iter().collect()
-    };
-    let stdout = tail(&out.stdout);
-    let stderr = tail(&out.stderr);
-    let mut detail = stdout;
-    if !stderr.is_empty() {
+
+    // Drain both pipes on their own threads: polling `try_wait` while the child
+    // fills a pipe buffer would deadlock (the child blocks on write, we block on
+    // the deadline), and `wait_with_output` consumes the child so there'd be no
+    // handle left to kill.
+    let stdout = child.stdout.take().map(spawn_reader);
+    let stderr = child.stderr.take().map(spawn_reader);
+
+    let timeout = std::time::Duration::from_secs(
+        timeout_secs.unwrap_or(crate::session::automation::DEFAULT_EXEC_TIMEOUT_SECS),
+    );
+    let (status, timed_out) = wait_with_deadline(&mut child, timeout);
+    // Collect with a grace period rather than an unbounded join: killing the
+    // process group should close every pipe, but a descendant that escaped the
+    // group (or a host without one) must not pin this thread — and for the
+    // detached TUI worker that would mean a `Running` row that never closes.
+    let out = stdout.map(collect_reader).unwrap_or_default();
+    let err = stderr.map(collect_reader).unwrap_or_default();
+
+    let mut detail = tail_chars(&out);
+    let stderr_tail = tail_chars(&err);
+    if !stderr_tail.is_empty() {
         if !detail.is_empty() {
             detail.push('\n');
         }
-        detail.push_str(&stderr);
+        detail.push_str(&stderr_tail);
     }
-    if out.status.success() {
+
+    if timed_out {
+        let secs = timeout.as_secs();
+        let msg = if detail.is_empty() {
+            format!("timed out after {secs}s (killed)")
+        } else {
+            format!("timed out after {secs}s (killed): {detail}")
+        };
+        return (AutomationRunStatus::Error, msg);
+    }
+    let Some(status) = status else {
+        return (AutomationRunStatus::Error, "wait failed".to_string());
+    };
+    if status.success() {
         let msg = if detail.is_empty() {
             "ok".into()
         } else {
@@ -75,7 +210,7 @@ pub fn run_exec_command(command: &str) -> (AutomationRunStatus, String) {
         };
         (AutomationRunStatus::Success, msg)
     } else {
-        let code = out.status.code().map_or("signal".into(), |c| c.to_string());
+        let code = status.code().map_or("signal".into(), |c| c.to_string());
         let msg = if detail.is_empty() {
             format!("exit {code}")
         } else {
@@ -83,6 +218,169 @@ pub fn run_exec_command(command: &str) -> (AutomationRunStatus, String) {
         };
         (AutomationRunStatus::Error, msg)
     }
+}
+
+/// [`run_exec_command_with_timeout`] on the default deadline.
+pub fn run_exec_command(command: &str) -> (AutomationRunStatus, String) {
+    run_exec_command_with_timeout(command, None)
+}
+
+/// Run an `Exec` automation on a detached worker thread, closing out the
+/// already-recorded `Running` run (`run_id`) when the command exits.
+///
+/// This is what keeps a long command off the TUI's tick thread. The worker owns
+/// its own database connection (`App::db` isn't shareable, and the run outlives
+/// the tick that started it); if it can't open one the run row is left for
+/// `Database::reap_orphaned_automation_runs` to close on the next startup.
+pub fn run_exec_command_detached(run_id: i64, command: String, timeout_secs: Option<u64>) {
+    std::thread::spawn(move || {
+        let (status, detail) = run_exec_command_with_timeout(&command, timeout_secs);
+        let Some(path) = crate::paths::database_file() else {
+            tracing::error!("exec run {run_id} finished but the database path is unresolvable");
+            return;
+        };
+        let db = match crate::storage::Database::open(&path) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!("exec run {run_id} finished but its result is unrecorded: {e}");
+                return;
+            }
+        };
+        if let Err(e) = db.finish_automation_run(run_id, status, &detail) {
+            tracing::error!("Failed to finish automation run {run_id}: {e}");
+        }
+    });
+}
+
+/// How much of each pipe is kept while the command runs.
+///
+/// Only [`tail_chars`]'s last 500 characters ever reach the run row, but the
+/// pipe still has to be drained or the child blocks. Buffering it all would let
+/// a chatty command (a runaway build log) grow a `Vec` inside friring's own
+/// process for the whole timeout window — up to 15 minutes by default — for
+/// output that is then discarded. 64 KiB is far more than the tail needs, even
+/// for multi-byte characters.
+const EXEC_TAIL_BYTES: usize = 64 * 1024;
+
+/// Drain a child pipe on its own thread (see [`run_exec_command_with_timeout`]
+/// for why the pipes can't be polled inline), keeping only the trailing
+/// [`EXEC_TAIL_BYTES`].
+fn spawn_reader<R: std::io::Read + Send + 'static>(
+    mut pipe: R,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut tail: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match std::io::Read::read(&mut pipe, &mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    tail.extend(&chunk[..n]);
+                    let excess = tail.len().saturating_sub(EXEC_TAIL_BYTES);
+                    tail.drain(..excess);
+                }
+            }
+        }
+        // A closed receiver means the deadline already gave up on us; drop the
+        // bytes rather than panicking on a detached thread.
+        let _ = tx.send(Vec::from(tail));
+    });
+    rx
+}
+
+/// How long to wait for a pipe reader after the child has exited or been
+/// killed. Reaching EOF is near-instant once every writer is gone, so this only
+/// bounds the pathological case (a descendant still holding the pipe).
+const READER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Collect a reader thread's bytes, giving up after [`READER_GRACE`]. A reader
+/// that never reaches EOF is abandoned (its thread exits when the pipe finally
+/// closes) rather than blocking the caller forever; a panicked reader yields no
+/// output rather than taking the run down with it.
+fn collect_reader(rx: std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    rx.recv_timeout(READER_GRACE).unwrap_or_default()
+}
+
+/// Wait for `child` up to `timeout`, killing it if the deadline passes.
+/// Returns `(exit status, timed_out)`.
+fn wait_with_deadline(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> (Option<std::process::ExitStatus>, bool) {
+    /// Poll cadence — fine enough that a quick command isn't noticeably
+    /// delayed, coarse enough to cost nothing over a 15-minute job.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return (Some(status), false),
+            Ok(None) => {}
+            Err(_) => return (None, false),
+        }
+        if std::time::Instant::now() >= deadline {
+            kill_process_tree(child);
+            // Reap the killed child so it doesn't linger as a zombie; the pipe
+            // readers unblock once every writer's stdio handle closes.
+            let _ = child.wait();
+            return (None, true);
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Kill the timed-out command **and everything it started**.
+///
+/// `Child::kill` signals only the direct `sh -c` / `cmd /C` process, so a job
+/// that backgrounded work (`worker & wait`) would keep running past its deadline
+/// and keep the pipes open. The child was spawned into its own process group
+/// (unix) so the whole group can be signalled at once; Windows has no group to
+/// signal, so `taskkill /T` walks the tree instead.
+///
+/// Killing the tree is the deliberate semantic: an `exec` automation's deadline
+/// is a promise that nothing of it outlives the run.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // Negating the pid targets the process group (`process_group(0)` made
+        // the child its leader, so pgid == pid). `kill(1)` avoids a direct libc
+        // dependency for one signal.
+        let group = format!("-{}", child.id());
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &group])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    // Always signal the direct child too: on unix the group kill covers it, but
+    // if the group could not be created (or `kill` is missing) this is still the
+    // one process we are certain about.
+    let _ = child.kill();
+}
+
+/// Keep the last 500 chars of a captured stream. Single pass via a capped ring
+/// so a huge stream isn't walked twice (count + skip) or materialized in full.
+fn tail_chars(raw: &[u8]) -> String {
+    const TAIL_CHARS: usize = 500;
+    let t = String::from_utf8_lossy(raw);
+    let t = t.trim();
+    let mut ring: std::collections::VecDeque<char> =
+        std::collections::VecDeque::with_capacity(TAIL_CHARS + 1);
+    for c in t.chars() {
+        if ring.len() == TAIL_CHARS {
+            ring.pop_front();
+        }
+        ring.push_back(c);
+    }
+    ring.into_iter().collect()
 }
 
 /// Decide whether to pass the agent's resume group vs starting fresh when
@@ -253,7 +551,132 @@ pub(crate) fn inject_friring_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::AutomationAction;
     use crate::session::SessionId;
+
+    #[cfg(unix)]
+    #[test]
+    fn run_exec_command_kills_a_hung_command_at_the_deadline() {
+        let started = std::time::Instant::now();
+        let (status, detail) = run_exec_command_with_timeout("sleep 30", Some(1));
+        assert_eq!(status, AutomationRunStatus::Error);
+        assert!(detail.contains("timed out"), "got {detail}");
+        // The point of the deadline: it returns instead of hanging the caller.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_exec_command_kills_backgrounded_descendants_at_the_deadline() {
+        // The regression the plain `sleep 30` timeout test could not catch: a
+        // command that backgrounds work keeps the pipe write-ends open, so
+        // killing only the shell leaves the read blocking for the grandchild's
+        // whole lifetime — well past the deadline.
+        let started = std::time::Instant::now();
+        let (status, detail) =
+            run_exec_command_with_timeout("sleep 120 & echo spawned; wait", Some(1));
+        let elapsed = started.elapsed();
+        assert_eq!(status, AutomationRunStatus::Error);
+        assert!(detail.contains("timed out"), "got {detail}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "deadline overran: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_exec_command_captures_output_larger_than_a_pipe_buffer() {
+        // Regression guard for the reader threads: polling the deadline while
+        // the child fills a 64 KiB pipe would deadlock instead of finishing.
+        let (status, detail) = run_exec_command_with_timeout(
+            "for i in $(seq 1 20000); do echo aaaaaaaaaaaaaaaaaaaa; done",
+            Some(30),
+        );
+        assert_eq!(status, AutomationRunStatus::Success);
+        // Only the tail is kept, so the history stays bounded.
+        assert!(detail.len() <= 500, "detail was {} chars", detail.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_exec_command_keeps_the_tail_of_a_huge_stream() {
+        // The reader drops everything but the trailing `EXEC_TAIL_BYTES` as it
+        // drains, so the last lines still have to survive intact.
+        let (status, detail) = run_exec_command_with_timeout(
+            "for i in $(seq 1 60000); do echo filler-line-$i; done; echo THE-END",
+            Some(60),
+        );
+        assert_eq!(status, AutomationRunStatus::Success);
+        assert!(detail.ends_with("THE-END"), "got {detail}");
+        assert!(detail.len() <= 500, "detail was {} chars", detail.len());
+    }
+
+    fn spawn(host: Option<&str>, worktree: Option<&str>, repo: &str) -> AutomationAction {
+        AutomationAction::Spawn {
+            repo_path: std::path::PathBuf::from(repo),
+            worktree_branch: worktree.map(str::to_string),
+            base_branch: None,
+            agent: None,
+            extra_repos: Vec::new(),
+            host: host.map(str::to_string),
+            session_mode: crate::session::SpawnSessionMode::Reuse,
+        }
+    }
+
+    #[test]
+    fn remote_spawns_reject_worktrees_and_home_relative_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let hosts = crate::agent::host_config::hosts_config_path().unwrap();
+        std::fs::create_dir_all(hosts.parent().unwrap()).unwrap();
+        std::fs::write(
+            hosts,
+            "[[hosts]]\nname = \"devbox\"\ndestination = \"me@devbox\"\n",
+        )
+        .unwrap();
+
+        // Remote worktree provisioning is unsupported: the TUI would create the
+        // checkout locally and hand the remote session a path that isn't there.
+        let err =
+            validate_spawn_action(&spawn(Some("devbox"), Some("auto/x"), "/srv/repo")).unwrap_err();
+        assert!(err.contains("worktree"), "got {err}");
+
+        // A worktree extra-repo is the same problem.
+        let mut with_extra = spawn(Some("devbox"), None, "/srv/repo");
+        if let AutomationAction::Spawn { extra_repos, .. } = &mut with_extra {
+            extra_repos.push(crate::session::ExtraRepo {
+                repo_path: std::path::PathBuf::from("/srv/other"),
+                worktree: true,
+                base_branch: None,
+            });
+        }
+        let err = validate_spawn_action(&with_extra).unwrap_err();
+        assert!(err.contains("extra-repos"), "got {err}");
+
+        // `~` would resolve against this machine's home, not the host's.
+        let err = validate_spawn_action(&spawn(Some("devbox"), None, "~/repo")).unwrap_err();
+        assert!(err.contains('~'), "got {err}");
+
+        // A remote repo-root spawn on an absolute path is fine...
+        validate_spawn_action(&spawn(Some("devbox"), None, "/srv/repo")).unwrap();
+        // ...and a *local* worktree spawn is entirely unaffected.
+        validate_spawn_action(&spawn(None, Some("auto/x"), "~/repo")).unwrap();
+    }
+
+    #[test]
+    fn validate_spawn_action_ignores_non_spawn_actions() {
+        validate_spawn_action(&AutomationAction::Exec {
+            command: "sync.sh".into(),
+            timeout_secs: None,
+        })
+        .unwrap();
+        validate_spawn_action(&AutomationAction::send_to(SessionId::default())).unwrap();
+    }
 
     #[cfg(unix)]
     #[test]

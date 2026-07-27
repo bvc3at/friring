@@ -30,8 +30,9 @@ friring-cli session list --parent <lead-uuid> --json | jq  # direct children onl
 
 - **`session`** — create / list / get / delete / restore / restart / send /
   capture / focus / signal.
-- **`automation`** (alias `auto`) — create / list / show / edit / remove / run /
-  runs / tick. See the Automations section of `docs/FEATURES.md`.
+- **`automation`** (alias `auto`) — create / list / show / dry-run / export /
+  import / edit / remove / run / runs / tick. See the Automations section of
+  `docs/FEATURES.md`, and the flag reference below.
 - **`task`** (alias `todo`) — create / list / show / edit / remove / run. See the
   Tasks section of `docs/FEATURES.md`.
 - **`message`** (alias `msg`) — send / inbox / prune (the inter-session mailbox
@@ -57,6 +58,64 @@ friring-cli session list --parent <lead-uuid> --json | jq  # direct children onl
   section of `docs/FEATURES.md`.
 - **`perf`** — prints the perf snapshot a running TUI publishes while
   `FRIRING_PERF_LOG` or its perf HUD is active. See `docs/PERFORMANCE.md`.
+
+## Automation flags
+
+`automation create` and `automation edit` share one **action-flag group**, so an
+automation's action is editable in place rather than delete-and-recreate. On
+`create` the group picks the action (exactly one of the four selectors); on
+`edit` a selector *switches* the action kind outright and the rest amend the
+current one.
+
+| Flag | Action | Meaning |
+|---|---|---|
+| `--session <uuid>` | send | target this exact session |
+| `--session-name <name>` | send | target whichever session has this name, re-resolved on every fire |
+| `--repo <path>` | spawn | repository to run a new session in |
+| `--worktree <branch>` | spawn | create/attach a worktree branch |
+| `--base <branch>` | spawn | fork point for a new worktree (default `main`) |
+| `--agent <name>` | spawn | agent from `agents.toml` (default: the registry default) |
+| `--host <name>` | spawn | host from `hosts.toml` to run on (default local); needs an absolute path and rules out `--worktree` |
+| `--session-mode <reuse\|fresh>` | spawn | one session across fires, or a new one per fire |
+| `--add-repo <path[@base]>` | spawn | extra repo on its own worktree (repeatable) |
+| `--add-dir <path>` | spawn | extra directory attached as-is (repeatable) |
+| `--command <shell>` | exec | run headlessly, no agent or session |
+| `--timeout <secs>` | exec | kill the command *and its descendants* after this long (default 900) |
+
+Prompts are separate from the action and apply to send/spawn:
+
+- `--prompt <text>` — **repeatable**. Each occurrence is one delivery step: its
+  own paste + Enter, in order. This is how you configure an agent before giving
+  it work; a single multi-line prompt would submit as one message.
+- `--step-delay <ms>` — settle time between steps (default 1200). On `edit` it
+  only applies together with `--prompt`, since the delay belongs to a step.
+  This flag applies **one** value to every gap; for delays that differ per step,
+  author the `[[automations.steps]]` form and `automation import` it (see
+  `docs/CONFIG.md`), or set them in the TUI editor.
+- `--timezone <IANA>` — validated on save (a typo is rejected, not silently
+  resolved to system local time).
+
+```bash
+# A weekday-morning triage agent, configured before it gets its real prompt.
+friring-cli automation create --name inbox --trigger weekdays --time 07:00 \
+    --timezone Europe/Zurich --repo ~/code/app --worktree auto/inbox \
+    --agent claude --session-mode fresh \
+    --prompt '/model opus' --prompt '/effort high' \
+    --prompt 'Summarize my email history and file anything actionable.'
+
+friring-cli automation dry-run 3        # what would the next fire do?
+friring-cli automation edit 3 --agent codex     # amend, don't recreate
+friring-cli automation export --id 3 > inbox.toml
+friring-cli automation import inbox.toml --replace
+```
+
+`dry-run` resolves the schedule, target/spawn parameters, host and every prompt
+step **without firing** and without touching the run history; its JSON is an
+ordered array of `{"label", "value"}` rows, because a plan repeats labels (one
+`extra repo` row per extra repository). `export`/`import`
+round-trip through the `[[automations]]` TOML grammar extension manifests use
+(see `docs/CONFIG.md`); import matches on name and skips an existing automation
+unless `--replace`.
 
 ## Output format
 

@@ -32,9 +32,11 @@ pub(crate) fn action_label(action: Option<&AutomationAction>) -> String {
 pub(crate) fn action_to_json(action: Option<&AutomationAction>) -> Value {
     match action {
         None => Value::Null,
-        Some(AutomationAction::Send { session_id }) => json!({
+        Some(AutomationAction::Send { target }) => json!({
             "kind": "send",
-            "session_id": session_id.to_string(),
+            // Exactly one is non-null: an id target or a name target.
+            "session_id": target.id().map(|id| id.to_string()),
+            "session_name": target.name(),
         }),
         Some(AutomationAction::Spawn {
             repo_path,
@@ -42,6 +44,8 @@ pub(crate) fn action_to_json(action: Option<&AutomationAction>) -> Value {
             base_branch,
             agent,
             extra_repos,
+            host,
+            session_mode,
         }) => json!({
             "kind": "spawn",
             "repo_path": repo_path.to_string_lossy(),
@@ -49,10 +53,16 @@ pub(crate) fn action_to_json(action: Option<&AutomationAction>) -> Value {
             "base_branch": base_branch,
             "agent": agent,
             "extra_repos": serde_json::to_value(extra_repos).unwrap_or(Value::Null),
+            "host": host,
+            "session_mode": session_mode.as_str(),
         }),
-        Some(AutomationAction::Exec { command }) => json!({
+        Some(AutomationAction::Exec {
+            command,
+            timeout_secs,
+        }) => json!({
             "kind": "exec",
             "command": command,
+            "timeout_secs": timeout_secs,
         }),
     }
 }
@@ -90,14 +100,29 @@ pub(crate) fn spawn_and_deliver(
     req: SpawnRequest,
     prompt: &str,
 ) -> Result<SessionId, SpawnDeliverError> {
+    spawn_and_deliver_steps(db, name, req, &[crate::session::PromptStep::new(prompt)])
+}
+
+/// [`spawn_and_deliver`] for an ordered prompt list: each step lands as its own
+/// paste + Enter, on the host the request targets (the delivery timer runs on
+/// that host's multiplexer server, not ours).
+pub(crate) fn spawn_and_deliver_steps(
+    db: &Database,
+    name: &str,
+    req: SpawnRequest,
+    steps: &[crate::session::PromptStep],
+) -> Result<SessionId, SpawnDeliverError> {
+    // Resolve the delivery target before spawning: an unknown host must fail
+    // before it creates a session nothing will ever prompt.
+    let target = crate::agent::tmux::MuxTarget::resolve(req.host.as_deref())
+        .map_err(|e| SpawnDeliverError::Spawn(e.to_string()))?;
     let session_id = crate::session_ops::spawn_session_headless(db, req)
         .map_err(SpawnDeliverError::Spawn)?
         .session_id;
-    crate::agent::tmux::send_prompt_after_delay(name, prompt, BOOT_DELAY_SECS).map_err(|e| {
-        SpawnDeliverError::Deliver {
+    crate::agent::tmux::send_prompt_steps_after_delay(&target, name, steps, BOOT_DELAY_SECS)
+        .map_err(|e| SpawnDeliverError::Deliver {
             session_id,
             message: format!("spawned {name} but prompt delivery failed: {e}"),
-        }
-    })?;
+        })?;
     Ok(session_id)
 }

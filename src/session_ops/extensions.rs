@@ -923,22 +923,17 @@ pub fn ensure_extension(db: &Database, def: &ExtensionDef) -> Result<EnsureRepor
 
     for auto in &def.automations {
         auto.validate()?;
-        // An exec automation has no session; a send one resolves its target.
-        let target = if auto.command.is_some() {
-            None
-        } else {
-            let session_ref = auto.session_ref.as_deref().ok_or_else(|| {
-                format!(
-                    "automation '{}' has neither a command nor a session_ref",
-                    auto.name
-                )
-            })?;
-            Some(*session_ids.get(session_ref).ok_or_else(|| {
+        // Only a `session_ref` send needs binding to a session this pass just
+        // ensured; the exec, spawn and send-by-UUID flavours carry everything
+        // they need, and `validate` already rejected a declaration with none.
+        let target = match auto.session_ref.as_deref() {
+            Some(session_ref) => Some(*session_ids.get(session_ref).ok_or_else(|| {
                 format!(
                     "automation '{}' references unknown session '{session_ref}'",
                     auto.name
                 )
-            })?)
+            })?),
+            None => None,
         };
         ensure_automation(
             db,
@@ -963,25 +958,20 @@ fn ensure_automation(
     existing: Option<&Automation>,
     report: &mut EnsureReport,
 ) -> Result<(), String> {
-    // Desired action: a command wins (exec); otherwise send to the target.
-    let action = match (&auto.command, target) {
-        (Some(command), _) => AutomationAction::Exec {
-            command: command.clone(),
-        },
-        (None, Some(session_id)) => AutomationAction::Send { session_id },
-        (None, None) => {
-            return Err(format!(
-                "automation '{}' has neither a command nor a session_ref",
-                auto.name
-            ))
-        }
-    };
+    // The declared action, with a `session_ref` bound to the id of the session
+    // this pass just ensured (so the row points at the live session, not a name).
+    let action = auto.to_action(target.map(crate::session::SendTarget::Id))?;
+    // A manifest is an authoring path like any other, so hold it to the same
+    // rule as `automation create`: a typo'd agent or host must fail at activate,
+    // not silently launch the registry default on every fire.
+    super::validate_spawn_action(&action)
+        .map_err(|e| format!("automation '{}': {e}", auto.name))?;
     if let Some(row) = existing {
         // Re-link a send automation whose target session was recreated (a new id).
-        if let (AutomationAction::Send { session_id }, Some(t)) = (&row.action, target) {
-            if *session_id != t {
+        if let (AutomationAction::Send { target: current }, Some(t)) = (&row.action, target) {
+            if current.id() != Some(t) {
                 let mut row = row.clone();
-                row.action = AutomationAction::Send { session_id: t };
+                row.action = AutomationAction::send_to(t);
                 db.update_automation(&row)
                     .map_err(|e| format!("update_automation: {e}"))?;
                 report.automations_relinked.push(auto.name.clone());
@@ -990,14 +980,24 @@ fn ensure_automation(
         return Ok(());
     }
     let schedule = parse_trigger(&auto.trigger, None, None)?;
-    let next_run_at = schedule.next_after(current_time_millis(), None);
+    // Honor the declared `enabled`/`timezone` exactly as `automation import`
+    // does, so one declaration behaves the same whichever way it arrives.
+    let timezone = crate::session::automation::validate_timezone(
+        auto.timezone.as_deref().unwrap_or_default(),
+    )?;
+    let enabled = auto.enabled.unwrap_or(true);
+    let next_run_at = enabled
+        .then(|| schedule.next_after(current_time_millis(), timezone.as_deref()))
+        .flatten();
+    let steps = auto.steps();
     let new = NewAutomation {
         name: auto.name.clone(),
-        enabled: true,
+        enabled,
         schedule,
-        timezone: None,
+        timezone,
         action,
-        prompt: auto.prompt.clone().unwrap_or_default(),
+        prompt: steps.first().map(|s| s.text.clone()).unwrap_or_default(),
+        prompt_steps: steps,
         next_run_at,
     };
     db.create_automation(&new)
@@ -1300,6 +1300,7 @@ mod tests {
                 session_ref: Some("flow".into()),
                 prompt: Some("tick".into()),
                 command: None,
+                ..ExtensionAutomation::default()
             }],
         }
     }
@@ -1340,7 +1341,7 @@ mod tests {
         // First pass binds the automation to the original session id.
         ensure_extension(&db, &def).unwrap();
         let auto = &db.list_automations().unwrap()[0];
-        assert_eq!(auto.action, AutomationAction::Send { session_id: old_id });
+        assert_eq!(auto.action, AutomationAction::send_to(old_id));
 
         // The session is recreated under the same name with a fresh id (the
         // shape that orphaned the automation: soft-delete + new row).
@@ -1356,11 +1357,94 @@ mod tests {
         assert!(report.created_anything(), "a relink counts as repair");
 
         let auto = &db.list_automations().unwrap()[0];
-        assert_eq!(auto.action, AutomationAction::Send { session_id: new_id });
+        assert_eq!(auto.action, AutomationAction::send_to(new_id));
 
         // A subsequent pass is a no-op now that the link is correct.
         let again = ensure_extension(&db, &def).unwrap();
         assert!(!again.created_anything(), "relink is idempotent");
+    }
+
+    #[test]
+    fn ensure_activates_a_declared_spawn_automation() {
+        let db = Database::open_in_memory().unwrap();
+        let mut def = flow_def();
+        // An exported spawn automation pasted into an extension.toml: no
+        // session_ref to bind, so it must not be treated as a send.
+        def.sessions.clear();
+        def.automations = vec![ExtensionAutomation {
+            name: "nightly".into(),
+            trigger: "daily".into(),
+            repo: Some("/tmp/repo".into()),
+            prompt: Some("go".into()),
+            ..ExtensionAutomation::default()
+        }];
+        let report = ensure_extension(&db, &def).unwrap();
+        assert_eq!(report.automations_created, ["nightly"]);
+        let autos = db.list_automations().unwrap();
+        assert!(
+            matches!(autos[0].action, AutomationAction::Spawn { .. }),
+            "got {:?}",
+            autos[0].action
+        );
+    }
+
+    #[test]
+    fn ensure_rejects_a_spawn_naming_an_unconfigured_agent() {
+        // A manifest is an authoring path: a typo'd agent must fail at activate
+        // rather than silently launching the registry default on every fire,
+        // exactly as `automation create` does.
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let db = Database::open_in_memory().unwrap();
+        let mut def = flow_def();
+        def.sessions.clear();
+        def.automations = vec![ExtensionAutomation {
+            name: "nightly".into(),
+            trigger: "daily".into(),
+            repo: Some("/tmp/repo".into()),
+            agent: Some("ghost-agent".into()),
+            prompt: Some("go".into()),
+            ..ExtensionAutomation::default()
+        }];
+        let err = ensure_extension(&db, &def).unwrap_err();
+        assert!(err.contains("ghost-agent"), "got {err}");
+        assert!(
+            db.list_automations().unwrap().is_empty(),
+            "a rejected declaration must not leave a row behind"
+        );
+    }
+
+    #[test]
+    fn ensure_rejects_a_spawn_naming_an_unconfigured_host() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let db = Database::open_in_memory().unwrap();
+        let mut def = flow_def();
+        def.sessions.clear();
+        def.automations = vec![ExtensionAutomation {
+            name: "nightly".into(),
+            trigger: "daily".into(),
+            repo: Some("/tmp/repo".into()),
+            host: Some("ghost-host".into()),
+            prompt: Some("go".into()),
+            ..ExtensionAutomation::default()
+        }];
+        let err = ensure_extension(&db, &def).unwrap_err();
+        assert!(err.contains("ghost-host"), "got {err}");
+    }
+
+    #[test]
+    fn ensure_honors_a_declared_disabled_and_timezone() {
+        let db = Database::open_in_memory().unwrap();
+        insert_session(&db, "flow");
+        let mut def = flow_def();
+        def.automations[0].enabled = Some(false);
+        def.automations[0].timezone = Some("Europe/Zurich".into());
+        ensure_extension(&db, &def).unwrap();
+        let auto = &db.list_automations().unwrap()[0];
+        assert!(!auto.enabled, "a declared-disabled automation must not arm");
+        assert_eq!(auto.timezone.as_deref(), Some("Europe/Zurich"));
+        assert_eq!(auto.next_run_at, None);
     }
 
     #[test]

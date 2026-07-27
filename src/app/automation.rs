@@ -28,6 +28,16 @@ impl App {
         if !force && self.metrics.tick_count % 100 != 0 {
             return;
         }
+        if force {
+            // A `Running` exec row whose worker died with the previous process
+            // would otherwise show as running forever. The startup pass is the
+            // only moment we know no worker of ours owns one.
+            match self.db.reap_orphaned_automation_runs() {
+                Ok(n) if n > 0 => info!("Closed {n} automation run(s) left running by a crash"),
+                Ok(_) => {}
+                Err(e) => error!("Failed to reap orphaned automation runs: {e}"),
+            }
+        }
         let now = crate::sync::current_time_millis();
         let due = match self.db.due_automations(now) {
             Ok(autos) => autos,
@@ -58,93 +68,174 @@ impl App {
                     continue;
                 }
             }
-            let (status, detail, related) = self.fire_automation(&auto);
-            if let Err(e) = self
-                .db
-                .record_automation_run(auto.id, status, &detail, related)
-            {
-                error!("Failed to record run for automation {}: {e}", auto.id);
-            }
+            self.fire_automation(&auto, now);
         }
     }
 
-    /// Execute a single automation's action, returning its run status, detail,
-    /// and the session it sent to / spawned (when one exists).
-    fn fire_automation(
+    /// Execute a single automation's action and record its run.
+    ///
+    /// Every action but `Exec` completes inline and records one final row.
+    /// `Exec` records a `Running` row and hands the command to a worker thread
+    /// (see [`Self::fire_exec_async`]) — `process_automations` is called from
+    /// `tick_core`, so running a shell command inline would freeze the render
+    /// loop for as long as it takes.
+    fn fire_automation(&mut self, auto: &Automation, now: u64) {
+        if let AutomationAction::Exec {
+            command,
+            timeout_secs,
+        } = &auto.action
+        {
+            self.fire_exec_async(auto.id, command, *timeout_secs);
+            return;
+        }
+        let (status, detail, related) = match &auto.action {
+            AutomationAction::Send { target } => self.fire_send(auto, target),
+            AutomationAction::Spawn { .. } => self.fire_spawn(auto, now),
+            // Handled above; `Exec` never reaches here.
+            AutomationAction::Exec { .. } => return,
+        };
+        if let Err(e) = self
+            .db
+            .record_automation_run(auto.id, status, &detail, related)
+        {
+            error!("Failed to record run for automation {}: {e}", auto.id);
+        }
+    }
+
+    /// Deliver a `Send` automation's prompt steps to its target session.
+    /// An id target must still be open; a name target is re-resolved here, so it
+    /// survives the session being closed and recreated under the same name.
+    fn fire_send(
         &mut self,
         auto: &Automation,
+        target: &crate::session::SendTarget,
     ) -> (AutomationRunStatus, String, Option<SessionId>) {
-        match &auto.action {
-            AutomationAction::Send { session_id } => {
-                if self.sessions.iter().any(|s| s.info.id == *session_id) {
-                    self.send_prompt_to_session(*session_id, &auto.prompt, 0);
-                    info!("Automation {} sent prompt to {}", auto.id, session_id);
-                    (
-                        AutomationRunStatus::Success,
-                        format!("sent to {session_id}"),
-                        Some(*session_id),
-                    )
-                } else {
-                    (
-                        AutomationRunStatus::Skipped,
-                        "target session not running".to_string(),
-                        None,
-                    )
-                }
-            }
-            AutomationAction::Spawn {
-                repo_path,
-                worktree_branch,
-                base_branch,
-                agent,
-                extra_repos,
-            } => match self.spawn_for_automation(
-                auto,
-                repo_path,
-                worktree_branch.as_deref(),
-                base_branch.as_deref(),
-                agent.as_deref(),
-                extra_repos,
-            ) {
-                Ok(session_id) => (
-                    AutomationRunStatus::Success,
-                    format!("session {session_id}"),
-                    Some(session_id),
-                ),
-                Err(e) => {
-                    error!("Automation {} spawn failed: {e}", auto.id);
-                    (AutomationRunStatus::Error, e, None)
-                }
-            },
-            AutomationAction::Exec { command } => {
-                let (status, detail) = crate::session_ops::run_exec_command(command);
-                (status, detail, None)
-            }
+        let resolved = match target {
+            crate::session::SendTarget::Id(id) => self
+                .sessions
+                .iter()
+                .find(|s| s.info.id == *id)
+                .map(|s| s.info.id),
+            crate::session::SendTarget::Name(name) => self
+                .sessions
+                .iter()
+                .find(|s| s.info.name == *name)
+                .map(|s| s.info.id),
+        };
+        let Some(session_id) = resolved else {
+            return (
+                AutomationRunStatus::Skipped,
+                "target session not running".to_string(),
+                None,
+            );
+        };
+        if let Err(e) = self.send_prompt_steps_to_session(session_id, &auto.steps(), 0) {
+            error!("Automation {} failed to send to {session_id}: {e}", auto.id);
+            return (AutomationRunStatus::Error, e, None);
         }
+        info!("Automation {} sent prompt to {}", auto.id, session_id);
+        (
+            AutomationRunStatus::Success,
+            format!("sent to {session_id}"),
+            Some(session_id),
+        )
     }
 
     /// Spawn (or reuse) the session for a `Spawn` automation and queue its
-    /// prompt. Each automation owns one session named `auto-<id>`; a recurring
-    /// automation reuses that session on later fires (and after a TUI restart,
-    /// where it is restored from the database by name).
-    fn spawn_for_automation(
+    /// prompt steps.
+    ///
+    /// [`SpawnSessionMode::Reuse`](crate::session::SpawnSessionMode::Reuse)
+    /// keeps one session named `auto-<id>`, reused on later fires (and after a
+    /// TUI restart, where it is restored from the database by name).
+    /// `Fresh` spawns `auto-<id>-<stamp>` per fire — and, when a worktree branch
+    /// is configured, its own branch off the same base, so two live runs never
+    /// share one checkout.
+    fn fire_spawn(
         &mut self,
         auto: &Automation,
-        repo_path: &std::path::Path,
-        worktree_branch: Option<&str>,
-        base_branch: Option<&str>,
-        agent: Option<&str>,
-        extra_repos: &[crate::session::ExtraRepo],
-    ) -> Result<SessionId, String> {
-        self.spawn_and_prompt(
-            format!("auto-{}", auto.id),
+        now: u64,
+    ) -> (AutomationRunStatus, String, Option<SessionId>) {
+        let AutomationAction::Spawn {
             repo_path,
             worktree_branch,
             base_branch,
             agent,
             extra_repos,
-            &auto.prompt,
-        )
+            host,
+            session_mode,
+        } = &auto.action
+        else {
+            return (AutomationRunStatus::Error, "not a spawn".into(), None);
+        };
+        if let Some(reason) = self.fresh_spawn_guard(auto, *session_mode) {
+            return (AutomationRunStatus::Skipped, reason, None);
+        }
+        let branch = worktree_branch
+            .as_deref()
+            .map(|b| crate::session::automation::spawn_branch_for(b, *session_mode, now));
+        let result = self.spawn_and_prompt(super::SpawnPromptRequest {
+            name: auto.session_name(now),
+            repo_path,
+            worktree_branch: branch.as_deref(),
+            base_branch: base_branch.as_deref(),
+            agent: agent.as_deref(),
+            host: host.as_deref(),
+            extra_repos,
+            steps: &auto.steps(),
+        });
+        match result {
+            Ok(session_id) => (
+                AutomationRunStatus::Success,
+                format!("session {session_id}"),
+                Some(session_id),
+            ),
+            Err(e) => {
+                error!("Automation {} spawn failed: {e}", auto.id);
+                (AutomationRunStatus::Error, e, None)
+            }
+        }
+    }
+
+    /// Reason to skip a fresh-session fire, or `None` to go ahead. The cap
+    /// itself lives in
+    /// [`fresh_session_cap_reason`](crate::session::automation::fresh_session_cap_reason)
+    /// so the headless dispatcher skips on the same terms.
+    fn fresh_spawn_guard(
+        &self,
+        auto: &Automation,
+        mode: crate::session::SpawnSessionMode,
+    ) -> Option<String> {
+        if mode != crate::session::SpawnSessionMode::Fresh {
+            return None;
+        }
+        let prefix = crate::session::automation::fresh_session_prefix(auto.id);
+        let live = self
+            .sessions
+            .iter()
+            .filter(|s| s.info.name.starts_with(&prefix))
+            .count();
+        crate::session::automation::fresh_session_cap_reason(live)
+    }
+
+    /// Start an `Exec` automation off the tick thread: record a `Running` row,
+    /// then run the command on a worker that closes the row out when it exits.
+    ///
+    /// The worker opens its own database connection — `App::db` is not shared
+    /// across threads, and the run outlives this tick either way.
+    fn fire_exec_async(&mut self, automation_id: i64, command: &str, timeout_secs: Option<u64>) {
+        let run_id = match self.db.record_automation_run(
+            automation_id,
+            AutomationRunStatus::Running,
+            command,
+            None,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                error!("Failed to record run for automation {automation_id}: {e}");
+                return;
+            }
+        };
+        crate::session_ops::run_exec_command_detached(run_id, command.to_string(), timeout_secs);
     }
 
     /// Open the automations list modal.
@@ -171,7 +262,7 @@ impl App {
     /// in-pane editor uses [`new_automation_in_pane`](Self::new_automation_in_pane)
     /// instead.
     pub(crate) fn open_automation_editor(&mut self) {
-        self.modal = modals::Modal::AutomationEditor(self.blank_automation_editor());
+        self.modal = modals::Modal::AutomationEditor(Box::new(self.blank_automation_editor()));
     }
 
     /// `(id, name)` pairs for every session, used to populate the editor's Send
@@ -189,7 +280,31 @@ impl App {
         let mut m = modals::AutomationEditorModal::default();
         let active = self.sessions.get(self.active_index).map(|s| s.info.id);
         m.set_target_sessions(self.session_target_choices(), active);
+        self.populate_editor_registries(&mut m, None, None);
         m
+    }
+
+    /// Fill the editor's agent + host selectors from the live registries,
+    /// selecting the automation's current values. Shared by the blank and
+    /// pre-filled editor builders so both offer the same choices.
+    fn populate_editor_registries(
+        &self,
+        m: &mut modals::AutomationEditorModal,
+        agent: Option<&str>,
+        host: Option<&str>,
+    ) {
+        m.set_agents(
+            self.agents
+                .names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            agent,
+        );
+        m.set_hosts(
+            self.hosts.names().into_iter().map(str::to_string).collect(),
+            host,
+        );
     }
 
     /// Open the centered-overlay editor pre-filled for an existing automation
@@ -204,18 +319,20 @@ impl App {
         else {
             return;
         };
-        self.modal = modals::Modal::AutomationEditor(self.build_automation_editor(&auto));
+        self.modal = modals::Modal::AutomationEditor(Box::new(self.build_automation_editor(&auto)));
     }
 
     /// Build an editor pre-filled from an existing automation, with its Send
     /// target list populated from the running sessions.
     fn build_automation_editor(&self, auto: &Automation) -> modals::AutomationEditorModal {
         let mut m = modals::AutomationEditorModal::from_automation(auto);
-        let selected = match &auto.action {
-            AutomationAction::Send { session_id } => Some(*session_id),
-            AutomationAction::Spawn { .. } | AutomationAction::Exec { .. } => None,
+        let (selected, agent) = match &auto.action {
+            AutomationAction::Send { target } => (target.id(), None),
+            AutomationAction::Spawn { agent, .. } => (None, agent.as_deref()),
+            AutomationAction::Exec { .. } => (None, None),
         };
         m.set_target_sessions(self.session_target_choices(), selected);
+        self.populate_editor_registries(&mut m, agent, auto.action.host());
         m
     }
 
@@ -329,11 +446,18 @@ impl App {
             self.set_error("Name cannot be empty");
             return false;
         }
-        let prompt = m.prompt.value().trim().to_string();
-        if prompt.is_empty() {
-            self.set_error("Prompt cannot be empty");
-            return false;
-        }
+        // `Exec` runs a command, not an agent turn, so it needs no prompt.
+        let steps = if m.action == modals::AutomationActionKind::Exec {
+            Vec::new()
+        } else {
+            match m.build_steps() {
+                Ok(steps) => steps,
+                Err(e) => {
+                    self.set_error(e);
+                    return false;
+                }
+            }
+        };
 
         let now = crate::sync::current_time_millis();
         let schedule = match m.build_schedule(now) {
@@ -344,7 +468,13 @@ impl App {
             }
         };
 
-        let timezone = m.timezone();
+        let timezone = match crate::session::automation::validate_timezone(m.timezone.value()) {
+            Ok(tz) => tz,
+            Err(e) => {
+                self.set_error(e);
+                return false;
+            }
+        };
 
         let Some(action) = self.build_automation_action(m) else {
             return false;
@@ -361,7 +491,10 @@ impl App {
             schedule,
             timezone,
             action,
-            prompt,
+            // The `prompt` column keeps the first step, so a pre-v44 friring
+            // reading this row still finds a usable prompt.
+            prompt: steps.first().map(|s| s.text.clone()).unwrap_or_default(),
+            prompt_steps: steps,
             next_run_at,
         };
         let Some(result) = self.persist_automation(m.editing_id, new) else {
@@ -386,11 +519,19 @@ impl App {
     ) -> Option<AutomationAction> {
         match m.action {
             modals::AutomationActionKind::Send => {
+                // The selector can only offer running sessions, so a name target
+                // (or an id whose session is closed) isn't in it. Saving an
+                // untouched selector must not retarget the automation.
+                if !m.target_dirty {
+                    if let Some(target) = m.original_target.clone() {
+                        return Some(AutomationAction::Send { target });
+                    }
+                }
                 let Some(session_id) = m.selected_target().map(|(id, _)| *id) else {
                     self.set_error("No target session — start a session first");
                     return None;
                 };
-                Some(AutomationAction::Send { session_id })
+                Some(AutomationAction::send_to(session_id))
             }
             modals::AutomationActionKind::Spawn => {
                 let repo = m.repo.value().trim();
@@ -398,19 +539,36 @@ impl App {
                     self.set_error("Repo path required for spawn action");
                     return None;
                 }
+                let host = m.selected_host();
                 let worktree = m.worktree.value().trim();
-                let agent = m.agent.value().trim();
-                Some(AutomationAction::Spawn {
-                    // Expand `~` so the stored path is absolute (git and the
-                    // session cwd don't expand it themselves).
-                    repo_path: crate::paths::expand_tilde(repo),
+                let base = m.base_branch.value().trim();
+                // `~` is expanded so the stored path is absolute (git and the
+                // session cwd don't expand it themselves) — but only for a local
+                // spawn; the validator below rejects `~` with a host, where it
+                // would resolve against the wrong machine's home.
+                let repo_path = match host {
+                    Some(_) => std::path::PathBuf::from(repo),
+                    None => crate::paths::expand_tilde(repo),
+                };
+                let action = AutomationAction::Spawn {
+                    repo_path,
                     worktree_branch: (!worktree.is_empty()).then(|| worktree.to_string()),
-                    base_branch: None,
-                    agent: (!agent.is_empty()).then(|| agent.to_string()),
-                    // The TUI automation editor is single-repo; multi-repo spawns
-                    // are authored via the CLI (`--add-repo`/`--add-dir`).
-                    extra_repos: Vec::new(),
-                })
+                    base_branch: (!base.is_empty()).then(|| base.to_string()),
+                    agent: m.selected_agent().map(str::to_string),
+                    extra_repos: modals::parse_extra_repo_fields(
+                        m.extra_repos.value(),
+                        m.extra_dirs.value(),
+                    ),
+                    host: host.map(str::to_string),
+                    session_mode: m.session_mode,
+                };
+                // One shared check with every other authoring path: unknown
+                // agent/host, and the unsupported remote-worktree combinations.
+                if let Err(e) = crate::session_ops::validate_spawn_action(&action) {
+                    self.set_error(e);
+                    return None;
+                }
+                Some(action)
             }
             modals::AutomationActionKind::Exec => {
                 let command = m.command.value().trim();
@@ -418,8 +576,14 @@ impl App {
                     self.set_error("Command required for exec action");
                     return None;
                 }
+                let timeout = m.timeout.value().trim();
+                if !timeout.is_empty() && timeout.parse::<u64>().is_err() {
+                    self.set_error("Timeout must be a whole number of seconds");
+                    return None;
+                }
                 Some(AutomationAction::Exec {
                     command: command.to_string(),
+                    timeout_secs: timeout.parse().ok(),
                 })
             }
         }
@@ -438,6 +602,7 @@ impl App {
                 Ok(Some(mut auto)) => {
                     auto.name = new.name;
                     auto.prompt = new.prompt;
+                    auto.prompt_steps = new.prompt_steps;
                     auto.schedule = new.schedule;
                     auto.timezone = new.timezone;
                     auto.action = new.action;
@@ -539,6 +704,25 @@ impl App {
             error!("Failed to toggle automation {id}: {e}");
         }
         self.refresh_automations();
+    }
+
+    /// Open the read-only dry-run overlay for an automation: the resolved
+    /// schedule, target/spawn parameters, host and prompt steps it *would* use
+    /// on its next fire. Fires nothing. Shares
+    /// [`dry_run_plan`](crate::session::automation::dry_run_plan) with
+    /// `friring-cli automation dry-run`, so both describe the same plan.
+    fn open_automation_dry_run(&mut self, id: i64) {
+        let Ok(Some(auto)) = self.db.get_automation(id) else {
+            self.set_error("Automation not found");
+            return;
+        };
+        self.modal = modals::Modal::AutomationDryRun(modals::AutomationDryRunModal {
+            name: auto.name.clone(),
+            rows: crate::session::automation::dry_run_plan(
+                &auto,
+                crate::sync::current_time_millis(),
+            ),
+        });
     }
 
     /// Mark an automation due so the next tick fires it.
@@ -667,7 +851,10 @@ impl App {
             Action::AutomationsOpen => self.enter_automation_editor_in_pane(count),
             // Toggle / run / delete act on the row under the cursor — no-ops on
             // an empty pane.
-            Action::AutomationsToggle | Action::AutomationsRun | Action::AutomationsDelete
+            Action::AutomationsToggle
+            | Action::AutomationsRun
+            | Action::AutomationsDryRun
+            | Action::AutomationsDelete
                 if count > 0 =>
             {
                 self.run_selected_automation_action(action, count)
@@ -703,6 +890,7 @@ impl App {
                 self.sync_automation_editor();
             }
             Action::AutomationsRun => self.run_automation_by_id(id),
+            Action::AutomationsDryRun => self.open_automation_dry_run(id),
             Action::AutomationsDelete => {
                 self.delete_automation_by_id(id);
                 let new_count = self.automation_ui.cached_automations.len();
@@ -872,6 +1060,11 @@ impl App {
             KeyCode::Char('r') => {
                 if let Some(id) = self.selected_automation_id() {
                     self.run_automation_by_id(id);
+                }
+            }
+            KeyCode::Char('p') => {
+                if let Some(id) = self.selected_automation_id() {
+                    self.open_automation_dry_run(id);
                 }
             }
             KeyCode::Char('d') => {

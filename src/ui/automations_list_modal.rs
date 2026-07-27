@@ -77,6 +77,8 @@ pub fn render_automations_list_modal(
         Span::styled(" toggle  ", Theme::keybind_desc()),
         Span::styled("r", Theme::keybind()),
         Span::styled(" run  ", Theme::keybind_desc()),
+        Span::styled("p", Theme::keybind()),
+        Span::styled(" preview  ", Theme::keybind_desc()),
         Span::styled("d", Theme::keybind()),
         Span::styled(" delete", Theme::keybind_desc()),
     ]);

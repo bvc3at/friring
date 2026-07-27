@@ -14,7 +14,7 @@ pub mod theme_config;
 pub use agent_def::{AgentDef, AgentRegistry};
 pub use automation::{
     parse_hhmm, preset_to_cron, Automation, AutomationAction, AutomationRun, AutomationRunStatus,
-    AutomationSchedule, ExtraRepo, SchedulePreset,
+    AutomationSchedule, ExtraRepo, PromptStep, SchedulePreset, SendTarget, SpawnSessionMode,
 };
 pub use cc_activity::{
     CcActivity, CcAgent, CcAgentState, CcPhase, CcRunStatus, CcWorkflow, CcWorkflowSummary,
@@ -22,7 +22,7 @@ pub use cc_activity::{
 };
 pub use extension_def::{
     AgentPatch, ConfigMerge, ExtensionAutomation, ExtensionDef, ExtensionFile, ExtensionSession,
-    ExtensionSymlink, ExternalFile,
+    ExtensionSymlink, ExternalFile, PromptStepDecl,
 };
 pub use host_def::{
     is_remote_backend, is_ssh_backend, is_wsl_backend, HostDef, HostKind, HostRegistry,

@@ -55,47 +55,69 @@ pub(super) fn extra_repos_from_json(raw: Option<String>) -> Vec<crate::session::
 /// The action-specific columns an [`AutomationAction`] is stored as, shared by
 /// the `tasks` and `automations` tables (both carry an identical group). The
 /// `action_kind` discriminant is stored separately (`AutomationAction::kind`).
-pub(super) type ActionColumns = (
-    Option<String>, // target_session
-    Option<String>, // repo_path
-    Option<String>, // worktree_branch
-    Option<String>, // base_branch
-    Option<String>, // agent
-    Option<String>, // action_extra_repos (JSON)
-    Option<String>, // action_command
-);
+///
+/// Every field added after v33 is nullable and decodes to the pre-existing
+/// default, so a row written by an older friring round-trips unchanged.
+#[derive(Debug, Default, Clone)]
+pub(super) struct ActionColumns {
+    pub target_session: Option<String>,
+    pub repo_path: Option<String>,
+    pub worktree_branch: Option<String>,
+    pub base_branch: Option<String>,
+    pub agent: Option<String>,
+    /// `action_extra_repos` (JSON list, `NULL` = single-repo).
+    pub extra_repos: Option<String>,
+    pub command: Option<String>,
+    /// `action_target_name` — a `Send` target resolved by session name
+    /// (`NULL` = the `target_session` id form).
+    pub target_name: Option<String>,
+    /// `action_host` — `hosts.toml` name for a remote `Spawn` (`NULL` = local).
+    pub host: Option<String>,
+    /// `action_session_mode` — `NULL`/`reuse` = the one-session-per-automation
+    /// default, `fresh` = a new session per fire.
+    pub session_mode: Option<String>,
+    /// `action_timeout_secs` — `Exec` kill deadline (`NULL` = the default).
+    pub timeout_secs: Option<i64>,
+}
 
 /// Encode an action into its persisted columns (sans the `action_kind`
 /// discriminant, which the caller derives via [`AutomationAction::kind`]).
 pub(super) fn action_to_columns(action: &AutomationAction) -> ActionColumns {
     match action {
-        AutomationAction::Send { session_id } => (
-            Some(session_id.to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
+        AutomationAction::Send { target } => ActionColumns {
+            target_session: target.id().map(|id| id.to_string()),
+            target_name: target.name().map(str::to_string),
+            ..ActionColumns::default()
+        },
         AutomationAction::Spawn {
             repo_path,
             worktree_branch,
             base_branch,
             agent,
             extra_repos,
-        } => (
-            None,
-            Some(repo_path.to_string_lossy().into_owned()),
-            worktree_branch.clone(),
-            base_branch.clone(),
-            agent.clone(),
-            extra_repos_to_json(extra_repos),
-            None,
-        ),
-        AutomationAction::Exec { command } => {
-            (None, None, None, None, None, None, Some(command.clone()))
-        }
+            host,
+            session_mode,
+        } => ActionColumns {
+            repo_path: Some(repo_path.to_string_lossy().into_owned()),
+            worktree_branch: worktree_branch.clone(),
+            base_branch: base_branch.clone(),
+            agent: agent.clone(),
+            extra_repos: extra_repos_to_json(extra_repos),
+            host: host.clone(),
+            // `Reuse` is the pre-v44 behavior, so it stores NULL and an
+            // untouched row stays byte-identical.
+            session_mode: (*session_mode != crate::session::SpawnSessionMode::Reuse)
+                .then(|| session_mode.as_str().to_string()),
+            ..ActionColumns::default()
+        },
+        AutomationAction::Exec {
+            command,
+            timeout_secs,
+        } => ActionColumns {
+            command: Some(command.clone()),
+            timeout_secs: timeout_secs.map(|s| s as i64),
+            ..ActionColumns::default()
+        },
     }
 }
 
@@ -104,24 +126,36 @@ pub(super) fn action_to_columns(action: &AutomationAction) -> ActionColumns {
 /// catch-all); callers that allow an action-less row (tasks) gate this on a
 /// non-NULL `action_kind` themselves.
 pub(super) fn action_from_columns(kind: &str, cols: ActionColumns) -> AutomationAction {
-    let (target_session, repo_path, worktree_branch, base_branch, agent, extra_repos_json, command) =
-        cols;
     match kind {
+        // A name target wins when set; otherwise fall back to the id column
+        // (every pre-v44 send row).
         "send" => AutomationAction::Send {
-            session_id: target_session
-                .unwrap_or_default()
-                .parse()
-                .unwrap_or_default(),
+            target: match cols.target_name {
+                Some(name) => crate::session::SendTarget::Name(name),
+                None => crate::session::SendTarget::Id(
+                    cols.target_session
+                        .unwrap_or_default()
+                        .parse()
+                        .unwrap_or_default(),
+                ),
+            },
         },
         "exec" => AutomationAction::Exec {
-            command: command.unwrap_or_default(),
+            command: cols.command.unwrap_or_default(),
+            timeout_secs: cols.timeout_secs.and_then(|s| u64::try_from(s).ok()),
         },
         _ => AutomationAction::Spawn {
-            repo_path: PathBuf::from(repo_path.unwrap_or_default()),
-            worktree_branch,
-            base_branch,
-            agent,
-            extra_repos: extra_repos_from_json(extra_repos_json),
+            repo_path: PathBuf::from(cols.repo_path.unwrap_or_default()),
+            worktree_branch: cols.worktree_branch,
+            base_branch: cols.base_branch,
+            agent: cols.agent,
+            extra_repos: extra_repos_from_json(cols.extra_repos),
+            host: cols.host,
+            session_mode: cols
+                .session_mode
+                .as_deref()
+                .map(crate::session::SpawnSessionMode::from_str_or_default)
+                .unwrap_or_default(),
         },
     }
 }
