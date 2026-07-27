@@ -523,6 +523,17 @@ pub fn parse_trigger(
 /// Shared by the TUI dry-run overlay and `friring-cli automation dry-run` so
 /// both describe the same plan; `now_millis` anchors the next-fire computation.
 pub fn dry_run_plan(auto: &Automation, now_millis: u64) -> Vec<(String, String)> {
+    // The persisted `next_run_at` is the fire the next tick will claim, so it —
+    // not a recomputed occurrence — is what the preview must describe. An
+    // overdue one-shot has no *future* occurrence yet is about to fire.
+    let fire_at = auto
+        .enabled
+        .then_some(auto.next_run_at)
+        .flatten()
+        .or_else(|| {
+            auto.schedule
+                .next_after(now_millis, auto.timezone.as_deref())
+        });
     let mut rows = vec![
         ("name".to_string(), auto.name.clone()),
         (
@@ -539,14 +550,20 @@ pub fn dry_run_plan(auto: &Automation, now_millis: u64) -> Vec<(String, String)>
         ),
         (
             "next fire".to_string(),
-            auto.schedule
-                .next_after(now_millis, auto.timezone.as_deref())
-                .map(|at| format_fire_time(at, auto.timezone.as_deref()))
-                .unwrap_or_else(|| "never (no further occurrence)".into()),
+            match fire_at {
+                Some(at) if at <= now_millis => {
+                    format!(
+                        "due now ({})",
+                        format_fire_time(at, auto.timezone.as_deref())
+                    )
+                }
+                Some(at) => format_fire_time(at, auto.timezone.as_deref()),
+                None => "never (no further occurrence)".into(),
+            },
         ),
         ("action".to_string(), auto.action.kind().to_string()),
     ];
-    rows.extend(action_plan_rows(auto, now_millis));
+    rows.extend(action_plan_rows(auto, fire_at.unwrap_or(now_millis)));
     if !matches!(auto.action, AutomationAction::Exec { .. }) {
         let steps = auto.steps();
         let total = steps.len();
@@ -565,8 +582,10 @@ pub fn dry_run_plan(auto: &Automation, now_millis: u64) -> Vec<(String, String)>
 }
 
 /// The action-specific rows of a [`dry_run_plan`] — resolved target, spawn
-/// parameters + host, or the exec command and its timeout.
-fn action_plan_rows(auto: &Automation, now_millis: u64) -> Vec<(String, String)> {
+/// parameters + host, or the exec command and its timeout. `fire_at` is the
+/// timestamp the pending fire will use, so a fresh spawn previews the very
+/// session and branch names that fire will produce.
+fn action_plan_rows(auto: &Automation, fire_at: u64) -> Vec<(String, String)> {
     match &auto.action {
         AutomationAction::Send { target } => match target {
             SendTarget::Id(id) => vec![("target session".into(), id.to_string())],
@@ -584,10 +603,6 @@ fn action_plan_rows(auto: &Automation, now_millis: u64) -> Vec<(String, String)>
             host,
             session_mode,
         } => {
-            let fire_at = auto
-                .schedule
-                .next_after(now_millis, auto.timezone.as_deref())
-                .unwrap_or(now_millis);
             let mut rows = vec![
                 (
                     "host".into(),
@@ -1125,6 +1140,31 @@ mod tests {
             .any(|(k, v)| k == "timeout" && v == &format!("{DEFAULT_EXEC_TIMEOUT_SECS} s")));
         // An exec has no agent turn, so the plan lists no prompt steps.
         assert!(!rows.iter().any(|(k, _)| k.starts_with("step ")));
+    }
+
+    #[test]
+    fn dry_run_plan_previews_the_pending_fire_of_an_overdue_automation() {
+        // A one-shot whose time has passed has no *future* occurrence, but the
+        // next tick will still claim its `next_run_at` — the plan must describe
+        // that fire, not report "never".
+        let mut auto = sample(spawn(SpawnSessionMode::Fresh));
+        auto.schedule = AutomationSchedule::Once { at: MON_2024 };
+        auto.next_run_at = Some(MON_2024);
+        let rows = dry_run_plan(&auto, MON_2024 + 60_000);
+        let get = |label: &str| {
+            rows.iter()
+                .find(|(k, _)| k == label)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("no `{label}` row in {rows:?}"))
+        };
+        assert!(get("next fire").starts_with("due now"), "{rows:?}");
+        // The previewed names are the ones the pending fire will derive.
+        assert!(get("session").contains(&auto.session_name(MON_2024)));
+        assert!(get("worktree").starts_with(&spawn_branch_for(
+            "auto/nightly",
+            SpawnSessionMode::Fresh,
+            MON_2024
+        )));
     }
 
     #[test]
