@@ -682,8 +682,9 @@ column nullable so pre-v44 rows keep their exact old behavior):
   loop. The fork records a `running` run, hands the command to a worker, and
   updates that same row when it exits — one history entry per fire, visible
   while it works. Commands are killed at a deadline (`--timeout`, default
-  900 s) with output drained on separate threads, and a `running` row orphaned
-  by a crash is reaped on the next startup.
+  900 s) with output drained to a bounded tail on separate threads, and a
+  `running` row orphaned by a crash is reaped — on the next startup and on every
+  headless tick — once it outlives its own command's timeout.
 - **The editor reaches the whole model.** Upstream's editor exposes repo /
   worktree / agent as free text and can't set a base branch, extra repos, a
   host, a session mode or an exec timeout at all. The fork makes **agent** and
