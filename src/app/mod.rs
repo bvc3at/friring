@@ -7512,7 +7512,7 @@ impl App {
     /// already running, or [`AGENT_BOOT_DELAY_TICKS`] for one just spawned so
     /// its agent CLI has time to come up.
     fn send_prompt_to_session(&mut self, session_id: SessionId, text: &str, boot_delay_ticks: u64) {
-        self.send_prompt_steps_to_session(
+        let _ = self.send_prompt_steps_to_session(
             session_id,
             &[crate::session::PromptStep::new(text)],
             boot_delay_ticks,
@@ -7527,12 +7527,17 @@ impl App {
     /// submissions; the gap also lets a slash command's autocomplete popup close
     /// before the next paste lands. `boot_delay_ticks` delays the *first* step
     /// (0 = send it inline to an already-running session).
+    ///
+    /// Only the inline leg can report: a deferred step is written by a later
+    /// tick, long after this returns. `Err` therefore means the caller's very
+    /// first delivery attempt failed, which an automation records as an error
+    /// run instead of a success.
     fn send_prompt_steps_to_session(
         &mut self,
         session_id: SessionId,
         steps: &[crate::session::PromptStep],
         boot_delay_ticks: u64,
-    ) {
+    ) -> Result<(), String> {
         let mut offset = boot_delay_ticks;
         for step in steps {
             let mut paste = b"\x1b[200~".to_vec();
@@ -7541,11 +7546,11 @@ impl App {
 
             if offset == 0 {
                 let Some(session) = self.sessions.iter().find(|s| s.info.id == session_id) else {
-                    return;
+                    return Err(format!("session {session_id} is no longer open"));
                 };
                 if let Err(e) = session.send_input(paste) {
                     error!("Failed to send prompt to session {session_id}: {e}");
-                    return;
+                    return Err(format!("failed to send prompt to {session_id}: {e}"));
                 }
             } else {
                 self.deferred_inputs
@@ -7559,6 +7564,7 @@ impl App {
             ));
             offset = enter_at + step.delay().div_ceil(TICK_MS);
         }
+        Ok(())
     }
 
     /// A "spawn (or reuse) a named session and prompt it" request — the shared
@@ -7579,7 +7585,7 @@ impl App {
         // Reuse an existing session (this run or restored after restart).
         if let Some(existing) = self.sessions.iter().find(|s| s.info.name == name) {
             let id = existing.info.id;
-            self.send_prompt_steps_to_session(id, steps, 0);
+            let _ = self.send_prompt_steps_to_session(id, steps, 0);
             return Ok(id);
         }
 
@@ -7652,7 +7658,7 @@ impl App {
             .find(|s| s.info.name == name)
             .ok_or_else(|| "session spawn failed".to_string())?;
         let id = session.info.id;
-        self.send_prompt_steps_to_session(id, steps, AGENT_BOOT_DELAY_TICKS);
+        let _ = self.send_prompt_steps_to_session(id, steps, AGENT_BOOT_DELAY_TICKS);
         Ok(id)
     }
 
@@ -15640,7 +15646,7 @@ mod tests {
             PromptStep::new("go"),
         ];
         // A boot delay defers everything, so the whole schedule is inspectable.
-        app.send_prompt_steps_to_session(id, &steps, AGENT_BOOT_DELAY_TICKS);
+        let _ = app.send_prompt_steps_to_session(id, &steps, AGENT_BOOT_DELAY_TICKS);
 
         assert_eq!(app.deferred_inputs.len(), 4, "paste + Enter per step");
         let at = |i: usize| app.deferred_inputs[i].2 - 100;

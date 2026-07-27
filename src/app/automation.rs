@@ -133,7 +133,10 @@ impl App {
                 None,
             );
         };
-        self.send_prompt_steps_to_session(session_id, &auto.steps(), 0);
+        if let Err(e) = self.send_prompt_steps_to_session(session_id, &auto.steps(), 0) {
+            error!("Automation {} failed to send to {session_id}: {e}", auto.id);
+            return (AutomationRunStatus::Error, e, None);
+        }
         info!("Automation {} sent prompt to {}", auto.id, session_id);
         (
             AutomationRunStatus::Success,
