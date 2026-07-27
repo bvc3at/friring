@@ -246,14 +246,6 @@ impl SendTarget {
             Self::Name(name) => Some(name),
         }
     }
-
-    /// Human label for the target (`<uuid>` or `name:<name>`).
-    pub fn label(&self) -> String {
-        match self {
-            Self::Id(id) => id.to_string(),
-            Self::Name(name) => format!("name:{name}"),
-        }
-    }
 }
 
 /// Whether a recurring `Spawn` keeps one long-lived session or starts a new one
@@ -1079,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn send_target_labels_id_and_name_distinctly() {
+    fn send_target_exposes_only_its_own_flavor() {
         let id = SessionId::default();
         let by_id = SendTarget::Id(id);
         assert_eq!(by_id.id(), Some(id));
@@ -1087,7 +1079,6 @@ mod tests {
         let by_name = SendTarget::Name("inbox".into());
         assert_eq!(by_name.id(), None);
         assert_eq!(by_name.name(), Some("inbox"));
-        assert_eq!(by_name.label(), "name:inbox");
     }
 
     #[test]
