@@ -346,10 +346,17 @@ A live keeper window both runs the heartbeat and keeps the tmux
 server alive (a bare pending `run-shell` job does not), so even
 spawn-only automations fire with no other sessions. Claim-first
 ordering gives at-most-once semantics (a crash loses a run rather
-than double-firing), the right default for agent prompts. tmux is
-local-only; the send/spawn dispatch sits behind a seam so a future
-remote/SSH `SessionBackend` (ADR-2) slots in without changing the
-scheduler.
+than double-firing), the right default for agent prompts.
+
+Dispatch is **host-aware**: a `spawn` action resolves its `hosts.toml`
+host into an `agent::tmux::MuxTarget` (transport + socket + group
+session + that host's multiplexer binary), used for both the headless
+window lookup and the deferred prompt delivery, so a remote automation
+creates its session *and* is prompted on the right machine (an unknown
+host is an error before the spawn, never a silent local one). A
+*reused* spawn session is delivered over the backend it was created
+on. `send` stays deliberately local — it targets a session friring
+already owns, which the user picked from the running-session list.
 
 **Rejected**:
 
