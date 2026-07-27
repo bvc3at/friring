@@ -643,8 +643,14 @@ impl App {
             Modal::SessionName(_) => self.handle_session_name_key(code, mods),
             Modal::AutomationEditor(_) => self.handle_automation_editor_key(code, mods),
             Modal::AutomationsList(_) => self.handle_automations_list_key(code),
-            // Read-only: any key dismisses it.
-            Modal::AutomationDryRun(_) => self.modal.close(),
+            // Read-only, so only the usual dismissal keys close it. Closing on
+            // *any* key would contradict the overlay's own `Esc` hint and would
+            // fight a future scrolling pass, where j/k have to reach the plan.
+            Modal::AutomationDryRun(_) => {
+                if matches!(code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                    self.modal.close();
+                }
+            }
             Modal::AgentPicker(_) => self.handle_agent_picker_key(code, mods),
             Modal::HostPicker(_) => self.handle_host_picker_key(code, mods),
             Modal::ThemePicker(_) => self.handle_theme_picker_key(code),

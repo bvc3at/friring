@@ -15633,6 +15633,37 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_overlay_closes_only_on_its_dismissal_keys() {
+        let mut app = App::new(24, 80, stub_backend(), stub_agents(), test_db());
+        let open = |app: &mut App| {
+            app.modal = modals::Modal::AutomationDryRun(modals::AutomationDryRunModal {
+                name: "inbox".into(),
+                rows: vec![("action".into(), "spawn".into())],
+            });
+        };
+
+        // A stray keystroke must not dismiss a plan the user is still reading —
+        // and j/k have to stay free for a future scrolling pass.
+        open(&mut app);
+        for code in [KeyCode::Char('j'), KeyCode::Char('x'), KeyCode::Down] {
+            app.handle_modal_key_if_open(code, KeyModifiers::NONE);
+            assert!(
+                matches!(app.modal, modals::Modal::AutomationDryRun(_)),
+                "{code:?} should not close the overlay"
+            );
+        }
+        // The keys the overlay's own hint advertises do close it.
+        for code in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('q')] {
+            open(&mut app);
+            app.handle_modal_key_if_open(code, KeyModifiers::NONE);
+            assert!(
+                matches!(app.modal, modals::Modal::None),
+                "{code:?} should close the overlay"
+            );
+        }
+    }
+
+    #[test]
     fn send_prompt_steps_schedules_one_paste_and_enter_per_step() {
         use crate::session::PromptStep;
         let mut app = App::new(24, 80, stub_backend(), stub_agents(), test_db());

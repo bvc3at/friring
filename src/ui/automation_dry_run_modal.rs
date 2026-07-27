@@ -38,7 +38,7 @@ pub fn render_automation_dry_run_modal(frame: &mut Frame, state: &AutomationDryR
 /// The plan rows plus the pinned hint line, windowed to `inner`'s height so a
 /// long multi-step plan scrolls off the bottom rather than overflowing.
 fn plan_lines<'a>(state: &AutomationDryRunState<'a>, inner: Rect) -> Vec<Line<'a>> {
-    let hint = super::key_hint_line(&[("Esc", " close")]);
+    let hint = super::key_hint_line(&[("Esc/q", " close")]);
     let visible = (inner.height as usize).saturating_sub(2);
     let mut lines: Vec<Line> = state
         .rows
