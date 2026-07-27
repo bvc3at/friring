@@ -479,11 +479,13 @@ impl App {
             }
         };
 
-        let timezone = m.timezone();
-        if let Err(e) = crate::session::automation::validate_timezone(m.timezone.value()) {
-            self.set_error(e);
-            return false;
-        }
+        let timezone = match crate::session::automation::validate_timezone(m.timezone.value()) {
+            Ok(tz) => tz,
+            Err(e) => {
+                self.set_error(e);
+                return false;
+            }
+        };
 
         let Some(action) = self.build_automation_action(m) else {
             return false;

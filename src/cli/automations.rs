@@ -354,21 +354,21 @@ fn create_automation(db: &Database, args: CreateArgs) -> Result<CommandOutput, S
         return Err("--prompt does not apply to --command (exec has no agent turn)".into());
     }
     let schedule = parse_trigger(&args.trigger, args.time.as_deref(), args.weekday)?;
-    if let Some(tz) = args.timezone.as_deref() {
-        crate::session::automation::validate_timezone(tz)?;
-    }
+    let timezone = crate::session::automation::validate_timezone(
+        args.timezone.as_deref().unwrap_or_default(),
+    )?;
     let action = resolve_action(&args.action, db)?;
     let next_run_at = if args.disabled {
         None
     } else {
-        schedule.next_after(current_time_millis(), args.timezone.as_deref())
+        schedule.next_after(current_time_millis(), timezone.as_deref())
     };
     let steps = build_steps(&prompts, args.step_delay);
     let new = NewAutomation {
         name: args.name,
         enabled: !args.disabled,
         schedule,
-        timezone: args.timezone,
+        timezone,
         action,
         // The `prompt` column keeps the first step so an older friring reading
         // this row still finds a usable prompt.
@@ -511,8 +511,7 @@ fn apply_edit_overrides(
         return Err("--step-delay only applies with --prompt".into());
     }
     if let Some(tz) = timezone {
-        crate::session::automation::validate_timezone(&tz)?;
-        auto.timezone = if tz.is_empty() { None } else { Some(tz) };
+        auto.timezone = crate::session::automation::validate_timezone(&tz)?;
     }
     if let Some(t) = trigger {
         auto.schedule = parse_trigger(&t, time.as_deref(), weekday)?;
@@ -1200,9 +1199,9 @@ fn import_automations(db: &Database, file: &str, replace: bool) -> Result<Comman
 fn manifest_to_new_automation(
     decl: &crate::session::ExtensionAutomation,
 ) -> Result<NewAutomation, String> {
-    if let Some(tz) = decl.timezone.as_deref() {
-        crate::session::automation::validate_timezone(tz)?;
-    }
+    let timezone = crate::session::automation::validate_timezone(
+        decl.timezone.as_deref().unwrap_or_default(),
+    )?;
     let schedule = parse_trigger(&decl.trigger, None, None)?;
     let action = decl.to_action(None)?;
     // A manifest is authored by hand as often as it is exported, so its spawn
@@ -1217,13 +1216,13 @@ fn manifest_to_new_automation(
     }
     let enabled = decl.enabled.unwrap_or(true);
     let next_run_at = enabled
-        .then(|| schedule.next_after(current_time_millis(), decl.timezone.as_deref()))
+        .then(|| schedule.next_after(current_time_millis(), timezone.as_deref()))
         .flatten();
     Ok(NewAutomation {
         name: decl.name.clone(),
         enabled,
         schedule,
-        timezone: decl.timezone.clone(),
+        timezone,
         action,
         prompt: steps.first().map(|s| s.text.clone()).unwrap_or_default(),
         prompt_steps: steps,
@@ -2113,6 +2112,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("--prompt"), "got {err}");
+    }
+
+    #[test]
+    fn create_stores_a_padded_timezone_trimmed() {
+        let db = Database::open_in_memory().unwrap();
+        create_automation(
+            &db,
+            CreateArgs {
+                timezone: Some(" UTC ".into()),
+                ..spawn_create(
+                    "n",
+                    ActionArgs {
+                        repo: Some("/repo".into()),
+                        ..ActionArgs::default()
+                    },
+                )
+            },
+        )
+        .unwrap();
+        // Stored untrimmed, `AutomationSchedule::next_after` fails to parse it
+        // and silently schedules in local time instead.
+        assert_eq!(
+            db.list_automations().unwrap()[0].timezone.as_deref(),
+            Some("UTC")
+        );
     }
 
     #[test]

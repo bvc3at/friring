@@ -687,16 +687,23 @@ fn format_fire_time(at_millis: u64, timezone: Option<&str>) -> String {
     }
 }
 
-/// Validate an IANA timezone name against `chrono-tz`.
+/// Validate an IANA timezone name against `chrono-tz`, returning the value to
+/// persist: trimmed, or `None` for "system local".
 ///
 /// The schedule math silently falls back to system local time for an
 /// unrecognized name (`next_after`), which turns a typo into an automation that
 /// fires hours off with no signal — so every authoring path (TUI editor, CLI
-/// create/edit, manifest import) rejects it up front instead.
-pub fn validate_timezone(tz: &str) -> Result<(), String> {
+/// create/edit, manifest import) rejects it up front instead. Returning the
+/// normalized value is what keeps `" UTC "` from validating (it trims) and then
+/// being stored untrimmed, where `next_after` would fail to parse it and fall
+/// back to local time anyway.
+pub fn validate_timezone(tz: &str) -> Result<Option<String>, String> {
     let tz = tz.trim();
-    if tz.is_empty() || chrono_tz::Tz::from_str(tz).is_ok() {
-        return Ok(());
+    if tz.is_empty() {
+        return Ok(None);
+    }
+    if chrono_tz::Tz::from_str(tz).is_ok() {
+        return Ok(Some(tz.to_string()));
     }
     Err(format!(
         "unknown timezone `{tz}` (use an IANA name like Europe/Zurich or UTC)"
@@ -1044,10 +1051,16 @@ mod tests {
 
     #[test]
     fn validate_timezone_accepts_iana_and_empty_but_rejects_typos() {
-        assert!(validate_timezone("Europe/Zurich").is_ok());
-        assert!(validate_timezone("UTC").is_ok());
+        assert_eq!(
+            validate_timezone("Europe/Zurich").unwrap().as_deref(),
+            Some("Europe/Zurich")
+        );
+        // Padding is stripped: an untrimmed value stored as-is would fail to
+        // parse at fire time and silently fall back to local.
+        assert_eq!(validate_timezone(" UTC ").unwrap().as_deref(), Some("UTC"));
         // Empty = "system local", the documented default.
-        assert!(validate_timezone("").is_ok());
+        assert_eq!(validate_timezone("").unwrap(), None);
+        assert_eq!(validate_timezone("   ").unwrap(), None);
         let err = validate_timezone("Europe/Zurihc").unwrap_err();
         assert!(err.contains("unknown timezone"), "got {err}");
     }
