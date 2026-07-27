@@ -363,8 +363,13 @@ window lookup and the deferred prompt delivery, so a remote automation
 creates its session *and* is prompted on the right machine (an unknown
 host is an error before the spawn, never a silent local one). A
 *reused* spawn session is delivered over the backend it was created
-on. `send` stays deliberately local — it targets a session friring
-already owns, which the user picked from the running-session list.
+on. A `send` follows the **target session's own** `backend_type`
+(`MuxTarget::for_backend`), so a session started on a remote host is
+reached there rather than typed at the local server — and the TUI and
+the headless tick agree about the same automation instead of the
+outcome depending on which firer won the claim. A backend naming a
+host that is no longer in `hosts.toml` is an error run, never a
+delivery to the wrong machine.
 
 **Rejected**:
 
