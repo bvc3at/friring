@@ -1707,8 +1707,12 @@ fn deferred_prompt_script(
     let mut parts: Vec<String> = Vec::new();
     for (i, step) in steps.iter().enumerate() {
         // Bracketed-paste wrap (see `bracketed_paste`) so multi-line prompts
-        // don't submit early; `-l` delivers the bytes literally.
-        let escaped_text = shell_escape(&bracketed_paste(&step.text));
+        // don't submit early; `-l` delivers the bytes literally. Quoted with
+        // `posix_quote`, not `control_mode::shell_escape`: the latter also
+        // strips newlines (tmux control mode is line-delimited), which a
+        // single-quoted argument in a shell *script* has no need of — and
+        // stripping them would flatten a multi-line prompt step.
+        let escaped_text = crate::shell::posix_quote(&bracketed_paste(&step.text));
         parts.push(format!(
             "{mux} -L {socket} send-keys -t {escaped_window} -l {escaped_text}"
         ));
@@ -1744,7 +1748,50 @@ fn deferred_prompt_script(
             parts.push(format!("Start-Sleep -Milliseconds {}", step.delay()));
         }
     }
-    format!("powershell -NoProfile -Command \"{}\"", parts.join("; "))
+    powershell_encoded_command(&parts.join("; "))
+}
+
+/// Frame a PowerShell script as `-EncodedCommand` (base64 of UTF-16LE, what
+/// PowerShell expects).
+///
+/// The script embeds arbitrary prompt text, so it cannot ride inside a
+/// double-quoted `-Command "…"`: one `"` or newline in a prompt would end the
+/// framing and run the remainder as separate commands — after `run-shell -b`
+/// had already reported the scheduling a success. Base64 has no character that
+/// can escape the argument.
+#[cfg(windows)]
+fn powershell_encoded_command(script: &str) -> String {
+    let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    format!(
+        "powershell -NoProfile -EncodedCommand {}",
+        base64_encode(&utf16le)
+    )
+}
+
+/// Standard-alphabet base64 (RFC 4648) with `=` padding.
+#[cfg(windows)]
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b1 = *chunk.first().unwrap_or(&0) as u32;
+        let b2 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b3 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b1 << 16) | (b2 << 8) | b3;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// Format a millisecond delay as a POSIX `sleep` argument (`sleep 1.2`), which
@@ -2077,6 +2124,20 @@ mod tests {
         assert!(script.contains("sleep 2.000"), "got {script}");
         // The last step has no trailing settle — nothing waits on it.
         assert_eq!(script.matches("sleep 1.200").count(), 0);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn deferred_prompt_script_preserves_arbitrary_prompt_bytes() {
+        use crate::session::PromptStep;
+        let target = MuxTarget::local();
+        // A single-quoted shell word carries newlines and quotes verbatim; the
+        // control-mode escaper would have flattened the newline into a space.
+        let text = "line one\nline two 'quoted' \"dquoted\"";
+        let script =
+            deferred_prompt_script(&target, "friring:=tb-auto-1", &[PromptStep::new(text)]);
+        assert!(script.contains("line one\nline two"), "got {script}");
+        assert!(script.contains(r#""dquoted""#), "got {script}");
     }
 
     #[cfg(not(windows))]
