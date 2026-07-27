@@ -676,6 +676,12 @@ column nullable so pre-v44 rows keep their exact old behavior):
   live runs share one checkout, since `create_or_attach_worktree` is
   idempotent) and capping concurrently-open sessions at 5 so a short cron can't
   accumulate them unboundedly. `reuse` remains the default and matches upstream.
+- **Send follows the session's own backend.** Delivery resolves the target
+  session's `backend_type`, so an automation can prompt a session running on a
+  remote host — and the TUI and the headless tick agree about it. Upstream (and
+  this fork's first pass) hardcoded the local multiplexer headlessly, so the
+  same automation succeeded from the TUI and recorded a skip from the keeper,
+  depending only on which firer won the claim.
 - **Send by session name.** A `Send` target is an id *or* a name, re-resolved
   per fire. Upstream's hard UUID dies with the session (force-deleting it
   disables the automation); the name form survives a close-and-recreate — the

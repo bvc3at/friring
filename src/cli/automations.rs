@@ -874,16 +874,15 @@ fn fire_send(
     auto: &Automation,
     target: &crate::session::SendTarget,
 ) -> (AutomationRunStatus, String, Option<SessionId>) {
-    let resolved = match target {
-        crate::session::SendTarget::Id(id) => db
-            .get_session_name(*id)
-            .map(|name| name.map(|name| (*id, name))),
-        crate::session::SendTarget::Name(name) => db
-            .list_active_sessions()
-            .map(|rows| rows.into_iter().find(|s| s.name == *name))
-            .map(|found| found.map(|s| (s.id, s.name))),
-    };
-    let (session_id, name) = match resolved {
+    // Resolve to the whole row, not just the name: the session's own
+    // `backend_type` is what says which multiplexer server owns its window.
+    let resolved = db.list_active_sessions().map(|rows| {
+        rows.into_iter().find(|s| match target {
+            crate::session::SendTarget::Id(id) => s.id == *id,
+            crate::session::SendTarget::Name(name) => s.name == *name,
+        })
+    });
+    let session = match resolved {
         Ok(Some(found)) => found,
         Ok(None) => {
             return (
@@ -894,9 +893,17 @@ fn fire_send(
         }
         Err(e) => return (AutomationRunStatus::Error, format!("{e}"), None),
     };
-    // A `send` always targets a session friring already owns, so its window
-    // lives on the local server (remote sessions are spawn-authored).
-    let mux = crate::agent::tmux::MuxTarget::local();
+    let (session_id, name) = (session.id, session.name);
+    // Deliver over the server the session actually lives on. Assuming local
+    // here made the TUI and this path disagree about the same automation: the
+    // TUI routes through the session's backend and succeeds, while this found
+    // no local window and skipped.
+    let mux = match crate::agent::tmux::MuxTarget::for_backend(&session.backend_type) {
+        Ok(m) => m,
+        // A host that vanished from hosts.toml is a loud failure, never a
+        // silent skip or a delivery to the wrong machine.
+        Err(e) => return (AutomationRunStatus::Error, e.to_string(), None),
+    };
     if !crate::agent::tmux::window_exists_on(&mux, &name) {
         return (
             AutomationRunStatus::Skipped,

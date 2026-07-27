@@ -1545,6 +1545,34 @@ impl MuxTarget {
         }
     }
 
+    /// Resolve the server a **session** lives on, from its persisted
+    /// `backend_type` (`local-tmux`/`tmux` = local, `ssh:<host>` /
+    /// `wsl:<host>` = that host).
+    ///
+    /// This is what lets a headless `send` reach a session the user started on a
+    /// remote host. Hardcoding the local server here made the TUI and the
+    /// headless tick disagree about the same automation: the TUI delivered over
+    /// the session's backend and reported success, while the tick found no local
+    /// window and recorded a skip.
+    ///
+    /// A backend naming a host that is no longer in `hosts.toml` is an error,
+    /// not a fallback to local — delivering someone's prompt to the wrong
+    /// machine is worse than a failed run.
+    pub fn for_backend(backend_type: &str) -> Result<Self> {
+        if !crate::session::is_remote_backend(backend_type) {
+            return Ok(Self::local());
+        }
+        let registry = crate::agent::host_config::load_all();
+        match registry.get_by_backend(backend_type) {
+            Some(host) => Ok(Self::for_host(host)),
+            None => bail!(
+                "Session backend '{backend_type}' names a host that is not in hosts.toml. \
+                 Available: [{}]",
+                registry.names().join(", ")
+            ),
+        }
+    }
+
     /// Build a one-shot multiplexer command against this target.
     fn command(&self, args: &[&str]) -> Command {
         self.transport.tmux_command(&self.socket, args)
@@ -2181,6 +2209,33 @@ mod tests {
             deferred_prompt_script(&target, "friring:=tb-auto-1", &[PromptStep::new(text)]);
         assert!(script.contains("line one\nline two"), "got {script}");
         assert!(script.contains(r#""dquoted""#), "got {script}");
+    }
+
+    #[test]
+    fn mux_target_for_backend_maps_a_session_to_its_own_server() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let hosts = crate::agent::host_config::hosts_config_path().unwrap();
+        std::fs::create_dir_all(hosts.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hosts,
+            "[[hosts]]\nname = \"devbox\"\ndestination = \"me@devbox\"\nsession = \"remote\"\n",
+        )
+        .unwrap();
+
+        // A local session keeps the local server.
+        for local in ["", "local-tmux", "tmux"] {
+            let t = MuxTarget::for_backend(local).unwrap();
+            assert!(!t.transport.is_remote(), "{local} should stay local");
+        }
+        // A remote one resolves to its host's transport and group session.
+        let t = MuxTarget::for_backend("ssh:devbox").unwrap();
+        assert!(t.transport.is_remote());
+        assert_eq!(t.window_target("s"), "remote:=tb-s");
+        // A backend naming a host that is gone is an error, never a silent
+        // fallback that would type the prompt into the wrong machine.
+        let err = MuxTarget::for_backend("ssh:ghost").unwrap_err().to_string();
+        assert!(err.contains("ghost"), "got {err}");
     }
 
     #[test]

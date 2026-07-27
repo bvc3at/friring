@@ -1340,7 +1340,11 @@ step 3   Summarize my email history and file anything actionable.
   either a session **id** (exact, but force-deleting the session disables the
   automation) or a session **name** (`--session-name`), re-resolved on every
   fire so it survives the session being closed and recreated. Skipped (and
-  logged as such) if no matching session is running.
+  logged as such) if no matching session is running. Delivery follows the
+  target session's **own** backend, so a session running on a remote host is
+  reached there (`MuxTarget::for_backend`); a backend naming a host that is no
+  longer in `hosts.toml` is an error run, never a delivery to the wrong
+  machine.
 - **spawn** — create a session, optionally on a worktree off a base branch,
   with the chosen agent, optionally on a remote **host**. The steps are
   delivered after a short boot delay so the agent CLI has time to start.
