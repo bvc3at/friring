@@ -283,9 +283,10 @@ mod tests {
             enabled: true,
             schedule: AutomationSchedule::Once { at: u64::MAX },
             timezone: None,
-            action: AutomationAction::Send { session_id },
+            action: AutomationAction::send_to(session_id),
             prompt: "noop".into(),
             next_run_at: Some(u64::MAX),
+            prompt_steps: Vec::new(),
         })
         .unwrap()
     }

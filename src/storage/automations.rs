@@ -7,11 +7,35 @@
 use rusqlite::{params, OptionalExtension};
 
 use crate::session::{
-    Automation, AutomationAction, AutomationRun, AutomationRunStatus, AutomationSchedule, SessionId,
+    Automation, AutomationAction, AutomationRun, AutomationRunStatus, AutomationSchedule,
+    PromptStep, SessionId,
 };
 use crate::sync::current_time_millis;
 
 use super::Database;
+
+/// Serialize the prompt-step list for the `prompt_steps` column.
+///
+/// A single step (the common case, and every pre-v44 row) stores `NULL` and
+/// lives in the plain `prompt` column alone, so an untouched automation is
+/// byte-identical to what an older friring wrote — the `action_extra_repos`
+/// precedent. A lone step carrying a custom delay still needs the column.
+fn prompt_steps_to_json(steps: &[PromptStep]) -> Option<String> {
+    match steps {
+        [] => None,
+        [only] if only.delay_ms.is_none() => None,
+        steps => serde_json::to_string(steps).ok(),
+    }
+}
+
+/// Decode the `prompt_steps` column. `NULL`/empty/malformed → an empty list,
+/// which [`Automation::steps`](crate::session::Automation::steps) resolves to
+/// the single `prompt` column. Never an error.
+fn prompt_steps_from_json(raw: Option<String>) -> Vec<PromptStep> {
+    raw.filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
 
 /// Fields needed to create an automation. `next_run_at` is computed by the
 /// caller (it depends on the schedule + timezone, which live in `session`).
@@ -21,7 +45,10 @@ pub struct NewAutomation {
     pub schedule: AutomationSchedule,
     pub timezone: Option<String>,
     pub action: AutomationAction,
+    /// The first (often only) prompt step — also what a pre-v44 friring reads.
     pub prompt: String,
+    /// The full step list; empty = the single `prompt` above.
+    pub prompt_steps: Vec<PromptStep>,
     pub next_run_at: Option<u64>,
 }
 
@@ -29,15 +56,17 @@ impl Database {
     /// Insert a new automation, returning its row id.
     pub fn create_automation(&self, new: &NewAutomation) -> rusqlite::Result<i64> {
         let now = current_time_millis() as i64;
-        let (target_session, repo_path, worktree_branch, base_branch, agent, extra, command) =
-            super::action_to_columns(&new.action);
+        let cols = super::action_to_columns(&new.action);
         self.conn.execute(
             "INSERT INTO automations
                 (name, enabled, schedule_kind, schedule_spec, timezone,
                  action_kind, target_session, repo_path, worktree_branch,
                  base_branch, agent, prompt, created_at, updated_at,
-                 last_run_at, next_run_at, action_extra_repos, action_command)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, NULL, ?14, ?15, ?16)",
+                 last_run_at, next_run_at, action_extra_repos, action_command,
+                 action_target_name, action_host, action_session_mode,
+                 action_timeout_secs, prompt_steps)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, NULL, ?14, ?15, \
+             ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 new.name,
                 new.enabled as i64,
@@ -45,16 +74,21 @@ impl Database {
                 new.schedule.spec(),
                 new.timezone,
                 new.action.kind(),
-                target_session,
-                repo_path,
-                worktree_branch,
-                base_branch,
-                agent,
+                cols.target_session,
+                cols.repo_path,
+                cols.worktree_branch,
+                cols.base_branch,
+                cols.agent,
                 new.prompt,
                 now,
                 new.next_run_at.map(|v| v as i64),
-                extra,
-                command,
+                cols.extra_repos,
+                cols.command,
+                cols.target_name,
+                cols.host,
+                cols.session_mode,
+                cols.timeout_secs,
+                prompt_steps_to_json(&new.prompt_steps),
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -93,8 +127,7 @@ impl Database {
 
     /// Replace an automation's definition (everything except id/created_at).
     pub fn update_automation(&self, auto: &Automation) -> rusqlite::Result<()> {
-        let (target_session, repo_path, worktree_branch, base_branch, agent, extra, command) =
-            super::action_to_columns(&auto.action);
+        let cols = super::action_to_columns(&auto.action);
         let now = current_time_millis() as i64;
         self.conn.execute(
             "UPDATE automations SET
@@ -102,7 +135,9 @@ impl Database {
                 timezone = ?6, action_kind = ?7, target_session = ?8, repo_path = ?9,
                 worktree_branch = ?10, base_branch = ?11, agent = ?12, prompt = ?13,
                 updated_at = ?14, last_run_at = ?15, next_run_at = ?16,
-                action_extra_repos = ?17, action_command = ?18
+                action_extra_repos = ?17, action_command = ?18,
+                action_target_name = ?19, action_host = ?20, action_session_mode = ?21,
+                action_timeout_secs = ?22, prompt_steps = ?23
              WHERE id = ?1",
             params![
                 auto.id,
@@ -112,17 +147,22 @@ impl Database {
                 auto.schedule.spec(),
                 auto.timezone,
                 auto.action.kind(),
-                target_session,
-                repo_path,
-                worktree_branch,
-                base_branch,
-                agent,
+                cols.target_session,
+                cols.repo_path,
+                cols.worktree_branch,
+                cols.base_branch,
+                cols.agent,
                 auto.prompt,
                 now,
                 auto.last_run_at.map(|v| v as i64),
                 auto.next_run_at.map(|v| v as i64),
-                extra,
-                command,
+                cols.extra_repos,
+                cols.command,
+                cols.target_name,
+                cols.host,
+                cols.session_mode,
+                cols.timeout_secs,
+                prompt_steps_to_json(&auto.prompt_steps),
             ],
         )?;
         Ok(())
@@ -241,8 +281,12 @@ impl Database {
         Ok(updated)
     }
 
-    /// Append a run-history entry. `related_session` is the session the run
-    /// sent to / spawned, when one exists.
+    /// Append a run-history entry, returning its row id. `related_session` is
+    /// the session the run sent to / spawned, when one exists.
+    ///
+    /// A final status also stamps `finished_at`; a
+    /// [`Running`](AutomationRunStatus::Running) row leaves it `NULL` until
+    /// [`finish_automation_run`](Self::finish_automation_run) closes it out.
     pub fn record_automation_run(
         &self,
         automation_id: i64,
@@ -253,17 +297,66 @@ impl Database {
         let now = current_time_millis() as i64;
         self.conn.execute(
             "INSERT INTO automation_runs \
-             (automation_id, started_at, status, detail, related_session_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (automation_id, started_at, status, detail, related_session_id, finished_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 automation_id,
                 now,
                 status.as_str(),
                 detail,
                 related_session.map(|id| id.to_string()),
+                status.is_final().then_some(now),
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Close out a [`Running`](AutomationRunStatus::Running) run with its final
+    /// status + detail, stamping `finished_at`.
+    ///
+    /// This is the post-hoc half of the async `Exec` contract: the tick thread
+    /// claims, records `Running`, and hands the command to a worker, which calls
+    /// this when the command exits (or is killed on timeout). Returns whether a
+    /// row was updated.
+    pub fn finish_automation_run(
+        &self,
+        run_id: i64,
+        status: AutomationRunStatus,
+        detail: &str,
+    ) -> rusqlite::Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE automation_runs SET status = ?2, detail = ?3, finished_at = ?4 WHERE id = ?1",
+            params![
+                run_id,
+                status.as_str(),
+                detail,
+                current_time_millis() as i64,
+            ],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Mark abandoned `running` runs as errored — a run whose worker died with
+    /// its process (a TUI crash, or a headless `tick` killed mid-command) would
+    /// otherwise show as running forever.
+    ///
+    /// Only rows older than the longest a command may legally run are touched:
+    /// another friring instance (or a concurrent headless `tick`) may own a
+    /// perfectly healthy `running` row right now, and this must never yank it
+    /// out from under it. Called once on startup; returns the rows reaped.
+    pub fn reap_orphaned_automation_runs(&self) -> rusqlite::Result<usize> {
+        let now = current_time_millis();
+        let cutoff = now.saturating_sub(
+            crate::session::automation::DEFAULT_EXEC_TIMEOUT_SECS.saturating_mul(1_000),
+        );
+        self.conn.execute(
+            "UPDATE automation_runs \
+             SET status = 'error', \
+                 detail = 'interrupted (friring exited while the command was running)', \
+                 finished_at = ?1 \
+             WHERE status = 'running' AND started_at < ?2",
+            params![now as i64, cutoff as i64],
+        )
     }
 
     /// List the most recent runs for an automation, newest first.
@@ -273,7 +366,8 @@ impl Database {
         limit: u32,
     ) -> rusqlite::Result<Vec<AutomationRun>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, automation_id, started_at, status, detail, related_session_id \
+            "SELECT id, automation_id, started_at, status, detail, related_session_id, \
+             finished_at \
              FROM automation_runs \
              WHERE automation_id = ?1 ORDER BY started_at DESC, id DESC LIMIT ?2",
         )?;
@@ -288,6 +382,7 @@ impl Database {
                 related_session_id: row
                     .get::<_, Option<String>>(5)?
                     .and_then(|s| s.parse().ok()),
+                finished_at: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
             })
         })?;
         rows.collect()
@@ -298,22 +393,27 @@ impl Database {
 const COLS: &str = "id, name, enabled, schedule_kind, schedule_spec, timezone, \
     action_kind, target_session, repo_path, worktree_branch, base_branch, agent, \
     prompt, created_at, updated_at, last_run_at, next_run_at, action_extra_repos, \
-    action_command";
+    action_command, action_target_name, action_host, action_session_mode, \
+    action_timeout_secs, prompt_steps";
 
 fn map_automation(row: &rusqlite::Row) -> rusqlite::Result<Automation> {
     let id: i64 = row.get(0)?;
     let schedule_kind: String = row.get(3)?;
     let schedule_spec: String = row.get(4)?;
     let action_kind: String = row.get(6)?;
-    let cols: super::ActionColumns = (
-        row.get(7)?,
-        row.get(8)?,
-        row.get(9)?,
-        row.get(10)?,
-        row.get(11)?,
-        row.get(17)?,
-        row.get(18)?,
-    );
+    let cols = super::ActionColumns {
+        target_session: row.get(7)?,
+        repo_path: row.get(8)?,
+        worktree_branch: row.get(9)?,
+        base_branch: row.get(10)?,
+        agent: row.get(11)?,
+        extra_repos: row.get(17)?,
+        command: row.get(18)?,
+        target_name: row.get(19)?,
+        host: row.get(20)?,
+        session_mode: row.get(21)?,
+        timeout_secs: row.get(22)?,
+    };
 
     let schedule =
         AutomationSchedule::from_parts(&schedule_kind, &schedule_spec).ok_or_else(|| {
@@ -334,6 +434,7 @@ fn map_automation(row: &rusqlite::Row) -> rusqlite::Result<Automation> {
         timezone: row.get(5)?,
         action,
         prompt: row.get(12)?,
+        prompt_steps: prompt_steps_from_json(row.get(23)?),
         created_at: row.get::<_, i64>(13)? as u64,
         updated_at: row.get::<_, i64>(14)? as u64,
         last_run_at: row.get::<_, Option<i64>>(15)?.map(|v| v as u64),
@@ -355,11 +456,10 @@ mod tests {
                 at: next.unwrap_or(0),
             },
             timezone: None,
-            action: AutomationAction::Send {
-                session_id: SessionId::default(),
-            },
+            action: AutomationAction::send_to(SessionId::default()),
             prompt: "run tests".to_string(),
             next_run_at: next,
+            prompt_steps: Vec::new(),
         }
     }
 
@@ -396,9 +496,12 @@ mod tests {
                 base_branch: Some("main".into()),
                 agent: Some("codex".into()),
                 extra_repos: Vec::new(),
+                host: None,
+                session_mode: Default::default(),
             },
             prompt: "triage issues".into(),
             next_run_at: Some(999),
+            prompt_steps: Vec::new(),
         };
         let id = db.create_automation(&new).unwrap();
         let got = db.get_automation(id).unwrap().unwrap();
@@ -411,6 +514,7 @@ mod tests {
                 base_branch,
                 agent,
                 extra_repos,
+                ..
             } => {
                 assert_eq!(repo_path, PathBuf::from("/tmp/repo"));
                 assert_eq!(worktree_branch.as_deref(), Some("feat/auto"));
@@ -434,14 +538,16 @@ mod tests {
             timezone: None,
             action: AutomationAction::Exec {
                 command: "~/github-issues/sync.sh".into(),
+                timeout_secs: None,
             },
             prompt: String::new(),
             next_run_at: Some(42),
+            prompt_steps: Vec::new(),
         };
         let id = db.create_automation(&new).unwrap();
         let got = db.get_automation(id).unwrap().unwrap();
         match got.action {
-            AutomationAction::Exec { command } => {
+            AutomationAction::Exec { command, .. } => {
                 assert_eq!(command, "~/github-issues/sync.sh");
             }
             other => panic!("expected exec, got {other:?}"),
@@ -553,7 +659,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let sid = SessionId::default();
         let new = NewAutomation {
-            action: AutomationAction::Send { session_id: sid },
+            action: AutomationAction::send_to(sid),
             ..send_automation("s", Some(100))
         };
         let id = db.create_automation(&new).unwrap();
@@ -603,5 +709,206 @@ mod tests {
         assert!(db.delete_automation(id).unwrap());
         assert!(db.get_automation(id).unwrap().is_none());
         assert!(db.list_automation_runs(id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn single_step_prompt_stores_no_json() {
+        // The pre-v44 shape must stay byte-identical: one plain step lives in
+        // the `prompt` column and leaves `prompt_steps` NULL.
+        let db = Database::open_in_memory().unwrap();
+        let id = db
+            .create_automation(&send_automation("one", Some(1)))
+            .unwrap();
+        let raw: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT prompt_steps FROM automations WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, None);
+        // ...and it still reads back as exactly one step.
+        let got = db.get_automation(id).unwrap().unwrap();
+        assert!(got.prompt_steps.is_empty());
+        assert_eq!(got.steps().len(), 1);
+    }
+
+    #[test]
+    fn multi_step_prompt_round_trips() {
+        let db = Database::open_in_memory().unwrap();
+        let new = NewAutomation {
+            prompt: "/model opus".into(),
+            prompt_steps: vec![
+                PromptStep {
+                    text: "/model opus".into(),
+                    delay_ms: Some(2_000),
+                },
+                PromptStep::new("summarize my inbox"),
+            ],
+            ..send_automation("multi", Some(1))
+        };
+        let id = db.create_automation(&new).unwrap();
+        let got = db.get_automation(id).unwrap().unwrap();
+        assert_eq!(got.prompt_steps.len(), 2);
+        assert_eq!(got.prompt_steps[0].delay_ms, Some(2_000));
+        assert_eq!(got.prompt_steps[1].text, "summarize my inbox");
+        // The legacy column still holds step 1 for an older reader.
+        assert_eq!(got.prompt, "/model opus");
+    }
+
+    #[test]
+    fn spawn_host_and_session_mode_round_trip() {
+        let db = Database::open_in_memory().unwrap();
+        let new = NewAutomation {
+            action: AutomationAction::Spawn {
+                repo_path: std::path::PathBuf::from("/repo"),
+                worktree_branch: None,
+                base_branch: None,
+                agent: None,
+                extra_repos: Vec::new(),
+                host: Some("devbox".into()),
+                session_mode: crate::session::SpawnSessionMode::Fresh,
+            },
+            ..send_automation("remote", Some(1))
+        };
+        let id = db.create_automation(&new).unwrap();
+        match db.get_automation(id).unwrap().unwrap().action {
+            AutomationAction::Spawn {
+                host, session_mode, ..
+            } => {
+                assert_eq!(host.as_deref(), Some("devbox"));
+                assert_eq!(session_mode, crate::session::SpawnSessionMode::Fresh);
+            }
+            other => panic!("expected spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reuse_session_mode_stores_null() {
+        // `reuse` is the pre-v44 behavior, so an untouched spawn row keeps
+        // writing NULL rather than a new discriminant.
+        let db = Database::open_in_memory().unwrap();
+        let new = NewAutomation {
+            action: AutomationAction::Spawn {
+                repo_path: std::path::PathBuf::from("/repo"),
+                worktree_branch: None,
+                base_branch: None,
+                agent: None,
+                extra_repos: Vec::new(),
+                host: None,
+                session_mode: crate::session::SpawnSessionMode::Reuse,
+            },
+            ..send_automation("local", Some(1))
+        };
+        let id = db.create_automation(&new).unwrap();
+        let raw: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT action_session_mode FROM automations WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw, None);
+    }
+
+    #[test]
+    fn send_by_name_round_trips_and_survives_session_deletion() {
+        let db = Database::open_in_memory().unwrap();
+        let sid = SessionId::default();
+        let by_name = NewAutomation {
+            action: AutomationAction::Send {
+                target: crate::session::SendTarget::Name("inbox".into()),
+            },
+            ..send_automation("by-name", Some(100))
+        };
+        let name_id = db.create_automation(&by_name).unwrap();
+        let by_id = NewAutomation {
+            action: AutomationAction::send_to(sid),
+            ..send_automation("by-id", Some(100))
+        };
+        let id_id = db.create_automation(&by_id).unwrap();
+
+        match db.get_automation(name_id).unwrap().unwrap().action {
+            AutomationAction::Send { target } => assert_eq!(target.name(), Some("inbox")),
+            other => panic!("expected send, got {other:?}"),
+        }
+        // Force-deleting the session disables only the id-targeted automation;
+        // a name target is re-resolved at fire time, so it keeps working.
+        assert_eq!(db.disable_send_automations_for_session(sid).unwrap(), 1);
+        assert!(!db.get_automation(id_id).unwrap().unwrap().enabled);
+        assert!(db.get_automation(name_id).unwrap().unwrap().enabled);
+    }
+
+    #[test]
+    fn exec_timeout_round_trips() {
+        let db = Database::open_in_memory().unwrap();
+        let new = NewAutomation {
+            action: AutomationAction::Exec {
+                command: "sync.sh".into(),
+                timeout_secs: Some(30),
+            },
+            ..send_automation("sync", Some(1))
+        };
+        let id = db.create_automation(&new).unwrap();
+        match db.get_automation(id).unwrap().unwrap().action {
+            AutomationAction::Exec { timeout_secs, .. } => assert_eq!(timeout_secs, Some(30)),
+            other => panic!("expected exec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn running_run_is_closed_out_by_finish() {
+        let db = Database::open_in_memory().unwrap();
+        let id = db
+            .create_automation(&send_automation("exec", Some(100)))
+            .unwrap();
+        let run = db
+            .record_automation_run(id, AutomationRunStatus::Running, "sync.sh", None)
+            .unwrap();
+        let listed = &db.list_automation_runs(id, 10).unwrap()[0];
+        assert_eq!(listed.status, AutomationRunStatus::Running);
+        // A run still in flight has no finish stamp.
+        assert_eq!(listed.finished_at, None);
+
+        assert!(db
+            .finish_automation_run(run, AutomationRunStatus::Success, "ok")
+            .unwrap());
+        let listed = &db.list_automation_runs(id, 10).unwrap()[0];
+        assert_eq!(listed.status, AutomationRunStatus::Success);
+        assert_eq!(listed.detail, "ok");
+        assert!(listed.finished_at.is_some());
+        // One fire keeps exactly one history row.
+        assert_eq!(db.list_automation_runs(id, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reap_leaves_recent_running_rows_alone() {
+        let db = Database::open_in_memory().unwrap();
+        let id = db
+            .create_automation(&send_automation("exec", Some(100)))
+            .unwrap();
+        let fresh = db
+            .record_automation_run(id, AutomationRunStatus::Running, "sync.sh", None)
+            .unwrap();
+        // A row another instance may still own is untouched...
+        assert_eq!(db.reap_orphaned_automation_runs().unwrap(), 0);
+
+        // ...but one older than any legal timeout is closed out as interrupted.
+        db.conn
+            .execute(
+                "UPDATE automation_runs SET started_at = 0 WHERE id = ?1",
+                params![fresh],
+            )
+            .unwrap();
+        assert_eq!(db.reap_orphaned_automation_runs().unwrap(), 1);
+        let listed = &db.list_automation_runs(id, 10).unwrap()[0];
+        assert_eq!(listed.status, AutomationRunStatus::Error);
+        assert!(
+            listed.detail.contains("interrupted"),
+            "got {}",
+            listed.detail
+        );
     }
 }

@@ -16,6 +16,87 @@ use crate::storage::automations::NewAutomation;
 use crate::storage::Database;
 use crate::sync::current_time_millis;
 
+/// The action-shaping flags, shared verbatim by `create` and `edit` so an
+/// automation's action is editable in place rather than delete-and-recreate.
+///
+/// On `create` the set picks the action (exactly one of `--session` /
+/// `--session-name` / `--repo` / `--command`); on `edit` any of those *switches*
+/// the action, and the rest amend the current one.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct ActionArgs {
+    /// Send action: target an existing session by UUID.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Send action: target whichever session currently has this name. Survives
+    /// the session being closed and recreated.
+    #[arg(long)]
+    pub session_name: Option<String>,
+    /// Spawn action: repository path to run a new session in.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Spawn action: optional worktree branch (created if missing).
+    #[arg(long)]
+    pub worktree: Option<String>,
+    /// Spawn action: base branch for a new worktree (default `main`).
+    #[arg(long)]
+    pub base: Option<String>,
+    /// Agent name (spawn action; default registry agent).
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Spawn action: host from `hosts.toml` to run on (empty = local).
+    #[arg(long)]
+    pub host: Option<String>,
+    /// Spawn action: `reuse` one session across fires (default) or spawn a
+    /// `fresh` one per fire.
+    #[arg(long)]
+    pub session_mode: Option<String>,
+    /// Spawn action: extra repo on its own worktree, `path[@base]`. Repeatable.
+    #[arg(long = "add-repo")]
+    pub add_repo: Vec<String>,
+    /// Spawn action: extra directory attached as-is. Repeatable.
+    #[arg(long = "add-dir")]
+    pub add_dir: Vec<String>,
+    /// Exec action: shell command to run headlessly on fire (no session, no
+    /// agent). Mutually exclusive with --session/--session-name/--repo.
+    #[arg(long)]
+    pub command: Option<String>,
+    /// Exec action: seconds before the command is killed (default 900).
+    #[arg(long)]
+    pub timeout: Option<u64>,
+}
+
+impl ActionArgs {
+    /// Whether any flag was supplied at all — `edit` leaves the stored action
+    /// untouched when none were.
+    fn is_empty(&self) -> bool {
+        self.session.is_none()
+            && self.session_name.is_none()
+            && self.repo.is_none()
+            && self.command.is_none()
+            && self.worktree.is_none()
+            && self.base.is_none()
+            && self.agent.is_none()
+            && self.host.is_none()
+            && self.session_mode.is_none()
+            && self.add_repo.is_empty()
+            && self.add_dir.is_empty()
+            && self.timeout.is_none()
+    }
+
+    /// Which action kind these flags select, when they select one at all.
+    fn selected_kind(&self) -> Option<&'static str> {
+        if self.command.is_some() {
+            Some("exec")
+        } else if self.repo.is_some() {
+            Some("spawn")
+        } else if self.session.is_some() || self.session_name.is_some() {
+            Some("send")
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Action {
     /// Create an automation.
@@ -37,28 +118,17 @@ pub enum Action {
         /// IANA timezone (e.g. `Europe/Zurich`); default system local.
         #[arg(long)]
         timezone: Option<String>,
-        /// Prompt text sent on fire (send/spawn actions). Unused by `--command`.
-        #[arg(long, default_value = "")]
-        prompt: String,
-        /// Send action: target an existing session by UUID.
+        /// Prompt text sent on fire (send/spawn actions). Repeat for a
+        /// multi-step delivery: each `--prompt` is a separate paste + Enter, in
+        /// order (e.g. `--prompt '/model opus' --prompt 'summarize my inbox'`).
+        /// Unused by `--command`.
+        #[arg(long = "prompt")]
+        prompts: Vec<String>,
+        /// Milliseconds to settle between prompt steps (default 1200).
         #[arg(long)]
-        session: Option<String>,
-        /// Spawn action: repository path to run a new session in.
-        #[arg(long)]
-        repo: Option<String>,
-        /// Spawn action: optional worktree branch (created if missing).
-        #[arg(long)]
-        worktree: Option<String>,
-        /// Spawn action: base branch for a new worktree (default `main`).
-        #[arg(long)]
-        base: Option<String>,
-        /// Agent name (spawn action; default registry agent).
-        #[arg(long)]
-        agent: Option<String>,
-        /// Exec action: shell command to run headlessly on fire (no session,
-        /// no agent). Mutually exclusive with --session/--repo.
-        #[arg(long)]
-        command: Option<String>,
+        step_delay: Option<u64>,
+        #[command(flatten)]
+        action: ActionArgs,
         /// Create the automation disabled.
         #[arg(long)]
         disabled: bool,
@@ -69,6 +139,27 @@ pub enum Action {
     Show {
         /// Automation id.
         id: i64,
+    },
+    /// Show what an automation would do on its next fire, without firing it.
+    DryRun {
+        /// Automation id.
+        id: i64,
+    },
+    /// Print automations as a TOML `[[automations]]` manifest (the same grammar
+    /// extensions use), for backup or transfer.
+    Export {
+        /// Export only this automation (default: all of them).
+        #[arg(long)]
+        id: Option<i64>,
+    },
+    /// Create automations from a TOML `[[automations]]` manifest.
+    Import {
+        /// Path to the manifest file.
+        file: String,
+        /// Overwrite an existing automation of the same name instead of
+        /// skipping it.
+        #[arg(long)]
+        replace: bool,
     },
     /// Edit an automation.
     Edit {
@@ -84,8 +175,14 @@ pub enum Action {
         weekday: Option<u32>,
         #[arg(long)]
         timezone: Option<String>,
+        /// Replace the whole prompt list. Repeat for multiple steps.
+        #[arg(long = "prompt")]
+        prompts: Vec<String>,
+        /// Milliseconds to settle between prompt steps.
         #[arg(long)]
-        prompt: Option<String>,
+        step_delay: Option<u64>,
+        #[command(flatten)]
+        action: ActionArgs,
         /// Enable the automation.
         #[arg(long)]
         enabled: bool,
@@ -124,17 +221,23 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
             time,
             weekday,
             timezone,
-            prompt,
-            session,
-            repo,
-            worktree,
-            base,
-            agent,
-            command,
+            prompts,
+            step_delay,
+            action,
             disabled,
         } => create_automation(
-            db, name, trigger, time, weekday, timezone, prompt, session, repo, worktree, base,
-            agent, command, disabled,
+            db,
+            CreateArgs {
+                name,
+                trigger,
+                time,
+                weekday,
+                timezone,
+                prompts,
+                step_delay,
+                action,
+                disabled,
+            },
         ),
         Action::List => list_automations(db),
         Action::Show { id } => {
@@ -144,6 +247,9 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
                 render_automation_detail(&auto),
             ))
         }
+        Action::DryRun { id } => dry_run(db, id),
+        Action::Export { id } => export_automations(db, id),
+        Action::Import { file, replace } => import_automations(db, &file, replace),
         Action::Edit {
             id,
             name,
@@ -151,11 +257,26 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
             time,
             weekday,
             timezone,
-            prompt,
+            prompts,
+            step_delay,
+            action,
             enabled,
             disabled,
         } => edit_automation(
-            db, id, name, trigger, time, weekday, timezone, prompt, enabled, disabled,
+            db,
+            id,
+            EditArgs {
+                name,
+                trigger,
+                time,
+                weekday,
+                timezone,
+                prompts,
+                step_delay,
+                action,
+                enabled,
+                disabled,
+            },
         ),
         Action::Remove { id } => remove_automation(db, id),
         Action::Run { id } => trigger_automation(db, id),
@@ -174,57 +295,86 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
     }
 }
 
-/// Handle `automation create`: validate, persist, and arm the heartbeat.
-#[allow(clippy::too_many_arguments)]
-fn create_automation(
-    db: &Database,
+/// Parsed `automation create` arguments (the flags, grouped so the handler
+/// isn't a dozen positional parameters).
+struct CreateArgs {
     name: String,
     trigger: String,
     time: Option<String>,
     weekday: Option<u32>,
     timezone: Option<String>,
-    prompt: String,
-    session: Option<String>,
-    repo: Option<String>,
-    worktree: Option<String>,
-    base: Option<String>,
-    agent: Option<String>,
-    command: Option<String>,
+    prompts: Vec<String>,
+    step_delay: Option<u64>,
+    action: ActionArgs,
     disabled: bool,
-) -> Result<CommandOutput, String> {
+}
+
+/// Parsed `automation edit` arguments.
+struct EditArgs {
+    name: Option<String>,
+    trigger: Option<String>,
+    time: Option<String>,
+    weekday: Option<u32>,
+    timezone: Option<String>,
+    prompts: Vec<String>,
+    step_delay: Option<u64>,
+    action: ActionArgs,
+    enabled: bool,
+    disabled: bool,
+}
+
+/// Build the persisted prompt-step list from repeated `--prompt` flags.
+/// `step_delay` applies to every step but the last (where it is never waited on).
+fn build_steps(prompts: &[String], step_delay: Option<u64>) -> Vec<crate::session::PromptStep> {
+    let last = prompts.len().saturating_sub(1);
+    prompts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| crate::session::PromptStep {
+            text: text.clone(),
+            delay_ms: (i < last).then_some(step_delay).flatten(),
+        })
+        .collect()
+}
+
+/// Handle `automation create`: validate, persist, and arm the heartbeat.
+fn create_automation(db: &Database, args: CreateArgs) -> Result<CommandOutput, String> {
     // An exec automation carries the command, not a prompt; send/spawn need one.
-    if command.is_none() && prompt.trim().is_empty() {
+    let prompts: Vec<String> = args
+        .prompts
+        .into_iter()
+        .filter(|p| !p.trim().is_empty())
+        .collect();
+    if args.action.command.is_none() && prompts.is_empty() {
         return Err("prompt must not be empty".into());
     }
-    let schedule = parse_trigger(&trigger, time.as_deref(), weekday)?;
-    let action = resolve_action(
-        session,
-        repo,
-        worktree,
-        base,
-        agent,
-        Vec::new(),
-        command,
-        db,
-    )?;
-    let next_run_at = if disabled {
+    let schedule = parse_trigger(&args.trigger, args.time.as_deref(), args.weekday)?;
+    if let Some(tz) = args.timezone.as_deref() {
+        crate::session::automation::validate_timezone(tz)?;
+    }
+    let action = resolve_action(&args.action, db)?;
+    let next_run_at = if args.disabled {
         None
     } else {
-        schedule.next_after(current_time_millis(), timezone.as_deref())
+        schedule.next_after(current_time_millis(), args.timezone.as_deref())
     };
+    let steps = build_steps(&prompts, args.step_delay);
     let new = NewAutomation {
-        name,
-        enabled: !disabled,
+        name: args.name,
+        enabled: !args.disabled,
         schedule,
-        timezone,
+        timezone: args.timezone,
         action,
-        prompt,
+        // The `prompt` column keeps the first step so an older friring reading
+        // this row still finds a usable prompt.
+        prompt: steps.first().map(|s| s.text.clone()).unwrap_or_default(),
+        prompt_steps: steps,
         next_run_at,
     };
     let id = db
         .create_automation(&new)
         .map_err(|e| format!("create_automation: {e}"))?;
-    if !disabled {
+    if !args.disabled {
         arm_heartbeat();
     }
     let auto = db
@@ -251,24 +401,29 @@ fn list_automations(db: &Database) -> Result<CommandOutput, String> {
 }
 
 /// Handle `automation edit`: apply the supplied field overrides and persist.
-#[allow(clippy::too_many_arguments)]
-fn edit_automation(
-    db: &Database,
-    id: i64,
-    name: Option<String>,
-    trigger: Option<String>,
-    time: Option<String>,
-    weekday: Option<u32>,
-    timezone: Option<String>,
-    prompt: Option<String>,
-    enabled: bool,
-    disabled: bool,
-) -> Result<CommandOutput, String> {
+fn edit_automation(db: &Database, id: i64, args: EditArgs) -> Result<CommandOutput, String> {
+    let EditArgs {
+        name,
+        trigger,
+        time,
+        weekday,
+        timezone,
+        prompts,
+        step_delay,
+        action,
+        enabled,
+        disabled,
+    } = args;
     if enabled && disabled {
         return Err("--enabled and --disabled are mutually exclusive".into());
     }
     let mut auto = load(db, id)?;
-    apply_edit_overrides(&mut auto, name, trigger, time, weekday, timezone, prompt)?;
+    apply_edit_overrides(
+        &mut auto, name, trigger, time, weekday, timezone, prompts, step_delay,
+    )?;
+    if !action.is_empty() {
+        auto.action = apply_action_overrides(&auto.action, &action, db)?;
+    }
     if disabled {
         auto.enabled = false;
     }
@@ -300,6 +455,7 @@ fn edit_automation(
 /// in the same call (the stored schedule is a raw cron expression with no
 /// recoverable preset to re-apply them to). Supplying them alone is a clear
 /// error rather than a silent no-op.
+#[allow(clippy::too_many_arguments)]
 fn apply_edit_overrides(
     auto: &mut Automation,
     name: Option<String>,
@@ -307,18 +463,26 @@ fn apply_edit_overrides(
     time: Option<String>,
     weekday: Option<u32>,
     timezone: Option<String>,
-    prompt: Option<String>,
+    prompts: Vec<String>,
+    step_delay: Option<u64>,
 ) -> Result<(), String> {
     if let Some(n) = name {
         auto.name = n;
     }
-    if let Some(p) = prompt {
-        if p.trim().is_empty() {
+    if !prompts.is_empty() {
+        if prompts.iter().all(|p| p.trim().is_empty()) {
             return Err("prompt must not be empty".into());
         }
-        auto.prompt = p;
+        let steps = build_steps(&prompts, step_delay);
+        auto.prompt = steps.first().map(|s| s.text.clone()).unwrap_or_default();
+        auto.prompt_steps = steps;
+    } else if step_delay.is_some() {
+        // The delay belongs to a step, so re-applying it means rewriting the
+        // list — which needs the prompts too, not a silent partial edit.
+        return Err("--step-delay only applies with --prompt".into());
     }
     if let Some(tz) = timezone {
+        crate::session::automation::validate_timezone(&tz)?;
         auto.timezone = if tz.is_empty() { None } else { Some(tz) };
     }
     if let Some(t) = trigger {
@@ -327,6 +491,83 @@ fn apply_edit_overrides(
         return Err("--time/--weekday only apply with --trigger (a preset)".into());
     }
     Ok(())
+}
+
+/// Apply `edit`'s action flags to the stored action.
+///
+/// A flag that selects a *different* kind (`--session`/`--session-name`,
+/// `--repo`, `--command`) switches the action outright; otherwise the flags
+/// amend the current one field by field, so `--agent x` on a spawn doesn't
+/// clobber its repo or worktree.
+fn apply_action_overrides(
+    current: &AutomationAction,
+    args: &ActionArgs,
+    db: &Database,
+) -> Result<AutomationAction, String> {
+    if let Some(kind) = args.selected_kind() {
+        if kind != current.kind() {
+            // Switching kinds: build the new action from the flags alone —
+            // nothing in the old one carries over.
+            return resolve_action(args, db);
+        }
+    }
+    Ok(match current {
+        AutomationAction::Send { target } => AutomationAction::Send {
+            target: match (&args.session, &args.session_name) {
+                (Some(s), _) => crate::session::SendTarget::Id(action::resolve_send_target(db, s)?),
+                (None, Some(n)) => crate::session::SendTarget::Name(n.clone()),
+                (None, None) => target.clone(),
+            },
+        },
+        AutomationAction::Spawn {
+            repo_path,
+            worktree_branch,
+            base_branch,
+            agent,
+            extra_repos,
+            host,
+            session_mode,
+        } => AutomationAction::Spawn {
+            repo_path: args
+                .repo
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| repo_path.clone()),
+            worktree_branch: override_optional(worktree_branch, &args.worktree),
+            base_branch: override_optional(base_branch, &args.base),
+            agent: override_optional(agent, &args.agent),
+            // An empty list means "not supplied" — clearing extras is done by
+            // switching the action, not by an ambiguous empty flag.
+            extra_repos: if args.add_repo.is_empty() && args.add_dir.is_empty() {
+                extra_repos.clone()
+            } else {
+                super::parse_extra_repos(&args.add_repo, &args.add_dir)
+            },
+            host: override_optional(host, &args.host),
+            session_mode: args
+                .session_mode
+                .as_deref()
+                .map(crate::session::SpawnSessionMode::from_str_or_default)
+                .unwrap_or(*session_mode),
+        },
+        AutomationAction::Exec {
+            command,
+            timeout_secs,
+        } => AutomationAction::Exec {
+            command: args.command.clone().unwrap_or_else(|| command.clone()),
+            timeout_secs: args.timeout.or(*timeout_secs),
+        },
+    })
+}
+
+/// Apply an optional string override to an optional field: absent leaves the
+/// stored value, an empty string clears it, anything else replaces it.
+fn override_optional(current: &Option<String>, flag: &Option<String>) -> Option<String> {
+    match flag {
+        None => current.clone(),
+        Some(v) if v.is_empty() => None,
+        Some(v) => Some(v.clone()),
+    }
 }
 
 /// Handle `automation remove`.
@@ -459,8 +700,13 @@ fn tick(db: &Database) -> Result<Value, String> {
             skipped.push(json!({ "id": auto.id, "reason": "claim-lost" }));
             continue;
         }
-        let (status, detail, related) = fire_headless(db, &auto);
-        let _ = db.record_automation_run(auto.id, status, &detail, related);
+        let is_exec = matches!(auto.action, AutomationAction::Exec { .. });
+        let (status, detail, related) = fire_headless(db, &auto, now);
+        // `exec` already owns a history row (recorded `Running`, then closed
+        // out); every other action records its single row here.
+        if !is_exec {
+            let _ = db.record_automation_run(auto.id, status, &detail, related);
+        }
         fired.push(json!({
             "id": auto.id,
             "status": status.as_str(),
@@ -474,52 +720,73 @@ fn tick(db: &Database) -> Result<Value, String> {
 ///
 /// `send` types into the still-alive tmux window; `spawn` creates a session
 /// headlessly (the TUI adopts it by name on next startup) and delivers the
-/// prompt via a deferred tmux timer once the agent boots. Local-tmux scoped —
-/// a future remote backend would branch here.
+/// prompt steps via a deferred tmux timer once the agent boots. Both route
+/// through the spawn's host (`MuxTarget`), so a remote automation types into the
+/// server that actually owns its window.
 fn fire_headless(
     db: &Database,
     auto: &Automation,
+    now: u64,
 ) -> (AutomationRunStatus, String, Option<SessionId>) {
     // tmux helpers are reached via fully-qualified paths (no `use crate::agent`)
     // to keep the cli module free of an `agent` import — see
     // tests/architecture_rules.rs::cli_module_isolation.
     match &auto.action {
-        AutomationAction::Send { session_id } => fire_send(db, auto, *session_id),
-        AutomationAction::Spawn {
-            repo_path,
-            worktree_branch,
-            base_branch,
-            agent,
-            extra_repos,
-        } => fire_spawn(
-            db,
-            auto,
-            repo_path,
-            worktree_branch,
-            base_branch,
-            agent,
-            extra_repos,
-        ),
-        AutomationAction::Exec { command } => fire_exec(command),
+        AutomationAction::Send { target } => fire_send(db, auto, target),
+        AutomationAction::Spawn { .. } => fire_spawn(db, auto, now),
+        AutomationAction::Exec {
+            command,
+            timeout_secs,
+        } => fire_exec(db, auto.id, command, *timeout_secs),
     }
 }
 
 /// Execute an `exec` automation headlessly via the shared runner. No session is
 /// involved (deterministic scheduled job).
-fn fire_exec(command: &str) -> (AutomationRunStatus, String, Option<SessionId>) {
-    let (status, detail) = crate::session_ops::run_exec_command(command);
+///
+/// Unlike the TUI this waits for the command inline — a `tick` process that
+/// detached the work would exit and strand the row as `running` — but it records
+/// the same `Running` → final pair, so a concurrently-open TUI sees the run
+/// appear while the command is still going.
+fn fire_exec(
+    db: &Database,
+    automation_id: i64,
+    command: &str,
+    timeout_secs: Option<u64>,
+) -> (AutomationRunStatus, String, Option<SessionId>) {
+    let run_id = db
+        .record_automation_run(automation_id, AutomationRunStatus::Running, command, None)
+        .ok();
+    let (status, detail) = crate::session_ops::run_exec_command_with_timeout(command, timeout_secs);
+    if let Some(id) = run_id {
+        // Close out the `Running` row this fire already owns; `tick` skips its
+        // own record for exec so the fire keeps exactly one history entry.
+        if let Err(e) = db.finish_automation_run(id, status, &detail) {
+            tracing::warn!("Failed to finish automation run {id}: {e}");
+        }
+    }
     (status, detail, None)
 }
 
-/// Execute a `send` automation: type the prompt into the target session's
-/// still-alive tmux window.
+/// Execute a `send` automation: type the prompt steps into the target session's
+/// still-alive tmux window. A name target is re-resolved against the live
+/// sessions here, so it survives the session being recreated.
 fn fire_send(
     db: &Database,
     auto: &Automation,
-    session_id: SessionId,
+    target: &crate::session::SendTarget,
 ) -> (AutomationRunStatus, String, Option<SessionId>) {
-    let name = match db.get_session_name(session_id) {
-        Ok(Some(name)) => name,
+    let resolved = match target {
+        crate::session::SendTarget::Id(id) => db
+            .get_session_name(*id)
+            .map(|name| name.map(|name| (*id, name))),
+        crate::session::SendTarget::Name(name) => db
+            .list_active_sessions()
+            .map(|rows| rows.into_iter().find(|s| s.name == *name))
+            .map(|found| found.map(|s| (s.id, s.name))),
+    };
+    let (session_id, name) = match resolved {
+        Ok(Some(found)) => found,
         Ok(None) => {
             return (
                 AutomationRunStatus::Skipped,
@@ -527,22 +794,19 @@ fn fire_send(
                 None,
             )
         }
-        Err(e) => {
-            return (
-                AutomationRunStatus::Error,
-                format!("get_session_name: {e}"),
-                None,
-            )
-        }
+        Err(e) => return (AutomationRunStatus::Error, format!("{e}"), None),
     };
-    if !crate::agent::tmux::window_exists(&name) {
+    // A `send` always targets a session friring already owns, so its window
+    // lives on the local server (remote sessions are spawn-authored).
+    let mux = crate::agent::tmux::MuxTarget::local();
+    if !crate::agent::tmux::window_exists_on(&mux, &name) {
         return (
             AutomationRunStatus::Skipped,
             "target session not running".into(),
             None,
         );
     }
-    match crate::agent::tmux::send_prompt_now(&name, &auto.prompt) {
+    match crate::agent::tmux::send_prompt_steps_now(&mux, &name, &auto.steps()) {
         Ok(()) => (
             AutomationRunStatus::Success,
             format!("sent to {session_id}"),
@@ -553,22 +817,36 @@ fn fire_send(
 }
 
 /// Execute a `spawn` automation: reuse an existing window or spawn a new
-/// headless session, then deliver the prompt once the agent boots.
-#[allow(clippy::too_many_arguments)]
+/// headless session, then deliver the prompt steps once the agent boots.
 fn fire_spawn(
     db: &Database,
     auto: &Automation,
-    repo_path: &std::path::Path,
-    worktree_branch: &Option<String>,
-    base_branch: &Option<String>,
-    agent: &Option<String>,
-    extra_repos: &[crate::session::ExtraRepo],
+    now: u64,
 ) -> (AutomationRunStatus, String, Option<SessionId>) {
-    let name = format!("auto-{}", auto.id);
-    // Reuse an existing session window (later fires / restored sessions).
-    if crate::agent::tmux::window_exists(&name) {
+    let AutomationAction::Spawn {
+        repo_path,
+        worktree_branch,
+        base_branch,
+        agent,
+        extra_repos,
+        host,
+        session_mode,
+    } = &auto.action
+    else {
+        return (AutomationRunStatus::Error, "not a spawn".into(), None);
+    };
+    let mux = match crate::agent::tmux::MuxTarget::resolve(host.as_deref()) {
+        Ok(m) => m,
+        Err(e) => return (AutomationRunStatus::Error, e.to_string(), None),
+    };
+    let name = auto.session_name(now);
+    let steps = auto.steps();
+    // Reuse an existing session window (later fires / restored sessions). A
+    // fresh-per-fire automation never matches — its name carries this fire's
+    // stamp.
+    if crate::agent::tmux::window_exists_on(&mux, &name) {
         // The reused window's session id has no cheap lookup here.
-        return match crate::agent::tmux::send_prompt_now(&name, &auto.prompt) {
+        return match crate::agent::tmux::send_prompt_steps_now(&mux, &name, &steps) {
             Ok(()) => (AutomationRunStatus::Success, format!("reused {name}"), None),
             Err(e) => (AutomationRunStatus::Error, e.to_string(), None),
         };
@@ -576,16 +854,20 @@ fn fire_spawn(
     let req = SpawnRequest {
         name: name.clone(),
         repo_path: repo_path.to_path_buf(),
-        worktree_branch: worktree_branch.clone(),
+        // A fresh session gets its own branch, so two live runs never share one
+        // worktree (see `session::automation::spawn_branch_for`).
+        worktree_branch: worktree_branch
+            .as_deref()
+            .map(|b| crate::session::automation::spawn_branch_for(b, *session_mode, now)),
         base_branch: base_branch.clone(),
         agent: agent.clone(),
         agent_session_id: None,
-        host: None,
+        host: host.clone(),
         parent_session_id: None,
         task_id: None,
         extra_repos: extra_repos.to_vec(),
     };
-    match action::spawn_and_deliver(db, &name, req, &auto.prompt) {
+    match action::spawn_and_deliver_steps(db, &name, req, &steps) {
         Ok(session_id) => (
             AutomationRunStatus::Success,
             format!("spawned {name}"),
@@ -606,44 +888,244 @@ fn load(db: &Database, id: i64) -> Result<Automation, String> {
         .ok_or_else(|| format!("Automation not found: {id}"))
 }
 
-/// Resolve the action from the send/spawn flags (exactly one of session/repo).
-#[allow(clippy::too_many_arguments)]
-fn resolve_action(
-    session: Option<String>,
-    repo: Option<String>,
-    worktree: Option<String>,
-    base: Option<String>,
-    agent: Option<String>,
-    extra_repos: Vec<crate::session::ExtraRepo>,
-    command: Option<String>,
-    db: &Database,
-) -> Result<AutomationAction, String> {
-    // Exec is mutually exclusive with the session/spawn forms.
-    if let Some(cmd) = command {
-        if session.is_some() || repo.is_some() {
-            return Err("specify only one of --session, --repo, or --command".into());
-        }
+/// Resolve the action from the flags — exactly one of `--session` /
+/// `--session-name` (send), `--repo` (spawn), or `--command` (exec).
+fn resolve_action(args: &ActionArgs, db: &Database) -> Result<AutomationAction, String> {
+    let selectors = [
+        args.session.is_some() || args.session_name.is_some(),
+        args.repo.is_some(),
+        args.command.is_some(),
+    ]
+    .into_iter()
+    .filter(|set| *set)
+    .count();
+    if selectors > 1 {
+        return Err(
+            "specify only one of --session/--session-name (send), --repo (spawn), or \
+             --command (exec)"
+                .into(),
+        );
+    }
+    if let Some(cmd) = &args.command {
         if cmd.trim().is_empty() {
             return Err("--command must not be empty".into());
         }
-        return Ok(AutomationAction::Exec { command: cmd });
+        return Ok(AutomationAction::Exec {
+            command: cmd.clone(),
+            timeout_secs: args.timeout,
+        });
     }
-    match (session, repo) {
-        (Some(_), Some(_)) => {
-            Err("specify either --session (send) or --repo (spawn), not both".into())
+    if let Some(repo) = &args.repo {
+        // Fail here rather than at fire time, hours later, in an error run.
+        if let Some(host) = args.host.as_deref().filter(|h| !h.is_empty()) {
+            let registry = crate::agent::host_config::load_all();
+            if registry.get(host).is_none() {
+                return Err(format!(
+                    "Unknown host '{host}'. Configure it in hosts.toml. Available: [{}]",
+                    registry.names().join(", ")
+                ));
+            }
         }
-        (None, None) => Err("specify --session (send), --repo (spawn), or --command (exec)".into()),
-        (Some(s), None) => Ok(AutomationAction::Send {
-            session_id: action::resolve_send_target(db, &s)?,
+        return Ok(AutomationAction::Spawn {
+            repo_path: repo.into(),
+            worktree_branch: args.worktree.clone(),
+            base_branch: args.base.clone(),
+            agent: args.agent.clone(),
+            extra_repos: super::parse_extra_repos(&args.add_repo, &args.add_dir),
+            host: args.host.clone().filter(|h| !h.is_empty()),
+            session_mode: args
+                .session_mode
+                .as_deref()
+                .map(crate::session::SpawnSessionMode::from_str_or_default)
+                .unwrap_or_default(),
+        });
+    }
+    match (&args.session, &args.session_name) {
+        (Some(s), _) => Ok(AutomationAction::Send {
+            target: crate::session::SendTarget::Id(action::resolve_send_target(db, s)?),
         }),
-        (None, Some(r)) => Ok(AutomationAction::Spawn {
-            repo_path: r.into(),
-            worktree_branch: worktree,
-            base_branch: base,
+        (None, Some(n)) => Ok(AutomationAction::Send {
+            target: crate::session::SendTarget::Name(n.clone()),
+        }),
+        (None, None) => Err(
+            "specify --session/--session-name (send), --repo (spawn), or --command (exec)".into(),
+        ),
+    }
+}
+
+/// Handle `automation dry-run`: report the resolved plan without firing.
+fn dry_run(db: &Database, id: i64) -> Result<CommandOutput, String> {
+    let auto = load(db, id)?;
+    let rows = crate::session::automation::dry_run_plan(&auto, current_time_millis());
+    let json = Value::Object(
+        rows.iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect(),
+    );
+    let pairs: Vec<(&str, String)> = rows.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let human = format!(
+        "Dry run — automation #{id} would do this on its next fire (nothing was \
+         fired):\n{}",
+        output::kv(&pairs)
+    );
+    Ok(CommandOutput::new(json, human))
+}
+
+/// Handle `automation export`: render automations as a TOML
+/// `[[automations]]` manifest — the same grammar extensions declare, so an
+/// exported file can be dropped into an `extension.toml` unchanged.
+fn export_automations(db: &Database, id: Option<i64>) -> Result<CommandOutput, String> {
+    let autos = match id {
+        Some(id) => vec![load(db, id)?],
+        None => db
+            .list_automations()
+            .map_err(|e| format!("list_automations: {e}"))?,
+    };
+    let manifest = crate::session::extension_def::AutomationManifest {
+        automations: autos.iter().map(automation_to_manifest).collect(),
+    };
+    let toml = toml::to_string_pretty(&manifest).map_err(|e| format!("serialize TOML: {e}"))?;
+    Ok(CommandOutput::new(
+        json!({ "count": autos.len(), "toml": toml }),
+        toml,
+    ))
+}
+
+/// Handle `automation import`: create automations from a TOML
+/// `[[automations]]` manifest. An existing automation of the same name is
+/// skipped unless `replace` is set (name is the manifest's identity, matching
+/// how extensions reconcile theirs).
+fn import_automations(db: &Database, file: &str, replace: bool) -> Result<CommandOutput, String> {
+    let path = crate::paths::expand_tilde(file);
+    let raw =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let manifest: crate::session::extension_def::AutomationManifest =
+        toml::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let existing: std::collections::HashMap<String, i64> = db
+        .list_automations()
+        .map_err(|e| format!("list_automations: {e}"))?
+        .into_iter()
+        .map(|a| (a.name, a.id))
+        .collect();
+
+    let (mut created, mut replaced, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
+    for decl in &manifest.automations {
+        decl.validate()?;
+        match existing.get(&decl.name) {
+            Some(_) if !replace => {
+                skipped.push(decl.name.clone());
+                continue;
+            }
+            Some(&id) => {
+                db.delete_automation(id)
+                    .map_err(|e| format!("delete_automation: {e}"))?;
+                replaced.push(decl.name.clone());
+            }
+            None => created.push(decl.name.clone()),
+        }
+        db.create_automation(&manifest_to_new_automation(decl)?)
+            .map_err(|e| format!("create_automation: {e}"))?;
+    }
+    if !created.is_empty() || !replaced.is_empty() {
+        arm_heartbeat();
+    }
+    let human = format!(
+        "Imported {} automation(s): {} created, {} replaced, {} skipped (already exist).",
+        created.len() + replaced.len(),
+        created.len(),
+        replaced.len(),
+        skipped.len()
+    );
+    Ok(CommandOutput::new(
+        json!({ "created": created, "replaced": replaced, "skipped": skipped }),
+        human,
+    ))
+}
+
+/// Turn an imported manifest entry into a row to insert. A `session_ref` stays a
+/// **name** target (see `ExtensionAutomation::to_action`), so an imported
+/// automation doesn't carry a session UUID from another machine.
+fn manifest_to_new_automation(
+    decl: &crate::session::ExtensionAutomation,
+) -> Result<NewAutomation, String> {
+    if let Some(tz) = decl.timezone.as_deref() {
+        crate::session::automation::validate_timezone(tz)?;
+    }
+    let schedule = parse_trigger(&decl.trigger, None, None)?;
+    let action = decl.to_action(None)?;
+    let steps = decl.steps();
+    if steps.is_empty() && !matches!(action, AutomationAction::Exec { .. }) {
+        return Err(format!("automation '{}' has no prompt", decl.name));
+    }
+    let enabled = decl.enabled.unwrap_or(true);
+    let next_run_at = enabled
+        .then(|| schedule.next_after(current_time_millis(), decl.timezone.as_deref()))
+        .flatten();
+    Ok(NewAutomation {
+        name: decl.name.clone(),
+        enabled,
+        schedule,
+        timezone: decl.timezone.clone(),
+        action,
+        prompt: steps.first().map(|s| s.text.clone()).unwrap_or_default(),
+        prompt_steps: steps,
+        next_run_at,
+    })
+}
+
+/// Project a stored automation onto the manifest grammar for `export`.
+fn automation_to_manifest(a: &Automation) -> crate::session::ExtensionAutomation {
+    use crate::session::{ExtensionAutomation, SpawnSessionMode};
+    let steps = a.steps();
+    let mut decl = ExtensionAutomation {
+        name: a.name.clone(),
+        trigger: match &a.schedule {
+            crate::session::AutomationSchedule::Once { at } => format!("at:{at}"),
+            crate::session::AutomationSchedule::Cron { expr } => format!("cron:{expr}"),
+        },
+        timezone: a.timezone.clone(),
+        enabled: Some(a.enabled),
+        prompts: steps.iter().map(|s| s.text.clone()).collect(),
+        step_delay_ms: steps.first().and_then(|s| s.delay_ms),
+        ..ExtensionAutomation::default()
+    };
+    match &a.action {
+        AutomationAction::Send { target } => match target {
+            crate::session::SendTarget::Id(id) => decl.session_id = Some(id.to_string()),
+            crate::session::SendTarget::Name(name) => decl.session_ref = Some(name.clone()),
+        },
+        AutomationAction::Spawn {
+            repo_path,
+            worktree_branch,
+            base_branch,
             agent,
             extra_repos,
-        }),
+            host,
+            session_mode,
+        } => {
+            decl.repo = Some(repo_path.display().to_string());
+            decl.worktree = worktree_branch.clone();
+            decl.base = base_branch.clone();
+            decl.agent = agent.clone();
+            decl.host = host.clone();
+            decl.session_mode =
+                (*session_mode != SpawnSessionMode::Reuse).then(|| session_mode.as_str().into());
+            decl.extra_repos = extra_repos.clone();
+        }
+        AutomationAction::Exec {
+            command,
+            timeout_secs,
+        } => {
+            decl.command = Some(command.clone());
+            decl.timeout_secs = *timeout_secs;
+        }
     }
+    // The single-prompt form stays on `prompt`, so an exported one-step
+    // automation is byte-identical to a hand-written manifest entry.
+    if decl.prompts.len() == 1 {
+        decl.prompt = decl.prompts.pop();
+    }
+    decl
 }
 
 fn automation_to_json(a: &Automation) -> Value {
@@ -724,9 +1206,7 @@ mod tests {
     #[test]
     fn action_label_distinguishes_send_and_spawn() {
         assert_eq!(
-            action::action_label(Some(&AutomationAction::Send {
-                session_id: SessionId::default(),
-            })),
+            action::action_label(Some(&AutomationAction::send_to(SessionId::default()))),
             "send"
         );
         assert_eq!(
@@ -736,6 +1216,8 @@ mod tests {
                 base_branch: None,
                 agent: None,
                 extra_repos: Vec::new(),
+                host: None,
+                session_mode: Default::default(),
             })),
             "spawn"
         );
@@ -750,14 +1232,13 @@ mod tests {
                 expr: "0 9 * * *".into(),
             },
             timezone: None,
-            action: AutomationAction::Send {
-                session_id: SessionId::default(),
-            },
+            action: AutomationAction::send_to(SessionId::default()),
             prompt: "hi".into(),
             created_at: 0,
             updated_at: 0,
             last_run_at: None,
             next_run_at: None,
+            prompt_steps: Vec::new(),
         }
     }
 
@@ -771,6 +1252,7 @@ mod tests {
             Some("09:30".into()),
             None,
             None,
+            Vec::new(),
             None,
         )
         .unwrap_err();
@@ -778,7 +1260,8 @@ mod tests {
 
         let mut auto = sample_automation();
         let err =
-            apply_edit_overrides(&mut auto, None, None, None, Some(3), None, None).unwrap_err();
+            apply_edit_overrides(&mut auto, None, None, None, Some(3), None, Vec::new(), None)
+                .unwrap_err();
         assert!(err.contains("--trigger"), "got {err}");
     }
 
@@ -792,6 +1275,7 @@ mod tests {
             Some("06:15".into()),
             None,
             None,
+            Vec::new(),
             None,
         )
         .unwrap();
@@ -801,9 +1285,103 @@ mod tests {
     #[test]
     fn edit_rejects_blank_prompt() {
         let mut auto = sample_automation();
-        let err = apply_edit_overrides(&mut auto, None, None, None, None, None, Some("   ".into()))
-            .unwrap_err();
+        let err = apply_edit_overrides(
+            &mut auto,
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec!["   ".into()],
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("prompt"), "got {err}");
+    }
+
+    #[test]
+    fn edit_rejects_unknown_timezone() {
+        let mut auto = sample_automation();
+        let err = apply_edit_overrides(
+            &mut auto,
+            None,
+            None,
+            None,
+            None,
+            Some("Mars/Olympus".into()),
+            Vec::new(),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("timezone"), "got {err}");
+    }
+
+    #[test]
+    fn edit_replaces_the_whole_prompt_list() {
+        let mut auto = sample_automation();
+        apply_edit_overrides(
+            &mut auto,
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec!["/model opus".into(), "go".into()],
+            Some(500),
+        )
+        .unwrap();
+        // The legacy `prompt` column keeps step 1 for older readers.
+        assert_eq!(auto.prompt, "/model opus");
+        assert_eq!(auto.prompt_steps.len(), 2);
+        assert_eq!(auto.prompt_steps[0].delay_ms, Some(500));
+        // The last step's delay is never waited on, so it isn't stored.
+        assert_eq!(auto.prompt_steps[1].delay_ms, None);
+    }
+
+    #[test]
+    fn edit_switches_action_kind_outright() {
+        let db = Database::open_in_memory().unwrap();
+        let auto = sample_automation(); // a send automation
+        let args = ActionArgs {
+            command: Some("sync.sh".into()),
+            ..ActionArgs::default()
+        };
+        let action = apply_action_overrides(&auto.action, &args, &db).unwrap();
+        assert!(matches!(action, AutomationAction::Exec { .. }));
+    }
+
+    #[test]
+    fn edit_amends_a_spawn_without_clobbering_it() {
+        let db = Database::open_in_memory().unwrap();
+        let current = AutomationAction::Spawn {
+            repo_path: "/repo".into(),
+            worktree_branch: Some("feat".into()),
+            base_branch: None,
+            agent: Some("claude".into()),
+            extra_repos: Vec::new(),
+            host: None,
+            session_mode: crate::session::SpawnSessionMode::Reuse,
+        };
+        let args = ActionArgs {
+            agent: Some("codex".into()),
+            session_mode: Some("fresh".into()),
+            ..ActionArgs::default()
+        };
+        match apply_action_overrides(&current, &args, &db).unwrap() {
+            AutomationAction::Spawn {
+                repo_path,
+                worktree_branch,
+                agent,
+                session_mode,
+                ..
+            } => {
+                assert_eq!(repo_path, std::path::PathBuf::from("/repo"));
+                assert_eq!(worktree_branch.as_deref(), Some("feat"));
+                assert_eq!(agent.as_deref(), Some("codex"));
+                assert_eq!(session_mode, crate::session::SpawnSessionMode::Fresh);
+            }
+            other => panic!("expected spawn, got {other:?}"),
+        }
     }
 
     #[test]
@@ -811,19 +1389,20 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let err = create_automation(
             &db,
-            "n".into(),
-            "daily".into(),
-            None,
-            None,
-            None,
-            "   ".into(),
-            None,
-            Some("/repo".into()),
-            None,
-            None,
-            None,
-            None,
-            false,
+            CreateArgs {
+                name: "n".into(),
+                trigger: "daily".into(),
+                time: None,
+                weekday: None,
+                timezone: None,
+                prompts: vec!["   ".into()],
+                step_delay: None,
+                action: ActionArgs {
+                    repo: Some("/repo".into()),
+                    ..ActionArgs::default()
+                },
+                disabled: false,
+            },
         )
         .unwrap_err();
         assert!(err.contains("prompt"), "got {err}");
@@ -832,10 +1411,13 @@ mod tests {
     #[test]
     fn resolve_action_spawn_carries_extra_repos() {
         let db = Database::open_in_memory().unwrap();
-        let extra = super::super::parse_extra_repos(&["/b@main".into()], &["/c".into()]);
-        let action =
-            resolve_action(None, Some("/a".into()), None, None, None, extra, None, &db).unwrap();
-        match action {
+        let args = ActionArgs {
+            repo: Some("/a".into()),
+            add_repo: vec!["/b@main".into()],
+            add_dir: vec!["/c".into()],
+            ..ActionArgs::default()
+        };
+        match resolve_action(&args, &db).unwrap() {
             AutomationAction::Spawn { extra_repos, .. } => {
                 assert_eq!(extra_repos.len(), 2);
                 assert!(extra_repos[0].worktree);
@@ -849,35 +1431,178 @@ mod tests {
     #[test]
     fn resolve_action_command_builds_exec() {
         let db = Database::open_in_memory().unwrap();
-        let action = resolve_action(
-            None,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Some("~/sync.sh".into()),
-            &db,
-        )
-        .unwrap();
-        assert!(matches!(action, AutomationAction::Exec { command } if command == "~/sync.sh"));
+        let args = ActionArgs {
+            command: Some("~/sync.sh".into()),
+            ..ActionArgs::default()
+        };
+        let action = resolve_action(&args, &db).unwrap();
+        assert!(matches!(action, AutomationAction::Exec { command, .. } if command == "~/sync.sh"));
     }
 
     #[test]
     fn resolve_action_rejects_command_with_session() {
         let db = Database::open_in_memory().unwrap();
-        let err = resolve_action(
-            Some("s".into()),
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            Some("cmd".into()),
+        let args = ActionArgs {
+            session: Some("s".into()),
+            command: Some("cmd".into()),
+            ..ActionArgs::default()
+        };
+        let err = resolve_action(&args, &db).unwrap_err();
+        assert!(err.contains("only one"), "got {err}");
+    }
+
+    #[test]
+    fn resolve_action_builds_a_name_send_target() {
+        let db = Database::open_in_memory().unwrap();
+        let args = ActionArgs {
+            session_name: Some("inbox".into()),
+            ..ActionArgs::default()
+        };
+        match resolve_action(&args, &db).unwrap() {
+            AutomationAction::Send { target } => {
+                assert_eq!(target.name(), Some("inbox"));
+                assert_eq!(target.id(), None);
+            }
+            other => panic!("expected send, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_import_round_trips_a_multi_step_spawn() {
+        let db = Database::open_in_memory().unwrap();
+        create_automation(
             &db,
+            CreateArgs {
+                name: "inbox".into(),
+                trigger: "daily".into(),
+                time: Some("07:00".into()),
+                weekday: None,
+                timezone: Some("Europe/Zurich".into()),
+                prompts: vec!["/model opus".into(), "summarize my inbox".into()],
+                step_delay: Some(2_000),
+                action: ActionArgs {
+                    repo: Some("/repo".into()),
+                    worktree: Some("auto/inbox".into()),
+                    session_mode: Some("fresh".into()),
+                    ..ActionArgs::default()
+                },
+                disabled: false,
+            },
+        )
+        .unwrap();
+        let toml = export_automations(&db, None).unwrap().human;
+        assert!(toml.contains("[[automations]]"), "got {toml}");
+
+        // Re-import into a clean database and compare the model, not the text.
+        let fresh = Database::open_in_memory().unwrap();
+        let manifest: crate::session::extension_def::AutomationManifest =
+            toml::from_str(&toml).unwrap();
+        for decl in &manifest.automations {
+            fresh
+                .create_automation(&manifest_to_new_automation(decl).unwrap())
+                .unwrap();
+        }
+        let got = &fresh.list_automations().unwrap()[0];
+        assert_eq!(got.name, "inbox");
+        assert_eq!(got.timezone.as_deref(), Some("Europe/Zurich"));
+        assert_eq!(got.schedule.spec(), "0 7 * * *");
+        let steps = got.steps();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].text, "/model opus");
+        assert_eq!(steps[0].delay_ms, Some(2_000));
+        match &got.action {
+            AutomationAction::Spawn {
+                repo_path,
+                worktree_branch,
+                session_mode,
+                ..
+            } => {
+                assert_eq!(repo_path, &std::path::PathBuf::from("/repo"));
+                assert_eq!(worktree_branch.as_deref(), Some("auto/inbox"));
+                assert_eq!(*session_mode, crate::session::SpawnSessionMode::Fresh);
+            }
+            other => panic!("expected spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_skips_an_existing_name_unless_replacing() {
+        let db = Database::open_in_memory().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("autos.toml");
+        std::fs::write(
+            &file,
+            "[[automations]]\nname = \"sync\"\ntrigger = \"hourly\"\ncommand = \"sync.sh\"\n",
+        )
+        .unwrap();
+        let path = file.display().to_string();
+
+        let out = import_automations(&db, &path, false).unwrap();
+        assert_eq!(out.json["created"], json!(["sync"]));
+        assert_eq!(db.list_automations().unwrap().len(), 1);
+
+        // A second import is a no-op by default...
+        let out = import_automations(&db, &path, false).unwrap();
+        assert_eq!(out.json["skipped"], json!(["sync"]));
+        assert_eq!(db.list_automations().unwrap().len(), 1);
+
+        // ...and replaces on request, still leaving exactly one row.
+        let out = import_automations(&db, &path, true).unwrap();
+        assert_eq!(out.json["replaced"], json!(["sync"]));
+        assert_eq!(db.list_automations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dry_run_reports_the_plan_without_firing() {
+        let db = Database::open_in_memory().unwrap();
+        create_automation(
+            &db,
+            CreateArgs {
+                name: "sync".into(),
+                trigger: "hourly".into(),
+                time: None,
+                weekday: None,
+                timezone: None,
+                prompts: Vec::new(),
+                step_delay: None,
+                action: ActionArgs {
+                    command: Some("sync.sh".into()),
+                    ..ActionArgs::default()
+                },
+                disabled: false,
+            },
+        )
+        .unwrap();
+        let id = db.list_automations().unwrap()[0].id;
+        let out = dry_run(&db, id).unwrap();
+        assert_eq!(out.json["action"], json!("exec"));
+        assert_eq!(out.json["command"], json!("sync.sh"));
+        // A dry run must not touch the history.
+        assert!(db.list_automation_runs(id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn create_rejects_an_unknown_timezone() {
+        let db = Database::open_in_memory().unwrap();
+        let err = create_automation(
+            &db,
+            CreateArgs {
+                name: "n".into(),
+                trigger: "daily".into(),
+                time: None,
+                weekday: None,
+                timezone: Some("Europe/Zurihc".into()),
+                prompts: vec!["go".into()],
+                step_delay: None,
+                action: ActionArgs {
+                    repo: Some("/repo".into()),
+                    ..ActionArgs::default()
+                },
+                disabled: false,
+            },
         )
         .unwrap_err();
-        assert!(err.contains("only one"), "got {err}");
+        assert!(err.contains("timezone"), "got {err}");
     }
 
     #[test]
@@ -890,6 +1615,7 @@ mod tests {
             status: AutomationRunStatus::Success,
             detail: "sent".into(),
             related_session_id: Some(sid),
+            finished_at: None,
         };
         assert_eq!(run_to_json(&run)["related_session_id"], sid.to_string());
 

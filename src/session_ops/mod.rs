@@ -31,43 +31,67 @@ use crate::session::{AutomationRunStatus, SessionConfig};
 /// involved — this is the deterministic-scheduled-job path shared by the TUI and
 /// the headless `automation tick`. stdout+stderr are tail-truncated so a chatty
 /// command can't bloat the history.
-pub fn run_exec_command(command: &str) -> (AutomationRunStatus, String) {
-    use std::process::Command;
-    let result = if cfg!(windows) {
-        Command::new("cmd").args(["/C", command]).output()
+///
+/// The command is killed after `timeout_secs`
+/// ([`DEFAULT_EXEC_TIMEOUT_SECS`](crate::session::automation::DEFAULT_EXEC_TIMEOUT_SECS)
+/// when `None`), so a hung job releases its run row instead of sitting
+/// `Running` forever.
+pub fn run_exec_command_with_timeout(
+    command: &str,
+    timeout_secs: Option<u64>,
+) -> (AutomationRunStatus, String) {
+    use std::process::{Command, Stdio};
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", command]);
+        c
     } else {
-        Command::new("sh").args(["-c", command]).output()
+        let mut c = Command::new("sh");
+        c.args(["-c", command]);
+        c
     };
-    let out = match result {
-        Ok(out) => out,
+    let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+    let mut child = match child {
+        Ok(c) => c,
         Err(e) => return (AutomationRunStatus::Error, format!("spawn failed: {e}")),
     };
-    // Keep the last 500 chars of each stream. Single pass via a capped ring so a
-    // huge stream isn't walked twice (count + skip) or materialized in full.
-    const TAIL_CHARS: usize = 500;
-    let tail = |s: &[u8]| -> String {
-        let t = String::from_utf8_lossy(s);
-        let t = t.trim();
-        let mut ring: std::collections::VecDeque<char> =
-            std::collections::VecDeque::with_capacity(TAIL_CHARS + 1);
-        for c in t.chars() {
-            if ring.len() == TAIL_CHARS {
-                ring.pop_front();
-            }
-            ring.push_back(c);
-        }
-        ring.into_iter().collect()
-    };
-    let stdout = tail(&out.stdout);
-    let stderr = tail(&out.stderr);
-    let mut detail = stdout;
-    if !stderr.is_empty() {
+
+    // Drain both pipes on their own threads: polling `try_wait` while the child
+    // fills a pipe buffer would deadlock (the child blocks on write, we block on
+    // the deadline), and `wait_with_output` consumes the child so there'd be no
+    // handle left to kill.
+    let stdout = child.stdout.take().map(spawn_reader);
+    let stderr = child.stderr.take().map(spawn_reader);
+
+    let timeout = std::time::Duration::from_secs(
+        timeout_secs.unwrap_or(crate::session::automation::DEFAULT_EXEC_TIMEOUT_SECS),
+    );
+    let (status, timed_out) = wait_with_deadline(&mut child, timeout);
+    let out = stdout.map(join_reader).unwrap_or_default();
+    let err = stderr.map(join_reader).unwrap_or_default();
+
+    let mut detail = tail_chars(&out);
+    let stderr_tail = tail_chars(&err);
+    if !stderr_tail.is_empty() {
         if !detail.is_empty() {
             detail.push('\n');
         }
-        detail.push_str(&stderr);
+        detail.push_str(&stderr_tail);
     }
-    if out.status.success() {
+
+    if timed_out {
+        let secs = timeout.as_secs();
+        let msg = if detail.is_empty() {
+            format!("timed out after {secs}s (killed)")
+        } else {
+            format!("timed out after {secs}s (killed): {detail}")
+        };
+        return (AutomationRunStatus::Error, msg);
+    }
+    let Some(status) = status else {
+        return (AutomationRunStatus::Error, "wait failed".to_string());
+    };
+    if status.success() {
         let msg = if detail.is_empty() {
             "ok".into()
         } else {
@@ -75,7 +99,7 @@ pub fn run_exec_command(command: &str) -> (AutomationRunStatus, String) {
         };
         (AutomationRunStatus::Success, msg)
     } else {
-        let code = out.status.code().map_or("signal".into(), |c| c.to_string());
+        let code = status.code().map_or("signal".into(), |c| c.to_string());
         let msg = if detail.is_empty() {
             format!("exit {code}")
         } else {
@@ -83,6 +107,100 @@ pub fn run_exec_command(command: &str) -> (AutomationRunStatus, String) {
         };
         (AutomationRunStatus::Error, msg)
     }
+}
+
+/// [`run_exec_command_with_timeout`] on the default deadline.
+pub fn run_exec_command(command: &str) -> (AutomationRunStatus, String) {
+    run_exec_command_with_timeout(command, None)
+}
+
+/// Run an `Exec` automation on a detached worker thread, closing out the
+/// already-recorded `Running` run (`run_id`) when the command exits.
+///
+/// This is what keeps a long command off the TUI's tick thread. The worker owns
+/// its own database connection (`App::db` isn't shareable, and the run outlives
+/// the tick that started it); if it can't open one the run row is left for
+/// `Database::reap_orphaned_automation_runs` to close on the next startup.
+pub fn run_exec_command_detached(run_id: i64, command: String, timeout_secs: Option<u64>) {
+    std::thread::spawn(move || {
+        let (status, detail) = run_exec_command_with_timeout(&command, timeout_secs);
+        let Some(path) = crate::paths::database_file() else {
+            tracing::error!("exec run {run_id} finished but the database path is unresolvable");
+            return;
+        };
+        let db = match crate::storage::Database::open(&path) {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!("exec run {run_id} finished but its result is unrecorded: {e}");
+                return;
+            }
+        };
+        if let Err(e) = db.finish_automation_run(run_id, status, &detail) {
+            tracing::error!("Failed to finish automation run {run_id}: {e}");
+        }
+    });
+}
+
+/// Read a child pipe to EOF on its own thread (see
+/// [`run_exec_command_with_timeout`] for why the pipes can't be polled inline).
+fn spawn_reader<R: std::io::Read + Send + 'static>(
+    mut pipe: R,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+        buf
+    })
+}
+
+/// Collect a reader thread's bytes; a panicked reader yields no output rather
+/// than taking the run down with it.
+fn join_reader(handle: std::thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    handle.join().unwrap_or_default()
+}
+
+/// Wait for `child` up to `timeout`, killing it if the deadline passes.
+/// Returns `(exit status, timed_out)`.
+fn wait_with_deadline(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> (Option<std::process::ExitStatus>, bool) {
+    /// Poll cadence — fine enough that a quick command isn't noticeably
+    /// delayed, coarse enough to cost nothing over a 15-minute job.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return (Some(status), false),
+            Ok(None) => {}
+            Err(_) => return (None, false),
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            // Reap the killed child so it doesn't linger as a zombie; the pipe
+            // readers unblock once its stdio handles close.
+            let _ = child.wait();
+            return (None, true);
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Keep the last 500 chars of a captured stream. Single pass via a capped ring
+/// so a huge stream isn't walked twice (count + skip) or materialized in full.
+fn tail_chars(raw: &[u8]) -> String {
+    const TAIL_CHARS: usize = 500;
+    let t = String::from_utf8_lossy(raw);
+    let t = t.trim();
+    let mut ring: std::collections::VecDeque<char> =
+        std::collections::VecDeque::with_capacity(TAIL_CHARS + 1);
+    for c in t.chars() {
+        if ring.len() == TAIL_CHARS {
+            ring.pop_front();
+        }
+        ring.push_back(c);
+    }
+    ring.into_iter().collect()
 }
 
 /// Decide whether to pass the agent's resume group vs starting fresh when
@@ -254,6 +372,35 @@ pub(crate) fn inject_friring_env(
 mod tests {
     use super::*;
     use crate::session::SessionId;
+
+    #[cfg(unix)]
+    #[test]
+    fn run_exec_command_kills_a_hung_command_at_the_deadline() {
+        let started = std::time::Instant::now();
+        let (status, detail) = run_exec_command_with_timeout("sleep 30", Some(1));
+        assert_eq!(status, AutomationRunStatus::Error);
+        assert!(detail.contains("timed out"), "got {detail}");
+        // The point of the deadline: it returns instead of hanging the caller.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_exec_command_captures_output_larger_than_a_pipe_buffer() {
+        // Regression guard for the reader threads: polling the deadline while
+        // the child fills a 64 KiB pipe would deadlock instead of finishing.
+        let (status, detail) = run_exec_command_with_timeout(
+            "for i in $(seq 1 20000); do echo aaaaaaaaaaaaaaaaaaaa; done",
+            Some(30),
+        );
+        assert_eq!(status, AutomationRunStatus::Success);
+        // Only the tail is kept, so the history stays bounded.
+        assert!(detail.len() <= 500, "detail was {} chars", detail.len());
+    }
 
     #[cfg(unix)]
     #[test]

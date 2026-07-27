@@ -31,8 +31,21 @@ pub struct AutomationEditorState<'a> {
     pub timezone: &'a str,
     pub repo: &'a str,
     pub worktree: &'a str,
-    pub agent: &'a str,
+    pub base_branch: &'a str,
+    pub extra_repos: &'a str,
+    pub extra_dirs: &'a str,
+    pub session_mode: crate::session::SpawnSessionMode,
+    /// Selected agent name; `None` = the registry default.
+    pub agent: Option<&'a str>,
+    /// Selected host name; `None` = local.
+    pub host: Option<&'a str>,
     pub command: &'a str,
+    /// Exec kill deadline in seconds, as typed (empty = the default).
+    pub timeout: &'a str,
+    /// `(selected, total)` prompt steps, for the `step` selector row.
+    pub step: (usize, usize),
+    /// Settle delay after the selected step, as typed (empty = the default).
+    pub step_delay: &'a str,
     pub prompt: &'a str,
     /// Caret `(line, col)` within the prompt, for drawing the block cursor while
     /// the multi-line `Prompt` field is active.
@@ -75,10 +88,18 @@ impl<'a> AutomationEditorState<'a> {
             timezone: m.timezone.value(),
             repo: m.repo.value(),
             worktree: m.worktree.value(),
-            agent: m.agent.value(),
+            base_branch: m.base_branch.value(),
+            extra_repos: m.extra_repos.value(),
+            extra_dirs: m.extra_dirs.value(),
+            session_mode: m.session_mode,
+            agent: m.selected_agent(),
+            host: m.selected_host(),
             command: m.command.value(),
-            prompt: m.prompt.value(),
-            prompt_cursor: m.prompt.cursor_line_col(),
+            timeout: m.timeout.value(),
+            step: (m.step_index + 1, m.steps.len()),
+            step_delay: m.current_step().delay.value(),
+            prompt: m.prompt().value(),
+            prompt_cursor: m.prompt().cursor_line_col(),
             target_session: m.selected_target().map(|(_, name)| name.as_str()),
             preview,
             focused,
@@ -317,8 +338,14 @@ fn prompt_lines<'a>(
     width: u16,
 ) -> (Vec<Line<'a>>, Option<usize>) {
     let prefix = if active { "▸ " } else { "  " };
+    // Name the step in a multi-step automation, so the text below is
+    // unambiguously "the one the step selector points at".
+    let label = match state.step {
+        (current, total) if total > 1 => format!("prompt {current}"),
+        _ => "prompt".to_string(),
+    };
     let mut lines = vec![Line::from(Span::styled(
-        format!("{prefix}{:<9}", "prompt"),
+        format!("{prefix}{label:<9}"),
         Theme::label(),
     ))];
 
@@ -474,8 +501,28 @@ fn field_line<'a>(
         AutomationField::Target => ("target", target_display(state), true),
         AutomationField::Repo => ("repo", state.repo.to_string(), false),
         AutomationField::Worktree => ("worktree", optional_display(state.worktree), false),
-        AutomationField::Agent => ("agent", optional_display(state.agent), false),
+        AutomationField::BaseBranch => ("base", base_display(state.base_branch), false),
+        AutomationField::Agent => (
+            "agent",
+            state.agent.unwrap_or("(default)").to_string(),
+            true,
+        ),
+        AutomationField::Host => ("host", state.host.unwrap_or("(local)").to_string(), true),
+        AutomationField::SessionMode => ("session", session_mode_display(state), true),
+        AutomationField::ExtraRepos => (
+            "+repos",
+            extras_display(state.extra_repos, "(none — path[@base], …)"),
+            false,
+        ),
+        AutomationField::ExtraDirs => (
+            "+dirs",
+            extras_display(state.extra_dirs, "(none — path, …)"),
+            false,
+        ),
         AutomationField::Command => ("command", state.command.to_string(), false),
+        AutomationField::Timeout => ("timeout", timeout_display(state.timeout), false),
+        AutomationField::Step => ("step", step_display(state), true),
+        AutomationField::StepDelay => ("wait", step_delay_display(state.step_delay), false),
         // The multi-line prompt is rendered by `prompt_lines`; `editor_body_lines`
         // never routes it here.
         AutomationField::Prompt => unreachable!("Prompt is rendered via prompt_lines"),
@@ -516,6 +563,65 @@ fn optional_display(value: &str) -> String {
     }
 }
 
+/// The worktree's fork point; empty falls back to `main` at spawn time.
+fn base_display(base: &str) -> String {
+    if base.is_empty() {
+        "main (default)".to_string()
+    } else {
+        base.to_string()
+    }
+}
+
+/// Extra repos / dirs, with a grammar hint while the field is empty.
+fn extras_display(value: &str, hint: &str) -> String {
+    if value.is_empty() {
+        hint.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn timeout_display(timeout: &str) -> String {
+    if timeout.is_empty() {
+        format!(
+            "{} s (default)",
+            crate::session::automation::DEFAULT_EXEC_TIMEOUT_SECS
+        )
+    } else {
+        format!("{timeout} s")
+    }
+}
+
+fn session_mode_display(state: &AutomationEditorState<'_>) -> String {
+    match state.session_mode {
+        crate::session::SpawnSessionMode::Reuse => "reuse".to_string(),
+        crate::session::SpawnSessionMode::Fresh => "fresh per fire".to_string(),
+    }
+}
+
+/// The step selector: `2/3` plus the chords that edit the list, so the
+/// add/remove/reorder keys are discoverable on the row that owns them.
+fn step_display(state: &AutomationEditorState<'_>) -> String {
+    let (current, total) = state.step;
+    if state.field == AutomationField::Step && state.focused {
+        format!("{current}/{total}   n add · d remove · [ ] reorder")
+    } else {
+        format!("{current}/{total}")
+    }
+}
+
+/// The settle delay before the next step; empty means the shared default.
+fn step_delay_display(delay: &str) -> String {
+    if delay.is_empty() {
+        format!(
+            "{} ms (default)",
+            crate::session::automation::DEFAULT_STEP_DELAY_MS
+        )
+    } else {
+        format!("{delay} ms")
+    }
+}
+
 fn action_display(state: &AutomationEditorState<'_>) -> String {
     match state.action {
         AutomationActionKind::Send => "send".to_string(),
@@ -553,8 +659,16 @@ mod tests {
             timezone: "",
             repo: "",
             worktree: "",
-            agent: "",
+            base_branch: "",
+            extra_repos: "",
+            extra_dirs: "",
+            session_mode: crate::session::SpawnSessionMode::Reuse,
+            agent: None,
+            host: None,
             command: "",
+            timeout: "",
+            step: (1, 1),
+            step_delay: "",
             prompt: "",
             prompt_cursor: (0, 0),
             target_session: None,

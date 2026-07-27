@@ -116,6 +116,9 @@ pub fn render_run_history(
 /// the relative age, and any free-text detail. Highlighted when `is_selected`.
 fn run_line<'a>(run: &AutomationRunRow<'_>, is_selected: bool) -> Line<'a> {
     let (glyph, word, color) = match run.status {
+        // An exec command still going: it updates this row in place when it
+        // finishes, so the history shows work in flight rather than nothing.
+        AutomationRunStatus::Running => ("•", "running", Theme::accent()),
         AutomationRunStatus::Success => ("✓", "ok", Theme::tool_allowed()),
         AutomationRunStatus::Error => ("✗", "error", Theme::status_error()),
         AutomationRunStatus::Skipped => ("–", "skipped", Theme::keybind_hint()),

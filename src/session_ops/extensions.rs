@@ -963,25 +963,15 @@ fn ensure_automation(
     existing: Option<&Automation>,
     report: &mut EnsureReport,
 ) -> Result<(), String> {
-    // Desired action: a command wins (exec); otherwise send to the target.
-    let action = match (&auto.command, target) {
-        (Some(command), _) => AutomationAction::Exec {
-            command: command.clone(),
-        },
-        (None, Some(session_id)) => AutomationAction::Send { session_id },
-        (None, None) => {
-            return Err(format!(
-                "automation '{}' has neither a command nor a session_ref",
-                auto.name
-            ))
-        }
-    };
+    // The declared action, with a `session_ref` bound to the id of the session
+    // this pass just ensured (so the row points at the live session, not a name).
+    let action = auto.to_action(target.map(crate::session::SendTarget::Id))?;
     if let Some(row) = existing {
         // Re-link a send automation whose target session was recreated (a new id).
-        if let (AutomationAction::Send { session_id }, Some(t)) = (&row.action, target) {
-            if *session_id != t {
+        if let (AutomationAction::Send { target: current }, Some(t)) = (&row.action, target) {
+            if current.id() != Some(t) {
                 let mut row = row.clone();
-                row.action = AutomationAction::Send { session_id: t };
+                row.action = AutomationAction::send_to(t);
                 db.update_automation(&row)
                     .map_err(|e| format!("update_automation: {e}"))?;
                 report.automations_relinked.push(auto.name.clone());
@@ -991,13 +981,15 @@ fn ensure_automation(
     }
     let schedule = parse_trigger(&auto.trigger, None, None)?;
     let next_run_at = schedule.next_after(current_time_millis(), None);
+    let steps = auto.steps();
     let new = NewAutomation {
         name: auto.name.clone(),
         enabled: true,
         schedule,
         timezone: None,
         action,
-        prompt: auto.prompt.clone().unwrap_or_default(),
+        prompt: steps.first().map(|s| s.text.clone()).unwrap_or_default(),
+        prompt_steps: steps,
         next_run_at,
     };
     db.create_automation(&new)
@@ -1300,6 +1292,7 @@ mod tests {
                 session_ref: Some("flow".into()),
                 prompt: Some("tick".into()),
                 command: None,
+                ..ExtensionAutomation::default()
             }],
         }
     }
@@ -1340,7 +1333,7 @@ mod tests {
         // First pass binds the automation to the original session id.
         ensure_extension(&db, &def).unwrap();
         let auto = &db.list_automations().unwrap()[0];
-        assert_eq!(auto.action, AutomationAction::Send { session_id: old_id });
+        assert_eq!(auto.action, AutomationAction::send_to(old_id));
 
         // The session is recreated under the same name with a fresh id (the
         // shape that orphaned the automation: soft-delete + new row).
@@ -1356,7 +1349,7 @@ mod tests {
         assert!(report.created_anything(), "a relink counts as repair");
 
         let auto = &db.list_automations().unwrap()[0];
-        assert_eq!(auto.action, AutomationAction::Send { session_id: new_id });
+        assert_eq!(auto.action, AutomationAction::send_to(new_id));
 
         // A subsequent pass is a no-op now that the link is correct.
         let again = ensure_extension(&db, &def).unwrap();

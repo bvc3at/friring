@@ -172,55 +172,208 @@ pub struct ExtensionSession {
     pub repo_path: PathBuf,
 }
 
-/// An automation an extension wants kept alive. Identified by `name`.
+/// A standalone `[[automations]]` document — the shape
+/// `friring-cli automation export`/`import` round-trips. Deliberately the same
+/// grammar an extension manifest uses for its automations, so an exported file
+/// pastes into an `extension.toml` unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomationManifest {
+    #[serde(default)]
+    pub automations: Vec<ExtensionAutomation>,
+}
+
+/// A declared automation — what an extension wants kept alive, and what
+/// `automation export`/`import` transfers. Identified by `name`.
 ///
-/// Two flavours: a **send** automation prompts an extension session
-/// (`session_ref` + `prompt`), or an **exec** automation runs a shell `command`
-/// headlessly (no session — a deterministic scheduled job). Set exactly one of
-/// `command` or (`session_ref` + `prompt`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Three flavours, exactly one of which the fields must select: **send** (a
+/// `session_ref` naming an extension session, or a `session_id` UUID),
+/// **spawn** (a `repo`), or **exec** (a `command`). The prompt is either the
+/// single `prompt` or the ordered `prompts` list.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtensionAutomation {
     /// Automation name. Used to find/reuse it.
     pub name: String,
     /// Trigger spec, same grammar as `friring-cli automation create --trigger`
     /// (`hourly` | `daily` | `weekdays` | `weekly` | `cron:<expr>` | `at:<ms>`).
     pub trigger: String,
-    /// Name of the extension session this automation sends its prompt to. Must
-    /// match one of the manifest's `[[sessions]]` entries. Omitted for `command`.
+    /// IANA timezone the schedule is evaluated in; omitted = system local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    /// Whether the imported automation starts enabled; omitted = enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Name of the session this automation sends its prompt to. In an extension
+    /// manifest it must match one of the `[[sessions]]` entries; on import it is
+    /// a plain session name, re-resolved on every fire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<String>,
-    /// Prompt text delivered on each fire (e.g. `tick`). Omitted for `command`.
+    /// Send target as an exact session UUID (the `session_ref` alternative;
+    /// what `export` writes for an id-targeted automation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Repository a `spawn` automation runs in. Selects the spawn flavour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Spawn: worktree branch to create/attach (omitted = the repo root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// Spawn: base branch a new worktree forks from (omitted = `main`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// Spawn: agent name (omitted = the registry default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Spawn: `hosts.toml` host to run on (omitted = local).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Spawn: `reuse` (default) or `fresh` — one session across fires, or a new
+    /// one per fire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_mode: Option<String>,
+    /// Spawn: additional repositories this session spans.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_repos: Vec<super::ExtraRepo>,
+    /// Prompt text delivered on each fire (e.g. `tick`). The single-step form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Ordered prompt steps, each delivered as its own paste + Enter. Use this
+    /// instead of `prompt` when the agent needs slash-command setup first
+    /// (`/model …`, `/effort …`, then the real work).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompts: Vec<String>,
+    /// Settle delay between prompt steps, in milliseconds (omitted = the
+    /// default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_delay_ms: Option<u64>,
     /// Shell command run headlessly on each fire (the `Exec` action). Mutually
-    /// exclusive with `session_ref`/`prompt`; `{home}` is substituted.
+    /// exclusive with the send/spawn fields; `{home}` is substituted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// Exec: seconds before the command is killed (omitted = the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 impl ExtensionAutomation {
-    /// Reject the invalid flavour combinations the 3-`Option` shape allows but
-    /// the `send`-xor-`exec` model forbids: setting `command` *and* a send field
-    /// (downstream `command` silently wins, dropping the send fields), or
-    /// setting neither. Mirrors [`crate::session::message::validate_kind_body`];
+    /// Reject the invalid flavour combinations the all-`Option` shape allows but
+    /// the send-xor-spawn-xor-exec model forbids: selecting more than one
+    /// flavour (downstream one silently wins, dropping the other's fields), or
+    /// selecting none. Mirrors [`crate::session::message::validate_kind_body`];
     /// called where the manifest is turned into resources
-    /// ([`crate::session_ops::ensure_extension`]).
+    /// ([`crate::session_ops::ensure_extension`]) and on import.
     pub fn validate(&self) -> Result<(), String> {
-        let has_send_fields = self.session_ref.is_some() || self.prompt.is_some();
-        if self.command.is_some() && has_send_fields {
+        let flavours = [
+            ("command", self.command.is_some()),
+            ("repo", self.repo.is_some()),
+            (
+                "session_ref/session_id",
+                self.session_ref.is_some() || self.session_id.is_some(),
+            ),
+        ];
+        let selected: Vec<&str> = flavours
+            .iter()
+            .filter(|(_, set)| *set)
+            .map(|(label, _)| *label)
+            .collect();
+        match selected.len() {
+            1 => {}
+            0 => {
+                return Err(format!(
+                    "automation '{}' selects no action: set one of `command` (exec), \
+                     `repo` (spawn), or `session_ref`/`session_id` (send)",
+                    self.name
+                ))
+            }
+            _ => {
+                return Err(format!(
+                    "automation '{}' selects several actions ({}); set exactly one flavour",
+                    self.name,
+                    selected.join(", ")
+                ))
+            }
+        }
+        if self.prompt.is_some() && !self.prompts.is_empty() {
             return Err(format!(
-                "automation '{}' sets both `command` (exec) and send fields \
-                 (`session_ref`/`prompt`); set exactly one flavour",
+                "automation '{}' sets both `prompt` and `prompts`; use one",
                 self.name
             ));
         }
-        if self.command.is_none() && self.session_ref.is_none() {
+        // An exec runs a command, not an agent turn, so a prompt on one would be
+        // silently dropped — almost always a half-converted send.
+        if self.command.is_some() && (self.prompt.is_some() || !self.prompts.is_empty()) {
             return Err(format!(
-                "automation '{}' has neither a `command` nor a `session_ref`",
+                "automation '{}' sets a prompt alongside `command` (exec); an exec \
+                 automation has no agent to prompt",
                 self.name
             ));
         }
         Ok(())
+    }
+
+    /// The declared prompt steps, in delivery order. `prompts` wins over the
+    /// single `prompt`; an exec automation legitimately has none.
+    pub fn steps(&self) -> Vec<super::PromptStep> {
+        let texts: Vec<String> = if self.prompts.is_empty() {
+            self.prompt.clone().into_iter().collect()
+        } else {
+            self.prompts.clone()
+        };
+        let last = texts.len().saturating_sub(1);
+        texts
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| super::PromptStep {
+                text,
+                delay_ms: (i < last).then_some(self.step_delay_ms).flatten(),
+            })
+            .collect()
+    }
+
+    /// The action this declaration describes.
+    ///
+    /// `send_target` overrides how a send resolves: an extension passes the id
+    /// of the session it just ensured (so a recreated session re-links), while
+    /// `automation import` passes `None` and gets the declared form — a
+    /// `session_id` UUID, or a `session_ref` kept as a **name** target so the
+    /// imported automation stays portable across machines.
+    pub fn to_action(
+        &self,
+        send_target: Option<super::SendTarget>,
+    ) -> Result<super::AutomationAction, String> {
+        use super::{AutomationAction, SendTarget, SpawnSessionMode};
+        self.validate()?;
+        if let Some(command) = &self.command {
+            return Ok(AutomationAction::Exec {
+                command: command.clone(),
+                timeout_secs: self.timeout_secs,
+            });
+        }
+        if let Some(repo) = &self.repo {
+            return Ok(AutomationAction::Spawn {
+                repo_path: std::path::PathBuf::from(repo),
+                worktree_branch: self.worktree.clone(),
+                base_branch: self.base.clone(),
+                agent: self.agent.clone(),
+                extra_repos: self.extra_repos.clone(),
+                host: self.host.clone(),
+                session_mode: self
+                    .session_mode
+                    .as_deref()
+                    .map(SpawnSessionMode::from_str_or_default)
+                    .unwrap_or_default(),
+            });
+        }
+        let target = match (send_target, &self.session_id, &self.session_ref) {
+            (Some(explicit), _, _) => explicit,
+            (None, Some(raw), _) => SendTarget::Id(
+                raw.parse()
+                    .map_err(|_| format!("automation '{}': invalid session UUID", self.name))?,
+            ),
+            (None, None, Some(name)) => SendTarget::Name(name.clone()),
+            // `validate` already rejected the no-flavour case.
+            (None, None, None) => unreachable!("validate rejects an automation with no action"),
+        };
+        Ok(AutomationAction::Send { target })
     }
 }
 
@@ -470,6 +623,7 @@ prompt = "tick"
                 session_ref: session_ref.map(str::to_string),
                 prompt: prompt.map(str::to_string),
                 command: command.map(str::to_string),
+                ..ExtensionAutomation::default()
             }
         };
         assert!(auto(Some("flow"), Some("tick"), None).validate().is_ok());
@@ -530,6 +684,7 @@ prompt = "tick"
                 session_ref: Some("flow".into()),
                 prompt: Some("tick".into()),
                 command: None,
+                ..ExtensionAutomation::default()
             }],
         };
         let text = toml::to_string(&def).unwrap();

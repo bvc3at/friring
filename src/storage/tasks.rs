@@ -47,7 +47,7 @@ impl Database {
     pub fn create_task(&self, new: &NewTask) -> rusqlite::Result<i64> {
         let now = current_time_millis() as i64;
         let action_kind = new.action.as_ref().map(|a| a.kind());
-        let (target_session, repo_path, worktree_branch, base_branch, agent, extra, command) = new
+        let cols = new
             .action
             .as_ref()
             .map(super::action_to_columns)
@@ -57,24 +57,30 @@ impl Database {
                 (title, status, action_kind, target_session, repo_path,
                  worktree_branch, base_branch, agent, source, external_id,
                  external_url, created_at, updated_at, deleted_at, description,
-                 action_extra_repos, action_command)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, NULL, ?13, ?14, ?15)",
+                 action_extra_repos, action_command, action_target_name,
+                 action_host, action_session_mode, action_timeout_secs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, NULL, ?13, ?14, ?15, \
+             ?16, ?17, ?18, ?19)",
             params![
                 new.title,
                 new.status.as_str(),
                 action_kind,
-                target_session,
-                repo_path,
-                worktree_branch,
-                base_branch,
-                agent,
+                cols.target_session,
+                cols.repo_path,
+                cols.worktree_branch,
+                cols.base_branch,
+                cols.agent,
                 new.source,
                 new.external_id,
                 new.external_url,
                 now,
                 new.description,
-                extra,
-                command,
+                cols.extra_repos,
+                cols.command,
+                cols.target_name,
+                cols.host,
+                cols.session_mode,
+                cols.timeout_secs,
             ],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -134,7 +140,7 @@ impl Database {
     /// Replace a task's definition (everything except id/created_at/deleted_at).
     pub fn update_task(&self, task: &Task) -> rusqlite::Result<()> {
         let action_kind = task.action.as_ref().map(|a| a.kind());
-        let (target_session, repo_path, worktree_branch, base_branch, agent, extra, command) = task
+        let cols = task
             .action
             .as_ref()
             .map(super::action_to_columns)
@@ -145,25 +151,31 @@ impl Database {
                 title = ?2, status = ?3, action_kind = ?4, target_session = ?5,
                 repo_path = ?6, worktree_branch = ?7, base_branch = ?8, agent = ?9,
                 source = ?10, external_id = ?11, external_url = ?12, updated_at = ?13,
-                description = ?14, action_extra_repos = ?15, action_command = ?16
+                description = ?14, action_extra_repos = ?15, action_command = ?16,
+                action_target_name = ?17, action_host = ?18, action_session_mode = ?19,
+                action_timeout_secs = ?20
              WHERE id = ?1",
             params![
                 task.id,
                 task.title,
                 task.status.as_str(),
                 action_kind,
-                target_session,
-                repo_path,
-                worktree_branch,
-                base_branch,
-                agent,
+                cols.target_session,
+                cols.repo_path,
+                cols.worktree_branch,
+                cols.base_branch,
+                cols.agent,
                 task.source,
                 task.external_id,
                 task.external_url,
                 now,
                 task.description,
-                extra,
-                command,
+                cols.extra_repos,
+                cols.command,
+                cols.target_name,
+                cols.host,
+                cols.session_mode,
+                cols.timeout_secs,
             ],
         )?;
         self.log_audit(
@@ -222,19 +234,24 @@ impl Database {
 const COLS: &str = "id, title, status, action_kind, target_session, repo_path, \
     worktree_branch, base_branch, agent, source, external_id, external_url, \
     created_at, updated_at, deleted_at, description, action_extra_repos, \
-    action_command";
+    action_command, action_target_name, action_host, action_session_mode, \
+    action_timeout_secs";
 
 fn map_task(row: &rusqlite::Row) -> rusqlite::Result<Task> {
     let action_kind: Option<String> = row.get(3)?;
-    let cols: super::ActionColumns = (
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        row.get(8)?,
-        row.get(16)?,
-        row.get(17)?,
-    );
+    let cols = super::ActionColumns {
+        target_session: row.get(4)?,
+        repo_path: row.get(5)?,
+        worktree_branch: row.get(6)?,
+        base_branch: row.get(7)?,
+        agent: row.get(8)?,
+        extra_repos: row.get(16)?,
+        command: row.get(17)?,
+        target_name: row.get(18)?,
+        host: row.get(19)?,
+        session_mode: row.get(20)?,
+        timeout_secs: row.get(21)?,
+    };
 
     // An action-less local todo has a NULL `action_kind`; only a present
     // discriminant decodes to an action (Exec round-trips even though the TUI
@@ -285,13 +302,13 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let sid = SessionId::default();
         let new = NewTask {
-            action: Some(AutomationAction::Send { session_id: sid }),
+            action: Some(AutomationAction::send_to(sid)),
             ..NewTask::local("Fix login")
         };
         let id = db.create_task(&new).unwrap();
         let got = db.get_task(id).unwrap().unwrap();
         match got.action {
-            Some(AutomationAction::Send { session_id }) => assert_eq!(session_id, sid),
+            Some(AutomationAction::Send { target }) => assert_eq!(target.id(), Some(sid)),
             other => panic!("expected send, got {other:?}"),
         }
     }
@@ -306,6 +323,8 @@ mod tests {
                 base_branch: Some("main".into()),
                 agent: Some("codex".into()),
                 extra_repos: Vec::new(),
+                host: None,
+                session_mode: Default::default(),
             }),
             ..NewTask::local("Refactor")
         };
@@ -318,6 +337,7 @@ mod tests {
                 base_branch,
                 agent,
                 extra_repos,
+                ..
             }) => {
                 assert_eq!(repo_path, PathBuf::from("/tmp/repo"));
                 assert_eq!(worktree_branch.as_deref(), Some("feat/task"));
@@ -351,6 +371,8 @@ mod tests {
                         base_branch: None,
                     },
                 ],
+                host: None,
+                session_mode: Default::default(),
             }),
             ..NewTask::local("Multi-repo")
         };
@@ -386,9 +408,7 @@ mod tests {
         let mut task = db.get_task(id).unwrap().unwrap();
         task.title = "new".into();
         task.status = TaskStatus::InProgress;
-        task.action = Some(AutomationAction::Send {
-            session_id: SessionId::default(),
-        });
+        task.action = Some(AutomationAction::send_to(SessionId::default()));
         db.update_task(&task).unwrap();
         let got = db.get_task(id).unwrap().unwrap();
         assert_eq!(got.title, "new");

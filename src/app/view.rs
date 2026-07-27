@@ -1708,9 +1708,10 @@ fn task_linkage(task: &crate::session::Task) -> String {
         // `None`, and the automation-only `Exec` (a task never carries one), are
         // plain local todos with no agent linkage to show.
         None | Some(AutomationAction::Exec { .. }) => "local todo".to_string(),
-        Some(AutomationAction::Send { session_id }) => {
-            format!("send → {}", short_session_id(session_id))
-        }
+        Some(AutomationAction::Send { target }) => match target {
+            crate::session::SendTarget::Id(id) => format!("send → {}", short_session_id(id)),
+            crate::session::SendTarget::Name(name) => format!("send → {name}"),
+        },
         Some(AutomationAction::Spawn {
             repo_path,
             worktree_branch,

@@ -824,9 +824,10 @@ mod tests {
                 enabled: true,
                 schedule: crate::session::AutomationSchedule::Once { at: u64::MAX },
                 timezone: None,
-                action: crate::session::AutomationAction::Send { session_id: id },
+                action: crate::session::AutomationAction::send_to(id),
                 prompt: "noop".into(),
                 next_run_at: Some(u64::MAX),
+                prompt_steps: Vec::new(),
             })
             .unwrap();
 

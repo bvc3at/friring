@@ -738,10 +738,47 @@ pub enum AutomationField {
     Target,
     Repo,
     Worktree,
+    /// Spawn action: base branch a new worktree forks from.
+    BaseBranch,
+    /// Spawn action: agent selector over the registry (cycled with ←/→).
     Agent,
+    /// Spawn action: host selector over `hosts.toml` (cycled with ←/→).
+    Host,
+    /// Spawn action: reuse one session or spawn a fresh one per fire.
+    SessionMode,
+    /// Spawn action: comma-separated extra repos (`path[@base]`), each on its
+    /// own worktree.
+    ExtraRepos,
+    /// Spawn action: comma-separated extra directories, attached as-is.
+    ExtraDirs,
     /// Exec action: shell command text.
     Command,
+    /// Exec action: seconds before the command is killed.
+    Timeout,
+    /// Which prompt step the `Prompt` field is editing (add/remove/reorder).
+    Step,
+    /// Settle delay after the current step, before the next one is pasted.
+    StepDelay,
     Prompt,
+}
+
+/// One prompt step being edited. The `Prompt` field edits
+/// [`text`](Self::text) for the currently selected step; `delay` overrides the
+/// settle time before the *next* step.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromptStepDraft {
+    pub text: TextArea,
+    /// Settle delay in milliseconds, as typed. Empty = the default.
+    pub delay: TextInput,
+}
+
+impl PromptStepDraft {
+    /// A draft holding `text` on the default delay.
+    fn from_text(text: &str) -> Self {
+        let mut draft = Self::default();
+        draft.text.set(text);
+        draft
+    }
 }
 
 /// Editor form for creating or editing an automation.
@@ -769,13 +806,23 @@ pub struct AutomationEditorModal {
     pub repo: TextInput,
     /// Spawn action: optional worktree branch.
     pub worktree: TextInput,
-    /// Spawn action: optional agent name.
-    pub agent: TextInput,
+    /// Spawn action: base branch a new worktree forks from (empty = `main`).
+    pub base_branch: TextInput,
+    /// Spawn action: comma-separated extra repos (`path[@base]`), each on its
+    /// own worktree off the shared branch.
+    pub extra_repos: TextInput,
+    /// Spawn action: comma-separated extra directories, attached as-is.
+    pub extra_dirs: TextInput,
+    /// Spawn action: reuse one session per automation, or spawn a fresh one.
+    pub session_mode: crate::session::SpawnSessionMode,
     /// Exec action: the shell command to run.
     pub command: TextInput,
-    /// Multi-line agent prompt (Send/Spawn). A `TextArea` so it accepts newlines
-    /// and renders wrapped, mirroring the task editor's description field.
-    pub prompt: TextArea,
+    /// Exec action: kill deadline in seconds, as typed. Empty = the default.
+    pub timeout: TextInput,
+    /// The ordered prompt steps (Send/Spawn). Always at least one.
+    pub steps: Vec<PromptStepDraft>,
+    /// Index into `steps` of the step the `Prompt`/`StepDelay` fields edit.
+    pub step_index: usize,
     pub enabled: bool,
     pub field: AutomationField,
     /// Send action: the running sessions available as targets (id + display
@@ -783,6 +830,15 @@ pub struct AutomationEditorModal {
     pub sessions: Vec<(crate::session::SessionId, String)>,
     /// Index into `sessions` of the selected Send target.
     pub target_index: usize,
+    /// Spawn action: selectable agent names, `""` first for "registry default".
+    /// Populated by the caller (the registry lives on `App`).
+    pub agents: Vec<String>,
+    /// Index into `agents` of the selected agent.
+    pub agent_index: usize,
+    /// Spawn action: selectable host names, `""` first for "local".
+    pub hosts: Vec<String>,
+    /// Index into `hosts` of the selected host.
+    pub host_index: usize,
 }
 
 /// Result of feeding a key to the automation editor — lets the caller decide
@@ -816,13 +872,24 @@ impl Default for AutomationEditorModal {
             action: AutomationActionKind::default(),
             repo: TextInput::default(),
             worktree: TextInput::default(),
-            agent: TextInput::default(),
+            base_branch: TextInput::default(),
+            extra_repos: TextInput::default(),
+            extra_dirs: TextInput::default(),
+            session_mode: crate::session::SpawnSessionMode::default(),
             command: TextInput::default(),
-            prompt: TextArea::default(),
+            timeout: TextInput::default(),
+            steps: vec![PromptStepDraft::default()],
+            step_index: 0,
             enabled: true,
             field: AutomationField::default(),
             sessions: Vec::new(),
             target_index: 0,
+            // `""` = the registry default; the caller replaces this with the
+            // real registry via `set_agents`.
+            agents: vec![String::new()],
+            agent_index: 0,
+            hosts: vec![String::new()],
+            host_index: 0,
         }
     }
 }
@@ -848,14 +915,97 @@ impl AutomationEditorModal {
         fields.push(Action);
         match self.action {
             AutomationActionKind::Send => fields.push(Target),
-            AutomationActionKind::Spawn => fields.extend([Repo, Worktree, Agent]),
-            AutomationActionKind::Exec => fields.push(Command),
+            AutomationActionKind::Spawn => fields.extend([
+                Repo,
+                Worktree,
+                BaseBranch,
+                Agent,
+                Host,
+                SessionMode,
+                ExtraRepos,
+                ExtraDirs,
+            ]),
+            AutomationActionKind::Exec => fields.extend([Command, Timeout]),
         }
         // Exec has no prompt (it runs a command, not an agent turn).
         if self.action != AutomationActionKind::Exec {
+            fields.push(Step);
+            // The settle delay only exists between steps.
+            if self.steps.len() > 1 {
+                fields.push(StepDelay);
+            }
             fields.push(Prompt);
         }
         fields
+    }
+
+    /// The prompt step the `Prompt`/`StepDelay` fields currently edit.
+    /// `steps` is never empty, so this always resolves.
+    pub fn current_step(&self) -> &PromptStepDraft {
+        let idx = self.step_index.min(self.steps.len().saturating_sub(1));
+        &self.steps[idx]
+    }
+
+    fn current_step_mut(&mut self) -> &mut PromptStepDraft {
+        let idx = self.step_index.min(self.steps.len().saturating_sub(1));
+        &mut self.steps[idx]
+    }
+
+    /// The prompt text of the selected step (what the `Prompt` field shows).
+    pub fn prompt(&self) -> &TextArea {
+        &self.current_step().text
+    }
+
+    /// Mutable access to the selected step's prompt text.
+    pub fn prompt_mut(&mut self) -> &mut TextArea {
+        &mut self.current_step_mut().text
+    }
+
+    /// Insert a blank step after the selected one and move to it.
+    pub fn add_step(&mut self) {
+        let at = (self.step_index + 1).min(self.steps.len());
+        self.steps.insert(at, PromptStepDraft::default());
+        self.step_index = at;
+    }
+
+    /// Remove the selected step. The last remaining step is cleared instead of
+    /// removed — an automation always has at least one prompt.
+    pub fn remove_step(&mut self) {
+        if self.steps.len() == 1 {
+            self.steps[0] = PromptStepDraft::default();
+            return;
+        }
+        self.steps.remove(self.step_index);
+        self.step_index = self.step_index.min(self.steps.len() - 1);
+    }
+
+    /// Move the selected step one position earlier (`-1`) or later (`+1`),
+    /// keeping the selection on it. A no-op at the ends.
+    pub fn move_step(&mut self, delta: i32) {
+        let target = self.step_index as i32 + delta;
+        if target < 0 || target as usize >= self.steps.len() {
+            return;
+        }
+        let target = target as usize;
+        self.steps.swap(self.step_index, target);
+        self.step_index = target;
+    }
+
+    /// The prompt steps as they would be persisted: trimmed text, parsed
+    /// per-step delays, and blank trailing steps dropped. `None` when nothing
+    /// survives (an all-blank prompt), which the caller reports as a validation
+    /// error.
+    pub fn build_steps(&self) -> Option<Vec<crate::session::PromptStep>> {
+        let steps: Vec<crate::session::PromptStep> = self
+            .steps
+            .iter()
+            .filter(|s| !s.text.value().trim().is_empty())
+            .map(|s| crate::session::PromptStep {
+                text: s.text.value().trim().to_string(),
+                delay_ms: s.delay.value().trim().parse().ok(),
+            })
+            .collect();
+        (!steps.is_empty()).then_some(steps)
     }
 
     /// Move focus to the next visible field (wraps).
@@ -879,11 +1029,16 @@ impl AutomationEditorModal {
             Timezone => &mut self.timezone,
             Repo => &mut self.repo,
             Worktree => &mut self.worktree,
-            Agent => &mut self.agent,
+            BaseBranch => &mut self.base_branch,
+            ExtraRepos => &mut self.extra_repos,
+            ExtraDirs => &mut self.extra_dirs,
             Command => &mut self.command,
+            Timeout => &mut self.timeout,
+            StepDelay => &mut self.current_step_mut().delay,
             // Prompt is a multi-line `TextArea`, handled explicitly in
             // `handle_key`, not as a single-line `TextInput`.
-            Prompt | Trigger | Weekday | Hour | Minute | Action | Target => return None,
+            Prompt | Trigger | Weekday | Hour | Minute | Action | Target | Agent | Host
+            | SessionMode | Step => return None,
         })
     }
 
@@ -893,7 +1048,7 @@ impl AutomationEditorModal {
         use AutomationField::*;
         matches!(
             self.field,
-            Trigger | Weekday | Hour | Minute | Action | Target
+            Trigger | Weekday | Hour | Minute | Action | Target | Agent | Host | SessionMode | Step
         )
     }
 
@@ -906,15 +1061,39 @@ impl AutomationEditorModal {
             Weekday => self.weekday = wrap_add(self.weekday, delta, 7),
             Hour => self.hour = wrap_add(self.hour, delta, 24),
             Minute => self.minute = wrap_add(self.minute, delta, 60),
-            Target => {
-                let len = self.sessions.len();
-                if len > 0 {
-                    self.target_index =
-                        wrap_add(self.target_index as u32, delta, len as u32) as usize;
+            Target => self.target_index = wrap_index(self.target_index, delta, self.sessions.len()),
+            Agent => self.agent_index = wrap_index(self.agent_index, delta, self.agents.len()),
+            Host => self.host_index = wrap_index(self.host_index, delta, self.hosts.len()),
+            SessionMode => {
+                self.session_mode = match self.session_mode {
+                    crate::session::SpawnSessionMode::Reuse => {
+                        crate::session::SpawnSessionMode::Fresh
+                    }
+                    crate::session::SpawnSessionMode::Fresh => {
+                        crate::session::SpawnSessionMode::Reuse
+                    }
                 }
             }
+            // ←/→ walk the step list; adding/removing/reordering is on the
+            // letter chords in `handle_step_key`.
+            Step => self.step_index = wrap_index(self.step_index, delta, self.steps.len()),
             _ => {}
         }
+    }
+
+    /// Step chords on the `Step` field: `n` adds a step after the current one,
+    /// `d` deletes it, `[`/`]` move it earlier/later. Returns whether the key was
+    /// consumed. Safe to bind letters here — `Step` is a selector, so nothing
+    /// types into it.
+    fn handle_step_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('n') => self.add_step(),
+            KeyCode::Char('d') => self.remove_step(),
+            KeyCode::Char('[') => self.move_step(-1),
+            KeyCode::Char(']') => self.move_step(1),
+            _ => return false,
+        }
+        true
     }
 
     /// Feed a key to the editor, mutating field state. Returns whether the caller
@@ -944,7 +1123,7 @@ impl AutomationEditorModal {
         // rather than leaking literal letters. Mirrors the task editor's
         // description field.
         if self.field == AutomationField::Prompt {
-            if apply_ctrl_line_edit(&mut self.prompt, code, mods) {
+            if apply_ctrl_line_edit(&mut self.current_step_mut().text, code, mods) {
                 return EditorOutcome::Continue;
             }
             match code {
@@ -952,14 +1131,16 @@ impl AutomationEditorModal {
                 KeyCode::Tab => self.next_field(),
                 KeyCode::BackTab => self.prev_field(),
                 _ => {
-                    handle_textarea_key(&mut self.prompt, code);
+                    let step = self.current_step_mut();
+                    handle_textarea_key(&mut step.text, code);
                 }
             }
             return EditorOutcome::Continue;
         }
 
         // Selector/stepper fields (trigger, weekday, hour, minute, action,
-        // target) are adjusted with ←/→/Space; text fields edit as usual.
+        // target, agent, host, session mode, step) are adjusted with ←/→/Space;
+        // text fields edit as usual.
         let adjustable = self.is_adjustable();
         match code {
             KeyCode::Esc => return EditorOutcome::Cancel,
@@ -968,6 +1149,7 @@ impl AutomationEditorModal {
             KeyCode::BackTab | KeyCode::Up => self.prev_field(),
             KeyCode::Left if adjustable => self.adjust(-1),
             KeyCode::Right | KeyCode::Char(' ') if adjustable => self.adjust(1),
+            other if self.field == AutomationField::Step && self.handle_step_key(other) => {}
             other => {
                 apply_text_input_key(self.active_field_mut(), other, mods);
             }
@@ -992,6 +1174,57 @@ impl AutomationEditorModal {
     /// are available.
     pub fn selected_target(&self) -> Option<&(crate::session::SessionId, String)> {
         self.sessions.get(self.target_index)
+    }
+
+    /// Populate the agent selector from the registry and select `selected`.
+    ///
+    /// A leading `""` entry is the "registry default" choice. An agent the row
+    /// still names but the registry no longer has is appended rather than
+    /// silently reset, so opening the editor never rewrites the stored value
+    /// behind the user's back — saving is what rejects it.
+    pub fn set_agents(&mut self, mut names: Vec<String>, selected: Option<&str>) {
+        names.insert(0, String::new());
+        if let Some(sel) = selected.filter(|s| !s.is_empty()) {
+            if !names.iter().any(|n| n == sel) {
+                names.push(sel.to_string());
+            }
+        }
+        self.agent_index = selected
+            .and_then(|sel| names.iter().position(|n| n == sel))
+            .unwrap_or(0);
+        self.agents = names;
+    }
+
+    /// The selected agent name, or `None` for the registry default.
+    pub fn selected_agent(&self) -> Option<&str> {
+        self.agents
+            .get(self.agent_index)
+            .map(String::as_str)
+            .filter(|n| !n.is_empty())
+    }
+
+    /// Populate the host selector from `hosts.toml` and select `selected`. A
+    /// leading `""` entry is "local"; an unknown stored host is kept the same
+    /// way [`set_agents`](Self::set_agents) keeps an unknown agent.
+    pub fn set_hosts(&mut self, mut names: Vec<String>, selected: Option<&str>) {
+        names.insert(0, String::new());
+        if let Some(sel) = selected.filter(|s| !s.is_empty()) {
+            if !names.iter().any(|n| n == sel) {
+                names.push(sel.to_string());
+            }
+        }
+        self.host_index = selected
+            .and_then(|sel| names.iter().position(|n| n == sel))
+            .unwrap_or(0);
+        self.hosts = names;
+    }
+
+    /// The selected host name, or `None` for a local spawn.
+    pub fn selected_host(&self) -> Option<&str> {
+        self.hosts
+            .get(self.host_index)
+            .map(String::as_str)
+            .filter(|n| !n.is_empty())
     }
 
     /// Cycle through Send → Spawn → Exec actions.
@@ -1086,7 +1319,17 @@ impl AutomationEditorModal {
         if let Some(tz) = &auto.timezone {
             m.timezone.set(tz);
         }
-        m.prompt.set(&auto.prompt);
+        m.steps = auto
+            .steps()
+            .iter()
+            .map(|step| {
+                let mut draft = PromptStepDraft::from_text(&step.text);
+                if let Some(ms) = step.delay_ms {
+                    draft.delay.set(&ms.to_string());
+                }
+                draft
+            })
+            .collect();
         match &auto.action {
             AutomationAction::Send { .. } => {
                 m.action = AutomationActionKind::Send;
@@ -1096,7 +1339,9 @@ impl AutomationEditorModal {
             AutomationAction::Spawn {
                 repo_path,
                 worktree_branch,
-                agent,
+                base_branch,
+                extra_repos,
+                session_mode,
                 ..
             } => {
                 m.action = AutomationActionKind::Spawn;
@@ -1104,22 +1349,94 @@ impl AutomationEditorModal {
                 if let Some(w) = worktree_branch {
                     m.worktree.set(w);
                 }
-                if let Some(a) = agent {
-                    m.agent.set(a);
+                if let Some(b) = base_branch {
+                    m.base_branch.set(b);
                 }
+                m.session_mode = *session_mode;
+                m.extra_repos.set(&format_extra_repos(extra_repos, true));
+                m.extra_dirs.set(&format_extra_repos(extra_repos, false));
+                // The agent + host selectors are filled in by the caller via
+                // `set_agents` / `set_hosts` (the registries live on `App`).
             }
-            AutomationAction::Exec { command } => {
+            AutomationAction::Exec {
+                command,
+                timeout_secs,
+            } => {
                 m.action = AutomationActionKind::Exec;
                 m.command.set(command);
+                if let Some(secs) = timeout_secs {
+                    m.timeout.set(&secs.to_string());
+                }
             }
         }
         m
     }
 }
 
+/// Render the worktree (`worktree = true`) or attached-dir half of an extra-repo
+/// list as the comma-separated text the editor's `ExtraRepos`/`ExtraDirs` fields
+/// use. A worktree extra with its own base renders as `path@base`.
+fn format_extra_repos(extras: &[crate::session::ExtraRepo], worktree: bool) -> String {
+    extras
+        .iter()
+        .filter(|e| e.worktree == worktree)
+        .map(|e| match (&e.base_branch, worktree) {
+            (Some(base), true) => format!("{}@{base}", e.repo_path.display()),
+            _ => e.repo_path.display().to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Parse the editor's comma-separated extra-repo / extra-dir fields into the
+/// persisted list. Mirrors the CLI's `--add-repo path[@base]` / `--add-dir path`
+/// grammar so both authoring paths agree.
+pub fn parse_extra_repo_fields(repos: &str, dirs: &str) -> Vec<crate::session::ExtraRepo> {
+    let split = |s: &str| -> Vec<String> {
+        s.split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let mut out: Vec<crate::session::ExtraRepo> = split(repos)
+        .into_iter()
+        .map(|entry| {
+            let (path, base) = match entry.rsplit_once('@') {
+                Some((p, b)) if !p.is_empty() && !b.is_empty() => (p.to_string(), Some(b.into())),
+                _ => (entry, None),
+            };
+            crate::session::ExtraRepo {
+                repo_path: crate::paths::expand_tilde(&path),
+                worktree: true,
+                base_branch: base,
+            }
+        })
+        .collect();
+    out.extend(
+        split(dirs)
+            .into_iter()
+            .map(|path| crate::session::ExtraRepo {
+                repo_path: crate::paths::expand_tilde(&path),
+                worktree: false,
+                base_branch: None,
+            }),
+    );
+    out
+}
+
 /// Add `delta` to `v` modulo `modulus`, wrapping (e.g. hour 23 +1 → 0).
 fn wrap_add(v: u32, delta: i32, modulus: u32) -> u32 {
     (v as i32 + delta).rem_euclid(modulus as i32) as u32
+}
+
+/// Step a selector index by `delta`, wrapping within `len`. An empty list keeps
+/// index 0 (nothing to select).
+fn wrap_index(index: usize, delta: i32, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (index as i32 + delta).rem_euclid(len as i32) as usize
 }
 
 /// Format a millisecond duration as a compact, re-enterable string like
@@ -2030,7 +2347,9 @@ pub enum Modal {
     AgentPicker(crate::ui::agent_picker_modal::AgentPickerState),
     HostPicker(crate::ui::host_picker_modal::HostPickerState),
     RestoreSessions(RestoreSessionsModal),
-    AutomationEditor(AutomationEditorModal),
+    /// Boxed: the editor form is by far the largest modal payload, and
+    /// `Modal` is moved around per frame — see `clippy::large_enum_variant`.
+    AutomationEditor(Box<AutomationEditorModal>),
     AutomationsList(AutomationsListModal),
     RepoPicker(RepoPickerModal),
     ConversationPicker(super::cc_import::ConversationPickerModal),
@@ -2560,7 +2879,7 @@ mod tests {
     #[test]
     fn test_automation_editor_daily_field_order_for_send() {
         let mut modal = AutomationEditorModal::default(); // Daily + Send
-        let order: Vec<_> = (0..8)
+        let order: Vec<_> = (0..9)
             .map(|_| {
                 let f = modal.field;
                 modal.next_field();
@@ -2578,6 +2897,8 @@ mod tests {
                 AutomationField::Action,
                 // Send exposes a target-session selector after the action.
                 AutomationField::Target,
+                // The step selector precedes the prompt it scopes.
+                AutomationField::Step,
                 AutomationField::Prompt,
             ]
         );
@@ -2671,30 +2992,170 @@ mod tests {
         // A one-shot delay never shows a wall-clock timezone field.
         assert_eq!(
             fields(TriggerKind::Once),
-            vec![Name, Trigger, Delay, Action, Target, Prompt]
+            vec![Name, Trigger, Delay, Action, Target, Step, Prompt]
         );
         assert!(!fields(TriggerKind::Once).contains(&Timezone));
         // Wall-clock schedules carry a timezone and their time steppers.
         assert_eq!(
             fields(TriggerKind::Hourly),
-            vec![Name, Trigger, Minute, Timezone, Action, Target, Prompt]
+            vec![Name, Trigger, Minute, Timezone, Action, Target, Step, Prompt]
         );
         assert_eq!(
             fields(TriggerKind::Daily),
-            vec![Name, Trigger, Hour, Minute, Timezone, Action, Target, Prompt]
+            vec![Name, Trigger, Hour, Minute, Timezone, Action, Target, Step, Prompt]
         );
         assert_eq!(
             fields(TriggerKind::Weekdays),
-            vec![Name, Trigger, Hour, Minute, Timezone, Action, Target, Prompt]
+            vec![Name, Trigger, Hour, Minute, Timezone, Action, Target, Step, Prompt]
         );
         assert_eq!(
             fields(TriggerKind::Weekly),
-            vec![Name, Trigger, Weekday, Hour, Minute, Timezone, Action, Target, Prompt]
+            vec![Name, Trigger, Weekday, Hour, Minute, Timezone, Action, Target, Step, Prompt]
         );
         assert_eq!(
             fields(TriggerKind::Cron),
-            vec![Name, Trigger, CronExpr, Timezone, Action, Target, Prompt]
+            vec![Name, Trigger, CronExpr, Timezone, Action, Target, Step, Prompt]
         );
+    }
+
+    #[test]
+    fn prompt_steps_add_remove_and_reorder() {
+        let mut m = AutomationEditorModal::default();
+        m.prompt_mut().set("first");
+        m.add_step();
+        assert_eq!(m.step_index, 1, "adding moves onto the new step");
+        m.prompt_mut().set("second");
+        assert_eq!(m.steps.len(), 2);
+
+        // Reorder swaps the pair and follows the moved step.
+        m.move_step(-1);
+        assert_eq!(m.step_index, 0);
+        assert_eq!(m.prompt().value(), "second");
+        // A move past either end is a no-op, not a panic.
+        m.move_step(-1);
+        assert_eq!(m.step_index, 0);
+
+        m.remove_step();
+        assert_eq!(m.steps.len(), 1);
+        assert_eq!(m.prompt().value(), "first");
+        // Removing the last step clears it rather than leaving no prompt at all.
+        m.remove_step();
+        assert_eq!(m.steps.len(), 1);
+        assert_eq!(m.prompt().value(), "");
+    }
+
+    #[test]
+    fn step_field_binds_letters_to_list_edits() {
+        let mut m = AutomationEditorModal {
+            field: AutomationField::Step,
+            ..Default::default()
+        };
+        m.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(m.steps.len(), 2, "`n` adds a step");
+        m.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(m.steps.len(), 1, "`d` removes it");
+        // ←/→ still walk the list (the letters don't shadow the selector).
+        m.add_step();
+        m.handle_key(KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(m.step_index, 0);
+    }
+
+    #[test]
+    fn step_delay_field_only_appears_with_more_than_one_step() {
+        let mut m = AutomationEditorModal::default();
+        assert!(!m.visible_fields().contains(&AutomationField::StepDelay));
+        m.add_step();
+        assert!(m.visible_fields().contains(&AutomationField::StepDelay));
+    }
+
+    #[test]
+    fn build_steps_trims_and_drops_blanks() {
+        let mut m = AutomationEditorModal::default();
+        m.prompt_mut().set("  /model opus  ");
+        m.add_step();
+        m.prompt_mut().set("   "); // a blank step the user never filled in
+        m.add_step();
+        m.prompt_mut().set("go");
+        m.current_step_mut().delay.set("500");
+
+        let steps = m.build_steps().unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].text, "/model opus");
+        assert_eq!(steps[1].text, "go");
+        assert_eq!(steps[1].delay_ms, Some(500));
+
+        // An all-blank prompt yields nothing, so the caller can reject the save.
+        let mut m = AutomationEditorModal::default();
+        m.prompt_mut().set("   ");
+        assert!(m.build_steps().is_none());
+    }
+
+    #[test]
+    fn spawn_action_shows_the_host_and_extra_repo_fields() {
+        use AutomationField::*;
+        let m = AutomationEditorModal {
+            action: AutomationActionKind::Spawn,
+            ..Default::default()
+        };
+        let fields = m.visible_fields();
+        for f in [
+            Repo,
+            Worktree,
+            BaseBranch,
+            Agent,
+            Host,
+            SessionMode,
+            ExtraRepos,
+            ExtraDirs,
+        ] {
+            assert!(fields.contains(&f), "{f:?} should be visible for spawn");
+        }
+        // Exec swaps them for the command + its kill deadline, and no prompt.
+        let m = AutomationEditorModal {
+            action: AutomationActionKind::Exec,
+            ..Default::default()
+        };
+        let fields = m.visible_fields();
+        assert!(fields.contains(&Command));
+        assert!(fields.contains(&Timeout));
+        assert!(!fields.contains(&Prompt));
+        assert!(!fields.contains(&Step));
+    }
+
+    #[test]
+    fn agent_selector_keeps_an_agent_the_registry_lost() {
+        let mut m = AutomationEditorModal::default();
+        // Opening an automation whose agent was removed from agents.toml must
+        // not silently rewrite it to the default — saving is what rejects it.
+        m.set_agents(vec!["claude".into()], Some("retired"));
+        assert_eq!(m.selected_agent(), Some("retired"));
+        // The default choice is the leading empty entry.
+        m.set_agents(vec!["claude".into()], None);
+        assert_eq!(m.selected_agent(), None);
+    }
+
+    #[test]
+    fn host_selector_defaults_to_local() {
+        let mut m = AutomationEditorModal::default();
+        m.set_hosts(vec!["devbox".into(), "wsl".into()], None);
+        assert_eq!(m.selected_host(), None, "no host = local");
+        m.set_hosts(vec!["devbox".into()], Some("devbox"));
+        assert_eq!(m.selected_host(), Some("devbox"));
+    }
+
+    #[test]
+    fn extra_repo_fields_round_trip_through_the_cli_grammar() {
+        let extras = parse_extra_repo_fields("/a@main, /b", "/docs");
+        assert_eq!(extras.len(), 3);
+        assert!(extras[0].worktree);
+        assert_eq!(extras[0].base_branch.as_deref(), Some("main"));
+        assert!(extras[1].worktree);
+        assert_eq!(extras[1].base_branch, None);
+        assert!(!extras[2].worktree);
+
+        // ...and back out to the two editor fields.
+        assert_eq!(format_extra_repos(&extras, true), "/a@main, /b");
+        assert_eq!(format_extra_repos(&extras, false), "/docs");
     }
 
     #[test]
@@ -2873,14 +3334,20 @@ mod tests {
                 base_branch: None,
                 agent: Some("codex".into()),
                 extra_repos: Vec::new(),
+                host: None,
+                session_mode: Default::default(),
             },
             prompt: "triage".into(),
             created_at: 0,
             updated_at: 0,
             last_run_at: None,
             next_run_at: None,
+            prompt_steps: Vec::new(),
         };
-        let modal = AutomationEditorModal::from_automation(&auto);
+        let mut modal = AutomationEditorModal::from_automation(&auto);
+        // The agent selector is populated by the caller, which owns the
+        // registry (`App::populate_editor_registries`).
+        modal.set_agents(vec!["claude".into(), "codex".into()], Some("codex"));
         assert_eq!(modal.editing_id, Some(7));
         assert!(!modal.enabled);
         // `0 9 * * 1-5` is recognized as the Weekdays preset at 09:00.
@@ -2890,7 +3357,7 @@ mod tests {
         assert_eq!(modal.action, AutomationActionKind::Spawn);
         assert_eq!(modal.repo.value(), "/tmp/repo");
         assert_eq!(modal.worktree.value(), "feat/x");
-        assert_eq!(modal.agent.value(), "codex");
+        assert_eq!(modal.selected_agent().unwrap_or_default(), "codex");
     }
 
     #[test]
@@ -3265,7 +3732,7 @@ mod tests {
             "Enter on the prompt inserts a newline, never saves"
         );
         m.handle_key(KeyCode::Char('b'), KeyModifiers::NONE);
-        assert_eq!(m.prompt.value(), "a\nb");
+        assert_eq!(m.prompt().value(), "a\nb");
     }
 
     #[test]
@@ -3286,16 +3753,16 @@ mod tests {
             field: AutomationField::Prompt,
             ..Default::default()
         };
-        m.prompt.set("a\nbb"); // cursor parks at the end → line 1
-        assert_eq!(m.prompt.cursor_line_col().0, 1);
+        m.prompt_mut().set("a\nbb"); // cursor parks at the end → line 1
+        assert_eq!(m.prompt().cursor_line_col().0, 1);
         m.handle_key(KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(
-            m.prompt.cursor_line_col().0,
+            m.prompt().cursor_line_col().0,
             0,
             "Up moves to the line above"
         );
         m.handle_key(KeyCode::Down, KeyModifiers::NONE);
-        assert_eq!(m.prompt.cursor_line_col().0, 1, "Down moves back");
+        assert_eq!(m.prompt().cursor_line_col().0, 1, "Down moves back");
         // Field navigation is unchanged: still on Prompt (Up/Down didn't nav).
         assert_eq!(m.field, AutomationField::Prompt);
     }
@@ -3316,7 +3783,7 @@ mod tests {
         m.handle_key(KeyCode::BackTab, KeyModifiers::NONE);
         assert_eq!(
             m.field,
-            AutomationField::Target,
+            AutomationField::Step,
             "BackTab steps to the prior field"
         );
     }
@@ -3336,7 +3803,7 @@ mod tests {
             !m.enabled,
             "Ctrl+E toggles enabled even while editing the prompt"
         );
-        assert_eq!(m.prompt.value(), "", "Ctrl+E is not inserted as text");
+        assert_eq!(m.prompt().value(), "", "Ctrl+E is not inserted as text");
     }
 
     #[test]

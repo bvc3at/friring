@@ -22,9 +22,12 @@ use rusqlite::{Connection, OptionalExtension};
 /// v42 adds `fingerprint` to `review_marks` (the semantic content hash that
 /// lets a diff rebuild drop "reviewed" marks whose file/hunk content changed);
 /// v43 adds `line_end` to `review_comments` (nullable — a range comment
-/// spans `line_no..=line_end` on one side of one file).
+/// spans `line_no..=line_end` on one side of one file); v44 widens automations
+/// (multi-step prompts, remote spawns, fresh-session-per-fire, send-by-name,
+/// exec timeouts, async exec run state) — every column nullable so a pre-v44
+/// row decodes to exactly its old behavior.
 /// Gaps in the step table are fine (there is no v18 step either).
-pub const SCHEMA_VERSION: u32 = 43;
+pub const SCHEMA_VERSION: u32 = 44;
 
 /// A single migration step: applied when the stored version is below `target`.
 type MigrationStep = (u32, fn(&Connection) -> rusqlite::Result<()>);
@@ -168,7 +171,12 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             last_run_at     INTEGER,
             next_run_at     INTEGER,
             action_extra_repos TEXT,
-            action_command  TEXT
+            action_command  TEXT,
+            action_target_name TEXT,
+            action_host     TEXT,
+            action_session_mode TEXT,
+            action_timeout_secs INTEGER,
+            prompt_steps    TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_automations_due
             ON automations(next_run_at)
@@ -180,7 +188,8 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             started_at         INTEGER NOT NULL,
             status             TEXT NOT NULL,
             detail             TEXT NOT NULL DEFAULT '',
-            related_session_id TEXT
+            related_session_id TEXT,
+            finished_at        INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_automation_runs_automation
             ON automation_runs(automation_id, started_at);
@@ -218,7 +227,11 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             deleted_at      INTEGER,
             description     TEXT,
             action_extra_repos TEXT,
-            action_command  TEXT
+            action_command  TEXT,
+            action_target_name TEXT,
+            action_host     TEXT,
+            action_session_mode TEXT,
+            action_timeout_secs INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_tasks_status
             ON tasks(status) WHERE deleted_at IS NULL;
@@ -355,6 +368,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         (41, migrate_v41_workspace_dir),
         (42, migrate_v42_review_mark_fingerprint),
         (43, migrate_v43_review_comment_line_end),
+        (44, migrate_v44_automation_reach),
     ];
 
     for &(target, step) in steps {
@@ -1264,6 +1278,29 @@ fn migrate_v43_review_comment_line_end(conn: &Connection) -> rusqlite::Result<()
     add_column_if_absent(conn, "review_comments", "line_end", "INTEGER")
 }
 
+/// v43 → v44: widen automations.
+///
+/// The four `action_*` columns land on **both** `tasks` and `automations`: the
+/// two tables share one action-column group (see
+/// [`crate::storage::ActionColumns`]), so a column missing on either side would
+/// break the shared encoder. `prompt_steps` and `finished_at` are
+/// automations-only (a task's prompt is derived, and only an automation records
+/// runs).
+///
+/// Every column is nullable with no default, so an existing row keeps decoding
+/// to the pre-v44 behavior: an id `Send` target, a local single-session `Spawn`,
+/// an `Exec` on the default timeout, and one prompt step.
+fn migrate_v44_automation_reach(conn: &Connection) -> rusqlite::Result<()> {
+    for table in ["tasks", "automations"] {
+        add_column_if_absent(conn, table, "action_target_name", "TEXT")?;
+        add_column_if_absent(conn, table, "action_host", "TEXT")?;
+        add_column_if_absent(conn, table, "action_session_mode", "TEXT")?;
+        add_column_if_absent(conn, table, "action_timeout_secs", "INTEGER")?;
+    }
+    add_column_if_absent(conn, "automations", "prompt_steps", "TEXT")?;
+    add_column_if_absent(conn, "automation_runs", "finished_at", "INTEGER")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1931,6 +1968,94 @@ mod tests {
                 .unwrap();
             assert!(exists, "{table}.action_command should be added at v36");
         }
+
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn migrate_from_v43_widens_automations_and_keeps_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Minimal v43 state with one send automation and one run recorded by
+        // the pre-v44 shape.
+        conn.execute_batch(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO metadata (key, value) VALUES ('schema_version', '43');
+             CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'todo', created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL, deleted_at INTEGER);
+             CREATE TABLE automations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1, schedule_kind TEXT NOT NULL,
+                schedule_spec TEXT NOT NULL, action_kind TEXT NOT NULL,
+                prompt TEXT NOT NULL, created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL);
+             INSERT INTO automations
+                (name, schedule_kind, schedule_spec, action_kind, prompt,
+                 created_at, updated_at)
+                VALUES ('nightly', 'cron', '0 9 * * *', 'send', 'run tests', 1, 1);
+             CREATE TABLE automation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, automation_id INTEGER NOT NULL,
+                started_at INTEGER NOT NULL, status TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '');
+             INSERT INTO automation_runs (automation_id, started_at, status, detail)
+                VALUES (1, 5, 'success', 'sent');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let has = |table: &str, column: &str| -> bool {
+            conn.prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('{table}') WHERE name='{column}'"
+            ))
+            .unwrap()
+            .exists([])
+            .unwrap()
+        };
+        for table in ["tasks", "automations"] {
+            for column in [
+                "action_target_name",
+                "action_host",
+                "action_session_mode",
+                "action_timeout_secs",
+            ] {
+                assert!(
+                    has(table, column),
+                    "{table}.{column} should be added at v44"
+                );
+            }
+        }
+        assert!(has("automations", "prompt_steps"));
+        assert!(has("automation_runs", "finished_at"));
+
+        // Every new column is nullable, so the existing rows survive untouched
+        // and still decode to the pre-v44 behavior.
+        let (prompt, steps, mode): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT prompt, prompt_steps, action_session_mode FROM automations WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(prompt, "run tests");
+        assert_eq!(steps, None);
+        assert_eq!(mode, None);
+        let finished: Option<i64> = conn
+            .query_row(
+                "SELECT finished_at FROM automation_runs WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(finished, None);
 
         let version: String = conn
             .query_row(

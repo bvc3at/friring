@@ -1,8 +1,9 @@
 //! Automations — named, schedulable agent runs.
 //!
 //! An automation fires on a schedule (one-shot or recurring cron) and, when it
-//! fires, either pastes a prompt into an existing session (`Send`) or spawns a
-//! new session — optionally on a fresh git worktree — and prompts it (`Spawn`).
+//! fires, delivers an ordered list of prompt steps to an existing session
+//! (`Send`) or to a session it spawns — optionally on a fresh git worktree,
+//! optionally on a remote host (`Spawn`).
 //!
 //! This module is pure data + schedule math (no local crate imports), matching
 //! the architecture rule for `session`. Persistence lives in
@@ -39,6 +40,47 @@ pub struct ExtraRepo {
     pub base_branch: Option<String>,
 }
 
+/// Default settle delay between two prompt steps, in milliseconds.
+///
+/// A step is a *separate* paste + Enter, not a newline in one paste (a
+/// bracketed paste submits as a single prompt). The gap has to outlast the
+/// agent CLI reacting to the previous submission — most importantly a slash
+/// command like `/model`, which opens an autocomplete popup that must settle
+/// and close before the next paste lands, or the next step is typed into the
+/// popup's filter instead of the prompt box.
+pub const DEFAULT_STEP_DELAY_MS: u64 = 1_200;
+
+/// One prompt in an automation's ordered delivery list.
+///
+/// The whole list is persisted as JSON in the `prompt_steps` column; a
+/// single-step automation stores `NULL` there and keeps using the plain
+/// `prompt` column, so existing rows stay byte-identical (the
+/// `action_extra_repos` precedent).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptStep {
+    /// The text pasted for this step (submitted with its own Enter).
+    pub text: String,
+    /// Settle delay *after* this step before the next one is pasted.
+    /// `None` = [`DEFAULT_STEP_DELAY_MS`]. Ignored on the last step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
+}
+
+impl PromptStep {
+    /// A step with the default settle delay.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            delay_ms: None,
+        }
+    }
+
+    /// Settle delay after this step, falling back to [`DEFAULT_STEP_DELAY_MS`].
+    pub fn delay(&self) -> u64 {
+        self.delay_ms.unwrap_or(DEFAULT_STEP_DELAY_MS)
+    }
+}
+
 /// A persisted automation definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Automation {
@@ -49,14 +91,58 @@ pub struct Automation {
     /// IANA timezone name (e.g. `"Europe/Zurich"`). `None` = system local time.
     pub timezone: Option<String>,
     pub action: AutomationAction,
-    /// Text sent to the target session when the automation fires.
+    /// First prompt sent to the target session when the automation fires. Also
+    /// the *only* prompt when [`prompt_steps`](Self::prompt_steps) is empty —
+    /// read through [`steps`](Self::steps) rather than directly.
     pub prompt: String,
+    /// The full ordered prompt list. Empty = the single [`prompt`](Self::prompt)
+    /// above (every pre-v44 row, and any automation the user never gave a
+    /// second step).
+    pub prompt_steps: Vec<PromptStep>,
     pub created_at: u64,
     pub updated_at: u64,
     pub last_run_at: Option<u64>,
     /// Next fire time (unix millis). `None` once a one-shot has fired or a
     /// schedule can no longer produce an occurrence.
     pub next_run_at: Option<u64>,
+}
+
+impl Automation {
+    /// The prompt steps to deliver, in order. Falls back to a single step built
+    /// from [`prompt`](Self::prompt) when no multi-step list is stored, so every
+    /// firing path can treat single- and multi-step automations identically.
+    pub fn steps(&self) -> Vec<PromptStep> {
+        if self.prompt_steps.is_empty() {
+            vec![PromptStep::new(self.prompt.clone())]
+        } else {
+            self.prompt_steps.clone()
+        }
+    }
+
+    /// The session name a `Spawn` fire targets.
+    ///
+    /// [`SpawnSessionMode::Reuse`] always yields `auto-<id>`, so later fires land
+    /// in the same conversation. [`SpawnSessionMode::Fresh`] appends a
+    /// timestamp derived from the fire time (`auto-<id>-<YYYYmmdd-HHMMSS>`, UTC)
+    /// so each run starts clean; claim-based firing makes that unique without a
+    /// counter, since two fires can never share a millisecond-level claim.
+    pub fn session_name(&self, fire_millis: u64) -> String {
+        match self.action.spawn_session_mode() {
+            SpawnSessionMode::Reuse => format!("auto-{}", self.id),
+            SpawnSessionMode::Fresh => {
+                format!("auto-{}-{}", self.id, fire_suffix(fire_millis))
+            }
+        }
+    }
+}
+
+/// Format a fire timestamp as the `YYYYmmdd-HHMMSS` suffix of a fresh-session
+/// name. UTC keeps the suffix stable across DST and host timezone changes.
+fn fire_suffix(fire_millis: u64) -> String {
+    Utc.timestamp_millis_opt(fire_millis as i64)
+        .single()
+        .map(|dt| dt.format("%Y%m%d-%H%M%S").to_string())
+        .unwrap_or_else(|| fire_millis.to_string())
 }
 
 /// When an automation fires.
@@ -124,11 +210,86 @@ impl AutomationSchedule {
     }
 }
 
+/// Which session a `Send` action delivers to.
+///
+/// A session **id** is exact but dies with the session: force-deleting the
+/// session disables every automation pointing at it
+/// (`Database::disable_send_automations_for_session`). A session **name**
+/// survives — it is re-resolved at fire time, so an automation keeps working
+/// against a session that was closed and recreated under the same name (the
+/// behavior extension-declared automations already got by re-linking).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendTarget {
+    /// Exactly this session, by id.
+    Id(SessionId),
+    /// Whichever session currently carries this name.
+    Name(String),
+}
+
+impl SendTarget {
+    /// The targeted session id, or `None` for a name target (resolved at fire
+    /// time against the live session list).
+    pub fn id(&self) -> Option<SessionId> {
+        match self {
+            Self::Id(id) => Some(*id),
+            Self::Name(_) => None,
+        }
+    }
+
+    /// The targeted session name, or `None` for an id target.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::Id(_) => None,
+            Self::Name(name) => Some(name),
+        }
+    }
+
+    /// Human label for the target (`<uuid>` or `name:<name>`).
+    pub fn label(&self) -> String {
+        match self {
+            Self::Id(id) => id.to_string(),
+            Self::Name(name) => format!("name:{name}"),
+        }
+    }
+}
+
+/// Whether a recurring `Spawn` keeps one long-lived session or starts a new one
+/// per fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpawnSessionMode {
+    /// Reuse `auto-<id>` on every fire, so runs pile into one conversation.
+    /// The pre-v44 behavior and still the default.
+    #[default]
+    Reuse,
+    /// Spawn a brand-new session per fire, so each run starts clean. See
+    /// [`Automation::session_name`] for the naming scheme.
+    Fresh,
+}
+
+impl SpawnSessionMode {
+    /// Storage value (`action_session_mode` column). `Reuse` stores `NULL`, so
+    /// pre-v44 rows decode to the unchanged default.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reuse => "reuse",
+            Self::Fresh => "fresh",
+        }
+    }
+
+    /// Parse a stored / CLI value; unknown values fall back to `Reuse`.
+    pub fn from_str_or_default(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fresh" => Self::Fresh,
+            _ => Self::Reuse,
+        }
+    }
+}
+
 /// What an automation does when it fires.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutomationAction {
-    /// Paste the prompt into an existing running session.
-    Send { session_id: SessionId },
+    /// Paste the prompt steps into an existing running session.
+    Send { target: SendTarget },
     /// Spawn a new session (optionally on a fresh worktree) and prompt it.
     ///
     /// A single-repo spawn leaves `extra_repos` empty (the common case). When it
@@ -144,6 +305,11 @@ pub enum AutomationAction {
         agent: Option<String>,
         /// Additional repositories spanned by this session (empty = single-repo).
         extra_repos: Vec<ExtraRepo>,
+        /// Host name from `hosts.toml`; `None` = local. The worktree, the tmux
+        /// window and the prompt delivery all happen on that host.
+        host: Option<String>,
+        /// Reuse one session across fires, or spawn a fresh one each time.
+        session_mode: SpawnSessionMode,
     },
     /// Run a shell command headlessly (`sh -c <command>`), no agent/session.
     ///
@@ -151,8 +317,18 @@ pub enum AutomationAction {
     /// extensions): the command is run by friring's automation scheduler — TUI
     /// and headless `automation tick` alike — and its exit status is recorded in
     /// the run history. There is no model in the loop.
-    Exec { command: String },
+    Exec {
+        command: String,
+        /// Kill the command after this many seconds. `None` =
+        /// [`DEFAULT_EXEC_TIMEOUT_SECS`].
+        timeout_secs: Option<u64>,
+    },
 }
+
+/// How long an `Exec` automation may run before it is killed. Generous enough
+/// for a real sync job, finite so a hung command can't pin a `Running` row (and,
+/// before the async move, the whole render loop) forever.
+pub const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 900;
 
 impl AutomationAction {
     /// Storage discriminant (`action_kind` column).
@@ -163,11 +339,38 @@ impl AutomationAction {
             Self::Exec { .. } => "exec",
         }
     }
+
+    /// Convenience constructor for the common "send to this exact session" case.
+    pub fn send_to(session_id: SessionId) -> Self {
+        Self::Send {
+            target: SendTarget::Id(session_id),
+        }
+    }
+
+    /// The `Spawn` session-reuse policy; `Reuse` for every other action.
+    pub fn spawn_session_mode(&self) -> SpawnSessionMode {
+        match self {
+            Self::Spawn { session_mode, .. } => *session_mode,
+            _ => SpawnSessionMode::Reuse,
+        }
+    }
+
+    /// The host this action runs on (`Spawn` only); `None` = local.
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            Self::Spawn { host, .. } => host.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 /// Outcome of a single automation fire, kept for history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutomationRunStatus {
+    /// The action was started but hasn't finished. Only an `Exec` run is ever
+    /// recorded this way: it runs off the tick thread and updates its own row
+    /// on completion, so a long command shows history while it runs.
+    Running,
     Success,
     Error,
     Skipped,
@@ -176,6 +379,7 @@ pub enum AutomationRunStatus {
 impl AutomationRunStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Running => "running",
             Self::Success => "success",
             Self::Error => "error",
             Self::Skipped => "skipped",
@@ -186,10 +390,16 @@ impl AutomationRunStatus {
     /// `Error`.
     pub fn from_db(s: &str) -> Self {
         match s {
+            "running" => Self::Running,
             "success" => Self::Success,
             "skipped" => Self::Skipped,
             _ => Self::Error,
         }
+    }
+
+    /// Whether the run has reached a final state (everything but `Running`).
+    pub fn is_final(self) -> bool {
+        !matches!(self, Self::Running)
     }
 }
 
@@ -205,6 +415,9 @@ pub struct AutomationRun {
     /// Session this run sent to / spawned, when one exists. `None` on
     /// pre-v28 rows (the TUI falls back to parsing `detail` for those).
     pub related_session_id: Option<super::SessionId>,
+    /// When the run reached a final status (unix millis). `None` while it is
+    /// still `Running`, and on every pre-v44 row.
+    pub finished_at: Option<u64>,
 }
 
 /// A scheduling preset offered in the CLI/TUI. Each compiles to a cron string.
@@ -297,6 +510,187 @@ pub fn parse_trigger(
     Ok(AutomationSchedule::Cron {
         expr: preset_to_cron(preset, hour, minute, dow),
     })
+}
+
+/// Resolved preview of what an automation *would* do on its next fire, as
+/// ordered `(label, value)` pairs — the schedule and its next occurrence, the
+/// resolved target / spawn parameters / host, and every prompt step in delivery
+/// order. Fires nothing and touches no session.
+///
+/// Shared by the TUI dry-run overlay and `friring-cli automation dry-run` so
+/// both describe the same plan; `now_millis` anchors the next-fire computation.
+pub fn dry_run_plan(auto: &Automation, now_millis: u64) -> Vec<(String, String)> {
+    let mut rows = vec![
+        ("name".to_string(), auto.name.clone()),
+        (
+            "enabled".to_string(),
+            if auto.enabled { "yes" } else { "no" }.to_string(),
+        ),
+        (
+            "schedule".to_string(),
+            format!("{} ({})", auto.schedule.kind(), auto.schedule.spec()),
+        ),
+        (
+            "timezone".to_string(),
+            auto.timezone.clone().unwrap_or_else(|| "(local)".into()),
+        ),
+        (
+            "next fire".to_string(),
+            auto.schedule
+                .next_after(now_millis, auto.timezone.as_deref())
+                .map(|at| format_fire_time(at, auto.timezone.as_deref()))
+                .unwrap_or_else(|| "never (no further occurrence)".into()),
+        ),
+        ("action".to_string(), auto.action.kind().to_string()),
+    ];
+    rows.extend(action_plan_rows(auto, now_millis));
+    if !matches!(auto.action, AutomationAction::Exec { .. }) {
+        let steps = auto.steps();
+        let total = steps.len();
+        for (i, step) in steps.iter().enumerate() {
+            rows.push((format!("step {}/{total}", i + 1), step.text.clone()));
+            // The delay after the last step is never waited on.
+            if i + 1 < total {
+                rows.push((
+                    format!("  then wait {}", i + 1),
+                    format!("{} ms", step.delay()),
+                ));
+            }
+        }
+    }
+    rows
+}
+
+/// The action-specific rows of a [`dry_run_plan`] — resolved target, spawn
+/// parameters + host, or the exec command and its timeout.
+fn action_plan_rows(auto: &Automation, now_millis: u64) -> Vec<(String, String)> {
+    match &auto.action {
+        AutomationAction::Send { target } => match target {
+            SendTarget::Id(id) => vec![("target session".into(), id.to_string())],
+            SendTarget::Name(name) => vec![(
+                "target session".into(),
+                format!("{name} (resolved by name at fire time)"),
+            )],
+        },
+        AutomationAction::Spawn {
+            repo_path,
+            worktree_branch,
+            base_branch,
+            agent,
+            extra_repos,
+            host,
+            session_mode,
+        } => {
+            let fire_at = auto
+                .schedule
+                .next_after(now_millis, auto.timezone.as_deref())
+                .unwrap_or(now_millis);
+            let mut rows = vec![
+                (
+                    "host".into(),
+                    host.clone().unwrap_or_else(|| "(local)".into()),
+                ),
+                ("session".into(), {
+                    let name = auto.session_name(fire_at);
+                    match session_mode {
+                        SpawnSessionMode::Reuse => format!("{name} (reused across fires)"),
+                        SpawnSessionMode::Fresh => format!("{name} (fresh per fire)"),
+                    }
+                }),
+                ("repo".into(), repo_path.display().to_string()),
+                (
+                    "worktree".into(),
+                    match worktree_branch {
+                        Some(b) => format!(
+                            "{} off {}",
+                            spawn_branch_for(b, *session_mode, fire_at),
+                            base_branch.as_deref().unwrap_or("main")
+                        ),
+                        None => "(repo root)".into(),
+                    },
+                ),
+                (
+                    "agent".into(),
+                    agent.clone().unwrap_or_else(|| "(registry default)".into()),
+                ),
+            ];
+            for extra in extra_repos {
+                rows.push((
+                    "extra repo".into(),
+                    format!(
+                        "{} ({})",
+                        extra.repo_path.display(),
+                        if extra.worktree {
+                            format!(
+                                "worktree off {}",
+                                extra.base_branch.as_deref().unwrap_or("—")
+                            )
+                        } else {
+                            "attached dir".into()
+                        }
+                    ),
+                ));
+            }
+            rows
+        }
+        AutomationAction::Exec {
+            command,
+            timeout_secs,
+        } => vec![
+            ("command".into(), command.clone()),
+            (
+                "timeout".into(),
+                format!("{} s", timeout_secs.unwrap_or(DEFAULT_EXEC_TIMEOUT_SECS)),
+            ),
+        ],
+    }
+}
+
+/// The worktree branch a `Spawn` fire uses.
+///
+/// [`SpawnSessionMode::Fresh`] suffixes the configured branch with the same
+/// fire stamp as the session name: two concurrently-live fresh sessions must not
+/// share one worktree, and `create_or_attach_worktree` is idempotent — it would
+/// happily hand the second run the first run's checkout.
+pub fn spawn_branch_for(branch: &str, mode: SpawnSessionMode, fire_millis: u64) -> String {
+    match mode {
+        SpawnSessionMode::Reuse => branch.to_string(),
+        SpawnSessionMode::Fresh => format!("{branch}-{}", fire_suffix(fire_millis)),
+    }
+}
+
+/// Format an absolute fire time in the automation's timezone (system local when
+/// unset), for the dry-run preview.
+fn format_fire_time(at_millis: u64, timezone: Option<&str>) -> String {
+    let Some(utc) = Utc.timestamp_millis_opt(at_millis as i64).single() else {
+        return at_millis.to_string();
+    };
+    match timezone.and_then(|tz| chrono_tz::Tz::from_str(tz).ok()) {
+        Some(tz) => utc
+            .with_timezone(&tz)
+            .format("%Y-%m-%d %H:%M:%S %Z")
+            .to_string(),
+        None => utc
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S %Z")
+            .to_string(),
+    }
+}
+
+/// Validate an IANA timezone name against `chrono-tz`.
+///
+/// The schedule math silently falls back to system local time for an
+/// unrecognized name (`next_after`), which turns a typo into an automation that
+/// fires hours off with no signal — so every authoring path (TUI editor, CLI
+/// create/edit, manifest import) rejects it up front instead.
+pub fn validate_timezone(tz: &str) -> Result<(), String> {
+    let tz = tz.trim();
+    if tz.is_empty() || chrono_tz::Tz::from_str(tz).is_ok() {
+        return Ok(());
+    }
+    Err(format!(
+        "unknown timezone `{tz}` (use an IANA name like Europe/Zurich or UTC)"
+    ))
 }
 
 /// Parse a relative duration like `30m`, `2h`, `1h30m`, `45s`, or `1d` into
@@ -537,5 +931,195 @@ mod tests {
         // Sunday 0 -> 1; star untouched.
         assert_eq!(normalize_cron("0 9 * * 0"), "0 0 9 * * 1");
         assert_eq!(normalize_cron("30 * * * *"), "0 30 * * * *");
+    }
+
+    fn sample(action: AutomationAction) -> Automation {
+        Automation {
+            id: 3,
+            name: "nightly".into(),
+            enabled: true,
+            schedule: AutomationSchedule::Cron {
+                expr: "0 9 * * *".into(),
+            },
+            timezone: Some("UTC".into()),
+            action,
+            prompt: "do it".into(),
+            prompt_steps: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+            last_run_at: None,
+            next_run_at: None,
+        }
+    }
+
+    fn spawn(session_mode: SpawnSessionMode) -> AutomationAction {
+        AutomationAction::Spawn {
+            repo_path: PathBuf::from("/repo"),
+            worktree_branch: Some("auto/nightly".into()),
+            base_branch: None,
+            agent: Some("claude".into()),
+            extra_repos: Vec::new(),
+            host: None,
+            session_mode,
+        }
+    }
+
+    #[test]
+    fn steps_falls_back_to_the_single_prompt_column() {
+        // Every pre-v44 row: one step, taken from `prompt`.
+        let auto = sample(AutomationAction::send_to(SessionId::default()));
+        assert_eq!(auto.steps(), vec![PromptStep::new("do it")]);
+        assert_eq!(auto.steps()[0].delay(), DEFAULT_STEP_DELAY_MS);
+    }
+
+    #[test]
+    fn steps_prefers_the_multi_step_list() {
+        let mut auto = sample(AutomationAction::send_to(SessionId::default()));
+        auto.prompt_steps = vec![
+            PromptStep {
+                text: "/model opus".into(),
+                delay_ms: Some(2_000),
+            },
+            PromptStep::new("summarize my inbox"),
+        ];
+        let steps = auto.steps();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].delay(), 2_000);
+        assert_eq!(steps[1].delay(), DEFAULT_STEP_DELAY_MS);
+    }
+
+    #[test]
+    fn reuse_mode_keeps_one_session_name_across_fires() {
+        let auto = sample(spawn(SpawnSessionMode::Reuse));
+        assert_eq!(auto.session_name(MON_2024), "auto-3");
+        assert_eq!(auto.session_name(MON_2024 + 86_400_000), "auto-3");
+    }
+
+    #[test]
+    fn fresh_mode_stamps_the_session_and_branch_per_fire() {
+        let auto = sample(spawn(SpawnSessionMode::Fresh));
+        assert_eq!(auto.session_name(MON_2024), "auto-3-20240101-000000");
+        // A later fire lands on a different session...
+        assert_ne!(
+            auto.session_name(MON_2024),
+            auto.session_name(MON_2024 + 3_600_000)
+        );
+        // ...and its own branch, so two live runs never share a worktree.
+        assert_eq!(
+            spawn_branch_for("auto/nightly", SpawnSessionMode::Fresh, MON_2024),
+            "auto/nightly-20240101-000000"
+        );
+        assert_eq!(
+            spawn_branch_for("auto/nightly", SpawnSessionMode::Reuse, MON_2024),
+            "auto/nightly"
+        );
+    }
+
+    #[test]
+    fn validate_timezone_accepts_iana_and_empty_but_rejects_typos() {
+        assert!(validate_timezone("Europe/Zurich").is_ok());
+        assert!(validate_timezone("UTC").is_ok());
+        // Empty = "system local", the documented default.
+        assert!(validate_timezone("").is_ok());
+        let err = validate_timezone("Europe/Zurihc").unwrap_err();
+        assert!(err.contains("unknown timezone"), "got {err}");
+    }
+
+    #[test]
+    fn session_mode_round_trips_and_defaults() {
+        assert_eq!(
+            SpawnSessionMode::from_str_or_default("fresh"),
+            SpawnSessionMode::Fresh
+        );
+        assert_eq!(
+            SpawnSessionMode::from_str_or_default("reuse"),
+            SpawnSessionMode::Reuse
+        );
+        // An unknown (or pre-v44 NULL-decoded) value keeps the old behavior.
+        assert_eq!(
+            SpawnSessionMode::from_str_or_default("wat"),
+            SpawnSessionMode::Reuse
+        );
+        assert_eq!(SpawnSessionMode::default(), SpawnSessionMode::Reuse);
+    }
+
+    #[test]
+    fn send_target_labels_id_and_name_distinctly() {
+        let id = SessionId::default();
+        let by_id = SendTarget::Id(id);
+        assert_eq!(by_id.id(), Some(id));
+        assert_eq!(by_id.name(), None);
+        let by_name = SendTarget::Name("inbox".into());
+        assert_eq!(by_name.id(), None);
+        assert_eq!(by_name.name(), Some("inbox"));
+        assert_eq!(by_name.label(), "name:inbox");
+    }
+
+    #[test]
+    fn dry_run_plan_resolves_spawn_parameters_and_every_step() {
+        let mut auto = sample(spawn(SpawnSessionMode::Fresh));
+        auto.prompt_steps = vec![
+            PromptStep {
+                text: "/model opus".into(),
+                delay_ms: Some(2_000),
+            },
+            PromptStep::new("go"),
+        ];
+        let rows = dry_run_plan(&auto, MON_2024);
+        let get = |label: &str| {
+            rows.iter()
+                .find(|(k, _)| k == label)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("no `{label}` row in {rows:?}"))
+        };
+        assert_eq!(get("action"), "spawn");
+        assert_eq!(get("host"), "(local)");
+        assert!(get("session").contains("fresh per fire"));
+        assert!(get("worktree").starts_with("auto/nightly-"));
+        assert_eq!(get("agent"), "claude");
+        // Both steps appear, in order, with the settle delay between them.
+        assert_eq!(get("step 1/2"), "/model opus");
+        assert_eq!(get("  then wait 1"), "2000 ms");
+        assert_eq!(get("step 2/2"), "go");
+        // The last step's delay is never waited on, so it isn't shown.
+        assert!(!rows.iter().any(|(k, _)| k == "  then wait 2"));
+    }
+
+    #[test]
+    fn dry_run_plan_shows_a_name_target_and_exec_timeout() {
+        let auto = sample(AutomationAction::Send {
+            target: SendTarget::Name("inbox".into()),
+        });
+        let rows = dry_run_plan(&auto, MON_2024);
+        assert!(rows
+            .iter()
+            .any(|(k, v)| k == "target session" && v.contains("inbox")));
+
+        let auto = sample(AutomationAction::Exec {
+            command: "sync.sh".into(),
+            timeout_secs: None,
+        });
+        let rows = dry_run_plan(&auto, MON_2024);
+        assert!(rows
+            .iter()
+            .any(|(k, v)| k == "timeout" && v == &format!("{DEFAULT_EXEC_TIMEOUT_SECS} s")));
+        // An exec has no agent turn, so the plan lists no prompt steps.
+        assert!(!rows.iter().any(|(k, _)| k.starts_with("step ")));
+    }
+
+    #[test]
+    fn run_status_running_round_trips_and_is_not_final() {
+        assert_eq!(
+            AutomationRunStatus::from_db("running"),
+            AutomationRunStatus::Running
+        );
+        assert!(!AutomationRunStatus::Running.is_final());
+        assert!(AutomationRunStatus::Success.is_final());
+        assert!(AutomationRunStatus::Skipped.is_final());
+        // Anything unrecognized still decodes to Error, as before.
+        assert_eq!(
+            AutomationRunStatus::from_db("??"),
+            AutomationRunStatus::Error
+        );
     }
 }

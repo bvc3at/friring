@@ -14,7 +14,7 @@ pub mod theme_config;
 pub use agent_def::{AgentDef, AgentRegistry};
 pub use automation::{
     parse_hhmm, preset_to_cron, Automation, AutomationAction, AutomationRun, AutomationRunStatus,
-    AutomationSchedule, ExtraRepo, SchedulePreset,
+    AutomationSchedule, ExtraRepo, PromptStep, SchedulePreset, SendTarget, SpawnSessionMode,
 };
 pub use cc_activity::{
     CcActivity, CcAgent, CcAgentState, CcPhase, CcRunStatus, CcWorkflow, CcWorkflowSummary,

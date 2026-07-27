@@ -2186,14 +2186,13 @@ async fn info_panel_hides_automations_when_feature_off() {
         enabled: true,
         schedule: AutomationSchedule::Once { at: 0 },
         timezone: None,
-        action: AutomationAction::Send {
-            session_id: SessionId::default(),
-        },
+        action: AutomationAction::send_to(SessionId::default()),
         prompt: "p".into(),
         created_at: 0,
         updated_at: 0,
         last_run_at: None,
         next_run_at: Some(far_future),
+        prompt_steps: Vec::new(),
     }];
 
     // Feature on: the info panel's automations section lists it.
