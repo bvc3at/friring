@@ -12903,6 +12903,46 @@ mod tests {
     }
 
     #[test]
+    fn editing_a_send_by_name_automation_keeps_its_target() {
+        let mut app = app_with_sessions(1);
+        let new = crate::storage::automations::NewAutomation {
+            name: "by-name".to_string(),
+            enabled: true,
+            schedule: AutomationSchedule::Cron {
+                expr: "0 9 * * *".to_string(),
+            },
+            timezone: None,
+            action: AutomationAction::Send {
+                target: crate::session::SendTarget::Name("inbox".to_string()),
+            },
+            prompt: "ping".to_string(),
+            next_run_at: None,
+            prompt_steps: Vec::new(),
+        };
+        let id = app.db.create_automation(&new).unwrap();
+        app.refresh_automations();
+        app.focus = InputFocus::Automations;
+        app.automation_ui.automation_panel_index = 0;
+        app.sync_automation_editor();
+        app.focus = InputFocus::AutomationEditor;
+        // The target selector only offers running sessions, so "inbox" isn't in
+        // it — renaming must not retarget the automation at the first session.
+        if let Some(ed) = app.automation_ui.automation_editor.as_mut() {
+            ed.field = AutomationField::Name;
+            ed.name.set("renamed");
+        }
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        let saved = app.db.get_automation(id).unwrap().expect("row present");
+        assert_eq!(saved.name, "renamed");
+        assert_eq!(
+            saved.action,
+            AutomationAction::Send {
+                target: crate::session::SendTarget::Name("inbox".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn esc_in_pane_editor_discards_and_returns_to_list() {
         let mut app = app_with_sessions(1);
         add_test_automation(&mut app, "a");

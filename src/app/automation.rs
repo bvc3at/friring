@@ -525,6 +525,14 @@ impl App {
     ) -> Option<AutomationAction> {
         match m.action {
             modals::AutomationActionKind::Send => {
+                // The selector can only offer running sessions, so a name target
+                // (or an id whose session is closed) isn't in it. Saving an
+                // untouched selector must not retarget the automation.
+                if !m.target_dirty {
+                    if let Some(target) = m.original_target.clone() {
+                        return Some(AutomationAction::Send { target });
+                    }
+                }
                 let Some(session_id) = m.selected_target().map(|(id, _)| *id) else {
                     self.set_error("No target session — start a session first");
                     return None;

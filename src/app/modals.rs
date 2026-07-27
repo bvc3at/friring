@@ -830,6 +830,14 @@ pub struct AutomationEditorModal {
     pub sessions: Vec<(crate::session::SessionId, String)>,
     /// Index into `sessions` of the selected Send target.
     pub target_index: usize,
+    /// Send action: the target the automation was loaded with. A name target —
+    /// or an id whose session isn't running — has no entry in `sessions`, so the
+    /// selector falls back to the first session; keeping the original lets an
+    /// unrelated edit save without silently retargeting the automation.
+    pub original_target: Option<crate::session::SendTarget>,
+    /// Whether the user actually moved the `Target` selector. Only then does the
+    /// selection win over [`original_target`](Self::original_target).
+    pub target_dirty: bool,
     /// Spawn action: selectable agent names, `""` first for "registry default".
     /// Populated by the caller (the registry lives on `App`).
     pub agents: Vec<String>,
@@ -884,6 +892,8 @@ impl Default for AutomationEditorModal {
             field: AutomationField::default(),
             sessions: Vec::new(),
             target_index: 0,
+            original_target: None,
+            target_dirty: false,
             // `""` = the registry default; the caller replaces this with the
             // real registry via `set_agents`.
             agents: vec![String::new()],
@@ -1061,7 +1071,10 @@ impl AutomationEditorModal {
             Weekday => self.weekday = wrap_add(self.weekday, delta, 7),
             Hour => self.hour = wrap_add(self.hour, delta, 24),
             Minute => self.minute = wrap_add(self.minute, delta, 60),
-            Target => self.target_index = wrap_index(self.target_index, delta, self.sessions.len()),
+            Target => {
+                self.target_index = wrap_index(self.target_index, delta, self.sessions.len());
+                self.target_dirty = true;
+            }
             Agent => self.agent_index = wrap_index(self.agent_index, delta, self.agents.len()),
             Host => self.host_index = wrap_index(self.host_index, delta, self.hosts.len()),
             SessionMode => {
@@ -1331,8 +1344,9 @@ impl AutomationEditorModal {
             })
             .collect();
         match &auto.action {
-            AutomationAction::Send { .. } => {
+            AutomationAction::Send { target } => {
                 m.action = AutomationActionKind::Send;
+                m.original_target = Some(target.clone());
                 // The target list + selected index are filled in by the caller
                 // via `set_target_sessions` (it has the running-session list).
             }
