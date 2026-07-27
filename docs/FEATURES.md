@@ -1378,8 +1378,22 @@ step 3   Summarize my email history and file anything actionable.
 A `spawn` automation can target any host from `hosts.toml`
 (`--host <name>`, or the editor's `host` selector; omitted = local). The
 whole fire happens there: `session_ops::spawn` resolves the host into an
-`ssh:<host>` / `wsl:<host>` backend, so the worktree, the tmux window **and**
+`ssh:<host>` / `wsl:<host>` backend, so the session, the tmux window **and**
 the prompt delivery land on that machine.
+
+**A remote spawn runs in the repo root, not a worktree.** Saving a host together
+with a worktree branch (or a worktree extra-repo) is **rejected**, as is a `~`
+in a remote path. The reason is the TUI: `App::spawn_and_prompt` provisions
+through the local `git::create_or_attach_worktree` and expands `~` against the
+local home, so a remote worktree spawn would build the checkout on the wrong
+machine and hand the remote session a path that does not exist there. The
+headless path could do it (`create_worktree_on` is host-aware), but an
+automation that works from `automation tick` and quietly misbehaves from the TUI
+is worse than one that is refused up front — the three firing paths are supposed
+to be indistinguishable. Use an absolute path on the host and attach extra repos
+as plain directories. `session_ops::validate_spawn_action` is the single check,
+called by the editor, `automation create`/`edit`, `automation import`, and
+extension activation alike.
 
 Getting delivery right was the actual work. The headless one-shot helpers
 (`window_exists`, `send_prompt_now`, the deferred-prompt timer) used to hardcode

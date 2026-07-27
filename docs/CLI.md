@@ -75,7 +75,7 @@ current one.
 | `--worktree <branch>` | spawn | create/attach a worktree branch |
 | `--base <branch>` | spawn | fork point for a new worktree (default `main`) |
 | `--agent <name>` | spawn | agent from `agents.toml` (default: the registry default) |
-| `--host <name>` | spawn | host from `hosts.toml` to run on (default local) |
+| `--host <name>` | spawn | host from `hosts.toml` to run on (default local); needs an absolute path and rules out `--worktree` |
 | `--session-mode <reuse\|fresh>` | spawn | one session across fires, or a new one per fire |
 | `--add-repo <path[@base]>` | spawn | extra repo on its own worktree (repeatable) |
 | `--add-dir <path>` | spawn | extra directory attached as-is (repeatable) |

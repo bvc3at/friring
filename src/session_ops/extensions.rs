@@ -964,10 +964,8 @@ fn ensure_automation(
     // A manifest is an authoring path like any other, so hold it to the same
     // rule as `automation create`: a typo'd agent or host must fail at activate,
     // not silently launch the registry default on every fire.
-    if let AutomationAction::Spawn { agent, host, .. } = &action {
-        super::validate_spawn_selectors(agent.as_deref(), host.as_deref())
-            .map_err(|e| format!("automation '{}': {e}", auto.name))?;
-    }
+    super::validate_spawn_action(&action)
+        .map_err(|e| format!("automation '{}': {e}", auto.name))?;
     if let Some(row) = existing {
         // Re-link a send automation whose target session was recreated (a new id).
         if let (AutomationAction::Send { target: current }, Some(t)) = (&row.action, target) {

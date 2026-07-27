@@ -539,7 +539,7 @@ fn apply_action_overrides(
             return resolve_action(args, db);
         }
     }
-    Ok(match current {
+    let updated = match current {
         AutomationAction::Send { target } => AutomationAction::Send {
             target: match (&args.session, &args.session_name) {
                 (Some(s), _) => crate::session::SendTarget::Id(action::resolve_send_target(db, s)?),
@@ -560,7 +560,7 @@ fn apply_action_overrides(
             // unknown agent/host just as `create` can.
             let agent = override_optional(agent, &args.agent);
             let host = override_optional(host, &args.host);
-            crate::session_ops::validate_spawn_selectors(agent.as_deref(), host.as_deref())?;
+
             AutomationAction::Spawn {
                 repo_path: args
                     .repo
@@ -591,7 +591,9 @@ fn apply_action_overrides(
             command: args.command.clone().unwrap_or_else(|| command.clone()),
             timeout_secs: args.timeout.or(*timeout_secs),
         },
-    })
+    };
+    crate::session_ops::validate_spawn_action(&updated)?;
+    Ok(updated)
 }
 
 /// Apply an optional string override to an optional field: absent leaves the
@@ -1025,8 +1027,8 @@ fn resolve_action(args: &ActionArgs, db: &Database) -> Result<AutomationAction, 
     }
     if let Some(repo) = &args.repo {
         // Fail here rather than at fire time, hours later, in an error run.
-        crate::session_ops::validate_spawn_selectors(args.agent.as_deref(), args.host.as_deref())?;
-        return Ok(AutomationAction::Spawn {
+
+        let action = AutomationAction::Spawn {
             repo_path: repo.into(),
             worktree_branch: args.worktree.clone(),
             base_branch: args.base.clone(),
@@ -1035,7 +1037,9 @@ fn resolve_action(args: &ActionArgs, db: &Database) -> Result<AutomationAction, 
             host: args.host.clone().filter(|h| !h.is_empty()),
             session_mode: crate::session::SpawnSessionMode::parse(args.session_mode.as_deref())?
                 .unwrap_or_default(),
-        });
+        };
+        crate::session_ops::validate_spawn_action(&action)?;
+        return Ok(action);
     }
     match (&args.session, &args.session_name) {
         (Some(s), _) => Ok(AutomationAction::Send {
@@ -1179,12 +1183,9 @@ fn manifest_to_new_automation(
     )?;
     let schedule = parse_trigger(&decl.trigger, None, None)?;
     let action = decl.to_action(None)?;
-    // A manifest is authored by hand as often as it is exported, so its spawn
-    // selectors get the same check `create`/`edit` apply.
-    if let AutomationAction::Spawn { agent, host, .. } = &action {
-        crate::session::SpawnSessionMode::parse(decl.session_mode.as_deref())?;
-        crate::session_ops::validate_spawn_selectors(agent.as_deref(), host.as_deref())?;
-    }
+    // A manifest is authored by hand as often as it is exported, so it gets the
+    // same spawn checks `create`/`edit` apply.
+    crate::session_ops::validate_spawn_action(&action)?;
     let steps = decl.steps();
     if steps.is_empty() && !matches!(action, AutomationAction::Exec { .. }) {
         return Err(format!("automation '{}' has no prompt", decl.name));

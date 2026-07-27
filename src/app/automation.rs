@@ -539,39 +539,36 @@ impl App {
                     self.set_error("Repo path required for spawn action");
                     return None;
                 }
-                // A selector can only offer registry agents, but an automation
-                // edited after its agent was removed still carries the stale
-                // name — reject it here rather than at fire time, hours later.
-                let agent = m.selected_agent();
-                if let Some(name) = agent {
-                    if !self.agents.names().contains(&name) {
-                        self.set_error(format!("Unknown agent '{name}' — check agents.toml"));
-                        return None;
-                    }
-                }
                 let host = m.selected_host();
-                if let Some(name) = host {
-                    if self.hosts.get(name).is_none() {
-                        self.set_error(format!("Unknown host '{name}' — check hosts.toml"));
-                        return None;
-                    }
-                }
                 let worktree = m.worktree.value().trim();
                 let base = m.base_branch.value().trim();
-                Some(AutomationAction::Spawn {
-                    // Expand `~` so the stored path is absolute (git and the
-                    // session cwd don't expand it themselves).
-                    repo_path: crate::paths::expand_tilde(repo),
+                // `~` is expanded so the stored path is absolute (git and the
+                // session cwd don't expand it themselves) — but only for a local
+                // spawn; the validator below rejects `~` with a host, where it
+                // would resolve against the wrong machine's home.
+                let repo_path = match host {
+                    Some(_) => std::path::PathBuf::from(repo),
+                    None => crate::paths::expand_tilde(repo),
+                };
+                let action = AutomationAction::Spawn {
+                    repo_path,
                     worktree_branch: (!worktree.is_empty()).then(|| worktree.to_string()),
                     base_branch: (!base.is_empty()).then(|| base.to_string()),
-                    agent: agent.map(str::to_string),
+                    agent: m.selected_agent().map(str::to_string),
                     extra_repos: modals::parse_extra_repo_fields(
                         m.extra_repos.value(),
                         m.extra_dirs.value(),
                     ),
                     host: host.map(str::to_string),
                     session_mode: m.session_mode,
-                })
+                };
+                // One shared check with every other authoring path: unknown
+                // agent/host, and the unsupported remote-worktree combinations.
+                if let Err(e) = crate::session_ops::validate_spawn_action(&action) {
+                    self.set_error(e);
+                    return None;
+                }
+                Some(action)
             }
             modals::AutomationActionKind::Exec => {
                 let command = m.command.value().trim();

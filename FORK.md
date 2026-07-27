@@ -659,7 +659,11 @@ column nullable so pre-v44 rows keep their exact old behavior):
   Headless delivery emits the whole sequence as one `tmux run-shell` script, so
   the sub-second gaps survive (`run-shell -d` takes whole seconds only).
 - **Remote hosts.** A `spawn` automation takes a `hosts.toml` host, so the
-  worktree, the tmux window and the prompt delivery all land there. Upstream
+  session, the tmux window and the prompt delivery all land there. A remote
+  spawn runs in the repo root: a host combined with a worktree branch, a
+  worktree extra-repo, or a `~` path is rejected at save, because the TUI
+  provisions worktrees through the local git helper and would build the
+  checkout on the wrong machine. Upstream
   hard-codes `host: None` and its headless prompt helpers hard-code
   `local_mux_command`, so a remote automation would have spawned a session and
   typed into a window on the wrong machine. The fork routes those helpers

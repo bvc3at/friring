@@ -26,7 +26,71 @@ use std::collections::HashMap;
 
 use crate::session::{AutomationRunStatus, SessionConfig};
 
+/// Reject a `Spawn` automation that cannot fire as authored.
+///
+/// Takes the finished action rather than loose fields so every authoring path —
+/// the TUI editor, `automation create`/`edit`, `automation import`, and
+/// extension activation — enforces exactly the same rule by making one call. A
+/// per-site field check is how the paths drifted apart in the first place.
+///
+/// Non-`Spawn` actions are a no-op.
+///
+/// (`crate::agent::…` is reached by fully-qualified path only — `session_ops`
+/// may not `use` it; see `tests/architecture_rules.rs`.)
+pub fn validate_spawn_action(action: &crate::session::AutomationAction) -> Result<(), String> {
+    let crate::session::AutomationAction::Spawn {
+        repo_path,
+        worktree_branch,
+        agent,
+        extra_repos,
+        host,
+        ..
+    } = action
+    else {
+        return Ok(());
+    };
+    validate_spawn_selectors(agent.as_deref(), host.as_deref())?;
+
+    let Some(host) = host.as_deref().filter(|h| !h.is_empty()) else {
+        return Ok(());
+    };
+    // Worktree provisioning for a remote spawn is not supported. The TUI fires
+    // through the local `git::create_or_attach_worktree`, so it would create the
+    // checkout on the wrong machine and hand the remote session a path that does
+    // not exist there. Rejecting at save keeps every firing path agreeing on
+    // what an automation does, rather than having it work headlessly and quietly
+    // misbehave from the TUI.
+    if worktree_branch.is_some() {
+        return Err(format!(
+            "a spawn on host '{host}' cannot use a worktree branch — remote worktree \
+             provisioning is unsupported; drop the worktree to run in the repo root"
+        ));
+    }
+    if extra_repos.iter().any(|e| e.worktree) {
+        return Err(format!(
+            "a spawn on host '{host}' cannot use worktree extra-repos — remote worktree \
+             provisioning is unsupported; attach them as plain directories instead"
+        ));
+    }
+    // `~` is expanded against the *local* home before the row is stored, which
+    // silently points a remote spawn at a path belonging to this machine's user.
+    let home_relative = |p: &std::path::Path| {
+        let s = p.to_string_lossy();
+        s == "~" || s.starts_with("~/")
+    };
+    if home_relative(repo_path) || extra_repos.iter().any(|e| home_relative(&e.repo_path)) {
+        return Err(format!(
+            "a spawn on host '{host}' needs absolute paths — `~` resolves to this \
+             machine's home, not the host's"
+        ));
+    }
+    Ok(())
+}
+
 /// Reject a spawn naming an agent or host that isn't configured.
+///
+/// Prefer [`validate_spawn_action`], which applies this plus the remote-spawn
+/// rules to a finished action.
 ///
 /// Neither is checked downstream: agent resolution falls back to the
 /// registry default for an unknown name, so a typo would silently launch the
@@ -425,6 +489,7 @@ pub(crate) fn inject_friring_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::AutomationAction;
     use crate::session::SessionId;
 
     #[cfg(unix)]
