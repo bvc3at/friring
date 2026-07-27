@@ -603,6 +603,7 @@ impl App {
                 Ok(Some(mut auto)) => {
                     auto.name = new.name;
                     auto.prompt = new.prompt;
+                    auto.prompt_steps = new.prompt_steps;
                     auto.schedule = new.schedule;
                     auto.timezone = new.timezone;
                     auto.action = new.action;

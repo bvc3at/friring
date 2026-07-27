@@ -12877,6 +12877,32 @@ mod tests {
     }
 
     #[test]
+    fn editing_in_pane_persists_the_edited_prompt_steps() {
+        let mut app = app_with_sessions(1);
+        add_test_automation(&mut app, "a");
+        app.focus = InputFocus::Automations;
+        app.automation_ui.automation_panel_index = 0;
+        app.sync_automation_editor();
+        app.focus = InputFocus::AutomationEditor;
+        // Turn the single-step automation into a two-step one with a custom
+        // settle delay between the steps.
+        if let Some(ed) = app.automation_ui.automation_editor.as_mut() {
+            ed.steps[0].text.set("/model opus");
+            ed.steps[0].delay.set("1500");
+            ed.add_step();
+            ed.steps[1].text.set("do the work");
+            ed.field = AutomationField::Name;
+        }
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        let id = app.db.list_automations().unwrap()[0].id;
+        let saved = app.db.get_automation(id).unwrap().expect("row present");
+        let texts: Vec<&str> = saved.prompt_steps.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["/model opus", "do the work"]);
+        assert_eq!(saved.prompt_steps[0].delay_ms, Some(1500));
+        assert_eq!(saved.prompt_steps[1].delay_ms, None);
+    }
+
+    #[test]
     fn esc_in_pane_editor_discards_and_returns_to_list() {
         let mut app = app_with_sessions(1);
         add_test_automation(&mut app, "a");
