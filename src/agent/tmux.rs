@@ -2244,12 +2244,9 @@ mod tests {
 
     #[test]
     fn format_secs_renders_sub_second_delays() {
-        #[cfg(not(windows))]
-        {
-            assert_eq!(format_secs(1_200), "1.200");
-            assert_eq!(format_secs(500), "0.500");
-            assert_eq!(format_secs(2_000), "2.000");
-        }
+        assert_eq!(format_secs(1_200), "1.200");
+        assert_eq!(format_secs(500), "0.500");
+        assert_eq!(format_secs(2_000), "2.000");
     }
 
     // The control-mode primitives are re-exported through this module. Their
