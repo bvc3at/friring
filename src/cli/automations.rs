@@ -700,11 +700,15 @@ fn tick(db: &Database) -> Result<Value, String> {
             skipped.push(json!({ "id": auto.id, "reason": "claim-lost" }));
             continue;
         }
-        let is_exec = matches!(auto.action, AutomationAction::Exec { .. });
-        let (status, detail, related) = fire_headless(db, &auto, now);
+        let FireOutcome {
+            status,
+            detail,
+            related,
+            recorded,
+        } = fire_headless(db, &auto, now);
         // `exec` already owns a history row (recorded `Running`, then closed
         // out); every other action records its single row here.
-        if !is_exec {
+        if !recorded {
             let _ = db.record_automation_run(auto.id, status, &detail, related);
         }
         fired.push(json!({
@@ -723,21 +727,38 @@ fn tick(db: &Database) -> Result<Value, String> {
 /// prompt steps via a deferred tmux timer once the agent boots. Both route
 /// through the spawn's host (`MuxTarget`), so a remote automation types into the
 /// server that actually owns its window.
-fn fire_headless(
-    db: &Database,
-    auto: &Automation,
-    now: u64,
-) -> (AutomationRunStatus, String, Option<SessionId>) {
+fn fire_headless(db: &Database, auto: &Automation, now: u64) -> FireOutcome {
     // tmux helpers are reached via fully-qualified paths (no `use crate::agent`)
     // to keep the cli module free of an `agent` import — see
     // tests/architecture_rules.rs::cli_module_isolation.
     match &auto.action {
-        AutomationAction::Send { target } => fire_send(db, auto, target),
-        AutomationAction::Spawn { .. } => fire_spawn(db, auto, now),
+        AutomationAction::Send { target } => fire_send(db, auto, target).into(),
+        AutomationAction::Spawn { .. } => fire_spawn(db, auto, now).into(),
         AutomationAction::Exec {
             command,
             timeout_secs,
         } => fire_exec(db, auto.id, command, *timeout_secs),
+    }
+}
+
+/// What one headless fire produced.
+struct FireOutcome {
+    status: AutomationRunStatus,
+    detail: String,
+    related: Option<SessionId>,
+    /// Whether the action already wrote its own history row, so [`tick`] must
+    /// not append a second one for the same fire.
+    recorded: bool,
+}
+
+impl From<(AutomationRunStatus, String, Option<SessionId>)> for FireOutcome {
+    fn from((status, detail, related): (AutomationRunStatus, String, Option<SessionId>)) -> Self {
+        Self {
+            status,
+            detail,
+            related,
+            recorded: false,
+        }
     }
 }
 
@@ -753,19 +774,30 @@ fn fire_exec(
     automation_id: i64,
     command: &str,
     timeout_secs: Option<u64>,
-) -> (AutomationRunStatus, String, Option<SessionId>) {
+) -> FireOutcome {
     let run_id = db
         .record_automation_run(automation_id, AutomationRunStatus::Running, command, None)
         .ok();
     let (status, detail) = crate::session_ops::run_exec_command_with_timeout(command, timeout_secs);
-    if let Some(id) = run_id {
-        // Close out the `Running` row this fire already owns; `tick` skips its
-        // own record for exec so the fire keeps exactly one history entry.
-        if let Err(e) = db.finish_automation_run(id, status, &detail) {
-            tracing::warn!("Failed to finish automation run {id}: {e}");
-        }
+    // Close out the `Running` row this fire already owns, so the fire keeps
+    // exactly one history entry. If opening it failed, report `recorded: false`
+    // and let `tick` write the final row instead of losing the run entirely.
+    let recorded = match run_id {
+        Some(id) => match db.finish_automation_run(id, status, &detail) {
+            Ok(updated) => updated,
+            Err(e) => {
+                tracing::warn!("Failed to finish automation run {id}: {e}");
+                false
+            }
+        },
+        None => false,
+    };
+    FireOutcome {
+        status,
+        detail,
+        related: None,
+        recorded,
     }
-    (status, detail, None)
 }
 
 /// Execute a `send` automation: type the prompt steps into the target session's
@@ -1550,6 +1582,40 @@ mod tests {
         let out = import_automations(&db, &path, true).unwrap();
         assert_eq!(out.json["replaced"], json!(["sync"]));
         assert_eq!(db.list_automations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_exec_fire_keeps_exactly_one_history_row() {
+        let db = Database::open_in_memory().unwrap();
+        create_automation(
+            &db,
+            CreateArgs {
+                name: "sync".into(),
+                trigger: "at:1".into(),
+                time: None,
+                weekday: None,
+                timezone: None,
+                prompts: Vec::new(),
+                step_delay: None,
+                action: ActionArgs {
+                    command: Some("true".into()),
+                    ..ActionArgs::default()
+                },
+                disabled: false,
+            },
+        )
+        .unwrap();
+        let id = db.list_automations().unwrap()[0].id;
+        db.trigger_automation_now(id).unwrap();
+
+        tick(&db).unwrap();
+
+        // The `Running` row the fire opened is the row it closes out — `tick`
+        // must not append a second one for the same fire.
+        let runs = db.list_automation_runs(id, 10).unwrap();
+        assert_eq!(runs.len(), 1, "got {runs:?}");
+        assert_eq!(runs[0].status, AutomationRunStatus::Success);
+        assert!(runs[0].finished_at.is_some());
     }
 
     #[test]
