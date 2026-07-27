@@ -1417,10 +1417,11 @@ The command is killed at its deadline (`--timeout`, default 900 s), with its
 stdout/stderr drained on separate threads — polling the deadline while the
 child fills a pipe buffer would deadlock. A `running` row whose worker died
 with its process (a crash) is closed out as `interrupted` by
-`Database::reap_orphaned_automation_runs` on the next TUI startup; the cutoff is
-per run — its own automation's timeout plus a grace period — so neither a
-concurrent instance's healthy run nor a legitimately hour-long command is ever
-yanked out from under it.
+`Database::reap_orphaned_automation_runs` — on the next TUI startup, and on
+every headless `automation tick`, so a keeper-only install closes them out too.
+The cutoff is per run — its own automation's timeout plus a grace period — so
+neither a concurrent instance's healthy run nor a legitimately hour-long command
+is ever yanked out from under it.
 
 ### Execution model
 

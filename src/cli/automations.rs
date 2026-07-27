@@ -732,6 +732,15 @@ fn tick(db: &Database) -> Result<Value, String> {
     if let Err(e) = db.prune_old_messages() {
         tracing::debug!("prune_old_messages: {e}");
     }
+    // A `running` exec row whose worker died with its process would otherwise
+    // show as running forever. The TUI does this on startup, but a keeper /
+    // OS-timer install may never open one; the reaper's per-run age floor makes
+    // it safe to call from any dispatcher. Best-effort.
+    match db.reap_orphaned_automation_runs() {
+        Ok(n) if n > 0 => tracing::info!("Closed {n} automation run(s) left running by a crash"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("reap_orphaned_automation_runs: {e}"),
+    }
     let now = current_time_millis();
     let due = db
         .due_automations(now)
@@ -1848,6 +1857,40 @@ mod tests {
         assert_eq!(runs.len(), 1, "got {runs:?}");
         assert_eq!(runs[0].status, AutomationRunStatus::Success);
         assert!(runs[0].finished_at.is_some());
+    }
+
+    #[test]
+    fn tick_closes_out_a_stale_running_row() {
+        let db = Database::open_in_memory().unwrap();
+        create_automation(
+            &db,
+            CreateArgs {
+                action: ActionArgs {
+                    command: Some("true".into()),
+                    ..ActionArgs::default()
+                },
+                prompts: Vec::new(),
+                ..spawn_create("sync", ActionArgs::default())
+            },
+        )
+        .unwrap();
+        let id = db.list_automations().unwrap()[0].id;
+        let run = db
+            .record_automation_run(id, AutomationRunStatus::Running, "true", None)
+            .unwrap();
+        db.conn_ref()
+            .execute(
+                "UPDATE automation_runs SET started_at = 0 WHERE id = ?1",
+                [run],
+            )
+            .unwrap();
+
+        // A keeper-only install never opens the TUI, so `tick` has to do the
+        // reaping the TUI's startup pass would.
+        tick(&db).unwrap();
+        let listed = &db.list_automation_runs(id, 10).unwrap()[0];
+        assert_eq!(listed.status, AutomationRunStatus::Error);
+        assert!(listed.detail.contains("interrupted"), "got {listed:?}");
     }
 
     #[test]
