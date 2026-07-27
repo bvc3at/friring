@@ -923,22 +923,17 @@ pub fn ensure_extension(db: &Database, def: &ExtensionDef) -> Result<EnsureRepor
 
     for auto in &def.automations {
         auto.validate()?;
-        // An exec automation has no session; a send one resolves its target.
-        let target = if auto.command.is_some() {
-            None
-        } else {
-            let session_ref = auto.session_ref.as_deref().ok_or_else(|| {
-                format!(
-                    "automation '{}' has neither a command nor a session_ref",
-                    auto.name
-                )
-            })?;
-            Some(*session_ids.get(session_ref).ok_or_else(|| {
+        // Only a `session_ref` send needs binding to a session this pass just
+        // ensured; the exec, spawn and send-by-UUID flavours carry everything
+        // they need, and `validate` already rejected a declaration with none.
+        let target = match auto.session_ref.as_deref() {
+            Some(session_ref) => Some(*session_ids.get(session_ref).ok_or_else(|| {
                 format!(
                     "automation '{}' references unknown session '{session_ref}'",
                     auto.name
                 )
-            })?)
+            })?),
+            None => None,
         };
         ensure_automation(
             db,
@@ -1354,6 +1349,30 @@ mod tests {
         // A subsequent pass is a no-op now that the link is correct.
         let again = ensure_extension(&db, &def).unwrap();
         assert!(!again.created_anything(), "relink is idempotent");
+    }
+
+    #[test]
+    fn ensure_activates_a_declared_spawn_automation() {
+        let db = Database::open_in_memory().unwrap();
+        let mut def = flow_def();
+        // An exported spawn automation pasted into an extension.toml: no
+        // session_ref to bind, so it must not be treated as a send.
+        def.sessions.clear();
+        def.automations = vec![ExtensionAutomation {
+            name: "nightly".into(),
+            trigger: "daily".into(),
+            repo: Some("/tmp/repo".into()),
+            prompt: Some("go".into()),
+            ..ExtensionAutomation::default()
+        }];
+        let report = ensure_extension(&db, &def).unwrap();
+        assert_eq!(report.automations_created, ["nightly"]);
+        let autos = db.list_automations().unwrap();
+        assert!(
+            matches!(autos[0].action, AutomationAction::Spawn { .. }),
+            "got {:?}",
+            autos[0].action
+        );
     }
 
     #[test]
