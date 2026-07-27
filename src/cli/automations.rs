@@ -1207,7 +1207,6 @@ fn manifest_to_new_automation(
 /// Project a stored automation onto the manifest grammar for `export`.
 fn automation_to_manifest(a: &Automation) -> crate::session::ExtensionAutomation {
     use crate::session::{ExtensionAutomation, SpawnSessionMode};
-    let steps = a.steps();
     let mut decl = ExtensionAutomation {
         name: a.name.clone(),
         trigger: match &a.schedule {
@@ -1216,15 +1215,30 @@ fn automation_to_manifest(a: &Automation) -> crate::session::ExtensionAutomation
         },
         timezone: a.timezone.clone(),
         enabled: Some(a.enabled),
-        prompts: steps.iter().map(|s| s.text.clone()).collect(),
-        step_delay_ms: steps.first().and_then(|s| s.delay_ms),
         ..ExtensionAutomation::default()
     };
+    // Only an agent-turn action carries prompts. `Automation::steps` synthesizes
+    // a single empty step for an exec row, and `ExtensionAutomation::validate`
+    // rejects a `prompt` next to a `command` — so writing one here would make
+    // every exported exec fail its own import.
+    let set_prompts = |decl: &mut ExtensionAutomation| {
+        let steps = a.steps();
+        decl.step_delay_ms = steps.first().and_then(|s| s.delay_ms);
+        decl.prompts = steps.into_iter().map(|s| s.text).collect();
+        // The single-prompt form stays on `prompt`, so an exported one-step
+        // automation is byte-identical to a hand-written manifest entry.
+        if decl.prompts.len() == 1 {
+            decl.prompt = decl.prompts.pop();
+        }
+    };
     match &a.action {
-        AutomationAction::Send { target } => match target {
-            crate::session::SendTarget::Id(id) => decl.session_id = Some(id.to_string()),
-            crate::session::SendTarget::Name(name) => decl.session_ref = Some(name.clone()),
-        },
+        AutomationAction::Send { target } => {
+            set_prompts(&mut decl);
+            match target {
+                crate::session::SendTarget::Id(id) => decl.session_id = Some(id.to_string()),
+                crate::session::SendTarget::Name(name) => decl.session_ref = Some(name.clone()),
+            }
+        }
         AutomationAction::Spawn {
             repo_path,
             worktree_branch,
@@ -1234,6 +1248,7 @@ fn automation_to_manifest(a: &Automation) -> crate::session::ExtensionAutomation
             host,
             session_mode,
         } => {
+            set_prompts(&mut decl);
             decl.repo = Some(repo_path.display().to_string());
             decl.worktree = worktree_branch.clone();
             decl.base = base_branch.clone();
@@ -1250,11 +1265,6 @@ fn automation_to_manifest(a: &Automation) -> crate::session::ExtensionAutomation
             decl.command = Some(command.clone());
             decl.timeout_secs = *timeout_secs;
         }
-    }
-    // The single-prompt form stays on `prompt`, so an exported one-step
-    // automation is byte-identical to a hand-written manifest entry.
-    if decl.prompts.len() == 1 {
-        decl.prompt = decl.prompts.pop();
     }
     decl
 }
@@ -1659,6 +1669,47 @@ mod tests {
                 assert_eq!(*session_mode, crate::session::SpawnSessionMode::Fresh);
             }
             other => panic!("expected spawn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_exported_exec_re_imports() {
+        let db = Database::open_in_memory().unwrap();
+        create_automation(
+            &db,
+            CreateArgs {
+                action: ActionArgs {
+                    command: Some("sync.sh".into()),
+                    timeout: Some(60),
+                    ..ActionArgs::default()
+                },
+                prompts: Vec::new(),
+                ..spawn_create("sync", ActionArgs::default())
+            },
+        )
+        .unwrap();
+        let toml = export_automations(&db, None).unwrap().human;
+        let manifest: crate::session::extension_def::AutomationManifest =
+            toml::from_str(&toml).unwrap();
+        // An exec carrying a prompt is rejected by the manifest grammar, so the
+        // export must not write one.
+        manifest.automations[0].validate().unwrap();
+
+        let fresh = Database::open_in_memory().unwrap();
+        fresh
+            .create_automation(&manifest_to_new_automation(&manifest.automations[0]).unwrap())
+            .unwrap();
+        let got = &fresh.list_automations().unwrap()[0];
+        assert!(got.prompt.is_empty(), "got {:?}", got.prompt);
+        match &got.action {
+            AutomationAction::Exec {
+                command,
+                timeout_secs,
+            } => {
+                assert_eq!(command, "sync.sh");
+                assert_eq!(*timeout_secs, Some(60));
+            }
+            other => panic!("expected exec, got {other:?}"),
         }
     }
 
