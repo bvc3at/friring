@@ -271,11 +271,31 @@ impl SpawnSessionMode {
         }
     }
 
-    /// Parse a stored / CLI value; unknown values fall back to `Reuse`.
+    /// Parse a **stored** value; unknown values fall back to `Reuse`.
+    ///
+    /// Lenient on purpose: a pre-v44 row stores `NULL` here and must keep the
+    /// old behavior. Authoring paths want [`parse`](Self::parse) instead, so a
+    /// typo is an error rather than a silently reused session.
     pub fn from_str_or_default(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "fresh" => Self::Fresh,
             _ => Self::Reuse,
+        }
+    }
+
+    /// Parse an **authored** value (a `--session-mode` flag or a manifest's
+    /// `session_mode`) strictly. `None` stays `None` so a caller can tell
+    /// "unset" from "explicitly reuse".
+    pub fn parse(raw: Option<&str>) -> Result<Option<Self>, String> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "reuse" => Ok(Some(Self::Reuse)),
+            "fresh" => Ok(Some(Self::Fresh)),
+            other => Err(format!(
+                "invalid session mode `{other}` (use reuse or fresh)"
+            )),
         }
     }
 }

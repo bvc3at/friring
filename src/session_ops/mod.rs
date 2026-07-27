@@ -26,6 +26,39 @@ use std::collections::HashMap;
 
 use crate::session::{AutomationRunStatus, SessionConfig};
 
+/// Reject a spawn naming an agent or host that isn't configured.
+///
+/// Neither is checked downstream: agent resolution falls back to the
+/// registry default for an unknown name, so a typo would silently launch the
+/// wrong agent on every fire, and an unknown host only surfaces when the fire
+/// tries to reach it. Lives here rather than in `cli` so the CLI authoring
+/// paths and extension activation ([`ensure_extension`]) enforce the same rule
+/// — a manifest is as much an authoring path as a flag.
+///
+/// (`crate::agent::…` is reached by fully-qualified path only — `session_ops`
+/// may not `use` it; see `tests/architecture_rules.rs`.)
+pub fn validate_spawn_selectors(agent: Option<&str>, host: Option<&str>) -> Result<(), String> {
+    if let Some(name) = agent.map(str::trim).filter(|a| !a.is_empty()) {
+        let registry = crate::agent::agent_config::load_or_seed();
+        if !registry.names().contains(&name) {
+            return Err(format!(
+                "Unknown agent '{name}'. Configure it in agents.toml. Available: [{}]",
+                registry.names().join(", ")
+            ));
+        }
+    }
+    if let Some(name) = host.map(str::trim).filter(|h| !h.is_empty()) {
+        let registry = crate::agent::host_config::load_all();
+        if registry.get(name).is_none() {
+            return Err(format!(
+                "Unknown host '{name}'. Configure it in hosts.toml. Available: [{}]",
+                registry.names().join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Run an `Exec` automation's shell command headlessly (`sh -c`, or `cmd /C` on
 /// Windows) and report its outcome for the run history. No session/agent is
 /// involved — this is the deterministic-scheduled-job path shared by the TUI and

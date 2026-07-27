@@ -356,10 +356,11 @@ impl ExtensionAutomation {
                 agent: self.agent.clone(),
                 extra_repos: self.extra_repos.clone(),
                 host: self.host.clone(),
-                session_mode: self
-                    .session_mode
-                    .as_deref()
-                    .map(SpawnSessionMode::from_str_or_default)
+                // Strict: this value was *authored* (a manifest or an import),
+                // so a typo must fail loudly rather than silently reusing one
+                // session forever.
+                session_mode: SpawnSessionMode::parse(self.session_mode.as_deref())
+                    .map_err(|e| format!("automation '{}': {e}", self.name))?
                     .unwrap_or_default(),
             });
         }
@@ -489,10 +490,20 @@ impl ExtensionDef {
             }
         }
         // An exec automation's command typically calls a script under the home
-        // dir (e.g. `{home}/sync.sh`); resolve it to an absolute path.
+        // dir (e.g. `{home}/sync.sh`), and a spawn automation's repos are
+        // usually the extension's own checkout (`{home}/repo`); resolve both to
+        // absolute paths. A `repo` left unresolved is not a cosmetic problem —
+        // it is persisted verbatim and fails on every fire.
         for a in &mut out.automations {
             if let Some(cmd) = &a.command {
                 a.command = Some(cmd.replace(HOME_TOKEN, home));
+            }
+            if let Some(repo) = &a.repo {
+                a.repo = Some(repo.replace(HOME_TOKEN, home));
+            }
+            for extra in &mut a.extra_repos {
+                let p = extra.repo_path.to_string_lossy().replace(HOME_TOKEN, home);
+                extra.repo_path = PathBuf::from(p);
             }
         }
         out
@@ -717,6 +728,52 @@ prompt = "tick"
             requires_dir: None,
         };
         assert_eq!(defaulted.source_path(), "settings.json");
+    }
+
+    #[test]
+    fn resolved_for_home_substitutes_spawn_repo_paths() {
+        // A spawn automation's repos are usually the extension's own checkout.
+        // Left unresolved, the literal `{home}` is persisted and every fire
+        // fails on a path that does not exist.
+        let def: ExtensionDef = toml::from_str(
+            "name = \"x\"\n[[automations]]\nname = \"nightly\"\ntrigger = \"daily\"\n\
+             repo = \"{home}/repo\"\nprompt = \"go\"\n\
+             [[automations.extra_repos]]\nrepo_path = \"{home}/docs\"\nworktree = false\n",
+        )
+        .unwrap();
+        let resolved = def.resolved_for_home("/home/me/x");
+        assert_eq!(
+            resolved.automations[0].repo.as_deref(),
+            Some("/home/me/x/repo")
+        );
+        assert_eq!(
+            resolved.automations[0].extra_repos[0].repo_path,
+            PathBuf::from("/home/me/x/docs")
+        );
+    }
+
+    #[test]
+    fn to_action_rejects_an_unrecognized_session_mode() {
+        // A manifest is authored, so a typo must fail loudly rather than
+        // silently reusing one session forever.
+        let decl = ExtensionAutomation {
+            name: "nightly".into(),
+            trigger: "daily".into(),
+            repo: Some("/repo".into()),
+            session_mode: Some("frehs".into()),
+            prompt: Some("go".into()),
+            ..ExtensionAutomation::default()
+        };
+        let err = decl.to_action(None).unwrap_err();
+        assert!(err.contains("frehs"), "got {err}");
+        // The two valid values still parse.
+        for mode in ["reuse", "fresh"] {
+            let decl = ExtensionAutomation {
+                session_mode: Some(mode.into()),
+                ..decl.clone()
+            };
+            assert!(decl.to_action(None).is_ok(), "{mode} should parse");
+        }
     }
 
     #[test]

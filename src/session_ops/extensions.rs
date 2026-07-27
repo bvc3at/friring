@@ -961,6 +961,13 @@ fn ensure_automation(
     // The declared action, with a `session_ref` bound to the id of the session
     // this pass just ensured (so the row points at the live session, not a name).
     let action = auto.to_action(target.map(crate::session::SendTarget::Id))?;
+    // A manifest is an authoring path like any other, so hold it to the same
+    // rule as `automation create`: a typo'd agent or host must fail at activate,
+    // not silently launch the registry default on every fire.
+    if let AutomationAction::Spawn { agent, host, .. } = &action {
+        super::validate_spawn_selectors(agent.as_deref(), host.as_deref())
+            .map_err(|e| format!("automation '{}': {e}", auto.name))?;
+    }
     if let Some(row) = existing {
         // Re-link a send automation whose target session was recreated (a new id).
         if let (AutomationAction::Send { target: current }, Some(t)) = (&row.action, target) {
@@ -1381,6 +1388,51 @@ mod tests {
             "got {:?}",
             autos[0].action
         );
+    }
+
+    #[test]
+    fn ensure_rejects_a_spawn_naming_an_unconfigured_agent() {
+        // A manifest is an authoring path: a typo'd agent must fail at activate
+        // rather than silently launching the registry default on every fire,
+        // exactly as `automation create` does.
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let db = Database::open_in_memory().unwrap();
+        let mut def = flow_def();
+        def.sessions.clear();
+        def.automations = vec![ExtensionAutomation {
+            name: "nightly".into(),
+            trigger: "daily".into(),
+            repo: Some("/tmp/repo".into()),
+            agent: Some("ghost-agent".into()),
+            prompt: Some("go".into()),
+            ..ExtensionAutomation::default()
+        }];
+        let err = ensure_extension(&db, &def).unwrap_err();
+        assert!(err.contains("ghost-agent"), "got {err}");
+        assert!(
+            db.list_automations().unwrap().is_empty(),
+            "a rejected declaration must not leave a row behind"
+        );
+    }
+
+    #[test]
+    fn ensure_rejects_a_spawn_naming_an_unconfigured_host() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let db = Database::open_in_memory().unwrap();
+        let mut def = flow_def();
+        def.sessions.clear();
+        def.automations = vec![ExtensionAutomation {
+            name: "nightly".into(),
+            trigger: "daily".into(),
+            repo: Some("/tmp/repo".into()),
+            host: Some("ghost-host".into()),
+            prompt: Some("go".into()),
+            ..ExtensionAutomation::default()
+        }];
+        let err = ensure_extension(&db, &def).unwrap_err();
+        assert!(err.contains("ghost-host"), "got {err}");
     }
 
     #[test]
