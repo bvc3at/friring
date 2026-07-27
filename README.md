@@ -874,22 +874,34 @@ Scheduled agent runs, persisted to the shared DB. See
 friring-cli automation create \
   --name nightly-triage \
   --trigger weekdays --time 09:00 \
-  --session <uuid> --prompt "triage new issues"
+  --repo ~/dev/app --agent claude --session-mode fresh \
+  --prompt '/model opus' --prompt 'triage new issues' --step-delay 2000
 friring-cli automation list
 friring-cli automation show <id>
-friring-cli automation edit <id> --prompt "..." --disabled
+friring-cli automation dry-run <id>      # what the next fire would do
+friring-cli automation edit <id> --command "sync.sh" --timeout 300
 friring-cli automation remove <id>
 friring-cli automation run <id>          # mark due for the next tick
 friring-cli automation runs <id> --limit 20   # run history
+friring-cli automation export --id <id> > nightly.toml
+friring-cli automation import nightly.toml --replace
 friring-cli automation tick              # fire all due automations now
 ```
 
 `--trigger` accepts `hourly`, `daily`, `weekdays`, `weekly`,
-`cron:"<expr>"`, or `at:<unix_millis>`. A `--session` makes it a
-*send* automation; a `--repo` (with optional `--worktree` / `--base`
-/ `--agent`) makes it a *spawn* automation. `automation tick` is the
-headless entry point the tmux heartbeat keeper and any
-systemd/cron timer call to fire due automations without a TUI.
+`cron:"<expr>"`, or `at:<unix_millis>`. The action is picked by
+`--session <uuid>` / `--session-name <name>` (*send*), `--repo`
+(*spawn*, with `--worktree` / `--base` / `--agent` / `--host` /
+`--session-mode reuse|fresh` / `--add-repo` / `--add-dir`), or
+`--command` (*exec*, with `--timeout` seconds). `edit` takes the same
+flags and switches an automation's action **kind in place**. Repeat
+`--prompt` for a multi-step delivery — each step is its own
+submission, `--step-delay` sets the gap. `dry-run` resolves the whole
+plan without firing; `export`/`import` round-trip the
+`[[automations]]` TOML manifest grammar extensions already use.
+`automation tick` is the headless entry point the tmux heartbeat
+keeper and any systemd/cron timer call to fire due automations
+without a TUI. Full flag table: [`docs/CLI.md`](docs/CLI.md).
 
 ### Tasks (alias `todo`)
 
