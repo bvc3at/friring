@@ -1133,7 +1133,11 @@ fn import_automations(db: &Database, file: &str, replace: bool) -> Result<Comman
         .map(|a| (a.name, a.id))
         .collect();
 
+    // Convert everything before touching the database: `--replace` deletes the
+    // existing automation *and its whole run history*, so a manifest that only
+    // fails on its third entry must not have destroyed the first two.
     let (mut created, mut replaced, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
+    let mut plan: Vec<(NewAutomation, Option<i64>)> = Vec::new();
     for decl in &manifest.automations {
         decl.validate()?;
         match existing.get(&decl.name) {
@@ -1142,15 +1146,29 @@ fn import_automations(db: &Database, file: &str, replace: bool) -> Result<Comman
                 continue;
             }
             Some(&id) => {
-                db.delete_automation(id)
-                    .map_err(|e| format!("delete_automation: {e}"))?;
+                plan.push((manifest_to_new_automation(decl)?, Some(id)));
                 replaced.push(decl.name.clone());
             }
-            None => created.push(decl.name.clone()),
+            None => {
+                plan.push((manifest_to_new_automation(decl)?, None));
+                created.push(decl.name.clone());
+            }
         }
-        db.create_automation(&manifest_to_new_automation(decl)?)
+    }
+    // One transaction, so a mid-batch failure leaves nothing half-applied.
+    let tx = db
+        .conn_ref()
+        .unchecked_transaction()
+        .map_err(|e| format!("begin transaction: {e}"))?;
+    for (new, replaced_id) in &plan {
+        if let Some(id) = replaced_id {
+            db.delete_automation(*id)
+                .map_err(|e| format!("delete_automation: {e}"))?;
+        }
+        db.create_automation(new)
             .map_err(|e| format!("create_automation: {e}"))?;
     }
+    tx.commit().map_err(|e| format!("commit import: {e}"))?;
     if !created.is_empty() || !replaced.is_empty() {
         arm_heartbeat();
     }
@@ -1738,6 +1756,38 @@ mod tests {
         let out = import_automations(&db, &path, true).unwrap();
         assert_eq!(out.json["replaced"], json!(["sync"]));
         assert_eq!(db.list_automations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_replace_leaves_the_existing_automation_and_its_runs() {
+        let db = Database::open_in_memory().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let good = dir.path().join("good.toml");
+        std::fs::write(
+            &good,
+            "[[automations]]\nname = \"sync\"\ntrigger = \"hourly\"\ncommand = \"sync.sh\"\n",
+        )
+        .unwrap();
+        import_automations(&db, &good.display().to_string(), false).unwrap();
+        let before = db.list_automations().unwrap()[0].clone();
+        db.record_automation_run(before.id, AutomationRunStatus::Success, "ok", None)
+            .unwrap();
+
+        // The trigger only fails once the entry is converted — after the point
+        // the old code had already deleted the row and its history.
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(
+            &bad,
+            "[[automations]]\nname = \"sync\"\ntrigger = \"neverly\"\ncommand = \"sync.sh\"\n",
+        )
+        .unwrap();
+        let err = import_automations(&db, &bad.display().to_string(), true).unwrap_err();
+        assert!(err.contains("trigger"), "got {err}");
+
+        let after = db.list_automations().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0], before);
+        assert_eq!(db.list_automation_runs(before.id, 10).unwrap().len(), 1);
     }
 
     #[test]
