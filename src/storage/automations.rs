@@ -14,6 +14,13 @@ use crate::sync::current_time_millis;
 
 use super::Database;
 
+/// Grace period added to a run's own timeout before
+/// [`Database::reap_orphaned_automation_runs`] claims it. Covers the window
+/// between a command hitting its deadline and its worker recording the kill, so
+/// a run that is merely *at* its deadline is never reaped from under a live
+/// worker.
+const REAP_GRACE_MS: u64 = 60_000;
+
 /// Serialize the prompt-step list for the `prompt_steps` column.
 ///
 /// A single step (the common case, and every pre-v44 row) stores `NULL` and
@@ -340,22 +347,26 @@ impl Database {
     /// its process (a TUI crash, or a headless `tick` killed mid-command) would
     /// otherwise show as running forever.
     ///
-    /// Only rows older than the longest a command may legally run are touched:
-    /// another friring instance (or a concurrent headless `tick`) may own a
-    /// perfectly healthy `running` row right now, and this must never yank it
-    /// out from under it. Called once on startup; returns the rows reaped.
+    /// The cutoff is **per run**: a row is only touched once it has outlived its
+    /// own automation's `action_timeout_secs` (the default when unset) plus
+    /// [`REAP_GRACE_MS`]. No authoring path caps that timeout, so a shared
+    /// cutoff would reap a healthy hour-long exec 15 minutes in — and another
+    /// friring instance (or a concurrent headless `tick`) may own that row right
+    /// now. Returns the rows reaped.
     pub fn reap_orphaned_automation_runs(&self) -> rusqlite::Result<usize> {
         let now = current_time_millis();
-        let cutoff = now.saturating_sub(
-            crate::session::automation::DEFAULT_EXEC_TIMEOUT_SECS.saturating_mul(1_000),
-        );
+        let default_ms =
+            crate::session::automation::DEFAULT_EXEC_TIMEOUT_SECS.saturating_mul(1_000);
         self.conn.execute(
             "UPDATE automation_runs \
              SET status = 'error', \
                  detail = 'interrupted (friring exited while the command was running)', \
                  finished_at = ?1 \
-             WHERE status = 'running' AND started_at < ?2",
-            params![now as i64, cutoff as i64],
+             WHERE status = 'running' \
+               AND started_at < ?1 - ?3 - COALESCE( \
+                     (SELECT a.action_timeout_secs * 1000 FROM automations a \
+                       WHERE a.id = automation_runs.automation_id), ?2)",
+            params![now as i64, default_ms as i64, REAP_GRACE_MS as i64],
         )
     }
 
@@ -910,5 +921,44 @@ mod tests {
             "got {}",
             listed.detail
         );
+    }
+
+    #[test]
+    fn reap_respects_a_longer_than_default_exec_timeout() {
+        let default_secs = crate::session::automation::DEFAULT_EXEC_TIMEOUT_SECS;
+        let long_secs = default_secs * 4;
+        let db = Database::open_in_memory().unwrap();
+        let id = db
+            .create_automation(&NewAutomation {
+                action: AutomationAction::Exec {
+                    command: "slow.sh".into(),
+                    timeout_secs: Some(long_secs),
+                },
+                ..send_automation("slow", Some(1))
+            })
+            .unwrap();
+        let run = db
+            .record_automation_run(id, AutomationRunStatus::Running, "slow.sh", None)
+            .unwrap();
+        let age_it = |ms: u64| {
+            let started = current_time_millis().saturating_sub(ms) as i64;
+            db.conn
+                .execute(
+                    "UPDATE automation_runs SET started_at = ?2 WHERE id = ?1",
+                    params![run, started],
+                )
+                .unwrap();
+        };
+
+        // Older than the *default* timeout, but well inside its own: a healthy
+        // long-running command must not be interrupted.
+        age_it(default_secs * 1_000 + 60_000);
+        assert_eq!(db.reap_orphaned_automation_runs().unwrap(), 0);
+        // Right at its own deadline: still inside the grace period.
+        age_it(long_secs * 1_000);
+        assert_eq!(db.reap_orphaned_automation_runs().unwrap(), 0);
+        // Past its own deadline plus the grace: reaped.
+        age_it(long_secs * 1_000 + REAP_GRACE_MS + 60_000);
+        assert_eq!(db.reap_orphaned_automation_runs().unwrap(), 1);
     }
 }
