@@ -975,13 +975,21 @@ fn ensure_automation(
         return Ok(());
     }
     let schedule = parse_trigger(&auto.trigger, None, None)?;
-    let next_run_at = schedule.next_after(current_time_millis(), None);
+    // Honor the declared `enabled`/`timezone` exactly as `automation import`
+    // does, so one declaration behaves the same whichever way it arrives.
+    if let Some(tz) = auto.timezone.as_deref() {
+        crate::session::automation::validate_timezone(tz)?;
+    }
+    let enabled = auto.enabled.unwrap_or(true);
+    let next_run_at = enabled
+        .then(|| schedule.next_after(current_time_millis(), auto.timezone.as_deref()))
+        .flatten();
     let steps = auto.steps();
     let new = NewAutomation {
         name: auto.name.clone(),
-        enabled: true,
+        enabled,
         schedule,
-        timezone: None,
+        timezone: auto.timezone.clone(),
         action,
         prompt: steps.first().map(|s| s.text.clone()).unwrap_or_default(),
         prompt_steps: steps,
@@ -1373,6 +1381,20 @@ mod tests {
             "got {:?}",
             autos[0].action
         );
+    }
+
+    #[test]
+    fn ensure_honors_a_declared_disabled_and_timezone() {
+        let db = Database::open_in_memory().unwrap();
+        insert_session(&db, "flow");
+        let mut def = flow_def();
+        def.automations[0].enabled = Some(false);
+        def.automations[0].timezone = Some("Europe/Zurich".into());
+        ensure_extension(&db, &def).unwrap();
+        let auto = &db.list_automations().unwrap()[0];
+        assert!(!auto.enabled, "a declared-disabled automation must not arm");
+        assert_eq!(auto.timezone.as_deref(), Some("Europe/Zurich"));
+        assert_eq!(auto.next_run_at, None);
     }
 
     #[test]
