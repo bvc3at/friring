@@ -147,7 +147,17 @@ pub fn run_exec_command_with_timeout(
         c.args(["-c", command]);
         c
     };
-    let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Put the child in its own process group so the deadline can kill the whole
+    // tree, not just the shell. `sh -c 'worker & wait'` otherwise survives:
+    // killing `sh` alone leaves the grandchild running *and* holding the pipe
+    // write-ends, so the reads below would block until it exits on its own.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd.spawn();
     let mut child = match child {
         Ok(c) => c,
         Err(e) => return (AutomationRunStatus::Error, format!("spawn failed: {e}")),
@@ -164,8 +174,12 @@ pub fn run_exec_command_with_timeout(
         timeout_secs.unwrap_or(crate::session::automation::DEFAULT_EXEC_TIMEOUT_SECS),
     );
     let (status, timed_out) = wait_with_deadline(&mut child, timeout);
-    let out = stdout.map(join_reader).unwrap_or_default();
-    let err = stderr.map(join_reader).unwrap_or_default();
+    // Collect with a grace period rather than an unbounded join: killing the
+    // process group should close every pipe, but a descendant that escaped the
+    // group (or a host without one) must not pin this thread — and for the
+    // detached TUI worker that would mean a `Running` row that never closes.
+    let out = stdout.map(collect_reader).unwrap_or_default();
+    let err = stderr.map(collect_reader).unwrap_or_default();
 
     let mut detail = tail_chars(&out);
     let stderr_tail = tail_chars(&err);
@@ -253,7 +267,8 @@ const EXEC_TAIL_BYTES: usize = 64 * 1024;
 /// [`EXEC_TAIL_BYTES`].
 fn spawn_reader<R: std::io::Read + Send + 'static>(
     mut pipe: R,
-) -> std::thread::JoinHandle<Vec<u8>> {
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut tail: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
         let mut chunk = [0u8; 8192];
@@ -267,14 +282,24 @@ fn spawn_reader<R: std::io::Read + Send + 'static>(
                 }
             }
         }
-        Vec::from(tail)
-    })
+        // A closed receiver means the deadline already gave up on us; drop the
+        // bytes rather than panicking on a detached thread.
+        let _ = tx.send(Vec::from(tail));
+    });
+    rx
 }
 
-/// Collect a reader thread's bytes; a panicked reader yields no output rather
-/// than taking the run down with it.
-fn join_reader(handle: std::thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
-    handle.join().unwrap_or_default()
+/// How long to wait for a pipe reader after the child has exited or been
+/// killed. Reaching EOF is near-instant once every writer is gone, so this only
+/// bounds the pathological case (a descendant still holding the pipe).
+const READER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Collect a reader thread's bytes, giving up after [`READER_GRACE`]. A reader
+/// that never reaches EOF is abandoned (its thread exits when the pipe finally
+/// closes) rather than blocking the caller forever; a panicked reader yields no
+/// output rather than taking the run down with it.
+fn collect_reader(rx: std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+    rx.recv_timeout(READER_GRACE).unwrap_or_default()
 }
 
 /// Wait for `child` up to `timeout`, killing it if the deadline passes.
@@ -294,14 +319,51 @@ fn wait_with_deadline(
             Err(_) => return (None, false),
         }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
+            kill_process_tree(child);
             // Reap the killed child so it doesn't linger as a zombie; the pipe
-            // readers unblock once its stdio handles close.
+            // readers unblock once every writer's stdio handle closes.
             let _ = child.wait();
             return (None, true);
         }
         std::thread::sleep(POLL);
     }
+}
+
+/// Kill the timed-out command **and everything it started**.
+///
+/// `Child::kill` signals only the direct `sh -c` / `cmd /C` process, so a job
+/// that backgrounded work (`worker & wait`) would keep running past its deadline
+/// and keep the pipes open. The child was spawned into its own process group
+/// (unix) so the whole group can be signalled at once; Windows has no group to
+/// signal, so `taskkill /T` walks the tree instead.
+///
+/// Killing the tree is the deliberate semantic: an `exec` automation's deadline
+/// is a promise that nothing of it outlives the run.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // Negating the pid targets the process group (`process_group(0)` made
+        // the child its leader, so pgid == pid). `kill(1)` avoids a direct libc
+        // dependency for one signal.
+        let group = format!("-{}", child.id());
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &group])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    // Always signal the direct child too: on unix the group kill covers it, but
+    // if the group could not be created (or `kill` is missing) this is still the
+    // one process we are certain about.
+    let _ = child.kill();
 }
 
 /// Keep the last 500 chars of a captured stream. Single pass via a capped ring
@@ -509,6 +571,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn run_exec_command_kills_backgrounded_descendants_at_the_deadline() {
+        // The regression the plain `sleep 30` timeout test could not catch: a
+        // command that backgrounds work keeps the pipe write-ends open, so
+        // killing only the shell leaves the read blocking for the grandchild's
+        // whole lifetime — well past the deadline.
+        let started = std::time::Instant::now();
+        let (status, detail) =
+            run_exec_command_with_timeout("sleep 120 & echo spawned; wait", Some(1));
+        let elapsed = started.elapsed();
+        assert_eq!(status, AutomationRunStatus::Error);
+        assert!(detail.contains("timed out"), "got {detail}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "deadline overran: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn run_exec_command_captures_output_larger_than_a_pipe_buffer() {
         // Regression guard for the reader threads: polling the deadline while
         // the child fills a 64 KiB pipe would deadlock instead of finishing.
@@ -533,6 +614,68 @@ mod tests {
         assert_eq!(status, AutomationRunStatus::Success);
         assert!(detail.ends_with("THE-END"), "got {detail}");
         assert!(detail.len() <= 500, "detail was {} chars", detail.len());
+    }
+
+    fn spawn(host: Option<&str>, worktree: Option<&str>, repo: &str) -> AutomationAction {
+        AutomationAction::Spawn {
+            repo_path: std::path::PathBuf::from(repo),
+            worktree_branch: worktree.map(str::to_string),
+            base_branch: None,
+            agent: None,
+            extra_repos: Vec::new(),
+            host: host.map(str::to_string),
+            session_mode: crate::session::SpawnSessionMode::Reuse,
+        }
+    }
+
+    #[test]
+    fn remote_spawns_reject_worktrees_and_home_relative_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let hosts = crate::agent::host_config::hosts_config_path().unwrap();
+        std::fs::create_dir_all(hosts.parent().unwrap()).unwrap();
+        std::fs::write(
+            hosts,
+            "[[hosts]]\nname = \"devbox\"\ndestination = \"me@devbox\"\n",
+        )
+        .unwrap();
+
+        // Remote worktree provisioning is unsupported: the TUI would create the
+        // checkout locally and hand the remote session a path that isn't there.
+        let err =
+            validate_spawn_action(&spawn(Some("devbox"), Some("auto/x"), "/srv/repo")).unwrap_err();
+        assert!(err.contains("worktree"), "got {err}");
+
+        // A worktree extra-repo is the same problem.
+        let mut with_extra = spawn(Some("devbox"), None, "/srv/repo");
+        if let AutomationAction::Spawn { extra_repos, .. } = &mut with_extra {
+            extra_repos.push(crate::session::ExtraRepo {
+                repo_path: std::path::PathBuf::from("/srv/other"),
+                worktree: true,
+                base_branch: None,
+            });
+        }
+        let err = validate_spawn_action(&with_extra).unwrap_err();
+        assert!(err.contains("extra-repos"), "got {err}");
+
+        // `~` would resolve against this machine's home, not the host's.
+        let err = validate_spawn_action(&spawn(Some("devbox"), None, "~/repo")).unwrap_err();
+        assert!(err.contains('~'), "got {err}");
+
+        // A remote repo-root spawn on an absolute path is fine...
+        validate_spawn_action(&spawn(Some("devbox"), None, "/srv/repo")).unwrap();
+        // ...and a *local* worktree spawn is entirely unaffected.
+        validate_spawn_action(&spawn(None, Some("auto/x"), "~/repo")).unwrap();
+    }
+
+    #[test]
+    fn validate_spawn_action_ignores_non_spawn_actions() {
+        validate_spawn_action(&AutomationAction::Exec {
+            command: "sync.sh".into(),
+            timeout_secs: None,
+        })
+        .unwrap();
+        validate_spawn_action(&AutomationAction::send_to(SessionId::default())).unwrap();
     }
 
     #[cfg(unix)]

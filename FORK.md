@@ -681,12 +681,14 @@ column nullable so pre-v44 rows keep their exact old behavior):
   disables the automation); the name form survives a close-and-recreate — the
   behavior upstream already grants extension-declared automations via re-linking
   but not user-authored ones.
-- **Exec off the tick thread.** Upstream runs an `exec` automation's command
-  synchronously inside `tick_core`, so a hung command freezes the whole render
-  loop. The fork records a `running` run, hands the command to a worker, and
-  updates that same row when it exits — one history entry per fire, visible
+- **Exec off the tick thread, with a process-tree deadline.** Upstream runs an
+  `exec` automation's command synchronously inside `tick_core`, so a hung
+  command freezes the whole render loop. The fork records a `running` run, hands
+  the command to a worker, and updates that same row when it exits — one history entry per fire, visible
   while it works. Commands are killed at a deadline (`--timeout`, default
-  900 s) with output drained to a bounded tail on separate threads, and a
+  900 s) — the whole process group, not just the shell, since a backgrounded
+  worker would otherwise outlive the deadline while holding the pipes open —
+  with output drained to a bounded tail on separate threads, and a
   `running` row orphaned by a crash is reaped — on the next startup and on every
   headless tick — once it outlives its own command's timeout.
 - **The editor reaches the whole model.** Upstream's editor exposes repo /

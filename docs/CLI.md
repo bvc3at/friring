@@ -80,7 +80,7 @@ current one.
 | `--add-repo <path[@base]>` | spawn | extra repo on its own worktree (repeatable) |
 | `--add-dir <path>` | spawn | extra directory attached as-is (repeatable) |
 | `--command <shell>` | exec | run headlessly, no agent or session |
-| `--timeout <secs>` | exec | kill the command after this long (default 900) |
+| `--timeout <secs>` | exec | kill the command *and its descendants* after this long (default 900) |
 
 Prompts are separate from the action and apply to send/spawn:
 

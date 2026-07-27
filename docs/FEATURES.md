@@ -1429,7 +1429,15 @@ now:
 
 The command is killed at its deadline (`--timeout`, default 900 s), with its
 stdout/stderr drained on separate threads — polling the deadline while the
-child fills a pipe buffer would deadlock. A `running` row whose worker died
+child fills a pipe buffer would deadlock. The kill takes the **whole process
+tree**: the child is spawned into its own process group (`taskkill /T` on
+Windows), because signalling only the `sh -c` leaves a backgrounded worker
+(`worker & wait`) running *and* holding the pipe write-ends, so the read would
+block for the grandchild's full lifetime — far past the deadline, with the run
+row still `running`. Collecting the drained output is itself bounded (2 s grace)
+so a descendant that escapes the group still cannot pin the worker.
+
+A `running` row whose worker died
 with its process (a crash) is closed out as `interrupted` by
 `Database::reap_orphaned_automation_runs` — on the next TUI startup, and on
 every headless `automation tick`, so a keeper-only install closes them out too.
