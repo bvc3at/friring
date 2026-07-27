@@ -711,8 +711,9 @@ column nullable so pre-v44 rows keep their exact old behavior):
   TUI's `p` overlay show what the next fire *would* do without firing;
   `automation export`/`import` round-trip through the existing
   `[[automations]]` manifest grammar, which the fork widened (spawn actions,
-  prompt steps, host, timezone, enabled) rather than forking into a second
-  format.
+  prompt steps with an optional per-step `[[automations.steps]]` table, host,
+  timezone, enabled) rather than forking into a second format; export picks the
+  narrowest form that survives a round trip.
 
 Behaviour is identical across all three firing paths (TUI tick, headless
 `automation tick`, OS timer) and claim-based at-most-once firing is untouched.

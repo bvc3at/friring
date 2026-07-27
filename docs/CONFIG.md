@@ -869,10 +869,29 @@ setting several (or none) is a load-time error.
 | `timeout_secs` | exec | kill deadline (omitted = 900 s) |
 | `prompt` | send/spawn | the single-step form |
 | `prompts` | send/spawn | ordered steps, each its own paste + Enter |
-| `step_delay_ms` | send/spawn | settle time between steps (omitted = 1200) |
+| `step_delay_ms` | send/spawn | settle time between *every* gap (omitted = 1200) |
+| `steps` | send/spawn | `[[automations.steps]]` tables — ordered `text` + optional per-step `delay_ms` |
 
-`prompt` and `prompts` are mutually exclusive, and a prompt alongside `command`
-is rejected — an exec has no agent to prompt, so it would be silently dropped.
+`prompt`, `prompts` and `steps` are three spellings of the same list and are
+mutually exclusive; a prompt alongside `command` is rejected — an exec has no
+agent to prompt, so it would be silently dropped.
+
+Reach for `steps` only when the gaps differ. `prompts` + `step_delay_ms` applies
+one delay to every gap, which is what most sequences want:
+
+```toml
+[[automations]]
+name = "inbox-triage"
+trigger = "weekdays"
+repo = "/home/me/app"
+
+# A slash command's popup needs longer to settle than a plain prompt does.
+[[automations.steps]]
+text = "/model opus"
+delay_ms = 2000
+[[automations.steps]]
+text = "Summarize my inbox."
+```
 
 ```toml
 # A spawn automation with slash-command setup before the real work.

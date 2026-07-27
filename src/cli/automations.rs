@@ -1213,6 +1213,27 @@ fn manifest_to_new_automation(
     })
 }
 
+/// The one delay the shorthand form can carry, when it is faithful.
+///
+/// `prompts` + `step_delay_ms` applies a single value to every gap, so it only
+/// round-trips when all the non-final delays agree *and* the final step carries
+/// none (nothing waits on the last step, so the shorthand always decodes it as
+/// `None`). Returns `Some(delay)` when the shorthand is safe — including
+/// `Some(None)` for "every gap is the default" — and `None` when the per-step
+/// table is required.
+#[allow(clippy::option_option)]
+fn uniform_step_delay(steps: &[crate::session::PromptStep]) -> Option<Option<u64>> {
+    let Some((last, leading)) = steps.split_last() else {
+        return Some(None);
+    };
+    if last.delay_ms.is_some() {
+        return None;
+    }
+    let mut delays = leading.iter().map(|s| s.delay_ms);
+    let first = delays.next().unwrap_or(None);
+    delays.all(|d| d == first).then_some(first)
+}
+
 /// Project a stored automation onto the manifest grammar for `export`.
 fn automation_to_manifest(a: &Automation) -> crate::session::ExtensionAutomation {
     use crate::session::{ExtensionAutomation, SpawnSessionMode};
@@ -1232,12 +1253,29 @@ fn automation_to_manifest(a: &Automation) -> crate::session::ExtensionAutomation
     // every exported exec fail its own import.
     let set_prompts = |decl: &mut ExtensionAutomation| {
         let steps = a.steps();
-        decl.step_delay_ms = steps.first().and_then(|s| s.delay_ms);
-        decl.prompts = steps.into_iter().map(|s| s.text).collect();
-        // The single-prompt form stays on `prompt`, so an exported one-step
-        // automation is byte-identical to a hand-written manifest entry.
-        if decl.prompts.len() == 1 {
-            decl.prompt = decl.prompts.pop();
+        // Write the narrowest form that round-trips *faithfully*: `prompt` for a
+        // lone step, `prompts` + one `step_delay_ms` when every gap is the same,
+        // and the per-step table only when the delays actually differ. So an
+        // exported single-step automation stays byte-identical to a hand-written
+        // entry, and the verbose form is only paid for when it buys something.
+        match uniform_step_delay(&steps) {
+            Some(delay) => {
+                decl.step_delay_ms = delay;
+                decl.prompts = steps.into_iter().map(|s| s.text).collect();
+                if decl.prompts.len() == 1 {
+                    decl.prompt = decl.prompts.pop();
+                    decl.step_delay_ms = None;
+                }
+            }
+            None => {
+                decl.steps = steps
+                    .into_iter()
+                    .map(|s| crate::session::PromptStepDecl {
+                        text: s.text,
+                        delay_ms: s.delay_ms,
+                    })
+                    .collect();
+            }
         }
     };
     match &a.action {
@@ -1725,6 +1763,123 @@ mod tests {
             }
             other => panic!("expected exec, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn export_uses_the_narrowest_faithful_prompt_form() {
+        use crate::session::PromptStep;
+        let mut auto = sample_automation();
+
+        // One step → the plain `prompt` scalar, as a hand-written entry would be.
+        auto.prompt_steps = vec![PromptStep::new("go")];
+        let decl = automation_to_manifest(&auto);
+        assert_eq!(decl.prompt.as_deref(), Some("go"));
+        assert!(decl.prompts.is_empty() && decl.steps.is_empty());
+        assert_eq!(decl.step_delay_ms, None);
+
+        // Uniform gaps → the compact list plus one scalar delay.
+        auto.prompt_steps = vec![
+            PromptStep {
+                text: "a".into(),
+                delay_ms: Some(1_500),
+            },
+            PromptStep {
+                text: "b".into(),
+                delay_ms: Some(1_500),
+            },
+            PromptStep::new("c"),
+        ];
+        let decl = automation_to_manifest(&auto);
+        assert_eq!(decl.prompts, ["a", "b", "c"]);
+        assert_eq!(decl.step_delay_ms, Some(1_500));
+        assert!(decl.steps.is_empty(), "no need for the verbose form");
+
+        // Differing gaps → the per-step table (the case that used to flatten).
+        auto.prompt_steps = vec![
+            PromptStep {
+                text: "a".into(),
+                delay_ms: Some(500),
+            },
+            PromptStep {
+                text: "b".into(),
+                delay_ms: Some(2_000),
+            },
+            PromptStep::new("c"),
+        ];
+        let decl = automation_to_manifest(&auto);
+        assert!(decl.prompts.is_empty() && decl.prompt.is_none());
+        assert_eq!(decl.steps.len(), 3);
+        assert_eq!(decl.steps[0].delay_ms, Some(500));
+        assert_eq!(decl.steps[1].delay_ms, Some(2_000));
+        assert_eq!(decl.steps[2].delay_ms, None);
+    }
+
+    #[test]
+    fn heterogeneous_step_delays_survive_an_export_import_round_trip() {
+        use crate::session::PromptStep;
+        let db = Database::open_in_memory().unwrap();
+        db.create_automation(&NewAutomation {
+            name: "inbox".into(),
+            enabled: true,
+            schedule: crate::session::AutomationSchedule::Cron {
+                expr: "0 9 * * *".into(),
+            },
+            timezone: None,
+            action: AutomationAction::Send {
+                target: crate::session::SendTarget::Name("box".into()),
+            },
+            prompt: "/model opus".into(),
+            prompt_steps: vec![
+                PromptStep {
+                    text: "/model opus".into(),
+                    delay_ms: Some(500),
+                },
+                PromptStep {
+                    text: "/effort high".into(),
+                    delay_ms: Some(2_000),
+                },
+                PromptStep::new("go"),
+            ],
+            next_run_at: None,
+        })
+        .unwrap();
+
+        let toml = export_automations(&db, None).unwrap().human;
+        let manifest: crate::session::extension_def::AutomationManifest =
+            toml::from_str(&toml).unwrap();
+        let steps = manifest.automations[0].steps();
+        // The delays used to flatten to 500/500 here.
+        assert_eq!(steps[0].delay_ms, Some(500));
+        assert_eq!(steps[1].delay_ms, Some(2_000));
+        assert_eq!(steps[2].delay_ms, None);
+        assert_eq!(
+            steps.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            ["/model opus", "/effort high", "go"]
+        );
+    }
+
+    #[test]
+    fn uniform_step_delay_detects_what_the_shorthand_can_carry() {
+        use crate::session::PromptStep;
+        let step = |d: Option<u64>| PromptStep {
+            text: "x".into(),
+            delay_ms: d,
+        };
+        // Empty / single / all-default all fit the shorthand.
+        assert_eq!(uniform_step_delay(&[]), Some(None));
+        assert_eq!(uniform_step_delay(&[step(None)]), Some(None));
+        assert_eq!(
+            uniform_step_delay(&[step(Some(9)), step(None)]),
+            Some(Some(9))
+        );
+        // Differing gaps do not.
+        assert_eq!(
+            uniform_step_delay(&[step(Some(1)), step(Some(2)), step(None)]),
+            None
+        );
+        // Nor does a delay on the final step: the shorthand always decodes the
+        // last gap as None, so writing it would lose information.
+        assert_eq!(uniform_step_delay(&[step(Some(1))]), None);
     }
 
     #[test]

@@ -89,6 +89,9 @@ Prompts are separate from the action and apply to send/spawn:
   it work; a single multi-line prompt would submit as one message.
 - `--step-delay <ms>` — settle time between steps (default 1200). On `edit` it
   only applies together with `--prompt`, since the delay belongs to a step.
+  This flag applies **one** value to every gap; for delays that differ per step,
+  author the `[[automations.steps]]` form and `automation import` it (see
+  `docs/CONFIG.md`), or set them in the TUI editor.
 - `--timezone <IANA>` — validated on save (a typo is rejected, not silently
   resolved to system local time).
 

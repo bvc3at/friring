@@ -1315,7 +1315,9 @@ step 3   Summarize my email history and file anything actionable.
   into step 1's filter). The default is **1200 ms**
   (`session::automation::DEFAULT_STEP_DELAY_MS`), overridable per step (the
   delay is stored *after* the step it follows; the last step's is never waited
-  on).
+  on). The TUI editor, the stored model and the `[[automations.steps]]` manifest
+  form all carry a genuine per-step value; `--step-delay` is the one coarse
+  surface, applying a single value to every gap.
 - **Storage.** The list is JSON in the `prompt_steps` column (schema **v44**),
   `NULL` for a plain single-prompt automation — which keeps living in the
   existing `prompt` column, byte-identical to what a pre-v44 friring wrote
@@ -1623,6 +1625,12 @@ them back. The grammar is deliberately the **same one extension manifests use**
 for their automations (`session::extension_def::ExtensionAutomation`), extended
 rather than forked, so an exported block pastes into an `extension.toml`
 unchanged — see `docs/CONFIG.md`.
+
+Export writes the **narrowest form that round-trips faithfully**: `prompt` for a
+single step, `prompts` + one `step_delay_ms` when every gap is the same, and the
+per-step `[[automations.steps]]` table only when the delays differ. So an
+exported single-step automation stays byte-identical to a hand-written entry,
+and heterogeneous delays (500 ms then 2000 ms) survive instead of flattening.
 
 Import matches on **name** (an extension's identity for its automations too): an
 existing automation is skipped unless `--replace`. A `session_ref` imports as a

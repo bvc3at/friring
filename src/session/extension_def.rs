@@ -172,6 +172,22 @@ pub struct ExtensionSession {
     pub repo_path: PathBuf,
 }
 
+/// One declared prompt step in the rich `[[automations.steps]]` form.
+///
+/// The shorthand (`prompts` + a single `step_delay_ms`) applies one delay to
+/// every gap, which silently flattens heterogeneous delays on export/import.
+/// This form carries a delay per step, so a `/model` step that needs 2 s to
+/// settle and a plain text step that needs none survive a round trip.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptStepDecl {
+    /// The text pasted for this step.
+    pub text: String,
+    /// Settle delay after this step, in milliseconds. Omitted = the default.
+    /// Ignored on the last step (nothing waits on it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
+}
+
 /// A standalone `[[automations]]` document — the shape
 /// `friring-cli automation export`/`import` round-trips. Deliberately the same
 /// grammar an extension manifest uses for its automations, so an exported file
@@ -242,9 +258,13 @@ pub struct ExtensionAutomation {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prompts: Vec<String>,
     /// Settle delay between prompt steps, in milliseconds (omitted = the
-    /// default).
+    /// default). Applies to *every* gap — use `steps` when they differ.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_delay_ms: Option<u64>,
+    /// Ordered steps with a **per-step** delay, for the cases `prompts` +
+    /// `step_delay_ms` cannot express. Mutually exclusive with both.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<PromptStepDecl>,
     /// Shell command run headlessly on each fire (the `Exec` action). Mutually
     /// exclusive with the send/spawn fields; `{home}` is substituted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -292,15 +312,34 @@ impl ExtensionAutomation {
                 ))
             }
         }
-        if self.prompt.is_some() && !self.prompts.is_empty() {
+        let prompt_forms = [
+            ("prompt", self.prompt.is_some()),
+            ("prompts", !self.prompts.is_empty()),
+            ("steps", !self.steps.is_empty()),
+        ];
+        let set: Vec<&str> = prompt_forms
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(label, _)| *label)
+            .collect();
+        if set.len() > 1 {
             return Err(format!(
-                "automation '{}' sets both `prompt` and `prompts`; use one",
+                "automation '{}' sets several prompt forms ({}); use one",
+                self.name,
+                set.join(", ")
+            ));
+        }
+        if !self.steps.is_empty() && self.steps.iter().any(|s| s.text.trim().is_empty()) {
+            return Err(format!(
+                "automation '{}' has a blank `steps` entry; every step needs text",
                 self.name
             ));
         }
         // An exec runs a command, not an agent turn, so a prompt on one would be
         // silently dropped — almost always a half-converted send.
-        if self.command.is_some() && (self.prompt.is_some() || !self.prompts.is_empty()) {
+        if self.command.is_some()
+            && (self.prompt.is_some() || !self.prompts.is_empty() || !self.steps.is_empty())
+        {
             return Err(format!(
                 "automation '{}' sets a prompt alongside `command` (exec); an exec \
                  automation has no agent to prompt",
@@ -313,6 +352,16 @@ impl ExtensionAutomation {
     /// The declared prompt steps, in delivery order. `prompts` wins over the
     /// single `prompt`; an exec automation legitimately has none.
     pub fn steps(&self) -> Vec<super::PromptStep> {
+        if !self.steps.is_empty() {
+            return self
+                .steps
+                .iter()
+                .map(|s| super::PromptStep {
+                    text: s.text.clone(),
+                    delay_ms: s.delay_ms,
+                })
+                .collect();
+        }
         let texts: Vec<String> = if self.prompts.is_empty() {
             self.prompt.clone().into_iter().collect()
         } else {
@@ -750,6 +799,72 @@ prompt = "tick"
             resolved.automations[0].extra_repos[0].repo_path,
             PathBuf::from("/home/me/x/docs")
         );
+    }
+
+    #[test]
+    fn steps_table_carries_a_delay_per_step() {
+        let def: ExtensionDef = toml::from_str(
+            "name = \"x\"\n[[automations]]\nname = \"a\"\ntrigger = \"daily\"\n\
+             session_ref = \"s\"\n\
+             [[automations.steps]]\ntext = \"/model opus\"\ndelay_ms = 500\n\
+             [[automations.steps]]\ntext = \"/effort high\"\ndelay_ms = 2000\n\
+             [[automations.steps]]\ntext = \"go\"\n",
+        )
+        .unwrap();
+        let steps = def.automations[0].steps();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].delay_ms, Some(500));
+        // The shorthand cannot express this — that is the whole point.
+        assert_eq!(steps[1].delay_ms, Some(2_000));
+        assert_eq!(steps[2].delay_ms, None);
+        def.automations[0].validate().unwrap();
+    }
+
+    #[test]
+    fn prompt_forms_are_mutually_exclusive() {
+        let base = ExtensionAutomation {
+            name: "a".into(),
+            trigger: "daily".into(),
+            session_ref: Some("s".into()),
+            ..ExtensionAutomation::default()
+        };
+        let step = || PromptStepDecl {
+            text: "go".into(),
+            delay_ms: None,
+        };
+        // Any two prompt forms together is an error, not a silent winner.
+        for (prompt, prompts, steps) in [
+            (Some("a"), vec!["b"], vec![]),
+            (Some("a"), vec![], vec![step()]),
+            (None, vec!["b"], vec![step()]),
+        ] {
+            let decl = ExtensionAutomation {
+                prompt: prompt.map(str::to_string),
+                prompts: prompts.into_iter().map(str::to_string).collect(),
+                steps,
+                ..base.clone()
+            };
+            let err = decl.validate().unwrap_err();
+            assert!(err.contains("prompt forms"), "got {err}");
+        }
+        // A blank step is rejected rather than silently dropped at fire time.
+        let decl = ExtensionAutomation {
+            steps: vec![PromptStepDecl {
+                text: "  ".into(),
+                delay_ms: None,
+            }],
+            ..base.clone()
+        };
+        assert!(decl.validate().unwrap_err().contains("blank"));
+        // ...and an exec still cannot carry any of them.
+        let decl = ExtensionAutomation {
+            name: "a".into(),
+            trigger: "daily".into(),
+            command: Some("sync.sh".into()),
+            steps: vec![step()],
+            ..ExtensionAutomation::default()
+        };
+        assert!(decl.validate().unwrap_err().contains("exec"));
     }
 
     #[test]

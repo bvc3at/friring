@@ -22,7 +22,7 @@ pub use cc_activity::{
 };
 pub use extension_def::{
     AgentPatch, ConfigMerge, ExtensionAutomation, ExtensionDef, ExtensionFile, ExtensionSession,
-    ExtensionSymlink, ExternalFile,
+    ExtensionSymlink, ExternalFile, PromptStepDecl,
 };
 pub use host_def::{
     is_remote_backend, is_ssh_backend, is_wsl_backend, HostDef, HostKind, HostRegistry,
