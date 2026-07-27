@@ -1288,6 +1288,18 @@ impl App {
             return Some(((fields, None), buttons));
         }
 
+        // Automation dry-run overlay (read-only, no click targets).
+        if let super::modals::Modal::AutomationDryRun(ref d) = self.modal {
+            crate::ui::automation_dry_run_modal::render_automation_dry_run_modal(
+                frame,
+                &crate::ui::automation_dry_run_modal::AutomationDryRunState {
+                    name: &d.name,
+                    rows: &d.rows,
+                },
+            );
+            return None;
+        }
+
         // Automations list modal
         if let super::modals::Modal::AutomationsList(ref al) = self.modal {
             return Some(self.render_automations_list_modal(frame, al));

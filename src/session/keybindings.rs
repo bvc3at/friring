@@ -101,6 +101,8 @@ pub enum Action {
     AutomationsToggle,
     /// Run the selected automation now.
     AutomationsRun,
+    /// Preview what the selected automation would do, without firing it.
+    AutomationsDryRun,
     AutomationsDelete,
     // ── Tasks pane (scoped) ─────────────────────────────────────────────
     TasksNew,
@@ -194,6 +196,7 @@ impl Action {
             Action::AutomationsOpen,
             Action::AutomationsToggle,
             Action::AutomationsRun,
+            Action::AutomationsDryRun,
             Action::AutomationsDelete,
             Action::TasksNew,
             Action::TasksNext,
@@ -266,6 +269,7 @@ impl Action {
             Action::AutomationsOpen => "Edit automation",
             Action::AutomationsToggle => "Toggle enabled",
             Action::AutomationsRun => "Run now",
+            Action::AutomationsDryRun => "Preview (dry run)",
             Action::AutomationsDelete => "Delete automation",
             Action::TasksNew => "New task",
             Action::TasksNext => "Next item",
@@ -311,6 +315,7 @@ impl Action {
             | Action::AutomationsOpen
             | Action::AutomationsToggle
             | Action::AutomationsRun
+            | Action::AutomationsDryRun
             | Action::AutomationsDelete => KeyContext::Automations,
             Action::TasksNew
             | Action::TasksNext
@@ -620,6 +625,7 @@ impl Action {
             Action::AutomationsOpen => vec![KeyChord::key(KeyCode::Enter), KeyChord::plain('e')],
             Action::AutomationsToggle => vec![KeyChord::plain(' ')],
             Action::AutomationsRun => vec![KeyChord::plain('r')],
+            Action::AutomationsDryRun => vec![KeyChord::plain('p')],
             Action::AutomationsDelete => vec![KeyChord::plain('d')],
             // Tasks pane (scoped).
             Action::TasksNew => vec![KeyChord::plain('n')],
@@ -778,6 +784,7 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
                 AutomationsOpen,
                 AutomationsToggle,
                 AutomationsRun,
+                AutomationsDryRun,
                 AutomationsDelete,
             ],
         ),
@@ -1855,6 +1862,7 @@ mod tests {
                 Action::AutomationsOpen => 0,
                 Action::AutomationsToggle => 0,
                 Action::AutomationsRun => 0,
+                Action::AutomationsDryRun => 0,
                 Action::AutomationsDelete => 0,
                 Action::TasksNew => 0,
                 Action::TasksNext => 0,
@@ -1881,7 +1889,7 @@ mod tests {
         }
         // The listed variants must equal Action::all().len(). If you add
         // a variant, update both `Action::all()` and the match above.
-        const EXPECTED: usize = 66;
+        const EXPECTED: usize = 67;
         assert_eq!(Action::all().len(), EXPECTED);
         for a in Action::all() {
             classify(*a);

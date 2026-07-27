@@ -706,6 +706,25 @@ impl App {
         self.refresh_automations();
     }
 
+    /// Open the read-only dry-run overlay for an automation: the resolved
+    /// schedule, target/spawn parameters, host and prompt steps it *would* use
+    /// on its next fire. Fires nothing. Shares
+    /// [`dry_run_plan`](crate::session::automation::dry_run_plan) with
+    /// `friring-cli automation dry-run`, so both describe the same plan.
+    fn open_automation_dry_run(&mut self, id: i64) {
+        let Ok(Some(auto)) = self.db.get_automation(id) else {
+            self.set_error("Automation not found");
+            return;
+        };
+        self.modal = modals::Modal::AutomationDryRun(modals::AutomationDryRunModal {
+            name: auto.name.clone(),
+            rows: crate::session::automation::dry_run_plan(
+                &auto,
+                crate::sync::current_time_millis(),
+            ),
+        });
+    }
+
     /// Mark an automation due so the next tick fires it.
     fn run_automation_by_id(&mut self, id: i64) {
         match self.db.trigger_automation_now(id) {
@@ -832,7 +851,10 @@ impl App {
             Action::AutomationsOpen => self.enter_automation_editor_in_pane(count),
             // Toggle / run / delete act on the row under the cursor — no-ops on
             // an empty pane.
-            Action::AutomationsToggle | Action::AutomationsRun | Action::AutomationsDelete
+            Action::AutomationsToggle
+            | Action::AutomationsRun
+            | Action::AutomationsDryRun
+            | Action::AutomationsDelete
                 if count > 0 =>
             {
                 self.run_selected_automation_action(action, count)
@@ -868,6 +890,7 @@ impl App {
                 self.sync_automation_editor();
             }
             Action::AutomationsRun => self.run_automation_by_id(id),
+            Action::AutomationsDryRun => self.open_automation_dry_run(id),
             Action::AutomationsDelete => {
                 self.delete_automation_by_id(id);
                 let new_count = self.automation_ui.cached_automations.len();
@@ -1037,6 +1060,11 @@ impl App {
             KeyCode::Char('r') => {
                 if let Some(id) = self.selected_automation_id() {
                     self.run_automation_by_id(id);
+                }
+            }
+            KeyCode::Char('p') => {
+                if let Some(id) = self.selected_automation_id() {
+                    self.open_automation_dry_run(id);
                 }
             }
             KeyCode::Char('d') => {

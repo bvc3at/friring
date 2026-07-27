@@ -1524,6 +1524,14 @@ fn weekday_plural(dow: u32) -> &'static str {
     }
 }
 
+/// The dry-run overlay's payload: an automation's name plus the resolved
+/// `(label, value)` plan rows, snapshotted when the overlay opens.
+#[derive(Debug, Clone, Default)]
+pub struct AutomationDryRunModal {
+    pub name: String,
+    pub rows: Vec<(String, String)>,
+}
+
 // ── AutomationsListModal ────────────────────────────────────────────────
 
 /// An entry in the automations list modal.
@@ -2351,6 +2359,8 @@ pub enum Modal {
     /// `Modal` is moved around per frame — see `clippy::large_enum_variant`.
     AutomationEditor(Box<AutomationEditorModal>),
     AutomationsList(AutomationsListModal),
+    /// Read-only preview of what an automation would do on its next fire.
+    AutomationDryRun(AutomationDryRunModal),
     RepoPicker(RepoPickerModal),
     ConversationPicker(super::cc_import::ConversationPickerModal),
     SessionName(SessionNameModal),

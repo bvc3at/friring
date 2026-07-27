@@ -643,6 +643,8 @@ impl App {
             Modal::SessionName(_) => self.handle_session_name_key(code, mods),
             Modal::AutomationEditor(_) => self.handle_automation_editor_key(code, mods),
             Modal::AutomationsList(_) => self.handle_automations_list_key(code),
+            // Read-only: any key dismisses it.
+            Modal::AutomationDryRun(_) => self.modal.close(),
             Modal::AgentPicker(_) => self.handle_agent_picker_key(code, mods),
             Modal::HostPicker(_) => self.handle_host_picker_key(code, mods),
             Modal::ThemePicker(_) => self.handle_theme_picker_key(code),
@@ -1843,6 +1845,7 @@ impl App {
             | Action::AutomationsOpen
             | Action::AutomationsToggle
             | Action::AutomationsRun
+            | Action::AutomationsDryRun
             | Action::AutomationsDelete => self.dispatch_automations_pane_action(action),
             Action::TasksNew
             | Action::TasksNext
