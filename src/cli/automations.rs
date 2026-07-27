@@ -348,6 +348,11 @@ fn create_automation(db: &Database, args: CreateArgs) -> Result<CommandOutput, S
     if args.action.command.is_none() && prompts.is_empty() {
         return Err("prompt must not be empty".into());
     }
+    // An exec has no agent to prompt, so a prompt on one would be silently
+    // dropped — the same combination `ExtensionAutomation::validate` rejects.
+    if args.action.command.is_some() && !prompts.is_empty() {
+        return Err("--prompt does not apply to --command (exec has no agent turn)".into());
+    }
     let schedule = parse_trigger(&args.trigger, args.time.as_deref(), args.weekday)?;
     if let Some(tz) = args.timezone.as_deref() {
         crate::session::automation::validate_timezone(tz)?;
@@ -418,11 +423,35 @@ fn edit_automation(db: &Database, id: i64, args: EditArgs) -> Result<CommandOutp
         return Err("--enabled and --disabled are mutually exclusive".into());
     }
     let mut auto = load(db, id)?;
+    // Remembered before `apply_edit_overrides` consumes the list.
+    let prompt_supplied = prompts.iter().any(|p| !p.trim().is_empty());
     apply_edit_overrides(
         &mut auto, name, trigger, time, weekday, timezone, prompts, step_delay,
     )?;
     if !action.is_empty() {
         auto.action = apply_action_overrides(&auto.action, &action, db)?;
+        // Switching the kind can leave the prompt out of step with the action:
+        // an exec turned into a send/spawn has none to deliver, and a send
+        // turned into an exec keeps steps it can never use (and would export as
+        // an invalid `command` + `prompt` declaration).
+        match &auto.action {
+            AutomationAction::Exec { .. } => {
+                if prompt_supplied {
+                    return Err(
+                        "--prompt does not apply to --command (exec has no agent turn)".into(),
+                    );
+                }
+                auto.prompt.clear();
+                auto.prompt_steps.clear();
+            }
+            _ => {
+                if auto.steps().iter().all(|s| s.text.trim().is_empty()) {
+                    return Err(
+                        "this action needs a prompt — pass --prompt with the same edit".into(),
+                    );
+                }
+            }
+        }
     }
     if disabled {
         auto.enabled = false;
@@ -1837,6 +1866,127 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("Unknown host"), "got {err}");
         assert_eq!(db.get_automation(before.id).unwrap().unwrap(), before);
+    }
+
+    /// `edit` with only the given action flags (plus optional prompts).
+    fn edit_action(action: ActionArgs, prompts: Vec<String>) -> EditArgs {
+        EditArgs {
+            name: None,
+            trigger: None,
+            time: None,
+            weekday: None,
+            timezone: None,
+            prompts,
+            step_delay: None,
+            action,
+            enabled: false,
+            disabled: false,
+        }
+    }
+
+    #[test]
+    fn switching_an_exec_to_a_spawn_requires_a_prompt() {
+        let db = Database::open_in_memory().unwrap();
+        create_automation(
+            &db,
+            CreateArgs {
+                action: ActionArgs {
+                    command: Some("sync.sh".into()),
+                    ..ActionArgs::default()
+                },
+                prompts: Vec::new(),
+                ..spawn_create("sync", ActionArgs::default())
+            },
+        )
+        .unwrap();
+        let id = db.list_automations().unwrap()[0].id;
+
+        // Without a prompt the spawn would submit a blank turn on every fire.
+        let err = edit_automation(
+            &db,
+            id,
+            edit_action(
+                ActionArgs {
+                    repo: Some("/repo".into()),
+                    ..ActionArgs::default()
+                },
+                Vec::new(),
+            ),
+        )
+        .unwrap_err();
+        assert!(err.contains("needs a prompt"), "got {err}");
+        assert!(matches!(
+            db.get_automation(id).unwrap().unwrap().action,
+            AutomationAction::Exec { .. }
+        ));
+
+        // With one, the switch goes through.
+        edit_automation(
+            &db,
+            id,
+            edit_action(
+                ActionArgs {
+                    repo: Some("/repo".into()),
+                    ..ActionArgs::default()
+                },
+                vec!["go".into()],
+            ),
+        )
+        .unwrap();
+        let auto = db.get_automation(id).unwrap().unwrap();
+        assert!(matches!(auto.action, AutomationAction::Spawn { .. }));
+        assert_eq!(auto.steps()[0].text, "go");
+    }
+
+    #[test]
+    fn switching_a_spawn_to_an_exec_clears_its_prompt() {
+        let db = Database::open_in_memory().unwrap();
+        create_automation(
+            &db,
+            spawn_create(
+                "nightly",
+                ActionArgs {
+                    repo: Some("/repo".into()),
+                    ..ActionArgs::default()
+                },
+            ),
+        )
+        .unwrap();
+        let id = db.list_automations().unwrap()[0].id;
+        edit_automation(
+            &db,
+            id,
+            edit_action(
+                ActionArgs {
+                    command: Some("sync.sh".into()),
+                    ..ActionArgs::default()
+                },
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        // An exec carrying a prompt exports as a declaration its own validation
+        // rejects, so the switch has to drop it.
+        let auto = db.get_automation(id).unwrap().unwrap();
+        assert!(auto.prompt.is_empty(), "got {:?}", auto.prompt);
+        assert!(auto.prompt_steps.is_empty());
+    }
+
+    #[test]
+    fn create_rejects_a_prompt_alongside_a_command() {
+        let db = Database::open_in_memory().unwrap();
+        let err = create_automation(
+            &db,
+            CreateArgs {
+                action: ActionArgs {
+                    command: Some("sync.sh".into()),
+                    ..ActionArgs::default()
+                },
+                ..spawn_create("sync", ActionArgs::default())
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("--prompt"), "got {err}");
     }
 
     #[test]
