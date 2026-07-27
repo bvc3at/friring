@@ -141,15 +141,36 @@ pub fn run_exec_command_detached(run_id: i64, command: String, timeout_secs: Opt
     });
 }
 
-/// Read a child pipe to EOF on its own thread (see
-/// [`run_exec_command_with_timeout`] for why the pipes can't be polled inline).
+/// How much of each pipe is kept while the command runs.
+///
+/// Only [`tail_chars`]'s last 500 characters ever reach the run row, but the
+/// pipe still has to be drained or the child blocks. Buffering it all would let
+/// a chatty command (a runaway build log) grow a `Vec` inside friring's own
+/// process for the whole timeout window — up to 15 minutes by default — for
+/// output that is then discarded. 64 KiB is far more than the tail needs, even
+/// for multi-byte characters.
+const EXEC_TAIL_BYTES: usize = 64 * 1024;
+
+/// Drain a child pipe on its own thread (see [`run_exec_command_with_timeout`]
+/// for why the pipes can't be polled inline), keeping only the trailing
+/// [`EXEC_TAIL_BYTES`].
 fn spawn_reader<R: std::io::Read + Send + 'static>(
     mut pipe: R,
 ) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
-        buf
+        let mut tail: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match std::io::Read::read(&mut pipe, &mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    tail.extend(&chunk[..n]);
+                    let excess = tail.len().saturating_sub(EXEC_TAIL_BYTES);
+                    tail.drain(..excess);
+                }
+            }
+        }
+        Vec::from(tail)
     })
 }
 
@@ -399,6 +420,20 @@ mod tests {
         );
         assert_eq!(status, AutomationRunStatus::Success);
         // Only the tail is kept, so the history stays bounded.
+        assert!(detail.len() <= 500, "detail was {} chars", detail.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_exec_command_keeps_the_tail_of_a_huge_stream() {
+        // The reader drops everything but the trailing `EXEC_TAIL_BYTES` as it
+        // drains, so the last lines still have to survive intact.
+        let (status, detail) = run_exec_command_with_timeout(
+            "for i in $(seq 1 60000); do echo filler-line-$i; done; echo THE-END",
+            Some(60),
+        );
+        assert_eq!(status, AutomationRunStatus::Success);
+        assert!(detail.ends_with("THE-END"), "got {detail}");
         assert!(detail.len() <= 500, "detail was {} chars", detail.len());
     }
 
