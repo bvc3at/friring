@@ -614,21 +614,42 @@ fn render_automation_list(autos: &[Automation]) -> String {
     output::table(&["ID", "STATE", "NAME", "SCHEDULE", "ACTION"], &rows)
 }
 
-/// Render a single automation as an aligned key/value block.
+/// Render a single automation as an aligned key/value block. Multi-step
+/// prompts list every step — showing only the `prompt` column would report
+/// step 1 as if it were the whole delivery.
 fn render_automation_detail(a: &Automation) -> String {
-    let pairs: Vec<(&str, String)> = vec![
-        ("id", a.id.to_string()),
-        ("name", a.name.clone()),
-        ("enabled", a.enabled.to_string()),
+    let mut pairs: Vec<(String, String)> = vec![
+        ("id".into(), a.id.to_string()),
+        ("name".into(), a.name.clone()),
+        ("enabled".into(), a.enabled.to_string()),
         (
-            "schedule",
+            "schedule".into(),
             format!("{} ({})", a.schedule.kind(), a.schedule.spec()),
         ),
-        ("timezone", output::dash(a.timezone.as_deref())),
-        ("action", action::action_label(Some(&a.action))),
-        ("prompt", a.prompt.clone()),
+        ("timezone".into(), output::dash(a.timezone.as_deref())),
+        ("action".into(), action::action_label(Some(&a.action))),
     ];
-    output::kv(&pairs)
+    if let Some(host) = a.action.host() {
+        pairs.push(("host".into(), host.to_string()));
+    }
+    if let AutomationAction::Spawn { session_mode, .. } = &a.action {
+        pairs.push(("session".into(), session_mode.as_str().to_string()));
+    }
+    if !matches!(a.action, AutomationAction::Exec { .. }) {
+        let steps = a.steps();
+        let total = steps.len();
+        for (i, step) in steps.iter().enumerate() {
+            let label = if total > 1 {
+                format!("step {}/{total}", i + 1)
+            } else {
+                "prompt".to_string()
+            };
+            pairs.push((label, step.text.clone()));
+        }
+    }
+    let borrowed: Vec<(&str, String)> =
+        pairs.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    output::kv(&borrowed)
 }
 
 /// Render an automation's run history as a table.
@@ -1170,6 +1191,12 @@ fn automation_to_json(a: &Automation) -> Value {
         "timezone": a.timezone,
         "action": action,
         "prompt": a.prompt,
+        // The resolved delivery list — always present, so a script never has to
+        // know whether this row predates multi-step prompts.
+        "prompt_steps": a.steps().iter().map(|s| json!({
+            "text": s.text,
+            "delay_ms": s.delay_ms,
+        })).collect::<Vec<_>>(),
         "created_at": a.created_at,
         "updated_at": a.updated_at,
         "last_run_at": a.last_run_at,
