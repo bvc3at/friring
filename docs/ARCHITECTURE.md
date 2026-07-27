@@ -193,6 +193,14 @@ when `tick()` polls `try_recv()`:
   continuation applied on completion. Programmatic spawns
   (automations/tasks, restore) stay **synchronous** — they read the new
   session's id straight back, so they cannot defer it to a later tick.
+- **Automation `exec`** — the one deliberate exception to the shape: the
+  tick records a `running` run row and hands the command to a *detached*
+  `std::thread` that opens its own `Database` connection and closes the row
+  out itself, because the run outlives the tick that started it and no
+  result has to reach the model. (The headless `automation tick` runs it
+  inline instead — a short-lived process that detached would exit and
+  strand the row.) A worker that dies with its process is recovered by
+  `reap_orphaned_automation_runs`; see `docs/FEATURES.md`.
 
 **Rejected**:
 
