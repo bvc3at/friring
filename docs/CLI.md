@@ -107,7 +107,9 @@ friring-cli automation import inbox.toml --replace
 ```
 
 `dry-run` resolves the schedule, target/spawn parameters, host and every prompt
-step **without firing** and without touching the run history. `export`/`import`
+step **without firing** and without touching the run history; its JSON is an
+ordered array of `{"label", "value"}` rows, because a plan repeats labels (one
+`extra repo` row per extra repository). `export`/`import`
 round-trip through the `[[automations]]` TOML grammar extension manifests use
 (see `docs/CONFIG.md`); import matches on name and skips an existing automation
 unless `--replace`.

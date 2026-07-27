@@ -1081,9 +1081,11 @@ fn resolve_action(args: &ActionArgs, db: &Database) -> Result<AutomationAction, 
 fn dry_run(db: &Database, id: i64) -> Result<CommandOutput, String> {
     let auto = load(db, id)?;
     let rows = crate::session::automation::dry_run_plan(&auto, current_time_millis());
-    let json = Value::Object(
+    // An ordered array, not an object: the plan repeats the `extra repo` label
+    // once per extra repository, so a map would keep only the last one.
+    let json = Value::Array(
         rows.iter()
-            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .map(|(k, v)| json!({ "label": k, "value": v }))
             .collect(),
     );
     let pairs: Vec<(&str, String)> = rows.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
@@ -1871,10 +1873,50 @@ mod tests {
         .unwrap();
         let id = db.list_automations().unwrap()[0].id;
         let out = dry_run(&db, id).unwrap();
-        assert_eq!(out.json["action"], json!("exec"));
-        assert_eq!(out.json["command"], json!("sync.sh"));
+        let value_of = |label: &str| {
+            out.json
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["label"] == json!(label))
+                .map(|row| row["value"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(value_of("action"), vec![json!("exec")]);
+        assert_eq!(value_of("command"), vec![json!("sync.sh")]);
         // A dry run must not touch the history.
         assert!(db.list_automation_runs(id, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dry_run_json_lists_every_extra_repo() {
+        let db = Database::open_in_memory().unwrap();
+        create_automation(
+            &db,
+            spawn_create(
+                "multi",
+                ActionArgs {
+                    repo: Some("/repo".into()),
+                    add_repo: vec!["/extra-one@main".into()],
+                    add_dir: vec!["/extra-two".into()],
+                    ..ActionArgs::default()
+                },
+            ),
+        )
+        .unwrap();
+        let id = db.list_automations().unwrap()[0].id;
+        let out = dry_run(&db, id).unwrap();
+        let extras: Vec<String> = out
+            .json
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["label"] == json!("extra repo"))
+            .map(|row| row["value"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(extras.len(), 2, "got {extras:?}");
+        assert!(extras[0].contains("/extra-one"), "got {extras:?}");
+        assert!(extras[1].contains("/extra-two"), "got {extras:?}");
     }
 
     #[test]
