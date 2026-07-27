@@ -16,10 +16,6 @@ use crate::session::{
 use crossterm::event::{KeyCode, KeyModifiers};
 use tracing::{debug, error, info};
 
-/// How many sessions one fresh-per-fire `Spawn` automation may leave open before
-/// further fires are skipped. See [`App::fresh_spawn_guard`].
-const MAX_LIVE_FRESH_SESSIONS: usize = 5;
-
 impl App {
     /// Fire any due automations. Called once per ~second from `tick()`; pass
     /// `force = true` for the one-shot startup catch-up pass (ignores cadence).
@@ -200,12 +196,10 @@ impl App {
         }
     }
 
-    /// Reason to skip a fresh-session fire, or `None` to go ahead.
-    ///
-    /// A fresh-per-fire automation on a short cron leaves every run's session
-    /// open, so without a cap an hourly job quietly accumulates sessions (and
-    /// worktrees) until the machine complains. Reuse mode is unbounded by
-    /// construction — it always lands in the same session.
+    /// Reason to skip a fresh-session fire, or `None` to go ahead. The cap
+    /// itself lives in
+    /// [`fresh_session_cap_reason`](crate::session::automation::fresh_session_cap_reason)
+    /// so the headless dispatcher skips on the same terms.
     fn fresh_spawn_guard(
         &self,
         auto: &Automation,
@@ -214,18 +208,13 @@ impl App {
         if mode != crate::session::SpawnSessionMode::Fresh {
             return None;
         }
-        let prefix = format!("auto-{}-", auto.id);
+        let prefix = crate::session::automation::fresh_session_prefix(auto.id);
         let live = self
             .sessions
             .iter()
             .filter(|s| s.info.name.starts_with(&prefix))
             .count();
-        (live >= MAX_LIVE_FRESH_SESSIONS).then(|| {
-            format!(
-                "{live} sessions from this automation are still open \
-                 (limit {MAX_LIVE_FRESH_SESSIONS}) — close some to let it fire again"
-            )
-        })
+        crate::session::automation::fresh_session_cap_reason(live)
     }
 
     /// Start an `Exec` automation off the tick thread: record a `Running` row,

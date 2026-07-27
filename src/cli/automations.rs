@@ -929,6 +929,18 @@ fn fire_spawn(
     else {
         return (AutomationRunStatus::Error, "not a spawn".into(), None);
     };
+    // The same cap the TUI applies, so which firer wins the claim can't change
+    // whether an hourly fresh-per-fire automation accumulates sessions.
+    if *session_mode == crate::session::SpawnSessionMode::Fresh {
+        let prefix = crate::session::automation::fresh_session_prefix(auto.id);
+        let live = db
+            .list_active_sessions()
+            .map(|rows| rows.iter().filter(|s| s.name.starts_with(&prefix)).count())
+            .unwrap_or(0);
+        if let Some(reason) = crate::session::automation::fresh_session_cap_reason(live) {
+            return (AutomationRunStatus::Skipped, reason, None);
+        }
+    }
     let mux = match crate::agent::tmux::MuxTarget::resolve(host.as_deref()) {
         Ok(m) => m,
         Err(e) => return (AutomationRunStatus::Error, e.to_string(), None),
@@ -1891,6 +1903,55 @@ mod tests {
         let listed = &db.list_automation_runs(id, 10).unwrap()[0];
         assert_eq!(listed.status, AutomationRunStatus::Error);
         assert!(listed.detail.contains("interrupted"), "got {listed:?}");
+    }
+
+    #[test]
+    fn a_headless_fresh_spawn_stops_at_the_live_session_cap() {
+        use crate::session::automation::MAX_LIVE_FRESH_SESSIONS;
+        let db = Database::open_in_memory().unwrap();
+        create_automation(
+            &db,
+            spawn_create(
+                "nightly",
+                ActionArgs {
+                    repo: Some("/repo".into()),
+                    session_mode: Some("fresh".into()),
+                    ..ActionArgs::default()
+                },
+            ),
+        )
+        .unwrap();
+        let auto = db.list_automations().unwrap().remove(0);
+        // The cap's worth of sessions this automation left open.
+        for i in 0..MAX_LIVE_FRESH_SESSIONS {
+            let shared = crate::sync::SharedSession {
+                id: SessionId::default(),
+                name: format!(
+                    "{}2024010{i}",
+                    crate::session::automation::fresh_session_prefix(auto.id)
+                ),
+                agent: "claude".into(),
+                backend_id: String::new(),
+                backend_type: "local-tmux".into(),
+                agent_session_id: None,
+                cwd: None,
+                additional_dirs: Vec::new(),
+                workspace_dir: None,
+                worktrees: Vec::new(),
+                shell_backend_id: None,
+                parent_session_id: None,
+                display_order: None,
+                tombstone: false,
+                tombstone_at: None,
+            };
+            db.upsert_session(&shared).unwrap();
+        }
+
+        // Whichever firer wins the claim must skip on the same terms, or a
+        // keeper-only install accumulates sessions and worktrees unboundedly.
+        let (status, detail, _) = fire_spawn(&db, &auto, current_time_millis());
+        assert_eq!(status, AutomationRunStatus::Skipped);
+        assert!(detail.contains("still open"), "got {detail}");
     }
 
     #[test]

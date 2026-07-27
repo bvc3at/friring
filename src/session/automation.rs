@@ -656,6 +656,33 @@ fn action_plan_rows(auto: &Automation, fire_at: u64) -> Vec<(String, String)> {
     }
 }
 
+/// How many sessions one fresh-per-fire `Spawn` automation may leave open
+/// before further fires are skipped. See [`fresh_session_cap_reason`].
+pub const MAX_LIVE_FRESH_SESSIONS: usize = 5;
+
+/// Reason to skip a fresh-session fire given the number of sessions this
+/// automation still has open, or `None` to go ahead.
+///
+/// A fresh-per-fire automation on a short cron leaves every run's session open,
+/// so without a cap an hourly job quietly accumulates sessions (and worktrees)
+/// until the machine complains. Reuse mode is unbounded by construction — it
+/// always lands in the same session. Shared by the TUI and the headless
+/// dispatcher so whichever wins the claim writes the same run history.
+pub fn fresh_session_cap_reason(live: usize) -> Option<String> {
+    (live >= MAX_LIVE_FRESH_SESSIONS).then(|| {
+        format!(
+            "{live} sessions from this automation are still open \
+             (limit {MAX_LIVE_FRESH_SESSIONS}) — close some to let it fire again"
+        )
+    })
+}
+
+/// The prefix every fresh session of automation `id` carries
+/// (`auto-<id>-<stamp>`), used to count the live ones against the cap.
+pub fn fresh_session_prefix(automation_id: i64) -> String {
+    format!("auto-{automation_id}-")
+}
+
 /// The worktree branch a `Spawn` fire uses.
 ///
 /// [`SpawnSessionMode::Fresh`] suffixes the configured branch with the same
