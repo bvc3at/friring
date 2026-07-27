@@ -1488,8 +1488,8 @@ fn bracketed_paste(text: &str) -> String {
 /// Which multiplexer server the headless one-shot helpers below talk to.
 ///
 /// Those helpers ([`window_exists_on`], [`send_prompt_now_on`],
-/// [`send_prompt_steps_after_delay_on`]) used to hardcode
-/// [`local_mux_command`], which made every headless automation local-only: a
+/// [`send_prompt_steps_after_delay`]) used to hardcode a local-only tmux
+/// command builder, which made every headless automation local-only: a
 /// `Spawn` on a remote host created the session over SSH and then typed its
 /// prompt into a window that only exists on the *other* machine's server. This
 /// bundles the [`TmuxTransport`] + socket + group session so the same helpers
