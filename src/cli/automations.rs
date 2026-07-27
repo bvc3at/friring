@@ -1138,8 +1138,17 @@ fn import_automations(db: &Database, file: &str, replace: bool) -> Result<Comman
     // fails on its third entry must not have destroyed the first two.
     let (mut created, mut replaced, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
     let mut plan: Vec<(NewAutomation, Option<i64>)> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for decl in &manifest.automations {
         decl.validate()?;
+        // Name is the manifest's identity (the skip/replace key), and the table
+        // has no UNIQUE constraint — two entries sharing one would both insert.
+        if !seen.insert(decl.name.as_str()) {
+            return Err(format!(
+                "manifest declares '{}' twice; each automation name must be unique",
+                decl.name
+            ));
+        }
         match existing.get(&decl.name) {
             Some(_) if !replace => {
                 skipped.push(decl.name.clone());
@@ -1788,6 +1797,22 @@ mod tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0], before);
         assert_eq!(db.list_automation_runs(before.id, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn import_rejects_a_manifest_with_duplicate_names() {
+        let db = Database::open_in_memory().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("autos.toml");
+        std::fs::write(
+            &file,
+            "[[automations]]\nname = \"sync\"\ntrigger = \"hourly\"\ncommand = \"a.sh\"\n\n\
+             [[automations]]\nname = \"sync\"\ntrigger = \"daily\"\ncommand = \"b.sh\"\n",
+        )
+        .unwrap();
+        let err = import_automations(&db, &file.display().to_string(), false).unwrap_err();
+        assert!(err.contains("twice"), "got {err}");
+        assert!(db.list_automations().unwrap().is_empty(), "nothing created");
     }
 
     #[test]
