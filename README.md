@@ -955,6 +955,12 @@ Run *inside* a session, `send`/`reply`/`inbox` default their sender,
 task, and recipient to the caller's injected identity
 (`FRIRING_SESSION` / `FRIRING_TASK`), so an agent passes no ids. `send`
 and `reply` wake the recipient by default (`--no-wake` to suppress).
+A recipient showing a dialog is not nudged — the message stays queued,
+`--json` reports `wake_deferred` with a `wake_deferred_reason`, and the
+nudge is retried on the next `automation tick` (see
+[`docs/CLI.md`](docs/CLI.md#typing-into-a-session-the-modal-guard)).
+`reply` records the id it answers as `in_reply_to`, shown as the `RE`
+column in `inbox`.
 
 ### Extensions (alias `ext`)
 
