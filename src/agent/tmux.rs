@@ -2422,6 +2422,48 @@ mod tests {
         assert_eq!(modal_marker("Overwrite? [y/N] "), Some("[y/N]"));
     }
 
+    /// Pins the marker set itself, and that every entry survives into both
+    /// deferred-script dialects. The literals are spelled out here rather than
+    /// read from [`MODAL_MARKERS`] on purpose: a dropped or mistyped marker is
+    /// a silently weaker security guard, and a self-derived expectation would
+    /// agree with it.
+    #[test]
+    fn every_marker_is_matched_and_reaches_both_guards() {
+        use crate::session::PromptStep;
+        const EXPECTED: &[&str] = &[
+            "Do you want to",
+            "Do you trust",
+            "Esc to cancel",
+            "❯ 1.",
+            "› 1.",
+            "[y/N]",
+            "[Y/n]",
+        ];
+        assert_eq!(MODAL_MARKERS, EXPECTED);
+
+        let steps = [PromptStep::new("x")];
+        let posix = deferred_prompt_script(&posix_target(), "friring:=tb-auto-1", &steps);
+        let powershell = decode_encoded_command(&deferred_prompt_script(
+            &psmux_target(),
+            "friring:=tb-auto-1",
+            &steps,
+        ));
+        for m in EXPECTED {
+            // One marker per pane, so the first-match order can't hide a
+            // marker behind another one.
+            let pane = format!("working…\n{m}\nmore");
+            assert_eq!(modal_marker(&pane), Some(*m));
+
+            let case = format!("*{}*", crate::shell::posix_quote(m));
+            assert!(posix.contains(&case), "{case} missing from {posix}");
+            let test = format!("$p.Contains({})", ps_single_quote(m));
+            assert!(
+                powershell.contains(&test),
+                "{test} missing from {powershell}"
+            );
+        }
+    }
+
     #[test]
     fn modal_marker_lets_an_ordinary_pane_through() {
         // A working agent, and one sitting at an empty composer: both must
