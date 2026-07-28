@@ -101,10 +101,18 @@ The fork guards every path that types into a pane (`session send`,
 `message send`/`reply`'s wake, `send` automations, task prompts, and the
 deferred `run-shell` delivery after a headless spawn):
 
-- **Two independent signals veto a write** — the agent's own hook-reported
-  `blocked` state (`session signal`) and a scrape of the visible pane for
-  `agent::tmux::MODAL_MARKERS`. Either is enough; each covers the other's blind
-  spot (hooks are agent-specific, the scrape is a heuristic).
+- **Two signals veto a write** — the agent's own hook-reported `blocked` state
+  (`session signal`) and a scrape of the visible pane for
+  `agent::tmux::MODAL_MARKERS`. Each covers the other's blind spot (hooks are
+  agent-specific, the scrape is a heuristic).
+- **Scheduled work is gated on the pane alone.** `blocked` means "a dialog was
+  raised this turn", not "a dialog is up now" — Claude Code fires `PreToolUse`
+  *before* the prompt and nothing on approval, so an approved tool call reports
+  `blocked` for its entire run (measured and pinned by the
+  `claude-blocked-spans-tool-run` e2e). The mailbox wake and `session send`
+  honor it anyway, since a false refusal there is cheap; `send` automations and
+  task delivery don't, so a session busy with a long approved tool call doesn't
+  silently miss every fire aimed at it.
 - **A refusal fits the caller.** The mailbox wake defers silently and reports
   `wake_deferred`; `session send` errors, with `--force` to type anyway; an
   automation records a `Skipped` run naming the marker and how many steps

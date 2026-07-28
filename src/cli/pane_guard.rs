@@ -10,9 +10,37 @@
 //! to `--state blocked`).
 //!
 //! Two signals rather than one because each covers the other's blind spot: the
-//! hook state is authoritative but only exists for agents whose hooks are
-//! wired, while the pane scrape works for any agent but is a heuristic. Either
-//! one is enough to refuse.
+//! hook state catches a dialog whose wording no marker matches, but only for
+//! agents whose hooks are wired, while the pane scrape works for any agent and
+//! is a heuristic.
+//!
+//! # Which callers use which signal, and why
+//!
+//! Not every caller gets both vetoes, and that asymmetry is deliberate.
+//!
+//! `blocked` is **not** "a dialog is on screen now" — it is "a dialog was
+//! raised at some point in this turn". Claude Code has no after-approval hook:
+//! `PreToolUse` fires *before* the permission prompt, and the next signal is
+//! `Stop` at the end of the turn, so an **approved** tool call reports
+//! `blocked` for its entire run. Measured, and pinned by the
+//! `claude-blocked-spans-tool-run` e2e: 38 consecutive `blocked` samples across
+//! a 20 s approved `Bash` call, then straight to `done`, never `working`.
+//!
+//! So the signal is only safe to act on where a false refusal is cheap:
+//!
+//! - **`message send`/`reply` wake** and **`session send`** consult it. A
+//!   deferred wake is retried, and `session send` is interactive with `--force`
+//!   one keystroke away.
+//! - **`send` automations** and **task delivery** deliberately do **not**.
+//!   They fire on a schedule and don't retry until the next one, so honoring a
+//!   stale `blocked` would silently skip every fire aimed at a session that is
+//!   merely running a long approved tool call — an ordinary thing to be doing.
+//!   Those paths take the pane scrape alone, which cannot go stale.
+//!
+//! The residual gap that leaves is narrow and accepted: an agent that wires
+//! friring's status hooks *and* renders a dialog no marker matches can still be
+//! typed into by an automation. Widen [`crate::agent::tmux::MODAL_MARKERS`] to
+//! close it rather than reintroducing the stale veto.
 
 use crate::session::SessionId;
 use crate::storage::Database;

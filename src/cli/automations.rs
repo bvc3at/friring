@@ -953,6 +953,11 @@ fn fire_send(
         );
     }
     let steps = auto.steps();
+    // Pane scrape only — no `pane_guard::blocked_on_prompt` here, unlike the
+    // mailbox wake and `session send`. A scheduled fire doesn't retry until its
+    // next occurrence, and `blocked` spans an *approved* tool call's whole run
+    // (no after-approval hook), so honoring it would skip every fire aimed at a
+    // session that is merely working. Reasoning in full: `cli::pane_guard`.
     match crate::agent::tmux::send_prompt_steps_now(&mux, &name, &steps) {
         Ok(write) => match write.refused() {
             None => (

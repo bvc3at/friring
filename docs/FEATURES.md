@@ -2782,7 +2782,9 @@ clear: the recipient's hook-reported state (`blocked`, from
 (`agent::tmux::MODAL_MARKERS`). A refusal is not a drop — the message is
 already durably queued, the row is marked `wake_pending` (schema v46), and
 the retry sweep on each `automation tick` nudges again once the pane is
-safe, so the guard costs no timeliness beyond the dialog's own lifetime.
+safe, so the guard costs no timeliness beyond the dialog's own lifetime
+(with `[features] automations` off there is no tick, so the nudge is lost
+and the message waits for the recipient's next read).
 Reading the inbox settles the debt on its own (a claimed message no longer
 matches `read_at IS NULL`), and a `--no-wake` send never marks it, so the
 sweep can't nudge behind a caller's back. Full call-site table:

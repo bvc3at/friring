@@ -289,6 +289,12 @@ fn status_glyph(status: TaskStatus) -> String {
 
 /// The `skipped` reason for a task whose target pane was showing a dialog, so
 /// the modal guard ([`crate::agent::tmux::MODAL_MARKERS`]) held the prompt back.
+///
+/// Task delivery takes the pane scrape alone — no `pane_guard::blocked_on_prompt`,
+/// unlike the mailbox wake and `session send`. `blocked` spans an *approved*
+/// tool call's whole run (Claude Code has no after-approval hook), so honoring
+/// it would leave a task Todo for as long as its target happened to be working.
+/// Reasoning in full: `cli::pane_guard`.
 fn modal_skip(marker: &str) -> String {
     format!("target session is showing a dialog ({marker:?}); prompt not typed")
 }

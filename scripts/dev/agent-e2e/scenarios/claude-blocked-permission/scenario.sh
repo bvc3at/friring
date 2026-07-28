@@ -32,11 +32,13 @@ scenario_steps() {
     step_wait_pane "Do you want" 60
     step_wait_state 'blocked' 60
     # Approve: option 1 ("Yes") is pre-selected; Enter confirms it. The tool
-    # then really runs (PreToolUse -> working), the tool_result reaches the
-    # stub, and its follow-up text lands in the pane before Stop -> done.
+    # then really runs, the tool_result reaches the stub, and its follow-up text
+    # lands in the pane before Stop -> done.
     step_key Enter
-    # 'working|done': hook_state is overwritten in place, so a fast tail can
-    # flip working->done between polls; done implies the tool turn ran.
+    # 'working|done', not 'working': no hook fires on approval — PreToolUse
+    # already ran *before* the dialog — so the state holds at `blocked` until
+    # Stop. See claude-blocked-spans-tool-run, which pins that; the modal
+    # guard's automation policy depends on it.
     step_wait_state 'working|done' 60
     step_wait_pane "$SCENARIO_DONE_PATTERN" 60
     step_wait_state 'done' 60
