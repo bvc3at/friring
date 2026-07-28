@@ -1961,10 +1961,16 @@ fn deferred_prompt_script_posix(
 /// string per screen row, so the rows are joined before matching — every
 /// [`MODAL_MARKERS`] entry sits within a single row once `-J` has rejoined
 /// tmux's wrapped lines.
+///
+/// `String.Contains`, not `-like`: `-like` reads `[…]` as a character class, so
+/// the `[y/N]` / `[Y/n]` markers would degrade into "contains any of `y`, `/`,
+/// `N`" and match essentially every pane. `Contains` is an ordinal,
+/// case-sensitive substring test with no wildcard syntax — the same contract as
+/// the `str::contains` in [`modal_marker`].
 fn powershell_modal_guard(mux: &str, socket: &str, quoted_window: &str) -> String {
     let tests = MODAL_MARKERS
         .iter()
-        .map(|m| format!("$p -like {}", ps_single_quote(&format!("*{m}*"))))
+        .map(|m| format!("$p.Contains({})", ps_single_quote(m)))
         .collect::<Vec<_>>()
         .join(" -or ");
     format!(
@@ -2456,9 +2462,12 @@ mod tests {
         let decoded = decode_encoded_command(&script);
         assert!(decoded.contains("capture-pane -p -J"), "got {decoded}");
         assert!(
-            decoded.contains("-like '*Do you want to*'"),
+            decoded.contains("$p.Contains('Do you want to')"),
             "got {decoded}"
         );
+        // A bracketed marker stays a literal — `-like` would have read it as a
+        // character class and matched any pane containing `y`, `/` or `N`.
+        assert!(decoded.contains("$p.Contains('[y/N]')"), "got {decoded}");
         assert!(decoded.contains("{ exit }"), "got {decoded}");
         // Every marker gets a test, joined into one condition.
         assert_eq!(
