@@ -124,6 +124,14 @@ deferred `run-shell` delivery after a headless spawn):
 Not a permission boundary: anything that can run `friring-cli` can still
 `session send --force`. What it removes is the surprise.
 
+Proved end to end against a **real** claude permission dialog
+(`claude-wake-modal-guard`): a send while the dialog is up types nothing and
+leaves the tool unexecuted, and the owed nudge lands once a human answers.
+Run against the pre-guard build the same scenario reports `"woke": true` and
+the pane shows the Bash call already `Done` — the report's finding, reproduced
+as a regression test. `scripted-message-queue` covers the pane-scrape half in
+isolation (that agent declares no status hooks, so only the scrape can refuse).
+
 #### tmux-style leader key (July 2026)
 
 Upstream dispatches every global command from a direct `Ctrl+<letter>` chord
