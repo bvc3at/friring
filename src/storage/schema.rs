@@ -1840,6 +1840,59 @@ mod tests {
     }
 
     #[test]
+    fn migrate_from_v45_adds_message_threading_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Minimal v45 state: the pre-v46 session_messages table with one queued
+        // message in it. (v45's own migration touches `sessions`, which this seed
+        // deliberately omits — `add_column_if_absent` no-ops on a missing table.)
+        conn.execute_batch(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO metadata (key, value) VALUES ('schema_version', '45');
+             CREATE TABLE session_messages (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                to_session_id   TEXT NOT NULL,
+                from_session_id TEXT,
+                from_task_id    INTEGER,
+                kind            TEXT NOT NULL DEFAULT 'note',
+                body            TEXT NOT NULL,
+                created_at      INTEGER NOT NULL,
+                read_at         INTEGER);
+             INSERT INTO session_messages (id, to_session_id, body, created_at)
+                VALUES (1, 'sess-a', 'scope?', 100);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        // Nullable with no default, so the ALTER can't rewrite existing rows.
+        for column in ["in_reply_to", "wake_pending"] {
+            let (notnull, dflt): (i64, Option<String>) = conn
+                .query_row(
+                    "SELECT \"notnull\", dflt_value FROM pragma_table_info('session_messages') \
+                     WHERE name = ?1",
+                    [column],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap_or_else(|e| panic!("{column} should be added at v46: {e}"));
+            assert_eq!(notnull, 0, "{column} should be nullable");
+            assert_eq!(dflt, None, "{column} should have no default");
+        }
+
+        // The pre-v46 row survives and decodes to the old behavior: unthreaded,
+        // no wake owed.
+        let (body, in_reply_to, wake_pending): (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT body, in_reply_to, wake_pending FROM session_messages WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(body, "scope?");
+        assert_eq!(in_reply_to, None);
+        assert_eq!(wake_pending, None);
+    }
+
+    #[test]
     fn migrate_from_v27_adds_parent_session_id_column() {
         let conn = Connection::open_in_memory().unwrap();
         // Minimal v27 state: a sessions table without the parent_session_id column.
