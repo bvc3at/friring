@@ -713,15 +713,20 @@ per-agent detail: `extensions/hooks/README.md`.
 ## themes.toml
 
 User-defined themes, offered in the `Ctrl+Y` picker (alt `F4`, which
-avoids terminals that grab `Ctrl+Y` as DSUSP) alongside the **fifteen
+avoids terminals that grab `Ctrl+Y` as DSUSP) alongside the **thirty-six
 built-in presets** and persisted by `name` like any preset. The presets
-are eleven dark — **Default**, **Catppuccin Mocha**, **Tokyo Night**,
-**Gruvbox Dark**, **Doom**, **Nord**, **Dracula**, **One Dark**, **Rosé
-Pine Moon**, **Everforest**, **Kanagawa** — and four light — **Catppuccin
-Latte**, **Tokyo Night Day**, **Gruvbox Light**, **Solarized Light**; each
-is available as a `base` in its id form (e.g. the `catppuccin-mocha`
-below). Each `[[themes]]` entry starts from a built-in `base` and
-overrides only the colours it names:
+are twenty-eight dark — **Default**, **Catppuccin Mocha**, **Tokyo
+Night**, **Gruvbox Dark**, **Doom**, **Nord**, **Dracula**, **One Dark**,
+**Rosé Pine Moon**, **Everforest**, **Kanagawa**, **Solarized Dark**,
+**Monokai**, **Ayu Dark**, **Ayu Mirage**, **Material**, **Rosé Pine**,
+**Oxocarbon**, **GitHub Dark**, **Nightfox**, **Sonokai**, **Melange**,
+**Zenburn**, **Iceberg**, **Vesper**, **Synthwave**, **Nightfly**,
+**Tomorrow Night** — and eight light — **Catppuccin Latte**, **Tokyo
+Night Day**, **Gruvbox Light**, **Solarized Light**, **Ayu Light**, **One
+Light**, **Rosé Pine Dawn**, **GitHub Light**; each is available as a
+`base` in its id form (e.g. the `catppuccin-mocha` below). The picker
+filters as you type (`/`). Each `[[themes]]` entry starts from a built-in
+`base` and overrides only the colours it names:
 
 ```toml
 [[themes]]
