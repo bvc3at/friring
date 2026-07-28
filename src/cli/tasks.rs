@@ -287,17 +287,17 @@ fn status_glyph(status: TaskStatus) -> String {
     }
 }
 
-/// Execute a task's action without a TUI, returning a JSON outcome.
-///
-/// tmux/spawn helpers are reached via fully-qualified paths (no `use
-/// crate::agent`) to keep the cli module free of an `agent` import — see
-/// tests/architecture_rules.rs::cli_module_isolation.
 /// The `skipped` reason for a task whose target pane was showing a dialog, so
 /// the modal guard ([`crate::agent::tmux::MODAL_MARKERS`]) held the prompt back.
 fn modal_skip(marker: &str) -> String {
     format!("target session is showing a dialog ({marker:?}); prompt not typed")
 }
 
+/// Execute a task's action without a TUI, returning a JSON outcome.
+///
+/// tmux/spawn helpers are reached via fully-qualified paths (no `use
+/// crate::agent`) to keep the cli module free of an `agent` import — see
+/// tests/architecture_rules.rs::cli_module_isolation.
 fn run_task(db: &Database, task: &Task) -> Result<Value, String> {
     // Seed the agent with full task context (id + title + description + how to
     // read more / mark done), not just the bare title — shared with the TUI
