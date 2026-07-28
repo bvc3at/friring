@@ -42,6 +42,8 @@ pub struct NewMessage {
     pub from_task_id: Option<i64>,
     pub kind: String,
     pub body: String,
+    /// The message being answered, when this is a `reply`.
+    pub in_reply_to: Option<i64>,
 }
 
 /// Why an [`enqueue_message`](Database::enqueue_message) was rejected.
@@ -96,8 +98,9 @@ impl Database {
         let now = current_time_millis() as i64;
         let inserted = self.conn.execute(
             "INSERT INTO session_messages
-                (to_session_id, from_session_id, from_task_id, kind, body, created_at, read_at)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, NULL
+                (to_session_id, from_session_id, from_task_id, kind, body, created_at, read_at,
+                 in_reply_to)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, NULL, ?8
              WHERE (
                  SELECT count(*) FROM session_messages
                  WHERE to_session_id = ?1 AND read_at IS NULL
@@ -110,6 +113,7 @@ impl Database {
                 new.body,
                 now,
                 MAX_UNREAD_PER_RECIPIENT as i64,
+                new.in_reply_to,
             ],
         )?;
         if inserted == 0 {
@@ -118,6 +122,46 @@ impl Database {
             });
         }
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Record that message `id` still owes its recipient a wake nudge, because
+    /// the modal guard refused to type into their pane at send time.
+    ///
+    /// Only a send that *asked* for a wake is ever marked, so the retry sweep
+    /// can never nudge a deliberately silent (`--no-wake`) message.
+    pub fn mark_wake_pending(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE session_messages SET wake_pending = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Recipients holding at least one **unread** message whose wake was
+    /// deferred — the work list for the retry sweep on each `automation tick`.
+    ///
+    /// Reading an inbox settles the debt implicitly: a claimed message stops
+    /// matching `read_at IS NULL`, so an agent that found its mail on its own
+    /// is never nudged about it afterwards.
+    pub fn sessions_awaiting_wake(&self) -> rusqlite::Result<Vec<SessionId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT to_session_id FROM session_messages \
+             WHERE read_at IS NULL AND wake_pending = 1",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows
+            .filter_map(|r| r.ok().and_then(|s| s.parse().ok()))
+            .collect())
+    }
+
+    /// Clear the deferred-wake debt for every unread message of `for_session`,
+    /// after a retry nudge finally landed. Returns the rows settled.
+    pub fn clear_wake_pending(&self, for_session: SessionId) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "UPDATE session_messages SET wake_pending = NULL \
+             WHERE to_session_id = ?1 AND read_at IS NULL AND wake_pending = 1",
+            params![for_session.to_string()],
+        )
     }
 
     /// Number of unread messages addressed to `for_session`.
@@ -223,7 +267,7 @@ impl Database {
 
 /// Column list for message SELECTs (keep in sync with [`map_message`]).
 const COLS: &str = "id, to_session_id, from_session_id, from_task_id, kind, body, \
-    created_at, read_at";
+    created_at, read_at, in_reply_to, wake_pending";
 
 fn map_message(row: &rusqlite::Row) -> rusqlite::Result<SessionMessage> {
     let to: String = row.get(1)?;
@@ -237,6 +281,8 @@ fn map_message(row: &rusqlite::Row) -> rusqlite::Result<SessionMessage> {
         body: row.get(5)?,
         created_at: row.get::<_, i64>(6)? as u64,
         read_at: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+        in_reply_to: row.get(8)?,
+        wake_pending: row.get::<_, Option<i64>>(9)?.unwrap_or(0) != 0,
     })
 }
 
@@ -251,6 +297,7 @@ mod tests {
             from_task_id: None,
             kind: kind.into(),
             body: body.into(),
+            in_reply_to: None,
         }
     }
 
@@ -310,11 +357,70 @@ mod tests {
             from_task_id: Some(7),
             kind: "result".into(),
             body: "{\"status\":\"ok\"}".into(),
+            in_reply_to: None,
         })
         .unwrap();
         let got = db.list_messages(to, false, None).unwrap();
         assert_eq!(got[0].from_session_id, Some(from));
         assert_eq!(got[0].from_task_id, Some(7));
+    }
+
+    #[test]
+    fn in_reply_to_round_trips_and_defaults_none() {
+        let db = Database::open_in_memory().unwrap();
+        let to = SessionId::default();
+        let asked = db.enqueue_message(&new_msg(to, "questions", "Q?")).unwrap();
+        let answered = db
+            .enqueue_message(&NewMessage {
+                in_reply_to: Some(asked),
+                ..new_msg(to, "reply", "A")
+            })
+            .unwrap();
+
+        let got = db.list_messages(to, false, None).unwrap();
+        assert_eq!(got[0].id, asked);
+        assert_eq!(
+            got[0].in_reply_to, None,
+            "an unsolicited send is unthreaded"
+        );
+        assert_eq!(got[1].id, answered);
+        assert_eq!(got[1].in_reply_to, Some(asked));
+    }
+
+    #[test]
+    fn deferred_wake_is_listed_then_settled() {
+        let db = Database::open_in_memory().unwrap();
+        let owed = SessionId::default();
+        let silent = SessionId::default();
+        let deferred = db.enqueue_message(&new_msg(owed, "note", "hi")).unwrap();
+        // A `--no-wake` send never marks the flag, so it must not show up as
+        // work for the retry sweep.
+        db.enqueue_message(&new_msg(silent, "note", "quiet"))
+            .unwrap();
+
+        assert!(db.sessions_awaiting_wake().unwrap().is_empty());
+        db.mark_wake_pending(deferred).unwrap();
+        assert_eq!(db.sessions_awaiting_wake().unwrap(), vec![owed]);
+        assert!(db.list_messages(owed, true, None).unwrap()[0].wake_pending);
+
+        // A landed retry settles the debt exactly once.
+        assert_eq!(db.clear_wake_pending(owed).unwrap(), 1);
+        assert!(db.sessions_awaiting_wake().unwrap().is_empty());
+        assert_eq!(db.clear_wake_pending(owed).unwrap(), 0);
+    }
+
+    #[test]
+    fn reading_the_inbox_settles_a_deferred_wake() {
+        // The recipient found its mail on its own, so no retry is owed — even
+        // though nothing ever called `clear_wake_pending`.
+        let db = Database::open_in_memory().unwrap();
+        let to = SessionId::default();
+        let id = db.enqueue_message(&new_msg(to, "note", "hi")).unwrap();
+        db.mark_wake_pending(id).unwrap();
+        assert_eq!(db.sessions_awaiting_wake().unwrap(), vec![to]);
+
+        db.claim_messages(to, None).unwrap();
+        assert!(db.sessions_awaiting_wake().unwrap().is_empty());
     }
 
     #[test]

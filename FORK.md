@@ -88,6 +88,42 @@ fork makes "not running" a first-class state:
   parse ≈ 50 µs; grey pass ≈ 7 µs; idle claude CLI ≈ 333 MB RSS) were taken
   with the e2e stub harness on real agent frames.
 
+#### Headless sends can't answer a dialog (July 2026)
+
+Upstream's headless senders type their text and press Enter as two separate
+`tmux send-keys` calls, with no look at the target pane. A session sitting on a
+permission dialog swallows the text and reads the Enter as the operator
+answering it — so `friring-cli message send`, whose contract is only "enqueue a
+payload", approved whatever the recipient was asking permission to do, by
+default and with nobody watching.
+
+The fork guards every path that types into a pane (`session send`,
+`message send`/`reply`'s wake, `send` automations, task prompts, and the
+deferred `run-shell` delivery after a headless spawn):
+
+- **Two independent signals veto a write** — the agent's own hook-reported
+  `blocked` state (`session signal`) and a scrape of the visible pane for
+  `agent::tmux::MODAL_MARKERS`. Either is enough; each covers the other's blind
+  spot (hooks are agent-specific, the scrape is a heuristic).
+- **A refusal fits the caller.** The mailbox wake defers silently and reports
+  `wake_deferred`; `session send` errors, with `--force` to type anyway; an
+  automation records a `Skipped` run naming the marker and how many steps
+  landed; a task stays due instead of being marked in progress.
+- **No timeliness lost.** A deferred wake is owed, not dropped
+  (`session_messages.wake_pending`, schema v46), and `automation tick` retries
+  it once the pane is clear. `--no-wake` never marks it; reading the inbox
+  settles it.
+- **The nudge is self-describing.** Upstream types the bare word `inbox`; the
+  fork names the command and the sender, since the nudge lands as a user turn
+  and a recipient that was never taught the convention can only guess at a
+  token. Still pointer-only — the body stays in the queue.
+- **Replies thread.** `message reply` records `in_reply_to` (schema v46),
+  exposed in `--json` and as the `RE` column, so two conversations in flight on
+  one task stay tellable apart without smuggling the id into `kind`.
+
+Not a permission boundary: anything that can run `friring-cli` can still
+`session send --force`. What it removes is the surprise.
+
 #### tmux-style leader key (July 2026)
 
 Upstream dispatches every global command from a direct `Ctrl+<letter>` chord

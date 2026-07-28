@@ -1617,8 +1617,107 @@ impl MuxTarget {
     }
 }
 
-/// Send text immediately to a session pane on friring's local server.
-pub fn send_prompt_now(session_name: &str, text: &str) -> Result<()> {
+/// Visible-pane text that means "a modal is waiting for a keypress".
+///
+/// Every headless sender below types its text and presses Enter as two
+/// separate `send-keys` calls. A pane showing one of these swallows the text
+/// and reads the Enter as *the operator answering the dialog* — for Claude
+/// Code's tool-approval prompt that confirms the highlighted `1. Yes`, so a
+/// `friring-cli message send` would approve a tool call no human ever saw.
+/// [`send_prompt_now_on`] therefore refuses to type when one is up.
+///
+/// Matched as substrings against the **visible** screen only (never
+/// scrollback), so a dialog that has since scrolled away can't block delivery
+/// forever. Deliberately over-broad, because the two failure directions are
+/// not symmetric: a false positive defers a nudge (retried later), a false
+/// negative answers a security prompt on the operator's behalf.
+pub const MODAL_MARKERS: &[&str] = &[
+    // Claude Code's tool-approval and folder-trust dialogs, plus the footer
+    // both of them render.
+    "Do you want to",
+    "Do you trust",
+    "Esc to cancel",
+    // A cursored numbered choice list — the shape an approval modal has
+    // whatever wording an agent puts above it.
+    "❯ 1.",
+    "› 1.",
+    // A raw terminal confirmation from something the agent shelled out to.
+    // Only the bracketed forms, which are the ones that *have* a default for
+    // a bare Enter to pick.
+    "[y/N]",
+    "[Y/n]",
+];
+
+/// Outcome of a guarded pane write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneWrite {
+    /// The text and its Enter were delivered.
+    Sent,
+    /// Delivery stopped: the pane is showing a modal (the matched
+    /// [`MODAL_MARKERS`] entry), so the Enter would have answered it.
+    RefusedModal {
+        marker: &'static str,
+        /// Prompt steps already delivered before the refusal — always 0 for a
+        /// single-text send, and for [`send_prompt_steps_now`] the count that
+        /// did land before the modal appeared.
+        after_steps: usize,
+    },
+}
+
+impl PaneWrite {
+    /// The matched marker when this write was refused, else `None`.
+    pub fn refused(self) -> Option<&'static str> {
+        match self {
+            Self::Sent => None,
+            Self::RefusedModal { marker, .. } => Some(marker),
+        }
+    }
+}
+
+/// The first [`MODAL_MARKERS`] entry present in `pane`, if any. Pure, so the
+/// marker set is testable without a live multiplexer.
+pub fn modal_marker(pane: &str) -> Option<&'static str> {
+    MODAL_MARKERS.iter().copied().find(|m| pane.contains(m))
+}
+
+/// Capture only the **visible** screen of a session's agent pane on `target`
+/// (no `-S`, so no scrollback) — the input for [`modal_marker`].
+fn capture_visible_pane_on(target: &MuxTarget, session_name: &str) -> Result<String> {
+    let window = target.window_target(session_name);
+    let output = target
+        .command(&["capture-pane", "-p", "-J", "-t", &window])
+        .output()
+        .context("Failed to run tmux capture-pane for the modal guard")?;
+    if !output.status.success() {
+        bail!(
+            "tmux capture-pane exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Which modal, if any, is on `session_name`'s visible pane right now.
+///
+/// A capture failure reports "no modal": the window is then almost certainly
+/// gone, and the send that follows fails loudly on its own. Failing *closed*
+/// here would let one flaky `capture-pane` silently stop every delivery — a
+/// worse outcome than the send erroring, and not a case an attacker can reach
+/// without already being able to drive tmux directly.
+pub fn pane_modal_on(target: &MuxTarget, session_name: &str) -> Option<&'static str> {
+    match capture_visible_pane_on(target, session_name) {
+        Ok(pane) => modal_marker(&pane),
+        Err(e) => {
+            tracing::debug!("modal guard: capture-pane for '{session_name}' failed: {e}");
+            None
+        }
+    }
+}
+
+/// Send text immediately to a session pane on friring's local server, unless a
+/// modal is up (see [`send_prompt_now_on`]).
+pub fn send_prompt_now(session_name: &str, text: &str) -> Result<PaneWrite> {
     send_prompt_now_on(&MuxTarget::local(), session_name, text)
 }
 
@@ -1627,7 +1726,27 @@ pub fn send_prompt_now(session_name: &str, text: &str) -> Result<()> {
 /// Targets the tmux window named `tb-<session_name>` in `target`'s group session
 /// and uses a "paste text → brief delay → press Enter" sequence so the target
 /// app has time to process the pasted input.
-pub fn send_prompt_now_on(target: &MuxTarget, session_name: &str, text: &str) -> Result<()> {
+///
+/// Guarded: when the pane is showing a modal ([`MODAL_MARKERS`]) nothing is
+/// typed and the caller gets [`PaneWrite::RefusedModal`] to defer or report.
+pub fn send_prompt_now_on(target: &MuxTarget, session_name: &str, text: &str) -> Result<PaneWrite> {
+    if let Some(marker) = pane_modal_on(target, session_name) {
+        return Ok(PaneWrite::RefusedModal {
+            marker,
+            after_steps: 0,
+        });
+    }
+    send_prompt_unguarded_on(target, session_name, text)?;
+    Ok(PaneWrite::Sent)
+}
+
+/// Type `text` + Enter into a session pane with **no** modal guard.
+///
+/// The escape hatch behind `friring-cli session send --force`, for an operator
+/// who is looking at the pane and means to answer what is on it. Every other
+/// caller goes through [`send_prompt_now_on`] — [`MODAL_MARKERS`] explains what
+/// an unguarded Enter costs.
+pub fn send_prompt_unguarded_on(target: &MuxTarget, session_name: &str, text: &str) -> Result<()> {
     let window = target.window_target(session_name);
     let payload = bracketed_paste(text);
 
@@ -1656,18 +1775,29 @@ pub fn send_prompt_now_on(target: &MuxTarget, session_name: &str, text: &str) ->
 /// Each step is its own paste + Enter with the step's settle delay in between —
 /// a multi-line bracketed paste would submit as a *single* prompt, which is
 /// exactly what a `/model x` → `/effort y` → "do the work" sequence must not do.
+///
+/// Every step is guarded, not just the first: a step can be what opens the
+/// modal the next one would answer. A refusal stops the sequence and reports
+/// how many steps had already landed.
 pub fn send_prompt_steps_now(
     target: &MuxTarget,
     session_name: &str,
     steps: &[crate::session::PromptStep],
-) -> Result<()> {
+) -> Result<PaneWrite> {
     for (i, step) in steps.iter().enumerate() {
-        send_prompt_now_on(target, session_name, &step.text)?;
+        if let PaneWrite::RefusedModal { marker, .. } =
+            send_prompt_now_on(target, session_name, &step.text)?
+        {
+            return Ok(PaneWrite::RefusedModal {
+                marker,
+                after_steps: i,
+            });
+        }
         if i + 1 < steps.len() {
             std::thread::sleep(std::time::Duration::from_millis(step.delay()));
         }
     }
-    Ok(())
+    Ok(PaneWrite::Sent)
 }
 
 /// Window name for the headless automation heartbeat keeper. Deliberately NOT
@@ -1732,6 +1862,13 @@ pub fn window_exists_on(target: &MuxTarget, session_name: &str) -> bool {
 /// sequence so the inter-step settle delays keep sub-second precision (tmux's
 /// `run-shell -d` only takes whole seconds) and a single scheduling failure
 /// can't leave half a sequence queued.
+///
+/// The script carries the same [`MODAL_MARKERS`] guard as the synchronous
+/// path, rewritten in the target host's shell — a just-booted agent
+/// may be sitting on its folder-trust prompt, and this timer's Enter would
+/// otherwise accept it. `run-shell -b` only reports scheduling, so a guarded
+/// abort is silent by construction; the session is left with its prompt
+/// untyped rather than trusted-by-timer.
 pub fn send_prompt_steps_after_delay(
     target: &MuxTarget,
     session_name: &str,
@@ -1771,6 +1908,23 @@ fn deferred_prompt_script(
     }
 }
 
+/// The `sh` fragment that aborts the deferred script when the pane is showing a
+/// modal, so the timer can't answer the agent's own first-run trust prompt with
+/// the Enter meant for its opening prompt. Same [`MODAL_MARKERS`] as the
+/// synchronous [`pane_modal_on`] guard, expressed as `case` patterns because
+/// the target host is only guaranteed a POSIX shell (no `grep` assumptions).
+fn posix_modal_guard(mux: &str, socket: &str, escaped_window: &str) -> String {
+    let patterns = MODAL_MARKERS
+        .iter()
+        .map(|m| format!("*{}*", crate::shell::posix_quote(m)))
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(
+        "case \"$({mux} -L {socket} capture-pane -p -J -t {escaped_window} 2>/dev/null)\" \
+         in {patterns}) exit 0;; esac"
+    )
+}
+
 /// POSIX path (`tmux` on Linux/macOS/WSL): a plain `sh` one-liner.
 fn deferred_prompt_script_posix(
     target: &MuxTarget,
@@ -1781,6 +1935,7 @@ fn deferred_prompt_script_posix(
     let (mux, socket) = (&target.mux, &target.socket);
     let mut parts: Vec<String> = Vec::new();
     for (i, step) in steps.iter().enumerate() {
+        parts.push(posix_modal_guard(mux, socket, &escaped_window));
         // Bracketed-paste wrap (see `bracketed_paste`) so multi-line prompts
         // don't submit early; `-l` delivers the bytes literally. Quoted with
         // `posix_quote`, not `control_mode::shell_escape`: the latter also
@@ -1802,6 +1957,22 @@ fn deferred_prompt_script_posix(
     parts.join("; ")
 }
 
+/// The PowerShell twin of [`posix_modal_guard`]. `capture-pane` yields one
+/// string per screen row, so the rows are joined before matching — every
+/// [`MODAL_MARKERS`] entry sits within a single row once `-J` has rejoined
+/// tmux's wrapped lines.
+fn powershell_modal_guard(mux: &str, socket: &str, quoted_window: &str) -> String {
+    let tests = MODAL_MARKERS
+        .iter()
+        .map(|m| format!("$p -like {}", ps_single_quote(&format!("*{m}*"))))
+        .collect::<Vec<_>>()
+        .join(" -or ");
+    format!(
+        "$p = ({mux} -L {socket} capture-pane -p -J -t {quoted_window}) -join ' '; \
+         if ({tests}) {{ exit }}"
+    )
+}
+
 /// psmux path: psmux's `run-shell` is not a POSIX shell, so drive the sequence
 /// through PowerShell explicitly (`Start-Sleep` for the sub-second beat).
 /// PowerShell single-quoted literals escape an embedded `'` by doubling it.
@@ -1812,8 +1983,10 @@ fn deferred_prompt_script_powershell(
 ) -> String {
     let w = ps_single_quote(window);
     let (mux, socket) = (&target.mux, &target.socket);
+    let guard = powershell_modal_guard(mux, socket, &w);
     let mut parts: Vec<String> = Vec::new();
     for (i, step) in steps.iter().enumerate() {
+        parts.push(guard.clone());
         let body = ps_single_quote(&bracketed_paste(&step.text));
         parts.push(format!("{mux} -L {socket} send-keys -t {w} -l {body}"));
         parts.push("Start-Sleep -Milliseconds 200".to_string());
@@ -2225,6 +2398,101 @@ mod tests {
     }
 
     #[test]
+    fn modal_marker_spots_an_approval_dialog() {
+        // The exact shape of Claude Code's tool-approval prompt. A synthetic
+        // Enter here confirms the highlighted `1. Yes`.
+        let pane = "\
+ Do you want to create probe.txt?
+ ❯ 1. Yes
+   2. Yes, allow all edits during this session (shift+tab)
+   3. No
+ Esc to cancel · Tab to amend";
+        assert_eq!(modal_marker(pane), Some("Do you want to"));
+
+        // The cursored choice list alone is enough — an agent that words its
+        // question differently still gets caught.
+        assert_eq!(modal_marker("Proceed?\n ❯ 1. Yes\n   2. No"), Some("❯ 1."));
+        // As is a shell confirmation with a default for Enter to pick.
+        assert_eq!(modal_marker("Overwrite? [y/N] "), Some("[y/N]"));
+    }
+
+    #[test]
+    fn modal_marker_lets_an_ordinary_pane_through() {
+        // A working agent, and one sitting at an empty composer: both must
+        // still receive their prompts.
+        assert_eq!(modal_marker("● Reading src/main.rs…\n  ⎿ 42 lines"), None);
+        assert_eq!(modal_marker("> \n\n? for shortcuts"), None);
+        assert_eq!(modal_marker(""), None);
+    }
+
+    #[test]
+    fn deferred_script_aborts_before_every_step_when_a_modal_is_up() {
+        use crate::session::PromptStep;
+        let target = posix_target();
+        let steps = vec![PromptStep::new("first"), PromptStep::new("second")];
+        let script = deferred_prompt_script(&target, "friring:=tb-auto-1", &steps);
+
+        // A just-booted agent may be on its folder-trust prompt, and this
+        // timer's Enter would accept it. Guard *each* step, not just the
+        // first: a step can be what opens the dialog the next one answers.
+        assert_eq!(script.matches("capture-pane").count(), 2, "got {script}");
+        assert!(script.contains("*'Do you want to'*"), "got {script}");
+        assert!(script.contains("*'Do you trust'*"), "got {script}");
+        assert!(script.contains(") exit 0;; esac"), "got {script}");
+        // The guard reads the pane it is about to type into.
+        assert!(
+            script.contains("capture-pane -p -J -t friring:=tb-auto-1"),
+            "got {script}"
+        );
+    }
+
+    #[test]
+    fn deferred_powershell_script_carries_the_same_guard() {
+        use crate::session::PromptStep;
+        let target = psmux_target();
+        let script =
+            deferred_prompt_script(&target, "friring:=tb-auto-1", &[PromptStep::new("hello")]);
+        // Base64 `-EncodedCommand`, so decode before asserting on the source.
+        let decoded = decode_encoded_command(&script);
+        assert!(decoded.contains("capture-pane -p -J"), "got {decoded}");
+        assert!(
+            decoded.contains("-like '*Do you want to*'"),
+            "got {decoded}"
+        );
+        assert!(decoded.contains("{ exit }"), "got {decoded}");
+        // Every marker gets a test, joined into one condition.
+        assert_eq!(
+            decoded.matches("-or").count(),
+            MODAL_MARKERS.len() - 1,
+            "got {decoded}"
+        );
+    }
+
+    /// Recover the PowerShell source from a `-EncodedCommand` script line.
+    fn decode_encoded_command(script: &str) -> String {
+        let b64 = script.rsplit(' ').next().unwrap();
+        let alphabet: Vec<u8> =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".to_vec();
+        let mut bytes = Vec::new();
+        let mut acc = 0u32;
+        let mut bits = 0u32;
+        for c in b64.bytes().filter(|c| *c != b'=') {
+            let v = alphabet.iter().position(|a| *a == c).unwrap() as u32;
+            acc = (acc << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                bytes.push((acc >> bits) as u8);
+            }
+        }
+        let utf16: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect();
+        String::from_utf16(&utf16).unwrap()
+    }
+
+    #[test]
     fn deferred_prompt_script_preserves_arbitrary_prompt_bytes() {
         use crate::session::PromptStep;
         let target = posix_target();
@@ -2307,9 +2575,11 @@ mod tests {
             "got {ps}"
         );
 
-        // A POSIX target gets the `sh` form even from a Windows build.
+        // A POSIX target gets the `sh` form even from a Windows build — the
+        // modal guard's `case` first, then the paste.
         let sh = deferred_prompt_script(&posix_target(), "friring:=tb-auto-1", &steps);
-        assert!(sh.starts_with("tmux -L friring send-keys"), "got {sh}");
+        assert!(sh.starts_with("case \"$(tmux -L friring "), "got {sh}");
+        assert!(sh.contains("; tmux -L friring send-keys"), "got {sh}");
         assert!(sh.contains("sleep 0.2"), "got {sh}");
     }
 

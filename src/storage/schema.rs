@@ -29,9 +29,12 @@ use rusqlite::{Connection, OptionalExtension};
 /// to `sessions` (`last_frame` styled-lines blob + `frame_rows`/`frame_cols`/
 /// `frame_saved_at`) and the `unloaded` flag — all nullable/defaulted, and
 /// deliberately outside the full-row session upsert (like the hook columns)
-/// so frame writes and row write-backs can't clobber each other.
+/// so frame writes and row write-backs can't clobber each other; v46 adds
+/// `in_reply_to` and `wake_pending` to `session_messages` (reply threading, and
+/// the deferred wake nudge the modal guard leaves behind), both nullable for
+/// the same reason.
 /// Gaps in the step table are fine (there is no v18 step either).
-pub const SCHEMA_VERSION: u32 = 45;
+pub const SCHEMA_VERSION: u32 = 46;
 
 /// A single migration step: applied when the stored version is below `target`.
 type MigrationStep = (u32, fn(&Connection) -> rusqlite::Result<()>);
@@ -255,7 +258,9 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             kind            TEXT NOT NULL DEFAULT 'note',
             body            TEXT NOT NULL,
             created_at      INTEGER NOT NULL,
-            read_at         INTEGER
+            read_at         INTEGER,
+            in_reply_to     INTEGER,
+            wake_pending    INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_session_messages_unread
             ON session_messages(to_session_id) WHERE read_at IS NULL;
@@ -379,6 +384,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         (43, migrate_v43_review_comment_line_end),
         (44, migrate_v44_automation_reach),
         (45, migrate_v45_ghost_frames),
+        (46, migrate_v46_message_threading),
     ];
 
     for &(target, step) in steps {
@@ -1324,6 +1330,22 @@ fn migrate_v45_ghost_frames(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_absent(conn, "sessions", "frame_cols", "INTEGER")?;
     add_column_if_absent(conn, "sessions", "frame_saved_at", "INTEGER")?;
     add_column_if_absent(conn, "sessions", "unloaded", "INTEGER NOT NULL DEFAULT 0")
+}
+
+/// v45 → v46: add `in_reply_to` + `wake_pending` to `session_messages`.
+///
+/// `in_reply_to` is the id of the message a reply answers, so a recipient with
+/// several conversations in flight can thread them instead of smuggling the id
+/// into `kind`. `wake_pending` marks a send whose wake nudge the modal guard
+/// refused (see [`crate::agent::tmux::MODAL_MARKERS`]), so `automation tick`
+/// can retry it once the recipient's pane is safe to type into — a `--no-wake`
+/// send never sets it and so is never nudged behind the sender's back.
+///
+/// Both nullable with no default: a pre-v46 row decodes to an unthreaded
+/// message with no wake owed, exactly its old behavior.
+fn migrate_v46_message_threading(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "session_messages", "in_reply_to", "INTEGER")?;
+    add_column_if_absent(conn, "session_messages", "wake_pending", "INTEGER")
 }
 
 #[cfg(test)]

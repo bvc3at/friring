@@ -22,6 +22,7 @@ pub mod identity;
 pub mod messages;
 pub mod notify;
 pub mod output;
+pub mod pane_guard;
 pub mod perf;
 pub mod sessions;
 pub mod tasks;
@@ -316,13 +317,14 @@ mod tests {
         ])
         .unwrap();
         let Command::Session {
-            action: sessions::Action::Send { uuid, text },
+            action: sessions::Action::Send { uuid, text, force },
         } = cli.command
         else {
             panic!("expected Session::Send");
         };
         assert_eq!(uuid, "0f4dec1e-9d4b-4c4f-9d05-3a3a3a3a3a3a");
         assert_eq!(text, "hello");
+        assert!(!force, "the modal guard is only skipped when asked");
 
         // The original collision-triggering invocation: global `--text` flag set.
         let cli = Cli::try_parse_from([

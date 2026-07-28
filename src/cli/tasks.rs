@@ -292,6 +292,12 @@ fn status_glyph(status: TaskStatus) -> String {
 /// tmux/spawn helpers are reached via fully-qualified paths (no `use
 /// crate::agent`) to keep the cli module free of an `agent` import — see
 /// tests/architecture_rules.rs::cli_module_isolation.
+/// The `skipped` reason for a task whose target pane was showing a dialog, so
+/// the modal guard ([`crate::agent::tmux::MODAL_MARKERS`]) held the prompt back.
+fn modal_skip(marker: &str) -> String {
+    format!("target session is showing a dialog ({marker:?}); prompt not typed")
+}
+
 fn run_task(db: &Database, task: &Task) -> Result<Value, String> {
     // Seed the agent with full task context (id + title + description + how to
     // read more / mark done), not just the bare title — shared with the TUI
@@ -312,8 +318,14 @@ fn run_task(db: &Database, task: &Task) -> Result<Value, String> {
             if !crate::agent::tmux::window_exists(&name) {
                 return Err("target session not running".into());
             }
-            crate::agent::tmux::send_prompt_now(&name, &prompt)
+            let write = crate::agent::tmux::send_prompt_now(&name, &prompt)
                 .map_err(|e| format!("send_prompt_now: {e}"))?;
+            // A target mid-dialog is skipped, not failed and not marked in
+            // progress: the task is still due, and the next run retries it once
+            // a human has answered. Typing anyway would answer it for them.
+            if let Some(marker) = write.refused() {
+                return Ok(json!({ "skipped": modal_skip(marker), "id": task.id }));
+            }
             mark_in_progress(db, task)?;
             Ok(json!({ "sent": true, "id": task.id, "session_id": session_id.to_string() }))
         }
@@ -337,8 +349,11 @@ fn run_task(db: &Database, task: &Task) -> Result<Value, String> {
                 .map(|s| s.name)
                 .find(|n| task.matches_spawn_session(n) && crate::agent::tmux::window_exists(n));
             if let Some(name) = existing {
-                crate::agent::tmux::send_prompt_now(&name, &prompt)
+                let write = crate::agent::tmux::send_prompt_now(&name, &prompt)
                     .map_err(|e| format!("send_prompt_now: {e}"))?;
+                if let Some(marker) = write.refused() {
+                    return Ok(json!({ "skipped": modal_skip(marker), "id": task.id }));
+                }
                 mark_in_progress(db, task)?;
                 return Ok(json!({ "reused": name, "id": task.id }));
             }
