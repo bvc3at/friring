@@ -2168,6 +2168,11 @@ impl App {
         );
         let old = std::mem::replace(&mut self.sessions[self.active_index], ghost);
         old.kill();
+        // Back to the agent view: the companion shell pane died with the
+        // session and is deliberately not restored on load, so a remembered
+        // Shell tab would label the ghost's frozen frame "Shell" and route the
+        // load-time keystrokes to a pane that no longer exists.
+        self.session_terminal_views.remove(&id);
         self.request_redraw();
         self.set_status(
             StatusLevel::Info,
@@ -2893,6 +2898,13 @@ impl App {
             return;
         };
         let session_id = session.info.id;
+        // A placeholder owns no pane, and placeholder teardown (`kill`/`detach`)
+        // skips shell panes — spawning one here would leak a window nothing ever
+        // closes.
+        if session.is_placeholder() {
+            self.set_status(StatusLevel::Info, "Session is not loaded");
+            return;
+        }
         if session.shell_pane.is_none() {
             let (rows, cols) = self.content_area_size();
             // Resolve the launch cwd (host-aware for remote workspaces) before
