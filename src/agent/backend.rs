@@ -1617,6 +1617,132 @@ mod tests {
         }
     }
 
+    /// The ghost-frame capture path: the depth the caller asked for must reach
+    /// the backend (this is the whole point of `ghost_scrollback_lines`), the
+    /// backend's seed must win over the in-memory screen, and every failure
+    /// mode must still yield the visible screen rather than nothing.
+    mod ghost_frame_capture {
+        use std::sync::atomic::AtomicUsize;
+
+        use super::*;
+
+        /// Capture outcome scripted per test case.
+        enum Capture {
+            Seed(&'static [u8]),
+            Empty,
+            Fail,
+        }
+
+        /// Backend that records the scrollback depth it was asked for.
+        struct CaptureBackend {
+            requested: Arc<AtomicUsize>,
+            capture: Capture,
+        }
+
+        impl SessionBackend for CaptureBackend {
+            fn name(&self) -> &str {
+                "capture-stub"
+            }
+            fn check_available(&self) -> Result<()> {
+                Ok(())
+            }
+            fn ensure_ready(&self) -> Result<()> {
+                Ok(())
+            }
+            fn spawn(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[String],
+                _: Option<&Path>,
+                _: &HashMap<String, String>,
+                _: u16,
+                _: u16,
+            ) -> Result<SpawnedSession> {
+                anyhow::bail!("capture stub does not spawn")
+            }
+            fn adopt(&self, _: &str, _: u16, _: u16, _: Option<Vec<u8>>) -> Result<AdoptedSession> {
+                anyhow::bail!("capture stub does not adopt")
+            }
+            fn capture_history_lines(&self, _: &str, lines: usize) -> Result<Vec<u8>> {
+                self.requested.store(lines, Ordering::Relaxed);
+                match self.capture {
+                    Capture::Seed(bytes) => Ok(bytes.to_vec()),
+                    Capture::Empty => Ok(Vec::new()),
+                    Capture::Fail => anyhow::bail!("capture failed"),
+                }
+            }
+            fn discover(&self) -> Result<Vec<DiscoveredSession>> {
+                Ok(Vec::new())
+            }
+            fn resize(&self, _: &str, _: u16, _: u16) -> Result<()> {
+                Ok(())
+            }
+            fn is_dead(&self, _: &str) -> Result<bool> {
+                Ok(false)
+            }
+            fn kill(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn detach(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn pane_pid(&self, _: &str) -> Result<Option<u32>> {
+                Ok(None)
+            }
+        }
+
+        /// Session on a `CaptureBackend`, with `on screen` in its parser, plus
+        /// the cell recording the requested depth.
+        fn session_with(capture: Capture) -> (Session, Arc<AtomicUsize>) {
+            let requested = Arc::new(AtomicUsize::new(0));
+            let backend: Arc<dyn SessionBackend> = Arc::new(CaptureBackend {
+                requested: Arc::clone(&requested),
+                capture,
+            });
+            let provider: Arc<dyn AgentProvider> = Arc::new(crate::agent::GenericProvider::new(
+                crate::agent::agent_config::builtin_registry()
+                    .default_agent()
+                    .unwrap()
+                    .clone(),
+            ));
+            let session = Session::stub("cap", &backend, &provider);
+            session.feed_output_for_test(b"on screen\r\n");
+            (session, requested)
+        }
+
+        #[test]
+        fn forwards_the_requested_depth_and_prefers_the_capture() {
+            let (session, requested) = session_with(Capture::Seed(b"scrollback history"));
+
+            let (_, _, bytes) = session.capture_unload_frame(4200).expect("frame");
+
+            assert_eq!(requested.load(Ordering::Relaxed), 4200);
+            assert_eq!(bytes, b"scrollback history");
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("on screen"),
+                "the capture seed replaces the visible screen, it is not appended"
+            );
+        }
+
+        #[test]
+        fn falls_back_to_the_visible_screen_when_the_capture_yields_nothing() {
+            for capture in [Capture::Empty, Capture::Fail] {
+                let (session, _) = session_with(capture);
+
+                let (_, _, bytes) = session.capture_unload_frame(1000).expect("frame");
+
+                assert!(
+                    String::from_utf8_lossy(&bytes).contains("on screen"),
+                    "expected the serialized visible screen, got {:?}",
+                    String::from_utf8_lossy(&bytes)
+                );
+                let (_, _, visible) = session.serialize_visible_frame().expect("visible frame");
+                assert_eq!(bytes, visible);
+            }
+        }
+    }
+
     #[test]
     fn remote_host_from_backend_strips_ssh_and_wsl_prefixes() {
         let host = crate::session::HostDef {
