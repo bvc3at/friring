@@ -2623,9 +2623,13 @@ hard reboot shows ghosts at most a minute stale, without scrollback
 until loaded). Frames re-parse at the *current* pane size, so a ghost
 restored into a different terminal size (or font) re-wraps: identical
 when same/wider, bottom-anchored with full-width rules wrapping into
-stubs when narrower. Remote sessions save visible-screen frames at
-shutdown (no per-host ssh round-trips on exit); a full capture happens
-on explicit unload. Frame blobs live on the `sessions` row (schema
+stubs when narrower. That holds for the unload/shutdown captures, which
+come from `tmux capture-pane -J` and so store **logical** lines; the
+in-memory debounce frame is serialized row by row, so a line that was
+soft-wrapped when it was captured keeps those breaks and will not rejoin
+on a wider pane. Remote sessions save visible-screen frames at shutdown
+(no per-host ssh round-trips on exit); a full capture happens on
+explicit unload. Frame blobs live on the `sessions` row (schema
 v45) and are never written by the full-row upsert, so debounced saves
 can't clobber concurrent metadata writes.
 

@@ -2149,6 +2149,21 @@ impl App {
                 error!("Failed to save ghost frame for '{name}': {e}");
             }
         }
+
+        // Tear the agent down BEFORE any state that claims it is gone — the
+        // `unloaded` flag and the ghost swap. A ghost asserts "this session's
+        // process is not running": reaching that state after a failed kill
+        // would strand a live agent still holding the memory the unload exists
+        // to reclaim, with no row left pointing at it. On failure the session
+        // is untouched and stays live (the backend leaves the pane registered
+        // when its kill fails), so the user can retry or investigate.
+        // Saving the frame above is safe either way — the crash-safety
+        // debounce writes frames for live sessions too.
+        if let Err(e) = self.sessions[self.active_index].kill_checked() {
+            error!("Failed to unload session '{name}': {e}");
+            self.set_error(format!("Failed to unload '{name}': {e:#}"));
+            return;
+        }
         if let Err(e) = self.db.set_session_unloaded(id, true) {
             error!("Failed to flag session '{name}' unloaded: {e}");
         }
@@ -2166,8 +2181,8 @@ impl App {
             HashMap::new(),
             frame.as_ref().map(|(_, _, bytes)| bytes.as_slice()),
         );
-        let old = std::mem::replace(&mut self.sessions[self.active_index], ghost);
-        old.kill();
+        // Already killed above; dropping `old` retires the (now EOF'd) reader.
+        let _old = std::mem::replace(&mut self.sessions[self.active_index], ghost);
         // Back to the agent view: the companion shell pane died with the
         // session and is deliberately not restored on load, so a remembered
         // Shell tab would label the ghost's frozen frame "Shell" and route the
@@ -16337,6 +16352,102 @@ mod tests {
             .map(|p| p.screen().contents())
             .unwrap();
         assert!(text.contains("frozen findings here"), "got: {text}");
+    }
+
+    /// A backend whose `kill` fails — the agent process outlives the request.
+    struct UnkillableBackend;
+    impl SessionBackend for UnkillableBackend {
+        fn name(&self) -> &str {
+            "unkillable"
+        }
+        fn check_available(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn ensure_ready(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn spawn(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[String],
+            _: Option<&Path>,
+            _: &std::collections::HashMap<String, String>,
+            _: u16,
+            _: u16,
+        ) -> anyhow::Result<crate::agent::backend::SpawnedSession> {
+            anyhow::bail!("stub backend does not spawn")
+        }
+        fn adopt(
+            &self,
+            _: &str,
+            _: u16,
+            _: u16,
+            _: Option<Vec<u8>>,
+        ) -> anyhow::Result<crate::agent::backend::AdoptedSession> {
+            anyhow::bail!("stub backend does not adopt")
+        }
+        fn discover(&self) -> anyhow::Result<Vec<crate::agent::backend::DiscoveredSession>> {
+            Ok(vec![])
+        }
+        fn resize(&self, _: &str, _: u16, _: u16) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn is_dead(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn kill(&self, _: &str) -> anyhow::Result<()> {
+            anyhow::bail!("kill-pane refused")
+        }
+        fn detach(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn pane_pid(&self, _: &str) -> anyhow::Result<Option<u32>> {
+            Ok(None)
+        }
+    }
+
+    /// A failed teardown must not produce a ghost. A ghost row asserts "this
+    /// session's process is not running"; reaching that state after a failed
+    /// kill would strand a live agent still holding its memory, with nothing
+    /// left pointing at it. The session stays live, the DB flag stays clear,
+    /// and the user is told.
+    #[tokio::test]
+    async fn unload_aborts_and_reports_when_the_kill_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let backend: Arc<dyn SessionBackend> = Arc::new(UnkillableBackend);
+        let provider = stub_provider();
+        let mut app = App::new(
+            24,
+            120,
+            BackendRegistry::new(backend.clone()),
+            stub_agents(),
+            test_db(),
+        );
+        app.sessions
+            .push(Session::stub("doomed", &backend, &provider));
+        app.active_index = 0;
+        let id = persist_session(&app, 0);
+        app.focus = InputFocus::Terminal;
+
+        app.unload_active_session();
+
+        assert!(!app.sessions[0].is_ghost(), "session must stay live");
+        assert!(!app.sessions[0].is_placeholder());
+        assert!(
+            app.db.unloaded_session_ids().unwrap().is_empty(),
+            "a failed unload must not flag the row unloaded"
+        );
+        assert_eq!(
+            app.focus,
+            InputFocus::Terminal,
+            "focus stays on the still-live pane"
+        );
+        let msg = app.status_message.as_ref().expect("an error is reported");
+        assert_eq!(msg.level, StatusLevel::Error);
+        assert!(msg.text.contains("Failed to unload"), "got: {}", msg.text);
+        let _ = id;
     }
 
     /// Unload swaps the live session for a ghost in place, persists the frame

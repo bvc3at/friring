@@ -1228,14 +1228,26 @@ impl Session {
 
     /// Kill/destroy the backend session (for Ctrl+X close).
     pub fn kill(&self) {
-        // A placeholder owns no live backend pane (see `placeholder`).
-        if self.placeholder {
-            return;
-        }
-        self.kill_shell_pane();
-        if let Err(e) = self.backend.kill(&self.backend_id) {
+        if let Err(e) = self.kill_checked() {
             tracing::warn!("Failed to kill session: {e}");
         }
+    }
+
+    /// [`Self::kill`] that **reports** a failed agent-pane teardown instead of
+    /// only logging it. Unload needs this: it must not swap in a ghost — a row
+    /// that says the agent process is gone — while that process is in fact
+    /// still running and still holding its memory. Delete keeps the
+    /// fire-and-forget [`Self::kill`], where a stale pane is cosmetic.
+    ///
+    /// The companion shell pane stays best-effort and is torn down first, as
+    /// in `kill`: it is the agent pane whose death the caller gates on.
+    pub fn kill_checked(&self) -> Result<()> {
+        // A placeholder owns no live backend pane (see `placeholder`).
+        if self.placeholder {
+            return Ok(());
+        }
+        self.kill_shell_pane();
+        self.backend.kill(&self.backend_id)
     }
 
     /// Detach from the backend session without killing it (for Ctrl+Q quit).

@@ -1415,8 +1415,14 @@ impl SessionBackend for TmuxBackend {
     }
 
     fn kill(&self, backend_id: &str) -> Result<()> {
-        let _ = self.unregister_pane(backend_id);
+        // Kill first, unregister second. The reverse order drops the pane's
+        // output sender (the reader sees EOF) *before* the fallible command,
+        // so a failed `kill-pane` left a live agent behind a session friring
+        // had already half-torn-down — and the unload path, which aborts on a
+        // kill error to avoid claiming a still-running process was freed, has
+        // nothing to abort back to unless the pane is untouched on failure.
         self.ctrl_command(&format!("kill-pane -t {backend_id}"))?;
+        let _ = self.unregister_pane(backend_id);
         Ok(())
     }
 
