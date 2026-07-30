@@ -34,7 +34,8 @@ config_version = 1
 # Scrollback lines captured into a session's ghost frame at unload/shutdown,
 # on top of the visible screen, so a ghost stays scrollable. 0 = visible
 # screen only (~5 KB per session); each 1000 lines adds ~50–100 KB per
-# session to the database. Capped at 10000.
+# session to the database. Clamped at 10000 by the capture, and friring's
+# tmux sessions retain 5000 lines — beyond that there is no history to capture.
 # ghost_scrollback_lines = 1000
 
 # Terminal width (columns) below which only the terminal pane renders.
