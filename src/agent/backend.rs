@@ -781,7 +781,9 @@ impl Session {
     /// seeded with `frame` — the session's saved last frame, SGR-styled lines
     /// joined with `\r\n` — at `rows`×`cols`, so the frozen pane re-wraps to
     /// the *current* size; `None` (no frame ever captured) seeds a short
-    /// notice instead. Keystrokes are dropped like any placeholder; the render
+    /// notice instead. The parser keeps `ghost_scrollback_lines` of history —
+    /// the depth the frame was captured at — so no captured row is evicted on
+    /// replay. Keystrokes are dropped like any placeholder; the render
     /// layer greys the pane. `info.status` is forced to `Unloaded`;
     /// [`Self::restart`] turns the ghost back into a live session in place.
     pub fn ghost(
@@ -802,10 +804,15 @@ impl Session {
         // `capture-pane -e` / `rows_formatted`) — no OSC/BEL, so replaying
         // them can't fire the title/attention callbacks.
         if let Ok(mut p) = session.parser.lock() {
+            // Sized from `ghost_scrollback_lines`: the frame was *captured* at
+            // that depth, so a smaller live-parser limit would evict the oldest
+            // captured rows on replay. `.max` keeps the live depth when it is
+            // the larger of the two.
+            let s = crate::session::settings::global();
             *p = vt100::Parser::new_with_callbacks(
                 rows.max(1),
                 cols.max(1),
-                crate::session::settings::global().scrollback_lines,
+                s.ghost_scrollback_lines.max(s.scrollback_lines),
                 TermSignals {
                     title: Arc::clone(&session.last_title),
                     attention_at: Arc::clone(&session.attention_at),
