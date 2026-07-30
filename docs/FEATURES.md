@@ -2276,8 +2276,9 @@ chord did nothing.
 
 `Ctrl+,` (rebindable `Action::OpenSettings`; `F6` alternate) opens a
 centered Settings modal (`Modal::Settings(SettingsModal)`) that views and
-edits **all of settings.toml** — the `[features]` toggles, the 4
-`[notifications]` knobs, and the 4 scalars — without hand-editing the file.
+edits **all of settings.toml** — the `[features]` toggles, the
+`[notifications]` knobs, and the top-level scalars and toggles (including
+lazy restore and ghost history depth) — without hand-editing the file.
 
 **Why apply-on-save, not live preview.** The modal edits a working-copy
 `draft` and writes it back only on `Ctrl+S` (`Esc` discards). Persistence
