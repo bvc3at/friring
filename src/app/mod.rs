@@ -16360,6 +16360,47 @@ mod tests {
         assert!(text.contains("frozen findings here"), "got: {text}");
     }
 
+    /// vt100 resizes by truncating each row's cells, so a narrowed pane loses
+    /// every cell past the new width and widening back pads with blanks. A
+    /// live session's agent repaints that away on SIGWINCH; a ghost has no
+    /// process to repaint it, so it must re-render from its saved frame or the
+    /// frozen content stays clipped to the narrowest size ever seen.
+    #[tokio::test]
+    async fn ghost_reflows_its_frame_after_a_shrink_and_regrow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_sessions(0);
+        let shared = make_shared_session("friring:@0", "wide");
+        app.db.upsert_session(&shared).unwrap();
+        // A line far wider than the shrunk pane below.
+        let wide = format!("LEFT-{}-ENDMARK", "x".repeat(100));
+        app.db
+            .save_session_frame(shared.id, 24, 200, wide.as_bytes())
+            .unwrap();
+        app.restore_sessions(vec![shared], 1);
+        assert!(app.sessions[0].is_ghost());
+
+        let visible = |app: &App| {
+            app.sessions[0]
+                .parser
+                .lock()
+                .map(|p| p.screen().contents())
+                .unwrap()
+        };
+        app.sessions[0].resize(24, 200);
+        assert!(visible(&app).contains("ENDMARK"), "baseline");
+
+        // Shrink well under the line's width, then restore the original size.
+        app.sessions[0].resize(20, 40);
+        app.sessions[0].resize(24, 200);
+
+        let after = visible(&app);
+        assert!(
+            after.contains("ENDMARK"),
+            "the ghost's frame was clipped by the shrink: {after:?}"
+        );
+    }
+
     /// A backend whose `kill` fails — the agent process outlives the request.
     struct UnkillableBackend;
     impl SessionBackend for UnkillableBackend {

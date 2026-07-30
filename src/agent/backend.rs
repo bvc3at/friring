@@ -514,6 +514,16 @@ pub struct Session {
     /// Its parser is seeded with the session's saved last frame, rendered
     /// greyed; [`Self::restart`] spawns the agent and clears both flags.
     ghost: bool,
+    /// The bytes a placeholder's parser was seeded with (a ghost's saved frame,
+    /// or the unreachable-host notice). Retained so [`Self::resize`] can
+    /// **re-render** rather than `set_size`: vt100 resizes by truncating each
+    /// row's cells, so narrowing a pane destroys every cell past the new width
+    /// and widening back pads with blanks. A live session's agent repaints that
+    /// away on SIGWINCH; a placeholder has no process to repaint it, so without
+    /// the seed its content would be permanently clipped to the narrowest size
+    /// the terminal ever hit. `None` for a live session, whose pane content is
+    /// owned by the backend, not by us.
+    placeholder_seed: Option<Vec<u8>>,
 }
 
 impl Session {
@@ -701,6 +711,7 @@ impl Session {
             env,
             placeholder: false,
             ghost: false,
+            placeholder_seed: None,
         }
     }
 
@@ -773,6 +784,7 @@ impl Session {
             env,
             placeholder: true,
             ghost: false,
+            placeholder_seed: Some(notice.into_bytes()),
         }
     }
 
@@ -803,33 +815,44 @@ impl Session {
         // notice with the saved frame. Frame bytes are SGR-styled lines (tmux
         // `capture-pane -e` / `rows_formatted`) — no OSC/BEL, so replaying
         // them can't fire the title/attention callbacks.
-        if let Ok(mut p) = session.parser.lock() {
-            // Sized from `ghost_scrollback_lines`: the frame was *captured* at
-            // that depth, so a smaller live-parser limit would evict the oldest
-            // captured rows on replay. `.max` keeps the live depth when it is
-            // the larger of the two.
-            let s = crate::session::settings::global();
-            *p = vt100::Parser::new_with_callbacks(
-                rows.max(1),
-                cols.max(1),
-                s.ghost_scrollback_lines.max(s.scrollback_lines),
-                TermSignals {
-                    title: Arc::clone(&session.last_title),
-                    attention_at: Arc::clone(&session.attention_at),
-                    notification: Arc::clone(&session.notification),
-                    meta_gen: Arc::clone(&session.meta_gen),
-                },
-            );
-            match frame {
-                Some(bytes) => p.process(bytes),
-                None => p.process(
-                    "\r\n  \u{25CC} Session unloaded \u{2014} no saved preview.\r\n\r\n  \
+        let seed: Vec<u8> = match frame {
+            Some(bytes) => bytes.to_vec(),
+            None => "\r\n  \u{25CC} Session unloaded \u{2014} no saved preview.\r\n\r\n  \
                      Press Enter (or restart) to launch the agent and resume.\r\n"
-                        .as_bytes(),
-                ),
-            }
-        }
+                .as_bytes()
+                .to_vec(),
+        };
+        session.seed_placeholder_parser(rows, cols, &seed);
+        session.placeholder_seed = Some(seed);
         session
+    }
+
+    /// Rebuild this placeholder's parser at `rows`×`cols` and replay `seed`
+    /// into it. Used both at construction and by [`Self::resize`] — a
+    /// placeholder re-renders from its seed instead of `set_size`, which would
+    /// truncate away every cell past a narrower width with no agent to repaint
+    /// it back (see [`Self::placeholder_seed`]).
+    ///
+    /// Sized from `ghost_scrollback_lines`: a ghost's frame was *captured* at
+    /// that depth, so a smaller live-parser limit would evict the oldest
+    /// captured rows on replay. `.max` keeps the live depth when it is larger.
+    fn seed_placeholder_parser(&self, rows: u16, cols: u16, seed: &[u8]) {
+        let Ok(mut p) = self.parser.lock() else {
+            return;
+        };
+        let s = crate::session::settings::global();
+        *p = vt100::Parser::new_with_callbacks(
+            rows.max(1),
+            cols.max(1),
+            s.ghost_scrollback_lines.max(s.scrollback_lines),
+            TermSignals {
+                title: Arc::clone(&self.last_title),
+                attention_at: Arc::clone(&self.attention_at),
+                notification: Arc::clone(&self.notification),
+                meta_gen: Arc::clone(&self.meta_gen),
+            },
+        );
+        p.process(seed);
     }
 
     /// Whether this is a placeholder for an unreachable remote session (no live
@@ -940,12 +963,21 @@ impl Session {
         // zero-row/col content area; vt100's `set_size` underflows on 0 and
         // tmux rejects it, so clamp at this boundary for every path below.
         let (rows, cols) = (rows.max(1), cols.max(1));
-        // A placeholder has no live pane; only resize its local notice buffer.
+        // A placeholder has no live pane; only resize its local buffer.
         // Talking to the (possibly-down) backend here would issue a blocking
         // ssh resize on the UI thread — the freeze we're avoiding.
         if self.placeholder {
-            if let Ok(mut parser) = self.parser.lock() {
-                parser.screen_mut().set_size(rows, cols);
+            match &self.placeholder_seed {
+                // Re-render from the seed rather than `set_size`, which
+                // truncates each row's cells: with no agent to repaint it, a
+                // shrink would clip the frozen content for good, so growing
+                // back showed bare background where the pane's text had been.
+                Some(seed) => self.seed_placeholder_parser(rows, cols, seed),
+                None => {
+                    if let Ok(mut parser) = self.parser.lock() {
+                        parser.screen_mut().set_size(rows, cols);
+                    }
+                }
             }
             return;
         }
@@ -1404,6 +1436,7 @@ impl Session {
             env: HashMap::new(),
             placeholder: false,
             ghost: false,
+            placeholder_seed: None,
         };
         (session, input_rx)
     }

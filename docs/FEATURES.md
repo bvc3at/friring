@@ -2627,7 +2627,12 @@ stubs when narrower. That holds for the unload/shutdown captures, which
 come from `tmux capture-pane -J` and so store **logical** lines; the
 in-memory debounce frame is serialized row by row, so a line that was
 soft-wrapped when it was captured keeps those breaks and will not rejoin
-on a wider pane. Remote sessions save visible-screen frames at shutdown
+on a wider pane. A ghost re-renders from its stored frame on **every**
+resize rather than resizing its parser in place: vt100 resizes by
+truncating each row's cells, and with no agent to repaint it a ghost
+would otherwise stay clipped to the narrowest width the terminal ever
+hit (bare background where its content had been). Remote sessions save
+visible-screen frames at shutdown
 (no per-host ssh round-trips on exit); a full capture happens on
 explicit unload. Frame blobs live on the `sessions` row (schema
 v45) and are never written by the full-row upsert, so debounced saves
