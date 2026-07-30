@@ -220,6 +220,16 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-unload-ghost"
 }
 
+@test "e2e: a ghost survives a terminal shrink and keeps its frame when it grows back" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-ghost-resize"
+}
+
+@test "e2e: lazy_session_restore = false respawns a pane-less session instead of ghosting it" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-eager-restore"
+}
+
 @test "protocol: codex exec completes a stubbed text turn (no Friring)" {
     require_agent codex
     e2e_protocol_smoke "$AGENT_E2E_DIR/scenarios/codex-text-turn"
