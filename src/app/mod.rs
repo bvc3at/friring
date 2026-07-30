@@ -2189,24 +2189,32 @@ impl App {
 
     /// Cycle the active session among **loaded** sessions only (skipping
     /// ghosts and unreachable placeholders), in rendered order, wrapping.
-    /// From a ghost it jumps to the nearest loaded session.
+    /// From a ghost it keeps going in the requested direction to the nearest
+    /// loaded session — the ghost holds its place in the order, it just can't
+    /// be landed on.
     pub(crate) fn switch_loaded_session(&mut self, forward: bool) {
-        let order: Vec<usize> = self
-            .render_order_indices()
-            .into_iter()
-            .filter(|&i| !self.sessions[i].is_placeholder())
-            .collect();
-        if order.is_empty() {
-            self.set_status(StatusLevel::Info, "No loaded sessions");
-            return;
-        }
-        let next = match (order.iter().position(|&i| i == self.active_index), forward) {
-            (Some(pos), true) => (pos + 1) % order.len(),
-            (Some(pos), false) => pos.checked_sub(1).unwrap_or(order.len() - 1),
-            // Active session is a ghost: land on the first loaded one.
-            (None, _) => 0,
+        // The *unfiltered* order, so a placeholder still occupies its slot and
+        // the scan below leaves it from the right side.
+        let order = self.render_order_indices();
+        let len = order.len();
+        let next = match order.iter().position(|&i| i == self.active_index) {
+            Some(pos) => (1..=len)
+                .map(|step| {
+                    if forward {
+                        (pos + step) % len
+                    } else {
+                        (pos + len - step) % len
+                    }
+                })
+                .find(|&p| !self.sessions[order[p]].is_placeholder()),
+            // Active session isn't rendered at all (nothing to scan from):
+            // land on the first loaded row.
+            None => (0..len).find(|&p| !self.sessions[order[p]].is_placeholder()),
         };
-        self.set_active_index(order[next]);
+        match next {
+            Some(p) => self.set_active_index(order[p]),
+            None => self.set_status(StatusLevel::Info, "No loaded sessions"),
+        }
     }
 
     /// Open the active session's worktree (or cwd) in the configured editor.
@@ -16366,17 +16374,22 @@ mod tests {
         app.unload_active_session();
         assert!(app.sessions[1].is_ghost());
 
-        // From the ghost, land on a loaded session.
-        app.switch_loaded_session(true);
-        assert_eq!(app.active_index, 0);
-        // Forward from 0 skips the ghost at 1 straight to 2, then wraps.
+        // From the ghost, keep going in the requested direction: forward is the
+        // next loaded row after it, not the first one in the list.
         app.switch_loaded_session(true);
         assert_eq!(app.active_index, 2);
+        // Forward from 2 wraps to 0, then skips the ghost at 1 back to 2.
         app.switch_loaded_session(true);
         assert_eq!(app.active_index, 0);
+        app.switch_loaded_session(true);
+        assert_eq!(app.active_index, 2);
         // Backward wraps and skips the ghost too.
         app.switch_loaded_session(false);
-        assert_eq!(app.active_index, 2);
+        assert_eq!(app.active_index, 0);
+        // Backward from the ghost goes to the loaded row *before* it.
+        app.active_index = 1;
+        app.switch_loaded_session(false);
+        assert_eq!(app.active_index, 0);
     }
 
     /// `serialize_visible_frame` → fresh parser reproduces the visible screen
