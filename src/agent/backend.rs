@@ -1151,6 +1151,17 @@ impl Session {
         // copy the restarted pane makes.
         self.osc52 = state.osc52;
         self.last_drained_osc52_gen = 0;
+        // Same for the metadata cells: `wire_up` wired the new parser's
+        // TermSignals to *its* cells, so the old ones belong to the retired
+        // reader — keeping them would strand every OSC title, notification and
+        // attention signal the restarted pane emits. Generations reset to the
+        // fresh-session values `wire_io` uses.
+        self.last_title = state.last_title;
+        self.attention_at = state.attention_at;
+        self.notification = state.notification;
+        self.meta_gen = state.meta_gen;
+        self.last_synced_meta_gen = u64::MAX;
+        self.attention_ack_at = 0;
         self.env = config.env.clone();
         self.info.backend_id = Some(self.backend_id.clone());
         if !config.agent.is_empty() {
