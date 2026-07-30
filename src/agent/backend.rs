@@ -879,7 +879,6 @@ impl Session {
                     break;
                 }
                 Ok(n) => {
-                    last_output_at.store(now_millis(), Ordering::Relaxed);
                     let mut data = std::mem::take(&mut carry);
                     data.extend_from_slice(&buf[..n]);
                     let ready = utf8_ready_prefix_len(&data);
@@ -892,6 +891,12 @@ impl Session {
                             p.process(&data);
                         }
                     }
+                    // Stamped *after* the parser saw the bytes: the ghost-frame
+                    // debounce treats this as the dirty marker, so advancing it
+                    // first would let a saver serialize the previous screen and
+                    // then record it as up to date. Unconditional — a read that
+                    // only extends `carry` is still output.
+                    last_output_at.store(now_millis(), Ordering::Relaxed);
                 }
                 Err(e) => {
                     debug!("Session reader error: {e}");
