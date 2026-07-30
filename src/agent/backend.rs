@@ -275,6 +275,15 @@ pub trait SessionBackend: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// [`Self::capture_history`] with an explicit scrollback depth instead of
+    /// the settings default — the ghost-frame capture at unload/shutdown, where
+    /// `ghost_scrollback_lines` (not `scrollback_lines`) decides how much
+    /// history the frozen frame keeps. Default: delegate, ignoring `lines`
+    /// (backends without a capture facility return the same empty seed).
+    fn capture_history_lines(&self, backend_id: &str, _lines: usize) -> Result<Vec<u8>> {
+        self.capture_history(backend_id)
+    }
+
     /// Discover existing sessions managed by this backend.
     fn discover(&self) -> Result<Vec<DiscoveredSession>>;
 
@@ -493,13 +502,18 @@ pub struct Session {
     pub shell_pane: Option<ShellPane>,
     /// Session environment variables, passed to shell pane spawns.
     env: HashMap<String, String>,
-    /// True for a **placeholder** session: a persisted remote session whose host
-    /// is currently unreachable, so it has no live backend pane / reader / writer
-    /// (its `input_tx` is a dead channel and its `parser` holds a static "host
-    /// unreachable" notice). Rendered with `SessionStatus::Unreachable` and
-    /// replaced in place by the real adopted session once the host recovers. See
-    /// `App::start_remote_restore` / the remote retry loop.
+    /// True for a **placeholder** session: no live backend pane / reader /
+    /// writer (its `input_tx` is a dead channel), so every pane-touching path
+    /// (kill/detach/hook sync/metrics/save_state upsert) skips it. Two kinds
+    /// exist, told apart by [`Self::is_ghost`]: a persisted remote session
+    /// whose host is unreachable (parser holds a "host unreachable" notice,
+    /// replaced in place once the host recovers), and a **ghost** (below).
     placeholder: bool,
+    /// True for a **ghost**: a placeholder whose agent process is deliberately
+    /// not running (unloaded, or lazily restored after the tmux server died).
+    /// Its parser is seeded with the session's saved last frame, rendered
+    /// greyed; [`Self::restart`] spawns the agent and clears both flags.
+    ghost: bool,
 }
 
 impl Session {
@@ -686,6 +700,7 @@ impl Session {
             shell_pane: None,
             env,
             placeholder: false,
+            ghost: false,
         }
     }
 
@@ -757,13 +772,70 @@ impl Session {
             shell_pane: None,
             env,
             placeholder: true,
+            ghost: false,
         }
+    }
+
+    /// Build a **ghost** session: a placeholder whose agent process is
+    /// deliberately not running (unloaded, or lazily restored). The parser is
+    /// seeded with `frame` — the session's saved last frame, SGR-styled lines
+    /// joined with `\r\n` — at `rows`×`cols`, so the frozen pane re-wraps to
+    /// the *current* size; `None` (no frame ever captured) seeds a short
+    /// notice instead. Keystrokes are dropped like any placeholder; the render
+    /// layer greys the pane. `info.status` is forced to `Unloaded`;
+    /// [`Self::restart`] turns the ghost back into a live session in place.
+    pub fn ghost(
+        mut info: SessionInfo,
+        rows: u16,
+        cols: u16,
+        backend: &Arc<dyn SessionBackend>,
+        provider: &Arc<dyn AgentProvider>,
+        env: HashMap<String, String>,
+        frame: Option<&[u8]>,
+    ) -> Self {
+        info.status = crate::session::SessionStatus::Unloaded;
+        let mut session = Self::placeholder(info, rows, cols, backend, provider, env);
+        session.info.status = crate::session::SessionStatus::Unloaded;
+        session.ghost = true;
+        // Re-seed the parser: replace the placeholder's "host unreachable"
+        // notice with the saved frame. Frame bytes are SGR-styled lines (tmux
+        // `capture-pane -e` / `rows_formatted`) — no OSC/BEL, so replaying
+        // them can't fire the title/attention callbacks.
+        if let Ok(mut p) = session.parser.lock() {
+            *p = vt100::Parser::new_with_callbacks(
+                rows.max(1),
+                cols.max(1),
+                crate::session::settings::global().scrollback_lines,
+                TermSignals {
+                    title: Arc::clone(&session.last_title),
+                    attention_at: Arc::clone(&session.attention_at),
+                    notification: Arc::clone(&session.notification),
+                    meta_gen: Arc::clone(&session.meta_gen),
+                },
+            );
+            match frame {
+                Some(bytes) => p.process(bytes),
+                None => p.process(
+                    "\r\n  \u{25CC} Session unloaded \u{2014} no saved preview.\r\n\r\n  \
+                     Press Enter (or restart) to launch the agent and resume.\r\n"
+                        .as_bytes(),
+                ),
+            }
+        }
+        session
     }
 
     /// Whether this is a placeholder for an unreachable remote session (no live
     /// backend pane). See [`Self::placeholder`].
     pub fn is_placeholder(&self) -> bool {
         self.placeholder
+    }
+
+    /// Whether this is a **ghost** (unloaded / lazily-restored placeholder
+    /// showing its saved frame). Ghosts are placeholders too — check this
+    /// first where the two need different handling (load vs remote retry).
+    pub fn is_ghost(&self) -> bool {
+        self.ghost
     }
 
     /// Blocking read loop feeding the vt100 parser. Runs on a
@@ -1025,9 +1097,16 @@ impl Session {
     /// Restart the session: kill the old pane, spawn a fresh one with new config.
     ///
     /// Uses the agent's resume args (when defined) so it picks up the
-    /// existing conversation instead of starting fresh.
+    /// existing conversation instead of starting fresh. On a **ghost** this is
+    /// the *load* path: there is no pane to kill, and success clears the
+    /// placeholder/ghost flags — the frozen frame is simply replaced by the
+    /// live stream, in place.
     pub fn restart(&mut self, config: &SessionConfig, rows: u16, cols: u16) -> Result<()> {
-        self.backend.kill(&self.backend_id)?;
+        // A placeholder/ghost owns no live pane — killing its empty backend_id
+        // would only produce a tmux error.
+        if !self.placeholder {
+            self.backend.kill(&self.backend_id)?;
+        }
 
         let args = self.provider.build_args(config);
         let window_name = crate::agent::tmux::agent_window_name(&self.info.name);
@@ -1070,9 +1149,58 @@ impl Session {
         if !config.agent.is_empty() {
             self.info.agent = config.agent.clone();
         }
+        if self.placeholder {
+            // A ghost just became a live session: hand the status back to the
+            // hook pipeline (fresh spawns start as Working until a hook says
+            // otherwise, matching `SessionInfo::new`).
+            self.placeholder = false;
+            self.ghost = false;
+            self.info.status = crate::session::SessionStatus::Working;
+        }
 
         debug!(session_id = %self.info.id, backend_id = %self.backend_id, "Restarted session");
         Ok(())
+    }
+
+    /// Serialize the pane's **visible screen** as a ghost frame: SGR-styled
+    /// lines joined with `\r\n` (the tmux-seed shape, so it re-parses at any
+    /// pane size), trailing blank rows trimmed, attrs reset per row so one
+    /// row's colors can't bleed into the next on replay. Pure in-memory read —
+    /// no tmux round-trip — which is what makes it safe on the crash-safety
+    /// debounce and for remote sessions at shutdown. Returns
+    /// `(rows, cols, bytes)`; `None` only on a poisoned parser lock.
+    pub fn serialize_visible_frame(&self) -> Option<(u16, u16, Vec<u8>)> {
+        let parser = self.parser.lock().ok()?;
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        let mut lines: Vec<Vec<u8>> = screen.rows_formatted(0, cols).collect();
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        Some((rows, cols, lines.join(&b"\x1b[0m\r\n"[..])))
+    }
+
+    /// Capture the ghost frame for an unload/shutdown: the visible screen plus
+    /// `lines` of scrollback via the backend (an independent `capture-pane`
+    /// subprocess), falling back to the in-memory visible screen when the
+    /// capture fails. Returns `(rows, cols, bytes)`.
+    pub fn capture_unload_frame(&self, lines: usize) -> Option<(u16, u16, Vec<u8>)> {
+        match self.backend.capture_history_lines(&self.backend_id, lines) {
+            Ok(seed) if !seed.is_empty() => {
+                let (rows, cols) = self
+                    .parser
+                    .lock()
+                    .ok()
+                    .map(|p| p.screen().size())
+                    .unwrap_or((0, 0));
+                Some((rows, cols, seed))
+            }
+            Ok(_) => self.serialize_visible_frame(),
+            Err(e) => {
+                tracing::warn!("Ghost-frame capture failed, saving visible screen only: {e}");
+                self.serialize_visible_frame()
+            }
+        }
     }
 
     /// Kill/destroy the backend session (for Ctrl+X close).
@@ -1240,6 +1368,7 @@ impl Session {
             shell_pane: None,
             env: HashMap::new(),
             placeholder: false,
+            ghost: false,
         };
         (session, input_rx)
     }

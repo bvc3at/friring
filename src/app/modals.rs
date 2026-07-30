@@ -1999,6 +1999,8 @@ pub enum SettingsField {
     NotifMinInterval,
     // ── top-level scalars ───────────────────────────────────────────────
     ScrollbackLines,
+    LazyRestore,
+    GhostScrollback,
     TwoPanelMinCols,
     ThreePanelMinCols,
     InfoPanelPosition,
@@ -2008,7 +2010,7 @@ pub enum SettingsField {
 impl SettingsField {
     /// Field nav order — also the render order (headers are interleaved by the
     /// renderer). Used by [`cycle_field`] and the scroll-windowing logic.
-    pub const ORDER: [SettingsField; 24] = [
+    pub const ORDER: [SettingsField; 26] = [
         SettingsField::FeatTasks,
         SettingsField::FeatAutomations,
         SettingsField::FeatFileViewer,
@@ -2029,6 +2031,8 @@ impl SettingsField {
         SettingsField::NotifSound,
         SettingsField::NotifMinInterval,
         SettingsField::ScrollbackLines,
+        SettingsField::LazyRestore,
+        SettingsField::GhostScrollback,
         SettingsField::TwoPanelMinCols,
         SettingsField::ThreePanelMinCols,
         SettingsField::InfoPanelPosition,
@@ -2115,6 +2119,16 @@ impl SettingsField {
                 "Scrollback",
                 "Terminal history lines kept per session",
             ),
+            LazyRestore => (
+                "lazy_session_restore",
+                "Lazy restore",
+                "Restore dead sessions as greyed ghosts, not respawns",
+            ),
+            GhostScrollback => (
+                "ghost_scrollback_lines",
+                "Ghost history",
+                "Scrollback lines saved into a ghost's frozen frame",
+            ),
             TwoPanelMinCols => (
                 "two_panel_min_cols",
                 "2-panel width",
@@ -2163,6 +2177,7 @@ impl SettingsField {
             self,
             NotifMinInterval
                 | ScrollbackLines
+                | GhostScrollback
                 | TwoPanelMinCols
                 | ThreePanelMinCols
                 | InfoPanelPosition
@@ -2244,8 +2259,9 @@ impl SettingsModal {
             NotifAlsoOnWaiting => n.also_on_waiting = !n.also_on_waiting,
             NotifSuppressForActive => n.suppress_for_active = !n.suppress_for_active,
             NotifSound => n.sound = !n.sound,
-            NotifMinInterval | ScrollbackLines | TwoPanelMinCols | ThreePanelMinCols
-            | InfoPanelPosition | AuditRetentionDays => {}
+            LazyRestore => self.draft.lazy_session_restore = !self.draft.lazy_session_restore,
+            NotifMinInterval | ScrollbackLines | GhostScrollback | TwoPanelMinCols
+            | ThreePanelMinCols | InfoPanelPosition | AuditRetentionDays => {}
         }
     }
 
@@ -2258,6 +2274,11 @@ impl SettingsModal {
             ScrollbackLines => {
                 d.scrollback_lines =
                     step_clamp(d.scrollback_lines as i64, delta, 500, 100, 200_000) as usize;
+            }
+            GhostScrollback => {
+                // Floor 0 = visible screen only; ceiling = the tmux capture cap.
+                d.ghost_scrollback_lines =
+                    step_clamp(d.ghost_scrollback_lines as i64, delta, 500, 0, 10_000) as usize;
             }
             TwoPanelMinCols => {
                 d.two_panel_min_cols =
@@ -2316,6 +2337,8 @@ impl SettingsModal {
             NotifSound => on(n.sound),
             NotifMinInterval => n.min_interval_secs.to_string(),
             ScrollbackLines => self.draft.scrollback_lines.to_string(),
+            LazyRestore => on(self.draft.lazy_session_restore),
+            GhostScrollback => self.draft.ghost_scrollback_lines.to_string(),
             TwoPanelMinCols => self.draft.two_panel_min_cols.to_string(),
             ThreePanelMinCols => self.draft.three_panel_min_cols.to_string(),
             InfoPanelPosition => self.draft.info_panel_position.as_str().to_string(),
@@ -3967,7 +3990,7 @@ mod tests {
 
     #[test]
     fn settings_order_lists_every_field_once() {
-        assert_eq!(SettingsField::ORDER.len(), 24);
+        assert_eq!(SettingsField::ORDER.len(), 26);
         for f in SettingsField::ORDER {
             assert_eq!(
                 SettingsField::ORDER.iter().filter(|x| **x == f).count(),

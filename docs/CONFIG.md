@@ -375,6 +375,8 @@ all commented so defaults still apply out of the box.
 | Key | Default | Purpose |
 |-----|---------|---------|
 | `scrollback_lines` | `1000` | terminal scrollback kept per session |
+| `lazy_session_restore` | `true` | restore dead sessions as greyed **ghosts** (last saved frame) instead of respawning; Enter/restart loads one. Live tmux panes always re-attach |
+| `ghost_scrollback_lines` | `1000` | scrollback lines captured into a ghost's frozen frame at unload/shutdown (`0` = visible screen only, ~5 KB; each 1000 lines ≈ 50–100 KB per session in the DB) |
 | `two_panel_min_cols` | `80` | width below which only the terminal renders |
 | `three_panel_min_cols` | `120` | width unlocking the optional third column |
 | `info_panel_position` | `"auto"` | where the F2 info pane docks: `auto` / `column` / `inline` |
@@ -398,6 +400,8 @@ config_version = 1
 
 # Scalar tuning knobs (top level)
 scrollback_lines      = 1000   # terminal scrollback kept per session
+lazy_session_restore  = true   # dead sessions restore as greyed ghosts (Enter loads)
+ghost_scrollback_lines = 1000  # scrollback saved into a ghost's frozen frame (0 = screen only)
 two_panel_min_cols    = 80     # width below which only the terminal renders
 three_panel_min_cols  = 120    # width unlocking the optional third column
 info_panel_position   = "auto" # F2 info pane dock: auto | column | inline
@@ -654,7 +658,11 @@ than fatal, so a typo in `key` still leaves you `key2` to get in with.
 
 Each session's state (Blocked / Working / Done / Idle / Error) is driven by
 **agent hooks** that call `friring-cli session signal --state
-<working|blocked|done|idle>`. The state is persisted on the `sessions` row
+<working|blocked|done|idle>`. Two states live outside the hook pipeline:
+`Unreachable` (a remote placeholder whose host is down) and `Unloaded` (a
+ghost — the agent process is deliberately not running; see
+`lazy_session_restore` above). Both are assigned by the TUI and cleared the
+moment the session adopts or loads. The state is persisted on the `sessions` row
 (`hook_state`, `hook_state_at`, `seen_at` — schema v34) and survives the TUI
 being closed; a hook fired headlessly is picked up via `PRAGMA data_version`.
 Identity comes from the injected `FRIRING_SESSION` env var, so a hook passes

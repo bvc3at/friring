@@ -1040,6 +1040,21 @@ impl App {
             }
         });
 
+        // A ghost has no live pane either — Enter is the load gesture, any
+        // other key just hints. Checked before the generic placeholder branch
+        // (ghosts are placeholders too).
+        if self.active_session_is_ghost() {
+            if code == KeyCode::Enter && mods.is_empty() {
+                self.restart_active_session();
+            } else {
+                self.set_status(
+                    super::StatusLevel::Info,
+                    "Session is unloaded — press Enter to load it",
+                );
+            }
+            return;
+        }
+
         // A placeholder (unreachable remote) has no live pane; swallow the
         // keystroke and hint how to recover instead of silently dropping it.
         if self
@@ -1678,6 +1693,10 @@ impl App {
                 self.restart_active_session();
                 true
             }
+            Action::UnloadSession => {
+                self.unload_active_session();
+                true
+            }
             Action::UndoDelete => {
                 if self.pending_delete.is_some() {
                     self.undo_delete();
@@ -1720,6 +1739,8 @@ impl App {
             }
             Action::NextSession => self.switch_session_forward(),
             Action::PreviousSession => self.switch_session_backward(),
+            Action::NextLoadedSession => self.switch_loaded_session(true),
+            Action::PreviousLoadedSession => self.switch_loaded_session(false),
             Action::NextBlockedSession => self.focus_next_blocked(),
             Action::LastSession => self.toggle_last_session(),
             Action::JumpToBlocked => self.toggle_blocked_jump(),
@@ -1822,7 +1843,15 @@ impl App {
         match action {
             Action::SessionListNext => self.act_session_list_next(),
             Action::SessionListPrev => self.act_session_list_prev(),
-            Action::SessionListOpen => self.focus = InputFocus::Terminal,
+            Action::SessionListOpen => {
+                // Opening a ghost row loads it (their UX contract: selection
+                // never starts an agent, Enter does) — then focus the terminal
+                // so the freshly-spawned agent gets the keyboard either way.
+                if self.active_session_is_ghost() {
+                    self.restart_active_session();
+                }
+                self.focus = InputFocus::Terminal;
+            }
             Action::SessionListMoveDown => self.move_active_session(true),
             Action::SessionListMoveUp => self.move_active_session(false),
             Action::SessionListSortAlphabetically => self.sort_sessions_alphabetically(),

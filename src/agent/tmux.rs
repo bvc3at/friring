@@ -1115,9 +1115,13 @@ impl TmuxBackend {
     /// so they re-wrap at the adopting panel's width, `-S -<n>` extends the
     /// capture into history (tmux clamps to what exists).
     fn capture_history_seed(&self, pane_id: &str) -> Result<Vec<u8>> {
-        let lines = crate::session::settings::global()
-            .scrollback_lines
-            .min(MAX_CAPTURE_LINES as usize);
+        self.capture_seed_with_lines(pane_id, crate::session::settings::global().scrollback_lines)
+    }
+
+    /// [`capture_history_seed`](Self::capture_history_seed) at an explicit
+    /// scrollback depth (the ghost-frame capture path).
+    fn capture_seed_with_lines(&self, pane_id: &str, lines: usize) -> Result<Vec<u8>> {
+        let lines = lines.min(MAX_CAPTURE_LINES as usize);
         let start = format!("-{lines}");
         let output = self.run_tmux(&[
             "capture-pane",
@@ -1321,6 +1325,13 @@ impl SessionBackend for TmuxBackend {
             bail!("refusing to capture invalid pane id: {backend_id:?}");
         }
         self.capture_history_seed(backend_id)
+    }
+
+    fn capture_history_lines(&self, backend_id: &str, lines: usize) -> Result<Vec<u8>> {
+        if !control_mode::is_valid_pane_id(backend_id) {
+            bail!("refusing to capture invalid pane id: {backend_id:?}");
+        }
+        self.capture_seed_with_lines(backend_id, lines)
     }
 
     fn discover(&self) -> Result<Vec<DiscoveredSession>> {

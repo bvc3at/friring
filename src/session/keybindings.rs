@@ -46,6 +46,9 @@ pub enum Action {
     ToggleCcActivity,
     ForkSession,
     RestartSession,
+    /// Unload the active session: save its ghost frame, kill the agent
+    /// process, keep the greyed frozen pane in place (Enter/restart loads it).
+    UnloadSession,
     UndoDelete,
     OpenRestoreSessions,
     OpenThemePicker,
@@ -53,6 +56,11 @@ pub enum Action {
     FocusForward,
     NextSession,
     PreviousSession,
+    /// Cycle forward among **loaded** sessions only, skipping ghosts and
+    /// unreachable placeholders.
+    NextLoadedSession,
+    /// Cycle backward among **loaded** sessions only.
+    PreviousLoadedSession,
     /// Jump to the next session whose status is Blocked (needs attention),
     /// scanning forward from the active session in rendered order (wraps).
     NextBlockedSession,
@@ -164,6 +172,7 @@ impl Action {
             Action::ToggleCcActivity,
             Action::ForkSession,
             Action::RestartSession,
+            Action::UnloadSession,
             Action::UndoDelete,
             Action::OpenRestoreSessions,
             Action::OpenThemePicker,
@@ -171,6 +180,8 @@ impl Action {
             Action::FocusForward,
             Action::NextSession,
             Action::PreviousSession,
+            Action::NextLoadedSession,
+            Action::PreviousLoadedSession,
             Action::NextBlockedSession,
             Action::LastSession,
             Action::JumpToBlocked,
@@ -237,6 +248,7 @@ impl Action {
             Action::ToggleCcActivity => "Toggle agent activity",
             Action::ForkSession => "Fork session",
             Action::RestartSession => "Restart session",
+            Action::UnloadSession => "Unload session (ghost)",
             Action::UndoDelete => "Undo delete",
             Action::OpenRestoreSessions => "Restore deleted sessions",
             Action::OpenThemePicker => "Pick theme",
@@ -244,6 +256,8 @@ impl Action {
             Action::FocusForward => "Focus next pane",
             Action::NextSession => "Next session",
             Action::PreviousSession => "Previous session",
+            Action::NextLoadedSession => "Next loaded session",
+            Action::PreviousLoadedSession => "Previous loaded session",
             Action::NextBlockedSession => "Next blocked session",
             Action::LastSession => "Last session (toggle)",
             Action::JumpToBlocked => "Jump to blocked by number",
@@ -443,6 +457,11 @@ impl Action {
             FocusForward => KeyChord::plain('l'),
             LastSession => KeyChord::key(KeyCode::Tab),
             NextBlockedSession => KeyChord::plain(']'),
+            // `c` for **c**ycle: the loaded-only twins of `j`/`k`. Their Alt
+            // chords' letters (`n`/`p`) are spent on NewSession/OpenAutomations
+            // here, so — like `v` for activity — the mnemonic moves to the verb.
+            NextLoadedSession => KeyChord::plain('c'),
+            PreviousLoadedSession => KeyChord::normalized(KeyModifiers::SHIFT, KeyCode::Char('c')),
             // `a` for **a**ttention. This is the second-level session table:
             // it opens the blocked-only overlay, whose `1`–`9` then select —
             // so `<leader> a 3` is "the third session that needs me".
@@ -454,6 +473,9 @@ impl Action {
             ForkSession => KeyChord::plain('f'),
             UndoDelete => KeyChord::plain('z'),
             OpenRestoreSessions => KeyChord::plain('u'),
+            // `u`'s shifted twin, mirroring the ReloadApp pattern: `u` lists
+            // deleted sessions to bring back, `U` puts the current one to sleep.
+            UnloadSession => KeyChord::normalized(KeyModifiers::SHIFT, KeyCode::Char('u')),
             OpenAutomations => KeyChord::plain('p'),
             FocusTasks => KeyChord::plain('w'),
             // ── Project ─────────────────────────────────────────────────
@@ -534,6 +556,12 @@ impl Action {
             Action::ToggleCcActivity => vec![KeyChord::function(9)],
             Action::ForkSession => vec![KeyChord::ctrl('f')],
             Action::RestartSession => vec![KeyChord::ctrl('r')],
+            // Alt+U (mnemonic: Unload) — every bare `Ctrl+<letter>` is taken,
+            // so this rides the narrow Alt exception like `Alt+A`. Shadows
+            // readline's rarely-used M-u (upcase-word) in a focused terminal;
+            // macOS needs option-as-alt, like the other Alt chords. Fully
+            // rebindable.
+            Action::UnloadSession => vec![KeyChord::alt(KeyCode::Char('u'))],
             Action::UndoDelete => vec![KeyChord::ctrl('z')],
             Action::OpenRestoreSessions => vec![KeyChord::ctrl('u')],
             Action::OpenThemePicker => vec![KeyChord::ctrl('y'), KeyChord::function(4)],
@@ -550,6 +578,12 @@ impl Action {
             Action::PreviousSession => {
                 vec![KeyChord::ctrl('k'), KeyChord::alt(KeyCode::Char('k'))]
             }
+            // Alt+N / Alt+P — the loaded-only twins of session cycling, on the
+            // same Alt namespace as `Alt+J`/`Alt+K`. Shadow readline's
+            // rarely-used M-n/M-p (non-incremental history search) in a
+            // focused terminal; fully rebindable.
+            Action::NextLoadedSession => vec![KeyChord::alt(KeyCode::Char('n'))],
+            Action::PreviousLoadedSession => vec![KeyChord::alt(KeyCode::Char('p'))],
             // F10 only (F1–F9 are taken, and every free bare `Ctrl+<letter>`
             // would collide with readline in the terminal/shell panes — an
             // F-key dispatches from any pane without a PTY collision). Fully
@@ -726,6 +760,8 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
                 FocusForward,
                 NextSession,
                 PreviousSession,
+                NextLoadedSession,
+                PreviousLoadedSession,
                 NextBlockedSession,
                 LastSession,
                 JumpToBlocked,
@@ -737,6 +773,7 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
                 NewSession,
                 DeleteSession,
                 RestartSession,
+                UnloadSession,
                 ForkSession,
                 OpenAutomations,
                 FocusTasks,
@@ -846,6 +883,8 @@ pub fn prefix_sections() -> Vec<(&'static str, Vec<PrefixEntry>)> {
                 PrefixEntry::MoveSession { up: false },
                 A(NextSession),
                 A(PreviousSession),
+                A(NextLoadedSession),
+                A(PreviousLoadedSession),
                 A(LastSession),
                 A(NextBlockedSession),
             ],
@@ -868,6 +907,7 @@ pub fn prefix_sections() -> Vec<(&'static str, Vec<PrefixEntry>)> {
                 A(NewSession),
                 A(DeleteSession),
                 A(RestartSession),
+                A(UnloadSession),
                 A(ForkSession),
                 A(UndoDelete),
                 A(OpenRestoreSessions),
@@ -1830,6 +1870,7 @@ mod tests {
                 Action::ToggleReview => 0,
                 Action::ForkSession => 0,
                 Action::RestartSession => 0,
+                Action::UnloadSession => 0,
                 Action::UndoDelete => 0,
                 Action::OpenRestoreSessions => 0,
                 Action::OpenThemePicker => 0,
@@ -1837,6 +1878,8 @@ mod tests {
                 Action::FocusForward => 0,
                 Action::NextSession => 0,
                 Action::PreviousSession => 0,
+                Action::NextLoadedSession => 0,
+                Action::PreviousLoadedSession => 0,
                 Action::NextBlockedSession => 0,
                 Action::LastSession => 0,
                 Action::JumpToBlocked => 0,
@@ -1889,7 +1932,7 @@ mod tests {
         }
         // The listed variants must equal Action::all().len(). If you add
         // a variant, update both `Action::all()` and the match above.
-        const EXPECTED: usize = 67;
+        const EXPECTED: usize = 70;
         assert_eq!(Action::all().len(), EXPECTED);
         for a in Action::all() {
             classify(*a);

@@ -13,6 +13,8 @@ expression: h.render()
 │                   │  ctrl+l          Focus next pane                        █│                   │
 │                   │  ctrl+j / alt+j  Next session                           █│                   │
 │                   │  ctrl+k / alt+k  Previous session                       ║│                   │
+│                   │  alt+n           Next loaded session                    ║│                   │
+│                   │  alt+p           Previous loaded session                ║│                   │
 │                   │  f10             Next blocked session                   ║│                   │
 │                   │  ctrl+6 / ctrl+^ Last session (toggle)                  ║│                   │
 │                   │  alt+a           Jump to blocked by number              ║│                   │
@@ -21,11 +23,9 @@ expression: h.render()
 │                   │  ctrl+n          New session                            ║│                   │
 │                   │  ctrl+d          Delete session                         ║│                   │
 │                   │  ctrl+r          Restart session                        ║│                   │
+│                   │  alt+u           Unload session (ghost)                 ║│                   │
 │                   │  ctrl+f          Fork session                           ║│                   │
-│                   │  ctrl+p          Automations                            ║│                   │
-│                   │  ctrl+w / f5     Tasks                                  ║│                   │
-│                   │  ctrl+z          Undo delete                            ║│                   │
-│                   │  ctrl+u          Restore deleted sessions               ▼│                   │
+│                   │  ctrl+p          Automations                            ▼│                   │
 │                   │j/k move · r rebind · d reset           Reset all   Close │                   │
 ╰───────────────────╰──────────────────────────────────────────────────────────╯                   │
 ┌ Automations ──────────┐│                                                                         │

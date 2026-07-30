@@ -54,6 +54,38 @@ merges carry rename conflicts on the renamed identifiers, and an existing
 
 ### Features
 
+#### Lazy sessions & ghosts (July 2026)
+
+Upstream restores every persisted session eagerly at startup: sessions whose
+tmux pane died (after a reboot, all of them) respawn their agent CLIs serially
+before the first frame — N × ~500 ms of boot latency and N × hundreds of MB of
+agent processes, whether or not the user wanted those sessions running. The
+fork makes "not running" a first-class state:
+
+- **Ghost sessions.** A session without an agent process renders as a greyed
+  frozen frame of its last state (`SessionStatus::Unloaded`, dotted `◌` icon,
+  muted list row, `unloaded — Enter loads` on the pane border). The frame is
+  SGR-styled lines (adopt-seed shape) persisted on the `sessions` row (schema
+  v45, columns outside the full-row upsert like the hook columns); it re-parses
+  at the current pane size, so ghosts survive terminal/font-size changes.
+- **`lazy_session_restore`** (settings.toml, default `true` — a changed
+  default vs upstream's respawn-everything): pane-less sessions restore as
+  ghosts; live panes still adopt. Startup after a reboot goes from N agent
+  boots to ~5 ms of frame parsing.
+- **Unload** (`Alt+U` direct / `<leader> U`): capture frame (visible screen +
+  `ghost_scrollback_lines` of history, default 1000), kill the agent window +
+  shell pane, swap in the ghost in place. Loading (Enter / restart) rides the
+  existing restart-resume machinery.
+- **Loaded-only cycling** (`Alt+N`/`Alt+P` direct, `<leader> c`/`<leader> C`):
+  session switching that skips ghosts and unreachable placeholders.
+- **Crash safety:** visible-screen frames are re-saved (~1/min, in-memory
+  serialization only) for sessions with new output; full captures happen at
+  unload and clean shutdown (remote hosts: visible-screen only at shutdown, no
+  ssh round-trips on exit).
+- Measurements behind the design (frame ≈ 4–5 KB raw / ~1 KB compressed;
+  parse ≈ 50 µs; grey pass ≈ 7 µs; idle claude CLI ≈ 333 MB RSS) were taken
+  with the e2e stub harness on real agent frames.
+
 #### tmux-style leader key (July 2026)
 
 Upstream dispatches every global command from a direct `Ctrl+<letter>` chord

@@ -24,6 +24,19 @@ config_version = 1
 # Scrollback lines kept per session terminal.
 # scrollback_lines = 1000
 
+# Lazy session restore: at startup, sessions whose agent process is gone
+# (e.g. after a reboot) show their greyed last-saved frame as a "ghost"
+# instead of respawning; press Enter (or restart) on one to load it. A
+# session with a live tmux pane always re-attaches — that spawns nothing.
+# false = respawn everything at startup (the old behavior).
+# lazy_session_restore = true
+
+# Scrollback lines captured into a session's ghost frame at unload/shutdown,
+# on top of the visible screen, so a ghost stays scrollable. 0 = visible
+# screen only (~5 KB per session); each 1000 lines adds ~50–100 KB per
+# session to the database. Capped at 10000.
+# ghost_scrollback_lines = 1000
+
 # Terminal width (columns) below which only the terminal pane renders.
 # two_panel_min_cols = 80
 
@@ -232,6 +245,8 @@ pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
     // Top-level scalars (cast to i64 — TOML's only integer type).
     doc["config_version"] = value(i64::from(settings.config_version.unwrap_or(1)));
     doc["scrollback_lines"] = value(settings.scrollback_lines as i64);
+    doc["lazy_session_restore"] = value(settings.lazy_session_restore);
+    doc["ghost_scrollback_lines"] = value(settings.ghost_scrollback_lines as i64);
     doc["two_panel_min_cols"] = value(i64::from(settings.two_panel_min_cols));
     doc["three_panel_min_cols"] = value(i64::from(settings.three_panel_min_cols));
     doc["audit_retention_days"] = value(settings.audit_retention_days as i64);
@@ -304,6 +319,8 @@ mod tests {
     fn seed_toml_documents_every_field() {
         for field in [
             "scrollback_lines",
+            "lazy_session_restore",
+            "ghost_scrollback_lines",
             "two_panel_min_cols",
             "three_panel_min_cols",
             "audit_retention_days",

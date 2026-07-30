@@ -19,7 +19,7 @@ pub mod review;
 mod schema;
 mod sessions;
 mod settings;
-pub use sessions::{DeletedSessionInfo, HookRow};
+pub use sessions::{DeletedSessionInfo, HookRow, SessionFrame};
 pub mod sync;
 mod sync_bases;
 pub mod tasks;

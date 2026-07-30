@@ -426,6 +426,29 @@ pub fn render_filter_selector_footer(
     )
 }
 
+/// Grey out a rendered buffer region — the ghost-session pane treatment.
+/// Style-only (glyphs untouched, like the selection highlight): every cell
+/// drops to the theme's muted foreground, DIM, no bold, no background fill,
+/// so the frozen frame reads as "this is what the session looked like" the
+/// way a greyed preview does on the web. ~7 µs for a full pane; measured in
+/// the lazy-sessions investigation.
+pub fn grey_out_buffer_area(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect) {
+    use ratatui::layout::Position;
+    use ratatui::style::{Modifier, Style};
+    let style = Style::default()
+        .fg(Theme::text_muted())
+        .bg(Color::Reset)
+        .remove_modifier(Modifier::BOLD)
+        .add_modifier(Modifier::DIM);
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                cell.set_style(style);
+            }
+        }
+    }
+}
+
 pub fn status_color(status: SessionStatus) -> Color {
     match status {
         SessionStatus::Working => Theme::status_working(),
@@ -434,6 +457,9 @@ pub fn status_color(status: SessionStatus) -> Color {
         SessionStatus::Idle => Theme::status_idle(),
         SessionStatus::Error => Theme::status_error(),
         SessionStatus::Unreachable => Theme::status_unreachable(),
+        // Muted grey, not a dedicated theme slot: a ghost's whole visual
+        // identity is "greyed out", so it rides the theme's muted text color.
+        SessionStatus::Unloaded => Theme::text_muted(),
     }
 }
 

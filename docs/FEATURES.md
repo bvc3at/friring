@@ -665,6 +665,7 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Ctrl+H` | Global | Focus previous pane (cycle backward) | Vim: **h** = left |
 | `Ctrl+J` / `Alt+J` | Global | Select next session (`Ctrl+J` defers to the agent in a focused terminal — it doubles as a legacy `Ctrl+Enter`; use `Alt+J` there) | Vim: **j** = down |
 | `Ctrl+K` / `Alt+K` | Global | Select previous session (`Ctrl+K` defers likewise — readline kill-to-end) | Vim: **k** = up |
+| `Alt+N` / `Alt+P` | Global | Select next / previous **loaded** session (skips ghosts and unreachable placeholders) | **N**ext / **P**revious, Alt like the other session-cycling chords |
 | `Ctrl+L` | Global | Focus next pane (cycle forward) | Vim: **l** = right |
 | `F10` | Global | Jump to next blocked session (wraps, focuses terminal) | Attention |
 | `Ctrl+6` / `Ctrl+^` | Global | Toggle between the two most recent sessions | vim alternate buffer |
@@ -674,7 +675,8 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `1`…`9` / `Esc` | Blocked-jump overlay | Jump to that blocked session / dismiss | |
 | `Ctrl+D` | Session list | Delete selected session | Vim: **d** = delete |
 | `Ctrl+O` | Global | Open active session's worktrees in editor | **O**pen |
-| `Ctrl+R` | Global | Restart active session | **R**estart |
+| `Ctrl+R` | Global | Restart active session (on a ghost: load it) | **R**estart |
+| `Alt+U` | Global | Unload active session — save its ghost frame, kill the agent process, keep the greyed pane | **U**nload |
 | `Ctrl+Alt+R` | Global | Reload friring in place (quit + re-exec the on-disk binary) | **R**estart, one modifier up |
 | `Ctrl+F` | Global | Fork active session | **F**ork |
 | `Ctrl+S` | Global | Sync all worktree sessions with their base branch | **S**ync |
@@ -2577,9 +2579,54 @@ friring instances.
 - On next startup, Friring discovers existing sessions from tmux,
   matches them to persisted metadata by `backend_id`, and adopts
   them — reconnecting to the live tmux panes with terminal content
-  intact. Unmatched persisted sessions fall back to
-  `--resume <session-id>` to create new tmux panes.
+  intact. Unmatched persisted sessions become greyed **ghosts** of
+  their last saved frame (`lazy_session_restore`, default on; see
+  Lazy sessions & ghosts below), or — with the setting off — fall
+  back to `--resume <session-id>` to create new tmux panes.
 - External recovery is always possible via `tmux -L friring attach`.
+
+### Lazy sessions & ghosts
+
+A session whose agent process is not running can still hold its place
+in the TUI as a **ghost**: a placeholder row (dotted `◌` icon, greyed
+name) whose pane shows the session's **last saved frame**, greyed out,
+with `unloaded — Enter loads` on the bottom border. No agent process,
+no live tmux pane; the parser is seeded once from the saved frame (a
+few KB) and the row costs effectively nothing. Ghosts appear two ways:
+
+- **Lazy restore** (`lazy_session_restore`, default `true`): at
+  startup, sessions whose tmux pane is gone — after a reboot, every
+  session — restore as ghosts instead of respawning agents serially
+  before the first frame. Sessions with a live pane always adopt
+  (adoption spawns nothing). Set it `false` for the old
+  respawn-everything behavior.
+- **Unload** (`Alt+U` / `<leader> U`): saves the frame, kills the
+  agent window + shell pane, and swaps the ghost in place. This is
+  the memory lever — the agent process itself (hundreds of MB for a
+  typical CLI) exits; the row, worktrees, and conversation survive.
+
+**Loading** a ghost is explicit, matching "selection never starts an
+agent": `Enter` (in the session list or the focused pane) or restart
+(`Ctrl+R` / `<leader> r`) respawns via the normal resume path
+(`--resume <id>` where a transcript exists, the agent's cwd-scoped
+resume otherwise), in place — order, id, and injected identity all
+survive. `Alt+N` / `Alt+P` (`<leader> c` / `<leader> C`) cycle among
+loaded sessions only, skipping ghosts.
+
+**Frames.** The saved frame is the pane's content as SGR-styled lines
+(the same byte shape as the adopt seed), captured with
+`ghost_scrollback_lines` of history at unload and clean shutdown — so
+a ghost is scrollable — and, as crash safety, the visible screen alone
+is re-saved about once a minute for any session with new output (so a
+hard reboot shows ghosts at most a minute stale, without scrollback
+until loaded). Frames re-parse at the *current* pane size, so a ghost
+restored into a different terminal size (or font) re-wraps: identical
+when same/wider, bottom-anchored with full-width rules wrapping into
+stubs when narrower. Remote sessions save visible-screen frames at
+shutdown (no per-host ssh round-trips on exit); a full capture happens
+on explicit unload. Frame blobs live on the `sessions` row (schema
+v45) and are never written by the full-row upsert, so debounced saves
+can't clobber concurrent metadata writes.
 
 ### State storage
 

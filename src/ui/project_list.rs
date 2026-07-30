@@ -821,18 +821,21 @@ fn group_header_line(
 /// up) still dominates the header dot.
 fn status_urgency(s: SessionStatus) -> u8 {
     match s {
-        SessionStatus::Blocked => 5,
-        SessionStatus::Error => 4,
-        SessionStatus::Working => 3,
-        SessionStatus::Done => 2,
-        SessionStatus::Unreachable => 1,
-        SessionStatus::Idle => 0,
+        SessionStatus::Blocked => 6,
+        SessionStatus::Error => 5,
+        SessionStatus::Working => 4,
+        SessionStatus::Done => 3,
+        SessionStatus::Unreachable => 2,
+        SessionStatus::Idle => 1,
+        // Below Idle: a ghost is deliberately at rest, so any live member —
+        // even an idle one — should own the group header dot.
+        SessionStatus::Unloaded => 0,
     }
 }
 
 /// The most-urgent status across a group's members (Blocked > Error > Working >
-/// Done > Unreachable > Idle), so the group header dot surfaces whatever needs
-/// attention first. Empty input rolls up to `Idle`.
+/// Done > Unreachable > Idle > Unloaded), so the group header dot surfaces
+/// whatever needs attention first. Empty input rolls up to `Idle`.
 pub fn group_status(statuses: impl IntoIterator<Item = SessionStatus>) -> SessionStatus {
     statuses
         .into_iter()
@@ -977,6 +980,10 @@ fn build_session_line<'a>(
     spinner: &str,
     jump_digit: Option<char>,
 ) -> Line<'a> {
+    // A ghost row greys its name like a search-dimmed one (its ◌ dot is
+    // already muted via `status_color`) — except while selected, where the
+    // selection colors keep it legible on the highlight background.
+    let is_dimmed = is_dimmed || (!is_active && info.status == SessionStatus::Unloaded);
     let name_style = name_span_style(is_active, is_dimmed);
     let status_style = if is_dimmed {
         Style::default().fg(Theme::text_muted())
