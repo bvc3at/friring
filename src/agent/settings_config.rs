@@ -403,12 +403,19 @@ mod tests {
 
         let path = settings_config_path().unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "scrollback_lines = 4000\naudit_retention_days = 7\n").unwrap();
+        std::fs::write(
+            &path,
+            "scrollback_lines = 4000\naudit_retention_days = 7\n\
+             lazy_session_restore = false\nghost_scrollback_lines = 3500\n",
+        )
+        .unwrap();
 
         let (s, warnings) = load_or_seed_with_warnings();
         assert!(warnings.is_empty());
         assert_eq!(s.scrollback_lines, 4000);
         assert_eq!(s.audit_retention_days, 7);
+        assert!(!s.lazy_session_restore);
+        assert_eq!(s.ghost_scrollback_lines, 3500);
         assert_eq!(s.two_panel_min_cols, 80);
     }
 
@@ -428,6 +435,8 @@ mod tests {
         s.features.auto_update = true;
         s.notifications.min_interval_secs = 30;
         s.notifications.suppress_for_active = false;
+        s.lazy_session_restore = false;
+        s.ghost_scrollback_lines = 3500;
         // A non-default backend must survive the save/reload round-trip; the
         // full-Settings equality below would silently pass on the `Auto`
         // default even if `backend` were dropped.
