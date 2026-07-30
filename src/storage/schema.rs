@@ -2150,60 +2150,36 @@ mod tests {
             assert!(has(column), "sessions.{column} should be added at v45");
         }
 
+        let column = |column: &str| -> rusqlite::types::Value {
+            conn.query_row(
+                &format!("SELECT {column} FROM sessions WHERE id = 's-1'"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        use rusqlite::types::Value;
+
         // No frame for a pre-v45 row (it renders the "no preview" ghost), and
         // `unloaded` defaults to loaded — the row must not turn into a ghost
         // just by upgrading.
-        let (frame, rows, cols, saved_at, unloaded): (
-            Option<Vec<u8>>,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            i64,
-        ) = conn
-            .query_row(
-                "SELECT last_frame, frame_rows, frame_cols, frame_saved_at, unloaded \
-                 FROM sessions WHERE id = 's-1'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-            .unwrap();
-        assert_eq!((frame, rows, cols, saved_at), (None, None, None, None));
-        assert_eq!(unloaded, 0);
+        for name in ["last_frame", "frame_rows", "frame_cols", "frame_saved_at"] {
+            assert_eq!(column(name), Value::Null, "{name} on an upgraded row");
+        }
+        assert_eq!(column("unloaded"), Value::Integer(0));
 
         // Nothing else about the row moved.
-        let (name, agent, backend_id, agent_session_id, cwd, order, created): (
-            String,
-            String,
-            String,
-            String,
-            String,
-            i64,
-            i64,
-        ) = conn
-            .query_row(
-                "SELECT name, agent, backend_id, agent_session_id, cwd, display_order, \
-                 created_at FROM sessions WHERE id = 's-1'",
-                [],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                        r.get(6)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(name, "old row");
-        assert_eq!(agent, "codex");
-        assert_eq!(backend_id, "friring:@3");
-        assert_eq!(agent_session_id, "conv-7");
-        assert_eq!(cwd, "/repo");
-        assert_eq!(order, 2);
-        assert_eq!(created, 11);
+        for (name, expected) in [
+            ("name", "old row"),
+            ("agent", "codex"),
+            ("backend_id", "friring:@3"),
+            ("agent_session_id", "conv-7"),
+            ("cwd", "/repo"),
+        ] {
+            assert_eq!(column(name), Value::Text(expected.into()), "{name}");
+        }
+        assert_eq!(column("display_order"), Value::Integer(2));
+        assert_eq!(column("created_at"), Value::Integer(11));
 
         let version: String = conn
             .query_row(
