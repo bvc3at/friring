@@ -787,7 +787,7 @@ impl Session {
     /// layer greys the pane. `info.status` is forced to `Unloaded`;
     /// [`Self::restart`] turns the ghost back into a live session in place.
     pub fn ghost(
-        mut info: SessionInfo,
+        info: SessionInfo,
         rows: u16,
         cols: u16,
         backend: &Arc<dyn SessionBackend>,
@@ -795,7 +795,7 @@ impl Session {
         env: HashMap<String, String>,
         frame: Option<&[u8]>,
     ) -> Self {
-        info.status = crate::session::SessionStatus::Unloaded;
+        // `placeholder` forces `Unreachable`, so the status is set after it.
         let mut session = Self::placeholder(info, rows, cols, backend, provider, env);
         session.info.status = crate::session::SessionStatus::Unloaded;
         session.ghost = true;
