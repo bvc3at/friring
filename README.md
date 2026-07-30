@@ -269,7 +269,16 @@ survives crashes, restarts, and reboots. Pick the agent and repo(s) at
 by hand (`Shift+J`/`Shift+K`), sort (`Shift+S`), restart with resume
 (`Ctrl+R`), or soft-delete with undo.
 
-[Getting started →](#getting-started)
+A session whose pane is gone — after a reboot, all of them — comes back as a
+greyed **ghost**: its last saved frame, no agent process, no memory cost.
+`Enter` (or `Ctrl+R`) loads one in place, resuming the conversation where the
+agent supports it, and `Alt+U` unloads a live session back to a ghost to
+reclaim the agent's memory while keeping the frozen preview. Set
+`lazy_session_restore = false` to respawn everything at startup as before.
+
+[Getting started →](#getting-started) ·
+[Lazy sessions & ghosts →](docs/FEATURES.md#lazy-sessions--ghosts) ·
+[Settings →](docs/CONFIG.md#settingstoml)
 
 </td>
 <td width="50%">
