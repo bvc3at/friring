@@ -16381,8 +16381,10 @@ mod tests {
         let mut app = app_with_sessions(1);
         let id = persist_session(&app, 0);
         // The debounce compares millisecond wall-clock stamps, and the output
-        // test seam bumps strictly past "now" — so let the clock move on before
-        // each save, exactly as the real ~60 s interval would.
+        // test seam bumps strictly *past* "now" — so let the clock move on
+        // around each feed (the real ~60 s interval is never this tight):
+        // after, so a save counts the output as captured; before, so the next
+        // output out-stamps the previous save.
         let settle = || std::thread::sleep(std::time::Duration::from_millis(5));
 
         app.sessions[0].feed_output_for_test(b"first words\r\n");
@@ -16409,6 +16411,7 @@ mod tests {
         );
 
         // New output → the frame is refreshed.
+        settle();
         app.sessions[0].feed_output_for_test(b"later words\r\n");
         settle();
         app.persist_dirty_frames();
