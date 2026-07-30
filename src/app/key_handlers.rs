@@ -1040,11 +1040,14 @@ impl App {
             }
         });
 
-        // A ghost has no live pane either — Enter is the load gesture, any
-        // other key just hints. Checked before the generic placeholder branch
-        // (ghosts are placeholders too).
+        // A ghost has no live pane either — Enter *and* the restart chord are
+        // load gestures (the chord is terminal passthrough, but there is no PTY
+        // to defer it to here), any other key just hints. Checked before the
+        // generic placeholder branch (ghosts are placeholders too).
         if self.active_session_is_ghost() {
-            if code == KeyCode::Enter && mods.is_empty() {
+            let restart =
+                self.keybindings.lookup(code, mods) == Some(crate::session::Action::RestartSession);
+            if restart || (code == KeyCode::Enter && mods.is_empty()) {
                 self.restart_active_session();
             } else {
                 self.set_status(
