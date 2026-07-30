@@ -16360,6 +16360,51 @@ mod tests {
         assert!(text.contains("frozen findings here"), "got: {text}");
     }
 
+    /// A ghost's frame carries `ghost_scrollback_lines` of history, so the
+    /// frozen pane must be scrollable — the rows above the visible screen land
+    /// in the parser's scrollback, and the scroll actions (which have no
+    /// placeholder gating) can reach them.
+    #[tokio::test]
+    async fn ghost_frame_is_scrollable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_sessions(0);
+        let shared = make_shared_session("friring:@0", "deep");
+        app.db.upsert_session(&shared).unwrap();
+        // Far more lines than the pane is tall, so most land in scrollback.
+        let frame: String = (0..200).map(|i| format!("line-{i}\r\n")).collect();
+        app.db
+            .save_session_frame(shared.id, 24, 80, frame.as_bytes())
+            .unwrap();
+        app.restore_sessions(vec![shared], 1);
+        assert!(app.sessions[0].is_ghost());
+
+        // Total scrollback available, read the way `render_terminal` does.
+        let total = {
+            let mut p = app.sessions[0].parser.lock().unwrap();
+            p.screen_mut().set_scrollback(usize::MAX);
+            let max = p.screen().scrollback();
+            p.screen_mut().set_scrollback(0);
+            max
+        };
+        assert!(total > 0, "a ghost's frame kept no scrollback");
+
+        // And the scroll action actually moves it (no placeholder gating).
+        app.scroll_terminal_up(5);
+        let offset = app.sessions[0]
+            .parser
+            .lock()
+            .map(|p| p.screen().scrollback())
+            .unwrap();
+        assert_eq!(offset, 5, "scrolling a ghost did not move its viewport");
+        let top = app.sessions[0]
+            .parser
+            .lock()
+            .map(|p| p.screen().contents())
+            .unwrap();
+        assert!(top.contains("line-"), "scrolled view shows frame content");
+    }
+
     /// vt100 resizes by truncating each row's cells, so a narrowed pane loses
     /// every cell past the new width and widening back pads with blanks. A
     /// live session's agent repaints that away on SIGWINCH; a ghost has no
