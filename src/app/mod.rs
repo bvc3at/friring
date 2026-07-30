@@ -16363,6 +16363,70 @@ mod tests {
         assert!(app.sessions[0].is_ghost());
     }
 
+    /// The crash-safety debounce: a session with new output gets its visible
+    /// screen persisted, a session with none is skipped (the dirty check is
+    /// what keeps this cheap at every interval), and a placeholder is never
+    /// written — its frozen frame would be overwritten by the empty pane.
+    #[tokio::test]
+    async fn persist_dirty_frames_writes_only_changed_live_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_sessions(1);
+        let id = persist_session(&app, 0);
+        // The debounce compares millisecond wall-clock stamps, and the output
+        // test seam bumps strictly past "now" — so let the clock move on before
+        // each save, exactly as the real ~60 s interval would.
+        let settle = || std::thread::sleep(std::time::Duration::from_millis(5));
+
+        app.sessions[0].feed_output_for_test(b"first words\r\n");
+        settle();
+        app.persist_dirty_frames();
+
+        let saved = app.db.load_session_frame(id).unwrap().expect("frame saved");
+        assert!(
+            String::from_utf8_lossy(&saved.bytes).contains("first words"),
+            "got: {:?}",
+            String::from_utf8_lossy(&saved.bytes)
+        );
+        assert!(saved.saved_at > 0);
+        assert!(app.frame_saved_at.get(&id).copied().unwrap_or(0) > 0);
+
+        // Overwrite the stored frame with a sentinel: a second pass with no new
+        // output must leave it alone.
+        app.db.save_session_frame(id, 1, 1, b"SENTINEL").unwrap();
+        app.persist_dirty_frames();
+        let kept = app.db.load_session_frame(id).unwrap().expect("frame kept");
+        assert_eq!(
+            kept.bytes, b"SENTINEL",
+            "clean session must not be rewritten"
+        );
+
+        // New output → the frame is refreshed.
+        app.sessions[0].feed_output_for_test(b"later words\r\n");
+        settle();
+        app.persist_dirty_frames();
+        let updated = app
+            .db
+            .load_session_frame(id)
+            .unwrap()
+            .expect("frame updated");
+        assert!(
+            String::from_utf8_lossy(&updated.bytes).contains("later words"),
+            "got: {:?}",
+            String::from_utf8_lossy(&updated.bytes)
+        );
+
+        // A ghost keeps the frame it was unloaded with, even if bytes arrive
+        // for it: the debounce skips placeholders entirely.
+        app.unload_active_session();
+        assert!(app.sessions[0].is_ghost());
+        app.db.save_session_frame(id, 1, 1, b"SENTINEL").unwrap();
+        app.sessions[0].feed_output_for_test(b"ghost noise\r\n");
+        app.persist_dirty_frames();
+        let ghost_frame = app.db.load_session_frame(id).unwrap().expect("frame kept");
+        assert_eq!(ghost_frame.bytes, b"SENTINEL");
+    }
+
     /// Loaded-only cycling skips ghosts in both directions and jumps from a
     /// ghost to the nearest loaded session.
     #[tokio::test]
