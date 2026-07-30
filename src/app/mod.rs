@@ -2326,11 +2326,13 @@ impl App {
 
         let session_id = session.info.id;
 
-        // A placeholder (unreachable remote) has no live pane / local resource to
-        // tear down — deleting it just removes the row (a hard delete would run
-        // blocking remote git/worktree ops against the down host). Always soft-
-        // delete it, regardless of the `soft_delete` feature flag.
-        if session.is_placeholder() {
+        // An *unreachable remote* placeholder has no live pane / local resource
+        // to tear down — deleting it just removes the row (a hard delete would
+        // run blocking remote git/worktree ops against the down host). Always
+        // soft-delete it, regardless of the `soft_delete` feature flag. A ghost
+        // is a placeholder too, but it owns real local resources (worktrees), so
+        // it follows the configured delete policy like any loaded session.
+        if session.is_placeholder() && !session.is_ghost() {
             if let Err(e) = self.db.soft_delete_session(session_id) {
                 error!("Failed to soft-delete session in DB: {e}");
             }
