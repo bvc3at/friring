@@ -1497,4 +1497,44 @@ mod tests {
         let style = Theme::modal_title_danger();
         assert_eq!(style.bg, Some(Theme::danger()));
     }
+
+    /// The ghost treatment: a rendered pane keeps its glyphs but goes muted +
+    /// DIM and loses bold, strictly inside the region it was given.
+    #[test]
+    fn grey_out_buffer_area_mutes_only_the_given_rect() {
+        use ratatui::layout::Position;
+        use ratatui::style::{Modifier, Style};
+
+        let full = area(10, 6);
+        let mut buf = ratatui::buffer::Buffer::empty(full);
+        let live = Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+        for y in 0..full.height {
+            for x in 0..full.width {
+                let cell = buf.cell_mut(Position::new(x, y)).unwrap();
+                cell.set_symbol("▓");
+                cell.set_style(live);
+            }
+        }
+
+        let inner = Rect::new(2, 1, 5, 3);
+        grey_out_buffer_area(&mut buf, inner);
+
+        for y in inner.y..inner.y + inner.height {
+            for x in inner.x..inner.x + inner.width {
+                let cell = buf.cell(Position::new(x, y)).unwrap();
+                assert_eq!(cell.symbol(), "▓", "glyphs survive at {x},{y}");
+                assert_eq!(cell.fg, Theme::text_muted(), "fg at {x},{y}");
+                assert!(cell.modifier.contains(Modifier::DIM), "dim at {x},{y}");
+                assert!(!cell.modifier.contains(Modifier::BOLD), "bold at {x},{y}");
+            }
+        }
+
+        // A cell just outside the rect is left as the live render made it.
+        let outside = buf.cell(Position::new(1, 1)).unwrap();
+        assert_eq!(outside.fg, Color::Green);
+        assert!(outside.modifier.contains(Modifier::BOLD));
+        assert!(!outside.modifier.contains(Modifier::DIM));
+    }
 }
