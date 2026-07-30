@@ -16,7 +16,9 @@ The same stubs also drive the demo recordings — see `docs/DEVELOPMENT.md` § D
 in `docs/ARCHITECTURE.md` for the decision record.
 
 The suite covers the app's **core feature surface**, not just agent smoke: tmux-persistence
-re-adoption, hook-driven status incl. the real permission→blocked path, restart-resume / fork /
+re-adoption, the ghost lifecycle (unload → frozen frame → load-resume, plus lazy restore after
+the agent window dies — on claude, codex, opencode *and* the scripted agent),
+hook-driven status incl. the real permission→blocked path, restart-resume / fork /
 conversation import (all riding claude's `--session-id {id}` pinning), worktree sessions and
 `Ctrl+S` sync incl. the conflict handoff, code-review export, automations, tasks, messages,
 extensions, global search, the F9 activity view, both wizard flows, and the polish surface
@@ -342,7 +344,10 @@ only a "Model metadata not found" warning, and render in both the header box and
 prompt glyph `›` is the ready marker (the composer's placeholder text rotates — never match it).
 Gotchas: the TUI **rewrites `config.toml` on startup**, so seed it fresh per run and never assume
 it stays byte-identical; `codex exec` appends piped stdin to the prompt, hence the harness's
-`< /dev/null`. Zero non-stub calls under dead proxies.
+`< /dev/null`. Zero non-stub calls under dead proxies. Also proven (0.145.0): `codex resume
+--last` in the session cwd re-renders the prior conversation **locally with zero model calls**
+(the ghost-unload scenario's journal assert), which is what friring's restart and ghost-load
+paths ride.
 
 **opencode 1.17.15** — the `@ai-sdk/openai-compatible` runtime is bundled in the binary (nothing is
 fetched from npm) and a cold cache works offline, so no warm-up step is needed; the models.dev
@@ -350,6 +355,9 @@ catalog fetch is best-effort and disabled anyway. Fictional model ids pass with 
 validation. One **ambient** call: title generation on each session's first message, to the same
 model, keyed by its "title generator" system prompt — its reply becomes the visible session title.
 No trust/onboarding dialogs. Ready marker: the input-box footer `Build · <model> <provider>`.
+Also proven: `opencode --continue` in the session cwd re-renders the prior session **locally with
+zero model calls** (the ghost-unload scenario's journal assert) — friring's restart and
+ghost-load paths ride it.
 
 **antigravity (`agy`) 1.1.2 — unstubbable, declared `none`.** Not the Gemini CLI and it does not
 share its auth surface: a Go binary that forces interactive Google OAuth
