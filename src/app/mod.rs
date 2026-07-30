@@ -16308,6 +16308,13 @@ mod tests {
         assert!(s.is_ghost() && s.is_placeholder());
         assert_eq!(s.info.status, SessionStatus::Unloaded);
         assert!(app.active_session_is_ghost());
+        // A pre-v45 row has no saved frame: the pane explains itself instead of
+        // rendering empty.
+        let text = s.parser.lock().map(|p| p.screen().contents()).unwrap();
+        assert!(
+            text.contains("no saved preview") && text.contains("Press Enter"),
+            "got: {text}"
+        );
     }
 
     /// A ghost restored from a saved frame replays that frame into its pane.
@@ -16479,6 +16486,19 @@ mod tests {
             .unwrap();
         assert_eq!(reparsed.screen().contents(), original);
         assert!(original.contains("bold red") && original.contains("日本 lines"));
+
+        // A frame is terminal bytes, not a bitmap: replaying the same capture
+        // into a smaller pane (a ghost restored at a different terminal/font
+        // size) still renders the content. Reflow of lines that were *soft*
+        // wrapped at capture size is out of scope — each captured row is its
+        // own line, so a narrower pane hard-wraps rather than re-flows.
+        let mut resized = vt100::Parser::new(12, 40, 0);
+        resized.process(&bytes);
+        let smaller = resized.screen().contents();
+        assert!(
+            smaller.contains("bold red") && smaller.contains("日本 lines"),
+            "got: {smaller}"
+        );
     }
 
     // --- Background remote restore tests ---
