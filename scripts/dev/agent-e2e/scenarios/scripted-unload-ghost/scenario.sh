@@ -59,6 +59,12 @@ scenario_steps() {
     # The ghost renders the frozen frame — pre-unload content still visible.
     step_wait_pane "GOT:probe-one" 10
 
+    # Unload hands focus to the session list (a ghost has no PTY worth
+    # pointing the keyboard at), so one Ctrl+L steps back into the pane. This
+    # also *asserts* that focus move: had unload left the terminal focused,
+    # Ctrl+L would move away from it and the ghost hint below would never
+    # appear.
+    step_key C-l
     # Keystrokes into a ghost are swallowed with a hint, never queued: after
     # the load below, no `GOT:zzz` may ever appear.
     step_type "zzz"

@@ -2188,6 +2188,12 @@ impl App {
         // Shell tab would label the ghost's frozen frame "Shell" and route the
         // load-time keystrokes to a pane that no longer exists.
         self.session_terminal_views.remove(&id);
+        // Leave the pane the way `FocusBackward` would: a ghost has no live
+        // PTY, so keeping terminal focus would point the keyboard at a surface
+        // that only answers "press Enter to load". The list is where the next
+        // action (pick another session, or Enter to load this one back) lives.
+        self.focus = InputFocus::SessionList;
+        self.on_focus_changed();
         self.request_redraw();
         self.set_status(
             StatusLevel::Info,
@@ -16459,12 +16465,15 @@ mod tests {
         let mut app = app_with_sessions(1);
         app.sessions[0].feed_output_for_test(b"important last words\r\n");
         let id = app.sessions[0].info.id;
+        app.focus = InputFocus::Terminal;
 
         app.unload_active_session();
 
         assert_eq!(app.sessions.len(), 1);
         assert!(app.sessions[0].is_ghost());
         assert_eq!(app.sessions[0].info.id, id, "identity survives the swap");
+        // The ghost has no live PTY, so focus leaves the pane for the list.
+        assert_eq!(app.focus, InputFocus::SessionList);
         assert_eq!(app.db.unloaded_session_ids().unwrap(), vec![id]);
         let frame = app.db.load_session_frame(id).unwrap().expect("frame saved");
         let text = String::from_utf8_lossy(&frame.bytes).to_string();
