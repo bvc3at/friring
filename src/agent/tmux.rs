@@ -1327,11 +1327,14 @@ impl SessionBackend for TmuxBackend {
         self.capture_history_seed(backend_id)
     }
 
-    fn capture_history_lines(&self, backend_id: &str, lines: usize) -> Result<Vec<u8>> {
+    fn capture_visible(&self, backend_id: &str) -> Result<Vec<u8>> {
         if !control_mode::is_valid_pane_id(backend_id) {
             bail!("refusing to capture invalid pane id: {backend_id:?}");
         }
-        self.capture_seed_with_lines(backend_id, lines)
+        // `-S 0` starts at the first visible row: no scrollback, which is all a
+        // ghost frame wants (see `SessionBackend::capture_visible`). `-J` still
+        // joins soft-wrapped rows into logical lines.
+        self.capture_seed_with_lines(backend_id, 0)
     }
 
     fn discover(&self) -> Result<Vec<DiscoveredSession>> {

@@ -2000,7 +2000,6 @@ pub enum SettingsField {
     // ── top-level scalars ───────────────────────────────────────────────
     ScrollbackLines,
     LazyRestore,
-    GhostScrollback,
     TwoPanelMinCols,
     ThreePanelMinCols,
     InfoPanelPosition,
@@ -2010,7 +2009,7 @@ pub enum SettingsField {
 impl SettingsField {
     /// Field nav order — also the render order (headers are interleaved by the
     /// renderer). Used by [`cycle_field`] and the scroll-windowing logic.
-    pub const ORDER: [SettingsField; 26] = [
+    pub const ORDER: [SettingsField; 25] = [
         SettingsField::FeatTasks,
         SettingsField::FeatAutomations,
         SettingsField::FeatFileViewer,
@@ -2032,7 +2031,6 @@ impl SettingsField {
         SettingsField::NotifMinInterval,
         SettingsField::ScrollbackLines,
         SettingsField::LazyRestore,
-        SettingsField::GhostScrollback,
         SettingsField::TwoPanelMinCols,
         SettingsField::ThreePanelMinCols,
         SettingsField::InfoPanelPosition,
@@ -2124,11 +2122,6 @@ impl SettingsField {
                 "Lazy restore",
                 "Restore dead sessions as greyed ghosts, not respawns",
             ),
-            GhostScrollback => (
-                "ghost_scrollback_lines",
-                "Ghost history",
-                "Scrollback lines saved into a ghost's frozen frame",
-            ),
             TwoPanelMinCols => (
                 "two_panel_min_cols",
                 "2-panel width",
@@ -2177,7 +2170,6 @@ impl SettingsField {
             self,
             NotifMinInterval
                 | ScrollbackLines
-                | GhostScrollback
                 | TwoPanelMinCols
                 | ThreePanelMinCols
                 | InfoPanelPosition
@@ -2260,8 +2252,8 @@ impl SettingsModal {
             NotifSuppressForActive => n.suppress_for_active = !n.suppress_for_active,
             NotifSound => n.sound = !n.sound,
             LazyRestore => self.draft.lazy_session_restore = !self.draft.lazy_session_restore,
-            NotifMinInterval | ScrollbackLines | GhostScrollback | TwoPanelMinCols
-            | ThreePanelMinCols | InfoPanelPosition | AuditRetentionDays => {}
+            NotifMinInterval | ScrollbackLines | TwoPanelMinCols | ThreePanelMinCols
+            | InfoPanelPosition | AuditRetentionDays => {}
         }
     }
 
@@ -2274,11 +2266,6 @@ impl SettingsModal {
             ScrollbackLines => {
                 d.scrollback_lines =
                     step_clamp(d.scrollback_lines as i64, delta, 500, 100, 200_000) as usize;
-            }
-            GhostScrollback => {
-                // Floor 0 = visible screen only; ceiling = the tmux capture cap.
-                d.ghost_scrollback_lines =
-                    step_clamp(d.ghost_scrollback_lines as i64, delta, 500, 0, 10_000) as usize;
             }
             TwoPanelMinCols => {
                 d.two_panel_min_cols =
@@ -2338,7 +2325,6 @@ impl SettingsModal {
             NotifMinInterval => n.min_interval_secs.to_string(),
             ScrollbackLines => self.draft.scrollback_lines.to_string(),
             LazyRestore => on(self.draft.lazy_session_restore),
-            GhostScrollback => self.draft.ghost_scrollback_lines.to_string(),
             TwoPanelMinCols => self.draft.two_panel_min_cols.to_string(),
             ThreePanelMinCols => self.draft.three_panel_min_cols.to_string(),
             InfoPanelPosition => self.draft.info_panel_position.as_str().to_string(),
@@ -3990,7 +3976,7 @@ mod tests {
 
     #[test]
     fn settings_order_lists_every_field_once() {
-        assert_eq!(SettingsField::ORDER.len(), 26);
+        assert_eq!(SettingsField::ORDER.len(), 25);
         for f in SettingsField::ORDER {
             assert_eq!(
                 SettingsField::ORDER.iter().filter(|x| **x == f).count(),

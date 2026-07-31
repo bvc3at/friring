@@ -100,7 +100,6 @@ const SECTIONS: [(&str, &[SettingsField]); 3] = [
         &[
             SettingsField::ScrollbackLines,
             SettingsField::LazyRestore,
-            SettingsField::GhostScrollback,
             SettingsField::TwoPanelMinCols,
             SettingsField::ThreePanelMinCols,
             SettingsField::InfoPanelPosition,

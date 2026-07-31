@@ -2115,8 +2115,8 @@ impl App {
         self.new_session.restart = false;
     }
 
-    /// Unload the active session: save its ghost frame (visible screen +
-    /// `ghost_scrollback_lines` of history), kill the agent window (and shell
+    /// Unload the active session: save its ghost frame (the visible screen),
+    /// kill the agent window (and shell
     /// pane), and swap in a greyed ghost in place. This is what actually frees
     /// memory — the agent *process* (hundreds of MB) dies; the frozen frame
     /// costs a few KB. Enter / restart loads the session again, resuming the
@@ -2134,14 +2134,13 @@ impl App {
         // row, and the ghost swap makes save_state skip this session afterwards.
         self.save_state();
 
-        let lines = crate::session::settings::global().ghost_scrollback_lines;
         let (id, name, shared, frame) = {
             let session = &self.sessions[self.active_index];
             (
                 session.info.id,
                 session.info.name.clone(),
                 self.session_to_shared(session),
-                session.capture_unload_frame(lines),
+                session.capture_unload_frame(),
             )
         };
         if let Some((rows, cols, bytes)) = &frame {
@@ -6771,14 +6770,12 @@ impl App {
     }
 
     /// Save every live session's ghost frame at shutdown, so a reboot (or a
-    /// lazy next launch) has a fresh frame to show. Local sessions capture the
-    /// full frame + `ghost_scrollback_lines` of history (an independent
-    /// subprocess each, ~10 ms); remote sessions serialize the in-memory
+    /// lazy next launch) has a fresh frame to show. Local sessions capture
+    /// through the backend (an independent subprocess each, ~10 ms, and its
+    /// output keeps logical lines); remote sessions serialize the in-memory
     /// visible screen instead — a per-session ssh round-trip could hang the
-    /// exit on a dying host, and the visible frame is what the ghost shows
-    /// first anyway.
+    /// exit on a dying host, and the two produce the same screen either way.
     fn persist_shutdown_frames(&self) {
-        let lines = crate::session::settings::global().ghost_scrollback_lines;
         for session in &self.sessions {
             if session.is_placeholder() {
                 continue;
@@ -6786,7 +6783,7 @@ impl App {
             let frame = if crate::session::is_remote_backend(session.backend_name()) {
                 session.serialize_visible_frame()
             } else {
-                session.capture_unload_frame(lines)
+                session.capture_unload_frame()
             };
             if let Some((rows, cols, bytes)) = frame {
                 if let Err(e) = self
@@ -16360,10 +16357,11 @@ mod tests {
         assert!(text.contains("frozen findings here"), "got: {text}");
     }
 
-    /// A ghost's frame carries `ghost_scrollback_lines` of history, so the
-    /// frozen pane must be scrollable — the rows above the visible screen land
-    /// in the parser's scrollback, and the scroll actions (which have no
-    /// placeholder gating) can reach them.
+    /// A ghost renders whatever its stored frame holds, including rows above
+    /// the visible screen: those land in the parser's scrollback and the scroll
+    /// actions (which have no placeholder gating) reach them. Captures are
+    /// visible-screen-only now, but a frame can still be taller than the pane
+    /// (a narrower terminal wraps it), so the seeding must not drop the excess.
     #[tokio::test]
     async fn ghost_frame_is_scrollable() {
         let tmp = tempfile::tempdir().unwrap();

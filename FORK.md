@@ -72,16 +72,18 @@ fork makes "not running" a first-class state:
   default vs upstream's respawn-everything): pane-less sessions restore as
   ghosts; live panes still adopt. Startup after a reboot goes from N agent
   boots to ~5 ms of frame parsing.
-- **Unload** (`Alt+U` direct / `<leader> U`): capture frame (visible screen +
-  `ghost_scrollback_lines` of history, default 1000), kill the agent window +
-  shell pane, swap in the ghost in place. Loading (Enter / restart) rides the
-  existing restart-resume machinery.
+- **Unload** (`Alt+U` direct / `<leader> U`): capture the visible screen, kill
+  the agent window + shell pane, swap in the ghost in place. Loading (Enter /
+  restart) rides the existing restart-resume machinery. A ghost is one screen
+  by design: scrollback only ever holds output that *scrolled out*, and every
+  supported agent's TUI repaints in place (`#{history_size}` measures 0), so
+  there is nothing above the screen to save.
 - **Loaded-only cycling** (`Alt+N`/`Alt+P` direct, `<leader> c`/`<leader> C`):
   session switching that skips ghosts and unreachable placeholders.
-- **Crash safety:** visible-screen frames are re-saved (~1/min, in-memory
-  serialization only) for sessions with new output; full captures happen at
-  unload and clean shutdown (remote hosts: visible-screen only at shutdown, no
-  ssh round-trips on exit).
+- **Crash safety:** frames are re-saved (~1/min, in-memory serialization only)
+  for sessions with new output; backend captures happen at
+  unload and clean shutdown (remote hosts serialize in-memory at shutdown
+  instead, so a dying host cannot hang the exit).
 - Measurements behind the design (frame ≈ 4–5 KB raw / ~1 KB compressed;
   parse ≈ 50 µs; grey pass ≈ 7 µs; idle claude CLI ≈ 333 MB RSS) were taken
   with the e2e stub harness on real agent frames.

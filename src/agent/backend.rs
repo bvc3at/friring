@@ -275,13 +275,17 @@ pub trait SessionBackend: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// [`Self::capture_history`] with an explicit scrollback depth instead of
-    /// the settings default — the ghost-frame capture at unload/shutdown, where
-    /// `ghost_scrollback_lines` (not `scrollback_lines`) decides how much
-    /// history the frozen frame keeps. Default: delegate, ignoring `lines`
-    /// (backends without a capture facility return the same empty seed).
-    fn capture_history_lines(&self, backend_id: &str, _lines: usize) -> Result<Vec<u8>> {
-        self.capture_history(backend_id)
+    /// Capture just the pane's **visible screen** as terminal bytes — the
+    /// ghost frame taken at unload/shutdown. Scrollback is deliberately not
+    /// included: it can only ever hold output that *scrolled out* of the pane,
+    /// and a full-screen agent TUI repaints in place, so for the sessions
+    /// friring drives there is none (measured: `#{history_size}` is 0 for
+    /// claude/codex/opencode/agy). Preferred over serializing the parser
+    /// in-memory because the backend joins soft-wrapped rows into logical
+    /// lines, which re-wrap cleanly when a ghost is rendered at another width.
+    /// Default: an empty seed, like [`Self::capture_history`].
+    fn capture_visible(&self, _backend_id: &str) -> Result<Vec<u8>> {
+        Ok(Vec::new())
     }
 
     /// Discover existing sessions managed by this backend.
@@ -793,9 +797,7 @@ impl Session {
     /// seeded with `frame` — the session's saved last frame, SGR-styled lines
     /// joined with `\r\n` — at `rows`×`cols`, so the frozen pane re-wraps to
     /// the *current* size; `None` (no frame ever captured) seeds a short
-    /// notice instead. The parser keeps `ghost_scrollback_lines` of history —
-    /// the depth the frame was captured at — so no captured row is evicted on
-    /// replay. Keystrokes are dropped like any placeholder; the render
+    /// notice instead. Keystrokes are dropped like any placeholder; the render
     /// layer greys the pane. `info.status` is forced to `Unloaded`;
     /// [`Self::restart`] turns the ghost back into a live session in place.
     pub fn ghost(
@@ -833,18 +835,14 @@ impl Session {
     /// truncate away every cell past a narrower width with no agent to repaint
     /// it back (see [`Self::placeholder_seed`]).
     ///
-    /// Sized from `ghost_scrollback_lines`: a ghost's frame was *captured* at
-    /// that depth, so a smaller live-parser limit would evict the oldest
-    /// captured rows on replay. `.max` keeps the live depth when it is larger.
     fn seed_placeholder_parser(&self, rows: u16, cols: u16, seed: &[u8]) {
         let Ok(mut p) = self.parser.lock() else {
             return;
         };
-        let s = crate::session::settings::global();
         *p = vt100::Parser::new_with_callbacks(
             rows.max(1),
             cols.max(1),
-            s.ghost_scrollback_lines.max(s.scrollback_lines),
+            crate::session::settings::global().scrollback_lines,
             TermSignals {
                 title: Arc::clone(&self.last_title),
                 attention_at: Arc::clone(&self.attention_at),
@@ -1235,12 +1233,13 @@ impl Session {
         Some((rows, cols, lines.join(&b"\x1b[0m\r\n"[..])))
     }
 
-    /// Capture the ghost frame for an unload/shutdown: the visible screen plus
-    /// `lines` of scrollback via the backend (an independent `capture-pane`
-    /// subprocess), falling back to the in-memory visible screen when the
-    /// capture fails. Returns `(rows, cols, bytes)`.
-    pub fn capture_unload_frame(&self, lines: usize) -> Option<(u16, u16, Vec<u8>)> {
-        match self.backend.capture_history_lines(&self.backend_id, lines) {
+    /// Capture the ghost frame for an unload/shutdown: the pane's visible
+    /// screen via the backend (an independent `capture-pane` subprocess, whose
+    /// output keeps logical lines — see [`SessionBackend::capture_visible`]),
+    /// falling back to the in-memory serialization when the capture fails.
+    /// Returns `(rows, cols, bytes)`.
+    pub fn capture_unload_frame(&self) -> Option<(u16, u16, Vec<u8>)> {
+        match self.backend.capture_visible(&self.backend_id) {
             Ok(seed) if !seed.is_empty() => {
                 let (rows, cols) = self
                     .parser
@@ -1662,10 +1661,9 @@ mod tests {
         }
     }
 
-    /// The ghost-frame capture path: the depth the caller asked for must reach
-    /// the backend (this is the whole point of `ghost_scrollback_lines`), the
-    /// backend's seed must win over the in-memory screen, and every failure
-    /// mode must still yield the visible screen rather than nothing.
+    /// The ghost-frame capture path: the backend's capture must win over the
+    /// in-memory screen (it keeps logical lines, which re-wrap better), and
+    /// every failure mode must still yield the visible screen, never nothing.
     mod ghost_frame_capture {
         use std::sync::atomic::AtomicUsize;
 
@@ -1678,9 +1676,9 @@ mod tests {
             Fail,
         }
 
-        /// Backend that records the scrollback depth it was asked for.
+        /// Backend that records how many times it was asked to capture.
         struct CaptureBackend {
-            requested: Arc<AtomicUsize>,
+            calls: Arc<AtomicUsize>,
             capture: Capture,
         }
 
@@ -1709,8 +1707,8 @@ mod tests {
             fn adopt(&self, _: &str, _: u16, _: u16, _: Option<Vec<u8>>) -> Result<AdoptedSession> {
                 anyhow::bail!("capture stub does not adopt")
             }
-            fn capture_history_lines(&self, _: &str, lines: usize) -> Result<Vec<u8>> {
-                self.requested.store(lines, Ordering::Relaxed);
+            fn capture_visible(&self, _: &str) -> Result<Vec<u8>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
                 match self.capture {
                     Capture::Seed(bytes) => Ok(bytes.to_vec()),
                     Capture::Empty => Ok(Vec::new()),
@@ -1738,11 +1736,11 @@ mod tests {
         }
 
         /// Session on a `CaptureBackend`, with `on screen` in its parser, plus
-        /// the cell recording the requested depth.
+        /// the cell counting capture calls.
         fn session_with(capture: Capture) -> (Session, Arc<AtomicUsize>) {
-            let requested = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::new(AtomicUsize::new(0));
             let backend: Arc<dyn SessionBackend> = Arc::new(CaptureBackend {
-                requested: Arc::clone(&requested),
+                calls: Arc::clone(&calls),
                 capture,
             });
             let provider: Arc<dyn AgentProvider> = Arc::new(crate::agent::GenericProvider::new(
@@ -1753,17 +1751,17 @@ mod tests {
             ));
             let session = Session::stub("cap", &backend, &provider);
             session.feed_output_for_test(b"on screen\r\n");
-            (session, requested)
+            (session, calls)
         }
 
         #[test]
-        fn forwards_the_requested_depth_and_prefers_the_capture() {
-            let (session, requested) = session_with(Capture::Seed(b"scrollback history"));
+        fn prefers_the_backend_capture_over_the_in_memory_screen() {
+            let (session, calls) = session_with(Capture::Seed(b"captured screen"));
 
-            let (_, _, bytes) = session.capture_unload_frame(4200).expect("frame");
+            let (_, _, bytes) = session.capture_unload_frame().expect("frame");
 
-            assert_eq!(requested.load(Ordering::Relaxed), 4200);
-            assert_eq!(bytes, b"scrollback history");
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            assert_eq!(bytes, b"captured screen");
             assert!(
                 !String::from_utf8_lossy(&bytes).contains("on screen"),
                 "the capture seed replaces the visible screen, it is not appended"
@@ -1775,7 +1773,7 @@ mod tests {
             for capture in [Capture::Empty, Capture::Fail] {
                 let (session, _) = session_with(capture);
 
-                let (_, _, bytes) = session.capture_unload_frame(1000).expect("frame");
+                let (_, _, bytes) = session.capture_unload_frame().expect("frame");
 
                 assert!(
                     String::from_utf8_lossy(&bytes).contains("on screen"),

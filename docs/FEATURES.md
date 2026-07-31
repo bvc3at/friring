@@ -2614,22 +2614,19 @@ resume otherwise), in place — order, id, and injected identity all
 survive. `Alt+N` / `Alt+P` (`<leader> c` / `<leader> C`) cycle among
 loaded sessions only, skipping ghosts.
 
-**Frames.** The saved frame is the pane's content as SGR-styled lines
-(the same byte shape as the adopt seed), captured with
-`ghost_scrollback_lines` of history at unload and clean shutdown — and,
-as crash safety, the visible screen alone is re-saved about once a
-minute for any session with new output (so a hard reboot shows ghosts at
-most a minute stale, without scrollback until loaded).
+**Frames.** The saved frame is the pane's **visible screen** as SGR-styled
+lines (the same byte shape as the adopt seed), captured at unload and
+clean shutdown, and re-saved about once a minute for any session with
+new output so a hard crash leaves ghosts at most a minute stale.
 
-That history is only what actually **scrolled out of the pane**, which
-is less than it sounds for a coding agent: a full-screen TUI (Claude
-Code, codex, opencode) repaints in place rather than scrolling, so its
-tmux pane keeps no history (`#{history_size}` stays 0) and its ghost is
-a **single screen** whatever `ghost_scrollback_lines` is set to. The
-conversation above that screen lives in the agent's own model, which
-friring cannot read — loading the ghost is what brings it back. The
-setting pays off for panes whose output genuinely scrolls: shell panes,
-and agents streaming long output.
+A ghost is one screen, deliberately. Scrollback would only ever hold
+output that *scrolled out* of the pane, and a full-screen agent TUI
+repaints in place rather than scrolling — measured, every supported
+agent's pane reports `#{history_size}` = 0 (claude and codex repaint on
+the normal screen; opencode and agy use the alternate screen, which has
+no history at all). The conversation above that screen lives in the
+agent's own model, which friring cannot read; loading the ghost is what
+brings it back.
 
 Frames re-parse at the *current* pane size, so a ghost
 restored into a different terminal size (or font) re-wraps: identical

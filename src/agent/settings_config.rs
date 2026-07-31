@@ -31,19 +31,6 @@ config_version = 1
 # false = respawn everything at startup (the old behavior).
 # lazy_session_restore = true
 
-# Scrollback lines captured into a session's ghost frame at unload/shutdown,
-# on top of the visible screen, so a ghost stays scrollable. 0 = visible
-# screen only (~5 KB per session); each 1000 lines adds ~50–100 KB per
-# session to the database. Clamped at 10000 by the capture, and friring's
-# tmux sessions retain 5000 lines — beyond that there is no history to capture.
-#
-# NOTE: this captures only output that actually SCROLLED out of the pane. A
-# full-screen agent TUI (Claude Code, codex, opencode) repaints in place
-# rather than scrolling, so its pane keeps no history and its ghost is a
-# single screen whatever this is set to. It pays off for panes whose output
-# really scrolls: shell panes, and agents streaming long output.
-# ghost_scrollback_lines = 1000
-
 # Terminal width (columns) below which only the terminal pane renders.
 # two_panel_min_cols = 80
 
@@ -253,7 +240,6 @@ pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
     doc["config_version"] = value(i64::from(settings.config_version.unwrap_or(1)));
     doc["scrollback_lines"] = value(settings.scrollback_lines as i64);
     doc["lazy_session_restore"] = value(settings.lazy_session_restore);
-    doc["ghost_scrollback_lines"] = value(settings.ghost_scrollback_lines as i64);
     doc["two_panel_min_cols"] = value(i64::from(settings.two_panel_min_cols));
     doc["three_panel_min_cols"] = value(i64::from(settings.three_panel_min_cols));
     doc["audit_retention_days"] = value(settings.audit_retention_days as i64);
@@ -327,7 +313,6 @@ mod tests {
         for field in [
             "scrollback_lines",
             "lazy_session_restore",
-            "ghost_scrollback_lines",
             "two_panel_min_cols",
             "three_panel_min_cols",
             "audit_retention_days",
@@ -413,7 +398,7 @@ mod tests {
         std::fs::write(
             &path,
             "scrollback_lines = 4000\naudit_retention_days = 7\n\
-             lazy_session_restore = false\nghost_scrollback_lines = 3500\n",
+             lazy_session_restore = false\n",
         )
         .unwrap();
 
@@ -422,7 +407,6 @@ mod tests {
         assert_eq!(s.scrollback_lines, 4000);
         assert_eq!(s.audit_retention_days, 7);
         assert!(!s.lazy_session_restore);
-        assert_eq!(s.ghost_scrollback_lines, 3500);
         assert_eq!(s.two_panel_min_cols, 80);
     }
 
@@ -443,7 +427,6 @@ mod tests {
         s.notifications.min_interval_secs = 30;
         s.notifications.suppress_for_active = false;
         s.lazy_session_restore = false;
-        s.ghost_scrollback_lines = 3500;
         // A non-default backend must survive the save/reload round-trip; the
         // full-Settings equality below would silently pass on the `Auto`
         // default even if `backend` were dropped.

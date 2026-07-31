@@ -33,24 +33,6 @@ pub struct Settings {
     /// Off = the pre-ghost behavior: every restorable session respawns at boot.
     #[serde(default = "default_true")]
     pub lazy_session_restore: bool,
-    /// Scrollback lines captured into a session's ghost frame at unload /
-    /// shutdown (on top of the visible screen), so a ghost stays scrollable.
-    /// `0` = visible screen only (~5 KB); each 1000 lines adds ~50–100 KB per
-    /// session to the DB and to a *viewed* ghost's memory.
-    ///
-    /// **This only captures output that actually scrolled out of the pane.**
-    /// A full-screen agent TUI (Claude Code, codex, opencode) repaints in
-    /// place instead of scrolling, so its pane history stays empty
-    /// (`#{history_size}` = 0) and its ghost is a single screen no matter what
-    /// this is set to — the conversation lives in the agent's own model, which
-    /// friring cannot read. The setting pays off for panes whose output really
-    /// scrolls: shell panes, and agents streaming long output.
-    ///
-    /// Two further ceilings apply: the capture path clamps at 10 000 lines,
-    /// and friring's tmux sessions keep `history-limit = 5000` — above ~5 000
-    /// there is simply no more history to capture.
-    #[serde(default = "default_scrollback_lines")]
-    pub ghost_scrollback_lines: usize,
     /// Terminal width (columns) below which only the terminal pane renders.
     #[serde(default = "default_two_panel_min_cols")]
     pub two_panel_min_cols: u16,
@@ -519,7 +501,6 @@ impl Settings {
     pub fn restart_only_differs(&self, other: &Settings) -> bool {
         self.scrollback_lines != other.scrollback_lines
             || self.lazy_session_restore != other.lazy_session_restore
-            || self.ghost_scrollback_lines != other.ghost_scrollback_lines
             || self.two_panel_min_cols != other.two_panel_min_cols
             || self.three_panel_min_cols != other.three_panel_min_cols
             || self.audit_retention_days != other.audit_retention_days
@@ -538,7 +519,6 @@ impl Default for Settings {
             config_version: None,
             scrollback_lines: default_scrollback_lines(),
             lazy_session_restore: true,
-            ghost_scrollback_lines: default_scrollback_lines(),
             two_panel_min_cols: default_two_panel_min_cols(),
             three_panel_min_cols: default_three_panel_min_cols(),
             audit_retention_days: default_audit_retention_days(),
@@ -575,7 +555,6 @@ mod tests {
         assert_eq!(s, Settings::default());
         assert_eq!(s.scrollback_lines, 1000);
         assert!(s.lazy_session_restore);
-        assert_eq!(s.ghost_scrollback_lines, 1000);
         assert_eq!(s.two_panel_min_cols, 80);
         assert_eq!(s.three_panel_min_cols, 120);
         assert_eq!(s.audit_retention_days, 90);

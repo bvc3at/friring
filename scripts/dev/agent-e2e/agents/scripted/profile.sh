@@ -23,10 +23,7 @@
 # <text> as an OSC 52 clipboard write — bare, or wrapped in the tmux DCS
 # passthrough the way real agents' copy commands emit it under `$TMUX` —
 # so a scenario can e2e the in-pane copy path with plaintext steps
-# (see scripted-osc52-clipboard). A `lines:<n>` line emits n numbered
-# `SCROLLLINE-<i>` rows, which pushes earlier output off the top of the pane
-# so a scenario can assert what scrolling brings back (see
-# scripted-ghost-scroll).
+# (see scripted-osc52-clipboard).
 #
 # No model traffic: the anthropic stub is booted (harness contract) but the
 # scenario's fixtures.json is just `{"responses": []}` — the strict-offline
@@ -96,14 +93,6 @@ while IFS= read -r line; do
         copy-wrapped:*)
             printf '\033Ptmux;\033\033]52;c;%s\007\033\\' \
                 "$(printf %s "${line#copy-wrapped:}" | base64)" ;;
-        # Scrollback probe: emit N numbered lines, so a scenario can push
-        # content off the top of the pane and then assert it is reachable by
-        # scrolling. Numbered (not repeated) so "which line is on screen" is
-        # an exact assertion rather than a count.
-        lines:*)
-            for i in $(seq 1 "${line#lines:}"); do
-                printf 'SCROLLLINE-%03d\n' "$i"
-            done ;;
     esac
     printf 'GOT:%s\n' "$line"
 done

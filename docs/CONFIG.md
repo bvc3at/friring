@@ -376,7 +376,6 @@ all commented so defaults still apply out of the box.
 |-----|---------|---------|
 | `scrollback_lines` | `1000` | terminal scrollback kept per session |
 | `lazy_session_restore` | `true` | restore dead sessions as greyed **ghosts** (last saved frame) instead of respawning; Enter/restart loads one. Live tmux panes always re-attach |
-| `ghost_scrollback_lines` | `1000` | scrollback lines captured into a ghost's frozen frame at unload/shutdown (`0` = visible screen only, ~5 KB; each 1000 lines ≈ 50–100 KB per session in the DB). **Only captures output that actually scrolled out of the pane** — a full-screen agent TUI repaints in place, so its ghost is one screen whatever this is set to (see below). Clamped to 10 000 by the capture path, and friring's tmux sessions run with `history-limit = 5000`, so above ~5 000 there is no further history to capture |
 | `two_panel_min_cols` | `80` | width below which only the terminal renders |
 | `three_panel_min_cols` | `120` | width unlocking the optional third column |
 | `info_panel_position` | `"auto"` | where the F2 info pane docks: `auto` / `column` / `inline` |
@@ -401,7 +400,6 @@ config_version = 1
 # Scalar tuning knobs (top level)
 scrollback_lines      = 1000   # terminal scrollback kept per session
 lazy_session_restore  = true   # dead sessions restore as greyed ghosts (Enter loads)
-ghost_scrollback_lines = 1000  # scrollback saved into a ghost's frozen frame (0 = screen only)
 two_panel_min_cols    = 80     # width below which only the terminal renders
 three_panel_min_cols  = 120    # width unlocking the optional third column
 info_panel_position   = "auto" # F2 info pane dock: auto | column | inline
