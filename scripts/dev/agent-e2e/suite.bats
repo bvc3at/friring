@@ -220,6 +220,11 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-unload-ghost"
 }
 
+@test "e2e: a ghost's saved scrollback is reachable with the scroll keys" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-ghost-scroll"
+}
+
 @test "e2e: a ghost survives a terminal shrink and keeps its frame when it grows back" {
     require_agent scripted
     e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-ghost-resize"

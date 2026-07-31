@@ -36,6 +36,12 @@ config_version = 1
 # screen only (~5 KB per session); each 1000 lines adds ~50–100 KB per
 # session to the database. Clamped at 10000 by the capture, and friring's
 # tmux sessions retain 5000 lines — beyond that there is no history to capture.
+#
+# NOTE: this captures only output that actually SCROLLED out of the pane. A
+# full-screen agent TUI (Claude Code, codex, opencode) repaints in place
+# rather than scrolling, so its pane keeps no history and its ghost is a
+# single screen whatever this is set to. It pays off for panes whose output
+# really scrolls: shell panes, and agents streaming long output.
 # ghost_scrollback_lines = 1000
 
 # Terminal width (columns) below which only the terminal pane renders.

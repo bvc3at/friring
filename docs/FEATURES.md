@@ -2616,11 +2616,22 @@ loaded sessions only, skipping ghosts.
 
 **Frames.** The saved frame is the pane's content as SGR-styled lines
 (the same byte shape as the adopt seed), captured with
-`ghost_scrollback_lines` of history at unload and clean shutdown — so
-a ghost is scrollable — and, as crash safety, the visible screen alone
-is re-saved about once a minute for any session with new output (so a
-hard reboot shows ghosts at most a minute stale, without scrollback
-until loaded). Frames re-parse at the *current* pane size, so a ghost
+`ghost_scrollback_lines` of history at unload and clean shutdown — and,
+as crash safety, the visible screen alone is re-saved about once a
+minute for any session with new output (so a hard reboot shows ghosts at
+most a minute stale, without scrollback until loaded).
+
+That history is only what actually **scrolled out of the pane**, which
+is less than it sounds for a coding agent: a full-screen TUI (Claude
+Code, codex, opencode) repaints in place rather than scrolling, so its
+tmux pane keeps no history (`#{history_size}` stays 0) and its ghost is
+a **single screen** whatever `ghost_scrollback_lines` is set to. The
+conversation above that screen lives in the agent's own model, which
+friring cannot read — loading the ghost is what brings it back. The
+setting pays off for panes whose output genuinely scrolls: shell panes,
+and agents streaming long output.
+
+Frames re-parse at the *current* pane size, so a ghost
 restored into a different terminal size (or font) re-wraps: identical
 when same/wider, bottom-anchored with full-width rules wrapping into
 stubs when narrower. That holds for the unload/shutdown captures, which

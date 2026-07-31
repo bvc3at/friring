@@ -16403,6 +16403,23 @@ mod tests {
             .map(|p| p.screen().contents())
             .unwrap();
         assert!(top.contains("line-"), "scrolled view shows frame content");
+
+        // …and the offset must SURVIVE the tick loop. A ghost re-renders from
+        // its seed on resize, which rebuilds the parser and snaps the viewport
+        // back to the bottom — so anything that re-resizes a ghost every tick
+        // would make it look like scrolling silently does nothing.
+        for _ in 0..5 {
+            app.tick_core();
+        }
+        let after_ticks = app.sessions[0]
+            .parser
+            .lock()
+            .map(|p| p.screen().scrollback())
+            .unwrap();
+        assert_eq!(
+            after_ticks, 5,
+            "the tick loop reset a ghost's scroll position"
+        );
     }
 
     /// vt100 resizes by truncating each row's cells, so a narrowed pane loses

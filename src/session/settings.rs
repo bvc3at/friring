@@ -36,10 +36,19 @@ pub struct Settings {
     /// Scrollback lines captured into a session's ghost frame at unload /
     /// shutdown (on top of the visible screen), so a ghost stays scrollable.
     /// `0` = visible screen only (~5 KB); each 1000 lines adds ~50–100 KB per
-    /// session to the DB and to a *viewed* ghost's memory. Two ceilings apply:
-    /// the capture path clamps at 10 000 lines, and friring's tmux sessions
-    /// keep `history-limit = 5000` — above ~5 000 there is simply no more
-    /// history to capture.
+    /// session to the DB and to a *viewed* ghost's memory.
+    ///
+    /// **This only captures output that actually scrolled out of the pane.**
+    /// A full-screen agent TUI (Claude Code, codex, opencode) repaints in
+    /// place instead of scrolling, so its pane history stays empty
+    /// (`#{history_size}` = 0) and its ghost is a single screen no matter what
+    /// this is set to — the conversation lives in the agent's own model, which
+    /// friring cannot read. The setting pays off for panes whose output really
+    /// scrolls: shell panes, and agents streaming long output.
+    ///
+    /// Two further ceilings apply: the capture path clamps at 10 000 lines,
+    /// and friring's tmux sessions keep `history-limit = 5000` — above ~5 000
+    /// there is simply no more history to capture.
     #[serde(default = "default_scrollback_lines")]
     pub ghost_scrollback_lines: usize,
     /// Terminal width (columns) below which only the terminal pane renders.
