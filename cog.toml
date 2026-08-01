@@ -35,8 +35,10 @@ revert = { changelog_title = "Reverts", order = 6 }
 path = "CHANGELOG.md"
 template = "remote"
 remote = "github.com"
-repository = "thurbox"
-owner = "Thurbeen"
+# The fork cuts its own releases, so commit/compare links must resolve here —
+# upstream has none of these SHAs.
+repository = "friring"
+owner = "bvc3at"
 
 # Map git signatures to GitHub usernames
 authors = [

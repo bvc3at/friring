@@ -11,7 +11,7 @@ default-run = "friring"
 authors = ["LeTuR <magicletur@protonmail.com>"]
 license = "MIT"
 description = "A TUI for orchestrating multiple coding-agent CLI sessions in persistent tmux panels"
-repository = "https://github.com/Thurbeen/thurbox"
+repository = "https://github.com/bvc3at/friring"
 keywords = ["tui", "agent", "tmux", "git", "cli"]
 categories = ["command-line-utilities"]
 

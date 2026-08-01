@@ -1,22 +1,25 @@
 # Homebrew packaging
 
-Thurbox ships a [Homebrew](https://brew.sh) formula that installs the
-**prebuilt** release binaries (`thurbox` + `thurbox-cli`) from the GitHub
-Release. It is distributed through a **tap**
-([`Thurbeen/homebrew-thurbox`](https://github.com/Thurbeen/homebrew-thurbox)),
-not homebrew-core.
+Friring ships a [Homebrew](https://brew.sh) formula that installs the
+**prebuilt** release binaries (`friring` + `friring-cli`) from the GitHub
+Release. **This repo is its own tap** — Homebrew reads formulae from a tap's
+`HomebrewFormula/` directory — so there is no separate `homebrew-friring`
+repository to keep in sync:
 
 ```bash
-brew install thurbeen/thurbox/thurbox
-# or, equivalently:
-brew tap thurbeen/thurbox
-brew install thurbox
+brew tap bvc3at/friring https://github.com/bvc3at/friring
+brew install bvc3at/friring/friring   # `brew install friring` also resolves
 ```
 
-The canonical formula lives here at
-[`Formula/thurbox.rb`](Formula/thurbox.rb); CI copies it into the tap on every
-release. The `version`/`sha256` values committed here are a last-known-good
-template — CI overrides them per release.
+The explicit URL is required because the repo is named `friring`: `brew tap`
+only infers `https://github.com/<user>/homebrew-<name>` from the short form.
+
+The formula is [`HomebrewFormula/friring.rb`](../../HomebrewFormula/friring.rb)
+at the repo root — Homebrew discovers a tap's formulae only in `Formula/`,
+`HomebrewFormula/` or the tap root, which is why it does not live here under
+`packaging/`. Its `version` and `sha256` values always name a **published**
+release (a tap user installs whatever `main` currently says); CI rewrites them
+on every release.
 
 ## Supported platforms
 
@@ -29,9 +32,9 @@ artifact:
 | Linux x86_64 | `x86_64-unknown-linux-musl` (static) |
 
 Intel macOS (`x86_64-apple-darwin`) and aarch64 Linux have **no** release
-binary, so `brew install` reports "no available formula" there. Use
-[`scripts/install.sh`](../../scripts/install.sh) or build from source on those
-platforms.
+binary, so `brew install` fails there (*"formula requires at least a URL"*).
+Build from source on those platforms — see the README's
+[Installation](../../README.md#installation) section.
 
 ## Runtime dependencies
 
@@ -41,72 +44,45 @@ platforms.
 
 ## Test locally
 
+Homebrew rejects any formula that is not in a tap (`brew install
+./HomebrewFormula/friring.rb` fails with *"Homebrew requires formulae to be in
+a tap"*), so testing an unpushed edit means tapping a **local clone** — `brew
+tap` clones it, so commit first:
+
 ```bash
-brew install --build-from-source ./Formula/thurbox.rb   # install the local formula
-brew audit --strict --formula ./Formula/thurbox.rb      # lint the recipe
-brew test thurbox                                       # run the formula test block
+brew tap bvc3at/friring /path/to/your/friring/checkout   # local git clone
+brew install bvc3at/friring/friring
+brew test bvc3at/friring/friring                          # formula test block
+brew audit --strict --formula bvc3at/friring/friring      # lint the recipe
+brew untap bvc3at/friring
 ```
+
+`brew audit` installs Homebrew's audit gem group on first run.
 
 ## Automated publishing (CI)
 
-New releases publish to the tap **automatically**. The `publish-homebrew` job
+Every release bumps the formula **automatically**. The `publish-homebrew` job
 in [`.github/workflows/cd.yml`](../../.github/workflows/cd.yml) runs after the
 GitHub Release is created and:
 
-1. downloads the release `thurbox-<version>-checksums.txt`,
+1. downloads the release `friring-<version>-checksums.txt`,
 2. runs [`bump-formula.py`](bump-formula.py) to set `version` and each
    per-platform `sha256` from those checksums, then
-3. clones the tap repo and commits the updated `Formula/thurbox.rb`.
+3. commits the bumped `HomebrewFormula/friring.rb` back to `main`.
 
-The job is a no-op if the formula is already current, and is skipped entirely
-when the deploy-key secret is absent (e.g. on forks).
+No secrets are involved — the workflow's own `GITHUB_TOKEN` pushes the commit,
+because the tap *is* this repo. The bump is a `chore` commit (not releasable to
+cocogitto) marked `[skip ci]`, so it cannot trigger another release. The job is
+a no-op if the formula is already current.
 
-The push uses **SSH with a write-enabled deploy key** rather than a PAT: the
-`Thurbeen` org blocks cross-repo personal access tokens, so a repo-scoped
-deploy key is both the working credential and the least-privilege one (it can
-write to the tap repo and nothing else).
+## Manual bump
 
-### One-time setup
-
-1. **Create the tap repo** — a GitHub repo named `homebrew-thurbox` under the
-   `Thurbeen` org (the `homebrew-` prefix is what makes `brew tap
-   thurbeen/thurbox` work). A bare repo with a `Formula/` directory is enough;
-   the first release populates `Formula/thurbox.rb`.
-
-2. **Add a write deploy key.** Generate a dedicated key, register the **public**
-   half on the tap repo with write access, and store the **private** half as the
-   `HOMEBREW_TAP_DEPLOY_KEY` secret on the **main** thurbox repo:
-
-   ```bash
-   ssh-keygen -t ed25519 -C "thurbox-release-ci@homebrew-tap" -f tap_key -N ""
-   gh repo deploy-key add tap_key.pub --repo Thurbeen/homebrew-thurbox \
-     --title thurbox-release-ci --allow-write
-   gh secret set HOMEBREW_TAP_DEPLOY_KEY --repo Thurbeen/thurbox < tap_key
-   rm -f tap_key tap_key.pub   # don't leave the private key on disk
-   ```
-
-   > Org-owned repos disable deploy keys by default. If `deploy-key add` reports
-   > *"Deploy keys are disabled for this repository"*, an org owner must enable
-   > them under **Org Settings → Repository → Repository deploy keys** first.
-
-After that, every release updates the tap automatically.
-
-## Manual publishing / initial import
-
-To seed or update the tap by hand:
+To move the formula to a published release by hand:
 
 ```bash
-# Bump the local template to a published release, then copy it into the tap.
 curl -fsSL -o /tmp/checksums.txt \
-  "https://github.com/Thurbeen/thurbox/releases/download/v<version>/thurbox-v<version>-checksums.txt"
-python3 bump-formula.py v<version> Formula/thurbox.rb /tmp/checksums.txt
-
-git clone https://github.com/Thurbeen/homebrew-thurbox.git
-mkdir -p homebrew-thurbox/Formula
-cp Formula/thurbox.rb homebrew-thurbox/Formula/thurbox.rb
-cd homebrew-thurbox
-git commit -am "Update to v<version>"
-git push
+  "https://github.com/bvc3at/friring/releases/download/v<version>/friring-v<version>-checksums.txt"
+python3 packaging/homebrew/bump-formula.py v<version> HomebrewFormula/friring.rb /tmp/checksums.txt
 ```
 
 Pick a `<version>` that has **published release assets** (the formula points at

@@ -1,4 +1,4 @@
-//! Self-update: download, verify, and replace the installed thurbox binaries.
+//! Self-update: download, verify, and replace the installed friring binaries.
 //!
 //! This is the **opt-in** auto-update feature (gated behind `[features]
 //! auto_update`, off by default — see
@@ -10,14 +10,14 @@
 //!   release is downloaded + installed in place (atomic renames against the
 //!   install dir — the running process is untouched); the new version applies on
 //!   the next launch, and the result is surfaced as a status toast.
-//! - **CLI** — `thurbox-cli update` does the same on demand (`--force` bypasses
+//! - **CLI** — `friring-cli update` does the same on demand (`--force` bypasses
 //!   the up-to-date / dev-build guards).
 //!
 //! It reuses the version-check plumbing ([`fetch_latest_release`],
 //! [`decide_update`], [`current_version`]) so dev builds (`0.0.0-dev`) never
 //! auto-update, and mirrors `scripts/install.sh` exactly: the same release
 //! artifacts, target-triple mapping, and SHA256 verification. Like the rest of
-//! thurbox it adds no new crate dependency — downloads go through the
+//! friring it adds no new crate dependency — downloads go through the
 //! `curl`/`wget` helpers and `tar` / `sha256sum`/`shasum` are shelled out to.
 
 use std::path::{Path, PathBuf};
@@ -25,12 +25,12 @@ use std::process::Command;
 
 use crate::agent::version_check::{current_version, decide_update, fetch_latest_release};
 
-/// GitHub release-download base for the thurbox repo (same repo as
+/// GitHub release-download base for the friring repo (same repo as
 /// `scripts/install.sh`); the per-release directory is `<base>/v{version}/`.
-const RELEASE_BASE: &str = "https://github.com/Thurbeen/thurbox/releases/download";
+const RELEASE_BASE: &str = "https://github.com/bvc3at/friring/releases/download";
 
 /// The binaries shipped in a release tarball, replaced in place on update.
-const BINARIES: [&str; 2] = ["thurbox", "thurbox-cli"];
+const BINARIES: [&str; 2] = ["friring", "friring-cli"];
 
 /// Outcome of an update attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,12 +71,12 @@ fn current_target() -> Result<&'static str, String> {
 
 /// Release tarball filename for `version` (no leading `v`) + `target`.
 fn tarball_name(version: &str, target: &str) -> String {
-    format!("thurbox-v{version}-{target}.tar.gz")
+    format!("friring-v{version}-{target}.tar.gz")
 }
 
 /// Release checksums filename for `version` (no leading `v`).
 fn checksums_name(version: &str) -> String {
-    format!("thurbox-v{version}-checksums.txt")
+    format!("friring-v{version}-checksums.txt")
 }
 
 fn tarball_url(version: &str, target: &str) -> String {
@@ -200,7 +200,7 @@ fn install_binaries(extract_dir: &Path, install_dir: &Path) -> Result<Vec<String
             return Err(format!("extracted `{name}` is empty"));
         }
         if !dest.exists() {
-            // e.g. thurbox-cli not co-located next to the running thurbox.
+            // e.g. friring-cli not co-located next to the running friring.
             skipped.push(name.to_string());
             continue;
         }
@@ -344,37 +344,40 @@ mod tests {
     fn artifact_names_and_urls_match_install_sh() {
         assert_eq!(
             tarball_name("0.114.0", "x86_64-unknown-linux-musl"),
-            "thurbox-v0.114.0-x86_64-unknown-linux-musl.tar.gz"
+            "friring-v0.114.0-x86_64-unknown-linux-musl.tar.gz"
         );
-        assert_eq!(checksums_name("0.114.0"), "thurbox-v0.114.0-checksums.txt");
-        let url = tarball_url("0.114.0", "aarch64-apple-darwin");
-        assert!(url.starts_with(RELEASE_BASE), "got: {url}");
-        assert!(url.contains("/v0.114.0/"), "got: {url}");
-        assert!(url.ends_with(".tar.gz"), "got: {url}");
-        assert!(checksums_url("0.114.0").contains("/v0.114.0/"));
+        assert_eq!(checksums_name("0.114.0"), "friring-v0.114.0-checksums.txt");
+        assert_eq!(
+            tarball_url("0.114.0", "aarch64-apple-darwin"),
+            "https://github.com/bvc3at/friring/releases/download/v0.114.0/friring-v0.114.0-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(
+            checksums_url("0.114.0"),
+            "https://github.com/bvc3at/friring/releases/download/v0.114.0/friring-v0.114.0-checksums.txt"
+        );
     }
 
     #[test]
     fn parse_checksum_picks_the_matching_line() {
         let body = "\
-aaaa1111  thurbox-v0.114.0-x86_64-apple-darwin.tar.gz
-bbbb2222  thurbox-v0.114.0-x86_64-unknown-linux-musl.tar.gz
-cccc3333  thurbox-v0.114.0-aarch64-apple-darwin.tar.gz
+aaaa1111  friring-v0.114.0-x86_64-apple-darwin.tar.gz
+bbbb2222  friring-v0.114.0-x86_64-unknown-linux-musl.tar.gz
+cccc3333  friring-v0.114.0-aarch64-apple-darwin.tar.gz
 ";
         assert_eq!(
-            parse_checksum(body, "thurbox-v0.114.0-x86_64-unknown-linux-musl.tar.gz").as_deref(),
+            parse_checksum(body, "friring-v0.114.0-x86_64-unknown-linux-musl.tar.gz").as_deref(),
             Some("bbbb2222")
         );
         assert_eq!(
-            parse_checksum(body, "thurbox-v0.114.0-aarch64-apple-darwin.tar.gz").as_deref(),
+            parse_checksum(body, "friring-v0.114.0-aarch64-apple-darwin.tar.gz").as_deref(),
             Some("cccc3333")
         );
     }
 
     #[test]
     fn parse_checksum_missing_entry_is_none() {
-        let body = "aaaa1111  thurbox-v0.114.0-x86_64-apple-darwin.tar.gz\n";
-        assert!(parse_checksum(body, "thurbox-v9.9.9-x86_64-unknown-linux-musl.tar.gz").is_none());
+        let body = "aaaa1111  friring-v0.114.0-x86_64-apple-darwin.tar.gz\n";
+        assert!(parse_checksum(body, "friring-v9.9.9-x86_64-unknown-linux-musl.tar.gz").is_none());
         assert!(parse_checksum("", "anything").is_none());
     }
 
@@ -419,19 +422,19 @@ cccc3333  thurbox-v0.114.0-aarch64-apple-darwin.tar.gz
         for name in BINARIES {
             std::fs::write(extract.path().join(name), b"NEW").unwrap();
         }
-        // Only `thurbox` is installed; `thurbox-cli` is not co-located.
-        std::fs::write(install.path().join("thurbox"), b"OLD").unwrap();
+        // Only `friring` is installed; `friring-cli` is not co-located.
+        std::fs::write(install.path().join("friring"), b"OLD").unwrap();
 
         let replaced = install_binaries(extract.path(), install.path()).unwrap();
-        assert_eq!(replaced, vec!["thurbox".to_string()]);
-        assert!(!install.path().join("thurbox-cli").exists());
+        assert_eq!(replaced, vec!["friring".to_string()]);
+        assert!(!install.path().join("friring-cli").exists());
     }
 
     #[test]
     fn install_binaries_errors_when_tarball_missing_a_binary() {
         let install = tempfile::TempDir::new().unwrap();
         let extract = tempfile::TempDir::new().unwrap();
-        std::fs::write(install.path().join("thurbox"), b"OLD").unwrap();
+        std::fs::write(install.path().join("friring"), b"OLD").unwrap();
         // extract dir has neither binary
         let err = install_binaries(extract.path(), install.path()).unwrap_err();
         assert!(err.contains("missing"), "got: {err}");

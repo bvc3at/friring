@@ -17,7 +17,7 @@
 
 [Unit]
 Description=Fire due friring automations (headless)
-Documentation=https://github.com/Thurbeen/thurbox
+Documentation=https://github.com/bvc3at/friring
 
 [Service]
 Type=oneshot

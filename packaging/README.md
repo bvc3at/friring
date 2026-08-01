@@ -4,17 +4,22 @@ Optional OS-level integration and distribution packages for Friring.
 
 ## Distribution packages
 
-| Directory   | Channel                  | Installs                                  |
-| ----------- | ------------------------ | ----------------------------------------- |
+| Directory   | Channel                    | Installs                                  |
+| ----------- | -------------------------- | ----------------------------------------- |
 | `homebrew/` | Homebrew tap (macOS/Linux) | prebuilt release binaries — see [`homebrew/README.md`](homebrew/README.md) |
-| `aur/`      | Arch Linux (AUR)         | source + prebuilt binary — see [`aur/README.md`](aur/README.md) |
-| `chocolatey/` | Chocolatey (Windows)   | prebuilt release zip — see [`chocolatey/README.md`](chocolatey/README.md) |
-| `winget/`   | winget (Windows)         | prebuilt release zip (portable) — see [`winget/README.md`](winget/README.md) |
 
-These are published automatically on each release by jobs in
-[`.github/workflows/cd.yml`](../.github/workflows/cd.yml). For the
-distro-agnostic one-liner installer, see
-[`scripts/install.sh`](../scripts/install.sh).
+Homebrew is the only package channel Friring publishes: this repo doubles as
+its own tap, so the formula itself lives at
+[`HomebrewFormula/friring.rb`](../HomebrewFormula/friring.rb) (Homebrew only
+looks at a tap's root, `Formula/` or `HomebrewFormula/`) and `homebrew/` keeps
+the bump tooling and its notes. The `publish-homebrew` job in
+[`.github/workflows/cd.yml`](../.github/workflows/cd.yml) bumps it on every
+release.
+
+Everywhere else, install with the one-liner installers
+([`scripts/install.sh`](../scripts/install.sh),
+[`scripts/install.ps1`](../scripts/install.ps1)) or build from source — see the
+README's [Installation](../README.md#installation) section.
 
 ## Reboot-proof automations (`systemd/`, `launchd/`)
 

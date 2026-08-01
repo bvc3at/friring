@@ -500,7 +500,7 @@ still written last, so the session remains restorable via `Ctrl+U`
 it makes a network call). On launch the TUI reads a cached result
 (`~/.local/share/friring/version-check.json`) and, if it is older than
 24 h, fires a single best-effort background fetch of GitHub's latest
-release (`api.github.com/repos/Thurbeen/thurbox/releases/latest`, via
+release (`api.github.com/repos/bvc3at/friring/releases/latest`, via
 `curl`/`wget` — no new dependency); a newer release shows a `⬆ vX.Y.Z
 available` badge next to the version in the header. The fetch never runs
 on the render path and never blocks startup; failures are silent. Dev
@@ -530,11 +530,9 @@ location (`~/.local/bin`) is user-writable; a system-wide install in a
 root-owned directory will fail the replace (logged, non-fatal). `version_check`
 and `auto_update` are independent — enable either or both.
 
-**Fork caveat (friring):** version-check and self-update deliberately retain the
-upstream **Thurbox** release contract — they query `Thurbeen/thurbox` releases
-and replace on-disk `thurbox`/`thurbox-cli` assets — so they do **not** update a
-source-built `friring`. Update friring by pulling this repo and rebuilding. See
-`FORK.md`'s Migration section.
+Both features target **this fork's** releases (`bvc3at/friring`) and its
+`friring` / `friring-cli` assets. A source-built binary reports `0.0.0-dev` and
+is therefore never auto-updated — pull this repo and rebuild instead.
 
 `auto_update = true` also keeps **installed extensions** in step with the
 binary. Extension versions are pinned to the binary's release tag, so an

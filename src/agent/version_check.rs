@@ -1,4 +1,4 @@
-//! Update check: is a newer thurbox release available?
+//! Update check: is a newer friring release available?
 //!
 //! This is the side-effect half of the **opt-in** version-deployment indicator
 //! (gated behind `[features] version_check`, off by default — see
@@ -7,7 +7,7 @@
 //! - **TUI** — a small "⬆ vX.Y.Z available" badge in the header. The draw loop
 //!   only ever reads a cached result ([`read_cached_status`]); the network
 //!   refresh ([`refresh_cache`]) runs off the render path.
-//! - **CLI** — `thurbox-cli version --check` fetches fresh and reports.
+//! - **CLI** — `friring-cli version --check` fetches fresh and reports.
 //!
 //! The pure decision ([`decide_update`]) is built on the existing
 //! [`compare_versions`] / [`is_dev_version`] helpers, so dev builds
@@ -22,9 +22,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::extension_def::{compare_versions, is_dev_version};
 
-/// GitHub "latest release" endpoint for the thurbox repo (same repo + API as
+/// GitHub "latest release" endpoint for the friring repo (same repo + API as
 /// `scripts/install.sh`).
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Thurbeen/thurbox/releases/latest";
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/bvc3at/friring/releases/latest";
 
 /// How long a cached check stays fresh. The TUI reads the cache on startup and
 /// only refreshes over the network once it is older than this, so a normal
@@ -52,6 +52,12 @@ struct CachedCheck {
     latest: String,
     /// Unix seconds when the check ran.
     checked_at: u64,
+    /// The release endpoint this entry was fetched from. An entry written
+    /// against a different repo (e.g. one left over from before the fork
+    /// pointed at its own releases) is ignored rather than trusted for the rest
+    /// of the TTL. Defaults to empty for pre-`source` cache files.
+    #[serde(default)]
+    source: String,
 }
 
 /// Decide whether `latest` is a newer release than `current`.
@@ -90,7 +96,7 @@ pub fn current_version() -> &'static str {
     crate::agent::extension_config::binary_version()
 }
 
-/// Path to the cache file: `~/.local/share/thurbox/version-check.json`.
+/// Path to the cache file: `~/.local/share/friring/version-check.json`.
 fn cache_path() -> Option<PathBuf> {
     crate::paths::log_directory().map(|d| d.join("version-check.json"))
 }
@@ -118,17 +124,21 @@ fn write_cache(latest: &str) {
     let entry = CachedCheck {
         latest: latest.trim_start_matches('v').to_string(),
         checked_at: now_secs(),
+        source: LATEST_RELEASE_URL.to_string(),
     };
     if let Ok(json) = serde_json::to_string(&entry) {
         let _ = std::fs::write(&path, json);
     }
 }
 
-/// Whether the cache is missing or older than the freshness window
-/// (`CACHE_TTL_SECS`, 24 h).
+/// Whether the cache is missing, written against a different release endpoint,
+/// or older than the freshness window (`CACHE_TTL_SECS`, 24 h).
 pub fn cache_is_stale() -> bool {
     match read_cache() {
-        Some(c) => now_secs().saturating_sub(c.checked_at) >= CACHE_TTL_SECS,
+        Some(c) => {
+            c.source != LATEST_RELEASE_URL
+                || now_secs().saturating_sub(c.checked_at) >= CACHE_TTL_SECS
+        }
         None => true,
     }
 }
@@ -139,6 +149,9 @@ pub fn cache_is_stale() -> bool {
 /// TUI draw loop.
 pub fn read_cached_status() -> Option<UpdateStatus> {
     let cached = read_cache()?;
+    if cached.source != LATEST_RELEASE_URL {
+        return None;
+    }
     decide_update(current_version(), &cached.latest)
 }
 
@@ -252,9 +265,30 @@ mod tests {
         let entry = CachedCheck {
             latest: "9.9.9".into(),
             checked_at: 0,
+            source: LATEST_RELEASE_URL.into(),
         };
         std::fs::write(&path, serde_json::to_string(&entry).unwrap()).unwrap();
 
         assert!(cache_is_stale(), "an epoch-stamped cache is past the TTL");
+    }
+
+    #[test]
+    fn cache_from_another_release_source_is_ignored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+
+        // A pre-`source` cache body: fresh by timestamp, but its `latest` came
+        // from whatever endpoint the old build queried, so it must not be
+        // trusted for the rest of the TTL.
+        let path = cache_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body = format!(r#"{{"latest":"9.9.9","checked_at":{}}}"#, now_secs());
+        std::fs::write(&path, body).unwrap();
+
+        assert!(cache_is_stale(), "a legacy cache entry is refetched");
+        assert!(
+            read_cached_status().is_none(),
+            "a legacy cache entry drives no badge"
+        );
     }
 }

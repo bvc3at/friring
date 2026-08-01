@@ -16,11 +16,11 @@
 > improvements get merged down into this fork; the original commit history is
 > kept intact as a tribute to the upstream author.
 >
-> **Heads up** — every link, install command, badge, and doc below points at
-> the **original** Thurbox project, and that's intentional: the packaged
-> installs still fetch the upstream `thurbox` binary and Friring publishes no
-> releases or website of its own. Building *this* repo from source, though, now
-> produces the renamed `friring` binary. See **[FORK.md](./FORK.md)** for the
+> **Heads up** — Friring cuts its **own** releases, so every install command
+> below fetches a `friring` binary from this repo. What still points upstream is
+> attribution (the `LICENSE`, provenance links, the website badge) plus two
+> formats shared with upstream: the `min_thurbox_version` extension-manifest key
+> and the `tb-` tmux window prefixes. See **[FORK.md](./FORK.md)** for the
 > running list of how this fork diverges from upstream.
 
 Run any coding-agent CLI in persistent terminal sessions.
@@ -30,14 +30,14 @@ you describe — inside persistent tmux panes that survive
 crashes, restarts, and reboots. Sessions, agents, and git
 worktrees are first-class citizens.
 
-[![CI](https://github.com/Thurbeen/thurbox/workflows/CI/badge.svg)](https://github.com/Thurbeen/thurbox/actions)
+[![CI](https://github.com/bvc3at/friring/actions/workflows/ci.yml/badge.svg)](https://github.com/bvc3at/friring/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Website](https://img.shields.io/badge/Website-thurbox.thurbeen.eu-blue)](https://thurbox.thurbeen.eu/)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=Thurbeen_thurbox&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Thurbeen_thurbox)
 
 ![Friring Demo](./docs/media/friring-demo.gif)
 
-> **Note:** Thurbox is still **v0.x.x**. While we try hard to avoid
+> **Note:** Friring is still **v0.x.x**. While we try hard to avoid
 > them, breaking changes may occasionally happen between releases
 > until the project reaches 1.0. Pin a version if you need stability.
 
@@ -46,7 +46,7 @@ worktrees are first-class citizens.
 **One-liner:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | sh
 ```
 
 Installs the latest release to `~/.local/bin` with checksum
@@ -56,10 +56,10 @@ verification and platform auto-detection.
 
 ```bash
 # Custom directory
-INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | INSTALL_DIR=/usr/local/bin sh
 
 # Pin a version
-VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | VERSION=v0.13.0 sh
 ```
 
 **Windows (PowerShell):**
@@ -71,68 +71,36 @@ VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/mai
 > issues.
 
 ```powershell
-irm https://raw.githubusercontent.com/Thurbeen/thurbox/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.ps1 | iex
 ```
 
 Installs the latest `x86_64-pc-windows-msvc` release to
-`%LOCALAPPDATA%\Programs\thurbox` (added to your user `PATH`) with checksum
-verification. Pin a version or directory with the `THURBOX_VERSION` /
-`THURBOX_INSTALL_DIR` env vars. Needs [psmux](https://github.com/psmux/psmux)
+`%LOCALAPPDATA%\Programs\friring` (added to your user `PATH`) with checksum
+verification. Pin a version or directory with the `FRIRING_VERSION` /
+`FRIRING_INSTALL_DIR` env vars. Needs [psmux](https://github.com/psmux/psmux)
 as the multiplexer.
 
-**winget (Windows):**
-
-```powershell
-winget install Thurbeen.thurbox
-```
-
-Installs the prebuilt x86_64 Windows binaries (`thurbox.exe` +
-`thurbox-cli.exe`) from the GitHub Release as portable commands on your `PATH`.
-Needs [psmux](https://github.com/psmux/psmux) as the multiplexer (installed
-separately).
-
-**Chocolatey (Windows):**
-
-```powershell
-choco install thurbox
-```
-
-Installs the prebuilt x86_64 Windows binaries (`thurbox.exe` +
-`thurbox-cli.exe`) from the GitHub Release and shims them onto your `PATH`.
-Needs [psmux](https://github.com/psmux/psmux) as the multiplexer (installed
-separately — there is no Chocolatey package for it).
-
-> **⚠️ Pending moderation.** The Chocolatey package has been pushed but is
-> **not yet approved** by the community-repo moderators, so `choco install
-> thurbox` won't resolve it from the community feed until it goes live. Use
-> **winget** or the PowerShell installer (both above) in the meantime.
-
-**Homebrew (macOS / Linux):**
+**Homebrew (macOS Apple Silicon / Linux x86_64):**
 
 ```bash
-brew install thurbeen/thurbox/thurbox
+brew tap bvc3at/friring https://github.com/bvc3at/friring
+brew install bvc3at/friring/friring
 ```
 
-Installs the prebuilt release binaries (`thurbox` + `thurbox-cli`)
-from the [tap](https://github.com/Thurbeen/homebrew-thurbox), with
-`tmux` and `git` pulled in as dependencies. Supports macOS arm64
-(Apple Silicon) and Linux x86_64.
+This repo *is* the tap — the formula lives at
+[`HomebrewFormula/friring.rb`](HomebrewFormula/friring.rb) — so the tap URL is
+spelled out, since `brew tap` only infers one from a repo named
+`homebrew-friring`. Installs the prebuilt release binaries (`friring` +
+`friring-cli`) with `tmux` and `git` pulled in as dependencies.
 
-**Arch Linux (AUR):**
-
-Thurbox is on the AUR as
-[`thurbox`](https://aur.archlinux.org/packages/thurbox) (builds
-from source) and
-[`thurbox-bin`](https://aur.archlinux.org/packages/thurbox-bin)
-(prebuilt release binary). Install with your AUR helper:
+**With cargo (any platform with a Rust toolchain):**
 
 ```bash
-paru -S thurbox-bin   # prebuilt binary (fastest)
-paru -S thurbox       # build from source
+cargo install --git https://github.com/bvc3at/friring --locked
 ```
 
-`tmux` is pulled in as a dependency. (Swap `paru` for `yay` or
-your preferred helper.)
+Builds and installs `friring` + `friring-cli` into `~/.cargo/bin`. This is the
+route for platforms with no prebuilt binary — Intel macOS and aarch64 Linux.
 
 **From source:**
 
@@ -141,13 +109,13 @@ sudo pacman -S --needed git tmux rust   # Arch deps; use your distro's equivalen
 git clone https://github.com/bvc3at/friring.git
 cd friring
 cargo build --release
-# binary at target/release/friring
+# binaries at target/release/friring and target/release/friring-cli
 ```
 
-The packaged installers above (Homebrew, winget, curl, AUR, Chocolatey) install
-the upstream **Thurbox** binary. To run **Friring** specifically, build it from
-source from this fork — there is no Friring package yet, so a source build is the
-only supported way to obtain `friring` for now.
+Prebuilt binaries are published for Linux x86_64 (gnu + musl), Apple-silicon
+macOS, and Windows x86_64; the installers and the Homebrew formula only offer
+what a release actually ships. Anywhere else, use `cargo install` or a source
+build.
 
 See [Prerequisites](#prerequisites) for required tooling.
 
@@ -477,12 +445,13 @@ switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
 Remove the binary, depending on how you installed it:
 
 ```bash
-rm ~/.local/bin/thurbox        # curl one-liner / manual install
-brew uninstall thurbox         # Homebrew
-paru -R thurbox thurbox-bin    # Arch (AUR)
-winget uninstall Thurbeen.thurbox  # winget (Windows)
-choco uninstall thurbox        # Chocolatey (Windows)
+rm ~/.local/bin/friring ~/.local/bin/friring-cli   # curl one-liner / manual install
+brew uninstall bvc3at/friring/friring              # Homebrew
+cargo uninstall friring                            # cargo install
 ```
+
+On Windows, delete `%LOCALAPPDATA%\Programs\friring` and drop it from your user
+`PATH`.
 
 Sessions outlive Friring in tmux, so stop them too:
 
@@ -1162,5 +1131,5 @@ This project is licensed under the MIT License - see the
 
 ## Support
 
-For issues, questions, or contributions, please visit our
-[GitHub repository](https://github.com/Thurbeen/thurbox).
+For issues, questions, or contributions, please visit the
+[GitHub repository](https://github.com/bvc3at/friring).
