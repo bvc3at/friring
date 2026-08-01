@@ -465,9 +465,14 @@ const FILE_VIEWER_HINTS: &[(&str, &str)] = &[
 ];
 
 /// The footer's left-hand text in render order, split into individually
-/// droppable segments. Roughly reverse-priority ordered — what goes first sits
-/// nearest the pills — so the trim shortens the row from the right and the
-/// surviving text stays put.
+/// droppable segments.
+///
+/// Render order is the *reading* order — state first (leader badge, focus,
+/// counts), key hints last — and is deliberately independent of `priority`,
+/// which is what drives the trim: the blocked badge renders after the session
+/// count but outlives it, and the file-viewer hints render after both counts
+/// yet outrank them. So dropping a segment mid-row re-flows everything after
+/// it; only the tail (the global hints) shortens the row in place.
 fn left_segments(state: &FooterState<'_>) -> Vec<LeftSegment> {
     let mut segments = Vec::new();
     // An armed leader replaces nothing — it prepends, so the badge sits where
