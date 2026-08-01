@@ -8,12 +8,17 @@
 # persisted agent_session_id is unchanged, and a fresh second turn proves the
 # resumed conversation is live.
 #
-# Test-mode only (drives the friring-dev tmux server mid-steps and reads
-# session state via friring-cli; Alt+U has no VHS key); not demo-able.
+# Demo-able: Alt+U records through `<leader> U` (SCENARIO_DEMO_KEYS). The
+# mid-step friring-dev/friring-cli probes run at tape-generation time, where
+# they only read — the ghost-window poll times out harmlessly before the
+# recording starts.
 #
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Alt+U unloads claude to a frozen ghost; Enter loads it back via --resume with zero model calls"
 SCENARIO_AGENT="claude"
+# VHS cannot press Alt (it emits the bare capital); `<leader> U` is the
+# fork's own second route to the same unload.
+SCENARIO_DEMO_KEYS=("M-u=C-f U")
 # The input-box prompt glyph — the stable "ready for input" marker across
 # claude 2.x permission modes (verified against 2.1.207).
 SCENARIO_AGENT_READY="❯"

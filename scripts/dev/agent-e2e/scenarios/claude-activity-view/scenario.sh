@@ -10,12 +10,16 @@
 # view. Asserts the transcript file exists under the minted id, the workspace
 # side effect, and the journal.
 #
-# Test-mode only (F9 has no VHS mapping; asserts probe friring-cli); not
-# demo-able.
+# Demo-able: F9 records through `<leader> v` (SCENARIO_DEMO_KEYS) and the
+# 220-column pane it needs is now the recorded canvas. Only the asserts
+# probe friring-cli, and those never run in demo mode.
 #
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="F9 activity view reconstructs a claude Write turn from its on-disk transcript"
 SCENARIO_AGENT="claude"
+# VHS has no F-keys; `<leader> v` is F9's own second route to the same
+# action, so the clip opens the view exactly as the scenario does.
+SCENARIO_DEMO_KEYS=("F9=C-f v")
 SCENARIO_PROMPT="Create activity-proof.txt using the Write tool."
 # The input-box prompt glyph — the stable "ready for input" marker across
 # claude 2.x permission modes (verified against 2.1.207).

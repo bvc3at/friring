@@ -22,6 +22,7 @@ E2E_DRIVER_SESSION="agent-e2e"
 E2E_MODE="test"
 E2E_STUB_PID=""
 E2E_TAPE=""
+E2E_TAPE_ERR=""
 
 e2e_log() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 e2e_die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; return 1; }
@@ -78,6 +79,16 @@ e2e_scenario_load() {
     SCENARIO_PRECREATE=1
     SCENARIO_REQUIRE_ALL_FIXTURES=1
     SCENARIO_DEMO_THEME=""
+    # Demo-mode key substitutions, `<tmux key>=<tmux key>…`, for keys VHS
+    # cannot express (F-keys, `Alt+<digit>`, `Ctrl+/`). The fork's leader is
+    # usually the equivalent route — `F9=C-f v` reaches the activity view the
+    # way `<leader> v` does — but whether a substitution preserves what the
+    # clip *shows* is a judgement the scenario has to make, never one the
+    # harness may assume: scripted-info-keybind presses F2 to prove it does
+    # nothing, so routing it to the same action's leader key would record the
+    # opposite of the feature. Declaring nothing leaves the scenario
+    # test-only, and `--demo` names the key that stopped it.
+    SCENARIO_DEMO_KEYS=()
     SCENARIO_PROMPT=""
     SCENARIO_AGENT_READY=""
     SCENARIO_DONE_PATTERN=""
@@ -274,15 +285,52 @@ e2e_session_create() {
 # Step primitives — the scenario's shared vocabulary. Test mode drives the
 # driver tmux and polls; demo mode appends VHS tape lines.
 
-# tmux key name -> VHS key name. VHS has no F-keys, so scenarios that want a
-# demo must stick to this subset (F-keys still work in test mode).
-_vhs_key() {
+# One tmux key name -> the VHS tape line that presses it. Prints the line;
+# returns 1 for a key VHS cannot press, which needs a SCENARIO_DEMO_KEYS route
+# or leaves the scenario test-only.
+#
+# The accepted set was established by capturing what vhs 0.11.0 actually writes
+# to a pty (`stty raw; cat > file`), not from its grammar — the two disagree,
+# and only one of them is what the app receives:
+#
+#   Ctrl+<letter>       0x01-0x1a          ✔
+#   Ctrl+^ \ [ ] - @ .  the control byte   ✔  (no other punctuation; no `Ctrl+/`)
+#   Shift+<letter>      the capital        ✔  (so a bare `J` covers it)
+#   Escape Tab Enter …  ✔
+#   Alt+<letter>        the BARE CAPITAL — no ESC prefix. Accepted by the
+#                       parser, so a mapping here would silently type `U` into
+#                       the agent instead of unloading a session.
+#   Ctrl+Alt+<letter>   NOTHING AT ALL — parsed, then dropped.
+#   Alt+<digit>, F-keys rejected by the parser.
+#
+# So every Alt chord demos through the fork's leader (`<leader> U` for Alt+U),
+# which is a real second route to the same action rather than a workaround.
+_vhs_key_line() {
     case "$1" in
-        Enter|Escape|Tab|Space|Up|Down|Left|Right|PageUp|PageDown|Backspace|Delete) echo "$1" ;;
+        Enter|Escape|Tab|Space|Up|Down|Left|Right|PageUp|PageDown|Backspace|Delete|Insert)
+            printf '%s\n' "$1" ;;
         # Uppercase the letter: VHS's canonical chord form is `Ctrl+N`.
-        C-?) echo "Ctrl+$(printf '%s' "${1#C-}" | tr '[:lower:]' '[:upper:]')" ;;
+        C-[a-zA-Z]) printf 'Ctrl+%s\n' "$(printf '%s' "${1#C-}" | tr '[:lower:]' '[:upper:]')" ;;
+        'C-^'|'C-['|'C-]'|'C--'|'C-@'|'C-.'|C-[\\]) printf 'Ctrl+%s\n' "${1#C-}" ;;
+        # A bare key is that character typed — including the uppercase letters
+        # tmux uses for `Shift+<letter>` (`J`). Single character only: a longer
+        # name is one VHS lacks (F-keys, Home/End), and typing it literally
+        # would silently record nonsense.
+        ?) printf 'Type "%s"\n' "$1" ;;
         *) return 1 ;;
     esac
+}
+
+# The tape lines for a key, honoring the scenario's demo-mode substitutions.
+_vhs_key_lines() {
+    local want="$1" entry sub="" k
+    for entry in ${SCENARIO_DEMO_KEYS[@]+"${SCENARIO_DEMO_KEYS[@]}"}; do
+        [ "${entry%%=*}" = "$want" ] && sub="${entry#*=}"
+    done
+    [ -n "$sub" ] || { _vhs_key_line "$want"; return $?; }
+    for k in $sub; do
+        _vhs_key_line "$k" || return 1
+    done
 }
 
 step_type() {
@@ -297,9 +345,16 @@ step_type() {
 
 step_key() {
     if [ "$E2E_MODE" = "demo" ]; then
-        local vk
-        vk="$(_vhs_key "$1")" || e2e_die "key '$1' has no VHS mapping (demo mode)" || return 1
-        printf '%s\n' "$vk" >> "$E2E_TAPE"
+        local lines
+        # A scenario's steps are a flat list with no error checking, so a
+        # `return 1` here would be swallowed and the keypress would simply go
+        # missing from the tape — a recording that runs to completion showing
+        # the wrong thing. Flag it for e2e_emit_tape to fail on instead.
+        lines="$(_vhs_key_lines "$1")" || {
+            E2E_TAPE_ERR="${E2E_TAPE_ERR}key '$1' has no VHS mapping and no SCENARIO_DEMO_KEYS route"$'\n'
+            return 1
+        }
+        printf '%s\n' "$lines" >> "$E2E_TAPE"
     else
         tmux -L "$E2E_DRIVER_SOCKET" send-keys -t "$E2E_DRIVER_SESSION" "$1"
     fi
@@ -321,16 +376,26 @@ step_sleep() {
 step_wait_pane() {
     local pattern="$1" timeout="${2:-30}"
     if [ "$E2E_MODE" = "demo" ]; then
-        # VHS matches on a Go (RE2) regexp delimited by /…/. Emit the pattern as
-        # a literal: backslash-escape every RE2 metacharacter, the `/` delimiter,
-        # and `]`/`}` — so a wait-for string containing any of them can't produce
-        # an invalid or wrong-meaning tape. Backslashes first (so we don't
-        # double-escape the ones we add); then a class with `]` leading (the only
-        # position it's literal) under a `#` delimiter to keep `/` in the set.
+        # Test mode greps (POSIX BRE); VHS matches a Go (RE2) regexp delimited
+        # by /…/. Translate rather than flatten to a literal: the two dialects
+        # already agree on everything these patterns use — `.`, `.*`, and the
+        # `\[`/`\]` a BRE needs for a literal bracket are spelled the same in
+        # RE2 — so escaping wholesale silently broke every wait a scenario
+        # meant as a regex. Only the characters BRE takes literally and RE2
+        # does not need escaping, or a pane title like `Edited (1)` becomes a
+        # capture group matching `Edited 1`. `/` is escaped because it
+        # delimits. A pattern with a bare unbalanced `[` would still make
+        # invalid RE2 — vhs then fails the recording loudly, which is the
+        # right failure.
         local esc
-        # shellcheck disable=SC2016  # sed classes, not unexpanded variables
-        esc="$(printf '%s' "$pattern" | sed 's/\\/\\\\/g' | sed 's#[]/.+*?(){}|^$[]#\\&#g')"
-        printf 'Wait+Screen@%ss /%s/\n' "$timeout" "$esc" >> "$E2E_TAPE"
+        esc="$(printf '%s' "$pattern" | sed 's#[/+?(){}|]#\\&#g')"
+        # vhs captures no frames while `Wait` blocks — a tape that synchronizes
+        # on ten waits and sleeps twice records as a two-second jump-cut past
+        # everything the app was doing. The wait still does the synchronizing;
+        # this dwell is what puts the state it waited for on screen. Keep it
+        # under the 1s max-held-frame budget: consecutive waits that land on
+        # one screen add up, and only a `step_sleep` should ever hold longer.
+        printf 'Wait+Screen@%ss /%s/\nSleep 600ms\n' "$timeout" "$esc" >> "$E2E_TAPE"
     else
         e2e_wait_pane "$pattern" "$((timeout * 10))" \
             || e2e_die "timed out waiting for pane: $pattern"
@@ -493,15 +558,35 @@ e2e_perf_report() {
 e2e_emit_tape() {
     E2E_MODE=demo
     E2E_TAPE="$1"
+    E2E_TAPE_ERR=""
     mkdir -p "$(dirname "$E2E_TAPE")"
+    # VHS sizes the canvas in pixels, so derive it from the columns/rows the
+    # scenario was written against at the standard demo font — the default
+    # 120x40 reproduces scripts/demo's 1920x1080 exactly, and a scenario that
+    # asks for a wider pane gets one instead of silently recording against a
+    # narrower screen (which truncates the very text its waits look for).
+    local width=$((SCENARIO_COLS * 16)) height=$((SCENARIO_ROWS * 27))
+    # …and cap the framerate to what screenshotting that canvas can sustain.
+    # vhs captures through headless Chromium but writes the gif at the nominal
+    # rate regardless, so a starved capture does not drop quality — it makes
+    # the clip *play back sped up*: at the default rate, 8s of scripted Sleep
+    # recorded as 0.84s (21 frames) at 1920x1080. Measured sustainable rates
+    # were ~5 fps at 1920x1080 and ~3 fps at 3520x1080 — near enough a constant
+    # pixel-rate budget, kept deliberately under the measured ceiling because
+    # under-shooting only costs smoothness while over-shooting silently
+    # compresses time. `scripts/demo`'s own tapes need none of this: agg
+    # renders them offline from an asciicast, with no capture to starve.
+    local fps=$((9000000 / (width * height)))
+    [ "$fps" -ge 2 ] || fps=2
     cat > "$E2E_TAPE" <<EOF
 Output target/agent-e2e/demos/$E2E_SCENARIO_NAME.gif
 Output target/agent-e2e/demos/$E2E_SCENARIO_NAME.mp4
 
 Set Shell "bash"
 Set FontSize 18
-Set Width 1920
-Set Height 1080
+Set Width $width
+Set Height $height
+Set Framerate $fps
 Set Padding 16
 Set Theme "Catppuccin Mocha"
 Set PlaybackSpeed 1.0
@@ -514,12 +599,23 @@ Sleep 2s
 Show
 Sleep 1s
 EOF
-    scenario_steps || return 1
-    # Closing beat: linger, then quit so the recording ends on a clean frame.
+    scenario_steps
+    local steps_rc=$?
+    # An unmappable key can't fail the flat step list (see step_key), so the
+    # tape is only trustworthy once every step got written. Checked ahead of
+    # the steps' own status: a bad key *is* a non-zero return when it happens
+    # to be the last step, and reporting only "steps failed" would bury the
+    # one line that says which key and why.
+    [ -z "$E2E_TAPE_ERR" ] \
+        || e2e_die "$E2E_SCENARIO_NAME is not demoable:
+$E2E_TAPE_ERR" || return 1
+    [ "$steps_rc" -eq 0 ] || return 1
+    # Closing beat: linger on the last frame. Deliberately no `Ctrl+Q` — quitting
+    # inside the recording ends every clip on ~1s of bare shell (measured at
+    # 0.07-0.09% ink, which check-pacing.mjs rejects as a leaked teardown). The
+    # TUI is torn down by e2e_teardown afterwards, off camera.
     cat >> "$E2E_TAPE" <<'EOF'
 Sleep 2s
-Ctrl+Q
-Sleep 1s
 EOF
 }
 
@@ -552,6 +648,14 @@ e2e_demo_record() {
     # create, before vhs starts; only vhs's own tooling gets network.
     local vhs_cache="$REPO_ROOT/target/agent-e2e/cache"
     mkdir -p "$vhs_cache"
+    # go-rod caches that browser under `$HOME/.cache/rod` and does NOT honor
+    # the XDG_CACHE_HOME handed to vhs below — and $HOME is the throwaway
+    # sandbox, so every single recording would re-download ~150MB. Point just
+    # that path at a repo-persistent cache; the sandbox stays hermetic because
+    # only vhs's own browser lives there, and the agent's env was frozen into
+    # the tmux server long before.
+    mkdir -p "$vhs_cache/rod" "$HOME/.cache"
+    ln -sfn "$vhs_cache/rod" "$HOME/.cache/rod"
     ( cd "$REPO_ROOT" && env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
         XDG_CACHE_HOME="$vhs_cache" vhs "$E2E_TAPE" )
 }

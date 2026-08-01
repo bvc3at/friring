@@ -163,8 +163,9 @@ actions. Two focus facts scenarios keep tripping over: `Ctrl+H` is a focus *cycl
 **externally while the TUI is already running** (mid-steps `friring-cli session create`) is
 adopted with the session list focused, unlike the pre-boot create; from there `Esc` (or
 `Enter` on the row) drops into the terminal. Assert focus from the pane when in doubt (footer
-focus pill / terminal pane title) instead of assuming it. Demo-able scenarios must stick to
-keys VHS knows (no F-keys; `C-x` → `Ctrl+X`).
+focus pill / terminal pane title) instead of assuming it. Demo-able scenarios must stick to keys
+VHS can actually press, or declare a `SCENARIO_DEMO_KEYS` route for the ones it can't (see
+Demo mode).
 
 Steps run in the bats process with the full sandbox env, so a scenario may also drive
 `friring-cli`, `git`, and the two tmux servers directly from `scenario_steps` — that is how
@@ -172,9 +173,13 @@ multi-session set-ups, external-instance mutations (the multi-instance-sync asse
 TUI-relaunch adoption test are built (`3>&-` on any call that can start a tmux server, like the
 harness's own). Where no pane string exists to wait on, a **bounded poll helper** mirroring
 `e2e_wait_pane` (fixed tries, small sleep, `e2e_die` on exhaustion) is the sanctioned escape
-hatch — never an open-loop sleep. Scenarios built on F-keys, mid-step CLI probes, or a TUI
-relaunch are **test-only**: they say so in their header comment and are simply never listed as
-demos; `SCENARIO_PRECREATE=0` + `step_resolve_session` remains the wizard-flow pattern.
+hatch — never an open-loop sleep. Everything in `scenario_steps` that is *not* a `step_*` runs at
+tape-**generation** time in demo mode, before vhs starts: one-shot setup (a `session create`, a
+seeded task) just lands before the first frame and records fine, but a mid-step poll burns its
+whole timeout against a state that can only happen later, and a mid-step `tmux kill-window` or TUI
+relaunch destroys what the clip was meant to show. Scenarios built on those are **test-only**:
+they say so in their header comment and are simply never listed as demos; `SCENARIO_PRECREATE=0` +
+`step_resolve_session` remains the wizard-flow pattern.
 
 ## Agent profiles
 
@@ -244,9 +249,72 @@ and writes `target/agent-e2e/demos/<name>.{gif,mp4}`. `SCENARIO_DEMO_THEME` seed
 synchronize on `Wait+Screen` instead of open-loop sleeps, so a slow turn can't desync the
 recording; `step_sleep`/`delayMs` control the rhythm.
 
+**Framerate is capped to what the canvas can sustain.** vhs screenshots a headless Chromium but
+writes the gif at the nominal rate whatever it actually captured, so a starved capture does not
+degrade quality — it *compresses time*. Measured: 8s of scripted `Sleep` records as 0.84s (21
+frames) at 1920x1080, 2.08s at 1280x720, and the full 7.6s at 700x300. Sustainable rates were
+~5 fps at 1920x1080 and ~3 fps at 3520x1080 — near enough a constant pixel-rate budget, which
+`Set Framerate` is derived from, deliberately under the measured ceiling (under-shooting costs
+smoothness; over-shooting silently speeds the clip up). The hand-written `scripts/demo` tapes
+are immune: agg renders them offline from an asciicast, with no capture to starve.
+
+**`Wait` synchronizes but does not film.** vhs captures no frames while a `Wait` blocks —
+measured: a tape that types a 4-second command and waits for its output records 2.0s, all of it
+the typing and the trailing `Sleep`. Since a generated tape is mostly waits, that made every
+clip a jump-cut past exactly the part where the app was doing something. Each wait is therefore
+followed by a short dwell (`Sleep 600ms`) that puts the state it waited for on screen; the wait
+still absorbs however long the agent actually took, off camera. Keep explicit `step_sleep` beats
+under the 1s max-held-frame budget, and remember consecutive waits landing on one screen add
+their dwells together.
+
+`scripts/demo/lib/check-pacing.mjs` is worth running over the result (`node
+scripts/demo/lib/check-pacing.mjs target/agent-e2e/demos/*.gif`) — its held-frame, size and
+final-frame-ink checks all apply. Its **opening** metric does not: that one shells out to
+ffmpeg `freezedetect`, which by its own header cannot tell a stall from typing, and on a wide
+low-framerate clip a single typed glyph is far below its threshold — so it reports the scenario
+typing its first prompt as a multi-second frozen opening. Read the first frame before believing
+it. Only `docs/media/` is gated in CI (the `demo-pacing` job); these are review artifacts under
+`target/`.
+
+The closing beat is a lingering `Sleep`, deliberately **not** `Ctrl+Q`: quitting inside the
+recording ends the clip on ~1s of bare shell, which `scripts/demo/lib/check-pacing.mjs` rejects
+as a leaked teardown (measured 0.07–0.09% ink against the 3.4–9.0% of a good final frame). The
+TUI is reaped by `e2e_teardown` afterwards, off camera. Canvas size is derived from the
+scenario's `SCENARIO_COLS`/`SCENARIO_ROWS` at the standard font, so a scenario that declares a
+wide pane records against one — the default 120x40 still yields exactly 1920x1080.
+
+**What VHS can press.** Its key grammar is narrower than tmux's, and — the part that bites —
+narrower than it *claims*: the accepted set below was established by capturing what vhs 0.11.0
+writes to a pty (`stty raw; cat > file`), not by reading its parser.
+
+| tmux key | VHS | Notes |
+|---|---|---|
+| `C-<letter>` | `Ctrl+<L>` | ✔ the control byte |
+| `C-^ \ [ ] - @ .` | `Ctrl+<c>` | ✔ the only punctuation; **no `Ctrl+/`** (tmux `C-_`) |
+| a bare key (`j`, `J`, `2`) | `Type "j"` | ✔ covers `Shift+<letter>`, which arrives as the capital |
+| `Enter Escape Tab` … | same | ✔ |
+| `M-<letter>` | `Alt+<L>` | ✘ **parses, then sends the bare capital** — no ESC prefix |
+| `C-M-<letter>` | `Ctrl+Alt+<L>` | ✘ **parses, then sends nothing at all** |
+| `M-<digit>`, F-keys | — | ✘ rejected by the parser |
+
+The two ✘ rows that *parse* are why `step_key` refuses them rather than mapping them: a tape with
+`Alt+U` in it records cleanly while typing a literal `U` into the agent.
+
+A scenario reaches those keys by declaring `SCENARIO_DEMO_KEYS`, an array of
+`<tmux key>=<tmux key>…` substitutions applied in demo mode only — usually the fork's leader,
+which is a genuine second route to the same action (`"F9=C-f v"`, `"M-u=C-f U"`, `"C-_=C-f /"`).
+Whether a substitution preserves what the clip *shows* is the scenario's judgement, never the
+harness's: `scripted-info-keybind` presses F2 to prove it does **nothing** after a rebind, so
+routing it to that action's leader key would record the opposite of the feature. Declaring
+nothing leaves the scenario test-only, and `--demo` names the key that stopped it — an unmappable
+key fails the tape rather than going silently missing from it.
+
 VHS renders through a headless Chromium (go-rod): a packaged system browser is used when
-present. The dead-proxy vars are dropped for the `vhs` process only — the agent pane's env was
-frozen into the tmux server before vhs starts, so the offline guarantee is unaffected.
+present, else one is downloaded into `target/agent-e2e/cache/rod`, which the sandbox `$HOME`
+symlinks to — go-rod ignores the `XDG_CACHE_HOME` handed to vhs, so without that link every
+single recording would re-fetch ~150 MB into a throwaway home. The dead-proxy vars are dropped
+for the `vhs` process only — the agent pane's env was frozen into the tmux server before vhs
+starts, so the offline guarantee is unaffected.
 
 Tape generation is factored out of recording (`e2e_emit_tape`): `run.sh --emit-tape <scenario>`
 writes the `.tape` and prints its path **without** booting a session or running vhs — pure

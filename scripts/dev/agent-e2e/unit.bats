@@ -68,7 +68,9 @@ JSON
     grep -q '^Set FontSize 18$' "$tape"
     grep -q '^Wait+Screen' "$tape"            # a step_wait_pane mapped to a wait
     grep -q '^Type "Create hello.txt' "$tape" # the prompt was typed
-    grep -q '^Ctrl+Q$' "$tape"                # the closing quit beat
+    grep -q '^Set Width 1920$' "$tape"        # geometry derived from SCENARIO_COLS
+    # No Ctrl+Q: quitting inside the recording ends the clip on a bare shell.
+    ! grep -q '^Ctrl+Q$' "$tape"
 }
 
 @test "demo: named-workspace wizard scenario is fully VHS-mappable (emit-tape)" {
@@ -81,7 +83,6 @@ JSON
     grep -q '^Ctrl+P$' "$tape"                          # parent import
     grep -q '^Ctrl+O$' "$tape"                          # workspace-dir field
     grep -q '^Type "/tmp/friring-e2e/named-ws"$' "$tape" # the custom dir
-    grep -q '^Ctrl+Q$' "$tape"
 }
 
 @test "drift: an unexpected non-message endpoint is surfaced but never fails" {
@@ -104,4 +105,39 @@ JSON
     run e2e_surface_unexpected_endpoints
     [ "$status" -eq 0 ]
     [ ! -f "$REPO_ROOT/target/agent-e2e/unexpected-endpoints.log" ]
+}
+
+@test "demo: a key VHS cannot press fails the tape instead of vanishing from it" {
+    e2e_scenario_load "$AGENT_E2E_DIR/scenarios/claude-tool-loop"
+    # Alt parses in VHS's grammar but sends the bare capital, so mapping it
+    # would type `U` at the agent; F-keys it rejects outright. Both must stop
+    # the tape by name rather than leave a recording that runs to the end
+    # having silently skipped the keypress.
+    scenario_steps() { step_key Enter; step_key M-u; }
+    run e2e_emit_tape "$BATS_TEST_TMPDIR/alt.tape"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"M-u"* ]]
+
+    scenario_steps() { step_key Enter; step_key F9; }
+    run e2e_emit_tape "$BATS_TEST_TMPDIR/fkey.tape"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"F9"* ]]
+}
+
+@test "demo: SCENARIO_DEMO_KEYS routes an unpressable key through the leader" {
+    e2e_scenario_load "$AGENT_E2E_DIR/scenarios/claude-tool-loop"
+    SCENARIO_DEMO_KEYS=("F9=C-f v" "M-u=C-f U")
+    scenario_steps() { step_key F9; step_key M-u; }
+    e2e_emit_tape "$BATS_TEST_TMPDIR/routed.tape"
+    grep -zq 'Ctrl+F\nType "v"\nCtrl+F\nType "U"\n' "$BATS_TEST_TMPDIR/routed.tape"
+}
+
+@test "demo: a wait keeps the regex a scenario wrote, escaping only what RE2 adds" {
+    e2e_scenario_load "$AGENT_E2E_DIR/scenarios/claude-tool-loop"
+    # `.*` and the `\[` a grep needs for a literal bracket mean the same in
+    # RE2; `(` does not, and `/` would close the delimiter.
+    scenario_steps() { step_wait_pane "edit.*out.txt" 9; step_wait_pane " x \[Idle\] (1) a/b" 9; }
+    e2e_emit_tape "$BATS_TEST_TMPDIR/waits.tape"
+    grep -q '^Wait+Screen@9s /edit\.\*out\.txt/$' "$BATS_TEST_TMPDIR/waits.tape"
+    grep -q '^Wait+Screen@9s / x \\\[Idle\\\] \\(1\\) a\\/b/$' "$BATS_TEST_TMPDIR/waits.tape"
 }

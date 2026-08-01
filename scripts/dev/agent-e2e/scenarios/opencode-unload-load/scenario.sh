@@ -16,6 +16,9 @@
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Alt+U unloads opencode to a frozen ghost; Enter loads it back via --continue in the same cwd"
 SCENARIO_AGENT="opencode"
+# VHS cannot press Alt (it emits the bare capital); `<leader> U` is the
+# fork's own second route to the same unload.
+SCENARIO_DEMO_KEYS=("M-u=C-f U")
 # The input-box footer renders "Build · <model> <provider>" once the TUI is
 # interactive — the stable ready marker (verified against opencode 1.17.15).
 SCENARIO_AGENT_READY="Build ·"

@@ -14,6 +14,8 @@
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Code review: comment on working changes, export the compiled review to claude"
 SCENARIO_AGENT="claude"
+# VHS has no F-keys; `<leader> x` is F7's own second route to the review.
+SCENARIO_DEMO_KEYS=("F7=C-f x")
 # The input-box prompt glyph — the stable "ready for input" marker across
 # claude 2.x permission modes (verified against 2.1.207).
 SCENARIO_AGENT_READY="❯"
@@ -49,8 +51,9 @@ scenario_steps() {
     step_wait_pane "Working changes" 15
 
     # Comment on a diff LINE: the cursor reopens on the file header, so walk
-    # rows (file header -> hunk header -> line) before composing. Default
-    # classification is Issue — left as-is.
+    # rows (file header -> hunk header -> line) before composing. Left at the
+    # default classification, which is `Note` (Tab cycles Note -> Issue -> …);
+    # the review-ack fixture keys on the comment body, not the class.
     step_key j
     step_key j
     step_key j
@@ -58,10 +61,10 @@ scenario_steps() {
     step_wait_pane "Compose" 15
     step_type "Please fix this line before merging."
     step_key C-s
-    # Saved-row badge adjacency "[Issue] Please fix…" only exists after the
+    # Saved-row badge adjacency "[Note] Please fix…" only exists after the
     # compose box closed and the comment row rendered (`.` stands for the `]`
     # — a literal `[` would open a grep bracket expression).
-    step_wait_pane "Issue. Please fix this line" 15
+    step_wait_pane "Note. Please fix this line" 15
 
     # Export: closes the review, pastes the compiled markdown into claude with
     # a deferred Enter, and toasts.

@@ -12,7 +12,9 @@
 # respawning, and Enter must load it again.
 #
 # Test-mode only (drives the friring-dev tmux server mid-steps and relaunches
-# the TUI; Alt+U has no VHS key); not demo-able.
+# the TUI — in demo mode those run while the tape is being *generated*, so the
+# kill lands before vhs ever starts and the clip opens on an already-unloaded
+# session); not demo-able. claude-unload-load records the same lifecycle.
 #
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Unload to a frozen ghost, load via resume, and lazy-restore the ghost after the agent window dies"

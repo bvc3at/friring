@@ -671,6 +671,81 @@ echoes stdin back, giving fast model-free scenarios that never skip — and a
 seeded sandbox `settings.toml` (`[features] notifications = false`) so
 blocked-state tests can never fire a real desktop banner. See `docs/E2E.md`.
 
+**The demo half of that promise was mostly untested** — one scenario
+description, two outputs only holds if the second output is exercised, and
+until a clip was asked of every fork feature, `--demo` had been run against a
+handful of plain-text scenarios. Recording the whole set found six defects in
+the tape generator, all of which produced a recording that *completed*:
+
+- **An unmappable key was dropped, not refused.** `step_key` returned 1 into a
+  flat step list that checks nothing, so the keypress silently went missing and
+  the tape ran on — `claude-activity-view` was recording a clip of the activity
+  view that never pressed F9. It now fails the tape and names the key.
+- **VHS's key grammar overstates what it sends.** Captured against a pty
+  (`stty raw; cat > file`), `Alt+<letter>` parses and then emits the *bare
+  capital* — a tape with `Alt+U` in it records cleanly while typing `U` into
+  the agent — and `Ctrl+Alt+<letter>` parses and emits nothing at all. Both are
+  refused now. Alt chords, F-keys and `Ctrl+/` reach a demo through the fork's
+  own leader (`<leader> U`, `<leader> v`, `<leader> /`) via a new per-scenario
+  `SCENARIO_DEMO_KEYS` table — opt-in, because whether a substitution preserves
+  what the clip *shows* is the scenario's judgement: `scripted-info-keybind`
+  presses F2 to prove it does nothing after a rebind, so routing it to that
+  action's leader key would film the opposite of the feature.
+- **Every wait a scenario meant as a regex was flattened to a literal.** Test
+  mode greps (BRE), demo mode matched Go's RE2, and the generator escaped the
+  pattern wholesale — so `edit.*activity-proof.txt` waited for a literal
+  `.` and `*`. The dialects already agree on everything these patterns use, so
+  only the characters BRE takes literally and RE2 does not (`+?(){}|`, plus the
+  `/` delimiter) are escaped now.
+- **The canvas ignored `SCENARIO_COLS`.** Width/Height were pinned at
+  1920x1080 whatever geometry the scenario declared, so a 220-column scenario
+  recorded against ~128 columns and its waits looked for text the pane had
+  truncated. Both are derived from the scenario's columns/rows at the standard
+  font; the default 120x40 still yields exactly 1920x1080.
+- **Every clip played back roughly ten times too fast.** vhs screenshots a
+  headless Chromium but writes the gif at the nominal rate whatever it managed
+  to capture, so a starved capture doesn't drop quality — it compresses time,
+  silently. At 1920x1080 eight seconds of scripted `Sleep` recorded as **0.84s
+  (21 frames)**; the sixteen real clips came out 1–4s long against 9–18s of
+  scripted pacing. It is purely canvas area (700x300 records the full 8s;
+  1280x720 gives 2.08s), and the fix is to cap the framerate to what that area
+  sustains — measured ~5 fps at 1920x1080 and ~3 fps at 3520x1080, so the
+  generator derives it from a pixel-rate budget and stays under the ceiling,
+  since under-shooting costs only smoothness. `scripts/demo`'s own tapes never
+  hit this: agg renders them offline from an asciicast, with no capture to
+  starve.
+- **`Wait` synchronizes but does not film**, on top of that: vhs captures no
+  frames while a wait blocks, and a generated tape is mostly waits. Each wait
+  now carries a short dwell that puts the state it waited for on screen, while
+  the wait still absorbs the agent's real latency off camera. The closing
+  `Ctrl+Q` went with it: quitting inside the recording ended all sixteen clips
+  on ~1s of bare shell, which the fork's own `check-pacing.mjs` rejects as a
+  leaked teardown.
+
+Two smaller ones: go-rod's headless Chromium cached under the *throwaway*
+sandbox `$HOME` (it ignores the `XDG_CACHE_HOME` handed to vhs), so every
+single recording re-downloaded ~150MB — it is symlinked to
+`target/agent-e2e/cache/rod` now.
+
+And one scenario bug, found only because a demo shows what a green test hid:
+`claude-review-export` waited for a saved comment to render `[Issue]` when the
+default classification is `Note`. That never matched — but a `step_wait_pane`
+timeout is not checked by the flat step list either, so in test mode it
+degraded to a silent 15s sleep and the scenario stayed green on its remaining
+asserts (bats hides a passing test's stderr, so the timeout line went
+unread). The demo path had no such cushion: vhs fails the recording on an
+unmet `Wait`. Worth knowing when reading any scenario: **a stale wait costs
+time, not a red test**, so `step_wait_pane` is a synchronization primitive and
+not, on its own, an assertion.
+
+The structural limit this also pinned down: everything in `scenario_steps`
+that is not a `step_*` runs at tape-**generation** time, before vhs starts.
+One-shot setup lands before the first frame and records fine, but a scenario
+whose *narrative* is a mid-step mutation or poll — `scripted-blocked-attention`
+signalling sessions blocked one after another, `scripted-theme-settings`
+rewriting `settings.toml` to watch it live-reload — collapses into its own
+prologue and stays test-only.
+
 #### Stub-driven demo recordings (`scripts/demo/`)
 
 The demo media are recorded against those same loopback stubs instead of real,
