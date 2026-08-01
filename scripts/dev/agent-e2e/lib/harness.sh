@@ -189,6 +189,18 @@ e2e_boot() {
     # ${arr[@]+…}: safe empty-array expansion under set -u on bash 3.2 (macOS).
     agent_seed_config "$E2E_WS" ${SCENARIO_TRUST_DIRS[@]+"${SCENARIO_TRUST_DIRS[@]}"}
 
+    # tmux config the agent panes inherit, written before any server starts (a
+    # server reads ~/.tmux.conf once, at start, and $HOME is the sandbox).
+    # Mirrors scripts/demo/record.sh, and for the same reason: without
+    # focus-events the agent's terminal never learns it has focus, so Claude
+    # Code paints a "tmux focus-events off · add 'set -g focus-events on' to
+    # ~/.tmux.conf" hint across its pane — noise in every artifact, and filmed
+    # in every clip.
+    # Only focus-events: record.sh also pins `default-terminal tmux-256color`,
+    # but under it codex boots to a permanently blank pane here, and the hint
+    # this is here to remove needs nothing but focus-events.
+    printf 'set -g focus-events on\n' > "$HOME/.tmux.conf"
+
     # Perf scenarios make the TUI publish its perf snapshot (counters +
     # frame/tick percentiles) into the sandbox DB for `friring-cli perf`.
     # Exported before the tmux servers start, like the agent env.

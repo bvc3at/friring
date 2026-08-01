@@ -36,5 +36,9 @@ themed `doom`, and the panes talk to models that do not exist (`fable-67`,
 | `scripted-extension-tasks.gif` | Extension lifecycle feeding the tasks panel |
 | `claude-text-turn.gif` | Baseline: a real Claude Code turn through a Friring pane |
 | `claude-tool-loop.gif` | Baseline: a real tool-use loop (`Write`) round-tripping through the stub |
-| `codex-text-turn.gif` | Baseline: codex, proving the registry is agent-neutral |
-| `opencode-text-turn.gif` | Baseline: opencode, same |
+| `opencode-text-turn.gif` | Baseline: opencode, proving the registry is agent-neutral |
+
+`codex-text-turn` is missing on purpose: it passes as a test but its recording
+stalls waiting for codex's `âº` ready glyph on a pane that never paints. Not the
+seeded tmux.conf, not machine load, not a leaked sandbox server — each was ruled
+out — so it needs a look of its own.
