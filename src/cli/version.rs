@@ -51,7 +51,7 @@ pub fn run(args: VersionArgs) -> CommandOutput {
                 ("update", "available".to_string()),
                 (
                     "upgrade",
-                    "curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/main/scripts/install.sh | sh"
+                    "curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | sh"
                         .to_string(),
                 ),
             ]);

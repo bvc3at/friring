@@ -1,4 +1,4 @@
-//! Update check: is a newer thurbox release available?
+//! Update check: is a newer friring release available?
 //!
 //! This is the side-effect half of the **opt-in** version-deployment indicator
 //! (gated behind `[features] version_check`, off by default — see
@@ -7,7 +7,7 @@
 //! - **TUI** — a small "⬆ vX.Y.Z available" badge in the header. The draw loop
 //!   only ever reads a cached result ([`read_cached_status`]); the network
 //!   refresh ([`refresh_cache`]) runs off the render path.
-//! - **CLI** — `thurbox-cli version --check` fetches fresh and reports.
+//! - **CLI** — `friring-cli version --check` fetches fresh and reports.
 //!
 //! The pure decision ([`decide_update`]) is built on the existing
 //! [`compare_versions`] / [`is_dev_version`] helpers, so dev builds
@@ -22,9 +22,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::extension_def::{compare_versions, is_dev_version};
 
-/// GitHub "latest release" endpoint for the thurbox repo (same repo + API as
+/// GitHub "latest release" endpoint for the friring repo (same repo + API as
 /// `scripts/install.sh`).
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Thurbeen/thurbox/releases/latest";
+const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/bvc3at/friring/releases/latest";
 
 /// How long a cached check stays fresh. The TUI reads the cache on startup and
 /// only refreshes over the network once it is older than this, so a normal
@@ -90,7 +90,7 @@ pub fn current_version() -> &'static str {
     crate::agent::extension_config::binary_version()
 }
 
-/// Path to the cache file: `~/.local/share/thurbox/version-check.json`.
+/// Path to the cache file: `~/.local/share/friring/version-check.json`.
 fn cache_path() -> Option<PathBuf> {
     crate::paths::log_directory().map(|d| d.join("version-check.json"))
 }

@@ -9,7 +9,7 @@
     behavioral tests for the two pure helpers exposed for testing -
     Get-Target and Get-ExpectedChecksum.
 
-    install.ps1 guards the installer behind $env:THURBOX_PS_TEST, so dot-sourcing
+    install.ps1 guards the installer behind $env:FRIRING_PS_TEST, so dot-sourcing
     it here defines every function without running Invoke-Install.
 
 .EXAMPLE
@@ -23,14 +23,14 @@
 
 BeforeAll {
     $script:ScriptPath = Join-Path $PSScriptRoot 'install.ps1'
-    $env:THURBOX_PS_TEST = '1'
+    $env:FRIRING_PS_TEST = '1'
     # Dot-source so the helper functions land in this scope; the
-    # THURBOX_PS_TEST guard keeps Invoke-Install from firing.
+    # FRIRING_PS_TEST guard keeps Invoke-Install from firing.
     . $script:ScriptPath
 }
 
 AfterAll {
-    Remove-Item Env:\THURBOX_PS_TEST -ErrorAction SilentlyContinue
+    Remove-Item Env:\FRIRING_PS_TEST -ErrorAction SilentlyContinue
 }
 
 Describe 'install.ps1 source' {
@@ -57,8 +57,15 @@ Describe 'install.ps1 source' {
             Should -BeFalse
     }
 
-    It 'guards the installer behind $env:THURBOX_PS_TEST' {
-        (Get-Content $script:ScriptPath -Raw) | Should -Match 'THURBOX_PS_TEST'
+    It 'guards the installer behind $env:FRIRING_PS_TEST' {
+        (Get-Content $script:ScriptPath -Raw) | Should -Match 'FRIRING_PS_TEST'
+    }
+
+    It 'downloads friring release artifacts from the friring repo' {
+        $src = Get-Content $script:ScriptPath -Raw
+        $src | Should -Match 'bvc3at/friring'
+        $src | Should -Match 'friring-\$ver-\$target\.zip'
+        $src | Should -Match 'friring-\$ver-checksums\.txt'
     }
 
     It 'defines the <Name> function' -ForEach @(
@@ -106,7 +113,7 @@ Describe 'Get-Target' {
 
 Describe 'Get-ExpectedChecksum' {
     BeforeAll {
-        $script:Archive = 'thurbox-v1.2.3-x86_64-pc-windows-msvc.zip'
+        $script:Archive = 'friring-v1.2.3-x86_64-pc-windows-msvc.zip'
         $script:Hash    = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
     }
 
@@ -140,9 +147,9 @@ Describe 'Get-ExpectedChecksum' {
     It 'selects the correct line among several entries' {
         $other = 'a' * 64
         Set-Content -Path $script:Checksums -Value @(
-            "$other  thurbox-v1.2.3-x86_64-unknown-linux-musl.tar.gz"
+            "$other  friring-v1.2.3-x86_64-unknown-linux-musl.tar.gz"
             "$script:Hash  $script:Archive"
-            "$other  thurbox-v1.2.3-aarch64-apple-darwin.tar.gz"
+            "$other  friring-v1.2.3-aarch64-apple-darwin.tar.gz"
         )
         Get-ExpectedChecksum -ChecksumFile $script:Checksums -ArchiveName $script:Archive |
             Should -Be $script:Hash

@@ -3,7 +3,7 @@
 
 [Unit]
 Description=Fire due friring automations every minute
-Documentation=https://github.com/Thurbeen/thurbox
+Documentation=https://github.com/bvc3at/friring
 
 [Timer]
 # First run shortly after login, then every minute.

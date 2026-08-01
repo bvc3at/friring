@@ -1,4 +1,4 @@
-//! `thurbox-cli update` — download, verify, and replace the installed binaries
+//! `friring-cli update` — download, verify, and replace the installed binaries
 //! with the latest GitHub release.
 //!
 //! Gated behind the opt-in `[features] auto_update` flag (off by default, since
@@ -36,7 +36,7 @@ pub fn run(args: UpdateArgs) -> CommandOutput {
                 "update_enabled": false,
                 "summary": hint,
             }),
-            format!("thurbox {current}\n{hint}"),
+            format!("friring {current}\n{hint}"),
         );
     }
 
@@ -46,7 +46,7 @@ pub fn run(args: UpdateArgs) -> CommandOutput {
                 ("from", from.clone()),
                 ("to", to.clone()),
                 ("updated", "true".to_string()),
-                ("note", "restart thurbox to apply".to_string()),
+                ("note", "restart friring to apply".to_string()),
             ]);
             CommandOutput::new(
                 json!({
@@ -54,7 +54,7 @@ pub fn run(args: UpdateArgs) -> CommandOutput {
                     "latest": to,
                     "updated": true,
                     "update_enabled": true,
-                    "summary": format!("Updated {from} → {to}. Restart thurbox to apply."),
+                    "summary": format!("Updated {from} → {to}. Restart friring to apply."),
                 }),
                 human,
             )
@@ -69,7 +69,7 @@ pub fn run(args: UpdateArgs) -> CommandOutput {
                     "summary": "Up to date — running the latest release.",
                 }),
                 format!(
-                "thurbox {current} (latest: {latest})\nUp to date — running the latest release."
+                "friring {current} (latest: {latest})\nUp to date — running the latest release."
             ),
             )
         }
@@ -82,7 +82,7 @@ pub fn run(args: UpdateArgs) -> CommandOutput {
                     "summary": "Development build — skipped. Use --force to update anyway.",
                 }),
                 format!(
-                "thurbox {current}\nDevelopment build — skipped (use --force to update anyway)."
+                "friring {current}\nDevelopment build — skipped (use --force to update anyway)."
             ),
             )
         }
@@ -93,7 +93,7 @@ pub fn run(args: UpdateArgs) -> CommandOutput {
                 "update_enabled": true,
                 "error": e,
             }),
-            format!("thurbox {current}\nUpdate failed: {e}"),
+            format!("friring {current}\nUpdate failed: {e}"),
             format!("update failed: {e}"),
         ),
     }

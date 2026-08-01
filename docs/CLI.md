@@ -48,11 +48,10 @@ friring-cli session list --parent <lead-uuid> --json | jq  # direct children onl
 - **`update`** — downloads, verifies, and replaces the installed binaries with
   the latest release; `--force` bypasses the up-to-date / dev-build guards (gated
   on `[features] auto_update`, off by default; the TUI also runs this silently on
-  startup when the flag is on). **Fork caveat (friring):** `version --check` and
-  `update` retain the upstream **Thurbox** release contract — they query
-  `Thurbeen/thurbox` releases and replace on-disk `thurbox`/`thurbox-cli` assets
-  — so they do **not** update a source-built `friring`; update it by pulling this
-  repo and rebuilding (see `FORK.md`).
+  startup when the flag is on). Both query this fork's releases
+  (`bvc3at/friring`) and replace on-disk `friring` / `friring-cli`. A
+  source-built binary reports `0.0.0-dev` and is skipped unless `--force`; update
+  it by pulling this repo and rebuilding.
 - **`notify`** — diagnose OS desktop notifications: prints the detected delivery
   backend and last error; `--test` fires a sample. See the OS Notifications
   section of `docs/FEATURES.md`.

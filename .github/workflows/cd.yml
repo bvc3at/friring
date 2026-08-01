@@ -259,228 +259,62 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Publish the Arch Linux AUR packages.
-  # Runs after `publish` so the GitHub Release assets (needed by thurbox-bin)
-  # and the tag's source tarball (needed by thurbox) are both available.
-  # Requires the AUR_SSH_PRIVATE_KEY secret; skipped automatically if unset.
-  publish-aur:
-    name: Publish AUR (${{ matrix.pkgname }})
-    needs: [check-release, create-tag, publish]
-    # Upstream-only: the fork republishes friring-* binaries but reuses upstream's
-    # package-manager channels (the thurbox/thurbox-bin AUR packages are theirs).
-    if: needs.check-release.outputs.should_release == 'true' && github.repository == 'Thurbeen/thurbox'
-    runs-on: ubuntu-latest
-    # Hoisted so the publish step can be skipped when the secret is unset
-    # (the `secrets` context cannot be used directly in an `if` condition).
-    env:
-      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-    strategy:
-      fail-fast: false
-      matrix:
-        pkgname: [thurbox, thurbox-bin]
-    steps:
-      - name: Checkout code at tag
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ needs.check-release.outputs.version }}
-
-      - name: Bump pkgver to the release version
-        run: |
-          PKGVER="${{ needs.check-release.outputs.version }}"
-          PKGVER="${PKGVER#v}"   # PKGBUILD pkgver is the bare semver
-          PKGBUILD="packaging/aur/${{ matrix.pkgname }}/PKGBUILD"
-          sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" "$PKGBUILD"
-          sed -i "s/^pkgrel=.*/pkgrel=1/" "$PKGBUILD"
-          echo "Set ${{ matrix.pkgname }} to pkgver=${PKGVER}"
-
-      - name: Publish to the AUR
-        if: env.AUR_SSH_PRIVATE_KEY != ''
-        uses: KSXGitHub/github-actions-deploy-aur@da03e160361ce01bf087e790b6ffd196d7dccff7 # v4.1.3
-        with:
-          pkgname: ${{ matrix.pkgname }}
-          pkgbuild: packaging/aur/${{ matrix.pkgname }}/PKGBUILD
-          updpkgsums: true   # recompute sha256sums from the freshly released sources
-          commit_username: thurbox-release-bot
-          commit_email: magicletur@protonmail.com
-          ssh_private_key: ${{ env.AUR_SSH_PRIVATE_KEY }}
-          commit_message: "Update to ${{ needs.check-release.outputs.version }}"
-
-  # Publish the Homebrew formula to the tap (Thurbeen/homebrew-thurbox).
-  # Runs after `publish` so the release tarballs + checksums.txt exist.
-  # Pushes over SSH using HOMEBREW_TAP_DEPLOY_KEY — a write-enabled deploy key
-  # registered on the tap repo (the Thurbeen org blocks cross-repo PATs, so a
-  # repo-scoped deploy key is the credential). Skipped automatically if the
-  # secret is unset (e.g. on forks).
+  # Publish the Homebrew formula.
+  #
+  # This repo doubles as its own tap — Homebrew reads formulae from a tap's
+  # `HomebrewFormula/` directory — so "publishing" is just bumping the formula
+  # on `main` to the release that was cut above:
+  #
+  #   brew tap bvc3at/friring https://github.com/bvc3at/friring
+  #   brew install friring
+  #
+  # Runs after `publish` so the release tarballs + checksums.txt exist. The bump
+  # lands as a `chore` commit (not releasable to cocogitto) carrying `[skip ci]`,
+  # so pushing it back to `main` cannot start another release.
   publish-homebrew:
     name: Publish Homebrew formula
     needs: [check-release, create-tag, publish]
-    # Upstream-only: the Thurbeen/homebrew-thurbox tap is upstream's. See publish-aur.
-    if: needs.check-release.outputs.should_release == 'true' && github.repository == 'Thurbeen/thurbox'
-    runs-on: ubuntu-latest
-    # Hoisted so the push step can be skipped when the secret is unset
-    # (the `secrets` context cannot be used directly in an `if` condition).
-    env:
-      HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+    if: needs.check-release.outputs.should_release == 'true'
+    runs-on: k3s-arc
+    permissions:
+      contents: write  # Required to push the formula bump to main
     steps:
-      - name: Checkout code at tag
+      # Checked out at `main`, not at the tag: the bump is a new commit on the
+      # branch tap users track. persist-credentials (default) leaves the token
+      # in place for the push.
+      - name: Checkout main
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          ref: ${{ needs.check-release.outputs.version }}
+          ref: main
 
       - name: Download release checksums
-        if: env.HOMEBREW_TAP_DEPLOY_KEY != ''
         run: |
           VERSION="${{ needs.check-release.outputs.version }}"
-          curl -fsSL -o checksums.txt \
-            "https://github.com/${{ github.repository }}/releases/download/${VERSION}/thurbox-${VERSION}-checksums.txt"
-          cat checksums.txt
+          # Downloaded outside the work tree so the bump commit stays formula-only.
+          curl -fsSL -o "${RUNNER_TEMP}/checksums.txt" \
+            "https://github.com/${{ github.repository }}/releases/download/${VERSION}/friring-${VERSION}-checksums.txt"
+          cat "${RUNNER_TEMP}/checksums.txt"
 
       - name: Bump formula to the release version
-        if: env.HOMEBREW_TAP_DEPLOY_KEY != ''
         run: |
           python3 packaging/homebrew/bump-formula.py \
             "${{ needs.check-release.outputs.version }}" \
-            packaging/homebrew/Formula/thurbox.rb \
-            checksums.txt
-          cat packaging/homebrew/Formula/thurbox.rb
+            HomebrewFormula/friring.rb \
+            "${RUNNER_TEMP}/checksums.txt"
+          cat HomebrewFormula/friring.rb
 
-      - name: Push formula to the tap
-        if: env.HOMEBREW_TAP_DEPLOY_KEY != ''
+      - name: Push the bump to main
         run: |
           VERSION="${{ needs.check-release.outputs.version }}"
-          mkdir -p ~/.ssh
-          printf '%s\n' "$HOMEBREW_TAP_DEPLOY_KEY" > ~/.ssh/tap_key
-          chmod 600 ~/.ssh/tap_key
-          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes"
-          git clone --depth 1 git@github.com:Thurbeen/homebrew-thurbox.git tap
-          mkdir -p tap/Formula
-          cp packaging/homebrew/Formula/thurbox.rb tap/Formula/thurbox.rb
-          cd tap
-          git config user.name thurbox-release-bot
-          git config user.email magicletur@protonmail.com
-          if git diff --quiet; then
+          if git diff --quiet -- HomebrewFormula/friring.rb; then
             echo "Formula already up to date; nothing to push."
             exit 0
           fi
-          git add Formula/thurbox.rb
-          git commit -m "Update to ${VERSION}"
-          git push origin HEAD
-
-  # Publish the Chocolatey package to the community repo.
-  # Runs after `publish` so the release zip + checksums.txt exist. The choco CLI
-  # is Windows-only, so this runs on windows-latest. Requires the
-  # CHOCOLATEY_API_KEY secret; skipped automatically if unset (e.g. on forks).
-  # New versions are held for community-repo moderation before going live.
-  publish-chocolatey:
-    name: Publish Chocolatey package
-    needs: [check-release, create-tag, publish]
-    # Upstream-only: the thurbox Chocolatey package id is upstream's. See publish-aur.
-    if: needs.check-release.outputs.should_release == 'true' && github.repository == 'Thurbeen/thurbox'
-    runs-on: windows-latest
-    # Hoisted so the steps can be skipped when the secret is unset
-    # (the `secrets` context cannot be used directly in an `if` condition).
-    env:
-      CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
-    steps:
-      - name: Checkout code at tag
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ needs.check-release.outputs.version }}
-
-      - name: Download release checksums
-        if: env.CHOCOLATEY_API_KEY != ''
-        shell: pwsh
-        run: |
-          $version = "${{ needs.check-release.outputs.version }}"
-          $repo = "${{ github.repository }}"
-          Invoke-WebRequest -UseBasicParsing `
-            -Uri "https://github.com/$repo/releases/download/$version/thurbox-$version-checksums.txt" `
-            -OutFile checksums.txt
-          Get-Content checksums.txt
-
-      - name: Bump package to the release version
-        if: env.CHOCOLATEY_API_KEY != ''
-        shell: pwsh
-        run: |
-          python packaging/chocolatey/bump-nuspec.py `
-            "${{ needs.check-release.outputs.version }}" `
-            packaging/chocolatey `
-            checksums.txt
-          Get-Content packaging/chocolatey/thurbox.nuspec
-          Get-Content packaging/chocolatey/tools/chocolateyinstall.ps1
-
-      - name: Pack the package
-        if: env.CHOCOLATEY_API_KEY != ''
-        shell: pwsh
-        run: |
-          # Version is read from the bumped nuspec — do not pass --version.
-          choco pack packaging/chocolatey/thurbox.nuspec --outputdirectory packaging/chocolatey
-
-      - name: Push to the Chocolatey community repo
-        if: env.CHOCOLATEY_API_KEY != ''
-        shell: pwsh
-        run: |
-          $nupkg = Get-ChildItem packaging/chocolatey/thurbox.*.nupkg | Select-Object -First 1
-          choco push $nupkg.FullName --source https://push.chocolatey.org/ --api-key $env:CHOCOLATEY_API_KEY
-
-  # Submit the winget manifests to microsoft/winget-pkgs.
-  # Runs after `publish` so the release zip + checksums.txt exist. wingetcreate
-  # is Windows-only, so this runs on windows-latest. Requires the WINGET_TOKEN
-  # secret (a classic PAT with `public_repo` scope that can fork/PR against
-  # microsoft/winget-pkgs); skipped automatically if unset (e.g. on forks).
-  # New versions go through winget-pkgs PR review before going live.
-  publish-winget:
-    name: Publish winget manifest
-    needs: [check-release, create-tag, publish]
-    # Upstream-only: the Thurbeen.thurbox winget id is upstream's. See publish-aur.
-    if: needs.check-release.outputs.should_release == 'true' && github.repository == 'Thurbeen/thurbox'
-    runs-on: windows-latest
-    # Hoisted so the steps can be skipped when the secret is unset
-    # (the `secrets` context cannot be used directly in an `if` condition).
-    env:
-      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
-    steps:
-      - name: Checkout code at tag
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ needs.check-release.outputs.version }}
-
-      - name: Download release checksums
-        if: env.WINGET_TOKEN != ''
-        shell: pwsh
-        run: |
-          $version = "${{ needs.check-release.outputs.version }}"
-          $repo = "${{ github.repository }}"
-          Invoke-WebRequest -UseBasicParsing `
-            -Uri "https://github.com/$repo/releases/download/$version/thurbox-$version-checksums.txt" `
-            -OutFile checksums.txt
-          Get-Content checksums.txt
-
-      - name: Bump manifests to the release version
-        if: env.WINGET_TOKEN != ''
-        shell: pwsh
-        run: |
-          python packaging/winget/bump-manifests.py `
-            "${{ needs.check-release.outputs.version }}" `
-            packaging/winget/manifests `
-            checksums.txt
-          Get-Content packaging/winget/manifests/Thurbeen.thurbox.installer.yaml
-
-      - name: Install wingetcreate
-        if: env.WINGET_TOKEN != ''
-        shell: pwsh
-        run: |
-          Invoke-WebRequest -UseBasicParsing `
-            -Uri https://aka.ms/wingetcreate/latest `
-            -OutFile wingetcreate.exe
-
-      # `submit` validates the bumped manifests and opens a PR against
-      # microsoft/winget-pkgs from a fork of the WINGET_TOKEN account. Works for
-      # both the first submission and every subsequent version from the same
-      # in-repo manifest set.
-      - name: Submit manifests to winget-pkgs
-        if: env.WINGET_TOKEN != ''
-        shell: pwsh
-        run: |
-          .\wingetcreate.exe submit --token $env:WINGET_TOKEN packaging/winget/manifests
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git commit -m "chore(fork): bump Homebrew formula to ${VERSION} [skip ci]" \
+            -- HomebrewFormula/friring.rb
+          # `main` may have moved while the release was building; rebase once
+          # rather than failing a published release on a benign race.
+          git pull --rebase origin main
+          git push origin HEAD:main

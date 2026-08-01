@@ -2341,11 +2341,9 @@ network — see *Feature Flags*) cover staying current:
 Both are off by default so a fresh install makes **no** network calls and
 never mutates its own binary unless the user asks.
 
-**Fork caveat (friring):** version-check and self-update deliberately retain the
-upstream **Thurbox** release contract — they query `Thurbeen/thurbox` releases
-and replace on-disk `thurbox`/`thurbox-cli` assets — so they do **not** update a
-source-built `friring`. Update friring by pulling this repo and rebuilding (see
-`FORK.md`'s Migration section).
+Both target this fork's own releases (`bvc3at/friring`) and its `friring` /
+`friring-cli` assets. A source build reports `0.0.0-dev`, which never
+auto-updates — pull this repo and rebuild instead.
 
 ---
 

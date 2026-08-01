@@ -31,20 +31,22 @@ As of July 2026 the plumbing is renamed too. The app's own identifiers are now
 (`~/.local/share/friring/friring.db`), the tmux socket (`tmux -L friring`), and
 the `FRIRING_*` env vars.
 
+Friring's own distribution is renamed along with it: `cd.yml` publishes
+`friring-*` release binaries, `scripts/install.{sh,ps1}` and the Homebrew
+formula fetch them from `bvc3at/friring`, and self-update / version-check query
+the same repo (see [Documentation / branding](#documentation--branding)).
+
 What still says `thurbox` is deliberate, and splits in two:
 
-- **Upstream attribution** — the repo URLs, badges, `LICENSE`, and provenance
-  notes point at [`Thurbeen/thurbox`](https://github.com/Thurbeen/thurbox) and
-  stay as-is (this is a fork, and the credit is upstream's).
-- **Upstream distribution machinery** — Friring cuts its **own** GitHub Releases
-  (`friring-*` binaries via `cd.yml`; see [CI / automation](#ci--automation)),
-  but reuses upstream's package-manager channels and website rather than
-  republishing them. So everything that fetches or ships an *upstream* artifact
-  keeps the upstream name: `packaging/` registry manifests, `scripts/install.*`,
-  the `pages.yml` workflow, `website/`, the self-update / version-check code, the
-  `min_thurbox_version` extension-manifest key (a wire format shared with
-  upstream), and the `tb-` / `tbs-` tmux window prefixes (brand-neutral, kept for
-  live-window compatibility).
+- **Upstream attribution** — the `LICENSE`, provenance notes, and the website /
+  quality-gate badges point at
+  [`Thurbeen/thurbox`](https://github.com/Thurbeen/thurbox) and stay as-is (this
+  is a fork, and the credit is upstream's).
+- **Upstream-owned surfaces and shared formats** — the `pages.yml` workflow and
+  `website/` (dormant here), the extension payloads a bare-name `extension
+  install` fetches from upstream, the `min_thurbox_version` extension-manifest
+  key (a wire format shared with upstream), and the `tb-` / `tbs-` tmux window
+  prefixes (brand-neutral, kept for live-window compatibility).
 
 The tradeoff the branding-only approach used to avoid is now real: upstream
 merges carry rename conflicts on the renamed identifiers, and an existing
@@ -1042,19 +1044,39 @@ already cover the case it was meant to serve.
   flipped from `thurbox` to `friring`: the `friring` / `friring-cli` binaries,
   the crate, `~/.config/friring`, `~/.local/share/friring/friring.db`, the
   `tmux -L friring` socket, and the `FRIRING_*` env vars. What deliberately
-  still says `thurbox`: upstream **attribution** (repo URLs, `LICENSE`,
-  provenance, badges) and the upstream **distribution machinery** the fork
-  reuses rather than republishes — `packaging/` registry manifests,
-  `scripts/install.*`, the `pages.yml` workflow, `website/`, the self-update /
-  version-check code, the `min_thurbox_version` manifest key, and the `tb-` /
-  `tbs-` tmux window prefixes (`cd.yml` is the exception — the fork cuts its own
-  `friring-*` releases). See [Migration](#migration); upstream merges now carry
-  rename conflicts on the renamed identifiers.
-- `README.md` and the agent-guide prose call the project **Friring**; the repo
-  URLs, install commands, badges, and packaging still point at upstream (that's
-  attribution and shared distribution, not a rename target).
-- A fork notice at the top of `README.md` explains the fork, the name, and that
-  all links intentionally point upstream.
+  still says `thurbox`: upstream **attribution** (`LICENSE`, provenance, the
+  website / quality-gate badges) and upstream-owned surfaces the fork does not
+  republish — the `pages.yml` workflow, `website/`, upstream extension payloads,
+  the `min_thurbox_version` manifest key, and the `tb-` / `tbs-` tmux window
+  prefixes. See [Migration](#migration); upstream merges now carry rename
+  conflicts on the renamed identifiers.
+- **Own install surface (August 2026).** The fork stopped reusing upstream's
+  installers and package channels, so nothing it ships installs a `thurbox`
+  binary any more:
+  - `scripts/install.sh` / `install.ps1` fetch `friring-*` archives from
+    `bvc3at/friring` and install `friring` / `friring-cli`; the PowerShell
+    installer's env vars are now `FRIRING_VERSION` / `FRIRING_INSTALL_DIR` /
+    `FRIRING_REPO` / `FRIRING_PS_TEST` and its default install dir is
+    `%LOCALAPPDATA%\Programs\friring`.
+  - Self-update and version-check (`friring-cli update`, `version --check`,
+    the header badge) query this repo's releases and replace `friring` /
+    `friring-cli`; `cog.toml`'s changelog links resolve here too (upstream has
+    none of these SHAs).
+  - **Homebrew is the only package channel**, and this repo *is* the tap:
+    `HomebrewFormula/friring.rb` at the root (Homebrew reads a tap's root,
+    `Formula/` or `HomebrewFormula/`), installed with
+    `brew tap bvc3at/friring https://github.com/bvc3at/friring`. The
+    `publish-homebrew` job bumps it from the release checksums and commits it
+    back to `main` — no tap repo, no secrets.
+  - Upstream's AUR / Chocolatey / winget manifests and their publish jobs were
+    **deleted**: they carry upstream's package identities (`thurbox`,
+    `thurbox-bin`, `Thurbeen.thurbox`), which this fork cannot publish under.
+    Upstream merges touching those paths now conflict as delete/modify.
+- `README.md` and the agent-guide prose call the project **Friring**, and so do
+  the install commands; what still points at upstream is attribution and the
+  shared formats above.
+- A fork notice at the top of `README.md` explains the fork, the name, and what
+  still points upstream.
 - **Agent-guide layout.** Upstream keeps one large `CLAUDE.md`. On the fork the
   always-loaded brief is a lean **`AGENTS.md`** (root) with **`CLAUDE.md` a
   symlink** to it, and the former monolith's detail was moved into on-demand
@@ -1074,17 +1096,14 @@ fork.
 
 - `.github/workflows/pages.yml` (GitHub Pages) — dormant; the fork has no Pages
   site.
-- `.github/workflows/cd.yml` (Release) — **active on the fork.** Every push to
-  `main` that includes a `feat` / `fix` / `perf` commit cuts a tag
-  (`cog bump --auto`) and publishes a GitHub Release with cross-platform
-  `friring-*` binaries + a checksums file — this needs only the built-in
-  `GITHUB_TOKEN`. The four package-manager publish jobs
-  (AUR / Homebrew / Chocolatey / winget) stay guarded to `Thurbeen/thurbox`:
-  those channels carry upstream's identity and the fork has no accounts or
-  secrets for them. Two things still point upstream — changelog compare links
-  (`cog.toml` `owner`/`repository`) and `scripts/install.*` (which fetch
-  `thurbox-*` from upstream); grab the fork's binaries from its Releases page
-  directly.
+- `.github/workflows/cd.yml` (Release) — **active on the fork, end to end.**
+  Every push to `main` that includes a `feat` / `fix` / `perf` commit cuts a tag
+  (`cog bump --auto`), publishes a GitHub Release with cross-platform
+  `friring-*` binaries + a checksums file, and then bumps
+  `HomebrewFormula/friring.rb` to that release and commits it back to `main`.
+  All of it needs only the built-in `GITHUB_TOKEN`. Upstream's AUR / Chocolatey
+  / winget publish jobs were deleted along with their manifests — those channels
+  carry upstream's package identity and the fork has no accounts for them.
 - `.github/workflows/ci.yml` — the `sonarqube` job is dormant; SonarQube is not
   set up for the fork at the moment. The `changes` (paths-filter) job also grants
   `pull-requests: read`, which a **private** repo's default token lacks (public
@@ -1092,11 +1111,12 @@ fork.
 - **Linux CI/CD jobs run on the self-hosted `k3s-arc` runner.** Every
   fork-active Linux job in `ci.yml` and `cd.yml` targets `runs-on: k3s-arc` —
   an Actions Runner Controller scale set on k3s — instead of GitHub-hosted
-  `ubuntu-latest`. The upstream-only jobs stay on plain `ubuntu-latest` — they
-  never run on the fork and upstream has no `k3s-arc` runner: `pages.yml`'s
-  deploy, `ci.yml`'s `sonarqube`, and `cd.yml`'s `publish-aur` /
-  `publish-homebrew`. The Windows / macOS jobs and the release build matrix are
-  unchanged — a Linux ARC runner can't service them.
+  `ubuntu-latest` — including `cd.yml`'s `publish-homebrew`, whose formula bump
+  needs `python3` on the runner. The upstream-only jobs stay on plain
+  `ubuntu-latest` — they never run on the fork and upstream has no `k3s-arc`
+  runner: `pages.yml`'s deploy and `ci.yml`'s `sonarqube`. The Windows / macOS
+  jobs and the release build matrix are unchanged — a Linux ARC runner can't
+  service them.
 - **`demo-pacing` job (fork-only).** Checks `docs/media/*.gif` against the
   pacing budget on any change under `docs/media/` or `scripts/demo/`. The media
   is recorded by hand on a workstation, so nothing else would catch a clip that
@@ -1158,9 +1178,9 @@ you lose whatever it writes mid-copy.
    you set in shell rc files, agent wrappers, or hooks: `THURBOX_CONFIG_DIR`,
    `THURBOX_DATA_DIR`, `THURBOX_SOCKET`, `THURBOX_SESSION`, `THURBOX_SESSION_ID`,
    `THURBOX_TASK`, `THURBOX_METRICS_DIR`, `THURBOX_PERF_LOG` → `FRIRING_*`.
-   Variables read by the **retained upstream** installer / release tooling keep
-   the `THURBOX_` prefix — leave `THURBOX_VERSION`, `THURBOX_INSTALL_DIR`,
-   `THURBOX_REPO`, `THURBOX_PS_TEST`, and `THURBOX_RELEASE_VERSION` as-is.
+   The Windows installer's variables moved too (August 2026): `THURBOX_VERSION`,
+   `THURBOX_INSTALL_DIR`, `THURBOX_REPO`, `THURBOX_PS_TEST` → `FRIRING_*`. The
+   release build already used `FRIRING_RELEASE_VERSION`.
 
 5. **Automation units** — reinstall your systemd / launchd units under the new
    `friring` names and disable the old `thurbox` ones.
@@ -1177,6 +1197,9 @@ you lose whatever it writes mid-copy.
    install ./extensions/<name>`). Bare-name / upstream-URL installs fetch
    upstream **Thurbox** payloads that call `thurbox-cli`.
 
-8. **Self-update** — the self-update / version-check paths still track upstream
-   **Thurbox** releases and aren't meaningful for a source-built `friring`;
-   update by pulling this repo and rebuilding.
+8. **Self-update** — self-update and version-check now track *this* fork's
+   releases and replace `friring` / `friring-cli`, so an installed release keeps
+   itself current. A source build reports `0.0.0-dev` and is skipped; update it
+   by pulling this repo and rebuilding. Remove the old `thurbox` binaries
+   (`rm ~/.local/bin/thurbox ~/.local/bin/thurbox-cli`) once nothing needs them
+   — nothing prunes them for you.

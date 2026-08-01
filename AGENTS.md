@@ -31,17 +31,19 @@ Two rules matter when working here:
 - **The plumbing is renamed to `friring` (July 2026).** The binaries
   (`friring`/`friring-cli`), the crate, config dir (`~/.config/friring`), data
   dir + DB (`~/.local/share/friring/friring.db`), tmux socket (`-L friring`),
-  and `FRIRING_*` env vars are all `friring` now. What still says `thurbox` is
-  deliberate: upstream **attributions** (repo URLs, `LICENSE`, provenance) and
-  the upstream **distribution machinery** the fork reuses rather than
-  republishes — `packaging/` registry manifests, `scripts/install.*`,
-  `pages.yml`, `website/`, self-update / version-check code, the
-  `min_thurbox_version` manifest key, and the `tb-`/`tbs-` tmux window prefixes.
-  (`cd.yml` is the exception: the fork **does** cut its own `friring-*` release
-  binaries — see `FORK.md` → CI / automation.)
+  and `FRIRING_*` env vars are all `friring` now. So is the fork's **own
+  distribution** (August 2026): `cd.yml` releases `friring-*` binaries,
+  `scripts/install.*` and `HomebrewFormula/friring.rb` (this repo doubles as its
+  own brew tap) fetch them from `bvc3at/friring`, and self-update /
+  version-check query the same repo. What still says `thurbox` is deliberate:
+  upstream **attribution** (`LICENSE`, provenance, the website/Sonar badges) and
+  upstream-owned surfaces — `pages.yml`, `website/`, upstream extension
+  payloads, the `min_thurbox_version` manifest key, and the `tb-`/`tbs-` tmux
+  window prefixes.
   Upstream merges now carry rename conflicts; resolve them toward `friring` for
-  this app's own identifiers, leaving the attribution/distribution names as
-  upstream.
+  this app's own identifiers and distribution, leaving the attribution names as
+  upstream. Upstream's AUR/Chocolatey/winget manifests were deleted here, so
+  merges touching them conflict as delete/modify — keep them deleted.
 - **Log every divergence in [`FORK.md`](FORK.md).** Whenever a change makes this
   fork behave differently from upstream (a new feature, a changed default, a
   guarded workflow), add a bullet under its "Differences from upstream" section

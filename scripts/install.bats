@@ -111,28 +111,37 @@
   grep -q "INSTALL_DIR" "${BATS_TEST_DIRNAME}/install.sh"
 }
 
-@test "do_install succeeds with only the thurbox binary in tarball" {
+@test "do_install succeeds with only the friring binary in tarball" {
   tmpdir=$(mktemp -d)
   mkdir -p "$tmpdir/src" "$tmpdir/dest"
-  printf '#!/bin/sh\n' > "$tmpdir/src/thurbox"
-  tar -czf "$tmpdir/archive.tar.gz" -C "$tmpdir/src" thurbox
+  printf '#!/bin/sh\n' > "$tmpdir/src/friring"
+  tar -czf "$tmpdir/archive.tar.gz" -C "$tmpdir/src" friring
   TEST_TMPDIR=1 sh -c ". '${BATS_TEST_DIRNAME}/install.sh'; do_install '$tmpdir/archive.tar.gz' '$tmpdir/dest'"
-  [ -x "$tmpdir/dest/thurbox" ]
+  [ -x "$tmpdir/dest/friring" ]
   rm -rf "$tmpdir"
 }
 
-@test "do_install chmods both binaries when thurbox-cli is present" {
+@test "do_install chmods both binaries when friring-cli is present" {
   tmpdir=$(mktemp -d)
   mkdir -p "$tmpdir/src" "$tmpdir/dest"
-  printf '#!/bin/sh\n' > "$tmpdir/src/thurbox"
-  printf '#!/bin/sh\n' > "$tmpdir/src/thurbox-cli"
-  tar -czf "$tmpdir/archive.tar.gz" -C "$tmpdir/src" thurbox thurbox-cli
+  printf '#!/bin/sh\n' > "$tmpdir/src/friring"
+  printf '#!/bin/sh\n' > "$tmpdir/src/friring-cli"
+  tar -czf "$tmpdir/archive.tar.gz" -C "$tmpdir/src" friring friring-cli
   TEST_TMPDIR=1 sh -c ". '${BATS_TEST_DIRNAME}/install.sh'; do_install '$tmpdir/archive.tar.gz' '$tmpdir/dest'"
-  [ -x "$tmpdir/dest/thurbox" ]
-  [ -x "$tmpdir/dest/thurbox-cli" ]
+  [ -x "$tmpdir/dest/friring" ]
+  [ -x "$tmpdir/dest/friring-cli" ]
   rm -rf "$tmpdir"
 }
 
-@test "script conditionally chmods thurbox-cli" {
-  grep -q 'thurbox-cli.*chmod' "${BATS_TEST_DIRNAME}/install.sh"
+@test "script conditionally chmods friring-cli" {
+  grep -q 'friring-cli.*chmod' "${BATS_TEST_DIRNAME}/install.sh"
+}
+
+@test "script downloads from the friring repo" {
+  grep -q 'REPO:-bvc3at/friring' "${BATS_TEST_DIRNAME}/install.sh"
+}
+
+@test "script names friring release artifacts" {
+  grep -q 'friring-\${version}-\${target}' "${BATS_TEST_DIRNAME}/install.sh"
+  grep -q 'friring-\${version}-checksums.txt' "${BATS_TEST_DIRNAME}/install.sh"
 }

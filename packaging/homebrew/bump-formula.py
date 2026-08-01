@@ -6,7 +6,7 @@ Usage: bump-formula.py <version> <formula.rb> <checksums.txt>
 Rewrites the formula's `version "..."` and each per-platform `sha256 "..."` to
 match the freshly published release. The url lines use `#{version}`
 interpolation, so each artifact's target triple is read from the url and the
-real filename (`thurbox-v<version>-<target>.tar.gz`) is looked up in the
+real filename (`friring-v<version>-<target>.tar.gz`) is looked up in the
 release `checksums.txt`. Exits non-zero if a url has no matching checksum, so
 CI fails loudly rather than pushing a stale/partial formula.
 """
@@ -36,14 +36,14 @@ def main() -> int:
         return 1
 
     pattern = re.compile(
-        r'(?P<url>url "[^"]*thurbox-v#\{version\}-(?P<target>[^"]+?)\.tar\.gz")'
+        r'(?P<url>url "[^"]*friring-v#\{version\}-(?P<target>[^"]+?)\.tar\.gz")'
         r'(?P<gap>\s*)sha256 "[0-9a-f]*"'
     )
 
     missing = []
 
     def repl(m: "re.Match[str]") -> str:
-        fname = f"thurbox-v{version}-{m.group('target')}.tar.gz"
+        fname = f"friring-v{version}-{m.group('target')}.tar.gz"
         sha = checks.get(fname)
         if sha is None:
             missing.append(fname)
