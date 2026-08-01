@@ -1019,15 +1019,19 @@ already cover the case it was meant to serve.
   chips around them. Both blocks are now fitted to the same column budget and
   painted into **disjoint** rects (`ui::status_bar::render_footer`), degrading in
   order: the pills' ` · ` separators first (` Help · F1 ` → ` Help F1 `), then
-  the left-hand text segment by segment (least useful first — the key hints,
-  then the counts; the focus label and the `◆ N blocked` badge are the last
-  text standing), then the optional panel-toggle pills as a set, and finally the
-  pill labels themselves, leaving key-only chips (` F1 `) so the freed columns
-  go back to the text. The armed-leader badge is pinned: the pills make room for
-  it instead. The file viewer's navigation hints, previously right-aligned into
-  whatever room was left of the buttons — where they overlapped the left-hand
-  text rather than the pills — are segments in the same flow now, trimming from
-  their tail (`n/N Next/Prev` goes long before `j/k Move`).
+  the left-hand text segment by segment (the global `^H/^L Focus ^O Open` hints,
+  then the counts, then the file viewer's hints, then the focus label, and last
+  the `◆ N blocked` badge), then the optional panel-toggle pills as a set, and
+  finally the pill labels themselves, leaving key-only chips (` F1 `) so the
+  freed columns go back to the text. The armed-leader badge is pinned: the pills
+  make room for it instead. The file viewer's navigation hints, previously
+  right-aligned into whatever room was left of the buttons — where they
+  overlapped the left-hand text rather than the pills — are segments in the same
+  flow now, trimming from their tail (`n/N Next/Prev` goes long before
+  `j/k Move`); they deliberately **outrank the counts**, because while the
+  viewer is open they are the live guidance for the pane being driven and
+  nothing else on screen carries them, where the session count is also in the
+  sidebar.
 
 ### Performance
 

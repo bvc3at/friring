@@ -387,12 +387,18 @@ fn push_status_message<'a>(spans: &mut Vec<Span<'a>>, msg: &'a StatusMessage) {
 const PRIO_PINNED: u8 = 0;
 const PRIO_BLOCKED: u8 = 1;
 const PRIO_FOCUS: u8 = 2;
-/// The file-viewer hints trim from the tail (`+ index`), so `j/k Move` outlives
-/// `n/N Next/Prev`.
+/// The file viewer's hints **outrank the counts below** — they are contextual
+/// state, not ambient: while the viewer is open they are the live guidance for
+/// the pane the user is driving, and nothing else on screen carries them, where
+/// the session count is also in the sidebar. So a narrow footer with the viewer
+/// open keeps `j/k Move` and drops ` N session(s) `. They trim from their own
+/// tail (`+ index`), so `j/k Move` outlives `n/N Next/Prev`.
 const PRIO_FILE_HINTS: u8 = 10;
 const PRIO_SESSIONS: u8 = 20;
 const PRIO_AUTOMATIONS: u8 = 21;
-/// Likewise tail-first: `^O Open` goes before `^H/^L Focus`.
+/// The global hints go first of everything: they duplicate the help overlay and
+/// apply whatever is focused. Tail-first within the pair, so `^O Open` goes
+/// before `^H/^L Focus`.
 const PRIO_GLOBAL_HINTS: u8 = 30;
 
 /// One self-contained chunk of the footer's left-hand text, with the priority
@@ -401,11 +407,12 @@ const PRIO_GLOBAL_HINTS: u8 = 30;
 struct LeftSegment {
     spans: Vec<Span<'static>>,
     priority: u8,
-    /// Decoration (the key hints) rather than state: it fills the tail of a row
-    /// that already shows everything more important, and is never kept in place
-    /// of something that didn't fit. Without this a stray `^O Open` survives
-    /// alone on a footer too narrow for the focus label — which reads as a
-    /// leftover, not as a degraded row.
+    /// A hint: it fills the tail of a row that already shows everything ranked
+    /// above it, and is never kept in place of something *more important* that
+    /// didn't fit. Without this a stray `^O Open` survives alone on a footer too
+    /// narrow for the focus label — which reads as a leftover, not as a degraded
+    /// row. Note this is relative to `priority`, not to some hints-lose-to-text
+    /// rule: the file viewer's hints outrank the counts and do displace them.
     trailing: bool,
 }
 
