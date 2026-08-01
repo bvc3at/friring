@@ -59,6 +59,54 @@ friring-cli session list --parent <lead-uuid> --json | jq  # direct children onl
 - **`perf`** — prints the perf snapshot a running TUI publishes while
   `FRIRING_PERF_LOG` or its perf HUD is active. See `docs/PERFORMANCE.md`.
 
+## Typing into a session (the modal guard)
+
+Every headless path that types into a pane — `session send`, `message send` /
+`reply`'s wake nudge, a `send` automation, a task's prompt, and the deferred
+`run-shell` delivery after a headless spawn — pastes its text and then presses
+Enter as a **separate** keystroke. A pane showing a modal swallows the text and
+reads that Enter as the operator answering the dialog, so an unguarded send
+confirms whatever the session is asking permission to do.
+
+All of them are therefore guarded, on two signals:
+
+- the agent's own hook state (`session signal --state blocked`, wired by the
+  built-in `hooks` extension), and
+- a scrape of the visible pane for the markers in
+  `agent::tmux::MODAL_MARKERS` (`Do you want to`, `❯ 1.`, `Esc to cancel`,
+  `[y/N]`, …).
+
+**Only the pane scrape gates scheduled work.** `blocked` means "a dialog was
+raised during this turn", not "a dialog is on screen now": Claude Code fires
+`PreToolUse` *before* the permission prompt and nothing on approval, so an
+approved tool call reports `blocked` for its whole run. The mailbox wake and
+`session send` still honor it — a deferred wake is retried and `session send`
+has `--force` — but `send` automations and task delivery take the pane scrape
+alone, so a session busy with a long approved tool call doesn't silently miss
+every fire aimed at it.
+
+What a refusal does depends on who asked:
+
+| Caller | On refusal |
+|---|---|
+| `message send` / `reply` wake | enqueues silently, reports `"wake_deferred": true` with a reason, retried on each `automation tick`¹ |
+| `session send` | **errors** — typing is the command's whole purpose; `--force` types anyway |
+| `automation` `send` | run recorded as `Skipped`, naming the marker and how many steps landed |
+| `task` `send`/reuse | reported as `skipped`, task left due (not marked in progress) |
+| deferred spawn delivery | the `run-shell` script aborts before typing |
+
+¹ The retry rides the `automation tick` heartbeat, so it needs
+`[features] automations` on (the default). With automations disabled a deferred
+wake is never retried automatically — the message is still durably queued and
+the recipient gets it on its next `message inbox`, but the "go look now" nudge
+is lost. Pass `--no-wake` and poll the inbox if you run that way.
+
+The guard is deliberately over-broad: a false positive only delays a delivery,
+while a false negative answers a security prompt with nobody watching. It is
+also not a permission boundary — anything that can run `friring-cli` can still
+`session send --force`. What it removes is the *surprise*: an operation whose
+contract is "enqueue a payload" no longer presses Enter in another session.
+
 ## Automation flags
 
 `automation create` and `automation edit` share one **action-flag group**, so an

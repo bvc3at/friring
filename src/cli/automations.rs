@@ -712,7 +712,11 @@ fn render_tick(v: &Value) -> String {
     let fired = count("fired");
     let skipped = count("skipped");
     let healed = count("healed");
-    format!("Tick: {fired} fired, {skipped} skipped, {healed} extension(s) healed.")
+    let woke = count("woke");
+    format!(
+        "Tick: {fired} fired, {skipped} skipped, {healed} extension(s) healed, \
+         {woke} deferred wake(s) delivered."
+    )
 }
 
 /// Fire every due automation headlessly: claim (atomic CAS, so this is safe to
@@ -736,6 +740,7 @@ fn tick(db: &Database) -> Result<Value, String> {
     if let Err(e) = db.prune_old_messages() {
         tracing::debug!("prune_old_messages: {e}");
     }
+    let woke = retry_deferred_wakes(db);
     // A `running` exec row whose worker died with its process would otherwise
     // show as running forever. The TUI does this on startup, but a keeper /
     // OS-timer install may never open one; the reaper's per-run age floor makes
@@ -783,7 +788,47 @@ fn tick(db: &Database) -> Result<Value, String> {
             "detail": detail,
         }));
     }
-    Ok(json!({ "fired": fired, "skipped": skipped, "healed": healed }))
+    Ok(json!({ "fired": fired, "skipped": skipped, "healed": healed, "woke": woke }))
+}
+
+/// Retry the wake nudges the modal guard deferred, and report the sessions that
+/// finally got one.
+///
+/// `message send` owes a recipient a nudge when their pane was mid-dialog at
+/// send time (see [`crate::cli::messages::wake_session`]). Without this sweep
+/// the guard would trade a security bug for a liveness one: the message stays
+/// durably queued either way, but nothing would tell the recipient it is there
+/// until it happened to check. Runs on the same 60 s heartbeat as the rest of
+/// the tick, so a deferred wake lands within a minute of the dialog clearing.
+///
+/// Best-effort throughout: a still-blocked recipient simply keeps its debt for
+/// the next tick, and reading the inbox settles it with no nudge at all.
+fn retry_deferred_wakes(db: &Database) -> Vec<String> {
+    let Ok(pending) = db.sessions_awaiting_wake() else {
+        return Vec::new();
+    };
+    let mut woke = Vec::new();
+    for id in pending {
+        let Ok(Some(session)) = db.get_session_by_id(id) else {
+            continue;
+        };
+        // The sender is deliberately left unnamed: by now several may be
+        // waiting, and the inbox the nudge points at names all of them.
+        if matches!(
+            crate::cli::messages::wake_session(db, &session, None),
+            crate::cli::messages::Wake::Delivered
+        ) {
+            // Report a session only once its debt is actually settled. The
+            // nudge did land either way, but an uncleared row is still owed, so
+            // the next tick nudges again — counting it here would report the
+            // same delivery on every tick and read as progress that isn't.
+            match db.clear_wake_pending(id) {
+                Ok(_) => woke.push(session.name),
+                Err(e) => tracing::warn!("clear_wake_pending({id}): {e}"),
+            }
+        }
+    }
+    woke
 }
 
 /// Execute one automation's action without a TUI, returning the run outcome.
@@ -911,13 +956,51 @@ fn fire_send(
             None,
         );
     }
-    match crate::agent::tmux::send_prompt_steps_now(&mux, &name, &auto.steps()) {
-        Ok(()) => (
-            AutomationRunStatus::Success,
-            format!("sent to {session_id}"),
-            Some(session_id),
-        ),
+    let steps = auto.steps();
+    // Pane scrape only — no `pane_guard::blocked_on_prompt` here, unlike the
+    // mailbox wake and `session send`. A scheduled fire doesn't retry until its
+    // next occurrence, and `blocked` spans an *approved* tool call's whole run
+    // (no after-approval hook), so honoring it would skip every fire aimed at a
+    // session that is merely working. Reasoning in full: `cli::pane_guard`.
+    match crate::agent::tmux::send_prompt_steps_now(&mux, &name, &steps) {
+        Ok(write) => match write.refused() {
+            None => (
+                AutomationRunStatus::Success,
+                format!("sent to {session_id}"),
+                Some(session_id),
+            ),
+            Some(marker) => (
+                AutomationRunStatus::Skipped,
+                modal_skip_detail(marker, write, steps.len()),
+                Some(session_id),
+            ),
+        },
         Err(e) => (AutomationRunStatus::Error, e.to_string(), None),
+    }
+}
+
+/// Run detail for a `send` the modal guard stopped, naming what was matched and
+/// how much of a multi-step sequence had already landed.
+///
+/// A skip is the honest status: nothing was typed *and* nothing failed — the
+/// target was mid-dialog, and delivering would have answered it (see
+/// [`crate::agent::tmux::MODAL_MARKERS`]). The next fire retries.
+fn modal_skip_detail(
+    marker: &str,
+    write: crate::agent::tmux::PaneWrite,
+    total_steps: usize,
+) -> String {
+    let delivered = match write {
+        crate::agent::tmux::PaneWrite::RefusedModal { after_steps, .. } => after_steps,
+        crate::agent::tmux::PaneWrite::Sent => total_steps,
+    };
+    if delivered == 0 {
+        format!("target is showing a dialog ({marker:?}); nothing typed")
+    } else {
+        format!(
+            "target is showing a dialog ({marker:?}) after step {delivered} of {total_steps}; \
+             the rest was not typed"
+        )
     }
 }
 
@@ -964,7 +1047,14 @@ fn fire_spawn(
     if crate::agent::tmux::window_exists_on(&mux, &name) {
         // The reused window's session id has no cheap lookup here.
         return match crate::agent::tmux::send_prompt_steps_now(&mux, &name, &steps) {
-            Ok(()) => (AutomationRunStatus::Success, format!("reused {name}"), None),
+            Ok(write) => match write.refused() {
+                None => (AutomationRunStatus::Success, format!("reused {name}"), None),
+                Some(marker) => (
+                    AutomationRunStatus::Skipped,
+                    modal_skip_detail(marker, write, steps.len()),
+                    None,
+                ),
+            },
             Err(e) => (AutomationRunStatus::Error, e.to_string(), None),
         };
     }
@@ -1385,16 +1475,23 @@ mod tests {
     }
 
     #[test]
-    fn render_tick_counts_fired_skipped_and_healed() {
+    fn render_tick_counts_fired_skipped_healed_and_woken() {
         let v = json!({
             "fired": [{ "id": 1 }, { "id": 2 }],
             "skipped": [{ "id": 3 }],
             "healed": [],
+            "woke": ["flow"],
         });
         assert_eq!(
             render_tick(&v),
-            "Tick: 2 fired, 1 skipped, 0 extension(s) healed."
+            "Tick: 2 fired, 1 skipped, 0 extension(s) healed, 1 deferred wake(s) delivered."
         );
+    }
+
+    #[test]
+    fn tick_reports_no_deferred_wakes_when_none_are_owed() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(tick(&db).unwrap()["woke"], json!([]));
     }
 
     #[test]

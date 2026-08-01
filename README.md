@@ -851,7 +851,11 @@ friring-cli session restore <uuid>       # undo a soft-delete
   (a name from `hosts.toml`) creates the worktree and tmux window on
   that remote host over SSH instead of locally.
 - **`send`** types text into the session's terminal followed by
-  Enter; **`capture`** dumps the rendered pane as text (`--lines`
+  Enter. It refuses while the target reports itself blocked on a
+  permission prompt or its visible pane shows a dialog — that
+  trailing Enter would answer the dialog; `--force` types anyway.
+  See [`docs/CLI.md`](docs/CLI.md#typing-into-a-session-the-modal-guard).
+  **`capture`** dumps the rendered pane as text (`--lines`
   defaults to 200, max 10000).
 
 #### How session delete is handled
@@ -951,6 +955,12 @@ Run *inside* a session, `send`/`reply`/`inbox` default their sender,
 task, and recipient to the caller's injected identity
 (`FRIRING_SESSION` / `FRIRING_TASK`), so an agent passes no ids. `send`
 and `reply` wake the recipient by default (`--no-wake` to suppress).
+A recipient showing a dialog is not nudged — the message stays queued,
+`--json` reports `wake_deferred` with a `wake_deferred_reason`, and the
+nudge is retried on the next `automation tick` (see
+[`docs/CLI.md`](docs/CLI.md#typing-into-a-session-the-modal-guard)).
+`reply` records the id it answers as `in_reply_to`, shown as the `RE`
+column in `inbox`.
 
 ### Extensions (alias `ext`)
 

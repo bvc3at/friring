@@ -42,6 +42,15 @@ pub struct SessionMessage {
     pub created_at: u64,
     /// When the message was claimed/marked read. `None` = unread.
     pub read_at: Option<u64>,
+    /// The message this one answers, set by `message reply`. `None` for an
+    /// unsolicited send. Lets a recipient thread several conversations at once
+    /// instead of encoding the id in `kind` or the body.
+    pub in_reply_to: Option<i64>,
+    /// A wake nudge is still owed for this message: the send asked for one, but
+    /// the recipient was mid-dialog at the time, so typing would have answered
+    /// it rather than submitted a prompt. Retried from `automation tick` until
+    /// it lands or the message is read. Always `false` for a `--no-wake` send.
+    pub wake_pending: bool,
 }
 
 impl SessionMessage {
@@ -91,6 +100,8 @@ mod tests {
             body: "?".into(),
             created_at: 0,
             read_at: None,
+            in_reply_to: None,
+            wake_pending: false,
         };
         assert!(m.is_unread());
         m.read_at = Some(123);

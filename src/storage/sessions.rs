@@ -550,6 +550,24 @@ impl Database {
         Ok(())
     }
 
+    /// The agent-reported `hook_state` of **one** session, or `None` when the
+    /// session is unknown, deleted, or has had no hook fire yet.
+    ///
+    /// The single-row counterpart to [`load_hook_states`](Self::load_hook_states),
+    /// which builds a map of every active session. Callers that need one answer
+    /// (the pane-input guard, on every send and once per owed wake in the retry
+    /// sweep) would otherwise pay a full scan per check.
+    pub fn hook_state_of(&self, id: SessionId) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT hook_state FROM sessions WHERE id = ?1 AND deleted_at IS NULL",
+                params![id.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+    }
+
     /// Load the hook-status columns for every active session in one indexed
     /// scan, keyed by id. The TUI derives statuses from this but reloads only
     /// when `data_version` moves (see `App::refresh_session_statuses`), so it

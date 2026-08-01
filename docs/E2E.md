@@ -19,7 +19,8 @@ The suite covers the app's **core feature surface**, not just agent smoke: tmux-
 re-adoption, the ghost lifecycle (unload → frozen frame → load-resume, plus lazy restore after
 the agent window dies — on claude, codex, opencode *and* the scripted agent), the
 `lazy_session_restore = false` opt-out and a ghost's survival of a terminal shrink,
-hook-driven status incl. the real permission→blocked path, restart-resume / fork /
+hook-driven status incl. the real permission→blocked path and the modal guard that
+keeps a headless send from answering it, restart-resume / fork /
 conversation import (all riding claude's `--session-id {id}` pinning), worktree sessions and
 `Ctrl+S` sync incl. the conflict handoff, code-review export, automations, tasks, messages,
 extensions, global search, the F9 activity view, both wizard flows, and the polish surface

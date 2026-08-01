@@ -94,6 +94,11 @@ pub enum Action {
         uuid: String,
         /// Text to send.
         text: String,
+        /// Type even when the session is showing a dialog. Without it the send
+        /// is refused there, because the trailing Enter would answer the dialog
+        /// rather than submit the text.
+        #[arg(long)]
+        force: bool,
     },
     /// Capture rendered pane contents as text.
     Capture {
@@ -302,18 +307,37 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
                 format!("Restarted session '{}' ({})", session.name, session.id),
             ))
         }
-        Action::Send { uuid, text } => {
+        Action::Send { uuid, text, force } => {
             let session = resolve(db, &uuid)?;
             if text.trim().is_empty() {
                 return Err("text must not be empty".into());
             }
-            crate::agent::tmux::send_prompt_now(&session.name, &text)
-                .map_err(|e| format!("send_prompt_now: {e}"))?;
+            // Typing into a pane is this command's whole purpose, so a refusal
+            // is a loud error rather than the silent skip the mailbox wake
+            // takes: the caller asked for exactly this and deserves to know it
+            // didn't happen. `--force` is the way through for an operator who
+            // is looking at the dialog and means to answer it.
+            if !force {
+                if let Some(reason) = refuse_send(db, &session) {
+                    return Err(format!(
+                        "refusing to type into '{}': {reason}. The trailing Enter would answer it \
+                         — re-run with --force to type anyway.",
+                        session.name
+                    ));
+                }
+            }
+            crate::agent::tmux::send_prompt_unguarded_on(
+                &crate::agent::tmux::MuxTarget::local(),
+                &session.name,
+                &text,
+            )
+            .map_err(|e| format!("send_prompt_unguarded_on: {e}"))?;
             Ok(CommandOutput::new(
                 json!({
                     "sent": true,
                     "session_id": session.id.to_string(),
                     "session_name": session.name,
+                    "forced": force,
                 }),
                 format!("Sent to '{}'.", session.name),
             ))
@@ -449,6 +473,21 @@ fn resolve(db: &Database, uuid: &str) -> Result<SharedSession, String> {
     db.get_session_by_id(id)
         .map_err(|e| format!("get_session_by_id: {e}"))?
         .ok_or_else(|| format!("Session not found: {uuid}"))
+}
+
+/// Why typing into `session` is refused right now, if it is.
+///
+/// Both halves of the guard, checked here rather than inside the send, because
+/// `--force` has to be able to step past them: the agent's own reported state
+/// (`session signal --state blocked`) and a scrape of its visible pane. tmux is
+/// reached by fully-qualified path (never `use crate::agent`) — see
+/// tests/architecture_rules.rs::cli_module_isolation.
+fn refuse_send(db: &Database, session: &SharedSession) -> Option<String> {
+    if crate::cli::pane_guard::blocked_on_prompt(db, session.id) {
+        return Some(crate::cli::pane_guard::BLOCKED_REASON.to_string());
+    }
+    crate::agent::tmux::pane_modal_on(&crate::agent::tmux::MuxTarget::local(), &session.name)
+        .map(crate::cli::pane_guard::modal_reason)
 }
 
 // `hook_state`/`hook_state_at` are the raw persisted hook columns (schema
@@ -786,6 +825,7 @@ mod tests {
                 Action::Send {
                     uuid: id.to_string(),
                     text: text.to_string(),
+                    force: false,
                 },
                 &db,
             )

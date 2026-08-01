@@ -1,0 +1,24 @@
+{
+  "responses": [
+    { "name": "ambient", "ambient": true, "match": { "modelContains": "haiku" }, "reply": { "text": "ok" } },
+    {
+      "name": "long-tool-call",
+      "match": { "promptContains": "longtool-probe", "hasToolResult": false },
+      "delayMs": 100,
+      "reply": {
+        "text": "Running the longtool-probe command now.",
+        "toolUse": {
+          "id": "toolu_probe_long_1",
+          "name": "Bash",
+          "input": { "command": "sleep 20; touch {{WS}}/longtool-proof.txt", "description": "slow proof" }
+        }
+      }
+    },
+    {
+      "name": "after-approval",
+      "match": { "toolResultFor": "toolu_probe_long_1" },
+      "delayMs": 100,
+      "reply": { "text": "LONGTOOL-PROBE-DONE" }
+    }
+  ]
+}

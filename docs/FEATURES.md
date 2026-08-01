@@ -2754,11 +2754,48 @@ mapping a task to a session id.
 Agent CLIs are TUIs: their output is rendered with box chrome, prefixes,
 and line-wrapping, so grepping a captured pane for a sentinel is fragile
 and only as timely as the next poll. The queue inverts the channel — a
-worker **pushes** a clean payload (`message send`) and a `--wake` nudge
-types a short `inbox` token into the recipient's pane so it drains
+worker **pushes** a clean payload (`message send`) and the wake nudge types
+a short self-describing line into the recipient's pane so it drains
 immediately. The payload always travels through the durable DB, never the
 pane; the wake is just an idempotent "go look" (a missed or colliding wake
 only delays a drain to the next nudge/tick).
+
+The nudge names the command and the sender ("friring: you have new mail
+from session 'x'. Read it with `friring-cli message inbox --claim
+--json`.") rather than typing a bare token, because it arrives as an
+ordinary **user turn**: a recipient that was never taught the convention
+can act on the first and only guesses at the second. It carries the
+pointer and never the body, so a peer's words can't reach the recipient
+dressed as the operator's own instructions.
+
+### Why the wake can refuse to type
+
+The nudge is a paste followed by a **separate** `Enter`. A recipient
+sitting on a permission dialog swallows the paste and reads that Enter as
+the operator answering — which for Claude Code's tool-approval prompt
+confirms the highlighted `1. Yes`. Sending someone a message would then
+approve whatever they were asking permission to do, with nobody watching.
+
+So `send`/`reply` consult two signals first and type only if both are
+clear: the recipient's hook-reported state (`blocked`, from
+`session signal`) and a scrape of their visible pane
+(`agent::tmux::MODAL_MARKERS`). A refusal is not a drop — the message is
+already durably queued, the row is marked `wake_pending` (schema v46), and
+the retry sweep on each `automation tick` nudges again once the pane is
+safe, so the guard costs no timeliness beyond the dialog's own lifetime
+(with `[features] automations` off there is no tick, so the nudge is lost
+and the message waits for the recipient's next read).
+Reading the inbox settles the debt on its own (a claimed message no longer
+matches `read_at IS NULL`), and a `--no-wake` send never marks it, so the
+sweep can't nudge behind a caller's back. Full call-site table:
+`docs/CLI.md` → "Typing into a session (the modal guard)".
+
+### Threading
+
+`reply <id>` records the id it answers in `in_reply_to` (schema v46), shown
+as the `RE` column in `inbox` and as a field in `--json`. The task tag
+alone can't separate two conversations in flight on the same task, which
+otherwise forced callers to smuggle the id into `kind` or the body.
 
 ### Why exactly-once and bounded
 
@@ -2779,9 +2816,10 @@ surface unread counts with no schema change.
 ### Data types & CLI
 
 - **Data** — `session::SessionMessage` (pure data, `session/message.rs`).
-  **Storage** — the `session_messages` table (schema **v32**, plain-TEXT
-  uuids, no FK — mirrors `tasks.target_session`), a partial unread index + a
-  `created_at` index, CRUD in `storage/messages.rs`.
+  **Storage** — the `session_messages` table (schema **v32**, plus
+  `in_reply_to`/`wake_pending` in **v46**; plain-TEXT uuids, no FK — mirrors
+  `tasks.target_session`), a partial unread index + a `created_at` index, CRUD
+  in `storage/messages.rs`.
 - **Identity is self-knowable and stable.** A session's `SessionId` is stable
   for life — `respawn_stale_session` reuses the original id on re-adoption
   (no soft-delete churn), so a cached id or a queued message never goes stale.
@@ -2791,20 +2829,22 @@ surface unread counts with no schema change.
   statusline).
 - **CLI** (`friring-cli message`, alias `msg`), identity-aware:
   - `send --to <uuid|name> --kind <k> [--task <id>] [--from <uuid|name>]
-    --body <text> [--no-wake]` enqueues and, unless `--no-wake`, types a short
-    `inbox` token into the recipient's pane (`agent::tmux::send_prompt_now`).
+    --body <text> [--no-wake]` enqueues and, unless `--no-wake`, nudges the
+    recipient's pane (`agent::tmux::send_prompt_now`, guarded — see above).
     Provenance + task tag default to the caller's `FRIRING_SESSION` /
     `FRIRING_TASK`.
   - `reply <message_id> --body <text> [--kind k] [--from …] [--no-wake]` —
     enqueues back to the original message's sender (via `get_message`),
-    carrying the original `from_task_id`.
+    carrying the original `from_task_id` and recording `in_reply_to`.
   - `inbox [--for <uuid|name>] [--claim] [--all] [--limit N]` reads it
     (`--claim` = atomic drain); `--for` defaults to the calling session.
   - `prune [--older-than-days N] [--read-only]`.
   - `cli::messages` resolves a session by UUID **or** name
     (`resolve_uuid_or_name` → `Database::get_session_by_name`); a `send`/`reply`
     with a wake also arms the automation heartbeat
-    (`cli::automations::arm_heartbeat`) so a missed wake still drains headless.
+    (`cli::automations::arm_heartbeat`) so a missed wake still drains headless,
+    and it is that same heartbeat's tick that retries a deferred wake
+    (`cli::automations::retry_deferred_wakes`).
 
 ---
 

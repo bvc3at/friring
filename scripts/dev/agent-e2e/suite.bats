@@ -85,6 +85,16 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-blocked-permission"
 }
 
+@test "e2e: a mailbox wake defers instead of answering a live permission dialog, then lands after approval" {
+    require_agent claude
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-wake-modal-guard"
+}
+
+@test "e2e: hook_state stays blocked for an approved tool call's whole run (the modal guard's policy rests on it)" {
+    require_agent claude
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-blocked-spans-tool-run"
+}
+
 @test "e2e: Ctrl+R restarts claude with --resume and the conversation continues" {
     require_agent claude
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-restart-resume"
