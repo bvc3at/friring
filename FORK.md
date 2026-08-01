@@ -503,22 +503,35 @@ What changed:
   `record_tape "$t" || …`, which suppresses `set -e` for its whole body, so a
   tape that died half-way still rendered and shipped — a clean recording of the
   first half of a demo, which is not visibly broken.
+- **The cast's teardown trim is no longer all-or-nothing.** `trim-cast.mjs` cut
+  at the client's leave-alt-screen event, but the teardown is chunked by the pty
+  and its screen-clear can land in a SEPARATE, earlier event — which then
+  survived the cut and became a blank final frame, held for the whole closing
+  hold. It is intermittent (it depends on how the bytes split: nine clips in one
+  batch were clean and the tenth was not) and invisible to every pacing metric,
+  because a blank frame is perfectly well-paced. The trim now also walks back
+  over content-free events, and the budget gained a **final-frame ink** check as
+  a backstop — a good closing frame measures 3.4–9.0% ink, a leaked teardown
+  0.013%.
 
-Result across nine clips: 202.2s → 84.9s, dead air 91.5% → within budget, worst
-held frame 3.81s → 0.86s, opening 2.3s → ~0.4s. Several content bugs surfaced on
-the way, all of which had been shipping unnoticed because the media was never
-re-recorded: two dead keypresses (`theme.tape`'s four no-op `Up`s;
+Result across all ten clips: 202.2s → 103.3s, dead air 91.5% → within budget,
+worst held frame 3.81s → 0.86s, opening 2.3s → 0.25–0.44s. Several content bugs
+surfaced on the way, all of which had been shipping unnoticed because the media
+was never re-recorded: two dead keypresses (`theme.tape`'s four no-op `Up`s;
 `file-manager.tape` pressing `Enter` on a file, which resolves to
-`open_file_in_editor` and so renders nothing in-pane), and a session-name field
-that is now pre-filled with the repo basename, so tapes that typed a name over
-it produced sessions called `orbital-hvacaurora-forecast`.
+`open_file_in_editor` and so renders nothing in-pane), a session-name field that
+is now pre-filled with the repo basename, so tapes that typed a name over it
+produced sessions called `orbital-hvacaurora-forecast`, and a repo picker in
+`agents.tape` still written for the pre-redesign "Select Repos" modal — the
+shipped hero predated that redesign.
 
-**`agents.tape` (the hero) is not yet re-recorded** — see
-`docs/DEVELOPMENT.md` § Demo video. Two stale beats in it were fixed (its repo
-picker was written for the pre-redesign "Select Repos" modal, and the session
-name field is now pre-filled with the repo basename), but after the code-review
-view closes the app does not act on `Ctrl+N` for ~3s, which wedges the take
-unless the tape waits it out. That pause is the app's, not the demo's.
+One caveat worth knowing when re-recording: **the recorder is sensitive to
+machine load.** Under a load average of ~5 the same tape recorded at 2.5x its
+length, the pause after the code-review view closes stretched from 0.3s to 3.0s
+(taking `Ctrl+N` with it, which then landed in a dead window and wedged the
+take), and `Wait Stable` overshot its nominal settle window because every poll
+spawns tmux. Record on an otherwise idle machine; a take that wedges or busts
+the budget under load is not necessarily a tape bug.
 
 #### Dev-live: run a dev build against the real sessions
 

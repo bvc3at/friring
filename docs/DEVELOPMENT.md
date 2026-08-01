@@ -463,9 +463,18 @@ Consequences worth knowing when editing a tape or the recorder:
 - **Every clip is held to a pacing budget** (`lib/check-pacing.mjs`), enforced by
   the recorder before a take is allowed to replace good media, and again in CI.
   A held frame may not exceed 1.0s (0.5s is the target) and the opening may not
-  exceed 0.75s. Runtime is deliberately *not* budgeted — a clip may be as long
-  as it earns. See `FORK.md` § Demo pacing budget for the measurements behind
-  the numbers.
+  exceed 0.75s. The budget also rejects a clip whose **final frame is blank**,
+  which is a correctness check rather than a pacing one: the detach teardown is
+  chunked by the pty and can leave a screen-clear behind that `trim-cast.mjs`
+  does not catch, and an empty closing frame is otherwise perfectly well-paced.
+  Runtime is deliberately *not* budgeted — a clip may be as long as it earns.
+  See `FORK.md` § Demo pacing budget for the measurements behind the numbers.
+- **Record on an idle machine.** The pipeline drives real processes in real
+  time, so load distorts it badly: at load ~5 the same tape recorded 2.5x
+  longer, the settle after closing the code-review view stretched 0.3s → 3.0s
+  and swallowed the `Ctrl+N` that followed it, and `Wait Stable` overshot its
+  window because every poll spawns tmux. A take that wedges or busts the budget
+  under load is not necessarily a tape bug — re-run it on a quiet box first.
 - The GIF keeps **variable** frame delays — that is where the exact pacing
   lives, so never re-encode it. The MP4 is derived from it with ffmpeg's
   `fps` filter, which re-times to a constant rate for players that need one

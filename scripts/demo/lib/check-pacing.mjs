@@ -60,6 +60,16 @@ const BUDGET = {
   // is the "waiting" case that costs the most.
   bytesWarn: 5 * 1024 * 1024,
   bytesMax: 10 * 1024 * 1024,
+  // Fraction of the final frame that must be ink rather than background.
+  //
+  // Not a pacing rule — a correctness one. The recorder stops filming by
+  // detaching, and trim-cast.mjs cuts the resulting teardown off the cast; when
+  // that teardown arrives split across writes the trim can leave the
+  // screen-clear behind, and the clip then ends on an empty terminal held for
+  // the full closing hold. It is intermittent and invisible to every other
+  // check here: a blank frame is perfectly well-paced. Measured on real takes,
+  // a good final frame is 3.4-9.0% ink and a leaked teardown is 0.013%.
+  finalFrameInk: 0.005,
 };
 
 // Per-frame delays, in seconds, from the gif's Graphic Control Extensions.
@@ -150,6 +160,35 @@ function openingHold(file) {
   return Number(start[1]) + Number(dur[1]);
 }
 
+// How much of one frame is ink rather than background, as a fraction.
+//
+// Decoded to 8-bit grey and compared against the frame's own modal value, so it
+// needs no knowledge of the theme: whatever colour the terminal background is,
+// it is the most common byte, and everything meaningfully away from it is drawn
+// content. The frame index comes from the gif's own frame count, so this costs
+// one ffmpeg call and no probing.
+function frameInk(file, index) {
+  const r = spawnSync(
+    'ffmpeg',
+    ['-v', 'error', '-i', file, '-vf', `select=eq(n\\,${index})`,
+     '-vsync', '0', '-frames:v', '1', '-pix_fmt', 'gray', '-f', 'rawvideo', '-'],
+    { maxBuffer: 1 << 28 }
+  );
+  if (r.error) {
+    if (r.error.code === 'ENOENT') return null;
+    throw r.error;
+  }
+  if (r.status !== 0 || !r.stdout?.length) return null;
+  const px = r.stdout;
+  const hist = new Array(256).fill(0);
+  for (const v of px) hist[v]++;
+  let mode = 0;
+  for (let i = 1; i < 256; i++) if (hist[i] > hist[mode]) mode = i;
+  let ink = 0;
+  for (const v of px) if (Math.abs(v - mode) > 20) ink++;
+  return ink / px.length;
+}
+
 function measure(file) {
   const buf = fs.readFileSync(file);
   const delays = frameDelays(buf);
@@ -174,6 +213,7 @@ function measure(file) {
     // How much of the clip is new information rather than a held image.
     framesPerSecond: frames.length / duration,
     opening: openingHold(file),
+    finalInk: frameInk(file, frames.length - 1),
     trailing: frames[frames.length - 1].delay,
     worstPause: worst.delay,
     worstPauseAt: worst.start,
@@ -195,6 +235,12 @@ function violations(m) {
     out.push(
       `opens on ${m.opening.toFixed(2)}s of held frame ` +
         `(target ${BUDGET.openingTarget}s, max ${BUDGET.opening}s)`
+    );
+  }
+  if (m.finalInk !== null && m.finalInk < BUDGET.finalFrameInk) {
+    out.push(
+      `ends on a blank frame (${(m.finalInk * 100).toFixed(3)}% ink) — the ` +
+        `recorder's teardown leaked past trim-cast.mjs; re-record`
     );
   }
   if (m.bytes > BUDGET.bytesMax) {
@@ -244,13 +290,13 @@ if (asJson) {
 
 // Never let a missing tool quietly turn a gate into a no-op: an unchecked
 // budget that prints nothing is indistinguishable from a passing one.
-if (results.some((r) => r.opening === null)) {
+if (results.some((r) => r.opening === null || r.finalInk === null)) {
   console.error(
-    '\nwarning: ffmpeg unavailable — opening-hold NOT checked on any clip.\n' +
-      '  The held-frame and size budgets still applied. Install ffmpeg to check\n' +
-      '  the opening (it is the one metric a gif\'s frame delays cannot express:\n' +
-      '  a static opening split by one ticking character looks like several\n' +
-      '  short frames).'
+    '\nwarning: ffmpeg unavailable — opening-hold and blank-final-frame NOT\n' +
+      '  checked on any clip. The held-frame and size budgets still applied.\n' +
+      '  Both skipped metrics need pixels: a gif\'s frame delays cannot tell a\n' +
+      '  static opening split by one ticking character from several short\n' +
+      '  frames, nor a blank teardown frame from a well-paced one.'
   );
 }
 
