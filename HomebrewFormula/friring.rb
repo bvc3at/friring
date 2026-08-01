@@ -16,8 +16,10 @@
 # Only the platforms with a published release artifact are supported:
 #   - macOS arm64 (Apple Silicon) -> aarch64-apple-darwin
 #   - Linux x86_64                -> x86_64-unknown-linux-musl (static)
-# Intel macOS and aarch64 Linux have no release binary, so they are omitted
-# (brew reports "no available formula" on those platforms).
+# Intel macOS and aarch64 Linux have no release binary, so they are omitted:
+# the formula is still found there, but has no url, and `brew install` fails
+# with "formula requires at least a URL". Build from source or use
+# `cargo install` on those platforms.
 class Friring < Formula
   desc "TUI for orchestrating multiple coding-agent CLI sessions in persistent tmux panels"
   homepage "https://github.com/bvc3at/friring"
