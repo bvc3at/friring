@@ -1062,10 +1062,15 @@ mod tests {
             line.contains("Files"),
             "the freed columns go back to the text: {line:?}"
         );
-        assert!(
-            hit_actions(&hits).contains(&Action::ToggleHelp),
-            "key-only chips still dispatch: {:?}",
-            hit_actions(&hits)
+        assert_eq!(
+            hit_actions(&hits),
+            vec![
+                Action::ToggleHelp,
+                Action::OpenThemePicker,
+                Action::OpenSettings,
+                Action::QuitApp
+            ],
+            "key-only chips still dispatch, in order: {line:?}"
         );
 
         // Squeezed further, whole chips go, cosmetics first…
