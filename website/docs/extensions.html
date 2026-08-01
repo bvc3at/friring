@@ -1,7 +1,7 @@
 ---
 layout: docs.njk
-title: 'Extensions — Thurbox Docs'
-description: 'Thurbox extensions: install, activate, deactivate, and self-heal opt-in, agent-agnostic add-ons with thurbox-cli, plus the extension.toml manifest format and how to author one.'
+title: 'Extensions — Friring Docs'
+description: 'Friring extensions: install, activate, deactivate, and self-heal opt-in, agent-agnostic add-ons with friring-cli, plus the extension.toml manifest format and how to author one.'
 currentPage: 'extensions'
 breadcrumb: 'Extensions'
 onThisPage:
@@ -20,8 +20,8 @@ onThisPage:
             <strong>agent-agnostic</strong>
             add-ons that
             <em>compose</em>
-            Thurbox through the public
-            <code>thurbox-cli</code>
+            Friring through the public
+            <code>friring-cli</code>
             surface &mdash; they never extend the binary. The core knows a declarative
             <strong>manifest format</strong>
             , never any specific extension, so the same machinery installs and manages any of them.
@@ -36,7 +36,7 @@ onThisPage:
             <code>extension.toml</code>
             manifest plus the files it ships (specs, scripts, config templates). One command
             installs it:
-            <code>thurbox-cli</code>
+            <code>friring-cli</code>
             fetches the manifest, lays the files down under a home directory, registers any agents
             the extension needs in
             <code>agents.toml</code>
@@ -57,7 +57,7 @@ onThisPage:
             <li>
               <strong>Self-healing.</strong>
               While an extension is active, deleting its session or automation is a no-op &mdash;
-              Thurbox recreates it. Deactivating is the real off-switch.
+              Friring recreates it. Deactivating is the real off-switch.
             </li>
           </ul>
           <div class="info-box">
@@ -85,7 +85,7 @@ onThisPage:
               . Unlike the others it's
               <strong>embedded in the binary and auto-activated</strong>
               , wiring each agent's lifecycle hooks to
-              <code>thurbox-cli session signal</code>
+              <code>friring-cli session signal</code>
               so the session list shows working/blocked/done/idle. It still installs through the
               same manifest machinery shown here.
             </p>
@@ -96,15 +96,15 @@ onThisPage:
             <a href="#install" class="heading-anchor">#</a>
           </h2>
           <p>Install an extension by name from the official source:</p>
-          <pre><code class="language-bash">thurbox-cli extension install flow</code></pre>
+          <pre><code class="language-bash">friring-cli extension install flow</code></pre>
           <p>
             That single command is the whole installer. It resolves the source, fetches the manifest
             and payload, writes them under the extension home (
-            <code>~/.config/thurbox/extensions/&lt;name&gt;</code>
+            <code>~/.config/friring/extensions/&lt;name&gt;</code>
             by default;
             <code>--home &lt;dir&gt;</code>
             to override), registers the extension's agents, writes the resolved manifest to
-            <code>~/.config/thurbox/extensions/&lt;name&gt;.toml</code>
+            <code>~/.config/friring/extensions/&lt;name&gt;.toml</code>
             , and activates it. It is idempotent &mdash; re-running refreshes shipped files while
             keeping your own data (seeded files you've edited, agent tweaks).
           </p>
@@ -124,7 +124,7 @@ onThisPage:
           </h2>
           <p>
             All extension management lives under
-            <code>thurbox-cli extension</code>
+            <code>friring-cli extension</code>
             (alias
             <code>ext</code>
             ):
@@ -219,8 +219,8 @@ onThisPage:
               &mdash; installs from your own source.
             </li>
           </ul>
-          <pre data-wrap><code class="language-bash">thurbox-cli extension install ./extensions/flow
-thurbox-cli extension install https://example.com/ext/flow --home ~/work/flow</code></pre>
+          <pre data-wrap><code class="language-bash">friring-cli extension install ./extensions/flow
+friring-cli extension install https://example.com/ext/flow --home ~/work/flow</code></pre>
           <div class="info-box">
             <p>
               <strong>Safety:</strong>
@@ -239,14 +239,14 @@ thurbox-cli extension install https://example.com/ext/flow --home ~/work/flow</c
           <p>
             An installed extension is recorded in an
             <strong>active set</strong>
-            . On TUI startup and on every automation tick, Thurbox re-ensures each active
+            . On TUI startup and on every automation tick, Friring re-ensures each active
             extension's declared sessions and automations exist &mdash; so deleting them by hand
             (TUI
             <code>Ctrl+D</code>
             , a
             <code>clean</code>
             , or
-            <code>thurbox-cli session/automation delete</code>
+            <code>friring-cli session/automation delete</code>
             ) is a no-op: they come back. This is what makes an extension hard to half-remove by
             accident.
           </p>
@@ -400,7 +400,7 @@ prompt = "tick"</code></pre>
             </li>
             <li>
               Build the behavior on the
-              <code>thurbox-cli</code>
+              <code>friring-cli</code>
               surface (
               <code>session</code>
               ,
@@ -411,7 +411,7 @@ prompt = "tick"</code></pre>
             </li>
             <li>
               Test locally with
-              <code>thurbox-cli extension install ./your-ext</code>
+              <code>friring-cli extension install ./your-ext</code>
               , then publish the directory (e.g. under
               <code>extensions/&lt;name&gt;/</code>
               ) so
@@ -423,7 +423,7 @@ prompt = "tick"</code></pre>
             For the exact config-file locations and the metadata key that tracks active extensions,
             see the
             <a
-              href="https://github.com/Thurbeen/thurbox/blob/main/docs/CONFIG.md"
+              href="https://github.com/bvc3at/friring/blob/main/docs/CONFIG.md"
               target="_blank"
               rel="noopener"
             >
@@ -452,7 +452,7 @@ prompt = "tick"</code></pre>
                 <h3>agent hooks <span class="badge badge-green">built in</span></h3>
                 <p>
                   Wires each agent's lifecycle hooks to
-                  <code>thurbox-cli session signal</code>
+                  <code>friring-cli session signal</code>
                   so every session reports working/blocked/done/idle. Embedded and on by default.
                 </p>
               </div>

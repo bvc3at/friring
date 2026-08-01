@@ -33,20 +33,22 @@ the `FRIRING_*` env vars.
 
 Friring's own distribution is renamed along with it: `cd.yml` publishes
 `friring-*` release binaries, `scripts/install.{sh,ps1}` and the Homebrew
-formula fetch them from `bvc3at/friring`, and self-update / version-check query
-the same repo (see [Documentation / branding](#documentation--branding)).
+formula fetch them from `bvc3at/friring`, self-update / version-check query the
+same repo, and `website/` is a Friring-branded site published to
+`bvc3at.github.io/friring` (see
+[Documentation / branding](#documentation--branding)).
 
 What still says `thurbox` is deliberate, and splits in two:
 
-- **Upstream attribution** — the `LICENSE`, provenance notes, and the website /
-  quality-gate badges point at
-  [`Thurbeen/thurbox`](https://github.com/Thurbeen/thurbox) and stay as-is (this
-  is a fork, and the credit is upstream's).
-- **Upstream-owned surfaces and shared formats** — the `pages.yml` workflow and
-  `website/` (dormant here), the extension payloads a bare-name `extension
-  install` fetches from upstream, the `min_thurbox_version` extension-manifest
-  key (a wire format shared with upstream), and the `tb-` / `tbs-` tmux window
-  prefixes (brand-neutral, kept for live-window compatibility).
+- **Upstream attribution** — the `LICENSE`, provenance notes, the quality-gate
+  badge, and the fork credit carried by the website (footer, FAQ, `llms.txt`)
+  point at [`Thurbeen/thurbox`](https://github.com/Thurbeen/thurbox) and stay
+  as-is (this is a fork, and the credit is upstream's).
+- **Upstream-owned surfaces and shared formats** — the extension payloads a
+  bare-name `extension install` fetches from upstream, the
+  `min_thurbox_version` extension-manifest key (a wire format shared with
+  upstream), and the `tb-` / `tbs-` tmux window prefixes (brand-neutral, kept
+  for live-window compatibility).
 
 The tradeoff the branding-only approach used to avoid is now real: upstream
 merges carry rename conflicts on the renamed identifiers, and an existing
@@ -1045,11 +1047,10 @@ already cover the case it was meant to serve.
   the crate, `~/.config/friring`, `~/.local/share/friring/friring.db`, the
   `tmux -L friring` socket, and the `FRIRING_*` env vars. What deliberately
   still says `thurbox`: upstream **attribution** (`LICENSE`, provenance, the
-  website / quality-gate badges) and upstream-owned surfaces the fork does not
-  republish — the `pages.yml` workflow, `website/`, upstream extension payloads,
-  the `min_thurbox_version` manifest key, and the `tb-` / `tbs-` tmux window
-  prefixes. See [Migration](#migration); upstream merges now carry rename
-  conflicts on the renamed identifiers.
+  quality-gate badge) and upstream-owned surfaces the fork does not republish —
+  upstream extension payloads, the `min_thurbox_version` manifest key, and the
+  `tb-` / `tbs-` tmux window prefixes. See [Migration](#migration); upstream
+  merges now carry rename conflicts on the renamed identifiers.
 - **Own install surface (August 2026).** The fork stopped reusing upstream's
   installers and package channels, so nothing it ships installs a `thurbox`
   binary any more:
@@ -1072,6 +1073,29 @@ already cover the case it was meant to serve.
     **deleted**: they carry upstream's package identities (`thurbox`,
     `thurbox-bin`, `Thurbeen.thurbox`), which this fork cannot publish under.
     Upstream merges touching those paths now conflict as delete/modify.
+- **Own website (August 2026).** `website/` was upstream's Thurbox site, kept
+  dormant here; it is now Friring's own, published by `pages.yml` to
+  **<https://bvc3at.github.io/friring>**:
+  - The site is renamed throughout — prose, binaries, `~/.config/friring` /
+    `~/.local/share/friring` paths, `FRIRING_*` env vars, repo links, demo
+    videos, and the `fri`/`ring` wordmark. `logo-mark.svg`, `favicon.svg` and
+    `og-image.svg` carry the fire-ring mark from `logo.svg` instead of
+    upstream's shell-box-and-tree.
+  - Its install docs match the install surface above: curl / PowerShell, the
+    self-tap Homebrew pair, `cargo install --git`, and a source build. The AUR /
+    Chocolatey / winget tabs and sections were removed with those channels.
+  - **No custom domain.** Upstream's `website/CNAME` (`thurbox.thurbeen.eu`) and
+    its Eleventy passthrough were dropped — `actions/deploy-pages` reads a CNAME
+    out of the artifact and would claim that hostname. The site is subpath-clean
+    (every link resolves through the per-page `root` depth variable), so it
+    needs no Eleventy `pathPrefix` to serve from `/friring/`.
+  - `pages.yml` lost its `github.repository == 'Thurbeen/thurbox'` guard and
+    moved to `runs-on: k3s-arc` like every other fork-active Linux job.
+  - **Pages from a private repo needs GitHub Pro** (Free allows Pages only from
+    public repos). The published site is public either way — access-controlled
+    Pages is Enterprise Cloud-only.
+  - Upstream credit moved into the site content: the landing-page footer, an
+    FAQ entry, and an `llms.txt` entry all point at `Thurbeen/thurbox`.
 - `README.md` and the agent-guide prose call the project **Friring**, and so do
   the install commands; what still points at upstream is attribution and the
   shared formats above.
@@ -1090,12 +1114,15 @@ already cover the case it was meant to serve.
 
 Some upstream workflows target infrastructure the fork doesn't have, so they are
 guarded to run only on the canonical `Thurbeen/thurbox` repo and stay dormant
-here (while remaining merge-safe). The release pipeline (`cd.yml`) is the
-exception — the fork runs it. All build / test / lint jobs run normally on the
-fork.
+here (while remaining merge-safe). The release (`cd.yml`) and website
+(`pages.yml`) pipelines are the exceptions — the fork runs both. All build /
+test / lint jobs run normally on the fork.
 
-- `.github/workflows/pages.yml` (GitHub Pages) — dormant; the fork has no Pages
-  site.
+- `.github/workflows/pages.yml` (GitHub Pages) — **active on the fork.** Its
+  upstream guard was dropped and it deploys `website/` to
+  <https://bvc3at.github.io/friring> on any push to `main` touching `website/`
+  or `docs/media/`. Publishing Pages from this **private** repo requires a
+  GitHub Pro plan; the site it serves is public regardless.
 - `.github/workflows/cd.yml` (Release) — **active on the fork, end to end.**
   Every push to `main` that includes a `feat` / `fix` / `perf` commit cuts a tag
   (`cog bump --auto`), publishes a GitHub Release with cross-platform
@@ -1109,14 +1136,13 @@ fork.
   `pull-requests: read`, which a **private** repo's default token lacks (public
   upstream doesn't need it).
 - **Linux CI/CD jobs run on the self-hosted `k3s-arc` runner.** Every
-  fork-active Linux job in `ci.yml` and `cd.yml` targets `runs-on: k3s-arc` —
-  an Actions Runner Controller scale set on k3s — instead of GitHub-hosted
-  `ubuntu-latest` — including `cd.yml`'s `publish-homebrew`, whose formula bump
-  needs `python3` on the runner. The upstream-only jobs stay on plain
-  `ubuntu-latest` — they never run on the fork and upstream has no `k3s-arc`
-  runner: `pages.yml`'s deploy and `ci.yml`'s `sonarqube`. The Windows / macOS
-  jobs and the release build matrix are unchanged — a Linux ARC runner can't
-  service them.
+  fork-active Linux job in `ci.yml`, `cd.yml` and `pages.yml` targets
+  `runs-on: k3s-arc` — an Actions Runner Controller scale set on k3s — instead
+  of GitHub-hosted `ubuntu-latest` — including `cd.yml`'s `publish-homebrew`,
+  whose formula bump needs `python3` on the runner. The upstream-only jobs stay
+  on plain `ubuntu-latest` — they never run on the fork and upstream has no
+  `k3s-arc` runner: `ci.yml`'s `sonarqube`. The Windows / macOS jobs and the
+  release build matrix are unchanged — a Linux ARC runner can't service them.
 - **`demo-pacing` job (fork-only).** Checks `docs/media/*.gif` against the
   pacing budget on any change under `docs/media/` or `scripts/demo/`. The media
   is recorded by hand on a workstation, so nothing else would catch a clip that

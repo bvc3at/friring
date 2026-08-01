@@ -1,7 +1,7 @@
 ---
 layout: base.njk
-title: 'Thurbox — TUI Agentic IDE'
-description: 'Thurbox runs any coding-agent CLI (Claude Code, Codex, Antigravity, opencode, aider, GitHub Copilot CLI, Vibe) in persistent tmux panes — sessions, agents, and git worktrees as first-class citizens.'
+title: 'Friring — TUI Agentic IDE'
+description: 'Friring runs any coding-agent CLI (Claude Code, Codex, Antigravity, opencode, aider, GitHub Copilot CLI, Vibe) in persistent tmux panes — sessions, agents, and git worktrees as first-class citizens.'
 root: '.'
 extraCss: ['landing.css']
 footer: true
@@ -84,26 +84,6 @@ footer: true
             </button>
             <button
               class="install-tab"
-              id="tab-winget"
-              role="tab"
-              aria-controls="panel-winget"
-              aria-selected="false"
-              tabindex="-1"
-            >
-              winget
-            </button>
-            <button
-              class="install-tab"
-              id="tab-choco"
-              role="tab"
-              aria-controls="panel-choco"
-              aria-selected="false"
-              tabindex="-1"
-            >
-              Chocolatey
-            </button>
-            <button
-              class="install-tab"
               id="tab-brew"
               role="tab"
               aria-controls="panel-brew"
@@ -114,13 +94,13 @@ footer: true
             </button>
             <button
               class="install-tab"
-              id="tab-aur"
+              id="tab-cargo"
               role="tab"
-              aria-controls="panel-aur"
+              aria-controls="panel-cargo"
               aria-selected="false"
               tabindex="-1"
             >
-              Arch (AUR)
+              cargo
             </button>
             <button
               class="install-tab"
@@ -141,7 +121,7 @@ footer: true
               <code>~/.local/bin</code>
               .
             </p>
-            <pre data-wrap><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/main/scripts/install.sh | sh</code></pre>
+            <pre data-wrap><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | sh</code></pre>
           </div>
 
           <div
@@ -153,110 +133,61 @@ footer: true
           >
             <p>
               Native Windows (PowerShell 5.1+). Verifies checksums and installs the latest release to
-              <code>%LOCALAPPDATA%\Programs\thurbox</code>
+              <code>%LOCALAPPDATA%\Programs\friring</code>
               (added to your user
               <code>PATH</code>
               ).
             </p>
-            <pre data-wrap><code class="language-powershell">irm https://raw.githubusercontent.com/Thurbeen/thurbox/main/scripts/install.ps1 | iex</code></pre>
-          </div>
-
-          <div class="install-panel" role="tabpanel" id="panel-winget" aria-labelledby="tab-winget" hidden>
-            <p>
-              Windows x86_64 via
-              <a href="https://learn.microsoft.com/windows/package-manager/" target="_blank" rel="noopener">
-                winget
-              </a>
-              (bundled with Windows 10/11). Installs the prebuilt
-              <code>thurbox.exe</code>
-              +
-              <code>thurbox-cli.exe</code>
-              as portable commands on your
-              <code>PATH</code>
-              . Needs
-              <a href="https://github.com/psmux/psmux" target="_blank" rel="noopener">psmux</a>
-              as the multiplexer (installed separately).
-            </p>
-            <pre><code class="language-powershell">winget install Thurbeen.thurbox</code></pre>
-          </div>
-
-          <div class="install-panel" role="tabpanel" id="panel-choco" aria-labelledby="tab-choco" hidden>
-            <p>
-              Windows x86_64 via the
-              <a href="https://community.chocolatey.org/packages/thurbox" target="_blank" rel="noopener">
-                Chocolatey community repository
-              </a>
-              . Installs the prebuilt
-              <code>thurbox.exe</code>
-              +
-              <code>thurbox-cli.exe</code>
-              and shims them onto your
-              <code>PATH</code>
-              . Needs
-              <a href="https://github.com/psmux/psmux" target="_blank" rel="noopener">psmux</a>
-              as the multiplexer (installed separately).
-            </p>
-            <p>
-              <strong>Pending moderation:</strong>
-              the package is pushed but not yet approved by the community-repo moderators, so
-              <code>choco install thurbox</code>
-              won't resolve until it goes live &mdash; use
-              <strong>winget</strong>
-              or the install script meanwhile.
-            </p>
-            <pre><code class="language-powershell">choco install thurbox</code></pre>
+            <pre data-wrap><code class="language-powershell">irm https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.ps1 | iex</code></pre>
           </div>
 
           <div class="install-panel" role="tabpanel" id="panel-brew" aria-labelledby="tab-brew" hidden>
             <p>
-              macOS (Apple Silicon) &amp; Linux x86_64. Prebuilt binaries from the
-              <a href="https://github.com/Thurbeen/homebrew-thurbox" target="_blank" rel="noopener">
-                thurbox tap
-              </a>
-              ; pulls in
+              macOS (Apple Silicon) &amp; Linux x86_64. This repo doubles as its own tap, so the
+              tap URL is spelled out &mdash;
+              <code>brew tap</code>
+              only infers one from a repo named
+              <code>homebrew-friring</code>
+              . Installs the prebuilt
+              <code>friring</code>
+              +
+              <code>friring-cli</code>
+              binaries and pulls in
               <code>tmux</code>
               and
               <code>git</code>
               automatically.
             </p>
-            <pre><code class="language-bash">brew install thurbeen/thurbox/thurbox</code></pre>
+            <pre data-wrap><code class="language-bash">brew tap bvc3at/friring https://github.com/bvc3at/friring
+brew install bvc3at/friring/friring</code></pre>
           </div>
 
-          <div class="install-panel" role="tabpanel" id="panel-aur" aria-labelledby="tab-aur" hidden>
+          <div class="install-panel" role="tabpanel" id="panel-cargo" aria-labelledby="tab-cargo" hidden>
             <p>
-              <a
-                href="https://aur.archlinux.org/packages/thurbox-bin"
-                target="_blank"
-                rel="noopener"
-              >
-                <code>thurbox-bin</code>
-              </a>
-              (prebuilt binary) or
-              <a href="https://aur.archlinux.org/packages/thurbox" target="_blank" rel="noopener">
-                <code>thurbox</code>
-              </a>
-              (builds from source) &mdash; use
-              <code>paru</code>
-              ,
-              <code>yay</code>
-              , or your preferred AUR helper.
+              Any platform with a Rust toolchain. Builds and installs
+              <code>friring</code>
+              +
+              <code>friring-cli</code>
+              into
+              <code>~/.cargo/bin</code>
+              &mdash; this is the route for platforms with no prebuilt binary, namely Intel macOS
+              and aarch64 Linux.
             </p>
-            <pre><code class="language-bash">paru -S thurbox-bin   # prebuilt (fastest)
-paru -S thurbox       # build from source</code></pre>
+            <pre data-wrap><code class="language-bash">cargo install --git https://github.com/bvc3at/friring --locked</code></pre>
           </div>
 
           <div class="install-panel" role="tabpanel" id="panel-source" aria-labelledby="tab-source" hidden>
             <p>
               Any platform with Rust 1.75+. Builds both the
-              <code>thurbox</code>
+              <code>friring</code>
               TUI and the
-              <code>thurbox-cli</code>
+              <code>friring-cli</code>
               headless binary into
               <code>target/release/</code>
               .
             </p>
-            <pre><code class="language-bash">git clone https://github.com/Thurbeen/thurbox.git
-cd thurbox
+            <pre><code class="language-bash">git clone https://github.com/bvc3at/friring.git
+cd friring
 cargo build --release</code></pre>
           </div>
         </div>
@@ -270,11 +201,11 @@ cargo build --release</code></pre>
               <div class="terminal-dot red"></div>
               <div class="terminal-dot yellow"></div>
               <div class="terminal-dot green"></div>
-              <span class="terminal-title">thurbox</span>
+              <span class="terminal-title">friring</span>
             </div>
             <div class="terminal-body">
-              <video src="assets/thurbox-demo.mp4" autoplay loop muted playsinline preload="none">
-                Thurbox demo showing multiple coding-agent sessions running in parallel
+              <video src="assets/friring-demo.mp4" autoplay loop muted playsinline preload="none">
+                Friring demo showing multiple coding-agent sessions running in parallel
               </video>
             </div>
           </div>
@@ -296,7 +227,7 @@ cargo build --release</code></pre>
               <h3>Persistent Sessions</h3>
               <p>
                 Run multiple coding-agent CLIs side-by-side, each in its own tmux pane. Sessions
-                persist across crashes, restarts, and multiple concurrent Thurbox instances.
+                persist across crashes, restarts, and multiple concurrent Friring instances.
               </p>
             </div>
           </a>
@@ -330,7 +261,7 @@ cargo build --release</code></pre>
               <h3>Agent Definitions</h3>
               <p>
                 Agents are declared as data in
-                <code>~/.config/thurbox/agents.toml</code>
+                <code>~/.config/friring/agents.toml</code>
                 , seeded with built-ins on first run. Add or tweak an agent &mdash; command and
                 argument templates &mdash; with no recompile.
               </p>
@@ -352,7 +283,7 @@ cargo build --release</code></pre>
                 a fresh one. Manage them from the always-on
                 <code>Ctrl+P</code>
                 pane (or the
-                <code>thurbox-cli</code>
+                <code>friring-cli</code>
                 headless binary); they fire even when the TUI is closed.
               </p>
             </div>
@@ -398,11 +329,11 @@ cargo build --release</code></pre>
               <p>
                 Opt-in,
                 <strong>agent-agnostic</strong>
-                add-ons that compose Thurbox through
-                <code>thurbox-cli</code>
+                add-ons that compose Friring through
+                <code>friring-cli</code>
                 &mdash; never the binary. Install each from a declarative manifest in one command (
-                <code>thurbox-cli extension install &lt;name&gt;</code>
-                ), and Thurbox keeps its session and automation
+                <code>friring-cli extension install &lt;name&gt;</code>
+                ), and Friring keeps its session and automation
                 <strong>self-healed</strong>
                 . Ships flow, forge, ci-shepherd, renovate, and task integrations
                 for GitHub / GitLab / Linear / Jira (all experimental).
@@ -429,7 +360,7 @@ cargo build --release</code></pre>
               <h3>Persistent tmux Sessions</h3>
               <p>
                 Every session runs in a dedicated
-                <code>tmux -L thurbox</code>
+                <code>tmux -L friring</code>
                 pane behind a single
                 <code>SessionBackend</code>
                 trait, so sessions survive crashes, restarts, and detaches.
@@ -442,7 +373,7 @@ cargo build --release</code></pre>
               <h3>Headless CLI</h3>
               <p>
                 The
-                <code>thurbox-cli</code>
+                <code>friring-cli</code>
                 binary scripts everything from the terminal: create and drive sessions and schedule
                 commands, all sharing the TUI's SQLite database.
               </p>
@@ -464,8 +395,8 @@ cargo build --release</code></pre>
             <span class="step-number">1</span>
             <div class="step-content">
               <h3>Launch</h3>
-              <p>Start Thurbox. The session sidebar and terminal panel appear.</p>
-              <pre><code class="language-bash">thurbox</code></pre>
+              <p>Start Friring. The session sidebar and terminal panel appear.</p>
+              <pre><code class="language-bash">friring</code></pre>
             </div>
           </div>
 
@@ -483,7 +414,7 @@ cargo build --release</code></pre>
                   <div class="terminal-dot red"></div>
                   <div class="terminal-dot yellow"></div>
                   <div class="terminal-dot green"></div>
-                  <span class="terminal-title">thurbox</span>
+                  <span class="terminal-title">friring</span>
                 </div>
                 <div class="terminal-body">
                   <pre>Ctrl+N  New session
@@ -507,7 +438,7 @@ cargo build --release</code></pre>
                   <div class="terminal-dot red"></div>
                   <div class="terminal-dot yellow"></div>
                   <div class="terminal-dot green"></div>
-                  <span class="terminal-title">thurbox</span>
+                  <span class="terminal-title">friring</span>
                 </div>
                 <div class="terminal-body">
                   <pre>Ctrl+N  New session (select mode)
@@ -670,7 +601,7 @@ Ctrl+O  Open repos in editor</pre>
                 </div>
                 <div class="terminal-body">
                   <!-- prettier-ignore -->
-                  <video src="assets/thurbox-session-creation.mp4" autoplay loop muted playsinline preload="none">
+                  <video src="assets/friring-session-creation.mp4" autoplay loop muted playsinline preload="none">
                     Creating a new session: repo picker, name, agent picker
                   </video>
                 </div>
@@ -698,7 +629,7 @@ Ctrl+O  Open repos in editor</pre>
                 </div>
                 <div class="terminal-body">
                   <!-- prettier-ignore -->
-                  <video src="assets/thurbox-file-manager.mp4" autoplay loop muted playsinline preload="none">
+                  <video src="assets/friring-file-manager.mp4" autoplay loop muted playsinline preload="none">
                     Browsing the worktree file tree with the file viewer
                   </video>
                 </div>
@@ -726,7 +657,7 @@ Ctrl+O  Open repos in editor</pre>
                 </div>
                 <div class="terminal-body">
                   <!-- prettier-ignore -->
-                  <video src="assets/thurbox-info-panel.mp4" autoplay loop muted playsinline preload="none">
+                  <video src="assets/friring-info-panel.mp4" autoplay loop muted playsinline preload="none">
                     Info panel showing session details and live metrics
                   </video>
                 </div>
@@ -753,7 +684,7 @@ Ctrl+O  Open repos in editor</pre>
                   <span class="terminal-title">Themes</span>
                 </div>
                 <div class="terminal-body">
-                  <video src="assets/thurbox-theme.mp4" autoplay loop muted playsinline preload="none">
+                  <video src="assets/friring-theme.mp4" autoplay loop muted playsinline preload="none">
                     Switching between light and dark themes live
                   </video>
                 </div>
@@ -769,7 +700,7 @@ Ctrl+O  Open repos in editor</pre>
       <div class="container">
         <div class="section-title">
           <h2>Prerequisites</h2>
-          <p>What you need before running Thurbox &mdash; plus extra install options</p>
+          <p>What you need before running Friring &mdash; plus extra install options</p>
         </div>
 
         <div class="install-main">

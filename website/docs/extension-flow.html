@@ -1,7 +1,7 @@
 ---
 layout: docs.njk
-title: 'flow extension — Thurbox Docs'
-description: 'The flow extension: a focus-protecting triage agent for Thurbox that captures brain-dumps into tasks, dispatches worker sessions, and surfaces the single next thing to focus on.'
+title: 'flow extension — Friring Docs'
+description: 'The flow extension: a focus-protecting triage agent for Friring that captures brain-dumps into tasks, dispatches worker sessions, and surfaces the single next thing to focus on.'
 currentPage: 'extension-flow'
 breadcrumb: 'flow'
 onThisPage:
@@ -15,7 +15,7 @@ onThisPage:
           <p>
             A focus-protecting triage agent. You brain-dump at a cheap, dedicated
             <em>flow session</em>
-            ; it captures everything into the Thurbox task list, dispatches real work to worker
+            ; it captures everything into the Friring task list, dispatches real work to worker
             sessions (each on its own git worktree), monitors them quietly, grooms the backlog, and
             ends every reply with the single next thing to focus on.
           </p>
@@ -34,7 +34,7 @@ onThisPage:
           <p>
             flow is
             <strong>agent-agnostic</strong>
-            , like Thurbox itself. The triager and workers are plain
+            , like Friring itself. The triager and workers are plain
             <code>agents.toml</code>
             aliases (
             <code>flow</code>
@@ -54,7 +54,7 @@ onThisPage:
             &rarr;
             <code>FLOW.md</code>
             ). All orchestration goes through
-            <code>thurbox-cli</code>
+            <code>friring-cli</code>
             &mdash; the core binary has no flow-specific code.
           </p>
 
@@ -63,24 +63,24 @@ onThisPage:
             <a href="#install" class="heading-anchor">#</a>
           </h2>
           <p>
-            flow is a Thurbox
+            flow is a Friring
             <a href="extensions.html">extension</a>
             (a declarative
             <code>extension.toml</code>
             manifest):
           </p>
-          <pre><code class="language-bash">thurbox-cli extension install flow      # or ./extensions/flow from a checkout
-thurbox-cli extension uninstall flow    # --purge also deletes ~/.config/thurbox/extensions/flow</code></pre>
+          <pre><code class="language-bash">friring-cli extension install flow      # or ./extensions/flow from a checkout
+friring-cli extension uninstall flow    # --purge also deletes ~/.config/friring/extensions/flow</code></pre>
           <p>
             Installing lays down the flow home (
-            <code>~/.config/thurbox/extensions/flow</code>
+            <code>~/.config/friring/extensions/flow</code>
             ; override with
             <code>--home</code>
             ), registers the agents, and activates the dedicated
             <code>flow</code>
             session &mdash;
             <strong>self-healed</strong>
-            by Thurbox, so deleting it is a no-op until you
+            by Friring, so deleting it is a no-op until you
             <code>deactivate</code>
             . Flow is event-driven (worker pushes over the mailbox queue wake
             it); there is no scheduled automation.
@@ -146,7 +146,7 @@ thurbox-cli extension uninstall flow    # --purge also deletes ~/.config/thurbox
             spawns its worker in one atomic helper call. Worker&harr;flow coordination is
             <strong>event-driven over the inter-session message queue</strong>
             (
-            <a href="features.html#headless-cli"><code>thurbox-cli message</code></a>
+            <a href="features.html#headless-cli"><code>friring-cli message</code></a>
             ): a worker pushes a structured
             <code>questions</code>
             ,
@@ -170,7 +170,7 @@ thurbox-cli extension uninstall flow    # --purge also deletes ~/.config/thurbox
           <p>
             See
             <a
-              href="https://github.com/Thurbeen/thurbox/tree/main/extensions/flow"
+              href="https://github.com/bvc3at/friring/tree/main/extensions/flow"
               target="_blank"
               rel="noopener"
             >
@@ -187,6 +187,6 @@ thurbox-cli extension uninstall flow    # --purge also deletes ~/.config/thurbox
             ,
             <code>parse-result.sh</code>
             ). The
-            <a href="features.html#flow-extension">Features</a>
+            <a href="extensions.html#overview">Extensions</a>
             page covers the design rationale.
           </p>

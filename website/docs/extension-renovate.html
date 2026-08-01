@@ -1,6 +1,6 @@
 ---
 layout: docs.njk
-title: 'renovate extension — Thurbox Docs'
+title: 'renovate extension — Friring Docs'
 description: 'The renovate extension: keeps your local repos on up-to-date dependencies by running Renovate''s local platform in an isolated worktree, testing the bumps, and opening a review PR.'
 currentPage: 'extension-renovate'
 breadcrumb: 'renovate'
@@ -48,7 +48,7 @@ onThisPage:
             <code>renovate</code>
             session sweeps your watched repos on a
             <code>renovate-tick</code>
-            automation (weekly, Monday&nbsp;09:00). Updaters are Thurbox
+            automation (weekly, Monday&nbsp;09:00). Updaters are Friring
             <strong>tasks</strong>
             (
             <code>update &lt;repo&gt; deps &hellip;</code>
@@ -77,10 +77,10 @@ onThisPage:
             , which hard-codes it):
             <strong>no hosted bot, no token, no Renovate-opened PRs.</strong>
             Renovate simply rewrites the dependency manifests + lockfiles in the worktree; the
-            Thurbox worker owns the rest (test, commit, push, open a PR). That keeps it
+            Friring worker owns the rest (test, commit, push, open a PR). That keeps it
             forge-agnostic
             <em>and</em>
-            agent-agnostic, like Thurbox itself &mdash; the only thing baked in is
+            agent-agnostic, like Friring itself &mdash; the only thing baked in is
             <strong>git</strong>
             . The worker works the forge out from
             <code>git remote -v</code>
@@ -137,7 +137,7 @@ onThisPage:
               ,
               <code>jq</code>
               , and
-              <code>thurbox-cli</code>
+              <code>friring-cli</code>
               on
               <code>PATH</code>
               .
@@ -166,17 +166,17 @@ onThisPage:
             <a href="#install" class="heading-anchor">#</a>
           </h2>
           <p>
-            renovate is a Thurbox
+            renovate is a Friring
             <a href="extensions.html">extension</a>
             (a declarative
             <code>extension.toml</code>
             manifest):
           </p>
-          <pre><code class="language-bash">thurbox-cli extension install renovate    # or ./extensions/renovate
-thurbox-cli extension uninstall renovate  # --purge also deletes ~/.config/thurbox/extensions/renovate</code></pre>
+          <pre><code class="language-bash">friring-cli extension install renovate    # or ./extensions/renovate
+friring-cli extension uninstall renovate  # --purge also deletes ~/.config/friring/extensions/renovate</code></pre>
           <p>
             Installing lays down the renovate home (
-            <code>~/.config/thurbox/extensions/renovate</code>
+            <code>~/.config/friring/extensions/renovate</code>
             ; override with
             <code>--home</code>
             ), registers the
@@ -189,7 +189,7 @@ thurbox-cli extension uninstall renovate  # --purge also deletes ~/.config/thurb
             <code>renovate-tick</code>
             automation &mdash; both
             <strong>self-healed</strong>
-            by Thurbox.
+            by Friring.
           </p>
 
           <h2 id="use">
@@ -199,7 +199,7 @@ thurbox-cli extension uninstall renovate  # --purge also deletes ~/.config/thurb
           <ul>
             <li>
               Add the repos to keep current to
-              <code>~/.config/thurbox/extensions/renovate/repos.md</code>
+              <code>~/.config/friring/extensions/renovate/repos.md</code>
               (one row each;
               <code>strategy</code>
               defaults to
@@ -232,7 +232,7 @@ thurbox-cli extension uninstall renovate  # --purge also deletes ~/.config/thurb
             <strong>brand-new</strong>
             branch, so &mdash; unlike ci-shepherd &mdash; there's no branch to adopt:
             <code>dispatch-update.sh</code>
-            uses Thurbox's native
+            uses Friring's native
             <code>--worktree</code>
             , which runs
             <code>git worktree add -b renovate/updates-&lt;ts&gt; origin/main</code>
@@ -249,7 +249,7 @@ thurbox-cli extension uninstall renovate  # --purge also deletes ~/.config/thurb
           <p>
             See
             <a
-              href="https://github.com/Thurbeen/thurbox/tree/main/extensions/renovate"
+              href="https://github.com/bvc3at/friring/tree/main/extensions/renovate"
               target="_blank"
               rel="noopener"
             >

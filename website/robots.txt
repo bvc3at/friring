@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://thurbox.thurbeen.eu/sitemap.xml
+Sitemap: https://bvc3at.github.io/friring/sitemap.xml

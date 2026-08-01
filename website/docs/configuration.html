@@ -1,7 +1,7 @@
 ---
 layout: docs.njk
-title: 'Configuration — Thurbox Docs'
-description: 'Every config file and knob Thurbox reads: agents.toml, hosts.toml, settings.toml feature flags, themes.toml, keybindings.json, extension manifests, SQLite-backed state, and environment variables.'
+title: 'Configuration — Friring Docs'
+description: 'Every config file and knob Friring reads: agents.toml, hosts.toml, settings.toml feature flags, themes.toml, keybindings.json, extension manifests, SQLite-backed state, and environment variables.'
 currentPage: 'configuration'
 breadcrumb: 'Configuration'
 onThisPage:
@@ -21,7 +21,7 @@ onThisPage:
 <h1>Configuration</h1>
 
           <p>
-            Every knob Thurbox reads, where it lives, and how it behaves. One file per
+            Every knob Friring reads, where it lives, and how it behaves. One file per
             audience/lifecycle: hand-edited registries are TOML, the machine-written keybindings
             are JSON, and concurrently-written runtime state lives in SQLite.
           </p>
@@ -31,11 +31,11 @@ onThisPage:
               (version
               <code>0.0.0-dev</code>
               ) use
-              <code>thurbox-dev</code>
+              <code>friring-dev</code>
               in place of
-              <code>thurbox</code>
+              <code>friring</code>
               in every path below, plus a
-              <code>thurbox-dev</code>
+              <code>friring-dev</code>
               tmux socket, so a development checkout never touches your real setup. All paths
               respect
               <code>$XDG_CONFIG_HOME</code>
@@ -61,58 +61,58 @@ onThisPage:
             </thead>
             <tbody>
               <tr>
-                <td><code>~/.config/thurbox/agents.toml</code></td>
+                <td><code>~/.config/friring/agents.toml</code></td>
                 <td>TOML</td>
                 <td>you</td>
                 <td>live (mtime poll)</td>
                 <td>coding-agent CLI definitions</td>
               </tr>
               <tr>
-                <td><code>~/.config/thurbox/hosts.toml</code></td>
+                <td><code>~/.config/friring/hosts.toml</code></td>
                 <td>TOML</td>
                 <td>you</td>
                 <td>startup</td>
                 <td>remote SSH hosts</td>
               </tr>
               <tr>
-                <td><code>~/.config/thurbox/settings.toml</code></td>
+                <td><code>~/.config/friring/settings.toml</code></td>
                 <td>TOML</td>
                 <td>you / Settings panel</td>
                 <td>live (mtime poll)</td>
                 <td>tuning knobs + feature flags</td>
               </tr>
               <tr>
-                <td><code>~/.config/thurbox/themes.toml</code></td>
+                <td><code>~/.config/friring/themes.toml</code></td>
                 <td>TOML</td>
                 <td>you</td>
                 <td>startup</td>
                 <td>custom theme palettes</td>
               </tr>
               <tr>
-                <td><code>~/.config/thurbox/keybindings.json</code></td>
+                <td><code>~/.config/friring/keybindings.json</code></td>
                 <td>JSON</td>
                 <td>F1 editor (or you)</td>
                 <td>live (mtime poll)</td>
                 <td>key chord overrides</td>
               </tr>
               <tr>
-                <td><code>~/.config/thurbox/extensions/&lt;name&gt;.toml</code></td>
+                <td><code>~/.config/friring/extensions/&lt;name&gt;.toml</code></td>
                 <td>TOML</td>
                 <td><code>extension install</code></td>
                 <td>startup + tick</td>
                 <td>extension manifests (self-healed resources)</td>
               </tr>
               <tr>
-                <td><code>~/.local/share/thurbox/thurbox.db</code></td>
+                <td><code>~/.local/share/friring/friring.db</code></td>
                 <td>SQLite</td>
-                <td>thurbox</td>
+                <td>friring</td>
                 <td>live</td>
                 <td>sessions, automations, tasks, theme, editor command</td>
               </tr>
               <tr>
-                <td><code>~/.local/share/thurbox/thurbox.log</code></td>
+                <td><code>~/.local/share/friring/friring.log</code></td>
                 <td>text</td>
-                <td>thurbox</td>
+                <td>friring</td>
                 <td>&mdash;</td>
                 <td>logs (incl. config warnings)</td>
               </tr>
@@ -147,8 +147,8 @@ onThisPage:
             reported by name, while syntax/type errors fall back to built-ins (agents), zero hosts,
             or defaults (settings). Check everything from the command line:
           </p>
-          <pre><code class="language-bash">thurbox-cli config validate   # strict parse of every file; exit 1 on problems
-thurbox-cli config show       # effective config + where each value came from</code></pre>
+          <pre><code class="language-bash">friring-cli config validate   # strict parse of every file; exit 1 on problems
+friring-cli config show       # effective config + where each value came from</code></pre>
 
           <h3 id="which-file">Which file do I edit?</h3>
           <p>
@@ -237,7 +237,7 @@ new_session_args = ["--session-id", "{id}"]   # emitted on a fresh spawn
 resume_latest = false       # true = id-less "resume last session in cwd"</code></pre>
           <p>
             <code>{id}</code>
-            is substituted with the thurbox-generated session UUID. Groups are emitted only when
+            is substituted with the friring-generated session UUID. Groups are emitted only when
             their driving value exists; precedence is fork &gt; resume &gt; new-session.
           </p>
 
@@ -284,19 +284,19 @@ resume_latest = false       # true = id-less "resume last session in cwd"</code>
               <tr>
                 <td><code>socket</code></td>
                 <td>no</td>
-                <td><code>thurbox</code></td>
+                <td><code>friring</code></td>
                 <td>remote <code>tmux -L</code> socket</td>
               </tr>
               <tr>
                 <td><code>session</code></td>
                 <td>no</td>
-                <td><code>thurbox</code></td>
+                <td><code>friring</code></td>
                 <td>remote tmux session name</td>
               </tr>
               <tr>
                 <td><code>worktrees_dir</code></td>
                 <td>no</td>
-                <td>remote <code>$HOME/.local/share/thurbox/worktrees</code></td>
+                <td>remote <code>$HOME/.local/share/friring/worktrees</code></td>
                 <td>absolute remote worktrees dir</td>
               </tr>
             </tbody>
@@ -304,7 +304,7 @@ resume_latest = false       # true = id-less "resume last session in cwd"</code>
           <p>
             Auth comes entirely from your
             <code>~/.ssh/config</code>
-            ; thurbox never handles credentials. Host changes require a restart.
+            ; friring never handles credentials. Host changes require a restart.
           </p>
 
           <h2 id="settings-toml">
@@ -488,7 +488,7 @@ min_interval_secs   = 5        # per-session floor between notifications</code><
                 <td>
                   TUI <code>Ctrl+D</code> soft-deletes (with a <code>Ctrl+Z</code> undo window);
                   <code>false</code> makes it a hard delete behind a confirmation modal. Never affects
-                  <code>thurbox-cli session delete</code> (soft unless <code>--force</code>).
+                  <code>friring-cli session delete</code> (soft unless <code>--force</code>).
                 </td>
               </tr>
               <tr>
@@ -496,7 +496,7 @@ min_interval_secs   = 5        # per-session floor between notifications</code><
                 <td><code>false</code></td>
                 <td>
                   GitHub update check: TUI header &ldquo;update available&rdquo; badge +
-                  <code>thurbox-cli version --check</code>
+                  <code>friring-cli version --check</code>
                 </td>
               </tr>
               <tr>
@@ -504,7 +504,7 @@ min_interval_secs   = 5        # per-session floor between notifications</code><
                 <td><code>false</code></td>
                 <td>
                   silent self-update: download + verify + replace the binaries on startup +
-                  <code>thurbox-cli update</code>
+                  <code>friring-cli update</code>
                 </td>
               </tr>
             </tbody>
@@ -513,7 +513,7 @@ min_interval_secs   = 5        # per-session floor between notifications</code><
             <code>automations = false</code>
             is the one flag with teeth beyond the UI: it also stops the TUI from firing due
             schedules and arming the tmux heartbeat at startup (explicit
-            <code>thurbox-cli automation</code>
+            <code>friring-cli automation</code>
             commands still work).
             <code>mouse = false</code>
             skips terminal mouse capture entirely, so the terminal keeps its native mouse behavior.
@@ -524,14 +524,14 @@ min_interval_secs   = 5        # per-session floor between notifications</code><
           <p>
             <code>version_check = true</code>
             enables the update check. On launch the TUI reads a cached result
-            (<code>~/.local/share/thurbox/version-check.json</code>) and, if it is older than 24&nbsp;h,
+            (<code>~/.local/share/friring/version-check.json</code>) and, if it is older than 24&nbsp;h,
             fires a single best-effort background fetch of GitHub's latest release (via
             <code>curl</code>/<code>wget</code>); a newer release shows a
             <code>&uarr; vX.Y.Z available</code>
             badge next to the version in the header. The fetch never blocks startup and failures are
             silent. Dev builds (<code>0.0.0-dev</code>) never show the badge. The same flag enables
-            <code>thurbox-cli version --check</code>
-            (<code>thurbox-cli version</code> with no flag always prints the current version).
+            <code>friring-cli version --check</code>
+            (<code>friring-cli version</code> with no flag always prints the current version).
           </p>
           <p>
             <code>auto_update = true</code>
@@ -540,13 +540,13 @@ min_interval_secs   = 5        # per-session floor between notifications</code><
             check, if a newer release exists it downloads that release's tarball + checksums from
             GitHub Releases (<code>curl</code>/<code>wget</code>), verifies the SHA256
             (<code>sha256sum</code>/<code>shasum</code>), extracts it (<code>tar</code>), and
-            atomically replaces the installed <code>thurbox</code>/<code>thurbox-cli</code> binaries
+            atomically replaces the installed <code>friring</code>/<code>friring-cli</code> binaries
             in place &mdash; mirroring <code>scripts/install.sh</code>. The download is verified
             <strong>before</strong> any installed file is touched, so a failed download leaves the
             current binaries untouched; the step runs before the TUI takes the terminal and is
             best-effort. The replaced binary takes effect on the <strong>next launch</strong>, so the
             TUI shows an &ldquo;Updated to vX.Y.Z &mdash; restart to apply&rdquo; status line.
-            <code>thurbox-cli update</code>
+            <code>friring-cli update</code>
             performs the same update on demand (<code>--force</code> bypasses the up-to-date and
             dev-build guards); dev builds (<code>0.0.0-dev</code>) never auto-update.
             <code>version_check</code> and <code>auto_update</code> are independent &mdash; enable
@@ -562,10 +562,10 @@ min_interval_secs   = 5        # per-session floor between notifications</code><
             <strong>click-to-focus</strong>: clicking the banner writes a focus request that the
             running TUI reads on its next tick and switches to that session. macOS shows the banner
             but ignores clicks (the modern <code>UNUserNotificationCenter</code> API requires a
-            signed app bundle, which thurbox is not). The notification body is the agent's last OSC
+            signed app bundle, which friring is not). The notification body is the agent's last OSC
             message when present, otherwise <code>Waiting for input</code>.
             <strong>Only fires while the TUI is open</strong>
-            &mdash; the agent terminal parser is what sees the bell, and it doesn't run when thurbox
+            &mdash; the agent terminal parser is what sees the bell, and it doesn't run when friring
             isn't. Gated by the <code>notifications</code> feature flag above.
           </p>
           <table>
@@ -724,10 +724,10 @@ app_bg = "reset"             # keep the terminal's native background</code></pre
             Each opt-in extension is described by a single
             <code>extension.toml</code>
             manifest.
-            <code>thurbox-cli extension install</code>
+            <code>friring-cli extension install</code>
             writes the home-resolved copy to
-            <code>~/.config/thurbox/extensions/&lt;name&gt;.toml</code>
-            (thurbox never seeds this dir). The manifest has an
+            <code>~/.config/friring/extensions/&lt;name&gt;.toml</code>
+            (friring never seeds this dir). The manifest has an
             <strong>install</strong>
             spec and a
             <strong>runtime</strong>
@@ -735,12 +735,12 @@ app_bg = "reset"             # keep the terminal's native background</code></pre
             <a href="extensions.html">Extensions</a>
             page for the full manifest format, lifecycle commands, and versioning.
           </p>
-          <pre><code class="language-bash">thurbox-cli extension install flow         # fetch + lay files + agents + activate
-thurbox-cli extension list                 # installed + active/healthy + version/stale
-thurbox-cli extension update --all         # re-fetch every installed extension
-thurbox-cli extension activate &lt;name&gt;      # (re)create resources + mark active
-thurbox-cli extension deactivate &lt;name&gt;    # tear down + stop self-heal
-thurbox-cli extension status [&lt;name&gt;]      # per-resource presence + version/stale</code></pre>
+          <pre><code class="language-bash">friring-cli extension install flow         # fetch + lay files + agents + activate
+friring-cli extension list                 # installed + active/healthy + version/stale
+friring-cli extension update --all         # re-fetch every installed extension
+friring-cli extension activate &lt;name&gt;      # (re)create resources + mark active
+friring-cli extension deactivate &lt;name&gt;    # tear down + stop self-heal
+friring-cli extension status [&lt;name&gt;]      # per-resource presence + version/stale</code></pre>
 
           <h2 id="sqlite-settings">
             SQLite-backed settings
@@ -767,7 +767,7 @@ thurbox-cli extension status [&lt;name&gt;]      # per-resource presence + versi
               </tr>
               <tr>
                 <td><code>editor_command</code></td>
-                <td><code>thurbox-cli editor set "&lt;cmd&gt;"</code></td>
+                <td><code>friring-cli editor set "&lt;cmd&gt;"</code></td>
                 <td>what <code>Ctrl+O</code> runs</td>
               </tr>
               <tr>
@@ -779,7 +779,7 @@ thurbox-cli extension status [&lt;name&gt;]      # per-resource presence + versi
           </table>
           <p>
             These are in the DB rather than a file because they are written concurrently by
-            multiple thurbox processes (TUI, CLI, MCP) and picked up live via
+            multiple friring processes (TUI, CLI, MCP) and picked up live via
             <code>PRAGMA data_version</code>
             polling.
           </p>
@@ -810,7 +810,7 @@ thurbox-cli extension status [&lt;name&gt;]      # per-resource presence + versi
               </tr>
               <tr>
                 <td><code>RUST_LOG</code></td>
-                <td>log filter for <code>thurbox.log</code></td>
+                <td>log filter for <code>friring.log</code></td>
               </tr>
             </tbody>
           </table>

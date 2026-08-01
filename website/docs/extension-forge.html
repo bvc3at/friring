@@ -1,7 +1,7 @@
 ---
 layout: docs.njk
-title: 'forge extension — Thurbox Docs'
-description: 'The forge extension: a workflow analyst that mines your Thurbox tasks, sessions, and automations for recurring patterns and writes ready-to-apply automation proposals.'
+title: 'forge extension — Friring Docs'
+description: 'The forge extension: a workflow analyst that mines your Friring tasks, sessions, and automations for recurring patterns and writes ready-to-apply automation proposals.'
 currentPage: 'extension-forge'
 breadcrumb: 'forge'
 onThisPage:
@@ -13,12 +13,12 @@ onThisPage:
 ---
 <h1>forge</h1>
           <p>
-            A workflow analyst that automates your Thurbox for you. forge watches how you actually
-            use Thurbox &mdash; your task backlog, the sessions you keep spawning, your existing
+            A workflow analyst that automates your Friring for you. forge watches how you actually
+            use Friring &mdash; your task backlog, the sessions you keep spawning, your existing
             automations and how often they fire or fail &mdash; and turns the
             <strong>recurring patterns</strong>
             into concrete, ready-to-apply proposals: mostly new
-            <code>thurbox-cli automation</code>
+            <code>friring-cli automation</code>
             s, sometimes a pointer to another extension.
           </p>
           <div class="info-box warning">
@@ -49,10 +49,10 @@ onThisPage:
             <code>forge</code>
             session. Each scan clusters your tasks/sessions/automations by intent and, where a
             pattern repeats, writes a proposal to
-            <code>~/.config/thurbox/extensions/forge/proposals.jsonl</code>
+            <code>~/.config/friring/extensions/forge/proposals.jsonl</code>
             (rendered for humans into
-            <code>~/.config/thurbox/extensions/forge/proposals.md</code>
-            ). Like Thurbox itself, forge is
+            <code>~/.config/friring/extensions/forge/proposals.md</code>
+            ). Like Friring itself, forge is
             <strong>agent-agnostic</strong>
             : the analyst is a plain
             <code>agents.toml</code>
@@ -66,17 +66,17 @@ onThisPage:
             <a href="#install" class="heading-anchor">#</a>
           </h2>
           <p>
-            forge is a Thurbox
+            forge is a Friring
             <a href="extensions.html">extension</a>
             (a declarative
             <code>extension.toml</code>
             manifest):
           </p>
-          <pre><code class="language-bash">thurbox-cli extension install forge      # or ./extensions/forge from a checkout
-thurbox-cli extension uninstall forge    # --purge also deletes ~/.config/thurbox/extensions/forge</code></pre>
+          <pre><code class="language-bash">friring-cli extension install forge      # or ./extensions/forge from a checkout
+friring-cli extension uninstall forge    # --purge also deletes ~/.config/friring/extensions/forge</code></pre>
           <p>
             Installing lays down the forge home (
-            <code>~/.config/thurbox/extensions/forge</code>
+            <code>~/.config/friring/extensions/forge</code>
             ; override with
             <code>--home</code>
             ), registers the
@@ -89,7 +89,7 @@ thurbox-cli extension uninstall forge    # --purge also deletes ~/.config/thurbo
             <code>forge-scan</code>
             automation &mdash; both
             <strong>self-healed</strong>
-            by Thurbox.
+            by Friring.
           </p>
 
           <h2 id="use">
@@ -105,7 +105,7 @@ thurbox-cli extension uninstall forge    # --purge also deletes ~/.config/thurbo
             <li>
               <code>status</code>
               for a one-screen list of open proposals; review the rendered backlog in
-              <code>~/.config/thurbox/extensions/forge/proposals.md</code>
+              <code>~/.config/friring/extensions/forge/proposals.md</code>
               .
             </li>
             <li>
@@ -129,9 +129,9 @@ thurbox-cli extension uninstall forge    # --purge also deletes ~/.config/thurbo
             <code>proposals.sh apply</code>
             <strong>
               refuses to run anything that does not start with
-              <code>thurbox-cli</code>
+              <code>friring-cli</code>
             </strong>
-            &mdash; so applying a proposal can only ever create or edit a Thurbox automation, never
+            &mdash; so applying a proposal can only ever create or edit a Friring automation, never
             run arbitrary shell.
           </p>
 
@@ -142,7 +142,7 @@ thurbox-cli extension uninstall forge    # --purge also deletes ~/.config/thurbo
           <p>
             See
             <a
-              href="https://github.com/Thurbeen/thurbox/tree/main/extensions/forge"
+              href="https://github.com/bvc3at/friring/tree/main/extensions/forge"
               target="_blank"
               rel="noopener"
             >

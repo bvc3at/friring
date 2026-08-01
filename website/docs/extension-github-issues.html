@@ -1,7 +1,7 @@
 ---
 layout: docs.njk
-title: 'github-issues extension — Thurbox Docs'
-description: 'The github-issues extension: bidirectionally syncs GitHub issues with the Thurbox task list — your issues show up as tasks, and marking a task done closes the issue.'
+title: 'github-issues extension — Friring Docs'
+description: 'The github-issues extension: bidirectionally syncs GitHub issues with the Friring task list — your issues show up as tasks, and marking a task done closes the issue.'
 currentPage: 'extension-github-issues'
 breadcrumb: 'GitHub issues'
 onThisPage:
@@ -18,7 +18,7 @@ onThisPage:
           <p>
             The github-issues extension bidirectionally syncs
             <strong>GitHub issues</strong>
-            with the Thurbox
+            with the Friring
             <strong>task list</strong>
             : your issues show up as tasks, and marking a task done closes the issue. A
             <code>github-issues-tick</code>
@@ -33,9 +33,9 @@ onThisPage:
             <code>trackers.md</code>
             with the task list. There is
             <strong>no agent, no LLM, no tokens</strong>
-            : Thurbox's scheduler runs the script (TUI or headless heartbeat) and records its output
+            : Friring's scheduler runs the script (TUI or headless heartbeat) and records its output
             in the automation run history. The script only calls
-            <code>thurbox-cli</code>
+            <code>friring-cli</code>
             and the
             <code>gh</code>
             CLI; no GitHub bot, no webhook.
@@ -53,7 +53,7 @@ onThisPage:
             <a href="#overview" class="heading-anchor">#</a>
           </h2>
           <p>
-            Pull is the default direction: GitHub issues become Thurbox tasks. GitHub is
+            Pull is the default direction: GitHub issues become Friring tasks. GitHub is
             authoritative for an issue's
             <strong>title, URL, and open-vs-done state</strong>
             ; your local
@@ -77,14 +77,14 @@ onThisPage:
           </h2>
           <ul>
             <li>
-              <code>thurbox-cli</code>
+              <code>friring-cli</code>
               <strong>&ge;&nbsp;0.141</strong>
               on
               <code>PATH</code>
               &mdash; the sync uses the
               <code>task --source/--external-id/--external-url</code>
               flags added there (check with
-              <code>thurbox-cli version</code>
+              <code>friring-cli version</code>
               ).
             </li>
             <li>
@@ -116,17 +116,17 @@ onThisPage:
             <a href="#install" class="heading-anchor">#</a>
           </h2>
           <p>
-            github-issues is a Thurbox
+            github-issues is a Friring
             <a href="extensions.html">extension</a>
             (a declarative
             <code>extension.toml</code>
             manifest):
           </p>
-          <pre><code><span class="syn-prompt">$</span> <span class="syn-cmd">thurbox-cli</span> extension install github-issues       <span class="syn-comment"># or ./extensions/github-issues</span>
-<span class="syn-prompt">$</span> <span class="syn-cmd">thurbox-cli</span> extension uninstall github-issues     <span class="syn-comment"># --purge also deletes ~/.config/thurbox/extensions/github-issues</span></code></pre>
+          <pre><code><span class="syn-prompt">$</span> <span class="syn-cmd">friring-cli</span> extension install github-issues       <span class="syn-comment"># or ./extensions/github-issues</span>
+<span class="syn-prompt">$</span> <span class="syn-cmd">friring-cli</span> extension uninstall github-issues     <span class="syn-comment"># --purge also deletes ~/.config/friring/extensions/github-issues</span></code></pre>
           <p>
             Installing lays down the
-            <code>~/.config/thurbox/extensions/github-issues/</code>
+            <code>~/.config/friring/extensions/github-issues/</code>
             home (override with
             <code>--home</code>
             ; it holds
@@ -137,7 +137,7 @@ onThisPage:
             <code>github-issues-tick</code>
             automation &mdash;
             <strong>self-healed</strong>
-            by Thurbox if deleted.
+            by Friring if deleted.
           </p>
 
           <h2 id="configure">
@@ -146,7 +146,7 @@ onThisPage:
           </h2>
           <p>
             Edit
-            <code>~/.config/thurbox/extensions/github-issues/trackers.md</code>
+            <code>~/.config/friring/extensions/github-issues/trackers.md</code>
             &mdash; one row per repo or saved filter. The
             <strong>query</strong>
             is
@@ -187,10 +187,10 @@ onThisPage:
             <code>r</code>
             ) or headless:
           </p>
-          <pre><code><span class="syn-prompt">$</span> <span class="syn-cmd">thurbox-cli</span> automation run &lt;id&gt;     <span class="syn-comment"># id from: thurbox-cli automation list</span>
-<span class="syn-prompt">$</span> <span class="syn-cmd">~/.config/thurbox/extensions/github-issues/scripts/sync.sh</span>     <span class="syn-comment"># or run the script directly</span></code></pre>
+          <pre><code><span class="syn-prompt">$</span> <span class="syn-cmd">friring-cli</span> automation run &lt;id&gt;     <span class="syn-comment"># id from: friring-cli automation list</span>
+<span class="syn-prompt">$</span> <span class="syn-cmd">~/.config/friring/extensions/github-issues/scripts/sync.sh</span>     <span class="syn-comment"># or run the script directly</span></code></pre>
           <p>Then inspect the imported tasks:</p>
-          <pre><code><span class="syn-prompt">$</span> <span class="syn-cmd">thurbox-cli</span> task list --json | jq -c '.[] | select(.source=="github") | {id,status,external_id,title}'</code></pre>
+          <pre><code><span class="syn-prompt">$</span> <span class="syn-cmd">friring-cli</span> task list --json | jq -c '.[] | select(.source=="github") | {id,status,external_id,title}'</code></pre>
           <p>
             Open issues import as
             <code>todo</code>
@@ -242,7 +242,7 @@ onThisPage:
           <p>
             See
             <a
-              href="https://github.com/Thurbeen/thurbox/tree/main/extensions/github-issues"
+              href="https://github.com/bvc3at/friring/tree/main/extensions/github-issues"
               target="_blank"
               rel="noopener"
             >

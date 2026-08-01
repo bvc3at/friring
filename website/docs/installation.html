@@ -1,13 +1,13 @@
 ---
 layout: docs.njk
-title: 'Installation — Thurbox Docs'
-description: 'Install Thurbox from binary or source. Platform detection, checksums, prerequisites.'
+title: 'Installation — Friring Docs'
+description: 'Install Friring from binary or source. Platform detection, checksums, prerequisites.'
 currentPage: 'installation'
 breadcrumb: 'Installation'
 onThisPage:
   - { id: 'from-binary', label: 'From Binary' }
   - { id: 'homebrew', label: 'Homebrew' }
-  - { id: 'arch-linux', label: 'Arch Linux (AUR)' }
+  - { id: 'cargo', label: 'With cargo' }
   - { id: 'from-source', label: 'From Source' }
   - { id: 'prerequisites', label: 'Prerequisites' }
   - { id: 'quick-start', label: 'Quick Start' }
@@ -26,7 +26,7 @@ onThisPage:
             checksums automatically.
           </p>
 
-          <pre data-wrap><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/main/scripts/install.sh | sh</code></pre>
+          <pre data-wrap><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | sh</code></pre>
 
           <p>
             This installs to
@@ -46,10 +46,10 @@ onThisPage:
           </ul>
 
           <h3>Custom install directory</h3>
-          <pre data-wrap><code class="language-bash">INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/main/scripts/install.sh | sh</code></pre>
+          <pre data-wrap><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | INSTALL_DIR=/usr/local/bin sh</code></pre>
 
           <h3>Specific version</h3>
-          <pre data-wrap><code class="language-bash">VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/main/scripts/install.sh | sh</code></pre>
+          <pre data-wrap><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | VERSION=v0.13.0 sh</code></pre>
 
           <h3>Windows (PowerShell)</h3>
           <div class="info-box warning">
@@ -63,13 +63,20 @@ onThisPage:
           </div>
           <p>
             On native Windows the install script is PowerShell. It installs to
-            <code>%LOCALAPPDATA%\Programs\thurbox</code>
+            <code>%LOCALAPPDATA%\Programs\friring</code>
             (added to your user
             <code>PATH</code>) and uses
             <a href="https://github.com/psmux/psmux">psmux</a>
             as the multiplexer.
           </p>
-          <pre data-wrap><code class="language-powershell">irm https://raw.githubusercontent.com/Thurbeen/thurbox/main/scripts/install.ps1 | iex</code></pre>
+          <pre data-wrap><code class="language-powershell">irm https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.ps1 | iex</code></pre>
+          <p>
+            Pin a version or an install directory with the
+            <code>FRIRING_VERSION</code>
+            /
+            <code>FRIRING_INSTALL_DIR</code>
+            environment variables.
+          </p>
 
           <h3>Available platforms</h3>
           <table>
@@ -84,127 +91,77 @@ onThisPage:
               <tr>
                 <td>Linux (glibc)</td>
                 <td>x86_64</td>
-                <td><code>thurbox-v{ver}-x86_64-unknown-linux-gnu.tar.gz</code></td>
+                <td><code>friring-v{ver}-x86_64-unknown-linux-gnu.tar.gz</code></td>
               </tr>
               <tr>
                 <td>Linux (musl)</td>
                 <td>x86_64</td>
-                <td><code>thurbox-v{ver}-x86_64-unknown-linux-musl.tar.gz</code></td>
+                <td><code>friring-v{ver}-x86_64-unknown-linux-musl.tar.gz</code></td>
               </tr>
               <tr>
                 <td>macOS</td>
                 <td>Apple Silicon</td>
-                <td><code>thurbox-v{ver}-aarch64-apple-darwin.tar.gz</code></td>
+                <td><code>friring-v{ver}-aarch64-apple-darwin.tar.gz</code></td>
               </tr>
               <tr>
                 <td>Windows</td>
                 <td>x86_64</td>
-                <td><code>thurbox-v{ver}-x86_64-pc-windows-msvc.zip</code></td>
+                <td><code>friring-v{ver}-x86_64-pc-windows-msvc.zip</code></td>
               </tr>
             </tbody>
           </table>
-
-          <h2 id="winget">
-            winget (Windows)
-            <a href="#winget" class="heading-anchor">#</a>
-          </h2>
-          <p>
-            On Windows, install the prebuilt x86_64 binaries with
-            <a href="https://learn.microsoft.com/windows/package-manager/">winget</a>
-            (Microsoft's package manager, bundled with Windows 10/11):
-          </p>
-          <pre><code class="language-powershell">winget install Thurbeen.thurbox</code></pre>
-          <p>
-            Installs
-            <code>thurbox.exe</code>
-            and
-            <code>thurbox-cli.exe</code>
-            from the GitHub Release as portable commands on your
-            <code>PATH</code>
-            . Needs
-            <a href="https://github.com/psmux/psmux">psmux</a>
-            as the multiplexer, installed separately.
-          </p>
-
-          <h2 id="chocolatey">
-            Chocolatey (Windows)
-            <a href="#chocolatey" class="heading-anchor">#</a>
-          </h2>
-          <p>
-            On Windows, install the prebuilt x86_64 binaries from the
-            <a href="https://community.chocolatey.org/packages/thurbox">Chocolatey community repository</a>
-            :
-          </p>
-          <pre><code class="language-powershell">choco install thurbox</code></pre>
-          <div class="info-box warning">
-            <p>
-              <strong>Pending moderation.</strong>
-              The Chocolatey package has been pushed to the community repository but is
-              <strong>not yet approved</strong>
-              by the moderators, so
-              <code>choco install thurbox</code>
-              will not resolve it from the community feed until it goes live. Use
-              <a href="#winget">winget</a>
-              or the PowerShell installer above in the meantime.
-            </p>
-          </div>
-          <p>
-            Installs
-            <code>thurbox.exe</code>
-            and
-            <code>thurbox-cli.exe</code>
-            from the GitHub Release and shims them onto your
-            <code>PATH</code>
-            . Needs
-            <a href="https://github.com/psmux/psmux">psmux</a>
-            as the multiplexer, installed separately (there is no Chocolatey package for it).
-            New versions go through community-repo moderation before they appear.
-          </p>
 
           <h2 id="homebrew">
             Homebrew
             <a href="#homebrew" class="heading-anchor">#</a>
           </h2>
           <p>
-            On macOS or Linux, install the prebuilt binaries from the
-            <a href="https://github.com/Thurbeen/homebrew-thurbox">thurbox tap</a>
+            On macOS or Linux, install the prebuilt binaries with Homebrew. This repo
+            <em>is</em>
+            the tap &mdash; the formula lives at
+            <a href="https://github.com/bvc3at/friring/blob/main/HomebrewFormula/friring.rb">
+              <code>HomebrewFormula/friring.rb</code>
+            </a>
+            &mdash; so the tap URL is spelled out, since
+            <code>brew tap</code>
+            only infers one from a repo named
+            <code>homebrew-friring</code>
             :
           </p>
-          <pre><code class="language-bash">brew install thurbeen/thurbox/thurbox</code></pre>
+          <pre data-wrap><code class="language-bash">brew tap bvc3at/friring https://github.com/bvc3at/friring
+brew install bvc3at/friring/friring</code></pre>
           <p>
             This installs
-            <code>thurbox</code>
+            <code>friring</code>
             and
-            <code>thurbox-cli</code>
+            <code>friring-cli</code>
             , pulling in
             <code>tmux</code>
             and
             <code>git</code>
             as dependencies. Supported on macOS Apple Silicon and Linux x86_64 (Intel macOS and
-            aarch64 Linux have no release binary &mdash; use the one-liner or build from source
-            there).
+            aarch64 Linux have no release binary &mdash; use
+            <a href="#cargo">cargo</a>
+            or build from source there).
           </p>
 
-          <h2 id="arch-linux">
-            Arch Linux (AUR)
-            <a href="#arch-linux" class="heading-anchor">#</a>
+          <h2 id="cargo">
+            With cargo
+            <a href="#cargo" class="heading-anchor">#</a>
           </h2>
           <p>
-            Thurbox is on the AUR as
-            <a href="https://aur.archlinux.org/packages/thurbox"><code>thurbox</code></a>
-            (builds from source) and
-            <a href="https://aur.archlinux.org/packages/thurbox-bin"><code>thurbox-bin</code></a>
-            (prebuilt release binary). Install with your AUR helper:
+            Any platform with a Rust toolchain. This is the route for platforms with no prebuilt
+            binary &mdash; Intel macOS and aarch64 Linux:
           </p>
-          <pre><code class="language-bash">paru -S thurbox-bin   # prebuilt binary (fastest)
-paru -S thurbox       # build from source</code></pre>
+          <pre data-wrap><code class="language-bash">cargo install --git https://github.com/bvc3at/friring --locked</code></pre>
           <p>
-            <code>tmux</code>
-            is pulled in as a dependency. Swap
-            <code>paru</code>
-            for
-            <code>yay</code>
-            or your preferred helper.
+            Builds and installs
+            <code>friring</code>
+            and
+            <code>friring-cli</code>
+            into
+            <code>~/.cargo/bin</code>
+            .
           </p>
 
           <h2 id="from-source">
@@ -212,13 +169,13 @@ paru -S thurbox       # build from source</code></pre>
             <a href="#from-source" class="heading-anchor">#</a>
           </h2>
 
-          <pre><code class="language-bash">git clone https://github.com/Thurbeen/thurbox.git
-cd thurbox
+          <pre><code class="language-bash">git clone https://github.com/bvc3at/friring.git
+cd friring
 cargo build --release</code></pre>
 
           <p>
             The binary will be at
-            <code>target/release/thurbox</code>
+            <code>target/release/friring</code>
             . Requires Rust 1.75+.
           </p>
 
@@ -277,9 +234,9 @@ cargo build --release</code></pre>
 
           <ol>
             <li>
-              <strong>Launch Thurbox</strong>
+              <strong>Launch Friring</strong>
               &mdash; run
-              <code>thurbox</code>
+              <code>friring</code>
               in your terminal. You'll see the session sidebar and a terminal panel.
             </li>
             <li>
@@ -321,13 +278,13 @@ cargo build --release</code></pre>
 
           <p>
             Session state is stored in SQLite at
-            <code>~/.local/share/thurbox/thurbox.db</code>
+            <code>~/.local/share/friring/friring.db</code>
             (
             <code>$XDG_DATA_HOME</code>
             respected). Agent definitions live in
-            <code>~/.config/thurbox/agents.toml</code>
+            <code>~/.config/friring/agents.toml</code>
             (seeded on first run). Logs go to
-            <code>~/.local/share/thurbox/thurbox.log</code>
+            <code>~/.local/share/friring/friring.log</code>
             .
           </p>
 
@@ -335,17 +292,22 @@ cargo build --release</code></pre>
             Uninstall
             <a href="#uninstall" class="heading-anchor">#</a>
           </h2>
-          <p>Remove the binary, depending on how you installed it:</p>
-          <pre><code class="language-bash">rm ~/.local/bin/thurbox        # curl one-liner / manual install
-brew uninstall thurbox         # Homebrew
-paru -R thurbox thurbox-bin    # Arch (AUR)
-winget uninstall Thurbeen.thurbox  # winget (Windows)
-choco uninstall thurbox        # Chocolatey (Windows)</code></pre>
+          <p>Remove the binaries, depending on how you installed them:</p>
+          <pre data-wrap><code class="language-bash">rm ~/.local/bin/friring ~/.local/bin/friring-cli   # curl one-liner / manual install
+brew uninstall bvc3at/friring/friring              # Homebrew
+cargo uninstall friring                            # cargo install</code></pre>
           <p>
-            Sessions outlive Thurbox in tmux, so stop them too &mdash; and optionally delete state
+            On Windows, delete
+            <code>%LOCALAPPDATA%\Programs\friring</code>
+            and drop it from your user
+            <code>PATH</code>
+            .
+          </p>
+          <p>
+            Sessions outlive Friring in tmux, so stop them too &mdash; and optionally delete state
             and config (this erases session history, theme, and
             <code>agents.toml</code>
             ):
           </p>
-          <pre data-wrap><code class="language-bash">tmux -L thurbox kill-server    # ends all running agent sessions
-rm -rf ~/.local/share/thurbox ~/.config/thurbox   # optional: wipe state</code></pre>
+          <pre data-wrap><code class="language-bash">tmux -L friring kill-server    # ends all running agent sessions
+rm -rf ~/.local/share/friring ~/.config/friring   # optional: wipe state</code></pre>

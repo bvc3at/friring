@@ -17,11 +17,12 @@
 > kept intact as a tribute to the upstream author.
 >
 > **Heads up** — Friring cuts its **own** releases, so every install command
-> below fetches a `friring` binary from this repo. What still points upstream is
-> attribution (the `LICENSE`, provenance links, the website badge) plus two
-> formats shared with upstream: the `min_thurbox_version` extension-manifest key
-> and the `tb-` tmux window prefixes. See **[FORK.md](./FORK.md)** for the
-> running list of how this fork diverges from upstream.
+> below fetches a `friring` binary from this repo, and its **own** site at
+> <https://bvc3at.github.io/friring>. What still points upstream is attribution
+> (the `LICENSE`, provenance links, the quality-gate badge) plus two formats
+> shared with upstream: the `min_thurbox_version` extension-manifest key and the
+> `tb-` tmux window prefixes. See **[FORK.md](./FORK.md)** for the running list
+> of how this fork diverges from upstream.
 
 Run any coding-agent CLI in persistent terminal sessions.
 Friring is a multi-session TUI orchestrator that launches
@@ -32,7 +33,7 @@ worktrees are first-class citizens.
 
 [![CI](https://github.com/bvc3at/friring/actions/workflows/ci.yml/badge.svg)](https://github.com/bvc3at/friring/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Website](https://img.shields.io/badge/Website-thurbox.thurbeen.eu-blue)](https://thurbox.thurbeen.eu/)
+[![Website](https://img.shields.io/badge/Website-bvc3at.github.io%2Ffriring-blue)](https://bvc3at.github.io/friring/)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=Thurbeen_thurbox&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Thurbeen_thurbox)
 
 ![Friring Demo](./docs/media/friring-demo.gif)
