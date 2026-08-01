@@ -131,6 +131,123 @@ fn footer_entries(flags: &FooterState<'_>) -> Vec<(&'static str, Action)> {
         .collect()
 }
 
+/// The panel-toggle pills. They are the *optional* group: the trim drops them
+/// together rather than shedding a random one, so the row never reads as a
+/// half-collapsed set.
+fn is_optional(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::ToggleInfoPanel | Action::ToggleFileViewer | Action::FocusTasks
+    )
+}
+
+/// Order the *essential* pills give way in once even key-only chips overflow —
+/// the lowest rank goes first. Cosmetics (Theme) lead; `Help` is last out
+/// because it is the one chip that documents every key the row can no longer
+/// show.
+fn pill_drop_rank(action: Action) -> u8 {
+    match action {
+        Action::ToggleHelp => 3,
+        Action::QuitApp => 2,
+        Action::OpenSettings => 1,
+        _ => 0,
+    }
+}
+
+/// How much of a pill's `label · shortcut` text survives the responsive trim.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PillText {
+    /// ` Help · F1 ` — the resting form.
+    Full,
+    /// ` Help F1 ` — the ` · ` separator dropped, buying two columns per pill
+    /// back for the left-hand text.
+    Tight,
+    /// ` F1 ` — the last resort: the key alone (a button with no bound key
+    /// keeps its label, since a blank chip would be unclickable noise).
+    KeyOnly,
+}
+
+/// Label each pill with its live (rebindable) shortcut at the given trim level.
+/// Index-aligned with `entries` so the click→action map survives every step of
+/// the ladder.
+fn pill_labels(
+    state: &FooterState<'_>,
+    entries: &[(&'static str, Action)],
+    text: PillText,
+) -> Vec<String> {
+    entries
+        .iter()
+        .map(|(label, action)| {
+            let shortcut = crate::session::compact_shortcut(state.keybindings.chords_for(*action));
+            match (shortcut, text) {
+                (Some(sc), PillText::Full) => format!("{label} · {sc}"),
+                (Some(sc), PillText::Tight) => format!("{label} {sc}"),
+                (Some(sc), PillText::KeyOnly) => sc,
+                (None, _) => (*label).to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Pick the pill row for a footer `width` columns wide, degrading in the order
+/// [`render_footer`] documents. `left_width` is what the left-hand text wants at
+/// full length — it only decides whether the ` · ` separators are affordable,
+/// since past that point the left text is what yields. `pinned` is the width
+/// the never-dropped left segments reserve.
+///
+/// Returns the surviving entries with their labels, index-aligned.
+fn fit_pills(
+    state: &FooterState<'_>,
+    width: u16,
+    left_width: u16,
+    pinned: u16,
+) -> (Vec<(&'static str, Action)>, Vec<String>) {
+    let mut entries = footer_entries(state);
+
+    // 1. Resting form — only while the whole row (pills *and* the full left
+    //    text) fits, so the separators are never paid for with dropped text.
+    let full = pill_labels(state, &entries, PillText::Full);
+    if pill_block_width(&full).saturating_add(left_width) <= width {
+        return (entries, full);
+    }
+
+    // Everything below sacrifices left-hand text, which the caller trims — but
+    // never past the pinned segments, so the pills make room for those.
+    let room = width.saturating_sub(pinned);
+
+    // 2. Drop the ` · ` separators.
+    let tight = pill_labels(state, &entries, PillText::Tight);
+    if pill_block_width(&tight) <= room {
+        return (entries, tight);
+    }
+
+    // 3. The pills no longer fit on their own: drop the optional panel toggles.
+    entries.retain(|(_, action)| !is_optional(action));
+    let tight = pill_labels(state, &entries, PillText::Tight);
+    if pill_block_width(&tight) <= room {
+        return (entries, tight);
+    }
+
+    // 4. The compact state: chips shrink to the bare key, handing every freed
+    //    column back to the left-hand text.
+    let mut keys = pill_labels(state, &entries, PillText::KeyOnly);
+
+    // 5. Still overflowing — shed whole chips, least useful first.
+    while pill_block_width(&keys) > room && !entries.is_empty() {
+        let Some(idx) = entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, action))| pill_drop_rank(*action))
+            .map(|(idx, _)| idx)
+        else {
+            break;
+        };
+        entries.remove(idx);
+        keys.remove(idx);
+    }
+    (entries, keys)
+}
+
 /// Total width of the footer pill block: each pill is ` label ` (the label plus
 /// the two padding spaces) and pills are joined by a single-space separator.
 /// Mirrors `render_button_bar`'s packing so the responsive trim below agrees
@@ -145,102 +262,67 @@ fn pill_block_width(labels: &[String]) -> u16 {
 
 /// Render the footer bar and return each clickable button's hitbox paired with
 /// the `Action` it dispatches, packed against the right edge. Info/Files/Tasks
-/// are gated by their feature flags, and the panel-toggle pills (Info/Files/
-/// Tasks) are *optional*: when the full set would overflow the footer they're
-/// dropped together, so the essential Help/Theme/Settings/Quit pills never fall
-/// off a narrow terminal. When the file viewer is open its navigation hints
-/// fill the space to the *left* of the buttons (right-aligned there) so both
-/// stay visible.
+/// are gated by their feature flags.
+///
+/// The row is two blocks that must never touch: the left-hand text (focus,
+/// counts, key hints) and the right-packed pills. Both are laid out against the
+/// same column budget and painted into *disjoint* rects, so nothing can bleed
+/// under a pill or through the one-column gaps between them. What gives way as
+/// the terminal narrows, in order:
+///
+/// 1. the ` · ` separators inside the pills (` Help · F1 ` → ` Help F1 `),
+///    bought back as columns for the text;
+/// 2. the left-hand text, segment by segment, least useful first (the priority
+///    order on `left_segments`) — text yields before any button does;
+/// 3. the optional panel-toggle pills, dropped together, once the pills alone
+///    no longer fit;
+/// 4. the pill labels, leaving key-only chips (` F1 `) and handing every freed
+///    column back to the text;
+/// 5. whole chips, least useful first (`pill_drop_rank`).
 pub fn render_footer(
     frame: &mut Frame,
     area: Rect,
     state: &FooterState<'_>,
 ) -> Vec<(super::ButtonHit, Action)> {
+    if area.height == 0 || area.width == 0 {
+        return Vec::new();
+    }
     // The footer always carries the idle session/automation counts + the focus
-    // hint; the transient status/error message (and sync spinner) now live on
-    // their own dedicated row above the footer (`render_status_message_row`), so
+    // hint; the transient status/error message (and sync spinner) live on their
+    // own dedicated row above the footer (`render_status_message_row`), so
     // nothing here can be overwritten by the right-aligned pills.
-    let mut spans = vec![Span::styled(
-        format!(" {} ", state.focus_label),
-        Theme::focused_title(),
-    )];
-    // An armed leader replaces nothing — it prepends, so the badge sits where
-    // the eye already is and the pending state is unmissable.
-    if let Some(chord) = &state.prefix_armed {
-        spans.insert(
-            0,
-            Span::styled(
-                format!(" {chord} "),
-                Style::default()
-                    .bg(Theme::accent())
-                    .fg(Theme::modal_bg())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        );
-    }
-    push_idle_counts(&mut spans, state);
-    push_shortcut_hints(&mut spans);
-
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-
-    let mut entries = footer_entries(state);
-    // Suffix each pill with its live shortcut (`Help · F1`); own the strings so
-    // the borrowed `ButtonSpec`s can reference them. Kept index-aligned with
-    // `entries` through the responsive trim below.
-    let mut labels: Vec<String> = entries
+    let mut segments = left_segments(state);
+    let left_width = segments_width(&segments);
+    let pinned = segments
         .iter()
-        .map(|(label, action)| {
-            match crate::session::compact_shortcut(state.keybindings.chords_for(*action)) {
-                Some(sc) => format!("{label} · {sc}"),
-                None => label.to_string(),
-            }
-        })
-        .collect();
-    // When the full set won't fit, drop the optional panel-toggle pills
-    // together (all-or-nothing) rather than letting `render_button_bar` shed
-    // the rightmost essential pill (Quit).
-    if pill_block_width(&labels) > area.width {
-        let optional = |a: &Action| {
-            matches!(
-                a,
-                Action::ToggleInfoPanel | Action::ToggleFileViewer | Action::FocusTasks
-            )
-        };
-        labels = entries
-            .iter()
-            .zip(&labels)
-            .filter(|((_, a), _)| !optional(a))
-            .map(|(_, l)| l.clone())
-            .collect();
-        entries.retain(|(_, a)| !optional(a));
-    }
+        .filter(|s| s.priority == PRIO_PINNED)
+        .map(LeftSegment::width)
+        .sum();
+
+    let (entries, labels) = fit_pills(state, area.width, left_width, pinned);
+
+    // The text gets its own rect, ending where the pills begin: whatever the
+    // trim can't shed is clipped there rather than painted under them.
+    let budget = area.width.saturating_sub(pill_block_width(&labels));
+    trim_segments(&mut segments, budget);
+    let spans: Vec<Span<'_>> = segments.into_iter().flat_map(|s| s.spans).collect();
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect {
+            width: budget,
+            ..area
+        },
+    );
+
     let specs: Vec<super::ButtonSpec<'_>> = labels
         .iter()
         .map(|l| super::ButtonSpec::secondary(l))
         .collect();
     let hits = super::render_button_bar(frame, area, &specs, true);
 
-    // File-viewer hints fill whatever room is left of the buttons.
-    if state.file_viewer_open {
-        let buttons_left = hits
-            .iter()
-            .map(|h| h.rect.x)
-            .min()
-            .unwrap_or(area.x + area.width);
-        let avail = buttons_left.saturating_sub(area.x).saturating_sub(1);
-        if avail > 0 {
-            let hint_area = Rect {
-                width: avail,
-                ..area
-            };
-            let right = Line::from(file_viewer_shortcut_spans())
-                .alignment(ratatui::layout::Alignment::Right);
-            frame.render_widget(Paragraph::new(right), hint_area);
-        }
-    }
-
     // Each placed hit keeps its index into `entries`, so the click→action map
-    // follows the same feature-filtered list that was rendered.
+    // follows the same feature-filtered, responsively trimmed list that was
+    // rendered.
     hits.into_iter()
         .map(|hit| {
             let action = entries[hit.index].1;
@@ -295,10 +377,131 @@ fn push_status_message<'a>(spans: &mut Vec<Span<'a>>, msg: &'a StatusMessage) {
     ));
 }
 
-fn push_idle_counts<'a>(spans: &mut Vec<Span<'a>>, state: &FooterState<'a>) {
-    spans.push(Span::styled(
-        format!(" {} session(s) ", state.session_count),
-        Style::default().fg(Theme::text_secondary()),
+/// Drop order for the footer's left-hand text — the responsive trim sheds the
+/// *highest* number first, so what survives a narrow footer is the most useful
+/// text rather than a half-word cut off under the pills.
+///
+/// `PRIO_PINNED` is never dropped: an armed leader with no feedback anywhere
+/// reads as a frozen app, so the pills reserve room for its badge instead (see
+/// [`fit_pills`]).
+const PRIO_PINNED: u8 = 0;
+const PRIO_BLOCKED: u8 = 1;
+const PRIO_FOCUS: u8 = 2;
+/// The file viewer's hints **outrank the counts below** — they are contextual
+/// state, not ambient: while the viewer is open they are the live guidance for
+/// the pane the user is driving, and nothing else on screen carries them, where
+/// the session count is also in the sidebar. So a narrow footer with the viewer
+/// open keeps `j/k Move` and drops ` N session(s) `. They trim from their own
+/// tail (`+ index`), so `j/k Move` outlives `n/N Next/Prev`.
+const PRIO_FILE_HINTS: u8 = 10;
+const PRIO_SESSIONS: u8 = 20;
+const PRIO_AUTOMATIONS: u8 = 21;
+/// The global hints go first of everything: they duplicate the help overlay and
+/// apply whatever is focused. Tail-first within the pair, so `^O Open` goes
+/// before `^H/^L Focus`.
+const PRIO_GLOBAL_HINTS: u8 = 30;
+
+/// One self-contained chunk of the footer's left-hand text, with the priority
+/// that orders the responsive trim. Segments carry their own padding, so the
+/// row re-flows cleanly whichever ones are dropped.
+struct LeftSegment {
+    spans: Vec<Span<'static>>,
+    priority: u8,
+    /// A hint: it fills the tail of a row that already shows everything ranked
+    /// above it, and is never kept in place of something *more important* that
+    /// didn't fit. Without this a stray `^O Open` survives alone on a footer too
+    /// narrow for the focus label — which reads as a leftover, not as a degraded
+    /// row. Note this is relative to `priority`, not to some hints-lose-to-text
+    /// rule: the file viewer's hints outrank the counts and do displace them.
+    trailing: bool,
+}
+
+impl LeftSegment {
+    fn new(priority: u8, spans: Vec<Span<'static>>) -> Self {
+        Self {
+            spans,
+            priority,
+            trailing: false,
+        }
+    }
+
+    fn trailing(mut self) -> Self {
+        self.trailing = true;
+        self
+    }
+
+    fn width(&self) -> u16 {
+        self.spans
+            .iter()
+            .map(|s| s.content.chars().count() as u16)
+            .sum()
+    }
+}
+
+fn segments_width(segments: &[LeftSegment]) -> u16 {
+    segments.iter().map(LeftSegment::width).sum()
+}
+
+/// A `key description` hint pair, styled as one trailing segment.
+fn hint_segment(priority: u8, key: &'static str, desc: &'static str) -> LeftSegment {
+    LeftSegment::new(
+        priority,
+        vec![
+            Span::styled(key, Theme::keybind().add_modifier(Modifier::BOLD)),
+            Span::styled(desc, Theme::keybind_desc()),
+        ],
+    )
+    .trailing()
+}
+
+/// The file viewer's navigation hints, shown while it is open. One segment each
+/// so a narrow footer keeps `j/k Move` long after it has lost `n/N Next/Prev`.
+const FILE_VIEWER_HINTS: &[(&str, &str)] = &[
+    ("j/k", " Move  "),
+    ("h/l", " Collapse/Expand  "),
+    ("\u{23CE}", " Open  "),
+    ("/", " Search  "),
+    ("n/N", " Next/Prev "),
+];
+
+/// The footer's left-hand text in render order, split into individually
+/// droppable segments.
+///
+/// Render order is the *reading* order — state first (leader badge, focus,
+/// counts), key hints last — and is deliberately independent of `priority`,
+/// which is what drives the trim: the blocked badge renders after the session
+/// count but outlives it, and the file-viewer hints render after both counts
+/// yet outrank them. So dropping a segment mid-row re-flows everything after
+/// it; only the tail (the global hints) shortens the row in place.
+fn left_segments(state: &FooterState<'_>) -> Vec<LeftSegment> {
+    let mut segments = Vec::new();
+    // An armed leader replaces nothing — it prepends, so the badge sits where
+    // the eye already is and the pending state is unmissable.
+    if let Some(chord) = &state.prefix_armed {
+        segments.push(LeftSegment::new(
+            PRIO_PINNED,
+            vec![Span::styled(
+                format!(" {chord} "),
+                Style::default()
+                    .bg(Theme::accent())
+                    .fg(Theme::modal_bg())
+                    .add_modifier(Modifier::BOLD),
+            )],
+        ));
+    }
+    segments.push(LeftSegment::new(
+        PRIO_FOCUS,
+        vec![Span::styled(
+            format!(" {} ", state.focus_label),
+            Theme::focused_title(),
+        )],
+    ));
+    segments.push(LeftSegment::new(
+        PRIO_SESSIONS,
+        vec![Span::styled(
+            format!(" {} session(s) ", state.session_count),
+            Style::default().fg(Theme::text_secondary()),
+        )],
     ));
     if state.blocked_count > 0 {
         let shortcut = crate::session::compact_shortcut(
@@ -308,54 +511,91 @@ fn push_idle_counts<'a>(spans: &mut Vec<Span<'a>>, state: &FooterState<'a>) {
             Some(sc) => format!(" \u{25c6} {} blocked · {sc} ", state.blocked_count),
             None => format!(" \u{25c6} {} blocked ", state.blocked_count),
         };
-        spans.push(Span::styled(
-            label,
-            Style::default()
-                .fg(Theme::text_primary())
-                .bg(super::status_color(crate::session::SessionStatus::Blocked)),
+        segments.push(LeftSegment::new(
+            PRIO_BLOCKED,
+            vec![Span::styled(
+                label,
+                Style::default()
+                    .fg(Theme::text_primary())
+                    .bg(super::status_color(crate::session::SessionStatus::Blocked)),
+            )],
         ));
     }
     if state.automation_count > 0 {
-        spans.push(Span::styled(
-            format!(" {} automation(s) ", state.automation_count),
-            Style::default()
-                .fg(Theme::text_primary())
-                .bg(Theme::accent()),
+        segments.push(LeftSegment::new(
+            PRIO_AUTOMATIONS,
+            vec![Span::styled(
+                format!(" {} automation(s) ", state.automation_count),
+                Style::default()
+                    .fg(Theme::text_primary())
+                    .bg(Theme::accent()),
+            )],
         ));
     }
-}
-
-fn push_shortcut_hints(spans: &mut Vec<Span<'_>>) {
+    if state.file_viewer_open {
+        for (idx, (key, desc)) in FILE_VIEWER_HINTS.iter().enumerate() {
+            segments.push(hint_segment(PRIO_FILE_HINTS + idx as u8, key, desc));
+        }
+    }
     // Focus + Open stay informational hints (no single click target); the footer
     // buttons (Help / Info / Files / Theme / Tasks / Settings / Quit) are
     // rendered as right-aligned clickable pills.
     let bold_key = Theme::keybind().add_modifier(Modifier::BOLD);
     let desc = Theme::keybind_desc();
-    spans.extend([
-        Span::styled(" ^H", bold_key),
-        Span::styled("/", desc),
-        Span::styled("^L", bold_key),
-        Span::styled(" Focus ", desc),
-        Span::styled("^O", bold_key),
-        Span::styled(" Open ", desc),
-    ]);
+    segments.push(
+        LeftSegment::new(
+            PRIO_GLOBAL_HINTS,
+            vec![
+                Span::styled(" ^H", bold_key),
+                Span::styled("/", desc),
+                Span::styled("^L", bold_key),
+                Span::styled(" Focus ", desc),
+            ],
+        )
+        .trailing(),
+    );
+    segments.push(hint_segment(PRIO_GLOBAL_HINTS + 1, "^O", " Open "));
+    segments
 }
 
-fn file_viewer_shortcut_spans() -> Vec<Span<'static>> {
-    let bold_key = Theme::keybind().add_modifier(Modifier::BOLD);
-    let desc = Theme::keybind_desc();
-    vec![
-        Span::styled("j/k", bold_key),
-        Span::styled(" Move  ", desc),
-        Span::styled("h/l", bold_key),
-        Span::styled(" Collapse/Expand  ", desc),
-        Span::styled("\u{23CE}", bold_key),
-        Span::styled(" Open  ", desc),
-        Span::styled("/", bold_key),
-        Span::styled(" Search  ", desc),
-        Span::styled("n/N", bold_key),
-        Span::styled(" Next/Prev ", desc),
-    ]
+/// Fit the left-hand text into `budget` columns by keeping segments
+/// most-important-first while they still fit, then rendering the survivors in
+/// render order.
+///
+/// Keeping rather than dropping is what stops a *wide* segment from starving the
+/// row: the 19-column blocked badge skips when it doesn't fit and the columns go
+/// to the focus label instead, where a drop-until-it-fits loop would have shed
+/// the label first and then the badge too, leaving the row blank. Trailing
+/// segments are the exception — a hint never fills in for state that didn't fit.
+///
+/// Pinned segments are kept whatever the budget: when even they overflow, the
+/// rect clips them, which is the compact last resort (show as much as there is
+/// room for), not a badge painted over a pill.
+fn trim_segments(segments: &mut Vec<LeftSegment>, budget: u16) {
+    if segments_width(segments) <= budget {
+        return;
+    }
+    let mut by_priority: Vec<usize> = (0..segments.len()).collect();
+    by_priority.sort_by_key(|&idx| segments[idx].priority); // stable: ties keep render order
+    let mut keep = vec![false; segments.len()];
+    let mut spent = 0u16;
+    let mut skipped = false;
+    for idx in by_priority {
+        let segment = &segments[idx];
+        let fits = spent.saturating_add(segment.width()) <= budget;
+        if segment.priority == PRIO_PINNED || (fits && !(segment.trailing && skipped)) {
+            spent = spent.saturating_add(segment.width());
+            keep[idx] = true;
+        } else {
+            skipped = true;
+        }
+    }
+    *segments = std::mem::take(segments)
+        .into_iter()
+        .zip(keep)
+        .filter(|(_, keep)| *keep)
+        .map(|(segment, _)| segment)
+        .collect();
 }
 
 fn push_spinner_badge<'a>(spans: &mut Vec<Span<'a>>, tick_count: u64, label: &'a str) {
@@ -445,16 +685,23 @@ mod tests {
     fn render_footer_state(
         state: &FooterState<'_>,
     ) -> (Vec<(super::super::ButtonHit, Action)>, String) {
-        let backend = TestBackend::new(120, 1);
+        footer_at(120, state)
+    }
+
+    /// Render `state` into a `width`×1 buffer and return (button+action hits,
+    /// line text).
+    fn footer_at(
+        width: u16,
+        state: &FooterState<'_>,
+    ) -> (Vec<(super::super::ButtonHit, Action)>, String) {
+        let backend = TestBackend::new(width, 1);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut hits = Vec::new();
         terminal
-            .draw(|f| hits = render_footer(f, Rect::new(0, 0, 120, 1), state))
+            .draw(|f| hits = render_footer(f, Rect::new(0, 0, width, 1), state))
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let line: String = (0..buffer.area.width)
-            .map(|x| buffer[(x, 0)].symbol())
-            .collect();
+        let line: String = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
         (hits, line)
     }
 
@@ -526,12 +773,7 @@ mod tests {
     #[test]
     fn footer_drops_view_toggles_when_narrow() {
         let state = footer_state(false);
-        let backend = TestBackend::new(70, 1);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut hits = Vec::new();
-        terminal
-            .draw(|f| hits = render_footer(f, Rect::new(0, 0, 70, 1), &state))
-            .unwrap();
+        let (hits, _) = footer_at(70, &state);
         let actions = hit_actions(&hits);
         assert!(
             !actions.contains(&Action::ToggleInfoPanel)
@@ -648,18 +890,24 @@ mod tests {
         assert_eq!(last.x + last.width, 120);
     }
 
+    /// The left-hand text at full length, before any responsive trim — what a
+    /// wide-enough footer shows.
+    fn left_text(state: &FooterState<'_>) -> String {
+        left_segments(state)
+            .iter()
+            .flat_map(|s| &s.spans)
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
     /// Blocked sessions surface as a footer badge carrying the live
     /// `NextBlockedSession` shortcut hint; without any it stays hidden.
-    /// Asserted on the spans directly (like the hint-cluster test below) —
-    /// the right-aligned pills overlay the left text in a full render.
     #[test]
     fn footer_blocked_badge_shows_count_and_shortcut() {
         let idle_counts = |blocked: usize| -> String {
             let mut state = footer_state(false);
             state.blocked_count = blocked;
-            let mut spans = Vec::new();
-            push_idle_counts(&mut spans, &state);
-            spans.iter().map(|s| s.content.as_ref()).collect()
+            left_text(&state)
         };
 
         let text = idle_counts(2);
@@ -676,17 +924,215 @@ mod tests {
     }
 
     /// The left informational hint cluster advertises both Focus (^H/^L) and
-    /// Open (^O). Asserted on the spans directly — on a narrow footer the
-    /// right-aligned pills overlay this text, so a full render can't see it.
+    /// Open (^O).
     #[test]
     fn shortcut_hints_advertise_focus_and_open() {
-        let mut spans = Vec::new();
-        push_shortcut_hints(&mut spans);
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        let text = left_text(&footer_state(false));
         assert!(text.contains("^H"), "Focus-previous key present: {text:?}");
         assert!(text.contains("^L"), "Focus-next key present: {text:?}");
         assert!(text.contains("Focus"), "Focus label present: {text:?}");
         assert!(text.contains("^O"), "Open key present: {text:?}");
         assert!(text.contains("Open"), "Open label present: {text:?}");
+    }
+
+    /// The bug this whole ladder exists for: at *every* width, the left-hand
+    /// text stops where the pills start. Any column of the pill block that
+    /// isn't inside a pill must be blank — a stray glyph there is left text
+    /// bleeding through the one-column gaps between the chips.
+    #[test]
+    fn footer_text_never_bleeds_into_the_pill_block() {
+        for width in 1..=200u16 {
+            for (blocked, automations, viewer) in
+                [(0, 0, false), (2, 3, false), (1, 0, true), (0, 2, true)]
+            {
+                let mut state = footer_state(viewer);
+                state.blocked_count = blocked;
+                state.automation_count = automations;
+                state.session_count = 7;
+                let (hits, line) = footer_at(width, &state);
+                let Some(first) = hits.iter().map(|(h, _)| h.rect.x).min() else {
+                    continue;
+                };
+                let cells: Vec<char> = line.chars().collect();
+                for x in first..width {
+                    let inside = hits
+                        .iter()
+                        .any(|(h, _)| x >= h.rect.x && x < h.rect.x + h.rect.width);
+                    if !inside {
+                        assert_eq!(
+                            cells[x as usize], ' ',
+                            "text bled into the pill gap at column {x} \
+                             (width {width}, blocked {blocked}, viewer {viewer}): {line:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The degenerate end of the range: a zero-width area draws nothing, and a
+    /// footer only a few columns wide still lays out without panicking and
+    /// without placing a chip past the right edge.
+    #[test]
+    fn footer_survives_degenerate_widths() {
+        let state = footer_state(false);
+        let backend = TestBackend::new(10, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|f| hits = render_footer(f, Rect::new(0, 0, 0, 1), &state))
+            .unwrap();
+        assert!(hits.is_empty(), "no clickable chips in a zero-width footer");
+
+        let mut armed = footer_state(false);
+        armed.prefix_armed = Some("^A".to_string());
+        for state in [&state, &armed] {
+            for width in 1..=7u16 {
+                let (hits, line) = footer_at(width, state);
+                for (hit, _) in &hits {
+                    assert!(
+                        hit.rect.x + hit.rect.width <= width,
+                        "chip overruns the {width}-column footer: {line:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Step 1 of the ladder: the ` · ` separators are the first thing sold for
+    /// columns — the left-hand text is still whole at that point.
+    #[test]
+    fn footer_drops_pill_separators_before_any_text() {
+        let state = footer_state(false);
+        let (_, wide) = footer_at(160, &state);
+        assert!(
+            wide.contains("Help · F1"),
+            "resting form when wide: {wide:?}"
+        );
+
+        let (_, line) = footer_at(120, &state);
+        assert!(
+            line.contains("Help F1") && !line.contains("Help · F1"),
+            "separators dropped first: {line:?}"
+        );
+        assert!(
+            line.contains("1 session(s)") && line.contains("Files"),
+            "the left-hand text survives that step intact: {line:?}"
+        );
+    }
+
+    /// Step 2: text goes segment by segment, least useful first — the generic
+    /// key hints before the counts, the focus label last.
+    #[test]
+    fn footer_trims_left_text_by_priority() {
+        let state = footer_state(false);
+        let (_, line) = footer_at(105, &state);
+        assert!(
+            !line.contains("Focus") && line.contains("1 session(s)"),
+            "the key hints go before the session count: {line:?}"
+        );
+
+        let (_, line) = footer_at(88, &state);
+        assert!(
+            !line.contains("session(s)") && line.contains("Files"),
+            "the count goes before the focus label: {line:?}"
+        );
+    }
+
+    /// A hint is decoration, never a stand-in: at a width where `^O Open` would
+    /// fit but the session count no longer does, the columns stay empty rather
+    /// than showing a hint floating where the state should be.
+    #[test]
+    fn footer_hints_never_replace_state() {
+        let state = footer_state(false);
+        let (_, line) = footer_at(92, &state);
+        assert!(
+            line.contains("Files") && !line.contains("session(s)"),
+            "the count is what didn't fit here: {line:?}"
+        );
+        assert!(
+            !line.contains("Open") && !line.contains("Focus"),
+            "no hint fills in for it: {line:?}"
+        );
+    }
+
+    /// Steps 4–5: with no room for labelled pills the chips shrink to their
+    /// bare key, and the columns that frees go back to the left-hand text.
+    #[test]
+    fn footer_falls_back_to_key_only_pills() {
+        let state = footer_state(false);
+        let (hits, line) = footer_at(40, &state);
+        assert!(
+            !line.contains("Help") && !line.contains("Settings"),
+            "pill labels gone in the compact state: {line:?}"
+        );
+        assert!(
+            line.contains("F1") && line.contains("^Q"),
+            "chips keep their key: {line:?}"
+        );
+        assert!(
+            line.contains("Files"),
+            "the freed columns go back to the text: {line:?}"
+        );
+        assert_eq!(
+            hit_actions(&hits),
+            vec![
+                Action::ToggleHelp,
+                Action::OpenThemePicker,
+                Action::OpenSettings,
+                Action::QuitApp
+            ],
+            "key-only chips still dispatch, in order: {line:?}"
+        );
+
+        // Squeezed further, whole chips go, cosmetics first…
+        let (hits, line) = footer_at(12, &state);
+        assert_eq!(
+            hit_actions(&hits),
+            vec![Action::ToggleHelp, Action::QuitApp],
+            "Theme and Settings go before Help/Quit: {line:?}"
+        );
+        // …until only Help is left: the chip that documents every key the row
+        // can no longer show.
+        let (hits, line) = footer_at(5, &state);
+        assert_eq!(
+            hit_actions(&hits),
+            vec![Action::ToggleHelp],
+            "Help outlives the other chips: {line:?}"
+        );
+    }
+
+    /// The armed-leader badge outranks the pills: it is the one segment the
+    /// trim can't shed, because an armed leader with no feedback anywhere reads
+    /// as a frozen app.
+    #[test]
+    fn footer_keeps_the_armed_leader_badge_when_narrow() {
+        let mut state = footer_state(false);
+        state.prefix_armed = Some("^A".to_string());
+        for width in [120u16, 80, 60, 40, 30, 8, 4] {
+            let (_, line) = footer_at(width, &state);
+            assert!(
+                line.contains("^A"),
+                "armed leader badge survives width {width}: {line:?}"
+            );
+        }
+    }
+
+    /// The file viewer's hints trim from the tail: `j/k Move` outlives
+    /// `n/N Next/Prev`, and both live in the same flow as the rest of the text.
+    #[test]
+    fn footer_trims_file_viewer_hints_from_the_tail() {
+        let state = footer_state(true);
+        let (_, wide) = footer_at(200, &state);
+        assert!(
+            wide.contains("Next/Prev") && wide.contains("Move"),
+            "every hint when there is room: {wide:?}"
+        );
+
+        let (_, line) = footer_at(120, &state);
+        assert!(
+            line.contains("Move") && !line.contains("Next/Prev"),
+            "the tail hints go first: {line:?}"
+        );
     }
 }
