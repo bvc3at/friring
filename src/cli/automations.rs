@@ -818,10 +818,14 @@ fn retry_deferred_wakes(db: &Database) -> Vec<String> {
             crate::cli::messages::wake_session(db, &session, None),
             crate::cli::messages::Wake::Delivered
         ) {
-            if let Err(e) = db.clear_wake_pending(id) {
-                tracing::debug!("clear_wake_pending({id}): {e}");
+            // Report a session only once its debt is actually settled. The
+            // nudge did land either way, but an uncleared row is still owed, so
+            // the next tick nudges again — counting it here would report the
+            // same delivery on every tick and read as progress that isn't.
+            match db.clear_wake_pending(id) {
+                Ok(_) => woke.push(session.name),
+                Err(e) => tracing::warn!("clear_wake_pending({id}): {e}"),
             }
-            woke.push(session.name);
         }
     }
     woke

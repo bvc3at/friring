@@ -331,7 +331,7 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
                 &session.name,
                 &text,
             )
-            .map_err(|e| format!("send_prompt_now: {e}"))?;
+            .map_err(|e| format!("send_prompt_unguarded_on: {e}"))?;
             Ok(CommandOutput::new(
                 json!({
                     "sent": true,

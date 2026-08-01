@@ -375,10 +375,19 @@ fn enqueue_and_wake(
             // The recipient is mid-dialog. Owe them the nudge instead of
             // dropping it, so the send keeps its timeliness once a human has
             // answered — retried by the sweep on each `automation tick`.
+            // Best-effort, like the nudge itself: the message is already
+            // durably enqueued, so failing the command here would tell a caller
+            // its send didn't happen and invite a retry that enqueues a
+            // duplicate. Surface the bookkeeping failure in the reason instead,
+            // since it means the retry sweep won't know a wake is owed.
             Wake::Refused(reason) => {
-                db.mark_wake_pending(id)
-                    .map_err(|e| format!("mark_wake_pending: {e}"))?;
-                deferred = Some(reason);
+                deferred = Some(match db.mark_wake_pending(id) {
+                    Ok(()) => reason,
+                    Err(e) => {
+                        tracing::warn!("message: mark_wake_pending({id}) failed: {e}");
+                        format!("{reason} (not queued for retry: {e})")
+                    }
+                });
             }
             // An unreachable pane stays best-effort, as it always was: the
             // message is durably queued for the recipient's next drain, and a
@@ -689,6 +698,52 @@ mod tests {
         )
         .unwrap();
         assert!(flow_inbox[0]["in_reply_to"].is_null(), "got {flow_inbox}");
+    }
+
+    #[test]
+    fn mark_wake_pending_failure_does_not_undo_a_successful_enqueue() {
+        // The message is durably queued before the wake is even attempted, so a
+        // bookkeeping failure must not report the send as failed — a caller
+        // that retried would enqueue a duplicate. Simulated by dropping the
+        // column `mark_wake_pending` writes.
+        let db = db();
+        add_session(&db, "flow");
+        db.conn_ref()
+            .execute_batch("ALTER TABLE session_messages DROP COLUMN wake_pending;")
+            .unwrap();
+        assert!(
+            db.mark_wake_pending(1).is_err(),
+            "precondition: writes fail"
+        );
+
+        let recipient = resolve_uuid_or_name(&db, "flow").unwrap();
+        let new = NewMessage {
+            to_session_id: recipient.id,
+            from_session_id: None,
+            from_task_id: None,
+            kind: "note".into(),
+            body: "hi".into(),
+            in_reply_to: None,
+        };
+        let id = db.enqueue_message(&new).unwrap();
+        assert!(
+            db.mark_wake_pending(id).is_err(),
+            "the debt could not be recorded"
+        );
+
+        // …and the payload is still on the queue, which is what the caller was
+        // promised. Read straight from the table: the dropped column is in the
+        // DTO's own SELECT list, so `list_messages` can't run against this
+        // deliberately broken schema.
+        let body: String = db
+            .conn_ref()
+            .query_row(
+                "SELECT body FROM session_messages WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, "hi");
     }
 
     #[test]
