@@ -1200,6 +1200,8 @@ you lose whatever it writes mid-copy.
 8. **Self-update** — self-update and version-check now track *this* fork's
    releases and replace `friring` / `friring-cli`, so an installed release keeps
    itself current. A source build reports `0.0.0-dev` and is skipped; update it
-   by pulling this repo and rebuilding. Remove the old `thurbox` binaries
+   by pulling this repo and rebuilding. A `version-check.json` cache left over
+   from the upstream endpoint is ignored and refetched, so no stale upstream tag
+   is reported after the switch. Remove the old `thurbox` binaries
    (`rm ~/.local/bin/thurbox ~/.local/bin/thurbox-cli`) once nothing needs them
    — nothing prunes them for you.
