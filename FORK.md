@@ -1009,6 +1009,26 @@ already cover the case it was meant to serve.
   agent sheds, then the branch drops — status and the scrollback marker are
   never dropped.
 
+- **The footer's text no longer runs under its buttons.** Upstream paints the
+  left-hand text (focus label, session/automation counts, key hints) across the
+  whole footer row and the right-aligned pills on top of it, so any terminal too
+  narrow for both left the text chopped mid-word *and* leaking through the
+  one-column gaps between the pills — at 100 cols the row read
+  `Sessions  Help · F1 s Info · F2 c Files · F3 …`, where the stray `s` and `c`
+  are what survived of `0 session(s)`, painted in a different colour from the
+  chips around them. Both blocks are now fitted to the same column budget and
+  painted into **disjoint** rects (`ui::status_bar::render_footer`), degrading in
+  order: the pills' ` · ` separators first (` Help · F1 ` → ` Help F1 `), then
+  the left-hand text segment by segment (least useful first — the key hints,
+  then the counts; the focus label and the `◆ N blocked` badge are the last
+  text standing), then the optional panel-toggle pills as a set, and finally the
+  pill labels themselves, leaving key-only chips (` F1 `) so the freed columns
+  go back to the text. The armed-leader badge is pinned: the pills make room for
+  it instead. The file viewer's navigation hints, previously right-aligned into
+  whatever room was left of the buttons — where they overlapped the left-hand
+  text rather than the pills — are segments in the same flow now, trimming from
+  their tail (`n/N Next/Prev` goes long before `j/k Move`).
+
 ### Performance
 
 - **Shell-tab keystrokes echo immediately.** The demand-driven render loop's

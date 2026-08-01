@@ -90,9 +90,12 @@ return `ui::RowHitbox`es / `ui::ButtonHit`es, `App::view` records them as
 them. A modal-button click **replays the paired key** through the modal's
 own handler, so a click always follows the exact keyboard path. Clickable
 "pill" buttons (`ui::render_button_bar`) draw the status-bar footer
-(Help/Info/Files/Theme/Tasks/Settings/Quit — feature-gated, and dropped as
-a set when the footer is too narrow so the essential pills never fall off)
-plus every modal's action buttons (`ui::ModalButtons`). The `ClickAction`
+(Help/Info/Files/Theme/Tasks/Settings/Quit — feature-gated, and
+responsively degraded so the pills and the text left of them never share a
+column: separators, then the text segment by segment, then the optional
+panel toggles as a set, then the labels themselves — see the ladder on
+`ui::status_bar::render_footer`) plus every modal's action buttons
+(`ui::ModalButtons`). The `ClickAction`
 variants (`Global`, `ModalButton`, `ModalField`, `PaneField`, `RepoFocus`,
 `CentralTab`, …) select or toggle what was clicked — a Settings bool row
 toggles on click, scalar rows only select. The whole subsystem is gated by
