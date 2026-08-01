@@ -485,7 +485,6 @@ fn theme_picker_filtered_shows_both_sections() {
     insta::assert_snapshot!(h.render());
 }
 
-
 // ── Behavioral tests: drive keys, assert on App state ────────────────────────
 
 #[test]

@@ -784,16 +784,16 @@ mod tests {
 
     #[test]
     fn test_build_ignores_config_and_data_dir_override_env() {
-        // Regression: the unit-test harness often runs *inside* a live thurbox
-        // session whose env carries THURBOX_CONFIG_DIR/THURBOX_DATA_DIR pointing
+        // Regression: the unit-test harness often runs *inside* a live friring
+        // session whose env carries FRIRING_CONFIG_DIR/FRIRING_DATA_DIR pointing
         // at the developer's real config/data. On the XDG strategy a test build
         // must ignore those and stay under the per-process temp sandbox, so an
         // unguarded config write can never clobber the user's live settings.
         reset_to_xdg();
         let saved_cfg = std::env::var_os(CONFIG_DIR_OVERRIDE_ENV);
         let saved_data = std::env::var_os(DATA_DIR_OVERRIDE_ENV);
-        std::env::set_var(CONFIG_DIR_OVERRIDE_ENV, "/real/config/thurbox");
-        std::env::set_var(DATA_DIR_OVERRIDE_ENV, "/real/data/thurbox");
+        std::env::set_var(CONFIG_DIR_OVERRIDE_ENV, "/real/config/friring");
+        std::env::set_var(DATA_DIR_OVERRIDE_ENV, "/real/data/friring");
 
         let cfg = config_file().unwrap();
         let db = database_file().unwrap();
@@ -809,8 +809,8 @@ mod tests {
 
         assert!(cfg.starts_with(test_sandbox_base()), "config: {cfg:?}");
         assert!(db.starts_with(test_sandbox_base()), "db: {db:?}");
-        assert!(!cfg.starts_with("/real/config/thurbox"), "config: {cfg:?}");
-        assert!(!db.starts_with("/real/data/thurbox"), "db: {db:?}");
+        assert!(!cfg.starts_with("/real/config/friring"), "config: {cfg:?}");
+        assert!(!db.starts_with("/real/data/friring"), "db: {db:?}");
     }
 
     #[test]

@@ -1221,8 +1221,12 @@ fn resolve_base_ref_for_remote(
     [format!("{remote}/main"), format!("{remote}/master")]
         .into_iter()
         .find(|r| {
-            run_git_capture_on(host, &["rev-parse", "--verify", "--quiet", r], worktree_path)
-                .is_some()
+            run_git_capture_on(
+                host,
+                &["rev-parse", "--verify", "--quiet", r],
+                worktree_path,
+            )
+            .is_some()
         })
 }
 

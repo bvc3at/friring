@@ -39,8 +39,3 @@ remote = "github.com"
 # upstream has none of these SHAs.
 repository = "friring"
 owner = "bvc3at"
-
-# Map git signatures to GitHub usernames
-authors = [
-    { signature = "LeTuR", username = "magicletur" },
-]
