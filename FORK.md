@@ -538,6 +538,81 @@ the anthropic stub's `/api/oauth/usage` route, fed with scripted numbers from
 `demo-content.json` — otherwise every clip films "not logged in". Details in
 `docs/DEVELOPMENT.md` § Demo video.
 
+#### Demo pacing budget (`lib/check-pacing.mjs`, `Wait` in the tapes)
+
+The demo clips are held to a measured pacing budget, and the tapes gained a
+`Wait` directive so they stop guessing how long the app needs.
+
+The problem was measured before it was fixed. Across the ten clips, **185.0s of
+202.2s was a frozen frame — 91.5% dead air**, and only 466 of 6,065 frames were
+unique (2.31 unique fps). Auditing the tapes agreed independently: 178.8s of
+scripted `Sleep` against 12.85s of typing, 93.3%. The clips were not unusually
+long — the 39.4s hero sits near the median of eighteen comparable TUI project
+demos — they simply stalled. Every clip also opened on ~2.3s of frozen screen
+(a filmed `sleep 1` in the recorder plus a settle `Sleep` in every tape), and
+`theme.tape` spent 3.8s — a third of its runtime — on one static image because
+it pressed `Up` eight times through a list with four entries above the cursor.
+
+What changed:
+
+- **`Wait /<re>/` and `Wait Stable [<quiet>]`** in the tape driver, replacing
+  the "leave it the time it needs" sleeps. Measured against the guesses they
+  replace: a forked agent CLI paints in **0.3–0.4s**, not the scripted 3.5s.
+  This mirrors what `record.sh` already did for its own pre-play step, which
+  has synced on pane markers rather than fixed sleeps all along.
+  Stability is only a proxy for readiness — a beat that repaints, pauses, then
+  repaints again satisfies it early — so the settle window is a per-beat
+  argument, and the driver prints a note naming any wait whose screen kept
+  moving afterwards. That check costs nothing (no key is sent during the `Sleep`
+  after a wait, so movement there is the app) and it immediately caught a
+  shipped clip: `friring-session-creation` was ending on a blank terminal
+  because its wait settled while the agent was still booting.
+- **The opening is polled, not slept.** `record.sh` waits for the attached
+  client to paint one settled frame instead of a blind `sleep 1`, and the tapes
+  dropped their settle beats: ~2.3s → ~0.4s. The floor is ~0.35s (the poll plus
+  node's own startup before the first keystroke, all of it filmed), which is
+  why the budget targets 0.5s but caps at 0.75s.
+- **`check-pacing.mjs`** enforces max held frame 1.0s, opening 0.75s, and
+  GitHub's 10MB image limit. It reads each held frame's duration straight from
+  the GIF's own frame delays — exact, and with no false positive on typing.
+  Only the opening metric shells out to ffmpeg, because a static opening split
+  by one ticking character is several short frames to a delay reader and needs
+  pixels to see. The recorder refuses a take that busts the budget; CI
+  (`demo-pacing`) re-checks whatever was committed.
+- **The recorder fails closed on a driver error.** `record_tape` is called as
+  `record_tape "$t" || …`, which suppresses `set -e` for its whole body, so a
+  tape that died half-way still rendered and shipped — a clean recording of the
+  first half of a demo, which is not visibly broken.
+- **The cast's teardown trim is no longer all-or-nothing.** `trim-cast.mjs` cut
+  at the client's leave-alt-screen event, but the teardown is chunked by the pty
+  and its screen-clear can land in a SEPARATE, earlier event — which then
+  survived the cut and became a blank final frame, held for the whole closing
+  hold. It is intermittent (it depends on how the bytes split: nine clips in one
+  batch were clean and the tenth was not) and invisible to every pacing metric,
+  because a blank frame is perfectly well-paced. The trim now also walks back
+  over content-free events, and the budget gained a **final-frame ink** check as
+  a backstop — a good closing frame measures 3.4–9.0% ink, a leaked teardown
+  0.013%.
+
+Result across all ten clips: 202.2s → 103.3s, dead air 91.5% → within budget,
+worst held frame 3.81s → 0.86s, opening 2.3s → 0.25–0.44s. Several content bugs
+surfaced on the way, all of which had been shipping unnoticed because the media
+was never re-recorded: two dead keypresses (`theme.tape`'s four no-op `Up`s;
+`file-manager.tape` pressing `Enter` on a file, which resolves to
+`open_file_in_editor` and so renders nothing in-pane), a session-name field that
+is now pre-filled with the repo basename, so tapes that typed a name over it
+produced sessions called `orbital-hvacaurora-forecast`, and a repo picker in
+`agents.tape` still written for the pre-redesign "Select Repos" modal — the
+shipped hero predated that redesign.
+
+One caveat worth knowing when re-recording: **the recorder is sensitive to
+machine load.** Under a load average of ~5 the same tape recorded at 2.5x its
+length, the pause after the code-review view closes stretched from 0.3s to 3.0s
+(taking `Ctrl+N` with it, which then landed in a dead window and wedged the
+take), and `Wait Stable` overshot its nominal settle window because every poll
+spawns tmux. Record on an otherwise idle machine; a take that wedges or busts
+the budget under load is not necessarily a tape bug.
+
 #### Dev-live: run a dev build against the real sessions
 
 Upstream (and the fork's sandbox) keeps dev builds fully isolated: a
@@ -970,6 +1045,14 @@ fork.
   deploy, `ci.yml`'s `sonarqube`, and `cd.yml`'s `publish-aur` /
   `publish-homebrew`. The Windows / macOS jobs and the release build matrix are
   unchanged — a Linux ARC runner can't service them.
+- **`demo-pacing` job (fork-only).** Checks `docs/media/*.gif` against the
+  pacing budget on any change under `docs/media/` or `scripts/demo/`. The media
+  is recorded by hand on a workstation, so nothing else would catch a clip that
+  regressed into holding a frozen frame: the asset is binary, so the diff shows
+  nothing, and no reviewer plays ten gifs. It installs `ffmpeg` for the
+  opening-hold metric only — without it the job still gates on the held-frame
+  and size budgets and says loudly that the opening went unchecked, rather than
+  passing quietly. See [Demo pacing budget](#demo-pacing-budget-libcheck-pacingmjs-wait-in-the-tapes).
 
 ## Migration
 

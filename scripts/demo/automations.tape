@@ -7,6 +7,10 @@
 #
 # Requires: asciinema + agg + ffmpeg (see record.sh). The tape driver has no
 # function-key commands, so this uses Ctrl-key bindings + j/k / Tab / arrows.
+#
+# Most of this clip is a form being filled: every Tab/Right moves a selector and
+# repaints the "next:" preview, so the beats are short by design — the screen
+# changes on every one of them.
 
 Output docs/media/automations-demo.gif
 Output docs/media/automations-demo.mp4
@@ -28,8 +32,7 @@ Show
 
 # Sessions are pre-seeded; the always-present Automations pane sits beneath the
 # session list in the left column.
-Sleep 1200ms
-
+#
 # Focus the session list (Ctrl+H from the terminal), then step INTO the
 # Automations pane: the left column reads as one continuous list, and `Down`
 # on the LAST session flows into the pane (act_session_list_next). The seeder
@@ -39,101 +42,97 @@ Sleep 1200ms
 # rather than focusing the pane (that path closes back to the session list on
 # save, which once left two-thirds of this tape typing at a static screen).
 Ctrl+H
-Sleep 600ms
+Sleep 300ms
 Down
-Sleep 900ms
+Sleep 450ms
 
 # Create a new automation right from the pane (`n`, like Ctrl+N for a session).
 # This is the in-pane path: the editor opens in the central pane — one screen,
 # no popup — and saving returns focus HERE, to the pane.
 Type "n"
-Sleep 1000ms
+Sleep 550ms
 
 # Name it.
 Type "morning-triage"
-Sleep 700ms
+Sleep 400ms
 
 # Trigger is a selector cycled with the arrows — step through, land on "daily".
 Tab
-Sleep 400ms
-Right
-Sleep 350ms
-Right
-Sleep 350ms
-Left
-Sleep 350ms
-Left
-Sleep 500ms
-
-# Hour stepper (arrows adjust, wrapping); watch the "next:" preview update.
-Tab
-Sleep 350ms
-Right
 Sleep 300ms
-Right
-Sleep 450ms
-
-# Minute stepper.
-Tab
-Sleep 350ms
 Right
 Sleep 250ms
 Right
-Sleep 450ms
+Sleep 250ms
+Left
+Sleep 250ms
+Left
+Sleep 350ms
+
+# Hour stepper (arrows adjust, wrapping); watch the "next:" preview update.
+Tab
+Sleep 250ms
+Right
+Sleep 250ms
+Right
+Sleep 350ms
+
+# Minute stepper.
+Tab
+Sleep 250ms
+Right
+Sleep 250ms
+Right
+Sleep 350ms
 
 # Skip timezone, leave the Action on "send".
 Tab
-Sleep 400ms
+Sleep 300ms
 Tab
-Sleep 500ms
+Sleep 350ms
 
 # Target selector — cycle through the running sessions to pick where the
 # prompt is sent.
 Tab
-Sleep 400ms
+Sleep 300ms
+Right
+Sleep 250ms
 Right
 Sleep 350ms
-Right
-Sleep 500ms
 
 # The prompt that fires on schedule.
 Tab
-Sleep 350ms
+Sleep 250ms
 Type "Triage failing CI and summarize blockers"
-Sleep 800ms
+Sleep 450ms
 
 # Save with Ctrl+S — back to the pane with the new automation selected (a new
 # one lands at the top) and a live next-run countdown. NOT Enter: `prompt` is
 # the one multi-line field, so Enter inserts a newline there rather than saving
 # (see AutomationEditorModal::handle_key).
 Ctrl+S
-Sleep 1400ms
+Sleep 700ms
 
 # Toggle enabled off and back on, straight from the pane.
 Space
-Sleep 700ms
+Sleep 400ms
 Space
-Sleep 900ms
+Sleep 450ms
 
 # Step into the central pane: Ctrl+L focuses the editor (its fields), again
 # focuses the run-history panel beneath it. The focus ring stays within the
 # automation context (pane → editor → history), never jumping to a session.
 Ctrl+L
-Sleep 900ms
+Sleep 450ms
 Ctrl+L
-Sleep 900ms
+Sleep 450ms
 
 # Run it now from the history panel (`r`); the run is recorded and the prompt
 # is delivered to the target session.
 Type "r"
-Sleep 1500ms
+Sleep 700ms
 
 # Ctrl+H walks back to the editor, then to the Automations pane (like Esc).
 Ctrl+H
-Sleep 500ms
+Sleep 300ms
 Ctrl+H
-Sleep 900ms
-
-# Final beat; the recorder then stops filming (detach) and quits the TUI
-# off-camera - see record.sh.
-Sleep 1000ms
+Sleep 400ms

@@ -422,6 +422,59 @@ Consequences worth knowing when editing a tape or the recorder:
   (`lib/trim-cast.mjs`), so every clip ends on the last live TUI frame.
 - `agg --idle-time-limit` is set far above any beat in the tapes; it would
   otherwise silently compress the very pauses the tapes exist to script.
+- **`Sleep` is the viewer's time; `Wait` is the app's.** Use `Sleep` only for a
+  beat someone is meant to read. When the tape is waiting on the app — a picker
+  building its list, a forked agent CLI booting — use `Wait`, which polls
+  `tmux capture-pane` and continues the moment the screen says it is ready:
+
+  - `Wait /<regex>/ [<timeout>]` — until the pane matches. Prefer this whenever
+    the beat has a marker; `agent_ready_marker()` in `record.sh` has one per
+    agent (`claude` → `❯`, `codex` → `›`, `opencode` → `Build ·`).
+  - `Wait Stable [<quiet>] [<timeout>]` — until the pane *changes* and then
+    holds still for `quiet` (default 250ms). Both halves matter: waiting only
+    for quiet resolves inside the gap before the app reacts and calls the old
+    screen settled.
+
+  Limits, all of them learned by shipping a clip that was wrong:
+
+  - **Quiet is a proxy for readiness, and they come apart.** A beat that
+    repaints, pauses longer than the settle window, then repaints again — a
+    picker closing, then an agent CLI painting 3.5s later — satisfies `Wait
+    Stable` on the intermediate screen. Hence the per-beat `<quiet>` argument,
+    and hence preferring a marker. The driver detects this for free and prints a
+    `note:` naming the line: no key is sent during the `Sleep` after a wait, so
+    anything that moves there was the app still working. It is a note, not an
+    error — it is *expected* when a tape deliberately stops short of a later
+    stage, which `fork.tape` and `session-creation.tape` both do rather than
+    film seconds of blank terminal.
+  - **A settle window is dwell.** `Wait Stable <quiet>` ends by definition on
+    `quiet` ms of unchanged screen, and the `Sleep` after it lands on that same
+    frame, so `quiet + Sleep` is one held frame and must stay under the budget.
+    Worse, every poll spawns `tmux`, so the wall-clock cost overshoots the
+    nominal figure under load — a 600ms window rendered a 1.04s held frame.
+  - `capture-pane` returns **text without styling**, so `Wait Stable` cannot see
+    a colour-only repaint (committing a theme) — use a plain `Sleep`.
+  - It needs the screen to actually go quiet, which the multi-session view never
+    does for long because live agent panes repaint themselves; there it measures
+    seconds.
+  - A `Wait` that never resolves is a hard error, deliberately: a beat that
+    changes nothing is a bug in the tape, and the earlier lenient behaviour
+    filmed the wait as a frozen frame instead of saying so.
+- **Every clip is held to a pacing budget** (`lib/check-pacing.mjs`), enforced by
+  the recorder before a take is allowed to replace good media, and again in CI.
+  A held frame may not exceed 1.0s (0.5s is the target) and the opening may not
+  exceed 0.75s. The budget also rejects a clip whose **final frame is blank**,
+  which is a correctness check rather than a pacing one: the detach teardown is
+  chunked by the pty and can leave a screen-clear behind that `trim-cast.mjs`
+  does not catch, and an empty closing frame is otherwise perfectly well-paced.
+  Runtime is deliberately *not* budgeted — a clip may be as long as it earns.
+  See `FORK.md` § Demo pacing budget for the measurements behind the numbers.
+- **Record on an idle machine.** The pipeline drives real processes in real
+  time, so load distorts it badly: at load ~5 the same tape recorded 2.5x
+  longer, the settle after closing the code-review view stretched 0.3s → 3.0s
+  and swallowed the `Ctrl+N` that followed it, and `Wait Stable` overshot its
+  window because every poll spawns tmux. A take that wedges or busts the budget
+  under load is not necessarily a tape bug — re-run it on a quiet box first.
 - The GIF keeps **variable** frame delays — that is where the exact pacing
   lives, so never re-encode it. The MP4 is derived from it with ffmpeg's
   `fps` filter, which re-times to a constant rate for players that need one

@@ -10,6 +10,25 @@
 # copy records the source as its parent — the session list nests children under
 # their parent with a `└` tree prefix, and the info panel (Ctrl+B) shows a
 # `Parent:` row.
+#
+# Forking spawns a REAL agent CLI, so the two beats after Enter are the only
+# genuinely unknown durations in this clip. They use `Wait Stable`, not a Sleep:
+# a sleep long enough to cover a cold boot is frozen screen on a warm one, and
+# that is what previously put two 3.5s holds — 5.2s of a 22s clip — on frames
+# where not a single pixel changed.
+#
+# They keep the DEFAULT settle window, and the driver's "screen was still
+# changing" note on these two lines is expected rather than a defect: the later
+# stage it is reporting is the forked agent painting, which this clip
+# deliberately does not film. The beats after here are session-list navigation
+# that does not depend on that pane, and waiting for it would add seconds of
+# blank terminal.
+#
+# Widening the window was tried and is worse. A settle window IS dwell — a wait
+# ends by definition on `quiet` ms of unchanged screen and the Sleep after it
+# lands on that same frame — and because every poll spawns tmux, its wall-clock
+# cost overshoots the nominal figure under load. At 600ms this beat rendered a
+# 1.04s held frame and the take was refused twice.
 
 Output docs/media/friring-fork.gif
 Output docs/media/friring-fork.mp4
@@ -31,53 +50,52 @@ Show
 
 # The TUI adopts the seeded sessions with the terminal focused, so hop back to
 # the session list first (Ctrl+F would otherwise forward to the agent's PTY).
-Sleep 1200ms
 Ctrl+H
-Sleep 500ms
+Sleep 300ms
 
 # Fork the active session (Ctrl+F): a name modal opens, pre-filled with
 # `<name>-fork`. Accept it as-is.
 Ctrl+F
-Sleep 1200ms
+Sleep 500ms
 Enter
-# The fork spawns a real agent CLI that boots on camera — leave it the time it
-# needs to paint.
-Sleep 3500ms
+# The fork spawns a real agent CLI that boots on camera. Hold for exactly as
+# long as it takes to paint and no longer.
+Wait Stable
+Sleep 400ms
 
 # The fork spawned nested under its parent (`└` tree prefix) and now has its
 # terminal focused. Back to the list, then hop up to the parent ...
 Ctrl+H
-Sleep 500ms
+Sleep 300ms
 Ctrl+K
-Sleep 900ms
+Sleep 400ms
 
 # ... and fork it again, this time tweaking the suggested name.
 Ctrl+F
-Sleep 900ms
+Sleep 400ms
 Type "2"
-Sleep 500ms
+Sleep 300ms
 Enter
-Sleep 3500ms
+Wait Stable
+Sleep 400ms
 
 # Two children now nest under the same parent. Walk the tree — Ctrl+J/K follow
 # the parent → children order automatically.
 Ctrl+H
-Sleep 500ms
+Sleep 300ms
 Ctrl+K
-Sleep 800ms
+Sleep 400ms
 Ctrl+K
-Sleep 800ms
+Sleep 400ms
 Ctrl+J
-Sleep 800ms
+Sleep 400ms
 
-# The info panel shows the lineage: a `Parent:` row on the selected child.
-Ctrl+B
-Sleep 2200ms
-Ctrl+J
-Sleep 1600ms
+# The info panel shows the lineage: a `Parent:` row on the selected child. This
+# is the one beat in the clip with text to actually read, so it gets the longest
+# dwell here — still inside the per-pause budget check-pacing.mjs enforces.
 Ctrl+B
 Sleep 800ms
-
-# Final beat; the recorder then stops filming (detach) and quits the TUI
-# off-camera - see record.sh.
-Sleep 1000ms
+Ctrl+J
+Sleep 600ms
+Ctrl+B
+Sleep 400ms

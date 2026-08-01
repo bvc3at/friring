@@ -651,10 +651,51 @@ record_tape() {
     tmux -L "$CAST_SOCKET" new-session -d -s rec -x "$DEMO_COLS" -y "$DEMO_ROWS" \
         "asciinema rec '$_cast' --overwrite -f asciicast-v2 --command 'tmux -L $DEMO_SOCKET attach -t demo'"
     tmux -L "$CAST_SOCKET" set -g status off
-    sleep 1   # let the attach paint its first full frame before the beats start
 
-    node "$SCRIPT_DIR/lib/drive-tape.mjs" "$SCRIPT_DIR/$_tape.tape" \
-        --socket "$DEMO_SOCKET" --session demo
+    # Wait for the attached client to paint one settled frame — do NOT sleep a
+    # fixed amount here. asciinema is recording from the moment the attach
+    # starts, so every millisecond spent waiting is filmed, and it lands on the
+    # opening frame where it costs the most: a viewer decides whether to keep
+    # watching a looping README gif in about the first second. Two identical
+    # consecutive captures mean the redraw is done (the demo session was
+    # already confirmed painted above, so this is only the attach's own
+    # repaint) and the beats can start immediately.
+    _prev=""
+    _same=0
+    _i=0
+    while [ "$_i" -lt 400 ]; do
+        _now=$(tmux -L "$CAST_SOCKET" capture-pane -p -t rec 2>/dev/null || true)
+        if printf '%s' "$_now" | grep -q "friring" && [ "$_now" = "$_prev" ]; then
+            _same=$((_same + 1))
+        else
+            _same=0
+        fi
+        if [ "$_same" -ge 2 ]; then break; fi
+        _prev="$_now"
+        sleep 0.025
+        _i=$((_i + 1))
+    done
+    if [ "$_i" -ge 400 ]; then
+        echo "error: the recorded attach never painted for $_tape — refusing to record" >&2
+        tmux -L "$DEMO_SOCKET" kill-server 2>/dev/null || true
+        tmux -L "$CAST_SOCKET" kill-server 2>/dev/null || true
+        return 1
+    fi
+
+    # Check this explicitly — `set -e` cannot. record_tape is invoked as
+    # `record_tape "$tape" || _failed=…`, and a shell function on the left of
+    # `||` runs with errexit suppressed through its WHOLE body, so a driver that
+    # dies half-way (an unsatisfied Wait, a chord that landed nowhere) would
+    # otherwise fall straight through to rendering. The resulting clip is not
+    # visibly broken — it is a clean recording of the first half of the demo,
+    # which is exactly why it has to be refused here rather than reviewed later.
+    if ! node "$SCRIPT_DIR/lib/drive-tape.mjs" "$SCRIPT_DIR/$_tape.tape" \
+        --socket "$DEMO_SOCKET" --session demo; then
+        echo "error: the tape driver failed part-way through $_tape — refusing" >&2
+        tmux -L "$DEMO_SOCKET" kill-server 2>/dev/null || true
+        tmux -L "$CAST_SOCKET" kill-server 2>/dev/null || true
+        return 1
+    fi
 
     # End the recording by DETACHING the filmed client, with the TUI still
     # running. The tapes deliberately do not quit on camera: a quit films its
@@ -715,9 +756,14 @@ record_tape() {
     _staged="$TBX_SANDBOX_ROOT/$_tape.gif"
     # --idle-time-limit is deliberately far above any beat in the tapes: agg
     # would otherwise silently compress the pauses the tapes exist to script.
+    # --last-frame-duration is the closing hold. It is the one frame every
+    # looping viewer sees twice, so it buys nothing to make it long: the clip
+    # restarts either way, and a held final frame reads as the gif having
+    # stalled. Keep it inside the same per-pause budget check-pacing.mjs
+    # enforces on everything else.
     # shellcheck disable=SC2086 # DEMO_FONT_DIRS is a pre-split flag list
     agg "$_cast" "$_staged" --font-size "$DEMO_FONT_SIZE" --fps-cap 30 \
-        --idle-time-limit 30 --last-frame-duration 1 --theme "$DEMO_PALETTE" \
+        --idle-time-limit 30 --last-frame-duration 0.5 --theme "$DEMO_PALETTE" \
         --text-font-family "$DEMO_FONT" $DEMO_FONT_DIRS \
         >/dev/null 2>&1 || { echo "error: agg failed for $_tape" >&2; return 1; }
 
@@ -740,14 +786,27 @@ record_tape() {
     ' "$_staged")
     if ! node -e '
         const [want, got] = [Number(process.argv[1]), Number(process.argv[2])];
-        // Generous: the clip legitimately carries the closing hold plus a beat
-        // of boot/attach settle on top of the script.
+        // Generous, and has to be: Wait counts as zero in the scripted total
+        // (see drive-tape.mjs), so however long the app really took lands in
+        // got alone. This check is only here to catch a wedged recording or a
+        // truncated cast — check-pacing.mjs is what holds the clip to a budget.
         process.exit(got > want + 20 || got < want * 0.6 ? 1 : 0);
     ' "$_want" "$_got"; then
         echo "error: $_tape rendered ${_got}s but its tape scripts ${_want}s — refusing" >&2
         echo "  (a stall under load, usually; the existing clip is left alone)" >&2
         return 1
     fi
+    # Hold the take to the pacing budget. This is the check the duration guard
+    # above cannot make: a clip can run for exactly as long as its tape says and
+    # still be unwatchable, because the time went into frames that sit there.
+    # Rejecting here rather than warning keeps the rule the same as every other
+    # recorder check — a bad take never replaces good media.
+    if ! node "$SCRIPT_DIR/lib/check-pacing.mjs" "$_staged"; then
+        echo "error: $_tape busts the pacing budget — refusing" >&2
+        echo "  shorten the Sleep at the reported timestamp, or make it a Wait" >&2
+        return 1
+    fi
+
     mv "$_staged" "$_gif"
 
     # gif -> mp4. ffmpeg reads the gif's per-frame delays as timestamps, so

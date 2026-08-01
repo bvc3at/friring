@@ -29,61 +29,67 @@ Enter
 Sleep 2s
 Show
 
-# The agent CLIs are pre-played and fully rendered; a short settle beat.
-Sleep 1200ms
-
 # Open the repo picker (Ctrl+N). The sample repo is already bookmarked (the
 # seeded sessions registered it) and now shows by basename, not full path.
 Ctrl+N
-Sleep 1200ms
+Sleep 600ms
 
 # Focus the path input (Tab) and type a PARENT folder containing several repos.
 Tab
-Sleep 400ms
+Sleep 300ms
 Type "~/projects"
-Sleep 800ms
+Sleep 500ms
 
 # Ctrl+P imports it as a parent: its git sub-dirs are listed (by basename),
 # nested under a collapsible "▾ projects (parent)" header — and the folder is
-# re-scanned on every open, so new repos appear automatically.
+# re-scanned on every open, so new repos appear automatically. A whole tree
+# arrives here, so this is one of the few beats with something to actually read.
 Ctrl+P
-Sleep 1500ms
+Sleep 800ms
 
 # Space on the header folds the tree (▸), then unfolds it (▾) again.
 Space
-Sleep 900ms
+Sleep 450ms
 Space
-Sleep 900ms
+Sleep 450ms
 
 # Move to a child repo and select it (Down to move, Space to check).
 Down
-Sleep 400ms
+Sleep 300ms
 Space
-Sleep 900ms
+Sleep 400ms
 
 # Confirm the selection (Enter).
 Enter
-Sleep 900ms
+Sleep 450ms
 
-# Session-name prompt: type a name, then confirm.
+# Session-name prompt. The field arrives PRE-FILLED with the chosen repo's
+# basename, so clear it first or the two concatenate — the clip this replaces
+# shipped a session called `orbital-hvacaurora-forecast`. More Backspaces than
+# the prefill is long; the extras are no-ops on an empty field.
+Backspace 16
+Sleep 250ms
 Type "aurora-forecast"
-Sleep 800ms
+Sleep 500ms
 Enter
-Sleep 900ms
+Sleep 450ms
 
 # Agent picker (shown because several agents are registered): choose one.
-Sleep 500ms
 Down
-Sleep 450ms
+Sleep 300ms
 Down
-Sleep 550ms
+Sleep 350ms
 Enter
-Sleep 900ms
 
-# The new session appears in the list and its agent boots (a real CLI painting
-# on camera — leave it the time it needs).
-Sleep 3s
-
-# Final beat; the recorder then stops filming (detach) and quits the TUI
-# off-camera - see record.sh.
-Sleep 1000ms
+# End on the new session appearing in the list — the payoff of a
+# session-creation clip — and deliberately do not film its agent booting.
+#
+# `Wait Stable` is wrong here and was measurably wrong: this beat happens in two
+# stages (the picker closes and the row appears, then ~3.5s later the agent CLI
+# paints), so a settle window resolves on the first stage and the clip ended on
+# a blank terminal. Waiting for the boot instead would film 3.5s of that blank
+# pane, which no settle window can shorten. The row is written as soon as the
+# session exists, so this marker lands in ~0.3s. It cannot match early: the name
+# is not on screen once the name modal closes.
+Wait /aurora-forecast/
+Sleep 500ms
