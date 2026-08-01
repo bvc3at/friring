@@ -56,10 +56,10 @@ verification and platform auto-detection.
 
 ```bash
 # Custom directory
-INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | INSTALL_DIR=/usr/local/bin sh
 
 # Pin a version
-VERSION=v0.13.0 curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | VERSION=v0.13.0 sh
 ```
 
 **Windows (PowerShell):**
