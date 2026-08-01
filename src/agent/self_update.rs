@@ -347,11 +347,14 @@ mod tests {
             "friring-v0.114.0-x86_64-unknown-linux-musl.tar.gz"
         );
         assert_eq!(checksums_name("0.114.0"), "friring-v0.114.0-checksums.txt");
-        let url = tarball_url("0.114.0", "aarch64-apple-darwin");
-        assert!(url.starts_with(RELEASE_BASE), "got: {url}");
-        assert!(url.contains("/v0.114.0/"), "got: {url}");
-        assert!(url.ends_with(".tar.gz"), "got: {url}");
-        assert!(checksums_url("0.114.0").contains("/v0.114.0/"));
+        assert_eq!(
+            tarball_url("0.114.0", "aarch64-apple-darwin"),
+            "https://github.com/bvc3at/friring/releases/download/v0.114.0/friring-v0.114.0-aarch64-apple-darwin.tar.gz"
+        );
+        assert_eq!(
+            checksums_url("0.114.0"),
+            "https://github.com/bvc3at/friring/releases/download/v0.114.0/friring-v0.114.0-checksums.txt"
+        );
     }
 
     #[test]
