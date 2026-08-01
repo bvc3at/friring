@@ -1122,7 +1122,13 @@ impl TmuxBackend {
     /// scrollback depth (the ghost-frame capture path).
     fn capture_seed_with_lines(&self, pane_id: &str, lines: usize) -> Result<Vec<u8>> {
         let lines = lines.min(MAX_CAPTURE_LINES as usize);
-        let start = format!("-{lines}");
+        // `-<n>` counts back into the history; a plain `0` is the first visible
+        // row. (`-0` parses the same, but reads like a history offset.)
+        let start = if lines == 0 {
+            "0".to_string()
+        } else {
+            format!("-{lines}")
+        };
         let output = self.run_tmux(&[
             "capture-pane",
             "-e",

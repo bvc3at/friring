@@ -24,9 +24,9 @@ pub struct HookRow {
 
 /// A session's saved terminal frame (schema v45): SGR-styled lines joined with
 /// `\r\n` — the same byte shape as the tmux adopt seed, so it feeds a vt100
-/// parser of *any* size and reflows. Captured at unload / shutdown (visible
-/// screen + `ghost_scrollback_lines` of history) and on the crash-safety
-/// debounce (visible screen only); rendered greyed by ghost sessions.
+/// parser of *any* size and reflows. Always the pane's visible screen —
+/// captured through the backend at unload / shutdown, serialized in-memory on
+/// the crash-safety debounce; rendered greyed by ghost sessions.
 #[derive(Debug, Clone)]
 pub struct SessionFrame {
     pub bytes: Vec<u8>,
