@@ -929,7 +929,7 @@ mod tests {
     /// bleeding through the one-column gaps between the chips.
     #[test]
     fn footer_text_never_bleeds_into_the_pill_block() {
-        for width in 8..=200u16 {
+        for width in 1..=200u16 {
             for (blocked, automations, viewer) in
                 [(0, 0, false), (2, 3, false), (1, 0, true), (0, 2, true)]
             {
@@ -953,6 +953,35 @@ mod tests {
                              (width {width}, blocked {blocked}, viewer {viewer}): {line:?}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// The degenerate end of the range: a zero-width area draws nothing, and a
+    /// footer only a few columns wide still lays out without panicking and
+    /// without placing a chip past the right edge.
+    #[test]
+    fn footer_survives_degenerate_widths() {
+        let state = footer_state(false);
+        let backend = TestBackend::new(10, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|f| hits = render_footer(f, Rect::new(0, 0, 0, 1), &state))
+            .unwrap();
+        assert!(hits.is_empty(), "no clickable chips in a zero-width footer");
+
+        let mut armed = footer_state(false);
+        armed.prefix_armed = Some("^A".to_string());
+        for state in [&state, &armed] {
+            for width in 1..=7u16 {
+                let (hits, line) = footer_at(width, state);
+                for (hit, _) in &hits {
+                    assert!(
+                        hit.rect.x + hit.rect.width <= width,
+                        "chip overruns the {width}-column footer: {line:?}"
+                    );
                 }
             }
         }
