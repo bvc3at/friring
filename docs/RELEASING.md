@@ -100,7 +100,8 @@ x86_64 build (runs under x64 emulation).
 **`install.sh` (POSIX `sh`) specifics:**
 
 - Colorized output (auto-disabled when stderr is not a TTY, `NO_COLOR` is set, or
-  `TERM=dumb`); platforms Linux/macOS × x86_64/aarch64.
+  `TERM=dumb`); platforms Linux x86_64 and macOS arm64 (anything else errors
+  cleanly — use `cargo install` or a source build).
 - No external deps beyond standard tools (curl/wget, tar, sha256sum/shasum).
 - Env vars: `VERSION=v0.1.0`, `INSTALL_DIR=/path` (default `~/.local/bin`).
 - Non-interactive (safe pipe-to-shell), cleanup via `trap`.
