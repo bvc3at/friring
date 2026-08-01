@@ -14,10 +14,10 @@ jobs:
   # Analyze commits and determine if release is needed
   check-release:
     name: Analyze commits for release
-    # Fork (Friring): this runs on the fork too — Friring cuts its own releases
-    # (friring-* binaries + GitHub Release). Only the downstream package-manager
-    # publish jobs stay upstream-guarded (the fork has no AUR/Homebrew/Choco/
-    # winget accounts or secrets). See FORK.md.
+    # Fork (Friring): this runs on the fork — Friring cuts its own releases
+    # (friring-* binaries + GitHub Release) and bumps its in-repo Homebrew
+    # formula, both on the built-in GITHUB_TOKEN. Upstream's AUR/Chocolatey/
+    # winget publish jobs were removed with their manifests. See FORK.md.
     runs-on: k3s-arc
     outputs:
       should_release: ${{ steps.parse.outputs.should_release }}
