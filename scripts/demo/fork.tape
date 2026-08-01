@@ -53,9 +53,20 @@ Show
 Ctrl+H
 Sleep 300ms
 
-# Fork the active session (Ctrl+F): a name modal opens, pre-filled with
-# `<name>-fork`. Accept it as-is.
+# Fork the active session with `<leader> f` — Ctrl+F arms the leader (the
+# which-key overlay opens immediately, `prefix.hint_delay_ms` defaults to 0),
+# then `f` runs ForkSession. A name modal opens pre-filled with `<name>-fork`;
+# accept it as-is.
+#
+# NOT a bare Ctrl+F, which is what this tape used to send. `ctrl+f` is now the
+# default leader itself (`prefix.key`, src/session/settings.rs) while
+# ForkSession's default direct chord is still `KeyChord::ctrl('f')` — the leader
+# shadows it, so a bare Ctrl+F arms the leader and forks nothing. This clip
+# films the binding that actually works today; the collision is reported
+# separately.
 Ctrl+F
+Sleep 500ms
+Type "f"
 Sleep 500ms
 Enter
 # The fork spawns a real agent CLI that boots on camera. Hold for exactly as
@@ -70,8 +81,11 @@ Sleep 300ms
 Ctrl+K
 Sleep 400ms
 
-# ... and fork it again, this time tweaking the suggested name.
+# ... and fork it again with the same `<leader> f`, this time tweaking the
+# suggested name.
 Ctrl+F
+Sleep 400ms
+Type "f"
 Sleep 400ms
 Type "2"
 Sleep 300ms
