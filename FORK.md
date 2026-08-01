@@ -21,6 +21,22 @@ contributed back to upstream over time; conversely, upstream's own improvements
 are merged down into Friring as they land. The original commit history is kept
 intact as a tribute to the upstream author.
 
+### Deliberately not adopted
+
+Upstream kept changing surfaces this fork had already rewritten. These stay
+divergent on purpose:
+
+- **`b6ddf31` copy over SSH via OSC 52** — the fork's clipboard stack already
+  covers this and more; see "Copy falls back to `tmux load-buffer` / OSC 52"
+  and "In-pane OSC 52 copies reach the user's clipboard" below.
+- **`03828a0` footer + status bar on narrow terminals** — the fork's own fix
+  (see "The footer's text no longer runs under its buttons") solves the same
+  overlap differently.
+- **`86ab3dc` / `4e19147` / `b951991` F9 session-list collapse** — `F9` is the
+  fork's activity view.
+- **`1dd5edb` / `2c07e3a` demo regeneration** and upstream's website work — the
+  fork records its own demos and ships its own site.
+
 ## Renamed to friring (July 2026)
 
 Friring began as a pure *branding* layer: only the human-facing name was
@@ -890,6 +906,19 @@ at the end of `docs/FEATURES.md` § Automations for why multi-step prompts
 already cover the case it was meant to serve.
 
 ### Behavior fixes
+
+- **A forced send is refused at a dead pane too.** Adopting upstream's
+  dead-pane guard (`c89eecd`) meant choosing where it sits. Upstream had one
+  entry point; the fork has two — the modal-guarded `send_prompt_now_on` and
+  `send_prompt_unguarded_on`, the escape hatch behind
+  `friring-cli session send --force`. The guard goes in the *unguarded* one,
+  which every send funnels through: `--force` exists to override the **modal**
+  check for an operator who is looking at the pane, and a pane whose process
+  has exited accepts nothing either way — so forcing into one would report a
+  delivery that did not happen, which is the exact bug being fixed. The
+  liveness probe is host-aware (`pane_is_dead_on` runs through the session's
+  `MuxTarget`), so a remote session is asked about its own pane rather than a
+  local one that may not exist.
 
 - **A database written by a newer friring is refused, not silently opened.**
   Upstream's schema migrations are forward-only and unguarded: a binary opening

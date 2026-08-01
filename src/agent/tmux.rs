@@ -769,8 +769,8 @@ impl TmuxBackend {
         }
 
         // `extended-keys-format csi-u` is best-effort: the option landed in tmux
-        // 3.3, but thurbox's floor is 3.2, so an older tmux rejects it ("invalid
-        // option"). It is advisory only — thurbox injects keystroke bytes directly
+        // 3.3, but friring's floor is 3.2, so an older tmux rejects it ("invalid
+        // option"). It is advisory only — friring injects keystroke bytes directly
         // via `send-keys` (not through tmux's key forwarder), so it never
         // re-encodes what an agent receives; it just sets what `tmux show-options`
         // reports, which some agents (notably `pi`) probe at startup and warn about

@@ -1,5 +1,6 @@
 ---
 source: src/app/acceptance.rs
+assertion_line: 485
 expression: h.render()
 ---
  friring  Multi-Session Agent Orchestrator  v0.0.0-dev                                    ◐ Default
@@ -31,4 +32,4 @@ expression: h.render()
 ┌ Automations ──────────┐│                                                                         │
 │none                   ││                                                                         │
 └───────────────────────┘└─────────────────────────────────────────────────────────────────────────┘
- Sessions  Help · F1   Info · F2   Files · F3   Theme · F4   Tasks · F5   Settings · F6   Quit · ^Q
+ Sessions  0 session(s)  Help F1   Info F2   Files F3   Theme F4   Tasks F5   Settings F6   Quit ^Q

@@ -826,7 +826,8 @@ prompt = "tick"
              [[automations.extra_repos]]\nrepo_path = \"{home}/docs\"\nworktree = false\n",
         )
         .unwrap();
-        let resolved = def.resolved_for_home("/home/me/x");
+        // No `~` in this fixture, so the user-home argument is irrelevant here.
+        let resolved = def.resolved_for_home("/home/me/x", None);
         assert_eq!(
             resolved.automations[0].repo.as_deref(),
             Some("/home/me/x/repo")
