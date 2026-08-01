@@ -1,7 +1,7 @@
 ---
 layout: docs.njk
-title: 'Performance — Thurbox Docs'
-description: 'Thurbox performance: demand-driven rendering, deterministic perf counters, caching, and measuring startup time, CPU, and binary size.'
+title: 'Performance — Friring Docs'
+description: 'Friring performance: demand-driven rendering, deterministic perf counters, caching, and measuring startup time, CPU, and binary size.'
 currentPage: 'performance'
 breadcrumb: 'Performance'
 onThisPage:
@@ -14,7 +14,7 @@ onThisPage:
 ---
 <h1>Performance</h1>
 <p>
-  How thurbox stays responsive and light, across four dimensions: input latency, runtime CPU /
+  How friring stays responsive and light, across four dimensions: input latency, runtime CPU /
   render cost, startup time, and memory / binary size. The guiding principle is
   <strong>measure first</strong> &mdash; every optimization is backed by a deterministic counter or
   a concrete code fact, and proven by a test that fails if it regresses. Full rationale lives in
@@ -132,7 +132,7 @@ onThisPage:
   the cache, so status latency is unchanged.
 </p>
 <p>
-  An external <code>thurbox-cli session signal</code> commits on another connection, which bumps
+  An external <code>friring-cli session signal</code> commits on another connection, which bumps
   <code>data_version</code> and is picked up on the next tick. The two writes that don't move
   <em>this</em> connection's version &mdash; marking a <code>done</code> session
   <code>seen</code>, and clearing state on restart &mdash; are handled explicitly (write-through and
@@ -212,8 +212,8 @@ onThisPage:
 </p>
 <ul>
   <li>
-    <strong>Startup</strong> &mdash; launch with <code>THURBOX_PERF_LOG=1</code>; a
-    <code>startup</code> line is logged to <code>thurbox.log</code> with a phase breakdown
+    <strong>Startup</strong> &mdash; launch with <code>FRIRING_PERF_LOG=1</code>; a
+    <code>startup</code> line is logged to <code>friring.log</code> with a phase breakdown
     (<code>config_init_ms</code> / <code>db_open_ms</code> / <code>extension_heal_ms</code> /
     <code>restore_ms</code>) that sums to <code>first_frame_ms</code>, plus per-backend
     <code>restore_discover</code> and per-session <code>restore_adopt</code> / <code>adopt_split</code>
@@ -221,7 +221,7 @@ onThisPage:
   </li>
   <li>
     <strong>Binary size</strong> &mdash; a non-gating CI job records the release
-    <code>thurbox</code> / <code>thurbox-cli</code> sizes to the job summary and an artifact, so
+    <code>friring</code> / <code>friring-cli</code> sizes to the job summary and an artifact, so
     growth is visible without blocking merges. The release profile is already LTO-tuned and stripped.
   </li>
   <li>
@@ -260,7 +260,7 @@ onThisPage:
     <text class="perf-axis" x="37" y="177">init + first paint &#8212; 33 ms</text>
   </svg>
   <figcaption>
-    Where startup time goes, from a real <code>THURBOX_PERF_LOG=1</code> run restoring five sessions
+    Where startup time goes, from a real <code>FRIRING_PERF_LOG=1</code> run restoring five sessions
     (~226&nbsp;ms to first frame). The breakdown is what motivated measuring restore before any
     parallelization &mdash; and what showed it is bounded by tmux's serialized control-mode
     connection rather than by parallelizable work. Numbers vary with session count and scrollback.

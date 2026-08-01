@@ -1,7 +1,7 @@
 ---
 layout: docs.njk
-title: 'gitlab-issues extension — Thurbox Docs'
-description: 'The gitlab-issues extension: bidirectionally syncs GitLab issues with the Thurbox task list — your issues show up as tasks, and marking a task done closes the issue.'
+title: 'gitlab-issues extension — Friring Docs'
+description: 'The gitlab-issues extension: bidirectionally syncs GitLab issues with the Friring task list — your issues show up as tasks, and marking a task done closes the issue.'
 currentPage: 'extension-gitlab-issues'
 breadcrumb: 'GitLab issues'
 onThisPage:
@@ -18,7 +18,7 @@ onThisPage:
           <p>
             The gitlab-issues extension bidirectionally syncs
             <strong>GitLab issues</strong>
-            with the Thurbox
+            with the Friring
             <strong>task list</strong>
             : your issues show up as tasks, and marking a task done closes the issue. A
             <code>gitlab-issues-tick</code>
@@ -33,9 +33,9 @@ onThisPage:
             <code>trackers.md</code>
             with the task list. There is
             <strong>no agent, no LLM, no tokens</strong>
-            : Thurbox's scheduler runs the script (TUI or headless heartbeat) and records its output
+            : Friring's scheduler runs the script (TUI or headless heartbeat) and records its output
             in the automation run history. The script only calls
-            <code>thurbox-cli</code>
+            <code>friring-cli</code>
             and the
             <code>glab</code>
             CLI; no GitLab bot, no webhook.
@@ -53,7 +53,7 @@ onThisPage:
             <a href="#overview" class="heading-anchor">#</a>
           </h2>
           <p>
-            Pull is the default direction: GitLab issues become Thurbox tasks. GitLab is
+            Pull is the default direction: GitLab issues become Friring tasks. GitLab is
             authoritative for an issue's
             <strong>title, URL, and open-vs-done state</strong>
             ; your local
@@ -77,14 +77,14 @@ onThisPage:
           </h2>
           <ul>
             <li>
-              <code>thurbox-cli</code>
+              <code>friring-cli</code>
               <strong>&ge;&nbsp;0.141</strong>
               on
               <code>PATH</code>
               &mdash; the sync uses the
               <code>task --source/--external-id/--external-url</code>
               flags added there (check with
-              <code>thurbox-cli version</code>
+              <code>friring-cli version</code>
               ).
             </li>
             <li>
@@ -122,17 +122,17 @@ onThisPage:
             <a href="#install" class="heading-anchor">#</a>
           </h2>
           <p>
-            gitlab-issues is a Thurbox
+            gitlab-issues is a Friring
             <a href="extensions.html">extension</a>
             (a declarative
             <code>extension.toml</code>
             manifest):
           </p>
-          <pre><code><span class="syn-prompt">$</span> <span class="syn-cmd">thurbox-cli</span> extension install gitlab-issues       <span class="syn-comment"># or ./extensions/gitlab-issues</span>
-<span class="syn-prompt">$</span> <span class="syn-cmd">thurbox-cli</span> extension uninstall gitlab-issues     <span class="syn-comment"># --purge also deletes ~/.config/thurbox/extensions/gitlab-issues</span></code></pre>
+          <pre><code><span class="syn-prompt">$</span> <span class="syn-cmd">friring-cli</span> extension install gitlab-issues       <span class="syn-comment"># or ./extensions/gitlab-issues</span>
+<span class="syn-prompt">$</span> <span class="syn-cmd">friring-cli</span> extension uninstall gitlab-issues     <span class="syn-comment"># --purge also deletes ~/.config/friring/extensions/gitlab-issues</span></code></pre>
           <p>
             Installing lays down the
-            <code>~/.config/thurbox/extensions/gitlab-issues/</code>
+            <code>~/.config/friring/extensions/gitlab-issues/</code>
             home (override with
             <code>--home</code>
             ; it holds
@@ -143,7 +143,7 @@ onThisPage:
             <code>gitlab-issues-tick</code>
             automation &mdash;
             <strong>self-healed</strong>
-            by Thurbox if deleted.
+            by Friring if deleted.
           </p>
 
           <h2 id="configure">
@@ -152,7 +152,7 @@ onThisPage:
           </h2>
           <p>
             Edit
-            <code>~/.config/thurbox/extensions/gitlab-issues/trackers.md</code>
+            <code>~/.config/friring/extensions/gitlab-issues/trackers.md</code>
             &mdash; one row per project or saved filter. The
             <strong>query</strong>
             is
@@ -196,10 +196,10 @@ onThisPage:
             <code>r</code>
             ) or headless:
           </p>
-          <pre><code><span class="syn-prompt">$</span> <span class="syn-cmd">thurbox-cli</span> automation run &lt;id&gt;     <span class="syn-comment"># id from: thurbox-cli automation list</span>
-<span class="syn-prompt">$</span> <span class="syn-cmd">~/.config/thurbox/extensions/gitlab-issues/scripts/sync.sh</span>     <span class="syn-comment"># or run the script directly</span></code></pre>
+          <pre><code><span class="syn-prompt">$</span> <span class="syn-cmd">friring-cli</span> automation run &lt;id&gt;     <span class="syn-comment"># id from: friring-cli automation list</span>
+<span class="syn-prompt">$</span> <span class="syn-cmd">~/.config/friring/extensions/gitlab-issues/scripts/sync.sh</span>     <span class="syn-comment"># or run the script directly</span></code></pre>
           <p>Then inspect the imported tasks:</p>
-          <pre><code><span class="syn-prompt">$</span> <span class="syn-cmd">thurbox-cli</span> task list --json | jq -c '.[] | select(.source=="gitlab") | {id,status,external_id,title}'</code></pre>
+          <pre><code><span class="syn-prompt">$</span> <span class="syn-cmd">friring-cli</span> task list --json | jq -c '.[] | select(.source=="gitlab") | {id,status,external_id,title}'</code></pre>
           <p>
             Open issues import as
             <code>todo</code>
@@ -251,7 +251,7 @@ onThisPage:
           <p>
             See
             <a
-              href="https://github.com/Thurbeen/thurbox/tree/main/extensions/gitlab-issues"
+              href="https://github.com/bvc3at/friring/tree/main/extensions/gitlab-issues"
               target="_blank"
               rel="noopener"
             >

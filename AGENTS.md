@@ -35,11 +35,13 @@ Two rules matter when working here:
   distribution** (August 2026): `cd.yml` releases `friring-*` binaries,
   `scripts/install.*` and `HomebrewFormula/friring.rb` (this repo doubles as its
   own brew tap) fetch them from `bvc3at/friring`, and self-update /
-  version-check query the same repo. What still says `thurbox` is deliberate:
-  upstream **attribution** (`LICENSE`, provenance, the website/Sonar badges) and
-  upstream-owned surfaces — `pages.yml`, `website/`, upstream extension
-  payloads, the `min_thurbox_version` manifest key, and the `tb-`/`tbs-` tmux
-  window prefixes.
+  version-check query the same repo. So is the **website** (August 2026):
+  `website/` is Friring-branded and `pages.yml` deploys it to
+  `bvc3at.github.io/friring`. What still says `thurbox` is deliberate: upstream
+  **attribution** (`LICENSE`, provenance, the Sonar badge, and the fork credit
+  in the site footer / FAQ / `llms.txt`) and upstream-owned surfaces — upstream
+  extension payloads, the `min_thurbox_version` manifest key, and the
+  `tb-`/`tbs-` tmux window prefixes.
   Upstream merges now carry rename conflicts; resolve them toward `friring` for
   this app's own identifiers and distribution, leaving the attribution names as
   upstream. Upstream's AUR/Chocolatey/winget manifests were deleted here, so

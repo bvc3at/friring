@@ -1,7 +1,7 @@
 ---
 layout: docs.njk
-title: 'Architecture — Thurbox Docs'
-description: 'Thurbox architecture: The Elm Architecture, module isolation, the session backend, and design principles.'
+title: 'Architecture — Friring Docs'
+description: 'Friring architecture: The Elm Architecture, module isolation, the session backend, and design principles.'
 currentPage: 'architecture'
 breadcrumb: 'Architecture'
 onThisPage:
@@ -133,7 +133,7 @@ app      &larr; coordinator, imports all modules</pre>
                   over a
                   <code>TmuxTransport</code>
                   (local
-                  <code>tmux -L thurbox</code>
+                  <code>tmux -L friring</code>
                   , or
                   <code>ssh &lt;dest&gt; tmux</code>
                   for
@@ -172,7 +172,7 @@ app      &larr; coordinator, imports all modules</pre>
                 <td><code>cli/</code></td>
                 <td>
                   Headless automation (
-                  <code>thurbox-cli</code>
+                  <code>friring-cli</code>
                   binary). Session, automation, and editor subcommands sharing the TUI's SQLite
                   database.
                 </td>
@@ -192,7 +192,7 @@ app      &larr; coordinator, imports all modules</pre>
             over a local
             <code>TmuxTransport</code>
             (
-            <code>tmux -L thurbox</code>
+            <code>tmux -L friring</code>
             ).
             <code>vt100::Parser</code>
             interprets escape sequences,
@@ -264,7 +264,7 @@ app      &larr; coordinator, imports all modules</pre>
             trait. The implementation is
             <code>TmuxBackend</code>
             , which runs every session in a dedicated
-            <code>tmux -L thurbox</code>
+            <code>tmux -L friring</code>
             server. The trait boundary keeps the app layer transport-agnostic.
           </p>
           <p>
@@ -274,9 +274,9 @@ app      &larr; coordinator, imports all modules</pre>
             : sessions can run on a
             <strong>remote host over SSH</strong>
             while the TUI runs locally. The local backend launches
-            <code>tmux -L thurbox</code>
+            <code>tmux -L friring</code>
             ; a remote one launches
-            <code>ssh &lt;dest&gt; tmux -L thurbox</code>
+            <code>ssh &lt;dest&gt; tmux -L friring</code>
             &mdash; the tmux control-mode protocol is byte-identical over either transport. Each host
             declared in
             <code>hosts.toml</code>
@@ -310,7 +310,7 @@ app      &larr; coordinator, imports all modules</pre>
           </h2>
           <p>
             All state is stored in SQLite at
-            <code>~/.local/share/thurbox/thurbox.db</code>
+            <code>~/.local/share/friring/friring.db</code>
             . Multiple instances synchronize via
             <code>PRAGMA data_version</code>
             polling (250ms). SQLite WAL mode handles concurrent access.
@@ -340,7 +340,7 @@ app      &larr; coordinator, imports all modules</pre>
             <a href="#principles" class="heading-anchor">#</a>
           </h2>
           <p>
-            Non-negotiable rules that define what Thurbox must always be. Each has an automated
+            Non-negotiable rules that define what Friring must always be. Each has an automated
             enforcement mechanism.
           </p>
 
@@ -439,7 +439,7 @@ app      &larr; coordinator, imports all modules</pre>
             </li>
             <li>
               Logging: file-based at
-              <code>~/.local/share/thurbox/thurbox.log</code>
+              <code>~/.local/share/friring/friring.log</code>
             </li>
             <li>Panic hook restores terminal before printing</li>
             <li>Requires tmux >= 3.2</li>

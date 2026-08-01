@@ -23,10 +23,11 @@ concurrency:
 jobs:
   deploy:
     name: Deploy to GitHub Pages
-    # Fork (Friring): the fork has no GitHub Pages site, so this deploy only
-    # runs on upstream. See FORK.md.
-    if: github.repository == 'Thurbeen/thurbox'
-    runs-on: ubuntu-latest
+    # Fork (Friring): active here — the fork publishes its own site to
+    # bvc3at.github.io/friring. The repo is private, so this needs the Pro plan
+    # that allows Pages from a private repo; the published site is public
+    # regardless. See FORK.md.
+    runs-on: k3s-arc
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}

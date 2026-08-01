@@ -1,33 +1,34 @@
-# Thurbox
+# Friring
 
-> Thurbox is a multi-session TUI orchestrator that runs any coding-agent CLI
+> Friring is a multi-session TUI orchestrator that runs any coding-agent CLI
 > — Claude Code, Codex, Antigravity, opencode, aider, GitHub Copilot CLI, Vibe,
 > or any CLI you define — inside persistent tmux panes. Sessions, agents, and
 > git worktrees
 > are first-class citizens, and sessions survive crashes, restarts, and
 > reboots because tmux keeps the agent processes alive. It is written in Rust,
 > open source under the MIT license, and runs on Linux, macOS, and Windows
-> (plus remote hosts over SSH). A headless companion binary, `thurbox-cli`,
+> (plus remote hosts over SSH). A headless companion binary, `friring-cli`,
 > drives the same sessions for scripting and automation.
 
 ## Docs
 
-- [Documentation hub](https://thurbox.thurbeen.eu/docs/index.html): entry point to all Thurbox documentation.
-- [FAQ](https://thurbox.thurbeen.eu/docs/faq.html): short answers to the most common questions (what it is, how it differs, install, platforms, license).
-- [Features](https://thurbox.thurbeen.eu/docs/features.html): sessions, agent definitions, git worktrees, remote SSH, automations, tasks, code review, headless CLI.
-- [Comparison](https://thurbox.thurbeen.eu/docs/comparison.html): how Thurbox compares to Conductor, Claude Squad, Cursor, and other parallel coding-agent tools.
-- [Installation](https://thurbox.thurbeen.eu/docs/installation.html): install via curl, Homebrew, AUR, winget, Chocolatey, or from source; prerequisites.
-- [Configuration](https://thurbox.thurbeen.eu/docs/configuration.html): every config file and knob — agents.toml, hosts.toml, settings.toml, themes, keybindings.
-- [Architecture](https://thurbox.thurbeen.eu/docs/architecture.html): the Elm Architecture, module isolation, the tmux session backend, and design decisions.
+- [Documentation hub](https://bvc3at.github.io/friring/docs/index.html): entry point to all Friring documentation.
+- [FAQ](https://bvc3at.github.io/friring/docs/faq.html): short answers to the most common questions (what it is, how it differs, install, platforms, license).
+- [Features](https://bvc3at.github.io/friring/docs/features.html): sessions, agent definitions, git worktrees, remote SSH, automations, tasks, code review, headless CLI.
+- [Comparison](https://bvc3at.github.io/friring/docs/comparison.html): how Friring compares to Conductor, Claude Squad, Cursor, and other parallel coding-agent tools.
+- [Installation](https://bvc3at.github.io/friring/docs/installation.html): install via curl, PowerShell, Homebrew, cargo, or from source; prerequisites.
+- [Configuration](https://bvc3at.github.io/friring/docs/configuration.html): every config file and knob — agents.toml, hosts.toml, settings.toml, themes, keybindings.
+- [Architecture](https://bvc3at.github.io/friring/docs/architecture.html): the Elm Architecture, module isolation, the tmux session backend, and design decisions.
 
 ## Extensions
 
-- [Extensions overview](https://thurbox.thurbeen.eu/docs/extensions.html): opt-in, agent-agnostic add-ons and the declarative manifest format.
-- [Agent hooks](https://thurbox.thurbeen.eu/docs/agent-hooks.html): the built-in extension mapping agent lifecycle hooks to session status.
-- [Recipes](https://thurbox.thurbeen.eu/docs/recipes.html): worked patterns for orchestrating multi-session, multi-repo workflows.
+- [Extensions overview](https://bvc3at.github.io/friring/docs/extensions.html): opt-in, agent-agnostic add-ons and the declarative manifest format.
+- [Agent hooks](https://bvc3at.github.io/friring/docs/agent-hooks.html): the built-in extension mapping agent lifecycle hooks to session status.
+- [Recipes](https://bvc3at.github.io/friring/docs/recipes.html): worked patterns for orchestrating multi-session, multi-repo workflows.
 
 ## Optional
 
-- [GitHub repository](https://github.com/Thurbeen/thurbox): source, README, and releases.
-- [Keybindings](https://thurbox.thurbeen.eu/docs/keybindings.html): the Vim-inspired keyboard reference.
-- [Performance](https://thurbox.thurbeen.eu/docs/performance.html): demand-driven rendering and how throughput is measured.
+- [GitHub repository](https://github.com/bvc3at/friring): source, README, and releases.
+- [Upstream project](https://github.com/Thurbeen/thurbox): Thurbox by Thurbeen — Friring is a personal fork of it.
+- [Keybindings](https://bvc3at.github.io/friring/docs/keybindings.html): the Vim-inspired keyboard reference.
+- [Performance](https://bvc3at.github.io/friring/docs/performance.html): demand-driven rendering and how throughput is measured.

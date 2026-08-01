@@ -1,6 +1,6 @@
 ---
 layout: docs.njk
-title: 'ci-shepherd extension — Thurbox Docs'
+title: 'ci-shepherd extension — Friring Docs'
 description: 'The ci-shepherd extension: watches your open change requests (GitHub PRs, GitLab MRs, Bitbucket PRs, and any git forge) and dispatches a worker to fix failing CI, a changes-requested review, or a branch that is behind its target (needs rebase).'
 currentPage: 'extension-ci-shepherd'
 breadcrumb: 'ci-shepherd'
@@ -45,7 +45,7 @@ onThisPage:
             <code>shepherd</code>
             session sweeps your watched repos on a
             <code>shepherd-tick</code>
-            automation (every 15&nbsp;min). Fixers are Thurbox
+            automation (every 15&nbsp;min). Fixers are Friring
             <strong>tasks</strong>
             (
             <code>fix #&lt;n&gt;: &hellip;</code>
@@ -154,7 +154,7 @@ onThisPage:
               ,
               <code>jq</code>
               , and
-              <code>thurbox-cli</code>
+              <code>friring-cli</code>
               on
               <code>PATH</code>
               .
@@ -179,17 +179,17 @@ onThisPage:
             <a href="#install" class="heading-anchor">#</a>
           </h2>
           <p>
-            ci-shepherd is a Thurbox
+            ci-shepherd is a Friring
             <a href="extensions.html">extension</a>
             (a declarative
             <code>extension.toml</code>
             manifest):
           </p>
-          <pre><code class="language-bash">thurbox-cli extension install ci-shepherd    # or ./extensions/ci-shepherd
-thurbox-cli extension uninstall ci-shepherd  # --purge also deletes ~/.config/thurbox/extensions/ci-shepherd</code></pre>
+          <pre><code class="language-bash">friring-cli extension install ci-shepherd    # or ./extensions/ci-shepherd
+friring-cli extension uninstall ci-shepherd  # --purge also deletes ~/.config/friring/extensions/ci-shepherd</code></pre>
           <p>
             Installing lays down the shepherd home (
-            <code>~/.config/thurbox/extensions/ci-shepherd</code>
+            <code>~/.config/friring/extensions/ci-shepherd</code>
             ; override with
             <code>--home</code>
             ), registers the
@@ -202,7 +202,7 @@ thurbox-cli extension uninstall ci-shepherd  # --purge also deletes ~/.config/th
             <code>shepherd-tick</code>
             automation &mdash; both
             <strong>self-healed</strong>
-            by Thurbox.
+            by Friring.
           </p>
 
           <h2 id="use">
@@ -212,7 +212,7 @@ thurbox-cli extension uninstall ci-shepherd  # --purge also deletes ~/.config/th
           <ul>
             <li>
               Add the repos to watch to
-              <code>~/.config/thurbox/extensions/ci-shepherd/repos.md</code>
+              <code>~/.config/friring/extensions/ci-shepherd/repos.md</code>
               (one row each;
               <code>author</code>
               defaults to
@@ -241,7 +241,7 @@ thurbox-cli extension uninstall ci-shepherd  # --purge also deletes ~/.config/th
             <a href="#branch" class="heading-anchor">#</a>
           </h2>
           <p>
-            Thurbox's own
+            Friring's own
             <code>--worktree</code>
             always runs
             <code>git worktree add -b</code>
@@ -249,7 +249,7 @@ thurbox-cli extension uninstall ci-shepherd  # --purge also deletes ~/.config/th
             does. So
             <code>dispatch-fix.sh</code>
             adopts the branch itself into a shepherd-owned worktree under
-            <code>~/.config/thurbox/extensions/ci-shepherd/worktrees/&lt;repo&gt;-&lt;provider&gt;-&lt;n&gt;</code>
+            <code>~/.config/friring/extensions/ci-shepherd/worktrees/&lt;repo&gt;-&lt;provider&gt;-&lt;n&gt;</code>
             , then spawns the fixer there. The checkout is git-universal: a built-in forge uses the
             provider's checkout (
             <code>gh pr checkout</code>
@@ -274,7 +274,7 @@ thurbox-cli extension uninstall ci-shepherd  # --purge also deletes ~/.config/th
           <p>
             See
             <a
-              href="https://github.com/Thurbeen/thurbox/tree/main/extensions/ci-shepherd"
+              href="https://github.com/bvc3at/friring/tree/main/extensions/ci-shepherd"
               target="_blank"
               rel="noopener"
             >

@@ -1,4 +1,4 @@
-// Eleventy build for the Thurbox docs website.
+// Eleventy build for the Friring docs website.
 //
 // The site is plain static HTML/CSS/JS; Eleventy is used only to de-duplicate
 // the shared chrome (head, nav, docs sidebar, footer) into layouts under
@@ -98,11 +98,12 @@ export default function (eleventyConfig) {
   eleventyConfig.addPassthroughCopy('website/css');
   eleventyConfig.addPassthroughCopy('website/js');
   eleventyConfig.addPassthroughCopy('website/assets');
-  // robots.txt (crawler discovery) + CNAME (the GitHub Pages custom domain,
-  // tracked so a redeploy can't drop it) + llms.txt (curated entry point for
+  // robots.txt (crawler discovery) + llms.txt (curated entry point for
   // LLM-based engines and coding agents). Same prefix-stripping as above.
+  // No CNAME: the fork serves from the default bvc3at.github.io/friring rather
+  // than a custom domain, and a CNAME in the artifact would make
+  // actions/deploy-pages claim that hostname instead.
   eleventyConfig.addPassthroughCopy('website/robots.txt');
-  eleventyConfig.addPassthroughCopy('website/CNAME');
   eleventyConfig.addPassthroughCopy('website/llms.txt');
 
   // Build-time syntax highlighting. Runs on rendered HTML output only, so the

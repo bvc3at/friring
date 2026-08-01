@@ -1,30 +1,43 @@
 ---
 layout: docs.njk
-title: 'FAQ — Thurbox Docs'
-description: 'Frequently asked questions about Thurbox: what it is, how it compares to other parallel coding-agent tools, which agents and platforms it supports, how to install it, session persistence, license, and headless use.'
+title: 'FAQ — Friring Docs'
+description: 'Frequently asked questions about Friring: what it is, how it compares to other parallel coding-agent tools, which agents and platforms it supports, how to install it, session persistence, license, and headless use.'
 currentPage: 'faq'
 breadcrumb: 'FAQ'
 ---
 <h1>Frequently Asked Questions</h1>
 <p>
-  Short answers to the most common questions about Thurbox. For depth, follow
+  Short answers to the most common questions about Friring. For depth, follow
   the links into the rest of the docs.
 </p>
 
-<h2 id="what-is-thurbox">What is Thurbox?</h2>
+<h2 id="what-is-friring">What is Friring?</h2>
 <p>
-  Thurbox is a multi-session TUI orchestrator that runs any coding-agent CLI
+  Friring is a multi-session TUI orchestrator that runs any coding-agent CLI
   — Claude Code, Codex, Antigravity, opencode, aider, GitHub Copilot CLI, Vibe,
   or any CLI you define — inside persistent tmux panes. Sessions, agents, and
   git worktrees are first-class citizens, and sessions survive crashes,
   restarts, and reboots because tmux keeps the processes alive.
 </p>
 
+<h2 id="fork">Is Friring related to Thurbox?</h2>
+<p>
+  Friring is a personal, opinionated fork of
+  <a href="https://github.com/Thurbeen/thurbox">Thurbox</a> by Thurbeen. It
+  tracks upstream — improvements there get merged down, and the original commit
+  history is kept intact — while landing features of its own. Thurbox's
+  <code>thur-</code> reads as <em>Thursday</em>; Friring bumps it to
+  <em>Friday</em>, and a <strong>ring</strong> is a boxing arena, so the name
+  reads as an arena for agents. Friring cuts its own releases, so every install
+  command here fetches a <code>friring</code> binary from
+  <a href="https://github.com/bvc3at/friring">its own repository</a>.
+</p>
+
 <h2 id="how-different">
-  How is Thurbox different from other parallel coding-agent tools?
+  How is Friring different from other parallel coding-agent tools?
 </h2>
 <p>
-  Unlike tools such as Conductor, Claude Squad, or Cursor, Thurbox uses real
+  Unlike tools such as Conductor, Claude Squad, or Cursor, Friring uses real
   tmux as its session backend rather than a re-implemented multiplexer, runs
   as a lightweight terminal UI rather than an Electron or native desktop app,
   and launches the unmodified vendor CLI rather than its own model. A single
@@ -34,34 +47,35 @@ breadcrumb: 'FAQ'
   breakdown.
 </p>
 
-<h2 id="supported-agents">Which coding agents does Thurbox support?</h2>
+<h2 id="supported-agents">Which coding agents does Friring support?</h2>
 <p>
-  Thurbox is agent-neutral. It ships built-in definitions for Claude Code,
+  Friring is agent-neutral. It ships built-in definitions for Claude Code,
   Codex, Antigravity, opencode, aider, GitHub Copilot CLI, and Vibe, and you can
-  add any other CLI by editing agents.toml — no recompile required. Thurbox only
+  add any other CLI by editing agents.toml — no recompile required. Friring only
   knows how to launch each CLI with the right command and arguments; it never
   touches the
   agent's model, prompts, or permissions.
 </p>
 
-<h2 id="install">How do I install Thurbox?</h2>
+<h2 id="install">How do I install Friring?</h2>
 <p>
   On Linux or macOS, run
-  <code>curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/main/scripts/install.sh | sh</code>.
-  It is also available via Homebrew
-  (<code>brew install thurbeen/thurbox/thurbox</code>), the AUR (<code>thurbox</code>
-  or <code>thurbox-bin</code>), and on Windows via PowerShell, winget
-  (<code>winget install Thurbeen.thurbox</code>), or Chocolatey
-  (<code>choco install thurbox</code>). You can also build from source with
-  <code>cargo build --release</code>. See
+  <code>curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | sh</code>.
+  It is also available via Homebrew (<code>brew tap bvc3at/friring
+  https://github.com/bvc3at/friring</code> then <code>brew install
+  bvc3at/friring/friring</code>), and on Windows via PowerShell
+  (<code>irm https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.ps1 | iex</code>).
+  On platforms with no prebuilt binary, install with
+  <code>cargo install --git https://github.com/bvc3at/friring --locked</code>, or
+  build from source with <code>cargo build --release</code>. See
   <a href="installation.html">installation</a> for details.
 </p>
 
 <h2 id="platforms">
-  Which platforms does Thurbox run on? Does it support remote machines?
+  Which platforms does Friring run on? Does it support remote machines?
 </h2>
 <p>
-  Thurbox runs on Linux, macOS, and Windows. It requires tmux 3.2+ on
+  Friring runs on Linux, macOS, and Windows. It requires tmux 3.2+ on
   Linux/macOS and psmux on Windows. It can also run sessions on a remote host
   over SSH while the TUI runs locally — remote hosts are declared in
   hosts.toml.
@@ -70,19 +84,19 @@ breadcrumb: 'FAQ'
 <h2 id="persistence">Do my sessions survive a crash or restart?</h2>
 <p>
   Yes. Each session runs inside a persistent tmux session, so the agent
-  processes keep running even if Thurbox crashes or you close and reopen it.
+  processes keep running even if Friring crashes or you close and reopen it.
   Session state is stored in SQLite and re-adopted on restart.
 </p>
 
-<h2 id="license">Is Thurbox free and open source?</h2>
-<p>Yes. Thurbox is open source under the MIT license and free to use.</p>
+<h2 id="license">Is Friring free and open source?</h2>
+<p>Yes. Friring is open source under the MIT license and free to use.</p>
 
-<h2 id="headless">Can I use Thurbox without the TUI, headlessly?</h2>
+<h2 id="headless">Can I use Friring without the TUI, headlessly?</h2>
 <p>
-  Yes. A second binary, thurbox-cli, drives the same SQLite-backed,
+  Yes. A second binary, friring-cli, drives the same SQLite-backed,
   tmux-hosted sessions headlessly — create, list, send to, capture, restart,
   and delete sessions, plus automations and tasks — sharing the database with
-  the TUI. This makes Thurbox scriptable for automation and CI.
+  the TUI. This makes Friring scriptable for automation and CI.
 </p>
 
 <script type="application/ld+json">
@@ -92,42 +106,50 @@ breadcrumb: 'FAQ'
     "mainEntity": [
       {
         "@type": "Question",
-        "name": "What is Thurbox?",
+        "name": "What is Friring?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Thurbox is a multi-session TUI orchestrator that runs any coding-agent CLI — Claude Code, Codex, Antigravity, opencode, aider, GitHub Copilot CLI, Vibe, or any CLI you define — inside persistent tmux panes. Sessions, agents, and git worktrees are first-class citizens, and sessions survive crashes, restarts, and reboots because tmux keeps the processes alive."
+          "text": "Friring is a multi-session TUI orchestrator that runs any coding-agent CLI — Claude Code, Codex, Antigravity, opencode, aider, GitHub Copilot CLI, Vibe, or any CLI you define — inside persistent tmux panes. Sessions, agents, and git worktrees are first-class citizens, and sessions survive crashes, restarts, and reboots because tmux keeps the processes alive."
         }
       },
       {
         "@type": "Question",
-        "name": "How is Thurbox different from other parallel coding-agent tools?",
+        "name": "Is Friring related to Thurbox?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Unlike tools such as Conductor, Claude Squad, or Cursor, Thurbox uses real tmux as its session backend rather than a re-implemented multiplexer, runs as a lightweight terminal UI rather than an Electron or native desktop app, and launches the unmodified vendor CLI rather than its own model. A single session can span multiple repositories, and it ships a native in-TUI code-review view. Agents are defined as data, so any CLI works with no recompile."
+          "text": "Friring is a personal, opinionated fork of Thurbox by Thurbeen. It tracks upstream — improvements there get merged down, and the original commit history is kept intact — while landing features of its own. Thurbox's thur- reads as Thursday; Friring bumps it to Friday, and a ring is a boxing arena, so the name reads as an arena for agents. Friring cuts its own releases, so every install command here fetches a friring binary from its own repository."
         }
       },
       {
         "@type": "Question",
-        "name": "Which coding agents does Thurbox support?",
+        "name": "How is Friring different from other parallel coding-agent tools?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Thurbox is agent-neutral. It ships built-in definitions for Claude Code, Codex, Antigravity, opencode, aider, GitHub Copilot CLI, and Vibe, and you can add any other CLI by editing agents.toml — no recompile required. Thurbox only knows how to launch each CLI with the right command and arguments; it never touches the agent's model, prompts, or permissions."
+          "text": "Unlike tools such as Conductor, Claude Squad, or Cursor, Friring uses real tmux as its session backend rather than a re-implemented multiplexer, runs as a lightweight terminal UI rather than an Electron or native desktop app, and launches the unmodified vendor CLI rather than its own model. A single session can span multiple repositories, and it ships a native in-TUI code-review view. Agents are defined as data, so any CLI works with no recompile."
         }
       },
       {
         "@type": "Question",
-        "name": "How do I install Thurbox?",
+        "name": "Which coding agents does Friring support?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "On Linux or macOS, run: curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/main/scripts/install.sh | sh. It is also available via Homebrew (brew install thurbeen/thurbox/thurbox), the AUR (thurbox or thurbox-bin), and on Windows via PowerShell, winget (winget install Thurbeen.thurbox), or Chocolatey (choco install thurbox). You can also build from source with cargo build --release."
+          "text": "Friring is agent-neutral. It ships built-in definitions for Claude Code, Codex, Antigravity, opencode, aider, GitHub Copilot CLI, and Vibe, and you can add any other CLI by editing agents.toml — no recompile required. Friring only knows how to launch each CLI with the right command and arguments; it never touches the agent's model, prompts, or permissions."
         }
       },
       {
         "@type": "Question",
-        "name": "Which platforms does Thurbox run on? Does it support remote machines?",
+        "name": "How do I install Friring?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Thurbox runs on Linux, macOS, and Windows. It requires tmux 3.2+ on Linux/macOS and psmux on Windows. It can also run sessions on a remote host over SSH while the TUI runs locally — remote hosts are declared in hosts.toml."
+          "text": "On Linux or macOS, run: curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | sh. It is also available via Homebrew (brew tap bvc3at/friring https://github.com/bvc3at/friring, then brew install bvc3at/friring/friring), and on Windows via PowerShell (irm https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.ps1 | iex). On platforms with no prebuilt binary, install with cargo install --git https://github.com/bvc3at/friring --locked, or build from source with cargo build --release."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Which platforms does Friring run on? Does it support remote machines?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Friring runs on Linux, macOS, and Windows. It requires tmux 3.2+ on Linux/macOS and psmux on Windows. It can also run sessions on a remote host over SSH while the TUI runs locally — remote hosts are declared in hosts.toml."
         }
       },
       {
@@ -135,23 +157,23 @@ breadcrumb: 'FAQ'
         "name": "Do my sessions survive a crash or restart?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Yes. Each session runs inside a persistent tmux session, so the agent processes keep running even if Thurbox crashes or you close and reopen it. Session state is stored in SQLite and re-adopted on restart."
+          "text": "Yes. Each session runs inside a persistent tmux session, so the agent processes keep running even if Friring crashes or you close and reopen it. Session state is stored in SQLite and re-adopted on restart."
         }
       },
       {
         "@type": "Question",
-        "name": "Is Thurbox free and open source?",
+        "name": "Is Friring free and open source?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Yes. Thurbox is open source under the MIT license and free to use."
+          "text": "Yes. Friring is open source under the MIT license and free to use."
         }
       },
       {
         "@type": "Question",
-        "name": "Can I use Thurbox without the TUI, headlessly?",
+        "name": "Can I use Friring without the TUI, headlessly?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Yes. A second binary, thurbox-cli, drives the same SQLite-backed, tmux-hosted sessions headlessly — create, list, send to, capture, restart, and delete sessions, plus automations and tasks — sharing the database with the TUI. This makes Thurbox scriptable for automation and CI."
+          "text": "Yes. A second binary, friring-cli, drives the same SQLite-backed, tmux-hosted sessions headlessly — create, list, send to, capture, restart, and delete sessions, plus automations and tasks — sharing the database with the TUI. This makes Friring scriptable for automation and CI."
         }
       }
     ]

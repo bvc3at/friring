@@ -1,7 +1,7 @@
 ---
 layout: docs.njk
-title: 'Agent hooks — Thurbox Docs'
-description: 'The built-in hooks extension: wire each coding agent CLI lifecycle hook to thurbox-cli session signal so every session reports working/blocked/done/idle. Per-agent coverage matrix for claude, codex, antigravity, opencode, aider, copilot, and vibe.'
+title: 'Agent hooks — Friring Docs'
+description: 'The built-in hooks extension: wire each coding agent CLI lifecycle hook to friring-cli session signal so every session reports working/blocked/done/idle. Per-agent coverage matrix for claude, codex, antigravity, opencode, aider, copilot, and vibe.'
 currentPage: 'agent-hooks'
 breadcrumb: 'Agent hooks'
 onThisPage:
@@ -18,8 +18,8 @@ onThisPage:
             The built-in
             <strong>hooks</strong>
             extension wires each coding agent's lifecycle hooks to
-            <code>thurbox-cli session signal</code>
-            so every session reports its state back to Thurbox. The session list then shows, at a
+            <code>friring-cli session signal</code>
+            so every session reports its state back to Friring. The session list then shows, at a
             glance, which agents are
             <strong>working</strong>
             ,
@@ -40,7 +40,7 @@ onThisPage:
               and is
               <strong>auto-activated on first run</strong>
               &mdash; the default agent's hook is pre-configured with zero setup. It installs
-              through the ordinary extension machinery (it just lives inside Thurbox instead of
+              through the ordinary extension machinery (it just lives inside Friring instead of
               being fetched).
             </p>
           </div>
@@ -51,11 +51,11 @@ onThisPage:
           </h2>
           <p>
             The hook command is always
-            <code>thurbox-cli session signal --state &lt;working|blocked|done|idle&gt;</code>
+            <code>friring-cli session signal --state &lt;working|blocked|done|idle&gt;</code>
             , suffixed
             <code>|| true</code>
             so it can never break the agent. Identity comes from the injected
-            <code>$THURBOX_SESSION</code>
+            <code>$FRIRING_SESSION</code>
             environment variable, so a hook passes
             <strong>no ids</strong>
             . The reported state is persisted on the session row and picked up by the TUI within a
@@ -131,7 +131,7 @@ onThisPage:
           </h2>
           <p>
             How much each agent can report depends on the lifecycle surface its CLI exposes &mdash;
-            Thurbox maps whatever hooks an agent offers, and the dot is accurate for the edges that
+            Friring maps whatever hooks an agent offers, and the dot is accurate for the edges that
             agent can express:
           </p>
           <table>
@@ -271,7 +271,7 @@ onThisPage:
               <code>agy</code>
               CLI loads hooks from its shared
               <code>~/.gemini/settings.json</code>
-              , so Thurbox
+              , so Friring
               <strong>JSON-merges</strong>
               its entries in without clobbering your settings.
               <code>agy</code>
@@ -299,7 +299,7 @@ onThisPage:
               <em>(experimental)</em>
               &mdash; Mistral Vibe loads hooks from
               <code>~/.vibe/hooks.toml</code>
-              ; Thurbox drops a managed file in (only when vibe is installed).
+              ; Friring drops a managed file in (only when vibe is installed).
               <code>before_tool</code>
               &rarr; working,
               <code>after_turn</code>
@@ -316,7 +316,7 @@ onThisPage:
               <em>(experimental)</em>
               &mdash; GitHub Copilot CLI loads hooks from its own
               <code>~/.copilot/hooks/</code>
-              dir, so Thurbox drops a managed standalone file in (only when copilot is installed),
+              dir, so Friring drops a managed standalone file in (only when copilot is installed),
               never touching your other hook files.
               <code>sessionStart</code>
               &rarr; idle,
@@ -355,17 +355,17 @@ onThisPage:
           </h2>
           <p>
             The wiring is applied
-            <strong>only to agents Thurbox launches</strong>
+            <strong>only to agents Friring launches</strong>
             &mdash; it never edits your own global agent config (e.g. your personal
             <code>~/.claude/settings.json</code>
             ). For claude the managed hooks file is passed with
             <code>--settings</code>
             , which claude
             <strong>merges on top of</strong>
-            your own settings: inside a Thurbox session both your hooks and Thurbox's fire, while a
+            your own settings: inside a Friring session both your hooks and Friring's fire, while a
             plain
             <code>claude</code>
-            outside Thurbox sees only your own. The other agents are wired by a reversible merge
+            outside Friring sees only your own. The other agents are wired by a reversible merge
             into &mdash; or a managed file dropped in &mdash; their own config dir.
           </p>
           <table>
@@ -379,7 +379,7 @@ onThisPage:
             <tbody>
               <tr>
                 <td>claude</td>
-                <td><code>~/.config/thurbox/hooks/claude.json</code></td>
+                <td><code>~/.config/friring/hooks/claude.json</code></td>
                 <td>
                   <code>--settings</code>
                   flag on the
@@ -399,7 +399,7 @@ onThisPage:
               </tr>
               <tr>
                 <td>opencode</td>
-                <td><code>~/.config/opencode/plugin/thurbox-status.js</code></td>
+                <td><code>~/.config/opencode/plugin/friring-status.js</code></td>
                 <td>managed plugin file</td>
               </tr>
               <tr>
@@ -414,7 +414,7 @@ onThisPage:
               </tr>
               <tr>
                 <td>copilot</td>
-                <td><code>~/.copilot/hooks/thurbox-status.json</code></td>
+                <td><code>~/.copilot/hooks/friring-status.json</code></td>
                 <td>managed standalone file</td>
               </tr>
               <tr>
@@ -426,16 +426,16 @@ onThisPage:
           </table>
           <p>
             The home dir is
-            <code>~/.config/thurbox/hooks</code>
+            <code>~/.config/friring/hooks</code>
             for a release build and
-            <code>~/.config/thurbox-dev/hooks</code>
+            <code>~/.config/friring-dev/hooks</code>
             for a dev build, so the two stay isolated.
           </p>
           <div class="info-box">
             <p>
               <strong>Inspect or customize.</strong>
-              To see exactly what Thurbox installed, read the file for the agent above (e.g.
-              <code>cat ~/.config/thurbox/hooks/claude.json</code>
+              To see exactly what Friring installed, read the file for the agent above (e.g.
+              <code>cat ~/.config/friring/hooks/claude.json</code>
               ). The injected
               <code>--settings</code>
               /
@@ -445,7 +445,7 @@ onThisPage:
               /
               <code>aider</code>
               entries of
-              <code>~/.config/thurbox/agents.toml</code>
+              <code>~/.config/friring/agents.toml</code>
               . You can hand-edit a managed file, but self-heal rewrites it from the embedded payload
               on the next TUI start / heartbeat tick &mdash; so to keep a change, either deactivate
               the extension and wire the hook yourself, or edit the payload source under
@@ -459,8 +459,8 @@ onThisPage:
             <a href="#optout" class="heading-anchor">#</a>
           </h2>
           <p>Hooks is the one extension that's on without you asking. Turn it off (and back on):</p>
-          <pre><code class="language-bash">thurbox-cli extension deactivate hooks   # remove the wiring; won't come back
-thurbox-cli extension activate hooks     # re-enable it</code></pre>
+          <pre><code class="language-bash">friring-cli extension deactivate hooks   # remove the wiring; won't come back
+friring-cli extension activate hooks     # re-enable it</code></pre>
           <p>
             Deactivating records an opt-out flag, so startup self-heal won't resurrect it. All the
             per-agent wiring is reversible, so opting out leaves your agent configs exactly as they
@@ -474,7 +474,7 @@ thurbox-cli extension activate hooks     # re-enable it</code></pre>
           <p>
             See
             <a
-              href="https://github.com/Thurbeen/thurbox/tree/main/extensions/hooks"
+              href="https://github.com/bvc3at/friring/tree/main/extensions/hooks"
               target="_blank"
               rel="noopener"
             >

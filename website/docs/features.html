@@ -1,7 +1,7 @@
 ---
 layout: docs.njk
-title: 'Features — Thurbox Docs'
-description: 'Thurbox features: persistent coding-agent sessions, agent definitions, git worktrees, remote SSH sessions, automations, a responsive UI, and a headless CLI.'
+title: 'Features — Friring Docs'
+description: 'Friring features: persistent coding-agent sessions, agent definitions, git worktrees, remote SSH sessions, automations, a responsive UI, and a headless CLI.'
 currentPage: 'features'
 breadcrumb: 'Features'
 ---
@@ -22,7 +22,7 @@ breadcrumb: 'Features'
             <div class="terminal-frame">
               <div class="terminal-body">
                 <video
-                  src="../assets/thurbox-session-creation.mp4"
+                  src="../assets/friring-session-creation.mp4"
                   autoplay
                   loop
                   muted
@@ -44,7 +44,7 @@ breadcrumb: 'Features'
             one agent (Claude Code, Codex, Antigravity, opencode, aider, GitHub Copilot CLI, Vibe, or
             your own), each with its own default config. Sessions persist across crashes, restarts,
             and even
-            multiple concurrent Thurbox instances &mdash; tmux keeps them alive in the background.
+            multiple concurrent Friring instances &mdash; tmux keeps them alive in the background.
           </p>
           <ul>
             <li>
@@ -94,7 +94,7 @@ breadcrumb: 'Features'
             </li>
             <li>
               Recover sessions externally at any time with
-              <code>tmux -L thurbox attach</code>
+              <code>tmux -L friring attach</code>
             </li>
           </ul>
 
@@ -103,8 +103,8 @@ breadcrumb: 'Features'
             <a href="#agent-definitions" class="heading-anchor">#</a>
           </h2>
           <p>
-            The set of available agents is data, not code. On first run Thurbox seeds
-            <code>~/.config/thurbox/agents.toml</code>
+            The set of available agents is data, not code. On first run Friring seeds
+            <code>~/.config/friring/agents.toml</code>
             with built-ins (claude, codex, antigravity, opencode, aider, vibe). Edit the file to tweak an
             agent or add a new one &mdash; no recompile required.
           </p>
@@ -203,7 +203,7 @@ breadcrumb: 'Features'
               +
               <code>automation_runs</code>
               history) and scriptable headlessly via
-              <code>thurbox-cli automation create/list/edit/run/runs/tick</code>
+              <code>friring-cli automation create/list/edit/run/runs/tick</code>
               .
             </li>
           </ul>
@@ -279,7 +279,7 @@ breadcrumb: 'Features'
             </li>
             <li>
               Persisted in SQLite and scriptable headlessly via
-              <code>thurbox-cli task</code>
+              <code>friring-cli task</code>
               (alias
               <code>todo</code>
               ):
@@ -299,7 +299,7 @@ breadcrumb: 'Features'
               <code>Ctrl+N</code>
               ), choose "Worktree" mode to select a base branch and name a new branch
             </li>
-            <li>Thurbox creates the worktree and launches the agent inside it</li>
+            <li>Friring creates the worktree and launches the agent inside it</li>
             <li>
               Press
               <code>Ctrl+S</code>
@@ -307,7 +307,7 @@ breadcrumb: 'Features'
               <code>origin/main</code>
             </li>
             <li>
-              On rebase conflicts, Thurbox automatically sends a resolution prompt to the agent
+              On rebase conflicts, Friring automatically sends a resolution prompt to the agent
             </li>
             <li>Closing a session automatically removes the worktree</li>
             <li>Worktree sessions show the branch name in the terminal title and session list</li>
@@ -316,7 +316,7 @@ breadcrumb: 'Features'
           <h3>Worktree storage</h3>
           <p>
             Worktrees are created at
-            <code>&lt;repo&gt;/.git/thurbox-worktrees/&lt;sanitized-branch&gt;</code>
+            <code>&lt;repo&gt;/.git/friring-worktrees/&lt;sanitized-branch&gt;</code>
             , where
             <code>/</code>
             in branch names is replaced by
@@ -332,10 +332,10 @@ breadcrumb: 'Features'
             (each gets its own isolated worktree on the session's branch) or
             <code>--add-dir PATH</code>
             (attached as-is, no branch). Because agent CLIs differ wildly in how they accept extra
-            directories, Thurbox launches a multi-repo session in a per-session
+            directories, Friring launches a multi-repo session in a per-session
             <strong>symlink workspace</strong>
             (
-            <code>~/.local/share/thurbox/workspaces/&lt;id&gt;/</code>
+            <code>~/.local/share/friring/workspaces/&lt;id&gt;/</code>
             , one symlink per repo) and starts the agent there, so every agent sees each repo as a
             subdirectory &mdash; fully agent-neutral. Single-repo sessions are unchanged.
           </p>
@@ -351,7 +351,7 @@ breadcrumb: 'Features'
           <ul>
             <li>
               Declare hosts in
-              <code>~/.config/thurbox/hosts.toml</code>
+              <code>~/.config/friring/hosts.toml</code>
               (seeded commented-out, so a fresh install has none); each entry registers a selectable
               backend named
               <code>ssh:&lt;name&gt;</code>
@@ -364,11 +364,11 @@ breadcrumb: 'Features'
               glyph in the session list
             </li>
             <li>
-              Thurbox shells out to your system
+              Friring shells out to your system
               <code>ssh</code>
               , so authentication, keys, and connection multiplexing come from
               <code>~/.ssh/config</code>
-              &mdash; thurbox never handles credentials
+              &mdash; friring never handles credentials
             </li>
             <li>
               Remote sessions get the same persistence, multi-instance sharing, and
@@ -381,7 +381,7 @@ breadcrumb: 'Features'
               <strong>git</strong>
             </li>
           </ul>
-          <pre data-title="~/.config/thurbox/hosts.toml"><code class="language-toml">[[hosts]]
+          <pre data-title="~/.config/friring/hosts.toml"><code class="language-toml">[[hosts]]
 name = "devbox"            # backend "ssh:devbox"; what --host expects
 destination = "me@devbox"  # ssh target or a ~/.ssh/config alias
 ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
@@ -389,7 +389,7 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
 # worktrees_dir      — optional absolute remote worktrees dir</code></pre>
           <p>
             Spawn remotely from the CLI with
-            <code>thurbox-cli session create --host devbox …</code>
+            <code>friring-cli session create --host devbox …</code>
             .
           </p>
 
@@ -430,7 +430,7 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
             <div class="terminal-frame">
               <div class="terminal-body">
                 <video
-                  src="../assets/thurbox-fork.mp4"
+                  src="../assets/friring-fork.mp4"
                   autoplay
                   loop
                   muted
@@ -475,7 +475,7 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
             . A
             <code>Ctrl+F</code>
             fork records its source as the parent automatically; headless,
-            <code>thurbox-cli session create --parent &lt;uuid&gt;</code>
+            <code>friring-cli session create --parent &lt;uuid&gt;</code>
             sets it explicitly, and
             <code>session list --parent &lt;uuid&gt;</code>
             lists a lead's direct children.
@@ -523,7 +523,7 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
             <li>
               <strong>Push, not poll.</strong>
               A worker pushes a clean payload with
-              <code>thurbox-cli message send</code>
+              <code>friring-cli message send</code>
               ; a wake nudge types a short
               <code>inbox</code>
               token into the recipient's pane so it drains immediately. The payload always travels
@@ -539,10 +539,10 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
             </li>
             <li>
               <strong>Self-knowable identity.</strong>
-              Thurbox injects a stable
-              <code>THURBOX_SESSION</code>
+              Friring injects a stable
+              <code>FRIRING_SESSION</code>
               (and, for task-spawned sessions,
-              <code>THURBOX_TASK</code>
+              <code>FRIRING_TASK</code>
               ) into each agent, so a CLI call
               <em>inside</em>
               a session proves its own identity: an agent sends and reads its own mail passing no
@@ -650,7 +650,7 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
             Every session is a git worktree on a branch forked from a base, so &ldquo;review what
             this agent built&rdquo; maps cleanly onto the session model. Press
             <code>Ctrl+X</code>
-            (or <code>F7</code>) to open a native diff reviewer in the central pane &mdash; rendered by Thurbox itself,
+            (or <code>F7</code>) to open a native diff reviewer in the central pane &mdash; rendered by Friring itself,
             with no external binary.
           </p>
           <ul>
@@ -754,7 +754,7 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
             <div class="terminal-frame">
               <div class="terminal-body">
                 <video
-                  src="../assets/thurbox-info-panel.mp4"
+                  src="../assets/friring-info-panel.mp4"
                   autoplay
                   loop
                   muted
@@ -775,7 +775,7 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
             <div class="terminal-frame">
               <div class="terminal-body">
                 <video
-                  src="../assets/thurbox-file-manager.mp4"
+                  src="../assets/friring-file-manager.mp4"
                   autoplay
                   loop
                   muted
@@ -806,7 +806,7 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
             <div class="terminal-frame">
               <div class="terminal-body">
                 <video
-                  src="../assets/thurbox-theme.mp4"
+                  src="../assets/friring-theme.mp4"
                   autoplay
                   loop
                   muted
@@ -833,7 +833,7 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
             <strong>needs-you</strong>
             state &mdash; the agent rang the terminal bell or emitted an OSC 9 / OSC 777
             notification (usually because it is waiting on an answer or has finished a task)
-            &mdash; Thurbox fires an OS desktop notification, so you can react without watching
+            &mdash; Friring fires an OS desktop notification, so you can react without watching
             the TUI. The notification body is the agent's last OSC message, or
             <code>Waiting for input</code>
             otherwise.
@@ -846,7 +846,7 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
               : clicking the banner switches the TUI to that session on its next tick.
               <strong>macOS</strong>
               shows the banner but ignores clicks (the modern notification API requires a signed
-              app bundle, which Thurbox is not).
+              app bundle, which Friring is not).
             </li>
             <li>
               It fires
@@ -916,7 +916,7 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
           </h2>
           <p>
             Whole TUI features can be switched off in
-            <code>~/.config/thurbox/settings.toml</code>
+            <code>~/.config/friring/settings.toml</code>
             under
             <code>[features]</code>
             (seeded commented-out; everything defaults to
@@ -928,7 +928,7 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
             , which are opt-in because they reach the network). A disabled feature hides its pane
             and turns its keybinding into an explanatory toast,
             but its data and the
-            <code>thurbox-cli</code>
+            <code>friring-cli</code>
             surface keep working &mdash; so flipping a flag back on is lossless.
           </p>
           <pre data-title="settings.toml"><code class="language-toml">[features]
@@ -947,7 +947,7 @@ auto_update = false   # opt-in: silently download+verify+replace binaries on sta
             <code>automations = false</code>
             is the one flag with teeth beyond the UI: it also stops the TUI from firing due
             schedules and arming the tmux heartbeat at startup (explicit
-            <code>thurbox-cli automation</code>
+            <code>friring-cli automation</code>
             commands still work).
           </p>
           <p>
@@ -977,28 +977,28 @@ auto_update = false   # opt-in: silently download+verify+replace binaries on sta
           </h2>
           <p>
             Sessions run inside a dedicated tmux server (
-            <code>tmux -L thurbox</code>
+            <code>tmux -L friring</code>
             ) and survive crashes, restarts, and multiple concurrent instances.
           </p>
 
           <h3>How it works</h3>
           <ul>
             <li>
-              Sessions spawn as tmux windows. The tmux pane keeps running regardless of Thurbox's
+              Sessions spawn as tmux windows. The tmux pane keeps running regardless of Friring's
               lifecycle.
             </li>
             <li>
               On shutdown (
               <code>Ctrl+Q</code>
-              ), session metadata is saved to SQLite. Thurbox detaches without killing sessions.
+              ), session metadata is saved to SQLite. Friring detaches without killing sessions.
             </li>
             <li>
-              On restart, Thurbox discovers existing sessions from tmux, matches them to persisted
+              On restart, Friring discovers existing sessions from tmux, matches them to persisted
               metadata, and adopts them with terminal content intact.
             </li>
             <li>
               External recovery is always possible via
-              <code>tmux -L thurbox attach</code>
+              <code>tmux -L friring attach</code>
               .
             </li>
           </ul>
@@ -1035,10 +1035,10 @@ auto_update = false   # opt-in: silently download+verify+replace binaries on sta
           </h2>
           <p>
             The
-            <code>thurbox-cli</code>
+            <code>friring-cli</code>
             binary drives the same sessions, automations, and editor settings without the TUI
             &mdash; ideal for scripting. It shares the TUI's SQLite database and
-            <code>tmux -L thurbox</code>
+            <code>tmux -L friring</code>
             server, so changes made by either show up live in the other. Output is
             <strong>human-readable by default</strong>
             and switches to JSON automatically when stdout is piped (so
@@ -1051,12 +1051,12 @@ auto_update = false   # opt-in: silently download+verify+replace binaries on sta
             <code>--text</code>
             (human even when piped).
           </p>
-          <pre data-wrap><code class="language-bash">thurbox-cli session list
-thurbox-cli session create --name reviewer --repo-path /path/to/repo --agent codex
-thurbox-cli session send &lt;uuid&gt; "run the test suite"
-thurbox-cli session capture &lt;uuid&gt; --lines 500
-thurbox-cli message send --to flow --kind questions --task 5 --body "scope?"
-thurbox-cli message inbox --for flow --claim</code></pre>
+          <pre data-wrap><code class="language-bash">friring-cli session list
+friring-cli session create --name reviewer --repo-path /path/to/repo --agent codex
+friring-cli session send &lt;uuid&gt; "run the test suite"
+friring-cli session capture &lt;uuid&gt; --lines 500
+friring-cli message send --to flow --kind questions --task 5 --body "scope?"
+friring-cli message inbox --for flow --claim</code></pre>
           <ul>
             <li>
               <strong>session</strong>
