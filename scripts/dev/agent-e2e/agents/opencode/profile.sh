@@ -22,8 +22,8 @@ AGENT_HAS_STATUS_HOOKS=0
 AGENT_LAUNCH_ARGS=()
 # Model id (displayed in the TUI status line as "<model> <provider name>").
 # Callers may pre-set AGENT_MODEL / AGENT_PROVIDER_LABEL before sourcing.
-AGENT_MODEL="${AGENT_MODEL:-stub-model-1}"
-AGENT_PROVIDER_LABEL="${AGENT_PROVIDER_LABEL:-Stub}"
+AGENT_MODEL="${AGENT_MODEL:-tempest-oss-140b}"
+AGENT_PROVIDER_LABEL="${AGENT_PROVIDER_LABEL:-Tempest}"
 
 agent_binary() {
     if [ -n "${FRIRING_E2E_OPENCODE_BIN:-}" ]; then

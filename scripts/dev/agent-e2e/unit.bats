@@ -67,7 +67,7 @@ JSON
     grep -q '^Output target/agent-e2e/demos/claude-tool-loop.gif$' "$tape"
     grep -q '^Set FontSize 18$' "$tape"
     grep -q '^Wait+Screen' "$tape"            # a step_wait_pane mapped to a wait
-    grep -q '^Type "Create hello.txt' "$tape" # the prompt was typed
+    grep -q '^Type "Write the moon re-enable note' "$tape" # the prompt was typed
     grep -q '^Set Width 1920$' "$tape"        # geometry derived from SCENARIO_COLS
     # No Ctrl+Q: quitting inside the recording ends the clip on a bare shell.
     ! grep -q '^Ctrl+Q$' "$tape"

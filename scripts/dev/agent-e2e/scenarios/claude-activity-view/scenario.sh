@@ -20,15 +20,11 @@ SCENARIO_AGENT="claude"
 # VHS has no F-keys; `<leader> v` is F9's own second route to the same
 # action, so the clip opens the view exactly as the scenario does.
 SCENARIO_DEMO_KEYS=("F9=C-f v")
-SCENARIO_PROMPT="Create activity-proof.txt using the Write tool."
+SCENARIO_PROMPT="Log the Antarctic drift fix to drift.md using the Write tool."
 # The input-box prompt glyph — the stable "ready for input" marker across
 # claude 2.x permission modes (verified against 2.1.207).
 SCENARIO_AGENT_READY="❯"
-SCENARIO_DONE_PATTERN="ACTIVITY-TURN-DONE"
-# Timeline/Files rows print the Write's *absolute* file_path head-truncated to
-# the panel width; the sandbox tmpdir path is ~100 chars, so a wide pane is
-# what keeps the "activity-proof.txt" tail on screen and greppable.
-SCENARIO_COLS=220
+SCENARIO_DONE_PATTERN="DRIFT-CONTAINED"
 
 scenario_steps() {
     step_wait_pane "$SCENARIO_AGENT_READY" 60
@@ -49,19 +45,25 @@ scenario_steps() {
     # edit count is a stat tile ("✎ 1 edits"), and the prompt-derived title.
     step_wait_pane "claude · claude-code" 20
     step_wait_pane "1 edits" 20
-    step_wait_pane "Title: Create activity-proof.txt" 20
+    step_wait_pane "Title: Log the Antarctic drift fix" 20
 
     # Navigator digits jump sections (2 Timeline, 4 Files). grep is line-based,
     # so tag.*path proves ONE row carries both the edit tag and the file.
     step_type "2"
-    step_wait_pane "edit.*activity-proof.txt" 15
+    # Timeline rows print the Write's *absolute* file_path, truncated to the
+    # central pane. It fits the default 120-column pane with ~6 columns to
+    # spare only because the sandbox root is /tmp/friring-sandbox.XXXXXX and
+    # the file name is short; lengthening either costs the greppable tail and
+    # the scenario needs SCENARIO_COLS back — which the demo then records at,
+    # so it buys a wider clip, not just a wider test.
+    step_wait_pane "edit.*drift.md" 15
     # The redesigned Timeline groups events under a "▶" prompt turn header, with
     # the turn's actions in a "│" gutter beneath it.
     step_wait_pane "▶" 15
     step_wait_pane "│" 15
     step_type "4"
     step_wait_pane "Edited (1)" 15
-    step_wait_pane "activity-proof.txt.*✎1" 15
+    step_wait_pane "drift.md.*✎1" 15
     step_key Escape
     # Terminal content re-surfacing proves Esc handed the frame back; the
     # title's absence is asserted in scenario_assert_ui.
@@ -69,7 +71,7 @@ scenario_steps() {
 }
 
 scenario_assert_effects() {
-    assert_ws_file_eq activity-proof.txt "activity!"
+    assert_ws_file_eq drift.md "capture ring clamped to 92%"
     # The reconstruction source itself: claude persisted the transcript under
     # the agent_session_id friring minted (the pinned --session-id) — the
     # filename↔id match is the whole reason the F9 scan finds this session.

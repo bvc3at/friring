@@ -738,6 +738,19 @@ unmet `Wait`. Worth knowing when reading any scenario: **a stale wait costs
 time, not a red test**, so `step_wait_pane` is a synchronization primitive and
 not, on its own, an assertion.
 
+Three choices make the resulting clips presentable rather than merely correct.
+Generated demos default to the **`doom`** theme, so a set of them reads as one
+product. Scenario prompts, stub replies and model ids follow
+`demo-content.json`'s register — planetary infrastructure treated as routine ops,
+answered by `fable-67` / `gpt-6.2` / `tempest-oss-140b` — which is not decoration:
+a fictional model id keeps a real product name off camera and off a clip that
+would otherwise date itself. And the hermetic sandbox moved from `$TMPDIR` to
+`/tmp`, because macOS's per-user `$TMPDIR` is ~60 characters before the workspace
+even starts, and that path is *on camera* whenever an agent names a file it
+wrote. It also set how wide a pane a scenario needed to read a filename off that
+path: `claude-activity-view` asked for 220 columns for exactly this reason and
+now runs — and records — at the 120 default.
+
 The structural limit this also pinned down: everything in `scenario_steps`
 that is not a `step_*` runs at tape-**generation** time, before vhs starts.
 One-shot setup lands before the first frame and records fine, but a scenario

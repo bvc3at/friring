@@ -35,13 +35,13 @@ ghost_wait_agent_window_gone() {
 scenario_steps() {
     step_wait_pane "$SCENARIO_AGENT_READY" 60
     step_sleep 1
-    step_type "This is the first ghost turn."
+    step_type "Bring the south capture ring back to full output."
     step_sleep 1
     step_key Enter
     # 'working|done': hook_state is overwritten in place, so a fast turn can
     # flip working->done between polls; done implies the turn ran.
     step_wait_state 'working|done' 30
-    step_wait_pane "GHOST-MARKER-ONE" 60
+    step_wait_pane "RING-RESTORED" 60
     step_wait_state 'done' 60
 
     # Captured BEFORE the unload so assert_effects can prove the load reused
@@ -55,23 +55,23 @@ scenario_steps() {
     step_key M-u
     step_wait_pane "unloaded — Enter loads" 30
     ghost_wait_agent_window_gone
-    step_wait_pane "GHOST-MARKER-ONE" 10
+    step_wait_pane "RING-RESTORED" 10
 
     # Enter loads via the resume template; the replay is local (the journal
     # pins turn 1 to exactly one match).
     step_key Enter
     step_wait_pane "Session loaded" 30
     step_wait_pane "$SCENARIO_AGENT_READY" 120
-    step_wait_pane "GHOST-MARKER-ONE" 60
+    step_wait_pane "RING-RESTORED" 60
 
     step_sleep 1
-    step_type "Now the second ghost turn."
+    step_type "Now re-arm the drift alarm you muted."
     step_sleep 1
     step_key Enter
     # Safe after the load: it cleared hook_state, so turn 1's terminal
     # 'done' cannot satisfy this wait.
     step_wait_state 'working|done' 30
-    step_wait_pane "GHOST-MARKER-TWO" 60
+    step_wait_pane "ALARM-ARMED" 60
     step_wait_state 'done' 60
     step_sleep 2
 }
@@ -92,7 +92,7 @@ scenario_assert_effects() {
 }
 
 scenario_assert_ui() {
-    assert_pane_contains "GHOST-MARKER-TWO"
+    assert_pane_contains "ALARM-ARMED"
     [ "$(e2e_hook_state)" = "done" ] \
         || e2e_die "final hook_state '$(e2e_hook_state)' != done"
 }

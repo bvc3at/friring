@@ -17,11 +17,11 @@
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Ctrl+F forks claude: parent link, sidebar nesting, forked conversation continues"
 SCENARIO_AGENT="claude"
-SCENARIO_PROMPT="Say the fork base turn phrase."
+SCENARIO_PROMPT="Draft the cutover plan for the Gulf Stream scheduler."
 # The input-box prompt glyph — the stable "ready for input" marker across
 # claude 2.x permission modes (verified against 2.1.207).
 SCENARIO_AGENT_READY="❯"
-SCENARIO_DONE_PATTERN="FORK-BASE-MARKER"
+SCENARIO_DONE_PATTERN="CUTOVER-PLAN-READY"
 
 scenario_steps() {
     # Turn 1 in the parent — this is the conversation the fork will replay.
@@ -31,7 +31,7 @@ scenario_steps() {
     # 'working|done': hook_state is overwritten in place, so a fast turn can
     # flip working->done between polls; done implies the turn ran.
     step_wait_state 'working|done' 30
-    step_wait_pane "FORK-BASE-MARKER" 60
+    step_wait_pane "CUTOVER-PLAN-READY" 60
     step_wait_state 'done' 60
 
     # Parent identity, captured before the fork rebinds E2E_SESSION_ID: the
@@ -60,7 +60,7 @@ scenario_steps() {
     # the same marker), then the replayed base turn, then a fresh input box.
     # The badge, not the pane title, is what identifies the active session.
     step_wait_pane "$E2E_SCENARIO_NAME-fork  ◐" 60
-    step_wait_pane "FORK-BASE-MARKER" 120
+    step_wait_pane "CUTOVER-PLAN-READY" 120
     step_wait_pane "$SCENARIO_AGENT_READY" 120
 
     # Sidebar nesting: the child renders under its parent with the tree glyph.
@@ -71,10 +71,10 @@ scenario_steps() {
 
     # Turn 2 in the CHILD: the request history now contains the replayed base
     # turn, so the fixtures key on the LAST user message (promptContains).
-    step_type "Say the fork child turn phrase."
+    step_type "In this branch, cut over the coldest current first instead."
     step_key Enter
     step_wait_state 'working|done' 30
-    step_wait_pane "FORK-CHILD-MARKER" 60
+    step_wait_pane "COLDEST-FIRST-PLAN" 60
     step_wait_state 'done' 60
 }
 
@@ -100,7 +100,7 @@ scenario_assert_effects() {
 }
 
 scenario_assert_ui() {
-    assert_pane_contains "FORK-CHILD-MARKER"
+    assert_pane_contains "COLDEST-FIRST-PLAN"
     [ "$(e2e_hook_state)" = "done" ] \
         || e2e_die "final hook_state '$(e2e_hook_state)' != done"
 }

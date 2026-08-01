@@ -8,18 +8,18 @@
     },
     {
       "name": "ghost-turn-1",
-      "match": { "promptContains": "first ghost turn", "hasToolResult": false },
+      "match": { "promptContains": "south capture ring", "hasToolResult": false },
       "delayMs": 150,
       "reply": {
-        "text": "GHOST-MARKER-ONE — this reply must survive on the frozen ghost frame and reappear after the load via local transcript replay, not a second model call."
+        "text": "RING-RESTORED — this reply must survive on the frozen ghost frame and reappear after the load via local transcript replay, not a second model call."
       }
     },
     {
       "name": "ghost-turn-2",
-      "match": { "promptContains": "second ghost turn", "hasToolResult": false },
+      "match": { "promptContains": "re-arm the drift alarm", "hasToolResult": false },
       "delayMs": 150,
       "reply": {
-        "text": "GHOST-MARKER-TWO — the loaded conversation answered a fresh turn."
+        "text": "ALARM-ARMED — the loaded conversation answered a fresh turn."
       }
     }
   ]

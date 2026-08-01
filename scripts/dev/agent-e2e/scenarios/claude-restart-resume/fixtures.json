@@ -8,18 +8,18 @@
     },
     {
       "name": "resume-turn-1",
-      "match": { "promptContains": "first resume turn", "hasToolResult": false },
+      "match": { "promptContains": "Q4 drawdown backfill", "hasToolResult": false },
       "delayMs": 150,
       "reply": {
-        "text": "RESUME-MARKER-ONE — this reply must reappear after the restart via local transcript replay, not a second model call."
+        "text": "BACKFILL-RUNNING — this reply must reappear after the restart via local transcript replay, not a second model call."
       }
     },
     {
       "name": "resume-turn-2",
-      "match": { "promptContains": "second resume turn", "hasToolResult": false },
+      "match": { "promptContains": "northern capture fleet", "hasToolResult": false },
       "delayMs": 150,
       "reply": {
-        "text": "RESUME-MARKER-TWO — the resumed conversation answered a fresh turn."
+        "text": "FLEET-WIDENED — the resumed conversation answered a fresh turn."
       }
     }
   ]

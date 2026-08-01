@@ -7,11 +7,11 @@
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Real Claude Code text turn rendered through Friring, model stubbed"
 SCENARIO_AGENT="claude"
-SCENARIO_PROMPT="Say the ready phrase now."
+SCENARIO_PROMPT="Is the habitat ring thermal loop still holding after the swap?"
 # The input-box prompt glyph — the stable "ready for input" marker across
 # claude 2.x permission modes (verified against 2.1.207).
 SCENARIO_AGENT_READY="❯"
-SCENARIO_DONE_PATTERN="FRIRING-E2E-READY"
+SCENARIO_DONE_PATTERN="RING-NOMINAL"
 
 scenario_steps() {
     step_wait_pane "$SCENARIO_AGENT_READY" 60

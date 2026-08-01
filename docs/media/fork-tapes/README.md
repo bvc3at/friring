@@ -14,8 +14,11 @@ re-recorded from source:
 just agent-demo claude-activity-view     # -> target/agent-e2e/demos/
 ```
 
-Recorded against loopback stubs on a throwaway `HOME`/`XDG_*`, so no account,
-token or real conversation is on camera — see `docs/E2E.md` § Demo mode.
+Recorded against loopback stubs on a throwaway `HOME`/`XDG_*` under `/tmp`, so
+no account, token, real conversation or real path is on camera. Every clip is
+themed `doom`, and the panes talk to models that do not exist (`fable-67`,
+`gpt-6.2`, `tempest-oss-140b`) about infrastructure nobody has yet — see
+`docs/E2E.md` § Demo mode.
 
 | Clip | Feature |
 |---|---|

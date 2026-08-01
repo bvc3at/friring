@@ -58,18 +58,24 @@ _tbx_resolve_root() {
 
     case "$mode" in
         fresh)
-            # Canonicalized (`pwd -P`): on macOS $TMPDIR is /var/folders/…, a
-            # symlink to /private/var/folders/…. Agent CLIs resolve their cwd to
-            # the real path, so a folder-trust entry seeded under the symlinked
-            # path silently misses and the agent boots into a "trust this
-            # folder?" dialog instead of a usable UI.
-            TBX_SANDBOX_ROOT="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/friring-sandbox.XXXXXX")" && pwd -P)"
+            # Under /tmp rather than $TMPDIR. On macOS the per-user $TMPDIR is
+            # /var/folders/<2>/<28 chars>/T/, which makes the sandbox workspace
+            # path ~60 characters before it reaches `ws/` — and that path is on
+            # camera in every demo recording (an agent prints the file it just
+            # wrote) and drives how wide a pane has to be for a scenario to see
+            # it. /tmp is short, is where tmux already puts its socket dir
+            # below, and is no closer to the user's real files.
+            #
+            # Canonicalized (`pwd -P`) because both are symlinks (/tmp ->
+            # /private/tmp). Agent CLIs resolve their cwd to the real path, so a
+            # folder-trust entry seeded under the symlinked path silently misses
+            # and the agent boots into a "trust this folder?" dialog instead of
+            # a usable UI.
+            TBX_SANDBOX_ROOT="$(cd "$(mktemp -d /tmp/friring-sandbox.XXXXXX)" && pwd -P)"
             TBX_SANDBOX_FRESH=1
             # NOT under the root: AF_UNIX socket paths are ~104-byte limited,
-            # and macOS's per-user $TMPDIR (/var/folders/…/T/) pushes
-            # <root>/tmux/tmux-<uid>/friring-dev past it (ENAMETOOLONG).
-            # /tmp is tmux's own default socket home; teardown removes this
-            # dir alongside the root.
+            # and <root>/tmux/tmux-<uid>/friring-dev would overflow it under any
+            # deeper prefix. Teardown removes this dir alongside the root.
             TBX_SANDBOX_TMUX_FRESH="$(mktemp -d /tmp/friring-sbx.XXXXXX)"
             TMUX_TMPDIR="$TBX_SANDBOX_TMUX_FRESH"
             ;;

@@ -78,7 +78,10 @@ e2e_scenario_load() {
     SCENARIO_ROWS=40
     SCENARIO_PRECREATE=1
     SCENARIO_REQUIRE_ALL_FIXTURES=1
-    SCENARIO_DEMO_THEME=""
+    # Every generated demo films the same theme, so a set of clips reads as one
+    # product rather than a screenshot pile. A scenario overrides it only when
+    # the theme itself is the subject (scripted-theme-settings picks its own).
+    SCENARIO_DEMO_THEME="doom"
     # Demo-mode key substitutions, `<tmux key>=<tmux key>…`, for keys VHS
     # cannot express (F-keys, `Alt+<digit>`, `Ctrl+/`). The fork's leader is
     # usually the equivalent route — `F9=C-f v` reaches the activity view the

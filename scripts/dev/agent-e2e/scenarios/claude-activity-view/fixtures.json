@@ -8,16 +8,16 @@
     },
     {
       "name": "activity-write-call",
-      "match": { "promptContains": "activity-proof.txt", "hasToolResult": false },
+      "match": { "promptContains": "drift.md", "hasToolResult": false },
       "delayMs": 100,
       "reply": {
-        "text": "Writing activity-proof.txt now.",
+        "text": "Writing drift.md now.",
         "toolUse": {
           "id": "toolu_e2e_activity_1",
           "name": "Write",
           "input": {
-            "file_path": "{{WS}}/activity-proof.txt",
-            "content": "activity!\n"
+            "file_path": "{{WS}}/drift.md",
+            "content": "capture ring clamped to 92%\n"
           }
         }
       }
@@ -27,7 +27,7 @@
       "match": { "toolResultFor": "toolu_e2e_activity_1" },
       "delayMs": 150,
       "reply": {
-        "text": "ACTIVITY-TURN-DONE — activity-proof.txt was written by a real tool round-trip."
+        "text": "DRIFT-CONTAINED — clamped the southern ring to 92% and logged it to drift.md. No pause needed."
       }
     }
   ]

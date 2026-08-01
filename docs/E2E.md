@@ -101,12 +101,16 @@ test mode** (demo pacing only), so a scenario physically cannot lean on a fixed 
 - `tbx_sandbox_init_full fresh` (shared `scripts/dev/lib/sandbox-env.sh`): throwaway
   `HOME`/`XDG_*`/`TMUX_TMPDIR`, dev `friring-dev` socket in a private dir. Nothing touches the
   real `~/.claude`, `~/.config/friring`, or any running tmux server. Leaked `FRIRING_*` identity
-  vars (from running inside a Friring session) are scrubbed. Two macOS details are load-bearing:
-  the sandbox root is **canonicalized** (`$TMPDIR` is a `/var/folders/…` symlink, and the agents
-  resolve their cwd to the real path — a folder-trust seed under the symlinked path misses, and
-  the agent boots into a trust dialog instead of a usable UI), and the fresh `TMUX_TMPDIR` lives
-  under `/tmp` rather than inside that root (the per-user `$TMPDIR` prefix overflows the ~104-byte
-  AF_UNIX socket path limit).
+  vars (from running inside a Friring session) are scrubbed. Three details are load-bearing: the
+  root is **canonicalized** (`/tmp` is a `/private/tmp` symlink on macOS, and the agents resolve
+  their cwd to the real path — a folder-trust seed under the symlinked path misses, and the agent
+  boots into a trust dialog instead of a usable UI); it sits under **`/tmp`, not `$TMPDIR`**,
+  because macOS's per-user `$TMPDIR` (`/var/folders/<2>/<28>/T/`) makes the workspace path ~60
+  characters before it reaches `ws/` — and that path is *on camera* in demo recordings and sets
+  how wide a pane a scenario needs to read a file name off it (`claude-activity-view` needed a
+  220-column pane for exactly this, and now runs at the 120 default); and the fresh `TMUX_TMPDIR`
+  is a **sibling** of the root rather than inside it (a nested socket path overflows the
+  ~104-byte AF_UNIX limit).
 - The sandbox `settings.toml` is seeded with `[features] notifications = false` before the TUI
   boots: a session flipping to Blocked would otherwise fire a **real desktop banner** on the
   host (macOS delivers via osascript/terminal-notifier). Tests must never touch the user's
@@ -245,7 +249,13 @@ literal `^X` under tmux (sst/opencode#4097).
 `scripts/demo/record.sh`: everything exported before the `session create` that starts the
 `friring-dev` server), generates a tape with the standard `scripts/demo` Set block, runs `vhs`,
 and writes `target/agent-e2e/demos/<name>.{gif,mp4}`. `SCENARIO_DEMO_THEME` seeds
-`metadata.active_theme` like `record.sh` does. Unlike the hand-written tapes, generated tapes
+`metadata.active_theme` like `record.sh` does — it defaults to **`doom`**, so a set of clips reads
+as one product, and a scenario overrides it only when the theme is itself the subject. Scenario
+prompts, stub replies and agent model ids follow `scripts/demo/demo-content.json`'s register:
+planetary-infrastructure ops treated as routine, answered by models that do not exist
+(`fable-67`, `gpt-6.2`, `tempest-oss-140b`). That is not decoration — a fictional model id keeps
+a real product name off camera, and off a clip that would otherwise date itself. Unlike the
+hand-written tapes, generated tapes
 synchronize on `Wait+Screen` instead of open-loop sleeps, so a slow turn can't desync the
 recording; `step_sleep`/`delayMs` control the rhythm.
 

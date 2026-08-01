@@ -4,12 +4,12 @@
       "name": "title-gen",
       "ambient": true,
       "match": { "systemContains": "You are a title generator" },
-      "reply": { "text": "E2E text turn" }
+      "reply": { "text": "Ocean-current cutover" }
     },
     {
       "name": "text-turn",
-      "match": { "promptContains": "ready phrase" },
-      "reply": { "text": "FRIRING-E2E-READY — stubbed opencode turn complete." }
+      "match": { "promptContains": "legacy cron box" },
+      "reply": { "text": "CRON-CUTOVER-STAGED — shadow mode is live and mirroring the routing weights. Gulf Stream cuts over first." }
     }
   ]
 }

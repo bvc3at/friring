@@ -21,13 +21,13 @@ SCENARIO_AGENT_READY="❯"
 scenario_steps() {
     step_wait_pane "$SCENARIO_AGENT_READY" 60
     step_sleep 1
-    step_type "This is the first resume turn."
+    step_type "Start the Q4 drawdown backfill."
     step_sleep 1
     step_key Enter
     # 'working|done': hook_state is overwritten in place, so a fast turn can
     # flip working->done between polls; done implies the turn ran.
     step_wait_state 'working|done' 30
-    step_wait_pane "RESUME-MARKER-ONE" 60
+    step_wait_pane "BACKFILL-RUNNING" 60
     step_wait_state 'done' 60
 
     # The conversation id friring minted (--session-id {id}) — captured
@@ -49,16 +49,16 @@ scenario_steps() {
     # The resumed claude replays the transcript locally — marker one
     # reappears; that the replay made no model call is pinned by the
     # journal assert (resume-turn-1 matched exactly once).
-    step_wait_pane "RESUME-MARKER-ONE" 60
+    step_wait_pane "BACKFILL-RUNNING" 60
 
     step_sleep 1
-    step_type "Now the second resume turn."
+    step_type "Now widen it to the northern capture fleet."
     step_sleep 1
     step_key Enter
     # Safe after the restart: it cleared hook_state, so turn 1's terminal
     # 'done' cannot satisfy this wait.
     step_wait_state 'working|done' 30
-    step_wait_pane "RESUME-MARKER-TWO" 60
+    step_wait_pane "FLEET-WIDENED" 60
     step_wait_state 'done' 60
     step_sleep 2
 }
@@ -79,7 +79,7 @@ scenario_assert_effects() {
 }
 
 scenario_assert_ui() {
-    assert_pane_contains "RESUME-MARKER-TWO"
+    assert_pane_contains "FLEET-WIDENED"
     [ "$(e2e_hook_state)" = "done" ] \
         || e2e_die "final hook_state '$(e2e_hook_state)' != done"
 }

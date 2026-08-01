@@ -9,11 +9,11 @@
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Real Claude Code tool-use loop (Write) through Friring, model stubbed"
 SCENARIO_AGENT="claude"
-SCENARIO_PROMPT="Create hello.txt using the Write tool."
+SCENARIO_PROMPT="Write the moon re-enable note to moon.md using the Write tool."
 # The input-box prompt glyph — the stable "ready for input" marker across
 # claude 2.x permission modes (verified against 2.1.207).
 SCENARIO_AGENT_READY="❯"
-SCENARIO_DONE_PATTERN="TOOL-LOOP-DONE"
+SCENARIO_DONE_PATTERN="MOON-RE-ENABLED"
 
 scenario_steps() {
     step_wait_pane "$SCENARIO_AGENT_READY" 60
@@ -30,7 +30,7 @@ scenario_steps() {
 }
 
 scenario_assert_effects() {
-    assert_ws_file_eq hello.txt "Hello from the Friring e2e stub!"
+    assert_ws_file_eq moon.md "deprecated = false  # the moon is back"
     [ "$(journal_matched write-tool-call)" -ge 1 ] \
         || e2e_die "write-tool-call fixture never matched"
     [ "$(journal_matched after-write)" -ge 1 ] \

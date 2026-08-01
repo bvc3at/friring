@@ -8,18 +8,18 @@
     },
     {
       "name": "fork-base",
-      "match": { "promptContains": "fork base turn", "hasToolResult": false },
+      "match": { "promptContains": "cutover plan", "hasToolResult": false },
       "delayMs": 150,
       "reply": {
-        "text": "FORK-BASE-MARKER — this turn is the conversation the fork will replay from the transcript."
+        "text": "CUTOVER-PLAN-READY — this turn is the conversation the fork will replay from the transcript."
       }
     },
     {
       "name": "fork-child",
-      "match": { "promptContains": "fork child turn", "hasToolResult": false },
+      "match": { "promptContains": "coldest current first", "hasToolResult": false },
       "delayMs": 150,
       "reply": {
-        "text": "FORK-CHILD-MARKER — the forked conversation continued with its own new turn."
+        "text": "COLDEST-FIRST-PLAN — the forked conversation continued with its own new turn."
       }
     }
   ]

@@ -8,10 +8,10 @@
     },
     {
       "name": "text-turn",
-      "match": { "promptContains": "ready phrase", "hasToolResult": false },
+      "match": { "promptContains": "thermal loop", "hasToolResult": false },
       "delayMs": 150,
       "reply": {
-        "text": "FRIRING-E2E-READY — this reply was streamed from the local stub through a real Claude Code binary rendered in Friring."
+        "text": "RING-NOMINAL — all twelve sectors are holding 21.0°C and the drift band has been flat for six days."
       }
     }
   ]
