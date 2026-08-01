@@ -233,7 +233,7 @@ fn fit_pills(
     let mut keys = pill_labels(state, &entries, PillText::KeyOnly);
 
     // 5. Still overflowing — shed whole chips, least useful first.
-    while pill_block_width(&keys) > room && entries.len() > 1 {
+    while pill_block_width(&keys) > room && !entries.is_empty() {
         let Some(idx) = entries
             .iter()
             .enumerate()
@@ -1063,7 +1063,7 @@ mod tests {
     fn footer_keeps_the_armed_leader_badge_when_narrow() {
         let mut state = footer_state(false);
         state.prefix_armed = Some("^A".to_string());
-        for width in [120u16, 80, 60, 40, 30] {
+        for width in [120u16, 80, 60, 40, 30, 8, 4] {
             let (_, line) = footer_at(width, &state);
             assert!(
                 line.contains("^A"),
