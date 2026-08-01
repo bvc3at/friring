@@ -2383,6 +2383,16 @@ optional columns that appear at wider widths:
 | `>=80` | Sidebar + terminal | 20-col sidebar + 60-col terminal min |
 | `>=120` | Sidebar + terminal + info | Terminal still gets ~70+ cols |
 
+### Footer degradation
+
+The footer never lets its left-hand text and its button pills share a column.
+As the terminal narrows it gives way in a fixed order: the ` · ` inside each
+pill, then the left-hand text segment by segment (key hints first, then the
+counts — the focus label and the `◆ N blocked` badge last), then the
+Info/Files/Tasks pills as a set, then the pill labels themselves, leaving
+clickable key-only chips (` F1 `). The armed-leader badge is never dropped.
+See `ui::status_bar::render_footer`.
+
 ### Info panel docking (`info_panel_position`)
 
 The F2 info pane has two possible homes: its **own column** between the
