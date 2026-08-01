@@ -99,7 +99,23 @@ Sleep 250ms
 Right
 Sleep 350ms
 
-# The prompt that fires on schedule.
+# Past the step selector to the prompt that fires on schedule.
+#
+# TWO Tabs, not one. The editor's field order is `visible_fields()` in
+# src/app/modals.rs, and for a daily/send automation it now reads
+#   Name · Trigger · Hour · Minute · Timezone · Action · Target · Step · Prompt
+# — `Step` (multi-step prompts) landed between Target and Prompt. This walk is a
+# fixed count of Tabs with no way to assert where it ended up: capture-pane
+# returns text without styling, so `Wait` cannot see which field is focused.
+# When a field is added to that list, add a Tab here — otherwise the prompt gets
+# typed into whatever now sits in its place, which is exactly what happened when
+# `Step` appeared and the tape kept sending seven.
+#
+# Only Tab past `Step`, never arrow onto it: it takes `n`/`d`/`[`/`]` to add,
+# remove and reorder steps, and adding one makes `StepDelay` appear — which
+# would shift every field after it and break the walk again mid-run.
+Tab
+Sleep 250ms
 Tab
 Sleep 250ms
 Type "Triage failing CI and summarize blockers"
