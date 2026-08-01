@@ -56,9 +56,12 @@ const BLOCKED_STATE: &str = "blocked";
 /// the decision to the pane scrape in `agent::tmux`, so a database hiccup can't
 /// stop every delivery on its own.
 pub(crate) fn blocked_on_prompt(db: &Database, session: SessionId) -> bool {
-    db.load_hook_states()
+    // One row, not the whole map: this runs on every send and once per owed
+    // wake in the retry sweep, so a full hook-state scan per check would cost
+    // sessions × pending for an answer about a single session.
+    db.hook_state_of(session)
         .ok()
-        .and_then(|states| states.get(&session).and_then(|h| h.state.clone()))
+        .flatten()
         .is_some_and(|state| state == BLOCKED_STATE)
 }
 

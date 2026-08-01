@@ -129,11 +129,20 @@ impl Database {
     ///
     /// Only a send that *asked* for a wake is ever marked, so the retry sweep
     /// can never nudge a deliberately silent (`--no-wake`) message.
+    ///
+    /// A no-op update (the row is gone, or the id never existed) is an error,
+    /// not a silent success: the debt would otherwise look recorded while the
+    /// sweep had nothing to find, which is the one failure this whole mechanism
+    /// exists to avoid. The caller reports it rather than failing the send —
+    /// see `cli::messages::enqueue_and_wake`.
     pub fn mark_wake_pending(&self, id: i64) -> rusqlite::Result<()> {
-        self.conn.execute(
+        let updated = self.conn.execute(
             "UPDATE session_messages SET wake_pending = 1 WHERE id = ?1",
             params![id],
         )?;
+        if updated == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(())
     }
 
@@ -407,6 +416,22 @@ mod tests {
         assert_eq!(db.clear_wake_pending(owed).unwrap(), 1);
         assert!(db.sessions_awaiting_wake().unwrap().is_empty());
         assert_eq!(db.clear_wake_pending(owed).unwrap(), 0);
+    }
+
+    #[test]
+    fn marking_a_missing_message_is_an_error_not_a_silent_no_op() {
+        // A recorded-but-absent debt is invisible: the sweep would find nothing
+        // and the recipient would never learn it has mail.
+        let db = Database::open_in_memory().unwrap();
+        assert!(matches!(
+            db.mark_wake_pending(404),
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        ));
+
+        let id = db
+            .enqueue_message(&new_msg(SessionId::default(), "note", "hi"))
+            .unwrap();
+        assert!(db.mark_wake_pending(id).is_ok());
     }
 
     #[test]
