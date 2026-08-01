@@ -281,11 +281,14 @@ jobs:
     steps:
       # Checked out at `main`, not at the tag: the bump is a new commit on the
       # branch tap users track. persist-credentials (default) leaves the token
-      # in place for the push.
+      # in place for the push. Full history (like `create-tag`) so the rebase
+      # below always has a merge base, whatever `main` did while the release
+      # was building.
       - name: Checkout main
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: main
+          fetch-depth: 0
 
       - name: Download release checksums
         run: |
