@@ -129,6 +129,11 @@ pub enum SessionStatus {
     /// remote session never silently vanishes from the list; cleared to the
     /// real hook-driven status once the host recovers and the session adopts.
     Unreachable,
+    /// A **ghost**: the agent process is not running — the session was unloaded
+    /// (or lazily restored) and its pane shows the greyed last-saved frame.
+    /// No live pane / hooks; loading it (Enter / restart) respawns the agent
+    /// and hands the status back to the hook pipeline.
+    Unloaded,
 }
 
 impl SessionStatus {
@@ -146,6 +151,9 @@ impl SessionStatus {
             Self::Idle => "○",
             Self::Error => "✗",
             Self::Unreachable => "⊘",
+            // Dotted circle: reads as "outline of a session" — present but not
+            // running — and stays distinct from the hollow Idle circle.
+            Self::Unloaded => "◌",
         }
     }
 }
@@ -159,6 +167,7 @@ impl fmt::Display for SessionStatus {
             Self::Idle => write!(f, "Idle"),
             Self::Error => write!(f, "Error"),
             Self::Unreachable => write!(f, "Unreachable"),
+            Self::Unloaded => write!(f, "Unloaded"),
         }
     }
 }

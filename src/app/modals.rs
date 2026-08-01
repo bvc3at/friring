@@ -1999,6 +1999,7 @@ pub enum SettingsField {
     NotifMinInterval,
     // ── top-level scalars ───────────────────────────────────────────────
     ScrollbackLines,
+    LazyRestore,
     TwoPanelMinCols,
     ThreePanelMinCols,
     InfoPanelPosition,
@@ -2008,7 +2009,7 @@ pub enum SettingsField {
 impl SettingsField {
     /// Field nav order — also the render order (headers are interleaved by the
     /// renderer). Used by [`cycle_field`] and the scroll-windowing logic.
-    pub const ORDER: [SettingsField; 24] = [
+    pub const ORDER: [SettingsField; 25] = [
         SettingsField::FeatTasks,
         SettingsField::FeatAutomations,
         SettingsField::FeatFileViewer,
@@ -2029,6 +2030,7 @@ impl SettingsField {
         SettingsField::NotifSound,
         SettingsField::NotifMinInterval,
         SettingsField::ScrollbackLines,
+        SettingsField::LazyRestore,
         SettingsField::TwoPanelMinCols,
         SettingsField::ThreePanelMinCols,
         SettingsField::InfoPanelPosition,
@@ -2114,6 +2116,11 @@ impl SettingsField {
                 "scrollback_lines",
                 "Scrollback",
                 "Terminal history lines kept per session",
+            ),
+            LazyRestore => (
+                "lazy_session_restore",
+                "Lazy restore",
+                "Restore dead sessions as greyed ghosts, not respawns",
             ),
             TwoPanelMinCols => (
                 "two_panel_min_cols",
@@ -2244,6 +2251,7 @@ impl SettingsModal {
             NotifAlsoOnWaiting => n.also_on_waiting = !n.also_on_waiting,
             NotifSuppressForActive => n.suppress_for_active = !n.suppress_for_active,
             NotifSound => n.sound = !n.sound,
+            LazyRestore => self.draft.lazy_session_restore = !self.draft.lazy_session_restore,
             NotifMinInterval | ScrollbackLines | TwoPanelMinCols | ThreePanelMinCols
             | InfoPanelPosition | AuditRetentionDays => {}
         }
@@ -2316,6 +2324,7 @@ impl SettingsModal {
             NotifSound => on(n.sound),
             NotifMinInterval => n.min_interval_secs.to_string(),
             ScrollbackLines => self.draft.scrollback_lines.to_string(),
+            LazyRestore => on(self.draft.lazy_session_restore),
             TwoPanelMinCols => self.draft.two_panel_min_cols.to_string(),
             ThreePanelMinCols => self.draft.three_panel_min_cols.to_string(),
             InfoPanelPosition => self.draft.info_panel_position.as_str().to_string(),
@@ -3967,7 +3976,7 @@ mod tests {
 
     #[test]
     fn settings_order_lists_every_field_once() {
-        assert_eq!(SettingsField::ORDER.len(), 24);
+        assert_eq!(SettingsField::ORDER.len(), 25);
         for f in SettingsField::ORDER {
             assert_eq!(
                 SettingsField::ORDER.iter().filter(|x| **x == f).count(),

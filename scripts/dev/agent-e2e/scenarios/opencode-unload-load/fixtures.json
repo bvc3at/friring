@@ -1,0 +1,24 @@
+{
+  "responses": [
+    {
+      "name": "title-gen",
+      "ambient": true,
+      "match": { "systemContains": "You are a title generator" },
+      "reply": { "text": "E2E ghost session" }
+    },
+    {
+      "name": "ghost-turn-1",
+      "match": { "promptContains": "first ghost phrase" },
+      "reply": {
+        "text": "GHOST-MARKER-ONE — this reply must survive on the frozen ghost frame and re-render after the load from local history, not a second model call."
+      }
+    },
+    {
+      "name": "ghost-turn-2",
+      "match": { "promptContains": "second ghost phrase" },
+      "reply": {
+        "text": "GHOST-MARKER-TWO — the loaded conversation answered a fresh turn."
+      }
+    }
+  ]
+}

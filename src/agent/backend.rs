@@ -275,6 +275,19 @@ pub trait SessionBackend: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Capture just the pane's **visible screen** as terminal bytes — the
+    /// ghost frame taken at unload/shutdown. Scrollback is deliberately not
+    /// included: it can only ever hold output that *scrolled out* of the pane,
+    /// and a full-screen agent TUI repaints in place, so for the sessions
+    /// friring drives there is none (measured: `#{history_size}` is 0 for
+    /// claude/codex/opencode/agy). Preferred over serializing the parser
+    /// in-memory because the backend joins soft-wrapped rows into logical
+    /// lines, which re-wrap cleanly when a ghost is rendered at another width.
+    /// Default: an empty seed, like [`Self::capture_history`].
+    fn capture_visible(&self, _backend_id: &str) -> Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
     /// Discover existing sessions managed by this backend.
     fn discover(&self) -> Result<Vec<DiscoveredSession>>;
 
@@ -493,13 +506,28 @@ pub struct Session {
     pub shell_pane: Option<ShellPane>,
     /// Session environment variables, passed to shell pane spawns.
     env: HashMap<String, String>,
-    /// True for a **placeholder** session: a persisted remote session whose host
-    /// is currently unreachable, so it has no live backend pane / reader / writer
-    /// (its `input_tx` is a dead channel and its `parser` holds a static "host
-    /// unreachable" notice). Rendered with `SessionStatus::Unreachable` and
-    /// replaced in place by the real adopted session once the host recovers. See
-    /// `App::start_remote_restore` / the remote retry loop.
+    /// True for a **placeholder** session: no live backend pane / reader /
+    /// writer (its `input_tx` is a dead channel), so every pane-touching path
+    /// (kill/detach/hook sync/metrics/save_state upsert) skips it. Two kinds
+    /// exist, told apart by [`Self::is_ghost`]: a persisted remote session
+    /// whose host is unreachable (parser holds a "host unreachable" notice,
+    /// replaced in place once the host recovers), and a **ghost** (below).
     placeholder: bool,
+    /// True for a **ghost**: a placeholder whose agent process is deliberately
+    /// not running (unloaded, or lazily restored after the tmux server died).
+    /// Its parser is seeded with the session's saved last frame, rendered
+    /// greyed; [`Self::restart`] spawns the agent and clears both flags.
+    ghost: bool,
+    /// The bytes a placeholder's parser was seeded with (a ghost's saved frame,
+    /// or the unreachable-host notice). Retained so [`Self::resize`] can
+    /// **re-render** rather than `set_size`: vt100 resizes by truncating each
+    /// row's cells, so narrowing a pane destroys every cell past the new width
+    /// and widening back pads with blanks. A live session's agent repaints that
+    /// away on SIGWINCH; a placeholder has no process to repaint it, so without
+    /// the seed its content would be permanently clipped to the narrowest size
+    /// the terminal ever hit. `None` for a live session, whose pane content is
+    /// owned by the backend, not by us.
+    placeholder_seed: Option<Vec<u8>>,
 }
 
 impl Session {
@@ -686,6 +714,8 @@ impl Session {
             shell_pane: None,
             env,
             placeholder: false,
+            ghost: false,
+            placeholder_seed: None,
         }
     }
 
@@ -757,13 +787,83 @@ impl Session {
             shell_pane: None,
             env,
             placeholder: true,
+            ghost: false,
+            placeholder_seed: Some(notice.into_bytes()),
         }
+    }
+
+    /// Build a **ghost** session: a placeholder whose agent process is
+    /// deliberately not running (unloaded, or lazily restored). The parser is
+    /// seeded with `frame` — the session's saved last frame, SGR-styled lines
+    /// joined with `\r\n` — at `rows`×`cols`, so the frozen pane re-wraps to
+    /// the *current* size; `None` (no frame ever captured) seeds a short
+    /// notice instead. Keystrokes are dropped like any placeholder; the render
+    /// layer greys the pane. `info.status` is forced to `Unloaded`;
+    /// [`Self::restart`] turns the ghost back into a live session in place.
+    pub fn ghost(
+        info: SessionInfo,
+        rows: u16,
+        cols: u16,
+        backend: &Arc<dyn SessionBackend>,
+        provider: &Arc<dyn AgentProvider>,
+        env: HashMap<String, String>,
+        frame: Option<&[u8]>,
+    ) -> Self {
+        // `placeholder` forces `Unreachable`, so the status is set after it.
+        let mut session = Self::placeholder(info, rows, cols, backend, provider, env);
+        session.info.status = crate::session::SessionStatus::Unloaded;
+        session.ghost = true;
+        // Re-seed the parser: replace the placeholder's "host unreachable"
+        // notice with the saved frame. Frame bytes are SGR-styled lines (tmux
+        // `capture-pane -e` / `rows_formatted`) — no OSC/BEL, so replaying
+        // them can't fire the title/attention callbacks.
+        let seed: Vec<u8> = match frame {
+            Some(bytes) => bytes.to_vec(),
+            None => "\r\n  \u{25CC} Session unloaded \u{2014} no saved preview.\r\n\r\n  \
+                     Press Enter (or restart) to launch the agent and resume.\r\n"
+                .as_bytes()
+                .to_vec(),
+        };
+        session.seed_placeholder_parser(rows, cols, &seed);
+        session.placeholder_seed = Some(seed);
+        session
+    }
+
+    /// Rebuild this placeholder's parser at `rows`×`cols` and replay `seed`
+    /// into it. Used both at construction and by [`Self::resize`] — a
+    /// placeholder re-renders from its seed instead of `set_size`, which would
+    /// truncate away every cell past a narrower width with no agent to repaint
+    /// it back (see [`Self::placeholder_seed`]).
+    ///
+    fn seed_placeholder_parser(&self, rows: u16, cols: u16, seed: &[u8]) {
+        let Ok(mut p) = self.parser.lock() else {
+            return;
+        };
+        *p = vt100::Parser::new_with_callbacks(
+            rows.max(1),
+            cols.max(1),
+            crate::session::settings::global().scrollback_lines,
+            TermSignals {
+                title: Arc::clone(&self.last_title),
+                attention_at: Arc::clone(&self.attention_at),
+                notification: Arc::clone(&self.notification),
+                meta_gen: Arc::clone(&self.meta_gen),
+            },
+        );
+        p.process(seed);
     }
 
     /// Whether this is a placeholder for an unreachable remote session (no live
     /// backend pane). See [`Self::placeholder`].
     pub fn is_placeholder(&self) -> bool {
         self.placeholder
+    }
+
+    /// Whether this is a **ghost** (unloaded / lazily-restored placeholder
+    /// showing its saved frame). Ghosts are placeholders too — check this
+    /// first where the two need different handling (load vs remote retry).
+    pub fn is_ghost(&self) -> bool {
+        self.ghost
     }
 
     /// Blocking read loop feeding the vt100 parser. Runs on a
@@ -800,7 +900,6 @@ impl Session {
                     break;
                 }
                 Ok(n) => {
-                    last_output_at.store(now_millis(), Ordering::Relaxed);
                     let mut data = std::mem::take(&mut carry);
                     data.extend_from_slice(&buf[..n]);
                     let ready = utf8_ready_prefix_len(&data);
@@ -813,6 +912,12 @@ impl Session {
                             p.process(&data);
                         }
                     }
+                    // Stamped *after* the parser saw the bytes: the ghost-frame
+                    // debounce treats this as the dirty marker, so advancing it
+                    // first would let a saver serialize the previous screen and
+                    // then record it as up to date. Unconditional — a read that
+                    // only extends `carry` is still output.
+                    last_output_at.store(now_millis(), Ordering::Relaxed);
                 }
                 Err(e) => {
                     debug!("Session reader error: {e}");
@@ -856,12 +961,21 @@ impl Session {
         // zero-row/col content area; vt100's `set_size` underflows on 0 and
         // tmux rejects it, so clamp at this boundary for every path below.
         let (rows, cols) = (rows.max(1), cols.max(1));
-        // A placeholder has no live pane; only resize its local notice buffer.
+        // A placeholder has no live pane; only resize its local buffer.
         // Talking to the (possibly-down) backend here would issue a blocking
         // ssh resize on the UI thread — the freeze we're avoiding.
         if self.placeholder {
-            if let Ok(mut parser) = self.parser.lock() {
-                parser.screen_mut().set_size(rows, cols);
+            match &self.placeholder_seed {
+                // Re-render from the seed rather than `set_size`, which
+                // truncates each row's cells: with no agent to repaint it, a
+                // shrink would clip the frozen content for good, so growing
+                // back showed bare background where the pane's text had been.
+                Some(seed) => self.seed_placeholder_parser(rows, cols, seed),
+                None => {
+                    if let Ok(mut parser) = self.parser.lock() {
+                        parser.screen_mut().set_size(rows, cols);
+                    }
+                }
             }
             return;
         }
@@ -1025,9 +1139,16 @@ impl Session {
     /// Restart the session: kill the old pane, spawn a fresh one with new config.
     ///
     /// Uses the agent's resume args (when defined) so it picks up the
-    /// existing conversation instead of starting fresh.
+    /// existing conversation instead of starting fresh. On a **ghost** this is
+    /// the *load* path: there is no pane to kill, and success clears the
+    /// placeholder/ghost flags — the frozen frame is simply replaced by the
+    /// live stream, in place.
     pub fn restart(&mut self, config: &SessionConfig, rows: u16, cols: u16) -> Result<()> {
-        self.backend.kill(&self.backend_id)?;
+        // A placeholder/ghost owns no live pane — killing its empty backend_id
+        // would only produce a tmux error.
+        if !self.placeholder {
+            self.backend.kill(&self.backend_id)?;
+        }
 
         let args = self.provider.build_args(config);
         let window_name = crate::agent::tmux::agent_window_name(&self.info.name);
@@ -1065,26 +1186,99 @@ impl Session {
         // copy the restarted pane makes.
         self.osc52 = state.osc52;
         self.last_drained_osc52_gen = 0;
+        // Same for the metadata cells: `wire_up` wired the new parser's
+        // TermSignals to *its* cells, so the old ones belong to the retired
+        // reader — keeping them would strand every OSC title, notification and
+        // attention signal the restarted pane emits. Generations reset to the
+        // fresh-session values `wire_io` uses.
+        self.last_title = state.last_title;
+        self.attention_at = state.attention_at;
+        self.notification = state.notification;
+        self.meta_gen = state.meta_gen;
+        self.last_synced_meta_gen = u64::MAX;
+        self.attention_ack_at = 0;
         self.env = config.env.clone();
         self.info.backend_id = Some(self.backend_id.clone());
         if !config.agent.is_empty() {
             self.info.agent = config.agent.clone();
+        }
+        if self.placeholder {
+            // A ghost just became a live session: hand the status back to the
+            // hook pipeline (fresh spawns start as Working until a hook says
+            // otherwise, matching `SessionInfo::new`).
+            self.placeholder = false;
+            self.ghost = false;
+            self.info.status = crate::session::SessionStatus::Working;
         }
 
         debug!(session_id = %self.info.id, backend_id = %self.backend_id, "Restarted session");
         Ok(())
     }
 
+    /// Serialize the pane's **visible screen** as a ghost frame: SGR-styled
+    /// lines joined with `\r\n` (the tmux-seed shape, so it re-parses at any
+    /// pane size), trailing blank rows trimmed, attrs reset per row so one
+    /// row's colors can't bleed into the next on replay. Pure in-memory read —
+    /// no tmux round-trip — which is what makes it safe on the crash-safety
+    /// debounce and for remote sessions at shutdown. Returns
+    /// `(rows, cols, bytes)`; `None` only on a poisoned parser lock.
+    pub fn serialize_visible_frame(&self) -> Option<(u16, u16, Vec<u8>)> {
+        let parser = self.parser.lock().ok()?;
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        let mut lines: Vec<Vec<u8>> = screen.rows_formatted(0, cols).collect();
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        Some((rows, cols, lines.join(&b"\x1b[0m\r\n"[..])))
+    }
+
+    /// Capture the ghost frame for an unload/shutdown: the pane's visible
+    /// screen via the backend (an independent `capture-pane` subprocess, whose
+    /// output keeps logical lines — see [`SessionBackend::capture_visible`]),
+    /// falling back to the in-memory serialization when the capture fails.
+    /// Returns `(rows, cols, bytes)`.
+    pub fn capture_unload_frame(&self) -> Option<(u16, u16, Vec<u8>)> {
+        match self.backend.capture_visible(&self.backend_id) {
+            Ok(seed) if !seed.is_empty() => {
+                let (rows, cols) = self
+                    .parser
+                    .lock()
+                    .ok()
+                    .map(|p| p.screen().size())
+                    .unwrap_or((0, 0));
+                Some((rows, cols, seed))
+            }
+            Ok(_) => self.serialize_visible_frame(),
+            Err(e) => {
+                tracing::warn!("Ghost-frame capture failed, saving visible screen only: {e}");
+                self.serialize_visible_frame()
+            }
+        }
+    }
+
     /// Kill/destroy the backend session (for Ctrl+X close).
     pub fn kill(&self) {
-        // A placeholder owns no live backend pane (see `placeholder`).
-        if self.placeholder {
-            return;
-        }
-        self.kill_shell_pane();
-        if let Err(e) = self.backend.kill(&self.backend_id) {
+        if let Err(e) = self.kill_checked() {
             tracing::warn!("Failed to kill session: {e}");
         }
+    }
+
+    /// [`Self::kill`] that **reports** a failed agent-pane teardown instead of
+    /// only logging it. Unload needs this: it must not swap in a ghost — a row
+    /// that says the agent process is gone — while that process is in fact
+    /// still running and still holding its memory. Delete keeps the
+    /// fire-and-forget [`Self::kill`], where a stale pane is cosmetic.
+    ///
+    /// The companion shell pane stays best-effort and is torn down first, as
+    /// in `kill`: it is the agent pane whose death the caller gates on.
+    pub fn kill_checked(&self) -> Result<()> {
+        // A placeholder owns no live backend pane (see `placeholder`).
+        if self.placeholder {
+            return Ok(());
+        }
+        self.kill_shell_pane();
+        self.backend.kill(&self.backend_id)
     }
 
     /// Detach from the backend session without killing it (for Ctrl+Q quit).
@@ -1240,6 +1434,8 @@ impl Session {
             shell_pane: None,
             env: HashMap::new(),
             placeholder: false,
+            ghost: false,
+            placeholder_seed: None,
         };
         (session, input_rx)
     }
@@ -1461,6 +1657,131 @@ mod tests {
                 sizes in prop::collection::vec(1usize..40, 1..16),
             ) {
                 prop_assert_eq!(carry_chunked(&bytes, &sizes), whole(&bytes));
+            }
+        }
+    }
+
+    /// The ghost-frame capture path: the backend's capture must win over the
+    /// in-memory screen (it keeps logical lines, which re-wrap better), and
+    /// every failure mode must still yield the visible screen, never nothing.
+    mod ghost_frame_capture {
+        use std::sync::atomic::AtomicUsize;
+
+        use super::*;
+
+        /// Capture outcome scripted per test case.
+        enum Capture {
+            Seed(&'static [u8]),
+            Empty,
+            Fail,
+        }
+
+        /// Backend that records how many times it was asked to capture.
+        struct CaptureBackend {
+            calls: Arc<AtomicUsize>,
+            capture: Capture,
+        }
+
+        impl SessionBackend for CaptureBackend {
+            fn name(&self) -> &str {
+                "capture-stub"
+            }
+            fn check_available(&self) -> Result<()> {
+                Ok(())
+            }
+            fn ensure_ready(&self) -> Result<()> {
+                Ok(())
+            }
+            fn spawn(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[String],
+                _: Option<&Path>,
+                _: &HashMap<String, String>,
+                _: u16,
+                _: u16,
+            ) -> Result<SpawnedSession> {
+                anyhow::bail!("capture stub does not spawn")
+            }
+            fn adopt(&self, _: &str, _: u16, _: u16, _: Option<Vec<u8>>) -> Result<AdoptedSession> {
+                anyhow::bail!("capture stub does not adopt")
+            }
+            fn capture_visible(&self, _: &str) -> Result<Vec<u8>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                match self.capture {
+                    Capture::Seed(bytes) => Ok(bytes.to_vec()),
+                    Capture::Empty => Ok(Vec::new()),
+                    Capture::Fail => anyhow::bail!("capture failed"),
+                }
+            }
+            fn discover(&self) -> Result<Vec<DiscoveredSession>> {
+                Ok(Vec::new())
+            }
+            fn resize(&self, _: &str, _: u16, _: u16) -> Result<()> {
+                Ok(())
+            }
+            fn is_dead(&self, _: &str) -> Result<bool> {
+                Ok(false)
+            }
+            fn kill(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn detach(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn pane_pid(&self, _: &str) -> Result<Option<u32>> {
+                Ok(None)
+            }
+        }
+
+        /// Session on a `CaptureBackend`, with `on screen` in its parser, plus
+        /// the cell counting capture calls.
+        fn session_with(capture: Capture) -> (Session, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let backend: Arc<dyn SessionBackend> = Arc::new(CaptureBackend {
+                calls: Arc::clone(&calls),
+                capture,
+            });
+            let provider: Arc<dyn AgentProvider> = Arc::new(crate::agent::GenericProvider::new(
+                crate::agent::agent_config::builtin_registry()
+                    .default_agent()
+                    .unwrap()
+                    .clone(),
+            ));
+            let session = Session::stub("cap", &backend, &provider);
+            session.feed_output_for_test(b"on screen\r\n");
+            (session, calls)
+        }
+
+        #[test]
+        fn prefers_the_backend_capture_over_the_in_memory_screen() {
+            let (session, calls) = session_with(Capture::Seed(b"captured screen"));
+
+            let (_, _, bytes) = session.capture_unload_frame().expect("frame");
+
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            assert_eq!(bytes, b"captured screen");
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("on screen"),
+                "the capture seed replaces the visible screen, it is not appended"
+            );
+        }
+
+        #[test]
+        fn falls_back_to_the_visible_screen_when_the_capture_yields_nothing() {
+            for capture in [Capture::Empty, Capture::Fail] {
+                let (session, _) = session_with(capture);
+
+                let (_, _, bytes) = session.capture_unload_frame().expect("frame");
+
+                assert!(
+                    String::from_utf8_lossy(&bytes).contains("on screen"),
+                    "expected the serialized visible screen, got {:?}",
+                    String::from_utf8_lossy(&bytes)
+                );
+                let (_, _, visible) = session.serialize_visible_frame().expect("visible frame");
+                assert_eq!(bytes, visible);
             }
         }
     }

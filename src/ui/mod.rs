@@ -426,6 +426,29 @@ pub fn render_filter_selector_footer(
     )
 }
 
+/// Grey out a rendered buffer region — the ghost-session pane treatment.
+/// Style-only (glyphs untouched, like the selection highlight): every cell
+/// drops to the theme's muted foreground, DIM, no bold, no background fill,
+/// so the frozen frame reads as "this is what the session looked like" the
+/// way a greyed preview does on the web. ~7 µs for a full pane; measured in
+/// the lazy-sessions investigation.
+pub fn grey_out_buffer_area(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect) {
+    use ratatui::layout::Position;
+    use ratatui::style::{Modifier, Style};
+    let style = Style::default()
+        .fg(Theme::text_muted())
+        .bg(Color::Reset)
+        .remove_modifier(Modifier::BOLD)
+        .add_modifier(Modifier::DIM);
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                cell.set_style(style);
+            }
+        }
+    }
+}
+
 pub fn status_color(status: SessionStatus) -> Color {
     match status {
         SessionStatus::Working => Theme::status_working(),
@@ -434,6 +457,9 @@ pub fn status_color(status: SessionStatus) -> Color {
         SessionStatus::Idle => Theme::status_idle(),
         SessionStatus::Error => Theme::status_error(),
         SessionStatus::Unreachable => Theme::status_unreachable(),
+        // Muted grey, not a dedicated theme slot: a ghost's whole visual
+        // identity is "greyed out", so it rides the theme's muted text color.
+        SessionStatus::Unloaded => Theme::text_muted(),
     }
 }
 
@@ -1470,5 +1496,45 @@ mod tests {
     fn modal_title_danger_uses_danger_color() {
         let style = Theme::modal_title_danger();
         assert_eq!(style.bg, Some(Theme::danger()));
+    }
+
+    /// The ghost treatment: a rendered pane keeps its glyphs but goes muted +
+    /// DIM and loses bold, strictly inside the region it was given.
+    #[test]
+    fn grey_out_buffer_area_mutes_only_the_given_rect() {
+        use ratatui::layout::Position;
+        use ratatui::style::{Modifier, Style};
+
+        let full = area(10, 6);
+        let mut buf = ratatui::buffer::Buffer::empty(full);
+        let live = Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+        for y in 0..full.height {
+            for x in 0..full.width {
+                let cell = buf.cell_mut(Position::new(x, y)).unwrap();
+                cell.set_symbol("▓");
+                cell.set_style(live);
+            }
+        }
+
+        let inner = Rect::new(2, 1, 5, 3);
+        grey_out_buffer_area(&mut buf, inner);
+
+        for y in inner.y..inner.y + inner.height {
+            for x in inner.x..inner.x + inner.width {
+                let cell = buf.cell(Position::new(x, y)).unwrap();
+                assert_eq!(cell.symbol(), "▓", "glyphs survive at {x},{y}");
+                assert_eq!(cell.fg, Theme::text_muted(), "fg at {x},{y}");
+                assert!(cell.modifier.contains(Modifier::DIM), "dim at {x},{y}");
+                assert!(!cell.modifier.contains(Modifier::BOLD), "bold at {x},{y}");
+            }
+        }
+
+        // A cell just outside the rect is left as the live render made it.
+        let outside = buf.cell(Position::new(1, 1)).unwrap();
+        assert_eq!(outside.fg, Color::Green);
+        assert!(outside.modifier.contains(Modifier::BOLD));
+        assert!(!outside.modifier.contains(Modifier::DIM));
     }
 }

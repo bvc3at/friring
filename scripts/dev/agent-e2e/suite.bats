@@ -90,6 +90,11 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-restart-resume"
 }
 
+@test "e2e: Alt+U unloads claude to a frozen ghost; Enter loads it back with zero model calls" {
+    require_agent claude
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-unload-load"
+}
+
 @test "e2e: <leader> f forks claude — parent link, sidebar nesting, forked conversation continues" {
     require_agent claude
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-fork"
@@ -210,6 +215,21 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-leader-key"
 }
 
+@test "e2e: unload to a ghost, load via resume, lazy-restore after the agent window dies" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-unload-ghost"
+}
+
+@test "e2e: a ghost survives a terminal shrink and keeps its frame when it grows back" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-ghost-resize"
+}
+
+@test "e2e: lazy_session_restore = false respawns a pane-less session instead of ghosting it" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-eager-restore"
+}
+
 @test "protocol: codex exec completes a stubbed text turn (no Friring)" {
     require_agent codex
     e2e_protocol_smoke "$AGENT_E2E_DIR/scenarios/codex-text-turn"
@@ -220,6 +240,11 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/codex-text-turn"
 }
 
+@test "e2e: Alt+U unloads codex to a frozen ghost; Enter loads it back via resume --last" {
+    require_agent codex
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/codex-unload-load"
+}
+
 @test "protocol: opencode run completes a stubbed text turn (no Friring)" {
     require_agent opencode
     e2e_protocol_smoke "$AGENT_E2E_DIR/scenarios/opencode-text-turn"
@@ -228,4 +253,9 @@ teardown() {
 @test "e2e: opencode text turn through Friring against the openai-dialect stub" {
     require_agent opencode
     e2e_scenario "$AGENT_E2E_DIR/scenarios/opencode-text-turn"
+}
+
+@test "e2e: Alt+U unloads opencode to a frozen ghost; Enter loads it back via --continue" {
+    require_agent opencode
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/opencode-unload-load"
 }

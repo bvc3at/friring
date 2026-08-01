@@ -25,9 +25,13 @@ use rusqlite::{Connection, OptionalExtension};
 /// spans `line_no..=line_end` on one side of one file); v44 widens automations
 /// (multi-step prompts, remote spawns, fresh-session-per-fire, send-by-name,
 /// exec timeouts, async exec run state) — every column nullable so a pre-v44
-/// row decodes to exactly its old behavior.
+/// row decodes to exactly its old behavior; v45 adds the ghost-session frame
+/// to `sessions` (`last_frame` styled-lines blob + `frame_rows`/`frame_cols`/
+/// `frame_saved_at`) and the `unloaded` flag — all nullable/defaulted, and
+/// deliberately outside the full-row session upsert (like the hook columns)
+/// so frame writes and row write-backs can't clobber each other.
 /// Gaps in the step table are fine (there is no v18 step either).
-pub const SCHEMA_VERSION: u32 = 44;
+pub const SCHEMA_VERSION: u32 = 45;
 
 /// A single migration step: applied when the stored version is below `target`.
 type MigrationStep = (u32, fn(&Connection) -> rusqlite::Result<()>);
@@ -92,6 +96,11 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             seen_at           INTEGER,
             force_deleted     INTEGER NOT NULL DEFAULT 0,
             base_branch       TEXT,
+            last_frame        BLOB,
+            frame_rows        INTEGER,
+            frame_cols        INTEGER,
+            frame_saved_at    INTEGER,
+            unloaded          INTEGER NOT NULL DEFAULT 0,
             created_at        INTEGER NOT NULL,
             updated_at        INTEGER NOT NULL,
             deleted_at        INTEGER
@@ -369,6 +378,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         (42, migrate_v42_review_mark_fingerprint),
         (43, migrate_v43_review_comment_line_end),
         (44, migrate_v44_automation_reach),
+        (45, migrate_v45_ghost_frames),
     ];
 
     for &(target, step) in steps {
@@ -1301,6 +1311,21 @@ fn migrate_v44_automation_reach(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_absent(conn, "automation_runs", "finished_at", "INTEGER")
 }
 
+/// v44 → v45: ghost sessions. `last_frame` is the saved terminal frame
+/// (SGR-styled lines joined with `\r\n` — the same shape as the tmux adopt
+/// seed, so it re-parses at any pane size); `frame_rows`/`frame_cols` are the
+/// pane size at capture; `unloaded` marks a session whose agent process was
+/// deliberately killed (it restores as a ghost even with lazy restore off).
+/// NULL frame on existing rows → a ghost renders its "no preview" notice.
+/// Fresh v45 databases already have the columns from `initialize`.
+fn migrate_v45_ghost_frames(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "sessions", "last_frame", "BLOB")?;
+    add_column_if_absent(conn, "sessions", "frame_rows", "INTEGER")?;
+    add_column_if_absent(conn, "sessions", "frame_cols", "INTEGER")?;
+    add_column_if_absent(conn, "sessions", "frame_saved_at", "INTEGER")?;
+    add_column_if_absent(conn, "sessions", "unloaded", "INTEGER NOT NULL DEFAULT 0")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2056,6 +2081,105 @@ mod tests {
             )
             .unwrap();
         assert_eq!(finished, None);
+
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn migrate_from_v44_adds_ghost_frame_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Minimal v44 `sessions` shape (no frame columns, no `unloaded`) with
+        // one fully-populated row, as an upgrading install would have.
+        conn.execute_batch(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO metadata (key, value) VALUES ('schema_version', '44');
+             CREATE TABLE sessions (
+                id                TEXT PRIMARY KEY,
+                name              TEXT NOT NULL,
+                agent             TEXT NOT NULL DEFAULT 'claude',
+                backend_id        TEXT NOT NULL DEFAULT '',
+                backend_type      TEXT NOT NULL DEFAULT 'tmux',
+                agent_session_id  TEXT,
+                cwd               TEXT,
+                additional_dirs   TEXT NOT NULL DEFAULT '',
+                workspace_dir     TEXT,
+                shell_backend_id  TEXT,
+                parent_session_id TEXT,
+                display_order     INTEGER,
+                hook_state        TEXT,
+                hook_state_at     INTEGER,
+                seen_at           INTEGER,
+                force_deleted     INTEGER NOT NULL DEFAULT 0,
+                base_branch       TEXT,
+                created_at        INTEGER NOT NULL,
+                updated_at        INTEGER NOT NULL,
+                deleted_at        INTEGER);
+             INSERT INTO sessions
+                (id, name, agent, backend_id, backend_type, agent_session_id, cwd,
+                 additional_dirs, display_order, hook_state, base_branch,
+                 created_at, updated_at)
+                VALUES ('s-1', 'old row', 'codex', 'friring:@3', 'tmux', 'conv-7',
+                        '/repo', '/extra', 2, 'idle', 'main', 11, 22);",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let has = |column: &str| -> bool {
+            conn.prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('sessions') WHERE name='{column}'"
+            ))
+            .unwrap()
+            .exists([])
+            .unwrap()
+        };
+        for column in [
+            "last_frame",
+            "frame_rows",
+            "frame_cols",
+            "frame_saved_at",
+            "unloaded",
+        ] {
+            assert!(has(column), "sessions.{column} should be added at v45");
+        }
+
+        let column = |column: &str| -> rusqlite::types::Value {
+            conn.query_row(
+                &format!("SELECT {column} FROM sessions WHERE id = 's-1'"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        use rusqlite::types::Value;
+
+        // No frame for a pre-v45 row (it renders the "no preview" ghost), and
+        // `unloaded` defaults to loaded — the row must not turn into a ghost
+        // just by upgrading.
+        for name in ["last_frame", "frame_rows", "frame_cols", "frame_saved_at"] {
+            assert_eq!(column(name), Value::Null, "{name} on an upgraded row");
+        }
+        assert_eq!(column("unloaded"), Value::Integer(0));
+
+        // Nothing else about the row moved.
+        for (name, expected) in [
+            ("name", "old row"),
+            ("agent", "codex"),
+            ("backend_id", "friring:@3"),
+            ("agent_session_id", "conv-7"),
+            ("cwd", "/repo"),
+        ] {
+            assert_eq!(column(name), Value::Text(expected.into()), "{name}");
+        }
+        assert_eq!(column("display_order"), Value::Integer(2));
+        assert_eq!(column("created_at"), Value::Integer(11));
 
         let version: String = conn
             .query_row(

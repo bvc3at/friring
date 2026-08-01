@@ -24,6 +24,13 @@ config_version = 1
 # Scrollback lines kept per session terminal.
 # scrollback_lines = 1000
 
+# Lazy session restore: at startup, sessions whose agent process is gone
+# (e.g. after a reboot) show their greyed last-saved frame as a "ghost"
+# instead of respawning; press Enter (or restart) on one to load it. A
+# session with a live tmux pane always re-attaches — that spawns nothing.
+# false = respawn everything at startup (the old behavior).
+# lazy_session_restore = true
+
 # Terminal width (columns) below which only the terminal pane renders.
 # two_panel_min_cols = 80
 
@@ -232,6 +239,7 @@ pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
     // Top-level scalars (cast to i64 — TOML's only integer type).
     doc["config_version"] = value(i64::from(settings.config_version.unwrap_or(1)));
     doc["scrollback_lines"] = value(settings.scrollback_lines as i64);
+    doc["lazy_session_restore"] = value(settings.lazy_session_restore);
     doc["two_panel_min_cols"] = value(i64::from(settings.two_panel_min_cols));
     doc["three_panel_min_cols"] = value(i64::from(settings.three_panel_min_cols));
     doc["audit_retention_days"] = value(settings.audit_retention_days as i64);
@@ -304,6 +312,7 @@ mod tests {
     fn seed_toml_documents_every_field() {
         for field in [
             "scrollback_lines",
+            "lazy_session_restore",
             "two_panel_min_cols",
             "three_panel_min_cols",
             "audit_retention_days",
@@ -386,12 +395,18 @@ mod tests {
 
         let path = settings_config_path().unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "scrollback_lines = 4000\naudit_retention_days = 7\n").unwrap();
+        std::fs::write(
+            &path,
+            "scrollback_lines = 4000\naudit_retention_days = 7\n\
+             lazy_session_restore = false\n",
+        )
+        .unwrap();
 
         let (s, warnings) = load_or_seed_with_warnings();
         assert!(warnings.is_empty());
         assert_eq!(s.scrollback_lines, 4000);
         assert_eq!(s.audit_retention_days, 7);
+        assert!(!s.lazy_session_restore);
         assert_eq!(s.two_panel_min_cols, 80);
     }
 
@@ -411,6 +426,7 @@ mod tests {
         s.features.auto_update = true;
         s.notifications.min_interval_secs = 30;
         s.notifications.suppress_for_active = false;
+        s.lazy_session_restore = false;
         // A non-default backend must survive the save/reload round-trip; the
         // full-Settings equality below would silently pass on the `Auto`
         // default even if `backend` were dropped.

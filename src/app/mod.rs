@@ -21,7 +21,7 @@ mod task_state;
 mod tasks;
 mod view;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 
@@ -32,7 +32,7 @@ use ratatui::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::agent::{BackendRegistry, GenericProvider, Session, SessionBackend};
+use crate::agent::{AgentProvider, BackendRegistry, GenericProvider, Session, SessionBackend};
 use crate::git;
 use crate::session::{
     AgentDef, AgentRegistry, SessionConfig, SessionId, SessionInfo, SessionStatus, WorktreeInfo,
@@ -94,6 +94,11 @@ const HOOK_VERSION_CHECK_TICKS: u64 = 10;
 /// Tick delay before sending Enter after pasting text into a session.
 /// At ~10ms per tick, 10 ticks ≈ 100ms — enough for the app to process the pasted text.
 const DEFERRED_INPUT_DELAY_TICKS: u64 = 10;
+
+/// Cadence of the crash-safety ghost-frame debounce (~60 s at the 10 ms tick):
+/// frequent enough that a reboot's ghosts look current, rare enough that the
+/// in-memory serialization + small DB writes never register.
+const FRAME_PERSIST_INTERVAL_TICKS: u64 = 6_000;
 
 /// Nominal milliseconds per tick, for converting a wall-clock delay (a prompt
 /// step's settle time) into the tick offsets `deferred_inputs` schedules on.
@@ -959,6 +964,10 @@ pub struct App {
     /// Deferred inputs: `(session_id, data, tick_at_which_to_send)`.
     /// Used to introduce a small delay between pasting text and pressing Enter.
     deferred_inputs: Vec<(SessionId, Vec<u8>, u64)>,
+    /// `now_millis()` of each session's last debounced ghost-frame save,
+    /// compared against `last_output_at` so [`Self::persist_dirty_frames`]
+    /// skips sessions with no new output.
+    frame_saved_at: HashMap<SessionId, u64>,
     /// Per-session terminal view state (Claude vs Shell). Defaults to Claude.
     session_terminal_views: HashMap<SessionId, TerminalView>,
     /// Recently deleted session awaiting finalization or undo (Ctrl+Z).
@@ -1360,6 +1369,7 @@ impl App {
             pending_session_spawn: None,
             remote_restore: None,
             deferred_inputs: Vec::new(),
+            frame_saved_at: HashMap::new(),
             session_terminal_views: HashMap::new(),
             pending_delete: None,
             text_selection: None,
@@ -1634,7 +1644,7 @@ impl App {
         self.config_reload.keybindings_mtime = config_reload::keybindings_mtime();
     }
 
-    /// Build an [`AgentProvider`](crate::agent::AgentProvider) for a session
+    /// Build an [`AgentProvider`] for a session
     /// config by looking its agent up in the registry. Falls back to the
     /// registry default, then to the built-in default, so a stale/unknown agent
     /// name never breaks spawning.
@@ -2004,10 +2014,13 @@ impl App {
         let Some(session) = self.sessions.get(self.active_index) else {
             return;
         };
-        // A placeholder (unreachable remote) has no live pane to restart — a
-        // manual restart means "reconnect now", so kick an immediate retry sweep
-        // for its backend instead of the live-restart path.
-        if session.is_placeholder() {
+        // A ghost's "restart" IS its load: fall through to the normal path,
+        // where `Session::restart` spawns the agent (no pane to kill) and
+        // clears the ghost flags. Only the *remote-unreachable* placeholder
+        // has no process to launch — a manual restart there means "reconnect
+        // now", so kick an immediate retry sweep for its backend instead.
+        let is_ghost_load = session.is_ghost();
+        if session.is_placeholder() && !is_ghost_load {
             let backend_type = session.backend_name().to_string();
             self.retry_remote_backend_now(&backend_type);
             self.set_status(StatusLevel::Info, "Retrying remote host…");
@@ -2052,11 +2065,19 @@ impl App {
         config.resume_session_id =
             crate::session_ops::resume_trigger_for(&def, &agent_session_id, &config.env);
 
-        self.do_restart(config);
+        self.do_restart(
+            config,
+            if is_ghost_load {
+                "Session loaded"
+            } else {
+                "Session restarted"
+            },
+        );
     }
 
-    /// Execute the actual restart with the finalized config.
-    fn do_restart(&mut self, config: SessionConfig) {
+    /// Execute the actual restart with the finalized config. `success_msg` is
+    /// the status-bar text on success ("restarted" vs a ghost's "loaded").
+    fn do_restart(&mut self, config: SessionConfig, success_msg: &str) {
         let (rows, cols) = self.content_area_size();
         // Resolve the relaunch provider from the *current* registry (and adapt
         // its args for a remote backend) before restarting — the provider the
@@ -2077,11 +2098,14 @@ impl App {
                 // resumed agent may not re-fire its boot hook). Mirrors the
                 // headless `restart_session_headless` path.
                 let _ = self.db.clear_hook_state(session_id);
+                // The agent process is running (again) — the row is no longer
+                // unloaded. A no-op for plain restarts (flag already clear).
+                let _ = self.db.set_session_unloaded(session_id, false);
                 // Our own write doesn't move this connection's `data_version`,
                 // so force the status cache to reload and pick up the cleared row.
                 self.invalidate_hook_state_cache();
                 self.save_state();
-                self.set_status(StatusLevel::Info, "Session restarted");
+                self.set_status(StatusLevel::Info, success_msg.to_string());
             }
             Err(e) => {
                 error!("Failed to restart session: {e}");
@@ -2089,6 +2113,128 @@ impl App {
             }
         }
         self.new_session.restart = false;
+    }
+
+    /// Unload the active session: save its ghost frame (the visible screen),
+    /// kill the agent window (and shell
+    /// pane), and swap in a greyed ghost in place. This is what actually frees
+    /// memory — the agent *process* (hundreds of MB) dies; the frozen frame
+    /// costs a few KB. Enter / restart loads the session again, resuming the
+    /// conversation where the agent supports it.
+    pub(crate) fn unload_active_session(&mut self) {
+        let already = match self.sessions.get(self.active_index) {
+            None => return,
+            Some(s) => s.is_placeholder(),
+        };
+        if already {
+            self.set_status(StatusLevel::Info, "Session is not loaded");
+            return;
+        }
+        // Persist the full row first: the frame/flag writes below UPDATE the
+        // row, and the ghost swap makes save_state skip this session afterwards.
+        self.save_state();
+
+        let (id, name, shared, frame) = {
+            let session = &self.sessions[self.active_index];
+            (
+                session.info.id,
+                session.info.name.clone(),
+                self.session_to_shared(session),
+                session.capture_unload_frame(),
+            )
+        };
+        if let Some((rows, cols, bytes)) = &frame {
+            if let Err(e) = self.db.save_session_frame(id, *rows, *cols, bytes) {
+                error!("Failed to save ghost frame for '{name}': {e}");
+            }
+        }
+
+        // Tear the agent down BEFORE any state that claims it is gone — the
+        // `unloaded` flag and the ghost swap. A ghost asserts "this session's
+        // process is not running": reaching that state after a failed kill
+        // would strand a live agent still holding the memory the unload exists
+        // to reclaim, with no row left pointing at it. On failure the session
+        // is untouched and stays live (the backend leaves the pane registered
+        // when its kill fails), so the user can retry or investigate.
+        // Saving the frame above is safe either way — the crash-safety
+        // debounce writes frames for live sessions too.
+        if let Err(e) = self.sessions[self.active_index].kill_checked() {
+            error!("Failed to unload session '{name}': {e}");
+            self.set_error(format!("Failed to unload '{name}': {e:#}"));
+            return;
+        }
+        if let Err(e) = self.db.set_session_unloaded(id, true) {
+            error!("Failed to flag session '{name}' unloaded: {e}");
+        }
+
+        // Ghost from the just-captured bytes (not a DB re-read) so the swap
+        // works even if the frame write failed.
+        let (info, backend, provider) = self.persisted_session_parts(&shared);
+        let (rows, cols) = self.content_area_size();
+        let ghost = Session::ghost(
+            info,
+            rows,
+            cols,
+            &backend,
+            &provider,
+            HashMap::new(),
+            frame.as_ref().map(|(_, _, bytes)| bytes.as_slice()),
+        );
+        // Already killed above; dropping `old` retires the (now EOF'd) reader.
+        let _old = std::mem::replace(&mut self.sessions[self.active_index], ghost);
+        // Back to the agent view: the companion shell pane died with the
+        // session and is deliberately not restored on load, so a remembered
+        // Shell tab would label the ghost's frozen frame "Shell" and route the
+        // load-time keystrokes to a pane that no longer exists.
+        self.session_terminal_views.remove(&id);
+        // Leave the pane the way `FocusBackward` would: a ghost has no live
+        // PTY, so keeping terminal focus would point the keyboard at a surface
+        // that only answers "press Enter to load". The list is where the next
+        // action (pick another session, or Enter to load this one back) lives.
+        self.focus = InputFocus::SessionList;
+        self.on_focus_changed();
+        self.request_redraw();
+        self.set_status(
+            StatusLevel::Info,
+            format!("Unloaded '{name}' — press Enter to load it again"),
+        );
+    }
+
+    /// Whether the active session is a ghost (unloaded, Enter loads it).
+    pub(crate) fn active_session_is_ghost(&self) -> bool {
+        self.sessions
+            .get(self.active_index)
+            .is_some_and(|s| s.is_ghost())
+    }
+
+    /// Cycle the active session among **loaded** sessions only (skipping
+    /// ghosts and unreachable placeholders), in rendered order, wrapping.
+    /// From a ghost it keeps going in the requested direction to the nearest
+    /// loaded session — the ghost holds its place in the order, it just can't
+    /// be landed on.
+    pub(crate) fn switch_loaded_session(&mut self, forward: bool) {
+        // The *unfiltered* order, so a placeholder still occupies its slot and
+        // the scan below leaves it from the right side.
+        let order = self.render_order_indices();
+        let len = order.len();
+        let next = match order.iter().position(|&i| i == self.active_index) {
+            Some(pos) => (1..=len)
+                .map(|step| {
+                    if forward {
+                        (pos + step) % len
+                    } else {
+                        (pos + len - step) % len
+                    }
+                })
+                .find(|&p| !self.sessions[order[p]].is_placeholder()),
+            // Active session isn't rendered at all (nothing to scan from):
+            // land on the first loaded row.
+            None => (0..len).find(|&p| !self.sessions[order[p]].is_placeholder()),
+        };
+        match next {
+            Some(p) => self.set_active_index(order[p]),
+            None => self.set_status(StatusLevel::Info, "No loaded sessions"),
+        }
     }
 
     /// Open the active session's worktree (or cwd) in the configured editor.
@@ -2208,11 +2354,13 @@ impl App {
 
         let session_id = session.info.id;
 
-        // A placeholder (unreachable remote) has no live pane / local resource to
-        // tear down — deleting it just removes the row (a hard delete would run
-        // blocking remote git/worktree ops against the down host). Always soft-
-        // delete it, regardless of the `soft_delete` feature flag.
-        if session.is_placeholder() {
+        // An *unreachable remote* placeholder has no live pane / local resource
+        // to tear down — deleting it just removes the row (a hard delete would
+        // run blocking remote git/worktree ops against the down host). Always
+        // soft-delete it, regardless of the `soft_delete` feature flag. A ghost
+        // is a placeholder too, but it owns real local resources (worktrees), so
+        // it follows the configured delete policy like any loaded session.
+        if session.is_placeholder() && !session.is_ghost() {
             if let Err(e) = self.db.soft_delete_session(session_id) {
                 error!("Failed to soft-delete session in DB: {e}");
             }
@@ -2780,6 +2928,13 @@ impl App {
             return;
         };
         let session_id = session.info.id;
+        // A placeholder owns no pane, and placeholder teardown (`kill`/`detach`)
+        // skips shell panes — spawning one here would leak a window nothing ever
+        // closes.
+        if session.is_placeholder() {
+            self.set_status(StatusLevel::Info, "Session is not loaded");
+            return;
+        }
         if session.shell_pane.is_none() {
             let (rows, cols) = self.content_area_size();
             // Resolve the launch cwd (host-aware for remote workspaces) before
@@ -5130,6 +5285,12 @@ impl App {
             self.refresh_automations();
             self.refresh_tasks();
         }
+
+        // Crash-safety ghost frames: persist changed visible screens so a hard
+        // crash / reboot restores ghosts at most one interval stale.
+        if self.metrics.tick_count % FRAME_PERSIST_INTERVAL_TICKS == 0 {
+            self.persist_dirty_frames();
+        }
     }
 
     /// The spawning half of [`Self::tick`]: kicks off background refreshes
@@ -6600,10 +6761,69 @@ impl App {
     pub fn shutdown(mut self) {
         self.finalize_pending_delete();
         self.save_state();
+        self.persist_shutdown_frames();
         // Do NOT remove worktrees — they persist for resume.
         // Detach from backend sessions without killing them — they persist in tmux.
         for session in self.sessions {
             session.detach();
+        }
+    }
+
+    /// Save every live session's ghost frame at shutdown, so a reboot (or a
+    /// lazy next launch) has a fresh frame to show. Local sessions capture
+    /// through the backend (an independent subprocess each, ~10 ms, and its
+    /// output keeps logical lines); remote sessions serialize the in-memory
+    /// visible screen instead — a per-session ssh round-trip could hang the
+    /// exit on a dying host, and the two produce the same screen either way.
+    fn persist_shutdown_frames(&self) {
+        for session in &self.sessions {
+            if session.is_placeholder() {
+                continue;
+            }
+            let frame = if crate::session::is_remote_backend(session.backend_name()) {
+                session.serialize_visible_frame()
+            } else {
+                session.capture_unload_frame()
+            };
+            if let Some((rows, cols, bytes)) = frame {
+                if let Err(e) = self
+                    .db
+                    .save_session_frame(session.info.id, rows, cols, &bytes)
+                {
+                    error!(
+                        "Failed to save shutdown frame for '{}': {e}",
+                        session.info.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Crash-safety frame debounce: persist the **visible screen** of every
+    /// session that produced output since its last save. Pure in-memory
+    /// serialization (~50 µs/session) + one small UPDATE each, so a hard
+    /// crash / reboot leaves ghosts at most one interval stale. Scrollback is
+    /// deliberately not captured here — that costs a subprocess (or an ssh
+    /// round-trip) per session and belongs to unload/shutdown.
+    fn persist_dirty_frames(&mut self) {
+        let now = crate::agent::backend::now_millis();
+        for session in &self.sessions {
+            if session.is_placeholder() {
+                continue;
+            }
+            let id = session.info.id;
+            let saved_at = self.frame_saved_at.get(&id).copied().unwrap_or(0);
+            if session.last_output_at() <= saved_at {
+                continue;
+            }
+            if let Some((rows, cols, bytes)) = session.serialize_visible_frame() {
+                match self.db.save_session_frame(id, rows, cols, &bytes) {
+                    Ok(()) => {
+                        self.frame_saved_at.insert(id, now);
+                    }
+                    Err(e) => error!("Failed to save frame for '{}': {e}", session.info.name),
+                }
+            }
         }
     }
 
@@ -6739,6 +6959,16 @@ impl App {
             .into_iter()
             .partition(|s| crate::session::is_remote_backend(&s.backend_type));
 
+        // Sessions to ghost instead of respawn: everything explicitly unloaded,
+        // plus — with lazy restore on — every session whose pane is gone. Read
+        // once; the per-session decision is in `restore_single_session`.
+        let unloaded: HashSet<SessionId> = self
+            .db
+            .unloaded_session_ids()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
         let discovered_by_backend = self.discover_windows_by_backend(&local, perf_log);
 
         // Prefetch every matched pane's scrollback capture in parallel before
@@ -6758,7 +6988,7 @@ impl App {
                 .unwrap_or_default();
             let adopt_start = perf_log.then(std::time::Instant::now);
             let name = perf_log.then(|| shared.name.clone());
-            self.restore_single_session(shared, &discovered, &seeds);
+            self.restore_single_session(shared, &discovered, &seeds, &unloaded);
             if let (Some(start), Some(name)) = (adopt_start, name) {
                 tracing::info!(
                     session = %name,
@@ -6856,18 +7086,20 @@ impl App {
         });
     }
 
-    /// Build (but don't insert) a placeholder [`Session`] for a persisted remote
-    /// session — a row tagged `SessionStatus::Unreachable` with no live pane. See
-    /// [`crate::agent::backend::Session::placeholder`].
-    fn build_placeholder_session(&self, shared: &sync::SharedSession) -> Session {
+    /// Rebuild the `(info, backend, provider)` triple for a persisted session
+    /// row — shared by the placeholder and ghost builders. The backend and
+    /// provider are dummies in both cases (neither does I/O until a real
+    /// adopt/spawn replaces the session); an unknown host falls back to the
+    /// local default so the row can still render.
+    fn persisted_session_parts(
+        &self,
+        shared: &sync::SharedSession,
+    ) -> (SessionInfo, Arc<dyn SessionBackend>, Arc<dyn AgentProvider>) {
         let agent = if shared.agent.is_empty() {
             DEFAULT_AGENT_NAME.to_string()
         } else {
             shared.agent.clone()
         };
-        // Dummy backend/provider: a placeholder never does I/O, but the fields
-        // must be populated. Fall back to the local default when the host is
-        // unknown (unconfigured) so the row can still render.
         let backend = self
             .resolve_persisted_backend(&shared.backend_type)
             .unwrap_or_else(|| self.backends.default_backend().clone());
@@ -6888,9 +7120,36 @@ impl App {
         info.display_order = shared.display_order;
         info.remote_host = host_label_from_backend_type(&shared.backend_type);
         resolve_repo_display_names(&mut info);
+        (info, backend, provider)
+    }
 
+    /// Build (but don't insert) a placeholder [`Session`] for a persisted remote
+    /// session — a row tagged `SessionStatus::Unreachable` with no live pane. See
+    /// [`crate::agent::backend::Session::placeholder`].
+    fn build_placeholder_session(&self, shared: &sync::SharedSession) -> Session {
+        let (info, backend, provider) = self.persisted_session_parts(shared);
         let (rows, cols) = self.content_area_size();
         Session::placeholder(info, rows, cols, &backend, &provider, HashMap::new())
+    }
+
+    /// Build (but don't insert) a **ghost** [`Session`] for a persisted row:
+    /// the saved last frame (if any) re-parsed at the *current* pane size —
+    /// the line-shaped frame bytes re-wrap, so a ghost restored into a
+    /// narrower terminal stays legible and bottom-anchored. See
+    /// [`crate::agent::backend::Session::ghost`].
+    fn build_ghost_session(&self, shared: &sync::SharedSession) -> Session {
+        let frame = self.db.load_session_frame(shared.id).ok().flatten();
+        let (info, backend, provider) = self.persisted_session_parts(shared);
+        let (rows, cols) = self.content_area_size();
+        Session::ghost(
+            info,
+            rows,
+            cols,
+            &backend,
+            &provider,
+            HashMap::new(),
+            frame.as_ref().map(|f| f.bytes.as_slice()),
+        )
     }
 
     /// Insert a placeholder row for a persisted remote session whose host is not
@@ -7072,6 +7331,14 @@ impl App {
         let prior_focus = self.focus;
         let mut restored = 0usize;
         let mut unreachable_hosts: Vec<String> = Vec::new();
+        // Same ghost-vs-respawn decision as the startup restore (a returned
+        // host whose pane is gone means the host rebooted).
+        let unloaded: HashSet<SessionId> = self
+            .db
+            .unloaded_session_ids()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
         for (backend_type, reachable, discovered) in ready {
             if !reachable {
@@ -7122,11 +7389,14 @@ impl App {
                 let retry_copy = shared.clone();
                 // Remote adoption keeps the inline capture (`seed: None` path)
                 // — the SSH control-mode round-trips dominate there anyway.
-                self.restore_single_session(shared, &discovered, &HashMap::new());
+                self.restore_single_session(shared, &discovered, &HashMap::new(), &unloaded);
+                // A ghost counts as restored: the host is back but the pane is
+                // gone, and lazy restore (or the unloaded flag) chose a frozen
+                // frame over respawning on the host.
                 if self
                     .sessions
                     .iter()
-                    .any(|s| s.info.id == id && !s.is_placeholder())
+                    .any(|s| s.info.id == id && (!s.is_placeholder() || s.is_ghost()))
                 {
                     self.remove_remote_placeholder(id);
                     restored += 1;
@@ -7166,11 +7436,12 @@ impl App {
         }
     }
 
-    /// Remove the placeholder row for `id` (leaving a real adopted session with
-    /// the same id untouched). See [`Self::insert_remote_placeholder`].
+    /// Remove the *unreachable* placeholder row for `id` (leaving a real
+    /// adopted session — or the ghost the retry produced — with the same id
+    /// untouched). See [`Self::insert_remote_placeholder`].
     fn remove_remote_placeholder(&mut self, id: SessionId) {
         self.sessions
-            .retain(|s| !(s.info.id == id && s.is_placeholder()));
+            .retain(|s| !(s.info.id == id && s.is_placeholder() && !s.is_ghost()));
     }
 
     /// Discover existing backend windows once per distinct `backend_type`.
@@ -7321,6 +7592,7 @@ impl App {
         shared: sync::SharedSession,
         discovered: &[crate::agent::backend::DiscoveredSession],
         seeds: &HashMap<String, Vec<u8>>,
+        unloaded: &HashSet<SessionId>,
     ) {
         let name = shared.name.clone();
 
@@ -7372,7 +7644,23 @@ impl App {
         });
 
         if let Some(session) = adopted {
+            // A live pane trumps the unloaded flag (e.g. a headless spawn
+            // re-created the window after an unload): adopting it is free —
+            // no process starts — so clear the flag rather than ghost a
+            // session that is actually running.
+            if unloaded.contains(&shared.id) {
+                let _ = self.db.set_session_unloaded(shared.id, false);
+            }
             self.finish_adopted_session(session, &shared, agent, worktrees, discovered);
+        } else if unloaded.contains(&shared.id)
+            || crate::session::settings::global().lazy_session_restore
+        {
+            // No live pane, and either the user unloaded this session or lazy
+            // restore is on: show the greyed last-frame ghost instead of
+            // spawning an agent process. Enter / restart loads it.
+            let session = self.build_ghost_session(&shared);
+            self.sessions.push(session);
+            self.request_redraw();
         } else {
             self.respawn_stale_session(name, shared, agent, agent_session_id, worktrees);
         }
@@ -16012,6 +16300,429 @@ mod tests {
         let shared = make_shared_session("friring:@0", "1");
         let result = App::find_matching_discovered(&shared, &[]);
         assert!(result.is_none());
+    }
+
+    // --- Lazy restore / ghost tests ---
+    // `settings::init` is never called in the test process, so `global()` is
+    // the all-default config: `lazy_session_restore = true` — the path under
+    // test. (Flipping it per-test would poison the process-wide OnceLock for
+    // in-process `cargo test` runs, so the respawn path stays untested here.)
+
+    /// Lazy restore: a persisted session with no live pane becomes a ghost —
+    /// no spawn attempt (the stub backend's `spawn` bails, so reaching it
+    /// would error), status `Unloaded`, keystrokes dropped.
+    #[test]
+    fn lazy_restore_ghosts_session_without_live_pane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_sessions(0);
+        let shared = make_shared_session("friring:@0", "gone");
+        app.db.upsert_session(&shared).unwrap();
+
+        app.restore_sessions(vec![shared], 1);
+
+        assert_eq!(app.sessions.len(), 1);
+        let s = &app.sessions[0];
+        assert!(s.is_ghost() && s.is_placeholder());
+        assert_eq!(s.info.status, SessionStatus::Unloaded);
+        assert!(app.active_session_is_ghost());
+        // A pre-v45 row has no saved frame: the pane explains itself instead of
+        // rendering empty.
+        let text = s.parser.lock().map(|p| p.screen().contents()).unwrap();
+        assert!(
+            text.contains("no saved preview") && text.contains("Press Enter"),
+            "got: {text}"
+        );
+    }
+
+    /// A ghost restored from a saved frame replays that frame into its pane.
+    #[test]
+    fn ghost_restores_saved_frame_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_sessions(0);
+        let shared = make_shared_session("friring:@0", "gone");
+        app.db.upsert_session(&shared).unwrap();
+        app.db
+            .save_session_frame(shared.id, 24, 80, b"frozen \x1b[31mfindings\x1b[0m here")
+            .unwrap();
+
+        app.restore_sessions(vec![shared], 1);
+
+        let text = app.sessions[0]
+            .parser
+            .lock()
+            .map(|p| p.screen().contents())
+            .unwrap();
+        assert!(text.contains("frozen findings here"), "got: {text}");
+    }
+
+    /// A ghost renders whatever its stored frame holds, including rows above
+    /// the visible screen: those land in the parser's scrollback and the scroll
+    /// actions (which have no placeholder gating) reach them. Captures are
+    /// visible-screen-only now, but a frame can still be taller than the pane
+    /// (a narrower terminal wraps it), so the seeding must not drop the excess.
+    #[tokio::test]
+    async fn ghost_frame_is_scrollable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_sessions(0);
+        let shared = make_shared_session("friring:@0", "deep");
+        app.db.upsert_session(&shared).unwrap();
+        // Far more lines than the pane is tall, so most land in scrollback.
+        let frame: String = (0..200).map(|i| format!("line-{i}\r\n")).collect();
+        app.db
+            .save_session_frame(shared.id, 24, 80, frame.as_bytes())
+            .unwrap();
+        app.restore_sessions(vec![shared], 1);
+        assert!(app.sessions[0].is_ghost());
+
+        // Total scrollback available, read the way `render_terminal` does.
+        let total = {
+            let mut p = app.sessions[0].parser.lock().unwrap();
+            p.screen_mut().set_scrollback(usize::MAX);
+            let max = p.screen().scrollback();
+            p.screen_mut().set_scrollback(0);
+            max
+        };
+        assert!(total > 0, "a ghost's frame kept no scrollback");
+
+        // And the scroll action actually moves it (no placeholder gating).
+        app.scroll_terminal_up(5);
+        let offset = app.sessions[0]
+            .parser
+            .lock()
+            .map(|p| p.screen().scrollback())
+            .unwrap();
+        assert_eq!(offset, 5, "scrolling a ghost did not move its viewport");
+        let top = app.sessions[0]
+            .parser
+            .lock()
+            .map(|p| p.screen().contents())
+            .unwrap();
+        assert!(top.contains("line-"), "scrolled view shows frame content");
+
+        // …and the offset must SURVIVE the tick loop. A ghost re-renders from
+        // its seed on resize, which rebuilds the parser and snaps the viewport
+        // back to the bottom — so anything that re-resizes a ghost every tick
+        // would make it look like scrolling silently does nothing.
+        for _ in 0..5 {
+            app.tick_core();
+        }
+        let after_ticks = app.sessions[0]
+            .parser
+            .lock()
+            .map(|p| p.screen().scrollback())
+            .unwrap();
+        assert_eq!(
+            after_ticks, 5,
+            "the tick loop reset a ghost's scroll position"
+        );
+    }
+
+    /// vt100 resizes by truncating each row's cells, so a narrowed pane loses
+    /// every cell past the new width and widening back pads with blanks. A
+    /// live session's agent repaints that away on SIGWINCH; a ghost has no
+    /// process to repaint it, so it must re-render from its saved frame or the
+    /// frozen content stays clipped to the narrowest size ever seen.
+    #[tokio::test]
+    async fn ghost_reflows_its_frame_after_a_shrink_and_regrow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_sessions(0);
+        let shared = make_shared_session("friring:@0", "wide");
+        app.db.upsert_session(&shared).unwrap();
+        // A line far wider than the shrunk pane below.
+        let wide = format!("LEFT-{}-ENDMARK", "x".repeat(100));
+        app.db
+            .save_session_frame(shared.id, 24, 200, wide.as_bytes())
+            .unwrap();
+        app.restore_sessions(vec![shared], 1);
+        assert!(app.sessions[0].is_ghost());
+
+        let visible = |app: &App| {
+            app.sessions[0]
+                .parser
+                .lock()
+                .map(|p| p.screen().contents())
+                .unwrap()
+        };
+        app.sessions[0].resize(24, 200);
+        assert!(visible(&app).contains("ENDMARK"), "baseline");
+
+        // Shrink well under the line's width, then restore the original size.
+        app.sessions[0].resize(20, 40);
+        app.sessions[0].resize(24, 200);
+
+        let after = visible(&app);
+        assert!(
+            after.contains("ENDMARK"),
+            "the ghost's frame was clipped by the shrink: {after:?}"
+        );
+    }
+
+    /// A backend whose `kill` fails — the agent process outlives the request.
+    struct UnkillableBackend;
+    impl SessionBackend for UnkillableBackend {
+        fn name(&self) -> &str {
+            "unkillable"
+        }
+        fn check_available(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn ensure_ready(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn spawn(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[String],
+            _: Option<&Path>,
+            _: &std::collections::HashMap<String, String>,
+            _: u16,
+            _: u16,
+        ) -> anyhow::Result<crate::agent::backend::SpawnedSession> {
+            anyhow::bail!("stub backend does not spawn")
+        }
+        fn adopt(
+            &self,
+            _: &str,
+            _: u16,
+            _: u16,
+            _: Option<Vec<u8>>,
+        ) -> anyhow::Result<crate::agent::backend::AdoptedSession> {
+            anyhow::bail!("stub backend does not adopt")
+        }
+        fn discover(&self) -> anyhow::Result<Vec<crate::agent::backend::DiscoveredSession>> {
+            Ok(vec![])
+        }
+        fn resize(&self, _: &str, _: u16, _: u16) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn is_dead(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn kill(&self, _: &str) -> anyhow::Result<()> {
+            anyhow::bail!("kill-pane refused")
+        }
+        fn detach(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn pane_pid(&self, _: &str) -> anyhow::Result<Option<u32>> {
+            Ok(None)
+        }
+    }
+
+    /// A failed teardown must not produce a ghost. A ghost row asserts "this
+    /// session's process is not running"; reaching that state after a failed
+    /// kill would strand a live agent still holding its memory, with nothing
+    /// left pointing at it. The session stays live, the DB flag stays clear,
+    /// and the user is told.
+    #[tokio::test]
+    async fn unload_aborts_and_reports_when_the_kill_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let backend: Arc<dyn SessionBackend> = Arc::new(UnkillableBackend);
+        let provider = stub_provider();
+        let mut app = App::new(
+            24,
+            120,
+            BackendRegistry::new(backend.clone()),
+            stub_agents(),
+            test_db(),
+        );
+        app.sessions
+            .push(Session::stub("doomed", &backend, &provider));
+        app.active_index = 0;
+        let id = persist_session(&app, 0);
+        app.focus = InputFocus::Terminal;
+
+        app.unload_active_session();
+
+        assert!(!app.sessions[0].is_ghost(), "session must stay live");
+        assert!(!app.sessions[0].is_placeholder());
+        assert!(
+            app.db.unloaded_session_ids().unwrap().is_empty(),
+            "a failed unload must not flag the row unloaded"
+        );
+        assert_eq!(
+            app.focus,
+            InputFocus::Terminal,
+            "focus stays on the still-live pane"
+        );
+        let msg = app.status_message.as_ref().expect("an error is reported");
+        assert_eq!(msg.level, StatusLevel::Error);
+        assert!(msg.text.contains("Failed to unload"), "got: {}", msg.text);
+        let _ = id;
+    }
+
+    /// Unload swaps the live session for a ghost in place, persists the frame
+    /// + `unloaded` flag, and keeps id/order stable.
+    #[tokio::test]
+    async fn unload_active_session_swaps_in_a_ghost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_sessions(1);
+        app.sessions[0].feed_output_for_test(b"important last words\r\n");
+        let id = app.sessions[0].info.id;
+        app.focus = InputFocus::Terminal;
+
+        app.unload_active_session();
+
+        assert_eq!(app.sessions.len(), 1);
+        assert!(app.sessions[0].is_ghost());
+        assert_eq!(app.sessions[0].info.id, id, "identity survives the swap");
+        // The ghost has no live PTY, so focus leaves the pane for the list.
+        assert_eq!(app.focus, InputFocus::SessionList);
+        assert_eq!(app.db.unloaded_session_ids().unwrap(), vec![id]);
+        let frame = app.db.load_session_frame(id).unwrap().expect("frame saved");
+        let text = String::from_utf8_lossy(&frame.bytes).to_string();
+        assert!(text.contains("important last words"), "got: {text}");
+        // The ghost pane replays the captured frame.
+        let ghost_text = app.sessions[0]
+            .parser
+            .lock()
+            .map(|p| p.screen().contents())
+            .unwrap();
+        assert!(ghost_text.contains("important last words"));
+        // Unloading a ghost is a no-op with a hint, not a crash.
+        app.unload_active_session();
+        assert!(app.sessions[0].is_ghost());
+    }
+
+    /// The crash-safety debounce: a session with new output gets its visible
+    /// screen persisted, a session with none is skipped (the dirty check is
+    /// what keeps this cheap at every interval), and a placeholder is never
+    /// written — its frozen frame would be overwritten by the empty pane.
+    #[tokio::test]
+    async fn persist_dirty_frames_writes_only_changed_live_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_sessions(1);
+        let id = persist_session(&app, 0);
+        // The debounce compares millisecond wall-clock stamps, and the output
+        // test seam bumps strictly *past* "now" — so let the clock move on
+        // around each feed (the real ~60 s interval is never this tight):
+        // after, so a save counts the output as captured; before, so the next
+        // output out-stamps the previous save.
+        let settle = || std::thread::sleep(std::time::Duration::from_millis(5));
+
+        app.sessions[0].feed_output_for_test(b"first words\r\n");
+        settle();
+        app.persist_dirty_frames();
+
+        let saved = app.db.load_session_frame(id).unwrap().expect("frame saved");
+        assert!(
+            String::from_utf8_lossy(&saved.bytes).contains("first words"),
+            "got: {:?}",
+            String::from_utf8_lossy(&saved.bytes)
+        );
+        assert!(saved.saved_at > 0);
+        assert!(app.frame_saved_at.get(&id).copied().unwrap_or(0) > 0);
+
+        // Overwrite the stored frame with a sentinel: a second pass with no new
+        // output must leave it alone.
+        app.db.save_session_frame(id, 1, 1, b"SENTINEL").unwrap();
+        app.persist_dirty_frames();
+        let kept = app.db.load_session_frame(id).unwrap().expect("frame kept");
+        assert_eq!(
+            kept.bytes, b"SENTINEL",
+            "clean session must not be rewritten"
+        );
+
+        // New output → the frame is refreshed.
+        settle();
+        app.sessions[0].feed_output_for_test(b"later words\r\n");
+        settle();
+        app.persist_dirty_frames();
+        let updated = app
+            .db
+            .load_session_frame(id)
+            .unwrap()
+            .expect("frame updated");
+        assert!(
+            String::from_utf8_lossy(&updated.bytes).contains("later words"),
+            "got: {:?}",
+            String::from_utf8_lossy(&updated.bytes)
+        );
+
+        // A ghost keeps the frame it was unloaded with, even if bytes arrive
+        // for it: the debounce skips placeholders entirely.
+        app.unload_active_session();
+        assert!(app.sessions[0].is_ghost());
+        app.db.save_session_frame(id, 1, 1, b"SENTINEL").unwrap();
+        app.sessions[0].feed_output_for_test(b"ghost noise\r\n");
+        app.persist_dirty_frames();
+        let ghost_frame = app.db.load_session_frame(id).unwrap().expect("frame kept");
+        assert_eq!(ghost_frame.bytes, b"SENTINEL");
+    }
+
+    /// Loaded-only cycling skips ghosts in both directions and jumps from a
+    /// ghost to the nearest loaded session.
+    #[tokio::test]
+    async fn switch_loaded_session_skips_ghosts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_sessions(3);
+        app.active_index = 1;
+        app.unload_active_session();
+        assert!(app.sessions[1].is_ghost());
+
+        // From the ghost, keep going in the requested direction: forward is the
+        // next loaded row after it, not the first one in the list.
+        app.switch_loaded_session(true);
+        assert_eq!(app.active_index, 2);
+        // Forward from 2 wraps to 0, then skips the ghost at 1 back to 2.
+        app.switch_loaded_session(true);
+        assert_eq!(app.active_index, 0);
+        app.switch_loaded_session(true);
+        assert_eq!(app.active_index, 2);
+        // Backward wraps and skips the ghost too.
+        app.switch_loaded_session(false);
+        assert_eq!(app.active_index, 0);
+        // Backward from the ghost goes to the loaded row *before* it.
+        app.active_index = 1;
+        app.switch_loaded_session(false);
+        assert_eq!(app.active_index, 0);
+    }
+
+    /// `serialize_visible_frame` → fresh parser reproduces the visible screen
+    /// exactly (styled text, wide chars, blank-row trim) — the contract the
+    /// ghost pane depends on.
+    #[test]
+    fn visible_frame_serialization_round_trips() {
+        let backend = stub_backend_arc();
+        let provider = stub_provider();
+        let session = Session::stub("frame", &backend, &provider);
+        session.feed_output_for_test(
+            b"plain then \x1b[1;31mbold red\x1b[0m\r\n\xe6\x97\xa5\xe6\x9c\xac lines\r\n> _",
+        );
+
+        let (rows, cols, bytes) = session.serialize_visible_frame().unwrap();
+        let mut reparsed = vt100::Parser::new(rows, cols, 0);
+        reparsed.process(&bytes);
+
+        let original = session
+            .parser
+            .lock()
+            .map(|p| p.screen().contents())
+            .unwrap();
+        assert_eq!(reparsed.screen().contents(), original);
+        assert!(original.contains("bold red") && original.contains("日本 lines"));
+
+        // A frame is terminal bytes, not a bitmap: replaying the same capture
+        // into a smaller pane (a ghost restored at a different terminal/font
+        // size) still renders the content. Reflow of lines that were *soft*
+        // wrapped at capture size is out of scope — each captured row is its
+        // own line, so a narrower pane hard-wraps rather than re-flows.
+        let mut resized = vt100::Parser::new(12, 40, 0);
+        resized.process(&bytes);
+        let smaller = resized.screen().contents();
+        assert!(
+            smaller.contains("bold red") && smaller.contains("日本 lines"),
+            "got: {smaller}"
+        );
     }
 
     // --- Background remote restore tests ---

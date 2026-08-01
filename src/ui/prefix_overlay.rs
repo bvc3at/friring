@@ -56,6 +56,8 @@ fn action_label(action: Action) -> &'static str {
     match action {
         NextSession => "next session",
         PreviousSession => "prev session",
+        NextLoadedSession => "next loaded",
+        PreviousLoadedSession => "prev loaded",
         FocusBackward => "focus prev panel",
         FocusForward => "focus next panel",
         LastSession => "last session",
@@ -64,6 +66,7 @@ fn action_label(action: Action) -> &'static str {
         NewSession => "new session",
         DeleteSession => "delete session",
         RestartSession => "restart session",
+        UnloadSession => "unload (ghost)",
         ForkSession => "fork session",
         UndoDelete => "undo delete",
         OpenRestoreSessions => "restore deleted",

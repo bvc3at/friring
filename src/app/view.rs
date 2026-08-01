@@ -5,7 +5,7 @@
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::Style,
     text::{Line, Span},
     widgets::Paragraph,
@@ -851,6 +851,16 @@ impl App {
                 None
             }
         };
+        // Ghost treatment: grey the frozen frame (content only — the border
+        // keeps its focus color and the `[Unloaded]` title, so selection stays
+        // visible). Style-only, after the normal render.
+        if self.active_session_is_ghost() {
+            let inner = terminal.inner(Margin {
+                vertical: 1,
+                horizontal: 1,
+            });
+            crate::ui::grey_out_buffer_area(frame.buffer_mut(), inner);
+        }
         if locked_parser {
             // One parser lock per terminal render (the O(1) scrollback read
             // rides along). Redraw throttling, not caching, bounds the rate.

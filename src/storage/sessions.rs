@@ -22,6 +22,22 @@ pub struct HookRow {
     pub seen_at: Option<i64>,
 }
 
+/// A session's saved terminal frame (schema v45): SGR-styled lines joined with
+/// `\r\n` — the same byte shape as the tmux adopt seed, so it feeds a vt100
+/// parser of *any* size and reflows. Always the pane's visible screen —
+/// captured through the backend at unload / shutdown, serialized in-memory on
+/// the crash-safety debounce; rendered greyed by ghost sessions.
+#[derive(Debug, Clone)]
+pub struct SessionFrame {
+    pub bytes: Vec<u8>,
+    /// Pane size at capture time. Informational — the ghost re-parses the
+    /// line-shaped bytes at the *current* pane size.
+    pub rows: u16,
+    pub cols: u16,
+    /// Epoch ms of the capture (staleness display / debounce bookkeeping).
+    pub saved_at: i64,
+}
+
 /// Information about a soft-deleted session, including its worktrees.
 #[derive(Debug, Clone)]
 pub struct DeletedSessionInfo {
@@ -188,6 +204,73 @@ impl Database {
         )?;
 
         Ok(())
+    }
+
+    /// Save a session's ghost frame (schema v45). Deliberately outside
+    /// [`upsert_session`](Self::upsert_session) — like the hook columns — so
+    /// the TUI's full-row write-back and frame writes can't clobber each
+    /// other. No audit entry: this fires on a debounce for every live session.
+    pub fn save_session_frame(
+        &self,
+        id: SessionId,
+        rows: u16,
+        cols: u16,
+        bytes: &[u8],
+    ) -> rusqlite::Result<()> {
+        let now = current_time_millis() as i64;
+        self.conn.execute(
+            "UPDATE sessions SET last_frame = ?1, frame_rows = ?2, frame_cols = ?3, \
+             frame_saved_at = ?4 WHERE id = ?5",
+            params![bytes, rows, cols, now, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Load a session's saved ghost frame, if one was ever captured.
+    pub fn load_session_frame(&self, id: SessionId) -> rusqlite::Result<Option<SessionFrame>> {
+        self.conn
+            .query_row(
+                "SELECT last_frame, frame_rows, frame_cols, frame_saved_at \
+                 FROM sessions WHERE id = ?1 AND last_frame IS NOT NULL",
+                params![id.to_string()],
+                |row| {
+                    Ok(SessionFrame {
+                        bytes: row.get(0)?,
+                        rows: row.get::<_, i64>(1).unwrap_or(0) as u16,
+                        cols: row.get::<_, i64>(2).unwrap_or(0) as u16,
+                        saved_at: row.get::<_, i64>(3).unwrap_or(0),
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Mark / unmark a session as unloaded (agent process deliberately killed).
+    /// An unloaded row restores as a ghost even with lazy restore off; loading
+    /// it (or adopting a live pane for it) clears the flag.
+    pub fn set_session_unloaded(&self, id: SessionId, unloaded: bool) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET unloaded = ?1 WHERE id = ?2",
+            params![unloaded as i64, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Ids of active sessions currently flagged unloaded. A separate lookup
+    /// rather than a [`SharedSession`] field: the flag (like the frame blob)
+    /// lives outside the full-row upsert, and only the restore path reads it.
+    pub fn unloaded_session_ids(&self) -> rusqlite::Result<Vec<SessionId>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM sessions WHERE unloaded = 1 AND deleted_at IS NULL")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            if let Ok(id) = row?.parse() {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
     }
 
     /// List all active (non-deleted) sessions.
@@ -624,6 +707,52 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "Session 1");
         assert_eq!(sessions[0].agent, "claude");
+    }
+
+    #[test]
+    fn ghost_frame_roundtrips_and_survives_upsert() {
+        let db = Database::open_in_memory().unwrap();
+        let mut session = make_session("Session 1");
+        db.upsert_session(&session).unwrap();
+
+        assert!(db.load_session_frame(session.id).unwrap().is_none());
+
+        let bytes = b"line one\x1b[31m red\x1b[0m\r\nline two".to_vec();
+        db.save_session_frame(session.id, 40, 120, &bytes).unwrap();
+        let frame = db.load_session_frame(session.id).unwrap().unwrap();
+        assert_eq!(frame.bytes, bytes);
+        assert_eq!((frame.rows, frame.cols), (40, 120));
+        assert!(frame.saved_at > 0);
+
+        // The full-row upsert (schema v45 contract) must not clobber the frame.
+        session.name = "renamed".to_string();
+        db.upsert_session(&session).unwrap();
+        assert_eq!(
+            db.load_session_frame(session.id).unwrap().unwrap().bytes,
+            bytes
+        );
+    }
+
+    #[test]
+    fn unloaded_flag_roundtrips_and_skips_deleted_rows() {
+        let db = Database::open_in_memory().unwrap();
+        let a = make_session("a");
+        let b = make_session("b");
+        db.upsert_session(&a).unwrap();
+        db.upsert_session(&b).unwrap();
+
+        assert!(db.unloaded_session_ids().unwrap().is_empty());
+        db.set_session_unloaded(a.id, true).unwrap();
+        db.set_session_unloaded(b.id, true).unwrap();
+        let mut ids = db.unloaded_session_ids().unwrap();
+        ids.sort_by_key(|id| id.to_string());
+        let mut want = vec![a.id, b.id];
+        want.sort_by_key(|id| id.to_string());
+        assert_eq!(ids, want);
+
+        db.set_session_unloaded(a.id, false).unwrap();
+        db.soft_delete_session(b.id).unwrap();
+        assert!(db.unloaded_session_ids().unwrap().is_empty());
     }
 
     #[test]

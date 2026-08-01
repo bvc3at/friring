@@ -1115,10 +1115,20 @@ impl TmuxBackend {
     /// so they re-wrap at the adopting panel's width, `-S -<n>` extends the
     /// capture into history (tmux clamps to what exists).
     fn capture_history_seed(&self, pane_id: &str) -> Result<Vec<u8>> {
-        let lines = crate::session::settings::global()
-            .scrollback_lines
-            .min(MAX_CAPTURE_LINES as usize);
-        let start = format!("-{lines}");
+        self.capture_seed_with_lines(pane_id, crate::session::settings::global().scrollback_lines)
+    }
+
+    /// [`capture_history_seed`](Self::capture_history_seed) at an explicit
+    /// scrollback depth (the ghost-frame capture path).
+    fn capture_seed_with_lines(&self, pane_id: &str, lines: usize) -> Result<Vec<u8>> {
+        let lines = lines.min(MAX_CAPTURE_LINES as usize);
+        // `-<n>` counts back into the history; a plain `0` is the first visible
+        // row. (`-0` parses the same, but reads like a history offset.)
+        let start = if lines == 0 {
+            "0".to_string()
+        } else {
+            format!("-{lines}")
+        };
         let output = self.run_tmux(&[
             "capture-pane",
             "-e",
@@ -1323,6 +1333,16 @@ impl SessionBackend for TmuxBackend {
         self.capture_history_seed(backend_id)
     }
 
+    fn capture_visible(&self, backend_id: &str) -> Result<Vec<u8>> {
+        if !control_mode::is_valid_pane_id(backend_id) {
+            bail!("refusing to capture invalid pane id: {backend_id:?}");
+        }
+        // `-S 0` starts at the first visible row: no scrollback, which is all a
+        // ghost frame wants (see `SessionBackend::capture_visible`). `-J` still
+        // joins soft-wrapped rows into logical lines.
+        self.capture_seed_with_lines(backend_id, 0)
+    }
+
     fn discover(&self) -> Result<Vec<DiscoveredSession>> {
         if !self.session_exists() {
             return Ok(Vec::new());
@@ -1404,8 +1424,14 @@ impl SessionBackend for TmuxBackend {
     }
 
     fn kill(&self, backend_id: &str) -> Result<()> {
-        let _ = self.unregister_pane(backend_id);
+        // Kill first, unregister second. The reverse order drops the pane's
+        // output sender (the reader sees EOF) *before* the fallible command,
+        // so a failed `kill-pane` left a live agent behind a session friring
+        // had already half-torn-down — and the unload path, which aborts on a
+        // kill error to avoid claiming a still-running process was freed, has
+        // nothing to abort back to unless the pane is untouched on failure.
         self.ctrl_command(&format!("kill-pane -t {backend_id}"))?;
+        let _ = self.unregister_pane(backend_id);
         Ok(())
     }
 

@@ -26,6 +26,13 @@ pub struct Settings {
     /// Scrollback lines kept per session terminal (vt100 parser history).
     #[serde(default = "default_scrollback_lines")]
     pub scrollback_lines: usize,
+    /// Lazy session restore: at startup, sessions whose agent process is gone
+    /// (e.g. after a reboot) become greyed **ghosts** showing their last saved
+    /// frame instead of respawning; loading one (Enter / restart) is explicit.
+    /// Sessions with a live tmux pane always adopt — adoption spawns nothing.
+    /// Off = the pre-ghost behavior: every restorable session respawns at boot.
+    #[serde(default = "default_true")]
+    pub lazy_session_restore: bool,
     /// Terminal width (columns) below which only the terminal pane renders.
     #[serde(default = "default_two_panel_min_cols")]
     pub two_panel_min_cols: u16,
@@ -493,6 +500,7 @@ impl Settings {
     /// panel and the live-reload toast.
     pub fn restart_only_differs(&self, other: &Settings) -> bool {
         self.scrollback_lines != other.scrollback_lines
+            || self.lazy_session_restore != other.lazy_session_restore
             || self.two_panel_min_cols != other.two_panel_min_cols
             || self.three_panel_min_cols != other.three_panel_min_cols
             || self.audit_retention_days != other.audit_retention_days
@@ -510,6 +518,7 @@ impl Default for Settings {
         Self {
             config_version: None,
             scrollback_lines: default_scrollback_lines(),
+            lazy_session_restore: true,
             two_panel_min_cols: default_two_panel_min_cols(),
             three_panel_min_cols: default_three_panel_min_cols(),
             audit_retention_days: default_audit_retention_days(),
@@ -545,6 +554,7 @@ mod tests {
         let s: Settings = toml::from_str("").unwrap();
         assert_eq!(s, Settings::default());
         assert_eq!(s.scrollback_lines, 1000);
+        assert!(s.lazy_session_restore);
         assert_eq!(s.two_panel_min_cols, 80);
         assert_eq!(s.three_panel_min_cols, 120);
         assert_eq!(s.audit_retention_days, 90);

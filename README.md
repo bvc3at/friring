@@ -269,7 +269,16 @@ survives crashes, restarts, and reboots. Pick the agent and repo(s) at
 by hand (`Shift+J`/`Shift+K`), sort (`Shift+S`), restart with resume
 (`Ctrl+R`), or soft-delete with undo.
 
-[Getting started →](#getting-started)
+A session whose pane is gone — after a reboot, all of them — comes back as a
+greyed **ghost**: its last saved frame, no agent process, no memory cost.
+`Enter` (or `Ctrl+R`) loads one in place, resuming the conversation where the
+agent supports it, and `Alt+U` unloads a live session back to a ghost to
+reclaim the agent's memory while keeping the frozen preview. Set
+`lazy_session_restore = false` to respawn everything at startup as before.
+
+[Getting started →](#getting-started) ·
+[Lazy sessions & ghosts →](docs/FEATURES.md#lazy-sessions--ghosts) ·
+[Settings →](docs/CONFIG.md#settingstoml)
 
 </td>
 <td width="50%">
@@ -699,7 +708,9 @@ overlay listing every command reachable from it; the next key runs one.
 `<leader> 1`–`9` jumps to that session in the list's rendered order,
 `<leader> a` then a digit reaches the Nth *blocked* session, and
 `<leader> <leader>` sends the leader's own bytes to the focused agent.
-`Esc` or `Ctrl+C` cancels a pending leader without running anything.
+`<leader> U` unloads the active session to a ghost, and `<leader> c` /
+`<leader> C` cycle among **loaded** sessions only. `Esc` or `Ctrl+C`
+cancels a pending leader without running anything.
 
 `[prefix] mode` in `settings.toml` chooses how much of dispatch it owns:
 `off` (no leader at all — `F12` goes back to the perf HUD), `both`
@@ -730,11 +741,13 @@ overlay delay are configurable — see [docs/CONFIG.md](docs/CONFIG.md)
 | `F10` | Jump to next blocked session (wraps, focuses terminal) | Attention |
 | `Ctrl+6` / `Ctrl+^` | Toggle between the two most recent sessions | vim alternate buffer |
 | `Alt+A` | Number blocked sessions; a digit jumps to that one | Attention |
+| `Alt+U` | Unload active session to a greyed ghost (frees the agent process, keeps the frozen preview) | **U**nload |
+| `Alt+N` / `Alt+P` | Select next/previous **loaded** session (skips ghosts and unreachable placeholders) | **N**ext / **P**revious |
 | `Shift+J` / `Shift+K` | Move selected session down/up (manual order) | reorder |
 | `Shift+S` | Sort sessions alphabetically within each repo group | **S**ort |
 | `Ctrl+D` | Delete session | Vim: **d** = delete |
 | `Ctrl+O` | Open active session's working dirs in editor | **O**pen |
-| `Ctrl+R` | Restart active session | **R**estart |
+| `Ctrl+R` | Restart active session (on a ghost: loads it) | **R**estart |
 | `Ctrl+Alt+R` | Reload friring in place — quit + re-exec the on-disk binary, re-adopting sessions (plain quit on Windows) | **R**estart, one modifier up |
 | `Ctrl+F` | Fork active session | **F**ork |
 | `Ctrl+S` | Sync worktrees with their base branch | **S**ync |

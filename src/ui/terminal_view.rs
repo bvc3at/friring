@@ -113,14 +113,27 @@ pub fn render_terminal(
         scroll_offset,
         usize::from(area.width.saturating_sub(tabs_width).saturating_sub(2)),
     );
-    let block = focus_block("", level)
+    let mut block = focus_block("", level)
         .title_top(Line::from(Span::styled(title, super::title_style(level))).right_aligned());
+    // A ghost's load gesture lives on the pane itself: the greyed frame is the
+    // whole message, the bottom border carries the one action that applies.
+    if info.status == crate::session::SessionStatus::Unloaded && !is_shell {
+        block = block.title_bottom(
+            Line::from(Span::styled(
+                " unloaded — Enter loads ",
+                Style::default().fg(Theme::text_muted()),
+            ))
+            .right_aligned(),
+        );
+    }
 
     let mut pseudo_term = PseudoTerminal::new(parser.screen())
         .block(block)
         .style(Style::default().fg(Theme::text_primary()).bg(Color::Reset));
 
-    if scroll_offset > 0 {
+    if scroll_offset > 0 || info.status == crate::session::SessionStatus::Unloaded {
+        // Hide the cursor while scrolled — and on a ghost, whose frozen
+        // cursor cell would otherwise render as a live-looking block.
         let mut cursor = Cursor::default();
         cursor.hide();
         pseudo_term = pseudo_term.cursor(cursor);
