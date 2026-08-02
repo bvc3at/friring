@@ -31,7 +31,8 @@ divergent on purpose:
   and "In-pane OSC 52 copies reach the user's clipboard" below.
 - **`03828a0` footer + status bar on narrow terminals** — the fork's own fix
   (see "The footer's text no longer runs under its buttons") solves the same
-  overlap differently.
+  overlap differently. Four ideas from it were ported into that fix rather than
+  the commit; see "The footer degrades at narrow widths instead of blanking".
 - **`86ab3dc` / `4e19147` / `b951991` F9 session-list collapse** — `F9` is the
   fork's activity view.
 - **`1dd5edb` / `2c07e3a` demo regeneration** and upstream's website work — the
@@ -1051,11 +1052,12 @@ already cover the case it was meant to serve.
   painted into **disjoint** rects (`ui::status_bar::render_footer`), degrading in
   order: the pills' ` · ` separators first (` Help · F1 ` → ` Help F1 `), then
   the left-hand text segment by segment (the global `^H/^L Focus ^O Open` hints,
-  then the counts, then the file viewer's hints, then the focus label, and last
-  the `◆ N blocked` badge), then the optional panel-toggle pills as a set, and
-  finally the pill labels themselves, leaving key-only chips (` F1 `) so the
-  freed columns go back to the text. The armed-leader badge is pinned: the pills
-  make room for it instead. The file viewer's navigation hints, previously
+  then the counts, then the file viewer's hints, and last the `◆ N blocked`
+  badge), then the optional panel-toggle pills as a set, then the pills'
+  shortcuts (` Theme `), and finally their labels, leaving key-only chips
+  (` F1 `) so the freed columns go back to the text. The armed-leader badge and
+  the focus label are never dropped: the pills make room for them instead (see
+  the next entry). The file viewer's navigation hints, previously
   right-aligned into whatever room was left of the buttons — where they
   overlapped the left-hand text rather than the pills — are segments in the same
   flow now, trimming from their tail (`n/N Next/Prev` goes long before
@@ -1063,6 +1065,26 @@ already cover the case it was meant to serve.
   viewer is open they are the live guidance for the pane being driven and
   nothing else on screen carries them, where the session count is also in the
   sidebar.
+
+- **The footer degrades at narrow widths instead of blanking.** The ladder above
+  only trimmed the pills *after* the left-hand text had been shed entirely, so
+  in two bands — 44–50 and 76–82 columns, **80** among them — a full set of
+  chips sat above an empty left half: no focus label, no session count, nothing
+  saying which pane the keys applied to. Four things upstream's `03828a0` does
+  better were taken into the fork's own layout rather than adopting the commit:
+  the pills now hold back the columns the armed-leader badge and the focus label
+  need (`reserved_left_width`, capped at half the row so a long label can't
+  starve the chips); a label-only rung sits between the tight and key-only forms
+  so a squeezed chip reads ` Theme ` rather than ` F4 `; `Quit` outlives `Help`
+  as the last chip standing, because at those widths it is the only one whose
+  action still works (the overlay `Help` opens needs room to render); and both
+  the footer's left cluster and the status row end in `…` rather than being cut
+  mid-word by ratatui. The result is that no width from 20 to 200 columns leaves
+  the left half of the footer empty, guarded by a width-parameterised test.
+  Upstream's version was not adopted for the failure modes it keeps: a blank
+  footer at 1–5 columns, a left cluster collapsed to a lone `…` at 92, and
+  span-by-span trimming that renders key chords without their descriptions
+  (`^H/^L` → `^H/` → `^H`).
 
 ### Performance
 
