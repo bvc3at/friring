@@ -64,16 +64,10 @@
     });
   });
 
-  // ---- Smooth scroll for anchor links ----
-  document.querySelectorAll('a[href^="#"]').forEach(function (link) {
-    link.addEventListener('click', function (e) {
-      var target = document.querySelector(link.getAttribute('href'));
-      if (target) {
-        e.preventDefault();
-        target.scrollIntoView({ behavior: 'smooth' });
-      }
-    });
-  });
+  // Anchor smooth-scrolling is handled natively by `html { scroll-behavior:
+  // smooth }` in base.css, which also honors prefers-reduced-motion and keeps
+  // location.hash (and therefore the back button and deep links) intact — so
+  // there is deliberately no JS click handler for a[href^="#"] here.
 
   // ---- Active sidebar link (docs pages) ----
   // Matches both in-page anchors (#id) and same-page section links

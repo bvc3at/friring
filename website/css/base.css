@@ -11,6 +11,14 @@ html {
   scroll-padding-top: calc(var(--nav-height) + var(--space-lg));
 }
 
+/* Native anchor scrolling is the only scroll path (there is no JS handler),
+   so the reduced-motion opt-out has to live here. */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
 body {
   font-family: var(--font-body);
   font-size: 16px;
