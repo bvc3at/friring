@@ -1189,6 +1189,16 @@ already cover the case it was meant to serve.
     breakable inline code, shrinkable `.step-content`, scrollable tables) and
     does not carry the rule. Putting it on `html` would work, but it would
     silently clip any future overflow out of reach rather than surfacing it.
+  - **The shared stylesheets ship as one generated bundle.** Upstream links
+    `variables`, `base`, `layout` and `components` separately, so the chrome
+    every page needs costs four render-blocking requests. The fork keeps the
+    four authored apart under `website/css/` and concatenates them — in that
+    order, so the cascade is unchanged — into `_site/css/core.css` at build
+    time (`eleventy.config.js`). The page-specific sheets (`landing`, `docs`,
+    `ui-review`) are deliberately left unbundled, since bundling them would
+    ship landing CSS to docs pages and vice versa. `core.css` is generated
+    output: it is never edited, never passthrough-copied, and only the four
+    sources are.
 - `README.md` and the agent-guide prose call the project **Friring**, and so do
   the install commands; what still points at upstream is attribution and the
   shared formats above.
