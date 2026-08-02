@@ -56,13 +56,27 @@ requires_dir = "~/.config/opencode"
 # requires_dir so it's a no-op when codex isn't installed. Events: SessionStart
 # → idle, UserPromptSubmit/PreToolUse → working, Stop → done. No `blocked` —
 # codex's top-level hooks have no permission/approval event (that lives only in
-# the legacy `notify`).
+# the legacy `notify`). Replaces the old `-c notify=…` patch (avoiding a
+# double-`done` signal); the trade is a reversible write into a separate
+# ~/.codex/hooks.json — never the user's config.toml.
 #
-# EXPERIMENTAL: codex's hooks.json is newer than its `notify`; the event names
-# here are assumed identical to claude's. If they differ on the live `codex`,
-# edit codex-hooks.json (no code change). Replaces the old `-c notify=…` patch
-# (avoiding a double-`done` signal); the trade is a reversible write into a
-# separate ~/.codex/hooks.json — never the user's config.toml.
+# The event names are verified against codex-cli 0.145.0, as are two contract
+# details the payload depends on (the first is asserted by the codex-text-turn
+# e2e scenario):
+#
+#   1. Hook stdout MUST be empty or a JSON object codex's per-event schema
+#      accepts — anything else fails the hook with "hook returned invalid
+#      <event> JSON output" and reports nothing. `friring-cli` renders JSON
+#      whenever stdout is not a TTY (cli::output::Format::resolve), which a
+#      hook's piped stdout always is, so every command here redirects stdout
+#      (and stderr, which codex surfaces too) to /dev/null.
+#   2. codex gates hooks behind a per-entry trust prompt keyed on the command
+#      string: on first launch after an install (or after this payload changes)
+#      it parks on "Hooks need review" and the hooks stay inert until the user
+#      accepts. Nothing friring can pre-seed — the hash lives in the user's
+#      codex config.toml.
+#
+# If a future codex changes the schema, edit codex-hooks.json (no code change).
 [[config_merges]]
 path = "~/.codex/hooks.json"
 source = "codex-hooks.json"

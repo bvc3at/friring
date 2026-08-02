@@ -915,6 +915,34 @@ already cover the case it was meant to serve.
 
 ### Behavior fixes
 
+- **codex status hooks actually report.** Upstream ships the codex
+  `hooks.json` payload with bare `friring-cli session signal --state <s> ||
+  true` commands, which codex rejects on *every* event: it parses each hook's
+  stdout and accepts only empty output or JSON matching its own per-event
+  schema, while `friring-cli` renders **JSON** whenever stdout isn't a TTY
+  (`cli::output::Format::resolve`) — which a hook's piped stdout always is. So
+  a codex session painted `error: hook returned invalid <event> JSON output`
+  on each turn instead of reporting. The fork's payload discards hook output
+  (`>/dev/null 2>&1`), which is asserted two ways: a unit test over the
+  embedded payload (`session_ops::builtin_hooks`) and the `codex-text-turn`
+  e2e scenario, which now drives codex's real hooks (the profile points
+  `CODEX_HOME` at the `~/.codex` friring writes and launches with
+  `--dangerously-bypass-hook-trust`) and fails on any hook cell in the pane.
+  Verified against codex-cli 0.145.0. Note the *second* gate, which is the
+  user's to clear and not a bug: codex parks on "Hooks need review" the first
+  time it sees a new hook command and won't run it until accepted.
+
+- **A `[[config_merges]]` upgrade replaces friring's entries instead of
+  stacking them.** Upstream's `install_config_merge` only ever merges, and the
+  merge unions arrays by deep equality — so an entry whose command changed
+  between payload versions isn't equal to its replacement and survives beside
+  it, still firing. (Upstream already knew the shape of this: its uninstall
+  prunes the pre-rename `thurbox-cli` marker "or reinstall would duplicate
+  ours".) The fork prunes both markers before merging, the same call the
+  uninstall revert makes, so the merge is self-healing across payload changes
+  and still a no-op write when nothing moved. Without it the codex hook fix
+  above could never reach an existing install.
+
 - **A forced send is refused at a dead pane too.** Adopting upstream's
   dead-pane guard (`c89eecd`) meant choosing where it sits. Upstream had one
   entry point; the fork has two — the modal-guarded `send_prompt_now_on` and

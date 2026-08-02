@@ -707,8 +707,11 @@ The home dir is `~/.config/friring/hooks` on a release build and
 `--settings` file, your own hooks still fire inside a friring session — both run.
 Hand-edits to a managed file are rewritten from the embedded payload on the next
 TUI start / heartbeat tick; to customize, deactivate the extension and wire the
-hook yourself, or edit the payload under `extensions/hooks/` and reinstall. Full
-per-agent detail: `extensions/hooks/README.md`.
+hook yourself, or edit the payload under `extensions/hooks/` and reinstall. A
+merged file (the codex/antigravity rows) is re-merged the same way: friring's own
+entries are pruned first, so an upgrade whose hook commands changed replaces them
+instead of leaving both versions firing. Full per-agent detail:
+`extensions/hooks/README.md`.
 
 ## themes.toml
 

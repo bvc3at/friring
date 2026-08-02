@@ -346,10 +346,23 @@ only a "Model metadata not found" warning, and render in both the header box and
 prompt glyph `›` is the ready marker (the composer's placeholder text rotates — never match it).
 Gotchas: the TUI **rewrites `config.toml` on startup**, so seed it fresh per run and never assume
 it stays byte-identical; `codex exec` appends piped stdin to the prompt, hence the harness's
-`< /dev/null`. Zero non-stub calls under dead proxies. Also proven (0.145.0): `codex resume
+`< /dev/null`; and the release banner is interactive, so the profile seeds
+`check_for_update_on_startup = false` (a stray Enter on it launches a real package-manager
+upgrade). Zero non-stub calls under dead proxies. Also proven (0.145.0): `codex resume
 --last` in the session cwd re-renders the prior conversation **locally with zero model calls**
 (the ghost-unload scenario's journal assert), which is what friring's restart and ghost-load
 paths ride.
+
+Status hooks are covered on codex too (0.145.0), which needs three things no other profile does.
+`CODEX_HOME` points at the sandbox HOME's **`.codex`** — the literal path the hooks extension
+merges into (`requires_dir = "~/.codex"`), so friring and codex share one file instead of friring
+writing hooks the binary never reads; the dir is created by `agent_seed_config`, which runs before
+the harness activates the extension (a missing dir silently skips the merge). Every launch carries
+**`--dangerously-bypass-hook-trust`**: codex won't run a hook until its command string is accepted
+at an interactive "Hooks need review" prompt, and the hash it persists isn't something the harness
+can pre-seed. And `codex-text-turn` asserts `idle → working → done` **plus** the absence of any
+hook cell in the pane — codex parses hook stdout strictly and rejects anything but empty or valid
+JSON, and since a rejected hook still *ran* its command, the DB state alone cannot catch it.
 
 **opencode 1.17.15** — the `@ai-sdk/openai-compatible` runtime is bundled in the binary (nothing is
 fetched from npm) and a cold cache works offline, so no warm-up step is needed; the models.dev

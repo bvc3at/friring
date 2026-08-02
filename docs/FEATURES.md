@@ -2045,7 +2045,8 @@ machinery, per agent: an `[[agent_patches]]` adds
 `--settings {home}/claude.json` to `claude` (claude merges it, never
 clobbering user settings); aider gets `--notifications-command` (blocked-only);
 a `[[config_merges]]` deep-merges codex's claude-shaped hooks into
-`~/.codex/hooks.json` (idle/working/done, *experimental*); an
+`~/.codex/hooks.json` (idle/working/done, verified against codex-cli 0.145.0 —
+codex parses hook stdout strictly, so those commands discard theirs); an
 `[[external_files]]` drops an opencode plugin into `~/.config/opencode/plugin/`
 and a managed `~/.vibe/hooks.toml` for Mistral `vibe` (refused if a user file
 exists) and a `~/.copilot/hooks/friring-status.json` for GitHub Copilot (both

@@ -46,17 +46,26 @@ passed by hand) and is suffixed `|| true` so it can never break the agent.
 - **opencode** — a plugin dropped into `~/.config/opencode/plugin/` (only when
   opencode is installed). Events: `session.created` → idle, `chat.message` →
   working, `permission.asked` → blocked, `session.idle` → done.
-- **codex** *(experimental)* — codex's `hooks.json` is claude-shaped, loaded
-  from `~/.codex/hooks.json`. We **JSON-merge** our entries in (a
-  `[[config_merges]]`, guarded by `requires_dir`) so your own hooks are
-  preserved; uninstall prunes exactly ours back out. Events: `SessionStart` →
-  idle, `UserPromptSubmit`/`PreToolUse` → working, `Stop` → done. **No blocked**
-  — codex's top-level hooks have no permission/approval event (that lives only in
-  the legacy `notify`). This replaced the old `-c notify=…` override (which only
-  reported done); the trade is a reversible write into a separate
-  `~/.codex/hooks.json`, never your `config.toml`. **Caveat:** codex's hooks.json
-  is newer than its `notify`; the event names are assumed identical to claude's —
-  if they differ, edit `codex-hooks.json` (no code change).
+- **codex** — codex's `hooks.json` is claude-shaped, loaded from
+  `~/.codex/hooks.json` (or `$CODEX_HOME/hooks.json`, if you set that). We
+  **JSON-merge** our entries in (a `[[config_merges]]`, guarded by
+  `requires_dir`) so your own hooks are preserved; uninstall prunes exactly ours
+  back out. Events: `SessionStart` → idle, `UserPromptSubmit`/`PreToolUse` →
+  working, `Stop` → done. **No blocked** — codex's top-level hooks have no
+  permission/approval event (that lives only in the legacy `notify`). This
+  replaced the old `-c notify=…` override (which only reported done); the trade
+  is a reversible write into a separate `~/.codex/hooks.json`, never your
+  `config.toml`. Two codex specifics (verified against codex-cli 0.145.0):
+  - codex **parses every hook's stdout** and fails the hook on anything that
+    isn't empty or JSON it accepts, so our commands discard their output
+    (`>/dev/null 2>&1`). Without that, codex reports
+    `hook returned invalid <event> JSON output` on every turn.
+  - codex **gates hooks behind a trust prompt** keyed on the command string:
+    the first codex launch after the extension is installed — or after the
+    payload changes — parks on *"Hooks need review"*, and the hooks stay inert
+    until you accept them. That approval is yours to give; friring can't
+    pre-seed it. (`codex --dangerously-bypass-hook-trust` skips the gate for
+    automation, which is how the e2e suite runs.)
 - **vibe** *(experimental)* — Mistral Vibe loads hooks from `~/.vibe/hooks.toml`.
   It's TOML, so we can't JSON-merge it — we drop a managed file in (an
   `[[external_files]]`, guarded by `requires_dir`, only when vibe is installed).

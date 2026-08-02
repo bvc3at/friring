@@ -423,7 +423,9 @@ fn write_json_if_changed(path: &Path, value: &serde_json::Value) -> Result<bool,
 /// Deep-merge an extension's shipped JSON into an agent's *own* config file
 /// (`~/.gemini/settings.json`, …) in place — reversibly and without clobbering
 /// the user's other settings. Skips when `requires_dir` is absent (the agent
-/// isn't installed) or when the merge is already present (no-op write).
+/// isn't installed) or when the merge is already present (no-op write). Entries
+/// from a *previous* payload version are pruned first, so an upgrade replaces
+/// our hooks rather than stacking a second copy beside them.
 fn install_config_merge(
     source: &crate::agent::extension_config::ExtensionSource,
     m: &crate::session::ConfigMerge,
@@ -451,6 +453,14 @@ fn install_config_merge(
             return Ok(());
         }
     };
+    // Drop our own previously-merged entries before re-merging, so a payload
+    // whose commands changed between versions *replaces* them instead of
+    // accumulating: `merge` unions arrays by deep equality, so a superseded
+    // entry is not equal to its replacement and would survive beside it — and
+    // keep firing. Marker-based and idempotent, exactly like the uninstall
+    // revert, so an unchanged payload still round-trips to a no-op write.
+    crate::agent::json_merge::prune_marked(&mut doc, HOOK_SIGNAL_MARKER);
+    crate::agent::json_merge::prune_marked(&mut doc, LEGACY_HOOK_SIGNAL_MARKER);
     crate::agent::json_merge::merge(&mut doc, &to_merge);
     if write_json_if_changed(&dest, &doc)? {
         report.config_merges_applied.push(m.path.clone());
@@ -1757,6 +1767,63 @@ requires_dir = '{agent_dir}'
             restored,
             serde_json::json!({"theme":"dark","mcpServers":{},"hooks":{"BeforeTool":[{"command":"user"}]}})
         );
+    }
+
+    #[test]
+    fn config_merge_upgrade_replaces_our_entries_instead_of_stacking_them() {
+        // The upgrade path a changed hook command takes: an install whose
+        // payload supersedes the merged one must leave exactly one copy of our
+        // hook behind. `merge` unions arrays by deep equality, so without the
+        // prune the superseded entry survives beside its replacement and keeps
+        // firing (which is how a broken codex hook outlived its own fix).
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let db = Database::open_in_memory().unwrap();
+
+        let agent_dir = temp.path().join("dotcodex");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let hooks_file = agent_dir.join("hooks.json");
+        std::fs::write(&hooks_file, r#"{"hooks":{"Stop":[{"command":"user"}]}}"#).unwrap();
+        let home = temp.path().join("hookshome");
+
+        let src = tempfile::TempDir::new().unwrap();
+        let manifest = format!(
+            r#"name = "hooks"
+home = '{home}'
+
+[[config_merges]]
+path = '{hooks_file}'
+source = "codex-hooks.json"
+requires_dir = '{agent_dir}'
+"#,
+            home = home.display(),
+            hooks_file = hooks_file.display(),
+            agent_dir = agent_dir.display(),
+        );
+        std::fs::write(src.path().join("extension.toml"), &manifest).unwrap();
+        let payload = |command: &str| {
+            format!(r#"{{"hooks":{{"Stop":[{{"hooks":[{{"command":"{command}"}}]}}]}}}}"#)
+        };
+        std::fs::write(
+            src.path().join("codex-hooks.json"),
+            payload("friring-cli session signal --state done || true"),
+        )
+        .unwrap();
+
+        let target = src.path().to_string_lossy().to_string();
+        install_extension(&db, &target, None, false).unwrap();
+
+        // The next version silences the command (the codex JSON-stdout fix).
+        let fixed = "friring-cli session signal --state done >/dev/null 2>&1 || true";
+        std::fs::write(src.path().join("codex-hooks.json"), payload(fixed)).unwrap();
+        install_extension(&db, &target, None, false).unwrap();
+
+        let merged: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_file).unwrap()).unwrap();
+        let stop = merged["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2, "expected the user's entry plus exactly ours");
+        assert_eq!(stop[0], serde_json::json!({"command": "user"}));
+        assert_eq!(stop[1]["hooks"][0]["command"], serde_json::json!(fixed));
     }
 
     #[test]
