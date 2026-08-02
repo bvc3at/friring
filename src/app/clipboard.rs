@@ -255,12 +255,17 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// [`ENV_LOCK`], restoring the previous values when the returned guard drops
 /// — including on a panicking assertion, so one failing test can't leak an
 /// SSH-looking environment into the next.
+///
+/// Saved as `OsString` via `var_os`, not `String` via `var`: a non-UTF-8 value
+/// makes `var` return `Err`, which would restore as "was unset" and delete a
+/// variable the test only meant to shadow. (The routing this guards reads its
+/// own variables with `var_os` for the same reason.)
 #[cfg(test)]
 pub(crate) fn scoped_env(vars: &[(&'static str, Option<&str>)]) -> EnvGuard {
     let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let saved = vars
         .iter()
-        .map(|(k, _)| (*k, std::env::var(k).ok()))
+        .map(|(k, _)| (*k, std::env::var_os(k)))
         .collect();
     for (k, v) in vars {
         match v {
@@ -275,7 +280,7 @@ pub(crate) fn scoped_env(vars: &[(&'static str, Option<&str>)]) -> EnvGuard {
 /// so the restore runs while the lock is still held.
 #[cfg(test)]
 pub(crate) struct EnvGuard {
-    saved: Vec<(&'static str, Option<String>)>,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
