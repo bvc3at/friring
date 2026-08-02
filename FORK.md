@@ -738,6 +738,28 @@ unmet `Wait`. Worth knowing when reading any scenario: **a stale wait costs
 time, not a red test**, so `step_wait_pane` is a synchronization primitive and
 not, on its own, an assertion.
 
+**A stub can drive a whole multi-agent workflow.** The Agents half of the F9
+view first filmed as "No workflows or subagents yet", and the assumption that a
+real workflow simply could not run offline — its agents each talk to the model
+API — turned out to be wrong on inspection. The stub answers the turn with a
+`Task` or `Workflow` `tool_use`; the real claude binary runs it; every agent
+inside calls back into the same loopback stub; and Claude Code writes the run to
+disk itself. `claude-activity-view` now films a genuine three-agent, two-phase
+workflow, and the one extra piece of traffic it needs is an ambient fixture for
+the system-notification turn a *backgrounded* workflow posts back into the main
+conversation when it finishes.
+
+Doing that surfaced a **parser drift** the seeded stand-in had been hiding.
+Against Claude Code v2.1.220 a workflow writes its agents as
+`agent-<id>.json` + `agent-<id>.meta` (a standalone `Task` subagent still writes
+`.jsonl` + `.meta.json`), and the completion record moved from
+`subagents/workflows/<run>.json` up to `<session>/workflows/<run>.json`. friring
+read only the older spelling, so a real workflow rendered as nothing at all —
+the exact failure mode `session::cc_activity`'s "degrades to partial data"
+promise is meant to make visible, and didn't, because there was no scenario
+driving a real one. Both spellings and both locations are read now, and the
+scenario is the regression test.
+
 Three choices make the resulting clips presentable rather than merely correct.
 Generated demos default to the **`doom`** theme, so a set of them reads as one
 product. Scenario prompts, stub replies and model ids follow

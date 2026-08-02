@@ -23,7 +23,7 @@ themed `doom`, and the panes talk to models that do not exist (`fable-67`,
 | Clip | Feature |
 |---|---|
 | `claude-unload-load.gif` | Lazy sessions & ghosts — unload to a frozen frame, load back through `--resume` |
-| `claude-activity-view.gif` | The F9 agent-activity view — Overview dashboard and turn-grouped Timeline |
+| `claude-activity-view.gif` | The F9 agent-activity view — Overview, Timeline, and a real 3-agent workflow |
 | `claude-review-loop.gif` | Code review v2 — classified comment, structured handoff to the agent |
 | `claude-fork.gif` | Session fork via `<leader> f`, parent linkage and sidebar nesting |
 | `claude-named-workspace.gif` | Named multi-repo workspace dir (`Ctrl+O` on the name step) |

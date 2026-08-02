@@ -551,7 +551,20 @@ fn build_workflow(
     let journal = std::fs::read_to_string(run_dir.join("journal.jsonl"))
         .map(|s| parse_journal(&s))
         .unwrap_or_default();
+    // The completion record sits beside the run dir in older builds and one
+    // level up — `<session>/workflows/<run_id>.json`, a sibling of `subagents/`
+    // — in v2.1.220. Both are checked; whichever exists is authoritative.
     let completion = std::fs::read_to_string(wf_root.join(format!("{run_id}.json")))
+        .or_else(|_| {
+            std::fs::read_to_string(
+                wf_root
+                    .parent()
+                    .and_then(|subagents| subagents.parent())
+                    .unwrap_or(wf_root)
+                    .join("workflows")
+                    .join(format!("{run_id}.json")),
+            )
+        })
         .ok()
         .and_then(|s| parse_workflow_completion(&s));
     let status = if completion.is_some() {
@@ -705,13 +718,25 @@ fn workflow_mtime(wf: &CcWorkflow) -> u128 {
 
 /// Extract `<id>` from an `agent-<id>.jsonl` filename; `None` for anything else
 /// (including the sibling `agent-<id>.meta.json`).
+/// `agent-<id>.jsonl` (standalone `Task` subagents) or `agent-<id>.json`
+/// (workflow agents). Claude Code spells the two differently — verified
+/// against v2.1.220, where a workflow run writes `.json`/`.meta` while a
+/// standalone Task writes `.jsonl`/`.meta.json` — and `.meta*` must never be
+/// mistaken for a transcript, hence the explicit reject.
 fn agent_id_from(name: &str) -> Option<&str> {
-    name.strip_prefix("agent-")
-        .and_then(|r| r.strip_suffix(".jsonl"))
+    let rest = name.strip_prefix("agent-")?;
+    let id = rest
+        .strip_suffix(".jsonl")
+        .or_else(|| rest.strip_suffix(".json"))?;
+    (!id.ends_with(".meta")).then_some(id)
 }
 
 fn read_agent_meta(dir: &Path, id: &str) -> crate::session::cc_activity::CcMeta {
-    let s = std::fs::read_to_string(dir.join(format!("agent-{id}.meta.json"))).unwrap_or_default();
+    // Same split as agent_id_from: `.meta.json` beside a `.jsonl` transcript,
+    // bare `.meta` beside a workflow agent's `.json`.
+    let s = std::fs::read_to_string(dir.join(format!("agent-{id}.meta.json")))
+        .or_else(|_| std::fs::read_to_string(dir.join(format!("agent-{id}.meta"))))
+        .unwrap_or_default();
     parse_meta(&s)
 }
 
@@ -2100,7 +2125,10 @@ mod tests {
     #[test]
     fn agent_id_from_filenames() {
         assert_eq!(agent_id_from("agent-abc123.jsonl"), Some("abc123"));
+        // Workflow agents (v2.1.220) drop the trailing `l`.
+        assert_eq!(agent_id_from("agent-abc123.json"), Some("abc123"));
         assert_eq!(agent_id_from("agent-abc123.meta.json"), None);
+        assert_eq!(agent_id_from("agent-abc123.meta"), None);
         assert_eq!(agent_id_from("journal.jsonl"), None);
     }
 
