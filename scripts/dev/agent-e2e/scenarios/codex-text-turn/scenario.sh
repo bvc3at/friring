@@ -6,8 +6,9 @@
 #
 # The hook asserts are the regression test for codex's strict hook contract:
 # it parses every hook's stdout and fails the hook on anything but empty/valid
-# JSON, so a `friring-cli session signal` that isn't output-silenced reports
-# nothing and paints "hook returned invalid <event> JSON output" in the pane.
+# JSON, so a `friring-cli session signal` that isn't output-silenced is rejected
+# after it runs, and codex paints "hook returned invalid <event> JSON output"
+# in the pane on every event.
 #
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Real Codex CLI text turn rendered through Friring, model stubbed"

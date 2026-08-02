@@ -922,9 +922,9 @@ already cover the case it was meant to serve.
   schema, while `friring-cli` renders **JSON** whenever stdout isn't a TTY
   (`cli::output::Format::resolve`) — which a hook's piped stdout always is. So
   a codex session painted `error: hook returned invalid <event> JSON output`
-  on each turn instead of reporting. The fork's payload discards hook output
-  (`>/dev/null 2>&1`), which is asserted two ways: a unit test over the
-  embedded payload (`session_ops::builtin_hooks`) and the `codex-text-turn`
+  on each turn, its hooks failing on every event. The fork's payload discards
+  hook output (`>/dev/null 2>&1`), which is asserted two ways: a unit test over
+  the embedded payload (`session_ops::builtin_hooks`) and the `codex-text-turn`
   e2e scenario, which now drives codex's real hooks (the profile points
   `CODEX_HOME` at the `~/.codex` friring writes and launches with
   `--dangerously-bypass-hook-trust`) and fails on any hook cell in the pane.

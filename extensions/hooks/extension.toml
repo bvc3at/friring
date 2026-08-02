@@ -65,11 +65,11 @@ requires_dir = "~/.config/opencode"
 # e2e scenario):
 #
 #   1. Hook stdout MUST be empty or a JSON object codex's per-event schema
-#      accepts — anything else fails the hook with "hook returned invalid
-#      <event> JSON output" and reports nothing. `friring-cli` renders JSON
-#      whenever stdout is not a TTY (cli::output::Format::resolve), which a
-#      hook's piped stdout always is, so every command here redirects stdout
-#      (and stderr, which codex surfaces too) to /dev/null.
+#      accepts — anything else fails the hook and codex reports "hook returned
+#      invalid <event> JSON output" in the pane on every event. `friring-cli`
+#      renders JSON whenever stdout is not a TTY (cli::output::Format::resolve),
+#      which a hook's piped stdout always is, so every command here redirects
+#      stdout (and stderr, which codex surfaces too) to /dev/null.
 #   2. codex gates hooks behind a per-entry trust prompt keyed on the command
 #      string: on first launch after an install (or after this payload changes)
 #      it parks on "Hooks need review" and the hooks stay inert until the user
