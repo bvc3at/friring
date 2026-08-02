@@ -75,14 +75,31 @@
       }
       if (!code) return;
 
-      navigator.clipboard.writeText(code).then(function () {
-        btn.textContent = 'Copied!';
-        btn.classList.add('copied');
+      var flash = function (label, cls) {
+        btn.textContent = label;
+        btn.classList.add(cls);
         setTimeout(function () {
           btn.textContent = 'Copy';
-          btn.classList.remove('copied');
+          btn.classList.remove(cls);
         }, 2000);
-      });
+      };
+
+      // The Clipboard API needs a secure context, so it is absent over plain
+      // http and rejects when permission is denied — report either instead of
+      // throwing and leaving the button looking untouched.
+      if (!navigator.clipboard || !navigator.clipboard.writeText) {
+        flash('Copy failed', 'copy-failed');
+        return;
+      }
+
+      navigator.clipboard.writeText(code).then(
+        function () {
+          flash('Copied!', 'copied');
+        },
+        function () {
+          flash('Copy failed', 'copy-failed');
+        },
+      );
     });
   });
 

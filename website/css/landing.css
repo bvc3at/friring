@@ -507,3 +507,18 @@
     transform: none;
   }
 }
+
+/* Phones: the two hero CTAs are 180px and 157px wide, so they no longer fit on
+   one row and wrapped into two ragged centred pills of different widths. Stack
+   them as full-width bars instead — tidier, and a much larger tap target. */
+@media (max-width: 639px) {
+  .hero-ctas {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-sm);
+  }
+
+  .hero-ctas .btn {
+    width: 100%;
+  }
+}
