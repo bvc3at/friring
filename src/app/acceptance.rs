@@ -2034,6 +2034,56 @@ async fn dragging_over_a_wrapped_url_copies_it_as_one_string() {
 }
 
 #[tokio::test]
+async fn dragging_in_the_session_list_copies_the_painted_row() {
+    // The session list has no vt100 grid behind it, so it must keep reading
+    // the painted cells — the grid path only claims the central terminal pane.
+    let mut h = Harness::standard(1);
+    h.render(); // lay the panes out so `screen_layout` is meaningful
+
+    let panel = h
+        .app
+        .screen_layout()
+        .left_panel
+        .expect("the session list is laid out");
+    let inner = Rect::new(panel.x + 1, panel.y + 1, panel.width - 2, panel.height - 2);
+
+    let buffer = h.terminal.backend().buffer();
+    let row = (inner.y..inner.y + inner.height)
+        .find(|y| {
+            (inner.x..inner.x + inner.width)
+                .map(|x| buffer[(x, *y)].symbol())
+                .collect::<String>()
+                .contains("session-0")
+        })
+        .expect("the session is listed");
+
+    h.app.update(AppMessage::MouseClick {
+        x: inner.x,
+        y: row,
+        modifiers: KeyModifiers::NONE,
+    });
+    h.app.update(AppMessage::MouseDrag {
+        x: inner.x + inner.width - 1,
+        y: row,
+    });
+    h.app.update(AppMessage::MouseUp {
+        x: inner.x + inner.width - 1,
+        y: row,
+    });
+    h.render(); // refreshes the selected-text cache
+
+    let text = h
+        .app
+        .selected_text_cache
+        .as_deref()
+        .expect("a pane with no grid behind it still copies");
+    assert!(
+        text.contains("session-0"),
+        "the session row copies what is painted: {text:?}"
+    );
+}
+
+#[tokio::test]
 async fn central_tab_strip_switches_agent_and_shell_views() {
     // The top-border tab strip is mouse-driven: clicking Shell flips to the
     // shell view (spawning the pane), clicking Agent flips back.
