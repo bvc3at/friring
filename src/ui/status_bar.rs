@@ -1114,27 +1114,36 @@ mod tests {
     /// — 80, the most common terminal width there is, among them.
     #[test]
     fn footer_never_blanks_its_left_half() {
+        // A bounded product over the axes the guarantee names — the shortest
+        // and longest focus labels, the armed badge, the file viewer, and the
+        // two count badges. 32 states x 181 widths; the full product of every
+        // label and count is ~20x slower for no extra coverage.
         for width in 20..=200u16 {
-            for (label, blocked, automations, viewer, armed) in [
-                ("Sessions", 0, 0, false, None),
-                ("Terminal", 2, 3, false, None),
-                ("Edit Automation", 0, 0, false, None),
-                ("Changed files", 1, 0, true, None),
-                ("Activity nav", 0, 2, true, Some("^A")),
-            ] {
-                let mut state = footer_state(viewer);
-                state.focus_label = label;
-                state.blocked_count = blocked;
-                state.automation_count = automations;
-                state.session_count = 7;
-                state.prefix_armed = armed.map(str::to_string);
-                let (hits, line) = footer_at(width, &state);
-                let first = hits.iter().map(|(h, _)| h.rect.x).min().unwrap_or(width);
-                let left: String = line.chars().take(first as usize).collect();
-                assert!(
-                    !left.trim().is_empty(),
-                    "left half blank at width {width} (focus {label:?}): {line:?}"
-                );
+            for label in ["Sessions", "Edit Automation"] {
+                for armed in [None, Some("^A")] {
+                    for viewer in [false, true] {
+                        for blocked in [0usize, 2] {
+                            for automations in [0usize, 3] {
+                                let mut state = footer_state(viewer);
+                                state.focus_label = label;
+                                state.blocked_count = blocked;
+                                state.automation_count = automations;
+                                state.session_count = 7;
+                                state.prefix_armed = armed.map(str::to_string);
+                                let (hits, line) = footer_at(width, &state);
+                                let first =
+                                    hits.iter().map(|(h, _)| h.rect.x).min().unwrap_or(width);
+                                let left: String = line.chars().take(first as usize).collect();
+                                assert!(
+                                    !left.trim().is_empty(),
+                                    "left half blank at width {width} (focus {label:?}, \
+                                     armed {armed:?}, viewer {viewer}, blocked {blocked}, \
+                                     automations {automations}): {line:?}"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
