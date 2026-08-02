@@ -268,7 +268,12 @@
   var sidebar = document.querySelector('.docs-sidebar');
   var backdrop = document.getElementById('docs-sidebar-backdrop');
 
-  function closeSidebar() {
+  // `returnFocus` distinguishes dismissing the drawer from following a link out
+  // of it: a dismissal (Escape, backdrop) hands focus back to the toggle, while
+  // a link click leaves focus alone so it can follow the anchor to its target.
+  // The `contains` guard is the backstop for either path — focus must never be
+  // left on a link that has just slid off-canvas.
+  function closeSidebar(returnFocus) {
     if (!sidebar) return;
     sidebar.classList.remove('open');
     if (sidebarToggle) {
@@ -276,6 +281,8 @@
       sidebarToggle.setAttribute('aria-expanded', 'false');
     }
     if (backdrop) backdrop.classList.remove('open');
+    if (!sidebarToggle) return;
+    if (returnFocus || sidebar.contains(document.activeElement)) sidebarToggle.focus();
   }
 
   if (sidebarToggle && sidebar) {
@@ -292,21 +299,29 @@
       }
     });
 
+    // Tapping the backdrop is a dismissal, so it returns focus like Escape —
+    // without this the click blurs to <body> and the next Tab restarts at the
+    // top of the page. (Wrapped: the listener's Event argument would otherwise
+    // arrive as `returnFocus`.)
     if (backdrop) {
-      backdrop.addEventListener('click', closeSidebar);
+      backdrop.addEventListener('click', function () {
+        closeSidebar(true);
+      });
     }
 
-    // Close the drawer when a link is followed.
+    // Close the drawer when a link is followed. Focus is deliberately left
+    // alone here so it can follow the link to its target.
     sidebar.querySelectorAll('a').forEach(function (link) {
-      link.addEventListener('click', closeSidebar);
+      link.addEventListener('click', function () {
+        closeSidebar(false);
+      });
     });
 
     // Escape closes the drawer and returns focus to the toggle that opened it.
     document.addEventListener('keydown', function (e) {
       if (e.key !== 'Escape') return;
       if (!sidebar.classList.contains('open')) return;
-      closeSidebar();
-      sidebarToggle.focus();
+      closeSidebar(true);
     });
   }
 })();

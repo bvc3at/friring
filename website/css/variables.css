@@ -1,8 +1,10 @@
 /* Self-hosted so the site makes no third-party request. Inter and JetBrains
-   Mono are variable fonts (wght 100–900 and 400–800), so one file each covers
-   every weight the site uses — hence the ranged font-weight, which lets the
-   browser instance the face instead of synthesizing bold. Press Start 2P is
-   static and only ever used at 400. Licensing: assets/fonts/OFL.txt. */
+   Mono are variable, so one file each covers every weight the site uses. The
+   declared 400–700 is that used subset, not the files' full wght axes (100–900
+   and 400–800 respectively) — declaring a range rather than a single weight is
+   what lets the browser instance real bold instead of synthesizing it. Press
+   Start 2P is static and only ever used at 400.
+   Licensing: assets/fonts/OFL.txt. */
 @font-face {
   font-family: Inter;
   font-style: normal;
