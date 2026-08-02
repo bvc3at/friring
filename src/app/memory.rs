@@ -414,6 +414,41 @@ mod tests {
     }
 
     #[test]
+    fn disabling_the_feature_live_clears_the_measured_figures() {
+        // The three surfaces render straight off `info.memory`: turning the
+        // flag off must take the badges with it, and an in-flight scan must not
+        // paint them back.
+        let (mut app, _guard, _tmp) = super::super::state::tests::app_with_sessions(2);
+        let id = app.sessions[0].info.id;
+        app.sessions[0].info.memory = Some(SessionMemory::Live {
+            rss_bytes: 347_078_656,
+            procs: 3,
+        });
+        app.sessions[1].info.memory = Some(SessionMemory::Unloaded);
+
+        let tx = app.memory_refresh.start();
+        tx.send(MemoryRefresh {
+            updates: vec![(
+                id,
+                Some(SessionMemory::Live {
+                    rss_bytes: 1,
+                    procs: 1,
+                }),
+            )],
+        })
+        .unwrap();
+
+        let mut settings = crate::session::settings::Settings::default();
+        settings.features.session_memory = false;
+        app.apply_live_settings(&settings);
+
+        assert!(app.sessions.iter().all(|s| s.info.memory.is_none()));
+        assert!(!app.memory_refresh.in_progress());
+        app.poll_memory_refresh();
+        assert!(app.sessions.iter().all(|s| s.info.memory.is_none()));
+    }
+
+    #[test]
     fn the_real_process_table_prices_this_test_process() {
         // Integration smoke test of whichever platform arm compiled: our own
         // pid must be present with a non-zero footprint. Skipped on targets

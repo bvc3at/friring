@@ -1599,6 +1599,16 @@ impl App {
         if !self.features.perf_hud {
             self.show_perf_hud = false;
         }
+        if !self.features.session_memory {
+            // The badges render straight off `info.memory`, so the last scan's
+            // figures would stay on screen after the flag went off — and a scan
+            // already in flight would repopulate them. Drop its receiver so its
+            // result can never be polled, then clear what it already wrote.
+            self.memory_refresh.cancel();
+            for session in &mut self.sessions {
+                session.info.memory = None;
+            }
+        }
     }
 
     /// Record the current `settings.toml` mtime so the next reload poll doesn't
