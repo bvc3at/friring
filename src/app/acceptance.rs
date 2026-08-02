@@ -732,6 +732,54 @@ fn alt_l_toggles_from_a_focused_terminal() {
 }
 
 #[test]
+fn alt_l_escapes_the_central_pane_capture_views() {
+    // The review and activity views capture nearly every key; both list
+    // `ToggleSessionList` among the chords that pass through, so the toggle
+    // works from them without closing the view.
+    let mut h = Harness::standard(1);
+    open_review(&mut h, 3);
+
+    h.alt('l');
+    assert!(!h.app.show_session_list, "Alt+L reaches the column");
+    assert_eq!(
+        h.app.focus,
+        InputFocus::CodeReview,
+        "the review keeps focus"
+    );
+
+    let mut h = Harness::standard(1);
+    h.app.sessions[0].info.cc_activity = Some(crate::session::CcActivity {
+        workflows: Vec::new(),
+        subagents: vec![crate::session::CcAgent {
+            agent_id: "s1".into(),
+            transcript_path: std::path::PathBuf::from("agent-s1.jsonl"),
+            agent_type: "Explore".into(),
+            description: None,
+            label: None,
+            phase_title: None,
+            state: crate::session::CcAgentState::Done,
+            mtime_ns: 0,
+            size: 0,
+            tokens: None,
+            tool_calls: None,
+            last_tool: None,
+            model: None,
+        }],
+    });
+    h.func(9); // ToggleCcActivity
+    assert_eq!(h.app.focus, InputFocus::CcActivityTree);
+
+    h.alt('l');
+    assert!(!h.app.show_session_list, "Alt+L reaches the column");
+    assert_eq!(
+        h.app.focus,
+        InputFocus::CcActivityTree,
+        "the activity view keeps focus"
+    );
+    assert!(h.app.active_cc_activity().is_some(), "and stays open");
+}
+
+#[test]
 fn collapsing_docks_an_inline_info_pane_in_its_own_column() {
     // Fork-specific: `auto`/`inline` put the info pane in the left column, so
     // collapsing it must fall the pane back to its dedicated column rather than
