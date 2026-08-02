@@ -701,6 +701,28 @@ fn collapsing_moves_focus_off_the_left_column() {
     // Restoring is purely a visibility toggle — it does not steal focus back.
     h.alt('l');
     assert_eq!(h.app.focus, InputFocus::Terminal);
+
+    // The automations pane shares the column, so it retreats with it.
+    h.app.focus = InputFocus::Automations;
+    h.alt('l');
+    assert_eq!(h.app.focus, InputFocus::Terminal);
+}
+
+#[test]
+fn closing_a_pane_while_collapsed_falls_back_to_the_terminal() {
+    // Every focus-drop site routes through `focus_fallback`, which must not
+    // hand focus to the session list while it is collapsed.
+    let mut h = Harness::standard(1);
+    h.alt('l');
+
+    h.func(5); // FocusTasks — showing the panel focuses it
+    assert_eq!(h.app.focus, InputFocus::TaskList);
+    h.func(5); // and hiding it drops that focus
+    assert_eq!(
+        h.app.focus,
+        InputFocus::Terminal,
+        "never onto the collapsed list"
+    );
 }
 
 #[test]
