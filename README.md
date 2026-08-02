@@ -426,7 +426,8 @@ switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
   `settings.toml`; a disabled feature hides its UI but keeps its data and
   CLI surface, so flipping it back on is lossless.
 - **Responsive layout** — `< 80` cols: terminal only · `>= 80`: + sidebar ·
-  `>= 120`: + info panel. Vim-inspired keys throughout.
+  `>= 120`: + info panel (and `Alt+L` collapses the sidebar at any width).
+  Vim-inspired keys throughout.
 
 > **Note:** Some features (tasks, extensions, the session-list display) are
 > new and still evolving — expect their UX to keep improving release to release.
@@ -728,6 +729,7 @@ overlay delay are configurable — see [docs/CONFIG.md](docs/CONFIG.md)
 | `F1` / `Ctrl+G` | Keybindings help + interactive editor | Universal |
 | `Ctrl+B` / `F2` | Toggle info panel | **B**rief |
 | `Ctrl+E` / `F3` | Toggle file viewer | **E**xplorer |
+| `Alt+L` / `<leader> Shift+L` | Collapse/restore the session-list column (full-width terminal) | **L**ist |
 | `<leader> m` | Toggle perf HUD (live counters + frame/tick timing) | **M**etrics |
 
 Every chord above is rebindable from the `F1` editor (or by editing
