@@ -164,12 +164,17 @@ pub fn extract_text_from_screen(
     let mut continues_previous = false;
 
     for (row, col_start, col_end) in selection.row_spans() {
-        // A selection may extend past the grid (a short session in a tall
-        // pane). Rows are yielded in ascending order, so nothing further can
-        // be in range.
-        let Some(grid_row) = (row as u16).checked_sub(oy).filter(|r| *r < grid_rows) else {
-            break;
+        // A selection may start above the grid — an anchor dropped on the
+        // pane's top border — in which case that row has no grid row but the
+        // rows after it still do.
+        let Some(grid_row) = (row as u16).checked_sub(oy) else {
+            continue;
         };
+        // It may also extend past the grid (a short session in a tall pane).
+        // Rows are yielded in ascending order, so nothing further is in range.
+        if grid_row >= grid_rows {
+            break;
+        }
 
         let lo = (col_start as u16).saturating_sub(ox);
         let hi = (col_end as u16).saturating_sub(ox).min(grid_cols);
@@ -513,6 +518,16 @@ mod tests {
         // rather than emitting blank lines.
         let sel = make_sel((0, 0), (7, 9), pane);
         assert_eq!(extract_text_from_screen(p.screen(), &sel, (0, 0)), "ab");
+    }
+
+    #[test]
+    fn screen_extract_keeps_rows_below_an_anchor_on_the_border() {
+        let p = screen_with(2, 10, 0, "ab");
+        // Inner area starts at (1, 1): the mouse-down landed on the pane's top
+        // border, one row above the grid, and the drag ran into the grid.
+        let pane = PaneBounds::from_rect(Rect::new(1, 1, 10, 2));
+        let sel = make_sel((0, 1), (1, 10), pane);
+        assert_eq!(extract_text_from_screen(p.screen(), &sel, (1, 1)), "ab");
     }
 
     #[test]
