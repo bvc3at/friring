@@ -1077,7 +1077,7 @@ already cover the case it was meant to serve.
   starve the chips); a label-only rung sits between the tight and key-only forms
   so a squeezed chip reads ` Theme ` rather than ` F4 `; `Quit` outlives `Help`
   as the last chip standing, because at those widths it is the only one whose
-  action still works (the overlay `Help` opens needs room to render); and both
+  action still works (the help overlay needs room to render); and both
   the footer's left cluster and the status row end in `…` rather than being cut
   mid-word by ratatui. The result is that no width from 20 to 200 columns leaves
   the left half of the footer empty, guarded by a width-parameterised test.

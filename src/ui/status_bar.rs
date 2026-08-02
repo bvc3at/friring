@@ -146,8 +146,8 @@ fn is_optional(action: &Action) -> bool {
 /// Order the *essential* pills give way in once even key-only chips overflow —
 /// the lowest rank goes first. Cosmetics (Theme) lead; `Quit` is last out
 /// because at the widths where a single chip survives it is the only one whose
-/// action still works — the overlay `Help` opens needs a terminal wide enough
-/// to render it, where a click on `Quit` does the same thing at any width.
+/// action still works: the help overlay needs a terminal wide enough to render
+/// it, where a click on `Quit` quits at any width.
 fn pill_drop_rank(action: Action) -> u8 {
     match action {
         Action::QuitApp => 3,
@@ -505,8 +505,24 @@ impl LeftSegment {
     }
 }
 
+/// Summed saturating, not wrapping: [`LeftSegment::width`] saturates at
+/// `u16::MAX`, and a wrapped total would read as "there is room" and hand the
+/// budget back out.
 fn segments_width(segments: &[LeftSegment]) -> u16 {
-    segments.iter().map(LeftSegment::width).sum()
+    segments
+        .iter()
+        .map(LeftSegment::width)
+        .fold(0, u16::saturating_add)
+}
+
+/// What the never-dropped segments ([`LeftSegment::always_kept`]) occupy — the
+/// floor both the pills' reserve and the trim's own accounting start from.
+fn always_kept_width(segments: &[LeftSegment]) -> u16 {
+    segments
+        .iter()
+        .filter(|s| s.always_kept())
+        .map(LeftSegment::width)
+        .fold(0, u16::saturating_add)
 }
 
 /// The columns the pills hold back for the left-hand text: what the
@@ -518,12 +534,7 @@ fn segments_width(segments: &[LeftSegment]) -> u16 {
 /// entirely, so a footer 44–50 or 76–82 columns wide (80 among them) showed a
 /// full set of chips above an empty left half.
 fn reserved_left_width(segments: &[LeftSegment], width: u16) -> u16 {
-    let want: u16 = segments
-        .iter()
-        .filter(|s| s.always_kept())
-        .map(LeftSegment::width)
-        .sum();
-    want.min(width / 2)
+    always_kept_width(segments).min(width / 2)
 }
 
 /// A `key description` hint pair, styled as one trailing segment.
@@ -664,11 +675,7 @@ fn trim_segments(segments: &mut Vec<LeftSegment>, budget: u16) {
     let mut by_priority: Vec<usize> = (0..segments.len()).collect();
     by_priority.sort_by_key(|&idx| segments[idx].priority); // stable: ties keep render order
     let mut keep: Vec<bool> = segments.iter().map(LeftSegment::always_kept).collect();
-    let mut spent: u16 = segments
-        .iter()
-        .filter(|s| s.always_kept())
-        .map(LeftSegment::width)
-        .sum();
+    let mut spent = always_kept_width(segments);
     let mut skipped = false;
     for idx in by_priority {
         let segment = &segments[idx];
@@ -1341,7 +1348,7 @@ mod tests {
             "Theme and Settings go before Help/Quit: {line:?}"
         );
         // …until only Quit is left: at these widths it is the one chip whose
-        // action still works, where the overlay Help opens can't render.
+        // action still works, where the help overlay can't render at all.
         let (hits, line) = footer_at(10, &state);
         assert_eq!(
             hit_actions(&hits),
