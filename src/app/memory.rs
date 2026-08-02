@@ -413,6 +413,33 @@ mod tests {
         assert_eq!(app.sessions[0].info.memory, None);
     }
 
+    #[tokio::test]
+    async fn unloading_reports_the_freed_memory_in_the_same_frame() {
+        // Alt+U killed the pane, so the absence is measured, not guessed —
+        // waiting a cadence for it would leave the badge claiming the memory
+        // the unload just freed. A pass measuring the live pane is in flight to
+        // prove its late result can't paint the figure back.
+        let (mut app, _guard, _tmp) = super::super::state::tests::app_with_sessions(1);
+        let id = app.sessions[0].info.id;
+        let live = SessionMemory::Live {
+            rss_bytes: 347_078_656,
+            procs: 3,
+        };
+        app.sessions[0].info.memory = Some(live);
+        let tx = app.memory_refresh.start();
+
+        app.unload_active_session();
+
+        assert!(app.sessions[0].is_ghost());
+        assert_eq!(app.sessions[0].info.memory, Some(SessionMemory::Unloaded));
+        assert!(!app.memory_refresh.in_progress());
+        let _ = tx.send(MemoryRefresh {
+            updates: vec![(id, Some(live))],
+        });
+        app.poll_memory_refresh();
+        assert_eq!(app.sessions[0].info.memory, Some(SessionMemory::Unloaded));
+    }
+
     #[test]
     fn disabling_the_feature_live_clears_the_measured_figures() {
         // The three surfaces render straight off `info.memory`: turning the

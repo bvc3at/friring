@@ -2113,6 +2113,10 @@ impl App {
         let session_id = session.info.id;
         match session.restart(&config, rows, cols) {
             Ok(()) => {
+                // The measured tree belonged to the pane just replaced — on a
+                // load it was the ghost's `—`. Back to unknown until the next
+                // scan prices the new pane.
+                session.info.memory = None;
                 // Re-spawned fresh: clear stale hook-driven status so it doesn't
                 // linger as Blocked/Working/Done until the agent re-reports (a
                 // resumed agent may not re-fire its boot hook). Mirrors the
@@ -2121,6 +2125,9 @@ impl App {
                 // The agent process is running (again) — the row is no longer
                 // unloaded. A no-op for plain restarts (flag already clear).
                 let _ = self.db.set_session_unloaded(session_id, false);
+                // A scan started before the relaunch measured the dead pane's
+                // tree; drop it rather than let it overwrite the fresh one.
+                self.memory_refresh.cancel();
                 // Our own write doesn't move this connection's `data_version`,
                 // so force the status cache to reload and pick up the cleared row.
                 self.invalidate_hook_state_cache();
@@ -2202,6 +2209,12 @@ impl App {
         );
         // Already killed above; dropping `old` retires the (now EOF'd) reader.
         let _old = std::mem::replace(&mut self.sessions[self.active_index], ghost);
+        // The kill succeeded, so the absence is measured, not guessed: flip the
+        // badge to `—` in this frame instead of up to a cadence later. A scan
+        // in flight still holds the live figure, so drop it first.
+        self.memory_refresh.cancel();
+        self.sessions[self.active_index].info.memory =
+            Some(crate::session::SessionMemory::Unloaded);
         // Back to the agent view: the companion shell pane died with the
         // session and is deliberately not restored on load, so a remembered
         // Shell tab would label the ghost's frozen frame "Shell" and route the
