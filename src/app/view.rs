@@ -40,14 +40,28 @@ struct CentralTabCell {
     active: bool,
 }
 
-/// Columns the tab strip occupies on the pane's top border, measured from the
-/// pane's left corner out to the last pill's right edge — the span a
-/// right-aligned title sharing that border must keep clear. `0` when no strip
-/// was laid out (all alternate views feature-gated off, or no session).
-fn central_tabs_width(area: Rect, cells: &[CentralTabCell]) -> u16 {
-    cells.last().map_or(0, |cell| {
-        (cell.rect.x + cell.rect.width).saturating_sub(area.x + 1)
-    })
+/// Cells the padded chevron (` ▶ `) occupies — the accent-styled head of the
+/// expand toggle's label, ahead of the muted shortcut hint. Both the label
+/// builder and the painter need to agree on where the chevron ends.
+const EXPAND_CHEVRON_CELLS: usize = 3;
+/// Minimum central-pane width to draw the expand toggle at all (bare chevron).
+const EXPAND_TOGGLE_MIN_WIDTH: u16 = 5;
+/// Minimum central-pane width to append the shortcut hint after the chevron;
+/// below it the toggle is chevron-only, to leave the tab strip its room.
+const EXPAND_HINT_MIN_WIDTH: u16 = 40;
+
+/// Columns the top-border strip occupies on the pane's top border, measured
+/// from the pane's left corner out to whichever of the expand chevron / last
+/// tab pill reaches furthest — the span a right-aligned title sharing that
+/// border must keep clear. The pills always pack to the chevron's right, so the
+/// last cell wins whenever there is one. `0` when neither was laid out (all
+/// alternate views feature-gated off, or no session, with the list shown).
+fn central_tabs_width(area: Rect, chevron: Option<Rect>, cells: &[CentralTabCell]) -> u16 {
+    cells
+        .last()
+        .map(|cell| cell.rect.x + cell.rect.width)
+        .or_else(|| chevron.map(|r| r.x + r.width))
+        .map_or(0, |right| right.saturating_sub(area.x + 1))
 }
 
 /// Owned info-panel inputs (built per frame by `App::info_panel_data`): the
@@ -143,8 +157,10 @@ impl App {
 
     /// Highlight the clickable element under the mouse pointer so what a click
     /// would hit is visible before clicking. List/selector rows get a subtle
-    /// background band (the theme's `selection_bg`); buttons brighten their
-    /// fill to `accent_bright`. Runs on the recorded click targets, after all
+    /// background band (the theme's `selection_bg`); filled pill buttons
+    /// brighten their fill to `accent_bright`. The session-list expand chevron
+    /// is a button by action but a bare border glyph by look, so it takes the
+    /// subtle band too. Runs on the recorded click targets, after all
     /// rendering; the text selection highlight is applied later and wins on
     /// overlap.
     fn apply_hover_highlight(&self, frame: &mut Frame) {
@@ -196,14 +212,22 @@ impl App {
         // chip stays legible regardless of the resting style (primary's accent
         // fill and the neutral selection-filled secondary chip carry different fg
         // colours); for rows we tint only the background, leaving each cell's
-        // fg/modifiers intact.
-        let is_button = matches!(
+        // fg/modifiers intact. The expand chevron is the one `Global` target
+        // that is *not* a filled pill (see `draw_session_list_expand`) — it
+        // restores a pane rather than acting as a peer of the view tabs — so it
+        // takes the row band and keeps its own accent/muted colouring.
+        let is_expand_chevron = matches!(
             target.action,
-            ClickAction::Global(_)
-                | ClickAction::ModalButton { .. }
-                | ClickAction::ReviewButton(_)
-                | ClickAction::CentralTab(_)
+            ClickAction::Global(crate::session::Action::ToggleSessionList)
         );
+        let is_button = !is_expand_chevron
+            && matches!(
+                target.action,
+                ClickAction::Global(_)
+                    | ClickAction::ModalButton { .. }
+                    | ClickAction::ReviewButton(_)
+                    | ClickAction::CentralTab(_)
+            );
         let hover_bg = if is_button {
             Theme::accent_bright()
         } else {
@@ -742,25 +766,56 @@ impl App {
             return;
         }
 
+        // While the session list is collapsed the central pane carries the only
+        // on-screen affordance that brings it back: a `▶` at its top-left,
+        // sized (for the hint) against the pane width. Nothing is drawn while
+        // the list is shown — see [`Self::session_list_expand_label`].
+        let chevron: Option<(Rect, String)> =
+            self.session_list_expand_label(terminal).map(|label| {
+                let width = label.chars().count() as u16;
+                (Rect::new(terminal.x + 1, terminal.y, width, 1), label)
+            });
+
         // Agent terminal / shell / code-review all share the central pane and a
-        // clickable tab strip in its top border. Record the tab click targets
-        // *before* the pane renders its own whole-rect focus fallback, so a tab
-        // click wins over a plain pane-focus click. The review overlay takes the
-        // pane whenever the active session has one open (persisted per session
-        // like the shell view, so it survives session switches).
-        let tabs = self.central_tab_cells(terminal);
+        // clickable tab strip in its top border. Record the chevron + tab click
+        // targets *before* the pane renders its own whole-rect focus fallback,
+        // so an on-border click wins over a plain pane-focus click. The review
+        // overlay takes the pane whenever the active session has one open
+        // (persisted per session like the shell view, so it survives switches).
+        //
+        // The tab strip starts one blank cell past the chevron, matching the gap
+        // the pills keep between themselves — flush, the chevron's hover fill
+        // would run into the Agent pill and the two would read as one chip.
+        let tab_start = chevron
+            .as_ref()
+            .map_or(terminal.x + 1, |(r, _)| r.x + r.width + 1);
+        if let Some((rect, _)) = chevron.as_ref() {
+            self.record_click(
+                *rect,
+                ClickAction::Global(crate::session::Action::ToggleSessionList),
+            );
+        }
+        let tabs = self.central_tab_cells(terminal, tab_start);
         for cell in &tabs {
             self.record_click(cell.rect, ClickAction::CentralTab(cell.tab));
         }
+        let strip_rect = chevron.as_ref().map(|(r, _)| *r);
         if self.active_review().is_some() {
             self.render_code_review_pane(frame, terminal);
         } else if self.active_cc_activity().is_some() {
             self.render_cc_activity_pane(frame, terminal);
         } else {
-            self.render_terminal_pane(frame, terminal, central_tabs_width(terminal, &tabs));
+            self.render_terminal_pane(
+                frame,
+                terminal,
+                central_tabs_width(terminal, strip_rect, &tabs),
+            );
         }
-        // Drawn last so it overlays the pane's top border (the right-aligned
-        // session-info title leaves the left free for the tabs).
+        // Drawn last so they overlay the pane's top border (the right-aligned
+        // session-info title leaves the left free for the chevron + tabs).
+        if let Some((rect, label)) = chevron {
+            self.draw_session_list_expand(frame, rect, &label);
+        }
         self.draw_central_tabs(frame, &tabs);
     }
 
@@ -880,16 +935,17 @@ impl App {
     }
 
     /// Lay out the central-pane tab strip (Agent / Shell / Review) along the top
-    /// border of `area` as filled pill buttons. Each cell carries its on-border
-    /// rect (click target + paint position), its display label (shortcut baked
-    /// in), and whether it's the active view. Packing mirrors `render_button_bar`
-    /// (` label ` chip = label+2 wide, one-space gaps) so the recorded hitboxes
-    /// match the pills `draw_central_tabs` paints. Shell/Review are gated by
-    /// their feature flags; cells stop before the pane's right edge, and the
-    /// pane's right-aligned info title budgets itself around the strip
-    /// ([`central_tabs_width`]) — so the two share the border instead of
-    /// colliding, however long the branch or narrow the pane.
-    fn central_tab_cells(&self, area: Rect) -> Vec<CentralTabCell> {
+    /// border of `area` as filled pill buttons, packed left-to-right from
+    /// `start_x` (which the caller advances past the expand chevron). Each cell
+    /// carries its on-border rect (click target + paint position), its display
+    /// label (shortcut baked in), and whether it's the active view. Packing
+    /// mirrors `render_button_bar` (` label ` chip = label+2 wide, one-space
+    /// gaps) so the recorded hitboxes match the pills `draw_central_tabs`
+    /// paints. Shell/Review are gated by their feature flags; cells stop before
+    /// the pane's right edge, and the pane's right-aligned info title budgets
+    /// itself around the strip ([`central_tabs_width`]) — so the two share the
+    /// border instead of colliding, however long the branch or narrow the pane.
+    fn central_tab_cells(&self, area: Rect, start_x: u16) -> Vec<CentralTabCell> {
         // No tabs on the empty "No Session" screen, or when the pane is too
         // narrow to hold even one.
         if area.width < 6 || area.height == 0 || self.sessions.get(self.active_index).is_none() {
@@ -929,10 +985,10 @@ impl App {
             return Vec::new();
         }
 
-        // Pack pills left-to-right starting one cell in from the rounded corner,
-        // separated by a one-space gap (which shows the border between chips),
-        // matching `render_button_bar`.
-        let mut x = area.x + 1;
+        // Pack pills left-to-right from `start_x` (one cell in from the rounded
+        // corner, or past the expand chevron), separated by a one-space gap
+        // (which shows the border between chips), matching `render_button_bar`.
+        let mut x = start_x;
         let limit = area.x + area.width.saturating_sub(1);
         let mut cells = Vec::with_capacity(specs.len());
         for (i, (tab, name, action)) in specs.into_iter().enumerate() {
@@ -971,6 +1027,46 @@ impl App {
         for cell in cells {
             crate::ui::render_pill(frame, cell.rect, &cell.label, cell.active);
         }
+    }
+
+    /// The label for the session-list expand toggle — ` ▶ alt+l `, or a bare
+    /// ` ▶ ` on a pane too narrow for the hint. `None` whenever the list is
+    /// already shown, or the pane is too narrow for even the chevron.
+    ///
+    /// **Expand-only, deliberately.** Upstream draws the chevron in both states;
+    /// here the collapse direction is dropped, because
+    /// [`Self::central_tab_cells`] already packs four pills into ~40 columns and
+    /// `break`s once it runs out of room. A permanent chevron costs ~9 of those
+    /// cells, and on a 120-column terminal with tasks + the file viewer open the
+    /// tab it silently drops is Activity. Nothing is lost: while the list is
+    /// shown, the affordance would only point at a pane already on screen.
+    fn session_list_expand_label(&self, area: Rect) -> Option<String> {
+        if self.show_session_list || area.width < EXPAND_TOGGLE_MIN_WIDTH || area.height == 0 {
+            return None;
+        }
+        let hint = crate::session::compact_shortcut(
+            self.keybindings
+                .chords_for(crate::session::Action::ToggleSessionList),
+        );
+        Some(match hint.filter(|_| area.width >= EXPAND_HINT_MIN_WIDTH) {
+            Some(k) => format!(" ▶ {k} "),
+            None => " ▶ ".to_string(),
+        })
+    }
+
+    /// Paint the expand toggle's `label` into its precomputed `rect` (the click
+    /// target is recorded in `render_central_pane`, ahead of the pane's
+    /// whole-rect focus fallback, so the on-border click wins). An accent
+    /// chevron plus a muted shortcut, not a filled pill: it restores a pane
+    /// rather than selecting a central view, so it must not read as a fifth tab.
+    fn draw_session_list_expand(&self, frame: &mut Frame, rect: Rect, label: &str) {
+        let chevron: String = label.chars().take(EXPAND_CHEVRON_CELLS).collect();
+        let hint: String = label.chars().skip(EXPAND_CHEVRON_CELLS).collect();
+        let mut spans = vec![Span::styled(chevron, Style::default().fg(Theme::accent()))];
+        if !hint.is_empty() {
+            spans.push(Span::styled(hint, Style::default().fg(Theme::text_muted())));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), rect);
     }
 
     /// Build the shared `FooterState` for the current frame. Consumed by both

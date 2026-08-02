@@ -82,6 +82,7 @@ fn action_label(action: Action) -> &'static str {
         ToggleHelp => "help",
         ToggleInfoPanel => "info panel",
         ToggleFileViewer => "file viewer",
+        ToggleSessionList => "session list",
         OpenThemePicker => "theme",
         GlobalSearch => "search",
         OpenSettings => "settings",

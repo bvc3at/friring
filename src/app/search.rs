@@ -584,7 +584,7 @@ impl App {
             .snapshot
             .as_ref()
             .map(|s| s.focus)
-            .unwrap_or(InputFocus::SessionList);
+            .unwrap_or_else(|| self.focus_fallback());
         // For the LastSession toggle the meaningful "previous" is the session
         // active before the search *opened* — live previews already moved
         // `active_index` while browsing results, so recording via
@@ -639,6 +639,11 @@ impl App {
                 {
                     self.automation_ui.automation_panel_index = pos;
                 }
+                // The pane lives in the left column, so a jump into it has to
+                // bring that column back — the one route into the automations
+                // context that survives a collapse (every other one starts
+                // from a rendered row).
+                self.show_session_list = true;
                 self.focus = InputFocus::Automations;
                 self.refresh_automation_view();
             }
