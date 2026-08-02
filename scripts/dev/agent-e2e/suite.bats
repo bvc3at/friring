@@ -255,6 +255,11 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/codex-unload-load"
 }
 
+@test "e2e: Shift+Up reaches the top of a codex transcript that scrolled off the pane" {
+    require_agent codex
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/codex-scrollback"
+}
+
 @test "protocol: opencode run completes a stubbed text turn (no Friring)" {
     require_agent opencode
     e2e_protocol_smoke "$AGENT_E2E_DIR/scenarios/opencode-text-turn"
