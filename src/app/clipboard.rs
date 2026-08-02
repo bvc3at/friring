@@ -239,6 +239,58 @@ fn base64(input: &[u8]) -> String {
     out
 }
 
+/// Serializes every test — in this module or any other — that mutates the
+/// process-global environment the clipboard routing reads (`SSH_*`,
+/// `DISPLAY`/`WAYLAND_DISPLAY`).
+///
+/// One lock shared across all of them, deliberately: a `static` declared
+/// *inside* a test function is a distinct instance per function, so
+/// same-named per-test locks synchronize nothing and `cargo test`'s threads
+/// race on the same variables. (nextest's process-per-test model hides that,
+/// which is exactly why the lock has to be right rather than merely present.)
+#[cfg(test)]
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Apply `vars` to the process environment (`None` unsets) under
+/// [`ENV_LOCK`], restoring the previous values when the returned guard drops
+/// — including on a panicking assertion, so one failing test can't leak an
+/// SSH-looking environment into the next.
+#[cfg(test)]
+pub(crate) fn scoped_env(vars: &[(&'static str, Option<&str>)]) -> EnvGuard {
+    let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let saved = vars
+        .iter()
+        .map(|(k, _)| (*k, std::env::var(k).ok()))
+        .collect();
+    for (k, v) in vars {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+    EnvGuard { saved, _lock: lock }
+}
+
+/// Restores what [`scoped_env`] replaced. `saved` is declared before `_lock`
+/// so the restore runs while the lock is still held.
+#[cfg(test)]
+pub(crate) struct EnvGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (k, v) in &self.saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,10 +324,9 @@ mod tests {
 
     #[test]
     fn ssh_connection_loopback_parsing() {
-        use std::sync::Mutex;
-        // `set_var` mutates process-global state; serialize the two cases.
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
+        // Holds the shared lock and restores `SSH_CONNECTION` afterwards; the
+        // cases below overwrite it in turn.
+        let _env = scoped_env(&[("SSH_CONNECTION", None)]);
 
         let cases = [
             ("127.0.0.1 54321 127.0.0.1 22", true),

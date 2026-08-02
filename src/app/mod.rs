@@ -10069,34 +10069,18 @@ mod tests {
     /// work instead.
     #[test]
     fn paste_refusal_over_ssh_is_an_info_hint_naming_the_terminals_key() {
-        use std::sync::Mutex;
-        // `set_var` mutates process-global state.
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        let saved: Vec<(&str, Option<String>)> =
-            ["SSH_TTY", "SSH_CONNECTION", "DISPLAY", "WAYLAND_DISPLAY"]
-                .iter()
-                .map(|k| (*k, std::env::var(k).ok()))
-                .collect();
         // A non-loopback SSH with no forwarded display: native is the host's.
-        std::env::set_var("SSH_TTY", "/dev/pts/0");
-        std::env::set_var("SSH_CONNECTION", "10.0.0.1 5555 10.0.0.2 22");
-        std::env::remove_var("DISPLAY");
-        std::env::remove_var("WAYLAND_DISPLAY");
+        let _env = clipboard::scoped_env(&[
+            ("SSH_TTY", Some("/dev/pts/0")),
+            ("SSH_CONNECTION", Some("10.0.0.1 5555 10.0.0.2 22")),
+            ("DISPLAY", None),
+            ("WAYLAND_DISPLAY", None),
+        ]);
 
         let mut app = app_with_sessions(1);
         app.paste_from_clipboard();
-        let status = app.status_message.clone();
 
-        for (k, v) in saved {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-
-        let status = status.expect("the refusal is surfaced");
+        let status = app.status_message.clone().expect("the refusal is surfaced");
         assert_eq!(
             status.level,
             StatusLevel::Info,
@@ -10117,32 +10101,14 @@ mod tests {
     /// hint naming the key that works, not a red banner.
     #[test]
     fn paste_refusal_without_a_clipboard_handle_is_an_info_hint() {
-        use std::sync::Mutex;
-        // `set_var` mutates process-global state.
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        let saved: Vec<(&str, Option<String>)> = ["SSH_TTY", "SSH_CONNECTION"]
-            .iter()
-            .map(|k| (*k, std::env::var(k).ok()))
-            .collect();
         // Not over SSH, so the refusal comes from the missing handle below.
-        std::env::remove_var("SSH_TTY");
-        std::env::remove_var("SSH_CONNECTION");
+        let _env = clipboard::scoped_env(&[("SSH_TTY", None), ("SSH_CONNECTION", None)]);
 
         let mut app = app_with_sessions(1);
         app.clipboard = None;
         app.paste_from_clipboard();
-        let status = app.status_message.clone();
 
-        for (k, v) in saved {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-
-        let status = status.expect("the refusal is surfaced");
+        let status = app.status_message.clone().expect("the refusal is surfaced");
         assert_eq!(
             status.level,
             StatusLevel::Info,
