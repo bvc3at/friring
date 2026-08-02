@@ -507,6 +507,11 @@ pub fn truncate_ellipsis(s: &str, max: usize) -> String {
         kept.push(ch);
         used += width;
     }
+    // A string's width is not the sum of its chars': a base glyph plus U+FE0F
+    // is one column by char, two as painted. Shed until the kept prefix fits.
+    while kept.width() > room {
+        kept.pop();
+    }
     format!("{kept}…")
 }
 
@@ -1440,6 +1445,10 @@ mod tests {
         assert_eq!(truncate_ellipsis("日本語版", 8), "日本語版");
         // A glyph that would straddle the cut is dropped, not half-painted.
         assert_eq!(truncate_ellipsis("日本語版", 4), "日…");
+        // An emoji-presentation sequence paints two columns but sums to one by
+        // char, so the kept prefix has to be re-measured as a string.
+        assert_eq!(truncate_ellipsis("#\u{FE0F}x", 2), "#…");
+        assert!(UnicodeWidthStr::width(truncate_ellipsis("#\u{FE0F}abc", 4).as_str()) <= 4);
     }
 
     #[test]
