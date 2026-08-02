@@ -892,23 +892,28 @@ const UNLOADED_BADGE: &str = "\u{2014}";
 /// column of them lines up on even the narrowest sidebar. Binary units, matching
 /// the info panel's `format_bytes`.
 ///
-/// Each cut-over is tested against the *rounded* magnitude, half a unit early,
-/// so no branch can round up into a fifth column (`1024K`, `1000M`); the decimal
-/// is dropped from 10 G for the same reason (`10.0G`).
+/// The four-column bound holds for every `u64` by construction rather than up to
+/// some largest handled unit: the walk hands over half a unit early, so a value
+/// can never round up into a fifth column (`1024K`, `1000M`, `1000G`), and it
+/// only stops at the last unit — which `u64` cannot overflow. Sub-10 values keep
+/// one decimal from `G` up (`1.9G`), where a whole number would throw away most
+/// of the range; `K` and `M` are precise enough without one (`1M`, not `1.0M`).
 fn format_rss(bytes: u64) -> String {
-    const GIB: f64 = 1_073_741_824.0;
-    const MIB: f64 = 1_048_576.0;
-    const KIB: f64 = 1_024.0;
+    /// Binary-unit suffixes from kibibytes up. `u64::MAX` is ~16 EiB, so the
+    /// walk below can never run past the last one.
+    const UNITS: [&str; 6] = ["K", "M", "G", "T", "P", "E"];
 
-    let b = bytes as f64;
-    if b >= 9.95 * GIB {
-        format!("{:.0}G", b / GIB)
-    } else if b >= 999.5 * MIB {
-        format!("{:.1}G", b / GIB)
-    } else if b >= 999.5 * KIB {
-        format!("{:.0}M", b / MIB)
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 999.5 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    // `>= 2` is the index of `G`.
+    if unit >= 2 && value < 9.95 {
+        format!("{value:.1}{}", UNITS[unit])
     } else {
-        format!("{:.0}K", b / KIB)
+        format!("{value:.0}{}", UNITS[unit])
     }
 }
 
@@ -1611,6 +1616,11 @@ mod tests {
         assert_eq!(format_rss(1_048_313_856), "1.0G");
         // …and the decimal goes at 10 G, which would otherwise read `10.0G`.
         assert_eq!(format_rss(10 * 1_073_741_824), "10G");
+        // The handover keeps going past G — 1000 GiB is `1.0T`, not `1000G`.
+        const TIB: u64 = 1024 * 1_073_741_824;
+        assert_eq!(format_rss(1000 * 1_073_741_824), "1.0T");
+        assert_eq!(format_rss(TIB), "1.0T");
+        assert_eq!(format_rss(u64::MAX), "16E");
         // No value near a boundary may widen to a fifth column.
         for bytes in [
             1_047_527_424u64,
@@ -1619,12 +1629,36 @@ mod tests {
             1_048_500,
             1_048_313_856,
             10 * 1_073_741_824,
+            1000 * 1_073_741_824,
+            TIB,
+            1000 * TIB,
+            u64::MAX,
         ] {
             let badge = format_rss(bytes);
             assert!(
                 badge.chars().count() <= 4,
                 "{bytes} formatted as {badge}, wider than the reserved column"
             );
+        }
+    }
+
+    #[test]
+    fn rss_badge_never_widens_at_any_magnitude() {
+        // The bound is structural, so assert it across the whole u64 range
+        // rather than at the handful of boundaries picked by hand above.
+        let mut bytes = 1u64;
+        loop {
+            for probe in [bytes, bytes.saturating_sub(1), bytes.saturating_add(1)] {
+                let badge = format_rss(probe);
+                assert!(
+                    badge.chars().count() <= 4,
+                    "{probe} formatted as {badge}, wider than the reserved column"
+                );
+            }
+            match bytes.checked_mul(2) {
+                Some(next) => bytes = next,
+                None => break,
+            }
         }
     }
 
