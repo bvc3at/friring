@@ -426,7 +426,7 @@ impl Action {
     ///
     /// Each key mirrors the letter of the action's own `Ctrl` chord (`Ctrl+N`
     /// new session → `<leader> n`), so the leader table is learnable as "your
-    /// chords, one key later" rather than a second vocabulary. Four cases can't
+    /// chords, one key later" rather than a second vocabulary. Five cases can't
     /// mirror and are resolved here:
     ///
     /// - **`r`** goes to `RestartSession` (bare `Ctrl+R`); `ReloadApp`
@@ -442,7 +442,8 @@ impl Action {
     ///   `Shift+L`, the same shift-up-for-the-bigger-hammer rule as `r`/`R`.
     ///
     /// Every key here is reachable **unshifted** on a US layout, except the
-    /// deliberate `Shift+R`. That is a hard constraint, not a preference:
+    /// deliberate `Shift+R` and `Shift+L`. That is a hard constraint, not a
+    /// preference:
     /// [`KeyChord::normalized`] folds `Shift` into the chord for letters only,
     /// so a shifted punctuation key (`~`, `!`, `?`) arrives as
     /// `Shift`+*that char* on some terminals and as the bare char on others,
