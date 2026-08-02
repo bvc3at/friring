@@ -201,6 +201,11 @@ export default function (eleventyConfig) {
   for (const sheet of PAGE_CSS) {
     eleventyConfig.addPassthroughCopy(`website/css/${sheet}.css`);
   }
+  // Passthrough copy is what used to put these in the watch set; the bundle
+  // replaced it, so watch them explicitly or `--serve` serves a stale core.css.
+  for (const sheet of CORE_CSS) {
+    eleventyConfig.addWatchTarget(`website/css/${sheet}.css`);
+  }
   eleventyConfig.addPassthroughCopy('website/js');
   eleventyConfig.addPassthroughCopy('website/assets');
   // robots.txt (crawler discovery) + llms.txt (curated entry point for
