@@ -678,6 +678,7 @@ fn leader_shift_l_toggles_the_session_list() {
     // `mode = "prefix-only"` (where direct global chords are disabled) and on
     // a terminal with no option-as-alt.
     let mut h = Harness::standard(1);
+    h.app.prefix_settings.mode = crate::session::PrefixMode::PrefixOnly;
     h.ctrl('f'); // arm the leader
     h.shift('l');
     assert!(!h.app.show_session_list);
