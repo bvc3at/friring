@@ -230,6 +230,11 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-unload-ghost"
 }
 
+@test "e2e: a ghost fleet — unload 3 of 5, cycle loaded-only, load one back" {
+    require_agent scripted
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-ghost-fleet"
+}
+
 @test "e2e: a ghost survives a terminal shrink and keeps its frame when it grows back" {
     require_agent scripted
     e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-ghost-resize"

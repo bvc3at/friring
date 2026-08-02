@@ -738,6 +738,19 @@ unmet `Wait`. Worth knowing when reading any scenario: **a stale wait costs
 time, not a red test**, so `step_wait_pane` is a synchronization primitive and
 not, on its own, an assertion.
 
+**One ghost is unreadable; a fleet of them is not.** `scripted-unload-ghost`
+proves the mechanism on a single session, which makes it a good test and an
+unwatchable clip — a frozen frame looks exactly like an idle one. The
+`scripted-ghost-fleet` scenario films the claim instead of the mechanism: five
+sessions each with output of their own, three frozen one after another, a
+sidebar where most rows are greyed, and `<leader> c` stepping over every ghost
+to the sessions that still have a process. It navigates by *cycling* rather
+than `<leader> <n>` because the rendered order shifts as sessions unload, so a
+numbered jump taken before an unload no longer addresses the same row after
+one. What it deliberately does **not** claim on screen is the memory: friring
+does not surface per-session RSS yet, and a host total cannot separate one
+agent from the rest of the machine.
+
 **A stub can drive a whole multi-agent workflow.** The Agents half of the F9
 view first filmed as "No workflows or subagents yet", and the assumption that a
 real workflow simply could not run offline — its agents each talk to the model

@@ -23,6 +23,7 @@ themed `doom`, and the panes talk to models that do not exist (`fable-67`,
 | Clip | Feature |
 |---|---|
 | `claude-unload-load.gif` | Lazy sessions & ghosts — unload to a frozen frame, load back through `--resume` |
+| `scripted-ghost-fleet.gif` | The same at fleet scale — 3 of 5 sessions frozen, cycling steps over them |
 | `claude-activity-view.gif` | The F9 agent-activity view — Overview, Timeline, and a real 3-agent workflow |
 | `claude-review-loop.gif` | Code review v2 — classified comment, structured handoff to the agent |
 | `claude-fork.gif` | Session fork via `<leader> f`, parent linkage and sidebar nesting |
