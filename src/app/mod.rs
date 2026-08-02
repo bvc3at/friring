@@ -10103,8 +10103,10 @@ mod tests {
             "an expected, correct refusal is not an error: {}",
             status.text
         );
+        // Both chords: over SSH the compile-time target is the host, not the
+        // machine whose keyboard the user is on, so neither may be dropped.
         assert!(
-            status.text.contains("Ctrl+Shift+V"),
+            status.text.contains("Ctrl+Shift+V") && status.text.contains("Cmd+V"),
             "the hint names the terminal's own paste key: {}",
             status.text
         );
