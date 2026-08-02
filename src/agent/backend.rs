@@ -1680,6 +1680,94 @@ mod tests {
         }
     }
 
+    /// Where a scrolled-off line goes when a scrolling region is set — the
+    /// contract that decides whether an agent pane can be scrolled at all.
+    ///
+    /// Agents that run on the alternate screen (Claude Code) handle the wheel
+    /// themselves, but one built on ratatui's *inline* viewport (Codex CLI)
+    /// grows its transcript on the normal screen by pinning a `DECSTBM` region
+    /// and scrolling inside it. Stock vt100 0.16.2 drops every line that leaves
+    /// such a region, so those panes had permanently empty scrollback and
+    /// Shift+Up, the wheel and the scrollbar all did nothing. Friring builds
+    /// against a fork that restores the real-terminal rule instead — see
+    /// `[patch.crates-io]` in Cargo.toml. These tests pin that rule, so a
+    /// dependency bump back onto stock vt100 fails here rather than silently
+    /// un-scrolling every Codex session.
+    mod inline_viewport_scrollback {
+        /// How many lines of history the parser actually holds. `set_scrollback`
+        /// clamps to what exists, so asking for more than any buffer could hold
+        /// reads its true depth back (same trick as `ui::terminal_view`).
+        fn depth(rows: u16, cols: u16, bytes: &[u8]) -> usize {
+            let mut p = vt100::Parser::new(rows, cols, 100);
+            p.process(bytes);
+            p.screen_mut().set_scrollback(usize::MAX);
+            p.screen().scrollback()
+        }
+
+        /// The oldest `n` lines of history, as text.
+        fn oldest(rows: u16, cols: u16, bytes: &[u8], n: usize) -> Vec<String> {
+            let mut p = vt100::Parser::new(rows, cols, 100);
+            p.process(bytes);
+            p.screen_mut().set_scrollback(usize::MAX);
+            p.screen()
+                .contents()
+                .lines()
+                .take(n)
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// A screen whose every row is labelled, so a line that reaches
+        /// scrollback can be told apart from a blank one.
+        fn labelled(rows: u16) -> Vec<u8> {
+            (1..=rows)
+                .flat_map(|r| format!("\x1b[{r};1Hrow{r:02}").into_bytes())
+                .collect()
+        }
+
+        /// The shape recorded from codex-cli 0.146.0: a region anchored at row
+        /// 1 and ending above the composer, scrolled up with `SU`. The lines
+        /// that leave it left the top of the screen, so they are history.
+        #[test]
+        fn top_anchored_region_keeps_what_leaves_the_screen() {
+            let mut stream = labelled(10);
+            stream.extend_from_slice(b"\x1b[1;8r\x1b[3S\x1b[r");
+            assert_eq!(depth(10, 40, &stream), 3);
+            assert_eq!(oldest(10, 40, &stream, 3), ["row01", "row02", "row03"]);
+        }
+
+        /// Same region, scrolled by writing at its last row — how the viewport
+        /// grows one transcript line at a time.
+        #[test]
+        fn top_anchored_region_keeps_history_on_linefeed() {
+            let mut stream = labelled(10);
+            stream.extend_from_slice(b"\x1b[1;8r\x1b[8;1H\n\n\n\x1b[r");
+            assert_eq!(depth(10, 40, &stream), 3);
+            assert_eq!(oldest(10, 40, &stream, 3), ["row01", "row02", "row03"]);
+        }
+
+        /// A region that starts *below* row 1 scrolls mid-screen: those lines
+        /// never crossed the top edge, so they are not history and must still
+        /// be discarded. (tmux keeps them; xterm doesn't, and neither do we —
+        /// the fix is deliberately the narrow one.)
+        #[test]
+        fn region_below_the_top_row_still_discards() {
+            let mut stream = labelled(10);
+            stream.extend_from_slice(b"\x1b[4;10r\x1b[3S\x1b[r");
+            assert_eq!(depth(10, 40, &stream), 0);
+        }
+
+        /// The ordinary case every other agent and the shell pane rely on:
+        /// no region at all, newlines at the bottom row.
+        #[test]
+        fn plain_screen_scroll_still_keeps_history() {
+            let mut stream = labelled(10);
+            stream.extend_from_slice(b"\x1b[10;1H\n\n\n");
+            assert_eq!(depth(10, 40, &stream), 3);
+            assert_eq!(oldest(10, 40, &stream, 3), ["row01", "row02", "row03"]);
+        }
+    }
+
     /// The ghost-frame capture path: the backend's capture must win over the
     /// in-memory screen (it keeps logical lines, which re-wrap better), and
     /// every failure mode must still yield the visible screen, never nothing.

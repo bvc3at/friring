@@ -915,6 +915,28 @@ already cover the case it was meant to serve.
 
 ### Behavior fixes
 
+- **A codex pane can be scrolled.** Upstream takes `vt100` straight from
+  crates.io, and 0.16.2 discards every line that scrolls off the top of the
+  screen while a `DECSTBM` scrolling region is set — even one anchored at row
+  1, which xterm, tmux and iTerm2 all keep. That is exactly how ratatui's
+  *inline* viewport grows a transcript on the normal screen, so a Codex session
+  had permanently empty scrollback: `Shift+Up`, the wheel and the scrollbar all
+  did nothing, and everything above the current screen was simply unreachable.
+  (Alternate-screen agents like Claude Code were never affected — they handle
+  the wheel themselves and Friring forwards it.) Replaying a recorded Codex
+  stream: tmux keeps 22 lines of history, stock vt100 keeps 0. The fork
+  resolves `vt100` to `panoptes-vt100` — upstream 0.16.2 with that one
+  condition relaxed to "the region starts at row 1" — through a
+  `[patch.crates-io]` entry and the one-line re-export crate at `vendor/vt100/`
+  that carries the name `[patch]` requires (`tui_term` renders a
+  `vt100::Screen`, so both must resolve to the same crate; `[patch]` cannot
+  rename). Same stream through the patched build: 22 lines, matching tmux
+  exactly. Pinned by `inline_viewport_scrollback` in `src/agent/backend.rs`
+  (four cases, including the region *below* row 1 that must still discard) and
+  end-to-end by the `codex-scrollback` e2e scenario. Rationale and the rejected
+  alternatives are in ADR-2; the whole thing retires if upstream vt100 ever
+  ships the fix.
+
 - **codex status hooks actually report.** Upstream ships the codex
   `hooks.json` payload with bare `friring-cli session signal --state <s> ||
   true` commands, which codex rejects on *every* event: it parses each hook's

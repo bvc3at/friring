@@ -2900,6 +2900,18 @@ is non-zero and new output arrives, vt100 auto-increments the
 offset to keep the view pinned at the same history position. When
 the offset is 0, new output naturally stays at the bottom.
 
+**Whose scrollback the keys reach** depends on how the agent draws.
+An agent on the *alternate screen* (Claude Code, vim, htop) has no
+history for Friring to keep — it enables mouse tracking and scrolls
+its own view, so a wheel tick is forwarded to the PTY
+(`App::try_forward_wheel_to_pty`) instead of moving the buffer above.
+An agent on the *normal screen* (Codex CLI, and anything else on
+ratatui's inline viewport) really does push its transcript out of the
+top of the pane, and that history lands in the buffer above — which
+is what `Shift+Up`, the wheel and the scrollbar then move through.
+Making the second case work at all needs the patched emulator; see
+"Which vt100" in ADR-2.
+
 ### Scroll keybindings
 
 `Shift+Up/Down` scrolls one line, `Shift+PageUp/PageDown` (or
