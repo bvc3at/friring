@@ -197,12 +197,17 @@ fn read_process_table() -> Vec<ProcEntry> {
         else {
             continue;
         };
-        // Kernel threads have no address space and report 0 resident pages —
-        // they belong in the table (as parents) but cost nothing.
-        let pages = std::fs::read_to_string(dir.join("statm"))
+        // Kernel threads have no address space, but their `statm` is readable
+        // and parses as a genuine 0 — they stay in the table as parents,
+        // costing nothing. A `statm` that won't read or parse is the vanished
+        // pid again, dropped like the `stat` read above rather than folded to
+        // a zero-cost live process.
+        let Some(pages) = std::fs::read_to_string(dir.join("statm"))
             .ok()
             .and_then(|s| parse_statm_resident_pages(&s))
-            .unwrap_or(0);
+        else {
+            continue;
+        };
         table.push(ProcEntry {
             pid,
             ppid,
