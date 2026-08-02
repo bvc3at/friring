@@ -1037,8 +1037,15 @@ pub struct App {
     /// Last pointer position from a motion event, used to highlight the
     /// hovered row in list panes and selector modals.
     pub(crate) mouse_hover: Option<(u16, u16)>,
-    /// Cached text extracted from the frame buffer for the current selection.
+    /// Cached text extracted for the current selection, refreshed every frame
+    /// by [`App::apply_selection_highlight`].
     selected_text_cache: Option<String>,
+    /// Selection text read from the terminal pane's vt100 grid during this
+    /// frame's central-pane render, where the parser is already locked (so a
+    /// live drag costs no extra lock). `Some` only while the selection is
+    /// inside a pane showing a terminal; every other pane falls back to the
+    /// painted cells. See `ui::selection::extract_text_from_screen`.
+    terminal_selection_text: Option<String>,
     /// Persistent clipboard handle to avoid "dropped too quickly" warnings on
     /// Linux. `None` when no display server is reachable (SSH/tmux/WSL) —
     /// copies then fall back to OSC 52 (see [`Self::set_clipboard_text`]).
@@ -1431,6 +1438,7 @@ impl App {
             click_targets: Vec::new(),
             mouse_hover: None,
             selected_text_cache: None,
+            terminal_selection_text: None,
             clipboard: arboard::Clipboard::new().ok(),
             #[cfg(test)]
             captured_clipboard: None,
@@ -3921,7 +3929,12 @@ impl App {
         // 3. No display server and no tmux: raw OSC 52 to a direct terminal.
         clipboard::osc52_copy(text)
             .map(|()| ClipboardVia::Osc52)
-            .map_err(|e| Self::clipboard_error(&native, "OSC 52", &e))
+            .map_err(|e| match e {
+                // A size refusal is about the text, not the transport: report
+                // it bare rather than as "the OSC 52 stage failed".
+                clipboard::Osc52Error::TooLarge { .. } => e.to_string(),
+                clipboard::Osc52Error::Write(err) => Self::clipboard_error(&native, "OSC 52", &err),
+            })
     }
 
     /// Compose a clipboard-failure message, prefixing the fallback's own error
@@ -3962,10 +3975,16 @@ impl App {
     /// forwards the copy to wherever the user's clipboard actually is (native,
     /// or the tmux/OSC 52 route over SSH). Any session's panes may copy —
     /// standard OSC 52 semantics, background panes included — so the toast
-    /// names the originating session. Applied in capture order across panes
-    /// (each copy carries a global sequence): the newest write is applied last
-    /// and wins the clipboard, like it would in a terminal — draining pane by
-    /// pane would otherwise let a later pane's older copy win.
+    /// names the originating session.
+    ///
+    /// Every pane's queue is drained, but only the **newest** copy is written:
+    /// each copy carries a global capture sequence (`agent::backend`'s
+    /// `OSC52_SEQ`), so the winner is the one a real terminal would have left
+    /// on the clipboard — the older ones are overwritten before anyone can
+    /// paste them, and their toasts before anyone can read them. Writing them
+    /// all would put up to `PaneClipboard::CAP` blocking `tmux load-buffer`
+    /// spawns *per pane* on the event-loop tick (ADR-P: the UI thread does not
+    /// block) to reach the same end state.
     fn drain_pane_clipboard_copies(&mut self) {
         let mut copies: Vec<(u64, String, String)> = Vec::new();
         for session in self.sessions.iter_mut() {
@@ -3974,14 +3993,14 @@ impl App {
                 copies.push((seq, name.clone(), text));
             }
         }
-        copies.sort_by_key(|(seq, _, _)| *seq);
-        for (_, name, text) in copies {
-            match self.set_clipboard_text(&text) {
-                Ok(via) => {
-                    self.set_status(StatusLevel::Info, via.toast(&format!("Copied from {name}")));
-                }
-                Err(e) => self.set_error(e),
+        let Some((_, name, text)) = copies.into_iter().max_by_key(|(seq, _, _)| *seq) else {
+            return;
+        };
+        match self.set_clipboard_text(&text) {
+            Ok(via) => {
+                self.set_status(StatusLevel::Info, via.toast(&format!("Copied from {name}")));
             }
+            Err(e) => self.set_error(e),
         }
     }
 
@@ -4052,14 +4071,30 @@ impl App {
         // (a read would paste whatever that machine last copied), on a
         // display-less Linux host there is none — either way, refuse rather
         // than paste the wrong text or error obscurely.
+        //
+        // Info, not Error, in both branches: running over SSH or without a
+        // display server is the expected steady state for a whole class of
+        // setups, and a red banner every time the user presses paste would
+        // report a correctly-working refusal as a fault. The read that *fails*
+        // below still errors — that one is a fault.
         if clipboard::native_clipboard_is_remote() {
-            self.set_error(
-                "Clipboard read unavailable over SSH — use the terminal's paste key instead",
+            self.set_status(
+                StatusLevel::Info,
+                format!(
+                    "Clipboard read unavailable over SSH — {}",
+                    clipboard::PASTE_UNAVAILABLE_HINT
+                ),
             );
             return;
         }
         let Some(clipboard) = &mut self.clipboard else {
-            self.set_error("Clipboard not available — use the terminal's paste key instead");
+            self.set_status(
+                StatusLevel::Info,
+                format!(
+                    "No clipboard to read here — {}",
+                    clipboard::PASTE_UNAVAILABLE_HINT
+                ),
+            );
             return;
         };
 
@@ -10026,6 +10061,53 @@ mod tests {
             "Ctrl+C without a selection must reach the PTY as SIGINT"
         );
         assert!(app.captured_clipboard.as_ref().unwrap().is_empty());
+    }
+
+    /// Refusing to read the clipboard over SSH is the *designed* behaviour —
+    /// the host's clipboard is not the user's — so it must read as a hint, not
+    /// as a red failure banner on every paste, and must say which key does
+    /// work instead.
+    #[test]
+    fn paste_refusal_over_ssh_is_an_info_hint_naming_the_terminals_key() {
+        use std::sync::Mutex;
+        // `set_var` mutates process-global state.
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let saved: Vec<(&str, Option<String>)> =
+            ["SSH_TTY", "SSH_CONNECTION", "DISPLAY", "WAYLAND_DISPLAY"]
+                .iter()
+                .map(|k| (*k, std::env::var(k).ok()))
+                .collect();
+        // A non-loopback SSH with no forwarded display: native is the host's.
+        std::env::set_var("SSH_TTY", "/dev/pts/0");
+        std::env::set_var("SSH_CONNECTION", "10.0.0.1 5555 10.0.0.2 22");
+        std::env::remove_var("DISPLAY");
+        std::env::remove_var("WAYLAND_DISPLAY");
+
+        let mut app = app_with_sessions(1);
+        app.paste_from_clipboard();
+        let status = app.status_message.clone();
+
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+
+        let status = status.expect("the refusal is surfaced");
+        assert_eq!(
+            status.level,
+            StatusLevel::Info,
+            "an expected, correct refusal is not an error: {}",
+            status.text
+        );
+        assert!(
+            status.text.contains("Ctrl+Shift+V"),
+            "the hint names the terminal's own paste key: {}",
+            status.text
+        );
     }
 
     /// An `App` with one session, focused terminal, plus the receiving end of

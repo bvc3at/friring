@@ -1954,11 +1954,13 @@ async fn ctrl_t_opens_shell_pane_on_spawnable_backend() {
 }
 
 #[tokio::test]
-async fn cross_pane_osc52_copies_apply_in_capture_order() {
+async fn cross_pane_osc52_copies_apply_newest_by_capture_order() {
     // A session drains its agent pane before its shell pane, so a shell copy
     // captured *earlier* than an agent copy would, without a capture sequence,
-    // be applied last and win the clipboard — an inversion. Capture the shell
-    // copy first, the agent copy second, and the newer (agent) copy must win.
+    // look like the newest and win the clipboard — an inversion. Capture the
+    // shell copy first, the agent copy second: the newer (agent) copy must win,
+    // and the older one must not be written at all (one clipboard write per
+    // tick, not one per queued copy).
     let mut h = Harness::spawnable(1);
     h.ctrl('t'); // ToggleShell — spawn the shell pane
     assert!(h.app.sessions[0].shell_pane.is_some());
@@ -1976,8 +1978,58 @@ async fn cross_pane_osc52_copies_apply_in_capture_order() {
 
     assert_eq!(
         h.app.captured_clipboard.as_deref(),
-        Some(&["older".to_string(), "newer".to_string()][..]),
-        "copies apply oldest-first across panes, so the newer agent copy wins"
+        Some(&["newer".to_string()][..]),
+        "the newest capture wins the clipboard; superseded copies are dropped"
+    );
+
+    // Both queues were still drained — a stale copy must not resurface later.
+    h.tick();
+    assert_eq!(h.app.captured_clipboard.as_ref().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn dragging_over_a_wrapped_url_copies_it_as_one_string() {
+    // A URL longer than the pane occupies two visual rows. Reading the painted
+    // cells would paste it with a newline at the seam — the one thing a URL
+    // must survive. The vt100 grid knows the seam is a soft wrap, so the
+    // selection rejoins it.
+    let mut h = Harness::standard(1);
+    h.render(); // lay the panes out so `screen_layout` is meaningful
+
+    let area = h.app.screen_layout().terminal;
+    let inner = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2);
+    // Match the grid to the pane so the wrap lands exactly at its right edge.
+    h.app
+        .with_active_parser(|p| p.screen_mut().set_size(inner.height, inner.width));
+
+    let tail = "/wrapped/across/two/rows";
+    let url = format!(
+        "https://example.com/{}{tail}",
+        "x".repeat(inner.width as usize - "https://example.com/".len())
+    );
+    h.feed_output(0, url.as_bytes());
+    h.render();
+
+    // Drag from the URL's first cell to its last, across the wrap seam.
+    h.app.update(AppMessage::MouseClick {
+        x: inner.x,
+        y: inner.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    h.app.update(AppMessage::MouseDrag {
+        x: inner.x + tail.len() as u16 - 1,
+        y: inner.y + 1,
+    });
+    h.app.update(AppMessage::MouseUp {
+        x: inner.x + tail.len() as u16 - 1,
+        y: inner.y + 1,
+    });
+    h.render(); // refreshes the selected-text cache
+
+    assert_eq!(
+        h.app.selected_text_cache.as_deref(),
+        Some(url.as_str()),
+        "a soft-wrapped URL copies as one unbroken string"
     );
 }
 

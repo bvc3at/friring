@@ -148,9 +148,10 @@ impl vt100::Callbacks for TermSignals {
 pub type SessionParser = vt100::Parser<TermSignals>;
 
 /// Process-wide monotonic capture sequence, stamped on every OSC 52 copy so
-/// the app can re-order copies drained from different panes back into the order
-/// they were captured (pane-by-pane draining alone would apply a later pane's
-/// older copy last — see [`crate::app::App::drain_pane_clipboard_copies`]).
+/// the app can tell which copy drained from which pane was captured last, and
+/// give that one the clipboard (pane-by-pane draining alone would let a later
+/// pane's older copy win — see
+/// [`crate::app::App::drain_pane_clipboard_copies`]).
 static OSC52_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Clipboard writes captured from a pane's output stream (OSC 52 — see

@@ -3187,7 +3187,13 @@ confined to the active pane bounds.
   path checks the `tmux` exit status, so success is real); **outside
   tmux**, a raw **OSC 52** escape for a direct OSC-52-capable terminal,
   whose toast says `(OSC 52)` since it is fire-and-forget (a terminal
-  without OSC 52 support ignores it silently).
+  without OSC 52 support ignores it silently). Only that raw-escape
+  route is length-capped (`clipboard::OSC52_MAX_BYTES`, 74,994 bytes —
+  what fits a 100,000-byte sequence after base64 and framing): a
+  terminal that abandons a longer sequence goes on *printing* the rest
+  of the base64 over the TUI, so an oversized copy is refused up front
+  with its size. `tmux load-buffer` has no cap — tmux reads the text
+  over a pipe.
 - **`Ctrl+C`** (no selection): Forwarded to the terminal as SIGINT.
   (`Cmd+C` with no selection does nothing — SUPER chords are never
   forwarded to the PTY.)
@@ -3203,12 +3209,23 @@ confined to the active pane bounds.
   clipboard *reads* for security) — without a display server, or
   over SSH (where a read would return the *host's* clipboard, not
   what the user just copied), use the terminal's own paste key,
-  which arrives as a bracketed paste.
+  which arrives as a bracketed paste. Both refusals are surfaced at
+  **Info** level naming that key (`Ctrl+Shift+V` / `Cmd+V`): having no
+  readable clipboard is the correct steady state for those setups, not
+  a fault. A read that is attempted and fails is still an error.
 - Any other keypress clears the selection.
 
 Selection is highlighted in the terminal render buffer using
-inverted colors. The clipboard handle is kept alive for the app
-lifetime to avoid Linux-specific "dropped too quickly" issues.
+inverted colors. The *text* is read from the pane's own vt100 grid
+when the selection sits in the central pane's terminal view
+(`ui::selection::extract_text_from_screen`, under the parser lock the
+render already holds), so soft-wrapped rows rejoin into one logical
+line — a wrapped URL or path copies unbroken — trimming is per logical
+line, and blank rows dragged past the last line of output are dropped.
+Panes with no grid behind them (session list, info panel, review,
+activity) read the painted cells instead
+(`extract_text_from_buffer`). The clipboard handle is kept alive for
+the app lifetime to avoid Linux-specific "dropped too quickly" issues.
 
 ### In-pane copies (OSC 52 from programs)
 
@@ -3236,6 +3253,13 @@ payloads (`52;<sel>;?`) are dropped, never answered — answering would
 leak the clipboard to whatever runs in the pane. Oversized payloads
 (> 8 MiB base64) are dropped whole; a truncated copy would be worse
 than a failed one.
+
+Every pane's queue is drained on each tick, but only the **newest**
+copy is written — copies carry a process-wide capture sequence, so the
+winner is the one a real terminal would have left on the clipboard.
+The superseded ones would be overwritten before anyone could paste
+them, and writing them all would put up to eight blocking
+`tmux load-buffer` spawns *per pane* on the event-loop tick.
 
 ---
 
