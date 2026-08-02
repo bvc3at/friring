@@ -169,6 +169,56 @@ implementation anchors:
   in `session::theme_config`, all 15 presets + custom overrides), mapped by
   `ui::status_color`.
 
+### Per-session memory (`[features] session_memory`)
+
+An idle agent CLI is expensive — a measured ~333 MB RSS for claude, whether or
+not you wanted that session running. The sidebar prices each one, so unloading
+(`Alt+U`, see `FORK.md` → *Lazy sessions & ghosts*) has a visible payoff instead
+of an argued one:
+
+```text
+╭ Sessions ────────────────○◌╮
+│○ ── repo ──────────────────│
+│ ○ alpha                331M│   live: its whole agent process tree
+│ ◌ beta                    —│   ghost: measured to have no process at all
+│                            │
+╰ Σ 331M ────────────────────╯   the fleet total — the number that argues
+                                 for unloading one
+```
+
+Three surfaces, all fed by the same measurement:
+
+- **Row badge** — right-aligned, at most four columns (`331M`, `1.9G`), so a
+  column of them scans. Reserved *before* the agent-activity text, which
+  truncates around it; dropped entirely when the sidebar is too narrow for
+  both, since the name outranks the price tag.
+- **Fleet total** — `Σ` on the session list's bottom border, summing every
+  session currently running a tree. Absent when none is.
+- **Info panel (`F2`)** — `RAM  331.0 MB  4 procs`, next to the session's CPU
+  gauge.
+
+**What the number is.** The summed RSS of the pane's pid *and every
+descendant* — an agent CLI forks MCP servers, language servers and shell tools,
+and they are part of what the session costs. RSS is summed per process, not
+deduplicated, so pages shared between a parent and its forks are counted once
+each; this is the same metric the ~333 MB figure above uses. A child that
+double-forks away (daemonizes) leaves the tree and stops being attributed, which
+is the honest answer — it is no longer the session's to reclaim.
+
+**Three states, never two.** A live tree reads its bytes; a session measured to
+have *no* process reads `—`; a session that could not be measured shows nothing
+at all. That last case is deliberate — a remote (`ssh:`/`wsl:`) session's tree
+lives on its host, and rendering `—` there would claim a saving nobody observed.
+The same holds if the pid lookup or the process-table read fails: unknown stays
+unknown rather than collapsing to a misleading zero.
+
+**How it's read.** Linux walks procfs directly (`/proc/<pid>/stat` for the
+parent pid, `/proc/<pid>/statm` × the kernel page size for resident pages) and
+forks nothing. macOS has no procfs, so one `ps -Ao pid=,ppid=,rss=` covers the
+whole machine per pass. Windows reads `sysinfo`'s process snapshot. Any other
+target reports nothing rather than guessing. All of it runs on a `spawn_blocking`
+worker every ~3 s, never on the UI thread — see `docs/PERFORMANCE.md`.
+
 ### Smart ordering & repo groups
 
 The list is **grouped by repository** under subtle headers

@@ -10,6 +10,7 @@ pub(crate) mod code_review;
 mod config_reload;
 mod helpers;
 mod key_handlers;
+mod memory;
 pub(crate) mod metrics_state;
 pub(crate) mod modals;
 mod new_session_state;
@@ -116,6 +117,13 @@ const CC_REFRESH_TICKS: u64 = 100;
 /// ~1 s), offset half a cadence from [`CC_REFRESH_TICKS`] so the two scans
 /// never land on the same tick. Also stat-gated.
 const ACTIVITY_REFRESH_TICKS: u64 = 100;
+
+/// How often to price each local session's agent process tree (in ticks,
+/// ~3 s). Deliberately slower than the ~1 s scans: the pass reads the whole
+/// process table (a procfs walk, or a `ps` fork on macOS) and a session's
+/// footprint moves on the scale of seconds, not frames. Offset half a cadence
+/// so it never lands on the tick the 1 s scans share.
+const MEMORY_REFRESH_TICKS: u64 = 300;
 
 /// How often to refresh git stats for the active session (in ticks). Git stats
 /// shell out to `git`, so they run on a slower cadence than other metrics
@@ -354,27 +362,24 @@ fn collect_system_metrics(
     let memory_used = sys.used_memory();
     let memory_total = sys.total_memory();
 
-    // Resolve the active session's root PID and sample its CPU/RAM.
-    let (session_cpu_percent, session_memory_bytes) = active
+    // Resolve the active session's root PID and sample its CPU. Its *memory*
+    // comes from the per-session scan instead (`app::memory`), which sums the
+    // whole agent process tree rather than this one process.
+    let session_cpu_percent = active
         .and_then(|(backend, id)| backend.pane_pid(&id).ok().flatten())
         .map(|pid| {
             let pid = sysinfo::Pid::from_u32(pid);
-            let kind = sysinfo::ProcessRefreshKind::nothing()
-                .with_memory()
-                .with_cpu();
+            let kind = sysinfo::ProcessRefreshKind::nothing().with_cpu();
             sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]), false, kind);
-            sys.process(pid)
-                .map(|p| (p.cpu_usage(), p.memory()))
-                .unwrap_or((0.0, 0))
+            sys.process(pid).map(|p| p.cpu_usage()).unwrap_or(0.0)
         })
-        .unwrap_or((0.0, 0));
+        .unwrap_or(0.0);
 
     let metrics = crate::ui::info_panel::SystemMetrics {
         cpu_percent,
         memory_used,
         memory_total,
         session_cpu_percent,
-        session_memory_bytes,
     };
 
     // Poll agent metrics files written by the statusline script.
@@ -923,6 +928,10 @@ pub struct App {
     activity_refresh: background::BackgroundTask<activity::ActivityRefresh>,
     /// Background active-session git-stats refresh, polled each tick.
     git_stats: background::BackgroundTask<(SessionId, Option<crate::session::GitStats>)>,
+    /// Background scan pricing each local session's agent process tree onto
+    /// `SessionInfo.memory`. Polled each tick; gated on `[features]
+    /// session_memory`.
+    memory_refresh: background::BackgroundTask<memory::MemoryRefresh>,
     /// Cached update-check result, rendered as the header "update available"
     /// badge. `Some` only when `[features] version_check` is on and a newer
     /// release is known (from the on-disk cache). Read off the network — see
@@ -1352,6 +1361,7 @@ impl App {
             activity: std::collections::HashMap::new(),
             activity_refresh: background::BackgroundTask::default(),
             git_stats: background::BackgroundTask::default(),
+            memory_refresh: background::BackgroundTask::default(),
             // Seed the badge from the cache (no network); refreshed on first
             // tick if the flag is on and the cache is stale.
             update_status: if crate::session::settings::global().features.version_check {
@@ -5585,15 +5595,17 @@ impl App {
         }
     }
 
-    /// Apply completed background metric/git-stat/usage refreshes and kick off
-    /// the next ones on their cadences. All run off the UI thread (sysinfo +
-    /// statusline file reads / `git` shell-outs) so a slow read never stalls
-    /// rendering — mirrors the worktree-sync poll.
+    /// Apply completed background metric/git-stat/memory/usage refreshes and
+    /// kick off the next ones on their cadences. All run off the UI thread
+    /// (sysinfo + statusline file reads / `git` shell-outs / the process-table
+    /// read) so a slow read never stalls rendering — mirrors the worktree-sync
+    /// poll.
     fn tick_background_refreshes(&mut self) {
         self.poll_metrics_refresh();
         self.poll_git_stats();
         self.poll_cc_refresh();
         self.poll_activity_refresh();
+        self.poll_memory_refresh();
 
         if self.metrics.tick_count % METRICS_REFRESH_TICKS == 0 {
             self.start_metrics_refresh();
@@ -5609,6 +5621,13 @@ impl App {
         }
         if self.metrics.tick_count % GIT_REFRESH_TICKS == 0 {
             self.start_git_stats_refresh();
+        }
+        // Offset half a cadence so the process-table read never shares a tick
+        // with the 1 s scans above.
+        if self.features.session_memory
+            && self.metrics.tick_count % MEMORY_REFRESH_TICKS == MEMORY_REFRESH_TICKS / 2
+        {
+            self.start_memory_refresh();
         }
         if self.metrics.tick_count % CONFIG_RELOAD_TICKS == 0 {
             self.poll_config_reload();
@@ -10112,6 +10131,7 @@ mod tests {
             shell_pane: false,
             code_review: false,
             cc_activity: false,
+            session_memory: false,
             perf_hud: false,
             mouse: true,
             notifications: false,
@@ -14788,7 +14808,6 @@ mod tests {
                 memory_used: 100,
                 memory_total: 200,
                 session_cpu_percent: 5.0,
-                session_memory_bytes: 50,
             },
             agent_metrics: vec![(sid, agent_metrics)],
         })

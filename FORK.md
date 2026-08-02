@@ -92,6 +92,25 @@ fork makes "not running" a first-class state:
   parse ≈ 50 µs; grey pass ≈ 7 µs; idle claude CLI ≈ 333 MB RSS) were taken
   with the e2e stub harness on real agent frames.
 
+#### Per-session memory (August 2026)
+
+The ~333 MB above was the argument *for* ghosts, but nothing in either
+upstream's or this fork's UI showed it: a user could not see what a session
+cost, what unloading saved, or tell a ghost's frozen frame from a live idle one.
+The fork measures it and puts it on screen — a badge on each session row
+(`331M`), an `Σ` fleet total on the session list's bottom border, and the info
+panel's RAM line (now the whole agent **process tree** with its process count,
+where upstream sampled only the pane process). A ghost reads `—`: the measured
+absence, distinct from a remote/unmeasurable session, which shows nothing at
+all rather than claiming a saving nobody observed.
+
+- Read off-thread every ~3 s from one process-table pass per scan (procfs on
+  Linux, one `ps` on macOS, `sysinfo` on Windows) — ADR-P14 in
+  `docs/PERFORMANCE.md`; behaviour and caveats in `docs/FEATURES.md` →
+  *Per-session memory*.
+- Gated by `[features] session_memory` (default `true`); off means the process
+  table is never read and none of the three surfaces render.
+
 #### Headless sends can't answer a dialog (July 2026)
 
 Upstream's headless senders type their text and press Enter as two separate

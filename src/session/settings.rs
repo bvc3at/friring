@@ -107,6 +107,12 @@ pub struct FeatureFlags {
     /// compatibility with the view's Claude-only v1.
     #[serde(default = "default_true")]
     pub cc_activity: bool,
+    /// Per-session memory: the RSS of each local session's agent process tree,
+    /// shown as a badge on its list row, a fleet total under the session list,
+    /// and the info panel's RAM line. Off = the process table is never read
+    /// (no procfs walk, no `ps` fork) and none of the three surfaces render.
+    #[serde(default = "default_true")]
+    pub session_memory: bool,
     /// Perf HUD overlay — `<leader> m`, or `F12` when `[prefix] mode = "off"`
     /// (with the leader on, `F12` is the second leader). Live perf counters +
     /// frame/tick timing; opening it also turns on wall-clock timing
@@ -464,6 +470,7 @@ impl Default for FeatureFlags {
             shell_pane: true,
             code_review: true,
             cc_activity: true,
+            session_memory: true,
             perf_hud: true,
             mouse: true,
             notifications: true,
@@ -858,6 +865,7 @@ mod tests {
             shell_pane,
             code_review,
             cc_activity,
+            session_memory,
             perf_hud,
             mouse,
             notifications,
@@ -878,6 +886,7 @@ mod tests {
             shell_pane,
             code_review,
             cc_activity,
+            session_memory,
             perf_hud,
             mouse,
             notifications,
@@ -889,7 +898,7 @@ mod tests {
         // `live` flags gate UI panels read from `App.features` every frame, so
         // flipping one is NOT a restart-only difference; the rest are read once
         // at startup and MUST register as one.
-        let live: [fn(&mut FeatureFlags); 10] = [
+        let live: [fn(&mut FeatureFlags); 11] = [
             |f| f.tasks = !f.tasks,
             |f| f.file_viewer = !f.file_viewer,
             |f| f.global_search = !f.global_search,
@@ -898,6 +907,7 @@ mod tests {
             |f| f.shell_pane = !f.shell_pane,
             |f| f.code_review = !f.code_review,
             |f| f.cc_activity = !f.cc_activity,
+            |f| f.session_memory = !f.session_memory,
             |f| f.perf_hud = !f.perf_hud,
             |f| f.soft_delete = !f.soft_delete,
         ];

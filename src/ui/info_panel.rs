@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use super::theme::Theme;
-use crate::session::{AgentMetrics, SessionInfo};
+use crate::session::{AgentMetrics, SessionInfo, SessionMemory};
 
 /// View-only entry for upcoming automations shown in the info panel.
 pub struct AutomationEntry {
@@ -25,8 +25,6 @@ pub struct SystemMetrics {
     pub memory_total: u64,
     /// Active session CPU usage 0-100+.
     pub session_cpu_percent: f32,
-    /// Active session memory in bytes.
-    pub session_memory_bytes: u64,
 }
 
 pub fn render_info_panel(
@@ -99,7 +97,7 @@ fn build_lines<'a>(
     }
 
     if let Some(m) = metrics {
-        append_session_resources(&mut lines, m, inner_width);
+        append_session_resources(&mut lines, info, m, inner_width);
     }
 
     if let Some(ref metrics) = info.agent_metrics {
@@ -192,19 +190,55 @@ fn append_session_section<'a>(
     }
 }
 
-/// Append the active session's CPU gauge + RAM line (only when non-zero).
-fn append_session_resources(lines: &mut Vec<Line<'_>>, m: &SystemMetrics, inner_width: usize) {
-    if m.session_cpu_percent > 0.0 || m.session_memory_bytes > 0 {
-        let cpu_gauge = render_gauge_lines("CPU", m.session_cpu_percent, None, inner_width);
-        lines.extend(cpu_gauge);
+/// Append the active session's CPU gauge + RAM line.
+///
+/// CPU comes from the sampled pane process; RAM is the whole agent process
+/// tree ([`SessionInfo::memory`]) with its process count, so the figure covers
+/// the CLI's children too. A session measured to have none — a ghost — reads
+/// `—`, which is the point: that dash is what unloading it bought. An
+/// *unmeasured* session (remote, scan not run, feature off) shows no RAM row at
+/// all rather than a figure nobody took.
+fn append_session_resources(
+    lines: &mut Vec<Line<'_>>,
+    info: &SessionInfo,
+    m: &SystemMetrics,
+    inner_width: usize,
+) {
+    if m.session_cpu_percent <= 0.0 && info.memory.is_none() {
+        return;
+    }
+    lines.extend(render_gauge_lines(
+        "CPU",
+        m.session_cpu_percent,
+        None,
+        inner_width,
+    ));
 
-        lines.push(Line::from(vec![
-            Span::styled("RAM", Style::default().fg(Theme::text_muted())),
-            Span::styled(
-                format!("  {}", format_bytes(m.session_memory_bytes)),
-                Style::default().fg(Theme::text_primary()),
-            ),
-        ]));
+    let Some(memory) = info.memory else {
+        return;
+    };
+    let (value, style) = match memory {
+        SessionMemory::Live { rss_bytes, procs } => (
+            format!("{}  {procs} proc{}", format_bytes(rss_bytes), plural(procs)),
+            Style::default().fg(Theme::text_primary()),
+        ),
+        SessionMemory::Unloaded => (
+            "\u{2014}".to_string(),
+            Style::default().fg(Theme::text_muted()),
+        ),
+    };
+    lines.push(Line::from(vec![
+        Span::styled("RAM", Style::default().fg(Theme::text_muted())),
+        Span::styled(format!("  {value}"), style),
+    ]));
+}
+
+/// Plural suffix for a count (`1 proc` / `3 procs`).
+fn plural(n: u32) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
     }
 }
 
@@ -916,6 +950,76 @@ mod tests {
     fn git_section_clean_repo_is_empty() {
         let git = crate::session::GitStats::default();
         assert_eq!(render_git(&git), "");
+    }
+
+    // ── session resources (CPU + process-tree RAM) tests ──
+
+    fn render_resources(info: &SessionInfo, cpu: f32) -> String {
+        let m = SystemMetrics {
+            cpu_percent: 0.0,
+            memory_used: 0,
+            memory_total: 0,
+            session_cpu_percent: cpu,
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        append_session_resources(&mut lines, info, &m, 24);
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn session_ram_reports_the_whole_process_tree() {
+        let mut info = SessionInfo::new("live".to_string());
+        info.memory = Some(SessionMemory::Live {
+            rss_bytes: 347_078_656,
+            procs: 3,
+        });
+        let out = render_resources(&info, 4.0);
+        assert!(out.contains("RAM  331.0 MB"), "got {out}");
+        assert!(
+            out.contains("3 procs"),
+            "the CLI's children are counted too"
+        );
+    }
+
+    #[test]
+    fn session_ram_singularizes_a_lone_process() {
+        let mut info = SessionInfo::new("live".to_string());
+        info.memory = Some(SessionMemory::Live {
+            rss_bytes: 1_048_576,
+            procs: 1,
+        });
+        let out = render_resources(&info, 4.0);
+        assert!(out.ends_with("1 proc"), "got {out}");
+    }
+
+    #[test]
+    fn unloaded_session_ram_reads_as_a_dash() {
+        // The measured absence: a ghost's RAM row is the saving, not a gap.
+        let mut info = SessionInfo::new("ghost".to_string());
+        info.memory = Some(SessionMemory::Unloaded);
+        let out = render_resources(&info, 0.0);
+        assert!(out.contains("RAM  \u{2014}"), "got {out}");
+        assert!(!out.contains("MB"));
+    }
+
+    #[test]
+    fn unmeasured_session_shows_no_ram_row() {
+        // Remote / not-yet-scanned: no number was taken, so none is shown.
+        let info = SessionInfo::new("remote".to_string());
+        assert_eq!(render_resources(&info, 0.0), "");
+        // A live CPU sample still renders its gauge without a RAM row.
+        let out = render_resources(&info, 7.0);
+        assert!(out.contains("CPU"));
+        assert!(!out.contains("RAM"));
     }
 
     // ── usage section tests ──

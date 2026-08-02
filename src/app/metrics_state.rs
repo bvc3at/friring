@@ -278,7 +278,6 @@ impl MetricsState {
                 memory_used: 0,
                 memory_total: 0,
                 session_cpu_percent: 0.0,
-                session_memory_bytes: 0,
             },
             perf: PerfCounters::default(),
             timings: PerfTimings::default(),
