@@ -69,10 +69,12 @@ hasOwnMain: false
       type="font/woff2"
       crossorigin
     />
-    <link rel="stylesheet" href="{{ root }}/css/variables.css" />
-    <link rel="stylesheet" href="{{ root }}/css/base.css" />
-    <link rel="stylesheet" href="{{ root }}/css/layout.css" />
-    <link rel="stylesheet" href="{{ root }}/css/components.css" />
+    <!-- Core CSS is concatenated at build time into one file (see the core.css
+         bundle step in eleventy.config.js), so every page costs one
+         render-blocking request for the shared chrome instead of four.
+         Page-specific sheets (landing / docs / ui-review) still load
+         separately — they are only wanted on the pages that declare them. -->
+    <link rel="stylesheet" href="{{ root }}/css/core.css" />
     {%- for css in extraCss %}
     <link rel="stylesheet" href="{{ root }}/css/{{ css }}" />
     {%- endfor %}
