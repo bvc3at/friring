@@ -6,6 +6,8 @@ use ratatui::{
     Frame,
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use super::theme::Theme;
 use crate::app::{StatusLevel, StatusMessage};
 use crate::session::{Action, KeyBindings};
@@ -267,7 +269,7 @@ fn pill_block_width(labels: &[String]) -> u16 {
     if labels.is_empty() {
         return 0;
     }
-    let pills: u16 = labels.iter().map(|l| l.chars().count() as u16 + 2).sum();
+    let pills: u16 = labels.iter().map(|l| l.width() as u16 + 2).sum();
     pills + labels.len() as u16 - 1
 }
 
@@ -317,8 +319,9 @@ pub fn render_footer(
     // The armed-leader badge keeps its columns whole (only the rect may cut it);
     // everything after it ends in `…` rather than mid-word, which is what makes
     // a lone over-long focus label degrade instead of vanish.
-    let (pinned, rest): (Vec<LeftSegment>, Vec<LeftSegment>) =
-        segments.into_iter().partition(|s| s.priority == PRIO_PINNED);
+    let (pinned, rest): (Vec<LeftSegment>, Vec<LeftSegment>) = segments
+        .into_iter()
+        .partition(|s| s.priority == PRIO_PINNED);
     let mut spans: Vec<Span<'_>> = pinned.into_iter().flat_map(|s| s.spans).collect();
     let head = spans_width(&spans);
     spans.extend(truncate_spans_to_width(
@@ -408,7 +411,7 @@ fn truncate_spans_to_width<'a>(mut spans: Vec<Span<'a>>, width: u16) -> Vec<Span
 }
 
 fn span_width(span: &Span<'_>) -> usize {
-    span.content.chars().count()
+    UnicodeWidthStr::width(span.content.as_ref())
 }
 
 fn spans_width(spans: &[Span<'_>]) -> u16 {
@@ -1133,6 +1136,21 @@ mod tests {
             line.starts_with(" Edit Automati…"),
             "label cut with an ellipsis, not mid-word: {line:?}"
         );
+    }
+
+    /// Both halves of the row are measured in the columns a terminal actually
+    /// paints them in, so a wide glyph — in a rebound shortcut, in a label —
+    /// can't make a block that "fits" overrun its rect and paint over the other
+    /// half.
+    #[test]
+    fn footer_measures_display_columns_not_chars() {
+        assert_eq!(
+            pill_block_width(&["日本".to_string()]),
+            6,
+            "4 columns + ` `"
+        );
+        let segment = LeftSegment::new(PRIO_FOCUS, vec![Span::raw(" 日本語版 ")]);
+        assert_eq!(segment.width(), 10, "8 columns + the padding spaces");
     }
 
     /// The degenerate end of the range: a zero-width area draws nothing, and a
