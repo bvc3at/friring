@@ -89,6 +89,13 @@
   font-weight: 600;
 }
 
+/* "On This Page" entries for h3s, nested one level under their h2. */
+.docs-sidebar li.toc-sub a {
+  padding-left: var(--space-lg);
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
 /* ---- Sidebar toggle (mobile) ---- */
 .sidebar-toggle {
   display: none;

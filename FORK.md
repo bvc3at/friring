@@ -1163,6 +1163,17 @@ already cover the case it was meant to serve.
     shrink-wraps them — and needs no breakpoint, which matters because these
     tables outgrow the prose column at intermediate desktop widths too, not
     only on phones.
+  - **"On This Page" is generated, and stays in the sidebar.** It used to be
+    restated in each page's `onThisPage` front matter — 17 of 21 pages carried
+    one and the rest silently got none, including `features.html` with its 19
+    sections. A `docs-toc` Eleventy transform now derives it from the rendered
+    heading ids. Upstream moves the result into a third column at 1280px+ as
+    part of its docs-layout rework; the fork keeps it where it already was, at
+    the foot of the sidebar, so the change is the generation and not the
+    layout. The fork's rule also falls back to the nearest enclosing block's
+    id when a heading has none, which is what keeps the generated
+    `ui-review.html` list intact — that page is emitted as
+    `<div class="review-card" id="screen-N"><h3>…`, with the id on the card.
   - **Self-hosted fonts ship their licence.** The three web fonts are served
     from `website/assets/fonts/` rather than Google Fonts, as upstream does.
     The fork also ships `assets/fonts/OFL.txt` — the SIL Open Font License 1.1

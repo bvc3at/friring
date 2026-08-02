@@ -73,12 +73,10 @@
     {%- endfor %}
   </ul>
   {%- endfor %}
-  {%- if onThisPage and onThisPage.length %}
-  <h4>On This Page</h4>
-  <ul>
-    {%- for item in onThisPage %}
-    <li><a href="#{{ item.id }}">{{ item.label }}</a></li>
-    {%- endfor %}
-  </ul>
-  {%- endif %}
+  <!-- Replaced at build time by the docs-toc transform (eleventy.config.js)
+       with an "On This Page" list built from the content's h2/h3 ids, or by
+       nothing at all when the page has fewer than two headings. It used to be
+       restated in every page's `onThisPage` front matter, which three pages
+       simply lacked. -->
+  <!--TOC-->
 </aside>

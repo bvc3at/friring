@@ -98,6 +98,64 @@ function renderCodeBlock(match, attrs, rawLang, body) {
 </div>`;
 }
 
+// ---- Build-time "On This Page" list ----
+// Every docs h2/h3 is already hand-authored with an `id`, so the list can be
+// derived from the rendered HTML instead of being restated in each page's front
+// matter — which 17 of 21 pages used to do, and which the other four simply
+// lacked (features.html has 19 sections and got no list at all). Build-time
+// keeps it consistent with the rest of the pipeline: no client-side JS, and no
+// first-paint layout shift from a list that appears late.
+const TOC_PLACEHOLDER = '<!--TOC-->';
+
+// A single heading's link text, minus the trailing "#" anchor affordance.
+function headingLabel(heading) {
+  const clone = parse(heading.innerHTML);
+  clone.querySelectorAll('.heading-anchor').forEach((a) => a.remove());
+  return clone.textContent.trim().replace(/\s+/g, ' ');
+}
+
+// The anchor a heading links to: its own id when it has one, otherwise the id of
+// the nearest enclosing block that does. The generated UI-review page is written
+// as `<div class="review-card" id="screen-N"><h3>…`, with the id on the card
+// rather than the heading, and its sections are just as linkable. The walk stops
+// at .docs-content so a heading in an unidentified block is skipped rather than
+// linking to the content wrapper itself.
+function headingAnchorId(heading, content) {
+  for (let el = heading; el && el !== content; el = el.parentNode) {
+    const id = el.getAttribute && el.getAttribute('id');
+    if (id) return id;
+  }
+  return null;
+}
+
+function renderToc(root) {
+  const content = root.querySelector('.docs-content');
+  if (!content) return '';
+
+  const items = [];
+  content.querySelectorAll('h2, h3').forEach((h) => {
+    const id = headingAnchorId(h, content);
+    const label = headingLabel(h);
+    if (id && label) items.push({ id, label, level: h.rawTagName.toLowerCase() });
+  });
+
+  // A page with a single heading gains nothing from a list of one.
+  if (items.length < 2) return '';
+
+  const lis = items
+    .map(
+      (i) =>
+        `<li${i.level === 'h3' ? ' class="toc-sub"' : ''}>` +
+        `<a href="#${i.id}">${escapeHtml(i.label)}</a></li>`,
+    )
+    .join('\n      ');
+
+  return `<h4>On This Page</h4>
+  <ul>
+      ${lis}
+  </ul>`;
+}
+
 // ---- Build-time CSS bundle ----
 // The four sheets every page loads (tokens, reset, layout, components) are
 // concatenated into one `core.css`, turning four render-blocking requests into
@@ -166,6 +224,15 @@ export default function (eleventyConfig) {
   eleventyConfig.addTransform('wrap-tables', function (content, outputPath) {
     if (!outputPath || !outputPath.endsWith('.html')) return content;
     return content.replace(TABLE_RE, (table) => `<div class="table-scroll">${table}</div>`);
+  });
+
+  // Registered after highlight-code: transforms run in registration order, and
+  // building the list from already-final HTML keeps the two independent. Pages
+  // without the placeholder (the landing page) short-circuit before parsing.
+  eleventyConfig.addTransform('docs-toc', function (content, outputPath) {
+    if (!outputPath || !outputPath.endsWith('.html')) return content;
+    if (!content.includes(TOC_PLACEHOLDER)) return content;
+    return content.replace(TOC_PLACEHOLDER, renderToc(parse(content)));
   });
 
   return {
