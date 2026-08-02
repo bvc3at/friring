@@ -44,21 +44,6 @@ pub enum SessionMemory {
     Unloaded,
 }
 
-impl SessionMemory {
-    /// Bytes to add into a fleet total: the tree's RSS, or `0` when unloaded.
-    pub fn rss_bytes(self) -> u64 {
-        match self {
-            Self::Live { rss_bytes, .. } => rss_bytes,
-            Self::Unloaded => 0,
-        }
-    }
-
-    /// Whether a process tree is actually running (`Live`).
-    pub fn is_live(self) -> bool {
-        matches!(self, Self::Live { .. })
-    }
-}
-
 /// The machine's process table, indexed for subtree sums.
 ///
 /// Built once per scan and queried once per session, so the parent→child index
@@ -242,20 +227,6 @@ mod tests {
     fn empty_table_is_reported_as_empty() {
         assert!(ProcTable::default().is_empty());
         assert!(!ProcTable::new([entry(1, 0, 1)]).is_empty());
-    }
-
-    // ── SessionMemory ──
-
-    #[test]
-    fn unloaded_contributes_nothing_to_a_total() {
-        assert_eq!(SessionMemory::Unloaded.rss_bytes(), 0);
-        assert!(!SessionMemory::Unloaded.is_live());
-        let live = SessionMemory::Live {
-            rss_bytes: 349_175_808,
-            procs: 3,
-        };
-        assert_eq!(live.rss_bytes(), 349_175_808);
-        assert!(live.is_live());
     }
 
     // ── parse_ps_table (macOS) ──

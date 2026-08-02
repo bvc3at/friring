@@ -927,18 +927,14 @@ fn memory_badge(info: &SessionInfo) -> Option<String> {
 /// the list's footer. `None` when none of them is live: with every row already
 /// reading `—`, a `0K` total would be noise.
 fn fleet_rss(sessions: &[&SessionInfo]) -> Option<String> {
-    let live: Vec<u64> = sessions
+    sessions
         .iter()
-        .filter_map(|s| s.memory)
-        .filter(|m| m.is_live())
-        .map(SessionMemory::rss_bytes)
-        .collect();
-    if live.is_empty() {
-        return None;
-    }
-    Some(format_rss(
-        live.iter().fold(0u64, |a, b| a.saturating_add(*b)),
-    ))
+        .filter_map(|s| match s.memory {
+            Some(SessionMemory::Live { rss_bytes, .. }) => Some(rss_bytes),
+            _ => None,
+        })
+        .reduce(|a, b| a.saturating_add(b))
+        .map(format_rss)
 }
 
 /// Style for the session name span.
