@@ -393,12 +393,12 @@ mod tests {
         }
 
         // codex parses hook stdout strictly: anything that isn't empty or a JSON
-        // object it accepts fails the hook ("hook returned invalid <event> JSON
-        // output") and the session reports nothing. `friring-cli` renders JSON
-        // whenever stdout isn't a TTY — which a hook's piped stdout always is —
-        // so every codex command must discard its output. Verified against
-        // codex-cli 0.145.0; asserted end-to-end by the codex-text-turn
-        // e2e scenario.
+        // object it accepts is rejected after the command has already run, so
+        // codex paints "hook returned invalid <event> JSON output" on every
+        // event. `friring-cli` renders JSON whenever stdout isn't a TTY — which
+        // a hook's piped stdout always is — so every codex command must discard
+        // its output. Verified against codex-cli 0.145.0; asserted end-to-end by
+        // the codex-text-turn e2e scenario.
         for command in codex_hook_commands(&codex_payload) {
             assert!(
                 command.contains(">/dev/null 2>&1"),
