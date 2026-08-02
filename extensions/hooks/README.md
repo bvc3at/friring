@@ -47,10 +47,12 @@ passed by hand) and is suffixed `|| true` so it can never break the agent.
   opencode is installed). Events: `session.created` → idle, `chat.message` →
   working, `permission.asked` → blocked, `session.idle` → done.
 - **codex** — codex's `hooks.json` is claude-shaped, loaded from
-  `~/.codex/hooks.json` (or `$CODEX_HOME/hooks.json`, if you set that). We
-  **JSON-merge** our entries in (a `[[config_merges]]`, guarded by
-  `requires_dir`) so your own hooks are preserved; uninstall prunes exactly ours
-  back out. Events: `SessionStart` → idle, `UserPromptSubmit`/`PreToolUse` →
+  `~/.codex/hooks.json`. We **JSON-merge** our entries in (a
+  `[[config_merges]]`, guarded by `requires_dir`) so your own hooks are
+  preserved; uninstall prunes exactly ours back out. Only that default path is
+  managed — the merge expands `~` from `$HOME`, never `CODEX_HOME`, so if you
+  point `CODEX_HOME` elsewhere codex reads a different file and you have to wire
+  the hooks there yourself. Events: `SessionStart` → idle, `UserPromptSubmit`/`PreToolUse` →
   working, `Stop` → done. **No blocked** — codex's top-level hooks have no
   permission/approval event (that lives only in the legacy `notify`). This
   replaced the old `-c notify=…` override (which only reported done); the trade
