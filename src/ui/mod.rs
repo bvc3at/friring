@@ -1362,6 +1362,31 @@ mod tests {
     }
 
     #[test]
+    fn button_chip_reserves_the_columns_a_wide_label_paints() {
+        // A chip has to occupy the columns the terminal actually paints, not
+        // the chars it holds: the footer sizes its right-hand block with the
+        // same measurement, so a char count here would let the pills grow into
+        // the columns the left text reserved.
+        let backend = ratatui::backend::TestBackend::new(20, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, 20, 1);
+                let specs = [ButtonSpec::secondary("日本").with_hint("·F1")];
+                let hits = render_button_bar(f, area, &specs, true);
+                assert_eq!(hits.len(), 1);
+                // " 日本·F1 ": label 4 display columns + hint 3 + 2 padding.
+                assert_eq!(hits[0].rect.width, 9);
+                assert_eq!(
+                    hits[0].rect.x + hits[0].rect.width,
+                    area.x + area.width,
+                    "the chip packs to the right edge without overrunning it"
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn truncate_ellipsis_keeps_short_strings_intact() {
         assert_eq!(truncate_ellipsis("hello", 10), "hello");
         assert_eq!(truncate_ellipsis("hello", 5), "hello");
