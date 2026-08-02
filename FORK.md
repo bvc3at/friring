@@ -1163,6 +1163,12 @@ already cover the case it was meant to serve.
     shrink-wraps them — and needs no breakpoint, which matters because these
     tables outgrow the prose column at intermediate desktop widths too, not
     only on phones.
+  - **Self-hosted fonts ship their licence.** The three web fonts are served
+    from `website/assets/fonts/` rather than Google Fonts, as upstream does.
+    The fork also ships `assets/fonts/OFL.txt` — the SIL Open Font License 1.1
+    plus each family's copyright notice, read out of the font files' own name
+    tables — because serving the `woff2` files is redistribution and the
+    licence requires it to travel with them.
   - **No `overflow-x: clip` backstop.** Upstream guards residual sideways
     scroll with `body { overflow-x: clip }`. That declaration does nothing:
     overflow only propagates from `body` to the viewport for the values
