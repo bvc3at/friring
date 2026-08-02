@@ -348,3 +348,45 @@ h3:hover .heading-anchor {
   overflow-x: auto;
 }
 
+/* ---- Mobile reading ---- */
+@media (max-width: 639px) {
+  .docs-content {
+    padding-top: var(--space-lg);
+    font-size: 0.95rem;
+  }
+
+  /* Press Start 2P is very wide; docs h2s are prose signposts, not title cards,
+     so drop to the mono face on phones to stop them wrapping to three lines. */
+  .docs-content h2 {
+    font-family: var(--font-mono);
+    letter-spacing: 0;
+    margin-top: var(--space-xl);
+  }
+
+  .docs-content table {
+    font-size: 0.8rem;
+  }
+
+  /* Each table is its own scroll box, so cells can keep their natural width
+     rather than wrapping every reference entry into a cramped stack. */
+  .docs-content th,
+  .docs-content td {
+    padding: var(--space-xs) var(--space-sm);
+    white-space: nowrap;
+  }
+
+  /* The hover-reveal "#" affordance can't be hovered on touch, and it pushes
+     long headings wider. */
+  .heading-anchor {
+    display: none;
+  }
+
+  .breadcrumbs {
+    margin-bottom: var(--space-lg);
+    font-size: 0.75rem;
+  }
+
+  .info-box {
+    padding: var(--space-sm) var(--space-md);
+  }
+}
