@@ -483,9 +483,18 @@ mod tests {
     #[test]
     fn the_real_process_table_prices_this_test_process() {
         // Integration smoke test of whichever platform arm compiled: our own
-        // pid must be present with a non-zero footprint. Skipped on targets
-        // with no implementation, which legitimately return nothing.
+        // pid must be present with a non-zero footprint.
         let entries = read_process_table();
+        // On a supported target an empty table means the reader itself broke (a
+        // failed `ps` fork, an unreadable /proc, an empty sysinfo snapshot) —
+        // the one thing this test exists to catch, so it must not pass silently.
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        assert!(
+            !entries.is_empty(),
+            "the platform process-table reader returned nothing"
+        );
+        // Targets with no implementation legitimately return nothing.
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         if entries.is_empty() {
             return;
         }
