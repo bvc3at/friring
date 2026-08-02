@@ -726,6 +726,47 @@ fn closing_a_pane_while_collapsed_falls_back_to_the_terminal() {
 }
 
 #[test]
+fn searching_to_an_automation_brings_the_collapsed_column_back() {
+    // The automations pane lives in the left column, and a global-search jump
+    // is the only route into it that does not start from a rendered row — so
+    // it has to restore the column rather than focus an invisible pane.
+    let mut h = Harness::standard(1);
+    let aid = h
+        .app
+        .db
+        .create_automation(&crate::storage::automations::NewAutomation {
+            name: "widget-nightly".into(),
+            enabled: true,
+            schedule: crate::session::AutomationSchedule::Once { at: 0 },
+            timezone: None,
+            action: crate::session::AutomationAction::send_to(SessionId::default()),
+            prompt: "go".into(),
+            next_run_at: None,
+            prompt_steps: Vec::new(),
+        })
+        .unwrap();
+    h.app.refresh_automations();
+
+    h.alt('l');
+    h.ctrl('/'); // GlobalSearch
+    for c in "widget-nightly".chars() {
+        h.key(KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    let selected = &h.app.global_search.results[h.app.global_search.selected];
+    assert_eq!(
+        selected.target,
+        search::SearchTarget::Automation { id: aid }
+    );
+
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        h.app.show_session_list,
+        "the jump restores the column it needs"
+    );
+    assert_eq!(h.app.focus, InputFocus::Automations);
+}
+
+#[test]
 fn collapsed_list_is_skipped_by_the_focus_ring() {
     let mut h = Harness::standard(1);
     h.alt('l');
