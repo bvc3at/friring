@@ -393,7 +393,9 @@ fn truncate_spans_to_width<'a>(mut spans: Vec<Span<'a>>, width: u16) -> Vec<Span
     if budget == 0 {
         return Vec::new();
     }
-    if spans_width(&spans) as usize <= budget {
+    // Summed unnarrowed: `spans_width` saturates at `u16::MAX`, which would
+    // make a wider-than-64k row look like it already fits.
+    if spans.iter().map(span_width).sum::<usize>() <= budget {
         return spans;
     }
     let others: usize = spans[..spans.len().saturating_sub(1)]
@@ -415,7 +417,9 @@ fn span_width(span: &Span<'_>) -> usize {
 }
 
 fn spans_width(spans: &[Span<'_>]) -> u16 {
-    spans.iter().map(span_width).sum::<usize>() as u16
+    // Saturate rather than wrap: a row wider than `u16::MAX` is still "wider
+    // than any terminal", and wrapping would report it as narrow.
+    u16::try_from(spans.iter().map(span_width).sum::<usize>()).unwrap_or(u16::MAX)
 }
 
 fn push_status_message<'a>(spans: &mut Vec<Span<'a>>, msg: &'a StatusMessage) {
@@ -961,6 +965,31 @@ mod tests {
     #[test]
     fn status_row_ellipsises_a_message_too_long_for_the_row() {
         let msg = long_error();
+        let mut state = footer_state(false);
+        state.status = Some(&msg);
+
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_status_message_row(f, Rect::new(0, 0, 40, 1), &state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let line: String = (0..40).map(|x| buffer[(x, 0)].symbol()).collect();
+
+        assert!(line.starts_with(" ERROR "), "badge preserved: {line:?}");
+        assert!(line.ends_with('…'), "message ends in an ellipsis: {line:?}");
+    }
+
+    /// A message wider than `u16::MAX` still gets an ellipsis: the fit check
+    /// sums in `usize`, so the row's total width can't wrap around and make an
+    /// enormous message look like it already fits.
+    #[test]
+    fn status_row_ellipsises_a_message_wider_than_u16() {
+        let msg = StatusMessage {
+            text: "x".repeat(65_536),
+            level: StatusLevel::Error,
+            created_at: std::time::Instant::now(),
+        };
         let mut state = footer_state(false);
         state.status = Some(&msg);
 
