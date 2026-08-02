@@ -890,17 +890,22 @@ const UNLOADED_BADGE: &str = "\u{2014}";
 
 /// Format a resident-set size for a sidebar badge: at most four columns, so a
 /// column of them lines up on even the narrowest sidebar. Binary units, matching
-/// the info panel's `format_bytes`; the gigabyte cut-over is at 1000 MiB rather
-/// than 1024 so the megabyte form never widens to a fifth column (`1024M`).
+/// the info panel's `format_bytes`.
+///
+/// Each cut-over is tested against the *rounded* magnitude, half a unit early,
+/// so no branch can round up into a fifth column (`1024K`, `1000M`); the decimal
+/// is dropped from 10 G for the same reason (`10.0G`).
 fn format_rss(bytes: u64) -> String {
     const GIB: f64 = 1_073_741_824.0;
     const MIB: f64 = 1_048_576.0;
     const KIB: f64 = 1_024.0;
 
     let b = bytes as f64;
-    if b >= 1_000.0 * MIB {
+    if b >= 9.95 * GIB {
+        format!("{:.0}G", b / GIB)
+    } else if b >= 999.5 * MIB {
         format!("{:.1}G", b / GIB)
-    } else if b >= MIB {
+    } else if b >= 999.5 * KIB {
         format!("{:.0}M", b / MIB)
     } else {
         format!("{:.0}K", b / KIB)
@@ -1604,8 +1609,21 @@ mod tests {
         assert_eq!(format_rss(2_040_109_465), "1.9G");
         assert_eq!(format_rss(512 * 1024), "512K");
         assert_eq!(format_rss(0), "0K");
-        // The megabyte form must never widen to `1024M` at the boundary.
-        for bytes in [1_047_527_424u64, 1_073_741_823, 1_073_741_824] {
+        // Each unit hands over before its own text rounds up a column: 1023.9
+        // KiB is `1M`, not `1024K`; 999.75 MiB is `1.0G`, not `1000M`.
+        assert_eq!(format_rss(1_048_500), "1M");
+        assert_eq!(format_rss(1_048_313_856), "1.0G");
+        // …and the decimal goes at 10 G, which would otherwise read `10.0G`.
+        assert_eq!(format_rss(10 * 1_073_741_824), "10G");
+        // No value near a boundary may widen to a fifth column.
+        for bytes in [
+            1_047_527_424u64,
+            1_073_741_823,
+            1_073_741_824,
+            1_048_500,
+            1_048_313_856,
+            10 * 1_073_741_824,
+        ] {
             let badge = format_rss(bytes);
             assert!(
                 badge.chars().count() <= 4,
