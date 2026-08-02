@@ -2050,6 +2050,7 @@ impl App {
     /// `handle_resize` performs when a terminal narrows below the third column.
     fn act_toggle_session_list(&mut self) {
         self.show_session_list = !self.show_session_list;
+        let mut no_room = false;
         if !self.show_session_list {
             if matches!(
                 self.focus,
@@ -2064,10 +2065,15 @@ impl App {
             }
             if self.show_info_panel && !self.info_panel_fits_without_the_list() {
                 self.show_info_panel = false;
-                self.set_status(super::StatusLevel::Info, Self::info_panel_needs_room_msg());
+                no_room = true;
             }
         }
+        // The status row steals a content line while it is up, and it expires
+        // without a re-push — so size the panes first, then report.
         self.resize_sessions_to_content_area();
+        if no_room {
+            self.set_status(super::StatusLevel::Info, Self::info_panel_needs_room_msg());
+        }
     }
 
     /// Whether the info panel still has a home once the session list is
