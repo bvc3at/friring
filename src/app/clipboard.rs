@@ -327,8 +327,10 @@ mod tests {
             matches!(err, Osc52Error::TooLarge { bytes } if bytes == OSC52_MAX_BYTES + 1),
             "got {err:?}"
         );
-        // The whole point is that the user sees the size, not a corrupted TUI.
+        // The whole point is that the user sees the size, not a corrupted TUI —
+        // and the limit, so the overshoot is a number they can act on.
         assert!(err.to_string().contains(&(OSC52_MAX_BYTES + 1).to_string()));
+        assert!(err.to_string().contains(&OSC52_MAX_BYTES.to_string()));
     }
 
     #[test]
