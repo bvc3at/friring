@@ -10110,6 +10110,51 @@ mod tests {
         );
     }
 
+    /// The other refusal: locally, but with no clipboard handle at all (no
+    /// display server). Same reasoning as over SSH — an expected state, so a
+    /// hint naming the key that works, not a red banner.
+    #[test]
+    fn paste_refusal_without_a_clipboard_handle_is_an_info_hint() {
+        use std::sync::Mutex;
+        // `set_var` mutates process-global state.
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let saved: Vec<(&str, Option<String>)> = ["SSH_TTY", "SSH_CONNECTION"]
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        // Not over SSH, so the refusal comes from the missing handle below.
+        std::env::remove_var("SSH_TTY");
+        std::env::remove_var("SSH_CONNECTION");
+
+        let mut app = app_with_sessions(1);
+        app.clipboard = None;
+        app.paste_from_clipboard();
+        let status = app.status_message.clone();
+
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+
+        let status = status.expect("the refusal is surfaced");
+        assert_eq!(
+            status.level,
+            StatusLevel::Info,
+            "having no clipboard to read is not a fault: {}",
+            status.text
+        );
+        assert!(
+            status.text.contains("No clipboard to read here")
+                && status.text.contains("Ctrl+Shift+V"),
+            "the hint says why and names the key that works: {}",
+            status.text
+        );
+    }
+
     /// An `App` with one session, focused terminal, plus the receiving end of
     /// that session's PTY input channel — the seam for asserting exactly which
     /// bytes a key does (or doesn't) forward to the agent.
