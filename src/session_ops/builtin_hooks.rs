@@ -374,6 +374,24 @@ mod tests {
         assert!(codex_payload["hooks"]["Stop"].is_array());
         assert!(CODEX_HOOKS.contains("friring-cli session signal"));
 
+        // The event → state mapping is what the TUI shows for a codex session;
+        // the e2e scenario can only observe the transitions loosely (a `working`
+        // turn can be over before the poller looks), so pin it here.
+        for (event, state) in [
+            ("SessionStart", "idle"),
+            ("UserPromptSubmit", "working"),
+            ("PreToolUse", "working"),
+            ("Stop", "done"),
+        ] {
+            let command = codex_payload["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("codex {event} hook has a command string"));
+            assert!(
+                command.contains(&format!("--state {state}")),
+                "codex {event} hook must signal {state}: {command}"
+            );
+        }
+
         // codex parses hook stdout strictly: anything that isn't empty or a JSON
         // object it accepts fails the hook ("hook returned invalid <event> JSON
         // output") and the session reports nothing. `friring-cli` renders JSON
