@@ -81,6 +81,7 @@ jobs:
               - '.github/workflows/ci.yml'
             website:
               - 'website/**'
+              - 'eleventy.config.js'
               - 'package.json'
               - 'package-lock.json'
               - '.github/workflows/ci.yml'
