@@ -178,10 +178,14 @@ pub fn extract_text_from_screen(
         for col in lo..hi {
             if let Some(cell) = screen.cell(grid_row, col) {
                 // A blank cell has no contents; the visual equivalent is a
-                // space, and dropping it would collapse column alignment.
+                // space, and dropping it would collapse column alignment. The
+                // second column of a double-width glyph is contentless too but
+                // must contribute nothing — the glyph itself is already two
+                // columns wide, so a space there would both corrupt the text
+                // and push the rest of the row out of alignment.
                 if cell.has_contents() {
                     text.push_str(cell.contents());
-                } else {
+                } else if !cell.is_wide_continuation() {
                     text.push(' ');
                 }
             }
@@ -531,6 +535,17 @@ mod tests {
         let sel = make_sel((0, 0), (0, 19), pane);
         // Interior spacing kept (column alignment), trailing trimmed.
         assert_eq!(extract_text_from_screen(p.screen(), &sel, (0, 0)), "a    b");
+    }
+
+    #[test]
+    fn screen_extract_keeps_double_width_glyphs_intact() {
+        // A wide glyph owns two grid columns: the first carries the character,
+        // the second is a contentless continuation. Emitting a space for it
+        // would paste "a界 b".
+        let p = screen_with(2, 20, 0, "a界b");
+        let pane = PaneBounds::from_rect(Rect::new(0, 0, 20, 2));
+        let sel = make_sel((0, 0), (0, 19), pane);
+        assert_eq!(extract_text_from_screen(p.screen(), &sel, (0, 0)), "a界b");
     }
 
     #[test]
