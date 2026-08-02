@@ -480,22 +480,55 @@ mod tests {
         assert!(app.sessions.iter().all(|s| s.info.memory.is_none()));
     }
 
+    /// Whether the OS source [`read_process_table`] reads is reachable on this
+    /// host, established independently of the reader itself so an empty table
+    /// can be attributed to the environment rather than excused as one.
+    /// `false` on a target with no implementation, and on a sandbox that
+    /// withholds procfs or `ps`.
+    fn process_source_reachable() -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            // Even a `hidepid` container shows a process its own entry; a host
+            // that withholds this one withholds the whole walk.
+            std::path::Path::new("/proc/self/statm").is_file()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("ps")
+                .args(["-p", &std::process::id().to_string()])
+                .output()
+                .is_ok_and(|out| out.status.success())
+        }
+        #[cfg(windows)]
+        {
+            true
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            false
+        }
+    }
+
     #[test]
     fn the_real_process_table_prices_this_test_process() {
         // Integration smoke test of whichever platform arm compiled: our own
         // pid must be present with a non-zero footprint.
         let entries = read_process_table();
-        // On a supported target an empty table means the reader itself broke (a
-        // failed `ps` fork, an unreadable /proc, an empty sysinfo snapshot) —
-        // the one thing this test exists to catch, so it must not pass silently.
-        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-        assert!(
-            !entries.is_empty(),
-            "the platform process-table reader returned nothing"
-        );
-        // Targets with no implementation legitimately return nothing.
-        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         if entries.is_empty() {
+            // Two very different things read as an empty table, and only one is
+            // a bug: a reader that broke (bad `ps` flags, wrong procfs path, an
+            // empty snapshot) versus a host that cannot enumerate processes at
+            // all — an unsupported target, or a locked-down sandbox/container
+            // whose `/proc` isn't reachable. Probing the OS source *directly*,
+            // rather than trusting the reader under test, tells them apart: an
+            // empty table is only tolerated where the source itself is absent.
+            // Production agrees — `ProcTable::is_empty` is treated as "unknown",
+            // never as an error.
+            assert!(
+                !process_source_reachable(),
+                "the platform process-table reader returned nothing on a host \
+                 that can enumerate processes"
+            );
             return;
         }
         let me = std::process::id();
