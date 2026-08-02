@@ -84,7 +84,14 @@ hasOwnMain: false
     <nav class="nav{% if navScrolled %} scrolled{% endif %}" id="nav">
       <!-- prettier-ignore -->
       <a href="{{ root }}/index.html" class="nav-brand"><img src="{{ root }}/assets/logo-mark.svg" alt="" class="nav-brand-mark" width="26" height="26" />fri<span>ring</span></a>
-      <button class="hamburger" id="hamburger" aria-label="Toggle menu">
+      <button
+        class="hamburger"
+        id="hamburger"
+        type="button"
+        aria-label="Toggle menu"
+        aria-controls="nav-links"
+        aria-expanded="false"
+      >
         <span></span>
         <span></span>
         <span></span>

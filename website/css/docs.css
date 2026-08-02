@@ -260,8 +260,32 @@ h3:hover .heading-anchor {
   border-left-color: var(--yellow);
 }
 
+/* ---- Sidebar backdrop (mobile) — dims the content behind the open drawer ---- */
+.docs-sidebar-backdrop {
+  display: none;
+}
+
 /* ---- Responsive ---- */
 @media (max-width: 1023px) {
+  .docs-sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: var(--nav-height) 0 0 0;
+    background: rgb(0, 0, 0, 0.65);
+    backdrop-filter: blur(2px);
+    z-index: 39;
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity var(--transition),
+      visibility var(--transition);
+  }
+
+  .docs-sidebar-backdrop.open {
+    opacity: 1;
+    visibility: visible;
+  }
+
   .docs-sidebar {
     position: fixed;
     top: var(--nav-height);

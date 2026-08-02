@@ -6,17 +6,39 @@
   var navLinks = document.getElementById('nav-links');
 
   if (hamburger && navLinks) {
+    var setNavOpen = function (open) {
+      hamburger.classList.toggle('active', open);
+      navLinks.classList.toggle('open', open);
+      hamburger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    };
+
+    var closeNav = function (returnFocus) {
+      if (!navLinks.classList.contains('open')) return;
+      setNavOpen(false);
+      if (returnFocus) hamburger.focus();
+    };
+
     hamburger.addEventListener('click', function () {
-      hamburger.classList.toggle('active');
-      navLinks.classList.toggle('open');
+      setNavOpen(!navLinks.classList.contains('open'));
     });
 
     // Close menu when a link is clicked
     navLinks.querySelectorAll('a').forEach(function (link) {
       link.addEventListener('click', function () {
-        hamburger.classList.remove('active');
-        navLinks.classList.remove('open');
+        closeNav(false);
       });
+    });
+
+    // Escape closes and hands focus back to the toggle that opened it.
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') closeNav(true);
+    });
+
+    // A tap outside the open dropdown dismisses it.
+    document.addEventListener('click', function (e) {
+      if (!navLinks.classList.contains('open')) return;
+      if (navLinks.contains(e.target) || hamburger.contains(e.target)) return;
+      closeNav(false);
     });
   }
 
@@ -224,21 +246,50 @@
     }
   }
 
-  // ---- Mobile sidebar toggle (docs pages) ----
+  // ---- Mobile sidebar drawer (docs pages) ----
   var sidebarToggle = document.getElementById('sidebar-toggle');
   var sidebar = document.querySelector('.docs-sidebar');
+  var backdrop = document.getElementById('docs-sidebar-backdrop');
+
+  function closeSidebar() {
+    if (!sidebar) return;
+    sidebar.classList.remove('open');
+    if (sidebarToggle) {
+      sidebarToggle.classList.remove('active');
+      sidebarToggle.setAttribute('aria-expanded', 'false');
+    }
+    if (backdrop) backdrop.classList.remove('open');
+  }
+
   if (sidebarToggle && sidebar) {
     sidebarToggle.addEventListener('click', function () {
-      sidebar.classList.toggle('open');
-      sidebarToggle.classList.toggle('active');
+      var open = sidebar.classList.toggle('open');
+      sidebarToggle.classList.toggle('active', open);
+      sidebarToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (backdrop) backdrop.classList.toggle('open', open);
+      // Move focus into the drawer so keyboard and screen-reader users land
+      // where the visual focus went.
+      if (open) {
+        var first = sidebar.querySelector('a');
+        if (first) first.focus();
+      }
     });
 
-    // Close sidebar when clicking a link on mobile
+    if (backdrop) {
+      backdrop.addEventListener('click', closeSidebar);
+    }
+
+    // Close the drawer when a link is followed.
     sidebar.querySelectorAll('a').forEach(function (link) {
-      link.addEventListener('click', function () {
-        sidebar.classList.remove('open');
-        if (sidebarToggle) sidebarToggle.classList.remove('active');
-      });
+      link.addEventListener('click', closeSidebar);
+    });
+
+    // Escape closes the drawer and returns focus to the toggle that opened it.
+    document.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape') return;
+      if (!sidebar.classList.contains('open')) return;
+      closeSidebar();
+      sidebarToggle.focus();
     });
   }
 })();
