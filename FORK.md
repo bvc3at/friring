@@ -34,8 +34,13 @@ divergent on purpose:
   overlap differently.
 - **`86ab3dc` / `4e19147` / `b951991` F9 session-list collapse** — `F9` is the
   fork's activity view.
-- **`1dd5edb` / `2c07e3a` demo regeneration** and upstream's website work — the
-  fork records its own demos and ships its own site.
+- **`1dd5edb` / `2c07e3a` demo regeneration** and the **visual identity** half of
+  upstream's website work — the fork records its own demos and ships its own
+  site, so upstream's Doom-inspired game-UI redesign, its restyled dividers and
+  chrome, and its `iddqd` easter egg stay unadopted. The **bug-fix and
+  load-cost** half of that work does apply to the fork's site, which was
+  upstream's pre-redesign CSS rebranded, and is adopted separately (see "Own
+  website" below).
 
 ## Renamed to friring (July 2026)
 
@@ -1149,6 +1154,24 @@ already cover the case it was meant to serve.
     Pages is Enterprise Cloud-only.
   - Upstream credit moved into the site content: the landing-page footer, an
     FAQ entry, and an `llms.txt` entry all point at `Thurbeen/thurbox`.
+  - **Docs tables scroll in their own box, at every width.** Wide reference
+    tables used to drag the whole page sideways. Upstream's fix puts
+    `display: block; overflow-x: auto` on the table itself below 640px; the
+    fork instead wraps each docs table in a `.table-scroll` box at build time
+    (the `wrap-tables` Eleventy transform). The wrapper keeps real table layout
+    — `display: block` reflows the rows through an anonymous table box and
+    shrink-wraps them — and needs no breakpoint, which matters because these
+    tables outgrow the prose column at intermediate desktop widths too, not
+    only on phones.
+  - **No `overflow-x: clip` backstop.** Upstream guards residual sideways
+    scroll with `body { overflow-x: clip }`. That declaration does nothing:
+    overflow only propagates from `body` to the viewport for the values
+    Chromium and WebKit actually propagate, and `clip` is not one of them — a
+    page that overflows still drags sideways with the rule in place, in both
+    engines. The fork fixes the causes instead (responsive display headings,
+    breakable inline code, shrinkable `.step-content`, scrollable tables) and
+    does not carry the rule. Putting it on `html` would work, but it would
+    silently clip any future overflow out of reach rather than surfacing it.
 - `README.md` and the agent-guide prose call the project **Friring**, and so do
   the install commands; what still points at upstream is attribution and the
   shared formats above.

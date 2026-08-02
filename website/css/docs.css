@@ -335,3 +335,16 @@ h3:hover .heading-anchor {
   font-size: 0.8rem;
   color: var(--text-muted);
 }
+
+/* Wide reference tables scroll in their own box instead of forcing the whole
+   page sideways. The box is added around every docs table at build time by the
+   wrap-tables transform (eleventy.config.js) rather than by putting
+   `display: block; overflow-x: auto` on the table itself: that reflows the rows
+   through an anonymous table box and shrink-wraps them, changing the layout at
+   every width. A wrapper keeps real table layout and confines the overflow — so
+   it needs no breakpoint, which matters because the tables outgrow the prose
+   column at intermediate desktop widths too, not just on phones. */
+.table-scroll {
+  overflow-x: auto;
+}
+

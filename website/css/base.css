@@ -50,6 +50,7 @@ h6 {
   font-weight: 700;
   line-height: 1.3;
   color: var(--text-primary);
+  overflow-wrap: break-word;
 }
 
 /* Press Start 2P for the largest display headings only — wide & blocky */
@@ -65,10 +66,10 @@ h2 {
 }
 
 h1 {
-  font-size: 2.25rem;
+  font-size: clamp(1.5rem, 6vw, 2.25rem);
 }
 h2 {
-  font-size: 1.4rem;
+  font-size: clamp(1rem, 5vw, 1.4rem);
 }
 h3 {
   font-size: 1.25rem;
@@ -113,6 +114,11 @@ code {
   padding: 0.15em 0.4em;
   border-radius: var(--border-radius-sm);
   color: var(--cyan);
+
+  /* Inline code is often a path or a flag with no break opportunity, which
+     pushed the page sideways on phones. Inert inside `pre` (white-space: pre
+     never wraps), so this only affects prose. */
+  overflow-wrap: break-word;
 }
 
 pre {

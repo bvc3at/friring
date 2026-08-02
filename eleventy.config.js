@@ -68,6 +68,11 @@ function parsePreAttrs(attrs) {
   };
 }
 
+// Every docs table is hand-authored as a bare `<table>` with no attributes and
+// none of them nest, so a non-greedy match over the rendered HTML is reliable
+// here. See the .table-scroll rule in docs.css for why they are wrapped.
+const TABLE_RE = /<table>[\s\S]*?<\/table>/g;
+
 function renderCodeBlock(match, attrs, rawLang, body) {
   const lang = LANG_ALIASES[rawLang.toLowerCase()];
   if (!lang || !Prism.languages[lang]) {
@@ -112,6 +117,13 @@ export default function (eleventyConfig) {
   eleventyConfig.addTransform('highlight-code', function (content, outputPath) {
     if (!outputPath || !outputPath.endsWith('.html')) return content;
     return content.replace(CODE_BLOCK_RE, renderCodeBlock);
+  });
+
+  // Give every docs table its own horizontal scroll box, so a wide reference
+  // table scrolls on its own instead of dragging the whole page sideways.
+  eleventyConfig.addTransform('wrap-tables', function (content, outputPath) {
+    if (!outputPath || !outputPath.endsWith('.html')) return content;
+    return content.replace(TABLE_RE, (table) => `<div class="table-scroll">${table}</div>`);
   });
 
   return {

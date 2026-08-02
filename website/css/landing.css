@@ -294,6 +294,12 @@
 
 .step-content {
   flex: 1;
+
+  /* A flex item's default min-width:auto refuses to shrink below its content,
+     so the ASCII .tui-demo inside pushed this past the viewport (the step
+     number + gap offset it by 80px). min-width:0 lets it shrink and the
+     .terminal-body's own overflow-x handle the wide ASCII art. */
+  min-width: 0;
 }
 
 .step-content h3 {
