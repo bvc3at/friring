@@ -758,6 +758,31 @@ fn collapsing_docks_an_inline_info_pane_in_its_own_column() {
 }
 
 #[test]
+fn collapsing_hides_an_info_pane_with_nowhere_left_to_dock() {
+    // Below `three_panel_min_cols` the dedicated column does not exist, so the
+    // pane genuinely cannot render. It is turned off with a note rather than
+    // left "shown" and invisible.
+    use ratatui::layout::Rect;
+    let screen = Rect::new(0, 0, 100, STD_ROWS);
+    let mut h = Harness::new(100, STD_ROWS, 1);
+    h.app.info_panel_position = crate::session::settings::InfoPanelPosition::Inline;
+    h.func(2);
+    assert!(h.app.layout_for(screen).info_panel.is_some());
+
+    h.alt('l');
+    assert!(!h.app.show_info_panel, "not left stranded");
+    assert!(h.app.layout_for(screen).info_panel.is_none());
+    let msg = h.app.status_message.as_ref().expect("a note was shown");
+    assert!(msg.text.contains("Info panel"), "got: {}", msg.text);
+
+    // And F2 says why instead of flipping a flag that changes nothing.
+    h.func(2);
+    assert!(!h.app.show_info_panel, "F2 is refused, not a silent no-op");
+    let msg = h.app.status_message.as_ref().expect("a note was shown");
+    assert!(msg.text.contains("Info panel"), "got: {}", msg.text);
+}
+
+#[test]
 fn expand_chevron_shows_only_while_collapsed_and_restores_the_list() {
     let mut h = Harness::standard(1);
     h.render();

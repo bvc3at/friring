@@ -5247,9 +5247,12 @@ impl App {
         // Collapse the optional right-side panels if the terminal gets too
         // narrow (they only render at width >= 120 anyway). The info panel is
         // exempt unless pinned to its column: with `auto`/`inline` it docks in
-        // the left column, which narrow terminals still show.
+        // the left column, which narrow terminals still show — but not while
+        // that column is collapsed, which leaves every position column-only.
         if cols < 120 {
-            if self.info_panel_position == crate::session::settings::InfoPanelPosition::Column {
+            if self.info_panel_position == crate::session::settings::InfoPanelPosition::Column
+                || !self.show_session_list
+            {
                 self.show_info_panel = false;
             }
             self.show_tasks_panel = false;

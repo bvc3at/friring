@@ -2440,6 +2440,14 @@ Because the inline dock lives in the sidebar it works from
 terminals too narrow for the third column. F2 toggles visibility the
 same in every mode.
 
+**One exception**: collapsing the sidebar (`Alt+L`, below) takes the inline
+dock with it, so while it is collapsed *every* position behaves like
+`column` — the pane falls back to the dedicated column at
+`three_panel_min_cols` and up, and below that width it has nowhere to go.
+Collapsing then hides the pane with a note rather than leaving it "shown"
+and invisible, and F2 reports why instead of toggling a flag that changes
+nothing on screen. Restoring the sidebar does not re-open it.
+
 ### Collapsing the session list (`Alt+L`)
 
 `Alt+L` (rebindable `ToggleSessionList`, also `<leader> Shift+L`) folds the
@@ -2454,6 +2462,7 @@ pane, so collapsing it:
 
 - moves focus off those panes onto the terminal, and drops the session list
   out of the `Ctrl+L`/`Ctrl+H` focus ring;
+- makes the info pane column-only (see the note above);
 - leaves the right-side columns (tasks, file viewer) exactly where they were.
 
 While collapsed the central pane's top-left border shows a clickable `▶`

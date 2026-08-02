@@ -1783,6 +1783,13 @@ impl App {
                 Self::open_automations_list,
             ),
             Action::ToggleInfoPanel => self.gated(self.features.info_panel, "Info panel", |s| {
+                // With the list collapsed and no room for the dedicated column
+                // the pane cannot render at all, so flipping the flag would
+                // make F2 a key that visibly does nothing. Say why instead.
+                if !s.show_session_list && !s.info_panel_fits_without_the_list() {
+                    s.set_status(super::StatusLevel::Info, Self::info_panel_needs_room_msg());
+                    return;
+                }
                 s.show_info_panel = !s.show_info_panel;
                 s.resize_sessions_to_content_area();
             }),
@@ -2038,6 +2045,9 @@ impl App {
     /// leaves focus where it is. This is a toggle for screen real estate, not
     /// an interaction switch, so unlike Tasks/Files it never grabs focus.
     ///
+    /// A visible info pane that would be left with nowhere to render is turned
+    /// off with a note rather than stranded "shown" — the same rescue
+    /// `handle_resize` performs when a terminal narrows below the third column.
     fn act_toggle_session_list(&mut self) {
         self.show_session_list = !self.show_session_list;
         if !self.show_session_list {
@@ -2052,8 +2062,28 @@ impl App {
                 // Leaving the automation context clears its editor/run cache.
                 self.on_focus_changed();
             }
+            if self.show_info_panel && !self.info_panel_fits_without_the_list() {
+                self.show_info_panel = false;
+                self.set_status(super::StatusLevel::Info, Self::info_panel_needs_room_msg());
+            }
         }
         self.resize_sessions_to_content_area();
+    }
+
+    /// Whether the info panel still has a home once the session list is
+    /// collapsed. Its inline dock (`auto`/`inline`) is part of that column, so
+    /// the dedicated column is all that is left — and that needs
+    /// `three_panel_min_cols`.
+    pub(crate) fn info_panel_fits_without_the_list(&self) -> bool {
+        self.terminal_cols >= crate::session::settings::global().three_panel_min_cols
+    }
+
+    /// Why the info panel can't be shown right now, naming both ways out.
+    fn info_panel_needs_room_msg() -> String {
+        format!(
+            "Info panel needs the session list or a {}-column terminal",
+            crate::session::settings::global().three_panel_min_cols
+        )
     }
 
     /// Session-list `Ctrl+J`: step to the next session, or flow into the

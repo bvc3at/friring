@@ -489,6 +489,10 @@ tick-side drift check re-pushes PTY sizes when an `auto` flip moves the dock
 `docs/CONFIG.md` + `docs/FEATURES.md` ("Info panel docking"); the **default
 changed** from upstream's always-column to `auto`.
 
+The one exception to "`inline` never falls back to the column" is the
+session-list collapse below: the inline dock *is* the left column, so
+collapsing it leaves every position column-only.
+
 #### Session-list collapse (`Alt+L`)
 
 Upstream hides the session-list pane with `F9` for a full-width terminal
@@ -510,10 +514,16 @@ not a bare `Ctrl+<letter>`, so it never defers to the PTY. `<leader> Shift+L`
 is the route that needs no terminal configuration at all — and the only one
 that works under `[prefix] mode = "prefix-only"`.
 
-**The automations pane shares the column**, so collapsing moves focus out of
-the whole automations context (pane, in-pane editor, run history), and a
-global-search jump to an automation brings the column back — every other route
-into that context starts from a row only the rendered pane has.
+**The collapse reconciles with the inline info pane.** Upstream drops the left
+column wholesale because upstream's info panel is always a dedicated column;
+here `info_panel_position = auto` (the default) or `inline` docks it *in* that
+column. So while the list is collapsed the pane is column-only: it falls back
+to the dedicated column at `three_panel_min_cols` and up, and below that width
+it has nowhere to render — collapsing turns it off with a note, and `F2` says
+why instead of flipping a flag that changes nothing on screen. The automations
+pane shares the column too, so collapsing moves focus out of the whole
+automations context, and a global-search jump to an automation brings the
+column back.
 
 **The chevron is expand-only.** Upstream draws a `◀`/`▶` affordance in both
 states; here it appears only while the list is collapsed. The fork's central

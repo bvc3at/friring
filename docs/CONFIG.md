@@ -402,7 +402,11 @@ back to the dedicated column otherwise; `column` always uses the dedicated
 column (the classic layout, needs `three_panel_min_cols`); `inline` always
 docks it under the session list, squeezing the list down to its 3-row
 minimum if it must. The inline dock only needs `two_panel_min_cols`, so
-`auto`/`inline` keep F2 usable on terminals too narrow for the column.
+`auto`/`inline` keep F2 usable on terminals too narrow for the column —
+except while the session column itself is collapsed (`Alt+L`), which takes
+the inline dock with it and leaves every position needing
+`three_panel_min_cols`. See `docs/FEATURES.md` ("Collapsing the session
+list").
 
 A complete `settings.toml` showing every knob at its default — copy
 this, uncomment what you want to change, and restart:
