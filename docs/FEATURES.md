@@ -3243,7 +3243,7 @@ discards. So the raw pane stream is scanned *before* the parser
 (`agent::osc52`, fed from the tmux control-mode `%output` bytes, which
 carry the escape raw — plain or passthrough-wrapped — regardless of
 the inner tmux's `set-clipboard`/`allow-passthrough` settings), and
-every completed payload is
+every completed payload is queued, and the newest is
 routed through the same `App::set_clipboard_text` stack as `Ctrl+C` —
 native, or the tmux/OSC 52 fallbacks over SSH — with a
 `Copied from <session>` toast naming the originating session (any
