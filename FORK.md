@@ -961,9 +961,13 @@ already cover the case it was meant to serve.
   it, still firing. (Upstream already knew the shape of this: its uninstall
   prunes the pre-rename `thurbox-cli` marker "or reinstall would duplicate
   ours".) The fork prunes both markers before merging, the same call the
-  uninstall revert makes, so the merge is self-healing across payload changes
-  and still a no-op write when nothing moved. Without it the codex hook fix
-  above could never reach an existing install.
+  uninstall revert makes, so the merge is self-healing across payload changes.
+  Without it the codex hook fix above could never reach an existing install.
+  The prune is gated on the merge actually adding something, and that gate is
+  load-bearing: the marker is a command substring, so it also matches a hook the
+  *user* hand-wrote around `friring-cli session signal`, and this path runs on
+  every TUI start and every heartbeat tick. Gated, the steady state never prunes
+  at all and only the one run that changes the payload can touch such a hook.
 
 - **A forced send is refused at a dead pane too.** Adopting upstream's
   dead-pane guard (`c89eecd`) meant choosing where it sits. Upstream had one

@@ -9,7 +9,11 @@
 #
 # Identity is the injected $FRIRING_SESSION env var (no ids passed by hand), and
 # every hook command is `… || true` so a missing friring-cli or a hook firing
-# outside a friring session can never break the agent.
+# outside a friring session can never break the agent. That `|| true` — and the
+# `>/dev/null 2>&1` codex needs below — assume every agent runs a hook command
+# through a POSIX shell, which is what they all do (Windows runs agents inside
+# WSL; the one payload with a native Windows path, copilot's, ships an explicit
+# `powershell` command variant because its schema has the field for it).
 
 name = "hooks"
 description = "Report each agent's lifecycle state (working/blocked/done) to friring via agent hooks."
