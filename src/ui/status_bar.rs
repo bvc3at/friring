@@ -287,7 +287,7 @@ fn pill_block_width(labels: &[String]) -> u16 {
 ///    bought back as columns for the text;
 /// 2. the left-hand text, segment by segment, least useful first (the priority
 ///    order on `left_segments`) — text yields before any button does, down to
-///    the columns [`reserved_left_width`] holds back for the focus label;
+///    the columns `reserved_left_width` holds back for the focus label;
 /// 3. the optional panel-toggle pills, dropped together, once the pills alone
 ///    no longer fit;
 /// 4. the pill shortcuts, leaving labelled chips (` Theme `);
