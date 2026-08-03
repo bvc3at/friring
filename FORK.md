@@ -28,7 +28,10 @@ divergent on purpose:
 
 - **`b6ddf31` copy over SSH via OSC 52** — the fork's clipboard stack already
   covers this and more; see "Copy falls back to `tmux load-buffer` / OSC 52"
-  and "In-pane OSC 52 copies reach the user's clipboard" below.
+  and "In-pane OSC 52 copies reach the user's clipboard" below. Two pieces of
+  it *were* since ported onto the fork's own stack: the `OSC52_MAX_BYTES`
+  ceiling and `extract_text_from_screen` (see "A terminal selection is read
+  from the vt100 grid").
 - **`03828a0` footer + status bar on narrow terminals** — the fork's own fix
   (see "The footer's text no longer runs under its buttons") solves the same
   overlap differently.
@@ -950,7 +953,13 @@ already cover the case it was meant to serve.
   exit status rather than being fire-and-forget (needs tmux ≥ 3.2 for `-w`,
   already required). (2) Outside tmux, a raw OSC 52 escape to stdout (for a
   direct OSC-52-capable terminal), whose toast is marked `(OSC 52)` since it is
-  fire-and-forget. Applies to all copy surfaces (selection, status bar,
+  fire-and-forget. That raw-escape route alone is length-capped
+  (`OSC52_MAX_BYTES`, 74,994 bytes — a 100,000-byte total sequence less base64
+  overhead and framing, the ceiling upstream derives in `b6ddf31`): a terminal
+  that abandons an over-long sequence keeps *printing* the rest of the base64
+  over the TUI, so an oversized copy is refused up front with its size instead.
+  The `tmux load-buffer` route has no such cap — tmux reads the text over a
+  pipe. Applies to all copy surfaces (selection, status bar,
   code-review markdown). The native path is also skipped when it *works but is
   the wrong machine*: on a macOS (or Windows) host reached over SSH the native
   clipboard API is reachable from the SSH login, so `arboard` "succeeded" onto
@@ -961,9 +970,13 @@ already cover the case it was meant to serve.
   (`clipboard::native_clipboard_is_remote`) — except a loopback SSH
   (`ssh localhost`, a loopback server address in `SSH_CONNECTION`), where host
   and user are the same machine and native is kept. Paste keeps arboard only —
-  terminals block OSC 52 *reads* — and the error points at the terminal's own
-  paste key (bracketed paste still works); over SSH paste likewise refuses
-  instead of silently pasting the *host's* clipboard.
+  terminals block OSC 52 *reads* — and over SSH it likewise refuses instead of
+  silently pasting the *host's* clipboard. Both refusals are **Info**, not
+  Error: over SSH, or on a display-less host, having no readable clipboard is
+  the correct steady state, not a fault, so the status names the key that does
+  work (`Ctrl+Shift+V` / `Cmd+V`, whichever the user's own terminal uses —
+  bracketed paste reaches friring either way) rather than painting a red banner
+  on every paste. A read that is attempted and *fails* still errors.
 
 - **In-pane OSC 52 copies reach the user's clipboard.** A program inside a
   pane that sets the clipboard via OSC 52 — Claude Code's `/copy`, nvim's
@@ -985,7 +998,25 @@ already cover the case it was meant to serve.
   answered; payloads over 8 MiB of base64 are dropped whole rather than
   truncated. Per-pane queues are generation-gated (ADR-P10: the every-tick
   nothing-new poll is one atomic load) and drop-oldest at 8 so a spamming
-  pane can't grow memory — the newest copy is the one that must win.
+  pane can't grow memory — the newest copy is the one that must win. Every
+  queue is drained each tick but only that newest copy (by global capture
+  sequence, so cross-pane order holds) is *written*: the rest would be
+  overwritten before anyone could paste them, and writing them all would put
+  up to eight blocking `tmux load-buffer` spawns per pane on the event-loop
+  tick.
+
+- **A terminal selection is read from the vt100 grid, not the painted cells.**
+  Upstream drags copy whatever glyphs the frame buffer holds, so a URL or path
+  long enough to soft-wrap arrives with a newline where the pane edge was — it
+  stops being one string exactly when pasting it as one string is the point,
+  and a drag past the last line of output carries blank rows along. Selections
+  inside the central pane's terminal view are extracted from the session's own
+  vt100 screen instead (`ui::selection::extract_text_from_screen`, ported from
+  Thurbox's `b6ddf31`), which knows a wrap seam from a hard newline and rejoins
+  it, trims per *logical* line, and drops trailing blank lines. It runs under
+  the parser lock the central-pane render already takes, so a live drag costs
+  no extra lock (ADR-P). Panes with no grid behind them — session list, info
+  panel, review, activity — still read the painted cells.
 
 - **`Cmd+C` / `Cmd+V` are macOS default chords for Copy/Paste.** `Ctrl+C`
   doubles as SIGINT (no-selection case), which upstream accepts as the only

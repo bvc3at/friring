@@ -697,6 +697,10 @@ impl App {
     /// with the scoped automation's run history beneath it. Everything else
     /// shows the session terminal.
     fn render_central_pane(&mut self, frame: &mut Frame, terminal: Rect) {
+        // Only the terminal branch below refills this; every other central view
+        // (review, activity, task/automation workspaces) has no vt100 grid, so
+        // its selection is read back off the painted cells.
+        self.terminal_selection_text = None;
         if matches!(
             self.focus,
             InputFocus::Automations
@@ -832,9 +836,26 @@ impl App {
         // there is none — and the scrollbar check runs before click targets).
         self.record_click(terminal, ClickAction::FocusPane(InputFocus::Terminal));
 
+        // A selection anchored in *this* pane is read off the vt100 grid rather
+        // than the painted cells, so soft-wrapped lines rejoin (see
+        // `selection::extract_text_from_screen`). The pane's inner area is where
+        // `PseudoTerminal` paints the grid 1:1, and `handle_mouse_click` stores
+        // that same inner rect on the selection — so an exact match is what
+        // identifies a selection as this pane's.
+        let inner = terminal.inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let grid_selection = self
+            .text_selection
+            .as_ref()
+            .filter(|sel| sel.pane.rect() == inner)
+            .cloned();
+
         // Scope the immutable `session` borrow so it ends before the
         // `&mut self` record_scrollbar call below.
         let mut locked_parser = false;
+        let mut selected_text = None;
         let geom = {
             let Some(session) = self.sessions.get(self.active_index) else {
                 terminal_view::render_empty_terminal(frame, terminal);
@@ -848,6 +869,11 @@ impl App {
             .unwrap_or(&session.parser);
             if let Ok(mut parser) = parser_arc.lock() {
                 locked_parser = true;
+                // Extracted under the render's existing lock rather than a
+                // second one of its own (ADR-P: one parser lock per frame).
+                selected_text = grid_selection.map(|sel| {
+                    selection::extract_text_from_screen(parser.screen(), &sel, (inner.x, inner.y))
+                });
                 terminal_view::render_terminal(
                     frame,
                     terminal,
@@ -861,6 +887,7 @@ impl App {
                 None
             }
         };
+        self.terminal_selection_text = selected_text;
         // Ghost treatment: grey the frozen frame (content only — the border
         // keeps its focus color and the `[Unloaded]` title, so selection stays
         // visible). Style-only, after the normal render.
@@ -1466,7 +1493,13 @@ impl App {
 
     /// Apply the selection highlight and refresh the selected-text cache —
     /// runs after all rendering.
+    ///
+    /// The highlight is always painted over the frame buffer, but the *text* of
+    /// a terminal-pane selection was already read off the vt100 grid during
+    /// [`Self::render_terminal_pane`] (soft-wrap seams rejoined); only the other
+    /// panes, which have no grid, are read back from the painted cells.
     fn apply_selection_highlight(&mut self, frame: &mut Frame) {
+        let grid_text = self.terminal_selection_text.take();
         let Some(ref sel) = self.text_selection else {
             self.selected_text_cache = None;
             return;
@@ -1478,7 +1511,8 @@ impl App {
 
         selection::highlight_buffer(frame.buffer_mut(), &sel_clone, sel_style);
 
-        let text = selection::extract_text_from_buffer(frame.buffer_mut(), &sel_clone);
+        let text = grid_text
+            .unwrap_or_else(|| selection::extract_text_from_buffer(frame.buffer_mut(), &sel_clone));
         self.selected_text_cache = if text.is_empty() { None } else { Some(text) };
     }
 

@@ -35,6 +35,17 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::process::{Command, Stdio};
 
+/// What to tell the user when friring has no clipboard it can *read* for them.
+///
+/// The terminal emulator's own paste chord still works — it arrives as a
+/// bracketed paste (`App::handle_paste`), never touching this module — so this
+/// is a hint, not a failure. Both chords are named because the machine that
+/// owns the keyboard is not necessarily the one friring runs on: over SSH a
+/// `cfg!(target_os)` here would describe the *host*, which is exactly the
+/// machine the user isn't typing at.
+pub(crate) const PASTE_UNAVAILABLE_HINT: &str = "paste with your terminal's key \
+                                                 (Ctrl+Shift+V / Cmd+V)";
+
 /// True when the native clipboard belongs to a different machine than the one
 /// whose screen the user is watching, so even a *successful* native write
 /// would land where the user isn't.
@@ -137,25 +148,72 @@ pub(crate) fn tmux_copy(text: &str) -> std::io::Result<()> {
     }))
 }
 
+/// Most text one OSC 52 sequence may carry.
+///
+/// Terminals cap the length of a single escape sequence and **discard the
+/// whole thing** past that cap (tmux's `input_osc_52` is the explicit case: it
+/// sets `INPUT_DISCARD` rather than truncating) — but a terminal that aborts
+/// mid-sequence stops *interpreting* while the rest of the base64 keeps
+/// arriving, and prints it as text over whatever ratatui last painted. So an
+/// oversized copy is either silent loss or a corrupted screen; refusing it up
+/// front is the only outcome the user can act on.
+///
+/// The de-facto ceiling is a 100,000-byte total sequence. base64 costs 4 bytes
+/// per 3, and the `ESC ] 5 2 ; c ;` + `BEL` framing costs 8, leaving
+/// `((100_000 - 8) / 4) * 3` bytes of payload.
+pub(crate) const OSC52_MAX_BYTES: usize = 74_994;
+
+/// Why an OSC 52 copy didn't happen.
+///
+/// [`TooLarge`](Osc52Error::TooLarge) is a property of the *text*, not a
+/// transport failure: nothing was written, and no fallback would fare better.
+/// It carries its own complete message so the caller doesn't prefix it with
+/// why the native clipboard was skipped (see `App::clipboard_error`).
+#[derive(Debug)]
+pub(crate) enum Osc52Error {
+    /// Text exceeds what one sequence can carry ([`OSC52_MAX_BYTES`]).
+    TooLarge { bytes: usize },
+    /// Writing the sequence to stdout failed.
+    Write(std::io::Error),
+}
+
+impl std::fmt::Display for Osc52Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge { bytes } => write!(
+                f,
+                "Too large to copy over OSC 52 ({bytes} bytes; limit {OSC52_MAX_BYTES})"
+            ),
+            Self::Write(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// Copy `text` to the terminal's clipboard via OSC 52
 /// (`ESC ] 52 ; c ; <base64> BEL`), written directly to stdout.
 ///
 /// Best-effort fire-and-forget: `Ok` means the sequence reached stdout, not
 /// that the terminal honoured it. Only meaningful when **not** behind tmux
-/// (see the module docs); inside tmux use [`tmux_copy`] instead. Safe to emit
-/// while ratatui owns the screen — the sequence paints nothing and moves no
-/// cursor.
-pub(crate) fn osc52_copy(text: &str) -> std::io::Result<()> {
+/// (see the module docs); inside tmux use [`tmux_copy`] instead, which has no
+/// such size limit — tmux reads the text over a pipe and sets the buffer
+/// whatever its length. Safe to emit while ratatui owns the screen — the
+/// sequence paints nothing and moves no cursor, provided it is short enough
+/// that the terminal doesn't abandon it mid-flight ([`OSC52_MAX_BYTES`]).
+pub(crate) fn osc52_copy(text: &str) -> Result<(), Osc52Error> {
+    let seq = osc52_sequence(text)?;
     let mut out = std::io::stdout().lock();
-    out.write_all(&osc52_sequence(text))?;
-    out.flush()
+    out.write_all(&seq).map_err(Osc52Error::Write)?;
+    out.flush().map_err(Osc52Error::Write)
 }
 
-fn osc52_sequence(text: &str) -> Vec<u8> {
+fn osc52_sequence(text: &str) -> Result<Vec<u8>, Osc52Error> {
+    if text.len() > OSC52_MAX_BYTES {
+        return Err(Osc52Error::TooLarge { bytes: text.len() });
+    }
     let mut seq = b"\x1b]52;c;".to_vec();
     seq.extend_from_slice(base64(text.as_bytes()).as_bytes());
     seq.push(0x07);
-    seq
+    Ok(seq)
 }
 
 /// Standard-alphabet base64 with `=` padding (RFC 4648). Hand-rolled: a few
@@ -179,6 +237,63 @@ fn base64(input: &[u8]) -> String {
         }
     }
     out
+}
+
+/// Serializes every test — in this module or any other — that mutates the
+/// process-global environment the clipboard routing reads (`SSH_*`,
+/// `DISPLAY`/`WAYLAND_DISPLAY`).
+///
+/// One lock shared across all of them, deliberately: a `static` declared
+/// *inside* a test function is a distinct instance per function, so
+/// same-named per-test locks synchronize nothing and `cargo test`'s threads
+/// race on the same variables. (nextest's process-per-test model hides that,
+/// which is exactly why the lock has to be right rather than merely present.)
+#[cfg(test)]
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Apply `vars` to the process environment (`None` unsets) under
+/// [`ENV_LOCK`], restoring the previous values when the returned guard drops
+/// — including on a panicking assertion, so one failing test can't leak an
+/// SSH-looking environment into the next.
+///
+/// Saved as `OsString` via `var_os`, not `String` via `var`: a non-UTF-8 value
+/// makes `var` return `Err`, which would restore as "was unset" and delete a
+/// variable the test only meant to shadow. (The routing this guards reads its
+/// own variables with `var_os` for the same reason.)
+#[cfg(test)]
+pub(crate) fn scoped_env(vars: &[(&'static str, Option<&str>)]) -> EnvGuard {
+    let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let saved = vars
+        .iter()
+        .map(|(k, _)| (*k, std::env::var_os(k)))
+        .collect();
+    for (k, v) in vars {
+        match v {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+    EnvGuard { saved, _lock: lock }
+}
+
+/// Restores what [`scoped_env`] replaced. `saved` is declared before `_lock`
+/// so the restore runs while the lock is still held.
+#[cfg(test)]
+pub(crate) struct EnvGuard {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (k, v) in &self.saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -214,10 +329,9 @@ mod tests {
 
     #[test]
     fn ssh_connection_loopback_parsing() {
-        use std::sync::Mutex;
-        // `set_var` mutates process-global state; serialize the two cases.
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap();
+        // Holds the shared lock and restores `SSH_CONNECTION` afterwards; the
+        // cases below overwrite it in turn.
+        let _env = scoped_env(&[("SSH_CONNECTION", None)]);
 
         let cases = [
             ("127.0.0.1 54321 127.0.0.1 22", true),
@@ -255,6 +369,32 @@ mod tests {
 
     #[test]
     fn sequence_wraps_payload_in_osc52() {
-        assert_eq!(osc52_sequence("hi"), b"\x1b]52;c;aGk=\x07".to_vec());
+        assert_eq!(
+            osc52_sequence("hi").unwrap(),
+            b"\x1b]52;c;aGk=\x07".to_vec()
+        );
+    }
+
+    #[test]
+    fn sequence_refuses_oversized_text_before_writing_anything() {
+        let over = "x".repeat(OSC52_MAX_BYTES + 1);
+        let err = osc52_sequence(&over).expect_err("past the ceiling");
+        assert!(
+            matches!(err, Osc52Error::TooLarge { bytes } if bytes == OSC52_MAX_BYTES + 1),
+            "got {err:?}"
+        );
+        // The whole point is that the user sees the size, not a corrupted TUI —
+        // and the limit, so the overshoot is a number they can act on.
+        assert!(err.to_string().contains(&(OSC52_MAX_BYTES + 1).to_string()));
+        assert!(err.to_string().contains(&OSC52_MAX_BYTES.to_string()));
+    }
+
+    #[test]
+    fn sequence_at_the_ceiling_fits_the_100k_budget() {
+        // The ceiling is derived from a 100,000-byte total sequence; a payload
+        // exactly at it must still be accepted and must not exceed that budget.
+        let at = "x".repeat(OSC52_MAX_BYTES);
+        let seq = osc52_sequence(&at).expect("exactly at the ceiling is allowed");
+        assert_eq!(seq.len(), 100_000);
     }
 }
