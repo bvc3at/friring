@@ -10,9 +10,18 @@ hasOwnMain: true
   <div class="docs-layout">
     {% include "sidebar.njk" %}
 
-    <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle sidebar">
+    <button
+      class="sidebar-toggle"
+      id="sidebar-toggle"
+      type="button"
+      aria-label="Toggle sidebar"
+      aria-controls="docs-sidebar"
+      aria-expanded="false"
+    >
       &#9776;
     </button>
+
+    <div class="docs-sidebar-backdrop" id="docs-sidebar-backdrop" aria-hidden="true"></div>
 
     <main class="docs-content" id="main-content">
       <div class="breadcrumbs">

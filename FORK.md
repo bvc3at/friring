@@ -37,8 +37,13 @@ divergent on purpose:
   overlap differently.
 - **`86ab3dc` / `4e19147` / `b951991` F9 session-list collapse** — `F9` is the
   fork's activity view.
-- **`1dd5edb` / `2c07e3a` demo regeneration** and upstream's website work — the
-  fork records its own demos and ships its own site.
+- **`1dd5edb` / `2c07e3a` demo regeneration** and the **visual identity** half of
+  upstream's website work — the fork records its own demos and ships its own
+  site, so upstream's Doom-inspired game-UI redesign, its restyled dividers and
+  chrome, and its `iddqd` easter egg stay unadopted. The **bug-fix and
+  load-cost** half of that work does apply to the fork's site, which was
+  upstream's pre-redesign CSS rebranded, and is adopted separately (see "Own
+  website" below).
 
 ## Renamed to friring (July 2026)
 
@@ -1180,6 +1185,51 @@ already cover the case it was meant to serve.
     Pages is Enterprise Cloud-only.
   - Upstream credit moved into the site content: the landing-page footer, an
     FAQ entry, and an `llms.txt` entry all point at `Thurbeen/thurbox`.
+  - **Docs tables scroll in their own box, at every width.** Wide reference
+    tables used to drag the whole page sideways. Upstream's fix puts
+    `display: block; overflow-x: auto` on the table itself below 640px; the
+    fork instead wraps each docs table in a `.table-scroll` box at build time
+    (the `wrap-tables` Eleventy transform). The wrapper keeps real table layout
+    — `display: block` reflows the rows through an anonymous table box and
+    shrink-wraps them — and needs no breakpoint, which matters because these
+    tables outgrow the prose column at intermediate desktop widths too, not
+    only on phones.
+  - **"On This Page" is generated, and stays in the sidebar.** It used to be
+    restated in each page's `onThisPage` front matter — 17 of 21 pages carried
+    one and the rest silently got none, including `features.html` with its 19
+    sections. A `docs-toc` Eleventy transform now derives it from the rendered
+    heading ids. Upstream moves the result into a third column at 1280px+ as
+    part of its docs-layout rework; the fork keeps it where it already was, at
+    the foot of the sidebar, so the change is the generation and not the
+    layout. The fork's rule also falls back to the nearest enclosing block's
+    id when a heading has none, which is what keeps the generated
+    `ui-review.html` list intact — that page is emitted as
+    `<div class="review-card" id="screen-N"><h3>…`, with the id on the card.
+  - **Self-hosted fonts ship their licence.** The three web fonts are served
+    from `website/assets/fonts/` rather than Google Fonts, as upstream does.
+    The fork also ships `assets/fonts/OFL.txt` — the SIL Open Font License 1.1
+    plus each family's copyright notice, read out of the font files' own name
+    tables — because serving the `woff2` files is redistribution and the
+    licence requires it to travel with them.
+  - **No `overflow-x: clip` backstop.** Upstream guards residual sideways
+    scroll with `body { overflow-x: clip }`. That declaration does nothing:
+    overflow only propagates from `body` to the viewport for the values
+    Chromium and WebKit actually propagate, and `clip` is not one of them — a
+    page that overflows still drags sideways with the rule in place, in both
+    engines. The fork fixes the causes instead (responsive display headings,
+    breakable inline code, shrinkable `.step-content`, scrollable tables) and
+    does not carry the rule. Putting it on `html` would work, but it would
+    silently clip any future overflow out of reach rather than surfacing it.
+  - **The shared stylesheets ship as one generated bundle.** Upstream links
+    `variables`, `base`, `layout` and `components` separately, so the chrome
+    every page needs costs four render-blocking requests. The fork keeps the
+    four authored apart under `website/css/` and concatenates them — in that
+    order, so the cascade is unchanged — into `_site/css/core.css` at build
+    time (`eleventy.config.js`). The page-specific sheets (`landing`, `docs`,
+    `ui-review`) are deliberately left unbundled, since bundling them would
+    ship landing CSS to docs pages and vice versa. `core.css` is generated
+    output: it is never edited, never passthrough-copied, and only the four
+    sources are.
 - `README.md` and the agent-guide prose call the project **Friring**, and so do
   the install commands; what still points at upstream is attribution and the
   shared formats above.

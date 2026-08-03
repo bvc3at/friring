@@ -89,6 +89,13 @@
   font-weight: 600;
 }
 
+/* "On This Page" entries for h3s, nested one level under their h2. */
+.docs-sidebar li.toc-sub a {
+  padding-left: var(--space-lg);
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
 /* ---- Sidebar toggle (mobile) ---- */
 .sidebar-toggle {
   display: none;
@@ -260,8 +267,32 @@ h3:hover .heading-anchor {
   border-left-color: var(--yellow);
 }
 
+/* ---- Sidebar backdrop (mobile) — dims the content behind the open drawer ---- */
+.docs-sidebar-backdrop {
+  display: none;
+}
+
 /* ---- Responsive ---- */
 @media (max-width: 1023px) {
+  .docs-sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: var(--nav-height) 0 0 0;
+    background: rgb(0, 0, 0, 0.65);
+    backdrop-filter: blur(2px);
+    z-index: 39;
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity var(--transition),
+      visibility var(--transition);
+  }
+
+  .docs-sidebar-backdrop.open {
+    opacity: 1;
+    visibility: visible;
+  }
+
   .docs-sidebar {
     position: fixed;
     top: var(--nav-height);
@@ -334,4 +365,59 @@ h3:hover .heading-anchor {
   margin-top: var(--space-sm);
   font-size: 0.8rem;
   color: var(--text-muted);
+}
+
+/* Wide reference tables scroll in their own box instead of forcing the whole
+   page sideways. The box is added around every docs table at build time by the
+   wrap-tables transform (eleventy.config.js) rather than by putting
+   `display: block; overflow-x: auto` on the table itself: that reflows the rows
+   through an anonymous table box and shrink-wraps them, changing the layout at
+   every width. A wrapper keeps real table layout and confines the overflow — so
+   it needs no breakpoint, which matters because the tables outgrow the prose
+   column at intermediate desktop widths too, not just on phones. */
+.table-scroll {
+  overflow-x: auto;
+}
+
+/* ---- Mobile reading ---- */
+@media (max-width: 639px) {
+  .docs-content {
+    padding-top: var(--space-lg);
+    font-size: 0.95rem;
+  }
+
+  /* Press Start 2P is very wide; docs h2s are prose signposts, not title cards,
+     so drop to the mono face on phones to stop them wrapping to three lines. */
+  .docs-content h2 {
+    font-family: var(--font-mono);
+    letter-spacing: 0;
+    margin-top: var(--space-xl);
+  }
+
+  .docs-content table {
+    font-size: 0.8rem;
+  }
+
+  /* Each table is its own scroll box, so cells can keep their natural width
+     rather than wrapping every reference entry into a cramped stack. */
+  .docs-content th,
+  .docs-content td {
+    padding: var(--space-xs) var(--space-sm);
+    white-space: nowrap;
+  }
+
+  /* The hover-reveal "#" affordance can't be hovered on touch, and it pushes
+     long headings wider. */
+  .heading-anchor {
+    display: none;
+  }
+
+  .breadcrumbs {
+    margin-bottom: var(--space-lg);
+    font-size: 0.75rem;
+  }
+
+  .info-box {
+    padding: var(--space-sm) var(--space-md);
+  }
 }

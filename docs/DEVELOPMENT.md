@@ -320,13 +320,20 @@ rumdl check .                        # markdown lint (.rumdl.toml)
 rumdl fmt .                          # markdown auto-fix
 ```
 
-### Website linting
+### Website
 
 ```bash
 npm ci                               # install deps (use lockfile)
+npm run build:website                # build the site into _site/
+npm run dev:website                  # build + serve with live rebuild
 npm run lint:website                 # run all website linters
 npm run fmt:website                  # auto-fix formatting (Prettier)
 ```
+
+`website/css/{variables,base,layout,components}.css` are the authored sources
+for the shared chrome; the Eleventy build concatenates them into the generated
+`_site/css/core.css` that every page links. Edit the sources — the bundle is
+overwritten on every build.
 
 ### Architecture enforcement
 

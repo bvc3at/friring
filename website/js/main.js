@@ -6,17 +6,39 @@
   var navLinks = document.getElementById('nav-links');
 
   if (hamburger && navLinks) {
+    var setNavOpen = function (open) {
+      hamburger.classList.toggle('active', open);
+      navLinks.classList.toggle('open', open);
+      hamburger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    };
+
+    var closeNav = function (returnFocus) {
+      if (!navLinks.classList.contains('open')) return;
+      setNavOpen(false);
+      if (returnFocus) hamburger.focus();
+    };
+
     hamburger.addEventListener('click', function () {
-      hamburger.classList.toggle('active');
-      navLinks.classList.toggle('open');
+      setNavOpen(!navLinks.classList.contains('open'));
     });
 
     // Close menu when a link is clicked
     navLinks.querySelectorAll('a').forEach(function (link) {
       link.addEventListener('click', function () {
-        hamburger.classList.remove('active');
-        navLinks.classList.remove('open');
+        closeNav(false);
       });
+    });
+
+    // Escape closes and hands focus back to the toggle that opened it.
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') closeNav(true);
+    });
+
+    // A tap outside the open dropdown dismisses it.
+    document.addEventListener('click', function (e) {
+      if (!navLinks.classList.contains('open')) return;
+      if (navLinks.contains(e.target) || hamburger.contains(e.target)) return;
+      closeNav(false);
     });
   }
 
@@ -53,27 +75,38 @@
       }
       if (!code) return;
 
-      navigator.clipboard.writeText(code).then(function () {
-        btn.textContent = 'Copied!';
-        btn.classList.add('copied');
+      var flash = function (label, cls) {
+        btn.textContent = label;
+        btn.classList.add(cls);
         setTimeout(function () {
           btn.textContent = 'Copy';
-          btn.classList.remove('copied');
+          btn.classList.remove(cls);
         }, 2000);
-      });
+      };
+
+      // The Clipboard API needs a secure context, so it is absent over plain
+      // http and rejects when permission is denied — report either instead of
+      // throwing and leaving the button looking untouched.
+      if (!navigator.clipboard || !navigator.clipboard.writeText) {
+        flash('Copy failed', 'copy-failed');
+        return;
+      }
+
+      navigator.clipboard.writeText(code).then(
+        function () {
+          flash('Copied!', 'copied');
+        },
+        function () {
+          flash('Copy failed', 'copy-failed');
+        },
+      );
     });
   });
 
-  // ---- Smooth scroll for anchor links ----
-  document.querySelectorAll('a[href^="#"]').forEach(function (link) {
-    link.addEventListener('click', function (e) {
-      var target = document.querySelector(link.getAttribute('href'));
-      if (target) {
-        e.preventDefault();
-        target.scrollIntoView({ behavior: 'smooth' });
-      }
-    });
-  });
+  // Anchor smooth-scrolling is handled natively by `html { scroll-behavior:
+  // smooth }` in base.css, which also honors prefers-reduced-motion and keeps
+  // location.hash (and therefore the back button and deep links) intact — so
+  // there is deliberately no JS click handler for a[href^="#"] here.
 
   // ---- Active sidebar link (docs pages) ----
   // Matches both in-page anchors (#id) and same-page section links
@@ -230,21 +263,65 @@
     }
   }
 
-  // ---- Mobile sidebar toggle (docs pages) ----
+  // ---- Mobile sidebar drawer (docs pages) ----
   var sidebarToggle = document.getElementById('sidebar-toggle');
   var sidebar = document.querySelector('.docs-sidebar');
+  var backdrop = document.getElementById('docs-sidebar-backdrop');
+
+  // `returnFocus` distinguishes dismissing the drawer from following a link out
+  // of it: a dismissal (Escape, backdrop) hands focus back to the toggle, while
+  // a link click leaves focus alone so it can follow the anchor to its target.
+  // The `contains` guard is the backstop for either path — focus must never be
+  // left on a link that has just slid off-canvas.
+  function closeSidebar(returnFocus) {
+    if (!sidebar) return;
+    sidebar.classList.remove('open');
+    if (sidebarToggle) {
+      sidebarToggle.classList.remove('active');
+      sidebarToggle.setAttribute('aria-expanded', 'false');
+    }
+    if (backdrop) backdrop.classList.remove('open');
+    if (!sidebarToggle) return;
+    if (returnFocus || sidebar.contains(document.activeElement)) sidebarToggle.focus();
+  }
+
   if (sidebarToggle && sidebar) {
     sidebarToggle.addEventListener('click', function () {
-      sidebar.classList.toggle('open');
-      sidebarToggle.classList.toggle('active');
+      var open = sidebar.classList.toggle('open');
+      sidebarToggle.classList.toggle('active', open);
+      sidebarToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+      if (backdrop) backdrop.classList.toggle('open', open);
+      // Move focus into the drawer so keyboard and screen-reader users land
+      // where the visual focus went.
+      if (open) {
+        var first = sidebar.querySelector('a');
+        if (first) first.focus();
+      }
     });
 
-    // Close sidebar when clicking a link on mobile
+    // Tapping the backdrop is a dismissal, so it returns focus like Escape —
+    // without this the click blurs to <body> and the next Tab restarts at the
+    // top of the page. (Wrapped: the listener's Event argument would otherwise
+    // arrive as `returnFocus`.)
+    if (backdrop) {
+      backdrop.addEventListener('click', function () {
+        closeSidebar(true);
+      });
+    }
+
+    // Close the drawer when a link is followed. Focus is deliberately left
+    // alone here so it can follow the link to its target.
     sidebar.querySelectorAll('a').forEach(function (link) {
       link.addEventListener('click', function () {
-        sidebar.classList.remove('open');
-        if (sidebarToggle) sidebarToggle.classList.remove('active');
+        closeSidebar(false);
       });
+    });
+
+    // Escape closes the drawer and returns focus to the toggle that opened it.
+    document.addEventListener('keydown', function (e) {
+      if (e.key !== 'Escape') return;
+      if (!sidebar.classList.contains('open')) return;
+      closeSidebar(true);
     });
   }
 })();

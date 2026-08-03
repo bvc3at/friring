@@ -369,6 +369,11 @@
   border-color: var(--green);
 }
 
+.copy-btn.copy-failed {
+  color: var(--red);
+  border-color: var(--red);
+}
+
 /* ---- Prism token theme → Doom palette ---- */
 .code-block .token.comment,
 .code-block .token.prolog,

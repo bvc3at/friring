@@ -1,3 +1,34 @@
+/* Self-hosted so the site makes no third-party request. Inter and JetBrains
+   Mono are variable, so one file each covers every weight the site uses. The
+   declared 400–700 is that used subset, not the files' full wght axes (100–900
+   and 400–800 respectively) — declaring a range rather than a single weight is
+   what lets the browser instance real bold instead of synthesizing it. Press
+   Start 2P is static and only ever used at 400.
+   Licensing: assets/fonts/OFL.txt. */
+@font-face {
+  font-family: Inter;
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('../assets/fonts/inter-400.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('../assets/fonts/jetbrains-mono-400.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Press Start 2P';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('../assets/fonts/press-start-2p-400.woff2') format('woff2');
+}
+
 :root {
   /* Backgrounds — neutral warm-charcoal (Doom is an accent, not the whole room) */
   --bg-primary: #15120f;
