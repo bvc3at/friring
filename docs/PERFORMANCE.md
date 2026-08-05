@@ -644,6 +644,52 @@ appear until the next open) for a keystroke path with zero I/O.
 
 ---
 
+## ADR-P14: Price sessions from one process-table read, off-thread, every ~3 s
+
+**Choice**: Per-session memory (`docs/FEATURES.md` → *Per-session memory*) is a
+`spawn_blocking` job on the ADR-P12 shape — inputs built on the UI thread,
+result applied by session id — with three cost decisions on top:
+
+- **One table read per pass, not one per session.** The worker resolves every
+  live pane's root pid first (each a control-mode round-trip), then reads the
+  machine's process table **once** and answers all N sessions from a single
+  parent→child index. N sessions cost one `ps` fork (macOS) or one procfs walk
+  (Linux), not N.
+- **Ghosts cost nothing.** An unloaded session has no process by construction,
+  so it is answered from the input list. An all-ghost fleet never reads the
+  process table at all.
+- **~3 s cadence, offset half a period** (`MEMORY_REFRESH_TICKS` = 300 at
+  ~10 ms/tick, fired at `% 300 == 150`) so the pass never shares a tick with
+  the ~1 s metrics / cc-activity / activity scans. A footprint moves on the
+  scale of seconds; nothing here is worth a per-frame syscall.
+
+Measured on macOS: `ps -Ao pid=,ppid=,rss=` over ~900 processes is ~50 ms
+wall-clock, essentially all fork/exec — fine on a worker every ~3 s, and exactly
+the kind of stall ADR-P12 keeps off the render path. Linux's procfs walk is two
+small reads per pid with no fork. The whole feature is behind
+`[features] session_memory`, so the read can be turned off outright.
+
+**Why**: the alternative shapes each cost more for the same number. A
+`sysinfo` full-process refresh per pass duplicates work friring already does for
+CPU and carries every process's name/cmdline/user; a per-session `ps -o rss= -p
+<pid>` fork multiplies the fork cost by N and still can't see children.
+
+**Rejected**:
+
+- *Reading it per frame, or on the UI thread* — a `ps` fork between a keystroke
+  and its repaint is the ADR-P12 stall, reintroduced.
+- *Summing remote sessions over the transport* — a second command down every
+  SSH/WSL connection every few seconds, for a number the local machine isn't
+  paying. Remote sessions report nothing (see *three states, never two*).
+- *Pricing only the pane process* (what `metrics_refresh` did for the info
+  panel's old RAM line) — it misses the MCP servers and tools an agent CLI
+  forks, which is most of what a session costs.
+- *Deduplicating shared pages across the tree* — needs `smaps_rollup`-class
+  reads per process (orders of magnitude more expensive) to refine a number
+  whose job is comparison between sessions, not accounting.
+
+---
+
 ## Quick reference
 
 | I want to… | Do this |
@@ -659,3 +705,4 @@ appear until the next open) for a keystroke path with zero I/O.
 | Profile CPU | `cargo flamegraph --profile release-with-debug --bin friring` |
 | Verify no perf regression | `cargo nextest run -E 'test(perf_)'` |
 | Confirm idle CPU is low | Launch, leave it idle — `redraws_skipped` climbs while `frames_rendered` stays flat |
+| See what a session costs in RAM | Read its list-row badge / the `Σ` fleet total / the info panel's RAM line; turn the scan off with `[features] session_memory = false` (ADR-P14) |

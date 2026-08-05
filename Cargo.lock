@@ -881,6 +881,7 @@ dependencies = [
  "cron",
  "crossterm",
  "insta",
+ "libc",
  "notify-rust",
  "proptest",
  "pulldown-cmark",

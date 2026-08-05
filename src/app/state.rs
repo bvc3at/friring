@@ -28,7 +28,7 @@ impl App {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::App;
     use crate::agent::backend::SpawnedSession;
     use crate::agent::{AgentProvider, BackendRegistry, GenericProvider, Session, SessionBackend};
@@ -91,8 +91,11 @@ mod tests {
 
     /// Build a real [`App`] seeded with `count` stub sessions (`active_index` at
     /// 0 when non-empty), hermetic via a [`TestPathGuard`] tempdir the caller
-    /// must keep alive for the `App`'s lifetime.
-    fn app_with_sessions(count: usize) -> (App, crate::paths::TestPathGuard, tempfile::TempDir) {
+    /// must keep alive for the `App`'s lifetime. Shared with sibling `app`
+    /// modules that need a live `App` without a tmux backend.
+    pub(crate) fn app_with_sessions(
+        count: usize,
+    ) -> (App, crate::paths::TestPathGuard, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let guard = crate::paths::TestPathGuard::new(tmp.path());
         let backend: Arc<dyn SessionBackend> = Arc::new(StubBackend);

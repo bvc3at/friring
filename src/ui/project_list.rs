@@ -9,7 +9,7 @@ use ratatui::{
 use super::highlight::append_highlighted as append_name_spans;
 use super::theme::Theme;
 use super::{focus_block, status_color, FocusLevel};
-use crate::session::{SessionInfo, SessionStatus};
+use crate::session::{SessionInfo, SessionMemory, SessionStatus};
 
 /// Per-field fuzzy match positions for a session entry.
 #[derive(Clone)]
@@ -647,6 +647,20 @@ fn render_session_section(
         block = block.title_top(Line::from(dots).right_aligned());
     }
 
+    // The fleet total, on the bottom border: one session's footprint is
+    // abstract, the sum of every running agent is the number that argues for
+    // unloading one. Bottom-*left* keeps it clear of the scroll indicators,
+    // which the renderer paints over the right end of both borders.
+    if let Some(total) = fleet_rss(sessions) {
+        block = block.title_bottom(
+            Line::from(Span::styled(
+                format!(" \u{3a3} {total} "),
+                Style::default().fg(Theme::text_muted()),
+            ))
+            .left_aligned(),
+        );
+    }
+
     if sessions.is_empty() {
         render_empty_sessions(frame, area, block);
         return Vec::new();
@@ -870,6 +884,64 @@ const AGENT_STATUS_SEPARATOR: &str = "  ";
 /// Minimum columns the inline agent status needs to be worth showing.
 const AGENT_STATUS_MIN_WIDTH: usize = 4;
 
+/// Badge for a session measured to have no process at all — the em dash reads
+/// as "nothing here", where a `0M` would read as a suspiciously cheap agent.
+const UNLOADED_BADGE: &str = "\u{2014}";
+
+/// Format a resident-set size for a sidebar badge: at most four columns, so a
+/// column of them lines up on even the narrowest sidebar. Binary units, matching
+/// the info panel's `format_bytes`.
+///
+/// The four-column bound holds for every `u64` by construction rather than up to
+/// some largest handled unit: the walk hands over half a unit early, so a value
+/// can never round up into a fifth column (`1024K`, `1000M`, `1000G`), and it
+/// only stops at the last unit — which `u64` cannot overflow. Sub-10 values keep
+/// one decimal from `G` up (`1.9G`), where a whole number would throw away most
+/// of the range; `K` and `M` are precise enough without one (`1M`, not `1.0M`).
+fn format_rss(bytes: u64) -> String {
+    /// Binary-unit suffixes from kibibytes up. `u64::MAX` is ~16 EiB, so the
+    /// walk below can never run past the last one.
+    const UNITS: [&str; 6] = ["K", "M", "G", "T", "P", "E"];
+
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 999.5 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    // `>= 2` is the index of `G`.
+    if unit >= 2 && value < 9.95 {
+        format!("{value:.1}{}", UNITS[unit])
+    } else {
+        format!("{value:.0}{}", UNITS[unit])
+    }
+}
+
+/// A session's memory badge: its process tree's RSS, or [`UNLOADED_BADGE`] when
+/// the tree was measured empty. `None` for an *unmeasured* session (remote, or
+/// not yet scanned) — it renders no badge at all, because an em dash there would
+/// claim a saving that was never observed.
+fn memory_badge(info: &SessionInfo) -> Option<String> {
+    match info.memory? {
+        SessionMemory::Live { rss_bytes, .. } => Some(format_rss(rss_bytes)),
+        SessionMemory::Unloaded => Some(UNLOADED_BADGE.to_string()),
+    }
+}
+
+/// Total RSS across the sessions currently running a process tree, formatted for
+/// the list's footer. `None` when none of them is live: with every row already
+/// reading `—`, a `0K` total would be noise.
+fn fleet_rss(sessions: &[&SessionInfo]) -> Option<String> {
+    sessions
+        .iter()
+        .filter_map(|s| match s.memory {
+            Some(SessionMemory::Live { rss_bytes, .. }) => Some(rss_bytes),
+            _ => None,
+        })
+        .reduce(|a, b| a.saturating_add(b))
+        .map(format_rss)
+}
+
 /// Style for the session name span.
 fn name_span_style(is_active: bool, is_dimmed: bool) -> Style {
     if is_dimmed {
@@ -968,6 +1040,23 @@ fn push_agent_status(
     }
 }
 
+/// Right-align the memory badge at the end of the row, keeping at least one
+/// column of gap. Dropped silently when the columns aren't there: on a narrow
+/// sidebar the session's name and state outrank its price tag.
+fn push_memory_badge(line: &mut Line<'_>, badge: &str, inner_width: usize) {
+    let pad = inner_width
+        .saturating_sub(line.width())
+        .saturating_sub(badge.chars().count());
+    if pad == 0 {
+        return;
+    }
+    line.spans.push(Span::raw(" ".repeat(pad)));
+    line.spans.push(Span::styled(
+        badge.to_string(),
+        Style::default().fg(Theme::text_muted()),
+    ));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_session_line<'a>(
     info: &'a SessionInfo,
@@ -1027,9 +1116,22 @@ fn build_session_line<'a>(
         name_style,
     );
 
-    push_agent_status(&mut spans, info, status_style, inner_width);
+    // Reserve the badge's columns before the activity text claims them: the
+    // memory figure is fixed-width and scans down the column, while the
+    // activity text is prose that truncates without losing its point.
+    let badge = memory_badge(info);
+    let reserved = badge.as_ref().map_or(0, |b| b.chars().count() + 1);
+    push_agent_status(
+        &mut spans,
+        info,
+        status_style,
+        inner_width.saturating_sub(reserved),
+    );
 
     let mut line = Line::from(spans);
+    if let Some(badge) = badge {
+        push_memory_badge(&mut line, &badge, inner_width);
+    }
 
     // Paint the selection background across the whole row here, rather than via
     // the List's `highlight_style` (which would also tint the repo-group header
@@ -1491,6 +1593,160 @@ mod tests {
             &s, None, false, false, 0, false, WIDE, "◐", None,
         ));
         assert!(text.contains("attn  Review this diff"));
+    }
+
+    // --- per-session memory ---
+
+    fn live(rss_bytes: u64) -> Option<SessionMemory> {
+        Some(SessionMemory::Live {
+            rss_bytes,
+            procs: 3,
+        })
+    }
+
+    #[test]
+    fn rss_badge_stays_within_four_columns() {
+        assert_eq!(format_rss(347_078_656), "331M"); // an idle claude
+        assert_eq!(format_rss(2_040_109_465), "1.9G");
+        assert_eq!(format_rss(512 * 1024), "512K");
+        assert_eq!(format_rss(0), "0K");
+        // Each unit hands over before its own text rounds up a column: 1023.9
+        // KiB is `1M`, not `1024K`; 999.75 MiB is `1.0G`, not `1000M`.
+        assert_eq!(format_rss(1_048_500), "1M");
+        assert_eq!(format_rss(1_048_313_856), "1.0G");
+        // …and the decimal goes at 10 G, which would otherwise read `10.0G`.
+        assert_eq!(format_rss(10 * 1_073_741_824), "10G");
+        // The handover keeps going past G — 1000 GiB is `1.0T`, not `1000G`.
+        const TIB: u64 = 1024 * 1_073_741_824;
+        assert_eq!(format_rss(1000 * 1_073_741_824), "1.0T");
+        assert_eq!(format_rss(TIB), "1.0T");
+        assert_eq!(format_rss(u64::MAX), "16E");
+        // No value near a boundary may widen to a fifth column.
+        for bytes in [
+            1_047_527_424u64,
+            1_073_741_823,
+            1_073_741_824,
+            1_048_500,
+            1_048_313_856,
+            10 * 1_073_741_824,
+            1000 * 1_073_741_824,
+            TIB,
+            1000 * TIB,
+            u64::MAX,
+        ] {
+            let badge = format_rss(bytes);
+            assert!(
+                badge.chars().count() <= 4,
+                "{bytes} formatted as {badge}, wider than the reserved column"
+            );
+        }
+    }
+
+    #[test]
+    fn rss_badge_never_widens_at_any_magnitude() {
+        // The bound is structural, so assert it across the whole u64 range
+        // rather than at the handful of boundaries picked by hand above.
+        let mut bytes = 1u64;
+        loop {
+            for probe in [bytes, bytes.saturating_sub(1), bytes.saturating_add(1)] {
+                let badge = format_rss(probe);
+                assert!(
+                    badge.chars().count() <= 4,
+                    "{probe} formatted as {badge}, wider than the reserved column"
+                );
+            }
+            match bytes.checked_mul(2) {
+                Some(next) => bytes = next,
+                None => break,
+            }
+        }
+    }
+
+    #[test]
+    fn line_shows_the_memory_badge_right_aligned() {
+        let mut s = info("busy");
+        s.memory = live(347_078_656);
+        let text = line_text(&build_session_line(
+            &s, None, false, false, 0, false, 20, "◐", None,
+        ));
+        assert_eq!(text.chars().count(), 20, "badge is flush to the right edge");
+        assert!(text.ends_with("331M"), "got {text:?}");
+    }
+
+    #[test]
+    fn line_shows_an_em_dash_for_an_unloaded_session() {
+        // The saving an `Alt+U` bought — a ghost row must read differently from
+        // an idle live one, which is the whole point of the badge.
+        let mut ghost = info("ghost");
+        ghost.status = SessionStatus::Unloaded;
+        ghost.memory = Some(SessionMemory::Unloaded);
+        let text = line_text(&build_session_line(
+            &ghost, None, false, false, 0, false, 20, "◌", None,
+        ));
+        assert!(text.ends_with('\u{2014}'), "got {text:?}");
+    }
+
+    #[test]
+    fn line_shows_no_badge_for_an_unmeasured_session() {
+        // A remote session's tree lives on the host: no badge at all, never a
+        // dash that would claim it costs nothing.
+        let mut remote = info("remote");
+        remote.remote_host = Some("devbox".to_string());
+        assert_eq!(remote.memory, None);
+        let text = line_text(&build_session_line(
+            &remote, None, false, false, 0, false, 20, "◐", None,
+        ));
+        assert!(!text.contains('\u{2014}'));
+        assert_eq!(text.trim_end(), " ◐ \u{21c5} remote");
+    }
+
+    #[test]
+    fn memory_badge_wins_columns_from_the_agent_status() {
+        // The badge is reserved first, so a long activity title truncates
+        // around it instead of pushing it off the row.
+        let mut s = info("busy");
+        s.agent_activity = Some("a very long activity title that cannot fit".to_string());
+        s.memory = live(347_078_656);
+        let text = line_text(&build_session_line(
+            &s, None, false, false, 0, false, 30, "◐", None,
+        ));
+        assert!(text.chars().count() <= 30);
+        assert!(text.ends_with("331M"), "got {text:?}");
+        assert!(text.contains('\u{2026}'), "activity truncated: {text:?}");
+    }
+
+    #[test]
+    fn memory_badge_is_dropped_when_the_row_has_no_room() {
+        // A narrow sidebar keeps the name; the price tag is what gives.
+        let mut s = info("a-rather-long-session-name");
+        s.memory = live(347_078_656);
+        let text = line_text(&build_session_line(
+            &s, None, false, false, 0, false, 12, "◐", None,
+        ));
+        assert!(!text.contains("331M"), "got {text:?}");
+        assert!(text.contains("a-rather-long-session-name"));
+    }
+
+    #[test]
+    fn fleet_total_sums_only_the_live_trees() {
+        let mut a = info("a");
+        a.memory = live(300 * 1024 * 1024);
+        let mut b = info("b");
+        b.memory = live(200 * 1024 * 1024);
+        let mut ghost = info("ghost");
+        ghost.memory = Some(SessionMemory::Unloaded);
+        let unmeasured = info("remote");
+        let sessions = vec![&a, &b, &ghost, &unmeasured];
+        assert_eq!(fleet_rss(&sessions), Some("500M".to_string()));
+    }
+
+    #[test]
+    fn fleet_total_is_absent_when_nothing_is_running() {
+        let mut ghost = info("ghost");
+        ghost.memory = Some(SessionMemory::Unloaded);
+        let unmeasured = info("remote");
+        assert_eq!(fleet_rss(&[&ghost, &unmeasured]), None);
+        assert_eq!(fleet_rss(&[]), None);
     }
 
     #[test]

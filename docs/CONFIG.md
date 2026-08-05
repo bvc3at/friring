@@ -27,7 +27,8 @@ development checkout never touches your real setup.
 the TUI polls their mtime (~1/s) and applies edits with a confirmation
 toast — no restart. For `settings.toml` only the **feature flags that
 gate UI panels** (`tasks`, `file_viewer`, `info_panel`, `global_search`,
-`shell_pane`, `code_review`, `cc_activity`, `perf_hud`, `soft_delete`),
+`shell_pane`, `code_review`, `cc_activity`, `session_memory`, `perf_hud`,
+`soft_delete`),
 `info_panel_position`, and the [`[prefix]`](#prefix--the-leader-key)
 leader-key table
 apply live; the restart-only values stay published through a write-once
@@ -432,6 +433,7 @@ info_panel    = true
 shell_pane    = true
 code_review   = true
 cc_activity   = true
+session_memory = true        # per-session RSS badge, fleet total, info-panel RAM
 perf_hud      = true
 mouse         = true
 notifications = true
@@ -462,7 +464,8 @@ Turn major TUI features off entirely. All default to `true` **except
 `version_check` and `auto_update`, which default to `false`** (both
 reach the network, so they are opt-in). The UI-panel flags
 (`tasks`, `file_viewer`, `info_panel`, `global_search`, `double_shift_search`,
-`shell_pane`, `code_review`, `cc_activity`, `perf_hud`, `soft_delete`) apply **live** on save; the rest
+`shell_pane`, `code_review`, `cc_activity`, `session_memory`, `perf_hud`,
+`soft_delete`) apply **live** on save; the rest
 (`automations`, `mouse`, `notifications`, `version_check`, `auto_update`)
 take effect on the next launch.
 A disabled feature's pane never renders, its keybinding shows
@@ -480,6 +483,7 @@ no results. Data is never touched, so re-enabling a flag is lossless.
 | `shell_pane` | `true` | per-session shell toggle (`Ctrl+T`) |
 | `code_review` | `true` | native code-review view (diff + comments, `Ctrl+X`) |
 | `cc_activity` | `true` | agent activity view (`F9`): per-session retrospective (commands / edits / reads / web / subagents) across supported agent CLIs, incl. the Claude workflow/subagent tree + conversation import; local sessions only (see `FORK.md`) |
+| `session_memory` | `true` | per-session memory: the RSS badge on each list row, the `Σ` fleet total under the list, and the info panel's RAM line. Off = the process table is never read (no procfs walk / `ps` fork). Local sessions only (see `docs/FEATURES.md`) |
 | `perf_hud` | `true` | perf HUD overlay (`<leader> m`, or `F12` when `[prefix] mode = "off"`): live perf counters + frame/tick timing (see `docs/PERFORMANCE.md`) |
 | `mouse` | `true` | mouse capture: clicks, wheel, drag-select, hover, scrollbars |
 | `notifications` | `true` | OS desktop notifications when a session needs attention |

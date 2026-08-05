@@ -5,6 +5,7 @@ pub mod cc_activity;
 pub mod extension_def;
 pub mod host_def;
 pub mod keybindings;
+pub mod memory;
 pub mod message;
 pub mod review;
 pub mod settings;
@@ -32,6 +33,7 @@ pub use keybindings::{
     compact_shortcut, prefix_sections, Action, KeyBindings, KeyChord, KeyContext, PrefixEntry,
     PrefixMode,
 };
+pub use memory::SessionMemory;
 pub use message::SessionMessage;
 pub use review::{
     parse_unified_diff, Classification, CommentAnchor, DiffFile, DiffHunk, DiffLine, DiffLineKind,
@@ -281,6 +283,12 @@ pub struct SessionInfo {
     /// Real git state of the session's worktree(s), refreshed periodically by
     /// the app layer. `None` until first computed (or for non-git sessions).
     pub git_stats: Option<GitStats>,
+    /// Resident memory of the session's agent process tree, sampled off-thread
+    /// by the app layer (see `app::memory`). `None` = not known: a remote
+    /// session (the process lives on the host), a pid that wouldn't resolve, or
+    /// no scan yet — never rendered as a zero. Derived from the OS process
+    /// table, never persisted.
+    pub memory: Option<SessionMemory>,
     /// Cached display names for repos, resolved from git remote or directory name.
     /// Order: worktree repos first, then non-worktree additional dirs.
     /// Populated by the app layer at spawn/restore time.
@@ -313,6 +321,7 @@ impl SessionInfo {
             cc_activity: None,
             notification: None,
             git_stats: None,
+            memory: None,
             repo_display_names: Vec::new(),
             parent_session_id: None,
             display_order: None,

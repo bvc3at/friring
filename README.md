@@ -245,8 +245,14 @@ agent supports it, and `Alt+U` unloads a live session back to a ghost to
 reclaim the agent's memory while keeping the frozen preview. Set
 `lazy_session_restore = false` to respawn everything at startup as before.
 
+That cost is priced, not claimed: each live row shows the RSS of its whole
+agent process tree with a `Σ` fleet total under the list, a ghost reads `—`,
+and a remote or not-yet-measured session shows nothing.
+`[features] session_memory = false` turns the scan off.
+
 [Getting started →](#getting-started) ·
 [Lazy sessions & ghosts →](docs/FEATURES.md#lazy-sessions--ghosts) ·
+[Per-session memory →](docs/FEATURES.md#per-session-memory-features-session_memory) ·
 [Settings →](docs/CONFIG.md#settingstoml)
 
 </td>
@@ -355,8 +361,9 @@ keyboard-driven, with unified or side-by-side layout.
 
 ### Info Panel & Live Metrics
 
-`Ctrl+B` (`F2`) shows per-session details with live CPU/RAM and agent
-metrics, right beside the terminal.
+`Ctrl+B` (`F2`) shows per-session details with live CPU, the resident memory of
+the session's whole agent process tree, and agent metrics, right beside the
+terminal.
 
 [Keybindings →](#keybindings)
 

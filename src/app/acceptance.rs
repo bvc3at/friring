@@ -2146,6 +2146,23 @@ async fn ctrl_r_restarts_session_on_spawnable_backend() {
 }
 
 #[tokio::test]
+async fn ctrl_r_restart_drops_the_replaced_pane_s_memory_figure() {
+    // A restart (and the load path a ghost's Enter takes) swaps in a new pane,
+    // so the figure on the row was measured for a process that no longer
+    // exists: on a load it is the ghost's `—`, which would keep claiming the
+    // session is unloaded until the next scan. An in-flight pass measured the
+    // old pane too, so it must not deliver either.
+    let mut h = Harness::spawnable(1);
+    h.app.sessions[0].info.memory = Some(crate::session::SessionMemory::Unloaded);
+    let _tx = h.app.memory_refresh.start();
+
+    h.ctrl('r'); // RestartSession
+
+    assert_eq!(h.app.sessions[0].info.memory, None);
+    assert!(!h.app.memory_refresh.in_progress());
+}
+
+#[tokio::test]
 async fn ctrl_r_restart_preserves_friring_identity_env() {
     // `Session::restart` replaces the session env wholesale, so the restart path
     // must re-inject the `FRIRING_*` identity vars — otherwise the restarted
