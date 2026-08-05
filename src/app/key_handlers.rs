@@ -834,7 +834,13 @@ impl App {
                 } else {
                     Terminal
                 };
-                let mut ring = vec![SessionList, central];
+                // The session list is the ring's left-most stop only while it
+                // is shown; collapsed, the cycle is central ↔ right-side panels.
+                let mut ring = Vec::with_capacity(4);
+                if self.show_session_list {
+                    ring.push(SessionList);
+                }
+                ring.push(central);
                 if self.show_tasks_panel {
                     ring.push(TaskList);
                 }
@@ -1777,9 +1783,22 @@ impl App {
                 Self::open_automations_list,
             ),
             Action::ToggleInfoPanel => self.gated(self.features.info_panel, "Info panel", |s| {
+                // With the list collapsed and no room for the dedicated column
+                // the pane cannot render at all, so flipping the flag would
+                // make F2 a key that visibly does nothing. Say why instead.
+                if !s.show_session_list && !s.info_panel_fits_without_the_list() {
+                    s.set_status(super::StatusLevel::Info, Self::info_panel_needs_room_msg());
+                    return;
+                }
                 s.show_info_panel = !s.show_info_panel;
                 s.resize_sessions_to_content_area();
             }),
+            // Core navigation rather than an opt-in feature, so no `gated`
+            // wrapper: there is no flag that can switch the left column off.
+            Action::ToggleSessionList => {
+                Self::act_toggle_session_list(self);
+                true
+            }
             Action::FocusTasks => {
                 self.gated(self.features.tasks, "Tasks panel", Self::act_toggle_tasks)
             }
@@ -2002,7 +2021,7 @@ impl App {
             // this the workspace shows the empty hint).
             self.sync_task_editor();
         } else if self.focus == InputFocus::TaskList {
-            self.focus = InputFocus::SessionList;
+            self.focus = self.focus_fallback();
         }
         self.resize_sessions_to_content_area();
     }
@@ -2014,9 +2033,63 @@ impl App {
         if self.show_file_viewer {
             self.rebuild_file_viewer_for_active();
         } else if self.focus == InputFocus::FileViewer {
-            self.focus = InputFocus::SessionList;
+            self.focus = self.focus_fallback();
         }
         self.resize_sessions_to_content_area();
+    }
+
+    /// Toggle the left column (`Alt+L` / `<leader> Shift+L`): the session list,
+    /// the automations pane under it, and — when it docks there — the info pane.
+    ///
+    /// Collapsing moves focus off that column onto the terminal; restoring it
+    /// leaves focus where it is. This is a toggle for screen real estate, not
+    /// an interaction switch, so unlike Tasks/Files it never grabs focus.
+    ///
+    /// A visible info pane that would be left with nowhere to render is turned
+    /// off with a note rather than stranded "shown" — the same rescue
+    /// `handle_resize` performs when a terminal narrows below the third column.
+    fn act_toggle_session_list(&mut self) {
+        self.show_session_list = !self.show_session_list;
+        let mut no_room = false;
+        if !self.show_session_list {
+            if matches!(
+                self.focus,
+                InputFocus::SessionList
+                    | InputFocus::Automations
+                    | InputFocus::AutomationEditor
+                    | InputFocus::AutomationRunHistory
+            ) {
+                self.focus = InputFocus::Terminal;
+                // Leaving the automation context clears its editor/run cache.
+                self.on_focus_changed();
+            }
+            if self.show_info_panel && !self.info_panel_fits_without_the_list() {
+                self.show_info_panel = false;
+                no_room = true;
+            }
+        }
+        // The status row steals a content line while it is up, and it expires
+        // without a re-push — so size the panes first, then report.
+        self.resize_sessions_to_content_area();
+        if no_room {
+            self.set_status(super::StatusLevel::Info, Self::info_panel_needs_room_msg());
+        }
+    }
+
+    /// Whether the info panel still has a home once the session list is
+    /// collapsed. Its inline dock (`auto`/`inline`) is part of that column, so
+    /// the dedicated column is all that is left — and that needs
+    /// `three_panel_min_cols`.
+    pub(crate) fn info_panel_fits_without_the_list(&self) -> bool {
+        self.terminal_cols >= crate::session::settings::global().three_panel_min_cols
+    }
+
+    /// Why the info panel can't be shown right now, naming both ways out.
+    fn info_panel_needs_room_msg() -> String {
+        format!(
+            "Info panel needs the session list or a {}-column terminal",
+            crate::session::settings::global().three_panel_min_cols
+        )
     }
 
     /// Session-list `Ctrl+J`: step to the next session, or flow into the

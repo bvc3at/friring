@@ -174,7 +174,9 @@ isolation (that agent declares no status hooks, so only the scrape can refuse).
 Upstream dispatches every global command from a direct `Ctrl+<letter>` chord
 and has no prefix/leader concept. The fork adds one, because that namespace is
 exhausted: every bare `Ctrl+<letter>` is bound or reserved, `F1`–`F10`/`F12`
-are spent, and several chords friring holds are ones the inner agent CLI wants
+are spent (`F11` belongs to the OS/terminal on every platform friring runs on,
+so new commands land on `Alt` or the leader — see *Session-list collapse*),
+and several chords friring holds are ones the inner agent CLI wants
 back (`Ctrl+L` clear-screen, `Ctrl+Z` suspend, `Ctrl+V` image-paste in Claude
 Code and Codex, `Ctrl+G` external editor).
 
@@ -495,6 +497,55 @@ tick-side drift check re-pushes PTY sizes when an `auto` flip moves the dock
 (a content-driven layout change no resize event covers). Details in
 `docs/CONFIG.md` + `docs/FEATURES.md` ("Info panel docking"); the **default
 changed** from upstream's always-column to `auto`.
+
+The one exception to "`inline` never falls back to the column" is the
+session-list collapse below: the inline dock *is* the left column, so
+collapsing it leaves every position column-only.
+
+#### Session-list collapse (`Alt+L`)
+
+Upstream hides the session-list pane with `F9` for a full-width terminal
+(upstream commits [`86ab3dc`], [`4e19147`], [`b951991`]). The feature is
+adopted here; two things differ.
+
+**The chord is `Alt+L`, plus `<leader> Shift+L`** — `F9` in this fork is the
+agent activity view, and there is no free F-key to move to: `F1`–`F10` and
+`F12` are bound, and `F11` belongs to Mission Control on macOS and to
+fullscreen in GNOME Terminal / Konsole / xfce4-terminal / Windows Terminal, so
+a pill labelled `F11` would silently do nothing. `Shift+F9` is worse than that:
+xterm-family terminals map `Shift+F1`–`F10` onto legacy `F13`–`F22`, which
+crossterm reports as a bare `KeyCode::F(13..22)` with no `SHIFT` bit, so on
+those terminals `Shift+F9` arrives as plain `F9` and opens the activity view
+instead. `Alt+L` (**L**ist) joins the fork's existing narrow Alt exception
+(`Alt+A`, `Alt+U`, `Alt+J/K`, `Alt+N/P`, `Alt+1`–`9`): it encodes as plain
+7-bit `ESC l`, so it survives ssh + tmux without the kitty protocol, and it is
+not a bare `Ctrl+<letter>`, so it never defers to the PTY. `<leader> Shift+L`
+is the route that needs no terminal configuration at all — and the only one
+that works under `[prefix] mode = "prefix-only"`.
+
+**The collapse reconciles with the inline info pane.** Upstream drops the left
+column wholesale because upstream's info panel is always a dedicated column;
+here `info_panel_position = auto` (the default) or `inline` docks it *in* that
+column. So while the list is collapsed the pane is column-only: it falls back
+to the dedicated column at `three_panel_min_cols` and up, and below that width
+it has nowhere to render — collapsing turns it off with a note, and `F2` says
+why instead of flipping a flag that changes nothing on screen. The automations
+pane shares the column too, so collapsing moves focus out of the whole
+automations context, and a global-search jump to an automation brings the
+column back.
+
+**The chevron is expand-only.** Upstream draws a `◀`/`▶` affordance in both
+states; here it appears only while the list is collapsed. The fork's central
+pane packs four tab pills (Agent · Review · F7 · Shell · F8 · Activity · F9)
+into ~40 columns and `break`s when it runs out of room — a permanent ~9-cell
+chevron would, on a 120-column terminal with tasks + the file viewer open,
+silently drop the Activity tab. Upstream's two refinements ([`b951991`]) are
+kept: the one-cell gap before the tab strip, and the hover carve-out that keeps
+the chevron a subtle band rather than a filled pill.
+
+[`86ab3dc`]: https://github.com/Thurbeen/thurbox/commit/86ab3dc728f5ab307822c442c959ae8cabc1e68d
+[`4e19147`]: https://github.com/Thurbeen/thurbox/commit/4e191473dffa01a20b028cbcc456d25665451972
+[`b951991`]: https://github.com/Thurbeen/thurbox/commit/b951991a458ae9ca11f2d92aca9ec36b84df6b13
 
 #### Global search: centered popup + double-`Shift` opener
 

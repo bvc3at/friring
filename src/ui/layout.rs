@@ -174,29 +174,34 @@ fn split_vertical(area: Rect, show_status_row: bool) -> VerticalBands {
 }
 
 /// Build the wide (≥ three_panel_min_cols) layout with optional info / tasks /
-/// file-viewer columns. Column order: list | info? | terminal | tasks? |
-/// file_viewer?. `show_info_column` and `inline_info_rows` are mutually
-/// exclusive — [`compute_layout`] resolves the info-pane placement first.
+/// file-viewer columns. Column order: list? | info? | terminal | tasks? |
+/// file_viewer?. The list column is dropped entirely when
+/// `p.show_session_list` is false — the terminal takes its width and the
+/// right-side columns are untouched. `show_info_column` and `inline_info_rows`
+/// are mutually exclusive — [`compute_layout`] resolves the info-pane
+/// placement first.
 fn three_panel_layout(
     bands: &VerticalBands,
     content: Rect,
+    p: &LayoutParams,
     show_info_column: bool,
-    show_tasks_panel: bool,
-    show_file_viewer: bool,
     auto_rows: u16,
     inline_info_rows: u16,
 ) -> PanelAreas {
-    let mut constraints: Vec<Constraint> = vec![Constraint::Percentage(18)];
+    let mut constraints: Vec<Constraint> = Vec::new();
+    if p.show_session_list {
+        constraints.push(Constraint::Percentage(18));
+    }
     if show_info_column {
         constraints.push(Constraint::Percentage(15));
     }
     // terminal takes the remainder
     let terminal_idx = constraints.len();
     constraints.push(Constraint::Min(0));
-    if show_tasks_panel {
+    if p.show_tasks_panel {
         constraints.push(Constraint::Percentage(20));
     }
-    if show_file_viewer {
+    if p.show_file_viewer {
         constraints.push(Constraint::Percentage(20));
     }
 
@@ -205,23 +210,30 @@ fn three_panel_layout(
         .constraints(constraints)
         .split(content);
 
-    let info_column = show_info_column.then(|| horizontal[1]);
+    // The list column, when present, is index 0 and info follows it; without it
+    // info slides to 0. Everything from the terminal rightward is addressed by
+    // `terminal_idx`, so it needs no such adjustment.
+    let info_column = show_info_column.then(|| horizontal[usize::from(p.show_session_list)]);
     let terminal = horizontal[terminal_idx];
     // Tasks (if shown) immediately follow the terminal; the file viewer
     // follows tasks (or the terminal when tasks are hidden).
     let mut next = terminal_idx + 1;
-    let tasks_panel = show_tasks_panel.then(|| {
+    let tasks_panel = p.show_tasks_panel.then(|| {
         let r = horizontal[next];
         next += 1;
         r
     });
-    let file_viewer = show_file_viewer.then(|| horizontal[next]);
+    let file_viewer = p.show_file_viewer.then(|| horizontal[next]);
 
-    let (left_panel, automations_panel, inline_info) =
-        split_left_column(horizontal[0], auto_rows, inline_info_rows);
+    let (left_panel, automations_panel, inline_info) = if p.show_session_list {
+        let (lp, ap, info) = split_left_column(horizontal[0], auto_rows, inline_info_rows);
+        (Some(lp), ap, info)
+    } else {
+        (None, None, None)
+    };
     PanelAreas {
         header: bands.header,
-        left_panel: Some(left_panel),
+        left_panel,
         automations_panel,
         info_panel: info_column.or(inline_info),
         tasks_panel,
@@ -233,13 +245,29 @@ fn three_panel_layout(
     }
 }
 
-/// Build the 2-panel layout: 25% list | 75% terminal.
+/// Build the 2-panel layout: 25% list | 75% terminal — or the terminal alone
+/// across the full content width when the list is collapsed.
 fn two_panel_layout(
     bands: &VerticalBands,
     content: Rect,
+    p: &LayoutParams,
     auto_rows: u16,
     inline_info_rows: u16,
 ) -> PanelAreas {
+    if !p.show_session_list {
+        return PanelAreas {
+            header: bands.header,
+            left_panel: None,
+            automations_panel: None,
+            info_panel: None,
+            tasks_panel: None,
+            file_viewer: None,
+            global_search: None,
+            status_message: bands.status_message,
+            terminal: content,
+            footer: bands.footer,
+        };
+    }
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
@@ -263,8 +291,12 @@ fn two_panel_layout(
 
 /// Inputs to [`compute_layout`]: the panel-visibility flags plus the measured
 /// row counts that place the info pane.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct LayoutParams {
+    /// Left-column visibility (`Alt+L`). Unlike every other flag here this one
+    /// defaults to *shown*: the column is the app's resting state, not an
+    /// opt-in panel.
+    pub show_session_list: bool,
     /// Info panel visibility (F2).
     pub show_info_panel: bool,
     /// Where the info panel docks (settings key `info_panel_position`).
@@ -287,11 +319,32 @@ pub struct LayoutParams {
     pub show_status_row: bool,
 }
 
+impl Default for LayoutParams {
+    /// The resting layout: session list shown, every optional panel hidden.
+    /// Hand-written rather than derived so `..Default::default()` can never
+    /// silently collapse the list.
+    fn default() -> Self {
+        Self {
+            show_session_list: true,
+            show_info_panel: false,
+            info_position: InfoPanelPosition::default(),
+            info_rows: 0,
+            session_rows: 0,
+            show_tasks_panel: false,
+            show_file_viewer: false,
+            show_global_search: false,
+            show_automations_pane: false,
+            automation_count: 0,
+            show_status_row: false,
+        }
+    }
+}
+
 /// Compute panel layout areas based on terminal dimensions and
 /// [`LayoutParams`].
 ///
 /// At width ≥ 120, the layout becomes
-/// `list | info? | terminal | tasks? | file_viewer?` with info (15%), tasks
+/// `list? | info? | terminal | tasks? | file_viewer?` with info (15%), tasks
 /// (20%), and file_viewer (20%) appearing only when requested. The tasks panel
 /// sits between the terminal and the file viewer (both right-side columns). The
 /// left column is further split into a session list, an automations pane
@@ -299,6 +352,12 @@ pub struct LayoutParams {
 /// is set — false when the `automations` feature flag is off; `automation_count`
 /// only sizes that pane), and — when [`InfoPanelPosition`] resolves to the
 /// inline dock — the info pane at the bottom.
+///
+/// `show_session_list` false drops that whole column and hands its width to the
+/// terminal; the right-side columns are unaffected. Since the inline info dock
+/// lives *in* that column, a visible info panel then falls back to its own
+/// column whatever [`InfoPanelPosition`] asks for — and so needs
+/// `three_panel_min_cols`, exactly like `Column` does.
 ///
 /// `show_status_row` carves a transient full-width 1-row band directly above the
 /// footer for the active status/error message (or the sync spinner), so a long
@@ -338,16 +397,21 @@ fn compute_panel_areas(area: Rect, p: &LayoutParams) -> PanelAreas {
     }
 
     // Both column branches give the left column the full content height, so
-    // the automations-pane rows (and the fit test below) are settled here.
-    let auto_rows =
-        automations_pane_rows(content.height, p.show_automations_pane, p.automation_count);
+    // the automations-pane rows (and the fit test below) are settled here. A
+    // collapsed column has no pane to size.
+    let auto_rows = automations_pane_rows(
+        content.height,
+        p.show_session_list && p.show_automations_pane,
+        p.automation_count,
+    );
 
     // Resolve where a visible info panel docks this frame: `inline_rows > 0`
     // puts it at the bottom of the left column; otherwise a still-visible
     // panel falls back to the dedicated column (three-panel widths only).
     // `Auto` inlines only when the full session list, the automations pane,
-    // and the full info content fit the column together.
-    let inline_rows = if p.show_info_panel {
+    // and the full info content fit the column together. A collapsed column
+    // can host nothing, so every position resolves to the dedicated one.
+    let inline_rows = if p.show_info_panel && p.show_session_list {
         match p.info_position {
             InfoPanelPosition::Column => 0,
             InfoPanelPosition::Inline => p.info_rows,
@@ -366,26 +430,19 @@ fn compute_panel_areas(area: Rect, p: &LayoutParams) -> PanelAreas {
     } else {
         0
     };
-    let show_info_column =
-        p.show_info_panel && inline_rows == 0 && p.info_position != InfoPanelPosition::Inline;
+    let show_info_column = p.show_info_panel
+        && inline_rows == 0
+        && (!p.show_session_list || p.info_position != InfoPanelPosition::Inline);
 
     // At width ≥ three_panel_min_cols (default 120), support optional info /
     // tasks / file-viewer columns.
     if area.width >= settings.three_panel_min_cols
         && (show_info_column || p.show_tasks_panel || p.show_file_viewer)
     {
-        return three_panel_layout(
-            &bands,
-            content,
-            show_info_column,
-            p.show_tasks_panel,
-            p.show_file_viewer,
-            auto_rows,
-            inline_rows,
-        );
+        return three_panel_layout(&bands, content, p, show_info_column, auto_rows, inline_rows);
     }
 
-    two_panel_layout(&bands, content, auto_rows, inline_rows)
+    two_panel_layout(&bands, content, p, auto_rows, inline_rows)
 }
 
 #[cfg(test)]
@@ -881,5 +938,76 @@ mod tests {
         let info = areas.info_panel.expect("inlined");
         assert_eq!(info.x, sessions.x);
         assert!(areas.tasks_panel.is_some());
+    }
+
+    #[test]
+    fn collapsed_list_hands_its_width_to_the_terminal() {
+        let shown = layout(area(120, 30), false, false, false, false, true, 2, false);
+        let p = LayoutParams {
+            show_session_list: false,
+            show_automations_pane: true,
+            automation_count: 2,
+            ..Default::default()
+        };
+        let areas = compute_layout(area(120, 30), &p);
+        assert!(areas.left_panel.is_none());
+        assert!(
+            areas.automations_panel.is_none(),
+            "the automations pane shares the collapsed column"
+        );
+        assert_eq!(areas.terminal.x, 0, "terminal starts at the left edge");
+        assert!(areas.terminal.width > shown.terminal.width);
+        assert_eq!(areas.terminal.width, 120);
+    }
+
+    #[test]
+    fn collapsed_list_keeps_the_right_side_columns() {
+        let p = LayoutParams {
+            show_session_list: false,
+            show_tasks_panel: true,
+            show_file_viewer: true,
+            ..Default::default()
+        };
+        let areas = compute_layout(area(160, 30), &p);
+        assert!(areas.left_panel.is_none());
+        let tasks = areas.tasks_panel.expect("tasks column unaffected");
+        let files = areas.file_viewer.expect("file viewer unaffected");
+        assert!(areas.terminal.x < tasks.x && tasks.x < files.x);
+        assert_eq!(areas.terminal.x, 0, "terminal starts at the left edge");
+    }
+
+    #[test]
+    fn collapsed_list_docks_the_info_pane_in_its_own_column() {
+        // The inline dock lives in the collapsed column, so `inline` (and
+        // `auto`, which would have picked inline here) falls back to the
+        // dedicated column rather than vanishing.
+        for position in [InfoPanelPosition::Inline, InfoPanelPosition::Auto] {
+            let p = LayoutParams {
+                show_session_list: false,
+                ..inline_params(position, 10, 5)
+            };
+            let areas = compute_layout(area(160, 40), &p);
+            let info = areas
+                .info_panel
+                .unwrap_or_else(|| panic!("{position:?} keeps a column"));
+            assert!(areas.left_panel.is_none());
+            assert_eq!(info.x, 0, "the info column takes the freed left edge");
+            assert!(areas.terminal.x >= info.x + info.width);
+        }
+    }
+
+    #[test]
+    fn collapsed_list_drops_the_info_pane_below_three_panel_width() {
+        // No left column to inline into and no room for the dedicated one:
+        // the pane genuinely cannot render. `App` mirrors this by turning the
+        // panel off rather than leaving it stranded.
+        let p = LayoutParams {
+            show_session_list: false,
+            ..inline_params(InfoPanelPosition::Inline, 10, 5)
+        };
+        let areas = compute_layout(area(100, 40), &p);
+        assert!(areas.left_panel.is_none());
+        assert!(areas.info_panel.is_none());
+        assert_eq!(areas.terminal.width, 100);
     }
 }

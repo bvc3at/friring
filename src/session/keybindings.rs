@@ -74,6 +74,10 @@ pub enum Action {
     ToggleInfoPanel,
     ToggleFileViewer,
     FocusTasks,
+    /// Collapse/restore the left column (session list + automations pane, and
+    /// the info pane when it docks inline), handing its width to the central
+    /// pane. Purely a view toggle — nothing is unloaded.
+    ToggleSessionList,
     GlobalSearch,
     /// Open the Settings panel (view/edit settings.toml in the TUI).
     OpenSettings,
@@ -189,6 +193,7 @@ impl Action {
             Action::ToggleInfoPanel,
             Action::ToggleFileViewer,
             Action::FocusTasks,
+            Action::ToggleSessionList,
             Action::GlobalSearch,
             Action::OpenSettings,
             Action::TogglePerfHud,
@@ -265,6 +270,7 @@ impl Action {
             Action::ToggleInfoPanel => "Toggle info panel",
             Action::ToggleFileViewer => "Toggle file viewer",
             Action::FocusTasks => "Tasks",
+            Action::ToggleSessionList => "Toggle session list",
             Action::GlobalSearch => "Global search",
             Action::OpenSettings => "Settings",
             Action::TogglePerfHud => "Toggle perf HUD",
@@ -420,7 +426,7 @@ impl Action {
     ///
     /// Each key mirrors the letter of the action's own `Ctrl` chord (`Ctrl+N`
     /// new session → `<leader> n`), so the leader table is learnable as "your
-    /// chords, one key later" rather than a second vocabulary. Four cases can't
+    /// chords, one key later" rather than a second vocabulary. Five cases can't
     /// mirror and are resolved here:
     ///
     /// - **`r`** goes to `RestartSession` (bare `Ctrl+R`); `ReloadApp`
@@ -432,9 +438,12 @@ impl Action {
     /// - **F-key-only actions** have no letter to mirror: `ToggleCcActivity`
     ///   (`F9`) → `v` (acti**v**ity), `NextBlockedSession` (`F10`) → `]` (a
     ///   "next" bracket), `TogglePerfHud` (`F12`) → `m` (**m**etrics).
+    /// - **`l`** goes to `FocusForward`; `ToggleSessionList` (`Alt+L`) takes
+    ///   `Shift+L`, the same shift-up-for-the-bigger-hammer rule as `r`/`R`.
     ///
     /// Every key here is reachable **unshifted** on a US layout, except the
-    /// deliberate `Shift+R`. That is a hard constraint, not a preference:
+    /// deliberate `Shift+R` and `Shift+L`. That is a hard constraint, not a
+    /// preference:
     /// [`KeyChord::normalized`] folds `Shift` into the chord for letters only,
     /// so a shifted punctuation key (`~`, `!`, `?`) arrives as
     /// `Shift`+*that char* on some terminals and as the bare char on others,
@@ -490,6 +499,10 @@ impl Action {
             ToggleHelp => KeyChord::plain('g'),
             ToggleInfoPanel => KeyChord::plain('b'),
             ToggleFileViewer => KeyChord::plain('e'),
+            // `l`'s shifted twin, mirroring the `u`/`U` and `r`/`R` pattern:
+            // `l` moves focus one pane right, `L` folds the left-most pane away
+            // entirely. Its direct chord's letter, one shift up.
+            ToggleSessionList => KeyChord::normalized(KeyModifiers::SHIFT, KeyCode::Char('l')),
             OpenThemePicker => KeyChord::plain('y'),
             GlobalSearch => KeyChord::plain('/'),
             OpenSettings => KeyChord::plain(','),
@@ -607,6 +620,18 @@ impl Action {
             Action::ToggleInfoPanel => vec![KeyChord::ctrl('b'), KeyChord::function(2)],
             Action::ToggleFileViewer => vec![KeyChord::ctrl('e'), KeyChord::function(3)],
             Action::FocusTasks => vec![KeyChord::ctrl('w'), KeyChord::function(5)],
+            // Alt+L (mnemonic: **L**ist) — the one panel toggle with no F-key.
+            // F1–F10 and F12 are spent (F9 is the activity view here, F12 the
+            // second leader) and F11 is claimed by the OS/terminal on both
+            // platforms, so a pill labelled `F11` would silently do nothing.
+            // Rides the documented Alt exception like `Alt+A`/`Alt+U`: plain
+            // 7-bit `ESC l` (see `agent::input::alt_bytes`), so it survives ssh
+            // + tmux without the kitty protocol, and it is not a bare
+            // `Ctrl+<letter>`, so it never defers to the PTY. Shadows
+            // readline's M-l (downcase-word), like Alt+U shadows M-u.
+            // `<leader> Shift+L` is the no-configuration route (macOS needs
+            // option-as-alt for the direct chord). Fully rebindable.
+            Action::ToggleSessionList => vec![KeyChord::alt(KeyCode::Char('l'))],
             // Ctrl+/ — the near-universal "search" chord. Terminals encode it
             // inconsistently: kitty-protocol ones deliver `Ctrl+/`, while legacy
             // ones send the raw 0x1F byte that crossterm decodes as `Ctrl+7` /
@@ -793,6 +818,7 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
                 ToggleHelp,
                 ToggleInfoPanel,
                 ToggleFileViewer,
+                ToggleSessionList,
                 OpenThemePicker,
                 OpenSettings,
                 GlobalSearch,
@@ -896,6 +922,7 @@ pub fn prefix_sections() -> Vec<(&'static str, Vec<PrefixEntry>)> {
                 A(FocusForward),
                 A(ToggleInfoPanel),
                 A(ToggleFileViewer),
+                A(ToggleSessionList),
                 A(FocusTasks),
                 A(ToggleShell),
                 A(OpenAutomations),
@@ -1581,6 +1608,33 @@ mod tests {
     }
 
     #[test]
+    fn toggle_session_list_has_alt_l_and_a_leader_row() {
+        // The one panel toggle with neither a Ctrl primary nor an F-key
+        // alternate: the F-key space is spent and F11 belongs to the OS, so
+        // Alt+L is the direct chord and `<leader> Shift+L` the route that needs
+        // no terminal configuration at all.
+        let kb = KeyBindings::default();
+        assert_eq!(
+            kb.lookup(KeyCode::Char('l'), KeyModifiers::ALT),
+            Some(Action::ToggleSessionList)
+        );
+        assert_eq!(
+            kb.chords_for(Action::ToggleSessionList),
+            &[KeyChord::alt(KeyCode::Char('l'))]
+        );
+        // Not a bare Ctrl+<letter>, so it must never defer to the PTY — that is
+        // what keeps it working from a focused terminal.
+        assert!(!Action::ToggleSessionList.terminal_passthrough());
+        assert_eq!(
+            action_for_prefix_key(KeyChord::normalized(
+                KeyModifiers::SHIFT,
+                KeyCode::Char('l')
+            )),
+            Some(Action::ToggleSessionList)
+        );
+    }
+
+    #[test]
     fn toggle_shell_has_dual_ctrl_and_f8_chord() {
         // Ctrl+T is the only panel toggle that historically lacked an F-key
         // alternate; F8 was the first free function key.
@@ -1887,6 +1941,7 @@ mod tests {
                 Action::ToggleInfoPanel => 0,
                 Action::ToggleFileViewer => 0,
                 Action::FocusTasks => 0,
+                Action::ToggleSessionList => 0,
                 Action::GlobalSearch => 0,
                 Action::OpenSettings => 0,
                 Action::TogglePerfHud => 0,
@@ -1932,7 +1987,7 @@ mod tests {
         }
         // The listed variants must equal Action::all().len(). If you add
         // a variant, update both `Action::all()` and the match above.
-        const EXPECTED: usize = 70;
+        const EXPECTED: usize = 71;
         assert_eq!(Action::all().len(), EXPECTED);
         for a in Action::all() {
             classify(*a);

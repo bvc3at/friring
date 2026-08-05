@@ -323,6 +323,11 @@ impl Harness {
         self.key(KeyCode::F(n), KeyModifiers::NONE)
     }
 
+    /// An `Alt+<c>` chord (the narrow Alt exception: `Alt+A`, `Alt+U`, `Alt+L`).
+    fn alt(&mut self, c: char) -> &mut Self {
+        self.key(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+
     /// A `Shift+<letter>` chord (e.g. session reordering). Terminals deliver
     /// these as an uppercase char; `KeyChord::normalized` canonicalizes the
     /// encoding, so the uppercase-char + SHIFT form resolves the same binding.
@@ -626,6 +631,295 @@ fn f5_toggles_tasks_panel_like_ctrl_w() {
     assert!(h.app.show_tasks_panel, "F5 reveals the tasks panel");
     h.func(5);
     assert!(!h.app.show_tasks_panel, "F5 again hides it");
+}
+
+#[test]
+fn alt_l_collapses_the_session_list_and_widens_the_terminal() {
+    use ratatui::layout::Rect;
+    let screen = Rect::new(0, 0, STD_COLS, STD_ROWS);
+    let mut h = Harness::standard(1);
+    assert!(h.app.show_session_list, "the list is shown by default");
+    assert!(h.app.layout_for(screen).left_panel.is_some());
+    let shown_width = h.app.layout_for(screen).terminal.width;
+
+    h.alt('l');
+    assert!(!h.app.show_session_list, "Alt+L collapses the list");
+    let hidden = h.app.layout_for(screen);
+    assert!(
+        hidden.left_panel.is_none(),
+        "no left column while collapsed"
+    );
+    assert!(
+        hidden.automations_panel.is_none(),
+        "the automations pane shares the column"
+    );
+    assert!(
+        hidden.terminal.width > shown_width,
+        "the terminal reclaims the column's width"
+    );
+
+    // The rendered screen loses the ` Sessions ` panel border.
+    let shown_screen = Harness::standard(1).render();
+    let hidden_screen = h.render();
+    let border = shown_screen
+        .lines()
+        .find(|row| row.contains("Sessions"))
+        .expect("the Sessions panel renders when shown");
+    assert!(!hidden_screen.contains(border.trim()));
+
+    h.alt('l');
+    assert!(h.app.show_session_list, "Alt+L again restores it");
+    assert!(h.app.layout_for(screen).left_panel.is_some());
+}
+
+#[test]
+fn leader_shift_l_toggles_the_session_list() {
+    // The leader route is what makes the toggle reachable under
+    // `mode = "prefix-only"` (where direct global chords are disabled) and on
+    // a terminal with no option-as-alt.
+    let mut h = Harness::standard(1);
+    h.app.prefix_settings.mode = crate::session::PrefixMode::PrefixOnly;
+    h.ctrl('f'); // arm the leader
+    h.shift('l');
+    assert!(!h.app.show_session_list);
+    h.ctrl('f');
+    h.shift('l');
+    assert!(h.app.show_session_list);
+}
+
+#[test]
+fn collapsing_moves_focus_off_the_left_column() {
+    let mut h = Harness::standard(1);
+    h.app.focus = InputFocus::SessionList;
+
+    h.alt('l');
+    assert_eq!(
+        h.app.focus,
+        InputFocus::Terminal,
+        "focus retreats off the unrendered column"
+    );
+
+    // Restoring is purely a visibility toggle — it does not steal focus back.
+    h.alt('l');
+    assert_eq!(h.app.focus, InputFocus::Terminal);
+
+    // The automations pane shares the column, so it retreats with it.
+    h.app.focus = InputFocus::Automations;
+    h.alt('l');
+    assert_eq!(h.app.focus, InputFocus::Terminal);
+}
+
+#[test]
+fn closing_a_pane_while_collapsed_falls_back_to_the_terminal() {
+    // Every focus-drop site routes through `focus_fallback`, which must not
+    // hand focus to the session list while it is collapsed.
+    let mut h = Harness::standard(1);
+    h.alt('l');
+
+    h.func(5); // FocusTasks — showing the panel focuses it
+    assert_eq!(h.app.focus, InputFocus::TaskList);
+    h.func(5); // and hiding it drops that focus
+    assert_eq!(
+        h.app.focus,
+        InputFocus::Terminal,
+        "never onto the collapsed list"
+    );
+}
+
+#[test]
+fn searching_to_an_automation_brings_the_collapsed_column_back() {
+    // The automations pane lives in the left column, and a global-search jump
+    // is the only route into it that does not start from a rendered row — so
+    // it has to restore the column rather than focus an invisible pane.
+    let mut h = Harness::standard(1);
+    let aid = h
+        .app
+        .db
+        .create_automation(&crate::storage::automations::NewAutomation {
+            name: "widget-nightly".into(),
+            enabled: true,
+            schedule: crate::session::AutomationSchedule::Once { at: 0 },
+            timezone: None,
+            action: crate::session::AutomationAction::send_to(SessionId::default()),
+            prompt: "go".into(),
+            next_run_at: None,
+            prompt_steps: Vec::new(),
+        })
+        .unwrap();
+    h.app.refresh_automations();
+
+    h.alt('l');
+    h.ctrl('/'); // GlobalSearch
+    for c in "widget-nightly".chars() {
+        h.key(KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    let selected = &h.app.global_search.results[h.app.global_search.selected];
+    assert_eq!(
+        selected.target,
+        search::SearchTarget::Automation { id: aid }
+    );
+
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        h.app.show_session_list,
+        "the jump restores the column it needs"
+    );
+    assert_eq!(h.app.focus, InputFocus::Automations);
+}
+
+#[test]
+fn collapsed_list_is_skipped_by_the_focus_ring() {
+    let mut h = Harness::standard(1);
+    h.alt('l');
+    h.app.focus = InputFocus::Terminal;
+
+    h.ctrl('l'); // FocusForward
+    assert_eq!(
+        h.app.focus,
+        InputFocus::Terminal,
+        "the ring has no session-list stop while collapsed"
+    );
+    h.ctrl('h'); // FocusBackward
+    assert_eq!(h.app.focus, InputFocus::Terminal);
+}
+
+#[test]
+fn alt_l_toggles_from_a_focused_terminal() {
+    // Not a bare Ctrl+<letter>, so it is not deferred to the PTY: the toggle
+    // works from the pane it exists to widen.
+    let mut h = Harness::standard(1);
+    h.app.focus = InputFocus::Terminal;
+
+    h.alt('l');
+    assert!(!h.app.show_session_list);
+    assert_eq!(h.app.focus, InputFocus::Terminal);
+}
+
+#[test]
+fn alt_l_escapes_the_central_pane_capture_views() {
+    // The review and activity views capture nearly every key; both list
+    // `ToggleSessionList` among the chords that pass through, so the toggle
+    // works from them without closing the view.
+    let mut h = Harness::standard(1);
+    open_review(&mut h, 3);
+
+    h.alt('l');
+    assert!(!h.app.show_session_list, "Alt+L reaches the column");
+    assert_eq!(
+        h.app.focus,
+        InputFocus::CodeReview,
+        "the review keeps focus"
+    );
+
+    let mut h = Harness::standard(1);
+    h.app.sessions[0].info.cc_activity = Some(crate::session::CcActivity {
+        workflows: Vec::new(),
+        subagents: vec![crate::session::CcAgent {
+            agent_id: "s1".into(),
+            transcript_path: std::path::PathBuf::from("agent-s1.jsonl"),
+            agent_type: "Explore".into(),
+            description: None,
+            label: None,
+            phase_title: None,
+            state: crate::session::CcAgentState::Done,
+            mtime_ns: 0,
+            size: 0,
+            tokens: None,
+            tool_calls: None,
+            last_tool: None,
+            model: None,
+        }],
+    });
+    h.func(9); // ToggleCcActivity
+    assert_eq!(h.app.focus, InputFocus::CcActivityTree);
+
+    h.alt('l');
+    assert!(!h.app.show_session_list, "Alt+L reaches the column");
+    assert_eq!(
+        h.app.focus,
+        InputFocus::CcActivityTree,
+        "the activity view keeps focus"
+    );
+    assert!(h.app.active_cc_activity().is_some(), "and stays open");
+}
+
+#[test]
+fn collapsing_docks_an_inline_info_pane_in_its_own_column() {
+    // Fork-specific: `auto`/`inline` put the info pane in the left column, so
+    // collapsing it must fall the pane back to its dedicated column rather than
+    // making F2 a dead key.
+    use ratatui::layout::Rect;
+    let screen = Rect::new(0, 0, STD_COLS, STD_ROWS);
+    let mut h = Harness::standard(1);
+    h.app.info_panel_position = crate::session::settings::InfoPanelPosition::Inline;
+    h.func(2); // ToggleInfoPanel
+    assert!(h.app.show_info_panel);
+    let inline = h.app.layout_for(screen);
+    assert_eq!(
+        inline.info_panel.expect("inlined").x,
+        inline.left_panel.expect("left column").x,
+        "docked in the left column"
+    );
+
+    h.alt('l');
+    assert!(h.app.show_info_panel, "the panel survives the collapse");
+    let collapsed = h.app.layout_for(screen);
+    let info = collapsed.info_panel.expect("moved to its own column");
+    assert!(collapsed.left_panel.is_none());
+    assert!(info.x < collapsed.terminal.x, "info column, then terminal");
+}
+
+#[test]
+fn collapsing_hides_an_info_pane_with_nowhere_left_to_dock() {
+    // Below `three_panel_min_cols` the dedicated column does not exist, so the
+    // pane genuinely cannot render. It is turned off with a note rather than
+    // left "shown" and invisible.
+    use ratatui::layout::Rect;
+    let screen = Rect::new(0, 0, 100, STD_ROWS);
+    let mut h = Harness::new(100, STD_ROWS, 1);
+    h.app.info_panel_position = crate::session::settings::InfoPanelPosition::Inline;
+    h.func(2);
+    assert!(h.app.layout_for(screen).info_panel.is_some());
+
+    h.alt('l');
+    assert!(!h.app.show_info_panel, "not left stranded");
+    assert!(h.app.layout_for(screen).info_panel.is_none());
+    let msg = h.app.status_message.as_ref().expect("a note was shown");
+    assert!(msg.text.contains("Info panel"), "got: {}", msg.text);
+
+    // And F2 says why instead of flipping a flag that changes nothing.
+    h.func(2);
+    assert!(!h.app.show_info_panel, "F2 is refused, not a silent no-op");
+    let msg = h.app.status_message.as_ref().expect("a note was shown");
+    assert!(msg.text.contains("Info panel"), "got: {}", msg.text);
+}
+
+#[test]
+fn expand_chevron_shows_only_while_collapsed_and_restores_the_list() {
+    let mut h = Harness::standard(1);
+    h.render();
+    let chevron = |h: &Harness| {
+        h.app.click_targets.iter().find_map(|t| match t.action {
+            ClickAction::Global(crate::session::Action::ToggleSessionList) => Some(t.rect),
+            _ => None,
+        })
+    };
+    assert!(
+        chevron(&h).is_none(),
+        "no chevron while the list is shown — the tab strip keeps those cells"
+    );
+
+    h.alt('l');
+    let screen = h.render();
+    assert!(screen.contains('▶'), "the expand chevron appears");
+    let rect = chevron(&h).expect("chevron recorded as a click target");
+    h.app.update(AppMessage::MouseClick {
+        x: rect.x + 1,
+        y: rect.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(h.app.show_session_list, "clicking it brings the list back");
+    assert!(!h.render().contains('▶'));
 }
 
 #[test]
@@ -4181,10 +4475,19 @@ fn assert_invariants(app: &App, ctx: &str) {
         }
         InputFocus::Automations
         | InputFocus::AutomationEditor
-        | InputFocus::AutomationRunHistory => assert!(
-            app.features.automations,
-            "[{ctx}] automations focus with the feature disabled"
-        ),
+        | InputFocus::AutomationRunHistory => {
+            assert!(
+                app.features.automations,
+                "[{ctx}] automations focus with the feature disabled"
+            );
+            // The pane lives in the left column, and the editor / run history
+            // exit back into it — so the whole context needs that column.
+            assert!(
+                app.show_session_list,
+                "[{ctx}] focus {:?} but the left column is collapsed",
+                app.focus
+            );
+        }
         InputFocus::CcActivity | InputFocus::CcActivityTree => {
             assert!(
                 app.features.cc_activity,
@@ -4196,7 +4499,11 @@ fn assert_invariants(app: &App, ctx: &str) {
                 app.focus
             );
         }
-        InputFocus::SessionList | InputFocus::Terminal => {}
+        InputFocus::SessionList => assert!(
+            app.show_session_list,
+            "[{ctx}] focus on a collapsed session list"
+        ),
+        InputFocus::Terminal => {}
     }
 
     if app.global_search.active {

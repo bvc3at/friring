@@ -545,7 +545,8 @@ their setting wins; rebind or disable it there.
 ### The leader key (`Ctrl+F`)
 
 The Ctrl namespace ran out. Every bare `Ctrl+<letter>` is bound or reserved,
-`F1`–`F10` and `F12` are spent, and the chords friring *does* hold are ones the
+`F1`–`F10` and `F12` are spent (`F11` is the OS/terminal's — Mission Control on
+macOS, fullscreen nearly everywhere else), and the chords friring *does* hold are ones the
 inner agent CLI wants back — `Ctrl+L` (clear screen), `Ctrl+Z` (suspend),
 `Ctrl+V` (image paste in Claude Code and Codex), `Ctrl+G` (external editor).
 A tmux-style leader solves both: one key buys a whole fresh namespace.
@@ -687,6 +688,7 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `F1` / `Ctrl+G` | Global | Keybindings help + interactive editor | Universal help |
 | `Ctrl+B` / `F2` | Global | Toggle info panel | **B**rowse info |
 | `Ctrl+E` / `F3` | Global | Toggle file viewer | **E**xplore files |
+| `Alt+L` / `<leader> Shift+L` | Global | Collapse/restore the session-list column (see [Collapsing the session list](#collapsing-the-session-list-altl)) | **L**ist |
 | `<leader> m` | Global | Toggle perf HUD (live counters + frame/tick timing). `F12` when `[prefix] mode = "off"`; otherwise `F12` is the second leader | **M**etrics |
 | `Shift+J` | Session list | Move selected session down | Reorder |
 | `Shift+K` | Session list | Move selected session up | Reorder |
@@ -2437,6 +2439,42 @@ Because the inline dock lives in the sidebar it works from
 `two_panel_min_cols` (80) up, so `auto`/`inline` keep F2 usable on
 terminals too narrow for the third column. F2 toggles visibility the
 same in every mode.
+
+**One exception**: collapsing the sidebar (`Alt+L`, below) takes the inline
+dock with it, so while it is collapsed *every* position behaves like
+`column` — the pane falls back to the dedicated column at
+`three_panel_min_cols` and up, and below that width it has nowhere to go.
+Collapsing then hides the pane with a note rather than leaving it "shown"
+and invisible, and F2 reports why instead of toggling a flag that changes
+nothing on screen. Restoring the sidebar does not re-open it.
+
+### Collapsing the session list (`Alt+L`)
+
+`Alt+L` (rebindable `ToggleSessionList`, also `<leader> Shift+L`) folds the
+whole left column away and hands its width to the central pane — on a
+120-column terminal that is 90 → 120 columns for the agent, a third more.
+Press it again to bring the column back.
+
+It is a **view toggle, not an unload**: nothing stops, and the collapse is
+in-memory only (a restart brings the column back). The column carries the
+session list, the automations pane, and — under `auto`/`inline` — the info
+pane, so collapsing it:
+
+- moves focus off those panes onto the terminal, and drops the session list
+  out of the `Ctrl+L`/`Ctrl+H` focus ring;
+- makes the info pane column-only (see the note above);
+- leaves the right-side columns (tasks, file viewer) exactly where they were.
+
+While collapsed the central pane's top-left border shows a clickable `▶`
+chevron — the affordance that brings the column back, alongside the chord.
+Nothing is drawn while the column is shown: those cells belong to the tab
+strip, which already packs Agent / Review / Shell / Activity into them.
+
+The chord is `Alt+L` rather than a function key because `F1`–`F10` and `F12`
+are bound and `F11` belongs to the OS/terminal; it joins the same narrow Alt
+exception as `Alt+A`/`Alt+U`. `<leader> Shift+L` needs no terminal
+configuration on any platform, and is the only route under
+`[prefix] mode = "prefix-only"`.
 
 ### Why not user-configurable?
 

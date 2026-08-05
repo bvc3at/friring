@@ -905,6 +905,13 @@ pub struct App {
     /// Whether the tasks panel column is shown (toggled like the file viewer).
     pub(crate) show_tasks_panel: bool,
     pub(crate) show_file_viewer: bool,
+    /// Whether the left column — session list, automations pane, and the info
+    /// pane when it docks inline — is shown. The inverse of the other `show_*`
+    /// flags: it defaults to `true`, since the column is the app's resting
+    /// state rather than an opt-in panel. In-memory only (a restart brings it
+    /// back), like the other view toggles. Toggled by
+    /// [`Action::ToggleSessionList`](crate::session::Action::ToggleSessionList).
+    pub(crate) show_session_list: bool,
     pub(crate) file_viewer: crate::ui::file_viewer::FileViewerState,
     /// Open native code-review views, keyed by session — persisted per session
     /// like [`Self::session_terminal_views`] (the shell view), so switching
@@ -1393,6 +1400,7 @@ impl App {
             last_content_size: None,
             show_tasks_panel: false,
             show_file_viewer: false,
+            show_session_list: true,
             file_viewer: crate::ui::file_viewer::FileViewerState::new(),
             code_reviews: std::collections::HashMap::new(),
             review_search_history: std::collections::HashMap::new(),
@@ -1596,6 +1604,19 @@ impl App {
         self.resize_sessions_to_content_area();
     }
 
+    /// Where focus retreats when the pane holding it is closed or hidden. The
+    /// session list is the natural home, but it is itself hideable
+    /// ([`Self::show_session_list`]) — so while it is collapsed, focus falls to
+    /// the terminal instead of resting on a surface that isn't rendered. Every
+    /// site that drops a pane's focus goes through here.
+    pub(crate) fn focus_fallback(&self) -> InputFocus {
+        if self.show_session_list {
+            InputFocus::SessionList
+        } else {
+            InputFocus::Terminal
+        }
+    }
+
     /// Tear down any panel/view/focus that a now-disabled live feature flag
     /// leaves stranded. The open-state booleans (`show_*`), the per-session
     /// shell views, and the open code reviews are all opt-in toggles that
@@ -1610,13 +1631,13 @@ impl App {
         if !self.features.file_viewer {
             self.show_file_viewer = false;
             if self.focus == InputFocus::FileViewer {
-                self.focus = InputFocus::SessionList;
+                self.focus = self.focus_fallback();
             }
         }
         if !self.features.tasks {
             self.show_tasks_panel = false;
             if matches!(self.focus, InputFocus::TaskList | InputFocus::TaskEditor) {
-                self.focus = InputFocus::SessionList;
+                self.focus = self.focus_fallback();
             }
         }
         if !self.features.automations
@@ -1627,7 +1648,7 @@ impl App {
                     | InputFocus::AutomationRunHistory
             )
         {
-            self.focus = InputFocus::SessionList;
+            self.focus = self.focus_fallback();
         }
         if !self.features.global_search && self.global_search.active {
             self.close_global_search();
@@ -2251,8 +2272,9 @@ impl App {
         // Leave the pane the way `FocusBackward` would: a ghost has no live
         // PTY, so keeping terminal focus would point the keyboard at a surface
         // that only answers "press Enter to load". The list is where the next
-        // action (pick another session, or Enter to load this one back) lives.
-        self.focus = InputFocus::SessionList;
+        // action (pick another session, or Enter to load this one back) lives
+        // — unless it is collapsed, in which case the frozen pane stays focused.
+        self.focus = self.focus_fallback();
         self.on_focus_changed();
         self.request_redraw();
         self.set_status(
@@ -5260,16 +5282,19 @@ impl App {
         // Collapse the optional right-side panels if the terminal gets too
         // narrow (they only render at width >= 120 anyway). The info panel is
         // exempt unless pinned to its column: with `auto`/`inline` it docks in
-        // the left column, which narrow terminals still show.
+        // the left column, which narrow terminals still show — but not while
+        // that column is collapsed, which leaves every position column-only.
         if cols < 120 {
-            if self.info_panel_position == crate::session::settings::InfoPanelPosition::Column {
+            if self.info_panel_position == crate::session::settings::InfoPanelPosition::Column
+                || !self.show_session_list
+            {
                 self.show_info_panel = false;
             }
             self.show_tasks_panel = false;
             // Rescue the editor too, not just the list — otherwise focus stays
             // on the hidden panel's editor, which keeps capturing every key.
             if matches!(self.focus, InputFocus::TaskList | InputFocus::TaskEditor) {
-                self.focus = InputFocus::SessionList;
+                self.focus = self.focus_fallback();
             }
         }
 
@@ -8288,6 +8313,7 @@ impl App {
         layout::compute_layout(
             area,
             &layout::LayoutParams {
+                show_session_list: self.show_session_list,
                 show_info_panel: self.show_info_panel,
                 info_position: self.info_panel_position,
                 info_rows: if measure { self.info_panel_rows() } else { 0 },
