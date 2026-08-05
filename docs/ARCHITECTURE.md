@@ -151,6 +151,24 @@ possible via `tmux -L friring attach`.
 directly. Sessions died when friring exited, terminal content was
 lost on restart, and multiple instances had no coordination.
 
+**Which vt100**: not the crates.io one. Stock `vt100` 0.16.2 discards
+any line that scrolls off the top of the screen while a `DECSTBM`
+scrolling region is set — even a region anchored at row 1, where
+xterm, tmux and iTerm2 all keep it. That is exactly how ratatui's
+*inline* viewport grows a transcript on the normal screen, so an
+agent built on it (Codex CLI) left the pane's scrollback empty
+forever: `Shift+Up`, the wheel and the scrollbar were silent no-ops.
+Friring resolves `vt100` to `panoptes-vt100`, which relaxes that one
+condition to "the region starts at row 1", through a
+`[patch.crates-io]` entry — `tui_term` renders a `vt100::Screen`, so
+both crates must resolve to the *same* vt100 or the types don't
+unify. `[patch]` matches on package name and cannot rename, hence the
+one-line re-export crate at `vendor/vt100/` that carries the required
+name. The rule is pinned by `inline_viewport_scrollback` in
+`src/agent/backend.rs` and end-to-end by the `codex-scrollback`
+scenario; retire both the patch and `vendor/vt100/` if upstream ever
+ships the fix.
+
 **Rejected**:
 
 - *`portable-pty` (previous)* — no session persistence,
@@ -159,6 +177,16 @@ lost on restart, and multiple instances had no coordination.
   far heavier than needed.
 - *Parsing raw ANSI ourselves* — error-prone,
   massive surface area, already solved by `vt100`.
+- *Reading scrollback back out of tmux* (`capture-pane -S -N` into a
+  second parser, rendered while scrolled) — no dependency games, and
+  it would paper over any emulator gap, not just this one. Rejected
+  as a second render path with its own resize / live-output /
+  remote-host edge cases, against a one-condition fix upstream of all
+  of them.
+- *Vendoring the whole patched emulator in-tree* — full control, but
+  ~4k lines of third-party code to re-patch on every bump. The
+  re-export shim keeps the emulator itself on crates.io, versioned
+  and checksummed like any other dependency.
 
 ---
 

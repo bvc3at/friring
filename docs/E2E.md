@@ -346,10 +346,33 @@ only a "Model metadata not found" warning, and render in both the header box and
 prompt glyph `›` is the ready marker (the composer's placeholder text rotates — never match it).
 Gotchas: the TUI **rewrites `config.toml` on startup**, so seed it fresh per run and never assume
 it stays byte-identical; `codex exec` appends piped stdin to the prompt, hence the harness's
-`< /dev/null`. Zero non-stub calls under dead proxies. Also proven (0.145.0): `codex resume
+`< /dev/null`; and the release banner is interactive, so the profile seeds
+`check_for_update_on_startup = false` (a stray Enter on it launches a real package-manager
+upgrade). Zero non-stub calls under dead proxies. Also proven (0.145.0): `codex resume
 --last` in the session cwd re-renders the prior conversation **locally with zero model calls**
 (the ghost-unload scenario's journal assert), which is what friring's restart and ghost-load
 paths ride.
+
+Status hooks are covered on codex too (0.145.0), which needs three things no other profile does.
+`CODEX_HOME` points at the sandbox HOME's **`.codex`** — the literal path the hooks extension
+merges into (`requires_dir = "~/.codex"`), so friring and codex share one file instead of friring
+writing hooks the binary never reads; the dir is created by `agent_seed_config`, which runs before
+the harness activates the extension (a missing dir silently skips the merge). Every launch carries
+**`--dangerously-bypass-hook-trust`**: codex won't run a hook until its command string is accepted
+at an interactive "Hooks need review" prompt, and the hash it persists isn't something the harness
+can pre-seed. And `codex-text-turn` asserts `idle → working → done` **plus** the absence of any
+hook cell in the pane — codex parses hook stdout strictly and rejects anything but empty or valid
+JSON, and since a rejected hook still *ran* its command, the DB state alone cannot catch it.
+
+Codex is also the reference agent for **pane scrollback** (`codex-scrollback`, 0.146.0), because
+it is the only covered agent that renders on the *normal* screen: `alternate_on` stays 0 and it
+enables no mouse tracking at all, so its transcript really scrolls out of the top of the pane
+instead of being repainted in place. It grows that transcript the way ratatui's inline viewport
+does — pin a `DECSTBM` region anchored at row 1, scroll inside it, reset — which is precisely what
+stock vt100 refuses to keep (see "Which vt100" in `docs/ARCHITECTURE.md`). The scenario stubs a
+reply taller than any pane the harness renders, waits for its head to leave the screen, and then
+presses `Shift+Up` until the head comes back; against stock vt100 the view never moves. It is
+test-mode only — `Shift+Up` has no VHS key, so it can't be recorded as a demo.
 
 **opencode 1.17.15** — the `@ai-sdk/openai-compatible` runtime is bundled in the binary (nothing is
 fetched from npm) and a cold cache works offline, so no warm-up step is needed; the models.dev

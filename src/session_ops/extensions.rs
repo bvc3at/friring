@@ -423,7 +423,9 @@ fn write_json_if_changed(path: &Path, value: &serde_json::Value) -> Result<bool,
 /// Deep-merge an extension's shipped JSON into an agent's *own* config file
 /// (`~/.gemini/settings.json`, …) in place — reversibly and without clobbering
 /// the user's other settings. Skips when `requires_dir` is absent (the agent
-/// isn't installed) or when the merge is already present (no-op write).
+/// isn't installed) or when the merge is already present (no-op write). Entries
+/// from a *previous* payload version are pruned first, so an upgrade replaces
+/// our hooks rather than stacking a second copy beside them.
 fn install_config_merge(
     source: &crate::agent::extension_config::ExtensionSource,
     m: &crate::session::ConfigMerge,
@@ -451,7 +453,28 @@ fn install_config_merge(
             return Ok(());
         }
     };
-    crate::agent::json_merge::merge(&mut doc, &to_merge);
+    // Drop our own previously-merged entries before re-merging, so a payload
+    // whose commands changed between versions *replaces* them instead of
+    // accumulating: `merge` unions arrays by deep equality, so a superseded
+    // entry is not equal to its replacement and would survive beside it — and
+    // keep firing. Marker-based, exactly like the uninstall revert.
+    //
+    // Gated on the merge actually adding something, and that gate is the point:
+    // the marker is a command substring, so it also matches a hook the *user*
+    // hand-wrote around `friring-cli session signal`, and this runs on every TUI
+    // start and every heartbeat tick. Pruning unconditionally would delete such
+    // a hook within a minute of writing it. When everything we ship is already
+    // present there is nothing superseded to drop, so the steady state — every
+    // run but the one that changes the payload — never prunes at all.
+    let mut merged = doc.clone();
+    crate::agent::json_merge::merge(&mut merged, &to_merge);
+    if merged != doc {
+        crate::agent::json_merge::prune_marked(&mut doc, HOOK_SIGNAL_MARKER);
+        crate::agent::json_merge::prune_marked(&mut doc, LEGACY_HOOK_SIGNAL_MARKER);
+        crate::agent::json_merge::merge(&mut doc, &to_merge);
+    } else {
+        doc = merged;
+    }
     if write_json_if_changed(&dest, &doc)? {
         report.config_merges_applied.push(m.path.clone());
     } else {
@@ -1756,6 +1779,132 @@ requires_dir = '{agent_dir}'
         assert_eq!(
             restored,
             serde_json::json!({"theme":"dark","mcpServers":{},"hooks":{"BeforeTool":[{"command":"user"}]}})
+        );
+    }
+
+    #[test]
+    fn config_merge_upgrade_replaces_our_entries_instead_of_stacking_them() {
+        // The upgrade path a changed hook command takes: an install whose
+        // payload supersedes the merged one must leave exactly one copy of our
+        // hook behind. `merge` unions arrays by deep equality, so without the
+        // prune the superseded entry survives beside its replacement and keeps
+        // firing (which is how a broken codex hook outlived its own fix).
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let db = Database::open_in_memory().unwrap();
+
+        let agent_dir = temp.path().join("dotcodex");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let hooks_file = agent_dir.join("hooks.json");
+        std::fs::write(&hooks_file, r#"{"hooks":{"Stop":[{"command":"user"}]}}"#).unwrap();
+        let home = temp.path().join("hookshome");
+
+        let src = tempfile::TempDir::new().unwrap();
+        let manifest = format!(
+            r#"name = "hooks"
+home = '{home}'
+
+[[config_merges]]
+path = '{hooks_file}'
+source = "codex-hooks.json"
+requires_dir = '{agent_dir}'
+"#,
+            home = home.display(),
+            hooks_file = hooks_file.display(),
+            agent_dir = agent_dir.display(),
+        );
+        std::fs::write(src.path().join("extension.toml"), &manifest).unwrap();
+        let payload = |command: &str| {
+            format!(r#"{{"hooks":{{"Stop":[{{"hooks":[{{"command":"{command}"}}]}}]}}}}"#)
+        };
+        std::fs::write(
+            src.path().join("codex-hooks.json"),
+            payload("friring-cli session signal --state done || true"),
+        )
+        .unwrap();
+
+        let target = src.path().to_string_lossy().to_string();
+        install_extension(&db, &target, None, false).unwrap();
+
+        // The next version silences the command (the codex JSON-stdout fix).
+        let fixed = "friring-cli session signal --state done >/dev/null 2>&1 || true";
+        std::fs::write(src.path().join("codex-hooks.json"), payload(fixed)).unwrap();
+        install_extension(&db, &target, None, false).unwrap();
+
+        let merged: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_file).unwrap()).unwrap();
+        let stop = merged["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 2, "expected the user's entry plus exactly ours");
+        assert_eq!(stop[0], serde_json::json!({"command": "user"}));
+        assert_eq!(stop[1]["hooks"][0]["command"], serde_json::json!(fixed));
+    }
+
+    #[test]
+    fn config_merge_reinstall_keeps_a_user_hook_that_calls_session_signal() {
+        // The prune above matches on a command substring, so a hook the user
+        // wrote themselves around `friring-cli session signal` looks exactly
+        // like one of ours. Reinstalling an UNCHANGED payload — which is what
+        // every TUI start and every heartbeat tick does — must therefore not
+        // prune at all, or that hook would survive about a minute.
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let db = Database::open_in_memory().unwrap();
+
+        let agent_dir = temp.path().join("dotcodex");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let hooks_file = agent_dir.join("hooks.json");
+        let home = temp.path().join("hookshome");
+
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            src.path().join("extension.toml"),
+            format!(
+                r#"name = "hooks"
+home = '{home}'
+
+[[config_merges]]
+path = '{hooks_file}'
+source = "codex-hooks.json"
+requires_dir = '{agent_dir}'
+"#,
+                home = home.display(),
+                hooks_file = hooks_file.display(),
+                agent_dir = agent_dir.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            src.path().join("codex-hooks.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"command":"friring-cli session signal --state done || true"}]}]}}"#,
+        )
+        .unwrap();
+
+        let target = src.path().to_string_lossy().to_string();
+        install_extension(&db, &target, None, false).unwrap();
+
+        // The user adds their own signal hook on an event we don't wire.
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_file).unwrap()).unwrap();
+        let mine = serde_json::json!({
+            "hooks": [{"command": "friring-cli session signal --state blocked || true"}]
+        });
+        doc["hooks"]["PostToolUse"] = serde_json::json!([mine]);
+        std::fs::write(&hooks_file, serde_json::to_string(&doc).unwrap()).unwrap();
+
+        // Same payload again: the tick/startup reinstall.
+        install_extension(&db, &target, None, false).unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_file).unwrap()).unwrap();
+        assert_eq!(
+            after["hooks"]["PostToolUse"],
+            serde_json::json!([mine]),
+            "a reinstall of an unchanged payload must leave the user's own hook alone"
+        );
+        assert_eq!(
+            after["hooks"]["Stop"].as_array().map(Vec::len),
+            Some(1),
+            "and must still leave exactly one copy of ours"
         );
     }
 

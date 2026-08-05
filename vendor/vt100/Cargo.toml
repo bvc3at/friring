@@ -1,0 +1,31 @@
+# A crate named `vt100` that is nothing but a re-export of `panoptes-vt100`.
+#
+# Its only reason to exist is Cargo's `[patch]` rules. Friring needs the fork
+# (upstream vt100 drops scrollback under a top-anchored scrolling region — see
+# the [patch.crates-io] comment in the root Cargo.toml), and `tui-term` renders
+# a `vt100::Screen`, so BOTH must resolve to the same crate or the types don't
+# unify. `[patch]` matches on package name and cannot rename, so a patch can
+# only be applied by something actually called `vt100` — and it must come from
+# a different source than crates.io. A local path crate is both.
+#
+# There is no vendored terminal-emulator code here: `src/lib.rs` is one
+# re-export and the emulator is the crates.io dependency below, auditable and
+# versioned like any other. Retire the whole directory if upstream vt100 ever
+# ships the fix.
+[package]
+name = "vt100"
+version = "0.16.2"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "Friring's vt100: a re-export of panoptes-vt100 under the name Cargo's [patch] needs"
+publish = false
+
+# Own workspace root: this crate is a `[patch]` target, not a member of
+# Friring's package, and without this Cargo would try to adopt it into one.
+[workspace]
+
+[dependencies]
+# Renamed so `lib.rs` can name it: the fork keeps `vt100` as its *lib* name,
+# which would collide with this crate's own name.
+fork = { package = "panoptes-vt100", version = "0.16.2" }

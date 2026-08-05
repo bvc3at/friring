@@ -715,8 +715,14 @@ The home dir is `~/.config/friring/hooks` on a release build and
 `--settings` file, your own hooks still fire inside a friring session — both run.
 Hand-edits to a managed file are rewritten from the embedded payload on the next
 TUI start / heartbeat tick; to customize, deactivate the extension and wire the
-hook yourself, or edit the payload under `extensions/hooks/` and reinstall. Full
-per-agent detail: `extensions/hooks/README.md`.
+hook yourself, or edit the payload under `extensions/hooks/` and reinstall. A
+merged file (the codex/antigravity rows) is re-merged the same way, and when the
+payload has actually changed friring's own entries are pruned first, so an
+upgrade whose hook commands changed replaces them instead of leaving both
+versions firing. That prune matches on the `session signal` command, so it would
+also catch a hook you wrote around the same command — which is why it is limited
+to the run that changes the payload rather than every tick. Full per-agent
+detail: `extensions/hooks/README.md`.
 
 ## themes.toml
 

@@ -245,7 +245,7 @@ teardown() {
     e2e_protocol_smoke "$AGENT_E2E_DIR/scenarios/codex-text-turn"
 }
 
-@test "e2e: codex text turn through Friring against the openai-dialect stub" {
+@test "e2e: codex text turn through Friring with idle→working→done status transition" {
     require_agent codex
     e2e_scenario "$AGENT_E2E_DIR/scenarios/codex-text-turn"
 }
@@ -253,6 +253,11 @@ teardown() {
 @test "e2e: Alt+U unloads codex to a frozen ghost; Enter loads it back via resume --last" {
     require_agent codex
     e2e_scenario "$AGENT_E2E_DIR/scenarios/codex-unload-load"
+}
+
+@test "e2e: Shift+Up reaches the top of a codex transcript that scrolled off the pane" {
+    require_agent codex
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/codex-scrollback"
 }
 
 @test "protocol: opencode run completes a stubbed text turn (no Friring)" {

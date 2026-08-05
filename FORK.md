@@ -986,6 +986,60 @@ already cover the case it was meant to serve.
 
 ### Behavior fixes
 
+- **A codex pane can be scrolled.** Upstream takes `vt100` straight from
+  crates.io, and 0.16.2 discards every line that scrolls off the top of the
+  screen while a `DECSTBM` scrolling region is set — even one anchored at row
+  1, which xterm, tmux and iTerm2 all keep. That is exactly how ratatui's
+  *inline* viewport grows a transcript on the normal screen, so a Codex session
+  had permanently empty scrollback: `Shift+Up`, the wheel and the scrollbar all
+  did nothing, and everything above the current screen was simply unreachable.
+  (Alternate-screen agents like Claude Code were never affected — they handle
+  the wheel themselves and Friring forwards it.) Replaying a recorded Codex
+  stream: tmux keeps 22 lines of history, stock vt100 keeps 0. The fork
+  resolves `vt100` to `panoptes-vt100` — upstream 0.16.2 with that one
+  condition relaxed to "the region starts at row 1" — through a
+  `[patch.crates-io]` entry and the one-line re-export crate at `vendor/vt100/`
+  that carries the name `[patch]` requires (`tui_term` renders a
+  `vt100::Screen`, so both must resolve to the same crate; `[patch]` cannot
+  rename). Same stream through the patched build: 22 lines, matching tmux
+  exactly. Pinned by `inline_viewport_scrollback` in `src/agent/backend.rs`
+  (four cases, including the region *below* row 1 that must still discard) and
+  end-to-end by the `codex-scrollback` e2e scenario. Rationale and the rejected
+  alternatives are in ADR-2; the whole thing retires if upstream vt100 ever
+  ships the fix.
+
+- **codex status hooks actually report.** Upstream ships the codex
+  `hooks.json` payload with bare `friring-cli session signal --state <s> ||
+  true` commands, which codex rejects on *every* event: it parses each hook's
+  stdout and accepts only empty output or JSON matching its own per-event
+  schema, while `friring-cli` renders **JSON** whenever stdout isn't a TTY
+  (`cli::output::Format::resolve`) — which a hook's piped stdout always is. So
+  a codex session painted `error: hook returned invalid <event> JSON output`
+  on each turn, its hooks failing on every event. The fork's payload discards
+  hook output (`>/dev/null 2>&1`), which is asserted two ways: a unit test over
+  the embedded payload (`session_ops::builtin_hooks`) and the `codex-text-turn`
+  e2e scenario, which now drives codex's real hooks (the profile points
+  `CODEX_HOME` at the `~/.codex` friring writes and launches with
+  `--dangerously-bypass-hook-trust`) and fails on any hook cell in the pane.
+  Verified against codex-cli 0.145.0. Note the *second* gate, which is the
+  user's to clear and not a bug: codex parks on "Hooks need review" the first
+  time it sees a new hook command and won't run it until accepted.
+
+- **A `[[config_merges]]` upgrade replaces friring's entries instead of
+  stacking them.** Upstream's `install_config_merge` only ever merges, and the
+  merge unions arrays by deep equality — so an entry whose command changed
+  between payload versions isn't equal to its replacement and survives beside
+  it, still firing. (Upstream already knew the shape of this: its uninstall
+  prunes the pre-rename `thurbox-cli` marker "or reinstall would duplicate
+  ours".) The fork prunes both markers before merging, the same call the
+  uninstall revert makes, so the merge is self-healing across payload changes.
+  Without it the codex hook fix above could never reach an existing install.
+  The prune is gated on the merge actually adding something, and that gate is
+  load-bearing: the marker is a command substring, so it also matches a hook the
+  *user* hand-wrote around `friring-cli session signal`, and this path runs on
+  every TUI start and every heartbeat tick. Gated, the steady state never prunes
+  at all and only the one run that changes the payload can touch such a hook.
+
 - **A forced send is refused at a dead pane too.** Adopting upstream's
   dead-pane guard (`c89eecd`) meant choosing where it sits. Upstream had one
   entry point; the fork has two — the modal-guarded `send_prompt_now_on` and

@@ -1555,6 +1555,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "panoptes-vt100"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6803e49464d8973093db29aaeca27f831cc2f9cbd0699ffb3435f53f3c56cc5e"
+dependencies = [
+ "itoa",
+ "unicode-width",
+ "vte",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2828,12 +2839,8 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vt100"
 version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
 dependencies = [
- "itoa",
- "unicode-width",
- "vte",
+ "panoptes-vt100",
 ]
 
 [[package]]

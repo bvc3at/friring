@@ -254,6 +254,21 @@ pub fn ensure_builtin_hooks_extension(db: &Database) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Every `command` string in a claude-shaped hooks payload, flattened out of
+    /// the `hooks.<Event>[].hooks[]` nesting.
+    fn codex_hook_commands(payload: &serde_json::Value) -> Vec<&str> {
+        payload["hooks"]
+            .as_object()
+            .expect("hooks object")
+            .values()
+            .filter_map(serde_json::Value::as_array)
+            .flatten()
+            .filter_map(|matcher| matcher["hooks"].as_array())
+            .flatten()
+            .filter_map(|hook| hook["command"].as_str())
+            .collect()
+    }
+
     // --- rewrite_hook_signals_for_remote tests ---
 
     #[test]
@@ -358,6 +373,38 @@ mod tests {
         assert!(codex_payload["hooks"]["SessionStart"].is_array());
         assert!(codex_payload["hooks"]["Stop"].is_array());
         assert!(CODEX_HOOKS.contains("friring-cli session signal"));
+
+        // The event → state mapping is what the TUI shows for a codex session;
+        // the e2e scenario can only observe the transitions loosely (a `working`
+        // turn can be over before the poller looks), so pin it here.
+        for (event, state) in [
+            ("SessionStart", "idle"),
+            ("UserPromptSubmit", "working"),
+            ("PreToolUse", "working"),
+            ("Stop", "done"),
+        ] {
+            let command = codex_payload["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("codex {event} hook has a command string"));
+            assert!(
+                command.contains(&format!("--state {state}")),
+                "codex {event} hook must signal {state}: {command}"
+            );
+        }
+
+        // codex parses hook stdout strictly: anything that isn't empty or a JSON
+        // object it accepts is rejected after the command has already run, so
+        // codex paints "hook returned invalid <event> JSON output" on every
+        // event. `friring-cli` renders JSON whenever stdout isn't a TTY — which
+        // a hook's piped stdout always is — so every codex command must discard
+        // its output. Verified against codex-cli 0.145.0; asserted end-to-end by
+        // the codex-text-turn e2e scenario.
+        for command in codex_hook_commands(&codex_payload) {
+            assert!(
+                command.contains(">/dev/null 2>&1"),
+                "codex hook command must silence its output: {command}"
+            );
+        }
 
         // vibe drops a managed hooks.toml into ~/.vibe/ (guarded by requires_dir).
         let vibe = def

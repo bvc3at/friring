@@ -21,7 +21,8 @@ ratatui = "0.30"
 crossterm = "0.29"
 tui-term = "0.3"
 
-# Terminal emulation
+# Terminal emulation — resolved through the [patch.crates-io] fork at the
+# bottom of this file, which is what lets a normal-screen agent's pane scroll.
 vt100 = "0.16"
 
 # Display-width math for clickable-link column positions (wide CJK/emoji cells)
@@ -127,3 +128,22 @@ insta = { version = "1.48.0", default-features = false }
 # render-transparent (control_mode transport + terminal_view rendering). Runs in
 # the normal `cargo nextest --all`.
 proptest = "1"
+
+# vt100 0.16.2 discards a line that scrolls off the top of the screen whenever
+# ANY scrolling region is set — even one anchored at row 1, where every real
+# terminal (xterm, tmux, iTerm2) saves it. That is exactly how ratatui's inline
+# viewport grows its transcript, so a Codex pane's scrollback stayed empty
+# forever and Shift+Up / the wheel / the scrollbar were silent no-ops.
+# `panoptes-vt100` is upstream 0.16.2 with that one condition relaxed to
+# `scroll_top == 0`; replaying a recorded Codex stream through it yields the
+# same 22 scrollback lines tmux itself keeps, against 0 unpatched (pinned by
+# `tests::inline_viewport_scrollback` in src/agent/backend.rs).
+#
+# It has to be a patch rather than a plain dependency: tui-term renders a
+# `vt100::Screen`, so both crates must resolve to the SAME vt100 or the types
+# don't unify. `[patch]` matches on package name and cannot rename, which is
+# what `vendor/vt100` is for — a one-line re-export crate that carries the
+# required name; the emulator itself still comes from crates.io. Retire both
+# if upstream vt100 ever ships the fix.
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }
