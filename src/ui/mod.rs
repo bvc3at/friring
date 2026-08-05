@@ -47,6 +47,8 @@ use ratatui::{
     Frame,
 };
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use crate::session::SessionStatus;
 use theme::Theme;
 
@@ -170,8 +172,8 @@ pub type ModalButtons = Vec<(
 /// label plus its optional hint suffix, with one space of padding on each side
 /// (` label·key `).
 fn button_width(spec: &ButtonSpec<'_>) -> u16 {
-    let hint = spec.hint.map_or(0, |h| h.chars().count());
-    (spec.label.chars().count() + hint) as u16 + 2
+    let hint = spec.hint.map_or(0, UnicodeWidthStr::width);
+    (spec.label.width() + hint) as u16 + 2
 }
 
 /// The resting fill style for a button — a filled "pill" chip. Primary actions
@@ -481,18 +483,35 @@ pub fn status_glyph(status: SessionStatus, spinner: &str) -> &str {
 
 /// Truncate `s` to at most `max` display columns, appending `…` when cut.
 ///
-/// Counts by `char` (not bytes), reserving one column for the ellipsis.
+/// Measures **display width**, not `char` count: a CJK name or an emoji in a
+/// session/task title takes two columns each, and counting them as one is what
+/// makes a "fitted" row overrun its rect and shove the chrome right. A glyph
+/// that would straddle the cut is dropped whole rather than half-painted.
 /// Returns an empty string when `max` is too small to show anything useful
 /// (`max <= 1`), since a lone `…` carries no information.
 pub fn truncate_ellipsis(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
+    if s.width() <= max {
         return s.to_string();
     }
     if max <= 1 {
         return String::new();
     }
-    let kept: String = s.chars().take(max - 1).collect();
+    let room = max - 1; // the `…` takes the last column
+    let mut kept = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let width = ch.width().unwrap_or(0);
+        if used + width > room {
+            break;
+        }
+        kept.push(ch);
+        used += width;
+    }
+    // A string's width is not the sum of its chars': a base glyph plus U+FE0F
+    // is one column by char, two as painted. Shed until the kept prefix fits.
+    while kept.width() > room {
+        kept.pop();
+    }
     format!("{kept}…")
 }
 
@@ -1343,6 +1362,31 @@ mod tests {
     }
 
     #[test]
+    fn button_chip_reserves_the_columns_a_wide_label_paints() {
+        // A chip has to occupy the columns the terminal actually paints, not
+        // the chars it holds: the footer sizes its right-hand block with the
+        // same measurement, so a char count here would let the pills grow into
+        // the columns the left text reserved.
+        let backend = ratatui::backend::TestBackend::new(20, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, 20, 1);
+                let specs = [ButtonSpec::secondary("日本").with_hint("·F1")];
+                let hits = render_button_bar(f, area, &specs, true);
+                assert_eq!(hits.len(), 1);
+                // " 日本·F1 ": label 4 display columns + hint 3 + 2 padding.
+                assert_eq!(hits[0].rect.width, 9);
+                assert_eq!(
+                    hits[0].rect.x + hits[0].rect.width,
+                    area.x + area.width,
+                    "the chip packs to the right edge without overrunning it"
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn truncate_ellipsis_keeps_short_strings_intact() {
         assert_eq!(truncate_ellipsis("hello", 10), "hello");
         assert_eq!(truncate_ellipsis("hello", 5), "hello");
@@ -1414,6 +1458,22 @@ mod tests {
     fn truncate_ellipsis_counts_by_char_not_byte() {
         // Multi-byte chars count as one column each.
         assert_eq!(truncate_ellipsis("héllo wörld", 5), "héll…");
+    }
+
+    /// Wide glyphs cost the two columns a terminal actually paints them in, so
+    /// a "fitted" row can't overrun its rect and shove the chrome right.
+    #[test]
+    fn truncate_ellipsis_measures_display_width() {
+        // Four double-width glyphs = 8 columns: two of them plus the `…` is all
+        // that fits in 5, where a char count would have kept four and drawn 9.
+        assert_eq!(truncate_ellipsis("日本語版", 5), "日本…");
+        assert_eq!(truncate_ellipsis("日本語版", 8), "日本語版");
+        // A glyph that would straddle the cut is dropped, not half-painted.
+        assert_eq!(truncate_ellipsis("日本語版", 4), "日…");
+        // An emoji-presentation sequence paints two columns but sums to one by
+        // char, so the kept prefix has to be re-measured as a string.
+        assert_eq!(truncate_ellipsis("#\u{FE0F}x", 2), "#…");
+        assert!(UnicodeWidthStr::width(truncate_ellipsis("#\u{FE0F}abc", 4).as_str()) <= 4);
     }
 
     #[test]

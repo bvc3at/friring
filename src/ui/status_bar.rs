@@ -6,6 +6,8 @@ use ratatui::{
     Frame,
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use super::theme::Theme;
 use crate::app::{StatusLevel, StatusMessage};
 use crate::session::{Action, KeyBindings};
@@ -142,13 +144,14 @@ fn is_optional(action: &Action) -> bool {
 }
 
 /// Order the *essential* pills give way in once even key-only chips overflow —
-/// the lowest rank goes first. Cosmetics (Theme) lead; `Help` is last out
-/// because it is the one chip that documents every key the row can no longer
-/// show.
+/// the lowest rank goes first. Cosmetics (Theme) lead; `Quit` is last out
+/// because at the widths where a single chip survives it is the only one whose
+/// action still works: the help overlay needs a terminal wide enough to render
+/// it, where a click on `Quit` quits at any width.
 fn pill_drop_rank(action: Action) -> u8 {
     match action {
-        Action::ToggleHelp => 3,
-        Action::QuitApp => 2,
+        Action::QuitApp => 3,
+        Action::ToggleHelp => 2,
         Action::OpenSettings => 1,
         _ => 0,
     }
@@ -162,6 +165,9 @@ enum PillText {
     /// ` Help F1 ` — the ` · ` separator dropped, buying two columns per pill
     /// back for the left-hand text.
     Tight,
+    /// ` Help ` — the shortcut dropped, the label kept. A chip is a click
+    /// target first: ` Theme ` says what it does, where ` F4 ` only says how.
+    LabelOnly,
     /// ` F1 ` — the last resort: the key alone (a button with no bound key
     /// keeps its label, since a blank chip would be unclickable noise).
     KeyOnly,
@@ -183,7 +189,7 @@ fn pill_labels(
                 (Some(sc), PillText::Full) => format!("{label} · {sc}"),
                 (Some(sc), PillText::Tight) => format!("{label} {sc}"),
                 (Some(sc), PillText::KeyOnly) => sc,
-                (None, _) => (*label).to_string(),
+                (Some(_), PillText::LabelOnly) | (None, _) => (*label).to_string(),
             }
         })
         .collect()
@@ -192,15 +198,15 @@ fn pill_labels(
 /// Pick the pill row for a footer `width` columns wide, degrading in the order
 /// [`render_footer`] documents. `left_width` is what the left-hand text wants at
 /// full length — it only decides whether the ` · ` separators are affordable,
-/// since past that point the left text is what yields. `pinned` is the width
-/// the never-dropped left segments reserve.
+/// since past that point the left text is what yields. `reserved` is the width
+/// the pills leave the text whatever it costs them ([`reserved_left_width`]).
 ///
 /// Returns the surviving entries with their labels, index-aligned.
 fn fit_pills(
     state: &FooterState<'_>,
     width: u16,
     left_width: u16,
-    pinned: u16,
+    reserved: u16,
 ) -> (Vec<(&'static str, Action)>, Vec<String>) {
     let mut entries = footer_entries(state);
 
@@ -212,8 +218,8 @@ fn fit_pills(
     }
 
     // Everything below sacrifices left-hand text, which the caller trims — but
-    // never past the pinned segments, so the pills make room for those.
-    let room = width.saturating_sub(pinned);
+    // never into the reserved columns, so the pills make room for those.
+    let room = width.saturating_sub(reserved);
 
     // 2. Drop the ` · ` separators.
     let tight = pill_labels(state, &entries, PillText::Tight);
@@ -228,11 +234,18 @@ fn fit_pills(
         return (entries, tight);
     }
 
-    // 4. The compact state: chips shrink to the bare key, handing every freed
+    // 4. Drop the shortcuts, keep the labels — a squeezed chip still reads as
+    //    the button it is, and the F-keys it stops advertising are all in Help.
+    let labels = pill_labels(state, &entries, PillText::LabelOnly);
+    if pill_block_width(&labels) <= room {
+        return (entries, labels);
+    }
+
+    // 5. The compact state: chips shrink to the bare key, handing every freed
     //    column back to the left-hand text.
     let mut keys = pill_labels(state, &entries, PillText::KeyOnly);
 
-    // 5. Still overflowing — shed whole chips, least useful first.
+    // 6. Still overflowing — shed whole chips, least useful first.
     while pill_block_width(&keys) > room && !entries.is_empty() {
         let Some(idx) = entries
             .iter()
@@ -256,7 +269,7 @@ fn pill_block_width(labels: &[String]) -> u16 {
     if labels.is_empty() {
         return 0;
     }
-    let pills: u16 = labels.iter().map(|l| l.chars().count() as u16 + 2).sum();
+    let pills: u16 = labels.iter().map(|l| l.width() as u16 + 2).sum();
     pills + labels.len() as u16 - 1
 }
 
@@ -273,12 +286,14 @@ fn pill_block_width(labels: &[String]) -> u16 {
 /// 1. the ` · ` separators inside the pills (` Help · F1 ` → ` Help F1 `),
 ///    bought back as columns for the text;
 /// 2. the left-hand text, segment by segment, least useful first (the priority
-///    order on `left_segments`) — text yields before any button does;
+///    order on `left_segments`) — text yields before any button does, down to
+///    the columns `reserved_left_width` holds back for the focus label;
 /// 3. the optional panel-toggle pills, dropped together, once the pills alone
 ///    no longer fit;
-/// 4. the pill labels, leaving key-only chips (` F1 `) and handing every freed
+/// 4. the pill shortcuts, leaving labelled chips (` Theme `);
+/// 5. the pill labels, leaving key-only chips (` F1 `) and handing every freed
 ///    column back to the text;
-/// 5. whole chips, least useful first (`pill_drop_rank`).
+/// 6. whole chips, least useful first (`pill_drop_rank`).
 pub fn render_footer(
     frame: &mut Frame,
     area: Rect,
@@ -293,19 +308,26 @@ pub fn render_footer(
     // nothing here can be overwritten by the right-aligned pills.
     let mut segments = left_segments(state);
     let left_width = segments_width(&segments);
-    let pinned = segments
-        .iter()
-        .filter(|s| s.priority == PRIO_PINNED)
-        .map(LeftSegment::width)
-        .sum();
+    let reserved = reserved_left_width(&segments, area.width);
 
-    let (entries, labels) = fit_pills(state, area.width, left_width, pinned);
+    let (entries, labels) = fit_pills(state, area.width, left_width, reserved);
 
     // The text gets its own rect, ending where the pills begin: whatever the
-    // trim can't shed is clipped there rather than painted under them.
+    // trim can't shed is cut there rather than painted under them.
     let budget = area.width.saturating_sub(pill_block_width(&labels));
     trim_segments(&mut segments, budget);
-    let spans: Vec<Span<'_>> = segments.into_iter().flat_map(|s| s.spans).collect();
+    // The armed-leader badge keeps its columns whole (only the rect may cut it);
+    // everything after it ends in `…` rather than mid-word, which is what makes
+    // a lone over-long focus label degrade instead of vanish.
+    let (pinned, rest): (Vec<LeftSegment>, Vec<LeftSegment>) = segments
+        .into_iter()
+        .partition(|s| s.priority == PRIO_PINNED);
+    let mut spans: Vec<Span<'_>> = pinned.into_iter().flat_map(|s| s.spans).collect();
+    let head = spans_width(&spans);
+    spans.extend(truncate_spans_to_width(
+        rest.into_iter().flat_map(|s| s.spans).collect(),
+        budget.saturating_sub(head),
+    ));
     frame.render_widget(
         Paragraph::new(Line::from(spans)),
         Rect {
@@ -357,8 +379,47 @@ pub fn render_status_message_row(frame: &mut Frame, area: Rect, state: &FooterSt
     } else {
         return; // nothing to show — row shouldn't have been carved
     }
-    // A status row is a single line; ratatui clips a longer message to width.
+    // Truncate to the row so a long message ends in `…` rather than being cut
+    // mid-word by ratatui — the leading badge is kept, the trailing text gives.
+    let spans = truncate_spans_to_width(spans, area.width);
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Fit a span row to `width` columns by shortening its *last* span with `…`,
+/// preserving everything before it — the leading badge on the status row, the
+/// armed-leader badge on the footer. Nothing survives a zero budget.
+fn truncate_spans_to_width<'a>(mut spans: Vec<Span<'a>>, width: u16) -> Vec<Span<'a>> {
+    let budget = width as usize;
+    if budget == 0 {
+        return Vec::new();
+    }
+    // Summed unnarrowed: `spans_width` saturates at `u16::MAX`, which would
+    // make a wider-than-64k row look like it already fits.
+    if spans.iter().map(span_width).sum::<usize>() <= budget {
+        return spans;
+    }
+    let others: usize = spans[..spans.len().saturating_sub(1)]
+        .iter()
+        .map(span_width)
+        .sum();
+    if let Some(last) = spans.last_mut() {
+        let style = last.style;
+        *last = Span::styled(
+            super::truncate_ellipsis(&last.content, budget.saturating_sub(others)),
+            style,
+        );
+    }
+    spans
+}
+
+fn span_width(span: &Span<'_>) -> usize {
+    UnicodeWidthStr::width(span.content.as_ref())
+}
+
+fn spans_width(spans: &[Span<'_>]) -> u16 {
+    // Saturate rather than wrap: a row wider than `u16::MAX` is still "wider
+    // than any terminal", and wrapping would report it as narrow.
+    u16::try_from(spans.iter().map(span_width).sum::<usize>()).unwrap_or(u16::MAX)
 }
 
 fn push_status_message<'a>(spans: &mut Vec<Span<'a>>, msg: &'a StatusMessage) {
@@ -381,9 +442,11 @@ fn push_status_message<'a>(spans: &mut Vec<Span<'a>>, msg: &'a StatusMessage) {
 /// *highest* number first, so what survives a narrow footer is the most useful
 /// text rather than a half-word cut off under the pills.
 ///
-/// `PRIO_PINNED` is never dropped: an armed leader with no feedback anywhere
-/// reads as a frozen app, so the pills reserve room for its badge instead (see
-/// [`fit_pills`]).
+/// `PRIO_PINNED` and `PRIO_FOCUS` are never dropped — an armed leader with no
+/// feedback anywhere reads as a frozen app, and a footer that has shed the
+/// focus label has stopped saying what the keys it lists apply to. The pills
+/// reserve their columns instead ([`reserved_left_width`]) and they shorten
+/// with `…` rather than vanish.
 const PRIO_PINNED: u8 = 0;
 const PRIO_BLOCKED: u8 = 1;
 const PRIO_FOCUS: u8 = 2;
@@ -431,15 +494,47 @@ impl LeftSegment {
     }
 
     fn width(&self) -> u16 {
-        self.spans
-            .iter()
-            .map(|s| s.content.chars().count() as u16)
-            .sum()
+        spans_width(&self.spans)
+    }
+
+    /// Whether the responsive trim keeps this segment whatever the budget: the
+    /// armed-leader badge and the focus label, the two things a footer that has
+    /// given up everything else still has to say.
+    fn always_kept(&self) -> bool {
+        self.priority == PRIO_PINNED || self.priority == PRIO_FOCUS
     }
 }
 
+/// Summed saturating, not wrapping: [`LeftSegment::width`] saturates at
+/// `u16::MAX`, and a wrapped total would read as "there is room" and hand the
+/// budget back out.
 fn segments_width(segments: &[LeftSegment]) -> u16 {
-    segments.iter().map(LeftSegment::width).sum()
+    segments
+        .iter()
+        .map(LeftSegment::width)
+        .fold(0, u16::saturating_add)
+}
+
+/// What the never-dropped segments ([`LeftSegment::always_kept`]) occupy — the
+/// floor both the pills' reserve and the trim's own accounting start from.
+fn always_kept_width(segments: &[LeftSegment]) -> u16 {
+    segments
+        .iter()
+        .filter(|s| s.always_kept())
+        .map(LeftSegment::width)
+        .fold(0, u16::saturating_add)
+}
+
+/// The columns the pills hold back for the left-hand text: what the
+/// never-dropped segments ([`LeftSegment::always_kept`]) want, capped at half
+/// the row so a long focus label can't starve the chips — past that cap the
+/// text is what gives, ending in `…`.
+///
+/// Without this the pill row was only trimmed *after* the text had been shed
+/// entirely, so a footer 44–50 or 76–82 columns wide (80 among them) showed a
+/// full set of chips above an empty left half.
+fn reserved_left_width(segments: &[LeftSegment], width: u16) -> u16 {
+    always_kept_width(segments).min(width / 2)
 }
 
 /// A `key description` hint pair, styled as one trailing segment.
@@ -568,22 +663,27 @@ fn left_segments(state: &FooterState<'_>) -> Vec<LeftSegment> {
 /// the label first and then the badge too, leaving the row blank. Trailing
 /// segments are the exception — a hint never fills in for state that didn't fit.
 ///
-/// Pinned segments are kept whatever the budget: when even they overflow, the
-/// rect clips them, which is the compact last resort (show as much as there is
-/// room for), not a badge painted over a pill.
+/// The always-kept segments (badge + focus label) take their columns up front,
+/// so a wide badge like ` ◆ 2 blocked · F10 ` competes for what's left rather
+/// than pushing the focus label out. When even they overflow, the caller cuts
+/// them down with `…` — the compact last resort (show as much as there is room
+/// for), not a badge painted over a pill.
 fn trim_segments(segments: &mut Vec<LeftSegment>, budget: u16) {
     if segments_width(segments) <= budget {
         return;
     }
     let mut by_priority: Vec<usize> = (0..segments.len()).collect();
     by_priority.sort_by_key(|&idx| segments[idx].priority); // stable: ties keep render order
-    let mut keep = vec![false; segments.len()];
-    let mut spent = 0u16;
+    let mut keep: Vec<bool> = segments.iter().map(LeftSegment::always_kept).collect();
+    let mut spent = always_kept_width(segments);
     let mut skipped = false;
     for idx in by_priority {
         let segment = &segments[idx];
+        if segment.always_kept() {
+            continue;
+        }
         let fits = spent.saturating_add(segment.width()) <= budget;
-        if segment.priority == PRIO_PINNED || (fits && !(segment.trailing && skipped)) {
+        if fits && !(segment.trailing && skipped) {
             spent = spent.saturating_add(segment.width());
             keep[idx] = true;
         } else {
@@ -867,6 +967,51 @@ mod tests {
         );
     }
 
+    /// A message too long for even its own row ends in `…`, with the level
+    /// badge — the part that says how much the message matters — intact.
+    #[test]
+    fn status_row_ellipsises_a_message_too_long_for_the_row() {
+        let msg = long_error();
+        let mut state = footer_state(false);
+        state.status = Some(&msg);
+
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_status_message_row(f, Rect::new(0, 0, 40, 1), &state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let line: String = (0..40).map(|x| buffer[(x, 0)].symbol()).collect();
+
+        assert!(line.starts_with(" ERROR "), "badge preserved: {line:?}");
+        assert!(line.ends_with('…'), "message ends in an ellipsis: {line:?}");
+    }
+
+    /// A message wider than `u16::MAX` still gets an ellipsis: the fit check
+    /// sums in `usize`, so the row's total width can't wrap around and make an
+    /// enormous message look like it already fits.
+    #[test]
+    fn status_row_ellipsises_a_message_wider_than_u16() {
+        let msg = StatusMessage {
+            text: "x".repeat(65_536),
+            level: StatusLevel::Error,
+            created_at: std::time::Instant::now(),
+        };
+        let mut state = footer_state(false);
+        state.status = Some(&msg);
+
+        let backend = TestBackend::new(40, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_status_message_row(f, Rect::new(0, 0, 40, 1), &state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let line: String = (0..40).map(|x| buffer[(x, 0)].symbol()).collect();
+
+        assert!(line.starts_with(" ERROR "), "badge preserved: {line:?}");
+        assert!(line.ends_with('…'), "message ends in an ellipsis: {line:?}");
+    }
+
     /// Regression guard for the original bug: with a message active, the footer
     /// row still renders every pill intact (the message no longer flows across
     /// it — it lives on the row above).
@@ -970,6 +1115,89 @@ mod tests {
         }
     }
 
+    /// No usable width leaves the left half of the footer empty. The pill row
+    /// used to be trimmed only *after* the text had been shed entirely, so a
+    /// full set of chips sat above a blank left half at 44–50 and 76–82 columns
+    /// — 80, the most common terminal width there is, among them.
+    #[test]
+    fn footer_never_blanks_its_left_half() {
+        // A bounded product over the axes the guarantee names — the shortest
+        // and longest focus labels, the armed badge, the file viewer, and the
+        // two count badges. 32 states x 181 widths; the full product of every
+        // label and count is ~20x slower for no extra coverage.
+        for width in 20..=200u16 {
+            for label in ["Sessions", "Edit Automation"] {
+                for armed in [None, Some("^A")] {
+                    for viewer in [false, true] {
+                        for blocked in [0usize, 2] {
+                            for automations in [0usize, 3] {
+                                let mut state = footer_state(viewer);
+                                state.focus_label = label;
+                                state.blocked_count = blocked;
+                                state.automation_count = automations;
+                                state.session_count = 7;
+                                state.prefix_armed = armed.map(str::to_string);
+                                let (hits, line) = footer_at(width, &state);
+                                let first =
+                                    hits.iter().map(|(h, _)| h.rect.x).min().unwrap_or(width);
+                                let left: String = line.chars().take(first as usize).collect();
+                                assert!(
+                                    !left.trim().is_empty(),
+                                    "left half blank at width {width} (focus {label:?}, \
+                                     armed {armed:?}, viewer {viewer}, blocked {blocked}, \
+                                     automations {automations}): {line:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The two bands the pill row used to take whole. What survives there is
+    /// the focus label — the one thing that says which pane the keys apply to.
+    #[test]
+    fn footer_keeps_the_focus_label_in_the_narrow_bands() {
+        let mut state = footer_state(false);
+        state.focus_label = "Terminal";
+        for width in (44..=50).chain(76..=82) {
+            let (_, line) = footer_at(width, &state);
+            assert!(
+                line.contains("Terminal"),
+                "focus label dropped at width {width}: {line:?}"
+            );
+        }
+    }
+
+    /// A focus label with nowhere near enough room degrades to `…` instead of
+    /// vanishing — the last resort below every step of the ladder.
+    #[test]
+    fn footer_ellipsises_a_focus_label_that_cannot_fit() {
+        let mut state = footer_state(false);
+        state.focus_label = "Edit Automation";
+        let (_, line) = footer_at(24, &state);
+        assert!(
+            line.starts_with(" Edit Automati…"),
+            "label cut with an ellipsis, not mid-word: {line:?}"
+        );
+    }
+
+    /// Both halves of the row are measured in the columns a terminal actually
+    /// paints them in, so a wide glyph — in a rebound shortcut, in a label —
+    /// can't make a block that "fits" overrun its rect and paint over the other
+    /// half.
+    #[test]
+    fn footer_measures_display_columns_not_chars() {
+        assert_eq!(
+            pill_block_width(&["日本".to_string()]),
+            6,
+            "4 columns + ` `"
+        );
+        let segment = LeftSegment::new(PRIO_FOCUS, vec![Span::raw(" 日本語版 ")]);
+        assert_eq!(segment.width(), 10, "8 columns + the padding spaces");
+    }
+
     /// The degenerate end of the range: a zero-width area draws nothing, and a
     /// footer only a few columns wide still lays out without panicking and
     /// without placing a chip past the right edge.
@@ -1056,12 +1284,39 @@ mod tests {
         );
     }
 
-    /// Steps 4–5: with no room for labelled pills the chips shrink to their
+    /// Step 4: before a chip gives up its label it gives up its shortcut — a
+    /// squeezed ` Theme ` still says what clicking it does, where ` F4 ` only
+    /// says how.
+    #[test]
+    fn footer_keeps_pill_labels_before_their_shortcuts() {
+        let state = footer_state(false);
+        let (hits, line) = footer_at(44, &state);
+        assert!(
+            line.contains("Theme") && line.contains("Quit"),
+            "chips keep their label: {line:?}"
+        );
+        assert!(
+            !line.contains("F4") && !line.contains("^Q"),
+            "the shortcuts are what paid for it: {line:?}"
+        );
+        assert_eq!(
+            hit_actions(&hits),
+            vec![
+                Action::ToggleHelp,
+                Action::OpenThemePicker,
+                Action::OpenSettings,
+                Action::QuitApp
+            ],
+            "label-only chips still dispatch, in order: {line:?}"
+        );
+    }
+
+    /// Steps 5–6: with no room for labelled pills the chips shrink to their
     /// bare key, and the columns that frees go back to the left-hand text.
     #[test]
     fn footer_falls_back_to_key_only_pills() {
         let state = footer_state(false);
-        let (hits, line) = footer_at(40, &state);
+        let (hits, line) = footer_at(30, &state);
         assert!(
             !line.contains("Help") && !line.contains("Settings"),
             "pill labels gone in the compact state: {line:?}"
@@ -1086,19 +1341,19 @@ mod tests {
         );
 
         // Squeezed further, whole chips go, cosmetics first…
-        let (hits, line) = footer_at(12, &state);
+        let (hits, line) = footer_at(20, &state);
         assert_eq!(
             hit_actions(&hits),
             vec![Action::ToggleHelp, Action::QuitApp],
             "Theme and Settings go before Help/Quit: {line:?}"
         );
-        // …until only Help is left: the chip that documents every key the row
-        // can no longer show.
-        let (hits, line) = footer_at(5, &state);
+        // …until only Quit is left: at these widths it is the one chip whose
+        // action still works, where the help overlay can't render at all.
+        let (hits, line) = footer_at(10, &state);
         assert_eq!(
             hit_actions(&hits),
-            vec![Action::ToggleHelp],
-            "Help outlives the other chips: {line:?}"
+            vec![Action::QuitApp],
+            "Quit outlives the other chips: {line:?}"
         );
     }
 
