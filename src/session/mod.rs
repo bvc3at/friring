@@ -179,7 +179,7 @@ impl fmt::Display for SessionStatus {
 /// `Serialize` is the `friring-cli session metrics` wire shape: field names are
 /// the JSON keys, and absent fields serialize as explicit `null` so a consumer
 /// sees a stable key set regardless of what the statusline emitted.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct AgentMetrics {
     pub model_id: Option<String>,
     pub model_display_name: Option<String>,
@@ -245,22 +245,9 @@ impl AgentMetrics {
     /// an empty or unrecognized payload, reported as "no metrics" rather than
     /// as a row of nulls.
     pub fn is_empty(&self) -> bool {
-        self.model_id.is_none()
-            && self.model_display_name.is_none()
-            && self.total_cost_usd.is_none()
-            && self.total_duration_ms.is_none()
-            && self.total_api_duration_ms.is_none()
-            && self.total_lines_added.is_none()
-            && self.total_lines_removed.is_none()
-            && self.total_input_tokens.is_none()
-            && self.total_output_tokens.is_none()
-            && self.context_window_size.is_none()
-            && self.used_percentage.is_none()
-            && self.current_input_tokens.is_none()
-            && self.current_output_tokens.is_none()
-            && self.cache_creation_input_tokens.is_none()
-            && self.cache_read_input_tokens.is_none()
-            && self.cli_version.is_none()
+        // Every field is an `Option`, so the default *is* "all absent" — and a
+        // newly added metric is covered without editing this.
+        *self == Self::default()
     }
 }
 
