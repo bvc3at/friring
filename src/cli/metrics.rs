@@ -327,9 +327,9 @@ fn activity_row(s: &SharedSession, agents: &crate::session::AgentRegistry) -> Va
 
 /// The launch dirs a cwd-keyed provider matches a session by.
 ///
-/// The TUI's `session_candidate_dirs` also resolves the *process* cwd through a
-/// tmux round-trip; here the persisted dirs are enough, and an unloaded session
-/// has no process to ask anyway.
+/// Mirrors the TUI's `session_candidate_dirs`: the persisted member dirs plus
+/// the launch cwd `App::session_process_cwd_existing` would derive — a
+/// deterministic path, so no running app (and no tmux round-trip) is needed.
 fn candidate_dirs(s: &SharedSession) -> Vec<String> {
     use crate::session::activity::normalize_dir;
 
@@ -340,6 +340,7 @@ fn candidate_dirs(s: &SharedSession) -> Vec<String> {
         .map(|w| w.worktree_path.clone())
         .chain(s.cwd.clone())
         .chain(s.workspace_dir.clone())
+        .chain(default_workspace_dir(s))
         .chain(s.additional_dirs.iter().cloned());
     for p in paths {
         let n = normalize_dir(&p.to_string_lossy());
@@ -348,6 +349,37 @@ fn candidate_dirs(s: &SharedSession) -> Vec<String> {
         }
     }
     out
+}
+
+/// The id-derived symlink workspace a multi-repo session launches in, when it
+/// has no user-chosen `workspace_dir`.
+///
+/// Without it a default multi-repo session is invisible to every cwd-keyed
+/// provider: the agent's transcript records the *workspace* as its cwd, which
+/// is none of the member dirs. Mirrors `App::session_process_cwd_existing`;
+/// remote sessions never reach here (`activity_row` returns before this).
+fn default_workspace_dir(s: &SharedSession) -> Option<std::path::PathBuf> {
+    if s.workspace_dir.is_some() || member_dir_count(s) < 2 {
+        return None;
+    }
+    crate::paths::session_workspace_dir(s.agent_session_id.as_deref()?)
+}
+
+/// How many directories this session spans, counted as `session_member_dirs`
+/// does: worktrees *replace* `cwd` as members, and an `additional_dir` that is
+/// already a worktree is not a second member.
+fn member_dir_count(s: &SharedSession) -> usize {
+    let base = if s.worktrees.is_empty() {
+        usize::from(s.cwd.is_some())
+    } else {
+        s.worktrees.len()
+    };
+    let extra = s
+        .additional_dirs
+        .iter()
+        .filter(|d| !s.worktrees.iter().any(|w| w.worktree_path == **d))
+        .count();
+    base + extra
 }
 
 /// The most-touched files, capped — the full stream is the F9 view's job.

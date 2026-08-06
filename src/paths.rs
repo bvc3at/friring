@@ -332,6 +332,22 @@ pub fn workspaces_directory() -> Option<PathBuf> {
     resolve(PathKind::WorkspacesDir)
 }
 
+/// The **default** multi-repo symlink workspace for one agent conversation:
+/// `<workspaces>/<sanitized agent_session_id>`.
+///
+/// Pure derivation — nothing is created or read. The single definition of that
+/// path: [`crate::workspace::workspace_path`] builds it here, and
+/// `friring-cli session activity` derives the same launch cwd for a session it
+/// cannot ask a running app about. `None` when no workspaces root resolves, or
+/// when the id sanitizes to nothing (defensive — it is a UUID in practice).
+pub fn session_workspace_dir(agent_session_id: &str) -> Option<PathBuf> {
+    let segment = sanitize_workspace_segment(agent_session_id);
+    if segment.is_empty() {
+        return None;
+    }
+    Some(workspaces_directory()?.join(segment))
+}
+
 /// Resolve the user keybindings file path.
 ///
 /// Returns: `$XDG_CONFIG_HOME/friring/keybindings.json` or

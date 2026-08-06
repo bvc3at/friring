@@ -34,20 +34,20 @@ use crate::paths;
 /// Resolve the workspace directory for a session id, ensuring it stays a single
 /// segment under the workspaces root (defensive — the id is a UUID in practice).
 fn workspace_dir(id: &str) -> io::Result<PathBuf> {
-    let base = paths::workspaces_directory().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "could not resolve workspaces directory",
-        )
-    })?;
-    let segment = paths::sanitize_workspace_segment(id);
-    if segment.is_empty() {
+    if paths::sanitize_workspace_segment(id).is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "empty workspace id",
         ));
     }
-    Ok(base.join(segment))
+    // The layout itself lives in `paths`, so every caller that only needs to
+    // *know* the path (without building it) derives the same one.
+    paths::session_workspace_dir(id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not resolve workspaces directory",
+        )
+    })
 }
 
 /// (Re)build the symlink workspace for `id` from `members` and return its path.
