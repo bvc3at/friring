@@ -2432,13 +2432,18 @@ pub fn window_pane_pid(session_name: &str) -> Result<Option<u32>> {
         return Ok(None);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let Some((name, pid)) = stdout.trim().split_once('\t') else {
-        return Ok(None);
-    };
+    Ok(parse_validated_pane_pid(&stdout, &want))
+}
+
+/// Pure parser for [`window_pane_pid`]' `name\tpid` answer: the pid, but only
+/// when the reported window really is `want` — tmux's current-client fallback
+/// otherwise hands back an unrelated pane's pid.
+fn parse_validated_pane_pid(stdout: &str, want: &str) -> Option<u32> {
+    let (name, pid) = stdout.trim().split_once('\t')?;
     if name != want {
-        return Ok(None);
+        return None;
     }
-    Ok(pid.parse::<u32>().ok())
+    pid.parse::<u32>().ok()
 }
 
 /// Pane pid of every live friring agent window on the local socket, keyed by
@@ -2505,6 +2510,22 @@ mod tests {
         // the whole machine as one session).
         assert!(!map.contains_key("tb-broken"));
         assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn validated_pane_pid_rejects_another_window() {
+        assert_eq!(
+            parse_validated_pane_pid("tb-alpha\t100\n", "tb-alpha"),
+            Some(100)
+        );
+        // tmux answers from the *current* client's pane (exit 0) when `-t`
+        // can't be resolved. Trusting it would reap an unrelated process.
+        assert_eq!(parse_validated_pane_pid("tb-beta\t100\n", "tb-alpha"), None);
+        assert_eq!(parse_validated_pane_pid("tb-alpha 100\n", "tb-alpha"), None);
+        assert_eq!(
+            parse_validated_pane_pid("tb-alpha\tnotapid\n", "tb-alpha"),
+            None
+        );
     }
 
     /// A target whose host runs POSIX tmux (a WSL distro), whatever OS this
