@@ -126,7 +126,7 @@ fn metrics_row(s: &SharedSession) -> Value {
     with_identity(
         s,
         json!({
-            "metrics": metrics.map(|m| serde_json::to_value(m).unwrap_or(Value::Null)),
+            "metrics": metrics,
             "note": note,
         }),
     )
