@@ -45,6 +45,12 @@ pub fn is_supported(agent: &str) -> bool {
     SUPPORTED.contains(&agent)
 }
 
+/// Every agent [`fetch`] knows how to query — what `friring-cli usage` probes
+/// when no `--agent` is given.
+pub fn supported_agents() -> &'static [&'static str] {
+    SUPPORTED
+}
+
 /// Fetch account usage for `agent` as seen from `host` (`None` = the local
 /// machine). Best-effort; never errors — unavailability is reported via
 /// [`AgentUsage::note`] with no windows.

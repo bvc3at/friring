@@ -21,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyModifiers};
 
+use crate::session::activity::normalize_dir;
 use crate::session::cc_activity::{
     parse_job_state, parse_journal, parse_meta, parse_roster, parse_transcript,
     parse_workflow_completion, CcFanEntry, CcJobState, CcPhase, CcWorkflowSummary, JournalEntry,
@@ -373,18 +374,6 @@ fn attribute_workers(
         }
     }
     owners
-}
-
-/// Trim trailing path separators so `/repo` and `/repo/` compare equal (the
-/// daemon records `--add-dir /repo/` but the worker `cwd` as `/repo`). Shared
-/// with the activity providers' cwd matching (`super::activity`).
-pub(super) fn normalize_dir(s: &str) -> String {
-    let t = s.trim_end_matches('/');
-    if t.is_empty() {
-        s.to_string()
-    } else {
-        t.to_string()
-    }
 }
 
 /// Combined change signature over a session's owned trees plus the live fields
@@ -2308,13 +2297,6 @@ mod tests {
             cwd: Some("/some/unrelated/dir".into()),
         }];
         assert!(attribute_workers(&orphan, Some("/h/claude.json"), &inputs).is_empty());
-    }
-
-    #[test]
-    fn normalize_dir_trims_trailing_slash() {
-        assert_eq!(normalize_dir("/repo/x/"), "/repo/x");
-        assert_eq!(normalize_dir("/repo/x"), "/repo/x");
-        assert_eq!(normalize_dir("/"), "/"); // never collapses to empty
     }
 
     #[test]

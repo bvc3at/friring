@@ -26,7 +26,7 @@ use crate::session::activity::ActivityMeta;
 /// dir (the SDK's precedence is `configDir > $COPILOT_HOME > ~/.copilot`; the
 /// on-disk env override is `COPILOT_HOME`). `home_override` is the test hook,
 /// mirroring [`crate::paths::vibe_sessions_dir`]'s `home_override`.
-pub(super) fn copilot_sessions_dir(home_override: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn copilot_sessions_dir(home_override: Option<&Path>) -> Option<PathBuf> {
     let home = if let Some(p) = home_override {
         p.to_path_buf()
     } else if let Some(env) = std::env::var_os("COPILOT_HOME").filter(|s| !s.is_empty()) {
@@ -42,7 +42,7 @@ pub(super) fn copilot_sessions_dir(home_override: Option<&Path>) -> Option<PathB
 /// newest-first. `events.jsonl` tails by byte offset; `workspace.yaml` (small,
 /// atomically rewritten) is re-parsed on any change for its title.
 #[derive(Default)]
-pub(super) struct CopilotSource {
+pub(crate) struct CopilotSource {
     pub(super) scan: CopilotScan,
     workspace: CopilotWorkspace,
     dir: Option<PathBuf>,
@@ -69,7 +69,7 @@ impl CopilotSource {
 
 /// Bind (or rebind) and tail a Copilot session dir. Returns whether anything
 /// changed (new events, or a `workspace.yaml` metadata update).
-pub(super) fn scan_copilot(
+pub(crate) fn scan_copilot(
     src: &mut CopilotSource,
     sig: &mut u64,
     root: Option<&Path>,
@@ -185,7 +185,7 @@ fn discover_copilot_dir(root: &Path, own_id: Option<&str>, dirs: &[String]) -> O
         let Some(cwd) = ws.cwd else {
             continue;
         };
-        if dirs.contains(&crate::app::cc_activity::normalize_dir(&cwd)) {
+        if dirs.contains(&crate::session::activity::normalize_dir(&cwd)) {
             matches.push((ws.created_ms.unwrap_or(0), dir));
         }
     }

@@ -25,7 +25,7 @@ use super::{newest_session_dir, stat_signature};
 /// One cline session's scan state: the bound session dir, its full-rewrite
 /// event stream (replaced each re-parse), and the manifest-derived metadata.
 #[derive(Default)]
-pub(super) struct ClineSource {
+pub(crate) struct ClineSource {
     pub(super) events: Vec<ActivityEvent>,
     pub(super) meta: ClineMeta,
     /// A single JSON object is always read whole, so history is never clipped —
@@ -41,7 +41,7 @@ pub(super) struct ClineSource {
 /// sessions dir) → `$CLINE_DATA_DIR/sessions` → `$CLINE_DIR/data/sessions` →
 /// `~/.cline/data/sessions`. `override` is the test hook, mirroring
 /// [`crate::paths::vibe_sessions_dir`]'s `home_override`.
-pub(super) fn cline_sessions_dir(override_dir: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn cline_sessions_dir(override_dir: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = override_dir {
         return Some(p.to_path_buf());
     }
@@ -59,7 +59,7 @@ pub(super) fn cline_sessions_dir(override_dir: Option<&Path>) -> Option<PathBuf>
 
 /// Bind (or rebind) and re-parse a cline session. Returns whether anything was
 /// re-read this pass.
-pub(super) fn scan_cline(
+pub(crate) fn scan_cline(
     src: &mut ClineSource,
     sig: &mut u64,
     root: Option<&Path>,
@@ -147,7 +147,7 @@ fn discover_cline_dir(root: &Path, dirs: &[String], own_id: Option<&str>) -> Opt
             .into_iter()
             .flatten()
         {
-            if dirs.contains(&crate::app::cc_activity::normalize_dir(key)) {
+            if dirs.contains(&crate::session::activity::normalize_dir(key)) {
                 return Some(dir);
             }
         }

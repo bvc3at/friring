@@ -297,6 +297,17 @@ pub fn metrics_directory() -> Option<PathBuf> {
     resolve(PathKind::MetricsDir)
 }
 
+/// The statusline metrics file for one agent conversation.
+///
+/// Keyed by `agent_session_id` (the id friring pins into the agent and exports
+/// as `FRIRING_SESSION_ID`), not by [`SessionId`](crate::session::SessionId) —
+/// the writer is the agent's own statusline, which only knows its conversation
+/// id. Shared by the TUI's per-tick poll and `friring-cli session metrics` so
+/// both look in exactly one place.
+pub fn session_metrics_file(agent_session_id: &str) -> Option<PathBuf> {
+    Some(metrics_directory()?.join(format!("{agent_session_id}.json")))
+}
+
 /// Directory where embedded built-in extensions are materialized so the
 /// extension installer can treat them as a local source.
 ///

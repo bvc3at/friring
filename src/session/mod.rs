@@ -175,7 +175,11 @@ impl fmt::Display for SessionStatus {
 }
 
 /// Agent metrics collected from the Claude CLI statusline mechanism.
-#[derive(Debug, Clone, Default)]
+///
+/// `Serialize` is the `friring-cli session metrics` wire shape: field names are
+/// the JSON keys, and absent fields serialize as explicit `null` so a consumer
+/// sees a stable key set regardless of what the statusline emitted.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct AgentMetrics {
     pub model_id: Option<String>,
     pub model_display_name: Option<String>,
@@ -193,6 +197,71 @@ pub struct AgentMetrics {
     pub cache_creation_input_tokens: Option<u64>,
     pub cache_read_input_tokens: Option<u64>,
     pub cli_version: Option<String>,
+}
+
+impl AgentMetrics {
+    /// Parse a Claude CLI statusline JSON payload.
+    ///
+    /// Every field is optional and read by JSON pointer: the statusline
+    /// contract is the agent's, not ours, so an absent or reshaped key yields
+    /// `None` rather than an error. Lives here (pure `session`) rather than in
+    /// the app because both readers of the file — the TUI's per-tick refresh
+    /// and `friring-cli session metrics` — must agree on the shape.
+    pub fn from_statusline_json(raw: &serde_json::Value) -> Self {
+        let u64_at = |ptr: &str| raw.pointer(ptr).and_then(serde_json::Value::as_u64);
+        let str_at = |ptr: &str| {
+            raw.pointer(ptr)
+                .and_then(serde_json::Value::as_str)
+                .map(String::from)
+        };
+        Self {
+            model_id: str_at("/model/id"),
+            model_display_name: str_at("/model/display_name"),
+            total_cost_usd: raw
+                .pointer("/cost/total_cost_usd")
+                .and_then(serde_json::Value::as_f64),
+            total_duration_ms: u64_at("/cost/total_duration_ms"),
+            total_api_duration_ms: u64_at("/cost/total_api_duration_ms"),
+            total_lines_added: u64_at("/cost/total_lines_added"),
+            total_lines_removed: u64_at("/cost/total_lines_removed"),
+            total_input_tokens: u64_at("/context_window/total_input_tokens"),
+            total_output_tokens: u64_at("/context_window/total_output_tokens"),
+            context_window_size: u64_at("/context_window/context_window_size"),
+            // Clamped: a vendor percentage over 100 would otherwise wrap the u8.
+            used_percentage: u64_at("/context_window/used_percentage").map(|v| v.min(100) as u8),
+            current_input_tokens: u64_at("/context_window/current_usage/input_tokens"),
+            current_output_tokens: u64_at("/context_window/current_usage/output_tokens"),
+            cache_creation_input_tokens: u64_at(
+                "/context_window/current_usage/cache_creation_input_tokens",
+            ),
+            cache_read_input_tokens: u64_at(
+                "/context_window/current_usage/cache_read_input_tokens",
+            ),
+            cli_version: str_at("/version"),
+        }
+    }
+
+    /// Whether the statusline produced nothing at all (every field absent) —
+    /// an empty or unrecognized payload, reported as "no metrics" rather than
+    /// as a row of nulls.
+    pub fn is_empty(&self) -> bool {
+        self.model_id.is_none()
+            && self.model_display_name.is_none()
+            && self.total_cost_usd.is_none()
+            && self.total_duration_ms.is_none()
+            && self.total_api_duration_ms.is_none()
+            && self.total_lines_added.is_none()
+            && self.total_lines_removed.is_none()
+            && self.total_input_tokens.is_none()
+            && self.total_output_tokens.is_none()
+            && self.context_window_size.is_none()
+            && self.used_percentage.is_none()
+            && self.current_input_tokens.is_none()
+            && self.current_output_tokens.is_none()
+            && self.cache_creation_input_tokens.is_none()
+            && self.cache_read_input_tokens.is_none()
+            && self.cli_version.is_none()
+    }
 }
 
 /// Real git state for a session's worktree(s), computed by the app/git layer
@@ -216,7 +285,7 @@ pub struct GitStats {
 
 /// One account-level rate-limit window (e.g. Claude's 5-hour or weekly), as
 /// shown by an agent's `/usage` command. Agent-neutral.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UsageWindow {
     /// Short label, e.g. "5h", "Week", or a model id.
     pub label: String,
@@ -230,7 +299,7 @@ pub struct UsageWindow {
 /// (the `/usage`-equivalent). Account-global — but the *account* is scoped to
 /// wherever the agent's credentials live, i.e. the host the session runs on
 /// (local machine, SSH host, or WSL distro). Agent-neutral.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct AgentUsage {
     pub windows: Vec<UsageWindow>,
     /// Plan/tier label when known (e.g. "max", "pro").
@@ -371,6 +440,79 @@ pub struct SessionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_metrics_parse_full_statusline_json() {
+        let json = serde_json::json!({
+            "version": "2.1.58",
+            "model": { "id": "claude-opus-4-6", "display_name": "Opus 4.6" },
+            "cost": {
+                "total_cost_usd": 0.0123,
+                "total_duration_ms": 5000,
+                "total_api_duration_ms": 3000,
+                "total_lines_added": 156,
+                "total_lines_removed": 23,
+            },
+            "context_window": {
+                "total_input_tokens": 15200,
+                "total_output_tokens": 4500,
+                "context_window_size": 200000,
+                "used_percentage": 8,
+                "current_usage": {
+                    "input_tokens": 1200,
+                    "output_tokens": 300,
+                    "cache_creation_input_tokens": 5000,
+                    "cache_read_input_tokens": 2000,
+                }
+            }
+        });
+        let m = AgentMetrics::from_statusline_json(&json);
+        assert_eq!(m.model_id.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(m.model_display_name.as_deref(), Some("Opus 4.6"));
+        assert!((m.total_cost_usd.unwrap() - 0.0123).abs() < 1e-6);
+        assert_eq!(m.total_input_tokens, Some(15200));
+        assert_eq!(m.total_output_tokens, Some(4500));
+        assert_eq!(m.context_window_size, Some(200000));
+        assert_eq!(m.used_percentage, Some(8));
+        assert_eq!(m.total_lines_added, Some(156));
+        assert_eq!(m.total_lines_removed, Some(23));
+        assert_eq!(m.cache_read_input_tokens, Some(2000));
+        assert_eq!(m.cache_creation_input_tokens, Some(5000));
+        assert_eq!(m.cli_version.as_deref(), Some("2.1.58"));
+        assert!(!m.is_empty());
+    }
+
+    #[test]
+    fn agent_metrics_parse_empty_statusline_json() {
+        let m = AgentMetrics::from_statusline_json(&serde_json::json!({}));
+        assert!(m.model_id.is_none());
+        assert!(m.total_cost_usd.is_none());
+        assert!(m.used_percentage.is_none());
+        assert!(m.is_empty(), "an empty payload reports as no metrics");
+    }
+
+    #[test]
+    fn agent_metrics_parse_partial_statusline_json() {
+        let json = serde_json::json!({
+            "model": { "display_name": "Sonnet" },
+            "cost": { "total_cost_usd": 0.05 }
+        });
+        let m = AgentMetrics::from_statusline_json(&json);
+        assert_eq!(m.model_display_name.as_deref(), Some("Sonnet"));
+        assert!(m.model_id.is_none());
+        assert!((m.total_cost_usd.unwrap() - 0.05).abs() < 1e-6);
+        assert!(m.total_input_tokens.is_none());
+        assert!(!m.is_empty(), "one present field is still metrics");
+    }
+
+    #[test]
+    fn agent_metrics_clamp_out_of_range_percentage() {
+        let json = serde_json::json!({ "context_window": { "used_percentage": 4000 } });
+        assert_eq!(
+            AgentMetrics::from_statusline_json(&json).used_percentage,
+            Some(100)
+        );
+    }
 
     #[test]
     fn session_id_display_is_uuid_format() {

@@ -25,7 +25,7 @@ use crate::session::activity::cursor::CursorScan;
 /// snapshot parse. A shrink or rewrite is handled by the unconditional
 /// re-parse in [`scan_cursor`], so no byte offset is tracked.
 #[derive(Default)]
-pub(super) struct CursorSource {
+pub(crate) struct CursorSource {
     pub(super) scan: CursorScan,
     transcript: Option<PathBuf>,
     pub(super) truncated: bool,
@@ -35,7 +35,7 @@ pub(super) struct CursorSource {
 /// `~/.cursor`. `home_override` is the test hook, mirroring
 /// [`crate::paths::vibe_sessions_dir`]'s override param. The env is read on the
 /// UI thread and the resolved root handed to the scan thread.
-pub(super) fn cursor_root(home_override: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn cursor_root(home_override: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = home_override {
         return Some(p.to_path_buf());
     }
@@ -48,7 +48,7 @@ pub(super) fn cursor_root(home_override: Option<&Path>) -> Option<PathBuf> {
 /// Bind (or rebind) and re-parse a session's Cursor transcript. Returns whether
 /// the accumulated events/meta changed this pass. Mirrors `scan_claude` /
 /// `scan_vibe`'s contract: a stat-signature gates the (re-)read.
-pub(super) fn scan_cursor(
+pub(crate) fn scan_cursor(
     src: &mut CursorSource,
     sig: &mut u64,
     root: Option<&Path>,

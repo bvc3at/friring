@@ -27,7 +27,7 @@ const FIRST_RECORD_SCAN_MAX: u64 = 256 * 1024;
 /// `<projects-base>/<sanitizeCwd(cwd)>/chats/`, found by deriving the project
 /// dir from the session's launch cwd and confirming the recorded `cwd`.
 #[derive(Default)]
-pub(super) struct QwenSource {
+pub(crate) struct QwenSource {
     pub(super) scan: QwenScan,
     transcript: Option<PathBuf>,
     offset: u64,
@@ -38,7 +38,7 @@ pub(super) struct QwenSource {
 /// `home_override` (tests) → `$QWEN_RUNTIME_DIR` (relocates only `projects/` +
 /// `tmp/`) → `$QWEN_HOME` (relocates all of `~/.qwen`) → `~/.qwen`. Env access,
 /// so it is resolved on the UI thread like the other provider roots.
-pub(super) fn qwen_projects_dir(home_override: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn qwen_projects_dir(home_override: Option<&Path>) -> Option<PathBuf> {
     let base = if let Some(p) = home_override {
         p.to_path_buf()
     } else if let Some(env) = std::env::var_os("QWEN_RUNTIME_DIR").filter(|s| !s.is_empty()) {
@@ -53,7 +53,7 @@ pub(super) fn qwen_projects_dir(home_override: Option<&Path>) -> Option<PathBuf>
 
 /// Bind (or rebind) and tail the session's Qwen transcript. Returns whether
 /// anything new was ingested.
-pub(super) fn scan_qwen(
+pub(crate) fn scan_qwen(
     src: &mut QwenSource,
     sig: &mut u64,
     root: Option<&Path>,
@@ -140,7 +140,7 @@ fn file_mtime(path: &Path) -> std::time::SystemTime {
 /// already derived from a candidate cwd.
 fn session_cwd_matches(path: &Path, dirs: &[String]) -> bool {
     match first_record_cwd(path) {
-        Some(cwd) => dirs.contains(&crate::app::cc_activity::normalize_dir(&cwd)),
+        Some(cwd) => dirs.contains(&crate::session::activity::normalize_dir(&cwd)),
         None => true,
     }
 }
