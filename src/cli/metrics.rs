@@ -847,6 +847,103 @@ mod tests {
         }
     }
 
+    /// A session carrying only what the metrics rows read (mirrors
+    /// `sessions::tests::make_test_session`).
+    fn session(name: &str, backend_type: &str) -> SharedSession {
+        SharedSession {
+            id: SessionId::default(),
+            name: name.into(),
+            agent: "claude".into(),
+            backend_id: String::new(),
+            backend_type: backend_type.into(),
+            agent_session_id: None,
+            cwd: None,
+            additional_dirs: Vec::new(),
+            workspace_dir: None,
+            worktrees: Vec::new(),
+            shell_backend_id: None,
+            parent_session_id: None,
+            display_order: None,
+            tombstone: false,
+            tombstone_at: None,
+        }
+    }
+
+    /// No agents defined, so the provider keys off the session's agent name —
+    /// keeps these tests off the user's real `agents.toml`.
+    fn empty_registry() -> crate::session::AgentRegistry {
+        crate::session::AgentRegistry {
+            config_version: None,
+            default: String::new(),
+            agents: Vec::new(),
+        }
+    }
+
+    /// The single data line of a one-row table, split into columns. The last
+    /// column (NOTE) is prose, so it splits into several fields.
+    fn row_fields(rendered: &str) -> Vec<&str> {
+        rendered
+            .lines()
+            .nth(1)
+            .expect("table has a header and one row")
+            .split_whitespace()
+            .collect()
+    }
+
+    #[test]
+    fn statusline_absence_reports_its_reason() {
+        let (metrics, note) = read_statusline(&session("remote-1", "ssh:box"));
+        assert!(metrics.is_none());
+        assert!(note.unwrap_or_default().contains("remote"), "got {note:?}");
+
+        // Local, but the agent hasn't reported a conversation id yet: there is
+        // no key to look a file up by, so no filesystem access happens.
+        let (metrics, note) = read_statusline(&session("local-1", "local-tmux"));
+        assert!(metrics.is_none());
+        assert!(
+            note.unwrap_or_default()
+                .contains("no agent conversation id"),
+            "got {note:?}"
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_activity_row_is_null_not_zero() {
+        let row = activity_row(&session("remote-1", "ssh:box"), &empty_registry());
+        assert!(row["provider"].is_null());
+        // Absent, not measured-as-idle — and every key is still present.
+        for key in ["counts", "tokens", "files"] {
+            assert!(row.get(key).is_some_and(Value::is_null), "{key}: {row}");
+        }
+        assert!(!row["note"].as_str().unwrap_or_default().is_empty());
+    }
+
+    #[test]
+    fn render_activity_dashes_an_unmeasured_row() {
+        let s = session("remote-1", "ssh:box");
+        let row = activity_row(&s, &empty_registry());
+        let rendered = render_activity(std::slice::from_ref(&s), std::slice::from_ref(&row));
+        let fields = row_fields(&rendered);
+        assert_eq!(fields[0], "remote-1");
+        // PROVIDER, the six counts and TOKENS I/O: dashed, never a `0` that
+        // would read as "measured, and it did nothing".
+        assert!(fields[1..9].iter().all(|f| *f == "-"), "got {rendered}");
+        assert!(rendered.contains("remote session"), "note: {rendered}");
+    }
+
+    #[test]
+    fn render_metrics_dashes_a_row_with_no_metrics() {
+        let s = session("remote-1", "ssh:box");
+        let row = metrics_row(&s);
+        assert!(row["metrics"].is_null());
+        let rendered = render_metrics(std::slice::from_ref(&s), std::slice::from_ref(&row));
+        let fields = row_fields(&rendered);
+        assert_eq!(fields[0], "remote-1");
+        // MODEL, COST, TOKENS I/O, CTX and LINES +/-.
+        assert!(fields[1..6].iter().all(|f| *f == "-"), "got {rendered}");
+        assert!(rendered.contains("remote session"), "note: {rendered}");
+    }
+
     #[test]
     fn target_rejects_both_and_neither() {
         let db = Database::open_in_memory().unwrap();
