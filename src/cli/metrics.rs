@@ -260,20 +260,16 @@ fn activity_row(s: &SharedSession, agents: &crate::session::AgentRegistry) -> Va
         .map(|a| a.command.clone())
         .unwrap_or_else(|| s.agent.clone());
 
+    // An unmeasured row still carries every key, explicitly null: absent is not
+    // zero, and a jq pipeline sees one stable shape across both outcomes.
     if is_remote(s) {
-        return with_identity(
-            s,
-            json!({
-                "provider": Value::Null,
-                "note": "remote session: its transcripts live on the host",
-            }),
-        );
+        return unmeasured_activity(s, "remote session: its transcripts live on the host".into());
     }
     let Some(provider) = crate::activity::ProviderKind::for_command(&command) else {
         let note = crate::activity::unsupported_reason(&command)
             .map(str::to_string)
             .unwrap_or_else(|| format!("no activity provider for '{command}'"));
-        return with_identity(s, json!({ "provider": Value::Null, "note": note }));
+        return unmeasured_activity(s, note);
     };
 
     let (state, complete) = crate::activity::scan_once(
@@ -320,6 +316,22 @@ fn activity_row(s: &SharedSession, agents: &crate::session::AgentRegistry) -> Va
                 "cache_write": meta.cache_write_tokens,
             },
             "files": files_summary(events),
+            "note": note,
+        }),
+    )
+}
+
+/// A row for a session whose activity could not be measured at all: the same
+/// keys a measured row carries, each explicitly `null`, plus the reason. A zero
+/// here would read as "measured, and it did nothing".
+fn unmeasured_activity(s: &SharedSession, note: String) -> Value {
+    with_identity(
+        s,
+        json!({
+            "provider": Value::Null,
+            "counts": Value::Null,
+            "tokens": Value::Null,
+            "files": Value::Null,
             "note": note,
         }),
     )
@@ -412,16 +424,21 @@ fn render_activity(sessions: &[SharedSession], rows: &[Value]) -> String {
         .zip(rows)
         .map(|(s, row)| {
             let c = &row["counts"];
-            let n = |key: &str| c[key].as_u64().unwrap_or(0);
+            // Dashed, not zeroed: an unmeasured session reports no count at all.
+            let n = |key: &str| {
+                c[key]
+                    .as_u64()
+                    .map_or_else(|| "-".to_string(), |v| v.to_string())
+            };
             vec![
                 s.name.clone(),
                 output::dash(row["provider"].as_str()),
-                n("prompts").to_string(),
-                n("commands").to_string(),
-                n("edits").to_string(),
-                n("reads").to_string(),
-                n("subagents").to_string(),
-                n("failed").to_string(),
+                n("prompts"),
+                n("commands"),
+                n("edits"),
+                n("reads"),
+                n("subagents"),
+                n("failed"),
                 fmt_tokens(
                     row["tokens"]["input"].as_u64(),
                     row["tokens"]["output"].as_u64(),
