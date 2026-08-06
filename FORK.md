@@ -984,6 +984,50 @@ Deliberately **not** built: automation→automation chaining. See the design not
 at the end of `docs/FEATURES.md` § Automations for why multi-step prompts
 already cover the case it was meant to serve.
 
+#### Agent metrics on the headless CLI (August 2026)
+
+Upstream collects four kinds of agent metrics and renders every one of them in
+the TUI info panel only; `friring-cli` exposed none of them (its `perf` command
+reports the app's own render loop, not the agent's cost). The fork adds the
+four readers to the headless CLI:
+
+- **`session metrics`** — model, cost, token totals, context use and lines
+  +/- from the agent's statusline JSON.
+- **`session resources`** — the summed RSS and process count of the agent's
+  whole process tree, with an opt-in `--cpu` sample.
+- **`session activity`** — commands / edits / reads / subagents / tokens and
+  the touched files, reconstructed from the agent CLI's own transcripts (the
+  fork-only F9 view's sources).
+- **`usage`** — account rate-limit windows and plan tier per `(agent, host)`.
+
+Each **reads the source the TUI reads** rather than a value the TUI publishes,
+so all four work with no TUI running — the case that matters for cron and
+scripts, since sessions outlive the TUI in tmux. Nothing is cached into SQLite:
+a metrics write on the tick cadence would bump every other friring connection's
+`data_version` and force a full shared-state reload per poll, which is why
+upstream's one published blob (`perf`) is gated behind a debug flag. The
+trade-off is that the commands have no history. Rationale and the rejected
+alternatives are ADR-24 in `docs/ARCHITECTURE.md`; the surface is documented in
+`docs/CLI.md`.
+
+Two supporting changes came with it:
+
+- **Module split.** The provider discovery + scan half of `app::activity`
+  became a top-level `activity` module and the platform process-table read
+  became `proctable`, because `cli` may not reference `app`
+  (`tests/architecture_rules.rs`). Duplicating where each agent CLI keeps its
+  transcripts was the alternative, and it would drift.
+- **`window_pane_pid` validates the window it resolved.** With an
+  unresolvable `-t`, tmux's `display-message` does not fail — it answers from
+  the *current* client's pane and exits 0. Every unloaded session therefore
+  priced the caller's own process; the fix compares `#{window_name}` against
+  the window asked for. The bulk `agent_window_pane_pids` reads every pane pid
+  in one `list-windows` so `--all` costs one tmux call.
+
+Covered end to end by the `claude-metrics-cli` e2e scenario, which seeds the
+documented statusline snippet and asserts all four commands against a real
+Claude turn and the stub's usage route.
+
 ### Behavior fixes
 
 - **A codex pane can be scrolled.** Upstream takes `vt100` straight from

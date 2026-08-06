@@ -165,6 +165,9 @@ impl App {
     }
 }
 
+// ─── Section content builders (view side) ───────────────────────────────────
+
+/// Which event kinds an event-list section shows.
 fn section_includes(section: Section, kind: ActionKind) -> bool {
     match section {
         Section::Timeline => true,

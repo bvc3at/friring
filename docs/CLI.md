@@ -29,7 +29,8 @@ friring-cli session list --parent <lead-uuid> --json | jq  # direct children onl
 ## Subcommands
 
 - **`session`** — create / list / get / delete / restore / restart / send /
-  capture / focus / signal.
+  capture / focus / signal, plus the per-session metrics readers
+  `metrics` / `resources` / `activity` (see Agent metrics below).
 - **`automation`** (alias `auto`) — create / list / show / dry-run / export /
   import / edit / remove / run / runs / tick. See the Automations section of
   `docs/FEATURES.md`, and the flag reference below.
@@ -58,8 +59,79 @@ friring-cli session list --parent <lead-uuid> --json | jq  # direct children onl
 - **`notify`** — diagnose OS desktop notifications: prints the detected delivery
   backend and last error; `--test` fires a sample. See the OS Notifications
   section of `docs/FEATURES.md`.
+- **`usage`** — account-level rate-limit windows for an agent (see Agent
+  metrics below).
 - **`perf`** — prints the perf snapshot a running TUI publishes while
   `FRIRING_PERF_LOG` or its perf HUD is active. See `docs/PERFORMANCE.md`.
+
+## Agent metrics
+
+Four commands expose what an agent is costing, in the four shapes friring
+collects. They differ from `perf` in the way that matters: `perf` reads a blob
+a *running TUI* publishes, while these read the **same sources the TUI reads**
+and therefore work with **no TUI running** — the normal case for cron and
+scripts, since sessions outlive the TUI inside tmux.
+
+| Command | Reports | Source |
+|---|---|---|
+| `session metrics [<uuid>\|--all]` | model, cost, token totals, context use, lines +/- | the agent's statusline JSON under `FRIRING_METRICS_DIR` |
+| `session resources [<uuid>\|--all] [--cpu]` | summed RSS + process count of the agent's process tree | the machine's process table, rooted at the pane pid |
+| `session activity [<uuid>\|--all]` | commands / edits / reads / subagents / tokens / touched files | the agent CLI's own transcripts (the F9 view's sources) |
+| `usage [--agent <name>]…` | account rate-limit windows, plan tier | the vendor's usage API on the target host |
+
+**Nothing is cached into SQLite.** Writing metrics on the TUI's tick cadence
+would bump every *other* friring connection's `data_version` and force a full
+shared-state reload on each poll — the reason `App::publish_perf_snapshot` is
+gated behind a debug flag. The sources are cheap, so each command re-reads
+them and is never stale. The consequence is that these commands have **no
+history**: the statusline file holds current totals and is overwritten in
+place, so cost-over-time is not derivable from them.
+
+Coverage matches the TUI's, including its gaps. All three per-session commands
+are **local-only** and report `null` with a `note` (never a zero) for a remote
+session: friring never injects `FRIRING_METRICS_DIR` into an ssh/wsl agent, and
+the process table and transcripts live on the host. `usage` is the exception —
+it reads credentials wherever they are, so `--host <name>` queries a host from
+`hosts.toml`.
+
+Cost varies by three orders of magnitude, which is why these are separate
+commands rather than one: `metrics` is a file read, `resources` is one process
+sweep plus one tmux call for any number of sessions, `activity` parses the
+session's transcript from scratch, and `usage` reaches the network (and spawns
+`codex app-server` for codex). `usage` fetches its agents concurrently under a
+single `--timeout`.
+
+`--cpu` is opt-in on `resources` because CPU is a *rate*: it needs two samples,
+so it delays the command by `--cpu-sample-ms` (default 200). Memory is
+instantaneous and always reported.
+
+A single UUID returns the object (like `session get`); `--all` returns an array
+(like `session list`). Both carry `session_id`/`name`/`agent` per row, so an
+`--all` sweep needs no second call to identify rows.
+
+### Wiring the statusline
+
+`session metrics` reads a file **the agent writes**, not one friring produces:
+friring injects `FRIRING_METRICS_DIR` and `FRIRING_SESSION_ID` into every local
+agent process (see `docs/CONFIG.md`) and reads back
+`$FRIRING_METRICS_DIR/$FRIRING_SESSION_ID.json`. Until something writes that
+file the command reports `no statusline metrics file written yet`.
+
+For Claude Code, point `statusLine` in `~/.claude/settings.json` at a script
+that saves its payload:
+
+```sh
+#!/bin/sh
+input=$(cat)
+if [ -n "$FRIRING_METRICS_DIR" ] && [ -n "$FRIRING_SESSION_ID" ]; then
+    mkdir -p "$FRIRING_METRICS_DIR"
+    printf '%s' "$input" > "$FRIRING_METRICS_DIR/$FRIRING_SESSION_ID.json"
+fi
+printf 'friring'
+```
+
+The `claude-metrics-cli` e2e scenario seeds exactly this snippet, so the
+documented contract is asserted rather than assumed (`docs/E2E.md`).
 
 ## Typing into a session (the modal guard)
 

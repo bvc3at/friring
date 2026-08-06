@@ -15,16 +15,16 @@
 //! Discovery is the expensive, agent-specific knowledge here — duplicating it
 //! for the CLI is exactly what this split avoids.
 
-pub mod aider;
-pub mod cline;
-pub mod codex;
-pub mod copilot;
-pub mod crush;
-pub mod cursor;
-pub mod gemini;
-pub mod goose;
-pub mod opencode;
-pub mod qwen;
+pub(crate) mod aider;
+pub(crate) mod cline;
+pub(crate) mod codex;
+pub(crate) mod copilot;
+pub(crate) mod crush;
+pub(crate) mod cursor;
+pub(crate) mod gemini;
+pub(crate) mod goose;
+pub(crate) mod opencode;
+pub(crate) mod qwen;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -928,10 +928,6 @@ fn read_tail_window(path: &Path, cap: u64) -> Option<(String, bool)> {
     }
     Some((chunk, clipped))
 }
-
-// ─── Section content builders (view side) ───────────────────────────────────
-
-/// Which event kinds an event-list section shows.
 
 #[cfg(test)]
 mod tests {

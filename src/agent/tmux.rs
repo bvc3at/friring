@@ -2443,7 +2443,7 @@ pub fn window_pane_pid(session_name: &str) -> Result<Option<u32>> {
 
 /// Pane pid of every live friring agent window on the local socket, keyed by
 /// **window name** (`tb-<sanitized session name>`) — look one up with
-/// [`agent_window_name`], since the session→window mapping is lossy.
+/// `agent_window_name`, since the session→window mapping is lossy.
 ///
 /// One `list-windows` for the whole server instead of a
 /// [`window_pane_pid`] round-trip per session — `friring-cli session
