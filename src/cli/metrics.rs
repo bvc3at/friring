@@ -670,8 +670,11 @@ pub fn run_resources(args: ResourceArgs, db: &Database) -> Result<CommandOutput,
     let sessions = args.target.resolve(db)?;
 
     // Resolve every root pid first: an all-remote (or all-dead) set needs no
-    // process-table read at all. One tmux call covers the whole run.
-    let panes = crate::agent::tmux::agent_window_pane_pids().unwrap_or_default();
+    // process-table read at all. One tmux call covers the whole run. A missing
+    // tmux *server* is an empty map (every row then notes "no live tmux pane");
+    // an error here is a real spawn failure, which must not read as "unloaded".
+    let panes = crate::agent::tmux::agent_window_pane_pids()
+        .map_err(|e| format!("agent_window_pane_pids: {e}"))?;
     let roots: Vec<Option<u32>> = sessions.iter().map(|s| root_pid(s, &panes)).collect();
     let table = if roots.iter().any(Option::is_some) {
         ProcTable::new(crate::proctable::read())
