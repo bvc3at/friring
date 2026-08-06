@@ -1364,6 +1364,53 @@ mod tests {
     }
 
     #[test]
+    fn scan_once_bounds_its_passes_and_reports_incompleteness() {
+        // `friring-cli session activity` has no next pass to carry an
+        // accumulator into, so it drains here — but under a bound, and it must
+        // say so rather than silently under-report.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp
+            .path()
+            .join("logs")
+            .join("session")
+            .join("session_20260712_100000_bbbbbbbb");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"session_id":"s","environment":{"working_directory":"/repo/b"}}"#,
+        )
+        .expect("meta");
+        let line = r#"{"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"bash","arguments":"{\"command\": \"ls\"}"},"type":"function"}]}"#
+            .to_string()
+            + "\n";
+        let repeats = (INGEST_CHUNK as usize / line.len()) + 500;
+        std::fs::write(dir.join("messages.jsonl"), line.repeat(repeats)).expect("messages");
+
+        // `ScanRoots::discover` reads the environment, which is the seam a
+        // one-shot scan is testable through.
+        let saved = std::env::var_os("VIBE_HOME");
+        std::env::set_var("VIBE_HOME", tmp.path());
+
+        let dirs = vec!["/repo/b".to_string()];
+        let (partial, complete) = scan_once(ProviderKind::Vibe, None, dirs.clone(), 1);
+        assert!(!complete, "one pass cannot drain a >8 MiB transcript");
+        assert!(
+            !partial.events().is_empty() && partial.events().len() < repeats,
+            "expected a partial ingest, got {} of {repeats}",
+            partial.events().len()
+        );
+
+        let (full, complete) = scan_once(ProviderKind::Vibe, None, dirs, 8);
+        assert!(complete, "a sufficient budget must drain the backlog");
+        assert_eq!(full.events().len(), repeats);
+
+        match saved {
+            Some(v) => std::env::set_var("VIBE_HOME", v),
+            None => std::env::remove_var("VIBE_HOME"),
+        }
+    }
+
+    #[test]
     fn claude_sub_sources_lists_standalone_and_workflow_agents() {
         use crate::session::{CcActivity, CcAgent, CcAgentState, CcRunStatus, CcWorkflow};
         let agent = |id: &str, path: &str, label: Option<&str>, atype: &str| CcAgent {
