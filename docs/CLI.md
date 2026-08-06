@@ -92,7 +92,10 @@ are **local-only** and report `null` with a `note` (never a zero) for a remote
 session: friring never injects `FRIRING_METRICS_DIR` into an ssh/wsl agent, and
 the process table and transcripts live on the host. `usage` is the exception —
 it reads credentials wherever they are, so `--host <name>` queries a host from
-`hosts.toml`.
+`hosts.toml`. One gap is the CLI's own: `session activity` reads the session's
+**main transcript only** — the F9 view folds Claude subagent and workflow
+transcripts into its counts from the TUI's cc tree scan, which is TUI state, so
+delegated work is absent from the CLI's counts, files and tokens.
 
 Cost varies by three orders of magnitude, which is why these are separate
 commands rather than one: `metrics` is a file read, `resources` is one process
