@@ -864,6 +864,25 @@ recorded in the JSON report (`killed_window`, `removed_worktrees`,
 delete. The DB row is always soft-deleted last, so even a forced
 delete remains restorable (it just re-spawns from a clean slate).
 
+### Agent metrics
+
+What an agent is costing, in the four shapes friring collects.
+
+```bash
+friring-cli session metrics <uuid>|--all      # model, cost, tokens, context
+friring-cli session resources <uuid>|--all \
+  [--cpu --cpu-sample-ms <ms>]                # process-tree RSS (+ CPU)
+friring-cli session activity <uuid>|--all     # commands / edits / reads
+friring-cli usage [--agent <name>] [--host <name>] [--timeout <secs>]
+```
+
+Each reads the same source the TUI reads, so they work with **no TUI
+running** and write nothing to SQLite (and therefore keep no history).
+The three per-session readers are local-only — a remote session reports
+`null` plus a `note` — and `session metrics` needs an agent-side
+statusLine writing `$FRIRING_METRICS_DIR/$FRIRING_SESSION_ID.json`. See
+[`docs/CLI.md`](docs/CLI.md#agent-metrics).
+
 ### Automations (alias `auto`)
 
 Scheduled agent runs, persisted to the shared DB. See
