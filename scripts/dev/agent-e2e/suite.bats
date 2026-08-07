@@ -105,9 +105,9 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-unload-load"
 }
 
-@test "e2e: <leader> f forks claude — parent link, sidebar nesting, forked conversation continues" {
+@test "e2e: <leader> f forks claude — parent link, sidebar nesting, both branches continue apart" {
     require_agent claude
-    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-fork"
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-lineage"
 }
 
 @test "e2e: import a Claude Code conversation (i) and resume it in a new session" {
@@ -230,9 +230,9 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-unload-ghost"
 }
 
-@test "e2e: a ghost fleet — unload 3 of 5, cycle loaded-only, load one back" {
-    require_agent scripted
-    e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-ghost-fleet"
+@test "e2e: a ghost fleet — freeze 4 real claude sessions, watch the memory fall, load one back" {
+    require_agent claude
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-ghost-fleet"
 }
 
 @test "e2e: a ghost survives a terminal shrink and keeps its frame when it grows back" {

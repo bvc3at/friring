@@ -1,0 +1,45 @@
+{
+  "responses": [
+    {
+      "name": "ambient",
+      "ambient": true,
+      "match": { "modelContains": "haiku" },
+      "reply": { "text": "ok" }
+    },
+    {
+      "name": "fork-context-leak",
+      "ambient": true,
+      "match": {
+        "anyUserContains": "coldest current first",
+        "promptContains": "freeze window"
+      },
+      "reply": {
+        "text": "CONTEXT-LEAK — the original branch was handed the fork's turn."
+      }
+    },
+    {
+      "name": "fork-base",
+      "match": { "promptContains": "cutover plan", "hasToolResult": false },
+      "delayMs": 150,
+      "reply": {
+        "text": "CUTOVER-PLAN-READY — warm currents first, 6 stages. This is the last turn both branches share."
+      }
+    },
+    {
+      "name": "fork-child",
+      "match": { "promptContains": "coldest current first", "hasToolResult": false },
+      "delayMs": 150,
+      "reply": {
+        "text": "COLDEST-FIRST-PLAN — resequenced to 4 stages. This branch only; the original still holds the warm-first order."
+      }
+    },
+    {
+      "name": "fork-parent",
+      "match": { "promptContains": "freeze window", "hasToolResult": false },
+      "delayMs": 150,
+      "reply": {
+        "text": "WARM-FIRST-WINDOW — 41 minutes across the 6 stages. This branch never saw the coldest-first turn."
+      }
+    }
+  ]
+}
