@@ -329,6 +329,8 @@ fn unmeasured_activity(s: &SharedSession, note: String) -> Value {
         s,
         json!({
             "provider": Value::Null,
+            "title": Value::Null,
+            "model": Value::Null,
             "counts": Value::Null,
             "tokens": Value::Null,
             "files": Value::Null,
@@ -910,12 +912,38 @@ mod tests {
     #[test]
     fn an_unmeasured_activity_row_is_null_not_zero() {
         let row = activity_row(&session("remote-1", "ssh:box"), &empty_registry());
-        assert!(row["provider"].is_null());
-        // Absent, not measured-as-idle — and every key is still present.
-        for key in ["counts", "tokens", "files"] {
+        // Absent, not measured-as-idle — every metric key is present and null.
+        for key in ["provider", "title", "model", "counts", "tokens", "files"] {
             assert!(row.get(key).is_some_and(Value::is_null), "{key}: {row}");
         }
         assert!(!row["note"].as_str().unwrap_or_default().is_empty());
+        // The *whole* key set, compared as a set: a measured row's keys and an
+        // unmeasured row's must not drift apart, or the "one stable shape" the
+        // JSON contract promises is only true for the keys someone remembered
+        // to list above.
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "agent",
+                "counts",
+                "files",
+                "model",
+                "name",
+                "note",
+                "provider",
+                "session_id",
+                "title",
+                "tokens",
+            ],
+            "unmeasured row key set drifted: {row}"
+        );
     }
 
     #[test]
