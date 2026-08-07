@@ -248,6 +248,28 @@ e2e_boot() {
     while IFS= read -r kv; do
         [ -n "$kv" ] && export "${kv?}"
     done < <(agent_env)
+
+    # The info panel's Claude usage gauges read "not logged in (no subscription
+    # token)" in a hermetic sandbox — true, and wrong on camera in any clip
+    # that opens the panel. The fork's own FRIRING_CLAUDE_USAGE_URL points that
+    # fetch at the stub's /api/oauth/usage route, which answers only when the
+    # scenario's fixtures carry a top-level `usage` key — so a scenario opts in
+    # by declaring one, and the rest never make the request at all.
+    if jq -e '.usage' "$E2E_FIXTURES" >/dev/null 2>&1; then
+        export FRIRING_CLAUDE_USAGE_URL="$AGENT_E2E_STUB_URL/api/oauth/usage"
+        # friring reads the OAuth token from `~/.claude/.credentials.json`
+        # before it fetches anything, so the URL alone still renders "not
+        # logged in". Seeded at $HOME and deliberately NOT under
+        # CLAUDE_CONFIG_DIR — that is where the claude CLI keeps its own
+        # state, and it must go on authenticating with ANTHROPIC_AUTH_TOKEN
+        # rather than try to refresh this fictional token against a dead
+        # proxy. Same split, and the same fictional plan tier, as
+        # scripts/demo/record.sh.
+        mkdir -p "$HOME/.claude"
+        printf '%s\n' \
+            '{"claudeAiOauth":{"accessToken":"friring-e2e-oauth-dummy","subscriptionType":"max-100x"}}' \
+            > "$HOME/.claude/.credentials.json"
+    fi
     # ${arr[@]+…}: safe empty-array expansion under set -u on bash 3.2 (macOS).
     agent_seed_config "$E2E_WS" ${SCENARIO_TRUST_DIRS[@]+"${SCENARIO_TRUST_DIRS[@]}"}
 

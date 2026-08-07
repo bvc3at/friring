@@ -12,7 +12,9 @@
 # border carries the fleet total, and a ghost reads `—` — a measured absence,
 # not a blank. So the clip can show the saving instead of asserting it: four
 # live trees, then three, then two, then a fleet with no total at all because
-# nothing is running, then one loaded back through `--resume`.
+# nothing is running, then one loaded back through `--resume`. The info panel
+# is opened on the way and left open: `RAM 361.0 MB  4 procs` is what the
+# badge is short for — the CLI plus every MCP server and tool it forked.
 #
 # The waits are what make that legible rather than lucky. `◌ ring-0N.*—` is
 # the row for that session, frozen and repriced — the `◌` matters, because the
@@ -108,6 +110,15 @@ scenario_steps() {
     step_wait_pane "RING-HOLDING" 90
     step_wait_state 'done' 60
 
+    # Now the cost. The badge is a number; the info panel is what the number
+    # means — `RAM 361.0 MB  4 procs` is the agent CLI *plus* the MCP servers
+    # and tools it forked, which is the whole point of measuring the tree
+    # rather than the pane process. It stays open for the rest of the clip and
+    # follows the active session, so every freeze below reprices it too.
+    step_key F2
+    step_wait_pane "RAM.*proc" 20
+    step_sleep 2
+
     # Freeze the three that were only ever idle. This is the fleet the feature
     # is for: agents kept for later, each still costing a process tree.
     fleet_freeze "ring-02"
@@ -162,6 +173,8 @@ scenario_assert_effects() {
 
 scenario_assert_ui() {
     assert_pane_contains "NO-DRIFT"
+    # The info panel prices the whole process tree, not the pane process.
+    assert_pane_contains "RAM.*proc"
     # Every session kept its row, frozen or not.
     local n
     for n in 1 2 3 4; do

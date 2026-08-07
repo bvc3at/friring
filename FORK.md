@@ -761,8 +761,17 @@ agent CLI is expensive and only a real one has that cost. With per-session
 memory on the rows (`feat(ui)`, #48) the clip can show the saving rather than
 assert it: four live trees at `Σ 1.3G`, then three, then two, then a sidebar of
 greyed rows each reading `—` and **no total at all**, then one loaded back
-through `--resume` with its conversation intact. It navigates by *cycling*
-rather than `<leader> <n>` because the rendered order shifts as sessions unload.
+through `--resume` with its conversation intact. The info panel is open
+throughout, because the badge is a number and the panel is what the number
+means: `RAM 320.9 MB  7 procs` is the CLI plus every MCP server and tool it
+forked, and on a ghost it reads `—` beside a 0% CPU bar. Its account-usage
+gauges are stubbed the way `scripts/demo/record.sh` stubs them — a scenario
+opts in by declaring a top-level `usage` fixture, which points the fetch at the
+loopback stub and seeds a fictional OAuth token at `$HOME/.claude`, never under
+`CLAUDE_CONFIG_DIR`, so the CLI itself goes on using its own auth — otherwise
+every clip that opens the panel films "not logged in". It navigates by
+*cycling* rather than `<leader> <n>` because the rendered order shifts as
+sessions unload.
 
 **A fork needs two branches on camera.** `claude-fork` was renamed
 `claude-lineage` for a blunt reason — the scenario name is the session name, so

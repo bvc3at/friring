@@ -23,7 +23,7 @@ infrastructure nobody has yet — see `docs/E2E.md` § Demo mode.
 
 | Clip | Feature |
 |---|---|
-| `claude-ghost-fleet.gif` | Lazy sessions & ghosts at fleet scale — 4 real claude trees frozen one by one, `Σ` falling to nothing, one loaded back |
+| `claude-ghost-fleet.gif` | Lazy sessions & ghosts at fleet scale — 4 real claude trees frozen one by one, `Σ` falling to nothing, the info panel pricing each tree, one loaded back |
 | `claude-unload-load.gif` | The same lifecycle on one session — unload to a frozen frame, load back through `--resume` |
 | `claude-activity-view.gif` | The F9 agent-activity view — Overview, Timeline, and a real 3-agent workflow |
 | `claude-review-loop.gif` | Code review v2 — classified comment, structured handoff to the agent |

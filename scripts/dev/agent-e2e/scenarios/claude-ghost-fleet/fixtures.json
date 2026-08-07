@@ -22,5 +22,9 @@
         "text": "NO-DRIFT — the transcript came back intact and the band is still flat."
       }
     }
-  ]
+  ],
+  "usage": {
+    "five_hour": { "utilization": 34, "resetsInMinutes": 161 },
+    "seven_day": { "utilization": 12, "resetsInMinutes": 5940 }
+  }
 }
