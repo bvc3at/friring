@@ -327,7 +327,7 @@ if have_agent claude; then
     # and never tries to refresh this fictional OAuth token against a dead
     # proxy. The plan tier is the fictional-future subscription on camera.
     mkdir -p "$HOME/.claude"
-    printf '{"claudeAiOauth":{"accessToken":"friring-demo-oauth-dummy","subscriptionType":"max-100x"}}\n' \
+    printf '{"claudeAiOauth":{"accessToken":"friring-demo-oauth-dummy","subscriptionType":"max"}}\n' \
         > "$HOME/.claude/.credentials.json"
 fi
 

@@ -130,8 +130,13 @@ e2e_scenario_load() {
     E2E_SCENARIO_NAME="$(basename "$E2E_SCENARIO_DIR")"
     # defaults a scenario.sh may override
     SCENARIO_AGENT="claude"
-    SCENARIO_COLS=120
-    SCENARIO_ROWS=40
+    # scripts/demo/record.sh's DEMO_COLS/DEMO_ROWS, and deliberately the same
+    # numbers: agg rasterizes the grid, so this geometry is what decides the
+    # clip's aspect ratio. 175x42 renders 1918x1084 — pixel-identical to every
+    # shipped docs/media clip, which is the point. A scenario overrides it only
+    # when the size is itself the subject, and then records at its own ratio.
+    SCENARIO_COLS=175
+    SCENARIO_ROWS=42
     SCENARIO_PRECREATE=1
     # What the precreated session is called. Defaults to the scenario name,
     # which is right for a scenario with one session and wrong for a fleet:
@@ -267,7 +272,7 @@ e2e_boot() {
         # scripts/demo/record.sh.
         mkdir -p "$HOME/.claude"
         printf '%s\n' \
-            '{"claudeAiOauth":{"accessToken":"friring-e2e-oauth-dummy","subscriptionType":"max-100x"}}' \
+            '{"claudeAiOauth":{"accessToken":"friring-e2e-oauth-dummy","subscriptionType":"max"}}' \
             > "$HOME/.claude/.credentials.json"
     fi
     # ${arr[@]+…}: safe empty-array expansion under set -u on bash 3.2 (macOS).

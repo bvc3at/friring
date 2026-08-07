@@ -817,7 +817,13 @@ moved from `$TMPDIR` to `/tmp`, because macOS's per-user `$TMPDIR` is ~60
 characters before the workspace even starts, and that path is *on camera*
 whenever an agent names a file it wrote. It also set how wide a pane a scenario
 needed to read a filename off that path: `claude-activity-view` asked for 220
-columns for exactly this reason and now runs — and records — at the 120 default.
+columns for exactly this reason and now runs — and records — at the default,
+which is `record.sh`'s 175x42 so that a generated clip and a shipped one are the
+same 1918x1084 frame. Two smaller things only a fresh eye catches: the seeded
+plan tier is `max`, and `trim-cast.mjs` rewrites U+00A0 to a plain space —
+Claude Code pads with no-break spaces and agg is alone in drawing one, because
+Meslo has no glyph for it and the fallback chain answers with a Nerd Font icon
+that overlaps the character after it (`❯▲`, `⎿▲Wrote`).
 
 The structural limit this also pinned down: everything in `scenario_steps` that
 is not a `step_*` runs at tape-**generation** time. One-shot setup lands before

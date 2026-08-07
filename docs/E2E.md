@@ -323,10 +323,18 @@ The closing beat is a lingering `Sleep`, deliberately **not** `Ctrl+Q`: quitting
 recording ends the clip on ~1s of bare shell, which `check-pacing.mjs` rejects as a leaked
 teardown (measured 0.07-0.09% ink against the 3.4-9.0% of a good final frame). Recording ends by
 **detaching** the filmed client with the TUI still up, and `trim-cast.mjs` drops the detach's own
-teardown from the tail. The TUI is reaped by `e2e_teardown` afterwards, off camera. The terminal
-is sized from the scenario's `SCENARIO_COLS`/`SCENARIO_ROWS`, and agg rasterizes that grid at
-`E2E_DEMO_FONT_SIZE` in the same face the shipped clips use — which it is asked to confirm
-up-front, because agg falls back silently when a family is missing.
+teardown from the tail — and normalizes U+00A0, which Claude Code pads with and agg is alone in
+drawing as a visible icon (Meslo has no glyph for it, so the fallback chain answers with a Nerd
+Font one that overlaps the next character). The TUI is reaped by `e2e_teardown` afterwards, off
+camera.
+
+The terminal is sized from the scenario's `SCENARIO_COLS`/`SCENARIO_ROWS`, and agg rasterizes
+that grid at `E2E_DEMO_FONT_SIZE` in the same face the shipped clips use — which it is asked to
+confirm up-front, because agg falls back silently when a family is missing. **That geometry is
+the aspect ratio**, since there is no canvas to fit the grid into: the 175x42 default is
+`record.sh`'s `DEMO_COLS`/`DEMO_ROWS` and renders 1918x1084, pixel-identical to every shipped
+clip. A scenario that overrides it records at its own ratio, which is right when the size is the
+subject and a mistake otherwise.
 
 Tape generation is factored out of recording (`e2e_emit_tape`): `run.sh --emit-tape <scenario>`
 writes the `.tape` and prints its path **without** booting a session or rendering anything —

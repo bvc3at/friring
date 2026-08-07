@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Cut the tmux-client detach tail off a recorded demo cast, in place.
+// Post-process a recorded demo cast, in place: cut the tmux-client detach tail
+// and normalize the one codepoint agg cannot draw as itself.
 //
 // The recording is an attached tmux client (see record.sh): when the recorder
 // detaches it to stop filming, the client leaves the alternate screen, resets
@@ -14,6 +15,15 @@
 // A cast with no such event did not end with the client detaching cleanly —
 // that is not a stream this trim understands, so fail closed rather than
 // ship whatever it is (same rule as every other recorder check).
+//
+// The second job is smaller and unrelated: U+00A0. Claude Code pads with
+// no-break spaces (`\u276f\u00a0 `, `\u23bf\u00a0 Wrote …`), which every
+// terminal draws as blank. agg does not — Meslo LG S has no U+00A0, so it
+// falls through to the next usable family, and Symbols Nerd Font answers with
+// a visible icon that overlaps the character after it. Nothing about a NBSP
+// survives into a rendered cast (the grid is already laid out; there is no
+// wrapping decision left to make), so replacing it with a plain space is
+// exactly what it was supposed to look like.
 //
 // Usage: trim-cast.mjs <file.cast>
 import fs from 'node:fs';
@@ -87,4 +97,11 @@ for (let n = 0; cut > 2 && n < 20; n++) {
   if (ev[1] !== 'o' || hasPrintable(ev[2])) break;
   cut--;
 }
-fs.writeFileSync(castPath, lines.slice(0, cut).join('\n') + '\n');
+const kept = lines.slice(0, cut).map((line, i) => {
+  if (i === 0 || !line) return line;
+  const ev = JSON.parse(line);
+  if (ev[1] !== 'o' || !ev[2].includes('\u00a0')) return line;
+  ev[2] = ev[2].replaceAll('\u00a0', ' ');
+  return JSON.stringify(ev);
+});
+fs.writeFileSync(castPath, kept.join('\n') + '\n');
