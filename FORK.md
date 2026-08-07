@@ -674,82 +674,104 @@ blocked-state tests can never fire a real desktop banner. See `docs/E2E.md`.
 **The demo half of that promise was mostly untested** — one scenario
 description, two outputs only holds if the second output is exercised, and
 until a clip was asked of every fork feature, `--demo` had been run against a
-handful of plain-text scenarios. Recording the whole set found six defects in
-the tape generator, all of which produced a recording that *completed*:
+handful of plain-text scenarios. Recording the whole set found defects that all
+produced a recording which *completed*, and eventually condemned the renderer
+itself.
+
+Three were in the generator and are fixed where they stood:
 
 - **An unmappable key was dropped, not refused.** `step_key` returned 1 into a
   flat step list that checks nothing, so the keypress silently went missing and
   the tape ran on — `claude-activity-view` was recording a clip of the activity
-  view that never pressed F9. It now fails the tape and names the key.
-- **VHS's key grammar overstates what it sends.** Captured against a pty
-  (`stty raw; cat > file`), `Alt+<letter>` parses and then emits the *bare
-  capital* — a tape with `Alt+U` in it records cleanly while typing `U` into
-  the agent — and `Ctrl+Alt+<letter>` parses and emits nothing at all. Both are
-  refused now. Alt chords, F-keys and `Ctrl+/` reach a demo through the fork's
-  own leader (`<leader> U`, `<leader> v`, `<leader> /`) via a new per-scenario
-  `SCENARIO_DEMO_KEYS` table — opt-in, because whether a substitution preserves
-  what the clip *shows* is the scenario's judgement: `scripted-info-keybind`
-  presses F2 to prove it does nothing after a rebind, so routing it to that
-  action's leader key would film the opposite of the feature.
+  view that never pressed F9.
 - **Every wait a scenario meant as a regex was flattened to a literal.** Test
-  mode greps (BRE), demo mode matched Go's RE2, and the generator escaped the
-  pattern wholesale — so `edit.*activity-proof.txt` waited for a literal
-  `.` and `*`. The dialects already agree on everything these patterns use, so
-  only the characters BRE takes literally and RE2 does not (`+?(){}|`, plus the
-  `/` delimiter) are escaped now.
-- **The canvas ignored `SCENARIO_COLS`.** Width/Height were pinned at
-  1920x1080 whatever geometry the scenario declared, so a 220-column scenario
-  recorded against ~128 columns and its waits looked for text the pane had
-  truncated. Both are derived from the scenario's columns/rows at the standard
-  font; the default 120x40 still yields exactly 1920x1080.
-- **Every clip played back roughly ten times too fast.** vhs screenshots a
-  headless Chromium but writes the gif at the nominal rate whatever it managed
-  to capture, so a starved capture doesn't drop quality — it compresses time,
-  silently. At 1920x1080 eight seconds of scripted `Sleep` recorded as **0.84s
-  (21 frames)**; the sixteen real clips came out 1–4s long against 9–18s of
-  scripted pacing. It is purely canvas area (700x300 records the full 8s;
-  1280x720 gives 2.08s), and the fix is to cap the framerate to what that area
-  sustains — measured ~5 fps at 1920x1080 and ~3 fps at 3520x1080, so the
-  generator derives it from a pixel-rate budget and stays under the ceiling,
-  since under-shooting costs only smoothness. `scripts/demo`'s own tapes never
-  hit this: agg renders them offline from an asciicast, with no capture to
-  starve.
-- **`Wait` synchronizes but does not film**, on top of that: vhs captures no
-  frames while a wait blocks, and a generated tape is mostly waits. Each wait
-  now carries a short dwell that puts the state it waited for on screen, while
-  the wait still absorbs the agent's real latency off camera. The closing
-  `Ctrl+Q` went with it: quitting inside the recording ended all sixteen clips
-  on ~1s of bare shell, which the fork's own `check-pacing.mjs` rejects as a
-  leaked teardown.
+  mode greps (BRE), demo mode matched a different dialect, and the generator
+  escaped the pattern wholesale — so `edit.*activity-proof.txt` waited for a
+  literal `.` and `*`. The dialects already agree on everything these patterns
+  use, so only the characters BRE takes literally and the other does not
+  (`+?(){}|`, plus the `/` delimiter) are escaped now.
+- **The canvas ignored `SCENARIO_COLS`.** Geometry was pinned whatever the
+  scenario declared, so a 220-column scenario recorded against ~128 columns and
+  its waits looked for text the pane had truncated.
 
-Two smaller ones: go-rod's headless Chromium cached under the *throwaway*
-sandbox `$HOME` (it ignores the `XDG_CACHE_HOME` handed to vhs), so every
-single recording re-downloaded ~150MB — it is symlinked to
-`target/agent-e2e/cache/rod` now.
+The rest were VHS, and there is no fixing them from outside it. It screenshots
+a headless Chromium and writes the gif at the *nominal* rate whatever it managed
+to grab, so a starved capture does not degrade quality — it **compresses time**,
+silently. At 1920x1080, eight seconds of scripted `Sleep` recorded as 0.84s (21
+frames); the first sixteen clips came out 1-4s long against 9-18s of scripted
+pacing. It is purely canvas area (700x300 records the full 8s), which bought a
+framerate derived from a measured pixel-rate budget — and ~5fps is also why
+typing arrived in visible chunks of five or six characters, a paste rather than
+a person. `Wait` captured nothing at all while it blocked, so a generated tape,
+which is mostly waits, jump-cut past every part where the app was working. Its
+key grammar overstates what it sends: captured against a pty, `Alt+<letter>`
+parses and emits the *bare capital* (a tape with `Alt+U` in it records cleanly
+while typing `U` into the agent) and `Ctrl+Alt+<letter>` parses and emits
+nothing. And its browser cached under the *throwaway* sandbox `$HOME`, so every
+single recording re-downloaded ~150MB.
+
+**So the generated demos now record the way the shipped ones always have.**
+`scripts/demo` had the right pipeline all along: asciinema captures the TUI's
+terminal *byte stream* and agg renders it offline, so capture costs nothing,
+every paint keeps its true timestamp, and the render can take as long as it
+likes. `e2e_demo_record` boots the TUI in the driver tmux, films an attached
+client, and replays the generated tape through `scripts/demo/lib/drive-tape.mjs`
+— the same driver, the same font and palette, one product on screen. What that
+buys beyond fidelity:
+
+- **Typing is typing again** — 30fps and 16ms/character, against ~5fps and an
+  effective ~70ms before. (`drive-tape.mjs` now charges each keystroke's own
+  `tmux send-keys` spawn against the interval instead of adding to it; at
+  10-20ms a spawn it was typing every tape at half its nominal speed, the
+  shipped ones included.)
+- **Waits film, and they fail the take.** A `Wait /re/` polls the same pane the
+  asserting test polls, so the clip carries the app's real latency — spinner,
+  boot, turn — and an unmet wait aborts the recording by line number instead of
+  yielding a clip that ran to the end having skipped what it came to film.
+- **The demo presses what the test presses.** A new `Key <tmux-key>` tape line
+  hands the name straight to `tmux send-keys`, so the translation table is gone
+  and with it every key that was unrecordable. `SCENARIO_DEMO_KEYS` survives as
+  an *editorial* choice rather than a workaround — an Alt chord is invisible on
+  camera, so `"M-u=C-f U"` unloads through the fork's leader and the which-key
+  overlay shows the viewer what was pressed.
+- **`step_leader <key>`** presses the leader as two keystrokes with a beat
+  between them. Test mode gets that gap for free (each `step_key` is its own
+  process); a tape does not, and it is also the only reason the which-key
+  overlay is ever on camera.
+- No framerate to derive, and `check-pacing.mjs` demoted to a **report**: its
+  budget assumes a seeded TUI with no agent latency, and here a held frame is
+  usually a real CLI booting.
 
 And one scenario bug, found only because a demo shows what a green test hid:
 `claude-review-export` waited for a saved comment to render `[Issue]` when the
 default classification is `Note`. That never matched — but a `step_wait_pane`
 timeout is not checked by the flat step list either, so in test mode it
 degraded to a silent 15s sleep and the scenario stayed green on its remaining
-asserts (bats hides a passing test's stderr, so the timeout line went
-unread). The demo path had no such cushion: vhs fails the recording on an
-unmet `Wait`. Worth knowing when reading any scenario: **a stale wait costs
-time, not a red test**, so `step_wait_pane` is a synchronization primitive and
-not, on its own, an assertion.
+asserts (bats hides a passing test's stderr, so the timeout line went unread).
+Worth knowing when reading any scenario: **a stale wait costs time, not a red
+test**, so `step_wait_pane` is a synchronization primitive and not, on its own,
+an assertion.
 
-**One ghost is unreadable; a fleet of them is not.** `scripted-unload-ghost`
-proves the mechanism on a single session, which makes it a good test and an
-unwatchable clip — a frozen frame looks exactly like an idle one. The
-`scripted-ghost-fleet` scenario films the claim instead of the mechanism: five
-sessions each with output of their own, three frozen one after another, a
-sidebar where most rows are greyed, and `<leader> c` stepping over every ghost
-to the sessions that still have a process. It navigates by *cycling* rather
-than `<leader> <n>` because the rendered order shifts as sessions unload, so a
-numbered jump taken before an unload no longer addresses the same row after
-one. What it deliberately does **not** claim on screen is the memory: friring
-does not surface per-session RSS yet, and a host total cannot separate one
-agent from the rest of the machine.
+**One ghost is unreadable; a fleet of them is not — and the point is the
+number.** `scripted-unload-ghost` proves the mechanism on a single session,
+which makes it a good test and an unwatchable clip: a frozen frame looks exactly
+like an idle one. `claude-ghost-fleet` films the claim instead, on **four real
+Claude Code processes**, because the reason lazy sessions exist is that an idle
+agent CLI is expensive and only a real one has that cost. With per-session
+memory on the rows (`feat(ui)`, #48) the clip can show the saving rather than
+assert it: four live trees at `Σ 1.3G`, then three, then two, then a sidebar of
+greyed rows each reading `—` and **no total at all**, then one loaded back
+through `--resume` with its conversation intact. It navigates by *cycling*
+rather than `<leader> <n>` because the rendered order shifts as sessions unload.
+
+**A fork needs two branches on camera.** `claude-fork` was renamed
+`claude-lineage` for a blunt reason — the scenario name is the session name, so
+the child rendered as `claude-fork-fork` — but the substantive change is that
+both branches now take a turn of their own. A clip that stops after the child's
+reply has filmed a copy, not a fork; the child answers a question the parent
+never asked, the parent then answers one the child never saw, and a
+never-matching `fork-context-leak` fixture asserts at the wire that no request
+ever carried both.
 
 **A stub can drive a whole multi-agent workflow.** The Agents half of the F9
 view first filmed as "No workflows or subagents yet", and the assumption that a
@@ -779,20 +801,28 @@ product. Scenario prompts, stub replies and model ids follow
 `demo-content.json`'s register — planetary infrastructure treated as routine ops,
 answered by `fable-67` / `gpt-6.2` / `tempest-oss-140b` — which is not decoration:
 a fictional model id keeps a real product name off camera and off a clip that
-would otherwise date itself. And the hermetic sandbox moved from `$TMPDIR` to
-`/tmp`, because macOS's per-user `$TMPDIR` is ~60 characters before the workspace
-even starts, and that path is *on camera* whenever an agent names a file it
-wrote. It also set how wide a pane a scenario needed to read a filename off that
-path: `claude-activity-view` asked for 220 columns for exactly this reason and
-now runs — and records — at the 120 default.
+would otherwise date itself. (Claude Code 2.1.224 charges six lines of pane for
+that: it cannot know an unknown model's context window and says so, so the
+profile answers with `CLAUDE_CODE_MAX_CONTEXT_TOKENS`.) And the hermetic sandbox
+moved from `$TMPDIR` to `/tmp`, because macOS's per-user `$TMPDIR` is ~60
+characters before the workspace even starts, and that path is *on camera*
+whenever an agent names a file it wrote. It also set how wide a pane a scenario
+needed to read a filename off that path: `claude-activity-view` asked for 220
+columns for exactly this reason and now runs — and records — at the 120 default.
 
-The structural limit this also pinned down: everything in `scenario_steps`
-that is not a `step_*` runs at tape-**generation** time, before vhs starts.
-One-shot setup lands before the first frame and records fine, but a scenario
-whose *narrative* is a mid-step mutation or poll — `scripted-blocked-attention`
-signalling sessions blocked one after another, `scripted-theme-settings`
-rewriting `settings.toml` to watch it live-reload — collapses into its own
-prologue and stays test-only.
+The structural limit this also pinned down: everything in `scenario_steps` that
+is not a `step_*` runs at tape-**generation** time. One-shot setup lands before
+the first frame and records fine, but a scenario whose *narrative* is a mid-step
+mutation or poll — `scripted-blocked-attention` signalling sessions blocked one
+after another, `scripted-theme-settings` rewriting `settings.toml` to watch it
+live-reload — collapses into its own prologue and stays test-only. Its subtler
+consequence cost a recording each: generation runs **before** the TUI boots in
+demo mode and **while it is already running** in test mode, and the TUI focuses
+the terminal when it boots with a session (the list when it boots empty) and
+opens on the *last* session in the DB. A fleet scenario that creates its
+siblings in the steps therefore starts on a different session, with a different
+focus, in each mode — so it precreates one session, waits on the footer's focus
+field, and jumps to a known row before its first relative move.
 
 #### Stub-driven demo recordings (`scripts/demo/`)
 

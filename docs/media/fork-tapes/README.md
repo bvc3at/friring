@@ -11,22 +11,23 @@ Each file is named for the scenario that produced it, so any clip can be
 re-recorded from source:
 
 ```bash
-just agent-demo claude-activity-view     # -> target/agent-e2e/demos/
+just agent-demo claude-ghost-fleet     # -> target/agent-e2e/demos/
 ```
 
-Recorded against loopback stubs on a throwaway `HOME`/`XDG_*` under `/tmp`, so
-no account, token, real conversation or real path is on camera. Every clip is
-themed `doom`, and the panes talk to models that do not exist (`fable-67`,
-`gpt-6.2`, `tempest-oss-140b`) about infrastructure nobody has yet — see
-`docs/E2E.md` § Demo mode.
+Recorded the same way the shipped clips are — asciinema captures the TUI's
+terminal byte stream, agg renders it offline — against loopback stubs on a
+throwaway `HOME`/`XDG_*` under `/tmp`, so no account, token, real conversation
+or real path is on camera. Every clip is themed `doom`, and the panes talk to
+models that do not exist (`fable-67`, `gpt-6.2`, `tempest-oss-140b`) about
+infrastructure nobody has yet — see `docs/E2E.md` § Demo mode.
 
 | Clip | Feature |
 |---|---|
-| `claude-unload-load.gif` | Lazy sessions & ghosts — unload to a frozen frame, load back through `--resume` |
-| `scripted-ghost-fleet.gif` | The same at fleet scale — 3 of 5 sessions frozen, cycling steps over them |
+| `claude-ghost-fleet.gif` | Lazy sessions & ghosts at fleet scale — 4 real claude trees frozen one by one, `Σ` falling to nothing, one loaded back |
+| `claude-unload-load.gif` | The same lifecycle on one session — unload to a frozen frame, load back through `--resume` |
 | `claude-activity-view.gif` | The F9 agent-activity view — Overview, Timeline, and a real 3-agent workflow |
 | `claude-review-loop.gif` | Code review v2 — classified comment, structured handoff to the agent |
-| `claude-fork.gif` | Session fork via `<leader> f`, parent linkage and sidebar nesting |
+| `claude-lineage.gif` | Session fork via `<leader> f` — parent linkage, sidebar nesting, and both branches continuing apart |
 | `claude-named-workspace.gif` | Named multi-repo workspace dir (`Ctrl+O` on the name step) |
 | `claude-restart-resume.gif` | Restart resumes the same conversation |
 | `scripted-leader-key.gif` | The tmux-style leader key and its which-key overlay |
@@ -40,6 +41,6 @@ themed `doom`, and the panes talk to models that do not exist (`fable-67`,
 | `opencode-text-turn.gif` | Baseline: opencode, proving the registry is agent-neutral |
 
 `codex-text-turn` is missing on purpose: it passes as a test but its recording
-stalls waiting for codex's `âº` ready glyph on a pane that never paints. Not the
+stalls waiting for codex's `›` ready glyph on a pane that never paints. Not the
 seeded tmux.conf, not machine load, not a leaked sandbox server — each was ruled
 out — so it needs a look of its own.
