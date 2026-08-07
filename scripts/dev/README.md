@@ -41,8 +41,9 @@ theme → quit). Runs in CI as the `tui-smoke` job; also `just smoke`.
 A **real agent binary** (Claude Code is the reference) inside a Friring-managed
 pane, with the model API stubbed on loopback — hermetic, offline, asserting.
 One scenario description runs as a bats test (`just agent-e2e`, via
-`agent-e2e/run.sh`) **and** as a VHS demo recording (`just agent-demo
-<scenario>`). Runs in CI as the non-blocking `agent-e2e` job; skips when the
+`agent-e2e/run.sh`) **and** as a demo recording (`just agent-demo <scenario>`,
+asciinema + agg, same pipeline as the shipped clips). Runs in CI as the
+non-blocking `agent-e2e` job; skips when the
 agent binary is missing. Full architecture + contracts: `docs/E2E.md`.
 
 ## Dev utilities (not tests)
