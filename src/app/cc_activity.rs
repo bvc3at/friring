@@ -2116,6 +2116,39 @@ mod tests {
         assert_eq!(a.last_tool.as_deref(), Some("Read"));
     }
 
+    /// Same run as the test above, in Claude Code v2.1.220's spellings:
+    /// workflow agents are `agent-<id>.json` + a bare `agent-<id>.meta`, and
+    /// the completion record moved out of `subagents/` to
+    /// `<session>/workflows/<run_id>.json`.
+    #[test]
+    fn build_activity_reads_v2_1_220_workflow_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("subagents");
+        let wf = sub.join("workflows/wf_done/");
+        write(&wf.join("agent-x9.json"), "z\n");
+        write(
+            &wf.join("agent-x9.meta"),
+            r#"{"agentType":"workflow-subagent"}"#,
+        );
+        write(
+            &tmp.path().join("workflows/wf_done.json"),
+            r#"{"workflowName":"demo","status":"completed","phases":[{"index":1,"title":"Go"}],
+                "workflowProgress":[{"type":"workflow_agent","agentId":"x9","label":"the-agent","phaseTitle":"Go","state":"done","tokens":42,"toolCalls":3,"lastToolName":"Read","model":"m"}]}"#,
+        );
+
+        let act = build_activity(&sub, 0);
+        let w = &act.workflows[0];
+        assert_eq!(w.status, CcRunStatus::Completed);
+        assert_eq!(w.name.as_deref(), Some("demo"));
+        assert_eq!(w.phases.len(), 1);
+        let a = &w.agents[0];
+        assert_eq!(a.label.as_deref(), Some("the-agent"));
+        assert_eq!(a.phase_title.as_deref(), Some("Go"));
+        assert_eq!(a.state, CcAgentState::Done);
+        assert_eq!(a.tokens, Some(42));
+        assert_eq!(a.last_tool.as_deref(), Some("Read"));
+    }
+
     #[test]
     fn dir_signature_moves_on_append_only() {
         let tmp = tempfile::tempdir().unwrap();
