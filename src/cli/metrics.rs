@@ -132,31 +132,40 @@ fn metrics_row(s: &SharedSession) -> Value {
     )
 }
 
-fn read_statusline(s: &SharedSession) -> (Option<AgentMetrics>, Option<&'static str>) {
+fn read_statusline(s: &SharedSession) -> (Option<AgentMetrics>, Option<String>) {
+    let note = |s: &str| (None, Some(s.to_string()));
+
     if is_remote(s) {
-        return (
-            None,
-            Some("remote session: metrics are written on the host"),
-        );
+        return note("remote session: metrics are written on the host");
     }
     let Some(agent_session_id) = s.agent_session_id.as_deref() else {
-        return (None, Some("session has no agent conversation id yet"));
+        return note("session has no agent conversation id yet");
     };
     let Some(path) = crate::paths::session_metrics_file(agent_session_id) else {
-        return (None, Some("no metrics directory could be resolved"));
+        return note("no metrics directory could be resolved");
     };
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return (None, Some("no statusline metrics file written yet"));
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        // "Not written yet" sends the reader off to wire a statusline; a
+        // permission or I/O error means the wiring may be fine and the *read*
+        // failed. Collapsing the two would hide a real fault behind a setup
+        // instruction, so the error carries its own text.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return note("no statusline metrics file written yet")
+        }
+        Err(e) => {
+            return (
+                None,
+                Some(format!("statusline metrics file unreadable: {e}")),
+            )
+        }
     };
     let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-        return (None, Some("statusline metrics file is not valid JSON"));
+        return note("statusline metrics file is not valid JSON");
     };
     let metrics = AgentMetrics::from_statusline_json(&value);
     if metrics.is_empty() {
-        return (
-            None,
-            Some("statusline metrics file has no recognized fields"),
-        );
+        return note("statusline metrics file has no recognized fields");
     }
     (Some(metrics), None)
 }
@@ -827,14 +836,26 @@ fn render_resources(sessions: &[SharedSession], rows: &[Value], with_cpu: bool) 
     output::table(&headers, &table_rows)
 }
 
-/// Human byte size, matching the info panel's scale.
+/// Human byte size for the RSS column.
+///
+/// Floors at KB rather than MB: a tree small enough to round to `0 MB` (a
+/// shell-script agent, a pane whose agent has just execed) would read as
+/// measured-and-free, the same failure the `null`-plus-note rows avoid. Mirrors
+/// the unit ladder of `ui::project_list::format_rss`, which formats this very
+/// metric for the session list — `cli` can't call it (`ui` is not on its
+/// allowlist), so the ladder is duplicated rather than the number diverging.
 fn bytes(n: u64) -> String {
-    const MB: f64 = 1024.0 * 1024.0;
-    let mb = n as f64 / MB;
-    if mb >= 1024.0 {
-        format!("{:.1} GB", mb / 1024.0)
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * KB;
+    const GB: f64 = 1024.0 * MB;
+
+    let b = n as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.0} MB", b / MB)
     } else {
-        format!("{mb:.0} MB")
+        format!("{:.0} KB", b / KB)
     }
 }
 
@@ -896,14 +917,18 @@ mod tests {
     fn statusline_absence_reports_its_reason() {
         let (metrics, note) = read_statusline(&session("remote-1", "ssh:box"));
         assert!(metrics.is_none());
-        assert!(note.unwrap_or_default().contains("remote"), "got {note:?}");
+        assert!(
+            note.as_deref().unwrap_or_default().contains("remote"),
+            "got {note:?}"
+        );
 
         // Local, but the agent hasn't reported a conversation id yet: there is
         // no key to look a file up by, so no filesystem access happens.
         let (metrics, note) = read_statusline(&session("local-1", "local-tmux"));
         assert!(metrics.is_none());
         assert!(
-            note.unwrap_or_default()
+            note.as_deref()
+                .unwrap_or_default()
                 .contains("no agent conversation id"),
             "got {note:?}"
         );
@@ -972,6 +997,38 @@ mod tests {
         assert!(rendered.contains("remote session"), "note: {rendered}");
     }
 
+    /// A read that fails for a reason other than absence must not be reported
+    /// as "not written yet" — that sends the reader off to wire a statusline
+    /// they may already have wired, hiding the real fault.
+    #[test]
+    fn an_unreadable_statusline_file_is_not_reported_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(dir.path());
+
+        let mut s = session("local-1", "local-tmux");
+        s.agent_session_id = Some("conv-1".into());
+
+        // Nothing on disk yet: the ordinary "wire a statusline" case.
+        let (metrics, note) = read_statusline(&s);
+        assert!(metrics.is_none());
+        assert_eq!(
+            note.as_deref(),
+            Some("no statusline metrics file written yet")
+        );
+
+        // A directory where the file belongs reads as an I/O error, not
+        // NotFound — the stand-in for a permission or hardware fault.
+        let path = crate::paths::session_metrics_file("conv-1").unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        let (metrics, note) = read_statusline(&s);
+        assert!(metrics.is_none());
+        let note = note.unwrap_or_default();
+        assert!(
+            note.starts_with("statusline metrics file unreadable:"),
+            "got {note}"
+        );
+    }
+
     #[test]
     fn target_rejects_both_and_neither() {
         let db = Database::open_in_memory().unwrap();
@@ -997,6 +1054,19 @@ mod tests {
     fn bytes_scales_to_gb() {
         assert_eq!(bytes(333 * 1024 * 1024), "333 MB");
         assert_eq!(bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn bytes_never_rounds_a_live_tree_down_to_zero() {
+        // A sub-megabyte tree must not read as "0 MB" — measured-and-free is
+        // exactly what the unavailable rows go out of their way to avoid.
+        assert_eq!(bytes(500 * 1024), "500 KB");
+        assert_eq!(bytes(1), "0 KB");
+        // Only a genuine zero (an exited pane) says zero.
+        assert_eq!(bytes(0), "0 KB");
+        // Boundaries land on the larger unit, not just under it.
+        assert_eq!(bytes(1024 * 1024), "1 MB");
+        assert_eq!(bytes(1024 * 1024 * 1024), "1.0 GB");
     }
 
     #[test]
