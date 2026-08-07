@@ -23,9 +23,10 @@
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Leader key arms through nested tmux, dispatches, and never leaks to the PTY"
 SCENARIO_AGENT="scripted"
-# VHS has no F-keys, so the recording arms beat 2b with the primary leader
-# instead: the clip shows the overlay a second time rather than prefix2's own
-# door, which stays a test-mode claim. Nothing false is filmed — unlike the
+# The clip is about `Ctrl+F`, so the recording arms beat 2b with the primary
+# leader instead: an F-key press is invisible on camera, and the clip shows
+# the overlay a second time rather than prefix2's own door, which stays a
+# test-mode claim. Nothing false is filmed — unlike the
 # leader route an F2 would take in scripted-info-keybind — it is just the one
 # beat the demo cannot distinguish.
 SCENARIO_DEMO_KEYS=("F12=C-f")

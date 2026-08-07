@@ -24,8 +24,9 @@
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="F9 activity view: a claude Write turn reconstructed, plus the workflow/subagent tree"
 SCENARIO_AGENT="claude"
-# VHS has no F-keys; `<leader> v` is F9's own second route to the same
-# action, so the clip opens the view exactly as the scenario does.
+# `<leader> v` is F9's own second route to the same action, and the one that
+# films: the which-key overlay names the view before it opens, where a bare
+# F9 shows the viewer nothing of what was pressed.
 SCENARIO_DEMO_KEYS=("F9=C-f v")
 SCENARIO_PROMPT="Log the Antarctic drift fix to drift.md using the Write tool."
 # The input-box prompt glyph — the stable "ready for input" marker across

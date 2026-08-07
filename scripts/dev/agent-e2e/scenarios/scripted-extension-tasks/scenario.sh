@@ -20,7 +20,8 @@
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="github-issues extension: install/activate, offline upsert dedupe, tick self-heal, deactivate keeps tasks"
 SCENARIO_AGENT="scripted"
-# VHS has no F-keys; `<leader> w` is F5's own second route to the tasks panel.
+# `<leader> w` is F5's own second route to the tasks panel, and the one that
+# films: the overlay names the panel where a bare F5 shows nothing pressed.
 SCENARIO_DEMO_KEYS=("F5=C-f w")
 
 # The normalized shape fetch.sh emits — v2 re-sends the SAME external_id with

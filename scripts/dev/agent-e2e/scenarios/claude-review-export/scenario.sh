@@ -14,7 +14,8 @@
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Code review: comment on working changes, export the compiled review to claude"
 SCENARIO_AGENT="claude"
-# VHS has no F-keys; `<leader> x` is F7's own second route to the review.
+# `<leader> x` is F7's own second route to the review, and the one that films:
+# the overlay names the review where a bare F7 shows nothing pressed.
 SCENARIO_DEMO_KEYS=("F7=C-f x")
 # The input-box prompt glyph — the stable "ready for input" marker across
 # claude 2.x permission modes (verified against 2.1.207).

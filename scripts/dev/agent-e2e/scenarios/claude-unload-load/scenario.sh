@@ -16,8 +16,9 @@
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Alt+U unloads claude to a frozen ghost; Enter loads it back via --resume with zero model calls"
 SCENARIO_AGENT="claude"
-# VHS cannot press Alt (it emits the bare capital); `<leader> U` is the
-# fork's own second route to the same unload.
+# `<leader> U` is the fork's own second route to the same unload, and the one
+# that films: an Alt chord is invisible on camera, while the leader paints a
+# which-key overlay naming the action.
 SCENARIO_DEMO_KEYS=("M-u=C-f U")
 # The input-box prompt glyph — the stable "ready for input" marker across
 # claude 2.x permission modes (verified against 2.1.207).

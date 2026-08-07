@@ -9,14 +9,16 @@
 # once — and a fresh second turn proves the conversation is live. No status
 # hooks (AGENT_HAS_STATUS_HOOKS=0): pane-text sync only.
 #
-# Test-mode only (drives the friring-dev tmux server mid-steps; Alt+U has no
-# VHS key); not demo-able.
+# No clip ships for it: the ghost lifecycle is filmed at fleet scale by
+# claude-ghost-fleet, where four rows repricing at once are legible in a way
+# one frozen pane is not.
 #
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Alt+U unloads codex to a frozen ghost; Enter loads it back via 'resume --last' in the same cwd"
 SCENARIO_AGENT="codex"
-# VHS cannot press Alt (it emits the bare capital); `<leader> U` is the
-# fork's own second route to the same unload.
+# `<leader> U` is the fork's own second route to the same unload, and the one
+# that films: an Alt chord is invisible on camera, while the leader paints a
+# which-key overlay naming the action.
 SCENARIO_DEMO_KEYS=("M-u=C-f U")
 # The composer-line glyph — codex's stable ready marker (placeholder text
 # rotates, the footer varies with cwd; verified against codex-cli 0.144.4).

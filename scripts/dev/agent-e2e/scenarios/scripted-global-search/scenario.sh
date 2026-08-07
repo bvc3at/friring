@@ -18,8 +18,9 @@
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Global search across live session content, tasks, automations, and files; Esc restore + Enter jump"
 SCENARIO_AGENT="scripted"
-# VHS pairs Ctrl with letters and a little punctuation, but not `/` (tmux
-# spells the chord `C-_`); `<leader> /` is global search's own second route.
+# `<leader> /` is global search's own second route, and the one that films:
+# tmux spells `Ctrl+/` as the unreadable `C-_`, while the overlay names the
+# search.
 SCENARIO_DEMO_KEYS=("C-_=C-f /")
 
 # Bounded poll for the popup being GONE — step_wait_pane can only wait for
