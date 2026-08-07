@@ -68,6 +68,17 @@ drive_tape_parses() {
     node "$REPO_ROOT/scripts/demo/lib/drive-tape.mjs" "$1" --print-duration
 }
 
+# Does $1 contain the consecutive lines $2…? NOT `grep -z '…\n…'`: `\n` in a
+# BRE is undefined, and the two greps disagree — BSD's matches a newline, GNU's
+# matches an `n`, so that assertion passed on macOS and failed in CI.
+tape_has_run() {
+    local tape want
+    tape="$(cat "$1")"
+    shift
+    want="$(printf '%s\n' "$@")"
+    [[ "$tape" == *"$want"* ]]
+}
+
 @test "demo: emit-tape maps scenario steps to a tape the driver accepts" {
     e2e_scenario_load "$AGENT_E2E_DIR/scenarios/claude-tool-loop"
     local tape="$BATS_TEST_TMPDIR/out.tape"
@@ -127,7 +138,7 @@ drive_tape_parses() {
     # parsed both and sent the wrong thing (the bare capital) or nothing.
     scenario_steps() { step_key Enter; step_key M-u; step_key F9; }
     e2e_emit_tape "$BATS_TEST_TMPDIR/keys.tape"
-    grep -zq 'Key Enter\nKey M-u\nKey F9\n' "$BATS_TEST_TMPDIR/keys.tape"
+    tape_has_run "$BATS_TEST_TMPDIR/keys.tape" "Key Enter" "Key M-u" "Key F9"
     run drive_tape_parses "$BATS_TEST_TMPDIR/keys.tape"
     [ "$status" -eq 0 ]
 }
@@ -139,8 +150,8 @@ drive_tape_parses() {
     e2e_emit_tape "$BATS_TEST_TMPDIR/routed.tape"
     # With the leader's beat between the two keys — every multi-key route is a
     # leader chord, and back-to-back keys do not land as one (see step_leader).
-    grep -zq 'Key C-f\nSleep 350ms\nKey v\nKey C-f\nSleep 350ms\nKey U\n' \
-        "$BATS_TEST_TMPDIR/routed.tape"
+    tape_has_run "$BATS_TEST_TMPDIR/routed.tape" \
+        "Key C-f" "Sleep 350ms" "Key v" "Key C-f" "Sleep 350ms" "Key U"
 }
 
 @test "demo: a wait keeps the regex a scenario wrote, escaping only what JS adds" {
