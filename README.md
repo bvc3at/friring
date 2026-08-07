@@ -226,6 +226,11 @@ as of June 2026; check each project for the latest.
 
 ## Features
 
+Anything tagged **Friring** is where this fork differs from
+[Thurbox](https://github.com/Thurbeen/thurbox): *fork-only* means upstream has
+no equivalent, *changed* means it has the feature and this fork altered it.
+[`FORK.md`](./FORK.md) tracks every divergence in full.
+
 <table>
 <tr>
 <td width="50%" valign="middle">
@@ -238,27 +243,40 @@ survives crashes, restarts, and reboots. Pick the agent and repo(s) at
 by hand (`Shift+J`/`Shift+K`), sort (`Shift+S`), restart with resume
 (`Ctrl+R`), or soft-delete with undo.
 
-A session whose pane is gone — after a reboot, all of them — comes back as a
-greyed **ghost**: its last saved frame, no agent process, no memory cost.
-`Enter` (or `Ctrl+R`) loads one in place, resuming the conversation where the
-agent supports it, and `Alt+U` unloads a live session back to a ghost to
-reclaim the agent's memory while keeping the frozen preview. Set
-`lazy_session_restore = false` to respawn everything at startup as before.
-
-That cost is priced, not claimed: each live row shows the RSS of its whole
-agent process tree with a `Σ` fleet total under the list, a ghost reads `—`,
-and a remote or not-yet-measured session shows nothing.
-`[features] session_memory = false` turns the scan off.
-
 [Getting started →](#getting-started) ·
-[Lazy sessions & ghosts →](docs/FEATURES.md#lazy-sessions--ghosts) ·
-[Per-session memory →](docs/FEATURES.md#per-session-memory-features-session_memory) ·
 [Settings →](docs/CONFIG.md#settingstoml)
 
 </td>
 <td width="50%">
   <img src="./docs/media/friring-session-creation.gif"
        alt="Session creation workflow" width="100%" />
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Lazy Sessions & Ghosts
+
+**Friring — fork-only.** A session whose pane is gone — after a reboot, all of
+them — comes back as a greyed **ghost**: its last saved frame, no agent
+process, no memory cost. `Enter` (or `Ctrl+R`) loads one in place, resuming the
+conversation where the agent supports it, and `Alt+U` unloads a live session
+back to a ghost to reclaim the agent's memory while keeping the frozen preview.
+Upstream respawns every session at startup instead; set
+`lazy_session_restore = false` for that behavior.
+
+The cost is priced, not claimed: each live row carries the RSS of its whole
+agent process tree with a `Σ` fleet total under the list, a ghost reads `—`,
+and a remote or not-yet-measured session shows nothing.
+`[features] session_memory = false` turns the scan off.
+
+[Lazy sessions & ghosts →](docs/FEATURES.md#lazy-sessions--ghosts) ·
+[Per-session memory →](docs/FEATURES.md#per-session-memory-features-session_memory)
+
+</td>
+<td width="50%">
+  <img src="./docs/media/fork/claude-ghost-fleet.gif"
+       alt="Four real Claude Code sessions frozen one by one, the fleet memory total falling, then one loaded back" width="100%" />
 </td>
 </tr>
 <tr>
@@ -283,7 +301,8 @@ never cascades to its workers.
 
 ### Automations
 
-Named, scheduled runs — one-shot or recurring (cron, with
+**Friring — changed.** Upstream fires one action that delivers one static
+string, locally. Here: named, scheduled runs — one-shot or recurring (cron, with
 `hourly`/`daily`/`weekdays`/`weekly` presets) that **send** prompts to a
 running session, **spawn** a session (locally or on a remote host, reusing
 one or fresh per fire) to prompt, or **exec** a shell command on a timeout.
@@ -321,6 +340,8 @@ advances it to *in progress*.
 
 ### Global Search
 
+**Friring — changed.** Upstream docks a full-width strip above the footer,
+which resizes every visible session PTY as it opens and closes.
 `Ctrl+/` — or a double-tap of `Shift` (JetBrains "Search Everywhere"
 muscle memory) — opens a centered popup that searches every scope at
 once — sessions (including live terminal-buffer content), tasks,
@@ -349,11 +370,40 @@ tree-style), then send the whole review back to the agent to address. Reviews
 stay open **per session** as you switch around, like the shell view. Mouse- and
 keyboard-driven, with unified or side-by-side layout.
 
-[Keybindings →](#keybindings)
+**Friring — changed:** the loop around the view is this fork's v2 — a
+`Question` class, a structured handoff that quotes each comment's anchor line
+so the agent can find it, reviewed marks that self-invalidate when the content
+changes, a staged-only target, untracked files, word-level diffs, and more.
+
+[Keybindings →](#keybindings) · [What v2 adds →](FORK.md#code-review-v2-july-2026)
 
 </td>
 <td width="50%">
   <img src="./docs/media/code-review-demo.gif" alt="Code review demo" width="100%" />
+</td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Agent Activity View
+
+**Friring — fork-only.** `F9` reconstructs **what a session's agent actually
+did** — every shell command it ran, file it edited or read, web search it made,
+and subagent it delegated to — from whatever the agent CLI already persists on
+disk. Nothing is injected and nothing new is written, so it works on a
+conversation that started before you opened it.
+
+An Overview dashboard (tokens, stat tiles, a session sparkline, hottest files,
+last error), a Timeline grouped by turn with subagent work nested under its
+origin, and four filtered sections. Twelve agent CLIs are supported; one that
+can't be read says why instead of rendering empty.
+
+[Activity view →](docs/FEATURES.md#agent-activity-view-f9)
+
+</td>
+<td width="50%">
+  <img src="./docs/media/fork/claude-activity-view.gif"
+       alt="The F9 activity view: Overview dashboard, turn-grouped Timeline, and a real three-agent workflow" width="100%" />
 </td>
 </tr>
 <tr>
@@ -405,6 +455,12 @@ switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
 
 **Also in the box:**
 
+- **[Leader key](#leader-key)** *(Friring — fork-only)* — `Ctrl+F` arms a
+  tmux-style prefix and paints a which-key overlay naming everything reachable;
+  the next key runs it. Every global command is on it, plus jump-to-session by
+  number — which works where `Alt+<digit>` doesn't, since most Linux terminals
+  claim that for their own tabs. `prefix-only` mode hands every bare
+  `Ctrl+<letter>` back to the agent CLI.
 - **[Extensions](https://thurbeen.github.io/thurbox/docs/extensions.html)**
   *(experimental)* — opt-in, agent-agnostic add-ons that are **data, not
   code**: `flow`, `forge`, `ci-shepherd`, `renovate`, and bidirectional

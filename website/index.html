@@ -219,6 +219,13 @@ cargo build --release</code></pre>
         <div class="section-title">
           <h2>Features</h2>
           <p>Everything you need to run coding agents at scale</p>
+          <p class="section-note">
+            Cards marked
+            <span class="fork-tag">Friring</span>
+            are where this fork differs from
+            <a href="https://github.com/Thurbeen/thurbox" target="_blank" rel="noopener">Thurbox</a>
+            &mdash; either it has no equivalent, or this fork changed it.
+          </p>
         </div>
         <div class="grid grid-3">
           <a href="docs/features.html#session-orchestration" class="feature-link">
@@ -228,6 +235,57 @@ cargo build --release</code></pre>
               <p>
                 Run multiple coding-agent CLIs side-by-side, each in its own tmux pane. Sessions
                 persist across crashes, restarts, and multiple concurrent Friring instances.
+              </p>
+            </div>
+          </a>
+          <a href="docs/features.html#lazy-sessions" class="feature-link">
+            <div class="card">
+              <div class="card-icon">&#x1f47b;</div>
+              <h3>
+                Lazy Sessions &amp; Ghosts
+                <span class="fork-tag">Friring</span>
+              </h3>
+              <p>
+                An idle agent CLI costs hundreds of MB. A session that is not running holds its
+                place as a greyed
+                <strong>ghost</strong>
+                &mdash; its last frame, no process &mdash; and
+                <code>Alt+U</code>
+                freezes a live one back to that. Each row is priced with its whole process tree,
+                so the saving is on screen rather than argued.
+              </p>
+            </div>
+          </a>
+          <a href="docs/features.html#agent-activity-view" class="feature-link">
+            <div class="card">
+              <div class="card-icon">&#x1f50e;</div>
+              <h3>
+                Agent Activity View
+                <span class="fork-tag">Friring</span>
+              </h3>
+              <p>
+                <code>F9</code>
+                reconstructs what a session's agent actually did &mdash; every command, edit, read,
+                search and delegated subagent &mdash; from what the CLI already writes to disk.
+                An Overview dashboard, a turn-grouped Timeline, and twelve supported agent CLIs.
+              </p>
+            </div>
+          </a>
+          <a href="docs/features.html#leader-key" class="feature-link">
+            <div class="card">
+              <div class="card-icon">&#x2328;</div>
+              <h3>
+                Leader Key
+                <span class="fork-tag">Friring</span>
+              </h3>
+              <p>
+                <code>Ctrl+F</code>
+                arms a tmux-style prefix and paints a which-key overlay naming everything reachable;
+                the next key runs it. Jump to a session by number where
+                <code>Alt+&lt;digit&gt;</code>
+                is claimed by your terminal &mdash; or hand every bare
+                <code>Ctrl+&lt;letter&gt;</code>
+                back to the agent CLI.
               </p>
             </div>
           </a>
@@ -270,7 +328,10 @@ cargo build --release</code></pre>
           <a href="docs/features.html#automations" class="feature-link">
             <div class="card">
               <div class="card-icon">&#x23f0;</div>
-              <h3>Automations</h3>
+              <h3>
+                Automations
+                <span class="fork-tag">Friring</span>
+              </h3>
               <p>
                 Named, scheduled agent runs &mdash; one-shot or recurring (cron, with
                 <code>daily</code>
@@ -309,8 +370,11 @@ cargo build --release</code></pre>
           </a>
           <a href="docs/features.html#code-review" class="feature-link">
             <div class="card">
-              <div class="card-icon">&#x1f50e;</div>
-              <h3>Code Review</h3>
+              <div class="card-icon">&#x1f4dd;</div>
+              <h3>
+                Code Review
+                <span class="fork-tag">Friring</span>
+              </h3>
               <p>
                 A native, GitHub-style diff reviewer (
                 <code>Ctrl+X</code>
@@ -343,11 +407,16 @@ cargo build --release</code></pre>
           <a href="docs/features.html#global-search" class="feature-link">
             <div class="card">
               <div class="card-icon">&#x1f50d;</div>
-              <h3>Global Search</h3>
+              <h3>
+                Global Search
+                <span class="fork-tag">Friring</span>
+              </h3>
               <p>
                 One key (
                 <code>Ctrl+/</code>
-                ) searches
+                ) &mdash; or a double-tap of
+                <code>Shift</code>
+                &mdash; opens a centered popup that searches
                 <strong>every scope at once</strong>
                 &mdash; sessions (incl. live terminal content), tasks, automations, and files
                 &mdash; with matches highlighted live in the panels themselves.
@@ -467,8 +536,118 @@ Ctrl+O  Open repos in editor</pre>
         <div class="feature-showcase">
           <div class="feature-row">
             <div class="feature-row-text">
+              <p class="feature-row-eyebrow">Alt+U</p>
+              <h3>
+                Lazy sessions &amp; ghosts
+                <span class="fork-tag">Friring</span>
+              </h3>
+              <p>
+                Four real Claude Code sessions, frozen one at a time. Each row carries what its
+                agent process tree costs, the
+                <code>&Sigma;</code>
+                under the list carries the fleet total, and a frozen session reads
+                <code>&mdash;</code>
+                &mdash; a measured absence, not a blank. By the end nothing is running and the
+                total is gone; the last one loads back through
+                <code>--resume</code>
+                with its conversation intact.
+              </p>
+              <a class="feature-row-link" href="docs/features.html#lazy-sessions">Learn more &rarr;</a>
+            </div>
+            <div class="feature-row-media">
+              <div class="terminal-frame">
+                <div class="terminal-header">
+                  <div class="terminal-dot red"></div>
+                  <div class="terminal-dot yellow"></div>
+                  <div class="terminal-dot green"></div>
+                  <span class="terminal-title">Ghost fleet</span>
+                </div>
+                <div class="terminal-body">
+                  <!-- prettier-ignore -->
+                  <video src="assets/claude-ghost-fleet.mp4" autoplay loop muted playsinline preload="none">
+                    Four live agent sessions unloaded one by one, the fleet memory total falling to
+                    nothing, then one loaded back
+                  </video>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="feature-row">
+            <div class="feature-row-text">
+              <p class="feature-row-eyebrow">F9</p>
+              <h3>
+                Agent activity view
+                <span class="fork-tag">Friring</span>
+              </h3>
+              <p>
+                What did this agent actually do? Every command it ran, file it edited or read,
+                search it made and subagent it delegated to &mdash; reconstructed from what the CLI
+                already writes to disk, so it works on a conversation that started before you
+                opened the view. An Overview dashboard and a Timeline grouped by turn.
+              </p>
+              <a class="feature-row-link" href="docs/features.html#agent-activity-view">
+                Learn more &rarr;
+              </a>
+            </div>
+            <div class="feature-row-media">
+              <div class="terminal-frame">
+                <div class="terminal-header">
+                  <div class="terminal-dot red"></div>
+                  <div class="terminal-dot yellow"></div>
+                  <div class="terminal-dot green"></div>
+                  <span class="terminal-title">Activity view</span>
+                </div>
+                <div class="terminal-body">
+                  <!-- prettier-ignore -->
+                  <video src="assets/claude-activity-view.mp4" autoplay loop muted playsinline preload="none">
+                    The F9 activity view: an Overview dashboard, a turn-grouped timeline, and a
+                    three-agent workflow
+                  </video>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="feature-row">
+            <div class="feature-row-text">
+              <p class="feature-row-eyebrow">Ctrl+F</p>
+              <h3>
+                Leader key
+                <span class="fork-tag">Friring</span>
+              </h3>
+              <p>
+                A tmux-style prefix. Arming it paints a which-key overlay grouping everything
+                reachable, and the next key runs it &mdash; so the Ctrl namespace stops being a
+                fixed budget, and chords the agent CLI wants back can be handed over wholesale.
+              </p>
+              <a class="feature-row-link" href="docs/features.html#leader-key">Learn more &rarr;</a>
+            </div>
+            <div class="feature-row-media">
+              <div class="terminal-frame">
+                <div class="terminal-header">
+                  <div class="terminal-dot red"></div>
+                  <div class="terminal-dot yellow"></div>
+                  <div class="terminal-dot green"></div>
+                  <span class="terminal-title">Leader key</span>
+                </div>
+                <div class="terminal-body">
+                  <!-- prettier-ignore -->
+                  <video src="assets/scripted-leader-key.mp4" autoplay loop muted playsinline preload="none">
+                    Arming the leader key and running a command from its which-key overlay
+                  </video>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="feature-row">
+            <div class="feature-row-text">
               <p class="feature-row-eyebrow">Ctrl+X</p>
-              <h3>Code review</h3>
+              <h3>
+                Code review
+                <span class="fork-tag">Friring</span>
+              </h3>
               <p>
                 A native, GitHub-style diff reviewer &mdash; no external tool. Browse the branch, a
                 commit, or working changes in a folder tree, leave classified comments, fold reviewed
@@ -497,7 +676,10 @@ Ctrl+O  Open repos in editor</pre>
           <div class="feature-row">
             <div class="feature-row-text">
               <p class="feature-row-eyebrow">Ctrl+P</p>
-              <h3>Automations</h3>
+              <h3>
+                Automations
+                <span class="fork-tag">Friring</span>
+              </h3>
               <p>
                 Named, scheduled agent runs &mdash; one-shot or recurring cron. Each fires on its own
                 schedule to send a prompt to a session or spawn a fresh one, even when the TUI is
@@ -553,11 +735,15 @@ Ctrl+O  Open repos in editor</pre>
           <div class="feature-row">
             <div class="feature-row-text">
               <p class="feature-row-eyebrow">Ctrl+/</p>
-              <h3>Global search</h3>
+              <h3>
+                Global search
+                <span class="fork-tag">Friring</span>
+              </h3>
               <p>
-                One strip searches every scope at once &mdash; sessions (including live terminal
-                content), tasks, automations, and files &mdash; with matches highlighted live in the
-                panels themselves.
+                One centered popup searches every scope at once &mdash; sessions (including live
+                terminal content), tasks, automations, and files &mdash; with matches highlighted
+                live in the panels around it. It overlays rather than docks, so opening a search
+                never resizes a running agent's terminal.
               </p>
               <a class="feature-row-link" href="docs/features.html#global-search">Learn more &rarr;</a>
             </div>

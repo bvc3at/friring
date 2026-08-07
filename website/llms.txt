@@ -14,7 +14,7 @@
 
 - [Documentation hub](https://bvc3at.github.io/friring/docs/index.html): entry point to all Friring documentation.
 - [FAQ](https://bvc3at.github.io/friring/docs/faq.html): short answers to the most common questions (what it is, how it differs, install, platforms, license).
-- [Features](https://bvc3at.github.io/friring/docs/features.html): sessions, agent definitions, git worktrees, remote SSH, automations, tasks, code review, headless CLI.
+- [Features](https://bvc3at.github.io/friring/docs/features.html): sessions, agent definitions, git worktrees, remote SSH, automations, tasks, code review, the F9 agent-activity view, lazy sessions & ghosts, the leader key, headless CLI.
 - [Comparison](https://bvc3at.github.io/friring/docs/comparison.html): how Friring compares to Conductor, Claude Squad, Cursor, and other parallel coding-agent tools.
 - [Installation](https://bvc3at.github.io/friring/docs/installation.html): install via curl, PowerShell, Homebrew, cargo, or from source; prerequisites.
 - [Configuration](https://bvc3at.github.io/friring/docs/configuration.html): every config file and knob — agents.toml, hosts.toml, settings.toml, themes, keybindings.
@@ -29,6 +29,6 @@
 ## Optional
 
 - [GitHub repository](https://github.com/bvc3at/friring): source, README, and releases.
-- [Upstream project](https://github.com/Thurbeen/thurbox): Thurbox by Thurbeen — Friring is a personal fork of it.
+- [Upstream project](https://github.com/Thurbeen/thurbox): Thurbox by Thurbeen — Friring is a personal fork of it. Features the docs tag "Friring" are ones this fork adds or changes; the full list of divergences is in FORK.md in the repository.
 - [Keybindings](https://bvc3at.github.io/friring/docs/keybindings.html): the Vim-inspired keyboard reference.
 - [Performance](https://bvc3at.github.io/friring/docs/performance.html): demand-driven rendering and how throughput is measured.

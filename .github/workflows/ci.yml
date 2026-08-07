@@ -308,6 +308,11 @@ jobs:
       # straight from the gifs' own frame delays.
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      # Fork (Friring): the glob deliberately does not descend into
+      # docs/media/fork/. Those clips are recorded by the agent-e2e harness and
+      # film real agent CLIs booting and thinking, so their held frames are the
+      # app being honestly slow rather than the demo waiting on itself — the
+      # budget below cannot tell those apart. See docs/media/fork/README.md.
       - name: Check demo pacing budget
         run: node scripts/demo/lib/check-pacing.mjs docs/media/*.gif
 

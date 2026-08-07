@@ -42,7 +42,7 @@ jobs:
       # Demo videos are copied into the Eleventy input (website/assets/) before the
       # build, so the passthrough-copy step picks them up into the built _site/.
       - name: Copy demo videos into website assets
-        run: cp docs/media/*.mp4 website/assets/
+        run: cp docs/media/*.mp4 docs/media/fork/*.mp4 website/assets/
 
       - name: Install dependencies
         run: npm ci

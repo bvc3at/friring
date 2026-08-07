@@ -302,6 +302,13 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
   comment. The harness gained an optional `scenario_prepare()` hook for
   post-boot workspace state (an uncommitted edit for the Working target).
 
+That scenario is also the clip: a classified comment saved on a diff line, `e`
+compiling it into the structured record, a real Claude Code instance receiving
+it and editing the file, the re-review nudge on its idle edge, and the reopened
+review still holding the comment on its anchor.
+
+![Leaving a classified review comment and sending the structured handoff to a real agent](docs/media/fork/claude-review-loop.gif)
+
 #### Agent activity view (F9)
 
 *The first Friring feature (#1), redesigned in July 2026 into an
@@ -362,8 +369,9 @@ sessions only.
 - **Find-in-transcript (`/`).** Incremental find with in-place match
   highlighting, mirroring the code-review / file-viewer find.
 
-Implementation notes (this is a fork-only feature, so its detail lives here
-rather than in `docs/FEATURES.md`):
+What the view *is* — sections, keys, the supported agents, the clip — is
+`docs/FEATURES.md` → *Agent activity view*, alongside every other user-facing
+feature. The implementation stays here, since it is fork-only:
 
 - **Three data homes.** `SessionInfo.cc_activity` is the lightweight Claude
   **tree index** (workflows + agents + standalone subagents; ids, agentType,
@@ -639,7 +647,7 @@ Code is the proven reference) inside a Friring-managed pane with the **model
 API stubbed on loopback** — zero-dep node sidecars speaking each wire dialect
 from hand-curated semantic fixtures. One scenario description runs both as an
 asserting bats test (`just agent-e2e`; three drive depths: the agent's own
-print/exec mode → bare-tmux interactive → full Friring TUI) and as a VHS demo
+print/exec mode → bare-tmux interactive → full Friring TUI) and as a demo
 recording (`just agent-demo <scenario>`). Ships with a path-gated,
 **non-blocking** `agent-e2e` CI job that installs a pinned claude binary, and
 one small CLI addition: `session get/list --json` now expose the raw
@@ -838,6 +846,25 @@ opens on the *last* session in the DB. A fleet scenario that creates its
 siblings in the steps therefore starts on a different session, with a different
 focus, in each mode — so it precreates one session, waits on the footer's focus
 field, and jumps to a known row before its first relative move.
+
+**Six of the clips ship; the rest were recorded and left out.** They live in
+`docs/media/fork/`, each linked from the doc it illustrates — the ghost fleet,
+the F9 activity view and the leader key from `docs/FEATURES.md`, the named
+workspace and the review handoff from the two sections above, and the pair of
+text turns from `docs/E2E.md`. What was dropped was dropped for a reason worth
+recording: `claude-lineage` and `claude-unload-load` film features that already
+have a shipped clip or a better one (`friring-fork.gif`; `claude-ghost-fleet`
+supersedes the single-session ghost), `scripted-global-search` shows a popup
+`search-demo.gif` already shows, `claude-restart-resume` films upstream
+behavior, and the wizard, automation and extension clips duplicate media
+`scripts/demo` records. Every one is a `just agent-demo <scenario>` away if a
+doc later needs it; `docs/media/fork/README.md` keeps the list.
+
+`docs/media/fork/` is deliberately **outside** the `demo-pacing` gate, whose
+glob (`docs/media/*.gif`) does not descend. The budget assumes a seeded TUI
+with no agent latency; these clips film real CLIs booting and thinking, and
+every one of them busts the 1.0s max-hold for exactly that reason. The recorder
+still prints the numbers, and the shipped ten still have to pass.
 
 #### Stub-driven demo recordings (`scripts/demo/`)
 
@@ -1065,6 +1092,12 @@ flow away. The fork rebuilds the flow:
   the `claude-named-workspace` agent-e2e scenario drives the whole flow —
   wizard keys, agent writing through the symlinks, persistence, guarded
   delete — against the real Claude Code binary (`docs/E2E.md`).
+
+That last one, filmed by its own scenario — `Ctrl+O` opening the second field,
+a name typed into it, and the agent afterwards writing through the symlinks at
+the directory it names rather than at a UUID:
+
+![Naming a multi-repo session's workspace directory from the wizard's name step](docs/media/fork/claude-named-workspace.gif)
 
 Keys and flow are documented in `docs/FEATURES.md`; the back-navigation
 interplay with ADR-P12 in `docs/PERFORMANCE.md`.
@@ -1553,6 +1586,17 @@ already cover the case it was meant to serve.
     ship landing CSS to docs pages and vice versa. `core.css` is generated
     output: it is never edited, never passthrough-copied, and only the four
     sources are.
+- **`docs/FEATURES.md` marks its divergences.** The feature reference reads as
+  one document about one app, which made it impossible to tell which behavior a
+  reader could expect from upstream. Sections that differ now open with one of
+  two tags — **Friring — fork-only** or **Friring — changed** — naming the
+  divergence in a line and linking the section here that carries the reasoning.
+  The convention is stated at the top of the file; an untagged section is
+  shared with upstream. Two fork-only features that had never appeared there at
+  all, the **F9 activity view** and the **ghost fleet** side of lazy sessions,
+  are now documented as features rather than only as fork notes, and the
+  website carries the same tag as a chip. This file stays the single place the
+  divergences are *tracked*; the tags are signposts to it.
 - `README.md` and the agent-guide prose call the project **Friring**, and so do
   the install commands; what still points at upstream is attribution and the
   shared formats above.

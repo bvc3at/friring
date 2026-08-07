@@ -215,8 +215,9 @@ The TUI has three layers of end-to-end coverage:
 - **Real-agent e2e** (`scripts/dev/agent-e2e/`, `just agent-e2e`). A *real*
   agent binary (Claude Code is the reference) inside a Friring-managed pane,
   with the model API stubbed on loopback — hermetic, deterministic, offline.
-  One scenario description drives both the asserting bats suite and a VHS demo
-  recording (`just agent-demo <scenario>`). Not part of `cargo nextest`; runs
+  One scenario description drives both the asserting bats suite and a demo
+  recording (`just agent-demo <scenario>`, rendered the same way the shipped
+  clips are). Not part of `cargo nextest`; runs
   via the non-blocking `agent-e2e` CI job and skips cleanly when the agent
   binary is missing. Architecture, scenario/agent-profile contracts, and the
   conformance status live in **`docs/E2E.md`** (decision record: ADR-23).
