@@ -2147,6 +2147,9 @@ mod tests {
         assert_eq!(a.state, CcAgentState::Done);
         assert_eq!(a.tokens, Some(42));
         assert_eq!(a.last_tool.as_deref(), Some("Read"));
+        // The only field sourced from the sidecar rather than the completion
+        // record — so this is what actually holds the bare-`.meta` spelling.
+        assert_eq!(a.agent_type, "workflow-subagent");
     }
 
     #[test]

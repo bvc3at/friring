@@ -564,9 +564,12 @@ $(e2e_pane)"
 
 # Regex sibling of assert_pane_contains, for the patterns e2e_wait_pane waits
 # on: those go through `grep -q`, so a wait and an assert written against the
-# same pattern only agree if the assert matches as a regex too.
+# same pattern only agree if the assert matches as a regex too. Same `grep -q`
+# and not `-E` for exactly that reason — BRE and ERE disagree on unescaped
+# `()+?{}|`, so a pattern lifted from a step_wait_pane would match differently
+# here, silently, which is the bug this helper exists to close rather than move.
 assert_pane_matches() {
-    e2e_pane | grep -qE -- "$1" \
+    e2e_pane | grep -q -- "$1" \
         || e2e_die "pane does not match: $1
 --- pane ---
 $(e2e_pane)"
