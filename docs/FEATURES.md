@@ -461,6 +461,14 @@ keeps the list from accumulating stale entries.
 
 ### Agent definitions
 
+**Friring — changed.** The registry and its `{id}` templates are upstream's;
+`{name}` is not. Upstream's session name never leaves the DB and UI, so the
+agent's own conversation gets an auto-generated title — here the seeded claude
+entry passes `-n {name}` on fresh spawns and forks (never on resume), so a
+conversation friring creates appears under the same name in claude's own
+`/resume` picker. See
+[`FORK.md`](../FORK.md#session-name-passed-to-the-agent-name-in-agentstoml).
+
 The set of available agents is **data**, not code. On first run
 Friring seeds `~/.config/friring/agents.toml` with built-in
 definitions for claude, codex, antigravity, opencode, aider, and vibe
