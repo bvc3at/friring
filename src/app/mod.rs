@@ -413,7 +413,10 @@ fn collect_system_metrics(
     for (session_id, path) in metrics_files {
         if let Ok(content) = std::fs::read_to_string(&path) {
             if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&content) {
-                agent_metrics.push((session_id, parse_agent_metrics(&raw)));
+                agent_metrics.push((
+                    session_id,
+                    crate::session::AgentMetrics::from_statusline_json(&raw),
+                ));
             }
         }
     }
@@ -441,63 +444,6 @@ fn aggregate_git_stats(paths: &[PathBuf]) -> Option<crate::session::GitStats> {
         }
     }
     agg
-}
-
-/// Parse agent metrics from a Claude CLI statusline JSON value.
-fn parse_agent_metrics(raw: &serde_json::Value) -> crate::session::AgentMetrics {
-    use crate::session::AgentMetrics;
-    AgentMetrics {
-        model_id: raw
-            .pointer("/model/id")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        model_display_name: raw
-            .pointer("/model/display_name")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        total_cost_usd: raw.pointer("/cost/total_cost_usd").and_then(|v| v.as_f64()),
-        total_duration_ms: raw
-            .pointer("/cost/total_duration_ms")
-            .and_then(|v| v.as_u64()),
-        total_api_duration_ms: raw
-            .pointer("/cost/total_api_duration_ms")
-            .and_then(|v| v.as_u64()),
-        total_lines_added: raw
-            .pointer("/cost/total_lines_added")
-            .and_then(|v| v.as_u64()),
-        total_lines_removed: raw
-            .pointer("/cost/total_lines_removed")
-            .and_then(|v| v.as_u64()),
-        total_input_tokens: raw
-            .pointer("/context_window/total_input_tokens")
-            .and_then(|v| v.as_u64()),
-        total_output_tokens: raw
-            .pointer("/context_window/total_output_tokens")
-            .and_then(|v| v.as_u64()),
-        context_window_size: raw
-            .pointer("/context_window/context_window_size")
-            .and_then(|v| v.as_u64()),
-        used_percentage: raw
-            .pointer("/context_window/used_percentage")
-            .and_then(|v| v.as_u64())
-            .map(|v| v.min(100) as u8),
-        current_input_tokens: raw
-            .pointer("/context_window/current_usage/input_tokens")
-            .and_then(|v| v.as_u64()),
-        current_output_tokens: raw
-            .pointer("/context_window/current_usage/output_tokens")
-            .and_then(|v| v.as_u64()),
-        cache_creation_input_tokens: raw
-            .pointer("/context_window/current_usage/cache_creation_input_tokens")
-            .and_then(|v| v.as_u64()),
-        cache_read_input_tokens: raw
-            .pointer("/context_window/current_usage/cache_read_input_tokens")
-            .and_then(|v| v.as_u64()),
-        cli_version: raw
-            .get("version")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-    }
 }
 
 pub use modals::{AutomationActionKind, AutomationField, TaskField, TriggerKind};
@@ -6352,19 +6298,14 @@ impl App {
             .filter(|s| !s.is_placeholder())
             .map(|s| s.backend_handle());
 
-        let metrics_files: Vec<(SessionId, PathBuf)> = match crate::paths::metrics_directory() {
-            Some(dir) => self
-                .sessions
-                .iter()
-                .filter_map(|s| {
-                    s.info
-                        .agent_session_id
-                        .as_ref()
-                        .map(|sid| (s.info.id, dir.join(format!("{sid}.json"))))
-                })
-                .collect(),
-            None => Vec::new(),
-        };
+        let metrics_files: Vec<(SessionId, PathBuf)> = self
+            .sessions
+            .iter()
+            .filter_map(|s| {
+                let sid = s.info.agent_session_id.as_deref()?;
+                Some((s.info.id, crate::paths::session_metrics_file(sid)?))
+            })
+            .collect();
 
         let tx = self.metrics_refresh.start();
         tokio::task::spawn_blocking(move || {
@@ -16763,70 +16704,6 @@ mod tests {
         let now = crate::sync::current_time_millis();
         // Future timestamp should saturate to 0s
         assert_eq!(super::view::format_time_ago(now + 10_000), "0s ago");
-    }
-
-    // --- parse_agent_metrics tests ---
-
-    #[test]
-    fn parse_agent_metrics_full_json() {
-        let json = serde_json::json!({
-            "version": "2.1.58",
-            "model": { "id": "claude-opus-4-6", "display_name": "Opus 4.6" },
-            "cost": {
-                "total_cost_usd": 0.0123,
-                "total_duration_ms": 5000,
-                "total_api_duration_ms": 3000,
-                "total_lines_added": 156,
-                "total_lines_removed": 23,
-            },
-            "context_window": {
-                "total_input_tokens": 15200,
-                "total_output_tokens": 4500,
-                "context_window_size": 200000,
-                "used_percentage": 8,
-                "current_usage": {
-                    "input_tokens": 1200,
-                    "output_tokens": 300,
-                    "cache_creation_input_tokens": 5000,
-                    "cache_read_input_tokens": 2000,
-                }
-            }
-        });
-        let m = super::parse_agent_metrics(&json);
-        assert_eq!(m.model_id.as_deref(), Some("claude-opus-4-6"));
-        assert_eq!(m.model_display_name.as_deref(), Some("Opus 4.6"));
-        assert!((m.total_cost_usd.unwrap() - 0.0123).abs() < 1e-6);
-        assert_eq!(m.total_input_tokens, Some(15200));
-        assert_eq!(m.total_output_tokens, Some(4500));
-        assert_eq!(m.context_window_size, Some(200000));
-        assert_eq!(m.used_percentage, Some(8));
-        assert_eq!(m.total_lines_added, Some(156));
-        assert_eq!(m.total_lines_removed, Some(23));
-        assert_eq!(m.cache_read_input_tokens, Some(2000));
-        assert_eq!(m.cache_creation_input_tokens, Some(5000));
-        assert_eq!(m.cli_version.as_deref(), Some("2.1.58"));
-    }
-
-    #[test]
-    fn parse_agent_metrics_empty_json() {
-        let json = serde_json::json!({});
-        let m = super::parse_agent_metrics(&json);
-        assert!(m.model_id.is_none());
-        assert!(m.total_cost_usd.is_none());
-        assert!(m.used_percentage.is_none());
-    }
-
-    #[test]
-    fn parse_agent_metrics_partial_json() {
-        let json = serde_json::json!({
-            "model": { "display_name": "Sonnet" },
-            "cost": { "total_cost_usd": 0.05 }
-        });
-        let m = super::parse_agent_metrics(&json);
-        assert_eq!(m.model_display_name.as_deref(), Some("Sonnet"));
-        assert!(m.model_id.is_none());
-        assert!((m.total_cost_usd.unwrap() - 0.05).abs() < 1e-6);
-        assert!(m.total_input_tokens.is_none());
     }
 
     // --- find_matching_discovered tests ---

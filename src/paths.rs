@@ -297,6 +297,17 @@ pub fn metrics_directory() -> Option<PathBuf> {
     resolve(PathKind::MetricsDir)
 }
 
+/// The statusline metrics file for one agent conversation.
+///
+/// Keyed by `agent_session_id` (the id friring pins into the agent and exports
+/// as `FRIRING_SESSION_ID`), not by [`SessionId`](crate::session::SessionId) —
+/// the writer is the agent's own statusline, which only knows its conversation
+/// id. Shared by the TUI's per-tick poll and `friring-cli session metrics` so
+/// both look in exactly one place.
+pub fn session_metrics_file(agent_session_id: &str) -> Option<PathBuf> {
+    Some(metrics_directory()?.join(format!("{agent_session_id}.json")))
+}
+
 /// Directory where embedded built-in extensions are materialized so the
 /// extension installer can treat them as a local source.
 ///
@@ -319,6 +330,22 @@ pub fn worktrees_directory() -> Option<PathBuf> {
 /// `$HOME/.local/share/friring/workspaces/`
 pub fn workspaces_directory() -> Option<PathBuf> {
     resolve(PathKind::WorkspacesDir)
+}
+
+/// The **default** multi-repo symlink workspace for one agent conversation:
+/// `<workspaces>/<sanitized agent_session_id>`.
+///
+/// Pure derivation — nothing is created or read. The single definition of that
+/// path: [`crate::workspace::workspace_path`] builds it here, and
+/// `friring-cli session activity` derives the same launch cwd for a session it
+/// cannot ask a running app about. `None` when no workspaces root resolves, or
+/// when the id sanitizes to nothing (defensive — it is a UUID in practice).
+pub fn session_workspace_dir(agent_session_id: &str) -> Option<PathBuf> {
+    let segment = sanitize_workspace_segment(agent_session_id);
+    if segment.is_empty() {
+        return None;
+    }
+    Some(workspaces_directory()?.join(segment))
 }
 
 /// Resolve the user keybindings file path.

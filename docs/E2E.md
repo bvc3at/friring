@@ -23,7 +23,8 @@ hook-driven status incl. the real permission→blocked path and the modal guard 
 keeps a headless send from answering it, restart-resume / fork /
 conversation import (all riding claude's `--session-id {id}` pinning), worktree sessions and
 `Ctrl+S` sync incl. the conflict handoff, code-review export, automations, tasks, messages,
-extensions, global search, the F9 activity view, both wizard flows, and the polish surface
+extensions, global search, the F9 activity view, the four headless agent-metrics commands
+(statusline / process tree / transcripts / account usage), both wizard flows, and the polish surface
 (themes, settings live-reload, keybinding editor, shell pane, clipboard — in-pane OSC 52
 copies asserted against a sandboxed outer clipboard, plus raw kitty-protocol Cmd+C
 injection — soft delete, attention navigation). Scenarios that need no model at all run on
@@ -70,7 +71,10 @@ Claude Code, while the `openai` dialect exists to render text turns (scenarios a
 The `anthropic` stub also serves an account-usage route (`GET /api/oauth/usage`) when the fixture
 file carries a top-level `usage` key (reset times are minutes-from-now, converted at request
 time); friring's info panel reaches it via `FRIRING_CLAUDE_USAGE_URL` — the demo recorder uses
-this so its clips show real usage gauges instead of "not logged in".
+this so its clips show real usage gauges instead of "not logged in", and the
+`claude-metrics-cli` scenario asserts `friring-cli usage` against it (seeding
+`$CLAUDE_CONFIG_DIR/.credentials.json`, without which the fetch reports "not logged in" and
+never reaches the stub at all).
 
 Strictness is enforced **at assert time, not response time**: an unmatched model call gets a
 benign marker reply (so the pane stays alive and debuggable) plus an `UNMATCHED` journal entry,

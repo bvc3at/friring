@@ -124,6 +124,21 @@ pub struct ActivityEvent {
 /// tool output never bloats the in-memory stream (char-boundary safe).
 pub const RESULT_HEAD_MAX: usize = 400;
 
+/// Trim trailing path separators so `/repo` and `/repo/` compare equal (the
+/// daemon records `--add-dir /repo/` but the worker `cwd` as `/repo`).
+///
+/// Lives here because both cwd-matching users are outside each other's reach:
+/// the providers' session binding (`crate::activity`) and the Claude
+/// workflow/worker attribution (`app::cc_activity`).
+pub fn normalize_dir(s: &str) -> String {
+    let t = s.trim_end_matches('/');
+    if t.is_empty() {
+        s.to_string()
+    } else {
+        t.to_string()
+    }
+}
+
 /// Truncate to at most `max` bytes on a char boundary, marking the cut.
 pub(crate) fn head(s: &str, max: usize) -> String {
     if s.len() <= max {

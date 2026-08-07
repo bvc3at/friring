@@ -84,6 +84,10 @@ const MODULE_RULES: &[ModuleRules] = &[
         allowed_path_only: &["agent"],
     },
     // Thin headless dispatch — must not depend on TUI or the live backend.
+    // `usage`/`proctable`/`activity` are the metrics sources behind
+    // `friring-cli usage` and `session resources`/`activity`: each reads the
+    // same source the TUI reads, so the commands work with no TUI running and
+    // nothing has to be cached into SQLite for them.
     ModuleRules {
         name: "cli",
         allowed: &[
@@ -93,8 +97,29 @@ const MODULE_RULES: &[ModuleRules] = &[
             "sync",
             "paths",
             "notifications",
+            "usage",
+            "proctable",
+            "activity",
         ],
         allowed_path_only: &["agent"],
+    },
+    // Agent-neutral activity: provider dispatch, on-disk source discovery, and
+    // the incremental scan. Pure record→event parsers live in
+    // `session::activity`; this is their filesystem glue. Split out of `app` so
+    // `cli` can reach it — the F9 view and `session activity` must not each
+    // carry their own copy of where every agent CLI keeps its transcripts.
+    ModuleRules {
+        name: "activity",
+        allowed: &["session", "paths"],
+        allowed_path_only: &[],
+    },
+    // Leaf side-effect module: the platform process-table read behind
+    // per-session memory. Shared by the TUI's background scan (`app::memory`)
+    // and `friring-cli session resources`, which cannot reach into `app`.
+    ModuleRules {
+        name: "proctable",
+        allowed: &["session"],
+        allowed_path_only: &[],
     },
     // Leaf utilities.
     ModuleRules {
@@ -539,6 +564,15 @@ fn util_modules_are_leaves() {
     for name in ["fuzzy", "paths", "shell", "workspace"] {
         assert_module_clean(name);
     }
+}
+
+/// The metrics sources `cli` reads directly. Both were split out of `app` so
+/// the headless commands could reach them; a reference back into `app` (or into
+/// `ui`) would re-couple them to the TUI and put the split back where it was.
+#[test]
+fn metrics_source_modules_stay_app_free() {
+    assert_module_clean("activity");
+    assert_module_clean("proctable");
 }
 
 #[test]

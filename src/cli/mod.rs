@@ -20,6 +20,7 @@ pub mod editor;
 pub mod extensions;
 pub mod identity;
 pub mod messages;
+pub mod metrics;
 pub mod notify;
 pub mod output;
 pub mod pane_guard;
@@ -104,6 +105,12 @@ pub enum Command {
     Update(update::UpdateArgs),
     /// Diagnose OS desktop notifications; `--test` fires a sample.
     Notify(notify::NotifyArgs),
+    /// Report account-level usage / rate-limit windows for an agent.
+    ///
+    /// Account-global, not per-session: the account is whichever credentials
+    /// live on the target host. Reaches the vendor, so it is the one metrics
+    /// command with real latency.
+    Usage(metrics::UsageArgs),
     /// Print the perf snapshot a running TUI publishes (FRIRING_PERF_LOG or
     /// the perf HUD must be active in that TUI).
     Perf,
@@ -159,6 +166,7 @@ pub fn run(cli: Cli, db: &Database) -> Result<(), String> {
         Command::Version(args) => Ok(version::run(args)),
         Command::Update(args) => Ok(update::run(args)),
         Command::Notify(args) => Ok(notify::run(args)),
+        Command::Usage(args) => metrics::run_usage(args, db),
         Command::Perf => perf::run(db),
     }?;
 

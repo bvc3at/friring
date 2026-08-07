@@ -40,7 +40,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(2_000);
 /// (Replace), so no bound source or byte offset is kept (the stat-signature gate
 /// lives in the shared [`super::SessionActivity`]).
 #[derive(Default)]
-pub(super) struct OpencodeSource {
+pub(crate) struct OpencodeSource {
     pub(super) events: Vec<ActivityEvent>,
     pub(super) meta: ActivityMeta,
     pub(super) truncated: bool,
@@ -50,7 +50,7 @@ pub(super) struct OpencodeSource {
 /// `opencode.db` path (see [`opencode_db_path`]); `own_id` is the opencode
 /// session id when known; `dirs` are the session's normalized candidate cwds.
 /// Returns whether the rebuilt view differs from the last one.
-pub(super) fn scan_opencode(
+pub(crate) fn scan_opencode(
     src: &mut OpencodeSource,
     sig: &mut u64,
     db: Option<&Path>,
@@ -204,7 +204,7 @@ fn load_events(conn: &Connection, session_id: &str) -> Option<(Vec<ActivityEvent
 /// `$OPENCODE_DB` wins (`:memory:` ⇒ no on-disk file; absolute ⇒ verbatim; a
 /// bare name ⇒ resolved under the data dir); otherwise the DB lives under
 /// `$XDG_DATA_HOME/opencode` → `~/.local/share/opencode`.
-pub(super) fn opencode_db_path(data_dir_override: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn opencode_db_path(data_dir_override: Option<&Path>) -> Option<PathBuf> {
     if let Some(dir) = data_dir_override {
         return Some(pick_db_file(dir));
     }

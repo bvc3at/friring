@@ -1,0 +1,38 @@
+{
+  "usage": {
+    "five_hour": { "utilization": 34, "resetsInMinutes": 161 },
+    "seven_day": { "utilization": 12, "resetsInMinutes": 5940 }
+  },
+  "responses": [
+    {
+      "name": "ambient",
+      "ambient": true,
+      "match": { "modelContains": "haiku" },
+      "reply": { "text": "ok" }
+    },
+    {
+      "name": "metrics-write-call",
+      "match": { "promptContains": "metrics-proof.txt", "hasToolResult": false },
+      "delayMs": 100,
+      "reply": {
+        "text": "Writing metrics-proof.txt now.",
+        "toolUse": {
+          "id": "toolu_e2e_metrics_1",
+          "name": "Write",
+          "input": {
+            "file_path": "{{WS}}/metrics-proof.txt",
+            "content": "metrics!\n"
+          }
+        }
+      }
+    },
+    {
+      "name": "after-metrics-write",
+      "match": { "toolResultFor": "toolu_e2e_metrics_1" },
+      "delayMs": 150,
+      "reply": {
+        "text": "METRICS-TURN-DONE — metrics-proof.txt was written by a real tool round-trip."
+      }
+    }
+  ]
+}

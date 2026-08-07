@@ -121,6 +121,22 @@ pub enum Action {
         /// Session UUID.
         uuid: String,
     },
+    /// Report a session's agent metrics (cost, tokens, context, code churn).
+    ///
+    /// Read from the agent's statusline JSON under `FRIRING_METRICS_DIR` —
+    /// Claude-only today, and local sessions only (friring never injects that
+    /// dir into a remote agent). Works with no TUI running.
+    Metrics(crate::cli::metrics::TargetArgs),
+    /// Report a session's agent process-tree memory (summed RSS + process count).
+    ///
+    /// Local sessions only: a remote session's tree lives on its host. Add
+    /// `--cpu` to also sample process CPU, which costs a short sampling delay.
+    Resources(crate::cli::metrics::ResourceArgs),
+    /// Report what a session's agent did (commands, edits, reads, tokens).
+    ///
+    /// Reconstructed from the agent CLI's own on-disk transcripts, the same
+    /// source the F9 activity view reads. Local sessions only.
+    Activity(crate::cli::metrics::TargetArgs),
     /// Report an agent lifecycle transition (called from an agent hook).
     ///
     /// Records the session's state so the TUI can render it (working/blocked/
@@ -370,6 +386,9 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
                 format!("Focus requested for '{}'.", session.name),
             ))
         }
+        Action::Metrics(target) => crate::cli::metrics::run_metrics(target, db),
+        Action::Resources(args) => crate::cli::metrics::run_resources(args, db),
+        Action::Activity(target) => crate::cli::metrics::run_activity(target, db),
         Action::Signal { state, session } => {
             let target = resolve_signal_target(db, session.as_deref())?;
             db.set_hook_state(target.id, &state)

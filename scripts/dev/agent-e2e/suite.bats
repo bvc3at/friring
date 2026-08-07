@@ -130,6 +130,11 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-activity-view"
 }
 
+@test "e2e: friring-cli reports statusline, resource, activity and usage metrics headlessly" {
+    require_agent claude
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/claude-metrics-cli"
+}
+
 @test "e2e: shell-script agent through the registry — template expansion, PTY input, resume restart" {
     require_agent scripted
     e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-registry-terminal"

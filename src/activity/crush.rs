@@ -41,7 +41,7 @@ const MAX_MESSAGES: usize = 50_000;
 /// Crush: the session's bound per-project `crush.db` and the [`CrushScan`]
 /// rebuilt from it each changed pass.
 #[derive(Default)]
-pub(super) struct CrushSource {
+pub(crate) struct CrushSource {
     pub(super) scan: CrushScan,
     /// The bound `crush.db` (sticky once discovered — the project doesn't move).
     db: Option<PathBuf>,
@@ -51,7 +51,7 @@ pub(super) struct CrushSource {
 /// Bind (or reuse) and re-read a Crush `crush.db`. Returns whether the parse
 /// changed. Mirrors [`super::scan_vibe`]'s contract: a stat-signature gate over
 /// the DB + sidecars, then a full re-parse (Replace) on any change.
-pub(super) fn scan_crush(
+pub(crate) fn scan_crush(
     src: &mut CrushSource,
     sig: &mut u64,
     dirs: &[String],

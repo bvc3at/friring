@@ -27,7 +27,7 @@ use super::tail_source;
 /// [`crate::paths::vibe_sessions_dir`]'s style; the env var relocates the whole
 /// home (a hardcoded `.gemini` is always appended). Resolved on the UI thread
 /// (env access) and passed to the scan thread.
-pub(in crate::app) fn gemini_root(home_override: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn gemini_root(home_override: Option<&Path>) -> Option<PathBuf> {
     let root = if let Some(p) = home_override {
         p.to_path_buf()
     } else if let Some(env) = std::env::var_os("GEMINI_CLI_HOME") {
@@ -42,7 +42,7 @@ pub(in crate::app) fn gemini_root(home_override: Option<&Path>) -> Option<PathBu
 /// cwd), the bound session file, its tail offset, and the newest file name
 /// seen at the last discovery (the rebind trigger).
 #[derive(Default)]
-pub(in crate::app) struct GeminiSource {
+pub(crate) struct GeminiSource {
     pub(super) scan: GeminiScan,
     chats_dir: Option<PathBuf>,
     file: Option<PathBuf>,
@@ -53,7 +53,7 @@ pub(in crate::app) struct GeminiSource {
 
 /// Bind (or rebind) and tail a Gemini chat transcript. Returns whether
 /// anything new was ingested.
-pub(in crate::app) fn scan_gemini(
+pub(crate) fn scan_gemini(
     src: &mut GeminiSource,
     sig: &mut u64,
     root: Option<&Path>,
@@ -120,13 +120,13 @@ fn resolve_chats_dir(root: &Path, dirs: &[String]) -> Option<PathBuf> {
 }
 
 /// The slug `projects.json` maps one of `dirs` to. Keys are absolute project
-/// paths (normalized to match [`super::super::cc_activity::normalize_dir`]'s
+/// paths (normalized to match [`crate::session::activity::normalize_dir`]'s
 /// trailing-slash trim on `dirs`).
 fn slug_for_dirs(projects_json: &str, dirs: &[String]) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(projects_json).ok()?;
     let map = v.get("projects")?.as_object()?;
     for (path, slug) in map {
-        if dirs.contains(&super::super::cc_activity::normalize_dir(path)) {
+        if dirs.contains(&crate::session::activity::normalize_dir(path)) {
             return slug.as_str().map(String::from);
         }
     }

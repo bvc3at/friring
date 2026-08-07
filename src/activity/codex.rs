@@ -30,7 +30,7 @@ const MAX_DAY_DIRS: usize = 45;
 /// newest-first. One file per thread for its whole life — a new thread in the
 /// same cwd (agent restart) appears as a newer file and rebinds.
 #[derive(Default)]
-pub(super) struct CodexSource {
+pub(crate) struct CodexSource {
     pub(super) scan: CodexScan,
     file: Option<PathBuf>,
     offset: u64,
@@ -43,7 +43,7 @@ pub(super) struct CodexSource {
 /// `home_override` is the test hook, mirroring
 /// [`crate::paths::vibe_sessions_dir`]'s `home_override`. Codex does not honour
 /// `XDG_*`, so only `CODEX_HOME` is consulted.
-pub(super) fn codex_sessions_dir(home_override: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn codex_sessions_dir(home_override: Option<&Path>) -> Option<PathBuf> {
     let home = if let Some(p) = home_override {
         p.to_path_buf()
     } else if let Some(env) = std::env::var_os("CODEX_HOME") {
@@ -56,7 +56,7 @@ pub(super) fn codex_sessions_dir(home_override: Option<&Path>) -> Option<PathBuf
 
 /// Bind (or rebind) and tail a Codex rollout. Returns whether anything new was
 /// ingested.
-pub(super) fn scan_codex(
+pub(crate) fn scan_codex(
     src: &mut CodexSource,
     sig: &mut u64,
     root: Option<&Path>,
@@ -130,7 +130,7 @@ fn discover_codex_file(root: &Path, dirs: &[String], own_id: Option<&str>) -> Op
         head_meta(p).is_some_and(|m| {
             m.parent_thread_id.is_none()
                 && m.cwd.is_some_and(|cwd| {
-                    dirs.contains(&super::super::cc_activity::normalize_dir(&cwd))
+                    dirs.contains(&crate::session::activity::normalize_dir(&cwd))
                 })
         })
     })

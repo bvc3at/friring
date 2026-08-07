@@ -81,6 +81,17 @@ between it and the `app` coordinator.
 - **`cli/`** — `friring-cli` subcommand dispatch (headless session ops +
   scheduling + the editor command), sharing the SQLite DB with the TUI but
   never importing `app`/`ui` (ADR-15).
+- **`activity/`** — agent-neutral activity: which provider reads a
+  session's records, where each agent CLI keeps them, and the incremental
+  stat-gated scan that turns them into the `session::activity` event
+  stream. Split out of `app` so `cli` can reach it; `app::activity` keeps
+  only the scan scheduling and the F9 view's row building (ADR-24).
+- **`proctable/`** — the platform process-table read (procfs walk / one
+  `ps` / `sysinfo`) behind per-session memory. Shared by `app::memory` and
+  `friring-cli session resources` (ADR-24); the parent→child index and
+  subtree sum stay pure in `session::memory`.
+- **`usage/`** — account-level rate-limit fetches per `(agent, host)`,
+  reading each vendor's credentials wherever the agent is logged in.
 
 **Mouse routing (per-frame click registry).** Mouse input is unified with
 the keyboard through one per-frame registry (`App::click_targets`,
@@ -1026,3 +1037,60 @@ VHS tape lines), so test and demo cannot drift apart.
 - *Putting the suite in cargo/nextest* — would drag tmux/node/claude
   into `cargo nextest --all` and the prek pre-commit hook, and fight the
   120s slow-timeout kill; the repo convention is shell harnesses.
+
+---
+
+## ADR-24: Agent metrics are read from source, never cached into SQLite
+
+**Decision**: `friring-cli`'s four metrics commands (`session
+metrics`/`resources`/`activity`, `usage`) re-read the **same sources the TUI
+reads** — the agent's statusline JSON, the machine's process table, the agent
+CLI's transcripts, the vendor usage API — instead of reading a value a running
+TUI published into the DB. The sources each got a module `cli` may reference
+(`activity`, `proctable`, `usage`), split out of `app` where two of them lived.
+
+**Why**:
+
+- **The CLI must work with no TUI running.** Sessions outlive the TUI inside
+  tmux; that is the product's premise. A published cache is empty exactly when
+  cron and scripts want these numbers — the failure mode `friring-cli perf`
+  already has ("No perf snapshot published"), acceptable for a debug command
+  about the render loop but not for what an agent is costing.
+- **A tick-rate write would spam every other instance.** The DB is the
+  multi-instance channel and peers detect writes with `PRAGMA data_version`
+  (ADR-7b); a metrics row written each metrics tick would bump every other
+  connection's version continuously and force a full shared-state reload on
+  each poll, defeating the throttle the perf counters exist to protect.
+  `App::publish_perf_snapshot` is gated behind `FRIRING_PERF_LOG`/the perf HUD
+  for exactly this reason.
+- **The TUI is not the source of truth for any of them** — it is another
+  reader. Persisting would cache a cache, and add staleness the CLI could not
+  detect.
+- **Coverage is identical either way.** The statusline dir is never injected
+  into a remote agent (`session_ops::inject_friring_env`), and the process
+  table and transcripts are local, so the TUI knows nothing extra about a
+  remote session.
+
+**Consequences**:
+
+- These commands have **no history**. The statusline file holds current totals
+  and is overwritten in place, so cost-over-time is not derivable. A trend
+  feature would be a deliberate separate sampler on a slow cadence (minutes),
+  driven headlessly rather than by the TUI.
+- CPU is opt-in (`--cpu`): it is a rate, so a one-shot process must sample
+  twice around a delay. Memory, being instantaneous, is always reported.
+- `session activity` parses a transcript from scratch where the TUI tails it
+  incrementally — the one command whose cost scales with history. It drains the
+  per-pass ingest budget in a bounded loop (`activity::scan_once`) and reports
+  when history is still incomplete rather than under-reporting silently.
+
+**Rejected**:
+
+- *A TUI-published snapshot in the `metadata` table* (the `perf` pattern) —
+  fails the no-TUI case and causes the `data_version` churn above.
+- *An IPC socket to the running TUI* — friring has no RPC surface by design;
+  the CLI and TUI are peers over SQLite, tmux and the filesystem, and adding a
+  daemon protocol for read-only numbers buys nothing the sources don't give.
+- *Duplicating source discovery in `cli`* — where every agent CLI keeps its
+  transcripts is the expensive, version-specific knowledge in this codebase;
+  two copies would drift. Hence the module split rather than a second reader.

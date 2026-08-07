@@ -22,7 +22,7 @@ const HISTORY_FILE: &str = ".aider.chat.history.md";
 /// launch dirs (or the `AIDER_CHAT_HISTORY_FILE` override) and tailed as an
 /// append-only source.
 #[derive(Default)]
-pub(super) struct AiderSource {
+pub(crate) struct AiderSource {
     pub(super) scan: AiderScan,
     path: Option<PathBuf>,
     offset: u64,
@@ -35,7 +35,7 @@ pub(super) struct AiderSource {
 /// time. `env_override` is the test hook, mirroring
 /// [`crate::paths::vibe_sessions_dir`]'s override style (env read on the UI
 /// thread, path consumed on the scan thread).
-pub(super) fn aider_history_override(env_override: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn aider_history_override(env_override: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = env_override {
         return Some(p.to_path_buf());
     }
@@ -44,7 +44,7 @@ pub(super) fn aider_history_override(env_override: Option<&Path>) -> Option<Path
 
 /// Bind (once) and tail the session's aider transcript. Returns whether
 /// anything new was ingested.
-pub(super) fn scan_aider(
+pub(crate) fn scan_aider(
     src: &mut AiderSource,
     sig: &mut u64,
     override_path: Option<&Path>,

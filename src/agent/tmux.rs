@@ -2411,16 +2411,77 @@ pub fn kill_window(session_name: &str) -> Result<()> {
 /// is a live process's cwd cannot be removed (`os error 32`); Unix permits it,
 /// so callers only need the returned pid on Windows.
 pub fn window_pane_pid(session_name: &str) -> Result<Option<u32>> {
+    let want = agent_window_name(session_name);
     let target = window_target(session_name);
-    let output = local_mux_command(&["display-message", "-p", "-t", &target, "#{pane_pid}"])
-        .output()
-        .context("Failed to run tmux display-message for pane pid")?;
+    // `#{window_name}` rides along so the answer can be validated: with an
+    // unresolvable `-t`, tmux does *not* fail — `display-message` falls back to
+    // the current client's pane and exits 0. Trusting that would report the
+    // caller's own pid (and, for a killing caller, reap the wrong process) for
+    // every window that is already gone.
+    let output = local_mux_command(&[
+        "display-message",
+        "-p",
+        "-t",
+        &target,
+        "#{window_name}\t#{pane_pid}",
+    ])
+    .output()
+    .context("Failed to run tmux display-message for pane pid")?;
     if !output.status.success() {
         // No such window (already torn down) — not an error for the caller.
         return Ok(None);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.trim().parse::<u32>().ok())
+    Ok(parse_validated_pane_pid(&stdout, &want))
+}
+
+/// Pure parser for [`window_pane_pid`]' `name\tpid` answer: the pid, but only
+/// when the reported window really is `want` — tmux's current-client fallback
+/// otherwise hands back an unrelated pane's pid.
+fn parse_validated_pane_pid(stdout: &str, want: &str) -> Option<u32> {
+    let (name, pid) = stdout.trim().split_once('\t')?;
+    if name != want {
+        return None;
+    }
+    pid.parse::<u32>().ok()
+}
+
+/// Pane pid of every live friring agent window on the local socket, keyed by
+/// **window name** (`tb-<sanitized session name>`) — look one up with
+/// `agent_window_name`, since the session→window mapping is lossy.
+///
+/// One `list-windows` for the whole server instead of a
+/// [`window_pane_pid`] round-trip per session — `friring-cli session
+/// resources --all` prices thirty sessions with one tmux call. A window that
+/// isn't in the map has no live pane, which is the answer, not an error.
+pub fn agent_window_pane_pids() -> Result<std::collections::HashMap<String, u32>> {
+    let output = local_mux_command(&["list-windows", "-a", "-F", "#{window_name}\t#{pane_pid}"])
+        .output()
+        .context("Failed to run tmux list-windows for pane pids")?;
+    if !output.status.success() {
+        // No server running: no panes, rather than an error.
+        return Ok(std::collections::HashMap::new());
+    }
+    Ok(parse_window_pane_pids(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Pure parser for [`agent_window_pane_pids`]' `name\tpid` listing.
+fn parse_window_pane_pids(stdout: &str) -> std::collections::HashMap<String, u32> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (name, pid) = line.trim().split_once('\t')?;
+            // Agent windows only: the `tbs-` shell companions run a plain
+            // shell, not the agent tree this prices. `tbs-` also starts with
+            // `tb`, so the prefix test must be the full `WINDOW_PREFIX`.
+            if !name.starts_with(WINDOW_PREFIX) {
+                return None;
+            }
+            Some((name.to_string(), pid.parse::<u32>().ok()?))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2429,6 +2490,43 @@ mod tests {
     use crate::agent::control_mode::{
         decode_octal, format_send_keys, parse_notification, shell_escape,
     };
+
+    #[test]
+    fn window_pane_pids_keeps_agent_windows_only() {
+        let map = parse_window_pane_pids(
+            "tb-alpha\t100\n\
+             tbs-alpha\t101\n\
+             zsh\t102\n\
+             tb-beta_gamma\t103\n\
+             tb-broken\tnotapid\n\
+             garbled line without a tab\n",
+        );
+        assert_eq!(map.get("tb-alpha"), Some(&100));
+        assert_eq!(map.get("tb-beta_gamma"), Some(&103));
+        // The shell companion shares the `tb` stem but runs a plain shell.
+        assert!(!map.contains_key("tbs-alpha"));
+        assert!(!map.contains_key("zsh"));
+        // An unparseable pid is dropped, not folded to 0 (which would price
+        // the whole machine as one session).
+        assert!(!map.contains_key("tb-broken"));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn validated_pane_pid_rejects_another_window() {
+        assert_eq!(
+            parse_validated_pane_pid("tb-alpha\t100\n", "tb-alpha"),
+            Some(100)
+        );
+        // tmux answers from the *current* client's pane (exit 0) when `-t`
+        // can't be resolved. Trusting it would reap an unrelated process.
+        assert_eq!(parse_validated_pane_pid("tb-beta\t100\n", "tb-alpha"), None);
+        assert_eq!(parse_validated_pane_pid("tb-alpha 100\n", "tb-alpha"), None);
+        assert_eq!(
+            parse_validated_pane_pid("tb-alpha\tnotapid\n", "tb-alpha"),
+            None
+        );
+    }
 
     /// A target whose host runs POSIX tmux (a WSL distro), whatever OS this
     /// build runs on — the script dialect follows the target, not the builder.

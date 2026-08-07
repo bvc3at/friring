@@ -29,7 +29,8 @@ friring-cli session list --parent <lead-uuid> --json | jq  # direct children onl
 ## Subcommands
 
 - **`session`** — create / list / get / delete / restore / restart / send /
-  capture / focus / signal.
+  capture / focus / signal, plus the per-session metrics readers
+  `metrics` / `resources` / `activity` (see Agent metrics below).
 - **`automation`** (alias `auto`) — create / list / show / dry-run / export /
   import / edit / remove / run / runs / tick. See the Automations section of
   `docs/FEATURES.md`, and the flag reference below.
@@ -58,8 +59,118 @@ friring-cli session list --parent <lead-uuid> --json | jq  # direct children onl
 - **`notify`** — diagnose OS desktop notifications: prints the detected delivery
   backend and last error; `--test` fires a sample. See the OS Notifications
   section of `docs/FEATURES.md`.
+- **`usage`** — account-level rate-limit windows for an agent (see Agent
+  metrics below).
 - **`perf`** — prints the perf snapshot a running TUI publishes while
   `FRIRING_PERF_LOG` or its perf HUD is active. See `docs/PERFORMANCE.md`.
+
+## Agent metrics
+
+Four commands expose what an agent is costing, in the four shapes friring
+collects. They differ from `perf` in the way that matters: `perf` reads a blob
+a *running TUI* publishes, while these read the **same sources the TUI reads**
+and therefore work with **no TUI running** — the normal case for cron and
+scripts, since sessions outlive the TUI inside tmux.
+
+| Command | Reports | Source |
+|---|---|---|
+| `session metrics [<uuid>\|--all]` | model, cost, token totals, context use, lines +/- | the agent's statusline JSON under `FRIRING_METRICS_DIR` |
+| `session resources [<uuid>\|--all] [--cpu]` | summed RSS + process count of the agent's process tree | the machine's process table, rooted at the pane pid |
+| `session activity [<uuid>\|--all]` | commands / edits / reads / subagents / tokens / touched files | the agent CLI's own transcripts (the F9 view's sources) |
+| `usage [--agent <name>]…` | account rate-limit windows, plan tier | the vendor's usage API on the target host |
+
+**Nothing is cached into SQLite.** Writing metrics on the TUI's tick cadence
+would bump every *other* friring connection's `data_version` and force a full
+shared-state reload on each poll — the reason `App::publish_perf_snapshot` is
+gated behind a debug flag. The sources are cheap, so each command re-reads
+them and is never stale. The consequence is that these commands have **no
+history**: the statusline file holds current totals and is overwritten in
+place, so cost-over-time is not derivable from them.
+
+Coverage matches the TUI's, including its gaps. All three per-session commands
+are **local-only** and report `null` with a `note` (never a zero) for a remote
+session: friring never injects `FRIRING_METRICS_DIR` into an ssh/wsl agent, and
+the process table and transcripts live on the host. `usage` is the exception —
+it reads credentials wherever they are, so `--host <name>` queries a host from
+`hosts.toml`. One gap is the CLI's own: `session activity` reads the session's
+**main transcript only** — the F9 view folds Claude subagent and workflow
+transcripts into its counts from the TUI's cc tree scan, which is TUI state, so
+delegated work is absent from the CLI's counts, files and tokens.
+
+Cost varies by three orders of magnitude, which is why these are separate
+commands rather than one: `metrics` is a file read, `resources` is one process
+sweep plus one tmux call for any number of sessions, `activity` parses the
+session's transcript from scratch, and `usage` reaches the network (and spawns
+`codex app-server` for codex). `usage` fetches its agents concurrently under a
+single `--timeout`.
+
+`--cpu` is opt-in on `resources` because CPU is a *rate*: it needs two samples,
+so it delays the command by `--cpu-sample-ms` (default 200). Memory is
+instantaneous and always reported.
+
+A single UUID returns the object (like `session get`); `--all` returns an array
+(like `session list`). Both carry `session_id`/`name`/`agent` per row, so an
+`--all` sweep needs no second call to identify rows.
+
+### Wiring the statusline (opt-in, and why friring can't do it for you)
+
+`session metrics` reads a file **the agent writes**, not one friring produces:
+friring injects `FRIRING_METRICS_DIR` and `FRIRING_SESSION_ID` into every local
+agent process (see `docs/CONFIG.md`) and reads back
+`$FRIRING_METRICS_DIR/$FRIRING_SESSION_ID.json`. Until something writes that
+file the command reports `no statusline metrics file written yet`.
+
+**Only this command needs it.** `session activity` already reports token
+tallies with no statusline at all — it reads the agent's transcript, which
+records per-message `usage`. What the transcript does *not* carry is
+`total_cost_usd` (Claude computes it client-side), the context-window
+percentages, and the lines +/- tally. Those four are the whole reason to wire a
+statusline; if you don't need them, skip this section.
+
+**Why the hooks extension can't just wire it.** friring auto-wires status
+*hooks* (`friring-cli session signal`) through a managed settings file passed
+as `--settings`, and that is safe because **hook entries merge across settings
+scopes** — ours are added to yours, never instead of them. `statusLine` is a
+single scalar object, and scalar settings **override**: the `--settings` scope
+outranks your `~/.claude/settings.json`, so a friring-managed statusline would
+silently replace whatever statusline you had, with no way to compose the two.
+Verified against claude 2.1.224 — with a user statusline and a `--settings`
+statusline both configured, only the `--settings` one renders. So this stays
+opt-in and hand-wired rather than becoming an extension that eats a UI surface
+you own.
+
+**The same caution applies to you.** Setting `statusLine` replaces your current
+one, so if you already have a statusline, add the two recording lines to *your*
+script rather than pasting this one over it. The payload is passed on stdin and
+your script's stdout is what renders, so recording it is additive — a statusline
+that saves the JSON and still prints your own content costs you nothing:
+
+```sh
+#!/bin/sh
+input=$(cat)
+# Record for `friring-cli session metrics`. Both vars are injected by friring
+# into local sessions only, so this is inert outside one.
+if [ -n "$FRIRING_METRICS_DIR" ] && [ -n "$FRIRING_SESSION_ID" ]; then
+    mkdir -p "$FRIRING_METRICS_DIR"
+    printf '%s' "$input" > "$FRIRING_METRICS_DIR/$FRIRING_SESSION_ID.json"
+fi
+# Whatever you want on screen — this is where your existing statusline goes.
+printf '%s' "$input" | jq -r '"[\(.model.display_name)] \(.workspace.current_dir)"'
+```
+
+Then point `statusLine` at it in `~/.claude/settings.json`:
+
+```json
+{ "statusLine": { "type": "command", "command": "~/.claude/friring-statusline.sh" } }
+```
+
+The `claude-metrics-cli` e2e scenario seeds this snippet's recording half, so
+the documented contract is asserted rather than assumed (`docs/E2E.md`).
+
+One field note: as of claude 2.1.132, `context_window.total_input_tokens` /
+`total_output_tokens` report *current context usage*, not cumulative session
+totals — so `session metrics` token columns track the live window, while
+`session activity` tokens are cumulative over the transcript.
 
 ## Typing into a session (the modal guard)
 

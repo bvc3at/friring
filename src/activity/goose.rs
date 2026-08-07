@@ -27,7 +27,7 @@ const MESSAGE_CAP: i64 = 50_000;
 /// goose scan state: the streaming parser (rebuilt on each re-parse), the
 /// session's activity metadata, and whether older turns were clipped.
 #[derive(Default)]
-pub(super) struct GooseSource {
+pub(crate) struct GooseSource {
     pub(super) scan: GooseScan,
     pub(super) meta: ActivityMeta,
     pub(super) truncated: bool,
@@ -38,7 +38,7 @@ pub(super) struct GooseSource {
 /// then a full Replace of the accumulator (goose rewrites rows in place, so
 /// there is no append-only offset to advance). Returns whether events/meta were
 /// refreshed this pass.
-pub(super) fn scan_goose(
+pub(crate) fn scan_goose(
     src: &mut GooseSource,
     sig: &mut u64,
     sessions_dir: Option<&Path>,
@@ -191,7 +191,7 @@ fn load_messages(conn: &Connection, session_id: &str, cap: i64) -> Option<(Goose
 /// `<root>/data/sessions`; otherwise `$XDG_DATA_HOME/goose/sessions` →
 /// `~/.local/share/goose/sessions`. `path_root_override` is the test hook,
 /// mirroring [`crate::paths::vibe_sessions_dir`]'s `home_override`.
-pub(super) fn goose_sessions_dir(path_root_override: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn goose_sessions_dir(path_root_override: Option<&Path>) -> Option<PathBuf> {
     if let Some(root) = path_root_override {
         return Some(root.join("data").join("sessions"));
     }
