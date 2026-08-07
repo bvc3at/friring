@@ -395,6 +395,13 @@ fn union_signature(owned: &[(PathBuf, Option<CcJobState>)]) -> u64 {
     let mut job_states: Vec<&CcJobState> = Vec::new();
     for (dir, job) in owned {
         collect_dir_items(dir, &mut items);
+        // The v2.1.220 completion record is a sibling of `subagents/`
+        // (`<session>/workflows/<run_id>.json`, see build_workflow), so a run
+        // that completes after the last write under `subagents/` would not
+        // move this hash and would stay cached as Running.
+        if let Some(session_dir) = dir.parent() {
+            collect_dir_items(&session_dir.join("workflows"), &mut items);
+        }
         if let Some(j) = job {
             job_states.push(j);
         }
