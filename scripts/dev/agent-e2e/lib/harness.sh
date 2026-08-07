@@ -562,6 +562,16 @@ assert_pane_contains() {
 $(e2e_pane)"
 }
 
+# Regex sibling of assert_pane_contains, for the patterns e2e_wait_pane waits
+# on: those go through `grep -q`, so a wait and an assert written against the
+# same pattern only agree if the assert matches as a regex too.
+assert_pane_matches() {
+    e2e_pane | grep -qE -- "$1" \
+        || e2e_die "pane does not match: $1
+--- pane ---
+$(e2e_pane)"
+}
+
 assert_ws_file_eq() {
     local f="$E2E_WS/$1"
     [ -f "$f" ] || e2e_die "workspace file missing: $1" || return 1

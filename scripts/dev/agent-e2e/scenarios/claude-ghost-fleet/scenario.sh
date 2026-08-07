@@ -174,7 +174,7 @@ scenario_assert_effects() {
 scenario_assert_ui() {
     assert_pane_contains "NO-DRIFT"
     # The info panel prices the whole process tree, not the pane process.
-    assert_pane_contains "RAM.*proc"
+    assert_pane_matches "RAM.*proc"
     # Every session kept its row, frozen or not.
     local n
     for n in 1 2 3 4; do
