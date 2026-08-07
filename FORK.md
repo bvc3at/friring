@@ -984,7 +984,7 @@ Deliberately **not** built: automation→automation chaining. See the design not
 at the end of `docs/FEATURES.md` § Automations for why multi-step prompts
 already cover the case it was meant to serve.
 
-#### Agent metrics on the headless CLI (August 2026)
+#### Agent metrics on the headless CLI
 
 Upstream collects four kinds of agent metrics and renders every one of them in
 the TUI info panel only; `friring-cli` exposed none of them (its `perf` command
@@ -1024,9 +1024,22 @@ Two supporting changes came with it:
   the window asked for. The bulk `agent_window_pane_pids` reads every pane pid
   in one `list-windows` so `--all` costs one tmux call.
 
+`session metrics` is the one command with a **user-side prerequisite**, and
+deliberately so. friring injects `FRIRING_METRICS_DIR` / `FRIRING_SESSION_ID`
+and reads back what the agent's own statusline writes there; it does not wire
+that statusline itself. It cannot without taking something away: the hooks
+extension can inject hooks through a managed `--settings` file because **hook
+entries merge across settings scopes**, but `statusLine` is a scalar setting
+that **overrides**, and `--settings` outranks the user's `settings.json` — so a
+managed statusline would silently replace whatever the user had (verified
+against claude 2.1.224). The other three commands need no setup, and
+`session activity` already covers token tallies from the transcript; the
+statusline adds only cost, context percentages and lines +/-. See
+`docs/CLI.md` § Wiring the statusline.
+
 Covered end to end by the `claude-metrics-cli` e2e scenario, which seeds the
-documented statusline snippet and asserts all four commands against a real
-Claude turn and the stub's usage route.
+documented statusline recording snippet and asserts all four commands against a
+real Claude turn and the stub's usage route.
 
 ### Behavior fixes
 

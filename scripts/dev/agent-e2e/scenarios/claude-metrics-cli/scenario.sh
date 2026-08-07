@@ -37,11 +37,16 @@ SCENARIO_DONE_PATTERN="METRICS-TURN-DONE"
 E2E_METRICS_DIR=""
 
 scenario_setup() {
-    # 1. The statusline producer. friring ships no statusline: it injects
-    #    FRIRING_METRICS_DIR + FRIRING_SESSION_ID and reads whatever the
-    #    agent's own statusline writes there. This is that user-side half,
-    #    kept identical to the snippet documented in docs/CLI.md — so this
-    #    scenario fails if the documented contract stops working.
+    # 1. The statusline producer. friring ships no statusline and cannot wire
+    #    one: `statusLine` is a scalar setting, so a managed --settings file
+    #    (how the hooks extension injects hooks, which *merge*) would silently
+    #    replace the user's own statusline instead of composing with it. So it
+    #    injects FRIRING_METRICS_DIR + FRIRING_SESSION_ID and reads whatever
+    #    the user's statusline writes there. This is that user-side half — the
+    #    recording lines are the ones documented in docs/CLI.md, so this
+    #    scenario fails if the documented contract stops working. (The doc's
+    #    snippet then prints the user's own content where this prints a
+    #    constant; only the recording half is the contract.)
     local statusline="$TBX_SANDBOX_ROOT/friring-statusline.sh"
     cat > "$statusline" <<'SL'
 #!/bin/sh

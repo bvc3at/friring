@@ -112,7 +112,7 @@ A single UUID returns the object (like `session get`); `--all` returns an array
 (like `session list`). Both carry `session_id`/`name`/`agent` per row, so an
 `--all` sweep needs no second call to identify rows.
 
-### Wiring the statusline
+### Wiring the statusline (opt-in, and why friring can't do it for you)
 
 `session metrics` reads a file **the agent writes**, not one friring produces:
 friring injects `FRIRING_METRICS_DIR` and `FRIRING_SESSION_ID` into every local
@@ -120,21 +120,57 @@ agent process (see `docs/CONFIG.md`) and reads back
 `$FRIRING_METRICS_DIR/$FRIRING_SESSION_ID.json`. Until something writes that
 file the command reports `no statusline metrics file written yet`.
 
-For Claude Code, point `statusLine` in `~/.claude/settings.json` at a script
-that saves its payload:
+**Only this command needs it.** `session activity` already reports token
+tallies with no statusline at all — it reads the agent's transcript, which
+records per-message `usage`. What the transcript does *not* carry is
+`total_cost_usd` (Claude computes it client-side), the context-window
+percentages, and the lines +/- tally. Those four are the whole reason to wire a
+statusline; if you don't need them, skip this section.
+
+**Why the hooks extension can't just wire it.** friring auto-wires status
+*hooks* (`friring-cli session signal`) through a managed settings file passed
+as `--settings`, and that is safe because **hook entries merge across settings
+scopes** — ours are added to yours, never instead of them. `statusLine` is a
+single scalar object, and scalar settings **override**: the `--settings` scope
+outranks your `~/.claude/settings.json`, so a friring-managed statusline would
+silently replace whatever statusline you had, with no way to compose the two.
+Verified against claude 2.1.224 — with a user statusline and a `--settings`
+statusline both configured, only the `--settings` one renders. So this stays
+opt-in and hand-wired rather than becoming an extension that eats a UI surface
+you own.
+
+**The same caution applies to you.** Setting `statusLine` replaces your current
+one, so if you already have a statusline, add the two recording lines to *your*
+script rather than pasting this one over it. The payload is passed on stdin and
+your script's stdout is what renders, so recording it is additive — a statusline
+that saves the JSON and still prints your own content costs you nothing:
 
 ```sh
 #!/bin/sh
 input=$(cat)
+# Record for `friring-cli session metrics`. Both vars are injected by friring
+# into local sessions only, so this is inert outside one.
 if [ -n "$FRIRING_METRICS_DIR" ] && [ -n "$FRIRING_SESSION_ID" ]; then
     mkdir -p "$FRIRING_METRICS_DIR"
     printf '%s' "$input" > "$FRIRING_METRICS_DIR/$FRIRING_SESSION_ID.json"
 fi
-printf 'friring'
+# Whatever you want on screen — this is where your existing statusline goes.
+printf '%s' "$input" | jq -r '"[\(.model.display_name)] \(.workspace.current_dir)"'
 ```
 
-The `claude-metrics-cli` e2e scenario seeds exactly this snippet, so the
-documented contract is asserted rather than assumed (`docs/E2E.md`).
+Then point `statusLine` at it in `~/.claude/settings.json`:
+
+```json
+{ "statusLine": { "type": "command", "command": "~/.claude/friring-statusline.sh" } }
+```
+
+The `claude-metrics-cli` e2e scenario seeds this snippet's recording half, so
+the documented contract is asserted rather than assumed (`docs/E2E.md`).
+
+One field note: as of claude 2.1.132, `context_window.total_input_tokens` /
+`total_output_tokens` report *current context usage*, not cumulative session
+totals — so `session metrics` token columns track the live window, while
+`session activity` tokens are cumulative over the transcript.
 
 ## Typing into a session (the modal guard)
 
