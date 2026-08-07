@@ -847,7 +847,7 @@ siblings in the steps therefore starts on a different session, with a different
 focus, in each mode — so it precreates one session, waits on the footer's focus
 field, and jumps to a known row before its first relative move.
 
-**Six of the clips ship; the rest were recorded and left out.** They live in
+**Seven of the clips ship; the rest were recorded and left out.** They live in
 `docs/media/fork/`, each linked from the doc it illustrates — the ghost fleet,
 the F9 activity view and the leader key from `docs/FEATURES.md`, the named
 workspace and the review handoff from the two sections above, and the pair of
