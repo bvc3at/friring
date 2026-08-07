@@ -3,7 +3,9 @@
 # Real-agent e2e harness core — sourced by suite.bats (test mode) and run.sh
 # (demo mode). One scenario description (scenario.sh) drives both: the step_*
 # primitives either drive the live TUI through a driver tmux and poll for
-# results (test mode), or emit a VHS .tape (demo mode). See docs/E2E.md.
+# results (test mode), or emit a .tape that scripts/demo/lib/drive-tape.mjs
+# replays into that same driver tmux while asciinema films it (demo mode).
+# See docs/E2E.md.
 #
 # Hermeticity: everything runs under scripts/dev/lib/sandbox-env.sh
 # `tbx_sandbox_init_full fresh` (throwaway HOME/XDG/TMUX_TMPDIR), the model API
@@ -18,11 +20,40 @@ REPO_ROOT="$(cd "$AGENT_E2E_DIR/../../.." && pwd)"
 # sandbox's private TMUX_TMPDIR, so it can never collide with a real server.
 E2E_DRIVER_SOCKET="agent-e2e-driver"
 E2E_DRIVER_SESSION="agent-e2e"
+# Second server, demo mode only: asciinema needs a real tty, so it runs in a
+# pane here and records a *client attached to* the driver session — i.e. the
+# bytes a real terminal would receive. Same split as scripts/demo/record.sh.
+E2E_CAST_SOCKET="agent-e2e-cast"
+E2E_CAST_SESSION="rec"
+
+# Render settings for demo mode. Deliberately identical to the values in
+# scripts/demo/record.sh (which the shipped docs/media clips use) so a
+# generated clip and a hand-written one are the same product on screen —
+# change them together. Font size and family drive agg's rasterization;
+# the palette is Catppuccin Mocha's bg,fg + 16 ANSI slots, which is what the
+# agent panes' default-coloured text lands on (friring paints its own theme
+# in truecolor over it).
+E2E_DEMO_FONT="Meslo LG S"
+E2E_DEMO_FONT_SIZE=18
+E2E_DEMO_PALETTE="1e1e2e,cdd6f4,45475a,f38ba8,a6e3a1,f9e2af,89b4fa,f5c2e7,94e2d5,bac2de,585b70,f38ba8,a6e3a1,f9e2af,89b4fa,f5c2e7,94e2d5,a6adc8"
+# --font-dir flags for agg, filled by e2e_require_tools BEFORE the sandbox
+# replaces $HOME: a font is a host resource, not part of what we isolate, and
+# agg resolving nothing would silently render in a fallback face.
+E2E_DEMO_FONT_DIRS=""
+# Milliseconds per typed character. VHS's default (which drive-tape.mjs
+# inherits) is 50ms, tuned for the hand-written tapes where a prompt is one
+# short line. A scenario prompt is a whole sentence of agent instruction, and
+# at 50ms those read as a paragraph being dictated. Fast enough to feel like
+# someone who knows what they are typing, slow enough to still be typing:
+# about two characters per rendered frame at agg's 30fps cap.
+E2E_DEMO_TYPING_MS=16
+# The gap between the leader and the key that names its action — see
+# step_leader.
+E2E_DEMO_LEADER_BEAT="350ms"
 
 E2E_MODE="test"
 E2E_STUB_PID=""
 E2E_TAPE=""
-E2E_TAPE_ERR=""
 
 e2e_log() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 e2e_die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; return 1; }
@@ -55,11 +86,36 @@ e2e_require_tools() {
         missing=" timeout"
     fi
     local tools="tmux node jq git curl"
-    [ "$mode" = "demo" ] && tools="$tools vhs sqlite3"
+    [ "$mode" = "demo" ] && tools="$tools asciinema agg ffmpeg sqlite3"
     for t in $tools; do
         command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
     done
     [ -z "$missing" ] || e2e_die "missing required tool(s):$missing"
+    [ "$mode" = "demo" ] || return 0
+
+    # Host font dirs, captured while $HOME is still the real one (this runs
+    # before e2e_boot's sandbox init) — see E2E_DEMO_FONT_DIRS.
+    local fd
+    for fd in "$HOME/Library/Fonts" /Library/Fonts "$HOME/.local/share/fonts" \
+        /usr/share/fonts /usr/local/share/fonts; do
+        [ -d "$fd" ] && E2E_DEMO_FONT_DIRS="$E2E_DEMO_FONT_DIRS --font-dir $fd"
+    done
+    # Ask agg what it would pick rather than probing the system: it resolves
+    # families itself and falls back silently when one is missing, which is how
+    # the shipped media's typography drifted with the recording box before.
+    # A one-event cast is enough to make it report.
+    local probe picked
+    probe="$(mktemp -d "${TMPDIR:-/tmp}/friring-font.XXXXXX")"
+    printf '{"version": 2, "width": 20, "height": 3}\n[0.0, "o", "probe"]\n' > "$probe/p.cast"
+    # shellcheck disable=SC2086  # E2E_DEMO_FONT_DIRS is a pre-split flag list
+    picked="$(agg "$probe/p.cast" "$probe/p.gif" --fps-cap 1 $E2E_DEMO_FONT_DIRS \
+        --text-font-family "$E2E_DEMO_FONT" -v 2>&1 \
+        | sed -n 's/.*primary text font family: //p' | head -1)"
+    find "$probe" -depth -delete 2>/dev/null || true
+    [ "$picked" = "$E2E_DEMO_FONT" ] || e2e_die \
+        "demo font '$E2E_DEMO_FONT' is not installed (agg would use '${picked:-none}')
+  macOS:  brew install --cask font-meslo-lg
+  nix:    it is in the flake's demoTools"
 }
 
 # ---------------------------------------------------------------------------
@@ -77,20 +133,26 @@ e2e_scenario_load() {
     SCENARIO_COLS=120
     SCENARIO_ROWS=40
     SCENARIO_PRECREATE=1
+    # What the precreated session is called. Defaults to the scenario name,
+    # which is right for a scenario with one session and wrong for a fleet:
+    # its siblings are named by the steps, and `claude-ghost-fleet` sitting
+    # above `ring-02` reads as an accident. It is also the name the app puts
+    # on screen, so it is part of what a clip shows.
+    SCENARIO_SESSION_NAME=""
     SCENARIO_REQUIRE_ALL_FIXTURES=1
     # Every generated demo films the same theme, so a set of clips reads as one
     # product rather than a screenshot pile. A scenario overrides it only when
     # the theme itself is the subject (scripted-theme-settings picks its own).
     SCENARIO_DEMO_THEME="doom"
-    # Demo-mode key substitutions, `<tmux key>=<tmux key>…`, for keys VHS
-    # cannot express (F-keys, `Alt+<digit>`, `Ctrl+/`). The fork's leader is
-    # usually the equivalent route — `F9=C-f v` reaches the activity view the
-    # way `<leader> v` does — but whether a substitution preserves what the
-    # clip *shows* is a judgement the scenario has to make, never one the
-    # harness may assume: scripted-info-keybind presses F2 to prove it does
-    # nothing, so routing it to the same action's leader key would record the
-    # opposite of the feature. Declaring nothing leaves the scenario
-    # test-only, and `--demo` names the key that stopped it.
+    # Demo-mode key substitutions, `<tmux key>=<tmux key>…`. Editorial, not a
+    # workaround: the demo can press anything the test can, so this exists for
+    # the case where a second route to the same action *films* better. An Alt
+    # chord is invisible — `M-u=C-f U` unloads through the fork's leader
+    # instead, and the which-key overlay shows the viewer what was pressed.
+    # Whether a substitution preserves what the clip shows is always the
+    # scenario's judgement, never the harness's: scripted-info-keybind presses
+    # F2 to prove it does nothing, so routing it to the same action's leader
+    # key would record the opposite of the feature.
     SCENARIO_DEMO_KEYS=()
     SCENARIO_PROMPT=""
     SCENARIO_AGENT_READY=""
@@ -288,7 +350,7 @@ e2e_session_create() {
     local out
     # 3>&-: this is what boots the friring-dev tmux server (bats fd-3 guard,
     # see the TUI launch above).
-    out="$(friring-cli --json session create --name "$E2E_SCENARIO_NAME" \
+    out="$(friring-cli --json session create --name "${SCENARIO_SESSION_NAME:-$E2E_SCENARIO_NAME}" \
         --repo-path "$E2E_WS" --agent "$AGENT_NAME" 3>&-)" \
         || e2e_die "session create failed: $out" || return 1
     E2E_SESSION_ID="$(printf '%s' "$out" | jq -r '.id')"
@@ -298,54 +360,41 @@ e2e_session_create() {
 
 # ---------------------------------------------------------------------------
 # Step primitives — the scenario's shared vocabulary. Test mode drives the
-# driver tmux and polls; demo mode appends VHS tape lines.
+# driver tmux and polls; demo mode appends tape lines that do the same thing
+# later, when the driver replays them on camera.
 
-# One tmux key name -> the VHS tape line that presses it. Prints the line;
-# returns 1 for a key VHS cannot press, which needs a SCENARIO_DEMO_KEYS route
-# or leaves the scenario test-only.
-#
-# The accepted set was established by capturing what vhs 0.11.0 actually writes
-# to a pty (`stty raw; cat > file`), not from its grammar — the two disagree,
-# and only one of them is what the app receives:
-#
-#   Ctrl+<letter>       0x01-0x1a          ✔
-#   Ctrl+^ \ [ ] - @ .  the control byte   ✔  (no other punctuation; no `Ctrl+/`)
-#   Shift+<letter>      the capital        ✔  (so a bare `J` covers it)
-#   Escape Tab Enter …  ✔
-#   Alt+<letter>        the BARE CAPITAL — no ESC prefix. Accepted by the
-#                       parser, so a mapping here would silently type `U` into
-#                       the agent instead of unloading a session.
-#   Ctrl+Alt+<letter>   NOTHING AT ALL — parsed, then dropped.
-#   Alt+<digit>, F-keys rejected by the parser.
-#
-# So every Alt chord demos through the fork's leader (`<leader> U` for Alt+U),
-# which is a real second route to the same action rather than a workaround.
-_vhs_key_line() {
-    case "$1" in
-        Enter|Escape|Tab|Space|Up|Down|Left|Right|PageUp|PageDown|Backspace|Delete|Insert)
-            printf '%s\n' "$1" ;;
-        # Uppercase the letter: VHS's canonical chord form is `Ctrl+N`.
-        C-[a-zA-Z]) printf 'Ctrl+%s\n' "$(printf '%s' "${1#C-}" | tr '[:lower:]' '[:upper:]')" ;;
-        'C-^'|'C-['|'C-]'|'C--'|'C-@'|'C-.'|C-[\\]) printf 'Ctrl+%s\n' "${1#C-}" ;;
-        # A bare key is that character typed — including the uppercase letters
-        # tmux uses for `Shift+<letter>` (`J`). Single character only: a longer
-        # name is one VHS lacks (F-keys, Home/End), and typing it literally
-        # would silently record nonsense.
-        ?) printf 'Type "%s"\n' "$1" ;;
-        *) return 1 ;;
-    esac
-}
-
-# The tape lines for a key, honoring the scenario's demo-mode substitutions.
-_vhs_key_lines() {
-    local want="$1" entry sub="" k
+# The tape lines that press one key, honoring the scenario's demo-mode
+# substitutions. `Key <name>` hands the tmux key name straight through to
+# drive-tape.mjs, which sends it with `tmux send-keys` — the same call test
+# mode makes below. There is deliberately no translation table: the demo
+# presses exactly what the asserting test presses, and a name tmux does not
+# know fails the recording rather than recording something else.
+_demo_key_lines() {
+    local want="$1" entry sub="" k first=1
     for entry in ${SCENARIO_DEMO_KEYS[@]+"${SCENARIO_DEMO_KEYS[@]}"}; do
         [ "${entry%%=*}" = "$want" ] && sub="${entry#*=}"
     done
-    [ -n "$sub" ] || { _vhs_key_line "$want"; return $?; }
-    for k in $sub; do
-        _vhs_key_line "$k" || return 1
+    for k in ${sub:-$want}; do
+        # A beat between the keys of a substitution — see step_leader. Every
+        # multi-key route is a leader chord, and the app has to see the two as
+        # two events.
+        [ "$first" = "1" ] || printf 'Sleep %s\n' "$E2E_DEMO_LEADER_BEAT"
+        first=0
+        printf 'Key %s\n' "$k"
     done
+}
+
+# Press the fork's leader (`Ctrl+F`) and then the key that names the action.
+#
+# The beat between them is load-bearing, not pacing. Test mode gets one for
+# free — every step_key is its own `tmux send-keys` process — and a tape does
+# not, so the two keystrokes arrive back to back and the chord does not land.
+# It is also the only reason the which-key overlay the leader opens is ever on
+# camera; scripts/demo's hand-written tapes sleep 500ms in the same place.
+step_leader() {
+    step_key C-f
+    step_sleep "$E2E_DEMO_LEADER_BEAT"
+    step_key "$1"
 }
 
 step_type() {
@@ -360,16 +409,7 @@ step_type() {
 
 step_key() {
     if [ "$E2E_MODE" = "demo" ]; then
-        local lines
-        # A scenario's steps are a flat list with no error checking, so a
-        # `return 1` here would be swallowed and the keypress would simply go
-        # missing from the tape — a recording that runs to completion showing
-        # the wrong thing. Flag it for e2e_emit_tape to fail on instead.
-        lines="$(_vhs_key_lines "$1")" || {
-            E2E_TAPE_ERR="${E2E_TAPE_ERR}key '$1' has no VHS mapping and no SCENARIO_DEMO_KEYS route"$'\n'
-            return 1
-        }
-        printf '%s\n' "$lines" >> "$E2E_TAPE"
+        _demo_key_lines "$1" >> "$E2E_TAPE"
     else
         tmux -L "$E2E_DRIVER_SOCKET" send-keys -t "$E2E_DRIVER_SESSION" "$1"
     fi
@@ -381,36 +421,42 @@ step_key() {
 # as recording rhythm.
 step_sleep() {
     if [ "$E2E_MODE" = "demo" ]; then
-        printf 'Sleep %ss\n' "$1" >> "$E2E_TAPE"
+        # Verbatim, so a beat can be sub-second (`400ms`); a bare number is
+        # seconds, which is how every scenario already spells it.
+        printf 'Sleep %s\n' "$1" >> "$E2E_TAPE"
     fi
 }
 
-# Wait until the rendered TUI shows $1 (grep pattern in test mode; VHS
-# Wait+Screen regex in demo mode). The one synchronization primitive both
-# modes share — no open-loop sleeps around agent latency.
+# Wait until the rendered TUI shows $1 (grep pattern in test mode; a
+# drive-tape.mjs `Wait /re/` in demo mode). The one synchronization primitive
+# both modes share — no open-loop sleeps around agent latency. Both poll the
+# same pane through `tmux capture-pane`, so a wait that holds in the test
+# holds in the recording, and a wait that never resolves fails BOTH (vhs used
+# to record a clip that ran to completion showing the wrong thing).
 step_wait_pane() {
     local pattern="$1" timeout="${2:-30}"
     if [ "$E2E_MODE" = "demo" ]; then
-        # Test mode greps (POSIX BRE); VHS matches a Go (RE2) regexp delimited
-        # by /…/. Translate rather than flatten to a literal: the two dialects
-        # already agree on everything these patterns use — `.`, `.*`, and the
-        # `\[`/`\]` a BRE needs for a literal bracket are spelled the same in
-        # RE2 — so escaping wholesale silently broke every wait a scenario
-        # meant as a regex. Only the characters BRE takes literally and RE2
-        # does not need escaping, or a pane title like `Edited (1)` becomes a
-        # capture group matching `Edited 1`. `/` is escaped because it
-        # delimits. A pattern with a bare unbalanced `[` would still make
-        # invalid RE2 — vhs then fails the recording loudly, which is the
-        # right failure.
+        # Test mode greps (POSIX BRE); drive-tape.mjs builds a JS RegExp from
+        # what sits between the /…/. Translate rather than flatten to a
+        # literal: the two dialects already agree on everything these patterns
+        # use — `.`, `.*`, and the `\[`/`\]` a BRE needs for a literal bracket
+        # are spelled the same in JS — so escaping wholesale silently broke
+        # every wait a scenario meant as a regex. Only the characters BRE takes
+        # literally and JS does not need escaping, or a pane title like
+        # `Edited (1)` becomes a capture group matching `Edited 1`. `/` is
+        # escaped because it delimits. A pattern with a bare unbalanced `[`
+        # would still make an invalid RegExp — the driver then fails the
+        # recording loudly, which is the right failure.
         local esc
         esc="$(printf '%s' "$pattern" | sed 's#[/+?(){}|]#\\&#g')"
-        # vhs captures no frames while `Wait` blocks — a tape that synchronizes
-        # on ten waits and sleeps twice records as a two-second jump-cut past
-        # everything the app was doing. The wait still does the synchronizing;
-        # this dwell is what puts the state it waited for on screen. Keep it
-        # under the 1s max-held-frame budget: consecutive waits that land on
-        # one screen add up, and only a `step_sleep` should ever hold longer.
-        printf 'Wait+Screen@%ss /%s/\nSleep 600ms\n' "$timeout" "$esc" >> "$E2E_TAPE"
+        # Hold on what the wait resolved on. asciinema films the wait itself
+        # (the clip carries the app's real latency, spinners and all), but it
+        # ends the instant the marker paints — so without this the frame the
+        # scenario waited for is on screen for as long as it takes to send the
+        # next key. Keep it under the 1s max-held-frame budget: consecutive
+        # waits that land on one screen add up, and only a `step_sleep` should
+        # ever hold longer.
+        printf 'Wait /%s/ %ss\nSleep 300ms\n' "$esc" "$timeout" >> "$E2E_TAPE"
     else
         e2e_wait_pane "$pattern" "$((timeout * 10))" \
             || e2e_die "timed out waiting for pane: $pattern"
@@ -425,11 +471,15 @@ step_wait_pane() {
 # too. Status hooks are a per-agent capability, not a framework guarantee —
 # the profile must declare AGENT_HAS_STATUS_HOOKS=1 to use this. Demo mode
 # has no DB probe; the state flip has no fixed visual anchor, so pace with a
-# short sleep instead.
+# short beat instead ($3 overrides it). Deliberately short: this is a guess,
+# not a wait, and in every scenario that uses it a real `step_wait_pane` on
+# the turn's own marker follows within a step or two — which now films the
+# agent working for exactly as long as it works. A two-second guess on top of
+# that is a held frame, not pacing.
 step_wait_state() {
     local want="$1" timeout="${2:-30}"
     if [ "$E2E_MODE" = "demo" ]; then
-        printf 'Sleep %ss\n' "${3:-2}" >> "$E2E_TAPE"
+        printf 'Sleep %s\n' "${3:-400ms}" >> "$E2E_TAPE"
         return 0
     fi
     [ "${AGENT_HAS_STATUS_HOOKS:-0}" = "1" ] \
@@ -563,68 +613,31 @@ e2e_perf_report() {
 }
 
 # ---------------------------------------------------------------------------
-# Emit a record.sh-compatible .tape from the scenario's steps into $1, WITHOUT
+# Emit a drive-tape.mjs .tape from the scenario's steps into $1, WITHOUT
 # booting anything real: the demo-mode step_* primitives are pure string
 # mapping, so this needs only a loaded scenario (e2e_scenario_load). It is the
 # testable seam for the demo path and backs `run.sh --emit-tape` (preview a
-# tape offline). The Set block mirrors scripts/demo/*.tape so generated demos
-# match the hand-written ones frame-for-frame; Output paths are relative
-# because vhs runs from the repo root and its parser rejects absolute paths.
+# tape offline).
+#
+# No `Hide … Show` launch preamble and no framerate: the recorder boots the
+# TUI itself (it has to — recording attaches to an already-running session),
+# and agg renders the cast offline at a 30fps cap, so there is no live capture
+# to starve and nothing to derive a rate from. Output paths are relative
+# because the render runs from the repo root.
 e2e_emit_tape() {
     E2E_MODE=demo
     E2E_TAPE="$1"
-    E2E_TAPE_ERR=""
     mkdir -p "$(dirname "$E2E_TAPE")"
-    # VHS sizes the canvas in pixels, so derive it from the columns/rows the
-    # scenario was written against at the standard demo font — the default
-    # 120x40 reproduces scripts/demo's 1920x1080 exactly, and a scenario that
-    # asks for a wider pane gets one instead of silently recording against a
-    # narrower screen (which truncates the very text its waits look for).
-    local width=$((SCENARIO_COLS * 16)) height=$((SCENARIO_ROWS * 27))
-    # …and cap the framerate to what screenshotting that canvas can sustain.
-    # vhs captures through headless Chromium but writes the gif at the nominal
-    # rate regardless, so a starved capture does not drop quality — it makes
-    # the clip *play back sped up*: at the default rate, 8s of scripted Sleep
-    # recorded as 0.84s (21 frames) at 1920x1080. Measured sustainable rates
-    # were ~5 fps at 1920x1080 and ~3 fps at 3520x1080 — near enough a constant
-    # pixel-rate budget, kept deliberately under the measured ceiling because
-    # under-shooting only costs smoothness while over-shooting silently
-    # compresses time. `scripts/demo`'s own tapes need none of this: agg
-    # renders them offline from an asciicast, with no capture to starve.
-    local fps=$((9000000 / (width * height)))
-    [ "$fps" -ge 2 ] || fps=2
     cat > "$E2E_TAPE" <<EOF
 Output target/agent-e2e/demos/$E2E_SCENARIO_NAME.gif
 Output target/agent-e2e/demos/$E2E_SCENARIO_NAME.mp4
 
-Set Shell "bash"
-Set FontSize 18
-Set Width $width
-Set Height $height
-Set Framerate $fps
-Set Padding 16
-Set Theme "Catppuccin Mocha"
-Set PlaybackSpeed 1.0
-Set WaitTimeout 60s
-
-Hide
-Type \`exec "\$FRIRING_BIN"\`
-Enter
-Sleep 2s
-Show
-Sleep 1s
+Set FontSize $E2E_DEMO_FONT_SIZE
+Set Cols $SCENARIO_COLS
+Set Rows $SCENARIO_ROWS
+Set Theme "$SCENARIO_DEMO_THEME"
 EOF
-    scenario_steps
-    local steps_rc=$?
-    # An unmappable key can't fail the flat step list (see step_key), so the
-    # tape is only trustworthy once every step got written. Checked ahead of
-    # the steps' own status: a bad key *is* a non-zero return when it happens
-    # to be the last step, and reporting only "steps failed" would bury the
-    # one line that says which key and why.
-    [ -z "$E2E_TAPE_ERR" ] \
-        || e2e_die "$E2E_SCENARIO_NAME is not demoable:
-$E2E_TAPE_ERR" || return 1
-    [ "$steps_rc" -eq 0 ] || return 1
+    scenario_steps || return 1
     # Closing beat: linger on the last frame. Deliberately no `Ctrl+Q` — quitting
     # inside the recording ends every clip on ~1s of bare shell (measured at
     # 0.07-0.09% ink, which check-pacing.mjs rejects as a leaked teardown). The
@@ -635,11 +648,26 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Demo mode: boot the hermetic env, generate the tape (e2e_emit_tape), then run
-# vhs inside the (already exported) env.
+# Demo mode: boot the hermetic env, generate the tape (e2e_emit_tape), then
+# record and render it the way scripts/demo/record.sh records the shipped
+# clips — asciinema captures the TUI's terminal *byte stream* and agg renders
+# it offline.
+#
+# This is not an implementation detail. Grabbing pixels off a live GUI (vhs's
+# model) costs real time per frame, so the capture starves the moment the box
+# cannot rasterize fast enough, and vhs writes the gif at the nominal rate
+# regardless: the clip does not lose quality, it plays back sped up. At
+# 1920x1080 that meant a sustainable ~5fps, which had to be pinned per-canvas
+# from a measured pixel budget — and 5fps is also why typing arrived in visible
+# chunks of five or six characters. Capturing bytes costs nothing, so every
+# paint friring emits is kept with its true timestamp and the render can take
+# as long as it likes.
 e2e_demo_record() {
     local out_dir="$REPO_ROOT/target/agent-e2e/demos"
     mkdir -p "$out_dir"
+    local gif="$out_dir/$E2E_SCENARIO_NAME.gif"
+    local mp4="$out_dir/$E2E_SCENARIO_NAME.mp4"
+    local cast="$TBX_SANDBOX_ROOT/$E2E_SCENARIO_NAME.cast"
 
     # Mirror the three drive depths: apply the scenario's uncommitted workspace
     # edit before recording (the boot already ran via `e2e_boot demo` in run.sh).
@@ -652,27 +680,100 @@ e2e_demo_record() {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value"
     fi
 
+    # Generate BEFORE the TUI starts. A scenario's steps are a flat list, and
+    # anything in it that is not a step_* runs here rather than on camera —
+    # `friring-cli session create` for the extra sessions a fleet scenario
+    # needs, a mid-step id probe. Off camera and before boot is the one
+    # placement where that is predictable: the TUI opens on the state those
+    # commands left behind, instead of racing them mid-clip.
     # Tape lives in the throwaway sandbox during recording.
     e2e_emit_tape "$TBX_SANDBOX_ROOT/$E2E_SCENARIO_NAME.tape" || return 1
+
+    # Boot the TUI off camera, at the size the scenario was written against.
+    tmux -L "$E2E_DRIVER_SOCKET" new-session -d -s "$E2E_DRIVER_SESSION" \
+        -x "$SCENARIO_COLS" -y "$SCENARIO_ROWS" "$FRIRING_BIN" 3>&-
+    # No status bar: an attached client renders one, so it would be filmed.
+    tmux -L "$E2E_DRIVER_SOCKET" set -g status off
+    e2e_wait_pane "friring" 300 || e2e_die "TUI did not boot" || return 1
+
     e2e_log "recording $E2E_SCENARIO_NAME ($(basename "$E2E_TAPE"))"
-    # vhs renders through a headless Chromium (go-rod): use the system browser
-    # if present, else let rod download one into a cache that survives the
-    # throwaway sandbox (XDG_CACHE_HOME points into the sandbox). Dropping the
-    # dead-proxy vars here does NOT weaken the agent's offline guarantee — the
-    # agent pane env was frozen into the friring-dev tmux server at session
-    # create, before vhs starts; only vhs's own tooling gets network.
-    local vhs_cache="$REPO_ROOT/target/agent-e2e/cache"
-    mkdir -p "$vhs_cache"
-    # go-rod caches that browser under `$HOME/.cache/rod` and does NOT honor
-    # the XDG_CACHE_HOME handed to vhs below — and $HOME is the throwaway
-    # sandbox, so every single recording would re-download ~150MB. Point just
-    # that path at a repo-persistent cache; the sandbox stays hermetic because
-    # only vhs's own browser lives there, and the agent's env was frozen into
-    # the tmux server long before.
-    mkdir -p "$vhs_cache/rod" "$HOME/.cache"
-    ln -sfn "$vhs_cache/rod" "$HOME/.cache/rod"
-    ( cd "$REPO_ROOT" && env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
-        XDG_CACHE_HOME="$vhs_cache" vhs "$E2E_TAPE" )
+    # asciinema needs a real tty, which a script has no way to hand it, so it
+    # runs inside its own tmux pane and records an attached client of the
+    # driver session — i.e. exactly the bytes a real terminal would receive.
+    tmux -L "$E2E_CAST_SOCKET" new-session -d -s "$E2E_CAST_SESSION" \
+        -x "$SCENARIO_COLS" -y "$SCENARIO_ROWS" \
+        "asciinema rec '$cast' --overwrite -f asciicast-v2 \
+            --command 'tmux -L $E2E_DRIVER_SOCKET attach -t $E2E_DRIVER_SESSION'" 3>&-
+    tmux -L "$E2E_CAST_SOCKET" set -g status off
+
+    # Wait for the attached client to paint one settled frame — do NOT sleep a
+    # fixed amount. asciinema is recording from the moment the attach starts,
+    # so every millisecond spent waiting is filmed, and it lands on the opening
+    # frame where it costs the most. Two identical consecutive captures mean
+    # the redraw is done.
+    local prev="" now same=0 i=0
+    while [ "$i" -lt 400 ]; do
+        now="$(tmux -L "$E2E_CAST_SOCKET" capture-pane -p -t "$E2E_CAST_SESSION" 2>/dev/null || true)"
+        if printf '%s' "$now" | grep -q "friring" && [ "$now" = "$prev" ]; then
+            same=$((same + 1))
+        else
+            same=0
+        fi
+        [ "$same" -ge 2 ] && break
+        prev="$now"
+        sleep 0.025
+        i=$((i + 1))
+    done
+    [ "$i" -lt 400 ] || e2e_die "the recorded attach never painted" || return 1
+
+    # Drive it. Every Wait in here polls the same pane the asserting test
+    # polls and fails the take if it never resolves, so a recording can no
+    # longer run to completion having silently skipped what it came to film.
+    local drove=0
+    DEMO_TYPING_SPEED_MS="$E2E_DEMO_TYPING_MS" \
+        node "$REPO_ROOT/scripts/demo/lib/drive-tape.mjs" "$E2E_TAPE" \
+        --socket "$E2E_DRIVER_SOCKET" --session "$E2E_DRIVER_SESSION" || drove=1
+
+    # End the recording by DETACHING the filmed client, with the TUI still up:
+    # a quit on camera films its own teardown (friring leaves the alternate
+    # screen, the dying client resets the terminal) and that becomes the held
+    # closing frame. Only asciinema's own exit flushes the tail of the cast.
+    tmux -L "$E2E_DRIVER_SOCKET" detach-client >/dev/null 2>&1 || true
+    i=0
+    while tmux -L "$E2E_CAST_SOCKET" has-session -t "$E2E_CAST_SESSION" 2>/dev/null \
+        && [ "$i" -lt 40 ]; do
+        sleep 0.25
+        i=$((i + 1))
+    done
+    tmux -L "$E2E_CAST_SOCKET" kill-server >/dev/null 2>&1 || true
+    [ "$drove" -eq 0 ] || e2e_die "the tape driver failed part-way through" || return 1
+    [ -s "$cast" ] || e2e_die "no cast recorded" || return 1
+
+    # Drop the detach teardown from the tail, so the clip ends on the final
+    # live TUI frame — see scripts/demo/lib/trim-cast.mjs.
+    node "$REPO_ROOT/scripts/demo/lib/trim-cast.mjs" "$cast" \
+        || e2e_die "could not trim the detach tail" || return 1
+
+    # shellcheck disable=SC2086  # E2E_DEMO_FONT_DIRS is a pre-split flag list
+    agg "$cast" "$gif" --font-size "$E2E_DEMO_FONT_SIZE" --fps-cap 30 \
+        --idle-time-limit 30 --last-frame-duration 0.5 --theme "$E2E_DEMO_PALETTE" \
+        --text-font-family "$E2E_DEMO_FONT" $E2E_DEMO_FONT_DIRS \
+        || e2e_die "agg failed" || return 1
+    # gif -> mp4. ffmpeg reads the gif's per-frame delays as timestamps, so
+    # `fps=30` re-times to a constant rate for players that need one WITHOUT
+    # changing the duration. Never re-encode the gif: its variable delays are
+    # where the exact pacing lives.
+    ffmpeg -y -loglevel error -i "$gif" -movflags +faststart -pix_fmt yuv420p \
+        -vf "fps=30,scale=trunc(iw/2)*2:trunc(ih/2)*2" "$mp4" \
+        || e2e_die "ffmpeg failed" || return 1
+
+    # Report the pacing budget; do NOT gate on it. It is calibrated for the
+    # hand-written tapes, which film a seeded TUI and no agent latency at all.
+    # These clips film real CLIs booting and answering, so a held frame here is
+    # often the app being honestly slow — which is the thing the scenario came
+    # to show. Worth seeing, never worth silently discarding a take for.
+    node "$REPO_ROOT/scripts/demo/lib/check-pacing.mjs" "$gif" || true
+    e2e_log "recorded $gif"
 }
 
 # ---------------------------------------------------------------------------
@@ -757,7 +858,7 @@ e2e_collect_artifacts() {
     tmux -L "$E2E_DRIVER_SOCKET" capture-pane -p -S -200 -t "$E2E_DRIVER_SESSION" \
         > "$dest/driver-pane-history.txt" 2>/dev/null || true
     # The agent's own pane, straight from the friring-dev server.
-    friring-cli --json session capture "$E2E_SESSION_ID" --lines 500 \
+    friring-cli --json session capture "${E2E_SESSION_ID:-}" --lines 500 \
         > "$dest/agent-pane.json" 2>/dev/null || true
     cp "$E2E_JOURNAL" "$dest/" 2>/dev/null || true
     cp -r "$E2E_STUB_DIR/raw" "$dest/" 2>/dev/null || true
@@ -812,6 +913,7 @@ e2e_teardown() {
     e2e_surface_unexpected_endpoints
     [ "$failed" != "0" ] && e2e_collect_artifacts
     tmux -L "$E2E_DRIVER_SOCKET" kill-server >/dev/null 2>&1 || true
+    tmux -L "$E2E_CAST_SOCKET" kill-server >/dev/null 2>&1 || true
     [ -n "$E2E_STUB_PID" ] && kill "$E2E_STUB_PID" >/dev/null 2>&1 || true
     if [ "${FRIRING_E2E_KEEP:-0}" = "1" ]; then
         e2e_log "FRIRING_E2E_KEEP=1: sandbox left at $TBX_SANDBOX_ROOT"

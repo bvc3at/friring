@@ -69,11 +69,9 @@ scenario_steps() {
     # Perf HUD overlay on top of the agent view; closing is asserted (with a
     # bounded poll) in scenario_assert_ui — nothing new appears to wait on.
     # `F12` is the second leader now, so the HUD is `<leader> m`.
-    step_key C-f
-    step_key m
+    step_leader m
     step_wait_pane "idle skips" 15
-    step_key C-f
-    step_key m
+    step_leader m
 }
 
 scenario_assert_effects() {

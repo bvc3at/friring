@@ -373,8 +373,9 @@ scripts/demo/record.sh theme automations   # re-record a subset
 
 Real-agent e2e scenarios are demo-able too: `just agent-demo <scenario>`
 records the same scenario the asserting suite runs — real agent, stubbed model,
-deterministic `Wait+Screen` sync — into `target/agent-e2e/demos/` (see
-`docs/E2E.md`).
+waits that poll the same pane the test polls — into `target/agent-e2e/demos/`.
+It goes through the pipeline below (asciinema + `drive-tape.mjs` + agg), off a
+generated tape rather than a hand-written one (see `docs/E2E.md`).
 
 `record.sh` records every video pair in one pass: the combined hero demo
 (`friring-demo.*` via `agents.tape`), one clip per feature

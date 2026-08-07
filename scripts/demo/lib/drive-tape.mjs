@@ -22,6 +22,15 @@
 //   Wait Stable [<quiet>] [<timeout>]  until the pane stops changing
 //   Enter/Tab/Space/…      a single key
 //   Ctrl+<X>               a chord
+//   Key <tmux-key>         that tmux key name, verbatim
+//
+// `Key` exists for the *generated* tapes (scripts/dev/agent-e2e emits one per
+// scenario). Those tapes are compiled from the same step list an asserting test
+// drives, so the demo has to be able to press whatever the test presses — F9,
+// `M-u`, `C-\` — and a VHS-name translation table in between can only run out
+// of names or, worse, map one to something that parses and does the wrong
+// thing. tmux rejects a name it does not know, which fails the take. The
+// hand-written tapes keep the VHS spellings above; they read better.
 //
 // `Sleep` and `Wait` look interchangeable and are not. Sleep is viewer pacing:
 // time deliberately spent on a frame the viewer is meant to read. Wait is the
@@ -154,6 +163,12 @@ function parse(src) {
     }
     if ((m = line.match(/^Ctrl\+(\w)$/i))) {
       steps.push({ kind: 'key', key: `C-${m[1].toLowerCase()}` });
+      return;
+    }
+    // Verbatim tmux key name — see the header. Must precede the bare-name rule
+    // below, which would otherwise read `Key` as a key called "Key".
+    if ((m = line.match(/^Key\s+(\S+)$/))) {
+      steps.push({ kind: 'key', key: m[1] });
       return;
     }
     // `Enter 1` / `Down 3` — VHS's repeat-count form.
@@ -328,8 +343,14 @@ for (let i = 0; i < tape.steps.length; i++) {
   } else if (step.kind === 'type') {
     audit = null;
     for (const ch of step.text) {
+      const at = Date.now();
       sendLiteral(ch);
-      await sleep(TYPING_SPEED_MS);
+      // Charge the keystroke against the interval rather than adding to it.
+      // Each character is its own `tmux send-keys` spawn, which costs 10-20ms
+      // on macOS, so sleeping the full interval on top typed at roughly half
+      // the nominal speed — and `--print-duration`, which assumes the nominal,
+      // under-counted every Type by the same margin.
+      await sleep(Math.max(0, TYPING_SPEED_MS - (Date.now() - at)));
     }
   } else if (step.kind === 'match') {
     waits.push([step.lineNo, `/${step.re}/`, await waitForMatch(step)]);

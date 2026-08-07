@@ -42,7 +42,13 @@ scenario_steps() {
     # flip working->done between polls; done implies the turn ran.
     step_wait_state 'working|done' 30
     step_wait_pane "RING-RESTORED" 60
-    step_wait_state 'done' 60
+    # A longer demo beat here, and it is not pacing: the unload below kills
+    # claude, and what the load replays is the transcript on DISK. The reply is
+    # on screen before it is flushed, so a demo that only saw the marker paint
+    # can freeze a transcript holding turn 1's question and not its answer.
+    # Test mode gets the wait for free — it polls hook_state, which the agent
+    # signals after it has finished writing.
+    step_wait_state 'done' 60 2s
 
     # Captured BEFORE the unload so assert_effects can prove the load reused
     # the same conversation.

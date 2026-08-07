@@ -60,28 +60,41 @@ JSON
     [ "$status" -eq 0 ]
 }
 
-@test "demo: emit-tape maps scenario steps to a valid VHS tape" {
+# The driver parses the whole tape before it drives anything and errors on any
+# line it does not know, so parsing a generated tape is the real check that the
+# generator and the driver still speak the same language. `--print-duration`
+# does exactly that and touches no tmux.
+drive_tape_parses() {
+    node "$REPO_ROOT/scripts/demo/lib/drive-tape.mjs" "$1" --print-duration
+}
+
+@test "demo: emit-tape maps scenario steps to a tape the driver accepts" {
     e2e_scenario_load "$AGENT_E2E_DIR/scenarios/claude-tool-loop"
     local tape="$BATS_TEST_TMPDIR/out.tape"
     e2e_emit_tape "$tape"
+    run drive_tape_parses "$tape"
+    [ "$status" -eq 0 ]
     grep -q '^Output target/agent-e2e/demos/claude-tool-loop.gif$' "$tape"
     grep -q '^Set FontSize 18$' "$tape"
-    grep -q '^Wait+Screen' "$tape"            # a step_wait_pane mapped to a wait
-    grep -q '^Type "Write the moon re-enable note' "$tape" # the prompt was typed
-    grep -q '^Set Width 1920$' "$tape"        # geometry derived from SCENARIO_COLS
+    grep -q '^Wait /' "$tape"                              # a step_wait_pane
+    grep -q '^Type "Write the moon re-enable note' "$tape"  # the prompt was typed
     # No Ctrl+Q: quitting inside the recording ends the clip on a bare shell.
-    ! grep -q '^Ctrl+Q$' "$tape"
+    ! grep -q '^Key C-q$' "$tape"
+    # No launch preamble: the recorder boots the TUI itself, off camera.
+    ! grep -q '^Hide$' "$tape"
 }
 
-@test "demo: named-workspace wizard scenario is fully VHS-mappable (emit-tape)" {
+@test "demo: named-workspace wizard scenario emits a drivable tape" {
     e2e_scenario_load "$AGENT_E2E_DIR/scenarios/claude-named-workspace"
     local tape="$BATS_TEST_TMPDIR/named-ws.tape"
     # No boot: TBX_SANDBOX_ROOT is unset, so the steps' offline fallback root
     # must keep the tape generator deterministic.
     e2e_emit_tape "$tape"
-    grep -q '^Ctrl+N$' "$tape"                          # opens the wizard
-    grep -q '^Ctrl+P$' "$tape"                          # parent import
-    grep -q '^Ctrl+O$' "$tape"                          # workspace-dir field
+    run drive_tape_parses "$tape"
+    [ "$status" -eq 0 ]
+    grep -q '^Key C-n$' "$tape"                         # opens the wizard
+    grep -q '^Key C-p$' "$tape"                         # parent import
+    grep -q '^Key C-o$' "$tape"                         # workspace-dir field
     grep -q '^Type "/tmp/friring-e2e/named-ws"$' "$tape" # the custom dir
 }
 
@@ -107,37 +120,37 @@ JSON
     [ ! -f "$REPO_ROOT/target/agent-e2e/unexpected-endpoints.log" ]
 }
 
-@test "demo: a key VHS cannot press fails the tape instead of vanishing from it" {
+@test "demo: a key with no VHS spelling records as the key itself" {
     e2e_scenario_load "$AGENT_E2E_DIR/scenarios/claude-tool-loop"
-    # Alt parses in VHS's grammar but sends the bare capital, so mapping it
-    # would type `U` at the agent; F-keys it rejects outright. Both must stop
-    # the tape by name rather than leave a recording that runs to the end
-    # having silently skipped the keypress.
-    scenario_steps() { step_key Enter; step_key M-u; }
-    run e2e_emit_tape "$BATS_TEST_TMPDIR/alt.tape"
-    [ "$status" -ne 0 ]
-    [[ "$output" == *"M-u"* ]]
-
-    scenario_steps() { step_key Enter; step_key F9; }
-    run e2e_emit_tape "$BATS_TEST_TMPDIR/fkey.tape"
-    [ "$status" -ne 0 ]
-    [[ "$output" == *"F9"* ]]
+    # The whole point of `Key`: an Alt chord and an F-key are keys tmux knows
+    # and VHS does not, and the demo has to press what the test presses. VHS
+    # parsed both and sent the wrong thing (the bare capital) or nothing.
+    scenario_steps() { step_key Enter; step_key M-u; step_key F9; }
+    e2e_emit_tape "$BATS_TEST_TMPDIR/keys.tape"
+    grep -zq 'Key Enter\nKey M-u\nKey F9\n' "$BATS_TEST_TMPDIR/keys.tape"
+    run drive_tape_parses "$BATS_TEST_TMPDIR/keys.tape"
+    [ "$status" -eq 0 ]
 }
 
-@test "demo: SCENARIO_DEMO_KEYS routes an unpressable key through the leader" {
+@test "demo: SCENARIO_DEMO_KEYS routes a key through the leader instead" {
     e2e_scenario_load "$AGENT_E2E_DIR/scenarios/claude-tool-loop"
     SCENARIO_DEMO_KEYS=("F9=C-f v" "M-u=C-f U")
     scenario_steps() { step_key F9; step_key M-u; }
     e2e_emit_tape "$BATS_TEST_TMPDIR/routed.tape"
-    grep -zq 'Ctrl+F\nType "v"\nCtrl+F\nType "U"\n' "$BATS_TEST_TMPDIR/routed.tape"
+    # With the leader's beat between the two keys — every multi-key route is a
+    # leader chord, and back-to-back keys do not land as one (see step_leader).
+    grep -zq 'Key C-f\nSleep 350ms\nKey v\nKey C-f\nSleep 350ms\nKey U\n' \
+        "$BATS_TEST_TMPDIR/routed.tape"
 }
 
-@test "demo: a wait keeps the regex a scenario wrote, escaping only what RE2 adds" {
+@test "demo: a wait keeps the regex a scenario wrote, escaping only what JS adds" {
     e2e_scenario_load "$AGENT_E2E_DIR/scenarios/claude-tool-loop"
-    # `.*` and the `\[` a grep needs for a literal bracket mean the same in
-    # RE2; `(` does not, and `/` would close the delimiter.
+    # `.*` and the `\[` a grep needs for a literal bracket mean the same in a
+    # JS RegExp; `(` does not, and `/` would close the delimiter.
     scenario_steps() { step_wait_pane "edit.*out.txt" 9; step_wait_pane " x \[Idle\] (1) a/b" 9; }
     e2e_emit_tape "$BATS_TEST_TMPDIR/waits.tape"
-    grep -q '^Wait+Screen@9s /edit\.\*out\.txt/$' "$BATS_TEST_TMPDIR/waits.tape"
-    grep -q '^Wait+Screen@9s / x \\\[Idle\\\] \\(1\\) a\\/b/$' "$BATS_TEST_TMPDIR/waits.tape"
+    grep -q '^Wait /edit\.\*out\.txt/ 9s$' "$BATS_TEST_TMPDIR/waits.tape"
+    grep -q '^Wait / x \\\[Idle\\\] \\(1\\) a\\/b/ 9s$' "$BATS_TEST_TMPDIR/waits.tape"
+    run drive_tape_parses "$BATS_TEST_TMPDIR/waits.tape"
+    [ "$status" -eq 0 ]
 }

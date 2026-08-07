@@ -79,7 +79,7 @@ smoke:
 agent-e2e *ARGS:
     scripts/dev/agent-e2e/run.sh {{ARGS}}
 
-# Record a scenario as a VHS demo: `just agent-demo claude-tool-loop`.
+# Record a scenario as a demo clip: `just agent-demo claude-tool-loop`.
 agent-demo *ARGS:
     scripts/dev/agent-e2e/run.sh --demo {{ARGS}}
 

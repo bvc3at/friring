@@ -4,9 +4,9 @@
 #
 #   run.sh                      run the whole asserting suite (bats)
 #   run.sh <filter…>            run matching tests only (bats --filter, regex)
-#   run.sh --demo <scenario…>   record the scenario(s) as VHS demos instead
+#   run.sh --demo <scenario…>   record the scenario(s) as demo clips instead
 #                               (target/agent-e2e/demos/<name>.{gif,mp4})
-#   run.sh --emit-tape <scen…>  generate the .tape only (no boot, no vhs) and
+#   run.sh --emit-tape <scen…>  generate the .tape only (no boot, no render) and
 #                               print its path — the demo path, offline
 #   run.sh --list               list scenarios
 #
@@ -17,9 +17,9 @@
 #
 # Hermetic + offline by construction: throwaway HOME/XDG/tmux dirs, the model
 # API stubbed on loopback, all other HTTP(S) egress dead-ended. Requires:
-# tmux, node >= 18, jq, git, curl, timeout, bats (tests) / vhs + sqlite3
-# (demos), and the agent binary — tests SKIP (not fail) when the agent binary
-# is missing. See docs/E2E.md.
+# tmux, node >= 18, jq, git, curl, timeout, bats (tests) / asciinema + agg +
+# ffmpeg + sqlite3 (demos), and the agent binary — tests SKIP (not fail) when
+# the agent binary is missing. See docs/E2E.md.
 set -euo pipefail
 
 AGENT_E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -82,7 +82,10 @@ if [ "$MODE" = "demo" ]; then
             # shellcheck disable=SC1091
             source "$AGENT_E2E_DIR/lib/harness.sh"
             e2e_require_tools demo
-            trap 'e2e_teardown 1' ERR
+            # INT/TERM as well as ERR: a recording holds a TUI, a stub, two
+            # tmux servers and one agent CLI per session, and an interrupted
+            # run that only trapped ERR left every one of them behind.
+            trap 'e2e_teardown 1' ERR INT TERM
             e2e_scenario_load "$dir"
             e2e_boot demo
             e2e_demo_record

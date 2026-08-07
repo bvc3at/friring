@@ -51,7 +51,8 @@
           jq # handy for `friring-cli … --json` in the sandbox
         ];
 
-        # Optional demo-recording stack (scripts/demo/record.sh): record the
+        # Optional demo-recording stack (scripts/demo/record.sh, and the
+        # generated clips from scripts/dev/agent-e2e/run.sh --demo): record the
         # TUI's terminal byte stream (asciinema), render it to a GIF offline
         # (agg), derive the MP4 (ffmpeg). See docs/DEVELOPMENT.md § Demo video
         # for why this replaced the live pixel capture (vhs/ttyd).

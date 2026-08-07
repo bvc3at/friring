@@ -68,15 +68,13 @@ scenario_steps() {
 
     # 3. `<leader> b` opens the info panel. " Info ─" is the panel's border
     #    title; a bare " Info " would false-match the footer hint.
-    step_key C-f
-    step_key b
+    step_leader b
     step_wait_pane " Info ─" 15
 
     # 4. The Ctrl-held form of the same table key closes it again, proving
     #    `<leader> C-b` == `<leader> b` (GNU screen's convention) over the
     #    same transport.
-    step_key C-f
-    step_key C-b
+    step_leader C-b
     leader_wait_pane_gone " Info ─" 50
 
     # 5. A mistyped leader sequence must not reach the agent. `C-f` then an
@@ -84,8 +82,7 @@ scenario_steps() {
     #    probe, with no stray character from the swallowed key. Events are
     #    handled in order, so the probe round-trip proves the earlier press
     #    was already processed.
-    step_key C-f
-    step_key "§"
+    step_leader "§"
     step_type "leader-no-leak"
     step_key Enter
     step_wait_pane "GOT:leader-no-leak" 15
@@ -95,6 +92,7 @@ scenario_steps() {
     # 6. `<leader> <leader>` sends the literal byte instead of dispatching:
     #    the info panel must NOT have toggled, and the session stays drivable.
     step_key C-f
+    step_sleep 350ms
     step_key C-f
     ! e2e_pane | grep -qF -- " Info ─" \
         || e2e_die "double-leader dispatched a command instead of sending the byte" \
