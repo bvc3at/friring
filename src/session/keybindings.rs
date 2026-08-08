@@ -61,14 +61,17 @@ pub enum Action {
     NextLoadedSession,
     /// Cycle backward among **loaded** sessions only.
     PreviousLoadedSession,
-    /// Jump to the next session whose status is Blocked (needs attention),
-    /// scanning forward from the active session in rendered order (wraps).
+    /// Jump to the next session needing attention, scanning forward from the
+    /// active session in rendered order (wraps). Blocked sessions first, then
+    /// — unless `[navigation] attention_includes_done` is off — the finished
+    /// ones nobody has looked at yet. The name is kept for the config key.
     NextBlockedSession,
     /// Toggle between the two most recent sessions (tmux `last-window`,
     /// vim's alternate buffer).
     LastSession,
-    /// Open the blocked-only jump overlay: blocked sessions get numbers 1–9
-    /// in the session list and a digit jumps straight to that one.
+    /// Open the attention-only jump overlay: the sessions needing attention
+    /// get numbers 1–9 in the session list and a digit jumps straight to that
+    /// one. The name is kept for the config key.
     JumpToBlocked,
     /// Open the label-jump overlay: **every** session on screen gets a
     /// home-row letter label and typing it switches. The digit jumps only
@@ -269,9 +272,9 @@ impl Action {
             Action::PreviousSession => "Previous session",
             Action::NextLoadedSession => "Next loaded session",
             Action::PreviousLoadedSession => "Previous loaded session",
-            Action::NextBlockedSession => "Next blocked session",
+            Action::NextBlockedSession => "Next session needing attention",
             Action::LastSession => "Last session (toggle)",
-            Action::JumpToBlocked => "Jump to blocked by number",
+            Action::JumpToBlocked => "Jump to attention by number",
             Action::JumpToSession => "Jump to session by label",
             Action::ToggleHelp => "Help",
             Action::ToggleInfoPanel => "Toggle info panel",
@@ -479,7 +482,7 @@ impl Action {
             NextLoadedSession => KeyChord::plain('c'),
             PreviousLoadedSession => KeyChord::normalized(KeyModifiers::SHIFT, KeyCode::Char('c')),
             // `a` for **a**ttention. This is the second-level session table:
-            // it opens the blocked-only overlay, whose `1`–`9` then select —
+            // it opens the attention-only overlay, whose `1`–`9` then select —
             // so `<leader> a 3` is "the third session that needs me".
             JumpToBlocked => KeyChord::plain('a'),
             // `a`'s shifted twin, the same widening the `u`/`U` and `r`/`R`

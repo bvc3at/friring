@@ -671,21 +671,22 @@ fn render_session_section(
     let mut block = focus_block(" Sessions ", level);
 
     if !sessions.is_empty() {
-        let mut dots: Vec<Span> = Vec::with_capacity(sessions.len() + 1);
-        // A count in front of the per-session dots makes "how many need me"
-        // scannable without counting colored glyphs (and it survives the dots
-        // being clipped on a narrow sidebar).
-        let blocked = sessions
-            .iter()
-            .filter(|info| info.status == SessionStatus::Blocked)
-            .count();
-        if blocked > 0 {
-            dots.push(Span::styled(
-                format!("\u{25c6}{blocked} "),
-                Style::default()
-                    .fg(status_color(SessionStatus::Blocked))
-                    .add_modifier(Modifier::BOLD),
-            ));
+        let mut dots: Vec<Span> = Vec::with_capacity(sessions.len() + 2);
+        // Counts in front of the per-session dots make "how many need me"
+        // scannable without counting colored glyphs (and they survive the dots
+        // being clipped on a narrow sidebar). Both halves of the attention
+        // queue are shown, in the order `F10` walks them: the blocked sessions
+        // are stopped until you answer, the finished ones are only unread.
+        for status in [SessionStatus::Blocked, SessionStatus::Done] {
+            let n = sessions.iter().filter(|info| info.status == status).count();
+            if n > 0 {
+                dots.push(Span::styled(
+                    format!("{}{n} ", super::status_glyph(status, spinner)),
+                    Style::default()
+                        .fg(status_color(status))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
         }
         dots.extend(sessions.iter().map(|info| {
             Span::styled(

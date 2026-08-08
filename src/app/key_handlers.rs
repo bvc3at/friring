@@ -978,7 +978,7 @@ impl App {
         self.launch_editor(&[root, file], Some(subject));
     }
 
-    /// The session jump-overlay keys (see `App::jump_overlay_blocked_only`).
+    /// The session jump-overlay keys (see `App::jump_overlay_attention_only`).
     /// Returns `true` when the key was consumed.
     ///
     /// - While the blocked-only overlay is open: a digit jumps to that
@@ -989,27 +989,27 @@ impl App {
     /// - Otherwise `Alt+<digit>` jumps by the all-session numbering (works
     ///   blind on legacy terminals that can't show the hold overlay).
     fn handle_session_jump_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
-        use super::BlockedJumpMode;
+        use super::AttentionJumpMode;
         let plain_or_alt = mods.is_empty() || mods == KeyModifiers::ALT;
         if self.label_jump.is_some() {
             return self.handle_label_jump_key(code, mods);
         }
-        if let Some(mode) = self.blocked_jump {
+        if let Some(mode) = self.attention_jump {
             match code {
                 KeyCode::Char(c @ '1'..='9') if plain_or_alt => {
-                    self.blocked_jump = None;
+                    self.attention_jump = None;
                     self.jump_to_digit(c, true);
                     return true;
                 }
                 KeyCode::Esc => {
-                    self.blocked_jump = None;
+                    self.attention_jump = None;
                     return true;
                 }
                 _ => {
                     let is_toggle = self.keybindings.lookup(code, mods)
                         == Some(crate::session::Action::JumpToBlocked);
-                    if !is_toggle && mode == BlockedJumpMode::Sticky {
-                        self.blocked_jump = None;
+                    if !is_toggle && mode == AttentionJumpMode::Sticky {
+                        self.attention_jump = None;
                     }
                     return false;
                 }
@@ -1789,9 +1789,9 @@ impl App {
             Action::PreviousSession => self.switch_session_backward(),
             Action::NextLoadedSession => self.switch_loaded_session(true),
             Action::PreviousLoadedSession => self.switch_loaded_session(false),
-            Action::NextBlockedSession => self.focus_next_blocked(),
+            Action::NextBlockedSession => self.focus_next_attention(),
             Action::LastSession => self.toggle_last_session(),
-            Action::JumpToBlocked => self.toggle_blocked_jump(),
+            Action::JumpToBlocked => self.toggle_attention_jump(),
             Action::JumpToSession => self.toggle_label_jump(),
             _ => return None,
         }

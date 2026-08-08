@@ -395,14 +395,19 @@ impl App {
                     .collect()
             }
             Some(numbering) => {
-                let blocked_only = numbering == crate::app::JumpNumbering::Blocked;
+                // Resolved once: the queue's status is a property of the whole
+                // fleet, and `session_jump_targets` filters on the same value —
+                // so the digit painted on a row is the digit that jumps to it.
+                // `Some(status) == None` is false, so an emptied queue numbers
+                // nothing rather than falling back to numbering everything.
+                let attention_only = numbering == crate::app::JumpNumbering::Attention;
+                let wanted = self.attention_status();
                 let mut n = 0u32;
                 ordered
                     .sessions
                     .iter()
                     .map(|info| {
-                        let eligible =
-                            !blocked_only || info.status == crate::session::SessionStatus::Blocked;
+                        let eligible = !attention_only || wanted == Some(info.status);
                         if eligible && n < 9 {
                             n += 1;
                             char::from_digit(n, 10).map(|c| c.to_string())
@@ -1144,11 +1149,14 @@ impl App {
                 PrefixState::Idle => None,
             },
             session_count: self.sessions.len(),
-            blocked_count: self
-                .sessions
-                .iter()
-                .filter(|s| s.info.status == crate::session::SessionStatus::Blocked)
-                .count(),
+            attention: self.attention_status().map(|status| {
+                let n = self
+                    .sessions
+                    .iter()
+                    .filter(|s| s.info.status == status)
+                    .count();
+                (status, n)
+            }),
             status: self.status_message.as_ref(),
             focus_label,
             sync_in_progress: self.worktree_sync.in_progress,

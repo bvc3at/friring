@@ -745,7 +745,7 @@ pub(crate) enum TerminalView {
 /// invisible): it stays until a digit jump, `Esc`, the toggle chord, or any
 /// other key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BlockedJumpMode {
+pub(crate) enum AttentionJumpMode {
     Held,
     Sticky,
 }
@@ -811,8 +811,8 @@ pub struct App {
     /// (the overlay appears on a timer, not an input event — see
     /// [`Self::tick_jump_overlay`]).
     alt_overlay_redraw_requested: bool,
-    /// The blocked-only jump overlay (`Alt+A`), when open.
-    blocked_jump: Option<BlockedJumpMode>,
+    /// The attention-only jump overlay (`Alt+A`), when open.
+    attention_jump: Option<AttentionJumpMode>,
     /// The label-jump overlay (`Alt+G` / `<leader> A`), when open.
     pub(crate) label_jump: Option<LabelJump>,
     backends: BackendRegistry,
@@ -849,6 +849,10 @@ pub struct App {
     /// global like [`Self::features`] so the settings panel applies them live
     /// and tests can switch modes without touching the process-wide global.
     pub(crate) prefix_settings: crate::session::settings::PrefixSettings,
+    /// Session-navigation knobs (`[navigation]` in settings.toml) — copied out
+    /// of the global like [`Self::features`] so the settings panel / live
+    /// reload re-apply them without a restart.
+    pub(crate) navigation: crate::session::settings::NavigationSettings,
     /// Whether the leader is armed (see [`PrefixState`]).
     pub(crate) prefix_state: PrefixState,
     /// Whether the redraw for `prefix.hint_delay_ms` elapsing was already
@@ -1155,7 +1159,7 @@ const WORKING_OUTPUT_STALE_MS: u64 = 10_000;
 /// How long Alt must be held before the session-jump numbers appear: long
 /// enough that pass-through Alt chords (readline `M-b`/`M-f` in the shell
 /// pane) don't flash the overlay, short enough that a deliberate hold feels
-/// immediate. See [`App::jump_overlay_blocked_only`] / [`App::set_alt_held`].
+/// immediate. See [`App::jump_overlay_attention_only`] / [`App::set_alt_held`].
 const JUMP_OVERLAY_DELAY_MS: u64 = 150;
 
 /// Whether the leader key is armed, and since when.
@@ -1205,8 +1209,9 @@ impl PrefixState {
 pub(crate) enum JumpNumbering {
     /// Every session, numbered from the top (Alt held, or an armed leader).
     All,
-    /// Only `Blocked` sessions (`Alt+A` / `<leader> a`).
-    Blocked,
+    /// Only the sessions needing attention (`Alt+A` / `<leader> a`) — see
+    /// [`App::attention_status`] for which those are.
+    Attention,
     /// Rows in one direction from `from`, numbered by *distance* — so the row
     /// labelled `3` is where `<leader> K 3` lands the session.
     MoveDistance { from: usize, up: bool },
@@ -1359,7 +1364,7 @@ impl App {
             alt_held: false,
             alt_held_since: None,
             alt_overlay_redraw_requested: false,
-            blocked_jump: None,
+            attention_jump: None,
             label_jump: None,
             backends,
             agents,
@@ -1376,6 +1381,7 @@ impl App {
             info_panel_position: crate::session::settings::global().info_panel_position,
             review_settings: crate::session::settings::global().review,
             prefix_settings: crate::session::settings::global().prefix.clone(),
+            navigation: crate::session::settings::global().navigation,
             prefix_state: PrefixState::Idle,
             prefix_hint_redraw_requested: false,
             show_info_panel: false,
@@ -1574,6 +1580,7 @@ impl App {
         self.review_settings = settings.review;
         let old_leaders = self.prefix_settings.chords();
         self.prefix_settings = settings.prefix.clone();
+        self.navigation = settings.navigation;
         // A leader set that changed — rebound, or emptied by `mode = off` —
         // must not leave the old armed state behind. Armed against the *new*
         // leader, `handle_prefix_key` would read its first press as
@@ -5089,8 +5096,8 @@ impl App {
         self.alt_held = held;
         self.alt_overlay_redraw_requested = false;
         self.alt_held_since = held.then(std::time::Instant::now);
-        if !held && self.blocked_jump == Some(BlockedJumpMode::Held) {
-            self.blocked_jump = None;
+        if !held && self.attention_jump == Some(AttentionJumpMode::Held) {
+            self.attention_jump = None;
         }
     }
 
@@ -5102,9 +5109,9 @@ impl App {
     /// The armed leader paints the same numbers as the Alt-hold: `<leader> 1`
     /// is otherwise a documentation-only route, and a which-key row reading
     /// "go to session N" is useless without knowing which N is which.
-    pub(crate) fn jump_overlay_blocked_only(&self) -> Option<bool> {
+    pub(crate) fn jump_overlay_attention_only(&self) -> Option<bool> {
         match self.jump_numbering()? {
-            JumpNumbering::Blocked => Some(true),
+            JumpNumbering::Attention => Some(true),
             JumpNumbering::All => Some(false),
             JumpNumbering::MoveDistance { .. } | JumpNumbering::Labels => None,
         }
@@ -5122,8 +5129,8 @@ impl App {
         if self.label_jump.is_some() {
             return Some(JumpNumbering::Labels);
         }
-        if self.blocked_jump.is_some() {
-            return Some(JumpNumbering::Blocked);
+        if self.attention_jump.is_some() {
+            return Some(JumpNumbering::Attention);
         }
         if self.prefix_state.is_armed() {
             return Some(JumpNumbering::All);
@@ -5206,21 +5213,47 @@ impl App {
     fn tick_jump_overlay(&mut self) {
         if self.alt_held
             && !self.alt_overlay_redraw_requested
-            && self.jump_overlay_blocked_only().is_some()
+            && self.jump_overlay_attention_only().is_some()
         {
             self.alt_overlay_redraw_requested = true;
             self.request_redraw();
         }
     }
 
+    /// Which status the attention queue is walking right now, or `None` when
+    /// nothing needs the user.
+    ///
+    /// `Blocked` (an agent waiting on an answer) always wins: those sessions
+    /// are *stopped* until you act. Only when none is blocked does the queue
+    /// fall through to `Done` — a run that finished and hasn't been looked at
+    /// (`derive_session_status` drops a session back to `Idle` the moment it
+    /// is seen, so `Done` already means "unseen"). Following both at once
+    /// would bury the blocking prompts among finished runs.
+    ///
+    /// The `Done` half is opt-out via `[navigation] attention_includes_done`.
+    pub(crate) fn attention_status(&self) -> Option<SessionStatus> {
+        let any = |status| self.sessions.iter().any(|s| s.info.status == status);
+        if any(SessionStatus::Blocked) {
+            return Some(SessionStatus::Blocked);
+        }
+        if self.navigation.attention_includes_done && any(SessionStatus::Done) {
+            return Some(SessionStatus::Done);
+        }
+        None
+    }
+
     /// The sessions digits `1`–`9` jump to, in the order the overlay numbers
-    /// them: rendered order, optionally filtered to `Blocked`, capped at 9.
-    /// Must stay consistent with the numbering `App::view` paints (same
-    /// order, same predicate — see `render_left_panel`).
-    pub(crate) fn session_jump_targets(&self, blocked_only: bool) -> Vec<usize> {
+    /// them: rendered order, optionally filtered to the attention queue,
+    /// capped at 9. Must stay consistent with the numbering `App::view` paints
+    /// (same order, same predicate — see `render_left_panel`).
+    pub(crate) fn session_jump_targets(&self, attention_only: bool) -> Vec<usize> {
+        // `Some(status) == None` is false, so an empty queue numbers nothing —
+        // treating "no filter status" as "no filter" would silently turn the
+        // attention overlay into the all-sessions one.
+        let wanted = self.attention_status();
         self.render_order_indices()
             .into_iter()
-            .filter(|&i| !blocked_only || self.sessions[i].info.status == SessionStatus::Blocked)
+            .filter(|&i| !attention_only || wanted == Some(self.sessions[i].info.status))
             .take(9)
             .collect()
     }
@@ -5228,9 +5261,9 @@ impl App {
     /// Activate the `digit`-numbered session of the jump overlay (all
     /// sessions or blocked-only, matching what the overlay renders) and land
     /// in the terminal. An out-of-range digit reports instead of guessing.
-    pub(crate) fn jump_to_digit(&mut self, digit: char, blocked_only: bool) {
+    pub(crate) fn jump_to_digit(&mut self, digit: char, attention_only: bool) {
         let n = digit.to_digit(10).unwrap_or(0) as usize;
-        let targets = self.session_jump_targets(blocked_only);
+        let targets = self.session_jump_targets(attention_only);
         match n.checked_sub(1).and_then(|i| targets.get(i)) {
             Some(&idx) => {
                 self.set_active_index(idx);
@@ -5238,8 +5271,8 @@ impl App {
                 self.on_focus_changed();
             }
             None => {
-                let what = if blocked_only {
-                    "blocked session"
+                let what = if attention_only {
+                    "session needing attention"
                 } else {
                     "session"
                 };
@@ -5315,35 +5348,41 @@ impl App {
         false
     }
 
-    /// Toggle the blocked-only jump overlay (`Alt+A`): blocked sessions get
-    /// numbers `1`–`9` and a digit jumps to that one — fewer, lower digits
-    /// than the all-session numbering when the list is long. Entered while
-    /// Alt is held it lives until the Alt release; entered by a tap (legacy
-    /// terminals) it is sticky — see [`BlockedJumpMode`].
-    pub(crate) fn toggle_blocked_jump(&mut self) {
-        if self.blocked_jump.is_some() {
-            self.blocked_jump = None;
+    /// Toggle the attention-only jump overlay (`Alt+A`): the sessions needing
+    /// the user (see [`Self::attention_status`]) get numbers `1`–`9` and a
+    /// digit jumps to that one — fewer, lower digits than the all-session
+    /// numbering when the list is long. Entered while Alt is held it lives
+    /// until the Alt release; entered by a tap (legacy terminals) it is
+    /// sticky — see [`AttentionJumpMode`].
+    pub(crate) fn toggle_attention_jump(&mut self) {
+        if self.attention_jump.is_some() {
+            self.attention_jump = None;
             return;
         }
         if self.session_jump_targets(true).is_empty() {
-            self.set_status(StatusLevel::Info, "No blocked sessions");
+            self.set_status(StatusLevel::Info, "Nothing needs attention");
             return;
         }
-        self.blocked_jump = Some(if self.alt_held {
-            BlockedJumpMode::Held
+        self.attention_jump = Some(if self.alt_held {
+            AttentionJumpMode::Held
         } else {
-            BlockedJumpMode::Sticky
+            AttentionJumpMode::Sticky
         });
     }
 
-    /// Jump to the next session that needs attention (`Blocked`), scanning
-    /// forward from the active session in **rendered** order (wraps) and
-    /// landing focus in the terminal — so pressing the key repeatedly walks
-    /// the attention queue top-to-bottom, answering each prompt in turn.
-    /// Rendered order (not blocked-since time) so the walk matches the
-    /// sidebar the user is looking at; status never reorders rows, so the
-    /// walk is stable. No-ops with a status hint when nothing is blocked.
-    pub(crate) fn focus_next_blocked(&mut self) {
+    /// Jump to the next session needing attention, scanning forward from the
+    /// active session in **rendered** order (wraps) and landing focus in the
+    /// terminal — so pressing the key repeatedly walks the attention queue
+    /// top-to-bottom, answering each prompt in turn and then reviewing each
+    /// finished run. Rendered order (not waiting-since time) so the walk
+    /// matches the sidebar the user is looking at; status never reorders rows,
+    /// so the walk is stable. No-ops with a status hint when nothing is
+    /// waiting. See [`Self::attention_status`] for what counts.
+    pub(crate) fn focus_next_attention(&mut self) {
+        let Some(wanted) = self.attention_status() else {
+            self.set_status(StatusLevel::Info, "Nothing needs attention");
+            return;
+        };
         let order = self.render_order_indices();
         if order.is_empty() {
             return;
@@ -5353,28 +5392,19 @@ impl App {
             .position(|&i| i == self.active_index)
             .unwrap_or(0);
         // Steps 1..len visit every *other* session once, so the active one
-        // (blocked or not) never counts as its own jump target.
+        // never counts as its own jump target.
         let target = (1..order.len())
             .map(|step| order[(pos + step) % order.len()])
-            .find(|&idx| self.sessions[idx].info.status == SessionStatus::Blocked);
+            .find(|&idx| self.sessions[idx].info.status == wanted);
         match target {
             Some(idx) => {
                 self.set_active_index(idx);
                 self.focus = InputFocus::Terminal;
                 self.on_focus_changed();
             }
-            None => {
-                let active_blocked = self
-                    .sessions
-                    .get(self.active_index)
-                    .is_some_and(|s| s.info.status == SessionStatus::Blocked);
-                let msg = if active_blocked {
-                    "No other blocked sessions"
-                } else {
-                    "No blocked sessions"
-                };
-                self.set_status(StatusLevel::Info, msg);
-            }
+            // The only remaining member of the queue is the session already
+            // on screen.
+            None => self.set_status(StatusLevel::Info, "Nothing else needs attention"),
         }
     }
 
@@ -13477,7 +13507,7 @@ mod tests {
         app.handle_key(KeyCode::F(10), KeyModifiers::NONE);
         assert_eq!(app.active_index, 0);
         let msg = app.status_message.as_ref().expect("status hint set");
-        assert!(msg.text.contains("No blocked"), "{}", msg.text);
+        assert!(msg.text.contains("Nothing needs attention"), "{}", msg.text);
     }
 
     #[test]
@@ -13488,7 +13518,11 @@ mod tests {
         app.handle_key(KeyCode::F(10), KeyModifiers::NONE);
         assert_eq!(app.active_index, 0);
         let msg = app.status_message.as_ref().expect("status hint set");
-        assert!(msg.text.contains("No other blocked"), "{}", msg.text);
+        assert!(
+            msg.text.contains("Nothing else needs attention"),
+            "{}",
+            msg.text
+        );
     }
 
     // --- Session jump overlays (Alt hold / Alt+digit / Alt+A) ---
@@ -13519,13 +13553,13 @@ mod tests {
         app.update(AppMessage::AltHeld(true));
         // Before the debounce delay nothing shows (a readline M-chord in the
         // shell shouldn't flash numbers).
-        assert_eq!(app.jump_overlay_blocked_only(), None);
+        assert_eq!(app.jump_overlay_attention_only(), None);
         app.alt_held_since = Some(
             std::time::Instant::now() - std::time::Duration::from_millis(JUMP_OVERLAY_DELAY_MS),
         );
-        assert_eq!(app.jump_overlay_blocked_only(), Some(false));
+        assert_eq!(app.jump_overlay_attention_only(), Some(false));
         app.update(AppMessage::AltHeld(false));
-        assert_eq!(app.jump_overlay_blocked_only(), None);
+        assert_eq!(app.jump_overlay_attention_only(), None);
     }
 
     /// A delayed which-key overlay costs exactly one frame. The armed state
@@ -13575,23 +13609,71 @@ mod tests {
 
         // Tap (Alt not held → legacy terminal): sticky overlay.
         app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
-        assert_eq!(app.blocked_jump, Some(BlockedJumpMode::Sticky));
-        assert_eq!(app.jump_overlay_blocked_only(), Some(true));
+        assert_eq!(app.attention_jump, Some(AttentionJumpMode::Sticky));
+        assert_eq!(app.jump_overlay_attention_only(), Some(true));
 
         // A plain digit indexes the *blocked* numbering, not the row number.
         app.handle_key(KeyCode::Char('1'), KeyModifiers::NONE);
         assert_eq!(app.active_index, 2);
         assert_eq!(app.focus, InputFocus::Terminal);
-        assert_eq!(app.blocked_jump, None, "a jump dismisses the overlay");
+        assert_eq!(app.attention_jump, None, "a jump dismisses the overlay");
     }
 
     #[test]
     fn alt_a_without_blocked_sessions_reports() {
         let mut app = app_with_sessions(2);
         app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
-        assert_eq!(app.blocked_jump, None);
+        assert_eq!(app.attention_jump, None);
         let msg = app.status_message.as_ref().expect("status hint set");
-        assert!(msg.text.contains("No blocked"), "{}", msg.text);
+        assert!(msg.text.contains("Nothing needs attention"), "{}", msg.text);
+    }
+
+    /// The queue walks blocked sessions first and only falls through to the
+    /// finished-but-unseen ones once nothing is waiting on an answer — so a
+    /// blocking prompt is never buried behind a pile of completed runs.
+    #[test]
+    fn attention_queue_prefers_blocked_then_falls_through_to_done() {
+        let mut app = app_with_sessions(3);
+        app.sessions[1].info.status = SessionStatus::Done;
+        app.sessions[2].info.status = SessionStatus::Blocked;
+        app.active_index = 0;
+
+        assert_eq!(app.attention_status(), Some(SessionStatus::Blocked));
+        app.focus_next_attention();
+        assert_eq!(app.active_index, 2, "the blocked one, not the done one");
+
+        // Answering it leaves only the finished run in the queue.
+        app.sessions[2].info.status = SessionStatus::Idle;
+        assert_eq!(app.attention_status(), Some(SessionStatus::Done));
+        app.focus_next_attention();
+        assert_eq!(app.active_index, 1);
+    }
+
+    /// With the fall-through switched off the queue is blocked-only again.
+    #[test]
+    fn attention_queue_can_exclude_finished_sessions() {
+        let mut app = app_with_sessions(2);
+        app.navigation.attention_includes_done = false;
+        app.sessions[1].info.status = SessionStatus::Done;
+
+        assert_eq!(app.attention_status(), None);
+        assert!(app.session_jump_targets(true).is_empty());
+    }
+
+    /// An overlay left open while the last blocked session unblocks must stop
+    /// numbering, not fall back to numbering everything.
+    #[test]
+    fn attention_overlay_numbers_nothing_once_the_queue_empties() {
+        let mut app = app_with_sessions(3);
+        app.sessions[2].info.status = SessionStatus::Blocked;
+        app.toggle_attention_jump();
+        assert_eq!(app.session_jump_targets(true), vec![2]);
+
+        app.sessions[2].info.status = SessionStatus::Idle;
+        assert!(
+            app.session_jump_targets(true).is_empty(),
+            "an empty queue must not degrade into the all-sessions numbering"
+        );
     }
 
     #[test]
@@ -13600,7 +13682,7 @@ mod tests {
         app.sessions[1].info.status = SessionStatus::Blocked;
         app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
         app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(app.blocked_jump, None, "Esc dismisses");
+        assert_eq!(app.attention_jump, None, "Esc dismisses");
 
         // A non-digit key dismisses the sticky overlay *and* still performs
         // its normal action (here: session-list j moves the selection).
@@ -13608,7 +13690,7 @@ mod tests {
         app.focus = InputFocus::SessionList;
         app.active_index = 0;
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
-        assert_eq!(app.blocked_jump, None);
+        assert_eq!(app.attention_jump, None);
         assert_eq!(app.active_index, 1, "the key still acted normally");
     }
 
@@ -13617,9 +13699,9 @@ mod tests {
         let mut app = app_with_sessions(2);
         app.sessions[0].info.status = SessionStatus::Blocked;
         app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
-        assert!(app.blocked_jump.is_some());
+        assert!(app.attention_jump.is_some());
         app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
-        assert_eq!(app.blocked_jump, None);
+        assert_eq!(app.attention_jump, None);
     }
 
     #[test]
@@ -13628,13 +13710,13 @@ mod tests {
         app.sessions[1].info.status = SessionStatus::Blocked;
         app.update(AppMessage::AltHeld(true));
         app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
-        assert_eq!(app.blocked_jump, Some(BlockedJumpMode::Held));
+        assert_eq!(app.attention_jump, Some(AttentionJumpMode::Held));
         // Other keys don't dismiss a held overlay (Alt chords keep flowing) …
         app.handle_key(KeyCode::Char('x'), KeyModifiers::ALT);
-        assert_eq!(app.blocked_jump, Some(BlockedJumpMode::Held));
+        assert_eq!(app.attention_jump, Some(AttentionJumpMode::Held));
         // … releasing Alt does.
         app.update(AppMessage::AltHeld(false));
-        assert_eq!(app.blocked_jump, None);
+        assert_eq!(app.attention_jump, None);
     }
 
     #[test]

@@ -64,6 +64,55 @@ pub struct Settings {
     /// alongside the direct chords, `F12` as the second leader.
     #[serde(default)]
     pub prefix: PrefixSettings,
+    /// Session-navigation knobs (`[navigation]` table). Absent table =
+    /// defaults (attention queue covers finished sessions, jump numbers only
+    /// while a gesture is pending, ghosts listed inline).
+    #[serde(default)]
+    pub navigation: NavigationSettings,
+}
+
+/// When the session list paints its `1`–`9` jump numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionNumbers {
+    /// Only while a jump gesture is pending — Alt held past the delay, an
+    /// armed leader, or the `Alt+A` overlay.
+    #[default]
+    Auto,
+    /// Always. The Alt-hold overlay needs the kitty protocol to see the key go
+    /// down, which an outer tmux strips; with numbers always painted, `Alt+1`–
+    /// `9` is aim-then-shoot there too instead of firing blind.
+    Always,
+}
+
+/// Session-navigation knobs (`[navigation]` table). All fields have defaults so
+/// an absent table behaves like before the table existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NavigationSettings {
+    /// Whether the attention queue (`F10`, `Alt+A`, and the badges) counts a
+    /// finished-but-unseen session as needing attention, not just a blocked
+    /// one. Blocked sessions still come first: the queue only falls through to
+    /// the finished ones once nothing is waiting on an answer.
+    #[serde(default = "default_true")]
+    pub attention_includes_done: bool,
+    /// When the `1`–`9` jump numbers are painted.
+    #[serde(default)]
+    pub session_numbers: SessionNumbers,
+    /// Start with the ghost shelf collapsed: unloaded sessions fold out of the
+    /// session list into a count on its title bar. Toggled live with
+    /// `<leader> G` / `Alt+Shift+U`; this only sets the state at startup.
+    #[serde(default)]
+    pub ghost_shelf: bool,
+}
+
+impl Default for NavigationSettings {
+    fn default() -> Self {
+        Self {
+            attention_includes_done: true,
+            session_numbers: SessionNumbers::default(),
+            ghost_shelf: false,
+        }
+    }
 }
 
 /// Whole-feature switches (`[features]` in settings.toml). Each flag hides the
@@ -580,6 +629,7 @@ impl Default for Settings {
             notifications: NotificationSettings::default(),
             review: ReviewSettings::default(),
             prefix: PrefixSettings::default(),
+            navigation: NavigationSettings::default(),
         }
     }
 }

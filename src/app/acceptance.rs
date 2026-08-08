@@ -2793,7 +2793,7 @@ fn pending_move_numbers_rows_by_distance() {
         Some(crate::app::JumpNumbering::MoveDistance { from: 2, up: true })
     );
     assert_eq!(
-        h.app.jump_overlay_blocked_only(),
+        h.app.jump_overlay_attention_only(),
         None,
         "a move is neither the all-sessions nor the blocked numbering"
     );
@@ -3000,7 +3000,7 @@ fn leader_a_then_digit_jumps_to_the_nth_blocked_session() {
         .app
         .status_message
         .as_ref()
-        .is_some_and(|m| m.text.contains("No blocked session #9")));
+        .is_some_and(|m| m.text.contains("No session needing attention #9")));
 }
 
 #[test]
