@@ -841,7 +841,13 @@ mod tests {
             resolve_source("flow"),
             ExtensionSource::Remote(format!("{}/flow", official_base()))
         );
-        // Official base is pinned to a concrete ref (a tag or main), never bare.
+        // Deliberately a literal rather than `OFFICIAL_REPO_RAW`: this pins the
+        // constant's *value*, so an upstream merge that resolves the host back to
+        // `Thurbeen/thurbox` fails here instead of silently shipping bare-name
+        // installs that 404 (the fetch ref is a friring tag, which upstream has
+        // no counterpart for). Asserting against the constant would derive both
+        // sides from the same source and always pass. The trailing slash also
+        // proves the base is pinned to a concrete ref (a tag or main), never bare.
         assert!(
             official_base().starts_with("https://raw.githubusercontent.com/bvc3at/friring/"),
             "bare-name installs must resolve against the fork: {}",
