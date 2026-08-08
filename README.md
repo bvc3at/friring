@@ -19,10 +19,10 @@
 > **Heads up** — Friring cuts its **own** releases, so every install command
 > below fetches a `friring` binary from this repo, and its **own** site at
 > <https://bvc3at.github.io/friring>. What still points upstream is attribution
-> (the `LICENSE`, provenance links, the quality-gate badge) plus two formats
+> (the `LICENSE`'s original copyright line, provenance links) plus two formats
 > shared with upstream: the `min_thurbox_version` extension-manifest key and the
-> `tb-` tmux window prefixes. See **[FORK.md](./FORK.md)** for the running list
-> of how this fork diverges from upstream.
+> `tb-`/`tbs-` tmux window prefixes. See **[FORK.md](./FORK.md)** for the running
+> list of how this fork diverges from upstream.
 
 Run any coding-agent CLI in persistent terminal sessions.
 Friring is a multi-session TUI orchestrator that launches
@@ -34,7 +34,6 @@ worktrees are first-class citizens.
 [![CI](https://github.com/bvc3at/friring/actions/workflows/ci.yml/badge.svg)](https://github.com/bvc3at/friring/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Website](https://img.shields.io/badge/Website-bvc3at.github.io%2Ffriring-blue)](https://bvc3at.github.io/friring/)
-[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=Thurbeen_thurbox&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Thurbeen_thurbox)
 
 ![Friring Demo](./docs/media/friring-demo.gif)
 
@@ -60,7 +59,7 @@ verification and platform auto-detection.
 curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | INSTALL_DIR=/usr/local/bin sh
 
 # Pin a version
-curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | VERSION=v0.13.0 sh
+curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/scripts/install.sh | VERSION=v0.20.0 sh
 ```
 
 **Windows (PowerShell):**
@@ -122,8 +121,9 @@ See [Prerequisites](#prerequisites) for required tooling.
 
 **Contributing / hacking on friring?** The dev environment is a reproducible Nix
 flake (`nix develop` / `direnv allow`) with `just` tasks and an isolated runtime
-sandbox (`scripts/dev/sandbox.sh`) — see
-[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
+sandbox (`scripts/dev/sandbox.sh`) — see [`CONTRIBUTING.md`](CONTRIBUTING.md) to
+get set up and [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the full
+workflow.
 
 ## Why Friring
 
@@ -206,8 +206,8 @@ click-to-review visual diff is no longer a GUI-only trade-off. The GUI tools
 still trade footprint and that scriptability for a gentler on-ramp — and the
 most polished of them, [GitHub's Copilot App](https://github.com/github/app),
 also ties you to a single vendor's agent and a paid subscription, where Friring
-stays agent-neutral and runs whatever CLI you already pay for. Feature accuracy
-as of June 2026; check each project for the latest.
+stays agent-neutral and runs whatever CLI you already pay for. These projects
+move fast — check each one for its current feature set.
 
 > **Note:** The table above is a curated subset, not a leaderboard. The space of
 > agent orchestrators is large and grows weekly — see
@@ -289,7 +289,7 @@ nest under their lead in the list. Build lead → worker trees by hand or
 headlessly with `--parent`. The link is informational — deleting a lead
 never cascades to its workers.
 
-[CLI →](#sessions)
+[CLI →](#sessions-1)
 
 </td>
 <td width="50%">
@@ -441,8 +441,8 @@ terminal.
 
 ### Themes
 
-Nine palettes (five dark, four light) plus user-defined custom themes,
-switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
+Thirty-six palettes (twenty-eight dark, eight light) plus user-defined custom
+themes, switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
 
 [Config →](docs/CONFIG.md)
 
@@ -461,7 +461,7 @@ switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
   number — which works where `Alt+<digit>` doesn't, since most Linux terminals
   claim that for their own tabs. `prefix-only` mode hands every bare
   `Ctrl+<letter>` back to the agent CLI.
-- **[Extensions](https://thurbeen.github.io/thurbox/docs/extensions.html)**
+- **[Extensions](https://bvc3at.github.io/friring/docs/extensions.html)**
   *(experimental)* — opt-in, agent-agnostic add-ons that are **data, not
   code**: `flow`, `forge`, `ci-shepherd`, `renovate`, and bidirectional
   task-integration for GitHub Issues / GitLab / Linear / Jira. One command
@@ -564,8 +564,8 @@ See the full [keybindings](#keybindings) below.
 A session launches exactly one coding-agent CLI. Agents are
 described as data in `~/.config/friring/agents.toml`, which is
 seeded with built-ins (claude, codex, antigravity, opencode, aider,
-vibe) on first run. Edit the file to tweak an agent or add a new one — no
-recompile required.
+copilot, vibe) on first run. Edit the file to tweak an agent or add a new
+one — no recompile required.
 
 Each `[[agents]]` entry maps the resume / fork / new-session ids
 onto argument-template groups. `args` is always passed (bake in
@@ -662,7 +662,7 @@ for i in $(seq 1 "$N_REVIEWERS"); do
         $(host_flag) \
         --json | jq -r '.id')"
   # Seed the reviewer with its standing instructions.
-  cli session send --to "$id" --no-wake --body \
+  cli session send "$id" \
 "You are a continuous security & code-quality reviewer for this monorepo.
 Loop: pick the most recently changed files, review for security issues, correctness bugs,
 and quality regressions. Report findings concisely, then move to the next changed area.
@@ -765,7 +765,7 @@ overlay delay are configurable — see [docs/CONFIG.md](docs/CONFIG.md)
 | `Ctrl+P` | Automations (list/new/edit/toggle/run/delete) | **P**rogram |
 | `Ctrl+/` / `Shift Shift` | Global search (sessions/tasks/automations/files) | **/** = search; JetBrains double-shift |
 | `Ctrl+W` / `F5` | Toggle tasks panel (todo list) | **W**ork items |
-| `Ctrl+T` | Toggle shell pane | **T**erminal |
+| `Ctrl+T` / `F8` | Toggle shell pane | **T**erminal |
 | `Ctrl+X` / `F7` | Toggle code-review pane (native diff reviewer) | Review |
 | `Ctrl+H` | Focus previous pane (cycle backward) | Vim: **h** = left |
 | `Ctrl+J` / `Alt+J` | Select next session (`Ctrl+J` defers to the agent in a focused terminal — it doubles as a legacy `Ctrl+Enter`; use `Alt+J` there) | Vim: **j** = down |
@@ -1076,128 +1076,69 @@ is stored in SQLite.
 ### Module Dependency Rules
 
 ```text
-session  ← pure data types, no local imports
-agent    ← imports session only (NEVER ui or git)
-ui       ← imports session only (NEVER agent or git)
+session  ← pure data types, no crate-internal references
+agent    ← session (+ paths/shell utils; NEVER ui, git, app)
+ui       ← session + app model/view state (+ fuzzy/paths; NEVER agent or git)
 app      ← coordinator, imports all modules
 ```
 
-These rules are enforced by `tests/architecture_rules.rs`.
-For the full set of architectural decisions with rationale,
-see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+`ui → app` is the TEA `view(model)` coupling — ui renders app-owned state and
+never triggers side effects. These rules are an enforced allowlist
+(`tests/architecture_rules.rs`): a new module fails the test until it declares
+what it may reference. For the full set of architectural decisions with
+rationale, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Documentation
 
-- [docs/CONSTITUTION.md](docs/CONSTITUTION.md) — Core principles
-  and non-negotiable rules
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Architectural
-  decisions with rationale
-- [docs/FEATURES.md](docs/FEATURES.md) — Feature-level design
-  choices (including agent definitions)
-- [docs/CONFIG.md](docs/CONFIG.md) — Every config file, env var,
-  and DB setting in one place (settings.toml, feature flags, …)
+The full reference lives in [`docs/`](docs/README.md); this table is the map.
 
-## Development
-
-### Setup
-
-```bash
-git clone https://github.com/bvc3at/friring.git
-cd friring
-prek install   # Install pre-commit hooks
-```
-
-All required dev tools are documented in `Cargo.toml` under
-`[package.metadata.dev-tools]`. Run `./scripts/install-dev-tools.sh`
-to install them, or install individually with `cargo install`.
-
-### Build and Run
-
-```bash
-cargo build                          # Debug build
-cargo build --release                # Release build (LTO, stripped)
-cargo run                            # Run in dev mode
-just sandbox                         # Dev build in an isolated sandbox (never touches real state)
-just dev-live                        # Dev build against your REAL sessions (see below)
-```
-
-Dev builds are isolated by default (own tmux socket/session + data dir). To
-verify a change against your **live** sessions, quit the installed friring, run
-`just dev-live` (it backs up the DB, refuses to run while the release TUI is
-attached, and points the dev build at your real socket/session/DB/config via
-`FRIRING_TMUX_SESSION` + the other `FRIRING_*` overrides), then `Ctrl+Alt+R` to
-hot-reload after each rebuild. Full workflow — including how to restore the DB
-backup if a schema-bumping branch migrates it — is in
-[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
-
-### Testing
-
-```bash
-cargo nextest run --all              # Run all tests (preferred)
-cargo nextest run -E 'test(name)'    # Single test by name
-cargo test --test architecture_rules # Architecture validation
-bats scripts/install.bats            # Install script tests
-```
-
-### Code Quality
-
-```bash
-cargo fmt --all                      # Format (100 char max)
-cargo clippy --all-targets --all-features -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-rumdl check .                        # Markdown lint
-```
-
-### Architecture Checks
-
-```bash
-cargo test --test architecture_rules # Module dependency rules
-cargo deny check advisories          # Security advisories
-cargo deny check bans licenses sources  # Dependency policy
-```
-
-## Committing Changes
-
-This project uses
-[Conventional Commits](https://www.conventionalcommits.org/).
-
-```bash
-cog commit feat "add worktree management"
-cog commit fix "resolve memory leak" cli
-```
-
-### Commit Types
-
-- `feat`: New features (minor version bump)
-- `fix`: Bug fixes (patch version bump)
-- `docs`, `refactor`, `test`, `chore`, `perf`, `ci`, `style`,
-  `build`, `revert`: No release
-
-### Valid Scopes
-
-`api`, `cli`, `ui`, `git`, `core`, `docs`, `deps`, `config`, `mcp`, `fork`
+| Document | What's in it |
+|---|---|
+| [CONSTITUTION.md](docs/CONSTITUTION.md) | Core principles and non-negotiable invariants |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Architectural decisions with rationale, module layout, the event loop |
+| [FEATURES.md](docs/FEATURES.md) | Feature-level design and behavior (including agent definitions) |
+| [CONFIG.md](docs/CONFIG.md) | Every config file, env var, and DB setting in one place |
+| [CLI.md](docs/CLI.md) | The headless `friring-cli` surface |
+| [DEVELOPMENT.md](docs/DEVELOPMENT.md) | Build, test, the dev sandbox, e2e harnesses, demo recording |
+| [E2E.md](docs/E2E.md) | Real-agent e2e tests, the model stub, scenario-driven demos |
+| [PERFORMANCE.md](docs/PERFORMANCE.md) | Render/tick performance and how to measure it |
+| [RELEASING.md](docs/RELEASING.md) | Release automation, versioning, installers, packaging |
+| [FORK.md](FORK.md) | What this fork changes versus upstream Thurbox |
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes following our coding standards
-4. Write tests for new functionality
-5. Ensure all tests pass: `cargo nextest run --all`
-6. Use conventional commits: `cog commit <type> "message"`
-7. Submit a pull request
+Contributions are welcome. **[`CONTRIBUTING.md`](CONTRIBUTING.md)** is the full
+guide — toolchain setup, testing, linting, pre-commit hooks, commit conventions,
+and what a reviewable PR looks like. The short version:
 
-### Code Style
+```bash
+git clone https://github.com/<you>/friring.git   # your fork
+cd friring
+nix develop        # pinned toolchain (or: scripts/install-dev-tools.sh)
+prek install       # pre-commit hooks — the same checks CI runs
+just build && just test
+```
 
-- Follow Rust naming conventions
-- Maximum line width: 100 characters
-- Use `rustfmt` for formatting
-- Address all `clippy` warnings
+- Fork the repo, branch off `main`, open a pull request.
+- Write tests for new behavior; a bug fix starts with a failing test.
+- `just lint && just test` must pass locally — CI gates on the same checks.
+- Commits follow [Conventional Commits](https://www.conventionalcommits.org/),
+  enforced by cocogitto (`cog commit fix "resolve memory leak" cli`):
+  - **Types** — `feat` (minor bump), `fix`/`perf` (patch bump); `docs`,
+    `refactor`, `style`, `test`, `chore`, `ci`, `build`, `revert` (no release).
+  - **Scopes** — `api`, `cli`, `ui`, `git`, `core`, `docs`, `deps`, `config`,
+    `mcp`, `fork`, `review`.
+- Record anything that makes this fork behave differently from upstream in
+  [`FORK.md`](FORK.md), in the same change.
+
+Dev builds are isolated by default (their own tmux socket and data dir), so
+hacking on friring never touches your real sessions; `just sandbox` and
+`just dev-live` are described in [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
 ## License
 
-This project is licensed under the MIT License - see the
-[LICENSE](LICENSE) file for details.
+MIT — see [LICENSE](LICENSE). The copyright line for the upstream work this
+fork is built on is preserved there alongside the fork's own.
 
 ## Acknowledgments
 
