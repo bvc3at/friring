@@ -488,12 +488,20 @@ impl App {
                 jump_labels: &jump_labels,
             },
         );
+        let start = self.click_targets.len();
         self.record_row_clicks(
             rows,
             ClickAction::SelectSession,
             left_area,
             InputFocus::SessionList,
         );
+        if floating {
+            // The peek is drawn over the central pane, so its targets have to be
+            // hit-tested before the pane's whole-rect fallback recorded earlier
+            // (`handle_mouse` takes the first match).
+            let added = self.click_targets.len() - start;
+            self.click_targets.rotate_right(added);
+        }
     }
 
     /// Render the automations pane beneath the session list (when present).
