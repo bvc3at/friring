@@ -78,6 +78,10 @@ pub enum Action {
     /// reach the first nine rows; this is how the tenth is reached without
     /// stepping.
     JumpToSession,
+    /// Fold the unloaded (ghost) sessions out of the list into a count on its
+    /// title bar, or bring them back. They stay reachable by name from the
+    /// switcher either way.
+    ToggleGhostShelf,
     ToggleHelp,
     ToggleInfoPanel,
     ToggleFileViewer,
@@ -111,6 +115,18 @@ pub enum Action {
     /// Import an existing Claude Code conversation from disk as a new session
     /// (browse `~/.claude/projects`, pick a launch directory, `--resume` it).
     SessionListImport,
+    /// Collapse the selected session's repo group to its header line.
+    SessionListFold,
+    /// Expand the selected session's repo group.
+    SessionListUnfold,
+    /// Select the first session in the list.
+    SessionListFirst,
+    /// Select the last session in the list.
+    SessionListLast,
+    /// Select the first session of the next repo group (wraps).
+    SessionListNextGroup,
+    /// Select the first session of the previous repo group (wraps).
+    SessionListPrevGroup,
     // ── Automations pane (scoped) ───────────────────────────────────────
     AutomationsNew,
     AutomationsNext,
@@ -198,6 +214,7 @@ impl Action {
             Action::LastSession,
             Action::JumpToBlocked,
             Action::JumpToSession,
+            Action::ToggleGhostShelf,
             Action::ToggleHelp,
             Action::ToggleInfoPanel,
             Action::ToggleFileViewer,
@@ -215,6 +232,12 @@ impl Action {
             Action::SessionListMoveUp,
             Action::SessionListSortAlphabetically,
             Action::SessionListImport,
+            Action::SessionListFold,
+            Action::SessionListUnfold,
+            Action::SessionListFirst,
+            Action::SessionListLast,
+            Action::SessionListNextGroup,
+            Action::SessionListPrevGroup,
             Action::AutomationsNew,
             Action::AutomationsNext,
             Action::AutomationsPrev,
@@ -276,6 +299,7 @@ impl Action {
             Action::LastSession => "Last session (toggle)",
             Action::JumpToBlocked => "Jump to attention by number",
             Action::JumpToSession => "Jump to session by label",
+            Action::ToggleGhostShelf => "Shelve unloaded sessions",
             Action::ToggleHelp => "Help",
             Action::ToggleInfoPanel => "Toggle info panel",
             Action::ToggleFileViewer => "Toggle file viewer",
@@ -293,6 +317,12 @@ impl Action {
             Action::SessionListMoveUp => "Move session up",
             Action::SessionListSortAlphabetically => "Sort sessions A→Z",
             Action::SessionListImport => "Import CC conversation",
+            Action::SessionListFold => "Collapse repo group",
+            Action::SessionListUnfold => "Expand repo group",
+            Action::SessionListFirst => "First session",
+            Action::SessionListLast => "Last session",
+            Action::SessionListNextGroup => "Next repo group",
+            Action::SessionListPrevGroup => "Previous repo group",
             Action::AutomationsNew => "New automation",
             Action::AutomationsNext => "Next item",
             Action::AutomationsPrev => "Previous item",
@@ -338,7 +368,13 @@ impl Action {
             | Action::SessionListMoveDown
             | Action::SessionListMoveUp
             | Action::SessionListSortAlphabetically
-            | Action::SessionListImport => KeyContext::SessionList,
+            | Action::SessionListImport
+            | Action::SessionListFold
+            | Action::SessionListUnfold
+            | Action::SessionListFirst
+            | Action::SessionListLast
+            | Action::SessionListNextGroup
+            | Action::SessionListPrevGroup => KeyContext::SessionList,
             Action::AutomationsNew
             | Action::AutomationsNext
             | Action::AutomationsPrev
@@ -489,6 +525,9 @@ impl Action {
             // pairs use: `a` numbers the sessions that need **a**ttention,
             // `A` labels **a**ll of them.
             JumpToSession => KeyChord::normalized(KeyModifiers::SHIFT, KeyCode::Char('a')),
+            // `G` for **G**hosts. No lowercase twin to widen from — `g` is the
+            // help overlay — so it stands on the mnemonic alone.
+            ToggleGhostShelf => KeyChord::normalized(KeyModifiers::SHIFT, KeyCode::Char('g')),
             // ── Sessions ────────────────────────────────────────────────
             NewSession => KeyChord::plain('n'),
             DeleteSession => KeyChord::plain('d'),
@@ -638,6 +677,15 @@ impl Action {
             // shoot jump that works through an outer tmux. Shadows readline's
             // rarely-used M-g; fully rebindable.
             Action::JumpToSession => vec![KeyChord::alt(KeyCode::Char('g'))],
+            // Alt+Shift+U — `Alt+U`'s shifted twin, and the pair reads as one
+            // idea: `Alt+U` puts a session to sleep, `Alt+Shift+U` sweeps every
+            // sleeping session out of sight. Both encodings agree after
+            // normalization (kitty sends ALT|SHIFT+`u`, a legacy terminal sends
+            // `ESC U`), so it survives ssh + tmux like the other Alt chords.
+            Action::ToggleGhostShelf => vec![KeyChord::normalized(
+                KeyModifiers::ALT | KeyModifiers::SHIFT,
+                KeyCode::Char('u'),
+            )],
             Action::ToggleHelp => vec![KeyChord::ctrl('g'), KeyChord::function(1)],
             Action::ToggleInfoPanel => vec![KeyChord::ctrl('b'), KeyChord::function(2)],
             Action::ToggleFileViewer => vec![KeyChord::ctrl('e'), KeyChord::function(3)],
@@ -698,6 +746,23 @@ impl Action {
             // `Ctrl+<letter>` is taken or reserved, and the session list is
             // where imported sessions land.
             Action::SessionListImport => vec![KeyChord::plain('i')],
+            // Scoped `h`/`l` — the file viewer's collapse/expand pair, on the
+            // pane where the same gesture means the same thing. Safe because
+            // the two panes are never focused at once.
+            Action::SessionListFold => vec![KeyChord::plain('h'), KeyChord::key(KeyCode::Left)],
+            Action::SessionListUnfold => vec![KeyChord::plain('l'), KeyChord::key(KeyCode::Right)],
+            // Scoped `g`/`G` — vim's `gg`/`G`, minus the doubled `g` (a list
+            // this shallow doesn't need a pending-key state to disambiguate).
+            Action::SessionListFirst => vec![KeyChord::plain('g'), KeyChord::key(KeyCode::Home)],
+            Action::SessionListLast => vec![
+                KeyChord::normalized(KeyModifiers::NONE, KeyCode::Char('G')),
+                KeyChord::key(KeyCode::End),
+            ],
+            // Scoped `[`/`]` — unshifted on a US layout, and free here even
+            // though `<leader> ]` is the attention walk: leader keys and pane
+            // chords are separate namespaces.
+            Action::SessionListNextGroup => vec![KeyChord::plain(']')],
+            Action::SessionListPrevGroup => vec![KeyChord::plain('[')],
             // Automations pane (scoped) — same letters as the session list,
             // safe because the context lookup keeps them apart.
             Action::AutomationsNew => vec![KeyChord::plain('n')],
@@ -842,6 +907,7 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
                 ToggleInfoPanel,
                 ToggleFileViewer,
                 ToggleSessionList,
+                ToggleGhostShelf,
                 OpenThemePicker,
                 OpenSettings,
                 GlobalSearch,
@@ -859,6 +925,12 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
                 SessionListMoveUp,
                 SessionListSortAlphabetically,
                 SessionListImport,
+                SessionListFold,
+                SessionListUnfold,
+                SessionListFirst,
+                SessionListLast,
+                SessionListNextGroup,
+                SessionListPrevGroup,
             ],
         ),
         (
@@ -947,6 +1019,7 @@ pub fn prefix_sections() -> Vec<(&'static str, Vec<PrefixEntry>)> {
                 A(ToggleInfoPanel),
                 A(ToggleFileViewer),
                 A(ToggleSessionList),
+                A(ToggleGhostShelf),
                 A(FocusTasks),
                 A(ToggleShell),
                 A(OpenAutomations),
@@ -1962,6 +2035,7 @@ mod tests {
                 Action::LastSession => 0,
                 Action::JumpToBlocked => 0,
                 Action::JumpToSession => 0,
+                Action::ToggleGhostShelf => 0,
                 Action::ToggleHelp => 0,
                 Action::ToggleInfoPanel => 0,
                 Action::ToggleFileViewer => 0,
@@ -1979,6 +2053,12 @@ mod tests {
                 Action::SessionListMoveUp => 0,
                 Action::SessionListSortAlphabetically => 0,
                 Action::SessionListImport => 0,
+                Action::SessionListFold => 0,
+                Action::SessionListUnfold => 0,
+                Action::SessionListFirst => 0,
+                Action::SessionListLast => 0,
+                Action::SessionListNextGroup => 0,
+                Action::SessionListPrevGroup => 0,
                 Action::AutomationsNew => 0,
                 Action::AutomationsNext => 0,
                 Action::AutomationsPrev => 0,
@@ -2012,7 +2092,7 @@ mod tests {
         }
         // The listed variants must equal Action::all().len(). If you add
         // a variant, update both `Action::all()` and the match above.
-        const EXPECTED: usize = 72;
+        const EXPECTED: usize = 79;
         assert_eq!(Action::all().len(), EXPECTED);
         for a in Action::all() {
             classify(*a);

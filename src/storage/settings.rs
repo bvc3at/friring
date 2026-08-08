@@ -12,6 +12,7 @@ const THEME_KEY: &str = "active_theme";
 const ACTIVE_EXTENSIONS_KEY: &str = "active_extensions";
 const BUILTIN_HOOKS_OPTOUT_KEY: &str = "builtin_hooks_optout";
 const PERF_SNAPSHOT_KEY: &str = "perf_snapshot";
+const FOLDED_GROUPS_KEY: &str = "folded_session_groups";
 
 impl Database {
     /// Get the configured editor command (e.g. `code`, `nvim --remote-tab`).
@@ -222,6 +223,47 @@ impl Database {
         }
         self.set_active_extensions(&names)?;
         Ok(true)
+    }
+
+    /// The repo groups the session list is showing collapsed, by group key
+    /// (see `ui::project_list::group_key`). Persisted rather than kept in
+    /// memory because folding is how a user *curates* a long list — it is
+    /// worth setting up once, not once per launch.
+    ///
+    /// Unknown keys are kept, not pruned: a group whose only session is
+    /// deleted and later recreated should come back the way it was left, and
+    /// the set is a handful of short strings.
+    pub fn get_folded_session_groups(&self) -> rusqlite::Result<Vec<String>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                params![FOLDED_GROUPS_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(raw
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default())
+    }
+
+    /// Persist the collapsed repo groups as a JSON array. An empty set deletes
+    /// the key (mirrors the editor/theme reset-on-empty convention).
+    pub fn set_folded_session_groups(&self, keys: &[String]) -> rusqlite::Result<()> {
+        if keys.is_empty() {
+            self.conn.execute(
+                "DELETE FROM metadata WHERE key = ?1",
+                params![FOLDED_GROUPS_KEY],
+            )?;
+        } else {
+            let json = serde_json::to_string(keys).unwrap_or_else(|_| "[]".into());
+            self.conn.execute(
+                "INSERT INTO metadata (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![FOLDED_GROUPS_KEY, json],
+            )?;
+        }
+        Ok(())
     }
 
     /// Atomically read + clear the pending "focus this session" request that

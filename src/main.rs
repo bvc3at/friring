@@ -354,6 +354,7 @@ async fn main() -> Result<()> {
     app.report_config_warnings(config_warnings);
 
     let t_phase = std::time::Instant::now();
+    app.load_folded_groups();
     if let Some((sessions, counter)) = app.load_persisted_state_from_db() {
         app.restore_sessions(sessions, counter);
     }

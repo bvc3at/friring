@@ -1841,6 +1841,10 @@ impl App {
                 Self::act_toggle_session_list(self);
                 true
             }
+            Action::ToggleGhostShelf => {
+                self.toggle_ghost_shelf();
+                true
+            }
             Action::FocusTasks => {
                 self.gated(self.features.tasks, "Tasks panel", Self::act_toggle_tasks)
             }
@@ -1917,6 +1921,12 @@ impl App {
             Action::SessionListMoveDown => self.move_active_session(true),
             Action::SessionListMoveUp => self.move_active_session(false),
             Action::SessionListSortAlphabetically => self.sort_sessions_alphabetically(),
+            Action::SessionListFold => self.set_active_group_folded(true),
+            Action::SessionListUnfold => self.set_active_group_folded(false),
+            Action::SessionListFirst => self.select_first_session(),
+            Action::SessionListLast => self.select_last_session(),
+            Action::SessionListNextGroup => self.jump_to_adjacent_group(true),
+            Action::SessionListPrevGroup => self.jump_to_adjacent_group(false),
             // Same switch as the F9 view: both features read Claude Code's
             // undocumented on-disk layout, so one flag governs both.
             Action::SessionListImport => {

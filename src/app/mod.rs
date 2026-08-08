@@ -815,6 +815,15 @@ pub struct App {
     attention_jump: Option<AttentionJumpMode>,
     /// The label-jump overlay (`Alt+G` / `<leader> A`), when open.
     pub(crate) label_jump: Option<LabelJump>,
+    /// Repo groups collapsed in the session list, by
+    /// [`group_key`](crate::ui::project_list::group_key). Persisted (DB
+    /// metadata) — folding is how a long list gets curated, which is worth
+    /// setting up once rather than every launch.
+    pub(crate) folded_groups: std::collections::HashSet<String>,
+    /// Whether unloaded sessions are folded out of the list into a title-bar
+    /// count (the ghost shelf). In-memory like the other view toggles; its
+    /// startup value comes from `[navigation] ghost_shelf`.
+    pub(crate) ghost_shelf: bool,
     backends: BackendRegistry,
     /// Registry of declarative agent definitions, used to build providers per
     /// session at spawn/restart time.
@@ -1366,6 +1375,8 @@ impl App {
             alt_overlay_redraw_requested: false,
             attention_jump: None,
             label_jump: None,
+            folded_groups: std::collections::HashSet::new(),
+            ghost_shelf: crate::session::settings::global().navigation.ghost_shelf,
             backends,
             agents,
             hosts: crate::session::HostRegistry::default(),
@@ -3435,7 +3446,7 @@ impl App {
     fn activate_click_target(&mut self, action: ClickAction) -> bool {
         match action {
             ClickAction::SelectSession(display_idx) => {
-                if let Some(&idx) = self.render_order_indices().get(display_idx) {
+                if let Some(&idx) = self.visible_order_indices().get(display_idx) {
                     self.set_active_index(idx);
                 }
                 // Clicking a row is *activation*, not list management: land in
@@ -4910,10 +4921,153 @@ impl App {
         crate::ui::project_list::compute_session_order(&infos)
     }
 
-    /// Indices into `self.sessions` in the order they are rendered — the order
-    /// `Ctrl+J`/`Ctrl+K` step through (repo groups in manual order).
+    /// Indices into `self.sessions` in the **full** rendered order, hidden rows
+    /// included. This is the order the reordering operations work in: they
+    /// renumber every session's `display_order` along it, so a filtered order
+    /// would silently renumber the collapsed rows into each other.
+    ///
+    /// Navigation wants [`Self::visible_order_indices`] instead.
     fn render_order_indices(&self) -> Vec<usize> {
         self.session_order().order
+    }
+
+    /// What the session list hides this frame: collapsed repo groups and, with
+    /// the ghost shelf on, unloaded sessions — never the active session, whose
+    /// row has to stay under the cursor.
+    pub(crate) fn visibility_filter(&self) -> crate::ui::project_list::VisibilityFilter<'_> {
+        crate::ui::project_list::VisibilityFilter {
+            folded_groups: &self.folded_groups,
+            ghost_shelf: self.ghost_shelf,
+            keep: self.active_session_id(),
+        }
+    }
+
+    /// Indices into `self.sessions` for the rows actually **on screen**, in
+    /// render order — what `Ctrl+J`/`Ctrl+K`, the jump digits and the labels
+    /// step through. Stepping onto a row the user can't see would look like the
+    /// key was swallowed, so navigation follows the list rather than the data.
+    pub(crate) fn visible_order_indices(&self) -> Vec<usize> {
+        let infos: Vec<&crate::session::SessionInfo> =
+            self.sessions.iter().map(|s| &s.info).collect();
+        let order = crate::ui::project_list::compute_session_order(&infos);
+        let visible =
+            crate::ui::project_list::visible_rows(&infos, &order, &self.visibility_filter());
+        order
+            .order
+            .into_iter()
+            .zip(visible)
+            .filter_map(|(i, shown)| shown.then_some(i))
+            .collect()
+    }
+
+    /// The group key of the session at `idx`, for the fold toggles.
+    fn group_key_at(&self, idx: usize) -> Option<String> {
+        self.sessions
+            .get(idx)
+            .map(|s| crate::ui::project_list::group_key(&s.info))
+    }
+
+    /// Collapse or expand the active session's repo group and persist the set.
+    ///
+    /// Collapsing moves the selection to the group's first row: otherwise the
+    /// active session would be force-kept visible under its own collapsed
+    /// header (see [`Self::visibility_filter`]) and the key would look like it
+    /// did nothing.
+    pub(crate) fn set_active_group_folded(&mut self, folded: bool) {
+        let Some(key) = self.group_key_at(self.active_index) else {
+            return;
+        };
+        let changed = if folded {
+            self.folded_groups.insert(key.clone())
+        } else {
+            self.folded_groups.remove(&key)
+        };
+        if !changed {
+            return;
+        }
+        if folded {
+            if let Some(first) = self
+                .render_order_indices()
+                .into_iter()
+                .find(|&i| self.group_key_at(i).as_deref() == Some(key.as_str()))
+            {
+                self.set_active_index(first);
+            }
+        }
+        self.persist_folded_groups();
+    }
+
+    /// Write the collapsed-group set back to the DB. A failure here costs the
+    /// arrangement on the next launch, not the fold itself, so it is logged
+    /// rather than surfaced.
+    fn persist_folded_groups(&self) {
+        let mut keys: Vec<String> = self.folded_groups.iter().cloned().collect();
+        keys.sort_unstable();
+        if let Err(e) = self.db.set_folded_session_groups(&keys) {
+            tracing::warn!("failed to persist collapsed session groups: {e}");
+        }
+    }
+
+    /// Restore the collapsed-group set at startup.
+    pub fn load_folded_groups(&mut self) {
+        match self.db.get_folded_session_groups() {
+            Ok(keys) => self.folded_groups = keys.into_iter().collect(),
+            Err(e) => tracing::warn!("failed to load collapsed session groups: {e}"),
+        }
+    }
+
+    /// Show or hide the unloaded sessions (the ghost shelf). Reports the new
+    /// state, because with no ghosts around the toggle has nothing visible to
+    /// change and would otherwise look broken.
+    pub(crate) fn toggle_ghost_shelf(&mut self) {
+        self.ghost_shelf = !self.ghost_shelf;
+        let ghosts = self
+            .sessions
+            .iter()
+            .filter(|s| s.info.status == SessionStatus::Unloaded)
+            .count();
+        let msg = match (self.ghost_shelf, ghosts) {
+            (_, 0) => "No unloaded sessions to shelve".to_string(),
+            (true, n) => format!("Shelved {n} unloaded session(s)"),
+            (false, n) => format!("Showing {n} unloaded session(s)"),
+        };
+        self.set_status(StatusLevel::Info, msg);
+    }
+
+    /// Move the selection to the first visible session of the next (or
+    /// previous) repo group, wrapping — the coarse step that makes a list of
+    /// twenty sessions across five repos five keystrokes wide instead of twenty.
+    pub(crate) fn jump_to_adjacent_group(&mut self, forward: bool) {
+        let visible = self.visible_order_indices();
+        if visible.is_empty() {
+            return;
+        }
+        // First visible row of each group, in render order.
+        let mut heads: Vec<usize> = Vec::new();
+        let mut last: Option<String> = None;
+        for &i in &visible {
+            let key = self.group_key_at(i);
+            if key != last {
+                heads.push(i);
+                last = key;
+            }
+        }
+        if heads.len() < 2 {
+            self.set_status(StatusLevel::Info, "Only one repo group");
+            return;
+        }
+        // The group the cursor is in, by its head's position.
+        let active_key = self.group_key_at(self.active_index);
+        let here = heads
+            .iter()
+            .position(|&i| self.group_key_at(i) == active_key)
+            .unwrap_or(0);
+        let next = if forward {
+            (here + 1) % heads.len()
+        } else {
+            (here + heads.len() - 1) % heads.len()
+        };
+        self.set_active_index(heads[next]);
     }
 
     /// Move the active session one step up or down in the rendered order
@@ -4962,7 +5116,7 @@ impl App {
     /// Whether the active session is the first row in render order (top of the
     /// left column). Treats an empty list as "first" so `k` is a no-op there.
     pub(crate) fn active_is_first_in_order(&self) -> bool {
-        match self.render_order_indices().first() {
+        match self.visible_order_indices().first() {
             Some(&first) => first == self.active_index,
             None => true,
         }
@@ -4972,7 +5126,7 @@ impl App {
     /// the session list, directly above the automations pane). Treats an empty
     /// list as "last" so `j` falls straight through into the automations pane.
     pub(crate) fn active_is_last_in_order(&self) -> bool {
-        match self.render_order_indices().last() {
+        match self.visible_order_indices().last() {
             Some(&last) => last == self.active_index,
             None => true,
         }
@@ -4981,7 +5135,7 @@ impl App {
     /// Select the last session in render order — used when navigating up out of
     /// the automations pane back into the session list.
     pub(crate) fn select_last_session(&mut self) {
-        if let Some(&last) = self.render_order_indices().last() {
+        if let Some(&last) = self.visible_order_indices().last() {
             self.set_active_index(last);
         }
     }
@@ -4989,7 +5143,7 @@ impl App {
     /// Select the first session in render order — used when looping down out of
     /// the automations pane back to the top of the session list.
     pub(crate) fn select_first_session(&mut self) {
-        if let Some(&first) = self.render_order_indices().first() {
+        if let Some(&first) = self.visible_order_indices().first() {
             self.set_active_index(first);
         }
     }
@@ -5076,7 +5230,7 @@ impl App {
         if self.sessions.is_empty() {
             return;
         }
-        let order = self.render_order_indices();
+        let order = self.visible_order_indices();
         let pos = order
             .iter()
             .position(|&i| i == self.active_index)
@@ -5251,7 +5405,7 @@ impl App {
         // treating "no filter status" as "no filter" would silently turn the
         // attention overlay into the all-sessions one.
         let wanted = self.attention_status();
-        self.render_order_indices()
+        self.visible_order_indices()
             .into_iter()
             .filter(|&i| !attention_only || wanted == Some(self.sessions[i].info.status))
             .take(9)
@@ -5285,7 +5439,7 @@ impl App {
     /// one of them, which is the difference from [`Self::session_jump_targets`]
     /// and its nine-digit ceiling.
     pub(crate) fn label_jump_targets(&self) -> Vec<usize> {
-        self.render_order_indices()
+        self.visible_order_indices()
     }
 
     /// The label each row wears this frame, parallel to `label_jump_targets`.
@@ -5383,7 +5537,7 @@ impl App {
             self.set_status(StatusLevel::Info, "Nothing needs attention");
             return;
         };
-        let order = self.render_order_indices();
+        let order = self.visible_order_indices();
         if order.is_empty() {
             return;
         }
@@ -5413,7 +5567,7 @@ impl App {
         if self.sessions.is_empty() {
             return;
         }
-        let order = self.render_order_indices();
+        let order = self.visible_order_indices();
         let pos = order
             .iter()
             .position(|&i| i == self.active_index)

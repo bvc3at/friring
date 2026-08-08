@@ -1149,6 +1149,129 @@ mod tests {
         assert_eq!(app.active_index, 0);
     }
 
+    // ── collapsed repo groups & the ghost shelf ──
+
+    /// Give each session a repo so `compute_session_order` puts them in real
+    /// groups (the stub sessions otherwise all land in `(no repo)`).
+    fn in_repo(app: &mut App, idx: usize, repo: &str) {
+        app.sessions[idx].info.repo_display_names = vec![repo.to_string()];
+    }
+
+    #[test]
+    fn folding_a_group_hides_its_rows_from_the_list_and_from_navigation() {
+        let (mut app, _g, _t) = app_with_sessions(4);
+        for i in 0..3 {
+            in_repo(&mut app, i, "alpha");
+        }
+        in_repo(&mut app, 3, "beta");
+        app.set_active_index(3); // stand outside the group being folded
+        app.set_active_index(0);
+        app.set_active_group_folded(true);
+        // Folding selects the group's head, so the cursor isn't stranded on a
+        // row that is about to be hidden.
+        assert_eq!(app.active_index, 0);
+
+        let visible = app.visible_order_indices();
+        assert_eq!(visible, vec![0, 3], "only the head and the other group");
+        // Ctrl+J steps over the folded rows rather than appearing to stall.
+        app.switch_session_forward();
+        assert_eq!(app.active_index, 3);
+        app.switch_session_forward();
+        assert_eq!(app.active_index, 0, "and wraps within what's on screen");
+    }
+
+    #[test]
+    fn unfolding_brings_the_rows_back_and_the_set_persists() {
+        let (mut app, _g, _t) = app_with_sessions(3);
+        for i in 0..3 {
+            in_repo(&mut app, i, "alpha");
+        }
+        app.set_active_group_folded(true);
+        assert_eq!(app.visible_order_indices().len(), 1);
+        assert_eq!(
+            app.db.get_folded_session_groups().unwrap(),
+            vec!["alpha".to_string()],
+            "the arrangement outlives the process"
+        );
+
+        app.set_active_group_folded(false);
+        assert_eq!(app.visible_order_indices().len(), 3);
+        assert!(app.db.get_folded_session_groups().unwrap().is_empty());
+    }
+
+    #[test]
+    fn folding_never_hides_the_active_session() {
+        let (mut app, _g, _t) = app_with_sessions(3);
+        for i in 0..3 {
+            in_repo(&mut app, i, "alpha");
+        }
+        app.folded_groups.insert("alpha".to_string());
+        // Selection moved onto a folded row by some other route (a search
+        // commit, a notification click): its row has to come back.
+        app.set_active_index(2);
+        assert!(
+            app.visible_order_indices().contains(&2),
+            "a hidden cursor would make the list lie about where you are"
+        );
+    }
+
+    #[test]
+    fn folding_leaves_display_order_alone() {
+        let (mut app, _g, _t) = app_with_sessions(4);
+        for i in 0..4 {
+            in_repo(&mut app, i, "alpha");
+        }
+        app.sort_sessions_alphabetically();
+        let before: Vec<Option<i64>> = app.sessions.iter().map(|s| s.info.display_order).collect();
+
+        app.set_active_group_folded(true);
+        app.sort_sessions_alphabetically();
+
+        let after: Vec<Option<i64>> = app.sessions.iter().map(|s| s.info.display_order).collect();
+        assert_eq!(
+            before, after,
+            "reordering must see the whole list, not just what's on screen"
+        );
+    }
+
+    #[test]
+    fn ghost_shelf_hides_unloaded_sessions_but_keeps_the_active_one() {
+        let (mut app, _g, _t) = app_with_sessions(4);
+        app.sessions[1].info.status = SessionStatus::Unloaded;
+        app.sessions[2].info.status = SessionStatus::Unloaded;
+
+        app.toggle_ghost_shelf();
+        assert!(app.ghost_shelf);
+        assert_eq!(app.visible_order_indices(), vec![0, 3]);
+
+        // Reaching a ghost from the switcher must not leave it invisible.
+        app.set_active_index(2);
+        assert!(app.visible_order_indices().contains(&2));
+
+        app.toggle_ghost_shelf();
+        assert_eq!(app.visible_order_indices(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn group_leap_walks_group_heads_and_wraps() {
+        let (mut app, _g, _t) = app_with_sessions(5);
+        in_repo(&mut app, 0, "alpha");
+        in_repo(&mut app, 1, "alpha");
+        in_repo(&mut app, 2, "beta");
+        in_repo(&mut app, 3, "gamma");
+        in_repo(&mut app, 4, "gamma");
+        app.set_active_index(1); // second row of the first group
+
+        app.jump_to_adjacent_group(true);
+        assert_eq!(app.active_index, 2, "lands on the next group's first row");
+        app.jump_to_adjacent_group(true);
+        assert_eq!(app.active_index, 3);
+        app.jump_to_adjacent_group(true);
+        assert_eq!(app.active_index, 0, "wraps to the top group");
+        app.jump_to_adjacent_group(false);
+        assert_eq!(app.active_index, 3, "and back the other way");
+    }
+
     #[test]
     fn blocked_sessions_outrank_equal_name_matches() {
         let (mut app, _g, _t) = app_with_sessions(2);

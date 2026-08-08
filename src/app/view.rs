@@ -313,6 +313,19 @@ impl App {
             None => Vec::new(),
         };
 
+        // What the collapsed groups / ghost shelf are hiding this frame. Held
+        // in a local because it borrows `self` immutably and the render below
+        // takes `&mut self.session_list_state`.
+        let filter = self.visibility_filter();
+        let ghost_shelf_count = if self.ghost_shelf {
+            self.sessions
+                .iter()
+                .filter(|s| s.info.status == crate::session::SessionStatus::Unloaded)
+                .count()
+        } else {
+            0
+        };
+
         // Remap the cached order onto the current refs / match positions /
         // active_index (these vary independently of the order, so the remap
         // always runs — but it's a cheap O(n) index map, no grouping work).
@@ -326,6 +339,7 @@ impl App {
             order,
             &global_match_positions,
             self.active_index,
+            &filter,
         );
 
         use crate::ui::FocusLevel;
@@ -432,8 +446,10 @@ impl App {
                 session_list_state: &mut self.session_list_state,
                 session_match_positions: &ordered.match_positions,
                 session_search_active,
-                headers: ordered.headers,
-                depths: ordered.depths,
+                headers: &ordered.headers,
+                depths: &ordered.depths,
+                folded_counts: &ordered.folded_counts,
+                ghost_shelf_count,
                 spinner,
                 jump_labels: &jump_labels,
             },
