@@ -1207,6 +1207,16 @@ impl PrefixState {
     }
 }
 
+/// Columns a session row spends on things other than its name: the status dot
+/// and its padding, room for the tree/remote/worktree marks, the memory badge
+/// and the block's own borders. Deliberately generous — over-measuring costs a
+/// couple of blank columns in a transient overlay, under-measuring truncates
+/// the very name the overlay exists to reveal.
+const SESSION_ROW_CHROME_COLS: usize = 14;
+
+/// The same, for a repo-group header line (`● ── label ──`).
+const GROUP_HEADER_CHROME_COLS: usize = 10;
+
 /// How the session list numbers its rows this frame.
 ///
 /// The digits are an *argument* to whatever gesture is pending, so the
@@ -5295,6 +5305,13 @@ impl App {
         if self.alt_held && delay_elapsed {
             return Some(JumpNumbering::All);
         }
+        // The Alt-hold overlay needs the kitty protocol to see the key go
+        // down, which an outer tmux strips — and this fork is normally driven
+        // through one. `session_numbers = "always"` is the way to get
+        // aim-then-shoot `Alt+1`–`9` there instead of firing blind.
+        if self.navigation.session_numbers == crate::session::settings::SessionNumbers::Always {
+            return Some(JumpNumbering::All);
+        }
         None
     }
 
@@ -5433,6 +5450,47 @@ impl App {
                 self.set_status(StatusLevel::Info, format!("No {what} #{n}"));
             }
         }
+    }
+
+    /// Whether a session-navigation gesture is pending: the leader is armed
+    /// (or waiting for a move distance), a jump overlay is open, or Alt has
+    /// been held past the overlay delay.
+    ///
+    /// While one is, the next keystroke picks a *session*, so the list is the
+    /// only thing on screen that matters — which is what earns it the width to
+    /// show its names in full (see [`Self::session_peek_width`]).
+    pub(crate) fn session_nav_peek_active(&self) -> bool {
+        if self.label_jump.is_some() || self.attention_jump.is_some() {
+            return true;
+        }
+        if !matches!(self.prefix_state, PrefixState::Idle) {
+            return true;
+        }
+        self.alt_held
+            && self
+                .alt_held_since
+                .is_some_and(|t| t.elapsed().as_millis() as u64 >= JUMP_OVERLAY_DELAY_MS)
+    }
+
+    /// Columns the session list needs to show every visible row in full, while
+    /// a navigation gesture is pending; `None` otherwise.
+    ///
+    /// Sized from the rows actually on screen (collapsed groups and shelved
+    /// ghosts don't count) plus the chrome each one carries. The layout clamps
+    /// the result — this only measures.
+    pub(crate) fn session_peek_width(&self) -> Option<u16> {
+        if !self.session_nav_peek_active() {
+            return None;
+        }
+        let mut widest = 0usize;
+        for &i in &self.visible_order_indices() {
+            let info = &self.sessions[i].info;
+            widest = widest.max(info.name.chars().count() + SESSION_ROW_CHROME_COLS);
+            for repo in &info.repo_display_names {
+                widest = widest.max(repo.chars().count() + GROUP_HEADER_CHROME_COLS);
+            }
+        }
+        (widest > 0).then(|| widest.min(u16::MAX as usize) as u16)
     }
 
     /// The sessions the label-jump overlay labels, in rendered order — every
@@ -8637,6 +8695,7 @@ impl App {
                 // (a status/error toast or the live sync spinner) — must match what
                 // `render_status_message_row` renders so the row is never empty.
                 show_status_row: self.worktree_sync.in_progress || self.status_message.is_some(),
+                session_peek_width: self.session_peek_width(),
             },
         )
     }

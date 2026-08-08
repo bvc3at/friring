@@ -104,12 +104,20 @@ impl App {
         let areas = self.layout_for(frame.area());
 
         self.render_header(frame, areas.header);
-        self.render_left_panel(frame, areas.left_panel);
+        // While the list is peeked it is drawn *after* the central pane, over
+        // it — so its column stays blank here rather than being painted twice
+        // (which would also record every row's click target twice).
+        self.render_left_panel(
+            frame,
+            areas.session_peek.map_or(areas.left_panel, |_| None),
+            false,
+        );
         self.render_automations_pane(frame, areas.automations_panel);
         self.render_info_panel(frame, areas.info_panel);
         self.render_tasks_panel(frame, areas.tasks_panel);
         self.render_file_viewer(frame, areas.file_viewer);
         self.render_central_pane(frame, areas.terminal);
+        self.render_left_panel(frame, areas.session_peek, true);
         if let Some(search_area) = areas.global_search {
             let spinner =
                 crate::ui::SPINNER_FRAMES[self.spinner_frame() % crate::ui::SPINNER_FRAMES.len()];
@@ -273,11 +281,19 @@ impl App {
         );
     }
 
-    /// Render the flat session list in the left panel (when present).
-    fn render_left_panel(&mut self, frame: &mut Frame, left_area: Option<Rect>) {
+    /// Render the session list into `left_area`.
+    ///
+    /// `floating` marks the peeked render — the widened list drawn over the
+    /// central pane while a navigation gesture is pending — which has to wipe
+    /// the pane content underneath it first. See `layout::session_peek` for why
+    /// it floats instead of widening the column.
+    fn render_left_panel(&mut self, frame: &mut Frame, left_area: Option<Rect>, floating: bool) {
         let Some(left_area) = left_area else {
             return;
         };
+        if floating {
+            frame.render_widget(ratatui::widgets::Clear, left_area);
+        }
 
         // Rebuild the cached ordering only when its inputs changed (content
         // signature). The order is status-independent, so most frames — including
