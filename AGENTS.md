@@ -38,9 +38,10 @@ Two rules matter when working here:
   version-check query the same repo. So is the **website** (August 2026):
   `website/` is Friring-branded and `pages.yml` deploys it to
   `bvc3at.github.io/friring`. What still says `thurbox` is deliberate: upstream
-  **attribution** (`LICENSE`, provenance, the Sonar badge, and the fork credit
-  in the site footer / FAQ / `llms.txt`) and upstream-owned surfaces — upstream
-  extension payloads, the `min_thurbox_version` manifest key, and the
+  **attribution** (the `LICENSE`'s original copyright line, provenance, and the
+  fork credit in the site footer / FAQ / `llms.txt`) and upstream-owned
+  surfaces — upstream extension payloads, the `min_thurbox_version` manifest
+  **key** (whose **value** is a floor on *friring's* version line), and the
   `tb-`/`tbs-` tmux window prefixes.
   Upstream merges now carry rename conflicts; resolve them toward `friring` for
   this app's own identifiers and distribution, leaving the attribution names as

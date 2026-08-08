@@ -17,7 +17,8 @@ technical merits, and help newcomers find their footing.
 
 ## Getting started
 
-1. **Clone** the repository — you can push branches directly, no fork needed.
+1. **Fork** the repository and clone your fork. (Maintainers with push access
+   can branch directly on the upstream repo instead.)
 2. **Create a branch** off `main` for your work
    (`git switch -c feat/my-change`).
 3. **Set up the toolchain** (below).
@@ -123,7 +124,8 @@ All commits **must** follow
 - **Types:** `feat`, `fix`, `perf`, `refactor`, `docs`, `style`, `test`,
   `chore`, `ci`, `build`, `revert`
 - **Scopes:** `api`, `cli`, `ui`, `git`, `core`, `docs`, `deps`, `config`,
-  `mcp`, `fork` (fork-specific: `FORK.md`, migration, upstream divergences)
+  `mcp`, `fork` (fork-specific: `FORK.md`, migration, upstream divergences),
+  `review` (the code-review subsystem)
 
 ```bash
 cog commit feat "add remote host picker"
