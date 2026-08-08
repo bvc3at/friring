@@ -60,7 +60,7 @@ that calls `friring-cli extension install`), needed only to bootstrap on
 a box where you'd rather pipe a script:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/main/extensions/flow/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/extensions/flow/install.sh | sh
 ```
 
 **Fork caveat (friring):** that one-liner is the upstream **Thurbox** path — its
