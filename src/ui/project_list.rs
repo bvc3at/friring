@@ -500,46 +500,61 @@ pub struct VisibilityFilter<'a> {
 
 /// Which rows of `order` are visible under `filter`, parallel to `order.order`.
 ///
-/// A **collapsed** group keeps exactly one row — its first *unshelved* one,
-/// which becomes the group's single representative line. The **ghost shelf**
-/// hides unloaded sessions outright, so a folded group whose members are all
-/// unloaded disappears just like an unfolded one. The group header is not tied
-/// to any particular session (`OrderedSessions::from_order` re-attaches it to
-/// whatever row survives), so hiding the first row loses nothing.
+/// A **collapsed** group keeps exactly one row, its *stand-in*: the selection
+/// when the group holds it, else the first row the ghost shelf keeps. The
+/// selection has to win, because it must always have a row — but it has to
+/// *replace* the stand-in rather than join it, or a group the switcher jumped
+/// into would render as two rows under one collapsed header. That is why the
+/// stand-in is chosen in a pass of its own: the selection can sit anywhere in
+/// the group, so a single forward walk would already have emitted the row above
+/// it before learning it was there.
 ///
-/// `filter.keep` overrides both, so the selection always has a row.
+/// The **ghost shelf** hides unloaded sessions outright, so a folded group
+/// whose members are all unloaded disappears just like an unfolded one. The
+/// group header is not tied to any particular session
+/// (`OrderedSessions::from_order` re-attaches it to whatever row survives), so
+/// hiding the first row loses nothing.
 pub fn visible_rows(
     sessions: &[&SessionInfo],
     order: &SessionOrder,
     filter: &VisibilityFilter<'_>,
 ) -> Vec<bool> {
-    let mut folded_group = false;
-    let mut group_row_shown = false;
-    order
-        .order
+    let group_of = header_group_of(&order.headers);
+    let info_at = |row: usize| sessions[order.order[row]];
+    let shelved = |row: usize| filter.ghost_shelf && info_at(row).status == SessionStatus::Unloaded;
+    let is_selection = |row: usize| filter.keep == Some(info_at(row).id);
+
+    let folded_heads: std::collections::HashSet<usize> = order
+        .headers
         .iter()
         .enumerate()
-        .map(|(row, &i)| {
-            let info = sessions[i];
-            if order.headers[row].is_some() {
-                folded_group = filter.folded_groups.contains(&group_key(info));
-                group_row_shown = false;
+        .filter(|(_, label)| label.is_some())
+        .map(|(head, _)| head)
+        .filter(|&head| filter.folded_groups.contains(&group_key(info_at(head))))
+        .collect();
+
+    // Each collapsed group's stand-in row, keyed by its header row. A selection
+    // overwrites whatever candidate came before it; a later candidate never
+    // displaces a selection already recorded.
+    let mut stand_in: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (row, &head) in group_of.iter().enumerate() {
+        if !folded_heads.contains(&head) {
+            continue;
+        }
+        if is_selection(row) {
+            stand_in.insert(head, row);
+        } else if !shelved(row) {
+            stand_in.entry(head).or_insert(row);
+        }
+    }
+
+    (0..order.order.len())
+        .map(|row| {
+            let head = group_of[row];
+            if folded_heads.contains(&head) {
+                return stand_in.get(&head) == Some(&row);
             }
-            let shelved = filter.ghost_shelf && info.status == SessionStatus::Unloaded;
-            if filter.keep == Some(info.id) {
-                // A kept row stands in for its folded group; without this flag
-                // the group would also let a second row through.
-                group_row_shown = true;
-                return true;
-            }
-            if folded_group {
-                if group_row_shown || shelved {
-                    return false;
-                }
-                group_row_shown = true;
-                return true;
-            }
-            !shelved
+            is_selection(row) || !shelved(row)
         })
         .collect()
 }

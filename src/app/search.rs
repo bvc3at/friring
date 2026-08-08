@@ -1250,6 +1250,32 @@ mod tests {
         assert!(app.db.get_folded_session_groups().unwrap().is_empty());
     }
 
+    /// The switcher, a label jump, or `F10` can land on a session buried in an
+    /// already-collapsed group. Its row has to appear — but as the group's
+    /// stand-in, *replacing* the row that would otherwise represent it, or one
+    /// collapsed header would sit above two rows.
+    #[test]
+    fn a_collapsed_group_the_selection_jumped_into_still_shows_one_row() {
+        let (mut app, _g, _t) = app_with_sessions(4);
+        for i in 0..3 {
+            in_repo(&mut app, i, "alpha");
+        }
+        in_repo(&mut app, 3, "beta");
+        app.set_active_index(3);
+        app.folded_groups.insert("alpha".to_string());
+
+        // Land on the *third* member of the collapsed group, as the switcher's
+        // `activate_global_search_result` does (it indexes all sessions, not
+        // just the visible ones).
+        app.set_active_index(2);
+
+        assert_eq!(
+            app.visible_order_indices(),
+            vec![2, 3],
+            "the selection stands in for its group instead of joining its stand-in"
+        );
+    }
+
     #[test]
     fn folding_never_hides_the_active_session() {
         let (mut app, _g, _t) = app_with_sessions(3);
