@@ -823,7 +823,7 @@ name = "flow"
 description = "Focus-protecting triage agent"
 config_version = 1              # manifest *format* version (for migrations)
 version = "1.0.0"              # the extension's own version (bumped by its author)
-min_thurbox_version = "0.113.0" # minimum friring; older binaries get a warning
+min_thurbox_version = "0.1.0"  # minimum friring; older binaries get a warning
 # home = "~/flow"               # OPTIONAL; default is <config>/extensions/<name>.
                                 # {home} is substituted everywhere it appears
 
@@ -1015,6 +1015,12 @@ newer friring still installs on an older binary, but install/activate and
 self-heal emit a compatibility warning so the mismatch is visible.
 **Dev builds** (`0.0.0-dev`) skip both the staleness and compatibility
 checks — their version doesn't order against release tags.
+
+The **key name** is a wire format shared with upstream and stays as-is, but the
+**value** is compared against the running `friring` binary — so an extension in
+this repo declares a floor on *friring's* release line, not upstream's. Carrying
+an upstream floor over unchanged would warn on every install, since the two
+version lines are numbered independently.
 
 **Rollback.** There's no version snapshot store: to roll an extension
 back, pin a specific friring tag — `extension install
