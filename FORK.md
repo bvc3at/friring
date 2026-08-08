@@ -1704,13 +1704,17 @@ real Claude turn and the stub's usage route.
   builds (`0.0.0-dev`) skip the check, which is why it stayed invisible. Each
   extension now declares the first *friring* tag carrying the feature it needs
   (`0.1.0`, or `0.12.0` for the Exec automation action).
-- **Extension installers document the fork's own URL.** The `install.sh` header
-  in each `extensions/*/` and the `flow` README advertised
-  `raw.githubusercontent.com/Thurbeen/thurbox/main/extensions/…`, which serves
-  upstream payloads that call `thurbox-cli`. They point at `bvc3at/friring`
-  now. Bare-name installs through `friring-cli extension install <name>` still
-  resolve upstream (`OFFICIAL_REPO_RAW`) — that caveat is documented in
-  `docs/CONFIG.md` and the README.
+- **The official extension source is this repo.** `OFFICIAL_REPO_RAW` still
+  pointed at `Thurbeen/thurbox`, so a bare `friring-cli extension install
+  <name>` fetched upstream payloads that invoke `thurbox-cli`, pinned to an
+  upstream tag equal to the friring binary's version — a tag that generally
+  does not exist upstream, so the install either 404'd or landed a
+  `thurbox-cli` payload. It resolves against `bvc3at/friring` now, where the
+  release tags do exist and the payloads call `friring-cli`; the `install.sh`
+  header in each `extensions/*/` and the `flow` README advertise the same host.
+  This retires the "prefer a local-directory install" caveat that `README.md`
+  and `docs/CONFIG.md` used to carry. An upstream URL still installs if given
+  explicitly — it just won't work here, for the same two reasons.
 
 ### CI / automation
 

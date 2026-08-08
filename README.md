@@ -1033,12 +1033,9 @@ friring-cli extension deactivate <name>        # tear them down (real off-switch
 friring-cli extension uninstall <name> [--purge]
 ```
 
-A bare `<name>` resolves against the official source, **pinned to your
-binary's release tag** so the fetched extension matches the binary;
-a URL or local dir installs from there instead. On friring, prefer
-local-dir installs (`friring-cli extension install ./extensions/<name>`) —
-bare-name/upstream installs fetch upstream Thurbox payloads that call
-`thurbox-cli`. Installed extensions
+A bare `<name>` resolves against this repo's `extensions/`, **pinned to your
+binary's release tag** so the fetched extension matches the binary; a URL or
+local dir installs from there instead. Installed extensions
 **self-heal** — their declared sessions and automations are re-ensured
 at TUI startup and on every headless `automation tick`, so `deactivate`
 (not deleting the session) is the way to turn one off.

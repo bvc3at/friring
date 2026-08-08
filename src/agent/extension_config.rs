@@ -17,10 +17,15 @@ use serde::Serialize;
 
 use crate::session::{AgentDef, AgentPatch, ExtensionDef};
 
-/// Raw-content root of the thurbox repo (no git ref).
-const OFFICIAL_REPO_RAW: &str = "https://raw.githubusercontent.com/Thurbeen/thurbox";
+/// Raw-content root of the friring repo (no git ref).
+///
+/// The fork's own repo, not upstream's: [`official_ref`] pins the fetch to this
+/// binary's release tag, which only exists here, and the payloads under
+/// `extensions/` invoke `friring-cli`. Pointing this upstream would serve
+/// `thurbox-cli` payloads at a tag that may not exist. See `FORK.md`.
+const OFFICIAL_REPO_RAW: &str = "https://raw.githubusercontent.com/bvc3at/friring";
 
-/// The running binary's version string (e.g. `0.113.0`, or `0.0.0-dev` for a
+/// The running binary's version string (e.g. `0.20.0`, or `0.0.0-dev` for a
 /// development build), injected at compile time by `build.rs`. The reference
 /// point for extension staleness + compatibility checks.
 pub fn binary_version() -> &'static str {
@@ -44,7 +49,7 @@ fn official_ref() -> String {
     }
 }
 
-/// Base URL for the official extensions shipped in the thurbox repo, pinned to
+/// Base URL for the official extensions shipped in the friring repo, pinned to
 /// this binary's version. A bare `friring-cli extension install <name>` resolves
 /// to `<official_base()>/<name>`.
 pub fn official_base() -> String {
@@ -62,7 +67,7 @@ pub struct OfficialExtension {
     pub description: &'static str,
 }
 
-/// The official extensions shipped in `extensions/<name>/` of the thurbox repo.
+/// The official extensions shipped in `extensions/<name>/` of the friring repo.
 ///
 /// **Source of truth for discovery + typo suggestions.** Keep in sync when an
 /// extension is added/removed under `extensions/` (descriptions mirror each
