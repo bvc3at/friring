@@ -1350,6 +1350,27 @@ mod tests {
         );
     }
 
+    /// A collapsed group is represented by its first *unshelved* row: the shelf
+    /// is on, so leaking one ghost per folded group would defeat it.
+    #[test]
+    fn a_folded_group_is_represented_by_a_row_the_shelf_keeps() {
+        let (mut app, _g, _t) = app_with_sessions(3);
+        in_repo(&mut app, 0, "alpha");
+        in_repo(&mut app, 1, "beta");
+        in_repo(&mut app, 2, "beta");
+        app.sessions[1].info.status = SessionStatus::Unloaded;
+        app.set_active_index(1);
+        app.set_active_group_folded(true);
+        app.set_active_index(0); // stand outside the folded group
+        app.toggle_ghost_shelf();
+
+        assert_eq!(
+            app.visible_order_indices(),
+            vec![0, 2],
+            "the loaded member stands in for the group, not the ghost"
+        );
+    }
+
     /// A group that merely has a shelved session in it is not *collapsed* — its
     /// header must not claim to be, or `l` would appear to do nothing.
     #[test]

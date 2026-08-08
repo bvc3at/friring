@@ -500,12 +500,12 @@ pub struct VisibilityFilter<'a> {
 
 /// Which rows of `order` are visible under `filter`, parallel to `order.order`.
 ///
-/// A **collapsed** group keeps exactly its first row, which becomes the group's
-/// single representative line. The **ghost shelf** hides unloaded sessions
-/// outright — including a group's first row, and a group whose members are all
-/// unloaded therefore disappears entirely. The group header is not tied to any
-/// particular session (`OrderedSessions::from_order` re-attaches it to whatever
-/// row survives), so hiding the first row loses nothing.
+/// A **collapsed** group keeps exactly one row — its first *unshelved* one,
+/// which becomes the group's single representative line. The **ghost shelf**
+/// hides unloaded sessions outright, so a folded group whose members are all
+/// unloaded disappears just like an unfolded one. The group header is not tied
+/// to any particular session (`OrderedSessions::from_order` re-attaches it to
+/// whatever row survives), so hiding the first row loses nothing.
 ///
 /// `filter.keep` overrides both, so the selection always has a row.
 pub fn visible_rows(
@@ -514,7 +514,7 @@ pub fn visible_rows(
     filter: &VisibilityFilter<'_>,
 ) -> Vec<bool> {
     let mut folded_group = false;
-    let mut at_group_start = true;
+    let mut group_row_shown = false;
     order
         .order
         .iter()
@@ -523,16 +523,23 @@ pub fn visible_rows(
             let info = sessions[i];
             if order.headers[row].is_some() {
                 folded_group = filter.folded_groups.contains(&group_key(info));
-                at_group_start = true;
+                group_row_shown = false;
             }
-            let is_first = std::mem::replace(&mut at_group_start, false);
+            let shelved = filter.ghost_shelf && info.status == SessionStatus::Unloaded;
             if filter.keep == Some(info.id) {
+                // A kept row stands in for its folded group; without this flag
+                // the group would also let a second row through.
+                group_row_shown = true;
                 return true;
             }
             if folded_group {
-                return is_first;
+                if group_row_shown || shelved {
+                    return false;
+                }
+                group_row_shown = true;
+                return true;
             }
-            !(filter.ghost_shelf && info.status == SessionStatus::Unloaded)
+            !shelved
         })
         .collect()
 }
