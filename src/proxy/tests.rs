@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::*;
@@ -41,6 +41,10 @@ fn loopback_only() -> Policy {
 
 fn bearer(proxy: &Proxy) -> String {
     format!("Bearer {}", proxy.token())
+}
+
+fn tcp_addr(proxy: &Proxy) -> SocketAddr {
+    proxy.tcp_addr().expect("a TCP listener is bound")
 }
 
 /// A loopback server that echoes whatever it is sent, standing in for an
@@ -120,7 +124,11 @@ impl HttpServer {
 
 /// Read an HTTP response head one byte at a time, so nothing belonging to the
 /// tunnel behind it is swallowed.
-async fn read_response_head(stream: &mut TcpStream) -> String {
+///
+/// Every client helper below is generic over the transport: the same
+/// assertions have to hold whether the sandbox reached the proxy over loopback
+/// or over its unix socket, and writing them twice would let the two drift.
+async fn read_response_head<S: AsyncRead + Unpin>(stream: &mut S) -> String {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
@@ -136,7 +144,7 @@ async fn read_response_head(stream: &mut TcpStream) -> String {
     String::from_utf8(head).expect("an ASCII response head")
 }
 
-async fn read_body(stream: &mut TcpStream) -> String {
+async fn read_body<S: AsyncRead + Unpin>(stream: &mut S) -> String {
     let mut body = Vec::new();
     stream
         .read_to_end(&mut body)
@@ -145,15 +153,29 @@ async fn read_body(stream: &mut TcpStream) -> String {
     String::from_utf8(body).expect("a UTF-8 body")
 }
 
-async fn send_request(proxy: &Proxy, request: &str) -> (TcpStream, String) {
-    let mut stream = TcpStream::connect(proxy.addr())
-        .await
-        .expect("dialling the proxy");
+/// Write a request and read back the response head.
+async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, request: &str) -> String {
     stream
         .write_all(request.as_bytes())
         .await
         .expect("writing the request");
-    let head = read_response_head(&mut stream).await;
+    read_response_head(stream).await
+}
+
+fn connect_request(target: &str, credential: Option<&str>) -> String {
+    let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
+    if let Some(credential) = credential {
+        request.push_str(&format!("Proxy-Authorization: {credential}\r\n"));
+    }
+    request.push_str("\r\n");
+    request
+}
+
+async fn send_request(proxy: &Proxy, request: &str) -> (TcpStream, String) {
+    let mut stream = TcpStream::connect(tcp_addr(proxy))
+        .await
+        .expect("dialling the proxy");
+    let head = exchange(&mut stream, request).await;
     (stream, head)
 }
 
@@ -162,16 +184,11 @@ async fn send_connect(
     target: &str,
     credential: Option<&str>,
 ) -> (TcpStream, String) {
-    let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
-    if let Some(credential) = credential {
-        request.push_str(&format!("Proxy-Authorization: {credential}\r\n"));
-    }
-    request.push_str("\r\n");
-    send_request(proxy, &request).await
+    send_request(proxy, &connect_request(target, credential)).await
 }
 
 /// Bounce a byte string off the echo server through an open tunnel.
-async fn assert_tunnels(stream: &mut TcpStream, payload: &[u8]) {
+async fn assert_tunnels<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, payload: &[u8]) {
     stream
         .write_all(payload)
         .await
@@ -206,10 +223,10 @@ async fn wait_until(limit: Duration, mut ready: impl FnMut() -> bool) {
 
 const SOCKS_AUTH_USERNAME_PASSWORD: u8 = 0x02;
 
-async fn socks_greet(proxy: &Proxy, methods: &[u8]) -> (TcpStream, [u8; 2]) {
-    let mut stream = TcpStream::connect(proxy.addr())
-        .await
-        .expect("dialling the proxy");
+async fn socks_greet_on<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    methods: &[u8],
+) -> [u8; 2] {
     let mut greeting = vec![0x05, u8::try_from(methods.len()).expect("few methods")];
     greeting.extend_from_slice(methods);
     stream
@@ -221,10 +238,35 @@ async fn socks_greet(proxy: &Proxy, methods: &[u8]) -> (TcpStream, [u8; 2]) {
         .read_exact(&mut chosen)
         .await
         .expect("reading the method");
+    chosen
+}
+
+async fn socks_greet(proxy: &Proxy, methods: &[u8]) -> (TcpStream, [u8; 2]) {
+    let mut stream = TcpStream::connect(tcp_addr(proxy))
+        .await
+        .expect("dialling the proxy");
+    let chosen = socks_greet_on(&mut stream, methods).await;
     (stream, chosen)
 }
 
-async fn socks_authenticate(stream: &mut TcpStream, password: &str) -> [u8; 2] {
+/// The full SOCKS5 client sequence on an already-connected stream, for the
+/// transports that do not dial a TCP address.
+async fn socks_tunnel_on<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    token: &str,
+    host: &str,
+    port: u16,
+) -> [u8; 10] {
+    let chosen = socks_greet_on(stream, &[SOCKS_AUTH_USERNAME_PASSWORD]).await;
+    assert_eq!(chosen, [0x05, SOCKS_AUTH_USERNAME_PASSWORD]);
+    assert_eq!(socks_authenticate(stream, token).await, [0x01, 0x00]);
+    socks_request(stream, host, port).await
+}
+
+async fn socks_authenticate<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    password: &str,
+) -> [u8; 2] {
     let user = PROXY_USERNAME.as_bytes();
     let mut message = vec![0x01, u8::try_from(user.len()).expect("short username")];
     message.extend_from_slice(user);
@@ -242,7 +284,11 @@ async fn socks_authenticate(stream: &mut TcpStream, password: &str) -> [u8; 2] {
     status
 }
 
-async fn socks_request(stream: &mut TcpStream, host: &str, port: u16) -> [u8; 10] {
+async fn socks_request<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    host: &str,
+    port: u16,
+) -> [u8; 10] {
     let mut message = vec![0x05, 0x01, 0x00, 0x03];
     message.push(u8::try_from(host.len()).expect("short host"));
     message.extend_from_slice(host.as_bytes());
@@ -288,10 +334,13 @@ async fn an_allowed_connect_tunnels_bytes_both_ways() {
 async fn the_published_basic_credential_is_accepted() {
     let echo = spawn_echo_server().await;
     let (proxy, _denials) = start(loopback_only()).await;
-    let url = proxy.http_proxy_url();
+    let url = proxy.http_proxy_url().expect("a TCP proxy has a URL");
     assert!(url.starts_with(&format!("http://{PROXY_USERNAME}:")));
-    assert!(url.ends_with(&proxy.addr().to_string()));
-    assert!(proxy.socks5_proxy_url().starts_with("socks5h://"));
+    assert!(url.ends_with(&tcp_addr(&proxy).to_string()));
+    assert!(proxy
+        .socks5_proxy_url()
+        .expect("a TCP proxy has a URL")
+        .starts_with("socks5h://"));
 
     // What a client derives from that URL: base64("friring:<token>").
     let pair = format!("{PROXY_USERNAME}:{}", proxy.token());
@@ -716,7 +765,7 @@ async fn connections_beyond_the_cap_are_dropped_not_queued() {
 
     // Nothing is written on the extra connection: the proxy drops it at accept
     // time, and an unwritten socket closes with a clean EOF rather than a reset.
-    let mut extra = TcpStream::connect(proxy.addr())
+    let mut extra = TcpStream::connect(tcp_addr(&proxy))
         .await
         .expect("dialling the proxy");
     let mut response = Vec::new();
@@ -738,7 +787,7 @@ async fn connections_beyond_the_cap_are_dropped_not_queued() {
 async fn shutdown_releases_the_port_and_ends_live_tunnels() {
     let echo = spawn_echo_server().await;
     let (proxy, _denials) = start(loopback_only()).await;
-    let addr = proxy.addr();
+    let addr = tcp_addr(&proxy);
     let (mut tunnel, head) = send_connect(&proxy, &echo.to_string(), Some(&bearer(&proxy))).await;
     assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
 
@@ -773,7 +822,7 @@ async fn a_malformed_request_gets_a_400_rather_than_a_silent_close() {
 #[tokio::test]
 async fn an_oversized_request_head_is_capped() {
     let (proxy, _denials) = start(loopback_only()).await;
-    let mut stream = TcpStream::connect(proxy.addr())
+    let mut stream = TcpStream::connect(tcp_addr(&proxy))
         .await
         .expect("dialling the proxy");
     stream
@@ -801,4 +850,531 @@ async fn an_oversized_request_head_is_capped() {
     let response = String::from_utf8_lossy(&response);
     assert!(response.starts_with("HTTP/1.1 431 "), "{response}");
     proxy.shutdown().await;
+}
+
+/// The transport a network-namespaced sandbox actually uses: a unix socket on
+/// the host, reached from inside through [`super::relay`].
+///
+/// Every socket here lives under a fresh temporary directory that the test
+/// owns and deletes; nothing reads or writes a real Friring data directory.
+#[cfg(unix)]
+mod unix_transport {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+
+    use tokio::net::UnixStream;
+
+    use super::*;
+    use crate::proxy::{Relay, RelayConfig};
+
+    /// A private directory for one test's socket. Held by the caller: dropping
+    /// it removes the directory.
+    fn socket_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("a private temporary directory")
+    }
+
+    fn unix_config(policy: Policy, path: &Path) -> ProxyConfig {
+        ProxyConfig {
+            bind: ProxyBind::unix(path),
+            ..test_config(policy)
+        }
+    }
+
+    async fn start_unix(policy: Policy, path: &Path) -> (Proxy, mpsc::Receiver<DenialEvent>) {
+        Proxy::start(unix_config(policy, path))
+            .await
+            .expect("the proxy binds its socket")
+    }
+
+    async fn dial(proxy: &Proxy) -> UnixStream {
+        let path = proxy.unix_path().expect("a unix listener is bound");
+        UnixStream::connect(path)
+            .await
+            .expect("dialling the proxy socket")
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("the socket exists")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[tokio::test]
+    async fn a_connect_over_the_socket_tunnels_bytes_both_ways() {
+        let echo = spawn_echo_server().await;
+        let dir = socket_dir();
+        let (proxy, _denials) = start_unix(loopback_only(), &dir.path().join("p.sock")).await;
+        let mut tunnel = dial(&proxy).await;
+        let head = exchange(
+            &mut tunnel,
+            &connect_request(&echo.to_string(), Some(&bearer(&proxy))),
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert_tunnels(&mut tunnel, b"over a unix socket").await;
+        proxy.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn socks5_works_over_the_socket_too() {
+        let echo = spawn_echo_server().await;
+        let dir = socket_dir();
+        let (proxy, _denials) = start_unix(loopback_only(), &dir.path().join("p.sock")).await;
+        let mut tunnel = dial(&proxy).await;
+        let reply = socks_tunnel_on(&mut tunnel, proxy.token(), "127.0.0.1", echo.port()).await;
+        assert_eq!(reply[1], 0x00, "success reply");
+        assert_tunnels(&mut tunnel, b"socks over a unix socket").await;
+        proxy.shutdown().await;
+    }
+
+    /// The socket is not a way around the token or the allowlist: reaching the
+    /// proxy through the filesystem changes nothing about what it enforces.
+    #[tokio::test]
+    async fn the_socket_enforces_the_same_token_and_policy() {
+        let dir = socket_dir();
+        let (proxy, mut denials) = start_unix(loopback_only(), &dir.path().join("p.sock")).await;
+
+        let mut unauthenticated = dial(&proxy).await;
+        let head = exchange(
+            &mut unauthenticated,
+            &connect_request("127.0.0.1:1", Some("Bearer wrong")),
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 407 "), "{head}");
+        assert_eq!(
+            next_denial(&mut denials).await.reason,
+            DenyReason::Unauthorized
+        );
+
+        let mut denied = dial(&proxy).await;
+        let head = exchange(
+            &mut denied,
+            &connect_request("blocked.test:443", Some(&bearer(&proxy))),
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+        assert!(read_body(&mut denied)
+            .await
+            .contains("not in the sandbox allowlist"));
+        assert_eq!(
+            next_denial(&mut denials).await.reason,
+            DenyReason::NotAllowlisted
+        );
+
+        // And SOCKS5's own authentication step, over the same transport.
+        let mut socks = dial(&proxy).await;
+        assert_eq!(
+            socks_greet_on(&mut socks, &[SOCKS_AUTH_USERNAME_PASSWORD]).await,
+            [0x05, SOCKS_AUTH_USERNAME_PASSWORD]
+        );
+        assert_eq!(
+            socks_authenticate(&mut socks, "not-the-token").await,
+            [0x01, 0x01]
+        );
+        proxy.shutdown().await;
+    }
+
+    /// The socket is a credential-bearing endpoint. Even with the token
+    /// required, it has no business being connectable by every account on the
+    /// host.
+    #[tokio::test]
+    async fn the_socket_is_not_world_connectable() {
+        let dir = socket_dir();
+        let path = dir.path().join("p.sock");
+        let (proxy, _denials) = start_unix(loopback_only(), &path).await;
+        assert_eq!(mode_of(&path), 0o600, "default mode");
+        proxy.shutdown().await;
+
+        // A backend whose sandbox runs as another uid has to widen it
+        // deliberately, and gets exactly what it asked for.
+        let config = ProxyConfig {
+            bind: ProxyBind {
+                tcp: None,
+                unix: Some(UnixBind::new(&path).with_mode(0o660)),
+            },
+            ..test_config(loopback_only())
+        };
+        let (proxy, _denials) = Proxy::start(config).await.expect("the proxy binds");
+        assert_eq!(mode_of(&path), 0o660);
+        proxy.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_socket_is_removed_on_shutdown() {
+        let dir = socket_dir();
+        let path = dir.path().join("p.sock");
+        let (proxy, _denials) = start_unix(loopback_only(), &path).await;
+        assert!(path.exists());
+        proxy.shutdown().await;
+        assert!(!path.exists(), "shutdown leaves no socket behind");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_handle_also_removes_the_socket() {
+        let dir = socket_dir();
+        let path = dir.path().join("p.sock");
+        let (proxy, _denials) = start_unix(loopback_only(), &path).await;
+        assert!(path.exists());
+        drop(proxy);
+        assert!(!path.exists());
+    }
+
+    /// A crashed Friring leaves its socket file behind. The next start has to
+    /// reclaim it, or the sandbox is wedged until someone deletes it by hand.
+    #[tokio::test]
+    async fn a_stale_socket_file_does_not_wedge_startup() {
+        let dir = socket_dir();
+        let path = dir.path().join("p.sock");
+        let abandoned = std::os::unix::net::UnixListener::bind(&path).expect("bind a stale socket");
+        drop(abandoned);
+        assert!(path.exists(), "a listener's socket file outlives it");
+
+        let (proxy, _denials) = start_unix(loopback_only(), &path).await;
+        assert_eq!(proxy.unix_path(), Some(path.as_path()));
+        // And it serves: reclaiming the path is not just unlinking it.
+        let mut tunnel = dial(&proxy).await;
+        let head = exchange(
+            &mut tunnel,
+            &connect_request("blocked.test:443", Some(&bearer(&proxy))),
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+        proxy.shutdown().await;
+    }
+
+    /// Reclaiming a stale socket must not become stealing a live one.
+    #[tokio::test]
+    async fn a_socket_a_running_proxy_is_serving_is_not_taken_over() {
+        let dir = socket_dir();
+        let path = dir.path().join("p.sock");
+        let (first, _denials) = start_unix(loopback_only(), &path).await;
+
+        let error = Proxy::start(unix_config(loopback_only(), &path))
+            .await
+            .expect_err("a live socket is not free");
+        assert!(
+            error
+                .to_string()
+                .contains("already served by a running proxy"),
+            "{error}"
+        );
+
+        // The first proxy is untouched.
+        let mut tunnel = dial(&first).await;
+        let head = exchange(
+            &mut tunnel,
+            &connect_request("blocked.test:443", Some(&bearer(&first))),
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+        first.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_regular_file_at_the_socket_path_is_never_deleted() {
+        let dir = socket_dir();
+        let path = dir.path().join("not-a-socket");
+        std::fs::write(&path, b"something the user cares about").expect("write the file");
+
+        let error = Proxy::start(unix_config(loopback_only(), &path))
+            .await
+            .expect_err("a regular file is not a socket to reclaim");
+        assert!(error.to_string().contains("not a socket"), "{error}");
+        assert!(path.exists(), "the file must survive the refusal");
+    }
+
+    #[tokio::test]
+    async fn one_proxy_can_serve_both_transports_at_once() {
+        let echo = spawn_echo_server().await;
+        let dir = socket_dir();
+        let path = dir.path().join("p.sock");
+        let config = ProxyConfig {
+            bind: ProxyBind::both("127.0.0.1:0".parse().expect("a loopback address"), &path),
+            ..test_config(loopback_only())
+        };
+        let (proxy, _denials) = Proxy::start(config).await.expect("the proxy binds both");
+        assert!(proxy.tcp_addr().is_some());
+        assert_eq!(proxy.unix_path(), Some(path.as_path()));
+
+        let (mut over_tcp, head) =
+            send_connect(&proxy, &echo.to_string(), Some(&bearer(&proxy))).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        let mut over_unix = dial(&proxy).await;
+        let head = exchange(
+            &mut over_unix,
+            &connect_request(&echo.to_string(), Some(&bearer(&proxy))),
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+
+        assert_tunnels(&mut over_tcp, b"loopback").await;
+        assert_tunnels(&mut over_unix, b"socket").await;
+        proxy.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_proxy_with_no_listener_is_a_configuration_error() {
+        let config = ProxyConfig {
+            bind: ProxyBind {
+                tcp: None,
+                unix: None,
+            },
+            ..test_config(loopback_only())
+        };
+        let error = Proxy::start(config)
+            .await
+            .expect_err("a proxy nothing can reach is not a proxy");
+        assert!(
+            error.to_string().contains("at least one listener"),
+            "{error}"
+        );
+    }
+
+    // The relay: what makes the socket reachable from inside a network
+    // namespace, where no host TCP address exists.
+
+    async fn start_relay(socket: &Path) -> Relay {
+        Relay::start(RelayConfig {
+            connect_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(5),
+            ..RelayConfig::new(
+                "127.0.0.1:0".parse().expect("a loopback address"),
+                socket.to_path_buf(),
+            )
+        })
+        .await
+        .expect("the relay binds")
+    }
+
+    /// The whole path an agent inside a `--unshare-net` sandbox takes: TCP to
+    /// the relay, unix socket to the proxy, policy, upstream.
+    #[tokio::test]
+    async fn the_relay_carries_connect_through_to_the_proxy() {
+        let echo = spawn_echo_server().await;
+        let dir = socket_dir();
+        let path = dir.path().join("p.sock");
+        let (proxy, _denials) = start_unix(loopback_only(), &path).await;
+        let relay = start_relay(&path).await;
+
+        let mut tunnel = TcpStream::connect(relay.addr())
+            .await
+            .expect("dialling the relay");
+        let head = exchange(
+            &mut tunnel,
+            &connect_request(&echo.to_string(), Some(&bearer(&proxy))),
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert_tunnels(&mut tunnel, b"through the relay").await;
+
+        relay.shutdown().await;
+        proxy.shutdown().await;
+    }
+
+    /// The relay moves bytes and nothing else, so SOCKS5 crosses it unchanged.
+    #[tokio::test]
+    async fn the_relay_carries_socks5_unchanged() {
+        let echo = spawn_echo_server().await;
+        let dir = socket_dir();
+        let path = dir.path().join("p.sock");
+        let (proxy, _denials) = start_unix(loopback_only(), &path).await;
+        let relay = start_relay(&path).await;
+
+        let mut tunnel = TcpStream::connect(relay.addr())
+            .await
+            .expect("dialling the relay");
+        let reply = socks_tunnel_on(&mut tunnel, proxy.token(), "127.0.0.1", echo.port()).await;
+        assert_eq!(reply[1], 0x00, "success reply");
+        assert_tunnels(&mut tunnel, b"socks through the relay").await;
+
+        relay.shutdown().await;
+        proxy.shutdown().await;
+    }
+
+    /// The relay holds no credential and makes no decision: a denial still
+    /// comes from the proxy, with its reason intact.
+    #[tokio::test]
+    async fn a_denial_survives_the_relay_with_its_reason() {
+        let dir = socket_dir();
+        let path = dir.path().join("p.sock");
+        let (proxy, mut denials) = start_unix(loopback_only(), &path).await;
+        let relay = start_relay(&path).await;
+
+        let mut stream = TcpStream::connect(relay.addr())
+            .await
+            .expect("dialling the relay");
+        let head = exchange(
+            &mut stream,
+            &connect_request("blocked.test:443", Some(&bearer(&proxy))),
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+        assert!(read_body(&mut stream)
+            .await
+            .contains("not in the sandbox allowlist"));
+        assert_eq!(next_denial(&mut denials).await.host, "blocked.test");
+
+        // And the token is still required on the far side.
+        let mut unauthenticated = TcpStream::connect(relay.addr())
+            .await
+            .expect("dialling the relay");
+        let head = exchange(&mut unauthenticated, &connect_request("127.0.0.1:1", None)).await;
+        assert!(head.starts_with("HTTP/1.1 407 "), "{head}");
+
+        relay.shutdown().await;
+        proxy.shutdown().await;
+    }
+
+    /// The environment a sandbox is handed: the relay's address inside the
+    /// namespace, carrying the proxy's token.
+    #[tokio::test]
+    async fn the_sandbox_proxy_urls_point_at_the_relay() {
+        let dir = socket_dir();
+        let path = dir.path().join("p.sock");
+        let (proxy, _denials) = start_unix(loopback_only(), &path).await;
+        let relay = start_relay(&path).await;
+
+        // A unix-only proxy has no URL of its own to hand out.
+        assert_eq!(proxy.http_proxy_url(), None);
+        assert_eq!(proxy.socks5_proxy_url(), None);
+
+        let http = proxy.http_proxy_url_at(relay.addr());
+        assert_eq!(
+            http,
+            format!("http://{PROXY_USERNAME}:{}@{}", proxy.token(), relay.addr())
+        );
+        assert!(proxy
+            .socks5_proxy_url_at(relay.addr())
+            .starts_with("socks5h://"));
+
+        relay.shutdown().await;
+        proxy.shutdown().await;
+    }
+
+    /// The relay starts before the host proxy is guaranteed to be up, so a
+    /// missing socket must close the connection rather than hang or panic.
+    #[tokio::test]
+    async fn the_relay_closes_cleanly_when_the_socket_is_absent() {
+        let dir = socket_dir();
+        let relay = start_relay(&dir.path().join("never-created.sock")).await;
+
+        let mut stream = TcpStream::connect(relay.addr())
+            .await
+            .expect("dialling the relay");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("the relay closes it");
+        assert!(response.is_empty());
+
+        wait_until(Duration::from_secs(5), || relay.active_connections() == 0).await;
+        relay.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_client_that_vanishes_leaves_no_relay_task_behind() {
+        let echo = spawn_echo_server().await;
+        let dir = socket_dir();
+        let path = dir.path().join("p.sock");
+        let (proxy, _denials) = start_unix(loopback_only(), &path).await;
+        let relay = start_relay(&path).await;
+
+        let mut tunnel = TcpStream::connect(relay.addr())
+            .await
+            .expect("dialling the relay");
+        let head = exchange(
+            &mut tunnel,
+            &connect_request(&echo.to_string(), Some(&bearer(&proxy))),
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert_eq!(relay.active_connections(), 1);
+
+        drop(tunnel);
+        wait_until(Duration::from_secs(5), || relay.active_connections() == 0).await;
+        wait_until(Duration::from_secs(5), || proxy.active_connections() == 0).await;
+
+        relay.shutdown().await;
+        proxy.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_relay_drops_connections_beyond_its_cap() {
+        let echo = spawn_echo_server().await;
+        let dir = socket_dir();
+        let path = dir.path().join("p.sock");
+        let (proxy, _denials) = start_unix(loopback_only(), &path).await;
+        let relay = Relay::start(RelayConfig {
+            max_connections: 1,
+            connect_timeout: Duration::from_secs(5),
+            idle_timeout: Duration::from_secs(5),
+            ..RelayConfig::new("127.0.0.1:0".parse().expect("a loopback address"), &path)
+        })
+        .await
+        .expect("the relay binds");
+
+        let mut held = TcpStream::connect(relay.addr())
+            .await
+            .expect("dialling the relay");
+        let head = exchange(
+            &mut held,
+            &connect_request(&echo.to_string(), Some(&bearer(&proxy))),
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+
+        let mut extra = TcpStream::connect(relay.addr())
+            .await
+            .expect("dialling the relay");
+        let mut response = Vec::new();
+        extra
+            .read_to_end(&mut response)
+            .await
+            .expect("the relay closes it");
+        assert!(response.is_empty(), "an over-cap client is dropped");
+
+        assert_tunnels(&mut held, b"still open").await;
+        relay.shutdown().await;
+        proxy.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn relay_shutdown_releases_the_port() {
+        let dir = socket_dir();
+        let path = dir.path().join("p.sock");
+        let (proxy, _denials) = start_unix(loopback_only(), &path).await;
+        let relay = start_relay(&path).await;
+        let addr = relay.addr();
+        relay.shutdown().await;
+
+        let released = match TcpStream::connect(addr).await {
+            Err(_) => true,
+            Ok(mut stream) => {
+                let mut response = Vec::new();
+                let _ = stream.read_to_end(&mut response).await;
+                response.is_empty()
+            }
+        };
+        assert!(released, "the relay port still answers after shutdown");
+        proxy.shutdown().await;
+    }
+
+    /// Socket paths are length-limited by the OS (around 100 bytes), which is
+    /// short enough that a deep data directory can cross it. The failure has to
+    /// name the path rather than surface as a bare errno.
+    #[tokio::test]
+    async fn an_unbindable_socket_path_names_itself() {
+        let dir = socket_dir();
+        let path: PathBuf = dir.path().join("x".repeat(120));
+        let error = Proxy::start(unix_config(loopback_only(), &path))
+            .await
+            .expect_err("an over-long socket path cannot bind");
+        assert!(
+            error.to_string().contains("binding the sandbox proxy"),
+            "{error}"
+        );
+    }
 }

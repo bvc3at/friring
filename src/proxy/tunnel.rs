@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tokio::net::TcpStream;
 use tokio::time::Instant;
 
 /// Bytes moved per read. Two of these (one per direction) is the entire
@@ -31,6 +30,10 @@ pub(super) struct Transferred {
 
 /// Copy between `client` and `upstream` until both directions finish.
 ///
+/// Generic over both sides because the pairing differs by caller: the proxy
+/// splices a sandbox connection (TCP or unix) to an upstream TCP socket, and
+/// the relay splices a sandbox TCP connection to the proxy's unix socket.
+///
 /// A direction that reaches EOF shuts down the *other* socket's write half, so
 /// a peer doing a half-close still receives the rest of the response instead of
 /// hanging until a timeout. An error in either direction ends the whole
@@ -43,13 +46,17 @@ pub(super) struct Transferred {
 /// when no byte crossed in either direction for `idle_timeout`. The timeout is
 /// on *inactivity*, not on total duration: a slow download and a long-polling
 /// request are both legitimate and must not be cut off mid-stream.
-pub(super) async fn splice(
-    client: TcpStream,
-    upstream: TcpStream,
+pub(super) async fn splice<C, U>(
+    client: C,
+    upstream: U,
     idle_timeout: Duration,
-) -> io::Result<Transferred> {
-    let (from_client, to_client) = client.into_split();
-    let (from_upstream, to_upstream) = upstream.into_split();
+) -> io::Result<Transferred>
+where
+    C: AsyncRead + AsyncWrite,
+    U: AsyncRead + AsyncWrite,
+{
+    let (from_client, to_client) = tokio::io::split(client);
+    let (from_upstream, to_upstream) = tokio::io::split(upstream);
     let started = Instant::now();
     let last_activity = AtomicU64::new(0);
     let copy = async {
@@ -120,7 +127,7 @@ fn elapsed_millis(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     /// A connected loopback pair, standing in for the client and upstream
     /// sockets without any test needing a real network.

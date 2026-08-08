@@ -24,6 +24,7 @@ use tokio::time::timeout;
 
 use super::auth;
 use super::policy::{Decision, DenyReason};
+use super::stream::Client;
 use super::{Protocol, Shared};
 
 /// The only protocol version this proxy speaks, and the byte that identifies a
@@ -61,7 +62,7 @@ struct Target {
 }
 
 /// Serve one client connection that begins with a SOCKS5 greeting.
-pub(super) async fn serve(mut client: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
+pub(super) async fn serve(mut client: Client, shared: Arc<Shared>) -> io::Result<()> {
     let limits = shared.limits();
     let target = match timeout(limits.handshake_timeout, handshake(&mut client, &shared)).await {
         Ok(Ok(Some(target))) => target,
@@ -100,7 +101,7 @@ pub(super) async fn serve(mut client: TcpStream, shared: Arc<Shared>) -> io::Res
 /// Run method selection, authentication and the connect request.
 ///
 /// `Ok(None)` means the client was answered and refused; the caller closes.
-async fn handshake(client: &mut TcpStream, shared: &Shared) -> io::Result<Option<Target>> {
+async fn handshake(client: &mut Client, shared: &Shared) -> io::Result<Option<Target>> {
     let mut greeting = [0u8; 2];
     client.read_exact(&mut greeting).await?;
     if greeting[0] != VERSION {
@@ -179,7 +180,7 @@ async fn handshake(client: &mut TcpStream, shared: &Shared) -> io::Result<Option
 /// Read the RFC 1929 username/password pair and check the password against the
 /// instance token. The username is read and discarded — the token is the
 /// credential.
-async fn authenticate(client: &mut TcpStream, shared: &Shared) -> io::Result<bool> {
+async fn authenticate(client: &mut Client, shared: &Shared) -> io::Result<bool> {
     let mut header = [0u8; 2];
     client.read_exact(&mut header).await?;
     if header[0] != AUTH_SUBNEGOTIATION_VERSION {
@@ -198,19 +199,19 @@ async fn authenticate(client: &mut TcpStream, shared: &Shared) -> io::Result<boo
 
 /// Send a failure reply and close, so a refused client sees the code rather
 /// than a reset.
-async fn refuse(client: &mut TcpStream, code: u8) -> io::Result<()> {
+async fn refuse(client: &mut Client, code: u8) -> io::Result<()> {
     reply(client, code, None).await?;
     client.shutdown().await
 }
 
-async fn close(client: &mut TcpStream) -> io::Result<Option<Target>> {
+async fn close(client: &mut Client) -> io::Result<Option<Target>> {
     client.shutdown().await?;
     Ok(None)
 }
 
 /// Write a reply carrying the proxy's bound address, or the unspecified IPv4
 /// address when there is none to report (every failure case).
-async fn reply(client: &mut TcpStream, code: u8, bound: Option<SocketAddr>) -> io::Result<()> {
+async fn reply(client: &mut Client, code: u8, bound: Option<SocketAddr>) -> io::Result<()> {
     let mut message = vec![VERSION, code, 0x00];
     match bound {
         Some(SocketAddr::V4(bound)) => {
@@ -253,8 +254,9 @@ mod tests {
             .expect("bind loopback");
         let addr = listener.local_addr().expect("bound");
         let writer = tokio::spawn(async move {
-            let mut stream = TcpStream::connect(addr).await.expect("connect");
-            reply(&mut stream, code, bound).await.expect("reply");
+            let stream = TcpStream::connect(addr).await.expect("connect");
+            let mut client = Client::tcp(stream);
+            reply(&mut client, code, bound).await.expect("reply");
         });
         let (mut accepted, _) = listener.accept().await.expect("accept");
         let mut received = Vec::new();

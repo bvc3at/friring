@@ -21,6 +21,7 @@ use tokio::time::timeout;
 
 use super::auth;
 use super::policy::{Decision, DenyReason};
+use super::stream::Client;
 use super::{Protocol, Shared};
 
 /// Ceiling on a request head. Generous for real headers (cookies and bearer
@@ -47,7 +48,7 @@ const HOP_BY_HOP: &[&str] = &[
 /// Every refusal is answered before the socket closes — a proxy that hangs up
 /// silently leaves the agent guessing at a DNS failure instead of reading the
 /// reason.
-pub(super) async fn serve(mut client: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
+pub(super) async fn serve(mut client: Client, shared: Arc<Shared>) -> io::Result<()> {
     let limits = shared.limits();
     let head = match timeout(limits.handshake_timeout, read_head(&mut client)).await {
         Ok(Ok(head)) => head,
@@ -137,7 +138,7 @@ pub(super) async fn serve(mut client: TcpStream, shared: Arc<Shared>) -> io::Res
 /// pipelined behind its request head (a TLS `ClientHello` usually arrives in
 /// the same packet as the `CONNECT`).
 async fn finish(
-    client: TcpStream,
+    client: Client,
     mut upstream: TcpStream,
     body_prefix: &[u8],
     shared: &Shared,
@@ -287,7 +288,7 @@ enum HeadError {
 }
 
 /// Read until the blank line that ends the request head.
-async fn read_head(client: &mut TcpStream) -> Result<Vec<u8>, HeadError> {
+async fn read_head(client: &mut Client) -> Result<Vec<u8>, HeadError> {
     let mut head = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
@@ -359,7 +360,7 @@ fn split_authority(authority: &str, default_port: u16) -> Option<(String, u16)> 
 
 /// Answer with a status and a one-line explanation the agent's transcript will
 /// show verbatim.
-async fn refuse(client: &mut TcpStream, status: u16, reason: &str, detail: &str) -> io::Result<()> {
+async fn refuse(client: &mut Client, status: u16, reason: &str, detail: &str) -> io::Result<()> {
     respond(
         client,
         status,
@@ -371,7 +372,7 @@ async fn refuse(client: &mut TcpStream, status: u16, reason: &str, detail: &str)
 }
 
 async fn respond(
-    client: &mut TcpStream,
+    client: &mut Client,
     status: u16,
     reason: &str,
     extra_headers: &[&str],
