@@ -34,19 +34,32 @@ panes talk to models that do not exist (`fable-67`, `gpt-6.2`,
 `tempest-oss-140b`) about infrastructure nobody has yet — see `docs/E2E.md`
 § Demo mode.
 
-## Why this directory sits outside the pacing gate
+## The pacing gate here
 
-CI's `demo-pacing` job globs `docs/media/*.gif`, which does not descend here,
-and that is deliberate rather than incidental. The budget it enforces
-(`scripts/demo/lib/check-pacing.mjs`) is calibrated for tapes that film a
-seeded TUI with no agent in the loop, where a held frame can only be the demo
-waiting on itself. These clips film real CLIs booting, thinking and answering,
-so a held frame is usually the app being honestly slow at the moment the
-scenario came to film. Every clip here busts the 1.0s max-hold; the shipped ten
-do not, and should keep having to prove it.
+These clips are gated, on their own profile. CI's `demo-pacing` job runs
+`check-pacing.mjs --profile=agent` over this directory in a second step, and
+the recorder prints the same profile when it records, so what you see while
+recording is what CI will enforce.
 
-The recorder still runs the check and prints the numbers, so a clip that stalls
-for a reason other than the agent is visible when it is recorded.
+The profile relaxes **only** the two metrics real agent latency explains, and
+relaxes them to a measured ceiling rather than switching them off:
+
+| Metric | Shipped clips | Here | Why |
+|---|---|---|---|
+| Held frame | 1.0s | 3.0s | The worst held frame across these seven is 0.68–2.04s, and every one is a CLI booting or answering. 3.0s still catches the class of stall the budget exists to kill (the pre-`Wait` audit found 3.81s). |
+| Opening hold | 0.75s | 2.5s | Not an agent-latency allowance — see below. |
+| **Size (10MB)** | gated | **gated** | A gif GitHub refuses to render is not excused by anything. Two of these are embedded in `README.md`. |
+| **Blank final frame** | gated | **gated** | A leaked recorder teardown is perfectly well-paced, so this is the only check that sees it. It caught one clip in this very batch. |
+
+The opening cap is the one worth being explicit about, because it is **not**
+relaxed for the "the agent is slow" reason. An agent booting shows the viewer an
+empty pane, which nothing excuses; the recorder's `SCENARIO_DEMO_PREROLL` keeps
+that boot off camera instead. The cap is higher than the default because of the
+recorder's own filmed floor (~1.7s of asciinema attach, settle poll and node
+startup) plus the prompt being typed, which `freezedetect` cannot tell from a
+hold. The six clean openings measure 0.20–2.02s against that floor; the
+blank-pane defect this metric caught measured 2.93–3.54s. 2.5s is the line
+between them.
 
 ## Recorded but not shipped
 

@@ -331,10 +331,18 @@ metric is the least trustworthy of the lot: it shells out to ffmpeg `freezedetec
 own header cannot tell a stall from typing. Read the first frame before believing it.
 
 Recordings land under `target/`. A handful are committed — the clips this doc and
-`docs/FEATURES.md` / `FORK.md` embed — and those live in **`docs/media/fork/`**, which the CI
-`demo-pacing` job's `docs/media/*.gif` glob deliberately does not descend into, for the reason
-above. `docs/media/fork/README.md` says which clip is linked from where, and what was recorded
-and left out.
+`docs/FEATURES.md` / `FORK.md` embed — and those live in **`docs/media/fork/`**, where CI gates
+them with `--profile=agent`: the held-frame and opening budgets relax to a measured ceiling, the
+size cap and the blank-final-frame backstop do not relax at all. The recorder prints that same
+profile, so what it shows is what CI will enforce. `docs/media/fork/README.md` has the numbers
+and says which clip is linked from where.
+
+**Keep the agent's boot off camera.** `SCENARIO_DEMO_PREROLL` is a pane pattern the recorder
+waits for *before* filming starts, defaulting to the scenario's own `SCENARIO_AGENT_READY`. A
+CLI booting shows an empty pane, and it lands on the opening frame — which is the README preview
+and the whole of an autoplay impression — so it is the one wait worth taking off camera. A
+scenario whose narrative *is* the boot sets it to `""`. Do not follow it with a `step_sleep`: the
+pre-roll has already settled the pane, so a beat there just holds the opening frame.
 
 The closing beat is a lingering `Sleep`, deliberately **not** `Ctrl+Q`: quitting inside the
 recording ends the clip on ~1s of bare shell, which `check-pacing.mjs` rejects as a leaked

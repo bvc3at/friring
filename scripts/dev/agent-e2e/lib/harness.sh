@@ -159,6 +159,21 @@ e2e_scenario_load() {
     # F2 to prove it does nothing, so routing it to the same action's leader
     # key would record the opposite of the feature.
     SCENARIO_DEMO_KEYS=()
+    # A pane pattern the recorder waits for BEFORE the camera starts, so the
+    # wait itself is off camera. Empty means "as soon as the TUI paints".
+    #
+    # This is not a hole in "waits film, and they fail the take": those are the
+    # waits inside the tape, where the latency they film IS the app doing the
+    # thing the clip came to show. An agent booting before the tape's first
+    # keystroke shows nothing — the pane is literally empty — and it lands on
+    # the opening frame, which is the README preview and the whole of an
+    # autoplay impression. Measured: opencode-text-turn opened on 3.54s of
+    # blank pane, 40% of the clip.
+    #
+    # Defaults to the scenario's own agent-ready marker where it declares one,
+    # since that is exactly "the pane has something on it". Set it to "" in a
+    # scenario whose narrative IS the boot.
+    SCENARIO_DEMO_PREROLL="__agent_ready__"
     SCENARIO_PROMPT=""
     SCENARIO_AGENT_READY=""
     SCENARIO_DONE_PATTERN=""
@@ -736,6 +751,18 @@ e2e_demo_record() {
     tmux -L "$E2E_DRIVER_SOCKET" set -g status off
     e2e_wait_pane "friring" 300 || e2e_die "TUI did not boot" || return 1
 
+    # Off-camera pre-roll: let the agent finish booting before filming starts,
+    # so the clip opens on a pane with something on it. See
+    # SCENARIO_DEMO_PREROLL. A timeout is not fatal — the tape's own waits
+    # still gate the take, and refusing to record because a pre-roll marker
+    # never appeared would turn a cosmetic aid into a second failure mode.
+    local preroll="$SCENARIO_DEMO_PREROLL"
+    [ "$preroll" = "__agent_ready__" ] && preroll="$SCENARIO_AGENT_READY"
+    if [ -n "$preroll" ]; then
+        e2e_wait_pane "$preroll" 1200 \
+            || e2e_log "pre-roll marker never appeared: $preroll (recording anyway)"
+    fi
+
     e2e_log "recording $E2E_SCENARIO_NAME ($(basename "$E2E_TAPE"))"
     # asciinema needs a real tty, which a script has no way to hand it, so it
     # runs inside its own tmux pane and records an attached client of the
@@ -807,12 +834,12 @@ e2e_demo_record() {
         -vf "fps=30,scale=trunc(iw/2)*2:trunc(ih/2)*2" "$mp4" \
         || e2e_die "ffmpeg failed" || return 1
 
-    # Report the pacing budget; do NOT gate on it. It is calibrated for the
-    # hand-written tapes, which film a seeded TUI and no agent latency at all.
-    # These clips film real CLIs booting and answering, so a held frame here is
-    # often the app being honestly slow — which is the thing the scenario came
-    # to show. Worth seeing, never worth silently discarding a take for.
-    node "$REPO_ROOT/scripts/demo/lib/check-pacing.mjs" "$gif" || true
+    # Report the pacing budget; do NOT gate on it here — a take is worth
+    # keeping and looking at even when it busts one. `--profile=agent` is the
+    # same budget CI applies to the committed clips (see the demo-pacing job),
+    # so what prints here is what will be enforced if the clip ships, rather
+    # than a stricter number nobody can act on.
+    node "$REPO_ROOT/scripts/demo/lib/check-pacing.mjs" --profile=agent "$gif" || true
     e2e_log "recorded $gif"
 }
 

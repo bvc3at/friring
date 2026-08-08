@@ -860,11 +860,25 @@ behavior, and the wizard, automation and extension clips duplicate media
 `scripts/demo` records. Every one is a `just agent-demo <scenario>` away if a
 doc later needs it; `docs/media/fork/README.md` keeps the list.
 
-`docs/media/fork/` is deliberately **outside** the `demo-pacing` gate, whose
-glob (`docs/media/*.gif`) does not descend. The budget assumes a seeded TUI
-with no agent latency; these clips film real CLIs booting and thinking, and
-every one of them busts the 1.0s max-hold for exactly that reason. The recorder
-still prints the numbers, and the shipped ten still have to pass.
+`docs/media/fork/` is gated too, on its own profile
+(`check-pacing.mjs --profile=agent`, a second `demo-pacing` step). Exempting the
+directory wholesale was the first attempt and was too blunt: it also switched
+off the 10MB size cap and the blank-final-frame backstop, neither of which has
+anything to do with agent latency and both of which catch a defect no reviewer
+would (a gif GitHub refuses to render; a leaked teardown, which is perfectly
+well-paced). So only the held frame and the opening are relaxed, to ceilings
+measured across the seven clips rather than switched off.
+
+The opening is the interesting one. Filming an agent *boot* is not "the app
+being honestly slow" — the pane is empty, and it lands on the frame that is the
+README preview. `opencode-text-turn` opened on **3.54s of blank pane, 40% of the
+clip**. So the recorder gained an off-camera pre-roll
+(`SCENARIO_DEMO_PREROLL`, defaulting to the scenario's own agent-ready marker)
+that lets the CLI finish booting before the camera starts. That is not a hole in
+"waits film, and they fail the take": those are the waits *inside* the tape,
+where the latency filmed is the app doing the thing the clip came to show. With
+the pre-roll — and with the scenario's now-redundant one-second settle beat
+removed — that clip opens on a painted pane at 2.02s and the whole set passes.
 
 #### Stub-driven demo recordings (`scripts/demo/`)
 

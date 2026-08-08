@@ -16,8 +16,10 @@ SCENARIO_AGENT_READY="Build ·"
 SCENARIO_DONE_PATTERN="CRON-CUTOVER-STAGED"
 
 scenario_steps() {
+    # No settle beat after this wait: the recorder's pre-roll already waits for
+    # this same marker off camera, so a `step_sleep` here would hold the opening
+    # frame for a second with nothing happening on it.
     step_wait_pane "$SCENARIO_AGENT_READY" 60
-    step_sleep 1
     step_type "$SCENARIO_PROMPT"
     # Sync on the composer echo before Enter (step_sleep is a no-op in test
     # mode, so Enter would otherwise race the composer).
