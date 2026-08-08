@@ -333,28 +333,22 @@ Friring-owned filtering proxy outside the boundary enforces the allowlist.**
 
 ```text
 sandbox (no route to the internet)
-   │  HTTP_PROXY / HTTPS_PROXY / ALL_PROXY  →  loopback port
+   │  HTTP_PROXY / HTTPS_PROXY / ALL_PROXY
    ▼
 friring proxy  ──  allow?  ──►  upstream
                └─  deny   ──►  403 with a reason, event to the TUI
 ```
 
 Per backend the "no direct network" half is: seatbelt denies all outbound
-except the loopback proxy port; bwrap uses `--unshare-net` with a **unix socket**
-bridge; containers use `--network none` plus a bridge or an internal network.
-Because the kernel blocks everything else, a process that ignores the proxy
-environment variables gets *no* network rather than an escape route.
+except the loopback proxy port; bwrap uses `--unshare-net`; containers use
+`--network none`. Because the kernel blocks everything else, a process that
+ignores the proxy environment variables gets *no* network rather than an escape
+route.
 
-The endpoint shape is not uniform, and the difference is load-bearing:
-`--unshare-net` gives the sandbox its own empty network stack, so *host*
-loopback is unreachable from inside it. Seatbelt takes a loopback port; bwrap
-must take a socket bound across the boundary and refuses a loopback endpoint
-with that explanation.
-
-Until the proxy exists, `allowlist` configures the kernel exactly like `none`
-(ADR-27's claim that the two are identical at that layer), so it grants nothing
-— which is why a new profile can default to `allowlist` with an empty list and
-still start closed.
+Until the proxy is wired into a launch, `allowlist` configures the kernel
+exactly like `none` (ADR-27's claim that the two are identical at that layer),
+so it grants nothing — which is why a new profile can default to `allowlist`
+with an empty list and still start closed.
 
 **Allowlist matching** is suffix matching on label boundaries, case-insensitive:
 `github.com` covers `api.github.com` but not `evilgithub.com`, `github.com.evil.net`
@@ -363,6 +357,44 @@ every port. Denies are checked **first in every mode**, so a deny entry narrows
 `full` too. `prompt_new_domains` is meaningful only under `allowlist` — nothing
 is unlisted under `full` and nothing leaves under `none` — and the editor greys
 it out elsewhere.
+
+### Reaching the proxy
+
+That same denial is why the arrow above is not one mechanism. **A sandbox with
+its own network namespace cannot reach the host's loopback at all** — inside
+`--unshare-net`, `127.0.0.1` is the sandbox's own loopback, and there is no
+address that resolves to the host. The proxy therefore listens on two
+transports, and each backend uses the one its kernel primitive leaves open:
+
+| Backend | Transport | Why |
+|---|---|---|
+| `seatbelt` | host TCP loopback | Shares the host network stack; the profile denies non-loopback traffic but leaves the proxy port reachable. |
+| `bwrap`, `docker`/`podman` on `--network none` | unix socket + relay | A new network namespace has no route to the host. A unix socket is a filesystem object, so a bind mount carries it across. |
+| `wsl-distro` | as `bwrap`, inside the distro | Per-distro firewalling is impossible (one shared VM network namespace), so egress control comes from `bwrap` inside the distro — and so does its transport. |
+
+No mainstream HTTP or SOCKS client can *dial* a proxy over a unix socket:
+`HTTP_PROXY` and `ALL_PROXY` take a host and a port. So a small relay runs
+**inside** the namespace, offering a TCP endpoint and forwarding each
+connection to the bind-mounted socket:
+
+```text
+agent  →  127.0.0.1:PORT   (the sandbox's own loopback)
+       →  friring-cli sandbox relay
+       →  /…/proxy.sock    (bind-mounted from the host)
+       →  friring proxy    →  policy  →  upstream
+```
+
+This is the shape such setups usually build out of `socat`; Friring ships it
+instead, so it inherits the same timeouts, connection cap and clean shutdown as
+the proxy. The relay is protocol-agnostic — it never parses a byte, so
+`CONNECT` and SOCKS5 both cross unchanged — and it holds **no credential and no
+policy**: the proxy's token is still demanded at the far end, and the decision
+is still made outside the boundary. Giving the relay either would put both
+inside the boundary they exist to constrain.
+
+The socket is `0o600` by default. It is a credential-bearing endpoint, and a
+backend whose sandbox runs as a different uid (containers usually do) has to
+widen that deliberately rather than inherit a world-connectable socket.
 
 This is chosen over IP-based `iptables`/`ipset` allowlists (the pattern in
 Anthropic's devcontainer reference and in the `friring-autonomous` rig) because
@@ -383,11 +415,12 @@ allowlist and testable without a session, a database or a backend.
   bare rule covers its own subtree on a label boundary (`github.com` matches
   `api.github.com`, never `evilgithub.com`); `*.github.com` excludes the apex;
   an address rule is exact.
-- Both protocols share **one loopback port**, selected by the first byte
-  (`0x05` is a SOCKS greeting, anything else starts an HTTP request line).
-  Listening on a unix socket is deferred rather than dropped: no mainstream
-  HTTP or SOCKS client can dial a proxy over one, so a sandbox could not use
-  it. It becomes worth adding for a backend that cannot reach host loopback.
+- Both protocols share **one listener**, selected by the first byte (`0x05` is
+  a SOCKS greeting, anything else starts an HTTP request line), on either
+  transport. `ALL_PROXY` must be **`socks5h://`**, not `socks5://`: the `h`
+  keeps hostname resolution on the proxy's side, and without it the client
+  resolves first and hands the proxy an address that no domain rule can match —
+  silently defeating the allowlist rather than failing loudly.
 - Per-instance bearer token so only the intended sandbox can use it —
   `Proxy-Authorization` (`Bearer`, or the `Basic` header a client derives from
   the proxy URL) over HTTP, username/password over SOCKS5. Unauthenticated
@@ -787,8 +820,10 @@ CDN addresses rotate. An external runtime would contradict the single-binary
 distribution.
 
 **Consequences**: Friring runs a network service while a sandbox is alive,
-scoped to loopback and token-authenticated. Allow decisions trust the
-client-supplied hostname until TLS termination is added, which the UI
+token-authenticated and scoped to host loopback, to a `0o600` unix socket, or
+to both — a sandbox in its own network namespace can only reach the socket, and
+reaches it through a Friring-run relay inside the namespace. Allow decisions
+trust the client-supplied hostname until TLS termination is added, which the UI
 discloses.
 
 ## ADR-28: Credentials are never copied per sandbox
