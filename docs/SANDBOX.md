@@ -333,7 +333,7 @@ Friring-owned filtering proxy outside the boundary enforces the allowlist.**
 
 ```text
 sandbox (no route to the internet)
-   │  HTTP_PROXY / HTTPS_PROXY / ALL_PROXY  →  loopback port or unix socket
+   │  HTTP_PROXY / HTTPS_PROXY / ALL_PROXY  →  loopback port
    ▼
 friring proxy  ──  allow?  ──►  upstream
                └─  deny   ──►  403 with a reason, event to the TUI
@@ -373,16 +373,35 @@ identical across every backend and over the SSH transport, where it simply runs
 on the remote end. IP-level filtering remains available as optional
 defence-in-depth inside containers.
 
-The proxy is a Friring-owned Rust component (`src/sandbox/proxy/`):
+The proxy is a Friring-owned Rust component. It lives at **`src/proxy/`**, a
+top-level module rather than a child of `sandbox`: it enforces a policy handed
+to it and references no other crate module, so it is a leaf in the architecture
+allowlist and testable without a session, a database or a backend.
 
 - HTTP `CONNECT` and SOCKS5, allowlist matched on the requested host, with
-  optional `:port` scoping; denies win over allows.
-- Per-instance bearer token so only the intended sandbox can use it.
+  optional `:port` scoping; denies win over allows, in every network mode. A
+  bare rule covers its own subtree on a label boundary (`github.com` matches
+  `api.github.com`, never `evilgithub.com`); `*.github.com` excludes the apex;
+  an address rule is exact.
+- Both protocols share **one loopback port**, selected by the first byte
+  (`0x05` is a SOCKS greeting, anything else starts an HTTP request line).
+  Listening on a unix socket is deferred rather than dropped: no mainstream
+  HTTP or SOCKS client can dial a proxy over one, so a sandbox could not use
+  it. It becomes worth adding for a backend that cannot reach host loopback.
+- Per-instance bearer token so only the intended sandbox can use it —
+  `Proxy-Authorization` (`Bearer`, or the `Basic` header a client derives from
+  the proxy URL) over HTTP, username/password over SOCKS5. Unauthenticated
+  callers are refused before any policy is consulted, so they learn nothing
+  about the allowlist.
 - Denials carry a reason and surface as a TUI event; with
   `prompt_new_domains`, an unlisted domain raises a confirm modal whose answer
-  is written back to the profile.
+  is written back to the profile and applied to the running proxy without a
+  restart.
 - Optional HTTP-method restriction (`GET`/`HEAD`/`OPTIONS` only) as a cheap
-  brake on exfiltration through allowed hosts.
+  brake on exfiltration through allowed hosts. It reaches **plaintext HTTP
+  only** — a `CONNECT` tunnel is opaque, so the method inside it is unknowable
+  — and each forwarded plaintext request gets its own connection, so every one
+  of them is policed rather than only the first on a reused socket.
 - No TLS interception in the first release. Allow decisions therefore trust the
   client-supplied hostname, so domain fronting can bypass them — documented in
   the UI, not hidden.
@@ -768,9 +787,9 @@ CDN addresses rotate. An external runtime would contradict the single-binary
 distribution.
 
 **Consequences**: Friring runs a network service while a sandbox is alive,
-scoped to loopback or a unix socket and token-authenticated. Allow decisions
-trust the client-supplied hostname until TLS termination is added, which the
-UI discloses.
+scoped to loopback and token-authenticated. Allow decisions trust the
+client-supplied hostname until TLS termination is added, which the UI
+discloses.
 
 ## ADR-28: Credentials are never copied per sandbox
 
