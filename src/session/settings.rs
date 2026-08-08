@@ -746,6 +746,35 @@ mod tests {
     }
 
     #[test]
+    fn navigation_table_parses_every_key() {
+        let s: Settings = toml::from_str(
+            "[navigation]\nattention_includes_done = false\nsession_numbers = \"always\"\nghost_shelf = true",
+        )
+        .unwrap();
+        assert!(!s.navigation.attention_includes_done);
+        assert_eq!(s.navigation.session_numbers, SessionNumbers::Always);
+        assert!(s.navigation.ghost_shelf);
+    }
+
+    #[test]
+    fn a_partial_navigation_table_keeps_the_other_defaults() {
+        let s: Settings = toml::from_str("[navigation]\nghost_shelf = true").unwrap();
+        assert!(s.navigation.ghost_shelf);
+        assert!(
+            s.navigation.attention_includes_done,
+            "the queue still covers finished sessions"
+        );
+        assert_eq!(s.navigation.session_numbers, SessionNumbers::Auto);
+    }
+
+    #[test]
+    fn an_unknown_session_numbers_value_is_rejected() {
+        let err = toml::from_str::<Settings>("[navigation]\nsession_numbers = \"sometimes\"")
+            .unwrap_err();
+        assert!(err.to_string().contains("session_numbers"), "{err}");
+    }
+
+    #[test]
     fn partial_override_keeps_other_defaults() {
         let s: Settings = toml::from_str("scrollback_lines = 5000").unwrap();
         assert_eq!(s.scrollback_lines, 5000);
