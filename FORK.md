@@ -593,9 +593,24 @@ Everywhere:
   all; on legacy terminals the gesture is silently unavailable. Gated by a
   new `[features] double_shift_search` flag (default on).
 - **Scope fixes.** Sessions now match on **cwd** (documented upstream but
-  not implemented) and on **every** worktree branch, not just the first; the
-  Files scope is pinned to the session that was active at open (it used to
-  silently follow the live preview's session switches).
+  not implemented), on **every** worktree branch rather than just the first,
+  and on the repos they span; the Files scope is pinned to the session that
+  was active at open (it used to silently follow the live preview's session
+  switches).
+- **It opens as the session switcher, `Tab` widens it.** Upstream searches
+  every scope at once with a per-scope cap of 8, which is exactly wrong for
+  the errand run dozens of times an hour: a switcher that hides the session
+  you are looking for behind a cap has failed. The Sessions scope is
+  uncapped, lists every session **most-recently-used first when the query is
+  empty** (so `Ctrl+/` `Enter` bounces to the last session), and `Enter` on
+  an unloaded session **loads** it — the contract `Enter` already had in the
+  session list, which used to be the only route to a ghost.
+- **Ranked, not filtered.** `fuzzy_match` gained a score (fzf's two-pass
+  greedy plus word-boundary, contiguity and length weights); upstream's
+  matcher returns positions only, so results came back in `self.sessions`
+  order. Sessions rank on their best-scoring field minus a per-field
+  handicap (a name hit always beats an agent/branch/repo/cwd hit), with a
+  nudge for the attention queue and recency as the tiebreak.
 - The per-keystroke performance rework is tracked separately under
   *Performance* (ADR-P13).
 
@@ -1024,17 +1039,63 @@ list stays reachable for management (reorder, import) via `Ctrl+H` or a
 click on its empty area. See `docs/FEATURES.md` ("Focus model:
 terminal-first").
 
-#### Attention navigation (`F10` + blocked badges)
+#### Attention navigation (`F10` + attention badges)
 
 Upstream surfaces a blocked agent only as a red dot (and a desktop
 notification) — there is no way to *navigate* by attention. The fork adds
-`F10` (rebindable `NextBlockedSession`): jump to the next `Blocked`
-session in rendered order (wrapping), focus landing in the terminal, so
-repeated presses walk the attention queue and answer each prompt in turn.
-The blocked count is badged in the session list's title bar (`◆N` ahead
-of the status dots) and in the footer (`◆ N blocked · F10`, with the live
-shortcut), so attention is visible even when the sidebar is hidden on a
-narrow terminal. See `docs/FEATURES.md` ("Live status & needs attention").
+`F10` (rebindable `NextBlockedSession`): jump to the next session in the
+**attention queue** in rendered order (wrapping), focus landing in the
+terminal, so repeated presses walk the queue and answer each prompt in turn.
+
+The queue is `Blocked` first, then `Done` — a blocked agent is *stopped*
+until you act, so those always come first, and only when none is blocked does
+it fall through to the finished-but-unseen runs (`Done` already means
+"unread": a session drops back to `Idle` the moment you look at it). Both
+counts are badged in the session list's title bar (`◆N ●M` ahead of the
+status dots) and the live half in the footer (`◆ N blocked · F10`, with the
+live shortcut), so attention is visible even when the sidebar is hidden on a
+narrow terminal. Opt out of the `Done` half with `[navigation]
+attention_includes_done = false`. See `docs/FEATURES.md` ("Live status &
+needs attention").
+
+#### Label jump (`Alt+G`), collapsible groups, and the ghost shelf
+
+The digit jumps below only reach the first nine rows, so past ~20 sessions
+the tenth onward had no direct keyboard route at all — only stepping.
+`Alt+G` / `<leader> A` (rebindable `JumpToSession`) opens a sticky overlay
+that labels **every** row with a home-row letter; typing it switches.
+Sticky rather than held on purpose: the Alt-hold number overlay needs the
+kitty protocol to see the key go *down*, which an outer tmux strips, so this
+is the only aim-then-shoot jump that works through one. Labels are single
+keys up to 26 sessions; past that only as many trailing letters as needed
+become two-key prefixes. The chip reuses the status dot's three columns, so
+the overlay never shifts a row.
+
+Alongside it, the list itself can be shortened: `h`/`l` collapse and expand
+a repo group to its header line (`● ▸ stripe-api (+4) ──`, keeping the
+rolled-up dot), and `<leader> G` / `Alt+Shift+U` (`ToggleGhostShelf`) folds
+the unloaded sessions out into a `◌7` count on the title bar. Both filter
+the *view* only — `move_in_order` / `sort_alphabetically_within_groups`
+still see the full order, so a collapsed row can never be renumbered into
+its neighbour — and the active session is exempt from both, so the cursor is
+never on a row you can't see. Collapsed groups persist in DB `metadata`; the
+shelf is in-memory with a `[navigation] ghost_shelf` startup default. The
+pane also gained `g`/`G`/`Home`/`End` and `]`/`[` group leaps. See
+`docs/FEATURES.md` ("Collapsing repo groups & the ghost shelf").
+
+#### Peeking the session list during navigation
+
+A 30-column sidebar truncates the very names you are choosing between.
+Arming the leader, holding Alt, or opening a jump overlay floats the session
+list over the central pane at the width its names need (capped at 45% of the
+content, skipped when the column was already wide enough). It **floats**
+rather than widening the column because a real resize would reflow every
+session's PTY on each leader press — the same reason the global-search popup
+floats. While the column is collapsed (`Alt+L`) the peek anchors to the
+freed left edge, which is what makes the leader reveal the list there at all.
+`[navigation] session_numbers = "always"` additionally paints the `1`–`9`
+jump numbers permanently, which is how `Alt+digit` becomes aim-then-shoot
+through an outer tmux that strips the kitty protocol.
 
 #### Quick session switching (last-session toggle & numbered jumps)
 
@@ -1048,8 +1109,9 @@ live-previews) don't, so the toggle always means "where I actually was".
 `Alt+1`–`9` jumps to the Nth session in rendered order (tmux
 `Alt+digit`), and **holding Alt paints the numbers** on the session list
 so the target is visible before the digit is pressed. `Alt+A` (rebindable
-`JumpToBlocked`) is the attention variant: it numbers only the *blocked*
-sessions and a digit jumps among those. This is a deliberate, narrow Alt
+`JumpToBlocked`) is the attention variant: it numbers only the sessions in
+the attention queue and a digit jumps among those; `Alt+G` labels every row
+with a letter for the rows past nine (see *Label jump* above). This is a deliberate, narrow Alt
 exception to upstream's "Ctrl = global, everything else = PTY" philosophy
 (documented in `docs/FEATURES.md`); every other Alt chord still forwards
 to the agent. The hold-to-peek overlay needs the kitty keyboard protocol:

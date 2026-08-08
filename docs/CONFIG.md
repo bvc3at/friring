@@ -456,6 +456,11 @@ mode          = "both"         # leader key: off | both | prefix-only
 key           = "ctrl+f"       # the leader
 key2          = "f12"          # second leader ("" disables, freeing F12)
 hint_delay_ms = 0              # 0 = show the which-key overlay immediately
+
+[navigation]
+attention_includes_done = true   # F10/Alt+A also walk finished-but-unseen runs
+session_numbers         = "auto" # jump numbers: auto | always
+ghost_shelf             = false  # start with unloaded sessions folded away
 ```
 
 ### `[features]` — whole-feature switches
@@ -670,6 +675,24 @@ warning is silent when `mode = "off"`.
 Both leaders accept the same chord syntax as
 [`keybindings.json`](#keybindingsjson). An unparseable entry is skipped rather
 than fatal, so a typo in `key` still leaves you `key2` to get in with.
+
+### `[navigation]` — session navigation
+
+Knobs for moving between sessions (see `docs/FEATURES.md` § Live status &
+"needs attention" and § Collapsing repo groups & the ghost shelf). Applied
+**live** on panel save or file reload.
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `attention_includes_done` | `true` | Whether the attention queue (`F10`, `Alt+A`, the badges) falls through to finished-but-unseen sessions once nothing is blocked. `false` restores the blocked-only queue. Blocked sessions always come first either way |
+| `session_numbers` | `"auto"` | When the `1`–`9` jump numbers are painted: `auto` only while a gesture is pending (Alt held, leader armed, `Alt+A`), `always` permanently |
+| `ghost_shelf` | `false` | Start with unloaded sessions folded out of the list into a title-bar count. Toggled live with `<leader> G` / `Alt+Shift+U`; this only sets the startup state |
+
+Set `session_numbers = "always"` when running friring through an **outer
+tmux**: the hold-`Alt` overlay needs the kitty keyboard protocol to see the
+key go down, which tmux strips, so without it `Alt+1`–`9` is aim-blind.
+Collapsed repo groups aren't a setting — they persist per-fold in the
+SQLite `metadata` table (see [SQLite-backed settings](#sqlite-backed-settings)).
 
 ## Session status
 
@@ -1034,6 +1057,7 @@ Live in the `metadata` table and apply immediately (no restart):
 | `active_extensions` | `friring-cli extension activate/deactivate` | JSON array of active extensions to self-heal |
 | `builtin_hooks_optout` | `friring-cli extension deactivate hooks` | `1` when the user opted out of the auto-activated hooks extension |
 | `perf_snapshot` | the TUI, while perf timing is active (`FRIRING_PERF_LOG` or an open perf HUD) | JSON perf snapshot read by `friring-cli perf` (see `docs/PERFORMANCE.md`) |
+| `folded_session_groups` | `h` / `l` in the session list | JSON array of collapsed repo-group keys. Curating a long list is worth doing once, so the arrangement outlives the process; unknown keys are kept, not pruned, so a deleted-and-recreated group comes back the way you left it |
 
 These are in the DB rather than a file because they are written
 concurrently by multiple friring processes (TUI, CLI, MCP) and picked

@@ -24,7 +24,7 @@ pub struct PanelAreas {
     /// size; matches highlight live inside them around the popup.
     pub global_search: Option<Rect>,
     /// Widened session list, floating over the central pane while a navigation
-    /// gesture is pending — see [`session_peek`].
+    /// gesture is pending — see the `session_peek` helper below.
     pub session_peek: Option<Rect>,
     /// Full-width transient band for the active status/error message (or the
     /// sync spinner), docked directly above the footer. Present only while a

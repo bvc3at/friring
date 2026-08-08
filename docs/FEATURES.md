@@ -56,13 +56,15 @@ Searching is unified into the **global search** (`Ctrl+/`) — see the
 *Global Search* section below. There is no separate per-list `/`
 filter; instead the global popup highlights matches live across the
 session list, tasks panel, and automations pane at once. Sessions are
-matched on name, agent, branch name, and cwd.
+matched on name, agent, branch name, repo, and cwd.
 
-**Why all four fields?** Users remember sessions by whichever
+**Why all five fields?** Users remember sessions by whichever
 attribute is most distinctive — sometimes the branch name, often
 the agent ("the codex one"), occasionally the repo path. Indexing
-all four makes the search hit on the first attempt without forcing
-the user to remember which field to type into.
+them all makes the search hit on the first attempt without forcing
+the user to remember which field to type into. A hit on the *name*
+always outranks an equally good hit on the others, so the common case
+isn't diluted by the rare ones.
 
 ### Live status & "needs attention"
 
@@ -104,19 +106,28 @@ roll up to their most-urgent member
 **Friring — fork-only: navigating to what needs you.** Upstream surfaces a
 blocked agent as a red dot and a desktop notification and stops there; there is
 no way to move *by* attention. `F10` (rebindable `NextBlockedSession`)
-jumps to the next `Blocked` session — scanning forward from the active one
-in rendered order, wrapping — and lands focus in the terminal, so pressing
-it repeatedly walks the attention queue top-to-bottom, answering each
-prompt in turn. `Alt+A` (rebindable `JumpToBlocked`) numbers only the
-blocked sessions `1`–`9` in the list and a digit jumps straight to that
-one — fewer, lower digits than the all-session `Alt+digit` numbering when
-the list is long. Held with Alt (kitty-protocol terminals) the numbers
-live until Alt is released; tapped (legacy terminals) they stay until a
-digit, `Esc`, or any other key. The blocked count is surfaced twice: a
-`◆N` badge ahead of the status dots in the session list's title bar, and
-a `◆ N blocked · F10` badge in the footer (carrying the live shortcut),
-so attention stays visible even when the sidebar is hidden on a narrow
-terminal.
+jumps to the next session in the **attention queue** — scanning forward from
+the active one in rendered order, wrapping — and lands focus in the terminal,
+so pressing it repeatedly walks the queue top-to-bottom, answering each prompt
+in turn and then reviewing each finished run.
+
+The queue is **`Blocked` first, then `Done`**. A blocked session is *stopped*
+until you act, so those always come first; only when none is blocked does the
+queue fall through to the finished-but-unseen ones (a `Done` session drops
+back to `Idle` the moment you look at it, so `Done` already means "unread").
+Following both at once would bury the blocking prompts among completed runs.
+Set `[navigation] attention_includes_done = false` for the blocked-only queue.
+
+`Alt+A` (rebindable `JumpToBlocked`) numbers only the queue's sessions
+`1`–`9` in the list and a digit jumps straight to that one — fewer, lower
+digits than the all-session `Alt+digit` numbering when the list is long. Held
+with Alt (kitty-protocol terminals) the numbers live until Alt is released;
+tapped (legacy terminals) they stay until a digit, `Esc`, or any other key.
+The counts are surfaced twice: `◆N ●M` badges ahead of the status dots in the
+session list's title bar, and a `◆ N blocked · F10` badge in the footer
+(carrying the live shortcut, and naming whichever half of the queue is
+currently live), so attention stays visible even when the sidebar is hidden
+on a narrow terminal.
 
 The hooks are wired automatically by the built-in **hooks** extension
 (auto-activated on first run; opt out with `friring-cli extension
@@ -308,6 +319,48 @@ by status, which meant a row jumped around under your cursor every time
 an agent finished or started thinking. Letting the user pin the order —
 and only recoloring the status dot in place — keeps the list a stable
 spatial map you can build muscle memory against.
+
+### Collapsing repo groups & the ghost shelf
+
+**Friring — fork-only.** Twenty sessions across five repos is twenty rows to
+scan and step through. With the session list focused, `h`/`Left` collapses the
+selected session's repo group to its header line and `l`/`Right` expands it:
+
+```text
+● ▸ stripe-api (+4) ─────────────
+```
+
+The header keeps the group's rolled-up status dot, so a collapsed group still
+says whether anything inside it needs you, and the `(+4)` says how much is
+behind it. `<leader> G` / `Alt+Shift+U` does the same for the **unloaded**
+sessions, wherever they are: they fold out of the list into a `◌7` count on the
+title bar (the *ghost shelf*), which is what keeps the list readable after a
+restart with `lazy_session_restore` on. Both are reachable by name from the
+switcher regardless.
+
+Two invariants make this safe:
+
+- **They filter the view, never the data.** `move_in_order` and
+  `sort_alphabetically_within_groups` renumber *every* session's
+  `display_order` along the order they are handed, so a filtered order would
+  silently renumber the collapsed rows into each other. The order stays total;
+  only what is drawn and stepped through is filtered
+  (`App::visible_order_indices`, backing `Ctrl+J`/`Ctrl+K`, the jump digits,
+  the labels, the attention walk, and row clicks — stepping onto a row you
+  can't see reads as a swallowed keystroke).
+- **The active session is always visible.** A hidden cursor would make the
+  list lie about where you are, so its row is exempt from both filters;
+  collapsing your own group selects that group's header row first.
+
+Collapsed groups persist (DB `metadata`, keyed by the same repo-set key the
+grouping uses) — curating a long list is worth doing once, not once per
+launch. The ghost shelf is in-memory like the other view toggles, with
+`[navigation] ghost_shelf` as its startup default.
+
+The list also gained the navigation the pane never had: `g`/`Home` and
+`Shift+G`/`End` for first/last, and `]`/`[` to leap between repo groups —
+which makes stepping through a long list `O(groups)` instead of
+`O(sessions)`.
 
 ---
 
@@ -622,12 +675,15 @@ full, and "hold a modifier to peek at jump targets" only works on a
 modifier the app owns — so `Alt+1`–`9` jump to the numbered session,
 **holding Alt** paints those numbers on the session list (kitty-protocol
 terminals; after a short delay so readline's `M-b`/`M-f` passing through
-the terminal never flash it), and `Alt+A` numbers only the *blocked*
-sessions (see *Live status*). Every other Alt chord still forwards to the
-PTY, and the shadowed readline bindings (`M-digit` argument prefixes,
-`M-a`) are rare enough to spend. `Alt+A` is rebindable; the digits are
-fixed. Some terminal emulators claim `Alt+digit` for their own tabs —
-their setting wins; rebind or disable it there.
+the terminal never flash it), `Alt+A` numbers only the sessions needing
+attention (see *Live status*), and `Alt+G` labels **every** session with a
+home-row letter — the route past the nine digits, and the one that survives
+an outer tmux, since a sticky overlay needs no key-down report. Every other
+Alt chord still forwards to the PTY, and the shadowed readline bindings
+(`M-digit` argument prefixes, `M-a`, `M-g`) are rare enough to spend. All
+three chords are rebindable; the digits are fixed. Some terminal emulators
+claim `Alt+digit` for their own tabs — their setting wins; rebind or disable
+it there.
 
 ### The leader key (`Ctrl+F`)
 
@@ -658,10 +714,13 @@ becomes `<leader> n` — so the table is learnable as "your chords, one key
 later" rather than a second vocabulary. Four cases can't mirror: `r` goes to
 `RestartSession` (bare `Ctrl+R`) with `Shift+R` for `ReloadApp`; `LastSession`
 moves to `Tab` because digits belong to session selection; and the F-key-only
-actions take `v` (acti**v**ity), `]` (next blocked) and `m` (**m**etrics /
-perf HUD). `Copy`/`Paste` are deliberately **not** on the leader — they are
-routed ahead of every modal so paste reaches text inputs, which a leader route
-cannot do.
+actions take `v` (acti**v**ity), `]` (next attention) and `m` (**m**etrics /
+perf HUD). A handful of keys widen a lowercase sibling by shifting it, the
+same shape as `r`/`R`: `a` numbers the attention queue, `A` labels **a**ll
+sessions; `u` lists deleted sessions, `U` unloads the current one; `l` moves
+focus right, `L` folds the left column away; `G` shelves the **G**hosts.
+`Copy`/`Paste` are deliberately **not** on the leader — they are routed ahead
+of every modal so paste reaches text inputs, which a leader route cannot do.
 
 **Reordering by distance.** `<leader> K` then `1`–`9` moves the active session
 that many places toward the top; `<leader> J` moves it down. Rows shift around
@@ -672,11 +731,17 @@ the digit you read is the digit you need; the footer badge reads
 `move up 1-9`. Any non-digit cancels.
 
 **What the leader unlocks: session selection by number.** `<leader> 1`–`9`
-jumps straight to that session, and `<leader> a` then a digit jumps to the
-*Nth blocked* session. Unlike `Alt+1`–`9` this works everywhere — GNOME
+jumps straight to that session, `<leader> a` then a digit jumps to the *Nth*
+session needing attention, and `<leader> A` labels every session with a letter
+for the rows past nine. Unlike `Alt+1`–`9` this works everywhere — GNOME
 Terminal, Konsole, Tilix, xfce4 and Ghostty-on-Linux all bind `Alt+<digit>` to
 their own tabs, and macOS terminals ship with Option-as-Meta **off**, so the
 Alt route is unavailable to a large share of users by default.
+
+While the leader is armed the session list also **widens over the central
+pane** to whatever its names need, so the row you are numbering is legible
+rather than truncated at 30 columns. It floats rather than resizing the
+column — a real resize would reflow every session's PTY on each leader press.
 
 `<leader> <leader>` sends the leader's own byte to the agent — the universal
 convention (tmux `send-prefix`, screen `C-a a`, nvim `CTRL-\ CTRL-\`, ssh
@@ -769,12 +834,15 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Ctrl+K` / `Alt+K` | Global | Select previous session (`Ctrl+K` defers likewise — readline kill-to-end) | Vim: **k** = up |
 | `Alt+N` / `Alt+P` | Global | Select next / previous **loaded** session (skips ghosts and unreachable placeholders) | **N**ext / **P**revious, Alt like the other session-cycling chords |
 | `Ctrl+L` | Global | Focus next pane (cycle forward) | Vim: **l** = right |
-| `F10` | Global | Jump to next blocked session (wraps, focuses terminal) | Attention |
+| `F10` | Global | Jump to next session needing attention — blocked first, then finished-but-unseen (wraps, focuses terminal) | Attention |
 | `Ctrl+6` / `Ctrl+^` | Global | Toggle between the two most recent sessions | vim alternate buffer |
 | `Alt+1`…`9` | Global | Jump to the Nth session (rendered order); fixed, not rebindable | tmux `Alt+digit` |
 | hold `Alt` | Global | Paint the jump numbers on the session list (kitty protocol) | Peek |
-| `Alt+A` | Global | Number only *blocked* sessions; a digit jumps to that one | **A**ttention |
-| `1`…`9` / `Esc` | Blocked-jump overlay | Jump to that blocked session / dismiss | |
+| `Alt+A` / `<leader> a` | Global | Number only the sessions needing attention; a digit jumps to that one | **A**ttention |
+| `1`…`9` / `Esc` | Attention-jump overlay | Jump to that session / dismiss | |
+| `Alt+G` / `<leader> A` | Global | Label **every** session with a home-row letter; typing it jumps there (works past the nine digits, and through an outer tmux) | **G**o to |
+| letter / `Esc` | Label-jump overlay | Jump to that label / dismiss | |
+| `Alt+Shift+U` / `<leader> G` | Global | Shelve the unloaded sessions — fold them out of the list into a title-bar count | **G**hosts, `Alt+U`'s twin |
 | `Ctrl+D` | Session list | Delete selected session | Vim: **d** = delete |
 | `Ctrl+O` | Global | Open active session's worktrees in editor | **O**pen |
 | `Ctrl+R` | Global | Restart active session (on a ghost: load it) | **R**estart |
@@ -794,6 +862,11 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Shift+J` | Session list | Move selected session down | Reorder |
 | `Shift+K` | Session list | Move selected session up | Reorder |
 | `Shift+S` | Session list | Sort sessions alphabetically within repo groups | **S**ort |
+| `h` / `Left` | Session list | Collapse the selected session's repo group | Vim/file-viewer fold |
+| `l` / `Right` | Session list | Expand the selected session's repo group | |
+| `g` / `Home` | Session list | Select the first session | Vim `gg` |
+| `Shift+G` / `End` | Session list | Select the last session | Vim `G` |
+| `]` / `[` | Session list | Leap to the next / previous repo group | Brackets = sections |
 | `j` / `k` | F1 editor | Select action to rebind | |
 | `Enter` / `r` | F1 editor | Capture a new chord for the selected action | **R**ebind |
 | `d` | F1 editor | Reset selected action to its default chord(s) | **D**efault |
@@ -801,7 +874,8 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Esc` | F1 editor | Close (or cancel an in-progress capture) | |
 | `j` / `Down` | Lists | Next item | |
 | `k` / `Up` | Lists | Previous item | |
-| `Enter` | Global search | Jump to selected result | |
+| `Enter` | Global search | Jump to selected result (loads it if it's a ghost) | |
+| `Tab` | Global search | Widen from the session switcher to every scope, or back | |
 | `Esc` | Global search | Close search | |
 | `Enter` | Session list | Focus terminal | |
 | `Esc` | Session list | Focus terminal (back out of the list) | |
@@ -2328,17 +2402,47 @@ too (ADR-P13 in `docs/PERFORMANCE.md`). See
 
 `Ctrl+/` (the near-universal "search" chord) — or a **double-tap of
 `Shift`**, JetBrains "Search Everywhere" muscle memory — opens a **centered
-popup** that searches every scope at once — a single place to find and jump
-to anything. The chord is fully rebindable from the F1 editor
+popup**. The chord is fully rebindable from the F1 editor
 (`Action::GlobalSearch`); the double-`Shift` gesture is a fixed alias (see
 *Keys & bindings*).
 
-### Scopes
+### Two scopes: the switcher, and everything
 
-- **Sessions** — name, agent, every worktree branch, and cwd (fuzzy), plus
-  the live terminal **buffer content** so you can find *which session*
-  mentioned a string ("deploy failed", an error, a file path) and switch
-  straight to it.
+The popup **opens as the session switcher** and `Tab` widens it to every
+scope at once. Switching sessions is the errand you run dozens of times an
+hour; searching a file tree is one you run occasionally, and a popup that
+treats them as equals makes the common one worse. Re-opening always resets to
+the switcher, so the same keystrokes never mean different things on
+different opens.
+
+**Sessions (the switcher).** With **no query** it lists every session
+*most-recently-used first*, with the one already on screen dropped — so
+`Ctrl+/` `Enter` is "back to the last session" and arrowing down walks
+further back through the same history. Typing ranks the whole fleet:
+
+- Every field is scored with the same fuzzy matcher and the **best field
+  wins**, minus a per-field handicap — a hit on the **name** always outranks
+  an equally good hit on the agent, a branch, a repo, or the cwd.
+- Scoring is fzf's two-pass greedy: prefix and word-boundary matches beat
+  mid-word ones, unbroken runs beat scattered letters, and a shorter field
+  breaks the tie (`api` beats `payments-api-v2`).
+- Sessions **needing attention** get a nudge, and recency breaks what's left.
+- The list is **uncapped**. A switcher that silently hides the session you
+  are looking for is the exact failure a per-scope cap was meant to prevent.
+- Rows carry the sidebar's status dot and a dim `agent · repo` detail, so two
+  same-named sessions in different repos are told apart without opening
+  either.
+- `Enter` on an **unloaded** session loads it — the same contract `Enter`
+  already had in the session list, which used to be the only route to a ghost.
+
+**Everything (`Tab`).** The original all-scopes search, capped at 8 results
+per scope so one broad query can't push the other scopes off the popup:
+
+- **Sessions** — the same metadata ranking, plus the live terminal **buffer
+  content** so you can find *which session* mentioned a string ("deploy
+  failed", an error, a file path) and switch straight to it. Content matches
+  sort below every metadata hit: a name match is a deliberate target, a
+  scrollback match is a lucky one.
 - **Tasks** — title **and description** (fuzzy; a description snippet is
   shown when only the description matched).
 - **Automations** — name (fuzzy).

@@ -117,7 +117,8 @@ pub fn session_labels(n: usize) -> Vec<String> {
 /// `(no repo)` bucket.
 ///
 /// The `\0` join separator can't occur in a repo name, so distinct sets never
-/// collide. This is only a map key — never displayed (see [`group_display`]).
+/// collide. This is only a map key — never displayed (`group_display` builds
+/// the header label).
 pub fn group_key(info: &SessionInfo) -> String {
     if info.repo_display_names.is_empty() {
         return NO_REPO_GROUP.to_string();
