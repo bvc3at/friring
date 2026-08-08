@@ -652,6 +652,11 @@ impl<'a> OrderedSessions<'a> {
 
 pub struct LeftPanelState<'a> {
     pub sessions: &'a [&'a SessionInfo],
+    /// The complete ordered set, before the visibility filter. The status
+    /// aggregates (title-bar attention counts, the fleet total, each group's
+    /// rolled-up dot) are read from this: an agent that needs answering must
+    /// not stop being counted because its row is folded or shelved away.
+    pub all_sessions: &'a [&'a SessionInfo],
     pub active_session: usize,
     /// Whether to highlight the active-session row. `false` hides the selection
     /// entirely (e.g. while the automations pane is focused, where the active
@@ -697,6 +702,7 @@ pub fn render_left_panel(
         frame,
         area,
         state.sessions,
+        state.all_sessions,
         state.active_session,
         state.show_selection,
         state.session_focus,
@@ -784,6 +790,7 @@ fn render_session_section(
     frame: &mut Frame,
     area: Rect,
     sessions: &[&SessionInfo],
+    all_sessions: &[&SessionInfo],
     active_index: usize,
     show_selection: bool,
     level: FocusLevel,
@@ -806,8 +813,13 @@ fn render_session_section(
         // being clipped on a narrow sidebar). Both halves of the attention
         // queue are shown, in the order `F10` walks them: the blocked sessions
         // are stopped until you answer, the finished ones are only unread.
+        // Counted over the whole fleet, not the visible rows — a fold must not
+        // make an agent waiting on you disappear from the tally.
         for status in [SessionStatus::Blocked, SessionStatus::Done] {
-            let n = sessions.iter().filter(|info| info.status == status).count();
+            let n = all_sessions
+                .iter()
+                .filter(|info| info.status == status)
+                .count();
             if n > 0 {
                 dots.push(Span::styled(
                     format!("{}{n} ", super::status_glyph(status, spinner)),
@@ -842,7 +854,7 @@ fn render_session_section(
     // abstract, the sum of every running agent is the number that argues for
     // unloading one. Bottom-*left* keeps it clear of the scroll indicators,
     // which the renderer paints over the right end of both borders.
-    if let Some(total) = fleet_rss(sessions) {
+    if let Some(total) = fleet_rss(all_sessions) {
         block = block.title_bottom(
             Line::from(Span::styled(
                 format!(" \u{3a3} {total} "),
@@ -860,20 +872,16 @@ fn render_session_section(
     // Available width inside the block (subtract 2 for borders)
     let inner_width = area.width.saturating_sub(2) as usize;
 
-    // The header row each row belongs to, used to roll each group's members up
-    // to a single status dot on the header below.
-    let group_of = header_group_of(headers);
-
     // Roll each repo group up to its most-urgent member status, keyed by the
-    // group's header row index, so the header shows a single dot you can scan.
-    // Computed at render time (not in `SessionOrder`) so status never feeds the
-    // order cache or reorders rows — it only recolors.
-    let mut group_rollup: std::collections::HashMap<usize, SessionStatus> =
+    // group itself (not a row) so a collapsed header still speaks for the
+    // members folded away underneath it. Computed at render time (not in
+    // `SessionOrder`) so status never feeds the order cache or reorders rows —
+    // it only recolors.
+    let mut group_rollup: std::collections::HashMap<String, SessionStatus> =
         std::collections::HashMap::new();
-    for (i, info) in sessions.iter().enumerate() {
-        let h = group_of[i];
+    for info in all_sessions {
         group_rollup
-            .entry(h)
+            .entry(group_key(info))
             .and_modify(|s| *s = group_status([*s, info.status]))
             .or_insert(info.status);
     }
@@ -914,7 +922,10 @@ fn render_session_section(
             // each group. The header carries the group's rolled-up status dot
             // but never reflects selection (that stays on the session rows).
             if let Some(Some(label)) = headers.get(i) {
-                let rollup = group_rollup.get(&i).copied().unwrap_or(info.status);
+                let rollup = group_rollup
+                    .get(&group_key(info))
+                    .copied()
+                    .unwrap_or(info.status);
                 item_lines.insert(
                     0,
                     group_header_line(
@@ -1667,6 +1678,7 @@ mod tests {
                     Rect::new(0, 0, 30, 12),
                     &mut LeftPanelState {
                         sessions: &ordered.sessions,
+                        all_sessions: &sessions,
                         active_session: ordered.active_index,
                         show_selection: true,
                         session_focus: FocusLevel::Focused,
@@ -1688,6 +1700,72 @@ mod tests {
         assert_eq!(hitboxes[0].index, 0);
         assert_eq!(hitboxes[1].rect, Rect::new(1, 3, 28, 1));
         assert_eq!(hitboxes[1].index, 1);
+    }
+
+    #[test]
+    fn folded_group_still_reports_its_blocked_member() {
+        // A fold hides rows, not the fact that an agent is waiting: the
+        // collapsed header keeps the rolled-up dot and the title-bar count
+        // keeps counting the session behind it.
+        let mut head = info("a-head");
+        head.repo_display_names = vec!["repo".to_string()];
+        head.status = SessionStatus::Idle;
+        let mut member = info("b-member");
+        member.repo_display_names = vec!["repo".to_string()];
+        member.status = SessionStatus::Blocked;
+        let sessions = vec![&head, &member];
+        let order = compute_session_order(&sessions);
+        let folded: std::collections::HashSet<String> = ["repo".to_string()].into_iter().collect();
+        let ordered =
+            OrderedSessions::from_order(&sessions, &order, &[None, None], 0, &no_filter(&folded));
+        assert_eq!(ordered.sessions.len(), 1, "the group collapsed to one row");
+        assert_eq!(ordered.sessions[0].status, SessionStatus::Idle);
+
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut list_state = ListState::default();
+        terminal
+            .draw(|f| {
+                render_left_panel(
+                    f,
+                    Rect::new(0, 0, 40, 10),
+                    &mut LeftPanelState {
+                        sessions: &ordered.sessions,
+                        all_sessions: &sessions,
+                        active_session: ordered.active_index,
+                        show_selection: true,
+                        session_focus: FocusLevel::Focused,
+                        session_list_state: &mut list_state,
+                        session_match_positions: &ordered.match_positions,
+                        session_search_active: false,
+                        headers: &ordered.headers,
+                        depths: &ordered.depths,
+                        folded_counts: &ordered.folded_counts,
+                        ghost_shelf_count: ordered.hidden_ghosts,
+                        spinner: "\u{25d0}",
+                        jump_labels: &[],
+                    },
+                );
+            })
+            .unwrap();
+        let out: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        let blocked = SessionStatus::Blocked.icon();
+        assert!(
+            out.contains(&format!("{blocked}1")),
+            "the title bar still counts the folded blocked session: {out}"
+        );
+        assert_eq!(
+            out.matches(blocked).count(),
+            2,
+            "and the collapsed header wears the rolled-up dot too: {out}"
+        );
     }
 
     #[test]

@@ -473,6 +473,7 @@ impl App {
             left_area,
             &mut project_list::LeftPanelState {
                 sessions: &ordered.sessions,
+                all_sessions: &all_sessions,
                 active_session: ordered.active_index,
                 show_selection,
                 session_focus: list_focus,
