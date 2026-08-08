@@ -114,7 +114,8 @@ in turn and then reviewing each finished run.
 The queue is **`Blocked` first, then `Done`**. A blocked session is *stopped*
 until you act, so those always come first; only when none is blocked does the
 queue fall through to the finished-but-unseen ones (a `Done` session drops
-back to `Idle` the moment you look at it, so `Done` already means "unread").
+back to `Idle` once you move focus off it again, so `Done` already means
+"unread").
 Following both at once would bury the blocking prompts among completed runs.
 Set `[navigation] attention_includes_done = false` for the blocked-only queue.
 
