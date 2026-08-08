@@ -1268,19 +1268,45 @@ mod tests {
 
     #[test]
     fn folding_leaves_display_order_alone() {
+        /// Every row's `(name, display_order)`, hidden ones included.
+        fn numbering(app: &App) -> Vec<(String, Option<i64>)> {
+            app.sessions
+                .iter()
+                .map(|s| (s.info.name.clone(), s.info.display_order))
+                .collect()
+        }
+
         let (mut app, _g, _t) = app_with_sessions(4);
-        for i in 0..4 {
-            in_repo(&mut app, i, "alpha");
+        // Deliberately reversed: a sort that only saw the visible head would
+        // have to leave three rows misnumbered for the assertion to hold.
+        for (i, name) in ["delta", "charlie", "bravo", "alpha"].iter().enumerate() {
+            app.sessions[i].info.name = (*name).to_string();
+            in_repo(&mut app, i, "repo");
         }
         app.sort_sessions_alphabetically();
-        let before: Vec<Option<i64>> = app.sessions.iter().map(|s| s.info.display_order).collect();
+        let before = numbering(&app);
+        assert_eq!(
+            before,
+            vec![
+                ("delta".to_string(), Some(3)),
+                ("charlie".to_string(), Some(2)),
+                ("bravo".to_string(), Some(1)),
+                ("alpha".to_string(), Some(0)),
+            ],
+            "the first sort renumbers all four rows densely"
+        );
 
         app.set_active_group_folded(true);
+        assert_eq!(
+            app.visible_order_indices().len(),
+            1,
+            "the whole fleet is behind one folded header"
+        );
         app.sort_sessions_alphabetically();
 
-        let after: Vec<Option<i64>> = app.sessions.iter().map(|s| s.info.display_order).collect();
         assert_eq!(
-            before, after,
+            before,
+            numbering(&app),
             "reordering must see the whole list, not just what's on screen"
         );
     }
