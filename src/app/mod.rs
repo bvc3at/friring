@@ -794,6 +794,12 @@ pub struct App {
     /// [`Self::set_active_index`]; bookkeeping moves (restore reshuffles,
     /// delete clamps, search previews) bypass it on purpose.
     last_active_session: Option<SessionId>,
+    /// Every session ever activated, most-recently-active first (front = the
+    /// session showing now). Powers the switcher's no-query list and its
+    /// recency tiebreak. Fed by the same *deliberate*-switch rule as
+    /// [`Self::last_active_session`], so a live search preview arrowing past a
+    /// session never promotes it. In-memory: a restart starts from render order.
+    session_mru: Vec<SessionId>,
     /// Whether the Alt key is currently held (kitty-protocol modifier events;
     /// always `false` on legacy terminals). See [`Self::set_alt_held`].
     alt_held: bool,
@@ -1330,6 +1336,7 @@ impl App {
             sessions: Vec::new(),
             active_index: 0,
             last_active_session: None,
+            session_mru: Vec::new(),
             alt_held: false,
             alt_held_since: None,
             alt_overlay_redraw_requested: false,
@@ -4971,6 +4978,47 @@ impl App {
             self.last_active_session = self.active_session_id();
         }
         self.active_index = idx;
+        self.note_session_use();
+    }
+
+    /// Promote the active session to the front of the MRU list. Called by every
+    /// deliberate switch — including the search commit, which sets
+    /// `active_index` directly to keep live previews out of the toggle history
+    /// but still means "I chose this one".
+    pub(crate) fn note_session_use(&mut self) {
+        let Some(id) = self.active_session_id() else {
+            return;
+        };
+        self.session_mru.retain(|&seen| seen != id);
+        self.session_mru.insert(0, id);
+    }
+
+    /// Indices into `self.sessions`, most-recently-active first. Sessions never
+    /// deliberately switched to (a fresh start, or ones only ever passed over)
+    /// trail in render order, so the list is total and stable rather than
+    /// half-empty on the first switch of a session.
+    pub(crate) fn mru_order_indices(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::with_capacity(self.sessions.len());
+        for id in &self.session_mru {
+            if let Some(i) = self.sessions.iter().position(|s| s.info.id == *id) {
+                out.push(i);
+            }
+        }
+        for i in self.render_order_indices() {
+            if !out.contains(&i) {
+                out.push(i);
+            }
+        }
+        out
+    }
+
+    /// A session's position in the MRU list — the switcher's recency tiebreak
+    /// (lower is more recent). Never-activated sessions sort last.
+    fn mru_rank(&self, idx: usize) -> usize {
+        self.sessions
+            .get(idx)
+            .and_then(|s| self.session_mru.iter().position(|id| *id == s.info.id))
+            .unwrap_or(usize::MAX)
     }
 
     /// Toggle between the two most recent sessions (tmux `last-window`, vim's

@@ -1,7 +1,12 @@
 //! Global search — a centered popup (`Ctrl+/` or double-`Shift`, JetBrains
-//! Search-Everywhere-style) that searches across every scope at once: session
-//! metadata + live buffer **content**, automation names, task titles, and the
-//! file tree of the session that was active when the popup opened.
+//! Search-Everywhere-style).
+//!
+//! It opens in the **Sessions** scope, where it is the session switcher: no
+//! query lists every session most-recently-used first (so `Enter` alone is
+//! "back to the last one"), and typing ranks the whole fleet by relevance
+//! rather than truncating it. `Tab` widens to **Everything** — the original
+//! all-scopes search over session metadata + live buffer content, automation
+//! names, task titles, and the file tree of the session active at open.
 //!
 //! The state lives here; building results and dispatching a selection live on
 //! `App` (they touch `self.sessions`/vt100/caches). The renderer is
@@ -13,11 +18,58 @@ use std::time::{Duration, Instant};
 use super::background::{BackgroundTask, TaskPoll};
 use super::modals::TextInput;
 use super::{clock, App, InputFocus};
+use crate::session::SessionStatus;
 use crossterm::event::{KeyCode, KeyModifiers};
 
-/// Max results kept per group (sessions/tasks/automations/files), so a broad
-/// query can't flood the popup.
+/// Max results kept per group (sessions/tasks/automations/files) in the
+/// Everything scope, so a broad query can't flood the popup. The Sessions
+/// scope is deliberately **uncapped**: a switcher that silently hides the
+/// session you are looking for is worse than one that makes you scroll.
 pub(crate) const MAX_PER_GROUP: usize = 8;
+
+/// Score added to a session result whose agent is waiting on the user, so the
+/// sessions that need answering surface first among equally good name matches.
+const BLOCKED_BOOST: i32 = 12;
+/// Score added to a session result that just finished (unseen `Done`).
+const DONE_BOOST: i32 = 6;
+
+/// Per-field handicaps: a name hit always outranks the same-quality hit on the
+/// agent, a branch, a repo or the working directory.
+const AGENT_HANDICAP: i32 = 12;
+const BRANCH_HANDICAP: i32 = 8;
+const REPO_HANDICAP: i32 = 8;
+const CWD_HANDICAP: i32 = 16;
+
+/// Which scope the popup is searching. Toggled with `Tab`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SearchScope {
+    /// Sessions only — the switcher. The scope the popup opens in, because
+    /// switching sessions is the common errand and everything else is a
+    /// once-in-a-while one.
+    #[default]
+    Sessions,
+    /// Every scope at once: sessions (metadata + buffer content), tasks,
+    /// automations, files.
+    Everything,
+}
+
+impl SearchScope {
+    /// The other scope — `Tab` flips between exactly two.
+    fn toggled(self) -> Self {
+        match self {
+            SearchScope::Sessions => SearchScope::Everything,
+            SearchScope::Everything => SearchScope::Sessions,
+        }
+    }
+
+    /// Label for the popup's title chip.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SearchScope::Sessions => "Sessions",
+            SearchScope::Everything => "Everything",
+        }
+    }
+}
 
 /// How many trailing lines of a session's buffer the content scan inspects.
 pub(crate) const CONTENT_LINE_CAP: usize = 500;
@@ -55,6 +107,13 @@ pub(crate) struct GlobalSearchResult {
     pub label: String,
     /// Matching line for content matches, shown dimmed beneath the label.
     pub snippet: Option<String>,
+    /// Right-aligned context for a session row (agent · repo), so two
+    /// same-named sessions in different repos are told apart without opening
+    /// them. `None` for the other scopes.
+    pub detail: Option<String>,
+    /// Session status, drawn as the row's leading dot — the same glyph the
+    /// sidebar uses, so a blocked session is recognisable in the switcher.
+    pub status: Option<SessionStatus>,
     pub target: SearchTarget,
 }
 
@@ -69,6 +128,33 @@ pub(crate) struct FileIndexEntry {
     pub name: String,
     /// Lowercased `name`, precomputed off-thread so matching allocates nothing.
     pub name_lc: String,
+}
+
+/// Ranking nudge for a session's status: the sessions asking for the user's
+/// attention come first among comparable name matches, because those are the
+/// ones being reached for. Everything else — including a ghost, which the
+/// switcher lists like any other session — scores on its name alone.
+fn status_boost(status: SessionStatus) -> i32 {
+    match status {
+        SessionStatus::Blocked => BLOCKED_BOOST,
+        SessionStatus::Done => DONE_BOOST,
+        _ => 0,
+    }
+}
+
+/// The dim right-hand context on a session row: agent, then the repos it spans
+/// (or its branch when it has exactly one worktree). Enough to tell two
+/// same-named sessions apart without opening either.
+fn session_detail(info: &crate::session::SessionInfo) -> String {
+    let mut parts: Vec<String> = vec![info.agent.clone()];
+    match info.worktrees.as_slice() {
+        [only] => parts.push(only.branch.clone()),
+        _ if !info.repo_display_names.is_empty() => {
+            parts.push(info.repo_display_names.join(" + "));
+        }
+        _ => {}
+    }
+    parts.join(" · ")
 }
 
 /// Snapshot of the UI state taken when the popup opens, so cancelling (`Esc`)
@@ -89,6 +175,9 @@ pub(crate) struct SearchSnapshot {
 /// State for the global-search popup.
 pub(crate) struct GlobalSearchState {
     pub active: bool,
+    /// Which scope `Tab` last selected. Reset to the default on every open, so
+    /// the popup is always the switcher when it appears.
+    pub scope: SearchScope,
     pub query: TextInput,
     pub results: Vec<GlobalSearchResult>,
     /// Selected flat index into `results`.
@@ -110,6 +199,7 @@ impl Default for GlobalSearchState {
     fn default() -> Self {
         Self {
             active: false,
+            scope: SearchScope::default(),
             query: TextInput::new(),
             results: Vec::new(),
             selected: 0,
@@ -155,6 +245,10 @@ impl App {
             show_file_viewer: self.show_file_viewer,
         });
         self.global_search.active = true;
+        // Always open as the switcher, whatever `Tab` last selected: the popup
+        // is muscle memory for "go to a session", and a sticky Everything scope
+        // would make the same keystrokes mean different things on each open.
+        self.global_search.scope = SearchScope::default();
         self.global_search.query.clear();
         self.global_search.results.clear();
         self.global_search.selected = 0;
@@ -291,21 +385,36 @@ impl App {
         self.preview_global_search_result();
     }
 
-    /// Assemble the grouped result list. `with_content` adds session buffer
-    /// matches (the heavy path). Empty query → no results.
+    /// Assemble the result list. In the **Sessions** scope that is the ranked
+    /// session list alone (and, with no query, the most-recently-used order).
+    /// In **Everything** it is the grouped all-scopes list, which still needs a
+    /// query to mean anything.
     fn build_global_search_results(
         &self,
         query: &str,
         with_content: bool,
     ) -> Vec<GlobalSearchResult> {
+        let scope = self.global_search.scope;
         if query.trim().is_empty() {
-            return Vec::new();
+            return match scope {
+                SearchScope::Sessions => self.recent_sessions(),
+                SearchScope::Everything => Vec::new(),
+            };
         }
         let query_lc = query.to_lowercase();
+        // The switcher shows every match; Everything caps each group so one
+        // broad query can't push the other scopes off the popup.
+        let cap = match scope {
+            SearchScope::Sessions => usize::MAX,
+            SearchScope::Everything => MAX_PER_GROUP,
+        };
+        let mut out = self.search_sessions(query, &query_lc, with_content, cap);
+        if scope == SearchScope::Sessions {
+            return out;
+        }
         // Group order: Sessions → Tasks → Automations → Files. Disabled
         // features contribute no results, so a selection can never preview or
         // jump into a pane the feature flags hide.
-        let mut out = self.search_sessions(query, &query_lc, with_content);
         if self.features.tasks {
             out.extend(self.search_tasks(query, &query_lc));
         }
@@ -318,48 +427,103 @@ impl App {
         out
     }
 
-    /// Session results: fuzzy metadata (name / agent / every worktree branch /
-    /// cwd) plus, on the debounced heavy path, a buffer-content scan (skipping
-    /// metadata matches).
+    /// The no-query switcher list: every session, most-recently-used first,
+    /// with the one already on screen dropped. That makes row 1 the session you
+    /// were just in, so opening the popup and pressing `Enter` is the same
+    /// "bounce back" gesture as [`Action::LastSession`](crate::session::Action::LastSession)
+    /// — and arrowing down walks further back through the same history.
+    fn recent_sessions(&self) -> Vec<GlobalSearchResult> {
+        self.mru_order_indices()
+            .into_iter()
+            .filter(|&i| i != self.active_index)
+            .map(|i| self.session_result(i, None))
+            .collect()
+    }
+
+    /// Build a session row for the popup.
+    fn session_result(&self, index: usize, snippet: Option<String>) -> GlobalSearchResult {
+        let info = &self.sessions[index].info;
+        GlobalSearchResult {
+            kind: SearchKind::Session,
+            label: info.name.clone(),
+            snippet,
+            detail: Some(session_detail(info)),
+            status: Some(info.status),
+            target: SearchTarget::Session { index },
+        }
+    }
+
+    /// Session results, ranked. Every metadata field is scored with the same
+    /// fuzzy matcher and the best field wins, minus a per-field handicap so a
+    /// name hit always beats an equally good agent/branch/repo/cwd hit. Blocked
+    /// and just-finished sessions get a nudge (they are the ones you are most
+    /// likely reaching for), and recency breaks the remaining ties.
+    ///
+    /// `with_content` appends the debounced buffer-content scan, which stays
+    /// *below* every metadata hit: a name match is a deliberate target, a
+    /// scrollback match is a lucky one.
     fn search_sessions(
         &self,
         query: &str,
         query_lc: &str,
         with_content: bool,
+        cap: usize,
     ) -> Vec<GlobalSearchResult> {
-        let mut sessions: Vec<GlobalSearchResult> = Vec::new();
+        let mut scored: Vec<(i32, usize, usize)> = Vec::new(); // (score, mru rank, index)
         for (i, session) in self.sessions.iter().enumerate() {
-            if sessions.len() >= MAX_PER_GROUP {
-                break;
-            }
-            let info = &session.info;
-            let meta_hit = crate::fuzzy::fuzzy_match(query, &info.name).is_some()
-                || crate::fuzzy::fuzzy_match(query, &info.agent).is_some()
-                || info
-                    .worktrees
-                    .iter()
-                    .any(|w| crate::fuzzy::fuzzy_match(query, &w.branch).is_some())
-                || info.cwd.as_ref().is_some_and(|c| {
-                    crate::fuzzy::fuzzy_match(query, &c.to_string_lossy()).is_some()
-                });
-            if meta_hit {
-                sessions.push(GlobalSearchResult {
-                    kind: SearchKind::Session,
-                    label: info.name.clone(),
-                    snippet: None,
-                    target: SearchTarget::Session { index: i },
-                });
+            if let Some(score) = self.session_score(query, &session.info) {
+                scored.push((score, self.mru_rank(i), i));
             }
         }
+        // Best score first; then most recently used; then a stable index so the
+        // order never flickers between frames.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        let mut sessions: Vec<GlobalSearchResult> = scored
+            .into_iter()
+            .take(cap)
+            .map(|(_, _, i)| self.session_result(i, None))
+            .collect();
         if with_content {
-            self.push_session_content_matches(query_lc, &mut sessions);
+            self.push_session_content_matches(query_lc, &mut sessions, cap);
         }
         sessions
     }
 
+    /// The best score any of a session's metadata fields gives `query`, or
+    /// `None` when none of them matches.
+    fn session_score(&self, query: &str, info: &crate::session::SessionInfo) -> Option<i32> {
+        let field = |text: &str, handicap: i32| {
+            crate::fuzzy::fuzzy_match(query, text).map(|m| m.score - handicap)
+        };
+        let best = [
+            field(&info.name, 0),
+            field(&info.agent, AGENT_HANDICAP),
+            info.worktrees
+                .iter()
+                .filter_map(|w| field(&w.branch, BRANCH_HANDICAP))
+                .max(),
+            info.repo_display_names
+                .iter()
+                .filter_map(|r| field(r, REPO_HANDICAP))
+                .max(),
+            info.cwd
+                .as_ref()
+                .and_then(|c| field(&c.to_string_lossy(), CWD_HANDICAP)),
+        ]
+        .into_iter()
+        .flatten()
+        .max()?;
+        Some(best + status_boost(info.status))
+    }
+
     /// Append vt100 buffer-content matches to `out`, skipping sessions already
-    /// present (matched on metadata) and respecting the per-group cap.
-    fn push_session_content_matches(&self, query_lc: &str, out: &mut Vec<GlobalSearchResult>) {
+    /// present (matched on metadata) and respecting the scope's cap.
+    fn push_session_content_matches(
+        &self,
+        query_lc: &str,
+        out: &mut Vec<GlobalSearchResult>,
+        cap: usize,
+    ) {
         let already: std::collections::HashSet<usize> = out
             .iter()
             .filter_map(|r| match r.target {
@@ -368,19 +532,14 @@ impl App {
             })
             .collect();
         for i in 0..self.sessions.len() {
-            if out.len() >= MAX_PER_GROUP {
+            if out.len() >= cap {
                 break;
             }
             if already.contains(&i) {
                 continue;
             }
             if let Some(snippet) = self.session_content_match(query_lc, i) {
-                out.push(GlobalSearchResult {
-                    kind: SearchKind::Session,
-                    label: self.sessions[i].info.name.clone(),
-                    snippet: Some(snippet),
-                    target: SearchTarget::Session { index: i },
-                });
+                out.push(self.session_result(i, Some(snippet)));
             }
         }
     }
@@ -418,6 +577,8 @@ impl App {
                 kind: SearchKind::Task,
                 label: task.title.clone(),
                 snippet,
+                detail: None,
+                status: None,
                 target: SearchTarget::Task { id: task.id },
             });
         }
@@ -436,6 +597,8 @@ impl App {
                     kind: SearchKind::Automation,
                     label: auto.name.clone(),
                     snippet: None,
+                    detail: None,
+                    status: None,
                     target: SearchTarget::Automation { id: auto.id },
                 });
             }
@@ -457,6 +620,8 @@ impl App {
                     kind: SearchKind::File,
                     label: entry.name.clone(),
                     snippet: None,
+                    detail: None,
+                    status: None,
                     target: SearchTarget::File {
                         root: entry.root.clone(),
                         path: entry.path.clone(),
@@ -612,7 +777,17 @@ impl App {
                         self.last_active_session = prior_id;
                     }
                     self.active_index = index;
+                    self.note_session_use();
                     self.focus = InputFocus::Terminal;
+                    // Same contract as `Enter` on a ghost row in the session
+                    // list: selection never starts an agent, but choosing one
+                    // does. Without this the switcher could reach a ghost and
+                    // then strand the user on a frozen frame, which is exactly
+                    // the dead end that made the sidebar the only way to load
+                    // an unloaded session.
+                    if self.active_session_is_ghost() {
+                        self.restart_active_session();
+                    }
                 } else {
                     self.focus = fallback_focus;
                 }
@@ -682,15 +857,29 @@ impl App {
         }
     }
 
+    /// Widen from the Sessions switcher to the all-scopes search, or back
+    /// (`Tab`). The query survives the flip, so a search that came up empty in
+    /// one scope is one keystroke from being re-run in the other.
+    fn toggle_global_search_scope(&mut self) {
+        self.global_search.scope = self.global_search.scope.toggled();
+        self.global_search.selected = 0;
+        self.recompute_global_search_metadata();
+        // Everything's session rows come from the same scan, so a query typed
+        // in the switcher still needs its content pass once it widens.
+        self.global_search.content_dirty = true;
+        self.global_search.query_changed_at = Some(clock::now());
+    }
+
     /// Handle keys while the global-search popup is focused. Typed characters
     /// edit the query (so plain `j`/`k` insert, like the other search inputs);
-    /// `Up`/`Down` and `Ctrl+P`/`Ctrl+N` move the selection; `Enter` activates
-    /// the selected result; `Esc` closes the popup.
+    /// `Up`/`Down` and `Ctrl+P`/`Ctrl+N` move the selection; `Tab` switches
+    /// scope; `Enter` activates the selected result; `Esc` closes the popup.
     pub(super) fn handle_global_search_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         let ctrl = mods.contains(KeyModifiers::CONTROL);
         match code {
             KeyCode::Esc => self.close_global_search(),
             KeyCode::Enter => self.activate_global_search_result(),
+            KeyCode::Tab | KeyCode::BackTab => self.toggle_global_search_scope(),
             KeyCode::Down => self.move_global_search_selection(1),
             KeyCode::Up => self.move_global_search_selection(-1),
             KeyCode::Char('n') if ctrl => self.move_global_search_selection(1),
@@ -739,6 +928,8 @@ mod tests {
             kind: SearchKind::Task,
             label: label.to_string(),
             snippet: None,
+            detail: None,
+            status: None,
             target: SearchTarget::Task { id: 1 },
         }
     }
@@ -770,5 +961,141 @@ mod tests {
         let mut s = state_with(3, 1);
         s.clamp_selection();
         assert_eq!(s.selected, 1);
+    }
+
+    // ── the switcher (Sessions scope) ──
+
+    use crate::app::state::tests::app_with_sessions;
+
+    /// Every session result, by name, in the order the popup lists them.
+    fn session_names(app: &App) -> Vec<String> {
+        app.global_search
+            .results
+            .iter()
+            .filter(|r| r.kind == SearchKind::Session)
+            .map(|r| r.label.clone())
+            .collect()
+    }
+
+    #[test]
+    fn switcher_opens_on_the_sessions_scope_with_the_recent_list() {
+        let (mut app, _g, _t) = app_with_sessions(4);
+        // Visit two sessions, then come back to the first.
+        app.set_active_index(2);
+        app.set_active_index(3);
+        app.set_active_index(0);
+
+        app.open_global_search();
+
+        assert_eq!(app.global_search.scope, SearchScope::Sessions);
+        // Most-recently-used first, with the session already on screen dropped
+        // — so `Enter` on the untouched popup is "back to the last one".
+        assert_eq!(
+            session_names(&app),
+            vec!["session-3", "session-2", "session-1"],
+            "recent-first, active excluded, never-visited last"
+        );
+    }
+
+    #[test]
+    fn switcher_enter_with_no_query_returns_to_the_previous_session() {
+        let (mut app, _g, _t) = app_with_sessions(3);
+        app.set_active_index(2);
+        app.set_active_index(1);
+
+        app.open_global_search();
+        app.activate_global_search_result();
+
+        assert_eq!(app.active_index, 2, "row 1 is the session just left");
+        assert!(!app.global_search.active);
+    }
+
+    #[test]
+    fn switcher_ranks_the_best_name_match_first() {
+        let (mut app, _g, _t) = app_with_sessions(3);
+        app.sessions[0].info.name = "alpha-pipeline".into();
+        app.sessions[1].info.name = "api".into();
+        app.sessions[2].info.name = "grapikeeper".into();
+
+        app.open_global_search();
+        for c in "api".chars() {
+            app.global_search.query.insert(c);
+        }
+        app.on_global_search_query_changed();
+
+        // Exact/prefix beats the tight mid-word hit, which beats the one
+        // spelled out of scattered letters.
+        assert_eq!(
+            session_names(&app),
+            vec!["api", "grapikeeper", "alpha-pipeline"]
+        );
+    }
+
+    #[test]
+    fn switcher_lists_every_match_past_the_everything_cap() {
+        let (mut app, _g, _t) = app_with_sessions(MAX_PER_GROUP + 5);
+        app.open_global_search();
+        for c in "session".chars() {
+            app.global_search.query.insert(c);
+        }
+        app.on_global_search_query_changed();
+
+        assert_eq!(
+            session_names(&app).len(),
+            MAX_PER_GROUP + 5,
+            "the switcher must never hide a session behind a cap"
+        );
+    }
+
+    #[test]
+    fn tab_widens_to_everything_and_recaps_sessions() {
+        let (mut app, _g, _t) = app_with_sessions(MAX_PER_GROUP + 5);
+        app.open_global_search();
+        for c in "session".chars() {
+            app.global_search.query.insert(c);
+        }
+        app.on_global_search_query_changed();
+
+        app.handle_global_search_key(KeyCode::Tab, KeyModifiers::NONE);
+
+        assert_eq!(app.global_search.scope, SearchScope::Everything);
+        assert_eq!(session_names(&app).len(), MAX_PER_GROUP);
+        assert_eq!(
+            app.global_search.query.value(),
+            "session",
+            "the query survives the scope flip"
+        );
+    }
+
+    #[test]
+    fn reopening_resets_the_scope_to_the_switcher() {
+        let (mut app, _g, _t) = app_with_sessions(2);
+        app.open_global_search();
+        app.handle_global_search_key(KeyCode::Tab, KeyModifiers::NONE);
+        app.close_global_search();
+
+        app.open_global_search();
+
+        assert_eq!(app.global_search.scope, SearchScope::Sessions);
+    }
+
+    #[test]
+    fn blocked_sessions_outrank_equal_name_matches() {
+        let (mut app, _g, _t) = app_with_sessions(2);
+        app.sessions[0].info.name = "review".into();
+        app.sessions[1].info.name = "review".into();
+        app.sessions[1].info.status = SessionStatus::Blocked;
+
+        app.open_global_search();
+        for c in "review".chars() {
+            app.global_search.query.insert(c);
+        }
+        app.on_global_search_query_changed();
+
+        let blocked_first = matches!(
+            app.global_search.results.first().map(|r| r.target.clone()),
+            Some(SearchTarget::Session { index: 1 })
+        );
+        assert!(blocked_first, "the session waiting on the user comes first");
     }
 }

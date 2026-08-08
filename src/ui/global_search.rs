@@ -4,6 +4,10 @@
 //! (session list, tasks, automations) around the popup. The popup shows: a
 //! query line, a per-scope match summary, the grouped result list (scrollable,
 //! with the selected row highlighted), and key hints.
+//!
+//! In the Sessions scope the popup is the session switcher, so its rows carry
+//! the sidebar's status dot and a dim agent/repo detail on the right — the two
+//! things that tell near-identical session names apart.
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -13,10 +17,16 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::search::{GlobalSearchResult, SearchKind};
+use crate::app::search::{GlobalSearchResult, SearchKind, SearchScope};
 
 use super::theme::Theme;
 use super::truncate_ellipsis;
+
+/// Columns a row's detail column may take before the label is squeezed. The
+/// label is what the user is reading; the detail only disambiguates.
+const DETAIL_MAX_WIDTH: usize = 28;
+/// Columns the label keeps for itself before the detail is dropped entirely.
+const LABEL_MIN_WIDTH: usize = 12;
 
 /// View data for the popup (built by the app layer, so the UI stays free of the
 /// app's private `TextInput` internals — mirrors `tasks_panel`).
@@ -25,6 +35,10 @@ pub(crate) struct GlobalSearchView<'a> {
     pub cursor: usize,
     pub results: &'a [GlobalSearchResult],
     pub selected: usize,
+    pub scope: SearchScope,
+    /// Spinner frame for a `Working` session's status dot, so the switcher
+    /// animates in step with the sidebar.
+    pub spinner: &'a str,
 }
 
 pub(crate) fn render_global_search(frame: &mut Frame, area: Rect, state: &GlobalSearchView<'_>) {
@@ -33,7 +47,10 @@ pub(crate) fn render_global_search(frame: &mut Frame, area: Rect, state: &Global
     // Same dedicated search-bar accent the session-list search uses.
     let bar_style = Style::default().fg(Theme::search_bar());
     let block = Block::default()
-        .title(Line::from(Span::styled(" Search ", bar_style)))
+        .title(Line::from(Span::styled(
+            format!(" {} ", state.scope.label()),
+            bar_style,
+        )))
         .borders(Borders::ALL)
         .border_style(bar_style);
     let inner = block.inner(area);
@@ -60,7 +77,7 @@ pub(crate) fn render_global_search(frame: &mut Frame, area: Rect, state: &Global
         render_results(frame, chunks[2], state);
     }
     if inner.height >= 3 {
-        render_hint_line(frame, chunks[3]);
+        render_hint_line(frame, chunks[3], state.scope);
     }
 }
 
@@ -79,7 +96,9 @@ fn render_results(frame: &mut Frame, area: Rect, state: &GlobalSearchView<'_>) {
     let mut selected_line = 0usize;
     let mut last_kind: Option<SearchKind> = None;
     for (i, r) in state.results.iter().enumerate() {
-        if last_kind != Some(r.kind) {
+        // The switcher lists one scope, so a "SESSIONS" header above it would
+        // only cost a row and repeat the popup's own title.
+        if last_kind != Some(r.kind) && state.scope != SearchScope::Sessions {
             lines.push(scope_header_line(r.kind));
             last_kind = Some(r.kind);
         }
@@ -87,7 +106,7 @@ fn render_results(frame: &mut Frame, area: Rect, state: &GlobalSearchView<'_>) {
         if selected {
             selected_line = lines.len();
         }
-        push_result_row(&mut lines, r, selected, width);
+        push_result_row(&mut lines, r, selected, width, state.spinner);
     }
 
     // Scroll so the selected line stays visible within the result area.
@@ -109,20 +128,58 @@ fn scope_header_line<'a>(kind: SearchKind) -> Line<'a> {
 
 /// Push a single result's row line (plus its optional dim snippet line) into
 /// `lines`, marking and highlighting it when `selected`.
+///
+/// A session row reads `▸ ◆ name          agent · repo`: the status dot is the
+/// sidebar's own glyph and colour, and the right-aligned detail is dropped
+/// before the name is ever squeezed below [`LABEL_MIN_WIDTH`].
 fn push_result_row<'a>(
     lines: &mut Vec<Line<'a>>,
     r: &'a GlobalSearchResult,
     selected: bool,
     width: usize,
+    spinner: &str,
 ) {
     let marker = if selected { "▸ " } else { "  " };
-    let row = truncate_ellipsis(&format!("{marker}{}", r.label), width);
     let style = if selected {
         Theme::selected_item()
     } else {
         Style::default().fg(Theme::text_primary())
     };
-    lines.push(Line::from(Span::styled(row, style)));
+    let mut spans = vec![Span::styled(marker.to_string(), style)];
+    let mut used = marker.chars().count();
+    if let Some(status) = r.status {
+        let dot = format!("{} ", super::status_glyph(status, spinner));
+        used += dot.chars().count();
+        spans.push(Span::styled(
+            dot,
+            Style::default().fg(super::status_color(status)),
+        ));
+    }
+    // Reserve the detail's columns up front so the label truncates around it
+    // rather than pushing it off the row.
+    let detail = r
+        .detail
+        .as_deref()
+        .filter(|_| width.saturating_sub(used) > LABEL_MIN_WIDTH + 2)
+        .map(|d| {
+            truncate_ellipsis(
+                d,
+                DETAIL_MAX_WIDTH.min(width.saturating_sub(used + LABEL_MIN_WIDTH + 1)),
+            )
+        });
+    let reserved = detail.as_ref().map_or(0, |d| d.chars().count() + 1);
+    let label = truncate_ellipsis(&r.label, width.saturating_sub(used + reserved));
+    used += label.chars().count();
+    spans.push(Span::styled(label, style));
+    if let Some(detail) = detail {
+        let pad = width.saturating_sub(used + detail.chars().count());
+        spans.push(Span::styled(" ".repeat(pad), style));
+        spans.push(Span::styled(
+            detail,
+            Style::default().fg(Theme::text_muted()),
+        ));
+    }
+    lines.push(Line::from(spans));
     if let Some(snippet) = &r.snippet {
         lines.push(Line::from(Span::styled(
             truncate_ellipsis(&format!("      {snippet}"), width),
@@ -161,9 +218,16 @@ fn render_query_line(frame: &mut Frame, area: Rect, state: &GlobalSearchView<'_>
 /// result called out so the user knows what `Enter` will jump to.
 fn render_summary_line(frame: &mut Frame, area: Rect, state: &GlobalSearchView<'_>) {
     if state.query.trim().is_empty() {
+        let hint = match state.scope {
+            // With no query the switcher is already showing the recent list, so
+            // say what that list *is* rather than asking for input.
+            SearchScope::Sessions if !state.results.is_empty() => "recently used",
+            SearchScope::Sessions => "type to filter sessions",
+            SearchScope::Everything => "type to search sessions · tasks · automations · files",
+        };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "type to search sessions · tasks · automations · files",
+                hint,
                 Style::default().fg(Theme::text_muted()),
             ))),
             area,
@@ -223,12 +287,18 @@ fn render_summary_line(frame: &mut Frame, area: Rect, state: &GlobalSearchView<'
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_hint_line(frame: &mut Frame, area: Rect) {
+fn render_hint_line(frame: &mut Frame, area: Rect, scope: SearchScope) {
+    let widen = match scope {
+        SearchScope::Sessions => " everything  ",
+        SearchScope::Everything => " sessions  ",
+    };
     let line = Line::from(vec![
         Span::styled("↑↓", Theme::keybind()),
         Span::styled(" select  ", Theme::keybind_desc()),
         Span::styled("↵", Theme::keybind()),
         Span::styled(" jump  ", Theme::keybind_desc()),
+        Span::styled("tab", Theme::keybind()),
+        Span::styled(widen, Theme::keybind_desc()),
         Span::styled("esc", Theme::keybind()),
         Span::styled(" close", Theme::keybind_desc()),
     ]);
@@ -270,9 +340,26 @@ mod tests {
                 kind: SearchKind::Task,
                 label: format!("task-{i}"),
                 snippet: None,
+                detail: None,
+                status: None,
                 target: SearchTarget::Task { id: i as i64 },
             })
             .collect()
+    }
+
+    fn view<'a>(
+        query: &'a str,
+        list: &'a [GlobalSearchResult],
+        selected: usize,
+    ) -> GlobalSearchView<'a> {
+        GlobalSearchView {
+            query,
+            cursor: query.chars().count(),
+            results: list,
+            selected,
+            scope: SearchScope::Everything,
+            spinner: "\u{25d0}",
+        }
     }
 
     fn rendered_text(view: &GlobalSearchView<'_>) -> String {
@@ -301,13 +388,7 @@ mod tests {
         let list = results(3);
         // Query text is distinct from the result labels (`task-N`) so each
         // assertion isolates one concern: the query line vs. the result rows.
-        let view = GlobalSearchView {
-            query: "needle",
-            cursor: 6,
-            results: &list,
-            selected: 0,
-        };
-        let text = rendered_text(&view);
+        let text = rendered_text(&view("needle", &list, 0));
         assert!(text.contains("needle"), "query echoes into the popup");
         assert!(text.contains("task-0"), "first result is listed");
     }
@@ -315,13 +396,7 @@ mod tests {
     #[test]
     fn selection_beyond_first_page_is_scrolled_into_view() {
         let list = results(40);
-        let view = GlobalSearchView {
-            query: "task",
-            cursor: 4,
-            results: &list,
-            selected: 39,
-        };
-        let text = rendered_text(&view);
+        let text = rendered_text(&view("task", &list, 39));
         assert!(
             text.contains("task-39"),
             "the selected result must scroll into view:\n{text}"

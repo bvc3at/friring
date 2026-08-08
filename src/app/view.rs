@@ -111,6 +111,8 @@ impl App {
         self.render_file_viewer(frame, areas.file_viewer);
         self.render_central_pane(frame, areas.terminal);
         if let Some(search_area) = areas.global_search {
+            let spinner =
+                crate::ui::SPINNER_FRAMES[self.spinner_frame() % crate::ui::SPINNER_FRAMES.len()];
             let gs = &self.global_search;
             global_search::render_global_search(
                 frame,
@@ -120,6 +122,8 @@ impl App {
                     cursor: gs.query.cursor_pos(),
                     results: &gs.results,
                     selected: gs.selected,
+                    scope: gs.scope,
+                    spinner,
                 },
             );
         }

@@ -2,37 +2,121 @@
 pub(crate) struct FuzzyMatch {
     /// Byte positions of matched characters in the haystack.
     pub positions: Vec<usize>,
+    /// How good the match is; higher is better. Only comparable between
+    /// matches of the *same* query — see [`fuzzy_match`] for the weights.
+    pub score: i32,
 }
 
-/// Greedy left-to-right fuzzy match (case-insensitive).
+/// Score awarded to a match that starts at the very beginning of the haystack.
+const BONUS_FIRST_CHAR: i32 = 16;
+/// Score awarded to a match char that begins a word (follows a separator, or
+/// starts a camelCase hump).
+const BONUS_BOUNDARY: i32 = 8;
+/// Score awarded to a match char directly following another match char.
+const BONUS_CONSECUTIVE: i32 = 4;
+/// Score charged per haystack char skipped between two match chars.
+const PENALTY_GAP: i32 = 1;
+/// Haystack chars per point of length penalty — breaks ties toward the
+/// shortest field that contains the query (`api` beats `payments-api-v2`).
+const LENGTH_PENALTY_DIVISOR: i32 = 8;
+
+/// Whether `c` ends a word, so the char *after* it starts one.
+fn is_separator(c: char) -> bool {
+    matches!(c, '-' | '_' | '/' | '.' | ' ' | ':' | '@' | '+' | ',')
+}
+
+/// Lowercase `c`, folding to itself for chars with no lowercase form.
+fn lower(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// Case-insensitive fuzzy match with a relevance score.
 ///
 /// Returns `Some` if every character in `query` appears in `haystack` in order.
-/// An empty query matches everything with an empty positions vec.
+/// An empty query matches everything with an empty positions vec and score 0.
+///
+/// Matching is fzf's two-pass greedy (`FuzzyMatchV1`): a forward scan finds the
+/// end of the earliest complete match, then a backward scan from that end finds
+/// the *latest* start that still covers the query. Plain forward-greedy would
+/// anchor `api` to the `a` of `payments-api` and score it as three scattered
+/// chars; the backward pass tightens it onto the trailing `api`, which is both
+/// the run the user meant and the one that highlights sensibly.
 pub(crate) fn fuzzy_match(query: &str, haystack: &str) -> Option<FuzzyMatch> {
-    if query.is_empty() {
+    let needle: Vec<char> = query.chars().map(lower).collect();
+    if needle.is_empty() {
         return Some(FuzzyMatch {
             positions: Vec::new(),
+            score: 0,
         });
     }
+    let hay: Vec<(usize, char)> = haystack.char_indices().collect();
 
-    let mut positions = Vec::with_capacity(query.len());
-    let mut haystack_chars = haystack.char_indices().peekable();
-    for qc in query.chars() {
-        let qc_lower = qc.to_lowercase().next()?;
-        loop {
-            match haystack_chars.next() {
-                Some((byte_pos, hc)) => {
-                    if hc.to_lowercase().next() == Some(qc_lower) {
-                        positions.push(byte_pos);
-                        break;
-                    }
-                }
-                None => return None,
+    // Forward pass: the char index at which the query first completes.
+    let mut qi = 0;
+    let mut end = None;
+    for (i, &(_, c)) in hay.iter().enumerate() {
+        if lower(c) == needle[qi] {
+            qi += 1;
+            if qi == needle.len() {
+                end = Some(i);
+                break;
+            }
+        }
+    }
+    let end = end?;
+
+    // Backward pass from that end: the latest start still covering the query.
+    let mut qi = needle.len();
+    let mut start = 0;
+    for i in (0..=end).rev() {
+        if lower(hay[i].1) == needle[qi - 1] {
+            qi -= 1;
+            if qi == 0 {
+                start = i;
+                break;
             }
         }
     }
 
-    Some(FuzzyMatch { positions })
+    // Forward greedy inside the tightened window collects the positions.
+    let mut positions = Vec::with_capacity(needle.len());
+    let mut qi = 0;
+    for &(byte_pos, c) in &hay[start..=end] {
+        if lower(c) == needle[qi] {
+            positions.push(byte_pos);
+            qi += 1;
+            if qi == needle.len() {
+                break;
+            }
+        }
+    }
+
+    let score = score_positions(&hay, start, end, positions.len());
+    Some(FuzzyMatch { positions, score })
+}
+
+/// Score the tightened match window `[start, end]` covering `matched` chars.
+/// Word-boundary and consecutive-run bonuses reward the matches a human would
+/// call "the obvious one"; gaps and haystack length are charged against it.
+fn score_positions(hay: &[(usize, char)], start: usize, end: usize, matched: usize) -> i32 {
+    let mut score = matched as i32;
+    if start == 0 {
+        score += BONUS_FIRST_CHAR;
+    } else {
+        let prev = hay[start - 1].1;
+        let cur = hay[start].1;
+        if is_separator(prev) || (prev.is_lowercase() && cur.is_uppercase()) {
+            score += BONUS_BOUNDARY;
+        }
+    }
+    // A window of exactly `matched` chars is one unbroken run; everything wider
+    // paid for its gaps.
+    let span = end - start + 1;
+    let gaps = span - matched;
+    score += (matched.saturating_sub(1) as i32 - gaps as i32).max(0) * BONUS_CONSECUTIVE;
+    score -= gaps as i32 * PENALTY_GAP;
+    score -= hay.len() as i32 / LENGTH_PENALTY_DIVISOR;
+    score
 }
 
 /// Type-to-filter state for a selector list (host / base-branch / agent
@@ -212,6 +296,40 @@ mod tests {
         let m = fuzzy_match("aé", "café").unwrap();
         // 'c'=0, 'a'=1, 'f'=2, 'é'=3 (byte pos 3, 2-byte char)
         assert_eq!(m.positions, vec![1, 3]);
+    }
+
+    /// The backward pass is what makes the highlight land on the word the user
+    /// typed rather than the first stray letters that happen to spell it.
+    #[test]
+    fn match_is_tightened_to_the_latest_start() {
+        let m = fuzzy_match("api", "payments-api").unwrap();
+        assert_eq!(m.positions, vec![9, 10, 11]);
+    }
+
+    fn score(query: &str, haystack: &str) -> i32 {
+        fuzzy_match(query, haystack)
+            .unwrap_or_else(|| panic!("{query:?} must match {haystack:?}"))
+            .score
+    }
+
+    #[test]
+    fn prefix_match_outranks_an_interior_one() {
+        assert!(score("api", "api-server") > score("api", "the-api"));
+    }
+
+    #[test]
+    fn word_boundary_outranks_mid_word() {
+        assert!(score("api", "payments-api") > score("api", "grapikeeper"));
+    }
+
+    #[test]
+    fn contiguous_outranks_scattered() {
+        assert!(score("abc", "abc-zzz") > score("abc", "a-b-c-zzz"));
+    }
+
+    #[test]
+    fn shorter_haystack_breaks_the_tie() {
+        assert!(score("api", "api") > score("api", "api-with-a-long-tail"));
     }
 
     const ROWS: [&str; 4] = ["main", "develop", "feature/map", "release/1.0"];
