@@ -1149,6 +1149,57 @@ mod tests {
         assert_eq!(app.active_index, 0);
     }
 
+    /// The label of the `n`th visible row.
+    fn label_key(n: usize, of: usize) -> char {
+        crate::ui::project_list::session_labels(of)[n]
+            .chars()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn label_jump_owns_its_keys_from_a_capture_pane() {
+        let (mut app, _g, _t) = app_with_sessions(3);
+        // The review pane consumes everything outside its escape list, so the
+        // overlay is armed through the leader — the one route that reaches a
+        // capture pane.
+        app.focus = InputFocus::CodeReview;
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        app.handle_key(KeyCode::Char('A'), KeyModifiers::SHIFT);
+        assert!(app.label_jump.is_some(), "<leader> A opens the overlay");
+
+        app.handle_key(KeyCode::Char(label_key(1, 3)), KeyModifiers::NONE);
+
+        assert_eq!(app.active_index, 1, "the review pane did not eat the label");
+        assert!(app.label_jump.is_none());
+        assert_eq!(app.focus, InputFocus::Terminal);
+    }
+
+    #[test]
+    fn label_jump_swallows_a_clipboard_chord_instead_of_pasting() {
+        let (mut app, _g, _t) = app_with_sessions(3);
+        app.focus = InputFocus::Terminal;
+        app.toggle_label_jump();
+
+        app.handle_key(KeyCode::Char('v'), KeyModifiers::CONTROL);
+
+        assert!(app.label_jump.is_none(), "the chord ends the aim");
+        assert_eq!(app.active_index, 0, "and switches nothing");
+    }
+
+    #[test]
+    fn label_jump_swallows_an_unmatched_letter() {
+        let (mut app, _g, _t) = app_with_sessions(3);
+        app.focus = InputFocus::Terminal;
+        app.toggle_label_jump();
+
+        // `m` labels nothing with three rows; it must not reach the PTY.
+        app.handle_key(KeyCode::Char('m'), KeyModifiers::NONE);
+
+        assert!(app.label_jump.is_none());
+        assert_eq!(app.active_index, 0);
+    }
+
     // ── collapsed repo groups & the ghost shelf ──
 
     /// Give each session a repo so `compute_session_order` puts them in real
