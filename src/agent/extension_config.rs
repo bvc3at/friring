@@ -842,7 +842,11 @@ mod tests {
             ExtensionSource::Remote(format!("{}/flow", official_base()))
         );
         // Official base is pinned to a concrete ref (a tag or main), never bare.
-        assert!(official_base().starts_with(OFFICIAL_REPO_RAW));
+        assert!(
+            official_base().starts_with("https://raw.githubusercontent.com/bvc3at/friring/"),
+            "bare-name installs must resolve against the fork: {}",
+            official_base()
+        );
         assert!(official_base().ends_with("/extensions"));
         assert_eq!(
             resolve_source("https://example.com/ext/foo/"),
