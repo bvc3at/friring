@@ -750,6 +750,7 @@ fn searching_to_an_automation_brings_the_collapsed_column_back() {
 
     h.alt('l');
     h.ctrl('/'); // GlobalSearch
+    h.key(KeyCode::Tab, KeyModifiers::NONE); // widen past the session switcher
     for c in "widget-nightly".chars() {
         h.key(KeyCode::Char(c), KeyModifiers::NONE);
     }
@@ -4163,6 +4164,7 @@ fn global_search_files_match_from_the_cached_index() {
     // off-thread walk, keeping the test deterministic.
     let mut h = Harness::standard(1);
     h.ctrl('/');
+    h.key(KeyCode::Tab, KeyModifiers::NONE); // widen past the session switcher
     for c in "zanzi".chars() {
         h.key(KeyCode::Char(c), KeyModifiers::NONE);
     }

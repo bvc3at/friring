@@ -70,6 +70,11 @@ pub enum Action {
     /// Open the blocked-only jump overlay: blocked sessions get numbers 1–9
     /// in the session list and a digit jumps straight to that one.
     JumpToBlocked,
+    /// Open the label-jump overlay: **every** session on screen gets a
+    /// home-row letter label and typing it switches. The digit jumps only
+    /// reach the first nine rows; this is how the tenth is reached without
+    /// stepping.
+    JumpToSession,
     ToggleHelp,
     ToggleInfoPanel,
     ToggleFileViewer,
@@ -189,6 +194,7 @@ impl Action {
             Action::NextBlockedSession,
             Action::LastSession,
             Action::JumpToBlocked,
+            Action::JumpToSession,
             Action::ToggleHelp,
             Action::ToggleInfoPanel,
             Action::ToggleFileViewer,
@@ -266,6 +272,7 @@ impl Action {
             Action::NextBlockedSession => "Next blocked session",
             Action::LastSession => "Last session (toggle)",
             Action::JumpToBlocked => "Jump to blocked by number",
+            Action::JumpToSession => "Jump to session by label",
             Action::ToggleHelp => "Help",
             Action::ToggleInfoPanel => "Toggle info panel",
             Action::ToggleFileViewer => "Toggle file viewer",
@@ -475,6 +482,10 @@ impl Action {
             // it opens the blocked-only overlay, whose `1`–`9` then select —
             // so `<leader> a 3` is "the third session that needs me".
             JumpToBlocked => KeyChord::plain('a'),
+            // `a`'s shifted twin, the same widening the `u`/`U` and `r`/`R`
+            // pairs use: `a` numbers the sessions that need **a**ttention,
+            // `A` labels **a**ll of them.
+            JumpToSession => KeyChord::normalized(KeyModifiers::SHIFT, KeyCode::Char('a')),
             // ── Sessions ────────────────────────────────────────────────
             NewSession => KeyChord::plain('n'),
             DeleteSession => KeyChord::plain('d'),
@@ -616,6 +627,14 @@ impl Action {
             // readline's rarely-used M-a (backward-sentence) in the terminal;
             // fully rebindable.
             Action::JumpToBlocked => vec![KeyChord::alt(KeyCode::Char('a'))],
+            // Alt+G (mnemonic: **g**o to) — the third member of the narrow Alt
+            // exception for session jumps, alongside `Alt+A` and the fixed
+            // `Alt+1…9`. Plain 7-bit `ESC g` (see `agent::input::alt_bytes`),
+            // so it survives ssh + tmux without the kitty protocol — which the
+            // Alt-hold number overlay does not, making this the only aim-then-
+            // shoot jump that works through an outer tmux. Shadows readline's
+            // rarely-used M-g; fully rebindable.
+            Action::JumpToSession => vec![KeyChord::alt(KeyCode::Char('g'))],
             Action::ToggleHelp => vec![KeyChord::ctrl('g'), KeyChord::function(1)],
             Action::ToggleInfoPanel => vec![KeyChord::ctrl('b'), KeyChord::function(2)],
             Action::ToggleFileViewer => vec![KeyChord::ctrl('e'), KeyChord::function(3)],
@@ -790,6 +809,7 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
                 NextBlockedSession,
                 LastSession,
                 JumpToBlocked,
+                JumpToSession,
             ],
         ),
         (
@@ -904,6 +924,7 @@ pub fn prefix_sections() -> Vec<(&'static str, Vec<PrefixEntry>)> {
             "Go to session",
             vec![
                 SessionDigits,
+                A(JumpToSession),
                 A(JumpToBlocked),
                 PrefixEntry::MoveSession { up: true },
                 PrefixEntry::MoveSession { up: false },
@@ -1937,6 +1958,7 @@ mod tests {
                 Action::NextBlockedSession => 0,
                 Action::LastSession => 0,
                 Action::JumpToBlocked => 0,
+                Action::JumpToSession => 0,
                 Action::ToggleHelp => 0,
                 Action::ToggleInfoPanel => 0,
                 Action::ToggleFileViewer => 0,
@@ -1987,7 +2009,7 @@ mod tests {
         }
         // The listed variants must equal Action::all().len(). If you add
         // a variant, update both `Action::all()` and the match above.
-        const EXPECTED: usize = 71;
+        const EXPECTED: usize = 72;
         assert_eq!(Action::all().len(), EXPECTED);
         for a in Action::all() {
             classify(*a);

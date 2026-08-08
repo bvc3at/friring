@@ -356,8 +356,17 @@ impl App {
         // rows. Must stay consistent with `App::session_jump_targets` — same
         // order, same predicate — so the painted digit is the one a keypress
         // jumps to.
-        let jump_digits: Vec<Option<char>> = match self.jump_numbering() {
+        let jump_labels: Vec<Option<String>> = match self.jump_numbering() {
             None => vec![None; ordered.sessions.len()],
+            // Letter labels cover every row, so unlike the digit numbering they
+            // are built from the app's own target list rather than counted out
+            // here — `label_jump_chips` is the single source both the paint and
+            // the keystroke read.
+            Some(crate::app::JumpNumbering::Labels) => {
+                let mut chips = self.label_jump_chips();
+                chips.resize(ordered.sessions.len(), None);
+                chips
+            }
             // Distance numbering for a pending move: rows are counted outward
             // from the active session in the move direction, so the row
             // labelled `3` is exactly where `<leader> K 3` lands it.
@@ -381,6 +390,7 @@ impl App {
                         (1..=9)
                             .contains(&d)
                             .then(|| char::from_digit(d as u32, 10))?
+                            .map(|c| c.to_string())
                     })
                     .collect()
             }
@@ -395,7 +405,7 @@ impl App {
                             !blocked_only || info.status == crate::session::SessionStatus::Blocked;
                         if eligible && n < 9 {
                             n += 1;
-                            char::from_digit(n, 10)
+                            char::from_digit(n, 10).map(|c| c.to_string())
                         } else {
                             None
                         }
@@ -420,7 +430,7 @@ impl App {
                 headers: ordered.headers,
                 depths: ordered.depths,
                 spinner,
-                jump_digits: &jump_digits,
+                jump_labels: &jump_labels,
             },
         );
         self.record_row_clicks(

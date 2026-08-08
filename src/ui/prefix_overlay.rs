@@ -63,6 +63,7 @@ fn action_label(action: Action) -> &'static str {
         LastSession => "last session",
         NextBlockedSession => "next blocked",
         JumpToBlocked => "blocked 1-9…",
+        JumpToSession => "label any session",
         NewSession => "new session",
         DeleteSession => "delete session",
         RestartSession => "restart session",

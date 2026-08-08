@@ -813,6 +813,8 @@ pub struct App {
     alt_overlay_redraw_requested: bool,
     /// The blocked-only jump overlay (`Alt+A`), when open.
     blocked_jump: Option<BlockedJumpMode>,
+    /// The label-jump overlay (`Alt+G` / `<leader> A`), when open.
+    pub(crate) label_jump: Option<LabelJump>,
     backends: BackendRegistry,
     /// Registry of declarative agent definitions, used to build providers per
     /// session at spawn/restart time.
@@ -1208,6 +1210,23 @@ pub(crate) enum JumpNumbering {
     /// Rows in one direction from `from`, numbered by *distance* — so the row
     /// labelled `3` is where `<leader> K 3` lands the session.
     MoveDistance { from: usize, up: bool },
+    /// Every session, wearing a home-row letter label (`Alt+G` /
+    /// `<leader> A`). Unlike [`Self::All`] this is not capped at nine, which is
+    /// the whole point of it.
+    Labels,
+}
+
+/// The label-jump overlay (`Alt+G` / `<leader> A`), while open.
+///
+/// A sticky mode rather than a held one: the Alt-hold overlay needs the kitty
+/// protocol to see the key going down, which an outer tmux strips — and this
+/// fork is normally driven through one. Typed letters accumulate so a two-key
+/// label can be entered; any key that can't continue a label ends the mode.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LabelJump {
+    /// Label characters typed so far. Rows whose label starts with this show
+    /// only the remainder, so the overlay narrows as the user commits.
+    pub(crate) typed: String,
 }
 
 /// Map a session's persisted hook state to its rendered [`SessionStatus`]. Pure
@@ -1341,6 +1360,7 @@ impl App {
             alt_held_since: None,
             alt_overlay_redraw_requested: false,
             blocked_jump: None,
+            label_jump: None,
             backends,
             agents,
             hosts: crate::session::HostRegistry::default(),
@@ -5086,7 +5106,7 @@ impl App {
         match self.jump_numbering()? {
             JumpNumbering::Blocked => Some(true),
             JumpNumbering::All => Some(false),
-            JumpNumbering::MoveDistance { .. } => None,
+            JumpNumbering::MoveDistance { .. } | JumpNumbering::Labels => None,
         }
     }
 
@@ -5098,6 +5118,9 @@ impl App {
                 from: self.active_index,
                 up,
             });
+        }
+        if self.label_jump.is_some() {
+            return Some(JumpNumbering::Labels);
         }
         if self.blocked_jump.is_some() {
             return Some(JumpNumbering::Blocked);
@@ -5223,6 +5246,73 @@ impl App {
                 self.set_status(StatusLevel::Info, format!("No {what} #{n}"));
             }
         }
+    }
+
+    /// The sessions the label-jump overlay labels, in rendered order — every
+    /// one of them, which is the difference from [`Self::session_jump_targets`]
+    /// and its nine-digit ceiling.
+    pub(crate) fn label_jump_targets(&self) -> Vec<usize> {
+        self.render_order_indices()
+    }
+
+    /// The label each row wears this frame, parallel to `label_jump_targets`.
+    /// While a two-key label is half-typed, rows that can't still match drop
+    /// their label and the rest show only the remainder — so the overlay
+    /// narrows to the reachable set as the user commits.
+    pub(crate) fn label_jump_chips(&self) -> Vec<Option<String>> {
+        let Some(state) = self.label_jump.as_ref() else {
+            return Vec::new();
+        };
+        let targets = self.label_jump_targets();
+        crate::ui::project_list::session_labels(targets.len())
+            .into_iter()
+            .map(|label| {
+                label
+                    .strip_prefix(state.typed.as_str())
+                    .filter(|rest| !rest.is_empty())
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// Open the label-jump overlay (`Alt+G` / `<leader> A`), or close it if it
+    /// is already open. Reports rather than opening an empty overlay.
+    pub(crate) fn toggle_label_jump(&mut self) {
+        if self.label_jump.take().is_some() {
+            return;
+        }
+        if self.sessions.is_empty() {
+            self.set_status(StatusLevel::Info, "No sessions to jump to");
+            return;
+        }
+        self.label_jump = Some(LabelJump::default());
+    }
+
+    /// Feed a character to the open label-jump overlay. Returns `false` when
+    /// the character can't continue any label, which the caller reports as a
+    /// miss — the mode always ends on the keystroke either way, so a typo can
+    /// never leave the user trapped in an overlay.
+    pub(crate) fn push_label_jump_char(&mut self, c: char) -> bool {
+        let Some(mut state) = self.label_jump.take() else {
+            return false;
+        };
+        state.typed.push(c.to_ascii_lowercase());
+        let targets = self.label_jump_targets();
+        let labels = crate::ui::project_list::session_labels(targets.len());
+        if let Some(pos) = labels.iter().position(|l| *l == state.typed) {
+            let idx = targets[pos];
+            self.set_active_index(idx);
+            self.focus = InputFocus::Terminal;
+            self.on_focus_changed();
+            return true;
+        }
+        // Not a whole label yet: stay open only while something can still
+        // complete it.
+        if labels.iter().any(|l| l.starts_with(&state.typed)) {
+            self.label_jump = Some(state);
+            return true;
+        }
+        false
     }
 
     /// Toggle the blocked-only jump overlay (`Alt+A`): blocked sessions get
@@ -12958,6 +13048,9 @@ mod tests {
         app.refresh_automations();
 
         app.open_global_search();
+        // The all-scopes search is one `Tab` past the switcher the popup
+        // opens on.
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
         for c in "widget".chars() {
             app.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
@@ -12998,6 +13091,9 @@ mod tests {
         app.refresh_automations();
 
         app.open_global_search();
+        // The all-scopes search is one `Tab` past the switcher the popup
+        // opens on.
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
         for c in "widget".chars() {
             app.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
@@ -13048,6 +13144,9 @@ mod tests {
         app.refresh_tasks();
 
         app.open_global_search();
+        // The all-scopes search is one `Tab` past the switcher the popup
+        // opens on.
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
         for c in "flaky".chars() {
             app.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
@@ -13079,6 +13178,9 @@ mod tests {
         app.refresh_tasks();
 
         app.open_global_search();
+        // The all-scopes search is one `Tab` past the switcher the popup
+        // opens on.
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
         for c in "main pane".chars() {
             app.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
@@ -13109,6 +13211,9 @@ mod tests {
         app.refresh_tasks();
 
         app.open_global_search();
+        // The all-scopes search is one `Tab` past the switcher the popup
+        // opens on.
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
         for c in "invflaky".chars() {
             app.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
         }

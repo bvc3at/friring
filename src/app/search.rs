@@ -1079,6 +1079,76 @@ mod tests {
         assert_eq!(app.global_search.scope, SearchScope::Sessions);
     }
 
+    // ── label jump (Alt+G / <leader> A) ──
+
+    #[test]
+    fn label_jump_reaches_past_the_nine_digit_ceiling() {
+        let (mut app, _g, _t) = app_with_sessions(12);
+        app.toggle_label_jump();
+
+        // Row 12 has no digit at all; its label is the 12th letter.
+        let labels = crate::ui::project_list::session_labels(12);
+        let target = labels[11].chars().next().unwrap();
+        assert!(app.push_label_jump_char(target));
+
+        assert_eq!(app.active_index, 11);
+        assert!(app.label_jump.is_none(), "a hit closes the overlay");
+        assert_eq!(app.focus, InputFocus::Terminal);
+    }
+
+    #[test]
+    fn label_jump_waits_for_the_second_key_of_a_two_key_label() {
+        let (mut app, _g, _t) = app_with_sessions(30);
+        let labels = crate::ui::project_list::session_labels(30);
+        let two_key = labels
+            .iter()
+            .position(|l| l.chars().count() == 2)
+            .expect("30 sessions need two-key labels");
+        let mut chars = labels[two_key].chars();
+        let (first, second) = (chars.next().unwrap(), chars.next().unwrap());
+
+        app.toggle_label_jump();
+        assert!(app.push_label_jump_char(first));
+        assert!(app.label_jump.is_some(), "prefix keeps the overlay open");
+        assert_eq!(app.active_index, 0, "and switches nothing yet");
+
+        assert!(app.push_label_jump_char(second));
+        assert_eq!(app.active_index, two_key);
+    }
+
+    #[test]
+    fn label_jump_chips_narrow_to_the_typed_prefix() {
+        let (mut app, _g, _t) = app_with_sessions(30);
+        let labels = crate::ui::project_list::session_labels(30);
+        let prefix = labels
+            .iter()
+            .find(|l| l.chars().count() == 2)
+            .and_then(|l| l.chars().next())
+            .unwrap();
+
+        app.toggle_label_jump();
+        app.push_label_jump_char(prefix);
+
+        let chips = app.label_jump_chips();
+        let shown = chips.iter().filter(|c| c.is_some()).count();
+        assert!(shown > 0 && shown < 30, "only the reachable rows stay lit");
+        assert!(
+            chips.iter().flatten().all(|c| c.chars().count() == 1),
+            "each remaining row shows just the key left to press"
+        );
+    }
+
+    #[test]
+    fn label_jump_reports_a_key_that_matches_nothing() {
+        let (mut app, _g, _t) = app_with_sessions(3);
+        app.toggle_label_jump();
+        // Three sessions take `a`, `s`, `d`; `m` is the last letter of the
+        // alphabet and unreachable here.
+        assert!(!app.push_label_jump_char('m'));
+        assert!(app.label_jump.is_none(), "a miss ends the mode");
+        assert_eq!(app.active_index, 0);
+    }
+
     #[test]
     fn blocked_sessions_outrank_equal_name_matches() {
         let (mut app, _g, _t) = app_with_sessions(2);

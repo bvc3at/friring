@@ -61,6 +61,54 @@ impl SessionMatch {
 /// Fallback label/key for a session that spans no repos.
 const NO_REPO_GROUP: &str = "(no repo)";
 
+/// Keys the label-jump overlay hands out, home row first then the rows either
+/// side of it — so the common case is a single key under a resting finger.
+/// Deliberately letters only: digits stay the `Alt+1`–`9` numbering and would
+/// otherwise mean two things at once while the overlay is up.
+const LABEL_ALPHABET: [char; 26] = [
+    'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p',
+    'z', 'x', 'c', 'v', 'b', 'n', 'm',
+];
+
+/// Labels for `n` jump targets, in row order.
+///
+/// Up to 26 targets every label is one key. Past that, as few trailing letters
+/// as possible become two-key prefixes and the rest stay single — so growing
+/// from 26 to 30 sessions costs two keystrokes on four rows, not on all thirty.
+/// Beyond 26 × 26 the surplus rows get no label; they are still reachable by
+/// name from the switcher, and painting ambiguous labels would be worse than
+/// painting none.
+pub fn session_labels(n: usize) -> Vec<String> {
+    let base = LABEL_ALPHABET.len();
+    if n <= base {
+        return LABEL_ALPHABET
+            .iter()
+            .take(n)
+            .map(|c| c.to_string())
+            .collect();
+    }
+    // `p` trailing letters become prefixes: they stop being labels themselves
+    // (-p) and each yields `base` two-key labels.
+    let prefixes = (1..=base)
+        .find(|p| (base - p) + p * base >= n)
+        .unwrap_or(base);
+    let singles = base - prefixes;
+    let mut out: Vec<String> = LABEL_ALPHABET
+        .iter()
+        .take(singles)
+        .map(|c| c.to_string())
+        .collect();
+    for &prefix in &LABEL_ALPHABET[singles..] {
+        for &second in LABEL_ALPHABET.iter() {
+            if out.len() >= n {
+                return out;
+            }
+            out.push(format!("{prefix}{second}"));
+        }
+    }
+    out
+}
+
 /// The canonical grouping **key** for a session: the *set* of repos it
 /// spans (sorted + de-duplicated), so sessions touching the same repos cluster
 /// together regardless of selection order (`{infra, webapp}` == `{webapp,
@@ -507,9 +555,10 @@ pub struct LeftPanelState<'a> {
     /// Current animated spinner frame for the `Working` status
     /// (`SPINNER_FRAMES[App::spinner_frame()]`).
     pub spinner: &'a str,
-    /// Parallel to `sessions`: the jump-overlay digit painted ahead of the
-    /// status dot (Alt-hold / Alt+A numbering), `None` when hidden.
-    pub jump_digits: &'a [Option<char>],
+    /// Parallel to `sessions`: the jump-overlay chip painted ahead of the
+    /// status dot — a digit for the Alt-hold / `Alt+A` numbering, one or two
+    /// letters for the label-jump overlay. `None` when hidden.
+    pub jump_labels: &'a [Option<String>],
 }
 
 pub fn render_left_panel(
@@ -532,7 +581,7 @@ pub fn render_left_panel(
         state.headers,
         state.depths,
         state.spinner,
-        state.jump_digits,
+        state.jump_labels,
     )
 }
 
@@ -617,7 +666,7 @@ fn render_session_section(
     headers: &[Option<String>],
     depths: &[u8],
     spinner: &str,
-    jump_digits: &[Option<char>],
+    jump_labels: &[Option<String>],
 ) -> Vec<super::RowHitbox> {
     let mut block = focus_block(" Sessions ", level);
 
@@ -716,7 +765,7 @@ fn render_session_section(
                 cross_group_child,
                 inner_width,
                 spinner,
-                jump_digits.get(i).copied().flatten(),
+                jump_labels.get(i).and_then(Option::as_deref),
             )];
 
             // Prepend a subtle repo-group header above the first session of
@@ -883,6 +932,10 @@ fn agent_status_text(info: &SessionInfo) -> Option<String> {
 const AGENT_STATUS_SEPARATOR: &str = "  ";
 /// Minimum columns the inline agent status needs to be worth showing.
 const AGENT_STATUS_MIN_WIDTH: usize = 4;
+
+/// Columns the status dot and its padding occupy at the head of every row —
+/// the budget a jump chip has to fit inside so the overlay never shifts a row.
+const JUMP_CHIP_CELLS: usize = 3;
 
 /// Badge for a session measured to have no process at all — the em dash reads
 /// as "nothing here", where a `0M` would read as a suspiciously cheap agent.
@@ -1067,7 +1120,7 @@ fn build_session_line<'a>(
     cross_group_child: bool,
     inner_width: usize,
     spinner: &str,
-    jump_digit: Option<char>,
+    jump_label: Option<&str>,
 ) -> Line<'a> {
     // A ghost row greys its name like a search-dimmed one (its ◌ dot is
     // already muted via `status_color`) — except while selected, where the
@@ -1080,27 +1133,35 @@ fn build_session_line<'a>(
         Style::default().fg(super::status_color(info.status))
     };
 
-    // The jump digit takes the status dot's leading pad column, so the
-    // overlay appearing/disappearing never shifts the row. It is painted
-    // reverse-video (accent *background*, text knocked out) rather than as a
-    // coloured glyph: a bare digit abutting the status dot reads as part of
-    // the row's content, while a solid chip reads as a label stuck on top of
+    // The jump chip takes the status dot's leading pad column, so the overlay
+    // appearing/disappearing never shifts the row; a two-letter label borrows
+    // the dot's trailing space as well, keeping the same three columns. It is
+    // painted reverse-video (accent *background*, text knocked out) rather than
+    // as a coloured glyph: bare characters abutting the status dot read as part
+    // of the row's content, while a solid chip reads as a label stuck on top of
     // it — the same treatment as the armed-leader badge in the footer, so the
     // leader's two surfaces look like one system.
-    let mut spans = match jump_digit {
-        Some(d) => vec![
-            Span::styled(
-                d.to_string(),
-                Style::default()
-                    .bg(Theme::accent())
-                    .fg(Theme::modal_bg())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("{} ", super::status_glyph(info.status, spinner)),
-                status_style,
-            ),
-        ],
+    let mut spans = match jump_label {
+        Some(label) => {
+            let pad = JUMP_CHIP_CELLS.saturating_sub(label.chars().count() + 1);
+            vec![
+                Span::styled(
+                    label.to_string(),
+                    Style::default()
+                        .bg(Theme::accent())
+                        .fg(Theme::modal_bg())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "{}{}",
+                        super::status_glyph(info.status, spinner),
+                        " ".repeat(pad)
+                    ),
+                    status_style,
+                ),
+            ]
+        }
         None => vec![Span::styled(
             format!(" {} ", super::status_glyph(info.status, spinner)),
             status_style,
@@ -1427,7 +1488,7 @@ mod tests {
                         headers: ordered.headers,
                         depths: ordered.depths,
                         spinner: "◐",
-                        jump_digits: &[],
+                        jump_labels: &[],
                     },
                 );
             })
@@ -1534,12 +1595,56 @@ mod tests {
     fn line_jump_digit_replaces_leading_pad_without_shifting_the_row() {
         let s = info("target");
         let plain = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", None);
-        let numbered = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", Some('3'));
+        let numbered = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", Some("3"));
         let text = line_text(&numbered);
         assert!(text.starts_with('3'), "digit leads the row: {text:?}");
         // The digit takes the dot's pad column, so nothing moves.
         assert_eq!(line_text(&plain)[1..], text[1..]);
         assert_eq!(plain.width(), numbered.width());
+    }
+
+    #[test]
+    fn two_letter_jump_label_also_keeps_the_row_in_place() {
+        let s = info("target");
+        let plain = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", None);
+        let labelled = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", Some("qw"));
+        let text = line_text(&labelled);
+        assert!(text.starts_with("qw"), "label leads the row: {text:?}");
+        // A second label column borrows the dot's trailing space instead of
+        // pushing the name right (skip by chars — the status glyph is
+        // multibyte, so a byte slice would split it).
+        let tail = |t: &str| t.chars().skip(3).collect::<String>();
+        assert_eq!(tail(&line_text(&plain)), tail(&text));
+        assert_eq!(plain.width(), labelled.width());
+    }
+
+    #[test]
+    fn labels_are_single_keys_until_the_alphabet_runs_out() {
+        let labels = session_labels(26);
+        assert_eq!(labels.len(), 26);
+        assert!(labels.iter().all(|l| l.chars().count() == 1));
+        assert_eq!(labels[0], "a", "home row first");
+    }
+
+    #[test]
+    fn labels_are_unique_and_prefix_free_past_the_alphabet() {
+        let labels = session_labels(40);
+        assert_eq!(labels.len(), 40);
+        let unique: std::collections::HashSet<&String> = labels.iter().collect();
+        assert_eq!(unique.len(), 40, "no two rows share a label");
+        // A single-key label must never prefix a two-key one, or pressing it
+        // would be ambiguous.
+        for short in labels.iter().filter(|l| l.chars().count() == 1) {
+            assert!(
+                !labels
+                    .iter()
+                    .any(|l| l.chars().count() == 2 && l.starts_with(short.as_str())),
+                "`{short}` both jumps and starts a longer label"
+            );
+        }
+        // Most rows still cost one keystroke.
+        let singles = labels.iter().filter(|l| l.chars().count() == 1).count();
+        assert!(singles >= 20, "only the surplus rows pay a second key");
     }
 
     #[test]

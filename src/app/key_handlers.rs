@@ -991,6 +991,9 @@ impl App {
     fn handle_session_jump_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
         use super::BlockedJumpMode;
         let plain_or_alt = mods.is_empty() || mods == KeyModifiers::ALT;
+        if self.label_jump.is_some() {
+            return self.handle_label_jump_key(code, mods);
+        }
         if let Some(mode) = self.blocked_jump {
             match code {
                 KeyCode::Char(c @ '1'..='9') if plain_or_alt => {
@@ -1019,6 +1022,44 @@ impl App {
             }
         }
         false
+    }
+
+    /// Keys while the label-jump overlay is open. It owns **every** keystroke
+    /// (returning `true` throughout): the labels are plain letters, so letting
+    /// an unmatched one fall through would type it into the agent's prompt
+    /// instead of ending an aim the user has clearly abandoned.
+    ///
+    /// A letter extends the typed label; `Esc`/`Ctrl+C`/`Backspace` back out;
+    /// anything else ends the mode with the keystroke spent, which is the
+    /// cheapest possible escape from a mode entered by mistake.
+    fn handle_label_jump_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
+        let cancel = code == KeyCode::Esc
+            || code == KeyCode::Backspace
+            || (mods == KeyModifiers::CONTROL && code == KeyCode::Char('c'));
+        if cancel {
+            self.label_jump = None;
+            return true;
+        }
+        // Shift is tolerated so caps-lock or a stray shift still aims.
+        let typed = match code {
+            KeyCode::Char(c)
+                if c.is_ascii_alphabetic() && (mods.is_empty() || mods == KeyModifiers::SHIFT) =>
+            {
+                Some(c)
+            }
+            _ => None,
+        };
+        let Some(c) = typed else {
+            self.label_jump = None;
+            return true;
+        };
+        if !self.push_label_jump_char(c) {
+            self.set_status(
+                super::StatusLevel::Info,
+                format!("No session labelled `{c}`"),
+            );
+        }
+        true
     }
 
     /// Session-list keys are all rebindable `SessionList`-scoped actions
@@ -1751,6 +1792,7 @@ impl App {
             Action::NextBlockedSession => self.focus_next_blocked(),
             Action::LastSession => self.toggle_last_session(),
             Action::JumpToBlocked => self.toggle_blocked_jump(),
+            Action::JumpToSession => self.toggle_label_jump(),
             _ => return None,
         }
         Some(true)
