@@ -4949,7 +4949,41 @@ impl App {
             folded_groups: &self.folded_groups,
             ghost_shelf: self.ghost_shelf,
             keep: self.active_session_id(),
+            // While the attention overlay is up, its rows are what the next
+            // keystroke acts on, so they have to be on screen and wearing their
+            // digit — the painted numbers and `session_jump_targets` read the
+            // same order, and would otherwise disagree about a folded row.
+            reveal: self
+                .attention_jump
+                .is_some()
+                .then(|| self.attention_status())
+                .flatten(),
         }
+    }
+
+    /// The rows the attention queue may land on: the visible order with every
+    /// session in the queue revealed, whether or not its group is collapsed.
+    ///
+    /// Folding and the ghost shelf declutter the *list*; they must not put work
+    /// out of reach. Without this a blocked agent inside a collapsed group is
+    /// badged in the title bar (which counts the whole fleet) while `F10` says
+    /// nothing needs attention — the queue failing at the one thing it is for.
+    /// Landing on the session then reveals its row anyway, via `keep`.
+    fn attention_order_indices(&self) -> Vec<usize> {
+        let infos: Vec<&crate::session::SessionInfo> =
+            self.sessions.iter().map(|s| &s.info).collect();
+        let order = crate::ui::project_list::compute_session_order(&infos);
+        let filter = crate::ui::project_list::VisibilityFilter {
+            reveal: self.attention_status(),
+            ..self.visibility_filter()
+        };
+        let visible = crate::ui::project_list::visible_rows(&infos, &order, &filter);
+        order
+            .order
+            .into_iter()
+            .zip(visible)
+            .filter_map(|(i, shown)| shown.then_some(i))
+            .collect()
     }
 
     /// Indices into `self.sessions` for the rows actually **on screen**, in
@@ -5189,27 +5223,40 @@ impl App {
     /// trail in render order, so the list is total and stable rather than
     /// half-empty on the first switch of a session.
     pub(crate) fn mru_order_indices(&self) -> Vec<usize> {
-        let mut out: Vec<usize> = Vec::with_capacity(self.sessions.len());
-        for id in &self.session_mru {
-            if let Some(i) = self.sessions.iter().position(|s| s.info.id == *id) {
+        let by_id: std::collections::HashMap<SessionId, usize> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.info.id, i))
+            .collect();
+        let mut seen = vec![false; self.sessions.len()];
+        let mut out = Vec::with_capacity(self.sessions.len());
+        let mut take = |i: usize, out: &mut Vec<usize>| {
+            if !std::mem::replace(&mut seen[i], true) {
                 out.push(i);
+            }
+        };
+        for id in &self.session_mru {
+            if let Some(&i) = by_id.get(id) {
+                take(i, &mut out);
             }
         }
         for i in self.render_order_indices() {
-            if !out.contains(&i) {
-                out.push(i);
-            }
+            take(i, &mut out);
         }
         out
     }
 
-    /// A session's position in the MRU list — the switcher's recency tiebreak
-    /// (lower is more recent). Never-activated sessions sort last.
-    fn mru_rank(&self, idx: usize) -> usize {
-        self.sessions
-            .get(idx)
-            .and_then(|s| self.session_mru.iter().position(|id| *id == s.info.id))
-            .unwrap_or(usize::MAX)
+    /// Each session's position in the MRU list, keyed by id — the switcher's
+    /// recency tiebreak (lower is more recent). Built once per ranking pass:
+    /// scanning `session_mru` per session made the switcher quadratic in the
+    /// fleet size, on the path that runs for every keystroke.
+    pub(crate) fn mru_ranks(&self) -> std::collections::HashMap<SessionId, usize> {
+        self.session_mru
+            .iter()
+            .enumerate()
+            .map(|(rank, id)| (*id, rank))
+            .collect()
     }
 
     /// Toggle between the two most recent sessions (tmux `last-window`, vim's
@@ -5422,7 +5469,7 @@ impl App {
         // treating "no filter status" as "no filter" would silently turn the
         // attention overlay into the all-sessions one.
         let wanted = self.attention_status();
-        self.visible_order_indices()
+        self.attention_order_indices()
             .into_iter()
             .filter(|&i| !attention_only || wanted == Some(self.sessions[i].info.status))
             .take(9)
@@ -5598,7 +5645,7 @@ impl App {
             self.set_status(StatusLevel::Info, "Nothing needs attention");
             return;
         };
-        let order = self.visible_order_indices();
+        let order = self.attention_order_indices();
         if order.is_empty() {
             return;
         }

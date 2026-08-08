@@ -492,6 +492,12 @@ pub struct VisibilityFilter<'a> {
     pub folded_groups: &'a std::collections::HashSet<String>,
     /// Collapse unloaded sessions out of the list (the ghost shelf).
     pub ghost_shelf: bool,
+    /// A status that is exempt from both filters. The attention queue sets it
+    /// while its overlay is open: folding declutters the list, but it must
+    /// never put a session that needs the user out of the queue's reach — a
+    /// blocked agent hidden inside a collapsed group would be badged in the
+    /// title bar and unreachable by the very key that exists to reach it.
+    pub reveal: Option<SessionStatus>,
     /// The session that must stay visible whatever the filters say — the
     /// selection. A hidden cursor is a broken list: `Ctrl+J` would appear to
     /// skip rows, and the central pane would show a session with no row.
@@ -514,6 +520,10 @@ pub struct VisibilityFilter<'a> {
 /// group header is not tied to any particular session
 /// (`OrderedSessions::from_order` re-attaches it to whatever row survives), so
 /// hiding the first row loses nothing.
+///
+/// [`VisibilityFilter::reveal`] escapes both, and may put several rows under
+/// one collapsed header — that is the point: while the attention overlay is
+/// open the list is showing what needs answering, not a tidy summary.
 pub fn visible_rows(
     sessions: &[&SessionInfo],
     order: &SessionOrder,
@@ -523,6 +533,7 @@ pub fn visible_rows(
     let info_at = |row: usize| sessions[order.order[row]];
     let shelved = |row: usize| filter.ghost_shelf && info_at(row).status == SessionStatus::Unloaded;
     let is_selection = |row: usize| filter.keep == Some(info_at(row).id);
+    let is_revealed = |row: usize| filter.reveal == Some(info_at(row).status);
 
     let folded_heads: std::collections::HashSet<usize> = order
         .headers
@@ -550,6 +561,9 @@ pub fn visible_rows(
 
     (0..order.order.len())
         .map(|row| {
+            if is_revealed(row) {
+                return true;
+            }
             let head = group_of[row];
             if folded_heads.contains(&head) {
                 return stand_in.get(&head) == Some(&row);
@@ -626,6 +640,13 @@ impl<'a> OrderedSessions<'a> {
         let mut hidden_ghosts = 0usize;
         // Group header row → where that group's label landed in `kept`.
         let mut head_at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        // Rows a collapsed group hid, attributed after the walk — only then is
+        // it known whether the group kept a row at all. A group whose every
+        // member is shelved has no header left to carry a `(+n)`, and its rows
+        // would otherwise be reported nowhere, which is exactly the "sessions
+        // went missing" the title-bar count exists to prevent.
+        let mut hidden_in_group: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
         for (row, &shown) in visible.iter().enumerate() {
             let group = group_of[row];
             if shown {
@@ -642,11 +663,17 @@ impl<'a> OrderedSessions<'a> {
                 folded_counts.push(None);
                 kept.push(row);
             } else if is_folded(group) {
-                if let Some(count) = head_at.get(&group).and_then(|&h| folded_counts.get_mut(h)) {
-                    *count.get_or_insert(0) += 1;
-                }
+                *hidden_in_group.entry(group).or_insert(0) += 1;
             } else {
                 hidden_ghosts += 1;
+            }
+        }
+        for (group, count) in hidden_in_group {
+            match head_at.get(&group).and_then(|&h| folded_counts.get_mut(h)) {
+                Some(slot) => *slot = Some(count),
+                // The whole group is off screen, so only the shelf can have
+                // taken it: report its rows with the other shelved ghosts.
+                None => hidden_ghosts += count,
             }
         }
 
@@ -1417,6 +1444,7 @@ mod tests {
             folded_groups: folded,
             ghost_shelf: false,
             keep: None,
+            reveal: None,
         }
     }
 

@@ -469,10 +469,12 @@ impl App {
         with_content: bool,
         cap: usize,
     ) -> Vec<GlobalSearchResult> {
+        let ranks = self.mru_ranks();
         let mut scored: Vec<(i32, usize, usize)> = Vec::new(); // (score, mru rank, index)
         for (i, session) in self.sessions.iter().enumerate() {
             if let Some(score) = self.session_score(query, &session.info) {
-                scored.push((score, self.mru_rank(i), i));
+                let rank = ranks.get(&session.info.id).copied().unwrap_or(usize::MAX);
+                scored.push((score, rank, i));
             }
         }
         // Best score first; then most recently used; then a stable index so the
@@ -1423,6 +1425,103 @@ mod tests {
         assert!(
             ordered.folded_counts.iter().all(Option::is_none),
             "…and not as a collapsed group"
+        );
+    }
+
+    /// Folding declutters the list; it must not put work out of the attention
+    /// queue's reach. A blocked session inside a collapsed group is counted by
+    /// the title-bar badge (which reads the whole fleet), so `F10` reporting
+    /// "nothing needs attention" would be the queue failing at its one job.
+    #[test]
+    fn the_attention_queue_reaches_into_a_collapsed_group() {
+        let (mut app, _g, _t) = app_with_sessions(3);
+        in_repo(&mut app, 0, "alpha");
+        in_repo(&mut app, 1, "beta");
+        in_repo(&mut app, 2, "beta");
+        app.sessions[2].info.status = SessionStatus::Blocked;
+        app.set_active_index(0);
+        app.folded_groups.insert("beta".to_string());
+
+        assert!(
+            !app.visible_order_indices().contains(&2),
+            "the blocked session is folded out of the list…"
+        );
+        assert_eq!(app.attention_status(), Some(SessionStatus::Blocked));
+        assert_eq!(
+            app.session_jump_targets(true),
+            vec![2],
+            "…but the queue still numbers it"
+        );
+
+        app.focus_next_attention();
+        assert_eq!(app.active_index, 2, "and F10 lands on it");
+        assert!(
+            app.visible_order_indices().contains(&2),
+            "landing on it reveals its row"
+        );
+    }
+
+    /// While the overlay is open the queue's rows have to be on screen wearing
+    /// their digits, or the painted numbers and the jump targets disagree.
+    #[test]
+    fn the_attention_overlay_reveals_the_rows_it_numbers() {
+        let (mut app, _g, _t) = app_with_sessions(3);
+        in_repo(&mut app, 0, "alpha");
+        in_repo(&mut app, 1, "beta");
+        in_repo(&mut app, 2, "beta");
+        app.sessions[2].info.status = SessionStatus::Blocked;
+        app.set_active_index(0);
+        app.folded_groups.insert("beta".to_string());
+
+        assert!(
+            !app.visible_order_indices().contains(&2),
+            "hidden while no overlay is open"
+        );
+
+        app.toggle_attention_jump();
+
+        let visible = app.visible_order_indices();
+        assert!(
+            visible.contains(&2),
+            "the overlay puts every row it numbers on screen: {visible:?}"
+        );
+        for target in app.session_jump_targets(true) {
+            assert!(
+                visible.contains(&target),
+                "session {target} wears a digit but has no row"
+            );
+        }
+    }
+
+    /// A collapsed group whose every member is shelved leaves no header to
+    /// carry a `(+n)`, so its rows have to land in the title-bar ghost count
+    /// instead of being reported nowhere at all.
+    #[test]
+    fn a_fully_shelved_collapsed_group_is_still_counted() {
+        let (mut app, _g, _t) = app_with_sessions(3);
+        in_repo(&mut app, 0, "alpha");
+        in_repo(&mut app, 1, "beta");
+        in_repo(&mut app, 2, "beta");
+        app.sessions[1].info.status = SessionStatus::Unloaded;
+        app.sessions[2].info.status = SessionStatus::Unloaded;
+        app.set_active_index(0);
+        app.folded_groups.insert("beta".to_string());
+        app.toggle_ghost_shelf();
+
+        let infos: Vec<&crate::session::SessionInfo> =
+            app.sessions.iter().map(|s| &s.info).collect();
+        let order = crate::ui::project_list::compute_session_order(&infos);
+        let ordered = crate::ui::project_list::OrderedSessions::from_order(
+            &infos,
+            &order,
+            &[],
+            app.active_index,
+            &app.visibility_filter(),
+        );
+        assert_eq!(ordered.sessions.len(), 1, "the beta group is gone entirely");
+        assert_eq!(
+            ordered.hidden_ghosts, 2,
+            "and both its sessions are accounted for on the title bar"
         );
     }
 
