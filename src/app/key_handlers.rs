@@ -132,6 +132,15 @@ impl App {
             self.set_alt_held(false);
         }
 
+        // The label overlay owns every keystroke while open (see
+        // `handle_label_jump_key`) — ahead of the clipboard chords and every
+        // capture pane, or a review/activity pane eats the label letter and the
+        // overlay is left open with no way to aim.
+        if self.label_jump.is_some() {
+            self.handle_label_jump_key(code, mods);
+            return;
+        }
+
         // Help overlay + clipboard chords are routed before any modal handler.
         if self.handle_priority_key(code, mods) {
             return;
@@ -240,14 +249,15 @@ impl App {
     /// A bare modifier key press (kitty-protocol terminals only). Two `Shift`
     /// taps within [`DOUBLE_SHIFT_WINDOW_MS`] open the global search —
     /// mirroring the JetBrains "Search Everywhere" gesture. Taps never
-    /// accumulate while a modal or the search itself owns input (there,
-    /// `Shift` presses are just capitals being typed), and any non-`Shift`
-    /// modifier breaks a pending tap like a regular key would.
+    /// accumulate while a modal, the search itself or the label overlay owns
+    /// input (there, `Shift` presses are just capitals being typed), and any
+    /// non-`Shift` modifier breaks a pending tap like a regular key would.
     fn handle_modifier_press(&mut self, m: ModifierKeyCode) {
         let is_shift = matches!(m, ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift);
         if !is_shift
             || self.modal.is_open()
             || self.global_search.active
+            || self.label_jump.is_some()
             || !self.features.double_shift_search
         {
             self.pending_double_shift = None;
@@ -991,9 +1001,6 @@ impl App {
     fn handle_session_jump_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
         use super::AttentionJumpMode;
         let plain_or_alt = mods.is_empty() || mods == KeyModifiers::ALT;
-        if self.label_jump.is_some() {
-            return self.handle_label_jump_key(code, mods);
-        }
         if let Some(mode) = self.attention_jump {
             match code {
                 KeyCode::Char(c @ '1'..='9') if plain_or_alt => {
