@@ -1,0 +1,665 @@
+# Sandboxed agents
+
+How Friring runs a coding agent inside an isolation boundary — the profile
+model, the per-OS backends, the egress firewall, credential handling, and the
+UI that ties them together.
+
+This document is the **design contract** for the feature: implementation work
+reads it, and any change to the behaviour described here updates it in the same
+change. Fork-visible divergences are also listed in [`FORK.md`](../FORK.md).
+
+**Friring — fork-only.** Upstream has no sandboxing; see
+[`FORK.md`](../FORK.md).
+
+---
+
+## Goals and non-goals
+
+**Goals.**
+
+- Run *any* agent from the registry (`agents.toml`) inside a sandbox, without
+  the agent knowing. Friring stays agent-neutral: what an agent needs in order
+  to survive being sandboxed is **declared data**, never special-cased code.
+- Scope a sandbox to a folder, a worktree, or a combination of them, with
+  per-path read-only / read-write intent.
+- Restrict egress to an allowlist of domains, defaulting to deny.
+- Offer every backend the host supports, and let the user pick per session with
+  a sensible default rather than forcing one isolation technology.
+- Keep sessions crash-survivable. A sandboxed session reattaches after a
+  Friring restart exactly like an unsandboxed one.
+
+**Non-goals.**
+
+- Defeating a determined adversary. Native policy backends are *guardrails*:
+  they share the host kernel, and a domain allowlist is bypassable through
+  domain fronting and through any allowed domain that can host arbitrary
+  content. Container and VM backends are stronger, but the honest framing is
+  "reduce blast radius", not "prove containment". The UI says so.
+- A general container-management product. Friring manages the instances it
+  creates and nothing else.
+- Native Windows process sandboxing (restricted tokens / AppContainer). Windows
+  isolation is delivered through WSL2 and through containers. See
+  [Backend catalogue](#backend-catalogue).
+
+## The two sandbox shapes
+
+Every backend is one of two shapes, and the difference decides where tmux runs.
+
+**Policy backends** apply a kernel policy to a process tree. They wrap the
+agent's argv (`sandbox-exec -f … claude …`, `bwrap … claude …`). The tmux
+window is *outside* the sandbox and holds the wrapped process. Nothing about
+window discovery, pane-id reattach, `remain-on-exit`, scrollback capture or
+restart changes: the sandbox is invisible to the session layer.
+
+**Place backends** are environments that outlive an individual command — a
+container, a VM, a WSL distro. The agent runs in a tmux server *inside* the
+place, reached through a transport, exactly as an SSH host is reached today.
+The place is created once per profile and shared by every session using that
+profile.
+
+```text
+policy backend                        place backend
+──────────────                        ─────────────
+friring                               friring
+  └─ tmux (host)                        └─ tmux (host, control mode)
+       └─ sandbox-exec / bwrap               └─ docker exec -i <ctr> tmux …
+            └─ agent                              └─ tmux (in place)
+                                                       └─ agent
+```
+
+Consequences worth internalising:
+
+- A policy sandbox costs milliseconds and reuses the host toolchain. A place
+  sandbox costs a container start and needs an image containing the toolchain,
+  the agent, and tmux.
+- When a policy sandbox's process dies, one pane dies — the existing dead-pane
+  UX. When a place dies, every session in it dies at once.
+- Only place backends can enforce memory/CPU limits, and only place backends
+  give a filesystem the host cannot see.
+
+## Data model
+
+Sandbox profiles are UI-edited collections, so they live in SQLite following
+the automations pattern (list modal + editor modal + storage module + schema
+migration), not in a TOML file. Only `settings.toml` has config write-back in
+this codebase, and it is a fixed-schema file rather than a collection. A
+`friring-cli sandbox export|import` command covers portability.
+
+The dormant upstream `containers`, `project_container_config` and `vms` tables
+(created by schema v8/v10/v11, referenced nowhere in live code) are
+**superseded**: this feature adds its own tables and the old ones are dropped
+in the same migration. Recorded in `FORK.md`; upstream merges touching those
+tables conflict and resolve toward the Friring tables.
+
+### `sandbox_profiles`
+
+| Column | Type | Meaning |
+|---|---|---|
+| `name` | TEXT PK | Profile identity, shown everywhere in the UI |
+| `backend` | TEXT | `auto` \| `seatbelt` \| `apple-container` \| `bwrap` \| `docker` \| `podman` \| `wsl-distro` |
+| `paths` | TEXT (JSON) | `[{path, mode}]`, `mode` ∈ `ro` \| `rw` |
+| `network_mode` | TEXT | `none` \| `allowlist` \| `full` |
+| `network_allow` | TEXT (JSON) | `["api.anthropic.com", "github.com:443", …]` |
+| `network_deny` | TEXT (JSON) | Denies win over allows |
+| `prompt_new_domains` | INTEGER | Ask on first use of an unlisted domain, remember the answer |
+| `read_scope` | TEXT | `workspace` \| `host-minus-secrets` (policy backends only) |
+| `memory_mb`, `cpus` | INTEGER | Place backends only; NULL elsewhere |
+| `image` | TEXT | Place backends: image reference |
+| `containerfile` | TEXT | Place backends: build source, alternative to `image` |
+| `allow_unsandboxed_fallback` | INTEGER | Whether the agent may escape for a specific command |
+| `created_at`, `updated_at` | TEXT | Automations convention |
+
+Paths are stored as written (`~` preserved) and expanded at launch, so a
+profile stays meaningful if `$HOME` differs on a remote host.
+
+### `sandbox_instances`
+
+Tracks live places for the manager view and for garbage collection:
+`profile`, `engine`, `external_id` (container id / distro name), `state`,
+`created_at`, `last_used_at`. Policy backends never create rows here.
+
+### Session linkage
+
+`sessions` gains a nullable `sandbox_profile` column. Place-backed sessions
+additionally set `backend_type = "sandbox:<profile>"`, mirroring how `ssh:<host>`
+and `wsl:<host>` already drive restore and reattach. Both are written in the
+same migration that adds the tables.
+
+## Backend catalogue
+
+All backends listed here are **supported from the first release**. Availability
+is probed per host, and the session-creation UI shows what is available with the
+reason a backend was excluded.
+
+### `seatbelt` — macOS, policy
+
+`sandbox-exec` with a generated SBPL profile, parameterised per session
+(`-D WORKSPACE=…`). Deprecated in name since macOS 10.8 and fully functional
+through macOS 26; it is what Codex CLI, Claude Code, Cursor, Bazel and Chromium
+use, and Apple ships no replacement for sandboxing arbitrary headless
+processes. Treat the deprecation as a real but low-probability risk mitigated
+by the backend being pluggable.
+
+- Per-path `file-read*` / `file-write*` scoping with `subpath` filters, plus
+  `file-write-unlink` and ancestor-directory rules so a move cannot escape a
+  write boundary.
+- **Keychain works.** Under a restrictive profile a process can still reach
+  `securityd`, so Claude Code's Keychain-stored OAuth keeps working with no
+  credential handling at all. A default-deny profile must explicitly allow
+  `mach-lookup` for `com.apple.SecurityServer`, `com.apple.securityd`,
+  `com.apple.trustd`, `com.apple.ocspd` and `com.apple.cfprefsd.daemon`.
+- **Network granularity is all-or-localhost.** SBPL host filters accept only
+  `*` or `localhost` (with ports); there is no domain predicate. Domain
+  allowlists therefore mean: deny all outbound except the loopback proxy port.
+  See [Egress firewall](#egress-firewall).
+- **Nesting fails hard.** Under any outer profile containing a deny rule, an
+  inner `sandbox_apply` returns `Operation not permitted`. Agents with built-in
+  seatbelt sandboxes must run with them disabled; see
+  [Inner agent sandboxes](#inner-agent-sandboxes).
+
+### `apple-container` — macOS, place
+
+Apple's `container` CLI (Containerization.framework): one lightweight VM per
+container, sub-second boot, OCI images, virtiofs mounts. Apple Silicon only;
+macOS 26 or newer for isolated networks. Strongest isolation available on
+macOS, and the backend most likely to improve over time, which is why it ships
+alongside `seatbelt` rather than after it. No Compose and no Docker socket API,
+which this feature does not need. amd64 images run under Rosetta.
+
+### `bwrap` — Linux and WSL2, policy
+
+Bubblewrap: per-path `--ro-bind` / `--bind`, `--tmpfs`, `--unshare-net`,
+`--unshare-pid`, `--die-with-parent`. This is the industry mainline — Codex
+made bwrap its primary Linux backend and Claude Code's sandbox uses it too.
+
+- Version 0.11 or newer adds unprivileged overlays (`--overlay`,
+  `--tmp-overlay`), which back the optional copy-on-write workspace mode. Not
+  available when bwrap is installed setuid.
+- Requires unprivileged user namespaces. Probe for them: Ubuntu 23.10 through
+  24.04 restrict `clone(CLONE_NEWUSER)` via AppArmor and need either the
+  `bwrap-userns-restrict` profile or a sysctl; 25.04 and newer ship the fix.
+  The probe failure message states the fix.
+- Landlock is available as optional in-process hardening (per-hierarchy
+  filesystem rights, port-level TCP from ABI v4). It cannot express host
+  allowlists and is never the primary boundary.
+
+### `docker` / `podman` — everywhere, place
+
+The universal fallback and the only isolation available to a **native Windows
+binary** user who is not going through WSL. Also the backend to pick when the
+workload needs a toolchain the host does not have.
+
+- Podman rootless is preferred on shared and remote hosts (no daemon, no root
+  socket). It is CLI-compatible enough that one backend implementation covers
+  both, with a probe distinguishing them.
+- Mounts use **identical absolute paths** (see below). Network is `none` plus a
+  bridge to the proxy.
+- The agent runs as a non-root user; several agents refuse permissive modes as
+  root.
+
+### `wsl-distro` — Windows, place
+
+One cloned distro per profile, addressed by the existing `wsl.exe -d <distro>`
+transport with no new plumbing. Templates come from `wsl --export --format vhd`
+plus `wsl --import --vhd`; teardown is `wsl --unregister`.
+
+The decisive constraint: **all WSL distros share one utility VM, one kernel and
+one network namespace.** Per-distro firewalling is impossible at the Windows
+layer (Hyper-V firewall rules scope to the whole VM and accept IPs, not
+FQDNs), and `iptables` set in one distro applies to all. Per-sandbox egress
+control inside WSL therefore comes from running the `bwrap` backend *inside*
+the distro, whose `--unshare-net` creates a real per-sandbox namespace. Memory
+and CPU caps are global to the VM, so they are reported as unavailable rather
+than faked.
+
+Repositories should live on ext4 inside the distro. Mounting a Windows-side
+folder pays a 10–100× metadata penalty and weakens the boundary; the UI warns.
+
+### Identical absolute paths
+
+Every place backend mounts each profile path at **exactly its host path**. This
+is not a convenience:
+
+- A git linked worktree references its main repository by absolute path and
+  vice versa. Mounting both at their real paths is what keeps `git status`,
+  `git log` and `git commit` working inside.
+- Claude Code keys session transcripts by absolute project path, and Codex keys
+  `projects.<path>.trust_level` the same way. A path mismatch silently breaks
+  resume and re-triggers trust prompts.
+
+Place instances also set `safe.directory = *` (bind mounts surface foreign
+ownership) and a per-sandbox committer identity so agent commits are
+attributable.
+
+## Backend selection
+
+`backend = "auto"` resolves down a per-OS ladder:
+
+| Host | Order |
+|---|---|
+| macOS (Apple Silicon, macOS 26+) | `seatbelt` → `apple-container` → `docker`/`podman` |
+| macOS (other) | `seatbelt` → `docker`/`podman` |
+| Linux | `bwrap` → `podman` → `docker` |
+| Windows via WSL transport | `bwrap` (inside the distro) → `wsl-distro` → `docker` |
+| Windows native binary | `docker`/`podman` |
+
+The default is the first *available* rung, which favours startup latency,
+credential passthrough and zero image maintenance. The user overrides per
+profile, and the session-creation step shows the resolved backend so the choice
+is never invisible.
+
+`SandboxBackend` is the trait every backend implements:
+
+```rust
+trait SandboxBackend {
+    /// Cheap, cached, per host: is this usable, and if not, why (actionably)?
+    fn probe(&self, host: &HostRef) -> Availability;
+    /// What the UI may offer: limits, network modes, persistence, passthrough.
+    fn capabilities(&self) -> Caps;
+    /// Policy backends: argv in, wrapped argv out.
+    fn wrap(&self, argv: Argv, policy: &Policy) -> Result<Argv>;
+    /// Place backends: ensure the environment exists and is running.
+    fn ensure(&self, profile: &SandboxProfile) -> Result<Instance>;
+}
+```
+
+A backend implements `wrap` or `ensure`, never both. `probe` results are what
+the UI renders — a backend is never silently skipped.
+
+## Egress firewall
+
+One engine on every backend: **the sandbox has no direct network, and a
+Friring-owned filtering proxy outside the boundary enforces the allowlist.**
+
+```text
+sandbox (no route to the internet)
+   │  HTTP_PROXY / HTTPS_PROXY / ALL_PROXY  →  loopback port or unix socket
+   ▼
+friring proxy  ──  allow?  ──►  upstream
+               └─  deny   ──►  403 with a reason, event to the TUI
+```
+
+Per backend the "no direct network" half is: seatbelt denies all outbound
+except the loopback proxy port; bwrap uses `--unshare-net` with a socket bridge;
+containers use `--network none` plus a bridge or an internal network. Because
+the kernel blocks everything else, a process that ignores the proxy environment
+variables gets *no* network rather than an escape route.
+
+This is chosen over IP-based `iptables`/`ipset` allowlists (the pattern in
+Anthropic's devcontainer reference and in the `friring-autonomous` rig) because
+resolved-IP snapshots break mid-run when a CDN rotates addresses, and because
+`iptables` rules need `NET_ADMIN`, differ per host, and cannot work at all
+under seatbelt or in a shared WSL network namespace. The proxy's semantics are
+identical across every backend and over the SSH transport, where it simply runs
+on the remote end. IP-level filtering remains available as optional
+defence-in-depth inside containers.
+
+The proxy is a Friring-owned Rust component (`src/sandbox/proxy/`):
+
+- HTTP `CONNECT` and SOCKS5, allowlist matched on the requested host, with
+  optional `:port` scoping; denies win over allows.
+- Per-instance bearer token so only the intended sandbox can use it.
+- Denials carry a reason and surface as a TUI event; with
+  `prompt_new_domains`, an unlisted domain raises a confirm modal whose answer
+  is written back to the profile.
+- Optional HTTP-method restriction (`GET`/`HEAD`/`OPTIONS` only) as a cheap
+  brake on exfiltration through allowed hosts.
+- No TLS interception in the first release. Allow decisions therefore trust the
+  client-supplied hostname, so domain fronting can bypass them — documented in
+  the UI, not hidden.
+
+Written in Rust rather than shelling out to an external runtime: Friring ships
+as a self-contained binary, and a CONNECT/SOCKS filter is a small, testable
+component. The policy vocabulary deliberately mirrors the de-facto standard
+(`allowRead`/`denyRead`/`allowWrite`/`denyWrite`/`allowedDomains`/
+`deniedDomains`/`allowUnixSockets`) so profiles stay legible to anyone who
+knows the ecosystem.
+
+## Credentials
+
+Two facts drive the whole design.
+
+**Refresh tokens are single-use and rotating.** Both major agent vendors issue
+OAuth refresh tokens that are invalidated on use. Copying a credentials file
+into N sandboxes creates N consumers of one token: the first refresh wins, the
+siblings get `invalid_grant`, and some versions then delete their own
+credential file. Copy-per-sandbox is broken by construction, not merely
+inelegant.
+
+**Keychain does not cross a VM boundary.** On macOS, Claude Code stores OAuth in
+the Keychain and actively migrates any file-based credential into it. A
+container cannot reach it. A seatbelt sandbox can.
+
+Therefore, in resolution order:
+
+1. **`host-passthrough`** — policy backends only. The agent sees the real
+   credential store subject to path policy; Keychain works; no login, no
+   copying, nothing to expire. Default read policy is `host-minus-secrets`:
+   the host home is readable except a deny list (SSH keys, cloud credentials,
+   other agents' credential files), writes confined to the workspace plus the
+   agent's own state directory.
+2. **`env-token`** — a long-lived token the user supplies once. Friring stores
+   it in its own OS keychain entry and injects it at instance creation. No
+   rotation, no races. This is the recommended path for place backends.
+3. **`volume-login`** — a per-profile named volume holding the agent's state
+   directory, with one interactive login per *profile*. Both major agents have
+   TUI-compatible headless flows (paste-code, device-code), so the login
+   happens inside the session pane. Sessions sharing a profile share the
+   volume, which is the safe single-writer case. This is the answer to "logging
+   in for each sandbox is bad UX": login is per profile and effectively annual.
+4. **`seed-file`** — copy a credential file in once and honour write-back.
+   Opt-in, and only for agents whose vendor documents it.
+
+Never: bind-mounting the host agent configuration directory read-write into a
+place. It is useless on macOS (the credentials are not in the file) and it is
+an escape channel — an agent that can write the host's agent settings can plant
+hooks that the *host* agent later executes outside the boundary.
+
+Each agent declares what it needs, in the registry, as data:
+
+```toml
+[agents.<name>.sandbox]
+config_dir_env = "…"     # env var relocating agent state into the sandbox
+auth           = "auto"  # host-passthrough | env-token | volume-login | seed-file
+state_rw       = […]     # directories the agent writes and must keep
+copy_in        = […]     # config safe to project, subject to the lint pass
+env            = { … }   # static env (e.g. disable self-update in a place)
+secret_env     = […]     # names of tokens Friring may inject from its keychain
+bypass         = […]     # flags meaning "the outer boundary is the sandbox"
+writeback      = true    # refreshed credentials must persist
+login_fallback = "…"     # how to log in inside the pane when state is empty
+```
+
+Friring never reads a credential file to inspect it, and never logs credential
+contents. A future host-side credential broker (the sandbox asks, the host
+refreshes) is the theoretically cleanest endpoint and is deliberately deferred:
+`volume-login` removes the urgency.
+
+## Config projection
+
+A place sandbox gets a **synthetic per-profile home**, never a bind of the
+host's agent configuration. Safe configuration is copied in through a lint
+pass, because agent config routinely references the host filesystem:
+
+- Lifecycle hook commands, status-line commands and credential-helper scripts
+  are arbitrary shell, usually with absolute host paths.
+- Plugin, skill and rule directories may live outside the config directory.
+- Stdio MCP servers name host binaries.
+
+The lint pass classifies every such entry as *projectable*, *needs a mount*, or
+*host-only*, and the profile editor surfaces the result ("3 hooks reference
+host paths — mount read-only, drop, or rewrite?"). The `friring-autonomous`
+rig's hard-coded read-only hooks mount becomes a per-entry choice.
+
+Enforced settings go in through each agent's highest-precedence configuration
+layer, so a repository-level file cannot override the orchestrator's intent —
+including pre-seeded workspace trust, which several agents otherwise prompt for
+on first run inside a fresh home.
+
+Policy backends need none of this: the real home is already visible, subject to
+path policy.
+
+## Inner agent sandboxes
+
+Several agents sandbox their own tool calls. When Friring provides the outer
+boundary, the inner one must be disabled — under seatbelt it *cannot* work
+(nested `sandbox_apply` is denied outright), and inside a container it usually
+cannot either, because it needs user namespaces the container does not grant.
+
+This is why every agent declares `bypass` flags. They are applied only when a
+sandbox profile is active, and the UI states the composition plainly:
+
+```text
+sandbox: friring-dev (seatbelt) · inner agent sandbox: off — Friring is the boundary
+```
+
+The tradeoff is real and worth stating in the docs: with the inner sandbox off,
+anything inside the boundary — including the agent's own credentials — is
+reachable by whatever the agent runs. That is an argument for narrow profiles
+and for `env-token` credentials with a limited blast radius, not an argument for
+double sandboxing that does not work.
+
+Where a backend supports it, the workspace's `.git/hooks` and the agent's own
+configuration stay write-protected even inside read-write paths, so a
+compromised agent cannot rewrite the rules it runs under.
+
+## Launch integration
+
+**Policy backends** are a decorating provider applied where the invocation is
+composed (`build_agent_invocation` in `session_ops`, and the equivalent path in
+`Session::spawn`). Argv in, wrapped argv out. Wrapping happens *before*
+per-transport composition, because transports differ in how they quote and fold
+the command — the Windows multiplexer path collapses everything into a single
+token, so wrapping at the shell-string level would not survive. Spawn, restart
+and resume are all covered by the one seam.
+
+**Place backends** add an ensure-instance step before spawn and then use a new
+`TmuxTransport::Sandbox` variant, built exactly like the existing SSH transport
+(a command prefix wrapping the tmux argv). Control mode is transport-agnostic
+by design, so discovery, adoption, input and scrollback need no changes.
+Materialising agent configuration into a place generalises the existing
+remote-argument adaptation: a sandbox is a third kind of "elsewhere".
+
+Two details that silently break things if missed:
+
+- **Environment forwarding.** Session environment is set on the tmux window,
+  which is *outside* a policy sandbox and on the *host* side of a place. The
+  session identity variables must be forwarded inward explicitly, and host-only
+  path variables must be skipped or translated exactly as the remote path
+  already does. Without this, status reporting dies quietly.
+- **Resume identity.** A place keeps agent transcripts inside its own volume,
+  so a resume by id can target a transcript that does not exist there. The
+  launch path detects this and starts a fresh session under the requested id
+  instead, so later restarts resume normally. (The `friring-autonomous` rig
+  proved this pattern in a wrapper script; it belongs in core.)
+
+## Status signals
+
+Agents report working/blocked/done by running `friring-cli session signal`,
+which writes SQLite directly. Neither half of that works inside a sandbox:
+
+- The binary may not exist there (a Linux place on a macOS host).
+- **Database write access is a sandbox escape.** Automations stored in the
+  database carry shell commands that the *host* Friring executes. An agent that
+  can write the database can schedule arbitrary host commands.
+
+Sandboxed sessions therefore signal through a narrow file channel: a
+per-session directory under the data directory, mounted read-write, into which
+the hook writes a small status file that host Friring picks up on its existing
+poll. The database stays outside every boundary — see
+[ADR-29](#adr-29-the-database-never-enters-a-sandbox). Place backends reached
+through a transport may alternatively reuse the existing remote hook rewrite,
+which already solves the same problem for SSH hosts.
+
+## UI
+
+Everything below clones machinery that already exists, so the feature adds
+screens rather than patterns.
+
+**Profile list** (`Modal::SandboxList`) — the automations list: `n` new, `Enter`
+edit, `d` delete, empty-state hint, instance state and memory for place
+backends, with stop / rebuild / prune actions.
+
+**Profile editor** (`Modal::SandboxEditor`) — the automation editor's shape:
+text fields, `‹ ›` selectors for backend and network mode, and its add/remove
+sub-list (`n add · d remove`) twice, once for paths (each row a path plus a
+`‹ ro | rw ›` selector) and once for allowed domains. Path entry reuses the repo
+picker's live path completion. Validation returns a message that surfaces
+through the existing error toast; there is no inline form-error widget today
+and adding one is deferred.
+
+**Session creation** — a dedicated step in the `Ctrl+N` sequence, after
+directory selection so it can filter profiles to those covering the chosen
+directories, warn on a mismatch, and offer *create a sandbox for this
+selection* with the paths pre-filled from the repo picker's multi-select and
+worktree flags. The step shows the resolved backend and is skippable; like every
+other step it keeps its choice in the wizard state, contributes a breadcrumb
+line, and supports stepping back.
+
+**Indicators** — a `SessionInfo` field carries the profile, following the
+existing remote-host field end to end: a glyph in the session-list row prefix
+marks (beside the remote and worktree marks), a row in the info panel naming
+the profile, its backend and the inner-sandbox state, and the profile in the
+creation breadcrumb.
+
+**Firewall prompts** — a denial for an unlisted domain raises a notification and
+a confirm modal naming the domain and the command that wanted it; the answer is
+persisted to the profile.
+
+UI polish is explicitly a later pass. The first implementation aims for correct,
+complete and consistent with existing screens.
+
+## Failure modes
+
+- **Probe failures** are actionable text, not a missing option: the AppArmor
+  fix for user namespaces, "Docker is not running", "requires macOS 26",
+  "WSL1 is not supported".
+- **Dead instances** surface as dead panes with the error visible, because
+  sessions keep `remain-on-exit`.
+- **Unavailable capabilities** are shown as unavailable — memory limits on a
+  policy backend, per-sandbox limits on WSL — rather than accepted and ignored.
+- **Escape hatch.** Every profile carries an explicit
+  `allow_unsandboxed_fallback` switch. Escape hatches exist in every comparable
+  product; the design makes this one visible and per-profile instead of
+  ambient.
+
+## Testing and privacy
+
+**The user's real agent state is off limits.** No test, script, fixture,
+harness or agent working on this feature may read, copy, mount or otherwise
+touch the user's personal agent directories, credential stores, keychain items,
+`.env` files or tokens. This is a hard constraint on the feature *and* on the
+work that builds it.
+
+Concretely:
+
+- Tests use fabricated home directories under the test temporary directory,
+  populated with synthetic config. The e2e harness already builds isolated
+  config and data directories; sandbox tests extend that, and never point at a
+  real home.
+- Credential handling is tested with fake tokens and a stub endpoint. Nothing
+  reads a real credential store, including through the keychain-extraction
+  path, which is exercised against a stubbed command.
+- The proxy is tested against a local test server: allow, deny, deny-reason,
+  token rejection, SOCKS and CONNECT parity, method restriction.
+- Backend probes and argv/profile generation are unit-testable without running
+  the backend; where a backend is present in CI, integration tests run behind a
+  capability check and are skipped with a reason otherwise.
+- Documentation examples use placeholder paths, never the author's own.
+
+## Delivery phases
+
+Each phase is independently useful and lands with its own tests, docs and
+`FORK.md` entry.
+
+**P1 — Policy sandboxes.** The `sandbox` module, profile storage and migration,
+the profile list and editor, the session-creation step, the session indicator,
+`seatbelt` and `bwrap` backends, network `none` and `full` only,
+`host-passthrough` credentials.
+
+**P2 — The firewall.** The Rust filtering proxy, `allowlist` network mode,
+first-use domain prompts and their persistence, wiring into both policy
+backends.
+
+**P3 — Place sandboxes.** The `docker`/`podman` backend, the sandbox transport,
+instance lifecycle and garbage collection, identical-path mounts, the default
+image, `env-token` and `volume-login` credentials, config projection and its
+lint pass, and the signal-file channel.
+
+**P4 — Breadth.** `apple-container` and `wsl-distro` backends, copy-on-write
+workspaces, resource limits, the sandbox manager view, `friring-cli sandbox`
+subcommands, and profile export/import.
+
+## ADR-25: Sandboxing is a core feature, not an extension
+
+**Context**: Extensions are declarative data (ADR-20, ADR-21). An extension can
+register an agent whose `command` is a wrapper script, so a minimal "sandboxed
+agent" ships as an extension today.
+
+**Choice**: Build sandboxing into the core, in a new `sandbox` module.
+
+**Why**: Everything that makes the feature usable is outside what a manifest can
+express — extensions contribute no UI, have no session-lifecycle hook, cannot
+add a transport (the host kind is a closed enum), cannot add tables, and cannot
+add a session indicator. A wrapper-script extension also cannot forward session
+identity into a place reliably, so status reporting breaks. The extension route
+remains valid for prototyping and for user-authored wrappers.
+
+**Consequences**: A new module in the architecture allowlist (`sandbox` may
+reference `session`, `paths`, `shell`; never `ui`, `git` or `app`), a schema
+migration, and new modals. Sandbox *recipes* stay declarative data so they
+remain inspectable in the spirit of ADR-20.
+
+## ADR-26: Policy backends wrap argv; place backends are transports
+
+**Context**: Sandboxing technologies split into process-scoped policies and
+persistent environments.
+
+**Choice**: Model both. Policy backends wrap the composed invocation with tmux
+outside. Place backends are reached by a transport with tmux inside, mirroring
+ADR-13's SSH/WSL transports.
+
+**Why**: Forcing one shape breaks something. Wrapping a container start in a
+tmux pane makes every session a separate container start and loses the
+environment's persistence; putting tmux inside a policy sandbox gains nothing
+and complicates reattach. The transport seam already exists and is
+transport-agnostic at the control-mode layer, so a place backend is
+substantially free.
+
+**Consequences**: Two code paths, one profile model. Crash-survival semantics
+differ per shape and the UI says which is in effect.
+
+## ADR-27: One egress engine — a Friring-owned filtering proxy
+
+**Context**: Domain-level egress control has several possible mechanisms; the
+backends have wildly different network primitives, and one of them (seatbelt)
+cannot express host filtering at all.
+
+**Choice**: Deny direct egress at the kernel level in every backend, and filter
+by domain in a Friring-owned Rust proxy outside the boundary.
+
+**Why**: It is the only mechanism whose semantics are identical across every
+backend and over the existing remote transports, and the kernel-level denial
+means ignoring the proxy is not a bypass. Resolved-IP allowlists break when
+CDN addresses rotate. An external runtime would contradict the single-binary
+distribution.
+
+**Consequences**: Friring runs a network service while a sandbox is alive,
+scoped to loopback or a unix socket and token-authenticated. Allow decisions
+trust the client-supplied hostname until TLS termination is added, which the
+UI discloses.
+
+## ADR-28: Credentials are never copied per sandbox
+
+**Context**: Vendor OAuth refresh tokens are single-use and rotating; the
+macOS Keychain is unreachable from a VM.
+
+**Choice**: Prefer host passthrough under policy backends; otherwise an
+injected long-lived token or a per-profile login volume. Never copy a rotating
+credential file into more than one place, and never bind the host agent
+configuration directory read-write into a sandbox.
+
+**Why**: Copies invalidate each other on first refresh, cascading logouts
+across every sandbox. A writable host agent configuration is an escape channel
+through hooks the host agent later runs.
+
+**Consequences**: Place backends need one login per profile, or a token the
+user supplies once. Each agent declares its credential strategy as registry
+data.
+
+## ADR-29: The database never enters a sandbox
+
+**Context**: Sandboxed agents still need to report status, and the existing
+mechanism writes SQLite directly.
+
+**Choice**: Sandboxed sessions signal through a per-session file channel that
+host Friring polls. The database is never mounted into a sandbox, read-only or
+otherwise.
+
+**Why**: Automations stored in the database carry shell commands executed by
+the host. Database write access from inside a sandbox is therefore arbitrary
+host command execution — a complete escape.
+
+**Consequences**: One more signal path to maintain, reusing the existing poll.
+Transport-reached places may instead reuse the remote hook rewrite, which
+already avoids database access for SSH hosts.

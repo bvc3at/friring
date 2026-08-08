@@ -83,6 +83,39 @@ merges carry rename conflicts on the renamed identifiers, and an existing
 
 ### Features
 
+#### Sandboxed agents
+
+Fork-only. Upstream runs every agent as the user, on the host, with the user's
+full filesystem and network. The fork can run any registry agent inside an
+isolation boundary chosen per session, scoped to the directories the session
+actually needs and to an allowlist of domains.
+
+- **Sandbox profiles** — a UI-edited collection in SQLite (the automations
+  pattern): per-path read-only/read-write scope, network mode, domain
+  allowlist, resource limits, backend choice. New tables **supersede** the
+  dormant upstream `containers` / `project_container_config` / `vms` tables
+  (created by upstream schema v8/v10/v11 and referenced nowhere in live code),
+  which this feature's migration drops. Merges touching those tables resolve
+  toward the Friring tables.
+- **Two sandbox shapes** — *policy* backends (`seatbelt`, `bwrap`) wrap the
+  agent's argv with tmux outside; *place* backends (`docker`/`podman`,
+  `apple-container`, `wsl-distro`) run tmux inside and are reached through a
+  new sandbox transport that mirrors the fork's SSH/WSL transports.
+- **Egress firewall** — a Friring-owned Rust filtering proxy enforces a domain
+  allowlist while the kernel denies direct egress, so ignoring the proxy means
+  no network rather than a bypass. Chosen over resolved-IP `iptables`
+  allowlists, which break on CDN address rotation and cannot work under
+  seatbelt or in WSL's shared network namespace.
+- **Credential handling** — never copies rotating OAuth credentials per
+  sandbox (copies invalidate each other on first refresh); prefers host
+  passthrough under policy backends (the macOS Keychain keeps working), then an
+  injected long-lived token, then one login per profile in a named volume.
+- **The database never enters a sandbox** — sandboxed sessions report status
+  through a polled file channel, because automations make database write access
+  equivalent to arbitrary host command execution.
+
+Design and ADR-25 through ADR-29 live in [`docs/SANDBOX.md`](docs/SANDBOX.md).
+
 #### Lazy sessions & ghosts (July 2026)
 
 Upstream restores every persisted session eagerly at startup: sessions whose

@@ -139,6 +139,7 @@ Detail is read on demand — jump to the doc for what you're touching:
 | Any config file (agents / hosts / settings / themes / keybindings), env var, or DB setting | `docs/CONFIG.md` |
 | A user-facing feature — sessions, code review, automations, tasks, global search, notifications, status, remote/WSL, extensions, keybindings | `docs/FEATURES.md` |
 | Render-loop performance, perf counters, redraw throttling | `docs/PERFORMANCE.md` |
+| Sandboxed agents — profiles, backends (seatbelt/bwrap/docker/…), egress proxy, credentials | `docs/SANDBOX.md` |
 | The headless CLI (`friring-cli`) | `docs/CLI.md` |
 | Real-agent e2e tests, the model stub, scenario-driven demos | `docs/E2E.md` |
 | Cutting a release, versioning, installers, packaging | `docs/RELEASING.md` |
