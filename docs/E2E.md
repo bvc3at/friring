@@ -7,7 +7,7 @@ that one description runs two ways:
 
 ```bash
 just agent-e2e                        # asserting, hermetic, offline e2e suite (bats)
-just agent-demo claude-tool-loop      # the same scenario as a VHS demo recording
+just agent-demo claude-tool-loop      # the same scenario, recorded as a demo clip
 ```
 
 The agent binaries are real (Claude Code is the reference agent; codex and opencode are covered
@@ -43,6 +43,19 @@ same API:
 |---|---|---|---|
 | `anthropic` | `POST /v1/messages` (SSE; `tool_use` + `input_json_delta`) | `ANTHROPIC_BASE_URL` | claude |
 | `openai` | `POST /v1/responses` (SSE) · `POST /v1/chat/completions` (SSE) | provider entry in the CLI's own config | codex · opencode |
+
+What that buys is easier to see than to describe. Below are the `claude-text-turn` and
+`opencode-text-turn` scenarios recorded as clips: two different vendor CLIs, unmodified, each
+running a real turn inside a Friring pane — one talking the `anthropic` dialect, one the `openai`
+one, both answered by a stub on `127.0.0.1` from the same fixture vocabulary. Neither is logged
+in to anything, and the model each one names does not exist.
+
+![A real Claude Code turn through a Friring pane, answered by the anthropic stub](media/fork/claude-text-turn.gif)
+
+![The same scenario shape on opencode, answered by the openai stub](media/fork/opencode-text-turn.gif)
+
+They are also the harness's own smoke test: the pair is what fails first, and most legibly, when
+a CLI update changes its onboarding, its trust dialog, or its wire format.
 
 `stub-core.mjs` holds everything dialect-agnostic — CLI args, the fixture matcher, the journal,
 the HTTP skeleton — so a dialect stub contributes only what genuinely differs: how to summarize a
@@ -105,12 +118,16 @@ test mode** (demo pacing only), so a scenario physically cannot lean on a fixed 
 - `tbx_sandbox_init_full fresh` (shared `scripts/dev/lib/sandbox-env.sh`): throwaway
   `HOME`/`XDG_*`/`TMUX_TMPDIR`, dev `friring-dev` socket in a private dir. Nothing touches the
   real `~/.claude`, `~/.config/friring`, or any running tmux server. Leaked `FRIRING_*` identity
-  vars (from running inside a Friring session) are scrubbed. Two macOS details are load-bearing:
-  the sandbox root is **canonicalized** (`$TMPDIR` is a `/var/folders/…` symlink, and the agents
-  resolve their cwd to the real path — a folder-trust seed under the symlinked path misses, and
-  the agent boots into a trust dialog instead of a usable UI), and the fresh `TMUX_TMPDIR` lives
-  under `/tmp` rather than inside that root (the per-user `$TMPDIR` prefix overflows the ~104-byte
-  AF_UNIX socket path limit).
+  vars (from running inside a Friring session) are scrubbed. Three details are load-bearing: the
+  root is **canonicalized** (`/tmp` is a `/private/tmp` symlink on macOS, and the agents resolve
+  their cwd to the real path — a folder-trust seed under the symlinked path misses, and the agent
+  boots into a trust dialog instead of a usable UI); it sits under **`/tmp`, not `$TMPDIR`**,
+  because macOS's per-user `$TMPDIR` (`/var/folders/<2>/<28>/T/`) makes the workspace path ~60
+  characters before it reaches `ws/` — and that path is *on camera* in demo recordings and sets
+  how wide a pane a scenario needs to read a file name off it (`claude-activity-view` needed a
+  220-column pane for exactly this, and now runs at the 175 default); and the fresh `TMUX_TMPDIR`
+  is a **sibling** of the root rather than inside it (a nested socket path overflows the
+  ~104-byte AF_UNIX limit).
 - The sandbox `settings.toml` is seeded with `[features] notifications = false` before the TUI
   boots: a session flipping to Blocked would otherwise fire a **real desktop banner** on the
   host (macOS delivers via osascript/terminal-notifier). Tests must never touch the user's
@@ -155,7 +172,7 @@ calls `step_resolve_session <name>` once the wizard has spawned, which binds `E2
 for state waits and CLI probes (a no-op in demo mode, like `step_wait_state`). Steps use a small
 dual-mode vocabulary — `step_type`, `step_key`, `step_wait_pane`, `step_wait_state`,
 `step_sleep`, `step_resolve_session` — that either drives the driver tmux and polls (test mode)
-or emits VHS tape lines (demo mode; `step_wait_pane` becomes `Wait+Screen@timeout /regex/`).
+or emits tape lines (demo mode; `step_wait_pane` becomes `Wait /regex/ <timeout>s`).
 Keep steps a flat list: no branching, loops, or variables — the moment a scenario needs logic,
 that logic belongs in the assert functions or the harness, not in a grown-by-accident DSL.
 
@@ -167,8 +184,8 @@ actions. Two focus facts scenarios keep tripping over: `Ctrl+H` is a focus *cycl
 **externally while the TUI is already running** (mid-steps `friring-cli session create`) is
 adopted with the session list focused, unlike the pre-boot create; from there `Esc` (or
 `Enter` on the row) drops into the terminal. Assert focus from the pane when in doubt (footer
-focus pill / terminal pane title) instead of assuming it. Demo-able scenarios must stick to
-keys VHS knows (no F-keys; `C-x` → `Ctrl+X`).
+focus pill / terminal pane title) instead of assuming it. Any key tmux can send is recordable, so
+`SCENARIO_DEMO_KEYS` exists only to make an invisible chord legible on camera (see Demo mode).
 
 Steps run in the bats process with the full sandbox env, so a scenario may also drive
 `friring-cli`, `git`, and the two tmux servers directly from `scenario_steps` — that is how
@@ -176,9 +193,13 @@ multi-session set-ups, external-instance mutations (the multi-instance-sync asse
 TUI-relaunch adoption test are built (`3>&-` on any call that can start a tmux server, like the
 harness's own). Where no pane string exists to wait on, a **bounded poll helper** mirroring
 `e2e_wait_pane` (fixed tries, small sleep, `e2e_die` on exhaustion) is the sanctioned escape
-hatch — never an open-loop sleep. Scenarios built on F-keys, mid-step CLI probes, or a TUI
-relaunch are **test-only**: they say so in their header comment and are simply never listed as
-demos; `SCENARIO_PRECREATE=0` + `step_resolve_session` remains the wizard-flow pattern.
+hatch — never an open-loop sleep. Everything in `scenario_steps` that is *not* a `step_*` runs at
+tape-**generation** time in demo mode, before the TUI boots: one-shot setup (a `session create`, a
+seeded task) just lands before the first frame and records fine, but a mid-step poll burns its
+whole timeout against a state that can only happen later, and a mid-step `tmux kill-window` or TUI
+relaunch destroys what the clip was meant to show. Scenarios built on those are **test-only**:
+they say so in their header comment and are simply never listed as demos; `SCENARIO_PRECREATE=0` +
+`step_resolve_session` remains the wizard-flow pattern.
 
 ## Agent profiles
 
@@ -242,19 +263,112 @@ literal `^X` under tmux (sst/opencode#4097).
 
 `run.sh --demo <scenario>` boots the *same* hermetic env + stub (env inheritance mirrors
 `scripts/demo/record.sh`: everything exported before the `session create` that starts the
-`friring-dev` server), generates a tape with the standard `scripts/demo` Set block, runs `vhs`,
-and writes `target/agent-e2e/demos/<name>.{gif,mp4}`. `SCENARIO_DEMO_THEME` seeds
-`metadata.active_theme` like `record.sh` does. Unlike the hand-written tapes, generated tapes
-synchronize on `Wait+Screen` instead of open-loop sleeps, so a slow turn can't desync the
-recording; `step_sleep`/`delayMs` control the rhythm.
+`friring-dev` server), generates a tape, and then records it exactly the way the shipped
+`docs/media` clips are recorded: **asciinema** captures the TUI's terminal byte stream while
+`scripts/demo/lib/drive-tape.mjs` replays the tape into the driver tmux, and **agg** renders the
+cast offline. Output is `target/agent-e2e/demos/<name>.{gif,mp4}`.
 
-VHS renders through a headless Chromium (go-rod): a packaged system browser is used when
-present. The dead-proxy vars are dropped for the `vhs` process only — the agent pane's env was
-frozen into the tmux server before vhs starts, so the offline guarantee is unaffected.
+`SCENARIO_DEMO_THEME` seeds `metadata.active_theme` like `record.sh` does — it defaults to
+**`doom`**, so a set of clips reads as one product, and a scenario overrides it only when the
+theme is itself the subject. Scenario prompts, stub replies and agent model ids follow
+`scripts/demo/demo-content.json`'s register: planetary-infrastructure ops treated as routine,
+answered by models that do not exist (`fable-67`, `gpt-6.2`, `tempest-oss-140b`). That is not
+decoration — a fictional model id keeps a real product name off camera, and off a clip that
+would otherwise date itself. (Its one cost: Claude Code cannot know an unknown model's context
+window and says so across six lines of the pane, so the profile answers with
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS`.)
+
+**Why bytes and not pixels.** This path used to drive `vhs`, which screenshots a headless
+Chromium. Grabbing pixels costs real time per frame, so the capture starves the moment the box
+cannot rasterize fast enough — and vhs writes the gif at the *nominal* rate regardless, so a
+starved capture does not degrade quality, it **compresses time**. Measured: 8s of scripted
+`Sleep` recorded as 0.84s at 1920x1080, 2.08s at 1280x720, and the full 7.6s at 700x300. The
+sustainable rate at demo size was ~5fps, which also meant typing arrived in visible chunks of
+five or six characters — a paste, not a person. Capturing the byte stream costs nothing: every
+paint is kept with its true timestamp and the render can take as long as it likes.
+
+**Waits film, and they fail the take.** `step_wait_pane` becomes a `Wait /re/` that polls the
+same pane the asserting test polls, so a clip carries the app's real latency — the spinner, the
+boot, the turn — and a wait that never resolves aborts the recording by line number instead of
+producing a clip that ran to the end having skipped what it came to film. Each wait is followed
+by a short dwell (`Sleep 300ms`), because a wait ends the instant its marker paints and the
+frame it resolved on would otherwise last as long as it takes to send the next key. Keep
+explicit `step_sleep` beats under the 1s max-held-frame budget.
+
+**The demo presses what the test presses.** `step_key` emits `Key <tmux-key>`, handed straight
+to `tmux send-keys` — there is no translation table, so no key is unrecordable (F-keys, `M-u`,
+`C-\`), and a name tmux does not know fails the take. `SCENARIO_DEMO_KEYS` still exists, but as
+an **editorial** choice rather than a workaround: an Alt chord is invisible on camera, so
+`"M-u=C-f U"` unloads through the fork's leader and the which-key overlay shows the viewer what
+was pressed. Whether a substitution preserves what the clip *shows* is the scenario's
+judgement, never the harness's — `scripted-info-keybind` presses F2 to prove it does **nothing**
+after a rebind, so routing it to that action's leader key would record the opposite of the
+feature.
+
+Press the leader with **`step_leader <key>`**, not two `step_key`s. A leader chord is two
+keystrokes the app has to see as two events; test mode gets that gap for free (each `step_key`
+is its own process) and a tape does not. It is also the only reason the which-key overlay is
+ever on camera. `scripts/demo`'s hand-written tapes sleep 500ms in the same place.
+
+Typing runs at `E2E_DEMO_TYPING_MS` (16ms/character) rather than the 50ms VHS default the
+hand-written tapes inherit: a scenario prompt is a whole sentence of agent instruction, and at
+50ms those read as dictation. `drive-tape.mjs` charges each keystroke's own `tmux send-keys`
+spawn against the interval instead of adding to it — at 10-20ms per spawn on macOS, not doing
+so typed at roughly half the nominal speed.
+
+**Two boot-state traps**, both of which make a scenario pass as a test and film the wrong thing:
+
+- Anything in `scenario_steps` that is not a `step_*` runs at tape-*generation* time — so a
+  fleet scenario's `friring-cli session create` calls land **before the TUI starts** in demo
+  mode and **while it is already running** in test mode.
+- Which follows from that: the TUI focuses the terminal when it boots with a session and the
+  session list when it boots empty, and it opens on the *last* session in the DB. So a scenario
+  that starts by typing, or that navigates relative to whatever is active, must pin both —
+  precreate at least one session (`SCENARIO_SESSION_NAME` names it), wait on the footer's
+  focus field, and jump to a known row before the first relative move.
+
+`scripts/demo/lib/check-pacing.mjs` runs over the result and **reports without gating**. Its
+budget is calibrated for the hand-written tapes, which film a seeded TUI and no agent latency at
+all; these clips film real CLIs booting and answering, so a held frame here is often the app
+being honestly slow — which is usually the thing the scenario came to show. Its **opening**
+metric is the least trustworthy of the lot: it shells out to ffmpeg `freezedetect`, which by its
+own header cannot tell a stall from typing. Read the first frame before believing it.
+
+Recordings land under `target/`. A handful are committed — the clips this doc and
+`docs/FEATURES.md` / `FORK.md` embed — and those live in **`docs/media/fork/`**, where CI gates
+them with `--profile=agent`: the held-frame and opening budgets relax to a measured ceiling, the
+size cap and the blank-final-frame backstop do not relax at all. The recorder prints that same
+profile, so what it shows is what CI will enforce. `docs/media/fork/README.md` has the numbers
+and says which clip is linked from where.
+
+**Keep the agent's boot off camera.** `SCENARIO_DEMO_PREROLL` is a pane pattern the recorder
+waits for *before* filming starts, defaulting to the scenario's own `SCENARIO_AGENT_READY`. A
+CLI booting shows an empty pane, and it lands on the opening frame — which is the README preview
+and the whole of an autoplay impression — so it is the one wait worth taking off camera. A
+scenario whose narrative *is* the boot sets it to `""`. Do not follow it with a `step_sleep`: the
+pre-roll has already settled the pane, so a beat there just holds the opening frame.
+
+The closing beat is a lingering `Sleep`, deliberately **not** `Ctrl+Q`: quitting inside the
+recording ends the clip on ~1s of bare shell, which `check-pacing.mjs` rejects as a leaked
+teardown (measured 0.07-0.09% ink against the 3.4-9.0% of a good final frame). Recording ends by
+**detaching** the filmed client with the TUI still up, and `trim-cast.mjs` drops the detach's own
+teardown from the tail — and normalizes U+00A0, which Claude Code pads with and agg is alone in
+drawing as a visible icon (Meslo has no glyph for it, so the fallback chain answers with a Nerd
+Font one that overlaps the next character). The TUI is reaped by `e2e_teardown` afterwards, off
+camera.
+
+The terminal is sized from the scenario's `SCENARIO_COLS`/`SCENARIO_ROWS`, and agg rasterizes
+that grid at `E2E_DEMO_FONT_SIZE` in the same face the shipped clips use — which it is asked to
+confirm up-front, because agg falls back silently when a family is missing. **That geometry is
+the aspect ratio**, since there is no canvas to fit the grid into: the 175x42 default is
+`record.sh`'s `DEMO_COLS`/`DEMO_ROWS` and renders 1918x1084, pixel-identical to every shipped
+clip. A scenario that overrides it records at its own ratio, which is right when the size is the
+subject and a mistake otherwise.
 
 Tape generation is factored out of recording (`e2e_emit_tape`): `run.sh --emit-tape <scenario>`
-writes the `.tape` and prints its path **without** booting a session or running vhs — pure
-step→tape mapping, so it works offline with no agent binary and is unit-tested (`unit.bats`).
+writes the `.tape` and prints its path **without** booting a session or rendering anything —
+pure step→tape mapping, so it works offline with no agent binary and is unit-tested
+(`unit.bats`, which parses the result with the real driver).
 
 ## Running & knobs
 
@@ -275,10 +389,10 @@ semantics), so check the `1..N` line when filtering.
 `FRIRING_E2E_{CLAUDE,CODEX,OPENCODE,ANTIGRAVITY}_BIN` pin a binary per agent; `FRIRING_E2E_KEEP=1`
 keeps the sandbox for post-mortem; `FRIRING_E2E_SKIP_BUILD=1` skips the cargo build. Requires tmux,
 node ≥ 18, jq, git, curl, coreutils `timeout` (**`gtimeout` is preferred** — third-party `timeout`
-shims exist on `PATH` in the wild and silently break TUI children), bats (tests) / vhs + sqlite3 + a
-browser (demos). An agent binary that is missing — or present but unresponsive — makes only *that*
-agent's scenarios **skip**, not fail, so a machine with any subset of the CLIs stays green; missing
-infrastructure tools are hard errors.
+shims exist on `PATH` in the wild and silently break TUI children), bats (tests) /
+asciinema + agg + ffmpeg + sqlite3 (demos). An agent binary that is missing — or present but
+unresponsive — makes only *that* agent's scenarios **skip**, not fail, so a machine with any
+subset of the CLIs stays green; missing infrastructure tools are hard errors.
 
 CI: the `agent-e2e` job (`.github/workflows/ci.yml`) installs tmux + bats + the **pinned**
 `@anthropic-ai/claude-code` and runs the suite. It is path-gated like every job and deliberately
@@ -376,7 +490,8 @@ does — pin a `DECSTBM` region anchored at row 1, scroll inside it, reset — w
 stock vt100 refuses to keep (see "Which vt100" in `docs/ARCHITECTURE.md`). The scenario stubs a
 reply taller than any pane the harness renders, waits for its head to leave the screen, and then
 presses `Shift+Up` until the head comes back; against stock vt100 the view never moves. It is
-test-mode only — `Shift+Up` has no VHS key, so it can't be recorded as a demo.
+test-mode only: `Shift+Up` is recordable (`Key S-Up`), but every codex demo currently stalls
+waiting for the pane's ready glyph — see `docs/media/fork/README.md`.
 
 **opencode 1.17.15** — the `@ai-sdk/openai-compatible` runtime is bundled in the binary (nothing is
 fetched from npm) and a cold cache works offline, so no warm-up step is needed; the models.dev

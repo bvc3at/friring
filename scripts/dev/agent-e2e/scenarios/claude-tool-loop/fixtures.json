@@ -8,16 +8,16 @@
     },
     {
       "name": "write-tool-call",
-      "match": { "promptContains": "hello.txt", "hasToolResult": false },
+      "match": { "promptContains": "moon.md", "hasToolResult": false },
       "delayMs": 100,
       "reply": {
-        "text": "Writing hello.txt now.",
+        "text": "Flipping the registry flag and writing moon.md now.",
         "toolUse": {
           "id": "toolu_e2e_write_1",
           "name": "Write",
           "input": {
-            "file_path": "{{WS}}/hello.txt",
-            "content": "Hello from the Friring e2e stub!\n"
+            "file_path": "{{WS}}/moon.md",
+            "content": "deprecated = false  # the moon is back\n"
           }
         }
       }
@@ -27,7 +27,7 @@
       "match": { "toolResultFor": "toolu_e2e_write_1" },
       "delayMs": 150,
       "reply": {
-        "text": "TOOL-LOOP-DONE — hello.txt was written by a real tool round-trip against the local stub."
+        "text": "MOON-RE-ENABLED — moon.md written. Tides recompute on the next pass; nothing downstream needs a redeploy."
       }
     }
   ]

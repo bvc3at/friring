@@ -23,6 +23,16 @@
   margin: 0 auto;
 }
 
+/* A second line under a section's subtitle — the fork-tag legend. Smaller and
+   wider than the subtitle it follows, so it reads as a footnote to the section
+   rather than a competing headline. */
+.section-title .section-note {
+  font-size: 0.85rem;
+  max-width: 720px;
+  margin-top: var(--space-sm);
+  color: var(--text-muted);
+}
+
 /* Grid system */
 .grid {
   display: grid;

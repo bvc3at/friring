@@ -11,11 +11,17 @@
 # focus on the session (a self-jump: focus-wise a no-op, but the popup must
 # still tear down).
 #
-# Test-mode only (drives friring-cli mid-steps); not demo-able.
+# Demo-able: the mid-step friring-cli calls are one-shot seeding, so in demo
+# mode they simply land before the first frame; Ctrl+/ records through
+# `<leader> /` (SCENARIO_DEMO_KEYS).
 #
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Global search across live session content, tasks, automations, and files; Esc restore + Enter jump"
 SCENARIO_AGENT="scripted"
+# `<leader> /` is global search's own second route, and the one that films:
+# tmux spells `Ctrl+/` as the unreadable `C-_`, while the overlay names the
+# search.
+SCENARIO_DEMO_KEYS=("C-_=C-f /")
 
 # Bounded poll for the popup being GONE — step_wait_pane can only wait for
 # presence, and both the Esc close and the Enter jump are proven by the

@@ -1007,7 +1007,7 @@ through the real TUI by stubbing the **model HTTP API on loopback** — a
 zero-dependency node sidecar speaking the Anthropic Messages dialect
 (SSE + `tool_use`), answering from hand-curated *semantic* fixtures —
 and by expressing each covered flow as a **scenario** whose one
-description runs both as an asserting bats test and as a VHS demo
+description runs both as an asserting bats test and as a demo
 recording (`scripts/dev/agent-e2e/`, `docs/E2E.md`). The suite lives
 outside cargo/nextest (the repo's established shape for
 process-spawning e2e), reuses `scripts/dev/lib/sandbox-env.sh` for
@@ -1020,7 +1020,8 @@ and the demo tapes could drive but not assert. The HTTP boundary is the
 narrowest stable seam for an opaque real binary (proven against the
 pinned claude: plain-HTTP loopback, full tool loop, offline under a
 dead proxy). Steps are a thin dual-backend vocabulary (tmux send-keys /
-VHS tape lines), so test and demo cannot drift apart.
+tape lines replayed into a filmed tmux), so test and demo cannot drift
+apart.
 
 **Rejected**:
 

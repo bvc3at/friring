@@ -310,6 +310,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Check demo pacing budget
         run: node scripts/demo/lib/check-pacing.mjs docs/media/*.gif
+      # Fork (Friring): the agent-e2e clips are gated too, on the profile that
+      # relaxes ONLY the two metrics real agent latency explains (held frame,
+      # opening) to a measured ceiling. The size cap and the blank-final-frame
+      # backstop are not relaxed at all: neither becomes acceptable because
+      # there was an agent in the pane, and both catch defects a reviewer never
+      # would (a gif over GitHub's limit does not render; a leaked teardown is
+      # perfectly well-paced). See docs/media/fork/README.md.
+      - name: Check fork-clip pacing budget
+        run: node scripts/demo/lib/check-pacing.mjs --profile=agent docs/media/fork/*.gif
 
   install-script:
     name: Install Script Tests

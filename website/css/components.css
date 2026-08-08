@@ -234,6 +234,29 @@
   color: var(--yellow);
 }
 
+/* ---- Fork tag ----
+   Friring is a fork of Thurbox, and some features exist only here or behave
+   differently. This marks those on the landing cards and beside a docs
+   heading, so a reader comparing the two projects can tell which is which.
+   The chip never carries the claim on its own — the divergence is always
+   spelled out in the copy next to it. Smaller than .badge, since it sits
+   inline with a heading rather than on its own line. */
+.fork-tag {
+  display: inline-block;
+  vertical-align: middle;
+  margin-left: var(--space-sm);
+  padding: 0.1rem 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  font-weight: 400;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  border: 1px solid var(--green);
+  border-radius: 100px;
+  color: var(--green);
+}
+
 /* ---- Terminal frame (video panels + .tui-demo ASCII mockups) ---- */
 .terminal-frame,
 .tui-demo {

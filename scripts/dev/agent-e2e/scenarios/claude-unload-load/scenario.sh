@@ -8,12 +8,18 @@
 # persisted agent_session_id is unchanged, and a fresh second turn proves the
 # resumed conversation is live.
 #
-# Test-mode only (drives the friring-dev tmux server mid-steps and reads
-# session state via friring-cli; Alt+U has no VHS key); not demo-able.
+# Demo-able: Alt+U records through `<leader> U` (SCENARIO_DEMO_KEYS). The
+# mid-step friring-dev/friring-cli probes run at tape-generation time, where
+# they only read — the ghost-window poll times out harmlessly before the
+# recording starts.
 #
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Alt+U unloads claude to a frozen ghost; Enter loads it back via --resume with zero model calls"
 SCENARIO_AGENT="claude"
+# `<leader> U` is the fork's own second route to the same unload, and the one
+# that films: an Alt chord is invisible on camera, while the leader paints a
+# which-key overlay naming the action.
+SCENARIO_DEMO_KEYS=("M-u=C-f U")
 # The input-box prompt glyph — the stable "ready for input" marker across
 # claude 2.x permission modes (verified against 2.1.207).
 SCENARIO_AGENT_READY="❯"
@@ -30,14 +36,20 @@ ghost_wait_agent_window_gone() {
 scenario_steps() {
     step_wait_pane "$SCENARIO_AGENT_READY" 60
     step_sleep 1
-    step_type "This is the first ghost turn."
+    step_type "Bring the south capture ring back to full output."
     step_sleep 1
     step_key Enter
     # 'working|done': hook_state is overwritten in place, so a fast turn can
     # flip working->done between polls; done implies the turn ran.
     step_wait_state 'working|done' 30
-    step_wait_pane "GHOST-MARKER-ONE" 60
-    step_wait_state 'done' 60
+    step_wait_pane "RING-RESTORED" 60
+    # A longer demo beat here, and it is not pacing: the unload below kills
+    # claude, and what the load replays is the transcript on DISK. The reply is
+    # on screen before it is flushed, so a demo that only saw the marker paint
+    # can freeze a transcript holding turn 1's question and not its answer.
+    # Test mode gets the wait for free — it polls hook_state, which the agent
+    # signals after it has finished writing.
+    step_wait_state 'done' 60 2s
 
     # Captured BEFORE the unload so assert_effects can prove the load reused
     # the same conversation.
@@ -50,23 +62,23 @@ scenario_steps() {
     step_key M-u
     step_wait_pane "unloaded — Enter loads" 30
     ghost_wait_agent_window_gone
-    step_wait_pane "GHOST-MARKER-ONE" 10
+    step_wait_pane "RING-RESTORED" 10
 
     # Enter loads via the resume template; the replay is local (the journal
     # pins turn 1 to exactly one match).
     step_key Enter
     step_wait_pane "Session loaded" 30
     step_wait_pane "$SCENARIO_AGENT_READY" 120
-    step_wait_pane "GHOST-MARKER-ONE" 60
+    step_wait_pane "RING-RESTORED" 60
 
     step_sleep 1
-    step_type "Now the second ghost turn."
+    step_type "Now re-arm the drift alarm you muted."
     step_sleep 1
     step_key Enter
     # Safe after the load: it cleared hook_state, so turn 1's terminal
     # 'done' cannot satisfy this wait.
     step_wait_state 'working|done' 30
-    step_wait_pane "GHOST-MARKER-TWO" 60
+    step_wait_pane "ALARM-ARMED" 60
     step_wait_state 'done' 60
     step_sleep 2
 }
@@ -87,7 +99,7 @@ scenario_assert_effects() {
 }
 
 scenario_assert_ui() {
-    assert_pane_contains "GHOST-MARKER-TWO"
+    assert_pane_contains "ALARM-ARMED"
     [ "$(e2e_hook_state)" = "done" ] \
         || e2e_die "final hook_state '$(e2e_hook_state)' != done"
 }

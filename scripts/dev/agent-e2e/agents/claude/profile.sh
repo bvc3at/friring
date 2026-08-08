@@ -29,6 +29,16 @@ AGENT_STUB_DIALECT="anthropic"
 # The built-in hooks extension wires status signals for this agent, so
 # scenarios may assert working/done transitions (step_wait_state).
 AGENT_HAS_STATUS_HOOKS=1
+# ANTHROPIC_MODEL sets the id claude sends AND renders in its header, so a
+# fictional one keeps every clip free of a real product name (and dated in a
+# way a re-record would have to chase). Callers may pre-set it.
+#
+# The price of a model id claude has never heard of is that it cannot know the
+# context window, and since 2.1.224 it says so — six wrapped lines across the
+# top of the pane, on camera in every clip. agent_env answers the question
+# instead (CLAUDE_CODE_MAX_CONTEXT_TOKENS), which is the same fix the notice
+# itself suggests and true of the fictional models these fixtures play.
+AGENT_MODEL="${AGENT_MODEL:-fable-67}"
 # Bypass is safe here: throwaway workspace, loopback-only egress, dead-proxy
 # for everything else. Shared by agents.toml and the bare-tmux/-p smokes so
 # all three drive depths launch the binary identically.
@@ -70,6 +80,8 @@ agent_env() {
     cat <<EOF
 ANTHROPIC_BASE_URL=$AGENT_E2E_STUB_URL
 ANTHROPIC_AUTH_TOKEN=friring-e2e-dummy
+ANTHROPIC_MODEL=$AGENT_MODEL
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=200000
 CLAUDE_CONFIG_DIR=$HOME/claude-config
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 DISABLE_AUTOUPDATER=1

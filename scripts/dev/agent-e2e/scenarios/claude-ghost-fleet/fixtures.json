@@ -1,0 +1,30 @@
+{
+  "responses": [
+    {
+      "name": "ambient",
+      "ambient": true,
+      "match": { "modelContains": "haiku" },
+      "reply": { "text": "ok" }
+    },
+    {
+      "name": "fleet-turn",
+      "match": { "promptContains": "through the swap", "hasToolResult": false },
+      "delayMs": 150,
+      "reply": {
+        "text": "RING-HOLDING — south capture ring steady at 21.0C, swap window clear for 40 minutes."
+      }
+    },
+    {
+      "name": "fleet-after-load",
+      "match": { "promptContains": "while you were parked", "hasToolResult": false },
+      "delayMs": 150,
+      "reply": {
+        "text": "NO-DRIFT — the transcript came back intact and the band is still flat."
+      }
+    }
+  ],
+  "usage": {
+    "five_hour": { "utilization": 34, "resetsInMinutes": 161 },
+    "seven_day": { "utilization": 12, "resetsInMinutes": 5940 }
+  }
+}

@@ -384,6 +384,13 @@ fn union_signature(owned: &[(PathBuf, Option<CcJobState>)]) -> u64 {
     let mut job_states: Vec<&CcJobState> = Vec::new();
     for (dir, job) in owned {
         collect_dir_items(dir, &mut items);
+        // The v2.1.220 completion record is a sibling of `subagents/`
+        // (`<session>/workflows/<run_id>.json`, see build_workflow), so a run
+        // that completes after the last write under `subagents/` would not
+        // move this hash and would stay cached as Running.
+        if let Some(session_dir) = dir.parent() {
+            collect_dir_items(&session_dir.join("workflows"), &mut items);
+        }
         if let Some(j) = job {
             job_states.push(j);
         }
@@ -540,7 +547,20 @@ fn build_workflow(
     let journal = std::fs::read_to_string(run_dir.join("journal.jsonl"))
         .map(|s| parse_journal(&s))
         .unwrap_or_default();
+    // The completion record sits beside the run dir in older builds and one
+    // level up — `<session>/workflows/<run_id>.json`, a sibling of `subagents/`
+    // — in v2.1.220. Both are checked; whichever exists is authoritative.
     let completion = std::fs::read_to_string(wf_root.join(format!("{run_id}.json")))
+        .or_else(|_| {
+            std::fs::read_to_string(
+                wf_root
+                    .parent()
+                    .and_then(|subagents| subagents.parent())
+                    .unwrap_or(wf_root)
+                    .join("workflows")
+                    .join(format!("{run_id}.json")),
+            )
+        })
         .ok()
         .and_then(|s| parse_workflow_completion(&s));
     let status = if completion.is_some() {
@@ -694,13 +714,25 @@ fn workflow_mtime(wf: &CcWorkflow) -> u128 {
 
 /// Extract `<id>` from an `agent-<id>.jsonl` filename; `None` for anything else
 /// (including the sibling `agent-<id>.meta.json`).
+/// `agent-<id>.jsonl` (standalone `Task` subagents) or `agent-<id>.json`
+/// (workflow agents). Claude Code spells the two differently — verified
+/// against v2.1.220, where a workflow run writes `.json`/`.meta` while a
+/// standalone Task writes `.jsonl`/`.meta.json` — and `.meta*` must never be
+/// mistaken for a transcript, hence the explicit reject.
 fn agent_id_from(name: &str) -> Option<&str> {
-    name.strip_prefix("agent-")
-        .and_then(|r| r.strip_suffix(".jsonl"))
+    let rest = name.strip_prefix("agent-")?;
+    let id = rest
+        .strip_suffix(".jsonl")
+        .or_else(|| rest.strip_suffix(".json"))?;
+    (!id.ends_with(".meta")).then_some(id)
 }
 
 fn read_agent_meta(dir: &Path, id: &str) -> crate::session::cc_activity::CcMeta {
-    let s = std::fs::read_to_string(dir.join(format!("agent-{id}.meta.json"))).unwrap_or_default();
+    // Same split as agent_id_from: `.meta.json` beside a `.jsonl` transcript,
+    // bare `.meta` beside a workflow agent's `.json`.
+    let s = std::fs::read_to_string(dir.join(format!("agent-{id}.meta.json")))
+        .or_else(|_| std::fs::read_to_string(dir.join(format!("agent-{id}.meta"))))
+        .unwrap_or_default();
     parse_meta(&s)
 }
 
@@ -2073,6 +2105,42 @@ mod tests {
         assert_eq!(a.last_tool.as_deref(), Some("Read"));
     }
 
+    /// Same run as the test above, in Claude Code v2.1.220's spellings:
+    /// workflow agents are `agent-<id>.json` + a bare `agent-<id>.meta`, and
+    /// the completion record moved out of `subagents/` to
+    /// `<session>/workflows/<run_id>.json`.
+    #[test]
+    fn build_activity_reads_v2_1_220_workflow_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("subagents");
+        let wf = sub.join("workflows/wf_done/");
+        write(&wf.join("agent-x9.json"), "z\n");
+        write(
+            &wf.join("agent-x9.meta"),
+            r#"{"agentType":"workflow-subagent"}"#,
+        );
+        write(
+            &tmp.path().join("workflows/wf_done.json"),
+            r#"{"workflowName":"demo","status":"completed","phases":[{"index":1,"title":"Go"}],
+                "workflowProgress":[{"type":"workflow_agent","agentId":"x9","label":"the-agent","phaseTitle":"Go","state":"done","tokens":42,"toolCalls":3,"lastToolName":"Read","model":"m"}]}"#,
+        );
+
+        let act = build_activity(&sub, 0);
+        let w = &act.workflows[0];
+        assert_eq!(w.status, CcRunStatus::Completed);
+        assert_eq!(w.name.as_deref(), Some("demo"));
+        assert_eq!(w.phases.len(), 1);
+        let a = &w.agents[0];
+        assert_eq!(a.label.as_deref(), Some("the-agent"));
+        assert_eq!(a.phase_title.as_deref(), Some("Go"));
+        assert_eq!(a.state, CcAgentState::Done);
+        assert_eq!(a.tokens, Some(42));
+        assert_eq!(a.last_tool.as_deref(), Some("Read"));
+        // The only field sourced from the sidecar rather than the completion
+        // record — so this is what actually holds the bare-`.meta` spelling.
+        assert_eq!(a.agent_type, "workflow-subagent");
+    }
+
     #[test]
     fn dir_signature_moves_on_append_only() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2089,7 +2157,10 @@ mod tests {
     #[test]
     fn agent_id_from_filenames() {
         assert_eq!(agent_id_from("agent-abc123.jsonl"), Some("abc123"));
+        // Workflow agents (v2.1.220) drop the trailing `l`.
+        assert_eq!(agent_id_from("agent-abc123.json"), Some("abc123"));
         assert_eq!(agent_id_from("agent-abc123.meta.json"), None);
+        assert_eq!(agent_id_from("agent-abc123.meta"), None);
         assert_eq!(agent_id_from("journal.jsonl"), None);
     }
 

@@ -139,6 +139,7 @@ breadcrumb: 'Features'
 
           <h2 id="automations">
             Automations
+            <span class="fork-tag">Friring</span>
             <a href="#automations" class="heading-anchor">#</a>
           </h2>
           <div class="info-box">
@@ -146,6 +147,21 @@ breadcrumb: 'Features'
               <strong>Note:</strong>
               Automations are stable and good enough for daily use today, but the feature may still
               evolve.
+            </p>
+          </div>
+          <div class="info-box">
+            <p>
+              <strong>Changed from upstream.</strong>
+              Upstream Thurbox's scheduler fires one action that delivers one static string,
+              locally. This fork widened the model: an
+              <strong>ordered list</strong>
+              of prompts per fire (so a scheduled agent can be configured before it gets work), a
+              remote host to spawn on, a fresh session per run, sending by session
+              <em>name</em>
+              so the automation survives a recreate, and
+              <code>exec</code>
+              commands that run off the tick thread under a deadline instead of blocking the
+              render loop. Existing automations keep their old behavior.
             </p>
           </div>
           <p>
@@ -555,8 +571,24 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
 
           <h2 id="global-search">
             Global Search
+            <span class="fork-tag">Friring</span>
             <a href="#global-search" class="heading-anchor">#</a>
           </h2>
+          <div class="info-box">
+            <p>
+              <strong>Changed from upstream.</strong>
+              Upstream Thurbox docks the search as a full-width strip above the footer, which
+              shrinks the content area and so
+              <strong>resizes every visible session terminal</strong>
+              on open and close. This fork redesigns it after JetBrains&rsquo; Search Everywhere: a
+              centered popup that overlays instead, a double-
+              <code>Shift</code>
+              opener, and scope fixes (sessions match on working directory and on
+              <em>every</em>
+              worktree branch; the Files scope is pinned to the session that was active when you
+              opened it).
+            </p>
+          </div>
           <figure class="video-card">
             <div class="terminal-frame">
               <div class="terminal-body">
@@ -574,7 +606,7 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
               </div>
             </div>
             <figcaption>
-              One strip,
+              One popup,
               <code>Ctrl+/</code>
               , searching every scope at once.
             </figcaption>
@@ -582,12 +614,15 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
           <p>
             Press
             <code>Ctrl+/</code>
-            to open a non-modal search strip that searches
+            &mdash; or tap
+            <code>Shift</code>
+            twice &mdash; to open a centered popup that searches
             <strong>every scope at once</strong>
             &mdash; sessions, tasks, automations, and the active session's file tree. It is the one
             search: the old per-pane
             <code>/</code>
-            filters were folded into it.
+            filters were folded into it. It overlays the content rather than carving a band out of
+            it, so opening a search never reflows a running agent's terminal.
           </p>
           <ul>
             <li>
@@ -622,8 +657,22 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
 
           <h2 id="code-review">
             Code Review
+            <span class="fork-tag">Friring</span>
             <a href="#code-review" class="heading-anchor">#</a>
           </h2>
+          <div class="info-box">
+            <p>
+              <strong>Changed from upstream.</strong>
+              The review pane is upstream Thurbox's; the annotate &rarr; agent-fixes &rarr;
+              re-review loop around it is this fork's second version &mdash; see
+              <em>The feedback loop</em>
+              below, plus a
+              <code>Question</code>
+              comment class, reviewed marks that invalidate themselves when the content changes, a
+              staged-only target, untracked files in the working target, word-level intra-line
+              diffs, and range comments.
+            </p>
+          </div>
           <figure class="video-card">
             <div class="terminal-frame">
               <div class="terminal-body">
@@ -674,9 +723,11 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
             </li>
             <li>
               <strong>Comments.</strong>
-              Leave line, file, or review-summary comments classified as
-              <em>issue / suggestion / note / praise</em>
-              , composed inline at the line.
+              Leave line, file, range or review-summary comments classified as
+              <em>note / issue / suggestion / question / praise</em>
+              , composed inline at the line. A
+              <em>question</em>
+              asks the agent to answer rather than to change code.
             </li>
             <li>
               <strong>Mark reviewed &amp; fold.</strong>
@@ -694,12 +745,17 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
               shell view.
             </li>
             <li>
-              <strong>Feedback loop.</strong>
-              <code>y</code>
-              copies the review as markdown;
+              <strong>The feedback loop.</strong>
               <code>e</code>
-              sends the whole review back into the agent as a prompt to address it. (Submitting to
-              GitHub/GitLab is intentionally out of scope.)
+              sends the whole review back into the agent, and
+              <code>y</code>
+              copies the same thing. Both compile one record per comment carrying its id, class and
+              side:line anchor, and
+              <strong>quote the anchored diff line</strong>
+              so the agent can find the spot by searching rather than by trusting a line number
+              that its own edits are about to move. When the agent goes idle afterwards, a toast
+              offers to reload and re-review. (Submitting to GitHub/GitLab is intentionally out of
+              scope.)
             </li>
           </ul>
           <p>
@@ -750,6 +806,23 @@ ssh_opts = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"]
             <li>Vim-inspired keybindings throughout</li>
             <li>Tri-state focus system (Focused, Active, Inactive) with visual border feedback</li>
           </ul>
+          <div class="info-box">
+            <p>
+              <strong>Changed from upstream</strong>
+              <span class="fork-tag">Friring</span>
+              &mdash; the info panel is not always a column. Upstream Thurbox gives it a dedicated
+              one, so it needs 120 columns and costs the terminal about 15% of its width. Here
+              <code>info_panel_position</code>
+              can dock it
+              <strong>inline at the bottom of the sidebar</strong>
+              instead, which costs no terminal width and works from 80 columns up; the new default
+              (<code>auto</code>) picks whichever fits, and
+              <code>column</code>
+              is exactly upstream's behavior.
+              <code>Alt+L</code>
+              collapses the whole left column at any width.
+            </p>
+          </div>
           <figure class="video-card">
             <div class="terminal-frame">
               <div class="terminal-body">
@@ -1028,6 +1101,248 @@ auto_update = false   # opt-in: silently download+verify+replace binaries on sta
               </tr>
             </tbody>
           </table>
+
+          <h2 id="lazy-sessions">
+            Lazy Sessions &amp; Ghosts
+            <span class="fork-tag">Friring</span>
+            <a href="#lazy-sessions" class="heading-anchor">#</a>
+          </h2>
+          <div class="info-box">
+            <p>
+              <strong>Fork-only.</strong>
+              Upstream Thurbox restores every persisted session eagerly at startup &mdash; after a
+              reboot, when no pane survives, that is every agent CLI respawned serially before the
+              first frame. Here &ldquo;not running&rdquo; is a first-class state, and
+              <code>lazy_session_restore</code>
+              defaults to on.
+            </p>
+          </div>
+          <figure class="video-card">
+            <div class="terminal-frame">
+              <div class="terminal-body">
+                <!-- prettier-ignore -->
+                <video src="../assets/claude-ghost-fleet.mp4" autoplay loop muted playsinline preload="none">
+                  Four live agent sessions unloaded one by one, the fleet memory total falling to
+                  nothing, then one loaded back
+                </video>
+              </div>
+            </div>
+            <figcaption>
+              Four
+              <em>real</em>
+              Claude Code sessions frozen one at a time, then one loaded back.
+            </figcaption>
+          </figure>
+          <p>
+            An idle agent CLI is expensive &mdash; a measured ~333 MB of resident memory for
+            Claude Code, whether or not you wanted that session running. So a session whose agent
+            process is not running still holds its place in the list as a
+            <strong>ghost</strong>
+            : a greyed row whose pane shows the session's last saved frame, with no process and no
+            live tmux pane behind it.
+          </p>
+          <ul>
+            <li>
+              <strong>Lazy restore.</strong>
+              At startup, sessions whose tmux pane is gone come back as ghosts instead of
+              respawning agents before the first frame. Sessions with a live pane always adopt.
+              Set
+              <code>lazy_session_restore = false</code>
+              to respawn everything as upstream does.
+            </li>
+            <li>
+              <strong>Unload.</strong>
+              <code>Alt+U</code>
+              (or
+              <code>&lt;leader&gt; U</code>
+              ) saves the frame, kills the agent process, and swaps the ghost in place. The row,
+              the worktrees and the conversation all survive.
+            </li>
+            <li>
+              <strong>Load.</strong>
+              <code>Enter</code>
+              on a ghost respawns it through the normal resume path, in place &mdash; order, id and
+              injected identity intact.
+              <code>Alt+N</code>
+              /
+              <code>Alt+P</code>
+              cycle among loaded sessions only, skipping ghosts.
+            </li>
+            <li>
+              <strong>The saving is measured, not claimed.</strong>
+              Each live row shows the resident memory of its whole agent process tree &mdash; the
+              CLI plus every MCP server and tool it forked &mdash; with a
+              <code>&Sigma;</code>
+              fleet total under the list and a
+              <code>RAM</code>
+              line in the info panel. A ghost reads
+              <code>&mdash;</code>
+              : a measured absence, distinct from a remote session that cannot be measured, which
+              shows nothing rather than claiming a saving nobody observed. Turn the whole scan off
+              with
+              <code>[features] session_memory = false</code>
+              .
+            </li>
+          </ul>
+
+          <h2 id="agent-activity-view">
+            Agent Activity View
+            <span class="fork-tag">Friring</span>
+            <a href="#agent-activity-view" class="heading-anchor">#</a>
+          </h2>
+          <div class="info-box">
+            <p>
+              <strong>Fork-only.</strong>
+              It was the first feature this fork added; upstream Thurbox has nothing like it.
+            </p>
+          </div>
+          <figure class="video-card">
+            <div class="terminal-frame">
+              <div class="terminal-body">
+                <!-- prettier-ignore -->
+                <video src="../assets/claude-activity-view.mp4" autoplay loop muted playsinline preload="none">
+                  The F9 activity view: an Overview dashboard, a turn-grouped timeline, and a
+                  three-agent workflow
+                </video>
+              </div>
+            </div>
+            <figcaption>
+              <code>F9</code>
+              &mdash; the Overview dashboard, then the turn-grouped Timeline.
+            </figcaption>
+          </figure>
+          <p>
+            <code>F9</code>
+            opens a view that reconstructs
+            <strong>what this session's agent actually did</strong>
+            &mdash; every shell command it ran, file it edited or read, web search it made, and
+            subagent it delegated to &mdash; by reading whatever the agent CLI already persists on
+            disk. Nothing is injected into the agent and nothing new is written, so it works on a
+            conversation that started before you opened the view. Local sessions only; gated by
+            <code>[features] cc_activity</code>
+            .
+          </p>
+          <ul>
+            <li>
+              <strong>Overview.</strong>
+              A dashboard: agent, provider and model; a token line that folds in every subagent and
+              workflow transcript; stat tiles per tool kind (with a failure tile only when
+              something failed); an events-over-session sparkline; the hottest files, the
+              most-repeated commands, the newest actions, and the last error with the head of its
+              result.
+            </li>
+            <li>
+              <strong>Timeline.</strong>
+              Every event in order, grouped by
+              <strong>turn</strong>
+              : each user prompt is a header and its events sit in a gutter beneath it, with
+              subagent work nested under a dim origin badge. Repeats fold to one
+              <code>&times;N</code>
+              row, and rows carry call&rarr;result durations.
+            </li>
+            <li>
+              <strong>Commands &middot; Files &middot; Web &middot; Agents.</strong>
+              The same events filtered to one kind.
+              <em>Agents</em>
+              also nests the live and historical workflow/subagent tree, each with its full
+              transcript.
+            </li>
+          </ul>
+          <p>
+            Twelve agent CLIs are supported &mdash; claude, codex, gemini, qwen, copilot, vibe,
+            cursor-agent, opencode, goose, crush, aider and cline &mdash; dispatched by the command
+            name in your
+            <code>agents.toml</code>
+            . An agent whose store cannot be read says
+            <em>why</em>
+            in the Overview rather than rendering empty. The formats are undocumented and
+            version-specific, so every parser degrades to partial data instead of erroring.
+          </p>
+
+          <h2 id="leader-key">
+            Leader Key
+            <span class="fork-tag">Friring</span>
+            <a href="#leader-key" class="heading-anchor">#</a>
+          </h2>
+          <div class="info-box">
+            <p>
+              <strong>Fork-only.</strong>
+              Upstream Thurbox dispatches every global command from a direct
+              <code>Ctrl+&lt;letter&gt;</code>
+              chord and has no prefix concept.
+              <code>[prefix] mode = "off"</code>
+              reproduces that exactly.
+            </p>
+          </div>
+          <figure class="video-card">
+            <div class="terminal-frame">
+              <div class="terminal-body">
+                <!-- prettier-ignore -->
+                <video src="../assets/scripted-leader-key.mp4" autoplay loop muted playsinline preload="none">
+                  Arming the leader key and running a command from its which-key overlay
+                </video>
+              </div>
+            </div>
+            <figcaption>
+              <code>Ctrl+F</code>
+              arms the prefix; the overlay names what the next key will do.
+            </figcaption>
+          </figure>
+          <p>
+            The Ctrl namespace ran out: every bare
+            <code>Ctrl+&lt;letter&gt;</code>
+            is bound or reserved, the function keys are spent, and several chords Friring holds are
+            ones the agent CLI wants back (
+            <code>Ctrl+L</code>
+            clear screen,
+            <code>Ctrl+Z</code>
+            suspend,
+            <code>Ctrl+V</code>
+            image paste). A tmux-style leader buys a whole fresh namespace from one key.
+          </p>
+          <ul>
+            <li>
+              <strong>Which-key overlay.</strong>
+              Arming paints a grouped table of everything reachable, and the next key runs it. There
+              is no timeout &mdash; Friring is normally driven over SSH, where a timeout turns
+              &ldquo;I paused to read&rdquo; into a keystroke sent to the agent.
+              <code>Esc</code>
+              cancels.
+            </li>
+            <li>
+              <strong>Learnable by construction.</strong>
+              Each leader key mirrors that action's own Ctrl letter, so
+              <code>Ctrl+N</code>
+              becomes
+              <code>&lt;leader&gt; n</code>
+              .
+            </li>
+            <li>
+              <strong>Jump by number.</strong>
+              <code>&lt;leader&gt; 1</code>
+              &ndash;
+              <code>9</code>
+              selects a session and
+              <code>&lt;leader&gt; a</code>
+              plus a digit jumps to the Nth
+              <em>blocked</em>
+              one &mdash; a route that works where
+              <code>Alt+&lt;digit&gt;</code>
+              cannot, since most Linux terminals claim it for their own tabs and macOS terminals
+              ship Option-as-Meta off.
+            </li>
+            <li>
+              <strong>Three modes.</strong>
+              <code>off</code>
+              is upstream's behavior,
+              <code>both</code>
+              (the default) adds the leader alongside the direct chords, and
+              <code>prefix-only</code>
+              disables the direct global chords so every bare
+              <code>Ctrl+&lt;letter&gt;</code>
+              reaches the agent CLI untouched.
+            </li>
+          </ul>
 
           <h2 id="headless-cli">
             Headless CLI

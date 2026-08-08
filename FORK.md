@@ -302,6 +302,13 @@ The built-in review view grows the annotate → agent-fixes → re-review loop:
   comment. The harness gained an optional `scenario_prepare()` hook for
   post-boot workspace state (an uncommitted edit for the Working target).
 
+That scenario is also the clip: a classified comment saved on a diff line, `e`
+compiling it into the structured record, a real Claude Code instance receiving
+it and editing the file, the re-review nudge on its idle edge, and the reopened
+review still holding the comment on its anchor.
+
+![Leaving a classified review comment and sending the structured handoff to a real agent](docs/media/fork/claude-review-loop.gif)
+
 #### Agent activity view (F9)
 
 *The first Friring feature (#1), redesigned in July 2026 into an
@@ -362,8 +369,9 @@ sessions only.
 - **Find-in-transcript (`/`).** Incremental find with in-place match
   highlighting, mirroring the code-review / file-viewer find.
 
-Implementation notes (this is a fork-only feature, so its detail lives here
-rather than in `docs/FEATURES.md`):
+What the view *is* — sections, keys, the supported agents, the clip — is
+`docs/FEATURES.md` → *Agent activity view*, alongside every other user-facing
+feature. The implementation stays here, since it is fork-only:
 
 - **Three data homes.** `SessionInfo.cc_activity` is the lightweight Claude
   **tree index** (workflows + agents + standalone subagents; ids, agentType,
@@ -639,7 +647,7 @@ Code is the proven reference) inside a Friring-managed pane with the **model
 API stubbed on loopback** — zero-dep node sidecars speaking each wire dialect
 from hand-curated semantic fixtures. One scenario description runs both as an
 asserting bats test (`just agent-e2e`; three drive depths: the agent's own
-print/exec mode → bare-tmux interactive → full Friring TUI) and as a VHS demo
+print/exec mode → bare-tmux interactive → full Friring TUI) and as a demo
 recording (`just agent-demo <scenario>`). Ships with a path-gated,
 **non-blocking** `agent-e2e` CI job that installs a pinned claude binary, and
 one small CLI addition: `session get/list --json` now expose the raw
@@ -670,6 +678,207 @@ attention navigation). Two harness additions keep that hermetic: a
 echoes stdin back, giving fast model-free scenarios that never skip — and a
 seeded sandbox `settings.toml` (`[features] notifications = false`) so
 blocked-state tests can never fire a real desktop banner. See `docs/E2E.md`.
+
+**The demo half of that promise was mostly untested** — one scenario
+description, two outputs only holds if the second output is exercised, and
+until a clip was asked of every fork feature, `--demo` had been run against a
+handful of plain-text scenarios. Recording the whole set found defects that all
+produced a recording which *completed*, and eventually condemned the renderer
+itself.
+
+Three were in the generator and are fixed where they stood:
+
+- **An unmappable key was dropped, not refused.** `step_key` returned 1 into a
+  flat step list that checks nothing, so the keypress silently went missing and
+  the tape ran on — `claude-activity-view` was recording a clip of the activity
+  view that never pressed F9.
+- **Every wait a scenario meant as a regex was flattened to a literal.** Test
+  mode greps (BRE), demo mode matched a different dialect, and the generator
+  escaped the pattern wholesale — so `edit.*activity-proof.txt` waited for a
+  literal `.` and `*`. The dialects already agree on everything these patterns
+  use, so only the characters BRE takes literally and the other does not
+  (`+?(){}|`, plus the `/` delimiter) are escaped now.
+- **The canvas ignored `SCENARIO_COLS`.** Geometry was pinned whatever the
+  scenario declared, so a 220-column scenario recorded against ~128 columns and
+  its waits looked for text the pane had truncated.
+
+The rest were VHS, and there is no fixing them from outside it. It screenshots
+a headless Chromium and writes the gif at the *nominal* rate whatever it managed
+to grab, so a starved capture does not degrade quality — it **compresses time**,
+silently. At 1920x1080, eight seconds of scripted `Sleep` recorded as 0.84s (21
+frames); the first sixteen clips came out 1-4s long against 9-18s of scripted
+pacing. It is purely canvas area (700x300 records the full 8s), which bought a
+framerate derived from a measured pixel-rate budget — and ~5fps is also why
+typing arrived in visible chunks of five or six characters, a paste rather than
+a person. `Wait` captured nothing at all while it blocked, so a generated tape,
+which is mostly waits, jump-cut past every part where the app was working. Its
+key grammar overstates what it sends: captured against a pty, `Alt+<letter>`
+parses and emits the *bare capital* (a tape with `Alt+U` in it records cleanly
+while typing `U` into the agent) and `Ctrl+Alt+<letter>` parses and emits
+nothing. And its browser cached under the *throwaway* sandbox `$HOME`, so every
+single recording re-downloaded ~150MB.
+
+**So the generated demos now record the way the shipped ones always have.**
+`scripts/demo` had the right pipeline all along: asciinema captures the TUI's
+terminal *byte stream* and agg renders it offline, so capture costs nothing,
+every paint keeps its true timestamp, and the render can take as long as it
+likes. `e2e_demo_record` boots the TUI in the driver tmux, films an attached
+client, and replays the generated tape through `scripts/demo/lib/drive-tape.mjs`
+— the same driver, the same font and palette, one product on screen. What that
+buys beyond fidelity:
+
+- **Typing is typing again** — 30fps and 16ms/character, against ~5fps and an
+  effective ~70ms before. (`drive-tape.mjs` now charges each keystroke's own
+  `tmux send-keys` spawn against the interval instead of adding to it; at
+  10-20ms a spawn it was typing every tape at half its nominal speed, the
+  shipped ones included.)
+- **Waits film, and they fail the take.** A `Wait /re/` polls the same pane the
+  asserting test polls, so the clip carries the app's real latency — spinner,
+  boot, turn — and an unmet wait aborts the recording by line number instead of
+  yielding a clip that ran to the end having skipped what it came to film.
+- **The demo presses what the test presses.** A new `Key <tmux-key>` tape line
+  hands the name straight to `tmux send-keys`, so the translation table is gone
+  and with it every key that was unrecordable. `SCENARIO_DEMO_KEYS` survives as
+  an *editorial* choice rather than a workaround — an Alt chord is invisible on
+  camera, so `"M-u=C-f U"` unloads through the fork's leader and the which-key
+  overlay shows the viewer what was pressed.
+- **`step_leader <key>`** presses the leader as two keystrokes with a beat
+  between them. Test mode gets that gap for free (each `step_key` is its own
+  process); a tape does not, and it is also the only reason the which-key
+  overlay is ever on camera.
+- No framerate to derive, and `check-pacing.mjs` demoted to a **report**: its
+  budget assumes a seeded TUI with no agent latency, and here a held frame is
+  usually a real CLI booting.
+
+And one scenario bug, found only because a demo shows what a green test hid:
+`claude-review-export` waited for a saved comment to render `[Issue]` when the
+default classification is `Note`. That never matched — but a `step_wait_pane`
+timeout is not checked by the flat step list either, so in test mode it
+degraded to a silent 15s sleep and the scenario stayed green on its remaining
+asserts (bats hides a passing test's stderr, so the timeout line went unread).
+Worth knowing when reading any scenario: **a stale wait costs time, not a red
+test**, so `step_wait_pane` is a synchronization primitive and not, on its own,
+an assertion.
+
+**One ghost is unreadable; a fleet of them is not — and the point is the
+number.** `scripted-unload-ghost` proves the mechanism on a single session,
+which makes it a good test and an unwatchable clip: a frozen frame looks exactly
+like an idle one. `claude-ghost-fleet` films the claim instead, on **four real
+Claude Code processes**, because the reason lazy sessions exist is that an idle
+agent CLI is expensive and only a real one has that cost. With per-session
+memory on the rows (`feat(ui)`, #48) the clip can show the saving rather than
+assert it: four live trees at `Σ 1.3G`, then three, then two, then a sidebar of
+greyed rows each reading `—` and **no total at all**, then one loaded back
+through `--resume` with its conversation intact. The info panel is open
+throughout, because the badge is a number and the panel is what the number
+means: `RAM 320.9 MB  7 procs` is the CLI plus every MCP server and tool it
+forked, and on a ghost it reads `—` beside a 0% CPU bar. Its account-usage
+gauges are stubbed the way `scripts/demo/record.sh` stubs them — a scenario
+opts in by declaring a top-level `usage` fixture, which points the fetch at the
+loopback stub and seeds a fictional OAuth token at `$HOME/.claude`, never under
+`CLAUDE_CONFIG_DIR`, so the CLI itself goes on using its own auth — otherwise
+every clip that opens the panel films "not logged in". It navigates by
+*cycling* rather than `<leader> <n>` because the rendered order shifts as
+sessions unload.
+
+**A fork needs two branches on camera.** `claude-fork` was renamed
+`claude-lineage` for a blunt reason — the scenario name is the session name, so
+the child rendered as `claude-fork-fork` — but the substantive change is that
+both branches now take a turn of their own. A clip that stops after the child's
+reply has filmed a copy, not a fork; the child answers a question the parent
+never asked, the parent then answers one the child never saw, and a
+never-matching `fork-context-leak` fixture asserts at the wire that no request
+ever carried both.
+
+**A stub can drive a whole multi-agent workflow.** The Agents half of the F9
+view first filmed as "No workflows or subagents yet", and the assumption that a
+real workflow simply could not run offline — its agents each talk to the model
+API — turned out to be wrong on inspection. The stub answers the turn with a
+`Task` or `Workflow` `tool_use`; the real claude binary runs it; every agent
+inside calls back into the same loopback stub; and Claude Code writes the run to
+disk itself. `claude-activity-view` now films a genuine three-agent, two-phase
+workflow, and the one extra piece of traffic it needs is an ambient fixture for
+the system-notification turn a *backgrounded* workflow posts back into the main
+conversation when it finishes.
+
+Doing that surfaced a **parser drift** the seeded stand-in had been hiding.
+Against Claude Code v2.1.220 a workflow writes its agents as
+`agent-<id>.json` + `agent-<id>.meta` (a standalone `Task` subagent still writes
+`.jsonl` + `.meta.json`), and the completion record moved from
+`subagents/workflows/<run>.json` up to `<session>/workflows/<run>.json`. friring
+read only the older spelling, so a real workflow rendered as nothing at all —
+the exact failure mode `session::cc_activity`'s "degrades to partial data"
+promise is meant to make visible, and didn't, because there was no scenario
+driving a real one. Both spellings and both locations are read now, and the
+scenario is the regression test.
+
+Three choices make the resulting clips presentable rather than merely correct.
+Generated demos default to the **`doom`** theme, so a set of them reads as one
+product. Scenario prompts, stub replies and model ids follow
+`demo-content.json`'s register — planetary infrastructure treated as routine ops,
+answered by `fable-67` / `gpt-6.2` / `tempest-oss-140b` — which is not decoration:
+a fictional model id keeps a real product name off camera and off a clip that
+would otherwise date itself. (Claude Code 2.1.224 charges six lines of pane for
+that: it cannot know an unknown model's context window and says so, so the
+profile answers with `CLAUDE_CODE_MAX_CONTEXT_TOKENS`.) And the hermetic sandbox
+moved from `$TMPDIR` to `/tmp`, because macOS's per-user `$TMPDIR` is ~60
+characters before the workspace even starts, and that path is *on camera*
+whenever an agent names a file it wrote. It also set how wide a pane a scenario
+needed to read a filename off that path: `claude-activity-view` asked for 220
+columns for exactly this reason and now runs — and records — at the default,
+which is `record.sh`'s 175x42 so that a generated clip and a shipped one are the
+same 1918x1084 frame. Two smaller things only a fresh eye catches: the seeded
+plan tier is `max`, and `trim-cast.mjs` rewrites U+00A0 to a plain space —
+Claude Code pads with no-break spaces and agg is alone in drawing one, because
+Meslo has no glyph for it and the fallback chain answers with a Nerd Font icon
+that overlaps the character after it (`❯▲`, `⎿▲Wrote`).
+
+The structural limit this also pinned down: everything in `scenario_steps` that
+is not a `step_*` runs at tape-**generation** time. One-shot setup lands before
+the first frame and records fine, but a scenario whose *narrative* is a mid-step
+mutation or poll — `scripted-blocked-attention` signalling sessions blocked one
+after another, `scripted-theme-settings` rewriting `settings.toml` to watch it
+live-reload — collapses into its own prologue and stays test-only. Its subtler
+consequence cost a recording each: generation runs **before** the TUI boots in
+demo mode and **while it is already running** in test mode, and the TUI focuses
+the terminal when it boots with a session (the list when it boots empty) and
+opens on the *last* session in the DB. A fleet scenario that creates its
+siblings in the steps therefore starts on a different session, with a different
+focus, in each mode — so it precreates one session, waits on the footer's focus
+field, and jumps to a known row before its first relative move.
+
+**Seven of the clips ship; the rest were recorded and left out.** They live in
+`docs/media/fork/`, each linked from the doc it illustrates — the ghost fleet,
+the F9 activity view and the leader key from `docs/FEATURES.md`, the named
+workspace and the review handoff from the two sections above, and the pair of
+text turns from `docs/E2E.md`. What was dropped was dropped for a reason worth
+recording: `claude-lineage` and `claude-unload-load` film features that already
+have a shipped clip or a better one (`friring-fork.gif`; `claude-ghost-fleet`
+supersedes the single-session ghost), `scripted-global-search` shows a popup
+`search-demo.gif` already shows, `claude-restart-resume` films upstream
+behavior, and the wizard, automation and extension clips duplicate media
+`scripts/demo` records. Every one is a `just agent-demo <scenario>` away if a
+doc later needs it; `docs/media/fork/README.md` keeps the list.
+
+`docs/media/fork/` is gated too, on its own profile
+(`check-pacing.mjs --profile=agent`, a second `demo-pacing` step). Exempting the
+directory wholesale was the first attempt and was too blunt: it also switched
+off the 10MB size cap and the blank-final-frame backstop, neither of which has
+anything to do with agent latency and both of which catch a defect no reviewer
+would (a gif GitHub refuses to render; a leaked teardown, which is perfectly
+well-paced). So only the held frame and the opening are relaxed, to ceilings
+measured across the seven clips rather than switched off.
+
+The opening is the interesting one. Filming an agent *boot* is not "the app
+being honestly slow" — the pane is empty, and it lands on the frame that is the
+README preview. `opencode-text-turn` opened on **3.54s of blank pane, 40% of the
+clip**. So the recorder gained an off-camera pre-roll
+(`SCENARIO_DEMO_PREROLL`, defaulting to the scenario's own agent-ready marker)
+that lets the CLI finish booting before the camera starts. That is not a hole in
+"waits film, and they fail the take": those are the waits *inside* the tape,
+where the latency filmed is the app doing the thing the clip came to show. With
+the pre-roll — and with the scenario's now-redundant one-second settle beat
+removed — that clip opens on a painted pane at 2.02s and the whole set passes.
 
 #### Stub-driven demo recordings (`scripts/demo/`)
 
@@ -897,6 +1106,12 @@ flow away. The fork rebuilds the flow:
   the `claude-named-workspace` agent-e2e scenario drives the whole flow —
   wizard keys, agent writing through the symlinks, persistence, guarded
   delete — against the real Claude Code binary (`docs/E2E.md`).
+
+That last one, filmed by its own scenario — `Ctrl+O` opening the second field,
+a name typed into it, and the agent afterwards writing through the symlinks at
+the directory it names rather than at a UUID:
+
+![Naming a multi-repo session's workspace directory from the wizard's name step](docs/media/fork/claude-named-workspace.gif)
 
 Keys and flow are documented in `docs/FEATURES.md`; the back-navigation
 interplay with ADR-P12 in `docs/PERFORMANCE.md`.
@@ -1442,6 +1657,17 @@ real Claude turn and the stub's usage route.
     ship landing CSS to docs pages and vice versa. `core.css` is generated
     output: it is never edited, never passthrough-copied, and only the four
     sources are.
+- **`docs/FEATURES.md` marks its divergences.** The feature reference reads as
+  one document about one app, which made it impossible to tell which behavior a
+  reader could expect from upstream. Sections that differ now open with one of
+  two tags — **Friring — fork-only** or **Friring — changed** — naming the
+  divergence in a line and linking the section here that carries the reasoning.
+  The convention is stated at the top of the file; an untagged section is
+  shared with upstream. Two fork-only features that had never appeared there at
+  all, the **F9 activity view** and the **ghost fleet** side of lazy sessions,
+  are now documented as features rather than only as fork notes, and the
+  website carries the same tag as a chip. This file stays the single place the
+  divergences are *tracked*; the tags are signposts to it.
 - `README.md` and the agent-guide prose call the project **Friring**, and so do
   the install commands; what still points at upstream is attribution and the
   shared formats above.

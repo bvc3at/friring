@@ -33,7 +33,7 @@
 // after all — see openingHold() for why frame delay cannot see it and why
 // freezedetect's blind spot does not apply there.
 //
-// Usage: check-pacing.mjs <file.gif> [...] [--json]
+// Usage: check-pacing.mjs <file.gif> [...] [--json] [--profile=agent]
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -71,6 +71,34 @@ const BUDGET = {
   // a good final frame is 3.4-9.0% ink and a leaked teardown is 0.013%.
   finalFrameInk: 0.005,
 };
+
+// `--profile=agent`: the budget for a clip recorded by the agent-e2e harness,
+// which films a REAL agent CLI rather than a seeded TUI.
+//
+// Only the two metrics that agent latency actually explains are relaxed, and
+// they are relaxed to a measured ceiling rather than switched off. The other
+// two are not relaxed at all: a gif over GitHub's limit does not render, and a
+// blank final frame is a leaked teardown — neither becomes acceptable because
+// there was an agent in the pane.
+//
+//   pauseMax 3.0 — across the seven shipped fork clips the worst held frame
+//   sits at 0.68-2.04s, and every one of those is a CLI booting or answering.
+//   3.0s clears that with headroom while still catching the class of stall the
+//   budget exists to kill (the pre-`Wait` audit found 3.81s).
+//
+//   opening 2.5 — the one metric worth being explicit about, because it is
+//   NOT relaxed for the "agent is slow" reason. A slow opening is not the app
+//   working: the pane is empty while the CLI boots, and the viewer is looking
+//   at a blank terminal. The recorder's pre-roll (SCENARIO_DEMO_PREROLL) keeps
+//   that boot off camera instead, so the reason this cap is higher than the
+//   default 0.75s is the measurement, not the excuse: this pipeline's filmed
+//   floor is ~1.7s (asciinema attach + the settle poll + node's startup before
+//   drive-tape.mjs sends its first key), on top of which openingHold() charges
+//   the prompt being typed, since freezedetect cannot separate typing from a
+//   hold — its own header says so. Measured against that floor the six clips
+//   whose openings are clean land at 0.20-2.02s, while the blank-pane defect
+//   this caught measured 2.93-3.54s. 2.5s is the line between them.
+const AGENT_BUDGET = { pauseMax: 3.0, pauseTarget: 1.0, opening: 2.5, openingTarget: 1.5 };
 
 // Per-frame delays, in seconds, from the gif's Graphic Control Extensions.
 // GCE layout: 21 F9 04 <flags> <delay-lo> <delay-hi> <transparent-idx> 00.
@@ -253,9 +281,11 @@ function violations(m) {
 
 const args = process.argv.slice(2);
 const asJson = args.includes('--json');
+const profile = args.includes('--profile=agent') ? 'agent' : 'default';
+if (profile === 'agent') Object.assign(BUDGET, AGENT_BUDGET);
 const files = args.filter((a) => !a.startsWith('--'));
 if (!files.length) {
-  console.error('usage: check-pacing.mjs <file.gif> [...] [--json]');
+  console.error('usage: check-pacing.mjs <file.gif> [...] [--json] [--profile=agent]');
   process.exit(2);
 }
 
@@ -270,8 +300,16 @@ try {
 }
 
 if (asJson) {
-  console.log(JSON.stringify({ budget: BUDGET, results }, null, 2));
+  console.log(JSON.stringify({ profile, budget: BUDGET, results }, null, 2));
 } else {
+  // Name the profile: the same clip passes under one and fails under the other,
+  // so a bare table of numbers cannot be read without knowing which applied.
+  if (profile !== 'default') {
+    console.log(
+      `profile: ${profile} (held frame <= ${BUDGET.pauseMax}s, opening <= ${BUDGET.opening}s; ` +
+        `size and final-frame checks unchanged)`
+    );
+  }
   const w = Math.max(...results.map((r) => path.basename(r.file).length));
   console.log(
     `${'clip'.padEnd(w)}  ${'dur'.padStart(6)} ${'fps'.padStart(5)} ` +

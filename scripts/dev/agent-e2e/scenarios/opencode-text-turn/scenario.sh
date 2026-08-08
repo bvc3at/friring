@@ -9,19 +9,21 @@
 # shellcheck disable=SC2034,SC2317  # vars/functions are consumed by lib/harness.sh
 SCENARIO_SUMMARY="Real opencode text turn rendered through Friring, model stubbed"
 SCENARIO_AGENT="opencode"
-SCENARIO_PROMPT="Say the ready phrase now."
+SCENARIO_PROMPT="Move ocean-current balancing off the legacy cron box."
 # The input-box footer renders "Build · <model> <provider>" once the TUI is
 # interactive — the stable ready marker (verified against opencode 1.17.15).
 SCENARIO_AGENT_READY="Build ·"
-SCENARIO_DONE_PATTERN="FRIRING-E2E-READY"
+SCENARIO_DONE_PATTERN="CRON-CUTOVER-STAGED"
 
 scenario_steps() {
+    # No settle beat after this wait: the recorder's pre-roll already waits for
+    # this same marker off camera, so a `step_sleep` here would hold the opening
+    # frame for a second with nothing happening on it.
     step_wait_pane "$SCENARIO_AGENT_READY" 60
-    step_sleep 1
     step_type "$SCENARIO_PROMPT"
     # Sync on the composer echo before Enter (step_sleep is a no-op in test
     # mode, so Enter would otherwise race the composer).
-    step_wait_pane "ready phrase" 30
+    step_wait_pane "legacy cron box" 30
     step_key Enter
     step_wait_pane "$SCENARIO_DONE_PATTERN" 60
     step_sleep 2

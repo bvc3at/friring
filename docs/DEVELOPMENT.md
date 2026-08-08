@@ -215,8 +215,9 @@ The TUI has three layers of end-to-end coverage:
 - **Real-agent e2e** (`scripts/dev/agent-e2e/`, `just agent-e2e`). A *real*
   agent binary (Claude Code is the reference) inside a Friring-managed pane,
   with the model API stubbed on loopback — hermetic, deterministic, offline.
-  One scenario description drives both the asserting bats suite and a VHS demo
-  recording (`just agent-demo <scenario>`). Not part of `cargo nextest`; runs
+  One scenario description drives both the asserting bats suite and a demo
+  recording (`just agent-demo <scenario>`, rendered the same way the shipped
+  clips are). Not part of `cargo nextest`; runs
   via the non-blocking `agent-e2e` CI job and skips cleanly when the agent
   binary is missing. Architecture, scenario/agent-profile contracts, and the
   conformance status live in **`docs/E2E.md`** (decision record: ADR-23).
@@ -373,8 +374,9 @@ scripts/demo/record.sh theme automations   # re-record a subset
 
 Real-agent e2e scenarios are demo-able too: `just agent-demo <scenario>`
 records the same scenario the asserting suite runs — real agent, stubbed model,
-deterministic `Wait+Screen` sync — into `target/agent-e2e/demos/` (see
-`docs/E2E.md`).
+waits that poll the same pane the test polls — into `target/agent-e2e/demos/`.
+It goes through the pipeline below (asciinema + `drive-tape.mjs` + agg), off a
+generated tape rather than a hand-written one (see `docs/E2E.md`).
 
 `record.sh` records every video pair in one pass: the combined hero demo
 (`friring-demo.*` via `agents.tape`), one clip per feature

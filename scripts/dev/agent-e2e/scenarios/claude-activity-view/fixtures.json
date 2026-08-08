@@ -3,31 +3,103 @@
     {
       "name": "ambient",
       "ambient": true,
-      "match": { "modelContains": "haiku" },
-      "reply": { "text": "ok" }
+      "match": {
+        "modelContains": "haiku"
+      },
+      "reply": {
+        "text": "ok"
+      }
+    },
+    {
+      "name": "bg-notification",
+      "ambient": true,
+      "match": {
+        "anyUserContains": "SYSTEM NOTIFICATION"
+      },
+      "reply": {
+        "text": "Noted \u2014 the audit finished."
+      }
     },
     {
       "name": "activity-write-call",
-      "match": { "promptContains": "activity-proof.txt", "hasToolResult": false },
+      "match": {
+        "promptContains": "drift.md",
+        "hasToolResult": false
+      },
       "delayMs": 100,
       "reply": {
-        "text": "Writing activity-proof.txt now.",
+        "text": "Writing drift.md now.",
         "toolUse": {
           "id": "toolu_e2e_activity_1",
           "name": "Write",
           "input": {
-            "file_path": "{{WS}}/activity-proof.txt",
-            "content": "activity!\n"
+            "file_path": "{{WS}}/drift.md",
+            "content": "capture ring clamped to 92%\n"
           }
         }
       }
     },
     {
       "name": "after-activity-write",
-      "match": { "toolResultFor": "toolu_e2e_activity_1" },
+      "match": {
+        "toolResultFor": "toolu_e2e_activity_1"
+      },
       "delayMs": 150,
       "reply": {
-        "text": "ACTIVITY-TURN-DONE — activity-proof.txt was written by a real tool round-trip."
+        "text": "DRIFT-CONTAINED \u2014 clamped the southern ring to 92% and logged it to drift.md. No pause needed."
+      }
+    },
+    {
+      "name": "wf-ring",
+      "match": {
+        "anyUserContains": "WF-RING"
+      },
+      "reply": {
+        "text": "Sampled the southern ring: 0.4 ppm overshoot after the filter swap."
+      }
+    },
+    {
+      "name": "wf-filter",
+      "match": {
+        "anyUserContains": "WF-FILTER"
+      },
+      "reply": {
+        "text": "Both filter units are back and within spec."
+      }
+    },
+    {
+      "name": "wf-setpoint",
+      "match": {
+        "anyUserContains": "WF-SETPOINT"
+      },
+      "reply": {
+        "text": "Clamp the ring to 92%. No pause needed."
+      }
+    },
+    {
+      "name": "workflow-call",
+      "match": {
+        "promptContains": "drift audit workflow",
+        "hasToolResult": false
+      },
+      "reply": {
+        "text": "Running the drift audit across the ring.",
+        "toolUse": {
+          "id": "toolu_e2e_wf_1",
+          "name": "Workflow",
+          "input": {
+            "script": "export const meta = {\n  name: 'drift-audit',\n  description: 'Survey the capture ring, then contain the drift',\n  phases: [{ title: 'Survey' }, { title: 'Contain' }],\n}\nphase('Survey')\nawait parallel([\n  () => agent('WF-RING: report the southern ring telemetry in one line.', {label: 'ring-telemetry'}),\n  () => agent('WF-FILTER: report the filter fleet status in one line.', {label: 'filter-fleet'}),\n])\nphase('Contain')\nawait agent('WF-SETPOINT: propose the setpoint clamp in one line.', {label: 'setpoint-model'})\nreturn 'audited'\n"
+          }
+        }
+      }
+    },
+    {
+      "name": "after-workflow",
+      "match": {
+        "toolResultFor": "toolu_e2e_wf_1"
+      },
+      "reply": {
+        "text": "WORKFLOW-AUDIT-DONE \u2014 three agents across two phases; the clamp holds."
       }
     }
   ]

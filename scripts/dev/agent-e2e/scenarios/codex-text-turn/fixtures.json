@@ -2,8 +2,8 @@
   "responses": [
     {
       "name": "text-turn",
-      "match": { "promptContains": "ready phrase" },
-      "reply": { "text": "FRIRING-E2E-READY — stubbed codex turn complete." }
+      "match": { "promptContains": "Re-enable the moon" },
+      "reply": { "text": "MOON-BACK-ONLINE — the registry flag is flipped. Tides recompute on the next pass." }
     }
   ]
 }

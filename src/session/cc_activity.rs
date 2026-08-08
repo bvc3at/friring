@@ -9,10 +9,16 @@
 //! - `subagents/agent-<id>.jsonl` (+ `agent-<id>.meta.json`) — a standalone
 //!   `Task`-tool subagent.
 //! - `subagents/workflows/wf_<id>/` — one workflow run: a `journal.jsonl` of
-//!   `started`/`result` edges, one `agent-<id>.jsonl` (+ `.meta.json`) per
-//!   spawned agent, and a sibling `workflows/wf_<id>.json` **completion record**
-//!   (top-level `phases[]` + `workflowProgress[]` grid) written once the run
-//!   finishes.
+//!   `started`/`result` edges, one transcript (+ meta sidecar) per spawned
+//!   agent, and a **completion record** (top-level `phases[]` +
+//!   `workflowProgress[]` grid) written once the run finishes.
+//!
+//! Two spellings of that run dir are in the wild and both are read: v2.1.201
+//! wrote `agent-<id>.jsonl` + `.meta.json` with the record beside the run dir
+//! (`subagents/workflows/wf_<id>.json`), while v2.1.220 writes
+//! `agent-<id>.json` + `.meta` and puts the record one level up, at
+//! `<agent_session_id>/workflows/wf_<id>.json`. A standalone `Task` subagent
+//! kept the `.jsonl`/`.meta.json` pair throughout.
 //!
 //! The sibling **top-level conversation transcript**
 //! (`projects/<slug>/<agent_session_id>.jsonl`) shares the line format;
@@ -29,7 +35,7 @@
 //! Code layout change degrades to a partial tree rather than an error. The
 //! filesystem walk that *calls* these parsers lives in the app layer.
 //!
-//! Verified against Claude Code v2.1.201.
+//! Verified against Claude Code v2.1.201 and v2.1.220.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

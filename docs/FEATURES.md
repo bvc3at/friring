@@ -3,6 +3,20 @@
 Design rationale for user-facing behavior.
 For architectural choices, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
+**Fork tags.** Friring is a fork of
+[Thurbox](https://github.com/Thurbeen/thurbox), and a number of the features
+below exist only here or behave differently. Those sections — or, where only
+part of a feature diverges, those paragraphs — open with one of two tags, which
+name the divergence in a line and point at [`FORK.md`](../FORK.md) for the
+reasoning, the measurements and the code shape:
+
+- **Friring — fork-only.** Upstream has no equivalent.
+- **Friring — changed.** Upstream has the feature; this fork altered it.
+
+An untagged section describes behavior shared with upstream. The tags are for
+orientation, not provenance policing — the detail of every divergence lives in
+`FORK.md`, which is the single place that tracks them.
+
 ---
 
 ## Session Sidebar
@@ -87,7 +101,9 @@ manual order is never disturbed (see *Smart ordering* below). Repo groups
 roll up to their most-urgent member
 (`Blocked > Error > Working > Done > Unreachable > Idle`).
 
-**Navigating to what needs you.** `F10` (rebindable `NextBlockedSession`)
+**Friring — fork-only: navigating to what needs you.** Upstream surfaces a
+blocked agent as a red dot and a desktop notification and stops there; there is
+no way to move *by* attention. `F10` (rebindable `NextBlockedSession`)
 jumps to the next `Blocked` session — scanning forward from the active one
 in rendered order, wrapping — and lands focus in the terminal, so pressing
 it repeatedly walks the attention queue top-to-bottom, answering each
@@ -171,10 +187,14 @@ implementation anchors:
 
 ### Per-session memory (`[features] session_memory`)
 
+**Friring — fork-only.** Neither upstream nor this fork's first pass showed what
+a session *costs*: the argument for unloading one was a number in a design doc.
+See [`FORK.md`](../FORK.md#per-session-memory-august-2026).
+
 An idle agent CLI is expensive — a measured ~333 MB RSS for claude, whether or
 not you wanted that session running. The sidebar prices each one, so unloading
-(`Alt+U`, see `FORK.md` → *Lazy sessions & ghosts*) has a visible payoff instead
-of an argued one:
+(`Alt+U`, see [Lazy sessions & ghosts](#lazy-sessions--ghosts)) has a visible
+payoff instead of an argued one:
 
 ```text
 ╭ Sessions ────────────────○◌╮
@@ -294,6 +314,15 @@ spatial map you can build muscle memory against.
 ## Session Creation
 
 ![Session creation workflow](media/friring-session-creation.gif)
+
+**Friring — changed.** The wizard is a redesign of upstream's. Upstream's repo
+picker is a three-focus-zone modal where `Tab` completes *or* moves focus
+depending on whether a ghost suggestion exists, `Enter` with nothing checked
+silently starts a session in `$HOME`, and every step's `Esc` throws the whole
+flow away. Here it is one always-type palette, `Esc` steps back with state
+preserved, the name is prefilled, the host/branch/agent selectors are
+type-to-filter, and a multi-repo local spawn can name its workspace directory.
+See [`FORK.md`](../FORK.md#new-session-wizard-redesign-palette-picker-back-navigation-prefills).
 
 `Ctrl+N` walks through a series of modals to configure a new
 session. Each step has a sensible default and can be skipped when
@@ -431,6 +460,14 @@ arbitrary paths through the same input. Bookmark deletion (`Del`)
 keeps the list from accumulating stale entries.
 
 ### Agent definitions
+
+**Friring — changed.** The registry and its `{id}` templates are upstream's;
+`{name}` is not. Upstream's session name never leaves the DB and UI, so the
+agent's own conversation gets an auto-generated title — here the seeded claude
+entry passes `-n {name}` on fresh spawns and forks (never on resume), so a
+conversation friring creates appears under the same name in claude's own
+`/resume` picker. See
+[`FORK.md`](../FORK.md#session-name-passed-to-the-agent-name-in-agentstoml).
 
 The set of available agents is **data**, not code. On first run
 Friring seeds `~/.config/friring/agents.toml` with built-in
@@ -594,6 +631,14 @@ their setting wins; rebind or disable it there.
 
 ### The leader key (`Ctrl+F`)
 
+**Friring — fork-only.** Upstream dispatches every global command from a direct
+`Ctrl+<letter>` chord and has no prefix concept at all. See
+[`FORK.md`](../FORK.md#tmux-style-leader-key-july-2026) for the three modes
+(`off` reproduces upstream exactly), the `prefix2` second door, and why `Ctrl+F`
+specifically.
+
+![The leader key and its which-key overlay](media/fork/scripted-leader-key.gif)
+
 The Ctrl namespace ran out. Every bare `Ctrl+<letter>` is bound or reserved,
 `F1`–`F10` and `F12` are spent (`F11` is the OS/terminal's — Mission Control on
 macOS, fullscreen nearly everywhere else), and the chords friring *does* hold are ones the
@@ -685,6 +730,12 @@ is reachable unshifted (except the deliberate `Shift+R`), because terminals
 encode shifted punctuation inconsistently.
 
 ### Focus model: terminal-first
+
+**Friring — changed.** Upstream starts focused on the session list, and a click
+on a row focuses the *list* — so the first thing typed after startup or a click
+lands in the list's single-letter hotkeys (`i` opens the import picker,
+`Shift+S` re-sorts) instead of reaching the agent. See
+[`FORK.md`](../FORK.md#terminal-first-focus).
 
 The terminal is where keystrokes belong; the session list is a glanceable
 dashboard, not a destination. Selection *is* activation (the list has no
@@ -942,6 +993,10 @@ session after recycling.
 
 ### Reload friring in place (`Ctrl+Alt+R`)
 
+**Friring — fork-only.** The chord and the dev-live workflow it closes the loop
+on are both fork additions; see
+[`FORK.md`](../FORK.md#dev-live-run-a-dev-build-against-the-real-sessions).
+
 Where `Ctrl+R` restarts the active *session*, `Ctrl+Alt+R`
 (`Action::ReloadApp`) restarts *friring itself*: a normal quit —
 state saved, every session detached, tmux left running — followed by
@@ -996,6 +1051,20 @@ editor of choice can open them as a workspace.
 ---
 
 ## Code Review (native)
+
+**Friring — changed.** The view is upstream's; the annotate → agent-fixes →
+re-review loop around it is this fork's *v2*. In short: a `Question`
+classification, a **structured handoff** that compiles one `### C<id> [Class]
+<side>:<line>` record per comment quoting the anchored diff line as a grep-able
+locator (upstream's bullet format survives behind `[review] handoff =
+"legacy"`), reviewed marks that **self-invalidate** when the content they
+fingerprinted changes, a staged-only target and untracked files in the working
+one, word-level intra-line diff, syntax highlighting in the side-by-side
+layout, range comments, context expansion, a changed-files filter, comment
+navigation, an info popup, a re-review nudge, and `E` to open the selected line
+in `$EDITOR`. Each one is spelled out in
+[`FORK.md`](../FORK.md#code-review-v2-july-2026), which also has a clip of the
+handoff reaching a real agent.
 
 Friring ships a **native, built-in** tuicr-like review view (`Ctrl+X`, `F7`
 alternate; rebindable `Action::ToggleReview`, gated by `[features]
@@ -1336,6 +1405,71 @@ since landed.)
 
 ---
 
+## Agent Activity View (`F9`)
+
+**Friring — fork-only.** It was the first feature this fork added, and upstream
+has nothing like it. The implementation — three data homes, the per-provider
+parsers, the incremental tailing and chunked backfill, the follow-ups still
+open — is in [`FORK.md`](../FORK.md#agent-activity-view-f9).
+
+![The F9 activity view: Overview, Timeline, and a real 3-agent workflow](media/fork/claude-activity-view.gif)
+
+`F9` (gated by `[features] cc_activity`) opens a central-pane view that
+reconstructs **what this session's agent actually did** — every shell command it
+ran, file it edited or read, web search it made, and subagent it delegated to —
+by reading whatever the agent CLI already persists on disk. Nothing is injected
+into the agent and nothing new is written: it is a retrospective built from the
+agent's own transcript, so it works on a conversation that started before you
+opened the view. Local sessions only.
+
+A side navigator lists six sections with live counts and `1`–`6` jump to them:
+
+- **Overview** — a dashboard: the identity line (agent · provider · model), a
+  token line (`in · out · cache r / w`) that folds in every subagent and
+  workflow transcript, a stat-tile row (`$ ✎ ⊙ ⌕ ⚲ ⚙`, with a `✗ failed` tile
+  only when something failed), an events-over-session sparkline, the hottest
+  files, the most-repeated commands, the newest few actions, and the last error
+  with the head of its result.
+- **Timeline** — every event in order, grouped by **turn**: each user prompt
+  renders as a dash-filled header (`▶ HH:MM:SS "prompt" ───`) and its events sit
+  in a `│` gutter, with subagent-origin work nested as `└` under a dim origin
+  badge. Consecutive read/search repeats fold to one `×N` row, and rows carry
+  call→result durations.
+- **Commands · Files · Web · Agents** — the same events filtered to one kind.
+  Agents also nests the Claude workflow/subagent tree, live and historical, with
+  each agent's full transcript (thinking, tool calls, output) and a workflow
+  overview of phases, per-agent grid and logs.
+
+Keys mirror the code-review view — `j`/`k`, PageUp/Down, `Ctrl+D`/`Ctrl+U`,
+`g`/`G`, `w` wrap, `Left`/`Right` horizontal scroll, `/` find — plus `Enter` to
+expand a row's note and result head. The view is mutually exclusive with the
+code-review overlay, since both own the central pane.
+
+**Twelve agents are supported**, dispatched by the command basename of the
+session's `agents.toml` entry (so a wrapper entry like `claude-opus` resolves):
+claude, codex, gemini, qwen, copilot, vibe, cursor-agent, opencode, goose,
+crush, aider, cline. Each honors its CLI's own state-dir env overrides. An agent
+whose store can't be read says **why** in the Overview rather than rendering
+empty — `agy` encrypts its trajectory store, `amp` keeps threads server-side.
+
+**What this costs, and what it can't promise.** Sources are stat-signature
+gated and append-only files tail by byte offset, so a pass that finds nothing
+new does nothing; SQLite stores are opened read-only. The scan runs off the UI
+thread and the view's own parsing is on demand. The formats, though, are
+undocumented and version-specific — every parser degrades to skipped records on
+drift rather than erroring, which means a CLI that changes its layout can make
+part of the view go quiet. That is a real failure mode and has happened: see
+[`FORK.md`](../FORK.md#real-agent-e2e-harness--scenario-demos-scriptsdevagent-e2e)
+for the drift a real workflow recording caught, and the e2e scenario that now
+holds it in place.
+
+The counterpart to this view is **conversation import** (`i` in the session
+list, same feature flag): where `F9` reads what an agent Friring started has
+done, import adopts a conversation Friring never started. See
+[`FORK.md`](../FORK.md#import-an-existing-claude-code-conversation-i-in-the-session-list).
+
+---
+
 ## Automations
 
 `Ctrl+P` opens the automations list. An **automation** is a named,
@@ -1349,6 +1483,16 @@ session every weekday morning.
 
 Automations replace the older one-shot "scheduled commands"
 feature; a one-shot is simply an automation with a `once` schedule.
+
+**Friring — changed.** Upstream's scheduler fires one action that delivers one
+static string, locally: no multi-step prompts, no remote host, no fresh session
+per fire, no send-by-name, and `exec` runs synchronously inside the tick (so a
+hung command freezes the render loop). Everything below that goes past that
+model — *Prompt steps*, *Remote hosts*, *Exec runs off the tick thread*, the
+session mode, the editor's selectors and timezone validation, dry run and
+export — is this fork's. See
+[`FORK.md`](../FORK.md#automations-that-can-stand-up-a-real-agent-july-2026);
+pre-existing automations keep their exact old behavior.
 
 ### Schedules
 
@@ -2171,6 +2315,17 @@ only at TUI startup.
 
 ## Global Search
 
+**Friring — changed.** Upstream's global search is a full-width strip docked
+above the footer, which shrinks the content area and so **resizes every visible
+session PTY** on open and close. This fork redesigns it after JetBrains' Search
+Everywhere: a centered popup that overlays instead of resizing, a double-`Shift`
+opener, and three scope fixes (sessions match on cwd — documented upstream but
+never implemented — and on *every* worktree branch, and the Files scope is
+pinned to the session that was active at open instead of following the live
+preview). The per-keystroke rework behind *Responsiveness* below is the fork's
+too (ADR-P13 in `docs/PERFORMANCE.md`). See
+[`FORK.md`](../FORK.md#global-search-centered-popup--double-shift-opener).
+
 `Ctrl+/` (the near-universal "search" chord) — or a **double-tap of
 `Shift`**, JetBrains "Search Everywhere" muscle memory — opens a **centered
 popup** that searches every scope at once — a single place to find and jump
@@ -2470,6 +2625,12 @@ See `ui::status_bar::render_footer`.
 
 ### Info panel docking (`info_panel_position`)
 
+**Friring — changed.** Upstream's info panel is *always* a dedicated column: it
+needs ≥120 cols and costs the terminal ~15% of its width. The inline dock, the
+setting, and the new `auto` **default** are the fork's — `column` is exactly
+upstream's behavior. See
+[`FORK.md`](../FORK.md#inline-info-pane-docking-info_panel_position).
+
 The F2 info pane has two possible homes: its **own column** between the
 sidebar and the terminal (the classic layout above), or **inline** at
 the bottom of the sidebar — below the session list and automations pane
@@ -2500,6 +2661,14 @@ and invisible, and F2 reports why instead of toggling a flag that changes
 nothing on screen. Restoring the sidebar does not re-open it.
 
 ### Collapsing the session list (`Alt+L`)
+
+**Friring — changed.** The collapse is upstream's feature, adopted here on a
+different key and reconciled with the inline info dock: upstream binds it to
+`F9`, which in this fork is the activity view, and upstream can drop the left
+column wholesale because its info panel is never in it. The chevron is
+expand-only here for the same reason — the tab strip has no room for a
+permanent one. See
+[`FORK.md`](../FORK.md#session-list-collapse-altl).
 
 `Alt+L` (rebindable `ToggleSessionList`, also `<leader> Shift+L`) folds the
 whole left column away and hands its width to the central pane — on a
@@ -2630,6 +2799,11 @@ Per-worktree steps:
 
 ### Choosing the base remote
 
+**Friring — fork-only.** Upstream hardcodes `origin` for both the fetch and the
+rebase base, so a repo with several remotes — fork + upstream being the common
+case — had no way to sync onto anything else. See
+[`FORK.md`](../FORK.md#sync-base-picker-ctrls-with-multiple-remotes).
+
 `Ctrl+S` first lists each involved repo's remotes on a background
 thread (no git on the UI thread — the ADR-P12 discipline, see
 `docs/PERFORMANCE.md`):
@@ -2716,6 +2890,21 @@ friring instances.
 - External recovery is always possible via `tmux -L friring attach`.
 
 ### Lazy sessions & ghosts
+
+**Friring — fork-only**, including a changed default. Upstream restores every
+persisted session eagerly at startup: after a reboot, when no pane survives,
+that is N agent CLIs respawned serially before the first frame and N × hundreds
+of MB of processes, wanted or not. "Not running" is a first-class state here,
+and `lazy_session_restore` defaults to `true` where upstream always respawns.
+See [`FORK.md`](../FORK.md#lazy-sessions--ghosts-july-2026).
+
+![Four real claude sessions frozen one by one, the fleet total falling, then one loaded back](media/fork/claude-ghost-fleet.gif)
+
+The clip is four real Claude Code sessions, not a mock-up: the per-session
+memory badges are what each process tree actually costs, the info panel prices
+the one that is active, and the `Σ` total disappears rather than reading zero
+once nothing is left running. The last one is loaded back through `--resume`
+with its conversation intact.
 
 A session whose agent process is not running can still hold its place
 in the TUI as a **ghost**: a placeholder row (dotted `◌` icon, greyed
@@ -2898,6 +3087,13 @@ pointer and never the body, so a peer's words can't reach the recipient
 dressed as the operator's own instructions.
 
 ### Why the wake can refuse to type
+
+**Friring — fork-only.** Upstream types the text and presses Enter as two
+`tmux send-keys` calls without looking at the target pane, so a `message send`
+— whose contract is only "enqueue a payload" — could approve whatever the
+recipient was asking permission to do. The guard, the owed-nudge bookkeeping,
+and the self-describing nudge text are all the fork's; so is threading below.
+See [`FORK.md`](../FORK.md#headless-sends-cant-answer-a-dialog-july-2026).
 
 The nudge is a paste followed by a **separate** `Enter`. A recipient
 sitting on a permission dialog swallows the paste and reads that Enter as
