@@ -61,6 +61,54 @@ impl SessionMatch {
 /// Fallback label/key for a session that spans no repos.
 const NO_REPO_GROUP: &str = "(no repo)";
 
+/// Keys the label-jump overlay hands out, home row first then the rows either
+/// side of it — so the common case is a single key under a resting finger.
+/// Deliberately letters only: digits stay the `Alt+1`–`9` numbering and would
+/// otherwise mean two things at once while the overlay is up.
+const LABEL_ALPHABET: [char; 26] = [
+    'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p',
+    'z', 'x', 'c', 'v', 'b', 'n', 'm',
+];
+
+/// Labels for `n` jump targets, in row order.
+///
+/// Up to 26 targets every label is one key. Past that, as few trailing letters
+/// as possible become two-key prefixes and the rest stay single — so growing
+/// from 26 to 30 sessions costs two keystrokes on four rows, not on all thirty.
+/// Beyond 26 × 26 the surplus rows get no label; they are still reachable by
+/// name from the switcher, and painting ambiguous labels would be worse than
+/// painting none.
+pub fn session_labels(n: usize) -> Vec<String> {
+    let base = LABEL_ALPHABET.len();
+    if n <= base {
+        return LABEL_ALPHABET
+            .iter()
+            .take(n)
+            .map(|c| c.to_string())
+            .collect();
+    }
+    // `p` trailing letters become prefixes: they stop being labels themselves
+    // (-p) and each yields `base` two-key labels.
+    let prefixes = (1..=base)
+        .find(|p| (base - p) + p * base >= n)
+        .unwrap_or(base);
+    let singles = base - prefixes;
+    let mut out: Vec<String> = LABEL_ALPHABET
+        .iter()
+        .take(singles)
+        .map(|c| c.to_string())
+        .collect();
+    for &prefix in &LABEL_ALPHABET[singles..] {
+        for &second in LABEL_ALPHABET.iter() {
+            if out.len() >= n {
+                return out;
+            }
+            out.push(format!("{prefix}{second}"));
+        }
+    }
+    out
+}
+
 /// The canonical grouping **key** for a session: the *set* of repos it
 /// spans (sorted + de-duplicated), so sessions touching the same repos cluster
 /// together regardless of selection order (`{infra, webapp}` == `{webapp,
@@ -69,8 +117,9 @@ const NO_REPO_GROUP: &str = "(no repo)";
 /// `(no repo)` bucket.
 ///
 /// The `\0` join separator can't occur in a repo name, so distinct sets never
-/// collide. This is only a map key — never displayed (see [`group_display`]).
-fn group_key(info: &SessionInfo) -> String {
+/// collide. This is only a map key — never displayed (`group_display` builds
+/// the header label).
+pub fn group_key(info: &SessionInfo) -> String {
     if info.repo_display_names.is_empty() {
         return NO_REPO_GROUP.to_string();
     }
@@ -429,6 +478,101 @@ fn move_child_block_range(
     }
 }
 
+/// What the session list hides this frame, as a filter over an already-computed
+/// [`SessionOrder`].
+///
+/// Kept separate from [`compute_session_order`] on purpose: the reordering
+/// operations (`move_in_order`, `sort_alphabetically_within_groups`) renumber
+/// **every** session's `display_order` along the order they are handed, so
+/// giving them a filtered order would silently renumber the hidden rows into
+/// each other. The order stays total; only what is *drawn* and *stepped through*
+/// is filtered.
+pub struct VisibilityFilter<'a> {
+    /// Group keys (see [`group_key`]) the user has collapsed.
+    pub folded_groups: &'a std::collections::HashSet<String>,
+    /// Collapse unloaded sessions out of the list (the ghost shelf).
+    pub ghost_shelf: bool,
+    /// A status that is exempt from both filters. The attention queue sets it
+    /// while its overlay is open: folding declutters the list, but it must
+    /// never put a session that needs the user out of the queue's reach — a
+    /// blocked agent hidden inside a collapsed group would be badged in the
+    /// title bar and unreachable by the very key that exists to reach it.
+    pub reveal: Option<SessionStatus>,
+    /// The session that must stay visible whatever the filters say — the
+    /// selection. A hidden cursor is a broken list: `Ctrl+J` would appear to
+    /// skip rows, and the central pane would show a session with no row.
+    pub keep: Option<crate::session::SessionId>,
+}
+
+/// Which rows of `order` are visible under `filter`, parallel to `order.order`.
+///
+/// A **collapsed** group keeps exactly one row, its *stand-in*: the selection
+/// when the group holds it, else the first row the ghost shelf keeps. The
+/// selection has to win, because it must always have a row — but it has to
+/// *replace* the stand-in rather than join it, or a group the switcher jumped
+/// into would render as two rows under one collapsed header. That is why the
+/// stand-in is chosen in a pass of its own: the selection can sit anywhere in
+/// the group, so a single forward walk would already have emitted the row above
+/// it before learning it was there.
+///
+/// The **ghost shelf** hides unloaded sessions outright, so a folded group
+/// whose members are all unloaded disappears just like an unfolded one. The
+/// group header is not tied to any particular session
+/// (`OrderedSessions::from_order` re-attaches it to whatever row survives), so
+/// hiding the first row loses nothing.
+///
+/// [`VisibilityFilter::reveal`] escapes both, and may put several rows under
+/// one collapsed header — that is the point: while the attention overlay is
+/// open the list is showing what needs answering, not a tidy summary.
+pub fn visible_rows(
+    sessions: &[&SessionInfo],
+    order: &SessionOrder,
+    filter: &VisibilityFilter<'_>,
+) -> Vec<bool> {
+    let group_of = header_group_of(&order.headers);
+    let info_at = |row: usize| sessions[order.order[row]];
+    let shelved = |row: usize| filter.ghost_shelf && info_at(row).status == SessionStatus::Unloaded;
+    let is_selection = |row: usize| filter.keep == Some(info_at(row).id);
+    let is_revealed = |row: usize| filter.reveal == Some(info_at(row).status);
+
+    let folded_heads: std::collections::HashSet<usize> = order
+        .headers
+        .iter()
+        .enumerate()
+        .filter(|(_, label)| label.is_some())
+        .map(|(head, _)| head)
+        .filter(|&head| filter.folded_groups.contains(&group_key(info_at(head))))
+        .collect();
+
+    // Each collapsed group's stand-in row, keyed by its header row. A selection
+    // overwrites whatever candidate came before it; a later candidate never
+    // displaces a selection already recorded.
+    let mut stand_in: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (row, &head) in group_of.iter().enumerate() {
+        if !folded_heads.contains(&head) {
+            continue;
+        }
+        if is_selection(row) {
+            stand_in.insert(head, row);
+        } else if !shelved(row) {
+            stand_in.entry(head).or_insert(row);
+        }
+    }
+
+    (0..order.order.len())
+        .map(|row| {
+            if is_revealed(row) {
+                return true;
+            }
+            let head = group_of[row];
+            if folded_heads.contains(&head) {
+                return stand_in.get(&head) == Some(&row);
+            }
+            is_selection(row) || !shelved(row)
+        })
+        .collect()
+}
+
 /// Display-ordered view of the session list. All fields are parallel arrays
 /// aligned to the rendered order produced by [`compute_session_order`].
 pub struct OrderedSessions<'a> {
@@ -436,55 +580,132 @@ pub struct OrderedSessions<'a> {
     pub match_positions: Vec<Option<SessionMatch>>,
     pub active_index: usize,
     /// Parallel to `sessions`: `Some(label)` on each repo group's first row,
-    /// used to render a subtle header above it. `None` elsewhere. Borrowed from
-    /// the source [`SessionOrder`] (never cloned — the order is render-stable).
-    pub headers: &'a [Option<String>],
+    /// used to render a subtle header above it. `None` elsewhere.
+    pub headers: Vec<Option<String>>,
     /// Parallel to `sessions`: tree depth within the repo group
-    /// (see [`SessionOrder::depths`]). Borrowed from the source [`SessionOrder`].
-    pub depths: &'a [u8],
+    /// (see [`SessionOrder::depths`]).
+    pub depths: Vec<u8>,
+    /// Parallel to `sessions`: on a **collapsed** group's header row, how many
+    /// of its sessions are folded away underneath. `None` on every other row —
+    /// rows the ghost shelf hid are counted in [`Self::hidden_ghosts`] instead,
+    /// so a group that merely has a shelved session in it never renders as
+    /// collapsed (its `l` would have nothing to expand).
+    pub folded_counts: Vec<Option<usize>>,
+    /// Unloaded sessions the ghost shelf hid, for the title-bar count. Counts
+    /// what is actually **hidden**, not every unloaded session: the ones still
+    /// on screen (the selection, or any inside a collapsed group) already show
+    /// their own dot.
+    pub hidden_ghosts: usize,
+    /// Input indices of the rows actually shown, in render order — the exact
+    /// list keyboard navigation steps through, so a hidden row can never be
+    /// stepped onto or wear a jump label.
+    pub visible_input_indices: Vec<usize>,
 }
 
 impl<'a> OrderedSessions<'a> {
     /// Reorder the parallel arrays into render order against a previously
-    /// computed [`SessionOrder`], remapping `active_index` and `match_positions`
-    /// to follow it. The order is a pure function of the session set's
-    /// grouping/nesting inputs (`repo_display_names`, `display_order`, `id`,
-    /// `parent_session_id`) — never status — so the caller can cache it keyed by
-    /// a content signature and skip the grouping/sort/nest work on frames where
-    /// none of those changed (see `App::render_left_panel`). The per-frame remap
-    /// of refs / match positions / `active_index` still runs, since those vary
-    /// independently of the order; `headers`/`depths` are *borrowed* from the
-    /// cached `order` rather than cloned each frame.
+    /// computed [`SessionOrder`], dropping the rows `filter` hides and
+    /// remapping `active_index` and `match_positions` to follow.
+    ///
+    /// The order is a pure function of the session set's grouping/nesting
+    /// inputs (`repo_display_names`, `display_order`, `id`,
+    /// `parent_session_id`) — never status — so the caller can cache it keyed
+    /// by a content signature and skip the grouping/sort/nest work on frames
+    /// where none of those changed (see `App::render_left_panel`). What runs
+    /// per frame is only the O(n) filter + index remap: the visibility filter
+    /// *does* depend on status (the ghost shelf), so it can't join the cache,
+    /// and the handful of short group labels it copies costs nothing next to
+    /// the grouping work the cache is protecting.
     pub fn from_order(
         sessions: &[&'a SessionInfo],
         order: &'a SessionOrder,
         match_positions: &[Option<SessionMatch>],
         active_index: usize,
+        filter: &VisibilityFilter<'_>,
     ) -> Self {
-        let ordered_sessions = order.order.iter().map(|&i| sessions[i]).collect();
-        let ordered_matches = order
-            .order
-            .iter()
-            .map(|&i| match_positions.get(i).cloned().flatten())
-            .collect();
-        let new_active = order
-            .order
+        let visible = visible_rows(sessions, order, filter);
+        // The header row each row belongs to, so a group's label can be
+        // re-attached to whichever of its rows survives the filter.
+        let group_of = header_group_of(&order.headers);
+        let is_folded = |head_row: usize| {
+            filter
+                .folded_groups
+                .contains(&group_key(sessions[order.order[head_row]]))
+        };
+
+        let mut kept: Vec<usize> = Vec::new(); // rows, not input indices
+        let mut headers: Vec<Option<String>> = Vec::new();
+        let mut depths: Vec<u8> = Vec::new();
+        let mut folded_counts: Vec<Option<usize>> = Vec::new();
+        let mut hidden_ghosts = 0usize;
+        // Group header row → where that group's label landed in `kept`.
+        let mut head_at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        // Rows a collapsed group hid, attributed after the walk — only then is
+        // it known whether the group kept a row at all. A group whose every
+        // member is shelved has no header left to carry a `(+n)`, and its rows
+        // would otherwise be reported nowhere, which is exactly the "sessions
+        // went missing" the title-bar count exists to prevent.
+        let mut hidden_in_group: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        for (row, &shown) in visible.iter().enumerate() {
+            let group = group_of[row];
+            if shown {
+                let first_of_group = !head_at.contains_key(&group);
+                if first_of_group {
+                    head_at.insert(group, kept.len());
+                }
+                headers.push(
+                    first_of_group
+                        .then(|| order.headers[group].clone())
+                        .flatten(),
+                );
+                depths.push(order.depths[row]);
+                folded_counts.push(None);
+                kept.push(row);
+            } else if is_folded(group) {
+                *hidden_in_group.entry(group).or_insert(0) += 1;
+            } else {
+                hidden_ghosts += 1;
+            }
+        }
+        for (group, count) in hidden_in_group {
+            match head_at.get(&group).and_then(|&h| folded_counts.get_mut(h)) {
+                Some(slot) => *slot = Some(count),
+                // The whole group is off screen, so only the shelf can have
+                // taken it: report its rows with the other shelved ghosts.
+                None => hidden_ghosts += count,
+            }
+        }
+
+        let visible_input_indices: Vec<usize> = kept.iter().map(|&r| order.order[r]).collect();
+        let new_active = visible_input_indices
             .iter()
             .position(|&i| i == active_index)
             .unwrap_or(0);
 
         Self {
-            sessions: ordered_sessions,
-            match_positions: ordered_matches,
+            sessions: visible_input_indices.iter().map(|&i| sessions[i]).collect(),
+            match_positions: visible_input_indices
+                .iter()
+                .map(|&i| match_positions.get(i).cloned().flatten())
+                .collect(),
             active_index: new_active,
-            headers: &order.headers,
-            depths: &order.depths,
+            headers,
+            depths,
+            folded_counts,
+            hidden_ghosts,
+            visible_input_indices,
         }
     }
 }
 
 pub struct LeftPanelState<'a> {
     pub sessions: &'a [&'a SessionInfo],
+    /// The complete ordered set, before the visibility filter. The status
+    /// aggregates (title-bar attention counts, the fleet total, each group's
+    /// rolled-up dot) are read from this: an agent that needs answering must
+    /// not stop being counted because its row is folded or shelved away.
+    pub all_sessions: &'a [&'a SessionInfo],
     pub active_session: usize,
     /// Whether to highlight the active-session row. `false` hides the selection
     /// entirely (e.g. while the automations pane is focused, where the active
@@ -504,12 +725,19 @@ pub struct LeftPanelState<'a> {
     /// Parallel to `sessions`: tree depth within the repo group
     /// (see [`SessionOrder::depths`]). Children render indented.
     pub depths: &'a [u8],
+    /// Parallel to `sessions`: on a collapsed group's header row, how many
+    /// sessions it hides — rendered as `▸ label (+n)`.
+    pub folded_counts: &'a [Option<usize>],
+    /// Unloaded sessions the ghost shelf is hiding, shown as a title-bar count
+    /// so a collapsed shelf never looks like sessions went missing.
+    pub ghost_shelf_count: usize,
     /// Current animated spinner frame for the `Working` status
     /// (`SPINNER_FRAMES[App::spinner_frame()]`).
     pub spinner: &'a str,
-    /// Parallel to `sessions`: the jump-overlay digit painted ahead of the
-    /// status dot (Alt-hold / Alt+A numbering), `None` when hidden.
-    pub jump_digits: &'a [Option<char>],
+    /// Parallel to `sessions`: the jump-overlay chip painted ahead of the
+    /// status dot — a digit for the Alt-hold / `Alt+A` numbering, one or two
+    /// letters for the label-jump overlay. `None` when hidden.
+    pub jump_labels: &'a [Option<String>],
 }
 
 pub fn render_left_panel(
@@ -523,6 +751,7 @@ pub fn render_left_panel(
         frame,
         area,
         state.sessions,
+        state.all_sessions,
         state.active_session,
         state.show_selection,
         state.session_focus,
@@ -531,8 +760,10 @@ pub fn render_left_panel(
         state.session_search_active,
         state.headers,
         state.depths,
+        state.folded_counts,
+        state.ghost_shelf_count,
         state.spinner,
-        state.jump_digits,
+        state.jump_labels,
     )
 }
 
@@ -608,6 +839,7 @@ fn render_session_section(
     frame: &mut Frame,
     area: Rect,
     sessions: &[&SessionInfo],
+    all_sessions: &[&SessionInfo],
     active_index: usize,
     show_selection: bool,
     level: FocusLevel,
@@ -616,26 +848,46 @@ fn render_session_section(
     search_active: bool,
     headers: &[Option<String>],
     depths: &[u8],
+    folded_counts: &[Option<usize>],
+    ghost_shelf_count: usize,
     spinner: &str,
-    jump_digits: &[Option<char>],
+    jump_labels: &[Option<String>],
 ) -> Vec<super::RowHitbox> {
     let mut block = focus_block(" Sessions ", level);
 
     if !sessions.is_empty() {
-        let mut dots: Vec<Span> = Vec::with_capacity(sessions.len() + 1);
-        // A count in front of the per-session dots makes "how many need me"
-        // scannable without counting colored glyphs (and it survives the dots
-        // being clipped on a narrow sidebar).
-        let blocked = sessions
-            .iter()
-            .filter(|info| info.status == SessionStatus::Blocked)
-            .count();
-        if blocked > 0 {
+        let mut dots: Vec<Span> = Vec::with_capacity(sessions.len() + 2);
+        // Counts in front of the per-session dots make "how many need me"
+        // scannable without counting colored glyphs (and they survive the dots
+        // being clipped on a narrow sidebar). Both halves of the attention
+        // queue are shown, in the order `F10` walks them: the blocked sessions
+        // are stopped until you answer, the finished ones are only unread.
+        // Counted over the whole fleet, not the visible rows — a fold must not
+        // make an agent waiting on you disappear from the tally.
+        for status in [SessionStatus::Blocked, SessionStatus::Done] {
+            let n = all_sessions
+                .iter()
+                .filter(|info| info.status == status)
+                .count();
+            if n > 0 {
+                dots.push(Span::styled(
+                    format!("{}{n} ", super::status_glyph(status, spinner)),
+                    Style::default()
+                        .fg(status_color(status))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+        // A collapsed ghost shelf must never read as "those sessions are
+        // gone": the count says how many rows the shelf is holding, ahead of
+        // the dots for the ones actually listed.
+        if ghost_shelf_count > 0 {
             dots.push(Span::styled(
-                format!("\u{25c6}{blocked} "),
-                Style::default()
-                    .fg(status_color(SessionStatus::Blocked))
-                    .add_modifier(Modifier::BOLD),
+                format!(
+                    "{}{ghost_shelf_count} ",
+                    super::status_glyph(SessionStatus::Unloaded, spinner)
+                ),
+                Style::default().fg(status_color(SessionStatus::Unloaded)),
             ));
         }
         dots.extend(sessions.iter().map(|info| {
@@ -651,7 +903,7 @@ fn render_session_section(
     // abstract, the sum of every running agent is the number that argues for
     // unloading one. Bottom-*left* keeps it clear of the scroll indicators,
     // which the renderer paints over the right end of both borders.
-    if let Some(total) = fleet_rss(sessions) {
+    if let Some(total) = fleet_rss(all_sessions) {
         block = block.title_bottom(
             Line::from(Span::styled(
                 format!(" \u{3a3} {total} "),
@@ -669,20 +921,16 @@ fn render_session_section(
     // Available width inside the block (subtract 2 for borders)
     let inner_width = area.width.saturating_sub(2) as usize;
 
-    // The header row each row belongs to, used to roll each group's members up
-    // to a single status dot on the header below.
-    let group_of = header_group_of(headers);
-
     // Roll each repo group up to its most-urgent member status, keyed by the
-    // group's header row index, so the header shows a single dot you can scan.
-    // Computed at render time (not in `SessionOrder`) so status never feeds the
-    // order cache or reorders rows — it only recolors.
-    let mut group_rollup: std::collections::HashMap<usize, SessionStatus> =
+    // group itself (not a row) so a collapsed header still speaks for the
+    // members folded away underneath it. Computed at render time (not in
+    // `SessionOrder`) so status never feeds the order cache or reorders rows —
+    // it only recolors.
+    let mut group_rollup: std::collections::HashMap<String, SessionStatus> =
         std::collections::HashMap::new();
-    for (i, info) in sessions.iter().enumerate() {
-        let h = group_of[i];
+    for info in all_sessions {
         group_rollup
-            .entry(h)
+            .entry(group_key(info))
             .and_modify(|s| *s = group_status([*s, info.status]))
             .or_insert(info.status);
     }
@@ -716,15 +964,27 @@ fn render_session_section(
                 cross_group_child,
                 inner_width,
                 spinner,
-                jump_digits.get(i).copied().flatten(),
+                jump_labels.get(i).and_then(Option::as_deref),
             )];
 
             // Prepend a subtle repo-group header above the first session of
             // each group. The header carries the group's rolled-up status dot
             // but never reflects selection (that stays on the session rows).
             if let Some(Some(label)) = headers.get(i) {
-                let rollup = group_rollup.get(&i).copied().unwrap_or(info.status);
-                item_lines.insert(0, group_header_line(label, rollup, inner_width, spinner));
+                let rollup = group_rollup
+                    .get(&group_key(info))
+                    .copied()
+                    .unwrap_or(info.status);
+                item_lines.insert(
+                    0,
+                    group_header_line(
+                        label,
+                        rollup,
+                        folded_counts.get(i).copied().flatten(),
+                        inner_width,
+                        spinner,
+                    ),
+                );
             }
 
             item_heights.push(item_lines.len() as u16);
@@ -805,19 +1065,27 @@ fn header_group_of(headers: &[Option<String>]) -> Vec<usize> {
     out
 }
 
-/// A full-width repo-group header: `● ── label ──────────`. The leading dot is
-/// the group's rolled-up most-urgent status; the label is always muted. The
-/// header never reflects selection — highlighting belongs to the session rows
-/// alone, so selecting a group's first row must not light up its header.
+/// A full-width repo-group header: `● ── label ──────────`, or
+/// `● ▸ label (+4) ────` when the group is collapsed. The leading dot is the
+/// group's rolled-up most-urgent status; the label is always muted. The header
+/// never reflects selection — highlighting belongs to the session rows alone,
+/// so selecting a group's first row must not light up its header.
 fn group_header_line(
     label: &str,
     rollup: SessionStatus,
+    folded: Option<usize>,
     inner_width: usize,
     spinner: &str,
 ) -> Line<'static> {
     let style = Style::default().fg(Theme::text_muted());
     let dot = format!("{} ", super::status_glyph(rollup, spinner));
-    let mut text = format!("\u{2500}\u{2500} {label} ");
+    // A collapsed group swaps its leading rule for a `▸` and states how many
+    // sessions are behind it — the rolled-up dot already says whether any of
+    // them needs attention, so the count is the only fact still missing.
+    let mut text = match folded {
+        Some(n) => format!("\u{25b8} {label} (+{n}) "),
+        None => format!("\u{2500}\u{2500} {label} "),
+    };
     let used = dot.chars().count() + text.chars().count();
     if inner_width > used {
         text.push_str(&"\u{2500}".repeat(inner_width - used));
@@ -883,6 +1151,10 @@ fn agent_status_text(info: &SessionInfo) -> Option<String> {
 const AGENT_STATUS_SEPARATOR: &str = "  ";
 /// Minimum columns the inline agent status needs to be worth showing.
 const AGENT_STATUS_MIN_WIDTH: usize = 4;
+
+/// Columns the status dot and its padding occupy at the head of every row —
+/// the budget a jump chip has to fit inside so the overlay never shifts a row.
+const JUMP_CHIP_CELLS: usize = 3;
 
 /// Badge for a session measured to have no process at all — the em dash reads
 /// as "nothing here", where a `0M` would read as a suspiciously cheap agent.
@@ -1067,7 +1339,7 @@ fn build_session_line<'a>(
     cross_group_child: bool,
     inner_width: usize,
     spinner: &str,
-    jump_digit: Option<char>,
+    jump_label: Option<&str>,
 ) -> Line<'a> {
     // A ghost row greys its name like a search-dimmed one (its ◌ dot is
     // already muted via `status_color`) — except while selected, where the
@@ -1080,27 +1352,35 @@ fn build_session_line<'a>(
         Style::default().fg(super::status_color(info.status))
     };
 
-    // The jump digit takes the status dot's leading pad column, so the
-    // overlay appearing/disappearing never shifts the row. It is painted
-    // reverse-video (accent *background*, text knocked out) rather than as a
-    // coloured glyph: a bare digit abutting the status dot reads as part of
-    // the row's content, while a solid chip reads as a label stuck on top of
+    // The jump chip takes the status dot's leading pad column, so the overlay
+    // appearing/disappearing never shifts the row; a two-letter label borrows
+    // the dot's trailing space as well, keeping the same three columns. It is
+    // painted reverse-video (accent *background*, text knocked out) rather than
+    // as a coloured glyph: bare characters abutting the status dot read as part
+    // of the row's content, while a solid chip reads as a label stuck on top of
     // it — the same treatment as the armed-leader badge in the footer, so the
     // leader's two surfaces look like one system.
-    let mut spans = match jump_digit {
-        Some(d) => vec![
-            Span::styled(
-                d.to_string(),
-                Style::default()
-                    .bg(Theme::accent())
-                    .fg(Theme::modal_bg())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("{} ", super::status_glyph(info.status, spinner)),
-                status_style,
-            ),
-        ],
+    let mut spans = match jump_label {
+        Some(label) => {
+            let pad = JUMP_CHIP_CELLS.saturating_sub(label.chars().count() + 1);
+            vec![
+                Span::styled(
+                    label.to_string(),
+                    Style::default()
+                        .bg(Theme::accent())
+                        .fg(Theme::modal_bg())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "{}{}",
+                        super::status_glyph(info.status, spinner),
+                        " ".repeat(pad)
+                    ),
+                    status_style,
+                ),
+            ]
+        }
         None => vec![Span::styled(
             format!(" {} ", super::status_glyph(info.status, spinner)),
             status_style,
@@ -1156,6 +1436,18 @@ fn build_session_line<'a>(
 
 #[cfg(test)]
 mod tests {
+    /// The identity filter: nothing collapsed, ghosts listed inline. Most
+    /// ordering tests predate the fold/shelf filters and are about the *order*,
+    /// not what it hides.
+    fn no_filter<'a>(folded: &'a std::collections::HashSet<String>) -> super::VisibilityFilter<'a> {
+        super::VisibilityFilter {
+            folded_groups: folded,
+            ghost_shelf: false,
+            keep: None,
+            reveal: None,
+        }
+    }
+
     use super::super::highlight::highlighted_spans as build_highlighted_spans;
     use super::*;
     use crate::session::SessionStatus;
@@ -1173,7 +1465,13 @@ mod tests {
         // active_index points at the first input session; the manually ordered
         // one renders above it and active_index is remapped to follow it.
         let order = compute_session_order(&sessions);
-        let ordered = OrderedSessions::from_order(&sessions, &order, &matches, 0);
+        let ordered = OrderedSessions::from_order(
+            &sessions,
+            &order,
+            &matches,
+            0,
+            &no_filter(&Default::default()),
+        );
         assert_eq!(ordered.sessions[0].name, "moved");
         assert_eq!(ordered.sessions[1].name, "first");
         assert_eq!(ordered.active_index, 1);
@@ -1390,7 +1688,13 @@ mod tests {
         let n2 = info("n2");
         let sessions = vec![&n1, &n2];
         let order = compute_session_order(&sessions);
-        let ordered = OrderedSessions::from_order(&sessions, &order, &[None, None], 0);
+        let ordered = OrderedSessions::from_order(
+            &sessions,
+            &order,
+            &[None, None],
+            0,
+            &no_filter(&Default::default()),
+        );
         // Single "(no repo)" group: header on row 0, none after.
         assert_eq!(
             ordered.headers.to_vec(),
@@ -1412,22 +1716,31 @@ mod tests {
             .draw(|f| {
                 let sessions = vec![&n1, &n2];
                 let order = compute_session_order(&sessions);
-                let ordered = OrderedSessions::from_order(&sessions, &order, &[None, None], 0);
+                let ordered = OrderedSessions::from_order(
+                    &sessions,
+                    &order,
+                    &[None, None],
+                    0,
+                    &no_filter(&Default::default()),
+                );
                 hitboxes = render_left_panel(
                     f,
                     Rect::new(0, 0, 30, 12),
                     &mut LeftPanelState {
                         sessions: &ordered.sessions,
+                        all_sessions: &sessions,
                         active_session: ordered.active_index,
                         show_selection: true,
                         session_focus: FocusLevel::Focused,
                         session_list_state: &mut list_state,
                         session_match_positions: &ordered.match_positions,
                         session_search_active: false,
-                        headers: ordered.headers,
-                        depths: ordered.depths,
+                        headers: &ordered.headers,
+                        depths: &ordered.depths,
+                        folded_counts: &ordered.folded_counts,
+                        ghost_shelf_count: 0,
                         spinner: "◐",
-                        jump_digits: &[],
+                        jump_labels: &[],
                     },
                 );
             })
@@ -1440,10 +1753,77 @@ mod tests {
     }
 
     #[test]
+    fn folded_group_still_reports_its_blocked_member() {
+        // A fold hides rows, not the fact that an agent is waiting: the
+        // collapsed header keeps the rolled-up dot and the title-bar count
+        // keeps counting the session behind it.
+        let mut head = info("a-head");
+        head.repo_display_names = vec!["repo".to_string()];
+        head.status = SessionStatus::Idle;
+        let mut member = info("b-member");
+        member.repo_display_names = vec!["repo".to_string()];
+        member.status = SessionStatus::Blocked;
+        let sessions = vec![&head, &member];
+        let order = compute_session_order(&sessions);
+        let folded: std::collections::HashSet<String> = ["repo".to_string()].into_iter().collect();
+        let ordered =
+            OrderedSessions::from_order(&sessions, &order, &[None, None], 0, &no_filter(&folded));
+        assert_eq!(ordered.sessions.len(), 1, "the group collapsed to one row");
+        assert_eq!(ordered.sessions[0].status, SessionStatus::Idle);
+
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut list_state = ListState::default();
+        terminal
+            .draw(|f| {
+                render_left_panel(
+                    f,
+                    Rect::new(0, 0, 40, 10),
+                    &mut LeftPanelState {
+                        sessions: &ordered.sessions,
+                        all_sessions: &sessions,
+                        active_session: ordered.active_index,
+                        show_selection: true,
+                        session_focus: FocusLevel::Focused,
+                        session_list_state: &mut list_state,
+                        session_match_positions: &ordered.match_positions,
+                        session_search_active: false,
+                        headers: &ordered.headers,
+                        depths: &ordered.depths,
+                        folded_counts: &ordered.folded_counts,
+                        ghost_shelf_count: ordered.hidden_ghosts,
+                        spinner: "\u{25d0}",
+                        jump_labels: &[],
+                    },
+                );
+            })
+            .unwrap();
+        let out: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        let blocked = SessionStatus::Blocked.icon();
+        assert!(
+            out.contains(&format!("{blocked}1")),
+            "the title bar still counts the folded blocked session: {out}"
+        );
+        assert_eq!(
+            out.matches(blocked).count(),
+            2,
+            "and the collapsed header wears the rolled-up dot too: {out}"
+        );
+    }
+
+    #[test]
     fn ordered_sessions_empty_input() {
         let sessions: Vec<&SessionInfo> = vec![];
         let order = compute_session_order(&sessions);
-        let ordered = OrderedSessions::from_order(&sessions, &order, &[], 0);
+        let ordered =
+            OrderedSessions::from_order(&sessions, &order, &[], 0, &no_filter(&Default::default()));
         assert!(ordered.sessions.is_empty());
         assert_eq!(ordered.active_index, 0);
         assert!(ordered.headers.is_empty());
@@ -1534,12 +1914,56 @@ mod tests {
     fn line_jump_digit_replaces_leading_pad_without_shifting_the_row() {
         let s = info("target");
         let plain = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", None);
-        let numbered = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", Some('3'));
+        let numbered = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", Some("3"));
         let text = line_text(&numbered);
         assert!(text.starts_with('3'), "digit leads the row: {text:?}");
         // The digit takes the dot's pad column, so nothing moves.
         assert_eq!(line_text(&plain)[1..], text[1..]);
         assert_eq!(plain.width(), numbered.width());
+    }
+
+    #[test]
+    fn two_letter_jump_label_also_keeps_the_row_in_place() {
+        let s = info("target");
+        let plain = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", None);
+        let labelled = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", Some("qw"));
+        let text = line_text(&labelled);
+        assert!(text.starts_with("qw"), "label leads the row: {text:?}");
+        // A second label column borrows the dot's trailing space instead of
+        // pushing the name right (skip by chars — the status glyph is
+        // multibyte, so a byte slice would split it).
+        let tail = |t: &str| t.chars().skip(3).collect::<String>();
+        assert_eq!(tail(&line_text(&plain)), tail(&text));
+        assert_eq!(plain.width(), labelled.width());
+    }
+
+    #[test]
+    fn labels_are_single_keys_until_the_alphabet_runs_out() {
+        let labels = session_labels(26);
+        assert_eq!(labels.len(), 26);
+        assert!(labels.iter().all(|l| l.chars().count() == 1));
+        assert_eq!(labels[0], "a", "home row first");
+    }
+
+    #[test]
+    fn labels_are_unique_and_prefix_free_past_the_alphabet() {
+        let labels = session_labels(40);
+        assert_eq!(labels.len(), 40);
+        let unique: std::collections::HashSet<&String> = labels.iter().collect();
+        assert_eq!(unique.len(), 40, "no two rows share a label");
+        // A single-key label must never prefix a two-key one, or pressing it
+        // would be ambiguous.
+        for short in labels.iter().filter(|l| l.chars().count() == 1) {
+            assert!(
+                !labels
+                    .iter()
+                    .any(|l| l.chars().count() == 2 && l.starts_with(short.as_str())),
+                "`{short}` both jumps and starts a longer label"
+            );
+        }
+        // Most rows still cost one keystroke.
+        let singles = labels.iter().filter(|l| l.chars().count() == 1).count();
+        assert!(singles >= 20, "only the surplus rows pay a second key");
     }
 
     #[test]
@@ -1578,7 +2002,7 @@ mod tests {
     fn group_header_is_always_muted_without_background() {
         // The header never reflects selection: selecting a group's first row
         // must not light up its header. Always muted, never a background tint.
-        let line = group_header_line("repo", SessionStatus::Idle, WIDE, "◐");
+        let line = group_header_line("repo", SessionStatus::Idle, None, WIDE, "◐");
         assert!(line.spans.iter().all(|sp| sp.style.bg.is_none()));
         assert_eq!(line.spans[1].style.fg, Some(Theme::text_muted()));
         assert!(!line.spans[1].style.add_modifier.contains(Modifier::BOLD));

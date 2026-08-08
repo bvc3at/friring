@@ -132,6 +132,15 @@ impl App {
             self.set_alt_held(false);
         }
 
+        // The label overlay owns every keystroke while open (see
+        // `handle_label_jump_key`) — ahead of the clipboard chords and every
+        // capture pane, or a review/activity pane eats the label letter and the
+        // overlay is left open with no way to aim.
+        if self.label_jump.is_some() {
+            self.handle_label_jump_key(code, mods);
+            return;
+        }
+
         // Help overlay + clipboard chords are routed before any modal handler.
         if self.handle_priority_key(code, mods) {
             return;
@@ -240,14 +249,15 @@ impl App {
     /// A bare modifier key press (kitty-protocol terminals only). Two `Shift`
     /// taps within [`DOUBLE_SHIFT_WINDOW_MS`] open the global search —
     /// mirroring the JetBrains "Search Everywhere" gesture. Taps never
-    /// accumulate while a modal or the search itself owns input (there,
-    /// `Shift` presses are just capitals being typed), and any non-`Shift`
-    /// modifier breaks a pending tap like a regular key would.
+    /// accumulate while a modal, the search itself or the label overlay owns
+    /// input (there, `Shift` presses are just capitals being typed), and any
+    /// non-`Shift` modifier breaks a pending tap like a regular key would.
     fn handle_modifier_press(&mut self, m: ModifierKeyCode) {
         let is_shift = matches!(m, ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift);
         if !is_shift
             || self.modal.is_open()
             || self.global_search.active
+            || self.label_jump.is_some()
             || !self.features.double_shift_search
         {
             self.pending_double_shift = None;
@@ -978,7 +988,7 @@ impl App {
         self.launch_editor(&[root, file], Some(subject));
     }
 
-    /// The session jump-overlay keys (see `App::jump_overlay_blocked_only`).
+    /// The session jump-overlay keys (see `App::jump_overlay_attention_only`).
     /// Returns `true` when the key was consumed.
     ///
     /// - While the blocked-only overlay is open: a digit jumps to that
@@ -989,24 +999,24 @@ impl App {
     /// - Otherwise `Alt+<digit>` jumps by the all-session numbering (works
     ///   blind on legacy terminals that can't show the hold overlay).
     fn handle_session_jump_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
-        use super::BlockedJumpMode;
+        use super::AttentionJumpMode;
         let plain_or_alt = mods.is_empty() || mods == KeyModifiers::ALT;
-        if let Some(mode) = self.blocked_jump {
+        if let Some(mode) = self.attention_jump {
             match code {
                 KeyCode::Char(c @ '1'..='9') if plain_or_alt => {
-                    self.blocked_jump = None;
+                    self.attention_jump = None;
                     self.jump_to_digit(c, true);
                     return true;
                 }
                 KeyCode::Esc => {
-                    self.blocked_jump = None;
+                    self.attention_jump = None;
                     return true;
                 }
                 _ => {
                     let is_toggle = self.keybindings.lookup(code, mods)
                         == Some(crate::session::Action::JumpToBlocked);
-                    if !is_toggle && mode == BlockedJumpMode::Sticky {
-                        self.blocked_jump = None;
+                    if !is_toggle && mode == AttentionJumpMode::Sticky {
+                        self.attention_jump = None;
                     }
                     return false;
                 }
@@ -1019,6 +1029,44 @@ impl App {
             }
         }
         false
+    }
+
+    /// Keys while the label-jump overlay is open. It owns **every** keystroke
+    /// (returning `true` throughout): the labels are plain letters, so letting
+    /// an unmatched one fall through would type it into the agent's prompt
+    /// instead of ending an aim the user has clearly abandoned.
+    ///
+    /// A letter extends the typed label; `Esc`/`Ctrl+C`/`Backspace` back out;
+    /// anything else ends the mode with the keystroke spent, which is the
+    /// cheapest possible escape from a mode entered by mistake.
+    fn handle_label_jump_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
+        let cancel = code == KeyCode::Esc
+            || code == KeyCode::Backspace
+            || (mods == KeyModifiers::CONTROL && code == KeyCode::Char('c'));
+        if cancel {
+            self.label_jump = None;
+            return true;
+        }
+        // Shift is tolerated so caps-lock or a stray shift still aims.
+        let typed = match code {
+            KeyCode::Char(c)
+                if c.is_ascii_alphabetic() && (mods.is_empty() || mods == KeyModifiers::SHIFT) =>
+            {
+                Some(c)
+            }
+            _ => None,
+        };
+        let Some(c) = typed else {
+            self.label_jump = None;
+            return true;
+        };
+        if !self.push_label_jump_char(c) {
+            self.set_status(
+                super::StatusLevel::Info,
+                format!("No session labelled `{c}`"),
+            );
+        }
+        true
     }
 
     /// Session-list keys are all rebindable `SessionList`-scoped actions
@@ -1748,9 +1796,10 @@ impl App {
             Action::PreviousSession => self.switch_session_backward(),
             Action::NextLoadedSession => self.switch_loaded_session(true),
             Action::PreviousLoadedSession => self.switch_loaded_session(false),
-            Action::NextBlockedSession => self.focus_next_blocked(),
+            Action::NextBlockedSession => self.focus_next_attention(),
             Action::LastSession => self.toggle_last_session(),
-            Action::JumpToBlocked => self.toggle_blocked_jump(),
+            Action::JumpToBlocked => self.toggle_attention_jump(),
+            Action::JumpToSession => self.toggle_label_jump(),
             _ => return None,
         }
         Some(true)
@@ -1797,6 +1846,10 @@ impl App {
             // wrapper: there is no flag that can switch the left column off.
             Action::ToggleSessionList => {
                 Self::act_toggle_session_list(self);
+                true
+            }
+            Action::ToggleGhostShelf => {
+                self.toggle_ghost_shelf();
                 true
             }
             Action::FocusTasks => {
@@ -1875,6 +1928,12 @@ impl App {
             Action::SessionListMoveDown => self.move_active_session(true),
             Action::SessionListMoveUp => self.move_active_session(false),
             Action::SessionListSortAlphabetically => self.sort_sessions_alphabetically(),
+            Action::SessionListFold => self.set_active_group_folded(true),
+            Action::SessionListUnfold => self.set_active_group_folded(false),
+            Action::SessionListFirst => self.select_first_session(),
+            Action::SessionListLast => self.select_last_session(),
+            Action::SessionListNextGroup => self.jump_to_adjacent_group(true),
+            Action::SessionListPrevGroup => self.jump_to_adjacent_group(false),
             // Same switch as the F9 view: both features read Claude Code's
             // undocumented on-disk layout, so one flag governs both.
             Action::SessionListImport => {

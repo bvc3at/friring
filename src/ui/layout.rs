@@ -23,6 +23,9 @@ pub struct PanelAreas {
     /// Search-Everywhere-style) when active. The panels underneath keep their
     /// size; matches highlight live inside them around the popup.
     pub global_search: Option<Rect>,
+    /// Widened session list, floating over the central pane while a navigation
+    /// gesture is pending — see the `session_peek` helper below.
+    pub session_peek: Option<Rect>,
     /// Full-width transient band for the active status/error message (or the
     /// sync spinner), docked directly above the footer. Present only while a
     /// message is showing, so nothing is clipped by the footer pills.
@@ -65,6 +68,37 @@ fn global_search_popup(area: Rect, show_status_row: bool) -> Rect {
         width,
         height,
     }
+}
+
+/// Never let the peeked list take more than this share of the content width:
+/// the point is to read the names, not to hide the session you are aiming at.
+const SESSION_PEEK_MAX_PERCENT: u16 = 45;
+
+/// The widened session-list rect, or `None` when the column is already wide
+/// enough for `needed` columns.
+///
+/// The list **floats over** the central pane rather than widening the column,
+/// and that is the whole design: a real column resize would reflow every
+/// session's PTY on each leader press, which is both slow and visibly garbles a
+/// running agent's output. The global-search popup floats for the same reason.
+///
+/// Anchored to the left column when there is one, so the list appears to grow
+/// in place; anchored to the content's left edge when the column is collapsed
+/// (`Alt+L`), which is what makes the leader reveal the list at all there.
+fn session_peek(content: Rect, left_panel: Option<Rect>, needed: u16) -> Option<Rect> {
+    let (x, y, height, current) = match left_panel {
+        Some(lp) => (lp.x, lp.y, lp.height, lp.width),
+        None => (content.x, content.y, content.height, 0),
+    };
+    let max = content.width * SESSION_PEEK_MAX_PERCENT / 100;
+    let width = needed.clamp(current, max.max(current));
+    // Nothing was being truncated — widening would be a distracting no-op.
+    (width > current).then_some(Rect {
+        x,
+        y,
+        width,
+        height,
+    })
 }
 
 /// Max rows (including borders) the automations pane may occupy.
@@ -239,6 +273,7 @@ fn three_panel_layout(
         tasks_panel,
         file_viewer,
         global_search: None,
+        session_peek: None,
         status_message: bands.status_message,
         terminal,
         footer: bands.footer,
@@ -263,6 +298,7 @@ fn two_panel_layout(
             tasks_panel: None,
             file_viewer: None,
             global_search: None,
+            session_peek: None,
             status_message: bands.status_message,
             terminal: content,
             footer: bands.footer,
@@ -283,6 +319,7 @@ fn two_panel_layout(
         tasks_panel: None,
         file_viewer: None,
         global_search: None,
+        session_peek: None,
         status_message: bands.status_message,
         terminal: horizontal[1],
         footer: bands.footer,
@@ -317,6 +354,10 @@ pub struct LayoutParams {
     pub automation_count: usize,
     /// Carve the transient status/error row directly above the footer.
     pub show_status_row: bool,
+    /// Columns the session list needs to show every name in full, when a
+    /// navigation gesture is pending and the list should widen to be readable.
+    /// `None` when no gesture is pending.
+    pub session_peek_width: Option<u16>,
 }
 
 impl Default for LayoutParams {
@@ -336,6 +377,7 @@ impl Default for LayoutParams {
             show_automations_pane: false,
             automation_count: 0,
             show_status_row: false,
+            session_peek_width: None,
         }
     }
 }
@@ -371,6 +413,10 @@ pub fn compute_layout(area: Rect, p: &LayoutParams) -> PanelAreas {
     areas.global_search = p
         .show_global_search
         .then(|| global_search_popup(area, p.show_status_row));
+    let content = split_vertical(area, p.show_status_row).content;
+    areas.session_peek = p
+        .session_peek_width
+        .and_then(|needed| session_peek(content, areas.left_panel, needed));
     areas
 }
 
@@ -390,6 +436,7 @@ fn compute_panel_areas(area: Rect, p: &LayoutParams) -> PanelAreas {
             tasks_panel: None,
             file_viewer: None,
             global_search: None,
+            session_peek: None,
             status_message: bands.status_message,
             terminal: content,
             footer: bands.footer,
@@ -644,6 +691,67 @@ mod tests {
         assert!(
             popup.y + popup.height <= status.y,
             "popup {popup:?} must end at or above the status row {status:?}"
+        );
+    }
+
+    // ── the peeked (widened) session list ──
+
+    fn peek_params(width: Option<u16>, show_list: bool) -> LayoutParams {
+        LayoutParams {
+            show_session_list: show_list,
+            session_peek_width: width,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn peek_absent_without_a_pending_gesture() {
+        let areas = compute_layout(area(120, 40), &peek_params(None, true));
+        assert!(areas.session_peek.is_none());
+    }
+
+    #[test]
+    fn peek_widens_in_place_over_the_central_pane() {
+        let plain = compute_layout(area(120, 40), &peek_params(None, true));
+        let areas = compute_layout(area(120, 40), &peek_params(Some(48), true));
+        let list = plain.left_panel.unwrap();
+        let peek = areas.session_peek.expect("gesture pending ⇒ peek shown");
+
+        assert_eq!((peek.x, peek.y), (list.x, list.y), "grows in place");
+        assert_eq!(peek.height, list.height);
+        assert!(peek.width > list.width);
+        // It floats: every panel — and so every session PTY — keeps its size.
+        assert_eq!(areas.terminal, plain.terminal);
+        assert_eq!(areas.left_panel, plain.left_panel);
+    }
+
+    #[test]
+    fn peek_is_skipped_when_the_column_is_already_wide_enough() {
+        // 120 cols ⇒ a 30-col list column; 12 columns of names fit already.
+        let areas = compute_layout(area(120, 40), &peek_params(Some(12), true));
+        assert!(
+            areas.session_peek.is_none(),
+            "widening to the same width would be a distracting no-op"
+        );
+    }
+
+    #[test]
+    fn peek_is_capped_so_it_cannot_swallow_the_pane() {
+        let areas = compute_layout(area(120, 40), &peek_params(Some(500), true));
+        let peek = areas.session_peek.expect("peek shown");
+        assert_eq!(peek.width, 120 * SESSION_PEEK_MAX_PERCENT / 100);
+    }
+
+    #[test]
+    fn peek_reveals_the_list_while_the_column_is_collapsed() {
+        let areas = compute_layout(area(120, 40), &peek_params(Some(40), false));
+        assert!(areas.left_panel.is_none(), "still collapsed");
+        let peek = areas.session_peek.expect("the gesture reveals it anyway");
+        assert_eq!(peek.x, 0, "anchored to the freed left edge");
+        assert_eq!(peek.width, 40);
+        assert_eq!(
+            areas.terminal.width, 120,
+            "and the terminal keeps every column, so nothing reflows"
         );
     }
 

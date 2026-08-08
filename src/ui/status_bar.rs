@@ -76,11 +76,12 @@ pub struct HeaderBadge<'a> {
 /// State needed to render the footer bar.
 pub struct FooterState<'a> {
     pub session_count: usize,
-    /// Sessions currently `Blocked` (needing attention). Rendered as a badge
-    /// next to the session count — with the live `NextBlockedSession`
+    /// The attention queue: the status `F10` is currently walking and how many
+    /// sessions are in it (`None` when nothing needs the user). Rendered as a
+    /// badge next to the session count — with the live `NextBlockedSession`
     /// shortcut as its hint — so attention is visible even when the sidebar
     /// is hidden (narrow terminals) or its dots are clipped.
-    pub blocked_count: usize,
+    pub attention: Option<(crate::session::SessionStatus, usize)>,
     pub status: Option<&'a StatusMessage>,
     pub focus_label: &'a str,
     pub sync_in_progress: bool,
@@ -598,13 +599,22 @@ fn left_segments(state: &FooterState<'_>) -> Vec<LeftSegment> {
             Style::default().fg(Theme::text_secondary()),
         )],
     ));
-    if state.blocked_count > 0 {
+    if let Some((status, count)) = state.attention {
         let shortcut = crate::session::compact_shortcut(
             state.keybindings.chords_for(Action::NextBlockedSession),
         );
+        // The badge names whichever half of the queue is live, and wears that
+        // status's own glyph and colour, so it reads as the same thing the
+        // sidebar dots are showing rather than a second vocabulary.
+        let word = if status == crate::session::SessionStatus::Blocked {
+            "blocked"
+        } else {
+            "done"
+        };
+        let glyph = super::status_glyph(status, "");
         let label = match shortcut {
-            Some(sc) => format!(" \u{25c6} {} blocked · {sc} ", state.blocked_count),
-            None => format!(" \u{25c6} {} blocked ", state.blocked_count),
+            Some(sc) => format!(" {glyph} {count} {word} · {sc} "),
+            None => format!(" {glyph} {count} {word} "),
         };
         segments.push(LeftSegment::new(
             PRIO_BLOCKED,
@@ -612,7 +622,7 @@ fn left_segments(state: &FooterState<'_>) -> Vec<LeftSegment> {
                 label,
                 Style::default()
                     .fg(Theme::text_primary())
-                    .bg(super::status_color(crate::session::SessionStatus::Blocked)),
+                    .bg(super::status_color(status)),
             )],
         ));
     }
@@ -766,7 +776,7 @@ mod tests {
         FooterState {
             prefix_armed: None,
             session_count: 1,
-            blocked_count: 0,
+            attention: None,
             status: None,
             focus_label: "Files",
             sync_in_progress: false,
@@ -1045,13 +1055,14 @@ mod tests {
             .collect()
     }
 
-    /// Blocked sessions surface as a footer badge carrying the live
-    /// `NextBlockedSession` shortcut hint; without any it stays hidden.
+    /// The attention queue surfaces as a footer badge carrying the live
+    /// `NextBlockedSession` shortcut hint; with an empty queue it stays hidden.
     #[test]
     fn footer_blocked_badge_shows_count_and_shortcut() {
         let idle_counts = |blocked: usize| -> String {
             let mut state = footer_state(false);
-            state.blocked_count = blocked;
+            state.attention =
+                (blocked > 0).then_some((crate::session::SessionStatus::Blocked, blocked));
             left_text(&state)
         };
 
@@ -1091,7 +1102,8 @@ mod tests {
                 [(0, 0, false), (2, 3, false), (1, 0, true), (0, 2, true)]
             {
                 let mut state = footer_state(viewer);
-                state.blocked_count = blocked;
+                state.attention =
+                    (blocked > 0).then_some((crate::session::SessionStatus::Blocked, blocked));
                 state.automation_count = automations;
                 state.session_count = 7;
                 let (hits, line) = footer_at(width, &state);
@@ -1133,7 +1145,8 @@ mod tests {
                             for automations in [0usize, 3] {
                                 let mut state = footer_state(viewer);
                                 state.focus_label = label;
-                                state.blocked_count = blocked;
+                                state.attention = (blocked > 0)
+                                    .then_some((crate::session::SessionStatus::Blocked, blocked));
                                 state.automation_count = automations;
                                 state.session_count = 7;
                                 state.prefix_armed = armed.map(str::to_string);

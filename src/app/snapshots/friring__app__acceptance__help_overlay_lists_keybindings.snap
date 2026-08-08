@@ -15,17 +15,17 @@ expression: h.render()
 │                   │  ctrl+k / alt+k  Previous session                       ║│                   │
 │                   │  alt+n           Next loaded session                    ║│                   │
 │                   │  alt+p           Previous loaded session                ║│                   │
-│                   │  f10             Next blocked session                   ║│                   │
+│                   │  f10             Next session needing attention         ║│                   │
 │                   │  ctrl+6 / ctrl+^ Last session (toggle)                  ║│                   │
-│                   │  alt+a           Jump to blocked by number              ║│                   │
+│                   │  alt+a           Jump to attention by number            ║│                   │
+│                   │  alt+g           Jump to session by label               ║│                   │
 │                   │                                                         ║│                   │
 │                   │Sessions                                                 ║│                   │
 │                   │  ctrl+n          New session                            ║│                   │
 │                   │  ctrl+d          Delete session                         ║│                   │
 │                   │  ctrl+r          Restart session                        ║│                   │
 │                   │  alt+u           Unload session (ghost)                 ║│                   │
-│                   │  ctrl+f          Fork session                           ║│                   │
-│                   │  ctrl+p          Automations                            ▼│                   │
+│                   │  ctrl+f          Fork session                           ▼│                   │
 │                   │j/k move · r rebind · d reset           Reset all   Close │                   │
 ╰───────────────────╰──────────────────────────────────────────────────────────╯                   │
 ┌ Automations ──────────┐│                                                                         │

@@ -750,6 +750,7 @@ fn searching_to_an_automation_brings_the_collapsed_column_back() {
 
     h.alt('l');
     h.ctrl('/'); // GlobalSearch
+    h.key(KeyCode::Tab, KeyModifiers::NONE); // widen past the session switcher
     for c in "widget-nightly".chars() {
         h.key(KeyCode::Char(c), KeyModifiers::NONE);
     }
@@ -2122,6 +2123,31 @@ fn status_message_row_records_a_click_to_copy_target() {
 // ── Spawn-dependent flows (fake backend, real Tokio I/O wiring) ───────────────
 
 #[tokio::test]
+async fn switcher_enter_loads_an_unloaded_session() {
+    // `Enter` on a ghost row in the sidebar starts its agent; picking the same
+    // ghost out of the switcher has to do the same, or the switcher reaches it
+    // and leaves the user on a frozen frame with no way forward.
+    let mut h = Harness::spawnable(2);
+    h.app.set_active_index(1);
+    h.alt('u'); // UnloadSession
+    assert!(
+        h.app.sessions[1].is_ghost(),
+        "the row is a ghost to begin with"
+    );
+    h.app.set_active_index(0);
+
+    h.ctrl('/'); // GlobalSearch — the switcher, listing everything but the active row
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+
+    assert_eq!(h.app.active_index, 1);
+    assert!(
+        !h.app.active_session_is_ghost(),
+        "choosing a ghost loads it"
+    );
+    assert!(!h.app.global_search.active, "and the popup is gone");
+}
+
+#[tokio::test]
 async fn ctrl_r_restarts_session_on_spawnable_backend() {
     // Restart kills + respawns through the backend and rewires I/O; the fake
     // backend makes that succeed without a real tmux/PTY.
@@ -2792,7 +2818,7 @@ fn pending_move_numbers_rows_by_distance() {
         Some(crate::app::JumpNumbering::MoveDistance { from: 2, up: true })
     );
     assert_eq!(
-        h.app.jump_overlay_blocked_only(),
+        h.app.jump_overlay_attention_only(),
         None,
         "a move is neither the all-sessions nor the blocked numbering"
     );
@@ -2999,7 +3025,7 @@ fn leader_a_then_digit_jumps_to_the_nth_blocked_session() {
         .app
         .status_message
         .as_ref()
-        .is_some_and(|m| m.text.contains("No blocked session #9")));
+        .is_some_and(|m| m.text.contains("No session needing attention #9")));
 }
 
 #[test]
@@ -4163,6 +4189,7 @@ fn global_search_files_match_from_the_cached_index() {
     // off-thread walk, keeping the test deterministic.
     let mut h = Harness::standard(1);
     h.ctrl('/');
+    h.key(KeyCode::Tab, KeyModifiers::NONE); // widen past the session switcher
     for c in "zanzi".chars() {
         h.key(KeyCode::Char(c), KeyModifiers::NONE);
     }

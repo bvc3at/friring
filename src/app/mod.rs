@@ -745,7 +745,7 @@ pub(crate) enum TerminalView {
 /// invisible): it stays until a digit jump, `Esc`, the toggle chord, or any
 /// other key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BlockedJumpMode {
+pub(crate) enum AttentionJumpMode {
     Held,
     Sticky,
 }
@@ -794,6 +794,12 @@ pub struct App {
     /// [`Self::set_active_index`]; bookkeeping moves (restore reshuffles,
     /// delete clamps, search previews) bypass it on purpose.
     last_active_session: Option<SessionId>,
+    /// Every session ever activated, most-recently-active first (front = the
+    /// session showing now). Powers the switcher's no-query list and its
+    /// recency tiebreak. Fed by the same *deliberate*-switch rule as
+    /// [`Self::last_active_session`], so a live search preview arrowing past a
+    /// session never promotes it. In-memory: a restart starts from render order.
+    session_mru: Vec<SessionId>,
     /// Whether the Alt key is currently held (kitty-protocol modifier events;
     /// always `false` on legacy terminals). See [`Self::set_alt_held`].
     alt_held: bool,
@@ -805,8 +811,19 @@ pub struct App {
     /// (the overlay appears on a timer, not an input event — see
     /// [`Self::tick_jump_overlay`]).
     alt_overlay_redraw_requested: bool,
-    /// The blocked-only jump overlay (`Alt+A`), when open.
-    blocked_jump: Option<BlockedJumpMode>,
+    /// The attention-only jump overlay (`Alt+A`), when open.
+    attention_jump: Option<AttentionJumpMode>,
+    /// The label-jump overlay (`Alt+G` / `<leader> A`), when open.
+    pub(crate) label_jump: Option<LabelJump>,
+    /// Repo groups collapsed in the session list, by
+    /// [`group_key`](crate::ui::project_list::group_key). Persisted (DB
+    /// metadata) — folding is how a long list gets curated, which is worth
+    /// setting up once rather than every launch.
+    pub(crate) folded_groups: std::collections::HashSet<String>,
+    /// Whether unloaded sessions are folded out of the list into a title-bar
+    /// count (the ghost shelf). In-memory like the other view toggles; its
+    /// startup value comes from `[navigation] ghost_shelf`.
+    pub(crate) ghost_shelf: bool,
     backends: BackendRegistry,
     /// Registry of declarative agent definitions, used to build providers per
     /// session at spawn/restart time.
@@ -841,6 +858,10 @@ pub struct App {
     /// global like [`Self::features`] so the settings panel applies them live
     /// and tests can switch modes without touching the process-wide global.
     pub(crate) prefix_settings: crate::session::settings::PrefixSettings,
+    /// Session-navigation knobs (`[navigation]` in settings.toml) — copied out
+    /// of the global like [`Self::features`] so the settings panel / live
+    /// reload re-apply them without a restart.
+    pub(crate) navigation: crate::session::settings::NavigationSettings,
     /// Whether the leader is armed (see [`PrefixState`]).
     pub(crate) prefix_state: PrefixState,
     /// Whether the redraw for `prefix.hint_delay_ms` elapsing was already
@@ -1147,7 +1168,7 @@ const WORKING_OUTPUT_STALE_MS: u64 = 10_000;
 /// How long Alt must be held before the session-jump numbers appear: long
 /// enough that pass-through Alt chords (readline `M-b`/`M-f` in the shell
 /// pane) don't flash the overlay, short enough that a deliberate hold feels
-/// immediate. See [`App::jump_overlay_blocked_only`] / [`App::set_alt_held`].
+/// immediate. See [`App::jump_overlay_attention_only`] / [`App::set_alt_held`].
 const JUMP_OVERLAY_DELAY_MS: u64 = 150;
 
 /// Whether the leader key is armed, and since when.
@@ -1186,6 +1207,16 @@ impl PrefixState {
     }
 }
 
+/// Columns a session row spends on things other than its name: the status dot
+/// and its padding, room for the tree/remote/worktree marks, the memory badge
+/// and the block's own borders. Deliberately generous — over-measuring costs a
+/// couple of blank columns in a transient overlay, under-measuring truncates
+/// the very name the overlay exists to reveal.
+const SESSION_ROW_CHROME_COLS: usize = 14;
+
+/// The same, for a repo-group header line (`● ── label ──`).
+const GROUP_HEADER_CHROME_COLS: usize = 10;
+
 /// How the session list numbers its rows this frame.
 ///
 /// The digits are an *argument* to whatever gesture is pending, so the
@@ -1197,11 +1228,29 @@ impl PrefixState {
 pub(crate) enum JumpNumbering {
     /// Every session, numbered from the top (Alt held, or an armed leader).
     All,
-    /// Only `Blocked` sessions (`Alt+A` / `<leader> a`).
-    Blocked,
+    /// Only the sessions needing attention (`Alt+A` / `<leader> a`) — see
+    /// [`App::attention_status`] for which those are.
+    Attention,
     /// Rows in one direction from `from`, numbered by *distance* — so the row
     /// labelled `3` is where `<leader> K 3` lands the session.
     MoveDistance { from: usize, up: bool },
+    /// Every session, wearing a home-row letter label (`Alt+G` /
+    /// `<leader> A`). Unlike [`Self::All`] this is not capped at nine, which is
+    /// the whole point of it.
+    Labels,
+}
+
+/// The label-jump overlay (`Alt+G` / `<leader> A`), while open.
+///
+/// A sticky mode rather than a held one: the Alt-hold overlay needs the kitty
+/// protocol to see the key going down, which an outer tmux strips — and this
+/// fork is normally driven through one. Typed letters accumulate so a two-key
+/// label can be entered; any key that can't continue a label ends the mode.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LabelJump {
+    /// Label characters typed so far. Rows whose label starts with this show
+    /// only the remainder, so the overlay narrows as the user commits.
+    pub(crate) typed: String,
 }
 
 /// Map a session's persisted hook state to its rendered [`SessionStatus`]. Pure
@@ -1330,10 +1379,14 @@ impl App {
             sessions: Vec::new(),
             active_index: 0,
             last_active_session: None,
+            session_mru: Vec::new(),
             alt_held: false,
             alt_held_since: None,
             alt_overlay_redraw_requested: false,
-            blocked_jump: None,
+            attention_jump: None,
+            label_jump: None,
+            folded_groups: std::collections::HashSet::new(),
+            ghost_shelf: crate::session::settings::global().navigation.ghost_shelf,
             backends,
             agents,
             hosts: crate::session::HostRegistry::default(),
@@ -1349,6 +1402,7 @@ impl App {
             info_panel_position: crate::session::settings::global().info_panel_position,
             review_settings: crate::session::settings::global().review,
             prefix_settings: crate::session::settings::global().prefix.clone(),
+            navigation: crate::session::settings::global().navigation,
             prefix_state: PrefixState::Idle,
             prefix_hint_redraw_requested: false,
             show_info_panel: false,
@@ -1547,6 +1601,7 @@ impl App {
         self.review_settings = settings.review;
         let old_leaders = self.prefix_settings.chords();
         self.prefix_settings = settings.prefix.clone();
+        self.navigation = settings.navigation;
         // A leader set that changed — rebound, or emptied by `mode = off` —
         // must not leave the old armed state behind. Armed against the *new*
         // leader, `handle_prefix_key` would read its first press as
@@ -3401,7 +3456,7 @@ impl App {
     fn activate_click_target(&mut self, action: ClickAction) -> bool {
         match action {
             ClickAction::SelectSession(display_idx) => {
-                if let Some(&idx) = self.render_order_indices().get(display_idx) {
+                if let Some(&idx) = self.visible_order_indices().get(display_idx) {
                     self.set_active_index(idx);
                 }
                 // Clicking a row is *activation*, not list management: land in
@@ -4876,10 +4931,187 @@ impl App {
         crate::ui::project_list::compute_session_order(&infos)
     }
 
-    /// Indices into `self.sessions` in the order they are rendered — the order
-    /// `Ctrl+J`/`Ctrl+K` step through (repo groups in manual order).
+    /// Indices into `self.sessions` in the **full** rendered order, hidden rows
+    /// included. This is the order the reordering operations work in: they
+    /// renumber every session's `display_order` along it, so a filtered order
+    /// would silently renumber the collapsed rows into each other.
+    ///
+    /// Navigation wants [`Self::visible_order_indices`] instead.
     fn render_order_indices(&self) -> Vec<usize> {
         self.session_order().order
+    }
+
+    /// What the session list hides this frame: collapsed repo groups and, with
+    /// the ghost shelf on, unloaded sessions — never the active session, whose
+    /// row has to stay under the cursor.
+    pub(crate) fn visibility_filter(&self) -> crate::ui::project_list::VisibilityFilter<'_> {
+        crate::ui::project_list::VisibilityFilter {
+            folded_groups: &self.folded_groups,
+            ghost_shelf: self.ghost_shelf,
+            keep: self.active_session_id(),
+            // While the attention overlay is up, its rows are what the next
+            // keystroke acts on, so they have to be on screen and wearing their
+            // digit — the painted numbers and `session_jump_targets` read the
+            // same order, and would otherwise disagree about a folded row.
+            reveal: self
+                .attention_jump
+                .is_some()
+                .then(|| self.attention_status())
+                .flatten(),
+        }
+    }
+
+    /// The rows the attention queue may land on: the visible order with every
+    /// session in the queue revealed, whether or not its group is collapsed.
+    ///
+    /// Folding and the ghost shelf declutter the *list*; they must not put work
+    /// out of reach. Without this a blocked agent inside a collapsed group is
+    /// badged in the title bar (which counts the whole fleet) while `F10` says
+    /// nothing needs attention — the queue failing at the one thing it is for.
+    /// Landing on the session then reveals its row anyway, via `keep`.
+    fn attention_order_indices(&self) -> Vec<usize> {
+        let infos: Vec<&crate::session::SessionInfo> =
+            self.sessions.iter().map(|s| &s.info).collect();
+        let order = crate::ui::project_list::compute_session_order(&infos);
+        let filter = crate::ui::project_list::VisibilityFilter {
+            reveal: self.attention_status(),
+            ..self.visibility_filter()
+        };
+        let visible = crate::ui::project_list::visible_rows(&infos, &order, &filter);
+        order
+            .order
+            .into_iter()
+            .zip(visible)
+            .filter_map(|(i, shown)| shown.then_some(i))
+            .collect()
+    }
+
+    /// Indices into `self.sessions` for the rows actually **on screen**, in
+    /// render order — what `Ctrl+J`/`Ctrl+K`, the jump digits and the labels
+    /// step through. Stepping onto a row the user can't see would look like the
+    /// key was swallowed, so navigation follows the list rather than the data.
+    pub(crate) fn visible_order_indices(&self) -> Vec<usize> {
+        let infos: Vec<&crate::session::SessionInfo> =
+            self.sessions.iter().map(|s| &s.info).collect();
+        let order = crate::ui::project_list::compute_session_order(&infos);
+        let visible =
+            crate::ui::project_list::visible_rows(&infos, &order, &self.visibility_filter());
+        order
+            .order
+            .into_iter()
+            .zip(visible)
+            .filter_map(|(i, shown)| shown.then_some(i))
+            .collect()
+    }
+
+    /// The group key of the session at `idx`, for the fold toggles.
+    fn group_key_at(&self, idx: usize) -> Option<String> {
+        self.sessions
+            .get(idx)
+            .map(|s| crate::ui::project_list::group_key(&s.info))
+    }
+
+    /// Collapse or expand the active session's repo group and persist the set.
+    ///
+    /// Collapsing moves the selection to the group's first row: otherwise the
+    /// active session would be force-kept visible under its own collapsed
+    /// header (see [`Self::visibility_filter`]) and the key would look like it
+    /// did nothing.
+    pub(crate) fn set_active_group_folded(&mut self, folded: bool) {
+        let Some(key) = self.group_key_at(self.active_index) else {
+            return;
+        };
+        let changed = if folded {
+            self.folded_groups.insert(key.clone())
+        } else {
+            self.folded_groups.remove(&key)
+        };
+        if !changed {
+            return;
+        }
+        if folded {
+            if let Some(first) = self
+                .render_order_indices()
+                .into_iter()
+                .find(|&i| self.group_key_at(i).as_deref() == Some(key.as_str()))
+            {
+                self.set_active_index(first);
+            }
+        }
+        self.persist_folded_groups();
+    }
+
+    /// Write the collapsed-group set back to the DB. A failure here costs the
+    /// arrangement on the next launch, not the fold itself, so it is logged
+    /// rather than surfaced.
+    fn persist_folded_groups(&self) {
+        let mut keys: Vec<String> = self.folded_groups.iter().cloned().collect();
+        keys.sort_unstable();
+        if let Err(e) = self.db.set_folded_session_groups(&keys) {
+            tracing::warn!("failed to persist collapsed session groups: {e}");
+        }
+    }
+
+    /// Restore the collapsed-group set at startup.
+    pub fn load_folded_groups(&mut self) {
+        match self.db.get_folded_session_groups() {
+            Ok(keys) => self.folded_groups = keys.into_iter().collect(),
+            Err(e) => tracing::warn!("failed to load collapsed session groups: {e}"),
+        }
+    }
+
+    /// Show or hide the unloaded sessions (the ghost shelf). Reports the new
+    /// state, because with no ghosts around the toggle has nothing visible to
+    /// change and would otherwise look broken.
+    pub(crate) fn toggle_ghost_shelf(&mut self) {
+        self.ghost_shelf = !self.ghost_shelf;
+        let ghosts = self
+            .sessions
+            .iter()
+            .filter(|s| s.info.status == SessionStatus::Unloaded)
+            .count();
+        let msg = match (self.ghost_shelf, ghosts) {
+            (_, 0) => "No unloaded sessions to shelve".to_string(),
+            (true, n) => format!("Shelved {n} unloaded session(s)"),
+            (false, n) => format!("Showing {n} unloaded session(s)"),
+        };
+        self.set_status(StatusLevel::Info, msg);
+    }
+
+    /// Move the selection to the first visible session of the next (or
+    /// previous) repo group, wrapping — the coarse step that makes a list of
+    /// twenty sessions across five repos five keystrokes wide instead of twenty.
+    pub(crate) fn jump_to_adjacent_group(&mut self, forward: bool) {
+        let visible = self.visible_order_indices();
+        if visible.is_empty() {
+            return;
+        }
+        // First visible row of each group, in render order.
+        let mut heads: Vec<usize> = Vec::new();
+        let mut last: Option<String> = None;
+        for &i in &visible {
+            let key = self.group_key_at(i);
+            if key != last {
+                heads.push(i);
+                last = key;
+            }
+        }
+        if heads.len() < 2 {
+            self.set_status(StatusLevel::Info, "Only one repo group");
+            return;
+        }
+        // The group the cursor is in, by its head's position.
+        let active_key = self.group_key_at(self.active_index);
+        let here = heads
+            .iter()
+            .position(|&i| self.group_key_at(i) == active_key)
+            .unwrap_or(0);
+        let next = if forward {
+            (here + 1) % heads.len()
+        } else {
+            (here + heads.len() - 1) % heads.len()
+        };
+        self.set_active_index(heads[next]);
     }
 
     /// Move the active session one step up or down in the rendered order
@@ -4928,7 +5160,7 @@ impl App {
     /// Whether the active session is the first row in render order (top of the
     /// left column). Treats an empty list as "first" so `k` is a no-op there.
     pub(crate) fn active_is_first_in_order(&self) -> bool {
-        match self.render_order_indices().first() {
+        match self.visible_order_indices().first() {
             Some(&first) => first == self.active_index,
             None => true,
         }
@@ -4938,7 +5170,7 @@ impl App {
     /// the session list, directly above the automations pane). Treats an empty
     /// list as "last" so `j` falls straight through into the automations pane.
     pub(crate) fn active_is_last_in_order(&self) -> bool {
-        match self.render_order_indices().last() {
+        match self.visible_order_indices().last() {
             Some(&last) => last == self.active_index,
             None => true,
         }
@@ -4947,7 +5179,7 @@ impl App {
     /// Select the last session in render order — used when navigating up out of
     /// the automations pane back into the session list.
     pub(crate) fn select_last_session(&mut self) {
-        if let Some(&last) = self.render_order_indices().last() {
+        if let Some(&last) = self.visible_order_indices().last() {
             self.set_active_index(last);
         }
     }
@@ -4955,7 +5187,7 @@ impl App {
     /// Select the first session in render order — used when looping down out of
     /// the automations pane back to the top of the session list.
     pub(crate) fn select_first_session(&mut self) {
-        if let Some(&first) = self.render_order_indices().first() {
+        if let Some(&first) = self.visible_order_indices().first() {
             self.set_active_index(first);
         }
     }
@@ -4971,6 +5203,60 @@ impl App {
             self.last_active_session = self.active_session_id();
         }
         self.active_index = idx;
+        self.note_session_use();
+    }
+
+    /// Promote the active session to the front of the MRU list. Called by every
+    /// deliberate switch — including the search commit, which sets
+    /// `active_index` directly to keep live previews out of the toggle history
+    /// but still means "I chose this one".
+    pub(crate) fn note_session_use(&mut self) {
+        let Some(id) = self.active_session_id() else {
+            return;
+        };
+        self.session_mru.retain(|&seen| seen != id);
+        self.session_mru.insert(0, id);
+    }
+
+    /// Indices into `self.sessions`, most-recently-active first. Sessions never
+    /// deliberately switched to (a fresh start, or ones only ever passed over)
+    /// trail in render order, so the list is total and stable rather than
+    /// half-empty on the first switch of a session.
+    pub(crate) fn mru_order_indices(&self) -> Vec<usize> {
+        let by_id: std::collections::HashMap<SessionId, usize> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.info.id, i))
+            .collect();
+        let mut seen = vec![false; self.sessions.len()];
+        let mut out = Vec::with_capacity(self.sessions.len());
+        let mut take = |i: usize, out: &mut Vec<usize>| {
+            if !std::mem::replace(&mut seen[i], true) {
+                out.push(i);
+            }
+        };
+        for id in &self.session_mru {
+            if let Some(&i) = by_id.get(id) {
+                take(i, &mut out);
+            }
+        }
+        for i in self.render_order_indices() {
+            take(i, &mut out);
+        }
+        out
+    }
+
+    /// Each session's position in the MRU list, keyed by id — the switcher's
+    /// recency tiebreak (lower is more recent). Built once per ranking pass:
+    /// scanning `session_mru` per session made the switcher quadratic in the
+    /// fleet size, on the path that runs for every keystroke.
+    pub(crate) fn mru_ranks(&self) -> std::collections::HashMap<SessionId, usize> {
+        self.session_mru
+            .iter()
+            .enumerate()
+            .map(|(rank, id)| (*id, rank))
+            .collect()
     }
 
     /// Toggle between the two most recent sessions (tmux `last-window`, vim's
@@ -5001,7 +5287,7 @@ impl App {
         if self.sessions.is_empty() {
             return;
         }
-        let order = self.render_order_indices();
+        let order = self.visible_order_indices();
         let pos = order
             .iter()
             .position(|&i| i == self.active_index)
@@ -5021,8 +5307,8 @@ impl App {
         self.alt_held = held;
         self.alt_overlay_redraw_requested = false;
         self.alt_held_since = held.then(std::time::Instant::now);
-        if !held && self.blocked_jump == Some(BlockedJumpMode::Held) {
-            self.blocked_jump = None;
+        if !held && self.attention_jump == Some(AttentionJumpMode::Held) {
+            self.attention_jump = None;
         }
     }
 
@@ -5034,11 +5320,11 @@ impl App {
     /// The armed leader paints the same numbers as the Alt-hold: `<leader> 1`
     /// is otherwise a documentation-only route, and a which-key row reading
     /// "go to session N" is useless without knowing which N is which.
-    pub(crate) fn jump_overlay_blocked_only(&self) -> Option<bool> {
+    pub(crate) fn jump_overlay_attention_only(&self) -> Option<bool> {
         match self.jump_numbering()? {
-            JumpNumbering::Blocked => Some(true),
+            JumpNumbering::Attention => Some(true),
             JumpNumbering::All => Some(false),
-            JumpNumbering::MoveDistance { .. } => None,
+            JumpNumbering::MoveDistance { .. } | JumpNumbering::Labels => None,
         }
     }
 
@@ -5051,8 +5337,11 @@ impl App {
                 up,
             });
         }
-        if self.blocked_jump.is_some() {
-            return Some(JumpNumbering::Blocked);
+        if self.label_jump.is_some() {
+            return Some(JumpNumbering::Labels);
+        }
+        if self.attention_jump.is_some() {
+            return Some(JumpNumbering::Attention);
         }
         if self.prefix_state.is_armed() {
             return Some(JumpNumbering::All);
@@ -5061,6 +5350,13 @@ impl App {
             .alt_held_since
             .is_some_and(|t| t.elapsed().as_millis() as u64 >= JUMP_OVERLAY_DELAY_MS);
         if self.alt_held && delay_elapsed {
+            return Some(JumpNumbering::All);
+        }
+        // The Alt-hold overlay needs the kitty protocol to see the key go
+        // down, which an outer tmux strips — and this fork is normally driven
+        // through one. `session_numbers = "always"` is the way to get
+        // aim-then-shoot `Alt+1`–`9` there instead of firing blind.
+        if self.navigation.session_numbers == crate::session::settings::SessionNumbers::Always {
             return Some(JumpNumbering::All);
         }
         None
@@ -5135,21 +5431,47 @@ impl App {
     fn tick_jump_overlay(&mut self) {
         if self.alt_held
             && !self.alt_overlay_redraw_requested
-            && self.jump_overlay_blocked_only().is_some()
+            && self.jump_overlay_attention_only().is_some()
         {
             self.alt_overlay_redraw_requested = true;
             self.request_redraw();
         }
     }
 
+    /// Which status the attention queue is walking right now, or `None` when
+    /// nothing needs the user.
+    ///
+    /// `Blocked` (an agent waiting on an answer) always wins: those sessions
+    /// are *stopped* until you act. Only when none is blocked does the queue
+    /// fall through to `Done` — a run that finished and hasn't been looked at
+    /// (`derive_session_status` drops a session back to `Idle` the moment it
+    /// is seen, so `Done` already means "unseen"). Following both at once
+    /// would bury the blocking prompts among finished runs.
+    ///
+    /// The `Done` half is opt-out via `[navigation] attention_includes_done`.
+    pub(crate) fn attention_status(&self) -> Option<SessionStatus> {
+        let any = |status| self.sessions.iter().any(|s| s.info.status == status);
+        if any(SessionStatus::Blocked) {
+            return Some(SessionStatus::Blocked);
+        }
+        if self.navigation.attention_includes_done && any(SessionStatus::Done) {
+            return Some(SessionStatus::Done);
+        }
+        None
+    }
+
     /// The sessions digits `1`–`9` jump to, in the order the overlay numbers
-    /// them: rendered order, optionally filtered to `Blocked`, capped at 9.
-    /// Must stay consistent with the numbering `App::view` paints (same
-    /// order, same predicate — see `render_left_panel`).
-    pub(crate) fn session_jump_targets(&self, blocked_only: bool) -> Vec<usize> {
-        self.render_order_indices()
+    /// them: rendered order, optionally filtered to the attention queue,
+    /// capped at 9. Must stay consistent with the numbering `App::view` paints
+    /// (same order, same predicate — see `render_left_panel`).
+    pub(crate) fn session_jump_targets(&self, attention_only: bool) -> Vec<usize> {
+        // `Some(status) == None` is false, so an empty queue numbers nothing —
+        // treating "no filter status" as "no filter" would silently turn the
+        // attention overlay into the all-sessions one.
+        let wanted = self.attention_status();
+        self.attention_order_indices()
             .into_iter()
-            .filter(|&i| !blocked_only || self.sessions[i].info.status == SessionStatus::Blocked)
+            .filter(|&i| !attention_only || wanted == Some(self.sessions[i].info.status))
             .take(9)
             .collect()
     }
@@ -5157,9 +5479,9 @@ impl App {
     /// Activate the `digit`-numbered session of the jump overlay (all
     /// sessions or blocked-only, matching what the overlay renders) and land
     /// in the terminal. An out-of-range digit reports instead of guessing.
-    pub(crate) fn jump_to_digit(&mut self, digit: char, blocked_only: bool) {
+    pub(crate) fn jump_to_digit(&mut self, digit: char, attention_only: bool) {
         let n = digit.to_digit(10).unwrap_or(0) as usize;
-        let targets = self.session_jump_targets(blocked_only);
+        let targets = self.session_jump_targets(attention_only);
         match n.checked_sub(1).and_then(|i| targets.get(i)) {
             Some(&idx) => {
                 self.set_active_index(idx);
@@ -5167,8 +5489,8 @@ impl App {
                 self.on_focus_changed();
             }
             None => {
-                let what = if blocked_only {
-                    "blocked session"
+                let what = if attention_only {
+                    "session needing attention"
                 } else {
                     "session"
                 };
@@ -5177,36 +5499,153 @@ impl App {
         }
     }
 
-    /// Toggle the blocked-only jump overlay (`Alt+A`): blocked sessions get
-    /// numbers `1`–`9` and a digit jumps to that one — fewer, lower digits
-    /// than the all-session numbering when the list is long. Entered while
-    /// Alt is held it lives until the Alt release; entered by a tap (legacy
-    /// terminals) it is sticky — see [`BlockedJumpMode`].
-    pub(crate) fn toggle_blocked_jump(&mut self) {
-        if self.blocked_jump.is_some() {
-            self.blocked_jump = None;
+    /// Whether a session-navigation gesture is pending: the leader is armed
+    /// (or waiting for a move distance), a jump overlay is open, or Alt has
+    /// been held past the overlay delay.
+    ///
+    /// While one is, the next keystroke picks a *session*, so the list is the
+    /// only thing on screen that matters — which is what earns it the width to
+    /// show its names in full (see [`Self::session_peek_width`]).
+    pub(crate) fn session_nav_peek_active(&self) -> bool {
+        if self.label_jump.is_some() || self.attention_jump.is_some() {
+            return true;
+        }
+        if !matches!(self.prefix_state, PrefixState::Idle) {
+            return true;
+        }
+        self.alt_held
+            && self
+                .alt_held_since
+                .is_some_and(|t| t.elapsed().as_millis() as u64 >= JUMP_OVERLAY_DELAY_MS)
+    }
+
+    /// Columns the session list needs to show every visible row in full, while
+    /// a navigation gesture is pending; `None` otherwise.
+    ///
+    /// Sized from the rows actually on screen (collapsed groups and shelved
+    /// ghosts don't count) plus the chrome each one carries. The layout clamps
+    /// the result — this only measures.
+    pub(crate) fn session_peek_width(&self) -> Option<u16> {
+        if !self.session_nav_peek_active() {
+            return None;
+        }
+        use unicode_width::UnicodeWidthStr;
+        let mut widest = 0usize;
+        for &i in &self.visible_order_indices() {
+            let info = &self.sessions[i].info;
+            // Terminal columns, not chars: a CJK name takes two columns per
+            // char, and it is columns the renderer truncates against.
+            widest = widest.max(info.name.as_str().width() + SESSION_ROW_CHROME_COLS);
+            for repo in &info.repo_display_names {
+                widest = widest.max(repo.as_str().width() + GROUP_HEADER_CHROME_COLS);
+            }
+        }
+        (widest > 0).then(|| widest.min(u16::MAX as usize) as u16)
+    }
+
+    /// The sessions the label-jump overlay labels, in rendered order — every
+    /// one of them, which is the difference from [`Self::session_jump_targets`]
+    /// and its nine-digit ceiling.
+    pub(crate) fn label_jump_targets(&self) -> Vec<usize> {
+        self.visible_order_indices()
+    }
+
+    /// The label each row wears this frame, parallel to `label_jump_targets`.
+    /// While a two-key label is half-typed, rows that can't still match drop
+    /// their label and the rest show only the remainder — so the overlay
+    /// narrows to the reachable set as the user commits.
+    pub(crate) fn label_jump_chips(&self) -> Vec<Option<String>> {
+        let Some(state) = self.label_jump.as_ref() else {
+            return Vec::new();
+        };
+        let targets = self.label_jump_targets();
+        crate::ui::project_list::session_labels(targets.len())
+            .into_iter()
+            .map(|label| {
+                label
+                    .strip_prefix(state.typed.as_str())
+                    .filter(|rest| !rest.is_empty())
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// Open the label-jump overlay (`Alt+G` / `<leader> A`), or close it if it
+    /// is already open. Reports rather than opening an empty overlay.
+    pub(crate) fn toggle_label_jump(&mut self) {
+        if self.label_jump.take().is_some() {
+            return;
+        }
+        if self.sessions.is_empty() {
+            self.set_status(StatusLevel::Info, "No sessions to jump to");
+            return;
+        }
+        self.label_jump = Some(LabelJump::default());
+    }
+
+    /// Feed a character to the open label-jump overlay. Returns `false` when
+    /// the character can't continue any label, which the caller reports as a
+    /// miss — the mode always ends on the keystroke either way, so a typo can
+    /// never leave the user trapped in an overlay.
+    pub(crate) fn push_label_jump_char(&mut self, c: char) -> bool {
+        let Some(mut state) = self.label_jump.take() else {
+            return false;
+        };
+        state.typed.push(c.to_ascii_lowercase());
+        let targets = self.label_jump_targets();
+        let labels = crate::ui::project_list::session_labels(targets.len());
+        if let Some(pos) = labels.iter().position(|l| *l == state.typed) {
+            let idx = targets[pos];
+            self.set_active_index(idx);
+            self.focus = InputFocus::Terminal;
+            self.on_focus_changed();
+            return true;
+        }
+        // Not a whole label yet: stay open only while something can still
+        // complete it.
+        if labels.iter().any(|l| l.starts_with(&state.typed)) {
+            self.label_jump = Some(state);
+            return true;
+        }
+        false
+    }
+
+    /// Toggle the attention-only jump overlay (`Alt+A`): the sessions needing
+    /// the user (see [`Self::attention_status`]) get numbers `1`–`9` and a
+    /// digit jumps to that one — fewer, lower digits than the all-session
+    /// numbering when the list is long. Entered while Alt is held it lives
+    /// until the Alt release; entered by a tap (legacy terminals) it is
+    /// sticky — see [`AttentionJumpMode`].
+    pub(crate) fn toggle_attention_jump(&mut self) {
+        if self.attention_jump.is_some() {
+            self.attention_jump = None;
             return;
         }
         if self.session_jump_targets(true).is_empty() {
-            self.set_status(StatusLevel::Info, "No blocked sessions");
+            self.set_status(StatusLevel::Info, "Nothing needs attention");
             return;
         }
-        self.blocked_jump = Some(if self.alt_held {
-            BlockedJumpMode::Held
+        self.attention_jump = Some(if self.alt_held {
+            AttentionJumpMode::Held
         } else {
-            BlockedJumpMode::Sticky
+            AttentionJumpMode::Sticky
         });
     }
 
-    /// Jump to the next session that needs attention (`Blocked`), scanning
-    /// forward from the active session in **rendered** order (wraps) and
-    /// landing focus in the terminal — so pressing the key repeatedly walks
-    /// the attention queue top-to-bottom, answering each prompt in turn.
-    /// Rendered order (not blocked-since time) so the walk matches the
-    /// sidebar the user is looking at; status never reorders rows, so the
-    /// walk is stable. No-ops with a status hint when nothing is blocked.
-    pub(crate) fn focus_next_blocked(&mut self) {
-        let order = self.render_order_indices();
+    /// Jump to the next session needing attention, scanning forward from the
+    /// active session in **rendered** order (wraps) and landing focus in the
+    /// terminal — so pressing the key repeatedly walks the attention queue
+    /// top-to-bottom, answering each prompt in turn and then reviewing each
+    /// finished run. Rendered order (not waiting-since time) so the walk
+    /// matches the sidebar the user is looking at; status never reorders rows,
+    /// so the walk is stable. No-ops with a status hint when nothing is
+    /// waiting. See [`Self::attention_status`] for what counts.
+    pub(crate) fn focus_next_attention(&mut self) {
+        let Some(wanted) = self.attention_status() else {
+            self.set_status(StatusLevel::Info, "Nothing needs attention");
+            return;
+        };
+        let order = self.attention_order_indices();
         if order.is_empty() {
             return;
         }
@@ -5215,28 +5654,19 @@ impl App {
             .position(|&i| i == self.active_index)
             .unwrap_or(0);
         // Steps 1..len visit every *other* session once, so the active one
-        // (blocked or not) never counts as its own jump target.
+        // never counts as its own jump target.
         let target = (1..order.len())
             .map(|step| order[(pos + step) % order.len()])
-            .find(|&idx| self.sessions[idx].info.status == SessionStatus::Blocked);
+            .find(|&idx| self.sessions[idx].info.status == wanted);
         match target {
             Some(idx) => {
                 self.set_active_index(idx);
                 self.focus = InputFocus::Terminal;
                 self.on_focus_changed();
             }
-            None => {
-                let active_blocked = self
-                    .sessions
-                    .get(self.active_index)
-                    .is_some_and(|s| s.info.status == SessionStatus::Blocked);
-                let msg = if active_blocked {
-                    "No other blocked sessions"
-                } else {
-                    "No blocked sessions"
-                };
-                self.set_status(StatusLevel::Info, msg);
-            }
+            // The only remaining member of the queue is the session already
+            // on screen.
+            None => self.set_status(StatusLevel::Info, "Nothing else needs attention"),
         }
     }
 
@@ -5245,7 +5675,7 @@ impl App {
         if self.sessions.is_empty() {
             return;
         }
-        let order = self.render_order_indices();
+        let order = self.visible_order_indices();
         let pos = order
             .iter()
             .position(|&i| i == self.active_index)
@@ -8315,6 +8745,7 @@ impl App {
                 // (a status/error toast or the live sync spinner) — must match what
                 // `render_status_message_row` renders so the row is never empty.
                 show_status_row: self.worktree_sync.in_progress || self.status_message.is_some(),
+                session_peek_width: self.session_peek_width(),
             },
         )
     }
@@ -12910,6 +13341,9 @@ mod tests {
         app.refresh_automations();
 
         app.open_global_search();
+        // The all-scopes search is one `Tab` past the switcher the popup
+        // opens on.
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
         for c in "widget".chars() {
             app.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
@@ -12950,6 +13384,9 @@ mod tests {
         app.refresh_automations();
 
         app.open_global_search();
+        // The all-scopes search is one `Tab` past the switcher the popup
+        // opens on.
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
         for c in "widget".chars() {
             app.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
@@ -13000,6 +13437,9 @@ mod tests {
         app.refresh_tasks();
 
         app.open_global_search();
+        // The all-scopes search is one `Tab` past the switcher the popup
+        // opens on.
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
         for c in "flaky".chars() {
             app.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
@@ -13031,6 +13471,9 @@ mod tests {
         app.refresh_tasks();
 
         app.open_global_search();
+        // The all-scopes search is one `Tab` past the switcher the popup
+        // opens on.
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
         for c in "main pane".chars() {
             app.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
@@ -13061,6 +13504,9 @@ mod tests {
         app.refresh_tasks();
 
         app.open_global_search();
+        // The all-scopes search is one `Tab` past the switcher the popup
+        // opens on.
+        app.handle_key(KeyCode::Tab, KeyModifiers::NONE);
         for c in "invflaky".chars() {
             app.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
         }
@@ -13324,7 +13770,7 @@ mod tests {
         app.handle_key(KeyCode::F(10), KeyModifiers::NONE);
         assert_eq!(app.active_index, 0);
         let msg = app.status_message.as_ref().expect("status hint set");
-        assert!(msg.text.contains("No blocked"), "{}", msg.text);
+        assert!(msg.text.contains("Nothing needs attention"), "{}", msg.text);
     }
 
     #[test]
@@ -13335,7 +13781,11 @@ mod tests {
         app.handle_key(KeyCode::F(10), KeyModifiers::NONE);
         assert_eq!(app.active_index, 0);
         let msg = app.status_message.as_ref().expect("status hint set");
-        assert!(msg.text.contains("No other blocked"), "{}", msg.text);
+        assert!(
+            msg.text.contains("Nothing else needs attention"),
+            "{}",
+            msg.text
+        );
     }
 
     // --- Session jump overlays (Alt hold / Alt+digit / Alt+A) ---
@@ -13366,13 +13816,13 @@ mod tests {
         app.update(AppMessage::AltHeld(true));
         // Before the debounce delay nothing shows (a readline M-chord in the
         // shell shouldn't flash numbers).
-        assert_eq!(app.jump_overlay_blocked_only(), None);
+        assert_eq!(app.jump_overlay_attention_only(), None);
         app.alt_held_since = Some(
             std::time::Instant::now() - std::time::Duration::from_millis(JUMP_OVERLAY_DELAY_MS),
         );
-        assert_eq!(app.jump_overlay_blocked_only(), Some(false));
+        assert_eq!(app.jump_overlay_attention_only(), Some(false));
         app.update(AppMessage::AltHeld(false));
-        assert_eq!(app.jump_overlay_blocked_only(), None);
+        assert_eq!(app.jump_overlay_attention_only(), None);
     }
 
     /// A delayed which-key overlay costs exactly one frame. The armed state
@@ -13422,23 +13872,71 @@ mod tests {
 
         // Tap (Alt not held → legacy terminal): sticky overlay.
         app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
-        assert_eq!(app.blocked_jump, Some(BlockedJumpMode::Sticky));
-        assert_eq!(app.jump_overlay_blocked_only(), Some(true));
+        assert_eq!(app.attention_jump, Some(AttentionJumpMode::Sticky));
+        assert_eq!(app.jump_overlay_attention_only(), Some(true));
 
         // A plain digit indexes the *blocked* numbering, not the row number.
         app.handle_key(KeyCode::Char('1'), KeyModifiers::NONE);
         assert_eq!(app.active_index, 2);
         assert_eq!(app.focus, InputFocus::Terminal);
-        assert_eq!(app.blocked_jump, None, "a jump dismisses the overlay");
+        assert_eq!(app.attention_jump, None, "a jump dismisses the overlay");
     }
 
     #[test]
     fn alt_a_without_blocked_sessions_reports() {
         let mut app = app_with_sessions(2);
         app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
-        assert_eq!(app.blocked_jump, None);
+        assert_eq!(app.attention_jump, None);
         let msg = app.status_message.as_ref().expect("status hint set");
-        assert!(msg.text.contains("No blocked"), "{}", msg.text);
+        assert!(msg.text.contains("Nothing needs attention"), "{}", msg.text);
+    }
+
+    /// The queue walks blocked sessions first and only falls through to the
+    /// finished-but-unseen ones once nothing is waiting on an answer — so a
+    /// blocking prompt is never buried behind a pile of completed runs.
+    #[test]
+    fn attention_queue_prefers_blocked_then_falls_through_to_done() {
+        let mut app = app_with_sessions(3);
+        app.sessions[1].info.status = SessionStatus::Done;
+        app.sessions[2].info.status = SessionStatus::Blocked;
+        app.active_index = 0;
+
+        assert_eq!(app.attention_status(), Some(SessionStatus::Blocked));
+        app.focus_next_attention();
+        assert_eq!(app.active_index, 2, "the blocked one, not the done one");
+
+        // Answering it leaves only the finished run in the queue.
+        app.sessions[2].info.status = SessionStatus::Idle;
+        assert_eq!(app.attention_status(), Some(SessionStatus::Done));
+        app.focus_next_attention();
+        assert_eq!(app.active_index, 1);
+    }
+
+    /// With the fall-through switched off the queue is blocked-only again.
+    #[test]
+    fn attention_queue_can_exclude_finished_sessions() {
+        let mut app = app_with_sessions(2);
+        app.navigation.attention_includes_done = false;
+        app.sessions[1].info.status = SessionStatus::Done;
+
+        assert_eq!(app.attention_status(), None);
+        assert!(app.session_jump_targets(true).is_empty());
+    }
+
+    /// An overlay left open while the last blocked session unblocks must stop
+    /// numbering, not fall back to numbering everything.
+    #[test]
+    fn attention_overlay_numbers_nothing_once_the_queue_empties() {
+        let mut app = app_with_sessions(3);
+        app.sessions[2].info.status = SessionStatus::Blocked;
+        app.toggle_attention_jump();
+        assert_eq!(app.session_jump_targets(true), vec![2]);
+
+        app.sessions[2].info.status = SessionStatus::Idle;
+        assert!(
+            app.session_jump_targets(true).is_empty(),
+            "an empty queue must not degrade into the all-sessions numbering"
+        );
     }
 
     #[test]
@@ -13447,7 +13945,7 @@ mod tests {
         app.sessions[1].info.status = SessionStatus::Blocked;
         app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
         app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
-        assert_eq!(app.blocked_jump, None, "Esc dismisses");
+        assert_eq!(app.attention_jump, None, "Esc dismisses");
 
         // A non-digit key dismisses the sticky overlay *and* still performs
         // its normal action (here: session-list j moves the selection).
@@ -13455,7 +13953,7 @@ mod tests {
         app.focus = InputFocus::SessionList;
         app.active_index = 0;
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
-        assert_eq!(app.blocked_jump, None);
+        assert_eq!(app.attention_jump, None);
         assert_eq!(app.active_index, 1, "the key still acted normally");
     }
 
@@ -13464,9 +13962,9 @@ mod tests {
         let mut app = app_with_sessions(2);
         app.sessions[0].info.status = SessionStatus::Blocked;
         app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
-        assert!(app.blocked_jump.is_some());
+        assert!(app.attention_jump.is_some());
         app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
-        assert_eq!(app.blocked_jump, None);
+        assert_eq!(app.attention_jump, None);
     }
 
     #[test]
@@ -13475,13 +13973,13 @@ mod tests {
         app.sessions[1].info.status = SessionStatus::Blocked;
         app.update(AppMessage::AltHeld(true));
         app.handle_key(KeyCode::Char('a'), KeyModifiers::ALT);
-        assert_eq!(app.blocked_jump, Some(BlockedJumpMode::Held));
+        assert_eq!(app.attention_jump, Some(AttentionJumpMode::Held));
         // Other keys don't dismiss a held overlay (Alt chords keep flowing) …
         app.handle_key(KeyCode::Char('x'), KeyModifiers::ALT);
-        assert_eq!(app.blocked_jump, Some(BlockedJumpMode::Held));
+        assert_eq!(app.attention_jump, Some(AttentionJumpMode::Held));
         // … releasing Alt does.
         app.update(AppMessage::AltHeld(false));
-        assert_eq!(app.blocked_jump, None);
+        assert_eq!(app.attention_jump, None);
     }
 
     #[test]
@@ -13493,6 +13991,21 @@ mod tests {
         // A key event without the ALT bit means the release was lost.
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         assert!(!app.alt_held);
+    }
+
+    #[test]
+    fn peek_width_measures_names_in_columns_not_chars() {
+        let mut app = app_with_sessions(1);
+        // Seven characters, fourteen terminal columns.
+        app.sessions[0].info.name = "セッション名前".to_string();
+        app.toggle_label_jump(); // a pending gesture is what earns the peek
+
+        let width = app.session_peek_width().expect("a gesture is pending");
+        let chars = app.sessions[0].info.name.chars().count();
+        assert!(
+            width as usize > chars + SESSION_ROW_CHROME_COLS,
+            "a double-width name needs more columns than it has chars ({width} vs {chars})"
+        );
     }
 
     // --- Unified left-column (session list ↔ automations) navigation ---

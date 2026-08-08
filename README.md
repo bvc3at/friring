@@ -343,10 +343,14 @@ advances it to *in progress*.
 **Friring — changed.** Upstream docks a full-width strip above the footer,
 which resizes every visible session PTY as it opens and closes.
 `Ctrl+/` — or a double-tap of `Shift` (JetBrains "Search Everywhere"
-muscle memory) — opens a centered popup that searches every scope at
-once — sessions (including live terminal-buffer content), tasks,
-automations, and the file tree — highlighting matches live in the panels
-themselves. `Enter` jumps to a result; `Esc` restores exactly what you had.
+muscle memory) — opens a centered popup as a **session switcher**: a
+ranked, uncapped list of sessions, most-recently-used first with the
+active one dropped, so `Ctrl+/` then `Enter` is "back to the last
+session" and `Enter` on an unloaded ghost loads it. `Tab` widens the
+same popup to every scope — sessions (including live terminal-buffer
+content), tasks, automations, and the file tree — and back, keeping the
+query; matches highlight live in the panels themselves. `Enter` jumps to
+a result; `Esc` restores exactly what you had.
 
 [Keybindings →](#keybindings)
 
@@ -551,7 +555,8 @@ rm -rf ~/.local/share/friring ~/.config/friring
    launching with restored sessions) focuses the right pane — and
    `Alt+1`–`Alt+9` jump to the Nth session; hold `Alt` on
    kitty-protocol terminals to paint those numbers on the rows, and
-   `F10` walks the blocked sessions. (Like the other global chords,
+   `F10` walks the attention queue — the blocked sessions first, then
+   the finished-but-unseen ones. (Like the other global chords,
    these are swallowed while a capture pane — code review, F9
    activity, an editor — has focus.)
 5. **Quit without killing** — `Ctrl+Q` detaches all sessions.
@@ -740,7 +745,9 @@ repos? Add `--add-repo PATH@main` (its own worktree per repo) or
 tmux already owns `C-a`. Pressing it arms friring and paints a which-key
 overlay listing every command reachable from it; the next key runs one.
 `<leader> 1`–`9` jumps to that session in the list's rendered order,
-`<leader> a` then a digit reaches the Nth *blocked* session, and
+`<leader> a` then a digit reaches the Nth session in the *attention
+queue*, `<leader> A` labels every session with a letter to jump by,
+`<leader> G` shelves the unloaded ones, and
 `<leader> <leader>` sends the leader's own bytes to the focused agent.
 `<leader> U` unloads the active session to a ghost, and `<leader> c` /
 `<leader> C` cycle among **loaded** sessions only. `Esc` or `Ctrl+C`
@@ -763,7 +770,7 @@ overlay delay are configurable — see [docs/CONFIG.md](docs/CONFIG.md)
 | `Ctrl+C` / `Cmd+C` | Copy selection / SIGINT (terminal; `Cmd+C` never SIGINTs) | **C**opy |
 | `Ctrl+V` / `Cmd+V` | Paste from clipboard | Paste |
 | `Ctrl+P` | Automations (list/new/edit/toggle/run/delete) | **P**rogram |
-| `Ctrl+/` / `Shift Shift` | Global search (sessions/tasks/automations/files) | **/** = search; JetBrains double-shift |
+| `Ctrl+/` / `Shift Shift` | Session switcher (ranked, most-recent first); `Tab` widens it to every scope (tasks/automations/files/buffer content) and back | **/** = search; JetBrains double-shift |
 | `Ctrl+W` / `F5` | Toggle tasks panel (todo list) | **W**ork items |
 | `Ctrl+T` / `F8` | Toggle shell pane | **T**erminal |
 | `Ctrl+X` / `F7` | Toggle code-review pane (native diff reviewer) | Review |
@@ -772,10 +779,12 @@ overlay delay are configurable — see [docs/CONFIG.md](docs/CONFIG.md)
 | `Ctrl+K` / `Alt+K` | Select previous session (`Ctrl+K` defers likewise; use `Alt+K` in a focused terminal) | Vim: **k** = up |
 | `Ctrl+L` | Focus next pane (cycle forward) | Vim: **l** = right |
 | `F9` | Toggle agent activity view (per-session retrospective: dashboard + turn timeline) | Retrospective |
-| `F10` | Jump to next blocked session (wraps, focuses terminal) | Attention |
+| `F10` | Jump to the next session needing attention — blocked first, then finished-but-unseen (wraps, focuses terminal) | Attention |
 | `Ctrl+6` / `Ctrl+^` | Toggle between the two most recent sessions | vim alternate buffer |
-| `Alt+A` | Number blocked sessions; a digit jumps to that one | Attention |
+| `Alt+A` | Number the sessions needing attention; a digit jumps to that one | Attention |
+| `Alt+G` | Label every visible session with a home-row letter; typing the label jumps there (reaches past the nine digits) | **G**o to |
 | `Alt+U` | Unload active session to a greyed ghost (frees the agent process, keeps the frozen preview) | **U**nload |
+| `Alt+Shift+U` | Shelve/unshelve the unloaded sessions — fold them out of the list into a title-bar count | **U**nloaded, shelved |
 | `Alt+N` / `Alt+P` | Select next/previous **loaded** session (skips ghosts and unreachable placeholders) | **N**ext / **P**revious |
 | `Shift+J` / `Shift+K` | Move selected session down/up (manual order) | reorder |
 | `Shift+S` | Sort sessions alphabetically within each repo group | **S**ort |

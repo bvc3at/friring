@@ -72,6 +72,26 @@ struct InfoPanelData {
     parent_name: Option<String>,
 }
 
+/// `area` with the session list's columns carved off its left edge, so an
+/// overlay centred in the result can't cover the rows it is describing. Falls
+/// back to the full area when the list is hidden, or when carving it would
+/// leave too little room to be worth the shift.
+fn clear_of_session_list(area: Rect, list: Option<Rect>) -> Rect {
+    let Some(list) = list else {
+        return area;
+    };
+    let taken = (list.x + list.width).saturating_sub(area.x);
+    let remaining = area.width.saturating_sub(taken);
+    if remaining < area.width / 2 {
+        return area;
+    }
+    Rect {
+        x: area.x + taken,
+        width: remaining,
+        ..area
+    }
+}
+
 /// The rect to paint a hover tint over, given a click target's hitbox.
 ///
 /// A session row's hitbox spans a prepended repo-group header line plus the
@@ -104,13 +124,23 @@ impl App {
         let areas = self.layout_for(frame.area());
 
         self.render_header(frame, areas.header);
-        self.render_left_panel(frame, areas.left_panel);
+        // While the list is peeked it is drawn *after* the central pane, over
+        // it — so its column stays blank here rather than being painted twice
+        // (which would also record every row's click target twice).
+        self.render_left_panel(
+            frame,
+            areas.session_peek.map_or(areas.left_panel, |_| None),
+            false,
+        );
         self.render_automations_pane(frame, areas.automations_panel);
         self.render_info_panel(frame, areas.info_panel);
         self.render_tasks_panel(frame, areas.tasks_panel);
         self.render_file_viewer(frame, areas.file_viewer);
         self.render_central_pane(frame, areas.terminal);
+        self.render_left_panel(frame, areas.session_peek, true);
         if let Some(search_area) = areas.global_search {
+            let spinner =
+                crate::ui::SPINNER_FRAMES[self.spinner_frame() % crate::ui::SPINNER_FRAMES.len()];
             let gs = &self.global_search;
             global_search::render_global_search(
                 frame,
@@ -120,6 +150,8 @@ impl App {
                     cursor: gs.query.cursor_pos(),
                     results: &gs.results,
                     selected: gs.selected,
+                    scope: gs.scope,
+                    spinner,
                 },
             );
         }
@@ -148,7 +180,12 @@ impl App {
         // the only thing the next keystroke can act on, so nothing should
         // obscure it.
         if let Some(leader) = self.prefix_hint_chord() {
-            crate::ui::prefix_overlay::render_prefix_overlay(frame, frame.area(), &leader);
+            // Centred in what's *left* of the session list, not the whole
+            // frame: the headline thing an armed leader does is select a
+            // session by number, and a table that covers the numbered rows
+            // hides the half of the answer the user needs.
+            let area = clear_of_session_list(frame.area(), areas.session_peek.or(areas.left_panel));
+            crate::ui::prefix_overlay::render_prefix_overlay(frame, area, &leader);
         }
         self.repaint_theme_background(frame);
         self.apply_hover_highlight(frame);
@@ -269,11 +306,19 @@ impl App {
         );
     }
 
-    /// Render the flat session list in the left panel (when present).
-    fn render_left_panel(&mut self, frame: &mut Frame, left_area: Option<Rect>) {
+    /// Render the session list into `left_area`.
+    ///
+    /// `floating` marks the peeked render — the widened list drawn over the
+    /// central pane while a navigation gesture is pending — which has to wipe
+    /// the pane content underneath it first. See `layout::session_peek` for why
+    /// it floats instead of widening the column.
+    fn render_left_panel(&mut self, frame: &mut Frame, left_area: Option<Rect>, floating: bool) {
         let Some(left_area) = left_area else {
             return;
         };
+        if floating {
+            frame.render_widget(ratatui::widgets::Clear, left_area);
+        }
 
         // Rebuild the cached ordering only when its inputs changed (content
         // signature). The order is status-independent, so most frames — including
@@ -309,6 +354,11 @@ impl App {
             None => Vec::new(),
         };
 
+        // What the collapsed groups / ghost shelf are hiding this frame. Held
+        // in a local because it borrows `self` immutably and the render below
+        // takes `&mut self.session_list_state`.
+        let filter = self.visibility_filter();
+
         // Remap the cached order onto the current refs / match positions /
         // active_index (these vary independently of the order, so the remap
         // always runs — but it's a cheap O(n) index map, no grouping work).
@@ -322,6 +372,7 @@ impl App {
             order,
             &global_match_positions,
             self.active_index,
+            &filter,
         );
 
         use crate::ui::FocusLevel;
@@ -352,8 +403,17 @@ impl App {
         // rows. Must stay consistent with `App::session_jump_targets` — same
         // order, same predicate — so the painted digit is the one a keypress
         // jumps to.
-        let jump_digits: Vec<Option<char>> = match self.jump_numbering() {
+        let jump_labels: Vec<Option<String>> = match self.jump_numbering() {
             None => vec![None; ordered.sessions.len()],
+            // Letter labels cover every row, so unlike the digit numbering they
+            // are built from the app's own target list rather than counted out
+            // here — `label_jump_chips` is the single source both the paint and
+            // the keystroke read.
+            Some(crate::app::JumpNumbering::Labels) => {
+                let mut chips = self.label_jump_chips();
+                chips.resize(ordered.sessions.len(), None);
+                chips
+            }
             // Distance numbering for a pending move: rows are counted outward
             // from the active session in the move direction, so the row
             // labelled `3` is exactly where `<leader> K 3` lands it.
@@ -377,21 +437,27 @@ impl App {
                         (1..=9)
                             .contains(&d)
                             .then(|| char::from_digit(d as u32, 10))?
+                            .map(|c| c.to_string())
                     })
                     .collect()
             }
             Some(numbering) => {
-                let blocked_only = numbering == crate::app::JumpNumbering::Blocked;
+                // Resolved once: the queue's status is a property of the whole
+                // fleet, and `session_jump_targets` filters on the same value —
+                // so the digit painted on a row is the digit that jumps to it.
+                // `Some(status) == None` is false, so an emptied queue numbers
+                // nothing rather than falling back to numbering everything.
+                let attention_only = numbering == crate::app::JumpNumbering::Attention;
+                let wanted = self.attention_status();
                 let mut n = 0u32;
                 ordered
                     .sessions
                     .iter()
                     .map(|info| {
-                        let eligible =
-                            !blocked_only || info.status == crate::session::SessionStatus::Blocked;
+                        let eligible = !attention_only || wanted == Some(info.status);
                         if eligible && n < 9 {
                             n += 1;
-                            char::from_digit(n, 10)
+                            char::from_digit(n, 10).map(|c| c.to_string())
                         } else {
                             None
                         }
@@ -407,24 +473,35 @@ impl App {
             left_area,
             &mut project_list::LeftPanelState {
                 sessions: &ordered.sessions,
+                all_sessions: &all_sessions,
                 active_session: ordered.active_index,
                 show_selection,
                 session_focus: list_focus,
                 session_list_state: &mut self.session_list_state,
                 session_match_positions: &ordered.match_positions,
                 session_search_active,
-                headers: ordered.headers,
-                depths: ordered.depths,
+                headers: &ordered.headers,
+                depths: &ordered.depths,
+                folded_counts: &ordered.folded_counts,
+                ghost_shelf_count: ordered.hidden_ghosts,
                 spinner,
-                jump_digits: &jump_digits,
+                jump_labels: &jump_labels,
             },
         );
+        let start = self.click_targets.len();
         self.record_row_clicks(
             rows,
             ClickAction::SelectSession,
             left_area,
             InputFocus::SessionList,
         );
+        if floating {
+            // The peek is drawn over the central pane, so its targets have to be
+            // hit-tested before the pane's whole-rect fallback recorded earlier
+            // (`handle_mouse` takes the first match).
+            let added = self.click_targets.len() - start;
+            self.click_targets.rotate_right(added);
+        }
     }
 
     /// Render the automations pane beneath the session list (when present).
@@ -1130,11 +1207,14 @@ impl App {
                 PrefixState::Idle => None,
             },
             session_count: self.sessions.len(),
-            blocked_count: self
-                .sessions
-                .iter()
-                .filter(|s| s.info.status == crate::session::SessionStatus::Blocked)
-                .count(),
+            attention: self.attention_status().map(|status| {
+                let n = self
+                    .sessions
+                    .iter()
+                    .filter(|s| s.info.status == status)
+                    .count();
+                (status, n)
+            }),
             status: self.status_message.as_ref(),
             focus_label,
             sync_in_progress: self.worktree_sync.in_progress,
