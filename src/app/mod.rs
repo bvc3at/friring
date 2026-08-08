@@ -5482,12 +5482,15 @@ impl App {
         if !self.session_nav_peek_active() {
             return None;
         }
+        use unicode_width::UnicodeWidthStr;
         let mut widest = 0usize;
         for &i in &self.visible_order_indices() {
             let info = &self.sessions[i].info;
-            widest = widest.max(info.name.chars().count() + SESSION_ROW_CHROME_COLS);
+            // Terminal columns, not chars: a CJK name takes two columns per
+            // char, and it is columns the renderer truncates against.
+            widest = widest.max(info.name.as_str().width() + SESSION_ROW_CHROME_COLS);
             for repo in &info.repo_display_names {
-                widest = widest.max(repo.chars().count() + GROUP_HEADER_CHROME_COLS);
+                widest = widest.max(repo.as_str().width() + GROUP_HEADER_CHROME_COLS);
             }
         }
         (widest > 0).then(|| widest.min(u16::MAX as usize) as u16)
@@ -13941,6 +13944,21 @@ mod tests {
         // A key event without the ALT bit means the release was lost.
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         assert!(!app.alt_held);
+    }
+
+    #[test]
+    fn peek_width_measures_names_in_columns_not_chars() {
+        let mut app = app_with_sessions(1);
+        // Seven characters, fourteen terminal columns.
+        app.sessions[0].info.name = "セッション名前".to_string();
+        app.toggle_label_jump(); // a pending gesture is what earns the peek
+
+        let width = app.session_peek_width().expect("a gesture is pending");
+        let chars = app.sessions[0].info.name.chars().count();
+        assert!(
+            width as usize > chars + SESSION_ROW_CHROME_COLS,
+            "a double-width name needs more columns than it has chars ({width} vs {chars})"
+        );
     }
 
     // --- Unified left-column (session list ↔ automations) navigation ---
