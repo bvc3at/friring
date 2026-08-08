@@ -26,6 +26,7 @@ topic docs read on demand:
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Build, test, sandbox, e2e harnesses, demos | Changing the dev/test workflow or tooling |
 | [PERFORMANCE.md](PERFORMANCE.md) | Render/tick performance + how to measure | Touching the render loop or a perf optimization |
 | [CLI.md](CLI.md) | The headless `friring-cli` surface | Adding/changing a CLI subcommand or flag |
+| [E2E.md](E2E.md) | Real-agent e2e tests, the model stub, scenario-driven demos | Changing an e2e harness, stub, or demo scenario |
 | [RELEASING.md](RELEASING.md) | Release automation, versioning, installers, packaging | Changing the release/packaging pipeline |
 
 ## Keeping docs current

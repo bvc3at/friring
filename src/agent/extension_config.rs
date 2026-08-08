@@ -17,10 +17,15 @@ use serde::Serialize;
 
 use crate::session::{AgentDef, AgentPatch, ExtensionDef};
 
-/// Raw-content root of the thurbox repo (no git ref).
-const OFFICIAL_REPO_RAW: &str = "https://raw.githubusercontent.com/Thurbeen/thurbox";
+/// Raw-content root of the friring repo (no git ref).
+///
+/// The fork's own repo, not upstream's: [`official_ref`] pins the fetch to this
+/// binary's release tag, which only exists here, and the payloads under
+/// `extensions/` invoke `friring-cli`. Pointing this upstream would serve
+/// `thurbox-cli` payloads at a tag that may not exist. See `FORK.md`.
+const OFFICIAL_REPO_RAW: &str = "https://raw.githubusercontent.com/bvc3at/friring";
 
-/// The running binary's version string (e.g. `0.113.0`, or `0.0.0-dev` for a
+/// The running binary's version string (e.g. `0.20.0`, or `0.0.0-dev` for a
 /// development build), injected at compile time by `build.rs`. The reference
 /// point for extension staleness + compatibility checks.
 pub fn binary_version() -> &'static str {
@@ -44,7 +49,7 @@ fn official_ref() -> String {
     }
 }
 
-/// Base URL for the official extensions shipped in the thurbox repo, pinned to
+/// Base URL for the official extensions shipped in the friring repo, pinned to
 /// this binary's version. A bare `friring-cli extension install <name>` resolves
 /// to `<official_base()>/<name>`.
 pub fn official_base() -> String {
@@ -62,7 +67,7 @@ pub struct OfficialExtension {
     pub description: &'static str,
 }
 
-/// The official extensions shipped in `extensions/<name>/` of the thurbox repo.
+/// The official extensions shipped in `extensions/<name>/` of the friring repo.
 ///
 /// **Source of truth for discovery + typo suggestions.** Keep in sync when an
 /// extension is added/removed under `extensions/` (descriptions mirror each
@@ -836,8 +841,18 @@ mod tests {
             resolve_source("flow"),
             ExtensionSource::Remote(format!("{}/flow", official_base()))
         );
-        // Official base is pinned to a concrete ref (a tag or main), never bare.
-        assert!(official_base().starts_with(OFFICIAL_REPO_RAW));
+        // Deliberately a literal rather than `OFFICIAL_REPO_RAW`: this pins the
+        // constant's *value*, so an upstream merge that resolves the host back to
+        // `Thurbeen/thurbox` fails here instead of silently shipping bare-name
+        // installs that 404 (the fetch ref is a friring tag, which upstream has
+        // no counterpart for). Asserting against the constant would derive both
+        // sides from the same source and always pass. The trailing slash also
+        // proves the base is pinned to a concrete ref (a tag or main), never bare.
+        assert!(
+            official_base().starts_with("https://raw.githubusercontent.com/bvc3at/friring/"),
+            "bare-name installs must resolve against the fork: {}",
+            official_base()
+        );
         assert!(official_base().ends_with("/extensions"));
         assert_eq!(
             resolve_source("https://example.com/ext/foo/"),
@@ -869,6 +884,40 @@ mod tests {
         assert_eq!(def.name, "flow");
         assert_eq!(def.home.as_deref(), Some("~/flow"));
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn bundled_manifests_parse_and_dont_warn_on_a_release_binary() {
+        // The fork's newest release tag. A bundled floor above it warns on every
+        // install from a release binary, so raise this only alongside a floor
+        // that genuinely needs a newer tag.
+        const FORK_LATEST_RELEASE: &str = "0.20.0";
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("extensions");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&root).unwrap() {
+            let dir = entry.unwrap().path();
+            if !dir.join("extension.toml").is_file() {
+                continue;
+            }
+            let (def, _) = load_manifest_from_source(&ExtensionSource::Local(dir.clone()))
+                .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+            checked += 1;
+            // Extensions without a floor (e.g. hooks) never warn, by design.
+            if let Some(min) = def.min_thurbox_version.as_deref() {
+                assert!(
+                    def.compat_warning(FORK_LATEST_RELEASE).is_none(),
+                    "extension '{}' declares min_thurbox_version {min}, above the \
+                     fork's newest release {FORK_LATEST_RELEASE}",
+                    def.name
+                );
+            }
+        }
+        assert!(
+            checked > 0,
+            "no bundled manifests found in {}",
+            root.display()
+        );
     }
 
     #[test]

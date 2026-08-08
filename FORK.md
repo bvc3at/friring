@@ -1562,11 +1562,12 @@ real Claude turn and the stub's usage route.
   flipped from `thurbox` to `friring`: the `friring` / `friring-cli` binaries,
   the crate, `~/.config/friring`, `~/.local/share/friring/friring.db`, the
   `tmux -L friring` socket, and the `FRIRING_*` env vars. What deliberately
-  still says `thurbox`: upstream **attribution** (`LICENSE`, provenance, the
-  quality-gate badge) and upstream-owned surfaces the fork does not republish —
-  upstream extension payloads, the `min_thurbox_version` manifest key, and the
-  `tb-` / `tbs-` tmux window prefixes. See [Migration](#migration); upstream
-  merges now carry rename conflicts on the renamed identifiers.
+  still says `thurbox`: upstream **attribution** (the `LICENSE`'s original
+  copyright line, provenance) and upstream-owned surfaces the fork does not
+  republish — upstream extension payloads, the `min_thurbox_version` manifest
+  key, and the `tb-` / `tbs-` tmux window prefixes. See
+  [Migration](#migration); upstream merges now carry rename conflicts on the
+  renamed identifiers.
 - **Own install surface (August 2026).** The fork stopped reusing upstream's
   installers and package channels, so nothing it ships installs a `thurbox`
   binary any more:
@@ -1681,6 +1682,39 @@ real Claude turn and the stub's usage route.
   others read `AGENTS.md`). Thin path-scoped Claude Code rules live in
   `.claude/rules/` (rust/shell/markdown/website), each loaded only when a
   matching file is edited.
+- **`LICENSE` carries both copyright lines.** MIT requires the original notice
+  to survive in every copy, so upstream's stays — and the fork's own is listed
+  beside it, each labelled with the project it covers. `Cargo.toml`'s `authors`
+  mirrors that pair (fork maintainer first), and gained the `homepage`,
+  `readme`, and `rust-version` keys upstream's manifest never set; `rust-version`
+  is what actually enforces the MSRV that `clippy.toml` and `CONTRIBUTING.md`
+  already claimed.
+- **Dropped the upstream quality-gate badge.** `README.md` rendered
+  SonarCloud's badge for `Thurbeen_thurbox`, so the fork's README advertised
+  *upstream's* code quality — the CI job that would produce a fork verdict is
+  guarded off here (no SonarCloud project). The badge is gone rather than
+  wrong; `sonar-project.properties` and the guarded job stay, so re-enabling is
+  a one-line change.
+- **`min_thurbox_version` values renumbered onto the fork's release line.** The
+  key is a wire format shared with upstream and keeps its name, but
+  `compat_warning` compares the value against the running **friring** binary.
+  The bundled extensions had inherited upstream's floors (`0.113.0`–`0.141.0`)
+  while the fork's own line is at `v0.20.x`, so every release binary would warn
+  "wants friring >= 0.141.0 … upgrade friring" on install, unsatisfiably. Dev
+  builds (`0.0.0-dev`) skip the check, which is why it stayed invisible. Each
+  extension now declares the first *friring* tag carrying the feature it needs
+  (`0.1.0`, or `0.12.0` for the Exec automation action).
+- **The official extension source is this repo.** `OFFICIAL_REPO_RAW` still
+  pointed at `Thurbeen/thurbox`, so a bare `friring-cli extension install
+  <name>` fetched upstream payloads that invoke `thurbox-cli`, pinned to an
+  upstream tag equal to the friring binary's version — a tag that generally
+  does not exist upstream, so the install either 404'd or landed a
+  `thurbox-cli` payload. It resolves against `bvc3at/friring` now, where the
+  release tags do exist and the payloads call `friring-cli`; the `install.sh`
+  header in each `extensions/*/` and the `flow` README advertise the same host.
+  This retires the "prefer a local-directory install" caveat that `README.md`
+  and `docs/CONFIG.md` used to carry. An upstream URL still installs if given
+  explicitly — it just won't work here, for the same two reasons.
 
 ### CI / automation
 

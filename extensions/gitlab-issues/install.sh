@@ -11,7 +11,7 @@
 #
 # Usage:
 #   ./install.sh                  # from a checkout
-#   curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/main/extensions/gitlab-issues/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/extensions/gitlab-issues/install.sh | sh
 #
 # Environment variables:
 #   GITLAB_ISSUES_HOME=<dir>   override install home (default: <config>/extensions/gitlab-issues)

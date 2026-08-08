@@ -11,7 +11,7 @@
 #
 # Usage:
 #   ./install.sh                  # from a checkout
-#   curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/main/extensions/linear/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/extensions/linear/install.sh | sh
 #
 # Environment variables:
 #   LINEAR_HOME=<dir>   override install home (default: <config>/extensions/linear)

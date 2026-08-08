@@ -60,13 +60,13 @@ that calls `friring-cli extension install`), needed only to bootstrap on
 a box where you'd rather pipe a script:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Thurbeen/thurbox/main/extensions/flow/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/bvc3at/friring/main/extensions/flow/install.sh | sh
 ```
 
-**Fork caveat (friring):** that one-liner is the upstream **Thurbox** path — its
-shim invokes/requires `thurbox-cli`, not `friring-cli`. On a source-built
-`friring`, install Flow from this repo's local `extensions/flow` directory
-instead (`friring-cli extension install ./extensions/flow`).
+The one-liner and the bare name both resolve against this fork's repo. An
+**upstream** Thurbox URL still installs, but its payloads invoke `thurbox-cli`
+and its manifests declare floors on upstream's release line, so it won't work
+here.
 
 ### Self-healing
 
@@ -100,7 +100,7 @@ friring-cli extension update --all     # update every installed extension
 `update` re-lays flow's payload from its recorded source but keeps files
 you've edited — `repos.md` and a customised `.claude/settings.json` are
 preserved unless you pass `--force`. To pin an older flow, install from a
-tagged URL (`…/thurbox/v0.112.0/extensions/flow`) instead.
+tagged URL (`…/friring/v0.19.0/extensions/flow`) instead.
 
 ## Use
 

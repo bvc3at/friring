@@ -116,7 +116,7 @@ command = "fleet"        # runs claude under the hood
 hook_schema = "claude"   # ⇒ inherit claude's --settings hook wiring
 ```
 
-thurbox then applies the `claude` `[[agent_patches]]` to `fleet` as well, so it
+friring then applies the `claude` `[[agent_patches]]` to `fleet` as well, so it
 reports working/blocked/done exactly like `claude` (locally and on a remote/WSL
 host). `hook_schema` names the *family* to imitate; today `"claude"` is the
 useful value — it's the family wired via a per-agent arg patch. The

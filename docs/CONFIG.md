@@ -823,7 +823,7 @@ name = "flow"
 description = "Focus-protecting triage agent"
 config_version = 1              # manifest *format* version (for migrations)
 version = "1.0.0"              # the extension's own version (bumped by its author)
-min_thurbox_version = "0.113.0" # minimum friring; older binaries get a warning
+min_thurbox_version = "0.1.0"  # minimum friring; older binaries get a warning
 # home = "~/flow"               # OPTIONAL; default is <config>/extensions/<name>.
                                 # {home} is substituted everywhere it appears
 
@@ -963,7 +963,7 @@ friring-cli extension status [<name>]      # per-resource presence + version/sta
 ```
 
 A bare name installs from the official source
-(`raw.githubusercontent.com/Thurbeen/thurbox/<ref>/extensions/<name>`,
+(`raw.githubusercontent.com/bvc3at/friring/<ref>/extensions/<name>`,
 fetched via curl/wget) — `<ref>` is the running binary's release tag
 (`main` for dev builds), so a fetched extension matches your binary. A
 path or `http(s)://` URL installs from there instead. Payload paths are
@@ -972,11 +972,11 @@ validated against traversal (no absolute paths or `..`), and a
 `--force`). Payload files are fetched as **text** (specs/scripts/JSON),
 not binaries.
 
-**Fork caveat (friring):** a bare `<name>` (or an upstream URL) fetches upstream
-**Thurbox** payloads pinned to a release tag equal to your binary version — for
-a source-built `friring` that upstream tag may not exist, and the fetched hooks
-invoke `thurbox-cli`. Prefer a local-directory install from this repo:
-`friring-cli extension install ./extensions/<name>`.
+The official source is this fork's own repo. An **upstream** Thurbox URL still
+installs, but its payloads invoke `thurbox-cli` and its manifests declare
+version floors on upstream's release line, so it won't work here — install from
+a bare name, this repo, or a local directory
+(`friring-cli extension install ./extensions/<name>`).
 
 While an extension is **active**, friring **self-heals** its declared
 resources: on TUI startup and on every `automation tick` it re-creates
@@ -1016,9 +1016,15 @@ self-heal emit a compatibility warning so the mismatch is visible.
 **Dev builds** (`0.0.0-dev`) skip both the staleness and compatibility
 checks — their version doesn't order against release tags.
 
+The **key name** is a wire format shared with upstream and stays as-is, but the
+**value** is compared against the running `friring` binary — so an extension in
+this repo declares a floor on *friring's* release line, not upstream's. Carrying
+an upstream floor over unchanged would warn on every install, since the two
+version lines are numbered independently.
+
 **Rollback.** There's no version snapshot store: to roll an extension
 back, pin a specific friring tag — `extension install
-https://raw.githubusercontent.com/Thurbeen/thurbox/v0.112.0/extensions/flow`
+https://raw.githubusercontent.com/bvc3at/friring/v0.19.0/extensions/flow`
 — or downgrade the binary and run `extension update`, which re-resolves
 the bare name to that older tag.
 

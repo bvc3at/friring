@@ -8,12 +8,22 @@ edition = "2021"
 build = "build.rs"
 # `cargo run` (no --bin) launches the TUI; friring-cli is the headless binary.
 default-run = "friring"
-authors = ["LeTuR <magicletur@protonmail.com>"]
+# Fork maintainer first, then the upstream Thurbox author whose work this is
+# built on (see FORK.md); the LICENSE carries both copyright lines.
+authors = [
+    "bvc3at <3303681+bvc3at@users.noreply.github.com>",
+    "LeTuR <magicletur@protonmail.com>",
+]
 license = "MIT"
 description = "A TUI for orchestrating multiple coding-agent CLI sessions in persistent tmux panels"
 repository = "https://github.com/bvc3at/friring"
+homepage = "https://bvc3at.github.io/friring"
+readme = "README.md"
 keywords = ["tui", "agent", "tmux", "git", "cli"]
 categories = ["command-line-utilities"]
+# Asserted by clippy.toml's `msrv` and documented in CONTRIBUTING.md; declaring
+# it here is what actually makes an older toolchain refuse to build.
+rust-version = "1.75"
 
 [dependencies]
 # TUI framework
