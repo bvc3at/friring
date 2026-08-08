@@ -72,6 +72,26 @@ struct InfoPanelData {
     parent_name: Option<String>,
 }
 
+/// `area` with the session list's columns carved off its left edge, so an
+/// overlay centred in the result can't cover the rows it is describing. Falls
+/// back to the full area when the list is hidden, or when carving it would
+/// leave too little room to be worth the shift.
+fn clear_of_session_list(area: Rect, list: Option<Rect>) -> Rect {
+    let Some(list) = list else {
+        return area;
+    };
+    let taken = (list.x + list.width).saturating_sub(area.x);
+    let remaining = area.width.saturating_sub(taken);
+    if remaining < area.width / 2 {
+        return area;
+    }
+    Rect {
+        x: area.x + taken,
+        width: remaining,
+        ..area
+    }
+}
+
 /// The rect to paint a hover tint over, given a click target's hitbox.
 ///
 /// A session row's hitbox spans a prepended repo-group header line plus the
@@ -160,7 +180,12 @@ impl App {
         // the only thing the next keystroke can act on, so nothing should
         // obscure it.
         if let Some(leader) = self.prefix_hint_chord() {
-            crate::ui::prefix_overlay::render_prefix_overlay(frame, frame.area(), &leader);
+            // Centred in what's *left* of the session list, not the whole
+            // frame: the headline thing an armed leader does is select a
+            // session by number, and a table that covers the numbered rows
+            // hides the half of the answer the user needs.
+            let area = clear_of_session_list(frame.area(), areas.session_peek.or(areas.left_panel));
+            crate::ui::prefix_overlay::render_prefix_overlay(frame, area, &leader);
         }
         self.repaint_theme_background(frame);
         self.apply_hover_highlight(frame);
@@ -333,14 +358,6 @@ impl App {
         // in a local because it borrows `self` immutably and the render below
         // takes `&mut self.session_list_state`.
         let filter = self.visibility_filter();
-        let ghost_shelf_count = if self.ghost_shelf {
-            self.sessions
-                .iter()
-                .filter(|s| s.info.status == crate::session::SessionStatus::Unloaded)
-                .count()
-        } else {
-            0
-        };
 
         // Remap the cached order onto the current refs / match positions /
         // active_index (these vary independently of the order, so the remap
@@ -465,7 +482,7 @@ impl App {
                 headers: &ordered.headers,
                 depths: &ordered.depths,
                 folded_counts: &ordered.folded_counts,
-                ghost_shelf_count,
+                ghost_shelf_count: ordered.hidden_ghosts,
                 spinner,
                 jump_labels: &jump_labels,
             },

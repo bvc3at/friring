@@ -500,32 +500,37 @@ pub struct VisibilityFilter<'a> {
 
 /// Which rows of `order` are visible under `filter`, parallel to `order.order`.
 ///
-/// A collapsed group keeps its first row — that row carries the group header,
-/// so folding a group turns it into a single header line rather than making it
-/// vanish. The ghost shelf hides unloaded sessions anywhere except that first
-/// row, for the same reason.
+/// A **collapsed** group keeps exactly its first row, which becomes the group's
+/// single representative line. The **ghost shelf** hides unloaded sessions
+/// outright — including a group's first row, and a group whose members are all
+/// unloaded therefore disappears entirely. The group header is not tied to any
+/// particular session (`OrderedSessions::from_order` re-attaches it to whatever
+/// row survives), so hiding the first row loses nothing.
+///
+/// `filter.keep` overrides both, so the selection always has a row.
 pub fn visible_rows(
     sessions: &[&SessionInfo],
     order: &SessionOrder,
     filter: &VisibilityFilter<'_>,
 ) -> Vec<bool> {
     let mut folded_group = false;
+    let mut at_group_start = true;
     order
         .order
         .iter()
         .enumerate()
         .map(|(row, &i)| {
             let info = sessions[i];
-            let is_group_head = order.headers[row].is_some();
-            if is_group_head {
+            if order.headers[row].is_some() {
                 folded_group = filter.folded_groups.contains(&group_key(info));
-                return true;
+                at_group_start = true;
             }
+            let is_first = std::mem::replace(&mut at_group_start, false);
             if filter.keep == Some(info.id) {
                 return true;
             }
             if folded_group {
-                return false;
+                return is_first;
             }
             !(filter.ghost_shelf && info.status == SessionStatus::Unloaded)
         })
@@ -544,9 +549,17 @@ pub struct OrderedSessions<'a> {
     /// Parallel to `sessions`: tree depth within the repo group
     /// (see [`SessionOrder::depths`]).
     pub depths: Vec<u8>,
-    /// Parallel to `sessions`: on a collapsed group's header row, how many of
-    /// its sessions are folded away underneath. `None` on every other row.
+    /// Parallel to `sessions`: on a **collapsed** group's header row, how many
+    /// of its sessions are folded away underneath. `None` on every other row —
+    /// rows the ghost shelf hid are counted in [`Self::hidden_ghosts`] instead,
+    /// so a group that merely has a shelved session in it never renders as
+    /// collapsed (its `l` would have nothing to expand).
     pub folded_counts: Vec<Option<usize>>,
+    /// Unloaded sessions the ghost shelf hid, for the title-bar count. Counts
+    /// what is actually **hidden**, not every unloaded session: the ones still
+    /// on screen (the selection, or any inside a collapsed group) already show
+    /// their own dot.
+    pub hidden_ghosts: usize,
     /// Input indices of the rows actually shown, in render order — the exact
     /// list keyboard navigation steps through, so a hidden row can never be
     /// stepped onto or wear a jump label.
@@ -575,20 +588,43 @@ impl<'a> OrderedSessions<'a> {
         filter: &VisibilityFilter<'_>,
     ) -> Self {
         let visible = visible_rows(sessions, order, filter);
-        // Rows kept, and — on each group's header row — how many of its
-        // sessions were folded away underneath it.
-        let mut folded_counts: Vec<Option<usize>> = Vec::new();
+        // The header row each row belongs to, so a group's label can be
+        // re-attached to whichever of its rows survives the filter.
+        let group_of = header_group_of(&order.headers);
+        let is_folded = |head_row: usize| {
+            filter
+                .folded_groups
+                .contains(&group_key(sessions[order.order[head_row]]))
+        };
+
         let mut kept: Vec<usize> = Vec::new(); // rows, not input indices
-        let mut head: Option<usize> = None; // index into `kept`/`folded_counts`
+        let mut headers: Vec<Option<String>> = Vec::new();
+        let mut depths: Vec<u8> = Vec::new();
+        let mut folded_counts: Vec<Option<usize>> = Vec::new();
+        let mut hidden_ghosts = 0usize;
+        // Group header row → where that group's label landed in `kept`.
+        let mut head_at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
         for (row, &shown) in visible.iter().enumerate() {
+            let group = group_of[row];
             if shown {
-                if order.headers[row].is_some() {
-                    head = Some(kept.len());
+                let first_of_group = !head_at.contains_key(&group);
+                if first_of_group {
+                    head_at.insert(group, kept.len());
                 }
-                kept.push(row);
+                headers.push(
+                    first_of_group
+                        .then(|| order.headers[group].clone())
+                        .flatten(),
+                );
+                depths.push(order.depths[row]);
                 folded_counts.push(None);
-            } else if let Some(count) = head.and_then(|h| folded_counts.get_mut(h)) {
-                *count.get_or_insert(0) += 1;
+                kept.push(row);
+            } else if is_folded(group) {
+                if let Some(count) = head_at.get(&group).and_then(|&h| folded_counts.get_mut(h)) {
+                    *count.get_or_insert(0) += 1;
+                }
+            } else {
+                hidden_ghosts += 1;
             }
         }
 
@@ -605,9 +641,10 @@ impl<'a> OrderedSessions<'a> {
                 .map(|&i| match_positions.get(i).cloned().flatten())
                 .collect(),
             active_index: new_active,
-            headers: kept.iter().map(|&r| order.headers[r].clone()).collect(),
-            depths: kept.iter().map(|&r| order.depths[r]).collect(),
+            headers,
+            depths,
             folded_counts,
+            hidden_ghosts,
             visible_input_indices,
         }
     }

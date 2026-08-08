@@ -1252,6 +1252,56 @@ mod tests {
         assert_eq!(app.visible_order_indices(), vec![0, 1, 2, 3]);
     }
 
+    /// The shelf hides ghosts wherever they are — including a group's first
+    /// row, and a whole group when every member is unloaded. The header is not
+    /// tied to a session, so it moves to whichever row survives.
+    #[test]
+    fn ghost_shelf_hides_a_group_whose_members_are_all_unloaded() {
+        let (mut app, _g, _t) = app_with_sessions(3);
+        in_repo(&mut app, 0, "alpha");
+        in_repo(&mut app, 1, "beta");
+        in_repo(&mut app, 2, "beta");
+        app.sessions[1].info.status = SessionStatus::Unloaded;
+        app.sessions[2].info.status = SessionStatus::Unloaded;
+        app.set_active_index(0);
+
+        app.toggle_ghost_shelf();
+        assert_eq!(
+            app.visible_order_indices(),
+            vec![0],
+            "the beta group is gone"
+        );
+    }
+
+    /// A group that merely has a shelved session in it is not *collapsed* — its
+    /// header must not claim to be, or `l` would appear to do nothing.
+    #[test]
+    fn shelved_ghosts_are_counted_apart_from_collapsed_groups() {
+        let (mut app, _g, _t) = app_with_sessions(3);
+        for i in 0..3 {
+            in_repo(&mut app, i, "alpha");
+        }
+        app.sessions[1].info.status = SessionStatus::Unloaded;
+        app.set_active_index(0);
+        app.toggle_ghost_shelf();
+
+        let infos: Vec<&crate::session::SessionInfo> =
+            app.sessions.iter().map(|s| &s.info).collect();
+        let order = crate::ui::project_list::compute_session_order(&infos);
+        let ordered = crate::ui::project_list::OrderedSessions::from_order(
+            &infos,
+            &order,
+            &[],
+            app.active_index,
+            &app.visibility_filter(),
+        );
+        assert_eq!(ordered.hidden_ghosts, 1, "counted as shelved…");
+        assert!(
+            ordered.folded_counts.iter().all(Option::is_none),
+            "…and not as a collapsed group"
+        );
+    }
+
     #[test]
     fn group_leap_walks_group_heads_and_wraps() {
         let (mut app, _g, _t) = app_with_sessions(5);
