@@ -132,6 +132,16 @@ const MODULE_RULES: &[ModuleRules] = &[
         allowed: &["session"],
         allowed_path_only: &[],
     },
+    // The sandbox egress proxy: a self-contained network service (ADR-27).
+    // It owns its policy vocabulary rather than borrowing one, so a sandbox
+    // profile is translated into a `proxy::Policy` by its caller and the proxy
+    // itself stays a leaf — testable, and reusable by anything that needs a
+    // filtered egress path.
+    ModuleRules {
+        name: "proxy",
+        allowed: &[],
+        allowed_path_only: &[],
+    },
     // Leaf utilities.
     ModuleRules {
         name: "fuzzy",
@@ -598,6 +608,14 @@ fn metrics_source_modules_stay_app_free() {
 #[test]
 fn notifications_module_isolation() {
     assert_module_clean("notifications");
+}
+
+/// The egress proxy enforces a policy it is handed, so it needs nothing from
+/// the rest of the crate. Keeping it a leaf is what lets it be tested on its
+/// own, without a session, a database or a sandbox backend.
+#[test]
+fn proxy_module_is_self_contained() {
+    assert_module_clean("proxy");
 }
 
 /// Every module under `src/` must be governed: either a MODULE_RULES entry
