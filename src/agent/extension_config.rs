@@ -881,6 +881,40 @@ mod tests {
     }
 
     #[test]
+    fn bundled_manifests_parse_and_dont_warn_on_a_release_binary() {
+        // The fork's newest release tag. A bundled floor above it warns on every
+        // install from a release binary, so raise this only alongside a floor
+        // that genuinely needs a newer tag.
+        const FORK_LATEST_RELEASE: &str = "0.20.0";
+
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("extensions");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&root).unwrap() {
+            let dir = entry.unwrap().path();
+            if !dir.join("extension.toml").is_file() {
+                continue;
+            }
+            let (def, _) = load_manifest_from_source(&ExtensionSource::Local(dir.clone()))
+                .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+            checked += 1;
+            // Extensions without a floor (e.g. hooks) never warn, by design.
+            if let Some(min) = def.min_thurbox_version.as_deref() {
+                assert!(
+                    def.compat_warning(FORK_LATEST_RELEASE).is_none(),
+                    "extension '{}' declares min_thurbox_version {min}, above the \
+                     fork's newest release {FORK_LATEST_RELEASE}",
+                    def.name
+                );
+            }
+        }
+        assert!(
+            checked > 0,
+            "no bundled manifests found in {}",
+            root.display()
+        );
+    }
+
+    #[test]
     fn ensure_agents_registered_appends_only_missing() {
         let temp = tempfile::TempDir::new().unwrap();
         let _guard = crate::paths::TestPathGuard::new(temp.path());
