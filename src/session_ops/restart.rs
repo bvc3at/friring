@@ -21,6 +21,12 @@ struct RestartPlan {
     args: Vec<String>,
     cwd: Option<PathBuf>,
     env: HashMap<String, String>,
+    /// What this relaunch did with the session's sandbox profile — see
+    /// [`crate::session_ops::AgentInvocation::sandbox`]. Reported to the caller
+    /// rather than swallowed: a restart is exactly when a boundary that could
+    /// not be applied last time comes back, and when one that used to hold
+    /// stops holding.
+    sandbox: Option<crate::session::SandboxState>,
 }
 
 /// Build the [`RestartPlan`] for a persisted session: keep its identity stable,
@@ -77,14 +83,15 @@ fn build_restart_plan(
         ));
     }
 
-    let (command, args) = super::build_agent_invocation(&def, &mut config)?;
+    let invocation = super::build_agent_invocation(&def, &mut config)?;
 
     Ok(RestartPlan {
         window_name: session.name.clone(),
-        command,
-        args,
+        command: invocation.command,
+        args: invocation.args,
         cwd: config.cwd,
         env: config.env,
+        sandbox: invocation.sandbox,
     })
 }
 
@@ -97,7 +104,17 @@ fn build_restart_plan(
 /// resumes the latest session in the (unchanged) launch directory. Other agents
 /// degrade to "start fresh" (the live tmux process is what carries state across
 /// restarts).
-pub fn restart_session_headless(db: &Database, session_id: SessionId) -> Result<(), String> {
+///
+/// Returns what the relaunch did with the session's sandbox profile, so the
+/// caller can say so: `None` for a session with no profile, and an
+/// [`Unenforced`](crate::session::SandboxState::Unenforced) state when the
+/// profile could not be applied and its escape hatch let the agent start on the
+/// host anyway. The session's stored profile is untouched either way — the next
+/// restart tries the boundary again.
+pub fn restart_session_headless(
+    db: &Database,
+    session_id: SessionId,
+) -> Result<Option<crate::session::SandboxState>, String> {
     let session = db
         .get_session_by_id(session_id)
         .map_err(|e| format!("Failed to load session: {e}"))?
@@ -133,7 +150,7 @@ pub fn restart_session_headless(db: &Database, session_id: SessionId) -> Result<
     // (a resumed agent may not re-fire its boot hook). Best-effort.
     let _ = db.clear_hook_state(session_id);
 
-    Ok(())
+    Ok(plan.sandbox)
 }
 
 #[cfg(test)]
@@ -265,6 +282,69 @@ mod tests {
         let err = restart_session_headless(&db, sess.id).unwrap_err();
         assert!(err.contains("deleted"), "got: {err}");
         assert!(err.contains("no longer exists"), "got: {err}");
+    }
+
+    /// A restart whose boundary cannot be applied, on a profile that allows the
+    /// escape hatch: the agent starts on the host, the caller is told why, and
+    /// — the part that used to be wrong — the session's stored profile is left
+    /// exactly where it was, so the next restart tries the boundary again.
+    #[test]
+    fn a_headless_restart_that_falls_back_reports_it_and_keeps_the_profile() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let db = Database::open_in_memory().unwrap();
+
+        // `wsl-distro` is a place backend: unavailable in this build on every
+        // host, so the decision is the same wherever the suite runs.
+        let mut profile = crate::session::SandboxProfile::new(
+            "dev",
+            vec![crate::session::SandboxPath::workspace("~/dev/app")],
+        );
+        profile.backend = crate::session::SandboxBackendKind::WslDistro;
+        profile.allow_unsandboxed_fallback = true;
+        db.upsert_sandbox_profile(&profile).unwrap();
+
+        let mut sess = session(Some("sid-fallback"), Some(temp.path().join("repo")));
+        sess.sandbox_profile = Some("dev".into());
+        db.upsert_session(&sess).unwrap();
+
+        let loaded = super::super::load_sandbox_profile(&db, Some("dev")).unwrap();
+        let plan = build_restart_plan(&sess, loaded).unwrap();
+
+        let Some(crate::session::SandboxState::Unenforced(reason)) = plan.sandbox.as_ref() else {
+            panic!("expected the escape hatch to fire, got {:?}", plan.sandbox);
+        };
+        assert!(reason.contains("wsl-distro"), "{reason}");
+        // Nothing wrapped the agent — this really is a host process.
+        assert_eq!(plan.command, super::super::resolve_agent_def(None).command);
+        // And the link storage holds is untouched, which is what makes the
+        // next restart rebuild the boundary instead of staying on the host.
+        assert_eq!(
+            db.get_session_by_id(sess.id)
+                .unwrap()
+                .unwrap()
+                .sandbox_profile
+                .as_deref(),
+            Some("dev")
+        );
+    }
+
+    /// Without the escape hatch the same restart refuses outright rather than
+    /// relaunching the agent outside its boundary.
+    #[test]
+    fn a_headless_restart_refuses_when_the_boundary_cannot_be_applied() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+
+        let mut profile = crate::session::SandboxProfile::new(
+            "dev",
+            vec![crate::session::SandboxPath::workspace("~/dev/app")],
+        );
+        profile.backend = crate::session::SandboxBackendKind::WslDistro;
+
+        let sess = session(Some("sid-strict"), Some(temp.path().join("repo")));
+        let err = build_restart_plan(&sess, Some(profile)).unwrap_err();
+        assert!(err.contains("wsl-distro"), "got: {err}");
     }
 
     /// The other half of the same wiring: a session's profile survives the

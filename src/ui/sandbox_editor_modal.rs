@@ -67,6 +67,9 @@ pub struct SandboxEditorState<'a> {
     pub image: &'a str,
     pub containerfile: &'a str,
     pub allow_unsandboxed_fallback: bool,
+    /// Columns of the stored row friring could not decode, as
+    /// `column = 'value'`. Empty for a healthy profile.
+    pub undecoded: &'a [String],
 }
 
 impl<'a> SandboxEditorState<'a> {
@@ -93,6 +96,7 @@ impl<'a> SandboxEditorState<'a> {
             image: m.image.value(),
             containerfile: m.containerfile.value(),
             allow_unsandboxed_fallback: m.allow_unsandboxed_fallback,
+            undecoded: &m.undecoded,
         }
     }
 
@@ -265,12 +269,35 @@ fn editor_body_lines<'a>(
     (lines, active_row, field_spans)
 }
 
-/// The pinned footer: which shape the profile will run as (and what that costs
-/// it), the honest scope of the boundary, and the key hints. Save and cancel
-/// are rendered as clickable buttons over the last row, so the hints carry only
-/// the navigation chords.
+/// The pinned footer: the repair notice when the stored row did not decode,
+/// which shape the profile will run as (and what that costs it), the honest
+/// scope of the boundary, and the key hints. Save and cancel are rendered as
+/// clickable buttons over the last row, so the hints carry only the navigation
+/// chords.
+///
+/// The repair notice lives here rather than at the top of the body because the
+/// body scroll-windows around the active field: a banner that can scroll out of
+/// sight is a banner that gets missed.
 fn editor_footer_lines<'a>(state: &SandboxEditorState<'a>) -> Vec<Line<'a>> {
-    let mut lines = vec![
+    let mut lines = Vec::new();
+    if !state.undecoded.is_empty() {
+        // Says "replaces" rather than "repairs" on purpose: the form holds the
+        // narrow values storage substituted, and `network_deny` has no editor
+        // at all, so a save discards whatever the unreadable column was trying
+        // to express instead of recovering it.
+        lines.push(Line::from(Span::styled(
+            "  \u{26a0} this profile will not launch — saving replaces the values below",
+            Style::default().fg(Theme::danger()),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled("  did not decode  ", Theme::label()),
+            Span::styled(
+                state.undecoded.join(", "),
+                Style::default().fg(Theme::danger()),
+            ),
+        ]));
+    }
+    lines.extend([
         Line::from(vec![
             Span::styled("  shape    ", Theme::label()),
             Span::styled(shape_summary(state), Style::default().fg(Theme::accent())),
@@ -281,7 +308,7 @@ fn editor_footer_lines<'a>(state: &SandboxEditorState<'a>) -> Vec<Line<'a>> {
             "  a sandbox reduces blast radius; it does not prove containment",
             Style::default().fg(Theme::text_muted()),
         )),
-    ];
+    ]);
 
     lines.push(super::key_hint_line(&[
         ("Tab/↑↓", " move  "),
@@ -636,6 +663,7 @@ mod tests {
             image: "",
             containerfile: "",
             allow_unsandboxed_fallback: false,
+            undecoded: &[],
         }
     }
 
@@ -876,6 +904,39 @@ mod tests {
         assert_eq!(footer.len(), 3);
         assert!(text(&footer[1]).contains("does not prove containment"));
         assert!(text(&footer[2]).contains("adjust"));
+    }
+
+    /// A profile whose stored row did not decode is repairable here and nowhere
+    /// else, so the editor has to say that there is something to repair — the
+    /// narrow values it is pre-filled with are storage's substitutions, not the
+    /// user's choices.
+    #[test]
+    fn the_footer_names_the_columns_that_did_not_decode() {
+        let s = state();
+        let clean = editor_footer_lines(&s);
+        assert!(!text(&clean[0]).contains("will not launch"));
+
+        let undecoded = [
+            "read_scope = 'everything'".to_string(),
+            "network_deny = '[oops'".to_string(),
+        ];
+        let broken = SandboxEditorState {
+            undecoded: &undecoded,
+            ..state()
+        };
+        let footer = editor_footer_lines(&broken);
+        assert_eq!(footer.len(), clean.len() + 2);
+        assert!(
+            text(&footer[0]).contains("will not launch"),
+            "{:?}",
+            footer[0]
+        );
+        // "replaces", not "repairs": `network_deny` has no editor, so a save
+        // discards whatever the unreadable column meant.
+        assert!(text(&footer[0]).contains("saving replaces"));
+        assert!(text(&footer[1]).contains("did not decode"));
+        assert!(text(&footer[1]).contains("read_scope = 'everything'"));
+        assert!(text(&footer[1]).contains("network_deny = '[oops'"));
     }
 
     #[test]

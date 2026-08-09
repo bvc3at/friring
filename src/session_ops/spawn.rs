@@ -63,6 +63,13 @@ pub struct SpawnResult {
     pub cwd: PathBuf,
     pub worktrees: Vec<SharedWorktree>,
     pub parent_session_id: Option<SessionId>,
+    /// What the launch did with [`SpawnRequest::sandbox_profile`]. `None` = the
+    /// session asked for no boundary. A
+    /// [`SandboxState::Unenforced`](crate::session::SandboxState::Unenforced)
+    /// here means the agent is running **on the host**: the caller reports it,
+    /// because a session the user believes is sandboxed and is not is the worst
+    /// outcome this feature has.
+    pub sandbox: Option<crate::session::SandboxState>,
 }
 
 /// Spawn a new session inside `tmux -L friring`, persisting its state to the
@@ -138,7 +145,8 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
     };
     super::inject_friring_env(&mut config, &agent_session_id, req.task_id);
 
-    let (command, args) = super::build_agent_invocation(&agent_def, &mut config)?;
+    let invocation = super::build_agent_invocation(&agent_def, &mut config)?;
+    let (command, args) = (invocation.command, invocation.args);
 
     // Remote spawns drive the SSH backend's control mode to learn the real pane
     // id; local spawns leave `backend_id` empty for the TUI to resolve by name.
@@ -179,6 +187,10 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         workspace_dir: None,
         worktrees: worktrees.clone(),
         shell_backend_id: None,
+        // The profile the session **asked for**, recorded even when the launch
+        // fell back to the host: clearing it would strand the session outside
+        // its boundary for good, where keeping it makes the next relaunch
+        // sandboxed again as soon as the backend is available.
         sandbox_profile: config.sandbox.as_ref().map(|p| p.name.clone()),
         parent_session_id: req.parent_session_id,
         display_order: None,
@@ -231,6 +243,7 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         cwd: primary_cwd,
         worktrees,
         parent_session_id: req.parent_session_id,
+        sandbox: invocation.sandbox,
     })
 }
 

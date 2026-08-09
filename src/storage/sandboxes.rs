@@ -15,13 +15,16 @@
 //! the same transaction, and [`Database::upsert_sandbox_profile`], which
 //! deliberately refuses to move a profile's identity.
 
+use std::fmt;
 use std::str::FromStr;
 
 use rusqlite::{params, OptionalExtension};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::session::{SandboxBackendKind, SandboxProfile, SANDBOX_BACKEND_PREFIX};
+use crate::session::{
+    NetworkMode, ReadScope, SandboxBackendKind, SandboxProfile, SANDBOX_BACKEND_PREFIX,
+};
 use crate::sync::current_time_millis;
 
 use super::Database;
@@ -88,23 +91,172 @@ fn list_to_json<T: Serialize>(items: &[T]) -> String {
     serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// Decode a JSON list column. `NULL`/empty/malformed → an empty list, never an
-/// error: a profile that lost its paths still has to appear in the list modal so
-/// the user can repair or delete it, whereas a failed row read would take every
-/// *other* profile down with it. [`SandboxProfile::validate`] is what refuses to
-/// save the result.
-fn list_from_json<T: DeserializeOwned>(raw: Option<String>) -> Vec<T> {
-    raw.filter(|s| !s.is_empty())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-/// Decode an enum column, falling back to the type's default for the same
-/// reason [`list_from_json`] returns an empty list — a hand-edited or imported
-/// value friring does not know must not hide the whole collection. Every one of
-/// these defaults is also the default a fresh profile is created with.
+/// Decode an enum column, falling back to the type's default. Used for
+/// [`SandboxInstance::engine`] only: an instance row is a *record of* a place
+/// that already exists, never a policy anything is launched under, so an engine
+/// name friring does not know costs the manager view a label and nothing else.
+/// Profile columns go through [`RowDecoder`], which refuses to guess.
 fn enum_from_db<T: FromStr + Default>(raw: &str) -> T {
     T::from_str(raw).unwrap_or_default()
+}
+
+/// Longest stored value an [`UndecodedColumn`] quotes back. A corrupt JSON
+/// column has no length limit and the message built from it is a one-line
+/// toast.
+const MAX_QUOTED_VALUE: usize = 48;
+
+/// A `sandbox_profiles` column whose stored value friring could not decode, and
+/// the text it refused.
+///
+/// Recorded rather than raised as a read error: a corrupt row still has to
+/// reach the list modal so it can be repaired or deleted, whereas a failed read
+/// would take every *other* profile down with it. What must not happen is
+/// **launching** it — see [`StoredSandboxProfile`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndecodedColumn {
+    /// The column, spelled as the schema spells it.
+    pub column: &'static str,
+    /// The stored text, truncated: the message built from it is a one-line
+    /// toast and a corrupt JSON column has no length limit.
+    pub value: String,
+}
+
+impl fmt::Display for UndecodedColumn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} = '{}'", self.column, self.value)
+    }
+}
+
+/// Decodes one profile row, collecting the columns it could not read instead of
+/// silently substituting a value for them.
+#[derive(Debug, Default)]
+struct RowDecoder {
+    undecoded: Vec<UndecodedColumn>,
+}
+
+impl RowDecoder {
+    /// Decode an enum column, or record it and fall back to `safe`.
+    ///
+    /// `safe` is the **narrowest** option the column has, not the type's
+    /// `Default`: a policy friring cannot read must not decode to the wider
+    /// grant, and a blind re-save from the editor must repair the row towards
+    /// closed rather than towards open.
+    fn enum_col<T: FromStr>(&mut self, column: &'static str, raw: &str, safe: T) -> T {
+        match T::from_str(raw) {
+            Ok(value) => value,
+            Err(_) => {
+                self.record(column, raw);
+                safe
+            }
+        }
+    }
+
+    /// Decode a JSON list column. An empty column is an empty list — that is
+    /// how a `NOT NULL` TEXT column spells "nothing here" — but anything else
+    /// that does not parse is recorded, because an empty `network_deny` is a
+    /// *wider* profile than whatever the row was trying to say.
+    fn list_col<T: DeserializeOwned>(
+        &mut self,
+        column: &'static str,
+        raw: Option<String>,
+    ) -> Vec<T> {
+        let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+            return Vec::new();
+        };
+        match serde_json::from_str(&raw) {
+            Ok(list) => list,
+            Err(_) => {
+                self.record(column, &raw);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Decode an INTEGER limit column. `NULL` is "uncapped"; a value that is
+    /// not a `u32` is recorded, because "uncapped" is the wider reading of a
+    /// number friring could not use.
+    fn limit_col(&mut self, column: &'static str, raw: Option<i64>) -> Option<u32> {
+        let raw = raw?;
+        match u32::try_from(raw) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                self.record(column, &raw.to_string());
+                None
+            }
+        }
+    }
+
+    fn record(&mut self, column: &'static str, value: &str) {
+        let mut quoted: String = value.chars().take(MAX_QUOTED_VALUE).collect();
+        if value.chars().nth(MAX_QUOTED_VALUE).is_some() {
+            quoted.push('\u{2026}');
+        }
+        self.undecoded.push(UndecodedColumn {
+            column,
+            value: quoted,
+        });
+    }
+}
+
+/// A profile as it came out of the database, with every column friring could
+/// not decode recorded beside it.
+///
+/// Reading stays lenient so a corrupt row is repairable, but leniency has to
+/// pick *a* value and the value it picks cannot be trusted — an unreadable
+/// `read_scope` or `network_deny` would otherwise decode to the more permissive
+/// option. [`undecoded`](Self::undecoded) is what makes the leniency safe: the
+/// row still lists and still opens in the editor, and every launch path refuses
+/// it (`docs/SANDBOX.md` §Failure modes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSandboxProfile {
+    /// The decoded profile. Every column named in
+    /// [`undecoded`](Self::undecoded) holds the narrowest value that column
+    /// allows rather than what the row stored.
+    pub profile: SandboxProfile,
+    /// The columns friring could not read, in column order. Empty for a row
+    /// that decoded completely.
+    pub undecoded: Vec<UndecodedColumn>,
+}
+
+impl StoredSandboxProfile {
+    /// A profile that decoded completely — what an in-memory profile, or one
+    /// the editor just built, always is.
+    pub fn intact(profile: SandboxProfile) -> Self {
+        Self {
+            profile,
+            undecoded: Vec::new(),
+        }
+    }
+
+    /// Whether every column decoded. Only an intact profile may be launched.
+    pub fn is_intact(&self) -> bool {
+        self.undecoded.is_empty()
+    }
+
+    /// The refusal a launch shows, naming each column that failed to decode and
+    /// the value it refused; `None` for an intact profile.
+    ///
+    /// Launching is the one thing a corrupt profile must not do: its policy is
+    /// partly unknown, and the parts friring substituted are the parts a user
+    /// would least want guessed.
+    pub fn launch_refusal(&self) -> Option<String> {
+        if self.is_intact() {
+            return None;
+        }
+        let columns: Vec<String> = self.undecoded.iter().map(ToString::to_string).collect();
+        Some(format!(
+            "Sandbox profile '{}' cannot be launched: friring could not decode {} — \
+             open it in the profile list (Alt+S) and save it to repair",
+            self.profile.name,
+            columns.join(", ")
+        ))
+    }
+
+    /// Just the failed column names, for a list row that has no width for their
+    /// values.
+    pub fn undecoded_columns(&self) -> Vec<&'static str> {
+        self.undecoded.iter().map(|c| c.column).collect()
+    }
 }
 
 /// Column list for profile SELECTs (keep in sync with [`map_profile`]).
@@ -115,29 +267,44 @@ const COLS: &str = "name, backend, paths, network_mode, network_allow, network_d
 /// Column list for instance SELECTs (keep in sync with [`map_instance`]).
 const INSTANCE_COLS: &str = "profile, engine, external_id, state, created_at, last_used_at";
 
-fn map_profile(row: &rusqlite::Row) -> rusqlite::Result<SandboxProfile> {
-    Ok(SandboxProfile {
+fn map_profile(row: &rusqlite::Row) -> rusqlite::Result<StoredSandboxProfile> {
+    let mut decoder = RowDecoder::default();
+    let profile = SandboxProfile {
         name: row.get(0)?,
-        backend: enum_from_db(&row.get::<_, String>(1)?),
-        paths: list_from_json(row.get(2)?),
-        network_mode: enum_from_db(&row.get::<_, String>(3)?),
-        network_allow: list_from_json(row.get(4)?),
-        network_deny: list_from_json(row.get(5)?),
+        // No backend is inherently the narrow one, so an unreadable pin falls
+        // back to the ladder — and is refused at launch like every other
+        // undecoded column, because a pin that silently became `auto` is the
+        // "isolation technology the user did not choose" the design forbids.
+        backend: decoder.enum_col(
+            "backend",
+            &row.get::<_, String>(1)?,
+            SandboxBackendKind::Auto,
+        ),
+        paths: decoder.list_col("paths", row.get(2)?),
+        network_mode: decoder.enum_col(
+            "network_mode",
+            &row.get::<_, String>(3)?,
+            NetworkMode::None,
+        ),
+        network_allow: decoder.list_col("network_allow", row.get(4)?),
+        network_deny: decoder.list_col("network_deny", row.get(5)?),
         prompt_new_domains: row.get::<_, i64>(6)? != 0,
-        read_scope: enum_from_db(&row.get::<_, String>(7)?),
-        // Stored as INTEGER; a negative or over-wide value is meaningless as a
-        // limit, so it decodes to "uncapped" rather than failing the read.
-        memory_mb: row
-            .get::<_, Option<i64>>(8)?
-            .and_then(|v| u32::try_from(v).ok()),
-        cpus: row
-            .get::<_, Option<i64>>(9)?
-            .and_then(|v| u32::try_from(v).ok()),
+        read_scope: decoder.enum_col(
+            "read_scope",
+            &row.get::<_, String>(7)?,
+            ReadScope::Workspace,
+        ),
+        memory_mb: decoder.limit_col("memory_mb", row.get(8)?),
+        cpus: decoder.limit_col("cpus", row.get(9)?),
         image: row.get(10)?,
         containerfile: row.get(11)?,
         allow_unsandboxed_fallback: row.get::<_, i64>(12)? != 0,
         created_at: row.get::<_, i64>(13)? as u64,
         updated_at: row.get::<_, i64>(14)? as u64,
+    };
+    Ok(StoredSandboxProfile {
+        profile,
+        undecoded: decoder.undecoded,
     })
 }
 
@@ -155,7 +322,12 @@ fn map_instance(row: &rusqlite::Row) -> rusqlite::Result<SandboxInstance> {
 impl Database {
     /// Every sandbox profile, in the case-insensitive alphabetical order the
     /// list modal shows (the `name` column collates `NOCASE`).
-    pub fn list_sandbox_profiles(&self) -> rusqlite::Result<Vec<SandboxProfile>> {
+    ///
+    /// A row friring could not fully decode is included, carrying its
+    /// [`undecoded`](StoredSandboxProfile::undecoded) columns — the list is
+    /// where a corrupt profile is repaired or deleted, so hiding it would
+    /// strand it.
+    pub fn list_sandbox_profiles(&self) -> rusqlite::Result<Vec<StoredSandboxProfile>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {COLS} FROM sandbox_profiles ORDER BY name"
         ))?;
@@ -179,7 +351,14 @@ impl Database {
     /// name becomes a container or distro name where two spellings would be one
     /// object; it is also trimmed, because the name arrives from a text field
     /// and a stray space must not read as "no such profile".
-    pub fn get_sandbox_profile(&self, name: &str) -> rusqlite::Result<Option<SandboxProfile>> {
+    ///
+    /// Callers about to **launch** must check
+    /// [`is_intact`](StoredSandboxProfile::is_intact) first: a row whose policy
+    /// columns did not decode is repairable, not runnable.
+    pub fn get_sandbox_profile(
+        &self,
+        name: &str,
+    ) -> rusqlite::Result<Option<StoredSandboxProfile>> {
         self.conn
             .query_row(
                 &format!("SELECT {COLS} FROM sandbox_profiles WHERE name = ?1"),
@@ -405,6 +584,28 @@ impl Database {
             params![profile.trim()],
         )
     }
+
+    /// Insert the hand-edited or imported row [`StoredSandboxProfile`] exists
+    /// for: an unrecognised value in every enum column, a malformed JSON list,
+    /// and an out-of-range limit.
+    ///
+    /// Test-only, and the only way to produce one —
+    /// [`upsert_sandbox_profile`](Self::upsert_sandbox_profile) can only write
+    /// values that decode, so nothing else in the crate can reach the state the
+    /// launch refusal guards against.
+    #[cfg(test)]
+    pub(crate) fn insert_undecodable_sandbox_profile(&self, name: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO sandbox_profiles
+                (name, backend, paths, network_mode, network_allow, network_deny,
+                 prompt_new_domains, read_scope, memory_mb, cpus,
+                 allow_unsandboxed_fallback, created_at, updated_at)
+             VALUES (?1, 'firejail', 'not json', 'sometimes', '', '[oops',
+                     1, 'everything', -1, 0, 0, 1, 1)",
+            params![name],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -443,7 +644,7 @@ mod tests {
 
         db.upsert_sandbox_profile(&profile("dev")).unwrap();
 
-        let got = db.get_sandbox_profile("dev").unwrap().unwrap();
+        let got = db.get_sandbox_profile("dev").unwrap().unwrap().profile;
         assert_eq!(got.name, "dev");
         assert_eq!(got.paths.len(), 3);
         assert_eq!(db.list_sandbox_profiles().unwrap().len(), 1);
@@ -467,7 +668,7 @@ mod tests {
         p.allow_unsandboxed_fallback = true;
         db.upsert_sandbox_profile(&p).unwrap();
 
-        let got = db.get_sandbox_profile("place").unwrap().unwrap();
+        let got = db.get_sandbox_profile("place").unwrap().unwrap().profile;
         assert_eq!(got.backend, SandboxBackendKind::Podman);
         assert_eq!(got.network_mode, NetworkMode::Allowlist);
         assert_eq!(got.network_allow, p.network_allow);
@@ -501,7 +702,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.upsert_sandbox_profile(&profile("dev")).unwrap();
 
-        let got = db.get_sandbox_profile("dev").unwrap().unwrap();
+        let got = db.get_sandbox_profile("dev").unwrap().unwrap().profile;
         let listed: Vec<(&str, PathMode)> = got
             .paths
             .iter()
@@ -524,7 +725,7 @@ mod tests {
     fn upsert_replaces_the_row_and_keeps_created_at() {
         let db = Database::open_in_memory().unwrap();
         db.upsert_sandbox_profile(&profile("dev")).unwrap();
-        let first = db.get_sandbox_profile("dev").unwrap().unwrap();
+        let first = db.get_sandbox_profile("dev").unwrap().unwrap().profile;
         assert!(first.created_at > 0);
         assert_eq!(first.created_at, first.updated_at);
 
@@ -536,7 +737,7 @@ mod tests {
         edited.updated_at = 1;
         db.upsert_sandbox_profile(&edited).unwrap();
 
-        let got = db.get_sandbox_profile("dev").unwrap().unwrap();
+        let got = db.get_sandbox_profile("dev").unwrap().unwrap().profile;
         assert_eq!(db.list_sandbox_profiles().unwrap().len(), 1);
         assert_eq!(got.paths.len(), 1);
         assert_eq!(got.network_mode, NetworkMode::None);
@@ -559,8 +760,8 @@ mod tests {
         assert_eq!(all.len(), 1);
         // The edit landed, and the stored spelling stayed put — moving identity
         // is `rename_sandbox_profile`'s job alone.
-        assert_eq!(all[0].network_mode, NetworkMode::Full);
-        assert_eq!(all[0].name, "dev");
+        assert_eq!(all[0].profile.network_mode, NetworkMode::Full);
+        assert_eq!(all[0].profile.name, "dev");
         assert!(db.get_sandbox_profile("DeV").unwrap().is_some());
     }
 
@@ -613,7 +814,12 @@ mod tests {
 
         assert!(db.get_sandbox_profile("dev").unwrap().is_none());
         assert_eq!(
-            db.get_sandbox_profile("dev2").unwrap().unwrap().paths.len(),
+            db.get_sandbox_profile("dev2")
+                .unwrap()
+                .unwrap()
+                .profile
+                .paths
+                .len(),
             3
         );
         // The instance followed by ON UPDATE CASCADE…
@@ -827,35 +1033,96 @@ mod tests {
 
     #[test]
     fn a_row_friring_cannot_parse_still_lists() {
-        // Hand-edited or imported junk in the enum and JSON columns decodes to
-        // the defaults a fresh profile has, so the list modal can still show
-        // (and the editor repair) the row instead of the whole collection
-        // vanishing behind one bad value.
+        // Junk in the enum and JSON columns must not hide the row: the list
+        // modal is where it gets repaired or deleted, and a read error would
+        // take every *other* profile down with it.
         let db = Database::open_in_memory().unwrap();
+        db.insert_undecodable_sandbox_profile("broken").unwrap();
+
+        let got = db.get_sandbox_profile("broken").unwrap().unwrap();
+        assert!(got.profile.paths.is_empty());
+        assert!(got.profile.network_allow.is_empty() && got.profile.network_deny.is_empty());
+        // A negative limit is no limit, not a panic.
+        assert_eq!(got.profile.memory_mb, None);
+        assert_eq!(got.profile.cpus, Some(0));
+        // Unsaveable until repaired, which is exactly the intended nudge.
+        assert!(got.profile.validate().is_err());
+        assert_eq!(db.list_sandbox_profiles().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_column_decodes_to_the_narrower_option_and_is_recorded() {
+        // The bug this pins: leniency has to pick a value, and picking the
+        // type's default handed an unreadable `read_scope` the *wider* of its
+        // two options and an unreadable `network_deny` an empty deny list.
+        let db = Database::open_in_memory().unwrap();
+        db.insert_undecodable_sandbox_profile("broken").unwrap();
+
+        let got = db.get_sandbox_profile("broken").unwrap().unwrap();
+        assert_eq!(got.profile.read_scope, ReadScope::Workspace);
+        assert_eq!(got.profile.network_mode, NetworkMode::None);
+        assert_eq!(got.profile.backend, SandboxBackendKind::Auto);
+
+        assert!(!got.is_intact());
+        assert_eq!(
+            got.undecoded_columns(),
+            [
+                "backend",
+                "paths",
+                "network_mode",
+                "network_deny",
+                "read_scope",
+                "memory_mb"
+            ]
+        );
+        // An empty column is "nothing here", not a decode failure.
+        assert!(!got.undecoded_columns().contains(&"network_allow"));
+
+        // The refusal names the profile and every value it could not read, so
+        // the toast says what to repair.
+        let refusal = got.launch_refusal().expect("a corrupt row cannot launch");
+        assert!(refusal.contains("'broken'"), "{refusal}");
+        assert!(refusal.contains("read_scope = 'everything'"), "{refusal}");
+        assert!(refusal.contains("network_deny = '[oops'"), "{refusal}");
+    }
+
+    #[test]
+    fn an_intact_row_carries_no_decode_failures() {
+        let db = Database::open_in_memory().unwrap();
+        let mut p = profile("dev");
+        p.network_deny = vec!["gist.github.com".into()];
+        p.read_scope = ReadScope::HostMinusSecrets;
+        db.upsert_sandbox_profile(&p).unwrap();
+
+        let got = db.get_sandbox_profile("dev").unwrap().unwrap();
+        assert!(got.is_intact());
+        assert!(got.launch_refusal().is_none());
+        // A value friring *can* read is never narrowed on the way out.
+        assert_eq!(got.profile.read_scope, ReadScope::HostMinusSecrets);
+    }
+
+    #[test]
+    fn a_quoted_value_cannot_run_away_with_the_message() {
+        // The refusal is a one-line toast and the column it quotes is free
+        // text, so an enormous stored value is truncated rather than pasted.
+        let db = Database::open_in_memory().unwrap();
+        let huge = "x".repeat(4096);
         db.conn
             .execute(
                 "INSERT INTO sandbox_profiles
                     (name, backend, paths, network_mode, network_allow, network_deny,
-                     prompt_new_domains, read_scope, memory_mb, cpus,
-                     allow_unsandboxed_fallback, created_at, updated_at)
-                 VALUES ('broken', 'firejail', 'not json', 'sometimes', '', '[oops',
-                         1, 'everything', -1, 0, 0, 1, 1)",
-                [],
+                     prompt_new_domains, read_scope, allow_unsandboxed_fallback,
+                     created_at, updated_at)
+                 VALUES ('huge', 'auto', ?1, 'none', '[]', '[]', 0, 'workspace', 0, 1, 1)",
+                params![huge],
             )
             .unwrap();
 
-        let got = db.get_sandbox_profile("broken").unwrap().unwrap();
-        assert_eq!(got.backend, SandboxBackendKind::Auto);
-        assert_eq!(got.network_mode, NetworkMode::Allowlist);
-        assert_eq!(got.read_scope, ReadScope::HostMinusSecrets);
-        assert!(got.paths.is_empty());
-        assert!(got.network_allow.is_empty() && got.network_deny.is_empty());
-        // A negative limit is no limit, not a panic.
-        assert_eq!(got.memory_mb, None);
-        assert_eq!(got.cpus, Some(0));
-        // Unsaveable until repaired, which is exactly the intended nudge.
-        assert!(got.validate().is_err());
-        assert_eq!(db.list_sandbox_profiles().unwrap().len(), 1);
+        let got = db.get_sandbox_profile("huge").unwrap().unwrap();
+        assert_eq!(got.undecoded_columns(), ["paths"]);
+        let quoted = &got.undecoded[0].value;
+        assert_eq!(quoted.chars().count(), MAX_QUOTED_VALUE + 1);
+        assert!(quoted.ends_with('\u{2026}'));
     }
 
     #[test]
@@ -877,7 +1144,7 @@ mod tests {
         }
 
         let db = Database::open(&path).unwrap();
-        let got = db.get_sandbox_profile("dev").unwrap().unwrap();
+        let got = db.get_sandbox_profile("dev").unwrap().unwrap().profile;
         assert_eq!(got.paths.len(), 3);
         assert_eq!(got.network_mode, NetworkMode::Allowlist);
         assert_eq!(db.list_sandbox_instances().unwrap().len(), 1);

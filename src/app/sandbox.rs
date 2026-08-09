@@ -25,9 +25,12 @@ impl App {
     ///
     /// # Errors
     ///
-    /// The name is set but no such profile is stored. Deleting a profile
-    /// deliberately leaves referencing sessions dangling, so that a relaunch
-    /// fails here rather than quietly running the agent on the host.
+    /// Either the name is set but no such profile is stored — deleting a
+    /// profile deliberately leaves referencing sessions dangling, so that a
+    /// relaunch fails here rather than quietly running the agent on the host —
+    /// or the stored row did not decode, in which case part of its policy is a
+    /// substituted guess and the profile is repairable rather than runnable
+    /// ([`StoredSandboxProfile`](crate::storage::sandboxes::StoredSandboxProfile)).
     pub(crate) fn load_session_sandbox(
         &self,
         name: Option<&str>,
@@ -36,7 +39,10 @@ impl App {
             return Ok(None);
         };
         match self.db.get_sandbox_profile(name) {
-            Ok(Some(profile)) => Ok(Some(profile)),
+            Ok(Some(stored)) => match stored.launch_refusal() {
+                Some(refusal) => Err(refusal),
+                None => Ok(Some(stored.profile)),
+            },
             Ok(None) => Err(format!(
                 "Sandbox profile '{name}' no longer exists — recreate it, or clear the \
                  session's profile, before relaunching"
@@ -61,16 +67,7 @@ impl App {
         let host = SandboxHost::local_shared();
         profiles
             .into_iter()
-            .map(|p| SandboxProfileRow {
-                resolved: resolve_backend(host, p.backend),
-                name: p.name,
-                backend: p.backend,
-                paths: p.paths.len(),
-                network: p.network_mode,
-                // Place instances land with the sandbox transport (P3); until
-                // then no profile has one and the column stays empty.
-                instance: None,
-            })
+            .map(|p| profile_row(host, &p))
             .collect()
     }
 
@@ -102,10 +99,16 @@ impl App {
     }
 
     /// Open the editor on a stored profile.
+    ///
+    /// A row that did not decode opens too — the editor is the only repair
+    /// there is — pre-filled with the narrow values storage substituted and
+    /// carrying the list of columns it substituted them for, so a save is an
+    /// informed repair rather than a silent one.
     fn open_edit_sandbox_profile(&mut self, name: &str) {
         match self.db.get_sandbox_profile(name) {
-            Ok(Some(profile)) => {
-                let mut m = modals::SandboxEditorModal::from_profile(&profile);
+            Ok(Some(stored)) => {
+                let mut m = modals::SandboxEditorModal::from_profile(&stored.profile);
+                m.undecoded = stored.undecoded.iter().map(ToString::to_string).collect();
                 self.resolve_sandbox_editor_backend(&mut m);
                 self.modal = modals::Modal::SandboxEditor(Box::new(m));
             }
@@ -144,7 +147,6 @@ impl App {
                 return false;
             }
         };
-
         // The name *is* the storage key, so a rename is its own operation: it
         // rewrites the profile row, its instances and every session pointing at
         // it in one transaction. An upsert under the new name would leave the
@@ -262,20 +264,13 @@ impl App {
         }];
         let mut rows: Vec<SandboxChoice> = profiles
             .into_iter()
-            .map(|p| {
+            .map(|stored| {
                 let covers = dirs
                     .iter()
-                    .all(|dir| p.covers(&dir.to_string_lossy(), &home));
-                let row = SandboxProfileRow {
-                    resolved: resolve_backend(host, p.backend),
-                    name: p.name.clone(),
-                    backend: p.backend,
-                    paths: p.paths.len(),
-                    network: p.network_mode,
-                    instance: None,
-                };
+                    .all(|dir| stored.profile.covers(&dir.to_string_lossy(), &home));
+                let row = profile_row(host, &stored);
                 SandboxChoice {
-                    label: p.name,
+                    label: stored.profile.name,
                     profile: row.name.clone(),
                     detail: row.summary(),
                     covers,
@@ -421,6 +416,56 @@ impl App {
     }
 }
 
+/// The toast for a session whose launch fell back to the host, or `None` when
+/// the boundary went on (and for a session that never asked for one).
+///
+/// The state is on the session and in the info panel, but a toast is what gets
+/// noticed at the moment of the launch, and the escape hatch firing is exactly
+/// the event the design wants visible rather than ambient (`docs/SANDBOX.md`
+/// §Failure modes). A free function rather than a method so a caller that has
+/// already moved the session into `self.sessions` can compose the message first
+/// and set it afterwards.
+pub(crate) fn unenforced_sandbox_message(info: &crate::session::SessionInfo) -> Option<String> {
+    // Both halves, in the same order the indicators read them: a state with no
+    // profile beside it would be claiming something about a session that never
+    // asked for a boundary.
+    let profile = info.sandbox_profile.as_deref()?;
+    let crate::session::SandboxState::Unenforced(reason) = info.sandbox_state.as_ref()? else {
+        return None;
+    };
+    Some(format!(
+        "'{}' is NOT sandboxed — profile '{profile}' could not be applied: {reason}",
+        info.name
+    ))
+}
+
+/// One stored profile as a list row, with `auto` resolved against `host`.
+///
+/// The undecoded columns come across too: a row whose policy friring could not
+/// read still lists (that is where it gets repaired or deleted) but must say so
+/// rather than render a summary of values it substituted.
+fn profile_row(
+    host: &SandboxHost,
+    stored: &crate::storage::sandboxes::StoredSandboxProfile,
+) -> SandboxProfileRow {
+    let p = &stored.profile;
+    SandboxProfileRow {
+        resolved: resolve_backend(host, p.backend),
+        name: p.name.clone(),
+        backend: p.backend,
+        paths: p.paths.len(),
+        network: p.network_mode,
+        undecoded: stored
+            .undecoded_columns()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        // Place instances land with the sandbox transport (P3); until then no
+        // profile has one and the column stays empty.
+        instance: None,
+    }
+}
+
 /// What `requested` resolves to on `host`, or `None` when nothing on the ladder
 /// is available. Only `auto` needs resolving — an explicitly chosen backend is
 /// already the answer, and a pin never falls back.
@@ -484,17 +529,7 @@ mod tests {
         let host = SandboxHost::new(std::sync::Arc::new(
             crate::sandbox::probe::StubHost::linux_with_bwrap("0.11.0"),
         ));
-        let rows: Vec<SandboxProfileRow> = profiles
-            .into_iter()
-            .map(|p| SandboxProfileRow {
-                resolved: resolve_backend(&host, p.backend),
-                name: p.name,
-                backend: p.backend,
-                paths: p.paths.len(),
-                network: p.network_mode,
-                instance: None,
-            })
-            .collect();
+        let rows: Vec<SandboxProfileRow> = profiles.iter().map(|p| profile_row(&host, p)).collect();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "dev");
@@ -502,5 +537,57 @@ mod tests {
         assert_eq!(rows[0].network, NetworkMode::Full);
         // An explicit backend renders without an arrow; only `auto` gets one.
         assert!(!rows[0].summary().contains('→'), "{}", rows[0].summary());
+        assert!(rows[0].is_intact());
+    }
+
+    /// A corrupt row still lists — it is repairable, and the list is the only
+    /// way in — but it is marked, because its backend, path count and network
+    /// mode would otherwise be reported as the profile's when they are
+    /// storage's substitutions.
+    #[test]
+    fn a_row_that_did_not_decode_lists_as_invalid() {
+        let db = crate::storage::Database::open_in_memory().unwrap();
+        db.insert_undecodable_sandbox_profile("broken").unwrap();
+        let host = SandboxHost::new(std::sync::Arc::new(
+            crate::sandbox::probe::StubHost::linux_with_bwrap("0.11.0"),
+        ));
+
+        let stored = db.list_sandbox_profiles().unwrap();
+        let rows: Vec<SandboxProfileRow> = stored.iter().map(|p| profile_row(&host, p)).collect();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "broken");
+        assert!(!rows[0].is_intact());
+        assert!(rows[0].undecoded.contains(&"read_scope".to_string()));
+        assert!(rows[0].undecoded.contains(&"network_deny".to_string()));
+        assert!(
+            rows[0].summary().contains("unreadable"),
+            "{}",
+            rows[0].summary()
+        );
+    }
+
+    /// The toast a launch that landed on the host raises. Only that outcome
+    /// raises one: a boundary that went on, and a session that never asked for
+    /// one, are both silent.
+    #[test]
+    fn only_an_unenforced_boundary_produces_a_message() {
+        let mut info = crate::session::SessionInfo::new("api".to_string());
+        assert!(unenforced_sandbox_message(&info).is_none());
+
+        info.sandbox_profile = Some("dev".to_string());
+        info.sandbox_state = Some(crate::session::SandboxState::Applied(
+            "seatbelt · inner agent sandbox: off".to_string(),
+        ));
+        assert!(unenforced_sandbox_message(&info).is_none());
+
+        info.sandbox_state = Some(crate::session::SandboxState::Unenforced(
+            "bwrap is not installed".to_string(),
+        ));
+        let message = unenforced_sandbox_message(&info).expect("a fallback is reported");
+        assert!(message.contains("'api'"), "{message}");
+        assert!(message.contains("NOT sandboxed"), "{message}");
+        assert!(message.contains("'dev'"), "{message}");
+        assert!(message.contains("bwrap is not installed"), "{message}");
     }
 }

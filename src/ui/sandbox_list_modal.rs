@@ -31,6 +31,11 @@ pub struct SandboxProfileRow {
     pub resolved: Option<SandboxBackendKind>,
     pub paths: usize,
     pub network: NetworkMode,
+    /// Columns of the stored row friring could not decode
+    /// (`crate::storage::sandboxes::StoredSandboxProfile`). Empty for a healthy
+    /// profile; anything in it means the summary below would be describing
+    /// substituted values, so the row reports the damage instead.
+    pub undecoded: Vec<String>,
     /// Live place state for a place backend (`running`, `stopped`), rendered
     /// when present. Policy backends never create an instance, so this stays
     /// `None` for them — as it does everywhere until instance tracking lands.
@@ -39,7 +44,18 @@ pub struct SandboxProfileRow {
 
 impl SandboxProfileRow {
     /// The row's right-hand summary: `auto → seatbelt · 3 paths · allowlist`.
+    ///
+    /// A row that did not decode says so instead: its backend, path count and
+    /// network mode are partly friring's own substitutions, and printing them
+    /// as if they were the profile would be the same lie the refusal to launch
+    /// exists to prevent.
     pub fn summary(&self) -> String {
+        if !self.undecoded.is_empty() {
+            return format!(
+                "unreadable {} — will not launch until repaired",
+                self.undecoded.join(", ")
+            );
+        }
         let mut out = self.backend.to_string();
         let auto = matches!(self.backend, SandboxBackendKind::Auto);
         if let Some(resolved) = self.resolved.filter(|_| auto) {
@@ -51,6 +67,13 @@ impl SandboxProfileRow {
             out.push_str(&format!(" · {state}"));
         }
         out
+    }
+
+    /// Whether the stored row decoded completely. Drives the row's colour: a
+    /// broken profile is a launch failure waiting to happen, not a neutral
+    /// entry.
+    pub fn is_intact(&self) -> bool {
+        self.undecoded.is_empty()
     }
 }
 
@@ -116,10 +139,13 @@ pub fn render_sandbox_list_modal(
 /// One list row, fitted to `width` display columns.
 fn row_line<'a>(entry: &SandboxProfileRow, selected: bool, width: usize) -> Line<'a> {
     let text = super::truncate_ellipsis(&format!(" {} — {} ", entry.name, entry.summary()), width);
-    let style = if selected {
-        Theme::selected_item()
-    } else {
-        Style::default().fg(Theme::text_secondary())
+    let style = match (selected, entry.is_intact()) {
+        (true, _) => Theme::selected_item(),
+        (false, true) => Style::default().fg(Theme::text_secondary()),
+        // The selection style already owns the whole row's colours, so an
+        // unreadable profile can only be coloured while it is *not* selected —
+        // its summary says so in words either way.
+        (false, false) => Style::default().fg(Theme::danger()),
     };
     Line::from(Span::styled(text, style))
 }
@@ -136,6 +162,7 @@ mod tests {
             resolved: None,
             paths: 2,
             network: NetworkMode::Allowlist,
+            undecoded: Vec::new(),
             instance: None,
         }
     }
@@ -171,6 +198,23 @@ mod tests {
         r.backend = SandboxBackendKind::Docker;
         r.instance = Some("running".to_string());
         assert_eq!(r.summary(), "docker · 2 paths · allowlist · running");
+    }
+
+    /// A profile whose stored policy did not decode must not be summarised as
+    /// if friring had read it: the numbers in that summary would be its own
+    /// substitutions.
+    #[test]
+    fn summary_reports_an_unreadable_row_instead_of_its_values() {
+        let mut r = row();
+        r.undecoded = vec!["read_scope".to_string(), "network_deny".to_string()];
+        let summary = r.summary();
+        assert_eq!(
+            summary,
+            "unreadable read_scope, network_deny — will not launch until repaired"
+        );
+        assert!(!r.is_intact());
+        assert!(!summary.contains("allowlist"), "{summary}");
+        assert!(!summary.contains("2 paths"), "{summary}");
     }
 
     #[test]

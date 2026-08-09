@@ -2299,6 +2299,11 @@ impl App {
         let session_id = session.info.id;
         match session.restart(&config, rows, cols) {
             Ok(()) => {
+                // A restart re-derives the boundary, so it is also where one
+                // that could not be applied last time comes back — and where
+                // one that used to hold stops holding.
+                let unenforced_sandbox =
+                    crate::app::sandbox::unenforced_sandbox_message(&session.info);
                 // The measured tree belonged to the pane just replaced — on a
                 // load it was the ghost's `—`. Back to unknown until the next
                 // scan prices the new pane.
@@ -2318,7 +2323,10 @@ impl App {
                 // so force the status cache to reload and pick up the cleared row.
                 self.invalidate_hook_state_cache();
                 self.save_state();
-                self.set_status(StatusLevel::Info, success_msg.to_string());
+                match unenforced_sandbox {
+                    Some(message) => self.set_status(StatusLevel::Error, message),
+                    None => self.set_status(StatusLevel::Info, success_msg.to_string()),
+                }
             }
             Err(e) => {
                 error!("Failed to restart session: {e}");
@@ -3040,13 +3048,20 @@ impl App {
                 // `DeletedSessionInfo` doesn't carry display_order: a restored
                 // session simply re-appends at the end of its repo group.
                 resolve_repo_display_names(&mut session.info);
+                let unenforced_sandbox =
+                    crate::app::sandbox::unenforced_sandbox_message(&session.info);
                 self.sessions.push(session);
                 self.set_active_index(self.sessions.len() - 1);
                 self.focus = InputFocus::Terminal;
 
                 self.save_state();
 
-                if was_force_deleted {
+                // An undelete is meant to come back *inside* the session's
+                // boundary; one that could not says so instead of reporting a
+                // clean restore.
+                if let Some(message) = unenforced_sandbox {
+                    self.set_status(StatusLevel::Error, message);
+                } else if was_force_deleted {
                     // Recovery is lossy: note it, and flag any worktree whose
                     // branch was gone (so couldn't be reattached).
                     let mut msg =
@@ -4870,12 +4885,20 @@ impl App {
             resolve_repo_display_names(&mut session.info);
         }
         let session_id = session.info.id;
+        // Composed before the session moves into the list, raised after
+        // `status_message = None` — a launch that landed outside its boundary
+        // is what the status bar must be left showing.
+        let unenforced_sandbox = crate::app::sandbox::unenforced_sandbox_message(&session.info);
         self.sessions.push(session);
         self.set_active_index(self.sessions.len() - 1);
         self.focus = InputFocus::Terminal;
         self.status_message = None;
 
         self.save_state();
+
+        if let Some(message) = unenforced_sandbox {
+            self.set_status(StatusLevel::Error, message);
+        }
 
         // Persist the worktree's fork point (write-once, like the hook columns)
         // so the code-review view can scope its diff to `<base>..HEAD`. Runs
@@ -7580,12 +7603,19 @@ impl App {
             spawned.info.workspace_dir = shared_session.workspace_dir.clone();
             spawned.info.parent_session_id = shared_session.parent_session_id;
             spawned.info.display_order = shared_session.display_order;
+            let unenforced_sandbox = crate::app::sandbox::unenforced_sandbox_message(&spawned.info);
             self.sessions.push(spawned);
             self.save_state();
             tracing::debug!(
                 "Spawned restored session {} with --resume",
                 shared_session.name
             );
+            // Relaunching a session friring found in the database is still a
+            // launch: if its boundary could not be applied, that is not
+            // something to leave in the log.
+            if let Some(message) = unenforced_sandbox {
+                self.set_status(StatusLevel::Error, message);
+            }
         }
     }
 

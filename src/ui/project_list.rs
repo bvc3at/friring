@@ -1263,11 +1263,22 @@ fn push_prefix_marks(
     // Sandboxed sessions get a shield, beside the remote mark: the two answer
     // the same class of question — *where* the agent is allowed to reach. The
     // tool-permission colour is the palette's existing "restricted" one.
+    //
+    // A session whose profile could not be applied wears a warning instead. It
+    // still *wants* a boundary (the profile is still on the row, and the next
+    // relaunch will try again) but it is running on the host, and a shield over
+    // an unsandboxed agent is worse than no mark at all.
     if info.sandbox_profile.is_some() {
-        spans.push(Span::styled(
-            "\u{26e8} ",
-            mark_style(is_dimmed, Theme::tool_disallowed),
-        ));
+        let unenforced = matches!(
+            info.sandbox_state,
+            Some(crate::session::SandboxState::Unenforced(_))
+        );
+        let (glyph, color): (&str, fn() -> ratatui::style::Color) = if unenforced {
+            ("\u{26a0} ", Theme::danger)
+        } else {
+            ("\u{26e8} ", Theme::tool_disallowed)
+        };
+        spans.push(Span::styled(glyph, mark_style(is_dimmed, color)));
     }
 
     // Worktree sessions get a dedicated mark, subordinate to the status dot.
@@ -1890,8 +1901,27 @@ mod tests {
 
         let mut boxed = info("boxed");
         boxed.sandbox_profile = Some("dev".to_string());
+        boxed.sandbox_state = Some(crate::session::SandboxState::Applied(
+            "bwrap · inner agent sandbox: off".to_string(),
+        ));
         let line = build_session_line(&boxed, None, false, false, 0, false, WIDE, "◐", None);
         assert!(line_text(&line).contains('\u{26e8}'));
+    }
+
+    /// The mark follows the **applied** boundary, not the desired one: a
+    /// session whose profile could not be applied is running on the host, and a
+    /// shield over a host process is worse than no mark at all.
+    #[test]
+    fn line_marks_an_unenforced_sandbox_as_a_warning_not_a_shield() {
+        let mut escaped = info("escaped");
+        escaped.sandbox_profile = Some("dev".to_string());
+        escaped.sandbox_state = Some(crate::session::SandboxState::Unenforced(
+            "bwrap is not installed".to_string(),
+        ));
+        let line = build_session_line(&escaped, None, false, false, 0, false, WIDE, "◐", None);
+        let text = line_text(&line);
+        assert!(!text.contains('\u{26e8}'), "{text:?}");
+        assert!(text.contains('\u{26a0}'), "{text:?}");
     }
 
     #[test]

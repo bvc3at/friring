@@ -308,6 +308,37 @@ impl AgentUsage {
     }
 }
 
+/// What a launch actually did with the boundary a session's
+/// [`sandbox_profile`](SessionInfo::sandbox_profile) asks for.
+///
+/// The profile is the **desired** state — the user's choice, persisted, and
+/// never cleared by a launch that could not honour it. This is the **applied**
+/// state, which only the launch knows. Keeping the two apart is what stops the
+/// session-list mark and the info panel claiming a boundary that a fallback
+/// launch never put in place (`docs/SANDBOX.md` §Indicators).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxState {
+    /// The boundary is in effect. Carries the composition the launch applied:
+    /// the resolved backend and what became of the agent's own sandbox, e.g.
+    /// `seatbelt · inner agent sandbox: off — Friring is the boundary`.
+    Applied(String),
+    /// The profile could **not** be applied and its
+    /// `allow_unsandboxed_fallback` switch permitted launching anyway, so the
+    /// agent is running on the host. Carries the reason, which the UI shows in
+    /// place of the composition — a session the user believes is sandboxed and
+    /// is not is the worst outcome this feature has.
+    Unenforced(String),
+}
+
+impl SandboxState {
+    /// Whether the boundary is really in effect. Every "is this sandboxed"
+    /// question goes through this rather than through the profile name, which
+    /// only says what was asked for.
+    pub fn is_applied(&self) -> bool {
+        matches!(self, Self::Applied(_))
+    }
+}
+
 pub struct SessionInfo {
     pub id: SessionId,
     pub name: String,
@@ -329,20 +360,25 @@ pub struct SessionInfo {
     /// `ssh:<host>` backend; `None` for local sessions. Drives the remote
     /// indicator in the session list. Set by the agent layer at spawn/adopt.
     pub remote_host: Option<String>,
-    /// Name of the [`SandboxProfile`] this session's agent runs under; `None`
-    /// for an unsandboxed session. Persisted (`sessions.sandbox_profile`) so a
-    /// restart re-derives the same boundary, and drives the session-list mark
-    /// and the info-panel row. A dangling name — the profile was deleted — is
-    /// deliberately kept rather than cleared: launching unsandboxed because the
-    /// rules went missing is the one failure worth being loud about.
+    /// Name of the [`SandboxProfile`] this session's agent was launched to run
+    /// under — the **desired** boundary, not necessarily the applied one; ask
+    /// [`sandbox_state`](Self::sandbox_state) for that. `None` for a session
+    /// that asked for no boundary.
+    ///
+    /// Persisted (`sessions.sandbox_profile`) so a restart re-derives the same
+    /// boundary. Two things deliberately never clear it: a **dangling** name
+    /// (the profile was deleted), which must fail the next launch loudly rather
+    /// than quietly run on the host, and a launch that **fell back** to the
+    /// host, which must be sandboxed again the moment its backend returns.
     pub sandbox_profile: Option<String>,
-    /// The composition the last launch actually applied — the resolved backend
-    /// and what became of the agent's own sandbox, e.g. `seatbelt · inner agent
-    /// sandbox: off — Friring is the boundary`. Not persisted: it describes a
-    /// running process, and a restart recomputes it from the profile and the
-    /// host. `None` before the first launch of this process, and for a session
-    /// friring only adopted.
-    pub sandbox_state: Option<String>,
+    /// What the last launch did with that profile — whether the boundary is
+    /// actually in effect, and why it is not when it is not.
+    ///
+    /// Not persisted: it describes a running process, and a restart recomputes
+    /// it from the profile and the host. `None` means friring did not launch
+    /// this process — a session it only adopted — so the applied state is
+    /// unknown and the persisted profile is the only evidence there is.
+    pub sandbox_state: Option<SandboxState>,
     /// Agent metrics from the agent's statusline (Claude only).
     pub agent_metrics: Option<AgentMetrics>,
     /// Latest OSC window title the agent emitted (live activity text),

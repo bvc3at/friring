@@ -2606,6 +2606,16 @@ pub struct SandboxEditorModal {
     pub field: SandboxField,
     /// Carried from the stored profile so saving an edit doesn't reset it.
     pub created_at: u64,
+    /// `column = 'value'` for every column of the stored row friring could not
+    /// decode (`crate::storage::sandboxes::UndecodedColumn`). Empty for a
+    /// healthy profile and for a new one.
+    ///
+    /// The form already holds the narrow values storage substituted, so saving
+    /// **is** the repair — this is what tells the user there is something to
+    /// repair, and which of the values in front of them are friring's rather
+    /// than theirs. Filled in by the caller that loaded the row; a form has no
+    /// database.
+    pub undecoded: Vec<String>,
 }
 
 impl Default for SandboxEditorModal {
@@ -2673,6 +2683,7 @@ impl SandboxEditorModal {
             allow_unsandboxed_fallback: profile.allow_unsandboxed_fallback,
             field: SandboxField::default(),
             created_at: profile.created_at,
+            undecoded: Vec::new(),
         }
     }
 
@@ -4857,6 +4868,7 @@ mod tests {
             resolved: None,
             paths: 1,
             network: crate::session::NetworkMode::Allowlist,
+            undecoded: Vec::new(),
             instance: None,
         }
     }

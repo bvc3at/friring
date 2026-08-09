@@ -13,7 +13,7 @@ use tracing::{debug, error, warn};
 
 use crate::agent::osc52::Osc52Scanner;
 use crate::agent::provider::AgentProvider;
-use crate::session::{SessionConfig, SessionInfo};
+use crate::session::{SandboxState, SessionConfig, SessionInfo};
 
 pub(crate) fn now_millis() -> u64 {
     SystemTime::now()
@@ -497,13 +497,15 @@ struct Sandboxed {
     command: String,
     args: Vec<String>,
     env: HashMap<String, String>,
-    /// The profile actually in effect, for `SessionInfo::sandbox_profile`.
-    /// `None` when the session carries none *or* when applying it failed and
-    /// the profile permitted launching anyway — the indicator must never claim
-    /// a boundary that is not there.
+    /// The profile the session **asked for**, for
+    /// `SessionInfo::sandbox_profile`. Carried through whether or not the
+    /// boundary went on: a launch that fell back to the host must not erase the
+    /// session's link to its profile, or the next relaunch — once the backend
+    /// is available again — would have nothing to rebuild from.
     profile: Option<String>,
-    /// The composition the wrap applied, for `SessionInfo::sandbox_state`.
-    state: Option<String>,
+    /// What the launch **applied**, for `SessionInfo::sandbox_state`. `None`
+    /// only when the session carries no profile at all.
+    state: Option<SandboxState>,
 }
 
 /// Compose the invocation for a spawn or a restart, wrapping it in the
@@ -522,7 +524,9 @@ fn sandboxed_invocation(
         command: provider.command().to_string(),
         args: provider.build_args(config),
         env: config.env.clone(),
-        profile: None,
+        // The desired profile, regardless of what the decision turns out to be:
+        // it is `None` exactly when the session carries none.
+        profile: config.sandbox.as_ref().map(|p| p.name.clone()),
         state: None,
     };
     let decision =
@@ -531,9 +535,16 @@ fn sandboxed_invocation(
 
     match decision {
         crate::agent::sandboxing::SandboxDecision::Unsandboxed => Ok(plain),
+        // The escape hatch fired: the agent runs on the host. The link to the
+        // profile survives so a later relaunch is sandboxed again, and the
+        // reason rides on the session so the UI can say so — a log line is not
+        // an indicator.
         crate::agent::sandboxing::SandboxDecision::Skipped { reason } => {
             warn!(agent = %config.agent, "{reason}");
-            Ok(plain)
+            Ok(Sandboxed {
+                state: Some(SandboxState::Unenforced(reason)),
+                ..plain
+            })
         }
         crate::agent::sandboxing::SandboxDecision::Wrapped(wrapped) => {
             let mut env = plain.env;
@@ -543,8 +554,8 @@ fn sandboxed_invocation(
                 command: wrapped.command,
                 args: wrapped.args,
                 env,
-                profile: config.sandbox.as_ref().map(|p| p.name.clone()),
-                state: Some(wrapped.state),
+                profile: plain.profile,
+                state: Some(SandboxState::Applied(wrapped.state)),
             })
         }
     }
@@ -1647,6 +1658,99 @@ mod tests {
             0,
             "the existing pane must still be alive"
         );
+    }
+
+    fn default_provider() -> Arc<dyn AgentProvider> {
+        Arc::new(crate::agent::GenericProvider::new(
+            crate::agent::agent_config::builtin_registry()
+                .default_agent()
+                .unwrap()
+                .clone(),
+        ))
+    }
+
+    /// A profile pinned to a place backend: not in this build on any host, so
+    /// the decision is the same wherever the suite runs.
+    fn unappliable_profile(fallback: bool) -> crate::session::SandboxProfile {
+        let mut profile = crate::session::SandboxProfile::new(
+            "dev",
+            vec![crate::session::SandboxPath::workspace("~/dev/app")],
+        );
+        profile.backend = crate::session::SandboxBackendKind::WslDistro;
+        profile.allow_unsandboxed_fallback = fallback;
+        profile
+    }
+
+    /// The escape hatch firing must not erase the session's link to its
+    /// profile. The profile is the *desired* boundary — persisted, and all a
+    /// later relaunch has to rebuild from — while `sandbox_state` is what the
+    /// indicators read. Reporting the fallback as "no profile" dropped the link
+    /// for good and left every later launch unsandboxed.
+    #[test]
+    fn a_fallback_launch_keeps_the_desired_profile_and_says_why_it_is_not_applied() {
+        let provider = default_provider();
+        let config = SessionConfig {
+            sandbox: Some(unappliable_profile(true)),
+            ..SessionConfig::default()
+        };
+
+        let out = sandboxed_invocation(&config, &provider).unwrap();
+
+        assert_eq!(out.profile.as_deref(), Some("dev"));
+        let Some(SandboxState::Unenforced(reason)) = out.state.as_ref() else {
+            panic!("expected an unenforced boundary, got {:?}", out.state);
+        };
+        assert!(reason.contains("wsl-distro"), "{reason}");
+        // Nothing wrapped the agent, so the indicator must not claim a boundary.
+        assert_eq!(out.command, provider.command());
+        assert!(!out.state.as_ref().unwrap().is_applied());
+    }
+
+    /// A session that asked for no boundary records neither half, so the
+    /// indicators stay silent for the overwhelmingly common case.
+    #[test]
+    fn an_unsandboxed_session_records_no_sandbox_state() {
+        let provider = default_provider();
+        let out = sandboxed_invocation(&SessionConfig::default(), &provider).unwrap();
+        assert!(out.profile.is_none());
+        assert!(out.state.is_none());
+    }
+
+    /// Because the profile survives a fallback, the next launch tries the
+    /// boundary again: on a host with a policy backend it is applied, on one
+    /// with none it is refused. What it is never again is silently on the host.
+    #[test]
+    fn the_launch_after_a_fallback_tries_the_boundary_again() {
+        let provider = default_provider();
+        let mut profile = unappliable_profile(false);
+        // The same session, its profile now resolving down this host's ladder
+        // rather than naming a backend that will never exist.
+        profile.backend = crate::session::SandboxBackendKind::Auto;
+        let config = SessionConfig {
+            sandbox: Some(profile),
+            ..SessionConfig::default()
+        };
+
+        let host_has_a_backend = crate::sandbox::SandboxHost::local_shared()
+            .select(crate::session::SandboxBackendKind::Auto)
+            .chosen
+            .is_some();
+        match sandboxed_invocation(&config, &provider) {
+            Ok(out) => {
+                assert!(host_has_a_backend, "a host with no backend must not wrap");
+                assert_eq!(out.profile.as_deref(), Some("dev"));
+                assert!(
+                    out.state.as_ref().is_some_and(SandboxState::is_applied),
+                    "{:?}",
+                    out.state
+                );
+                assert_ne!(out.command, provider.command());
+            }
+            Err(e) => assert!(
+                !host_has_a_backend,
+                "this host offers a backend, so the wrap should have applied: {e:#}"
+            ),
+        }
     }
 
     #[test]

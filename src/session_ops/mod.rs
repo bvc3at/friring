@@ -453,10 +453,17 @@ pub(crate) fn resolve_agent_def(requested: Option<&str>) -> crate::session::Agen
 ///
 /// # Errors
 ///
-/// The name is set but no such profile is stored — the profile was deleted
-/// while a session still referenced it. Deleting deliberately leaves the
-/// reference dangling (see [`crate::storage::sandboxes`]) precisely so this
-/// fails instead of launching the agent unsandboxed on the host.
+/// Two ways a stored name refuses to become a launchable profile, both of them
+/// preferring a refusal to a boundary-free launch:
+///
+/// - **No such profile.** It was deleted while a session still referenced it.
+///   Deleting deliberately leaves the reference dangling (see
+///   [`crate::storage::sandboxes`]) precisely so this fails here.
+/// - **The row did not decode.** A hand-edited or imported value friring
+///   cannot read leaves part of the policy unknown, and the parts it
+///   substitutes are guesses; a corrupt profile is repairable in the editor,
+///   never runnable
+///   ([`StoredSandboxProfile`](crate::storage::sandboxes::StoredSandboxProfile)).
 pub(crate) fn load_sandbox_profile(
     db: &crate::storage::Database,
     name: Option<&str>,
@@ -464,19 +471,35 @@ pub(crate) fn load_sandbox_profile(
     let Some(name) = name.filter(|n| !n.trim().is_empty()) else {
         return Ok(None);
     };
-    db.get_sandbox_profile(name)
+    let stored = db
+        .get_sandbox_profile(name)
         .map_err(|e| format!("Failed to load sandbox profile '{name}': {e}"))?
-        .map(Some)
         .ok_or_else(|| {
             format!(
                 "Sandbox profile '{name}' no longer exists; refusing to launch this session \
                  outside the boundary it was created with"
             )
-        })
+        })?;
+    match stored.launch_refusal() {
+        Some(refusal) => Err(refusal),
+        None => Ok(Some(stored.profile)),
+    }
 }
 
-/// Build the `(command, args)` invocation for an already-resolved [`AgentDef`],
-/// with the session's sandbox profile applied.
+/// An agent launch composed and ready to hand to tmux, with the session's
+/// sandbox profile applied. Built by [`build_agent_invocation`].
+pub(crate) struct AgentInvocation {
+    /// The program to run: the agent, or the sandbox wrapper around it.
+    pub command: String,
+    pub args: Vec<String>,
+    /// What the launch did with `config.sandbox`. `None` = the session carries
+    /// no profile; [`SandboxState::Unenforced`] = it carries one that could not
+    /// be applied and whose escape hatch let the agent run on the host anyway.
+    pub sandbox: Option<crate::session::SandboxState>,
+}
+
+/// Build the invocation for an already-resolved [`AgentDef`], with the
+/// session's sandbox profile applied.
 ///
 /// Centralised here so headless spawn and restart agree on the args, and so the
 /// `AgentDef` is resolved exactly once per operation (callers pass the def they
@@ -495,7 +518,7 @@ pub(crate) fn load_sandbox_profile(
 fn build_agent_invocation(
     def: &crate::session::AgentDef,
     config: &mut SessionConfig,
-) -> Result<(String, Vec<String>), String> {
+) -> Result<AgentInvocation, String> {
     let provider = crate::agent::GenericProvider::new(def.clone());
     // Reach the provider trait methods via fully-qualified call syntax so this
     // module imports nothing from the agent module (architecture rule:
@@ -508,14 +531,30 @@ fn build_agent_invocation(
     );
 
     match crate::agent::sandboxing::apply(Some(def), config, &command, &args)? {
-        crate::agent::sandboxing::SandboxDecision::Unsandboxed => Ok((command, args)),
+        crate::agent::sandboxing::SandboxDecision::Unsandboxed => Ok(AgentInvocation {
+            command,
+            args,
+            sandbox: None,
+        }),
+        // The escape hatch fired: this agent runs on the host. The session's
+        // link to its profile is left alone by the caller — a relaunch once the
+        // backend is back must be sandboxed again — and the reason travels out
+        // so the caller can put it in front of whoever asked for the launch.
         crate::agent::sandboxing::SandboxDecision::Skipped { reason } => {
             tracing::warn!(agent = %def.name, "{reason}");
-            Ok((command, args))
+            Ok(AgentInvocation {
+                command,
+                args,
+                sandbox: Some(crate::session::SandboxState::Unenforced(reason)),
+            })
         }
         crate::agent::sandboxing::SandboxDecision::Wrapped(wrapped) => {
             config.env.extend(wrapped.env);
-            Ok((wrapped.command, wrapped.args))
+            Ok(AgentInvocation {
+                command: wrapped.command,
+                args: wrapped.args,
+                sandbox: Some(crate::session::SandboxState::Applied(wrapped.state)),
+            })
         }
     }
 }
@@ -603,6 +642,39 @@ mod tests {
     use super::*;
     use crate::session::AutomationAction;
     use crate::session::SessionId;
+
+    /// A profile whose stored policy friring cannot read is repairable, never
+    /// runnable: half its columns are friring's own substitutions, and the two
+    /// the decoder used to substitute silently (`read_scope`, `network_deny`)
+    /// were the *wider* option each time.
+    #[test]
+    fn a_profile_whose_row_did_not_decode_is_refused_at_launch() {
+        let db = crate::storage::Database::open_in_memory().unwrap();
+        db.insert_undecodable_sandbox_profile("broken").unwrap();
+
+        let err = load_sandbox_profile(&db, Some("broken")).unwrap_err();
+        // The message names what failed, because repairing it means knowing
+        // which values in the editor are friring's rather than the user's.
+        assert!(err.contains("'broken'"), "{err}");
+        assert!(err.contains("read_scope = 'everything'"), "{err}");
+        assert!(err.contains("network_deny = '[oops'"), "{err}");
+    }
+
+    /// The same path must not become paranoid: a profile that decoded
+    /// completely still loads.
+    #[test]
+    fn a_profile_that_decoded_completely_still_loads() {
+        let db = crate::storage::Database::open_in_memory().unwrap();
+        let profile = crate::session::SandboxProfile::new(
+            "dev",
+            vec![crate::session::SandboxPath::workspace("~/dev/app")],
+        );
+        db.upsert_sandbox_profile(&profile).unwrap();
+
+        let loaded = load_sandbox_profile(&db, Some("dev")).unwrap();
+        assert_eq!(loaded.map(|p| p.name).as_deref(), Some("dev"));
+        assert!(load_sandbox_profile(&db, None).unwrap().is_none());
+    }
 
     #[cfg(unix)]
     #[test]

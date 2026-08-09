@@ -218,13 +218,19 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
                 sandbox_profile: sandbox,
             };
             let res = crate::session_ops::spawn_session_headless(db, req)?;
-            let human = format!(
+            let mut human = format!(
                 "Created session '{}' ({}) — {}\ncwd: {}",
                 res.name,
                 res.agent,
                 res.session_id,
                 res.cwd.display()
             );
+            // A `--sandbox` the launch could not honour is the one thing about
+            // this session the caller must not have to read a log to learn.
+            let unenforced = unenforced_sandbox_reason(res.sandbox.as_ref());
+            if let Some(reason) = unenforced.as_deref() {
+                human.push_str(&format!("\nNOT sandboxed — {reason}"));
+            }
             Ok(CommandOutput::new(
                 json!({
                     "id": res.session_id.to_string(),
@@ -233,6 +239,7 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
                     "agent_session_id": res.agent_session_id,
                     "cwd": res.cwd.display().to_string(),
                     "parent_session_id": res.parent_session_id.map(|id| id.to_string()),
+                    "sandbox_unenforced": unenforced,
                 }),
                 human,
             ))
@@ -319,14 +326,20 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
         }
         Action::Restart { uuid } => {
             let session = resolve(db, &uuid)?;
-            crate::session_ops::restart_session_headless(db, session.id)?;
+            let sandbox = crate::session_ops::restart_session_headless(db, session.id)?;
+            let unenforced = unenforced_sandbox_reason(sandbox.as_ref());
+            let mut human = format!("Restarted session '{}' ({})", session.name, session.id);
+            if let Some(reason) = unenforced.as_deref() {
+                human.push_str(&format!("\nNOT sandboxed — {reason}"));
+            }
             Ok(CommandOutput::new(
                 json!({
                     "restarted": true,
                     "session_id": session.id.to_string(),
                     "session_name": session.name,
+                    "sandbox_unenforced": unenforced,
                 }),
-                format!("Restarted session '{}' ({})", session.name, session.id),
+                human,
             ))
         }
         Action::Send { uuid, text, force } => {
@@ -498,6 +511,19 @@ fn resolve(db: &Database, uuid: &str) -> Result<SharedSession, String> {
     db.get_session_by_id(id)
         .map_err(|e| format!("get_session_by_id: {e}"))?
         .ok_or_else(|| format!("Session not found: {uuid}"))
+}
+
+/// Why a launch ran **outside** the sandbox profile it asked for, or `None`
+/// when the boundary went on (and for a session that asked for none).
+///
+/// The session keeps its profile through a fallback so the next relaunch tries
+/// again, which is exactly why the fallback itself has to be reported rather
+/// than inferred from the row.
+fn unenforced_sandbox_reason(state: Option<&crate::session::SandboxState>) -> Option<String> {
+    match state? {
+        crate::session::SandboxState::Unenforced(reason) => Some(reason.clone()),
+        crate::session::SandboxState::Applied(_) => None,
+    }
 }
 
 /// Why typing into `session` is refused right now, if it is.
