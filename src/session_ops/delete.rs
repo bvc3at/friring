@@ -121,6 +121,16 @@ pub fn teardown_runtime_resources(
             tracing::warn!("remove_workspace_at({}) failed: {e}", ws.display());
         }
     }
+    // The scratch directory a sandboxed launch minted, and the policy file
+    // generated for it, both under the data directory (`docs/SANDBOX.md`
+    // §Launch integration). Keyed on the session id, so it is the *desired*
+    // profile that says whether there is anything to drop — a launch that fell
+    // back to the host keeps its profile and may have minted the scratch before
+    // failing. Always local: friring writes them beside its own database, on
+    // whichever machine composed the launch.
+    if session.sandbox_profile.is_some() {
+        crate::agent::sandboxing::cleanup_by_session_id(session.id);
+    }
 }
 
 /// Kill the session's window on the local tmux server, reaping the pane's child
@@ -432,6 +442,61 @@ mod tests {
             "no local git worktree removal attempted for a remote session"
         );
         assert!(!report.killed_window);
+    }
+
+    /// A sandboxed session's scratch directory is the agent's own writable
+    /// space; it must not outlive the session. The layout is
+    /// `<data>/sandbox/tmp/<session id>` (`crate::sandbox::dirs`), spelled out
+    /// here because `session_ops` reaches the sandbox layer only through
+    /// `agent::sandboxing`.
+    #[test]
+    fn tearing_down_a_sandboxed_session_drops_the_scratch_it_minted() {
+        let scratch_root = crate::paths::log_directory()
+            .expect("a test build pins the data directory under a temp dir")
+            .join("sandbox")
+            .join("tmp");
+
+        let sandboxed = SessionId::default();
+        let plain = SessionId::default();
+        for id in [sandboxed, plain] {
+            let dir = scratch_root.join(id.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("agent-scratch"), "x").unwrap();
+        }
+
+        let session = |id, profile: Option<&str>| SharedSession {
+            id,
+            name: "remote".into(),
+            agent: "dev".into(),
+            backend_id: "%3".into(),
+            // An unresolvable remote host: teardown records the failure and
+            // performs no tmux or git work, leaving the sandbox half isolated.
+            backend_type: "wsl:Ubuntu".into(),
+            agent_session_id: None,
+            cwd: None,
+            additional_dirs: Vec::new(),
+            workspace_dir: None,
+            worktrees: Vec::new(),
+            shell_backend_id: None,
+            sandbox_profile: profile.map(str::to_string),
+            parent_session_id: None,
+            display_order: None,
+            tombstone: false,
+            tombstone_at: None,
+        };
+
+        let mut report = ForceDeleteReport::default();
+        teardown_runtime_resources(&session(sandboxed, Some("dev")), &mut report);
+        teardown_runtime_resources(&session(plain, None), &mut report);
+
+        assert!(
+            !scratch_root.join(sandboxed.to_string()).exists(),
+            "the sandboxed session's scratch directory outlived it"
+        );
+        // The desired profile is what says there is anything to drop, so a
+        // session that never asked for a boundary is not touched.
+        assert!(scratch_root.join(plain.to_string()).exists());
+        let _ = std::fs::remove_dir_all(scratch_root.join(plain.to_string()));
     }
 
     #[test]

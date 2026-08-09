@@ -2972,7 +2972,8 @@ impl SandboxEditorModal {
 
     /// The profile these fields describe, validated against `existing_names`
     /// (every stored profile's name, the edited one included — it is filtered
-    /// out here so re-saving under its own name is not a collision).
+    /// out here so re-saving under its own name is not a collision) and against
+    /// the host locations no sandbox may be handed.
     ///
     /// The error is one sentence for the footer toast: the editor has no inline
     /// form-error widget.
@@ -2988,8 +2989,42 @@ impl SandboxEditorModal {
             .cloned()
             .collect();
         profile.validate_unique(&others)?;
-        Ok(profile)
+        writable_roots_refusal(&profile).map_or(Ok(profile), Err)
     }
+}
+
+/// Why this profile's read-write paths may not be stored, or `None` when they
+/// are grantable.
+///
+/// The same refusal
+/// [`SandboxLaunch::validate`](crate::sandbox::SandboxLaunch::validate) makes,
+/// moved forward to the save: a path enclosing friring's data directory reaches
+/// the database (ADR-29), and one reaching a tmux socket directory drives the
+/// host's own multiplexer. Catching it here turns "a stored profile that
+/// refuses every session picking it" into "a form that will not save", with the
+/// same sentence.
+///
+/// It cannot live in
+/// [`SandboxProfile::validate`](crate::session::SandboxProfile::validate): the
+/// check needs the data directory and the database path, and `session` may not
+/// reference [`crate::paths`]. A home or database path that is not valid UTF-8
+/// simply narrows what there is to compare — the launch refuses that outright,
+/// and that is where the user gets the whole sentence.
+fn writable_roots_refusal(profile: &crate::session::SandboxProfile) -> Option<String> {
+    let home = crate::paths::home_dir()
+        .as_deref()
+        .and_then(std::path::Path::to_str)
+        .unwrap_or_default()
+        .to_string();
+    let writable: Vec<String> = profile
+        .paths
+        .iter()
+        .filter(|p| p.mode.is_writable())
+        .map(|p| p.expanded(&home))
+        .collect();
+    let db = crate::paths::database_file();
+    crate::sandbox::check_writable_roots(&writable, db.as_deref().and_then(std::path::Path::to_str))
+        .err()
 }
 
 /// Where an `n`-added sub-list row lands: after the selection, or at the end of
@@ -5177,6 +5212,43 @@ mod tests {
             .validated_profile(&["DEV".to_string()])
             .unwrap_err()
             .contains("already exists"));
+    }
+
+    /// A read-write path reaching friring's data directory is refused at
+    /// launch; the editor refuses to store it in the first place, so the
+    /// profile never becomes a row that lists fine and fails every session
+    /// picking it.
+    #[test]
+    fn a_profile_reaching_the_database_is_refused_by_the_save_not_only_the_launch() {
+        let data_dir = crate::paths::log_directory().expect("a test build pins the data directory");
+        let ancestor = data_dir
+            .parent()
+            .expect("the data directory has a parent")
+            .to_string_lossy()
+            .into_owned();
+
+        let mut m = sandbox_editor();
+        m.paths[0].text.set(&ancestor);
+        m.paths[0].mode = crate::session::PathMode::ReadWrite;
+        let err = m
+            .validated_profile(&[])
+            .expect_err("a read-write path above the data directory cannot be saved");
+        assert!(err.contains("ADR-29"), "{err}");
+        assert!(
+            err.contains(&data_dir.to_string_lossy().into_owned()),
+            "{err}"
+        );
+
+        // Read-only is not the escape — only a writable root reaches the
+        // database — and a path *inside* the data directory reaches nothing
+        // above it.
+        m.paths[0].mode = crate::session::PathMode::ReadOnly;
+        m.validated_profile(&[]).unwrap();
+        m.paths[0].mode = crate::session::PathMode::ReadWrite;
+        m.paths[0]
+            .text
+            .set(&data_dir.join("sandbox").to_string_lossy());
+        m.validated_profile(&[]).unwrap();
     }
 
     #[test]
