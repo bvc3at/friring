@@ -7,10 +7,13 @@
 //!
 //! Three properties of SBPL shape everything here:
 //!
-//! - **The last matching rule wins.** Every deny that must hold — the secrets
-//!   list, the write boundaries, friring's own database — is emitted *after*
-//!   the allows it takes back, and nothing is emitted after it that could
-//!   re-open it.
+//! - **The last matching rule wins.** That is what orders the whole profile.
+//!   The profile's own paths are emitted in one ancestor-before-descendant pass
+//!   so the *most specific* rule is the last one to match — `repo` read-only
+//!   with `repo/work` read-write means what the user wrote, and means the same
+//!   thing bwrap's mount order means. The denies that must hold whatever a path
+//!   rule said — the secrets list, friring's database — come after all of them,
+//!   and nothing is emitted afterwards that could re-open one.
 //! - **There is no host predicate.** Network filters accept `*` or `localhost`
 //!   with a port, and nothing else, so a domain allowlist can only mean "deny
 //!   all outbound except the loopback proxy" (ADR-27).
@@ -19,20 +22,22 @@
 //!   `sandbox_apply` returns `Operation not permitted`, so an agent's own
 //!   seatbelt sandbox must be off. See [`InnerSandboxVerdict::Denied`].
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use crate::sandbox::backend::{
     Argv, Availability, Caps, InnerSandboxVerdict, ProxyEndpoint, SandboxBackend, SandboxError,
     SandboxLaunch, SandboxResult, PROTECTED_IN_WRITABLE_ROOT,
 };
+use crate::sandbox::dirs::{self, sanitize_component, write_private};
 use crate::sandbox::probe::{detect_platform, HostPlatform, LocalProbeHost, ProbeHost};
 use crate::sandbox::secrets::{secrets_for, SecretPlatform};
 use crate::session::{NetworkMode, ReadScope, SandboxBackendKind, SandboxShape};
 
 /// Absolute path of the system binary. Not looked up on `PATH`: the whole point
 /// of the wrapper is that the user's environment cannot choose what applies the
-/// policy.
+/// policy. [`crate::sandbox::bwrap::BWRAP`] keeps the same promise the only way
+/// it can, by resolving and vetting one path at probe time.
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// The session's launch directory.
@@ -270,9 +275,10 @@ pub fn render_profile(launch: &SandboxLaunch<'_>) -> String {
     ));
 
     render_reads(&mut out, launch, &readable);
-    render_writes(&mut out, &writable);
     render_network(&mut out, launch);
-    render_write_boundaries(&mut out, launch, &readable, &writable);
+    render_path_rules(&mut out, &readable, &writable);
+    render_protected_subdirectories(&mut out, launch, &writable);
+    render_rename_boundaries(&mut out, launch, &writable);
     render_secrets(&mut out, launch);
     render_database(&mut out, launch);
 
@@ -354,24 +360,49 @@ fn render_reads(out: &mut Vec<String>, launch: &SandboxLaunch<'_>, readable: &[P
     }
 }
 
-fn render_writes(out: &mut Vec<String>, writable: &[PathSlot]) {
+/// The profile's own paths, as one ancestor-before-descendant pass.
+///
+/// **Most specific wins.** A lexicographic sort puts a path before everything
+/// nested inside it, and the last matching SBPL rule is the one that applies, so
+/// emitting the whole set in that order makes the innermost rule decide:
+/// `repo` read-only with `repo/work` read-write leaves `repo/work` writable, and
+/// `repo` read-write with `repo/vendor` read-only leaves `vendor` read-only.
+/// That is what the user wrote, and — decisively — it is also what bwrap's mount
+/// order does with the same profile, so the two backends cannot disagree about
+/// one path (`docs/SANDBOX.md` §The two sandbox shapes).
+///
+/// Read rules are not here: `render_reads` grants them per scope, and nothing in
+/// this section takes a read back. Only writes are contested.
+fn render_path_rules(out: &mut Vec<String>, readable: &[PathSlot], writable: &[PathSlot]) {
     section(
         out,
-        "writes",
+        "paths",
         &[
-            "Sorted, so a writable ancestor is granted before the read-only",
-            "descendant that overrides it below.",
+            "Ancestor before descendant, so the most specific rule is the last",
+            "one to match — which is the one SBPL applies. A read-only path",
+            "nested in a writable one loses the ancestor's write grant, and a",
+            "writable path nested in a read-only one keeps its own.",
         ],
     );
-    if writable.is_empty() {
-        out.push(";; This profile grants no writes at all.".to_string());
+    let mut merged: Vec<(&PathSlot, bool)> = writable
+        .iter()
+        .map(|slot| (slot, true))
+        .chain(readable.iter().map(|slot| (slot, false)))
+        .collect();
+    merged.sort_by(|a, b| a.0.value.cmp(&b.0.value));
+    if merged.is_empty() {
+        out.push(";; This profile lists no paths at all.".to_string());
         return;
     }
-    for slot in writable {
-        out.push(format!(
-            "(allow file-read* file-write* (subpath {}))",
-            slot.expr
-        ));
+    for (slot, is_writable) in merged {
+        if is_writable {
+            out.push(format!(
+                "(allow file-read* file-write* (subpath {}))",
+                slot.expr
+            ));
+        } else {
+            out.push(format!("(deny file-write* (subpath {}))", slot.expr));
+        }
     }
 }
 
@@ -383,8 +414,9 @@ fn render_network(out: &mut Vec<String>, launch: &SandboxLaunch<'_>) {
                 "network: full",
                 &[
                     "Unrestricted egress. Domain denies cannot be expressed here —",
-                    "SBPL has no host predicate — so a profile that lists denies under",
-                    "`full` relies on the proxy, and this backend grants the rest.",
+                    "SBPL has no host predicate — so a profile carrying them under",
+                    "`full` is refused before this point (`SandboxLaunch::validate`)",
+                    "rather than launched with a rule it silently cannot keep.",
                 ],
             );
             out.push("(allow network*)".to_string());
@@ -452,28 +484,24 @@ fn render_network(out: &mut Vec<String>, launch: &SandboxLaunch<'_>) {
     }
 }
 
-fn render_write_boundaries(
+/// `.git/hooks` inside every writable root, after the path rules so no grant —
+/// however specific — re-opens it.
+fn render_protected_subdirectories(
     out: &mut Vec<String>,
     launch: &SandboxLaunch<'_>,
-    readable: &[PathSlot],
     writable: &[PathSlot],
 ) {
     section(
         out,
-        "write boundaries",
+        "protected inside every writable root",
         &[
-            "Denied after the allows above, because the last matching rule wins.",
-            "A read-only path nested inside a writable one is the case that matters:",
-            "without this, the whole subtree — and the directory entry itself, so a",
-            "rename could swap it for a symlink out of the boundary — would inherit",
-            "the ancestor's write grant.",
+            "Hook scripts are run by whichever git touches the repository next,",
+            "including the host's, outside the boundary. A no-op where the root",
+            "is not a repository.",
         ],
     );
-    for slot in readable {
-        out.push(format!("(deny file-write* (subpath {}))", slot.expr));
-    }
     // Only the profile's own roots and the session's workspace: the signal and
-    // temp directories friring mints are never repositories.
+    // scratch directories friring mints are never repositories.
     for slot in writable.iter().filter(|s| s.is_literal) {
         out.push(format!(
             "(deny file-write* (subpath {:?}))",
@@ -485,11 +513,70 @@ fn render_write_boundaries(
             "(deny file-write* (subpath (param {PARAM_WORKSPACE_PROTECTED:?})))"
         ));
     }
-    out.push(";; The anchors themselves cannot be unlinked or renamed, so the".to_string());
-    out.push(";; boundary cannot be replaced by something pointing elsewhere.".to_string());
+}
+
+/// Pin every pathname the denies below are written in.
+///
+/// SBPL matches by pathname, and a deny that names a path is only as good as the
+/// path staying where it is. With a read-write rule covering `~`, a sandbox can
+/// rename `~/.local/share` — an ordinary write, authorised by the subtree grant
+/// — and reach the database through a name no `(literal …)` deny matches. So the
+/// unlink of each writable anchor *and* of every directory on the way to a
+/// protected path is denied, which is what keeps those names from moving.
+///
+/// bwrap needs no counterpart: a directory containing a mount point cannot be
+/// renamed, so its masks pin themselves.
+///
+/// The ancestors are taken from the protected paths rather than from the
+/// writable roots, which is a superset of what is strictly needed. It is also
+/// stable: deriving them from the roots would write the session's own workspace
+/// into a profile text that is otherwise identical for every session.
+fn render_rename_boundaries(
+    out: &mut Vec<String>,
+    launch: &SandboxLaunch<'_>,
+    writable: &[PathSlot],
+) {
+    section(
+        out,
+        "rename boundaries",
+        &[
+            "SBPL denies by pathname, so a protected path must not be reachable",
+            "under a second name. Neither a writable anchor nor any directory",
+            "leading to a secret or to friring's database can be unlinked, and a",
+            "rename is an unlink of its source.",
+        ],
+    );
     for slot in writable {
         out.push(format!("(deny file-write-unlink (literal {}))", slot.expr));
     }
+    for path in protected_ancestors(launch) {
+        if writable.iter().any(|slot| slot.value == path) {
+            continue;
+        }
+        out.push(format!("(deny file-write-unlink (literal {path:?}))"));
+    }
+}
+
+/// Every directory a rename could move in order to bring a protected path out
+/// from under the denies that name it. Sorted and de-duplicated.
+fn protected_ancestors(launch: &SandboxLaunch<'_>) -> Vec<String> {
+    let mut targets: Vec<String> = secrets_for(SecretPlatform::MacOs, launch.agent)
+        .iter()
+        .map(|secret| secret.resolved(launch.home))
+        .collect();
+    if let Some(db) = launch.friring_db {
+        targets.push(db.to_string());
+    }
+    let mut out: Vec<String> = Vec::new();
+    for target in targets {
+        for ancestor in dirs::ancestors_of(&target) {
+            if !out.contains(&ancestor) {
+                out.push(ancestor);
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 fn render_secrets(out: &mut Vec<String>, launch: &SandboxLaunch<'_>) {
@@ -548,14 +635,17 @@ fn section(out: &mut Vec<String>, title: &str, why: &[&str]) {
 /// `sandbox-exec` with a generated profile.
 pub struct SeatbeltBackend {
     host: Arc<dyn ProbeHost>,
-    profile_dir: PathBuf,
+    /// `None` when friring cannot resolve a data directory, which is the only
+    /// place a generated profile may live — see [`default_profile_dir`]. A
+    /// launch then fails rather than falling back somewhere reachable.
+    profile_dir: Option<PathBuf>,
     availability: OnceLock<Availability>,
 }
 
 impl SeatbeltBackend {
     /// A backend probing `host` and writing its generated profiles under
     /// `profile_dir`.
-    pub fn new(host: Arc<dyn ProbeHost>, profile_dir: PathBuf) -> Self {
+    pub fn new(host: Arc<dyn ProbeHost>, profile_dir: Option<PathBuf>) -> Self {
         Self {
             host,
             profile_dir,
@@ -563,7 +653,7 @@ impl SeatbeltBackend {
         }
     }
 
-    /// The local machine, with profiles under the per-user temp directory.
+    /// The local machine, with profiles under the data directory.
     pub fn local() -> Self {
         Self::new(Arc::new(LocalProbeHost), default_profile_dir())
     }
@@ -574,68 +664,30 @@ impl SeatbeltBackend {
     /// restricted and a session key is a UUID: the file name is the one place
     /// where either value would become a path, and a defence that costs a
     /// character filter is worth keeping local to the code that needs it.
-    pub fn profile_path(&self, launch: &SandboxLaunch<'_>) -> PathBuf {
-        self.profile_dir.join(format!(
+    pub fn profile_path(&self, launch: &SandboxLaunch<'_>) -> SandboxResult<PathBuf> {
+        let dir = self.profile_dir.as_ref().ok_or_else(|| SandboxError::Io {
+            path: "<data directory>".to_string(),
+            detail: "friring cannot resolve its data directory, so it has nowhere outside every \
+                     sandbox-writable tree to write the generated profile"
+                .to_string(),
+        })?;
+        Ok(dir.join(format!(
             "{}-{}.sb",
-            sanitize(&launch.policy.profile),
-            sanitize(launch.session_key)
-        ))
+            sanitize_component(&launch.policy.profile),
+            sanitize_component(launch.session_key)
+        )))
     }
 }
 
-/// `<temp>/friring-sandbox`. On macOS the per-user `$TMPDIR` is already private
-/// to the user, and the directory is created `0700` regardless.
-pub fn default_profile_dir() -> PathBuf {
-    std::env::temp_dir().join("friring-sandbox")
-}
-
-fn sanitize(raw: &str) -> String {
-    let cleaned: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    if cleaned.is_empty() {
-        "sandbox".to_string()
-    } else {
-        cleaned
-    }
-}
-
-/// Write `contents` to `path`, creating a `0700` parent and a `0600` file.
-fn write_private(path: &Path, contents: &str) -> SandboxResult<()> {
-    use std::io::Write as _;
-
-    let io_err = |detail: std::io::Error| SandboxError::Io {
-        path: path.display().to_string(),
-        detail: detail.to_string(),
-    };
-
-    if let Some(parent) = path.parent() {
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-            builder.mode(0o700);
-        }
-        builder.create(parent).map_err(io_err)?;
-    }
-
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path).map_err(io_err)?;
-    file.write_all(contents.as_bytes()).map_err(io_err)
+/// `<data dir>/sandbox/profiles`, created `0700`.
+///
+/// Deliberately not under the host temp directory. The generated file *is* the
+/// policy, so a sandbox that can write it decides its own boundary — and the
+/// temp root was, until this moved, inside the writable set of every launch.
+/// Under the data directory it is somewhere no profile may make writable
+/// ([`crate::sandbox::dirs::check_writable_roots`]).
+pub fn default_profile_dir() -> Option<PathBuf> {
+    dirs::profile_dir()
 }
 
 impl SandboxBackend for SeatbeltBackend {
@@ -685,7 +737,8 @@ impl SandboxBackend for SeatbeltBackend {
                 ),
             });
         }
-        let path = self.profile_path(launch);
+        launch.validate()?;
+        let path = self.profile_path(launch)?;
         write_private(&path, &render_profile(launch))?;
 
         let mut out: Vec<String> = vec![
@@ -725,10 +778,7 @@ mod tests {
     }
 
     fn backend() -> SeatbeltBackend {
-        SeatbeltBackend::new(
-            Arc::new(StubHost::macos(26, true)),
-            std::env::temp_dir().join("friring-sandbox-test"),
-        )
+        SeatbeltBackend::new(Arc::new(StubHost::macos(26, true)), default_profile_dir())
     }
 
     #[test]
@@ -841,6 +891,105 @@ mod tests {
             .find(r#"(deny file-write* (subpath "/Users/u/dev/app/.git/hooks"))"#)
             .unwrap();
         assert!(allow < deny, "the nested deny must win by coming last");
+    }
+
+    /// "`repo` read-only, `repo/work` read-write" means the descendant is
+    /// writable. Anchoring only the read-only root made the descendant *not*
+    /// writable here while bwrap's mount order made it writable — one profile,
+    /// two answers, decided by the operating system.
+    #[test]
+    fn the_most_specific_path_rule_is_the_one_that_applies() {
+        let nested_grant = policy(vec![
+            SandboxPath::read_only("/repo"),
+            SandboxPath::workspace("/repo/work"),
+        ]);
+        let text = render_profile(&SandboxLaunch::new(&nested_grant, "/Users/u", "s1"));
+        let deny = text
+            .find(r#"(deny file-write* (subpath "/repo"))"#)
+            .unwrap();
+        let allow = text
+            .find(r#"(allow file-read* file-write* (subpath "/repo/work"))"#)
+            .unwrap();
+        assert!(deny < allow, "the descendant's grant must be the last word");
+
+        // …and the reverse nesting keeps the descendant read-only.
+        let nested_deny = policy(vec![
+            SandboxPath::workspace("/repo"),
+            SandboxPath::read_only("/repo/vendor"),
+        ]);
+        let text = render_profile(&SandboxLaunch::new(&nested_deny, "/Users/u", "s1"));
+        let allow = text
+            .find(r#"(allow file-read* file-write* (subpath "/repo"))"#)
+            .unwrap();
+        let deny = text
+            .find(r#"(deny file-write* (subpath "/repo/vendor"))"#)
+            .unwrap();
+        assert!(allow < deny, "the descendant's deny must be the last word");
+    }
+
+    /// Most-specific-wins makes this backend more permissive than it was, so the
+    /// two denies that must survive any grant are asserted against the most
+    /// specific grant there is: the protected path itself, listed read-write.
+    #[test]
+    fn the_database_and_secret_denies_outlast_even_a_grant_naming_them() {
+        let db = "/Users/u/.local/share/friring/friring.db";
+        let policy = policy(vec![
+            SandboxPath::workspace("~/.local/share/friring"),
+            SandboxPath::workspace("~/.ssh"),
+        ]);
+        let launch = SandboxLaunch::new(&policy, "/Users/u", "s1")
+            .with_agent("claude")
+            .with_friring_db(db);
+        let text = render_profile(&launch);
+
+        let ssh_grant = text
+            .find(r#"(allow file-read* file-write* (subpath "/Users/u/.ssh"))"#)
+            .unwrap();
+        let ssh_deny = text
+            .find(r#"(deny file-read* file-write* (subpath "/Users/u/.ssh"))"#)
+            .unwrap();
+        assert!(ssh_grant < ssh_deny, "a secret must stay denied");
+
+        let data_grant = text
+            .find(r#"(allow file-read* file-write* (subpath "/Users/u/.local/share/friring"))"#)
+            .unwrap();
+        let db_deny = text.find(&format!(r#"(literal "{db}")"#)).unwrap();
+        assert!(data_grant < db_deny, "ADR-29 must stay denied");
+    }
+
+    /// SBPL denies by pathname, so a deny is only as good as the path staying
+    /// put: with `~` writable, renaming `~/.local/share` moves the database to a
+    /// name no deny matches.
+    #[test]
+    fn every_directory_leading_to_a_protected_path_is_pinned_against_rename() {
+        let db = "/Users/u/.local/share/friring/friring.db";
+        let policy = policy(vec![SandboxPath::workspace("~")]);
+        let launch = SandboxLaunch::new(&policy, "/Users/u", "s1")
+            .with_agent("claude")
+            .with_friring_db(db);
+        let text = render_profile(&launch);
+
+        for dir in [
+            "/Users/u/.local",
+            "/Users/u/.local/share",
+            "/Users/u/.local/share/friring",
+            "/Users/u/.codex",
+            "/Users/u/Library",
+        ] {
+            assert!(
+                text.contains(&format!(r#"(deny file-write-unlink (literal "{dir}"))"#)),
+                "{dir} can still be renamed out from under its deny"
+            );
+        }
+        // The writable anchor was already pinned, and is not pinned twice.
+        assert_eq!(
+            text.matches(r#"(deny file-write-unlink (literal "/Users/u"))"#)
+                .count(),
+            1
+        );
+        // Nothing to pin when the launch names no protected path outside home.
+        let bare = SandboxLaunch::new(&policy, "/Users/u", "s1");
+        assert!(!render_profile(&bare).contains(r#"(literal "/Users/u/.local/share/friring")"#));
     }
 
     #[test]
@@ -1056,18 +1205,18 @@ mod tests {
         assert_eq!(&argv[end + 1..], ["claude", "--resume", "abc"]);
 
         // The profile really was written, and only for this user.
-        let written = std::fs::read_to_string(backend.profile_path(&launch)).unwrap();
+        let written = std::fs::read_to_string(backend.profile_path(&launch).unwrap()).unwrap();
         assert!(written.starts_with("(version 1)"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(backend.profile_path(&launch))
+            let mode = std::fs::metadata(backend.profile_path(&launch).unwrap())
                 .unwrap()
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
-        let _ = std::fs::remove_file(backend.profile_path(&launch));
+        let _ = std::fs::remove_file(backend.profile_path(&launch).unwrap());
     }
 
     #[test]
@@ -1086,7 +1235,7 @@ mod tests {
 
         let linux = SeatbeltBackend::new(
             Arc::new(StubHost::linux_with_bwrap("0.11.0")),
-            PathBuf::from("/tmp"),
+            Some(PathBuf::from("/tmp")),
         );
         assert_eq!(
             linux.probe().message(),
@@ -1099,7 +1248,7 @@ mod tests {
             .with_command("uname -s", ProbeOutput::success("Darwin\n"))
             .with_command("uname -m", ProbeOutput::success("arm64\n"))
             .with_command("sw_vers -productVersion", ProbeOutput::success("26.1\n"));
-        let backend = SeatbeltBackend::new(Arc::new(stripped), PathBuf::from("/tmp"));
+        let backend = SeatbeltBackend::new(Arc::new(stripped), Some(PathBuf::from("/tmp")));
         assert!(backend.probe().message().contains("/usr/bin/sandbox-exec"));
     }
 
@@ -1123,11 +1272,14 @@ mod tests {
             ..workspace_policy()
         };
         let launch = SandboxLaunch::new(&policy, "/Users/u", "../../s");
-        let path = backend().profile_path(&launch);
+        let path = backend().profile_path(&launch).unwrap();
         assert_eq!(
             path.file_name().unwrap().to_string_lossy(),
             "..-..-etc-evil-..-..-s.sb"
         );
-        assert_eq!(path.parent().unwrap(), backend().profile_dir);
+        assert_eq!(
+            Some(path.parent().unwrap()),
+            backend().profile_dir.as_deref()
+        );
     }
 }

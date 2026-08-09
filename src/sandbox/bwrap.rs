@@ -22,12 +22,20 @@ use crate::sandbox::backend::{
     Argv, Availability, Caps, InnerSandboxVerdict, ProxyEndpoint, SandboxBackend, SandboxError,
     SandboxLaunch, SandboxResult, PROTECTED_IN_WRITABLE_ROOT,
 };
+use crate::sandbox::dirs;
 use crate::sandbox::probe::{detect_platform, HostPlatform, LocalProbeHost, ProbeHost};
 use crate::sandbox::secrets::{secrets_for, SecretKind, SecretPlatform};
 use crate::session::{NetworkMode, ReadScope, SandboxBackendKind, SandboxShape};
 
-/// The bubblewrap binary, resolved on `PATH` because distributions disagree
-/// about where it lives (and a setuid install lives elsewhere again).
+/// The name looked up on `PATH`, because distributions disagree about where
+/// bubblewrap lives (and a setuid install lives elsewhere again).
+///
+/// It is a lookup key and **never** what gets executed: the probe resolves it to
+/// an absolute path once, refuses one a sandboxed agent could rewrite, and the
+/// launch runs that. Seatbelt makes the same promise by naming
+/// [`SANDBOX_EXEC`](crate::sandbox::seatbelt::SANDBOX_EXEC) outright — the
+/// user's environment must not choose what applies the policy, and a bare name
+/// re-resolved at launch through the tmux server's `PATH` lets it.
 pub const BWRAP: &str = "bwrap";
 
 /// Overlays (`--overlay`, `--tmp-overlay`) — the copy-on-write workspace mode —
@@ -43,12 +51,35 @@ const SYSTEM_RO_BINDS: &[&str] = &[
     "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/opt", "/nix",
 ];
 
+/// Control-socket trees an empty tmpfs is laid over, even though the read scope
+/// says the host is readable.
+///
+/// A read-only bind is not a barrier to a *socket*: `connect(2)` on a pathname
+/// unix socket needs nothing but the path, and `--unshare-net` isolates the
+/// network namespace, not the filesystem. Under `/run` — and its
+/// `/run/user/$UID` runtime directory — live rootless docker/podman, the user
+/// systemd bus, `gpg-agent` and dbus, several of which are arbitrary host
+/// command execution. Seatbelt's `(deny default)` already refuses unix-domain
+/// sockets, so masking these is what stops bwrap granting strictly *more* than
+/// seatbelt for the same profile.
+///
+/// This is deliberately its own category rather than an addition to the
+/// credentials deny list: those entries hide *secrets a read grants*, these hide
+/// *endpoints a connect reaches*, and conflating them would lose the reason
+/// either exists. A profile that explicitly lists a path under one of these
+/// keeps it — the mask is a default, and the profile's own paths are bound
+/// after it (most specific wins).
+const MASKED_SOCKET_DIRS: &[&str] = &["/run", "/var/run"];
+
 /// A parsed `bwrap --version`, and what the version implies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BwrapDetails {
     pub availability: Availability,
     /// `(major, minor)`, or `None` when `--version` could not be read.
     pub version: Option<(u32, u32)>,
+    /// The absolute path the probe resolved and vetted, or `None` when the
+    /// backend is unavailable. This — never [`BWRAP`] — is what a launch runs.
+    pub program: Option<String>,
 }
 
 impl BwrapDetails {
@@ -81,17 +112,20 @@ pub fn parse_version(output: &str) -> Option<(u32, u32)> {
 
 /// Build the bubblewrap command line for one launch.
 ///
-/// `exists` answers whether a path is present **on the host the sandbox runs
-/// on**; it is injected so the mount plan is a pure function of its inputs and
-/// a test never has to consult the developer's own filesystem. Only the secrets
-/// list consults it — everything else either must exist (a path the user
-/// listed, which should fail loudly) or is bound with `-try`.
+/// `program` is the absolute path the probe resolved and vetted — see
+/// [`BWRAP`]. `exists` answers whether a path is present **on the host the
+/// sandbox runs on**; it is injected so the mount plan is a pure function of its
+/// inputs and a test never has to consult the developer's own filesystem. The
+/// secrets list, the socket masks and the database mask consult it — everything
+/// else either must exist (a path the user listed, which should fail loudly) or
+/// is bound with `-try`.
 pub fn build_argv(
+    program: &str,
     launch: &SandboxLaunch<'_>,
     exists: &dyn Fn(&str) -> bool,
 ) -> SandboxResult<Argv> {
     let policy = launch.policy;
-    let mut argv: Vec<String> = vec![BWRAP.to_string()];
+    let mut argv: Vec<String> = vec![program.to_string()];
 
     // The sandbox dies with the pane that owns it, gets its own pid/ipc/uts
     // namespaces, and keeps the controlling terminal. `--new-session` is
@@ -119,12 +153,26 @@ pub fn build_argv(
             }
         }
     }
-    // After the root, so they are not shadowed by it. `/tmp` is a private
-    // tmpfs: writable (tools that ignore `TMPDIR` still work) and invisible to
-    // the host (nothing outside reads an agent's scratch files).
+    // After the root, so they are not shadowed by it. `/tmp` stays a private
+    // tmpfs and is never re-bound from the host: writable (tools that ignore
+    // `TMPDIR` still work), invisible to the host (nothing outside reads an
+    // agent's scratch files), and — the part that matters — not the directory
+    // friring's own tmux server listens in. The scratch the agent is *given*
+    // is a per-session directory friring mints elsewhere (see
+    // [`crate::sandbox::dirs`]).
     push(&mut argv, &["--proc", "/proc"]);
     push(&mut argv, &["--dev", "/dev"]);
     push(&mut argv, &["--tmpfs", "/tmp"]);
+    if policy.read_scope == ReadScope::HostMinusSecrets {
+        // Only this scope binds the host root, so only this scope has socket
+        // trees to take back. Emitted before the profile's own paths, so a path
+        // the user listed inside one still wins.
+        for dir in masked_socket_dirs() {
+            if exists(&dir) {
+                push(&mut argv, &["--tmpfs", &dir]);
+            }
+        }
+    }
 
     // One sorted pass over both sets, so a read-only path nested in a writable
     // one is bound *after* its ancestor and wins.
@@ -156,10 +204,30 @@ pub fn build_argv(
     }
 
     if let Some(db) = launch.friring_db {
-        // ADR-29: the database never enters a sandbox. Bound only when it is
-        // there, for the same mount-point reason as the secrets.
+        // ADR-29: the database never enters a sandbox.
+        //
+        // Whether a mask can be *created* decides how far this can go. Under a
+        // read-only root a mount point cannot be made, so only what is already
+        // there can be covered — the `exists` half. Where an ancestor is
+        // writable the mount point can be made, and then the mask must be
+        // unconditional: the `-wal` a launch does not see is exactly the file
+        // SQLite creates afterwards, and a `-wal` written from inside is
+        // replayed by the host on next open, which is the ADR-29 escape by a
+        // slower route. `SandboxLaunch::validate` refuses such a profile
+        // outright; this stays because `build_argv` is a pure function anyone
+        // may call, and a mount plan that leans on someone else's earlier check
+        // is the shape that produced this hole.
+        let parent_is_writable = std::path::Path::new(db)
+            .parent()
+            .map(|p| p.display().to_string())
+            .is_some_and(|parent| {
+                launch
+                    .writable_paths()
+                    .iter()
+                    .any(|root| dirs::encloses(root, &parent))
+            });
         for file in [db.to_string(), format!("{db}-wal"), format!("{db}-shm")] {
-            if exists(&file) {
+            if parent_is_writable || exists(&file) {
                 push(&mut argv, &["--ro-bind", "/dev/null", &file]);
             }
         }
@@ -223,6 +291,38 @@ fn proxy_mount(launch: &SandboxLaunch<'_>) -> SandboxResult<Option<(String, Stri
     }
 }
 
+/// Every control-socket tree to cover, with the ones this host puts somewhere
+/// non-standard folded in and anything already covered dropped.
+///
+/// The tmux socket root is here for friring's *own* server: `--tmpfs /tmp`
+/// covers the default location, but `$TMUX_TMPDIR` moves it, and a sandbox that
+/// can reach that socket can run a command in any pane on the host.
+fn masked_socket_dirs() -> Vec<String> {
+    // `/tmp` seeds the coverage test rather than the output: the caller has
+    // already made it a private tmpfs by the time this is consulted.
+    let mut covered: Vec<String> = vec!["/tmp".to_string()];
+    let mut out: Vec<String> = Vec::new();
+    let host_specific = [
+        std::env::var_os("XDG_RUNTIME_DIR").map(|v| v.to_string_lossy().into_owned()),
+        Some(dirs::tmux_socket_root().display().to_string()),
+    ];
+    for candidate in MASKED_SOCKET_DIRS
+        .iter()
+        .map(|d| (*d).to_string())
+        .chain(host_specific.into_iter().flatten())
+    {
+        if !candidate.starts_with('/') {
+            continue;
+        }
+        if covered.iter().any(|c| dirs::encloses(c, &candidate)) {
+            continue;
+        }
+        covered.push(candidate.clone());
+        out.push(candidate);
+    }
+    out
+}
+
 /// A hostname that says where you are, reduced to what `sethostname` accepts.
 fn hostname(profile: &str) -> String {
     let cleaned: String = profile
@@ -259,29 +359,42 @@ impl BwrapBackend {
     }
 
     fn run_probe(&self) -> BwrapDetails {
+        let unavailable = |availability| BwrapDetails {
+            availability,
+            version: None,
+            program: None,
+        };
         let platform = detect_platform(self.host.as_ref());
         if !matches!(platform, HostPlatform::Linux | HostPlatform::WslDistro) {
-            return BwrapDetails {
-                availability: Availability::unavailable(format!(
-                    "bubblewrap needs Linux; this host is {}",
-                    platform.label()
-                )),
-                version: None,
-            };
+            return unavailable(Availability::unavailable(format!(
+                "bubblewrap needs Linux; this host is {}",
+                platform.label()
+            )));
         }
-        if !self.host.which(BWRAP) {
-            return BwrapDetails {
-                availability: Availability::needs_fix(
-                    "bubblewrap (bwrap) is not installed",
-                    "install it: apt install bubblewrap / dnf install bubblewrap / \
-                     pacman -S bubblewrap",
+        let Some(program) = self.host.which(BWRAP) else {
+            return unavailable(Availability::needs_fix(
+                "bubblewrap (bwrap) is not installed",
+                "install it: apt install bubblewrap / dnf install bubblewrap / \
+                 pacman -S bubblewrap",
+            ));
+        };
+        if let Some(location) = self.rewritable_location(&program) {
+            // The wrapper is the boundary: a bwrap the sandboxed agent can
+            // overwrite is a boundary the sandboxed agent chooses. Refusing is
+            // the only safe answer — falling back to the next `PATH` entry would
+            // still be running whatever an attacker arranged to be found.
+            return unavailable(Availability::needs_fix(
+                format!(
+                    "bubblewrap resolves to '{program}', inside {location} — a sandboxed agent \
+                     could replace it and the next launch would run unwrapped"
                 ),
-                version: None,
-            };
+                "install bubblewrap system-wide (apt/dnf/pacman) and take the writable copy off \
+                 PATH",
+            ));
         }
         let version = self
             .host
-            .run(BWRAP, &["--version"])
+            .run(&program, &["--version"])
             .ok()
             .filter(|o| o.ok())
             .and_then(|o| parse_version(o.trimmed()));
@@ -289,7 +402,7 @@ impl BwrapBackend {
         // The decisive question is not what a sysctl says but whether a
         // namespace can actually be created, so ask bwrap. It costs one fork of
         // `true` and is the only check that cannot be wrong.
-        let attempt = self.host.run(BWRAP, &["--ro-bind", "/", "/", "true"]);
+        let attempt = self.host.run(&program, &["--ro-bind", "/", "/", "true"]);
         let availability = match attempt {
             Ok(output) if output.ok() => Availability::available(match version {
                 Some((major, minor)) => format!("bubblewrap {major}.{minor}"),
@@ -299,9 +412,37 @@ impl BwrapBackend {
             Err(detail) => Availability::unavailable(detail),
         };
         BwrapDetails {
+            program: availability.is_available().then_some(program),
             availability,
             version,
         }
+    }
+
+    /// Whether `program` sits somewhere a sandboxed agent can write, and where.
+    ///
+    /// The home directory is the one that matters — `~/.local/bin` is on most
+    /// users' `PATH` and inside the default read scope's writable set — with the
+    /// shared scratch directories alongside it because they are writable by
+    /// anyone. friring's own sandbox tree is included for completeness; it lives
+    /// under the data directory, which no profile may make writable.
+    fn rewritable_location(&self, program: &str) -> Option<String> {
+        let home = self.host.home();
+        let mut roots: Vec<String> = ["/tmp", "/var/tmp", "/dev/shm"]
+            .iter()
+            .map(|d| (*d).to_string())
+            .collect();
+        roots.extend(home.clone());
+        roots.extend(dirs::sandbox_root().map(|p| p.display().to_string()));
+        roots
+            .into_iter()
+            .find(|root| dirs::encloses(root, program))
+            .map(|root| {
+                if home.as_deref() == Some(root.as_str()) {
+                    format!("the home directory ('{root}')")
+                } else {
+                    format!("'{root}'")
+                }
+            })
     }
 
     /// Turn a failed namespace creation into the setting that would fix it.
@@ -380,7 +521,31 @@ impl SandboxBackend for BwrapBackend {
                 ),
             });
         }
-        let mut out = build_argv(launch, &|path| self.host.path_exists(path))?;
+        launch.validate()?;
+        let details = self.details();
+        let Some(program) = details.program.as_deref() else {
+            return Err(SandboxError::Unavailable {
+                backend: SandboxBackendKind::Bwrap,
+                reason: details.availability.message(),
+            });
+        };
+        // The probe vetted the binary against the *host*; this profile decides
+        // what the agent can write, and a profile that hands it the directory
+        // bubblewrap lives in hands it the boundary.
+        if let Some(root) = launch
+            .writable_paths()
+            .into_iter()
+            .find(|root| dirs::encloses(root, program))
+        {
+            return Err(SandboxError::Refused {
+                profile: launch.policy.profile.clone(),
+                detail: format!(
+                    "the read-write path '{root}' contains bubblewrap itself ('{program}'), so \
+                     the sandbox could replace the program that applies its own boundary"
+                ),
+            });
+        }
+        let mut out = build_argv(program, launch, &|path| self.host.path_exists(path))?;
         out.extend(argv);
         Ok(out)
     }
@@ -410,6 +575,18 @@ mod tests {
         false
     }
 
+    /// What the probe would have resolved: a system-installed bubblewrap.
+    const PROGRAM: &str = "/usr/bin/bwrap";
+
+    /// The per-session scratch directory friring mints, as a launch sees it.
+    /// Under the data directory — never the host temp root.
+    fn scratch() -> String {
+        crate::sandbox::dirs::session_scratch_dir("s1")
+            .unwrap()
+            .display()
+            .to_string()
+    }
+
     /// The index of `token` in `argv`, panicking with the whole command line so
     /// a failure reads as a diff rather than as `None`.
     fn index_of(argv: &[String], token: &str) -> usize {
@@ -433,9 +610,10 @@ mod tests {
     fn base_flags_isolate_without_stealing_the_terminal() {
         let policy = workspace_policy();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(&launch, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, &nothing).unwrap();
 
-        assert_eq!(argv[0], "bwrap");
+        // The absolute path the probe pinned, never the bare name.
+        assert_eq!(argv[0], PROGRAM);
         for flag in ["--die-with-parent", "--unshare-pid", "--unshare-ipc"] {
             assert!(argv.contains(&flag.to_string()), "missing {flag}");
         }
@@ -452,7 +630,7 @@ mod tests {
     fn the_hostname_says_which_sandbox_you_are_in() {
         let policy = workspace_policy();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(&launch, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, &nothing).unwrap();
         let at = index_of(&argv, "--hostname");
         assert_eq!(argv[at + 1], "friring-dev");
         // sethostname accepts a narrow charset, so the profile name is filtered.
@@ -463,7 +641,7 @@ mod tests {
     fn host_minus_secrets_binds_the_whole_root_read_only_first() {
         let policy = workspace_policy();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(&launch, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, &nothing).unwrap();
         assert!(has_mount(&argv, "--ro-bind", "/", "/"));
         // Everything that overrides the root must come after it.
         assert!(index_of(&argv, "/srv/shared") > index_of(&argv, "--ro-bind"));
@@ -477,7 +655,7 @@ mod tests {
             .resolve(SandboxBackendKind::Bwrap, "/home/u")
             .unwrap();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(&launch, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, &nothing).unwrap();
 
         assert!(!has_mount(&argv, "--ro-bind", "/", "/"));
         assert!(has_mount(&argv, "--ro-bind-try", "/usr", "/usr"));
@@ -498,7 +676,7 @@ mod tests {
             SandboxPath::read_only("~/dev/app/.git/hooks"),
         ]);
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(&launch, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, &nothing).unwrap();
         let parent = index_of(&argv, "/home/u/dev/app");
         let child = index_of(&argv, "/home/u/dev/app/.git/hooks");
         assert!(
@@ -516,23 +694,93 @@ mod tests {
     #[test]
     fn session_paths_are_bound_writable_at_their_own_paths() {
         let policy = workspace_policy();
+        let scratch = scratch();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1")
             .with_workspace("/home/u/work/repo")
             .with_signal_dir("/home/u/.local/share/friring/signals/s1")
-            .with_tmp_dir("/tmp/friring-s1");
-        let argv = build_argv(&launch, &nothing).unwrap();
+            .with_tmp_dir(&scratch);
+        let argv = build_argv(PROGRAM, &launch, &nothing).unwrap();
 
         for path in [
             "/home/u/work/repo",
             "/home/u/.local/share/friring/signals/s1",
-            "/tmp/friring-s1",
+            &scratch,
         ] {
             assert!(has_mount(&argv, "--bind", path, path), "missing {path}");
         }
-        // The private /tmp is created before anything is bound inside it.
-        assert!(index_of(&argv, "--tmpfs") < index_of(&argv, "/tmp/friring-s1"));
         let chdir = index_of(&argv, "--chdir");
         assert_eq!(argv[chdir + 1], "/home/u/work/repo");
+    }
+
+    /// The escape: the host `/tmp` holds friring's own tmux socket, and
+    /// `--unshare-net` does nothing about a unix socket reached by path. `/tmp`
+    /// is a private tmpfs and is never bound back over.
+    #[test]
+    fn the_host_temp_root_is_never_bound_into_the_sandbox() {
+        let policy = workspace_policy();
+        let scratch = scratch();
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1").with_tmp_dir(&scratch);
+        let argv = build_argv(PROGRAM, &launch, &nothing).unwrap();
+
+        assert!(has_flag(&argv, "--tmpfs", "/tmp"));
+        for flag in ["--bind", "--ro-bind", "--ro-bind-try"] {
+            assert!(
+                !has_mount(&argv, flag, "/tmp", "/tmp"),
+                "{flag} put the host /tmp back over the private tmpfs"
+            );
+        }
+        // The scratch the agent is given is friring's own per-session directory.
+        assert!(has_mount(&argv, "--bind", &scratch, &scratch));
+        assert_ne!(scratch, "/tmp");
+
+        // And a launch that tried to hand over the directory tmux keeps its
+        // sockets in is refused before a single mount is planned.
+        let sockets = crate::sandbox::dirs::tmux_socket_root()
+            .display()
+            .to_string();
+        assert!(SandboxLaunch::new(&policy, "/home/u", "s1")
+            .with_tmp_dir(&sockets)
+            .validate()
+            .is_err());
+    }
+
+    /// A read-only bind is no barrier to `connect(2)`, and `--unshare-net`
+    /// isolates the network namespace rather than the filesystem — so the
+    /// control-socket trees are covered rather than merely read-only.
+    #[test]
+    fn control_socket_trees_are_masked_under_the_host_read_scope() {
+        let host_scope = workspace_policy();
+        let launch = SandboxLaunch::new(&host_scope, "/home/u", "s1");
+        let argv = build_argv(PROGRAM, &launch, &|_| true).unwrap();
+        for dir in ["/run", "/var/run"] {
+            assert!(has_flag(&argv, "--tmpfs", dir), "missing mask for {dir}");
+            // After the root bind, so the mask is not shadowed by it.
+            assert!(index_of(&argv, dir) > index_of(&argv, "--ro-bind"));
+        }
+
+        // A path the profile lists inside a masked tree still wins: the mask is
+        // a default, and the profile's own paths are bound after it.
+        let listed = policy(vec![
+            SandboxPath::workspace("~/dev/app"),
+            SandboxPath::read_only("/run/systemd/resolve"),
+        ]);
+        let launch = SandboxLaunch::new(&listed, "/home/u", "s1");
+        let argv = build_argv(PROGRAM, &launch, &|_| true).unwrap();
+        assert!(
+            index_of(&argv, "/run/systemd/resolve") > index_of(&argv, "/run"),
+            "an explicitly listed path must be bound after the mask"
+        );
+
+        // The workspace scope binds no host root, so it has nothing to take
+        // back — and mounting a tmpfs there would only cost a launch.
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.read_scope = ReadScope::Workspace;
+        let narrow = profile
+            .resolve(SandboxBackendKind::Bwrap, "/home/u")
+            .unwrap();
+        let launch = SandboxLaunch::new(&narrow, "/home/u", "s1");
+        let argv = build_argv(PROGRAM, &launch, &|_| true).unwrap();
+        assert!(!has_flag(&argv, "--tmpfs", "/run"));
     }
 
     #[test]
@@ -540,7 +788,7 @@ mod tests {
         let policy = workspace_policy();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1").with_agent("claude");
         let present = |p: &str| matches!(p, "/home/u/.ssh" | "/home/u/.netrc");
-        let argv = build_argv(&launch, &present).unwrap();
+        let argv = build_argv(PROGRAM, &launch, &present).unwrap();
 
         // A directory is covered by an empty tmpfs, a file by /dev/null.
         assert!(has_flag(&argv, "--tmpfs", "/home/u/.ssh"));
@@ -561,7 +809,7 @@ mod tests {
             .unwrap();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
         // Nothing outside the listed paths is in the sandbox to begin with.
-        let argv = build_argv(&launch, &|_| true).unwrap();
+        let argv = build_argv(PROGRAM, &launch, &|_| true).unwrap();
         assert!(!argv.iter().any(|a| a == "/home/u/.ssh"));
     }
 
@@ -570,17 +818,45 @@ mod tests {
         let policy = policy(vec![SandboxPath::workspace("~/.local/share/friring")]);
         let db = "/home/u/.local/share/friring/friring.db";
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1").with_friring_db(db);
-        let argv = build_argv(&launch, &|p| p == db).unwrap();
+        let argv = build_argv(PROGRAM, &launch, &|p| p == db).unwrap();
         assert!(has_mount(&argv, "--ro-bind", "/dev/null", db));
         // ADR-29 wins over the writable data directory it sits inside.
         assert!(index_of(&argv, db) > index_of(&argv, "/home/u/.local/share/friring"));
+    }
+
+    /// The sidecar that does not exist yet is the one that matters: SQLite
+    /// creates the `-wal` on first write, and the host replays it on next open.
+    /// Where an ancestor is writable the mount point can be created, so the mask
+    /// cannot wait for the file to appear.
+    #[test]
+    fn database_sidecars_are_masked_before_they_exist_under_a_writable_ancestor() {
+        let db = "/home/u/.local/share/friring/friring.db";
+        let writable = policy(vec![SandboxPath::workspace("~/.local/share/friring")]);
+        let launch = SandboxLaunch::new(&writable, "/home/u", "s1").with_friring_db(db);
+        // Nothing exists yet — not even the database.
+        let argv = build_argv(PROGRAM, &launch, &nothing).unwrap();
+        for file in [db, &format!("{db}-wal"), &format!("{db}-shm")] {
+            assert!(
+                has_mount(&argv, "--ro-bind", "/dev/null", file),
+                "missing mask for {file}"
+            );
+        }
+
+        // Under a read-only root the mount point cannot be created, so only what
+        // is already there is masked — mounting over the rest would fail the
+        // launch rather than tighten it.
+        let read_only = policy(vec![SandboxPath::read_only("~/.local/share/friring")]);
+        let launch = SandboxLaunch::new(&read_only, "/home/u", "s1").with_friring_db(db);
+        let argv = build_argv(PROGRAM, &launch, &|p| p == db).unwrap();
+        assert!(has_mount(&argv, "--ro-bind", "/dev/null", db));
+        assert!(!argv.iter().any(|a| a == &format!("{db}-wal")));
     }
 
     #[test]
     fn git_hooks_stay_read_only_inside_a_writable_root() {
         let policy = workspace_policy();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(&launch, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, &nothing).unwrap();
         let hooks = "/home/u/dev/app/.git/hooks";
         assert!(has_mount(&argv, "--ro-bind-try", hooks, hooks));
     }
@@ -594,7 +870,7 @@ mod tests {
                 .resolve(SandboxBackendKind::Bwrap, "/home/u")
                 .unwrap();
             let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-            let argv = build_argv(&launch, &nothing).unwrap();
+            let argv = build_argv(PROGRAM, &launch, &nothing).unwrap();
             assert!(
                 argv.contains(&"--unshare-net".to_string()),
                 "{mode} must have no direct egress"
@@ -605,7 +881,7 @@ mod tests {
             .resolve(SandboxBackendKind::Bwrap, "/home/u")
             .unwrap();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(&launch, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, &nothing).unwrap();
         assert!(!argv.contains(&"--unshare-net".to_string()));
     }
 
@@ -617,7 +893,7 @@ mod tests {
                 host_path: "/run/friring/proxy-s1.sock".into(),
                 inside_path: "/run/friring-proxy.sock".into(),
             });
-        let argv = build_argv(&socket, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &socket, &nothing).unwrap();
         assert!(has_mount(
             &argv,
             "--bind",
@@ -629,7 +905,7 @@ mod tests {
 
         let loopback = SandboxLaunch::new(&policy, "/home/u", "s1")
             .with_proxy(ProxyEndpoint::Loopback { port: 8123 });
-        let err = build_argv(&loopback, &nothing).unwrap_err();
+        let err = build_argv(PROGRAM, &loopback, &nothing).unwrap_err();
         assert!(err.to_string().contains("no route to host loopback"));
     }
 
@@ -701,6 +977,57 @@ mod tests {
         assert!(missing.probe().message().contains("apt install bubblewrap"));
     }
 
+    /// A bare `bwrap` on `PATH` is chosen by the environment, and the tmux
+    /// server's environment is one a sandboxed agent with a writable home can
+    /// arrange: plant `~/.local/bin/bwrap` and the next launch runs it,
+    /// unwrapped, as the host user. So the probe resolves and vets one path, and
+    /// that path is what both the probe and the launch run.
+    #[test]
+    fn a_bwrap_the_agent_could_rewrite_is_never_the_boundary() {
+        let planted = StubHost::new()
+            .with_home("/home/u")
+            .with_command("uname -s", ProbeOutput::success("Linux\n"))
+            .with_file("/proc/sys/kernel/osrelease", "6.8.0-generic\n")
+            .with_binary_at("bwrap", "/home/u/.local/bin/bwrap");
+        let backend = BwrapBackend::new(Arc::new(planted));
+        let message = backend.probe().message();
+        assert!(message.contains("/home/u/.local/bin/bwrap"), "{message}");
+        assert!(message.contains("home directory"), "{message}");
+        assert!(!backend.probe().is_available());
+        assert!(backend.details().program.is_none());
+
+        // A shared scratch directory is no better: anyone can write it.
+        let shared = StubHost::new()
+            .with_command("uname -s", ProbeOutput::success("Linux\n"))
+            .with_file("/proc/sys/kernel/osrelease", "6.8.0-generic\n")
+            .with_binary_at("bwrap", "/tmp/bwrap");
+        assert!(BwrapBackend::new(Arc::new(shared))
+            .probe()
+            .message()
+            .contains("'/tmp'"));
+
+        // A system install is used by its absolute path, for the probe and the
+        // launch alike.
+        let system = BwrapBackend::new(Arc::new(StubHost::linux_with_bwrap("0.11.0")));
+        assert_eq!(system.details().program.as_deref(), Some(PROGRAM));
+        let policy = workspace_policy();
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
+        let argv = system.wrap(vec!["claude".into()], &launch).unwrap();
+        assert_eq!(argv[0], PROGRAM);
+    }
+
+    #[test]
+    fn a_profile_that_hands_over_bwrap_itself_is_refused_at_launch() {
+        // The probe vetted the binary against the host; this profile is what
+        // decides whether the agent can rewrite it.
+        let system = BwrapBackend::new(Arc::new(StubHost::linux_with_bwrap("0.11.0")));
+        let policy = policy(vec![SandboxPath::workspace("/usr/bin")]);
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
+        let err = system.wrap(vec!["claude".into()], &launch).unwrap_err();
+        assert!(err.to_string().contains(PROGRAM), "{err}");
+        assert!(matches!(err, SandboxError::Refused { .. }));
+    }
+
     #[test]
     fn a_blocked_user_namespace_reports_the_setting_that_would_fix_it() {
         let apparmor = StubHost::new()
@@ -708,11 +1035,11 @@ mod tests {
             .with_file("/proc/sys/kernel/osrelease", "6.8.0-generic\n")
             .with_binary("bwrap")
             .with_command(
-                "bwrap --version",
+                "/usr/bin/bwrap --version",
                 ProbeOutput::success("bubblewrap 0.9.0\n"),
             )
             .with_command(
-                "bwrap --ro-bind / / true",
+                "/usr/bin/bwrap --ro-bind / / true",
                 ProbeOutput::failure(1, "bwrap: setting up uid map: Permission denied\n"),
             )
             .with_file(
@@ -730,11 +1057,11 @@ mod tests {
             .with_file("/proc/sys/kernel/osrelease", "6.1.0-generic\n")
             .with_binary("bwrap")
             .with_command(
-                "bwrap --version",
+                "/usr/bin/bwrap --version",
                 ProbeOutput::success("bubblewrap 0.8.0\n"),
             )
             .with_command(
-                "bwrap --ro-bind / / true",
+                "/usr/bin/bwrap --ro-bind / / true",
                 ProbeOutput::failure(1, "bwrap: No permissions to create new namespace\n"),
             )
             .with_file("/proc/sys/kernel/unprivileged_userns_clone", "0\n");
@@ -752,11 +1079,11 @@ mod tests {
             .with_file("/proc/sys/kernel/osrelease", "6.8.0-generic\n")
             .with_binary("bwrap")
             .with_command(
-                "bwrap --version",
+                "/usr/bin/bwrap --version",
                 ProbeOutput::success("bubblewrap 0.11.0\n"),
             )
             .with_command(
-                "bwrap --ro-bind / / true",
+                "/usr/bin/bwrap --ro-bind / / true",
                 ProbeOutput::failure(1, "\nbwrap: Can't mount proc on /newroot/proc\n"),
             );
         let backend = BwrapBackend::new(Arc::new(odd));

@@ -36,6 +36,7 @@
 pub mod agent;
 pub mod backend;
 pub mod bwrap;
+pub mod dirs;
 pub mod probe;
 pub mod seatbelt;
 pub mod secrets;
@@ -49,6 +50,7 @@ pub use backend::{
     SandboxInstance, SandboxLaunch, SandboxResult,
 };
 pub use bwrap::{BwrapBackend, BwrapDetails};
+pub use dirs::{check_writable_roots, cleanup_session, create_session_scratch};
 pub use probe::{detect_platform, HostPlatform, LocalProbeHost, ProbeHost, RemoteProbeHost};
 pub use seatbelt::SeatbeltBackend;
 pub use secrets::{secrets_for, SecretKind, SecretPath, SecretPlatform, SECRET_PATHS};
@@ -218,7 +220,7 @@ mod tests {
             Some(seatbelt::SANDBOX_EXEC)
         );
         assert_eq!(argv.last().map(String::as_str), Some("claude"));
-        let _ = std::fs::remove_file(host.seatbelt.profile_path(&launch));
+        let _ = std::fs::remove_file(host.seatbelt.profile_path(&launch).unwrap());
     }
 
     #[test]
@@ -233,6 +235,202 @@ mod tests {
             .wrap(SandboxBackendKind::Podman, vec!["claude".into()], &launch)
             .unwrap_err();
         assert!(matches!(err, SandboxError::NotInThisStage { .. }));
+    }
+
+    /// One profile must mean one thing on both backends.
+    ///
+    /// The divergence this exists to catch: bwrap sorted every mount so the
+    /// most specific one landed last and won, while seatbelt anchored only the
+    /// read-only roots and let the *ancestor's* deny win. "repo read-only,
+    /// repo/work read-write" therefore meant opposite things on macOS and
+    /// Linux. The verdicts below are computed the way each kernel computes them
+    /// — last matching SBPL rule, last matching bwrap mount — so the assertion
+    /// is about behaviour rather than about text.
+    mod conformance {
+        use std::sync::Arc;
+
+        use crate::sandbox::backend::{SandboxBackend, SandboxError, SandboxLaunch};
+        use crate::sandbox::probe::StubHost;
+        use crate::sandbox::{bwrap, dirs, seatbelt, BwrapBackend, SeatbeltBackend};
+        use crate::session::{NetworkMode, SandboxBackendKind, SandboxPath, SandboxProfile};
+
+        /// The path a `(subpath "…")` filter names, if the line has one.
+        fn subpath_of(line: &str) -> Option<&str> {
+            let rest = line.split_once("(subpath \"")?.1;
+            rest.split_once('"').map(|(path, _)| path)
+        }
+
+        /// Whether the generated profile leaves `probe` writable: the last rule
+        /// whose subpath covers it decides, which is how SBPL evaluates.
+        fn seatbelt_grants_write(text: &str, probe: &str) -> bool {
+            let mut granted = false;
+            for line in text.lines() {
+                if !subpath_of(line).is_some_and(|path| dirs::encloses(path, probe)) {
+                    continue;
+                }
+                if line.starts_with("(allow file-read* file-write*") {
+                    granted = true;
+                } else if line.starts_with("(deny file-write*")
+                    || line.starts_with("(deny file-read* file-write*")
+                {
+                    granted = false;
+                }
+            }
+            granted
+        }
+
+        /// The same question of a bwrap command line: the last mount whose
+        /// destination covers `probe` decides, which is how the mount namespace
+        /// ends up.
+        fn bwrap_grants_write(argv: &[String], probe: &str) -> bool {
+            let mut granted = false;
+            let mut i = 0;
+            while i < argv.len() {
+                let (dest, writable, width) = match argv[i].as_str() {
+                    flag @ ("--bind" | "--bind-try" | "--ro-bind" | "--ro-bind-try")
+                        if i + 2 < argv.len() =>
+                    {
+                        (&argv[i + 2], flag.starts_with("--bind"), 3)
+                    }
+                    "--tmpfs" | "--dev" | "--proc" if i + 1 < argv.len() => (&argv[i + 1], true, 2),
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                };
+                if dirs::encloses(dest, probe) {
+                    granted = writable;
+                }
+                i += width;
+            }
+            granted
+        }
+
+        /// One profile's paths, and what each probe path underneath it must
+        /// resolve to on *both* backends.
+        type Case = (Vec<SandboxPath>, Vec<(&'static str, bool)>);
+
+        #[test]
+        fn both_backends_agree_on_overlapping_paths() {
+            let cases: Vec<Case> = vec![
+                (
+                    vec![
+                        SandboxPath::read_only("/repo"),
+                        SandboxPath::workspace("/repo/work"),
+                    ],
+                    vec![("/repo/f", false), ("/repo/work/f", true)],
+                ),
+                (
+                    vec![
+                        SandboxPath::workspace("/repo"),
+                        SandboxPath::read_only("/repo/vendor"),
+                    ],
+                    vec![("/repo/f", true), ("/repo/vendor/f", false)],
+                ),
+                (
+                    vec![
+                        SandboxPath::workspace("/repo"),
+                        SandboxPath::read_only("/repo/vendor"),
+                        SandboxPath::workspace("/repo/vendor/cache"),
+                    ],
+                    vec![
+                        ("/repo/f", true),
+                        ("/repo/vendor/f", false),
+                        ("/repo/vendor/cache/f", true),
+                    ],
+                ),
+                (
+                    vec![
+                        SandboxPath::workspace("/repo"),
+                        SandboxPath::read_only("/srv/shared"),
+                    ],
+                    vec![
+                        ("/repo/f", true),
+                        ("/srv/shared/f", false),
+                        ("/elsewhere/f", false),
+                    ],
+                ),
+            ];
+
+            for (paths, expected) in cases {
+                let profile = SandboxProfile::new("dev", paths.clone());
+                let mac = profile
+                    .resolve(SandboxBackendKind::Seatbelt, "/home/u")
+                    .unwrap();
+                let linux = profile
+                    .resolve(SandboxBackendKind::Bwrap, "/home/u")
+                    .unwrap();
+                let text = seatbelt::render_profile(&SandboxLaunch::new(&mac, "/home/u", "s1"));
+                let argv = bwrap::build_argv(
+                    "/usr/bin/bwrap",
+                    &SandboxLaunch::new(&linux, "/home/u", "s1"),
+                    &|_| false,
+                )
+                .unwrap();
+
+                for (probe, writable) in expected {
+                    let listed: Vec<String> = paths
+                        .iter()
+                        .map(|p| format!("{} {}", p.path, p.mode))
+                        .collect();
+                    assert_eq!(
+                        seatbelt_grants_write(&text, probe),
+                        writable,
+                        "seatbelt: {probe} under [{}]",
+                        listed.join(", ")
+                    );
+                    assert_eq!(
+                        bwrap_grants_write(&argv, probe),
+                        writable,
+                        "bwrap: {probe} under [{}]",
+                        listed.join(", ")
+                    );
+                }
+            }
+        }
+
+        /// A launch friring refuses is refused by both backends, with one
+        /// sentence — the checks live on the launch, not in either policy
+        /// generator, precisely so they cannot drift apart again.
+        #[test]
+        fn both_backends_refuse_the_same_launches() {
+            let mac = SeatbeltBackend::new(
+                Arc::new(StubHost::macos(26, true)),
+                seatbelt::default_profile_dir(),
+            );
+            let linux = BwrapBackend::new(Arc::new(StubHost::linux_with_bwrap("0.11.0")));
+
+            let mut reaching_the_database =
+                SandboxProfile::new("dev", vec![SandboxPath::workspace("~")]);
+            let mut inert_denies =
+                SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+            inert_denies.network_mode = NetworkMode::Full;
+            inert_denies.network_deny = vec!["evil.example".into()];
+
+            for profile in [&mut reaching_the_database, &mut inert_denies] {
+                let mac_policy = profile
+                    .resolve(SandboxBackendKind::Seatbelt, "/home/u")
+                    .unwrap();
+                let linux_policy = profile
+                    .resolve(SandboxBackendKind::Bwrap, "/home/u")
+                    .unwrap();
+                let db = "/home/u/.local/share/friring/friring.db";
+                let mac_err = mac
+                    .wrap(
+                        vec!["claude".into()],
+                        &SandboxLaunch::new(&mac_policy, "/home/u", "s1").with_friring_db(db),
+                    )
+                    .unwrap_err();
+                let linux_err = linux
+                    .wrap(
+                        vec!["claude".into()],
+                        &SandboxLaunch::new(&linux_policy, "/home/u", "s1").with_friring_db(db),
+                    )
+                    .unwrap_err();
+                assert!(matches!(mac_err, SandboxError::Refused { .. }), "{mac_err}");
+                assert_eq!(mac_err.to_string(), linux_err.to_string());
+            }
+        }
     }
 
     #[test]

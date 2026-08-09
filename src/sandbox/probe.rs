@@ -61,8 +61,23 @@ impl ProbeOutput {
 /// `Send + Sync` so a backend holding one can be shared across the async
 /// runtime.
 pub trait ProbeHost: Send + Sync {
-    /// Whether `program` resolves on the host's `PATH`.
-    fn which(&self, program: &str) -> bool;
+    /// Where `program` resolves on the host's `PATH`, as an absolute path.
+    ///
+    /// The *path*, not the fact, because a backend that re-runs a bare name at
+    /// launch lets whatever the tmux server's `PATH` points at apply the policy.
+    /// A sandboxed agent with a writable home plants `~/.local/bin/bwrap` and
+    /// the next launch runs it, unwrapped, as the host user. Seatbelt has never
+    /// had the hole — it names `/usr/bin/sandbox-exec` outright — and
+    /// [`crate::sandbox::bwrap::BwrapBackend`] closes it by resolving once, at
+    /// probe time, and vetting the answer.
+    fn which(&self, program: &str) -> Option<String>;
+
+    /// The home directory of the user a sandbox would run as, when the host can
+    /// be asked. `None` is "could not tell", not "there is none".
+    ///
+    /// Only used to vet where a sandbox tool lives: a `bwrap` under the home is
+    /// a `bwrap` the sandboxed agent can rewrite.
+    fn home(&self) -> Option<String>;
 
     /// Whether `path` exists on the host. Used to decide whether a secret is
     /// even there to hide — a bind-mount backend cannot overmount a path that
@@ -140,7 +155,7 @@ pub fn detect_platform(host: &dyn ProbeHost) -> HostPlatform {
     else {
         // No `uname` at all: either a native Windows host or something friring
         // has no vocabulary for. `cmd.exe` settles it.
-        return if host.which("cmd.exe") || host.which("powershell.exe") {
+        return if host.which("cmd.exe").is_some() || host.which("powershell.exe").is_some() {
             HostPlatform::Windows
         } else {
             HostPlatform::Unknown
@@ -183,8 +198,26 @@ pub fn detect_platform(host: &dyn ProbeHost) -> HostPlatform {
 pub struct LocalProbeHost;
 
 impl ProbeHost for LocalProbeHost {
-    fn which(&self, program: &str) -> bool {
-        crate::paths::which_on_path(program)
+    /// `crate::paths::which_on_path` answers the yes/no question; a sandbox
+    /// needs the path itself, so the scan is repeated here rather than the
+    /// shared helper's contract widened for one caller.
+    fn which(&self, program: &str) -> Option<String> {
+        let named = std::path::Path::new(program);
+        if named.components().count() > 1 {
+            // Already a path: it is what it is, and a relative one is refused
+            // rather than resolved against a working directory nobody pinned.
+            return (named.is_absolute() && named.exists()).then(|| program.to_string());
+        }
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join(program))
+            .find(|candidate| candidate.exists())
+            .map(|candidate| candidate.display().to_string())
+    }
+
+    fn home(&self) -> Option<String> {
+        crate::paths::home_dir().map(|h| h.display().to_string())
     }
 
     fn path_exists(&self, path: &str) -> bool {
@@ -257,12 +290,23 @@ impl RemoteProbeHost {
 }
 
 impl ProbeHost for RemoteProbeHost {
-    fn which(&self, program: &str) -> bool {
-        self.script(&format!(
-            "command -v {} >/dev/null 2>&1",
-            posix_quote(program)
-        ))
-        .is_ok_and(|o| o.ok())
+    fn which(&self, program: &str) -> Option<String> {
+        // `command -v` prints the resolved path for anything on `PATH`; a
+        // builtin or an alias prints something that is not one, and is refused
+        // rather than handed to a backend as if it were a binary.
+        self.script(&format!("command -v {}", posix_quote(program)))
+            .ok()
+            .filter(ProbeOutput::ok)
+            .map(|o| o.trimmed().to_string())
+            .filter(|resolved| resolved.starts_with('/'))
+    }
+
+    fn home(&self) -> Option<String> {
+        self.script("printf %s \"$HOME\"")
+            .ok()
+            .filter(ProbeOutput::ok)
+            .map(|o| o.stdout.trim().to_string())
+            .filter(|home| home.starts_with('/'))
     }
 
     fn path_exists(&self, path: &str) -> bool {
@@ -296,10 +340,13 @@ impl ProbeHost for RemoteProbeHost {
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub struct StubHost {
-    on_path: Vec<String>,
+    /// `(program, resolved path)` — the path matters to the backends, so the
+    /// stub answers with one rather than with a bare yes.
+    on_path: Vec<(String, String)>,
     existing: Vec<String>,
     files: Vec<(String, String)>,
     commands: Vec<(String, ProbeOutput)>,
+    home: Option<String>,
 }
 
 #[cfg(test)]
@@ -308,9 +355,24 @@ impl StubHost {
         Self::default()
     }
 
-    /// Pretend `program` is on `PATH`.
+    /// Pretend `program` is on `PATH`, in the system location a package manager
+    /// would put it.
     pub fn with_binary(mut self, program: &str) -> Self {
-        self.on_path.push(program.to_string());
+        self.on_path
+            .push((program.to_string(), format!("/usr/bin/{program}")));
+        self
+    }
+
+    /// Pretend `program` is on `PATH` at exactly `path` — the shape a test of
+    /// "where did this binary come from?" needs.
+    pub fn with_binary_at(mut self, program: &str, path: &str) -> Self {
+        self.on_path.push((program.to_string(), path.to_string()));
+        self
+    }
+
+    /// Pretend the host's home directory is `home`.
+    pub fn with_home(mut self, home: &str) -> Self {
+        self.home = Some(home.to_string());
         self
     }
 
@@ -329,28 +391,48 @@ impl StubHost {
     /// Answer `program args…` (matched on the space-joined command line) with
     /// `output`. Implies the program is on `PATH`.
     pub fn with_command(mut self, command_line: &str, output: ProbeOutput) -> Self {
-        if let Some(program) = command_line.split_whitespace().next() {
-            self.on_path.push(program.to_string());
+        // A command line naming an absolute program is a *resolved* one, so it
+        // adds nothing to `PATH`.
+        if let Some(program) = command_line
+            .split_whitespace()
+            .next()
+            .filter(|p| !p.contains('/'))
+        {
+            if !self.on_path.iter().any(|(p, _)| p == program) {
+                self.on_path
+                    .push((program.to_string(), format!("/usr/bin/{program}")));
+            }
         }
         self.commands.push((command_line.to_string(), output));
         self
     }
 
-    /// A Linux host with a working bubblewrap of `version`.
+    /// A Linux host with a working bubblewrap of `version`, installed where a
+    /// package manager puts it.
     pub fn linux_with_bwrap(version: &str) -> Self {
         Self::new()
+            .with_home("/home/u")
             .with_command("uname -s", ProbeOutput::success("Linux\n"))
             .with_file("/proc/sys/kernel/osrelease", "6.8.0-generic\n")
             .with_command(
                 "bwrap --version",
                 ProbeOutput::success(format!("bubblewrap {version}\n")),
             )
+            .with_command(
+                "/usr/bin/bwrap --version",
+                ProbeOutput::success(format!("bubblewrap {version}\n")),
+            )
             .with_command("bwrap --ro-bind / / true", ProbeOutput::success(""))
+            .with_command(
+                "/usr/bin/bwrap --ro-bind / / true",
+                ProbeOutput::success(""),
+            )
     }
 
     /// A macOS host with `sandbox-exec` present.
     pub fn macos(major: u32, apple_silicon: bool) -> Self {
         Self::new()
+            .with_home("/Users/u")
             .with_command("uname -s", ProbeOutput::success("Darwin\n"))
             .with_command(
                 "uname -m",
@@ -367,8 +449,15 @@ impl StubHost {
 
 #[cfg(test)]
 impl ProbeHost for StubHost {
-    fn which(&self, program: &str) -> bool {
-        self.on_path.iter().any(|p| p == program)
+    fn which(&self, program: &str) -> Option<String> {
+        self.on_path
+            .iter()
+            .find(|(p, _)| p == program)
+            .map(|(_, path)| path.clone())
+    }
+
+    fn home(&self) -> Option<String> {
+        self.home.clone()
     }
 
     fn path_exists(&self, path: &str) -> bool {
@@ -463,8 +552,10 @@ mod tests {
             .with_binary("bwrap")
             .with_file("/proc/sys/user/max_user_namespaces", "0\n")
             .with_path("/usr/bin/sandbox-exec");
-        assert!(host.which("bwrap"));
-        assert!(!host.which("docker"));
+        // The stub answers with a path, because that is what a backend must
+        // pin: a bare name is re-resolved through whatever `PATH` is live.
+        assert_eq!(host.which("bwrap").as_deref(), Some("/usr/bin/bwrap"));
+        assert!(host.which("docker").is_none());
         assert!(host.path_exists("/usr/bin/sandbox-exec"));
         assert!(!host.path_exists("/usr/bin/bwrap"));
         assert_eq!(

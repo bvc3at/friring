@@ -64,6 +64,11 @@ pub enum SandboxError {
         backend: SandboxBackendKind,
         detail: String,
     },
+    /// The launch would grant more than the profile's own words justify, or
+    /// less than they promise. Raised by [`SandboxLaunch::validate`] before any
+    /// policy is generated: a boundary that quietly differs from what the user
+    /// wrote is worse than one that refuses and says why.
+    Refused { profile: String, detail: String },
     /// Writing or reading a generated artefact failed.
     Io { path: String, detail: String },
 }
@@ -84,6 +89,12 @@ impl fmt::Display for SandboxError {
             }
             Self::Unsupported { backend, detail } => {
                 write!(f, "Sandbox backend '{backend}' cannot do this: {detail}")
+            }
+            Self::Refused { profile, detail } => {
+                write!(
+                    f,
+                    "Sandbox profile '{profile}' cannot be launched: {detail}"
+                )
             }
             Self::Io { path, detail } => write!(f, "Sandbox file '{path}': {detail}"),
         }
@@ -270,8 +281,14 @@ pub struct SandboxLaunch<'a> {
     pub workspace: Option<&'a str>,
     /// Per-session status-file directory (ADR-29's file channel). Writable.
     pub signal_dir: Option<&'a str>,
-    /// Temp directory the agent may write. A CLI that cannot write a temp file
-    /// dies on startup, so this is effectively required in practice.
+    /// The per-session scratch directory friring minted for this launch
+    /// ([`crate::sandbox::dirs::create_session_scratch`]). Writable, because a
+    /// CLI that cannot write a temp file dies on startup.
+    ///
+    /// Never the host temp root. `/tmp` is where friring's own tmux server
+    /// listens, and no backend's network isolation stops `connect(2)` on a
+    /// pathname unix socket, so a read-write host temp root is a complete
+    /// escape — see [`crate::sandbox::dirs`].
     pub tmp_dir: Option<&'a str>,
     /// Absolute path of friring's SQLite database, to be denied explicitly
     /// (ADR-29). Passed in rather than resolved here because the database of
@@ -316,7 +333,7 @@ impl<'a> SandboxLaunch<'a> {
         self
     }
 
-    /// The writable temp directory.
+    /// The per-session scratch directory — see [`tmp_dir`](Self::tmp_dir).
     pub fn with_tmp_dir(mut self, dir: &'a str) -> Self {
         self.tmp_dir = Some(dir);
         self
@@ -349,6 +366,41 @@ impl<'a> SandboxLaunch<'a> {
         out.sort();
         out.dedup();
         out
+    }
+
+    /// Refuse a launch whose grants do not match what the profile says, before
+    /// any backend generates a line of policy.
+    ///
+    /// Both checks fail closed, and both exist because the alternative is a
+    /// boundary the user cannot reason about:
+    ///
+    /// - **Denies under [`NetworkMode::Full`] are inert.** No kernel policy has
+    ///   a host-name predicate (`docs/SANDBOX.md` §Egress firewall), so `full`
+    ///   is all-or-nothing at this layer while the contract says denies are
+    ///   checked first *in every mode*. Until the egress proxy enforces them,
+    ///   carrying denies under `full` is refused rather than silently dropped.
+    /// - **Some read-write roots are escapes**, whatever the profile intended:
+    ///   one enclosing friring's data directory reaches the database, which
+    ///   ADR-29 keeps outside every boundary, and one reaching a tmux socket
+    ///   directory drives the host's own multiplexer. See
+    ///   [`crate::sandbox::dirs::check_writable_roots`].
+    pub fn validate(&self) -> SandboxResult<()> {
+        let refuse = |detail: String| SandboxError::Refused {
+            profile: self.policy.profile.clone(),
+            detail,
+        };
+        if self.policy.network == NetworkMode::Full && !self.policy.deny.is_empty() {
+            let denied: Vec<String> = self.policy.deny.iter().map(|r| r.to_string()).collect();
+            return Err(refuse(format!(
+                "network mode 'full' cannot enforce the domain denies it carries ({}). A kernel \
+                 policy has no host-name predicate, so those denies become enforceable only once \
+                 the egress proxy is wired in — until then use the 'allowlist' mode, or clear the \
+                 denies, rather than run with them silently inert",
+                denied.join(", ")
+            )));
+        }
+        crate::sandbox::dirs::check_writable_roots(&self.writable_paths(), self.friring_db)
+            .map_err(refuse)
     }
 
     /// The profile's read-only paths, minus any the launch made writable.
@@ -535,6 +587,107 @@ mod tests {
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1").with_workspace("/srv/shared");
         assert_eq!(launch.writable_paths(), ["/srv/shared"]);
         assert!(launch.readable_paths().is_empty());
+    }
+
+    /// The complete escape this whole shape exists to prevent: friring's tmux
+    /// server listens on a pathname unix socket under the host temp root, and no
+    /// backend's network isolation stops `connect(2)` on one. Nothing a launch
+    /// mints may therefore be — or contain — either directory.
+    #[test]
+    fn no_profile_shape_makes_the_host_temp_root_or_a_tmux_socket_writable() {
+        let scratch = crate::sandbox::dirs::session_scratch_dir("s1")
+            .unwrap()
+            .display()
+            .to_string();
+        let temp_root = crate::sandbox::dirs::host_temp_root().display().to_string();
+        let socket_root = crate::sandbox::dirs::tmux_socket_root()
+            .display()
+            .to_string();
+        let mut profile = SandboxProfile::new(
+            "dev",
+            vec![
+                SandboxPath::workspace("~/dev/app"),
+                SandboxPath::read_only("/srv/shared"),
+            ],
+        );
+        for scope in ReadScope::ALL {
+            for network in NetworkMode::ALL {
+                profile.read_scope = *scope;
+                profile.network_mode = *network;
+                for backend in [SandboxBackendKind::Seatbelt, SandboxBackendKind::Bwrap] {
+                    let policy = profile.resolve(backend, "/home/u").unwrap();
+                    let launch = SandboxLaunch::new(&policy, "/home/u", "s1")
+                        .with_workspace("/home/u/dev/app")
+                        .with_signal_dir("/home/u/.local/share/friring/signals/s1")
+                        .with_tmp_dir(&scratch)
+                        .with_friring_db("/home/u/.local/share/friring/friring.db");
+                    let writable = launch.writable_paths();
+                    for forbidden in [&temp_root, &socket_root] {
+                        assert!(
+                            !writable.contains(forbidden),
+                            "{backend}/{scope}/{network} granted {forbidden}: {writable:?}"
+                        );
+                    }
+                    launch.validate().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_writable_root_that_encloses_the_database_is_refused() {
+        let policy = SandboxProfile::new("dev", vec![SandboxPath::workspace("~")])
+            .resolve(SandboxBackendKind::Seatbelt, "/home/u")
+            .unwrap();
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1")
+            .with_friring_db("/home/u/.local/share/friring/friring.db");
+        let err = launch.validate().unwrap_err();
+        assert!(matches!(err, SandboxError::Refused { .. }));
+        let text = err.to_string();
+        assert!(text.contains("/home/u/.local/share/friring"), "{text}");
+        assert!(text.contains("ADR-29"), "{text}");
+        // A profile that stays out of the data directory launches.
+        let ok = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")])
+            .resolve(SandboxBackendKind::Seatbelt, "/home/u")
+            .unwrap();
+        SandboxLaunch::new(&ok, "/home/u", "s1")
+            .with_friring_db("/home/u/.local/share/friring/friring.db")
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn full_network_with_denies_is_refused_rather_than_silently_inert() {
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.network_mode = NetworkMode::Full;
+        profile.network_deny = vec!["evil.example".into()];
+        let policy = profile
+            .resolve(SandboxBackendKind::Bwrap, "/home/u")
+            .unwrap();
+        let err = SandboxLaunch::new(&policy, "/home/u", "s1")
+            .validate()
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("evil.example"), "{text}");
+        assert!(text.contains("egress proxy"), "{text}");
+
+        // The same denies under `allowlist` are the mode the proxy will enforce,
+        // and `full` without denies promises nothing it cannot keep.
+        profile.network_mode = NetworkMode::Allowlist;
+        let policy = profile
+            .resolve(SandboxBackendKind::Bwrap, "/home/u")
+            .unwrap();
+        SandboxLaunch::new(&policy, "/home/u", "s1")
+            .validate()
+            .unwrap();
+        profile.network_mode = NetworkMode::Full;
+        profile.network_deny.clear();
+        let policy = profile
+            .resolve(SandboxBackendKind::Bwrap, "/home/u")
+            .unwrap();
+        SandboxLaunch::new(&policy, "/home/u", "s1")
+            .validate()
+            .unwrap();
     }
 
     #[test]

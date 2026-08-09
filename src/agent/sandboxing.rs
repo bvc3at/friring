@@ -33,7 +33,8 @@ pub struct SandboxedInvocation {
     /// The whole composition, for the log line: `sandbox: dev (seatbelt) ·
     /// inner agent sandbox: off — Friring is the boundary`.
     pub label: String,
-    /// The same composition minus the profile name, for
+    /// The same composition minus the profile name: the payload of the
+    /// [`Applied`](crate::session::SandboxState::Applied) half of
     /// [`SessionInfo::sandbox_state`](crate::session::SessionInfo::sandbox_state)
     /// — the info panel already labels the row with the profile.
     pub state: String,
@@ -65,10 +66,13 @@ pub enum SandboxDecision {
 /// # Errors
 ///
 /// The profile named a backend that is unavailable here, resolved to a policy
-/// this build cannot express, or could not write its generated profile — and
-/// the profile does not permit running unsandboxed. Failing the spawn is
-/// deliberate: quietly launching an agent outside the boundary the user asked
-/// for is a security regression, not a degraded mode.
+/// this build cannot express, could not write its generated profile, or asks
+/// for a boundary friring will not grant — a read-write path reaching the
+/// database or the host's tmux socket, domain denies under a network mode that
+/// cannot enforce them, a path that is not valid UTF-8 — and the profile does
+/// not permit running unsandboxed. Failing the spawn is deliberate: quietly
+/// launching an agent outside the boundary the user asked for is a security
+/// regression, not a degraded mode.
 pub fn apply(
     def: Option<&AgentDef>,
     config: &SessionConfig,
@@ -80,7 +84,11 @@ pub fn apply(
     };
     let fallback = profile.allow_unsandboxed_fallback;
     let home = match crate::paths::home_dir() {
-        Some(home) => home.to_string_lossy().into_owned(),
+        Some(home) => match representable("the home directory", &home) {
+            Ok(home) => home,
+            Err(reason) if fallback => return Ok(SandboxDecision::Skipped { reason }),
+            Err(reason) => return Err(reason),
+        },
         None if fallback => {
             return Ok(SandboxDecision::Skipped {
                 reason: NO_HOME.to_string(),
@@ -105,6 +113,24 @@ pub fn apply(
 /// Every sandbox path is expanded against a home, and a profile stores `~`
 /// un-expanded precisely so it can be expanded against a *different* one.
 const NO_HOME: &str = "Cannot resolve a home directory to expand sandbox paths against";
+
+/// A security-relevant path as the sandbox layer needs it: exactly, or not at
+/// all.
+///
+/// Every rule a backend writes is a string. A lossy conversion turns a
+/// non-UTF-8 byte into `U+FFFD`, and the rule then names a path that does not
+/// exist while the real one stays visible — an ADR-29 deny that denies nothing,
+/// a secrets deny that hides nothing. The launch is refused instead, in front of
+/// the user, wherever a path of this kind cannot be spelled.
+fn representable(what: &str, path: &std::path::Path) -> Result<String, String> {
+    path.to_str().map(str::to_string).ok_or_else(|| {
+        format!(
+            "Cannot apply a sandbox profile: {what} ('{}') is not valid UTF-8, and a sandbox rule \
+             built from an approximation of it would name a different file",
+            path.display()
+        )
+    })
+}
 
 /// The whole call order `docs/SANDBOX.md` prescribes, in one place: select a
 /// concrete backend, resolve the profile against it, fold in what the agent
@@ -159,9 +185,18 @@ fn build(
     let workspace = config
         .cwd
         .as_ref()
-        .map(|p| p.to_string_lossy().into_owned());
-    let tmp_dir = std::env::temp_dir().to_string_lossy().into_owned();
-    let database = crate::paths::database_file().map(|p| p.to_string_lossy().into_owned());
+        .map(|p| representable("the session's working directory", p))
+        .transpose()?;
+    // Never the host temp root: `/tmp` holds friring's own tmux socket, and a
+    // read-write grant over it is a complete escape (ADR-29's sibling problem —
+    // see `crate::sandbox::dirs`). friring mints a private per-session directory
+    // instead, adopting one left behind by a crashed run.
+    let tmp_dir = crate::sandbox::create_session_scratch(&session_key)
+        .map_err(|e| e.to_string())
+        .and_then(|dir| representable("the sandbox scratch directory", &dir))?;
+    let database = crate::paths::database_file()
+        .map(|p| representable("friring's database", &p))
+        .transpose()?;
     // The credential family, not the registry name: a rebranded claude shares
     // claude's credential file, and denying it would log the agent out.
     let family = def.map(|d| d.hook_schema.as_deref().unwrap_or(&d.name));
@@ -208,10 +243,34 @@ fn build(
     })
 }
 
-/// Names the generated profile file, so two sessions of one profile never race
-/// on it. The friring session id when the caller pinned one (it always does on
-/// a real spawn, because it is also `FRIRING_SESSION`), otherwise the agent's
-/// own conversation id.
+/// Drop the per-session state a sandboxed launch minted: the scratch directory
+/// the agent wrote and the policy file generated for it.
+///
+/// Call this when a session ends or is deleted. Skipping it costs disk rather
+/// than correctness — the next launch of the same session adopts what is there,
+/// which is what makes a crashed run recoverable — but an agent's writable
+/// scratch should not outlive the agent. Harmless for a session that never had
+/// a profile.
+pub fn cleanup(config: &SessionConfig) {
+    crate::sandbox::cleanup_session(&session_key(config));
+}
+
+/// The same cleanup for a teardown path that holds a persisted session row
+/// rather than the [`SessionConfig`] the launch was composed from.
+///
+/// A real spawn always pins `SessionConfig::session_id` (it is also
+/// `FRIRING_SESSION`), so the friring session id *is* the launch key the
+/// wrapped invocation was keyed on — and a session that never had one minted
+/// nothing to drop. Exists so `session_ops`, which may not reference
+/// [`crate::sandbox`], still reaches the key derivation that lives here.
+pub fn cleanup_by_session_id(session_id: crate::session::SessionId) {
+    crate::sandbox::cleanup_session(&session_id.to_string());
+}
+
+/// Names the generated profile file and the scratch directory, so two sessions
+/// of one profile never race on either. The friring session id when the caller
+/// pinned one (it always does on a real spawn, because it is also
+/// `FRIRING_SESSION`), otherwise the agent's own conversation id.
 fn session_key(config: &SessionConfig) -> String {
     config
         .session_id
@@ -303,6 +362,10 @@ mod tests {
         ))
     }
 
+    /// Where the stub host's bubblewrap lives. A launch runs the path the probe
+    /// resolved, never the bare [`crate::sandbox::bwrap::BWRAP`] name.
+    const STUB_BWRAP: &str = "/usr/bin/bwrap";
+
     #[test]
     fn the_wrapper_surrounds_the_agent_and_appends_its_bypass_flags() {
         let profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
@@ -320,7 +383,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(wrapped.command, crate::sandbox::bwrap::BWRAP);
+        assert_eq!(wrapped.command, STUB_BWRAP);
         // The agent's own command line is last, after the backend's `--`, with
         // the bypass flags appended to *its* arguments rather than the
         // wrapper's.
@@ -416,9 +479,77 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(wrapped.command, crate::sandbox::bwrap::BWRAP);
+        assert_eq!(wrapped.command, STUB_BWRAP);
         assert_eq!(wrapped.args.last().map(String::as_str), Some("aider"));
         assert!(wrapped.state.contains("declares no bypass flags"));
+    }
+
+    /// A lossy conversion would turn a non-UTF-8 byte into `U+FFFD`, and every
+    /// rule built from the result would name a path that does not exist — an
+    /// ADR-29 deny that denies nothing while the real database stays visible.
+    /// Refusing is the only honest answer.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_cannot_be_spelled_exactly_refuses_the_launch() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        let mut config = config_with(Some(profile));
+        config.cwd = Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            vec![b'/', b'w', 0xff, b'k'],
+        )));
+        let err = build(
+            &stub_host(),
+            "/fabricated/home",
+            None,
+            &config,
+            "claude",
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.contains("not valid UTF-8"), "{err}");
+        assert!(err.contains("working directory"), "{err}");
+    }
+
+    /// The scratch directory is friring's own, per session, and adopted rather
+    /// than re-created when a crashed run left one behind. It is emphatically
+    /// not the host temp root, which holds friring's tmux socket.
+    #[test]
+    fn the_launch_mints_its_own_scratch_directory() {
+        let profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        let mut config = config_with(Some(profile));
+        config.agent_session_id = Some("scratch-mint-test".into());
+        let def = agent_def();
+        let wrapped = build(
+            &stub_host(),
+            "/fabricated/home",
+            Some(&def),
+            &config,
+            "claude",
+            &[],
+        )
+        .unwrap();
+
+        let scratch = crate::sandbox::dirs::session_scratch_dir("scratch-mint-test").unwrap();
+        assert!(
+            scratch.is_dir(),
+            "the scratch directory must exist by launch"
+        );
+        let scratch = scratch.display().to_string();
+        assert!(
+            wrapped.args.contains(&scratch),
+            "the sandbox was not given its scratch directory: {:?}",
+            wrapped.args
+        );
+        let host_temp = std::env::temp_dir().display().to_string();
+        assert!(
+            !wrapped.args.contains(&host_temp),
+            "the host temp root must never be granted: {:?}",
+            wrapped.args
+        );
+
+        crate::agent::sandboxing::cleanup(&config);
+        assert!(!std::path::Path::new(&scratch).exists());
     }
 
     /// The one shape assertion that does not need a backend to be installed:
@@ -433,5 +564,26 @@ mod tests {
         let id = crate::session::SessionId::default();
         config.session_id = Some(id);
         assert_eq!(session_key(&config), id.to_string());
+    }
+
+    /// Session teardown holds a stored row, not the config the launch was
+    /// composed from, so the id-keyed cleanup has to reach exactly what a
+    /// pinned launch minted. If the two key derivations ever drift, a deleted
+    /// session leaves its agent's writable scratch on disk forever.
+    #[test]
+    fn a_delete_that_knows_only_the_session_id_still_reaches_the_scratch() {
+        let id = crate::session::SessionId::default();
+        let mut config = config_with(None);
+        config.session_id = Some(id);
+
+        let minted = crate::sandbox::create_session_scratch(&session_key(&config)).unwrap();
+        std::fs::write(minted.join("agent-scratch"), "x").unwrap();
+
+        cleanup_by_session_id(id);
+        assert!(
+            !minted.exists(),
+            "{} outlived the session",
+            minted.display()
+        );
     }
 }
