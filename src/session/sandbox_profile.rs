@@ -800,10 +800,8 @@ impl SandboxProfile {
     /// shape is only known after a host probe, and the session-creation step
     /// reports an unavailable capability once it has resolved one.
     fn validate_backend_fields(&self) -> Result<(), String> {
-        if let Some(v) = self.memory_mb.or(self.cpus) {
-            if v == 0 {
-                return Err("Memory and CPU limits must be greater than 0".to_string());
-            }
+        if self.memory_mb == Some(0) || self.cpus == Some(0) {
+            return Err("Memory and CPU limits must be greater than 0".to_string());
         }
         if self.image.is_some() && self.containerfile.is_some() {
             return Err("Set an image or a containerfile, not both".to_string());
@@ -1392,6 +1390,15 @@ mod tests {
 
         p.containerfile = None;
         p.memory_mb = Some(0);
+        assert_eq!(
+            p.validate().unwrap_err(),
+            "Memory and CPU limits must be greater than 0"
+        );
+
+        // Each limit is checked on its own: a valid memory cap must not let a
+        // zero CPU count through.
+        p.memory_mb = Some(2048);
+        p.cpus = Some(0);
         assert_eq!(
             p.validate().unwrap_err(),
             "Memory and CPU limits must be greater than 0"
