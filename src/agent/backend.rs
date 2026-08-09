@@ -9,7 +9,7 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::agent::osc52::Osc52Scanner;
 use crate::agent::provider::AgentProvider;
@@ -491,6 +491,65 @@ fn remote_host_from_backend(backend: &Arc<dyn SessionBackend>) -> Option<String>
         .map(str::to_string)
 }
 
+/// Everything a `backend.spawn` needs, with the session's sandbox profile
+/// already applied. Built by [`sandboxed_invocation`].
+struct Sandboxed {
+    command: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+    /// The profile actually in effect, for `SessionInfo::sandbox_profile`.
+    /// `None` when the session carries none *or* when applying it failed and
+    /// the profile permitted launching anyway — the indicator must never claim
+    /// a boundary that is not there.
+    profile: Option<String>,
+    /// The composition the wrap applied, for `SessionInfo::sandbox_state`.
+    state: Option<String>,
+}
+
+/// Compose the invocation for a spawn or a restart, wrapping it in the
+/// session's sandbox profile when it has one.
+///
+/// Both live-session launch paths go through here so a restart re-derives the
+/// same boundary a spawn built, from the same [`SessionConfig`] the app
+/// reloaded out of the database. Wrapping happens here rather than inside the
+/// backend because the backend is where per-transport quoting starts (see
+/// [`crate::agent::sandboxing`]).
+fn sandboxed_invocation(
+    config: &SessionConfig,
+    provider: &Arc<dyn AgentProvider>,
+) -> Result<Sandboxed> {
+    let plain = Sandboxed {
+        command: provider.command().to_string(),
+        args: provider.build_args(config),
+        env: config.env.clone(),
+        profile: None,
+        state: None,
+    };
+    let decision =
+        crate::agent::sandboxing::apply(provider.agent_def(), config, &plain.command, &plain.args)
+            .map_err(anyhow::Error::msg)?;
+
+    match decision {
+        crate::agent::sandboxing::SandboxDecision::Unsandboxed => Ok(plain),
+        crate::agent::sandboxing::SandboxDecision::Skipped { reason } => {
+            warn!(agent = %config.agent, "{reason}");
+            Ok(plain)
+        }
+        crate::agent::sandboxing::SandboxDecision::Wrapped(wrapped) => {
+            let mut env = plain.env;
+            env.extend(wrapped.env);
+            debug!(sandbox = %wrapped.label, "Wrapping agent invocation");
+            Ok(Sandboxed {
+                command: wrapped.command,
+                args: wrapped.args,
+                env,
+                profile: config.sandbox.as_ref().map(|p| p.name.clone()),
+                state: Some(wrapped.state),
+            })
+        }
+    }
+}
+
 /// A running session connected to a backend.
 pub struct Session {
     pub info: SessionInfo,
@@ -559,14 +618,18 @@ impl Session {
         backend: &Arc<dyn SessionBackend>,
         provider: &Arc<dyn AgentProvider>,
     ) -> Result<Self> {
-        let args = provider.build_args(config);
         let window_name = crate::agent::tmux::agent_window_name(&name);
-
-        let env = config.env.clone();
+        let Sandboxed {
+            command,
+            args,
+            env,
+            profile,
+            state,
+        } = sandboxed_invocation(config, provider)?;
 
         let spawned = backend.spawn(
             &window_name,
-            provider.command(),
+            &command,
             &args,
             config.cwd.as_deref(),
             &env,
@@ -587,6 +650,8 @@ impl Session {
         }
         info.backend_id = Some(spawned.backend_id.clone());
         info.remote_host = remote_host_from_backend(backend);
+        info.sandbox_profile = profile;
+        info.sandbox_state = state;
         debug!(session_id = %info.id, backend_id = %spawned.backend_id, "Spawned session via backend");
 
         Ok(Self::wire_io(
@@ -1169,14 +1234,18 @@ impl Session {
             self.backend.kill(&self.backend_id)?;
         }
 
-        let args = self.provider.build_args(config);
         let window_name = crate::agent::tmux::agent_window_name(&self.info.name);
-
-        let env = config.env.clone();
+        let Sandboxed {
+            command,
+            args,
+            env,
+            profile,
+            state: sandbox_state,
+        } = sandboxed_invocation(config, &self.provider)?;
 
         let spawned = self.backend.spawn(
             &window_name,
-            self.provider.command(),
+            &command,
             &args,
             config.cwd.as_deref(),
             &env,
@@ -1216,8 +1285,10 @@ impl Session {
         self.meta_gen = state.meta_gen;
         self.last_synced_meta_gen = u64::MAX;
         self.attention_ack_at = 0;
-        self.env = config.env.clone();
+        self.env = env;
         self.info.backend_id = Some(self.backend_id.clone());
+        self.info.sandbox_profile = profile;
+        self.info.sandbox_state = sandbox_state;
         if !config.agent.is_empty() {
             self.info.agent = config.agent.clone();
         }

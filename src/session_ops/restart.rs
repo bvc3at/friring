@@ -28,7 +28,14 @@ struct RestartPlan {
 /// agent definition, and resolve the process cwd (the symlink workspace for a
 /// multi-repo session, else the primary repo — mirroring the TUI's
 /// `App::resolve_process_cwd`).
-fn build_restart_plan(session: &SharedSession) -> Result<RestartPlan, String> {
+///
+/// `sandbox` is the session's profile, re-read from storage by the caller: a
+/// restart must rebuild the same boundary the spawn built, and a profile that
+/// has since been edited takes effect here.
+fn build_restart_plan(
+    session: &SharedSession,
+    sandbox: Option<crate::session::SandboxProfile>,
+) -> Result<RestartPlan, String> {
     let agent_session_id = session.agent_session_id.clone().ok_or_else(|| {
         format!(
             "Cannot restart session {} without agent_session_id",
@@ -46,6 +53,7 @@ fn build_restart_plan(session: &SharedSession) -> Result<RestartPlan, String> {
         // conversation (no transcript → new_session_args); a resume never
         // renames — the resume template carries no {name}.
         session_name: Some(session.name.clone()),
+        sandbox,
         ..SessionConfig::default()
     };
     super::inject_friring_env(&mut config, &agent_session_id, None);
@@ -69,7 +77,7 @@ fn build_restart_plan(session: &SharedSession) -> Result<RestartPlan, String> {
         ));
     }
 
-    let (command, args) = super::build_agent_invocation(&def, &config);
+    let (command, args) = super::build_agent_invocation(&def, &mut config)?;
 
     Ok(RestartPlan {
         window_name: session.name.clone(),
@@ -106,7 +114,8 @@ pub fn restart_session_headless(db: &Database, session_id: SessionId) -> Result<
         ));
     }
 
-    let plan = build_restart_plan(&session)?;
+    let sandbox = super::load_sandbox_profile(db, session.sandbox_profile.as_deref())?;
+    let plan = build_restart_plan(&session, sandbox)?;
 
     crate::agent::tmux::kill_window(&plan.window_name)
         .map_err(|e| format!("Failed to kill tmux window: {e}"))?;
@@ -144,6 +153,7 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -155,7 +165,7 @@ mod tests {
     fn restart_plan_requires_agent_session_id() {
         let temp = tempfile::TempDir::new().unwrap();
         let _guard = crate::paths::TestPathGuard::new(temp.path());
-        let err = build_restart_plan(&session(None, None)).unwrap_err();
+        let err = build_restart_plan(&session(None, None), None).unwrap_err();
         assert!(err.contains("agent_session_id"), "got: {err}");
     }
 
@@ -164,7 +174,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let _guard = crate::paths::TestPathGuard::new(temp.path());
         let sess = session(Some("agent-conv-uuid"), Some(PathBuf::from("/tmp/repo")));
-        let plan = build_restart_plan(&sess).unwrap();
+        let plan = build_restart_plan(&sess, None).unwrap();
 
         // The friring session key and the agent conversation id are both present
         // and distinct, exactly as a fresh spawn would inject them.
@@ -184,7 +194,7 @@ mod tests {
         // No transcript on disk for this id, so claude's restart falls back to a
         // fresh conversation: new_session_args run and the friring session name
         // ("demo") reaches argv via the seeded `-n {name}` pair.
-        let plan = build_restart_plan(&session(Some("agent-conv-uuid"), Some(cwd))).unwrap();
+        let plan = build_restart_plan(&session(Some("agent-conv-uuid"), Some(cwd)), None).unwrap();
         assert_eq!(
             plan.args,
             vec!["--session-id", "agent-conv-uuid", "-n", "demo"]
@@ -197,7 +207,7 @@ mod tests {
         let _guard = crate::paths::TestPathGuard::new(temp.path());
         let primary = temp.path().join("primary");
         std::fs::create_dir_all(&primary).unwrap();
-        let plan = build_restart_plan(&session(Some("sid"), Some(primary.clone()))).unwrap();
+        let plan = build_restart_plan(&session(Some("sid"), Some(primary.clone())), None).unwrap();
         assert_eq!(plan.cwd, Some(primary));
     }
 
@@ -213,7 +223,7 @@ mod tests {
         let mut sess = session(Some("sid-multi"), Some(primary.clone()));
         sess.additional_dirs = vec![extra];
 
-        let plan = build_restart_plan(&sess).unwrap();
+        let plan = build_restart_plan(&sess, None).unwrap();
         // ≥2 members → the symlink workspace, not the primary repo itself.
         assert_ne!(plan.cwd.as_deref(), Some(primary.as_path()));
         assert!(plan.cwd.is_some());
@@ -233,8 +243,55 @@ mod tests {
         sess.additional_dirs = vec![extra];
         sess.workspace_dir = Some(custom.clone());
 
-        let plan = build_restart_plan(&sess).unwrap();
+        let plan = build_restart_plan(&sess, None).unwrap();
         // The relaunch happens in the user-chosen dir, not workspaces/<id>.
         assert_eq!(plan.cwd, Some(custom));
+    }
+
+    /// A restart re-derives its boundary from the database, so a profile that
+    /// was deleted while the session ran has to stop the relaunch. Clearing the
+    /// reference instead would put the agent on the host with no boundary and
+    /// no message — the one failure this feature must never have.
+    #[test]
+    fn a_restart_refuses_when_the_sessions_profile_was_deleted() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let db = Database::open_in_memory().unwrap();
+
+        let mut sess = session(Some("sid-sandbox"), Some(temp.path().join("repo")));
+        sess.sandbox_profile = Some("deleted".into());
+        db.upsert_session(&sess).unwrap();
+
+        let err = restart_session_headless(&db, sess.id).unwrap_err();
+        assert!(err.contains("deleted"), "got: {err}");
+        assert!(err.contains("no longer exists"), "got: {err}");
+    }
+
+    /// The other half of the same wiring: a session's profile survives the
+    /// round trip through storage, so the restart path has something to
+    /// rebuild from.
+    #[test]
+    fn a_sessions_profile_is_persisted_and_reloaded_for_the_relaunch() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let db = Database::open_in_memory().unwrap();
+
+        let profile = crate::session::SandboxProfile::new(
+            "dev",
+            vec![crate::session::SandboxPath::workspace("~/dev/app")],
+        );
+        db.upsert_sandbox_profile(&profile).unwrap();
+
+        let mut sess = session(Some("sid-live"), Some(temp.path().join("repo")));
+        sess.sandbox_profile = Some("dev".into());
+        db.upsert_session(&sess).unwrap();
+
+        let stored = db.get_session_by_id(sess.id).unwrap().unwrap();
+        assert_eq!(stored.sandbox_profile.as_deref(), Some("dev"));
+        let loaded = super::super::load_sandbox_profile(&db, stored.sandbox_profile.as_deref())
+            .unwrap()
+            .expect("the profile the session names is still stored");
+        assert_eq!(loaded.name, "dev");
+        assert_eq!(loaded.paths.len(), 1);
     }
 }

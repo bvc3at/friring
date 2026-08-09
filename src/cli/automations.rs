@@ -1073,6 +1073,7 @@ fn fire_spawn(
         parent_session_id: None,
         task_id: None,
         extra_repos: extra_repos.to_vec(),
+        sandbox_profile: None,
     };
     match action::spawn_and_deliver_steps(db, &name, req, &steps) {
         Ok(session_id) => (
@@ -2156,6 +2157,7 @@ mod tests {
                 workspace_dir: None,
                 worktrees: Vec::new(),
                 shell_backend_id: None,
+                sandbox_profile: None,
                 parent_session_id: None,
                 display_order: None,
                 tombstone: false,

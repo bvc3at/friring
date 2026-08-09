@@ -58,6 +58,10 @@ pub enum Action {
         /// worktree / branch). Makes a multi-repo session.
         #[arg(long = "add-dir")]
         add_dir: Vec<String>,
+        /// Sandbox profile to run the agent under (name from the profile list;
+        /// see docs/SANDBOX.md). Unset = unsandboxed. An unknown name fails.
+        #[arg(long)]
+        sandbox: Option<String>,
     },
     /// Soft-delete a session.
     ///
@@ -196,6 +200,7 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
             parent,
             add_repo,
             add_dir,
+            sandbox,
         } => {
             let parent_session_id = parent.as_deref().map(parse_session_id).transpose()?;
             let extra_repos = super::parse_extra_repos(&add_repo, &add_dir);
@@ -210,6 +215,7 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
                 parent_session_id,
                 task_id: None,
                 extra_repos,
+                sandbox_profile: sandbox,
             };
             let res = crate::session_ops::spawn_session_headless(db, req)?;
             let human = format!(
@@ -524,6 +530,7 @@ fn shared_session_to_json(s: &SharedSession, hook: Option<&HookRow>) -> Value {
         "additional_dirs": s.additional_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         "workspace_dir": s.workspace_dir.as_ref().map(|p| p.display().to_string()),
         "parent_session_id": s.parent_session_id.map(|id| id.to_string()),
+        "sandbox_profile": s.sandbox_profile,
         "display_order": s.display_order,
         "hook_state": hook.and_then(|h| h.state.as_deref()),
         "hook_state_at": hook.and_then(|h| h.state_at),
@@ -670,6 +677,7 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -691,6 +699,7 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -720,6 +729,7 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -758,6 +768,7 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -832,6 +843,7 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -871,6 +883,7 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
             parent_session_id: None,
             display_order: None,
             tombstone: false,

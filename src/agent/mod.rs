@@ -9,6 +9,7 @@ pub mod json_merge;
 pub mod osc52;
 pub mod provider;
 pub mod registry;
+pub mod sandboxing;
 pub mod self_update;
 pub mod settings_config;
 pub mod themes_config;

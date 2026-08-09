@@ -448,15 +448,54 @@ pub(crate) fn resolve_agent_def(requested: Option<&str>) -> crate::session::Agen
         })
 }
 
-/// Build the `(command, args)` invocation for an already-resolved [`AgentDef`].
+/// Load the [`SandboxProfile`](crate::session::SandboxProfile) a session row
+/// names, for a launch that has to rebuild the boundary from persisted state.
+///
+/// # Errors
+///
+/// The name is set but no such profile is stored — the profile was deleted
+/// while a session still referenced it. Deleting deliberately leaves the
+/// reference dangling (see [`crate::storage::sandboxes`]) precisely so this
+/// fails instead of launching the agent unsandboxed on the host.
+pub(crate) fn load_sandbox_profile(
+    db: &crate::storage::Database,
+    name: Option<&str>,
+) -> Result<Option<crate::session::SandboxProfile>, String> {
+    let Some(name) = name.filter(|n| !n.trim().is_empty()) else {
+        return Ok(None);
+    };
+    db.get_sandbox_profile(name)
+        .map_err(|e| format!("Failed to load sandbox profile '{name}': {e}"))?
+        .map(Some)
+        .ok_or_else(|| {
+            format!(
+                "Sandbox profile '{name}' no longer exists; refusing to launch this session \
+                 outside the boundary it was created with"
+            )
+        })
+}
+
+/// Build the `(command, args)` invocation for an already-resolved [`AgentDef`],
+/// with the session's sandbox profile applied.
 ///
 /// Centralised here so headless spawn and restart agree on the args, and so the
 /// `AgentDef` is resolved exactly once per operation (callers pass the def they
 /// already resolved rather than re-running [`resolve_agent_def`]).
+///
+/// `config` is taken by `&mut` because a sandbox contributes environment as well
+/// as argv: a policy backend applies nothing in argv, so `config.env` — which
+/// becomes the tmux window's environment, *outside* the boundary and inherited
+/// through it — is the only channel inward. Callers must therefore finish
+/// composing `config` (including [`inject_friring_env`]) before calling.
+///
+/// # Errors
+///
+/// The session's sandbox profile could not be applied and does not permit
+/// launching without it. See [`crate::agent::sandboxing::apply`].
 fn build_agent_invocation(
     def: &crate::session::AgentDef,
-    config: &SessionConfig,
-) -> (String, Vec<String>) {
+    config: &mut SessionConfig,
+) -> Result<(String, Vec<String>), String> {
     let provider = crate::agent::GenericProvider::new(def.clone());
     // Reach the provider trait methods via fully-qualified call syntax so this
     // module imports nothing from the agent module (architecture rule:
@@ -467,7 +506,18 @@ fn build_agent_invocation(
     let args = <crate::agent::GenericProvider as crate::agent::AgentProvider>::build_args(
         &provider, config,
     );
-    (command, args)
+
+    match crate::agent::sandboxing::apply(Some(def), config, &command, &args)? {
+        crate::agent::sandboxing::SandboxDecision::Unsandboxed => Ok((command, args)),
+        crate::agent::sandboxing::SandboxDecision::Skipped { reason } => {
+            tracing::warn!(agent = %def.name, "{reason}");
+            Ok((command, args))
+        }
+        crate::agent::sandboxing::SandboxDecision::Wrapped(wrapped) => {
+            config.env.extend(wrapped.env);
+            Ok((wrapped.command, wrapped.args))
+        }
+    }
 }
 
 /// Inject the standard friring env hints into a session config so a

@@ -935,6 +935,7 @@ pub fn ensure_extension(db: &Database, def: &ExtensionDef) -> Result<EnsureRepor
                         parent_session_id: None,
                         task_id: None,
                         extra_repos: Vec::new(),
+                        sandbox_profile: None,
                     },
                 )?;
                 report.sessions_created.push(sess.name.clone());
@@ -1285,6 +1286,7 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
             parent_session_id: None,
             display_order: None,
             tombstone: false,

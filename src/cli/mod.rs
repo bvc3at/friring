@@ -283,6 +283,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_create_accepts_a_sandbox_profile() {
+        let cli = Cli::try_parse_from([
+            "friring-cli",
+            "session",
+            "create",
+            "--name",
+            "boxed",
+            "--repo-path",
+            "/tmp/repo",
+            "--sandbox",
+            "dev",
+        ])
+        .unwrap();
+        let Command::Session {
+            action: sessions::Action::Create { sandbox, .. },
+        } = cli.command
+        else {
+            panic!("expected Session::Create");
+        };
+        assert_eq!(sandbox.as_deref(), Some("dev"));
+    }
+
+    #[test]
     fn parse_session_create_accepts_parent() {
         let cli = Cli::try_parse_from([
             "friring-cli",

@@ -50,6 +50,10 @@ pub struct DeletedSessionInfo {
     /// Persisted backend (`local-tmux` or `ssh:<host>`). Preserved on restore so
     /// a remote session re-spawns against its own host, not the local default.
     pub backend_type: String,
+    /// Sandbox profile the session ran under, for the same reason
+    /// `backend_type` is kept: a restore must come back inside its boundary
+    /// rather than silently on the host.
+    pub sandbox_profile: Option<String>,
     pub deleted_at: u64,
     /// Whether this row was hard-deleted (tmux window + worktrees torn down). A
     /// force-deleted session is shown in the restore list but cannot be restored
@@ -86,8 +90,8 @@ impl Database {
             "INSERT INTO sessions (id, name, agent, backend_id, backend_type, \
              agent_session_id, cwd, additional_dirs, workspace_dir, \
              shell_backend_id, parent_session_id, display_order, \
-             created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13) \
+             sandbox_profile, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14) \
              ON CONFLICT(id) DO UPDATE SET \
                  name = excluded.name, agent = excluded.agent, \
                  backend_id = excluded.backend_id, \
@@ -98,6 +102,7 @@ impl Database {
                  shell_backend_id = excluded.shell_backend_id, \
                  parent_session_id = excluded.parent_session_id, \
                  display_order = excluded.display_order, \
+                 sandbox_profile = excluded.sandbox_profile, \
                  updated_at = excluded.updated_at, deleted_at = NULL",
             params![
                 id_str,
@@ -118,6 +123,7 @@ impl Database {
                 session.shell_backend_id,
                 session.parent_session_id.map(|id| id.to_string()),
                 session.display_order,
+                session.sandbox_profile,
                 now,
             ],
         )?;
@@ -290,7 +296,7 @@ impl Database {
             "SELECT s.id, s.name, s.agent, s.backend_id, s.backend_type, \
              s.agent_session_id, s.cwd, s.additional_dirs, s.workspace_dir, \
              s.shell_backend_id, s.parent_session_id, s.display_order, \
-             w.repo_path, w.worktree_path, w.branch \
+             s.sandbox_profile, w.repo_path, w.worktree_path, w.branch \
              FROM sessions s \
              LEFT JOIN worktrees w ON s.id = w.session_id AND w.deleted_at IS NULL \
              WHERE {condition} \
@@ -406,7 +412,7 @@ impl Database {
         let sql = format!(
             "SELECT s.id, s.name, s.agent, s.agent_session_id, \
              s.cwd, s.parent_session_id, s.deleted_at, s.backend_type, \
-             s.force_deleted, \
+             s.force_deleted, s.sandbox_profile, \
              w.repo_path, w.worktree_path, w.branch \
              FROM sessions s \
              LEFT JOIN worktrees w ON s.id = w.session_id \
@@ -422,9 +428,10 @@ impl Database {
             let deleted_at: i64 = row.get(6)?;
             let backend_type: String = row.get(7)?;
             let force_deleted: i64 = row.get(8)?;
-            let wt_repo: Option<String> = row.get(9)?;
-            let wt_path: Option<String> = row.get(10)?;
-            let wt_branch: Option<String> = row.get(11)?;
+            let sandbox_profile: Option<String> = row.get(9)?;
+            let wt_repo: Option<String> = row.get(10)?;
+            let wt_path: Option<String> = row.get(11)?;
+            let wt_branch: Option<String> = row.get(12)?;
 
             let worktree = worktree_from_cols(wt_repo, wt_path, wt_branch);
 
@@ -437,6 +444,7 @@ impl Database {
                     cwd: cwd.map(PathBuf::from),
                     parent_session_id: parent_str.and_then(|s| s.parse().ok()),
                     backend_type,
+                    sandbox_profile,
                     deleted_at: deleted_at as u64,
                     force_deleted: force_deleted != 0,
                     worktrees: Vec::new(),
@@ -660,9 +668,10 @@ fn row_to_shared_session(
     let shell_backend_id: Option<String> = row.get(9)?;
     let parent_str: Option<String> = row.get(10)?;
     let display_order: Option<i64> = row.get(11)?;
-    let wt_repo: Option<String> = row.get(12)?;
-    let wt_path: Option<String> = row.get(13)?;
-    let wt_branch: Option<String> = row.get(14)?;
+    let sandbox_profile: Option<String> = row.get(12)?;
+    let wt_repo: Option<String> = row.get(13)?;
+    let wt_path: Option<String> = row.get(14)?;
+    let wt_branch: Option<String> = row.get(15)?;
 
     let additional_dirs = additional_dirs_from_db(&dirs_str);
 
@@ -681,6 +690,7 @@ fn row_to_shared_session(
             workspace_dir: workspace_dir.map(PathBuf::from),
             worktrees: Vec::new(),
             shell_backend_id,
+            sandbox_profile,
             parent_session_id: parent_str.and_then(|s| s.parse().ok()),
             display_order,
             tombstone: false,
@@ -707,6 +717,7 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -1152,6 +1163,54 @@ mod tests {
 
         let deleted = db.get_deleted_session_by_id(sid).unwrap().unwrap();
         assert_eq!(deleted.backend_type, "ssh:devbox");
+    }
+
+    /// The sandbox profile is a full-row write-back field: a restart re-derives
+    /// the boundary from it, and clearing it on a save would silently unsandbox
+    /// the session on its next launch.
+    #[test]
+    fn sandbox_profile_round_trips_and_is_cleared_only_deliberately() {
+        let db = Database::open_in_memory().unwrap();
+        let mut s = make_session("boxed");
+        s.sandbox_profile = Some("dev".to_string());
+        let sid = s.id;
+        db.upsert_session(&s).unwrap();
+        assert_eq!(
+            db.get_session_by_id(sid).unwrap().unwrap().sandbox_profile,
+            Some("dev".to_string())
+        );
+
+        // An unrelated field changing must not drop it.
+        s.name = "renamed".to_string();
+        db.upsert_session(&s).unwrap();
+        assert_eq!(
+            db.get_session_by_id(sid).unwrap().unwrap().sandbox_profile,
+            Some("dev".to_string())
+        );
+
+        // …and writing `None` really does clear it, so detaching a session from
+        // its profile is possible without a bespoke statement.
+        s.sandbox_profile = None;
+        db.upsert_session(&s).unwrap();
+        assert_eq!(
+            db.get_session_by_id(sid).unwrap().unwrap().sandbox_profile,
+            None
+        );
+    }
+
+    /// A restore has to come back inside its boundary, for the same reason a
+    /// remote session comes back on its own host.
+    #[test]
+    fn deleted_session_preserves_its_sandbox_profile() {
+        let db = Database::open_in_memory().unwrap();
+        let mut s = make_session("boxed");
+        s.sandbox_profile = Some("dev".to_string());
+        let sid = s.id;
+        db.upsert_session(&s).unwrap();
+        db.soft_delete_session(sid).unwrap();
+
+        let deleted = db.get_deleted_session_by_id(sid).unwrap().unwrap();
+        assert_eq!(deleted.sandbox_profile.as_deref(), Some("dev"));
     }
 
     #[test]

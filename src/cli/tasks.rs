@@ -374,6 +374,7 @@ fn run_task(db: &Database, task: &Task) -> Result<Value, String> {
                 parent_session_id: None,
                 task_id: Some(task.id),
                 extra_repos: extra_repos.clone(),
+                sandbox_profile: None,
             };
             action::spawn_and_deliver(db, &name, req, &prompt).map_err(|e| match e {
                 SpawnDeliverError::Spawn(msg) | SpawnDeliverError::Deliver { message: msg, .. } => {

@@ -72,6 +72,12 @@ pub struct SharedSession {
     /// Backend ID of the companion shell pane (if spawned).
     pub shell_backend_id: Option<String>,
 
+    /// Sandbox profile the agent runs under (`docs/SANDBOX.md`); `None` for an
+    /// unsandboxed session. A policy backend leaves `backend_type` alone — the
+    /// boundary is invisible to the session layer — so this is the only record
+    /// of it, and the only way a restart re-derives the same wrapper.
+    pub sandbox_profile: Option<String>,
+
     /// Parent session (lead/worker relationship for orchestration).
     /// `None` for top-level sessions. Purely informational: deleting the
     /// parent does not cascade to children.

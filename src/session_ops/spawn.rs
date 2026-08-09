@@ -47,6 +47,10 @@ pub struct SpawnRequest {
     /// as-is as an additional directory. When any extra is non-empty the agent
     /// launches in a per-session symlink workspace gathering every member.
     pub extra_repos: Vec<ExtraRepo>,
+    /// Name of the sandbox profile to run the agent under (`docs/SANDBOX.md`).
+    /// `None` = unsandboxed, the default. An unknown name fails the spawn
+    /// rather than quietly running on the host.
+    pub sandbox_profile: Option<String>,
 }
 
 /// Result returned on successful headless spawn.
@@ -129,11 +133,12 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         agent: agent_name.clone(),
         backend: (backend_type != LOCAL_TMUX_BACKEND_TYPE).then(|| backend_type.clone()),
         session_name: Some(req.name.clone()),
+        sandbox: super::load_sandbox_profile(db, req.sandbox_profile.as_deref())?,
         ..SessionConfig::default()
     };
     super::inject_friring_env(&mut config, &agent_session_id, req.task_id);
 
-    let (command, args) = super::build_agent_invocation(&agent_def, &config);
+    let (command, args) = super::build_agent_invocation(&agent_def, &mut config)?;
 
     // Remote spawns drive the SSH backend's control mode to learn the real pane
     // id; local spawns leave `backend_id` empty for the TUI to resolve by name.
@@ -174,6 +179,7 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         workspace_dir: None,
         worktrees: worktrees.clone(),
         shell_backend_id: None,
+        sandbox_profile: config.sandbox.as_ref().map(|p| p.name.clone()),
         parent_session_id: req.parent_session_id,
         display_order: None,
         tombstone: false,
@@ -627,6 +633,7 @@ mod tests {
             parent_session_id: None,
             task_id: None,
             extra_repos: Vec::new(),
+            sandbox_profile: None,
         }
     }
 
@@ -674,6 +681,7 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
             parent_session_id: None,
             display_order: None,
             tombstone: false,
