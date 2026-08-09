@@ -653,7 +653,7 @@ runs.
 Everything below clones machinery that already exists, so the feature adds
 screens rather than patterns.
 
-**Profile list** (`Modal::SandboxList`, `F11` or `<leader> S`) — the automations
+**Profile list** (`Modal::SandboxList`, `Alt+S` or `<leader> S`) — the automations
 list: `n` new, `e`/`Enter` edit, `d` delete, empty-state hint. Each row shows the
 resolved backend (`auto → seatbelt`), the path count and the network mode; the
 resolution is as invisible-free here as at the creation step. Instance state and
