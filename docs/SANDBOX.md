@@ -83,7 +83,8 @@ Sandbox profiles are UI-edited collections, so they live in SQLite following
 the automations pattern (list modal + editor modal + storage module + schema
 migration), not in a TOML file. Only `settings.toml` has config write-back in
 this codebase, and it is a fixed-schema file rather than a collection. A
-`friring-cli sandbox export|import` command covers portability.
+`friring-cli sandbox export|import` command will cover portability (P4 — see
+[Delivery phases](#delivery-phases)).
 
 The dormant upstream `containers`, `project_container_config`, `vms` and
 `project_vm_config` tables (created by schema v8/v10/v11, referenced nowhere in
@@ -163,9 +164,12 @@ same migration that adds the tables.
 
 ## Backend catalogue
 
-All backends listed here are **supported from the first release**. Availability
-is probed per host, and the session-creation UI shows what is available with the
-reason a backend was excluded.
+Every backend below is part of the design; **this release ships the two policy
+backends (`seatbelt`, `bwrap`) only** — the place backends are probed as
+unavailable with the reason, and land in P3/P4 (see
+[Delivery phases](#delivery-phases)). Availability is probed per host, and the
+session-creation UI shows what is available with the reason a backend was
+excluded.
 
 ### `seatbelt` — macOS, policy
 
@@ -695,9 +699,10 @@ in the session-list row prefix marks, beside the remote and worktree marks, and
 resolved backend and the inner-sandbox composition to the info panel's
 `Sandbox:` row. The profile also appears in the creation breadcrumb.
 
-**Firewall prompts** — a denial for an unlisted domain raises a notification and
-a confirm modal naming the domain and the command that wanted it; the answer is
-persisted to the profile.
+**Firewall prompts** — with the firewall (P2 — see
+[Delivery phases](#delivery-phases)), a denial for an unlisted domain will raise
+a notification and a confirm modal naming the domain and the command that wanted
+it; the answer is persisted to the profile.
 
 UI polish is explicitly a later pass. The first implementation aims for correct,
 complete and consistent with existing screens.
