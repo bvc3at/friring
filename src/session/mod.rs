@@ -8,11 +8,12 @@ pub mod keybindings;
 pub mod memory;
 pub mod message;
 pub mod review;
+pub mod sandbox_profile;
 pub mod settings;
 pub mod task;
 pub mod theme_config;
 
-pub use agent_def::{AgentDef, AgentRegistry};
+pub use agent_def::{AgentDef, AgentRegistry, AgentSandboxDef, SandboxAuth};
 pub use automation::{
     parse_hhmm, preset_to_cron, Automation, AutomationAction, AutomationRun, AutomationRunStatus,
     AutomationSchedule, ExtraRepo, PromptStep, SchedulePreset, SendTarget, SpawnSessionMode,
@@ -38,6 +39,11 @@ pub use message::SessionMessage;
 pub use review::{
     parse_unified_diff, Classification, CommentAnchor, DiffFile, DiffHunk, DiffLine, DiffLineKind,
     FileStatus, ReviewComment, Side,
+};
+pub use sandbox_profile::{
+    expand_tilde, is_sandbox_backend, sandbox_backend_profile, DomainRule, EgressDecision,
+    NetworkMode, PathMode, ReadScope, SandboxBackendKind, SandboxPath, SandboxPolicy,
+    SandboxProfile, SandboxShape, SANDBOX_BACKEND_PREFIX,
 };
 pub use task::{Task, TaskStatus, SOURCE_LOCAL};
 pub use theme_config::{ThemePalette, ThemePreset};
@@ -323,6 +329,20 @@ pub struct SessionInfo {
     /// `ssh:<host>` backend; `None` for local sessions. Drives the remote
     /// indicator in the session list. Set by the agent layer at spawn/adopt.
     pub remote_host: Option<String>,
+    /// Name of the [`SandboxProfile`] this session's agent runs under; `None`
+    /// for an unsandboxed session. Persisted (`sessions.sandbox_profile`) so a
+    /// restart re-derives the same boundary, and drives the session-list mark
+    /// and the info-panel row. A dangling name — the profile was deleted — is
+    /// deliberately kept rather than cleared: launching unsandboxed because the
+    /// rules went missing is the one failure worth being loud about.
+    pub sandbox_profile: Option<String>,
+    /// The composition the last launch actually applied — the resolved backend
+    /// and what became of the agent's own sandbox, e.g. `seatbelt · inner agent
+    /// sandbox: off — Friring is the boundary`. Not persisted: it describes a
+    /// running process, and a restart recomputes it from the profile and the
+    /// host. `None` before the first launch of this process, and for a session
+    /// friring only adopted.
+    pub sandbox_state: Option<String>,
     /// Agent metrics from the agent's statusline (Claude only).
     pub agent_metrics: Option<AgentMetrics>,
     /// Latest OSC window title the agent emitted (live activity text),
@@ -372,6 +392,8 @@ impl SessionInfo {
             backend_id: None,
             shell_backend_id: None,
             remote_host: None,
+            sandbox_profile: None,
+            sandbox_state: None,
             agent_metrics: None,
             agent_activity: None,
             cc_activity: None,
@@ -422,6 +444,12 @@ pub struct SessionConfig {
     /// Environment variables injected into the spawned session process
     /// (friring-internal: session id, metrics dir, etc.).
     pub env: HashMap<String, String>,
+    /// Sandbox profile the agent runs under, loaded from storage by whoever
+    /// built this config. Carried as the whole profile rather than its name so
+    /// the launch path — which has no database — can resolve a policy from it;
+    /// `SessionInfo::sandbox_profile` is the persisted half. `None` = the agent
+    /// runs on the host with no boundary.
+    pub sandbox: Option<SandboxProfile>,
 }
 
 #[cfg(test)]

@@ -46,6 +46,14 @@ resume_args = ["--resume", "{id}"]
 fork_args = ["--resume", "{id}", "--fork-session", "-n", "{name}"]
 new_session_args = ["--session-id", "{id}", "-n", "{name}"]
 
+# What this CLI needs to survive a sandbox profile (docs/SANDBOX.md). Applied
+# only while a profile is active; edit it if your CLI's flags differ.
+[agents.sandbox]
+auth = "host-passthrough"
+config_dir_env = "CLAUDE_CONFIG_DIR"
+state_rw = ["~/.claude", "~/.claude.json"]
+bypass = ["--dangerously-skip-permissions"]
+
 # codex can't pin or report its session id, so resume/fork target the most
 # recent session in the launch directory. friring keeps that directory stable
 # across restart (same cwd) and single-repo fork (child reuses the parent cwd).
@@ -55,6 +63,12 @@ command = "codex"
 resume_args = ["resume", "--last"]
 fork_args = ["fork", "--last"]
 resume_latest = true
+
+[agents.sandbox]
+auth = "host-passthrough"
+config_dir_env = "CODEX_HOME"
+state_rw = ["~/.codex"]
+bypass = ["--dangerously-bypass-approvals-and-sandbox"]
 
 # antigravity (the `agy` CLI, the Gemini CLI successor) resumes the latest
 # session in the launch directory via `--continue`; it has no fork (Ctrl+F falls
@@ -117,6 +131,15 @@ command = "vibe"
 #                               #   A rebranded-claude CLI sets "claude" to get
 #                               #   claude's --settings hook wiring under its own
 #                               #   name. Omit if the agent has no known family.
+#
+# [agents.sandbox]              # OPTIONAL: what this CLI needs inside a sandbox
+# auth = "host-passthrough"     #   host-passthrough | env-token | volume-login
+#                               #   | seed-file (see docs/SANDBOX.md §Credentials)
+# state_rw = ["~/.my-agent"]    #   directories it writes and must keep — an
+#                               #   agent that can't write its state dies at launch
+# bypass = ["--no-sandbox"]     #   flags turning its OWN sandbox off, applied
+#                               #   only while a friring profile is active
+# env = { X = "1" }             #   static env applied whenever a sandbox is active
 #
 # {id} is a friring-generated UUID. Only agents that accept it at creation
 # (like claude's `--session-id {id}`) can resume/fork by that exact id; for

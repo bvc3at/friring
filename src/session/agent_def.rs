@@ -11,6 +11,8 @@
 //! beyond serde/std) to satisfy the `session/` architecture rule. The TOML
 //! loading and the `AgentProvider` bridge live in `crate::agent`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Placeholder substituted with a session id in resume/fork/new-session groups.
@@ -66,6 +68,78 @@ pub struct AgentDef {
     /// (`apply_agent_patches`) and `extensions/hooks/`.
     #[serde(default)]
     pub hook_schema: Option<String>,
+    /// What this CLI needs in order to survive being sandboxed
+    /// (`[agents.<name>.sandbox]`). Absent for an agent nobody has sandboxed
+    /// yet: it still launches, it just gets no help — which the editor says
+    /// rather than papering over. friring bakes in no agent knowledge; the
+    /// *user* declares the flags and directories here.
+    #[serde(default)]
+    pub sandbox: Option<AgentSandboxDef>,
+}
+
+/// How an agent gets its credentials inside a sandbox (`docs/SANDBOX.md`
+/// §Credentials, in resolution order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxAuth {
+    /// Let friring pick: host passthrough under a policy backend, and the
+    /// strongest strategy the agent declares elsewhere in a place.
+    #[default]
+    Auto,
+    /// The agent sees the real credential store, subject to path policy. Policy
+    /// backends only, and the reason they are the default.
+    HostPassthrough,
+    /// A long-lived token friring holds in its own keychain entry and injects.
+    EnvToken,
+    /// A per-profile volume holding the agent's state, with one login per
+    /// profile.
+    VolumeLogin,
+    /// Copy a credential file in once and honour write-back. Opt-in, and only
+    /// for agents whose vendor documents it.
+    SeedFile,
+}
+
+/// The `[agents.<name>.sandbox]` block.
+///
+/// Every field is optional: an agent that declares nothing still runs, it just
+/// gets no help. Lives here rather than in `crate::sandbox` because `session` is
+/// the dependency sink — [`AgentDef`] can only embed a type defined alongside
+/// it. `crate::sandbox::agent` is what turns a declaration plus the chosen
+/// backend into the extra argv and extra writable paths a launch applies.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AgentSandboxDef {
+    /// Environment variable that relocates the agent's state into the sandbox.
+    /// Meaningful for a place, whose home is synthetic; a policy backend leaves
+    /// it alone, because the real state directory is already visible and
+    /// relocating it would strand the agent's existing login.
+    #[serde(default)]
+    pub config_dir_env: Option<String>,
+    #[serde(default)]
+    pub auth: SandboxAuth,
+    /// Directories the agent writes and must keep. Added to the policy's
+    /// writable set: an agent that cannot write its own state directory dies on
+    /// first launch under an otherwise correct profile.
+    #[serde(default)]
+    pub state_rw: Vec<String>,
+    /// Configuration safe to project into a place, subject to the lint pass.
+    #[serde(default)]
+    pub copy_in: Vec<String>,
+    /// Static environment applied whenever a sandbox is active.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Names of tokens friring may inject from its own keychain entry.
+    #[serde(default)]
+    pub secret_env: Vec<String>,
+    /// Flags that mean "the outer boundary is the sandbox" — the agent's own
+    /// sandbox off. Applied only when a profile is active.
+    #[serde(default)]
+    pub bypass: Vec<String>,
+    /// Whether refreshed credentials must persist back out of the sandbox.
+    #[serde(default)]
+    pub writeback: bool,
+    /// How to log in inside the pane when the agent's state is empty.
+    #[serde(default)]
+    pub login_fallback: Option<String>,
 }
 
 impl AgentDef {
@@ -229,6 +303,7 @@ mod tests {
             ],
             resume_latest: false,
             hook_schema: None,
+            sandbox: None,
         }
     }
 
@@ -369,6 +444,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: None,
+            sandbox: None,
         };
         let args = d.build_args(None, None, Some("ignored"), None);
         assert_eq!(args, vec!["--quiet"]);
@@ -387,6 +463,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: true,
             hook_schema: None,
+            sandbox: None,
         };
         // resume id present, but no {id} token -> tokens unchanged.
         assert_eq!(
@@ -423,6 +500,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: true,
             hook_schema: None,
+            sandbox: None,
         };
         // Flag set but no resume_args -> nothing to emit, so not "resumes latest".
         assert!(!d.resumes_latest());
@@ -448,12 +526,47 @@ mod tests {
                     new_session_args: vec![],
                     resume_latest: false,
                     hook_schema: None,
+                    sandbox: None,
                 },
             ],
         };
         assert_eq!(reg.get("claude").unwrap().command, "claude");
         assert_eq!(reg.default_agent().unwrap().name, "codex");
         assert_eq!(reg.names(), vec!["claude", "codex"]);
+    }
+
+    #[test]
+    fn sandbox_block_round_trips_and_is_optional() {
+        let toml = r#"
+name = "claude"
+command = "claude"
+
+[sandbox]
+config_dir_env = "CLAUDE_CONFIG_DIR"
+auth = "host-passthrough"
+state_rw = ["~/.claude"]
+bypass = ["--dangerously-skip-permissions"]
+writeback = true
+[sandbox.env]
+DISABLE_AUTOUPDATER = "1"
+"#;
+        let def: AgentDef = toml::from_str(toml).unwrap();
+        let sandbox = def.sandbox.expect("declared block parses");
+        assert_eq!(sandbox.auth, SandboxAuth::HostPassthrough);
+        assert_eq!(sandbox.config_dir_env.as_deref(), Some("CLAUDE_CONFIG_DIR"));
+        assert_eq!(sandbox.state_rw, ["~/.claude"]);
+        assert_eq!(sandbox.bypass, ["--dangerously-skip-permissions"]);
+        assert_eq!(sandbox.env.get("DISABLE_AUTOUPDATER").unwrap(), "1");
+        assert!(sandbox.writeback);
+        assert!(sandbox.copy_in.is_empty());
+
+        // An agents.toml written before sandboxing existed must load unchanged.
+        let legacy: AgentDef = toml::from_str("name = \"x\"\ncommand = \"x\"\n").unwrap();
+        assert_eq!(legacy.sandbox, None);
+
+        // An empty block is valid and means "declare nothing".
+        let bare: AgentDef = toml::from_str("name = \"x\"\ncommand = \"x\"\n[sandbox]\n").unwrap();
+        assert_eq!(bare.sandbox, Some(AgentSandboxDef::default()));
     }
 
     #[test]
