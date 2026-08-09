@@ -1260,6 +1260,16 @@ fn push_prefix_marks(
         ));
     }
 
+    // Sandboxed sessions get a shield, beside the remote mark: the two answer
+    // the same class of question — *where* the agent is allowed to reach. The
+    // tool-permission colour is the palette's existing "restricted" one.
+    if info.sandbox_profile.is_some() {
+        spans.push(Span::styled(
+            "\u{26e8} ",
+            mark_style(is_dimmed, Theme::tool_disallowed),
+        ));
+    }
+
     // Worktree sessions get a dedicated mark, subordinate to the status dot.
     if !info.worktrees.is_empty() {
         spans.push(Span::styled(
@@ -1870,6 +1880,18 @@ mod tests {
         let s = info("local");
         let line = build_session_line(&s, None, false, false, 0, false, WIDE, "◐", None);
         assert!(!line_text(&line).contains('\u{21c5}'));
+    }
+
+    #[test]
+    fn line_shows_sandbox_glyph_only_for_a_sandboxed_session() {
+        let plain = info("plain");
+        let line = build_session_line(&plain, None, false, false, 0, false, WIDE, "◐", None);
+        assert!(!line_text(&line).contains('\u{26e8}'));
+
+        let mut boxed = info("boxed");
+        boxed.sandbox_profile = Some("dev".to_string());
+        let line = build_session_line(&boxed, None, false, false, 0, false, WIDE, "◐", None);
+        assert!(line_text(&line).contains('\u{26e8}'));
     }
 
     #[test]

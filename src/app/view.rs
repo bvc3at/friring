@@ -1268,7 +1268,9 @@ impl App {
         // (activate a list row).
         let field_editor = matches!(
             self.modal,
-            super::modals::Modal::Settings(_) | super::modals::Modal::AutomationEditor(_)
+            super::modals::Modal::Settings(_)
+                | super::modals::Modal::AutomationEditor(_)
+                | super::modals::Modal::SandboxEditor(_)
         );
         for row in modal_rows {
             let action = if field_editor {
@@ -1327,6 +1329,9 @@ impl App {
         }
         if let Some(base) = self.new_session.base_branch.as_deref() {
             parts.push(format!("wt from {base}"));
+        }
+        if let Some(profile) = self.new_session.sandbox_profile.as_deref() {
+            parts.push(format!("\u{26e8} {profile}"));
         }
         if let Some(ws) = self.new_session.workspace_dir.as_deref() {
             parts.push(format!("ws {}", crate::paths::display_path_tilde(ws)));
@@ -1532,6 +1537,31 @@ impl App {
         // Automations list modal
         if let super::modals::Modal::AutomationsList(ref al) = self.modal {
             return Some(self.render_automations_list_modal(frame, al));
+        }
+
+        // The new-session wizard's sandbox step
+        if let super::modals::Modal::SandboxPicker(ref sp) = self.modal {
+            return Some(crate::ui::sandbox_picker_modal::render_sandbox_picker_modal(frame, sp));
+        }
+
+        // Sandbox-profile list modal
+        if let super::modals::Modal::SandboxList(ref sl) = self.modal {
+            return Some(crate::ui::sandbox_list_modal::render_sandbox_list_modal(
+                frame,
+                &crate::ui::sandbox_list_modal::SandboxListState {
+                    entries: &sl.entries,
+                    selected_index: sl.index,
+                },
+            ));
+        }
+
+        // Sandbox-profile editor modal
+        if let super::modals::Modal::SandboxEditor(ref m) = self.modal {
+            let (fields, buttons) = crate::ui::sandbox_editor_modal::render_sandbox_editor_modal(
+                frame,
+                &crate::ui::sandbox_editor_modal::SandboxEditorState::from_modal(m),
+            );
+            return Some(((fields, None), buttons));
         }
 
         // Conversation-import picker. Same borrow dance as the repo picker

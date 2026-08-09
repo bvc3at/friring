@@ -1,5 +1,5 @@
 //! In-progress new-session wizard state
-//! (host → repo → [base branch] → name → [branch name] → agent).
+//! (host → repo → [base branch] → [sandbox] → name → [branch name] → agent).
 //!
 //! Grouped out of the [`App`](super::App) god object. Fields are `pub(crate)`
 //! so call-sites keep direct access (`self.new_session.repo_path`). The whole
@@ -26,6 +26,14 @@ pub(crate) struct NewSessionWizardState {
     /// Normal (non-worktree) repos to include alongside worktree repos.
     pub(crate) normal_repos: Vec<PathBuf>,
     pub(crate) base_branch: Option<String>,
+    /// Sandbox profile chosen at the wizard's sandbox step (`None` = the step
+    /// was skipped, or there were no profiles to offer). Kept here rather than
+    /// on `spawn_config` so Esc-back from the name modal can re-open the step
+    /// with the previous answer selected, like every other picker.
+    pub(crate) sandbox_profile: Option<String>,
+    /// Whether the sandbox step ran for this flow. Decides where Esc from the
+    /// name modal goes — back to the step, or past it to the repo palette.
+    pub(crate) sandbox_step_shown: bool,
     pub(crate) session_name: Option<String>,
     pub(crate) spawn_config: Option<SessionConfig>,
     pub(crate) spawn_worktrees: Vec<WorktreeInfo>,

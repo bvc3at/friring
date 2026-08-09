@@ -15,6 +15,7 @@ pub(crate) mod metrics_state;
 pub(crate) mod modals;
 mod new_session_state;
 mod notify_state;
+mod sandbox;
 pub(crate) mod search;
 mod state;
 mod sync_state;
@@ -1808,6 +1809,8 @@ impl App {
         // Clear any choice left over from a previously cancelled flow.
         self.new_session.backend = None;
         self.new_session.workspace_dir = None;
+        self.new_session.sandbox_profile = None;
+        self.new_session.sandbox_step_shown = false;
         self.new_session.saved_repo_picker = None;
         self.new_session.saved_conversation_picker = None;
 
@@ -2015,20 +2018,67 @@ impl App {
         self.prepare_spawn(config, Vec::new());
     }
 
-    /// Route session creation through the name modal, then agent selection.
+    /// Route session creation through the sandbox step and the name modal,
+    /// then agent selection.
     ///
     /// The name modal opens prefilled with a suggestion derived from the
     /// working directory, so the common case is Enter-through; the user edits
     /// or clears it freely.
     pub(crate) fn prepare_spawn(&mut self, config: SessionConfig, worktrees: Vec<WorktreeInfo>) {
-        let mut modal = modals::SessionNameModal::default();
-        let backend = self.spawn_backend_name(config.backend.as_deref());
-        modal
-            .name
-            .set(&self.suggested_session_name(config.cwd.as_deref(), &backend));
-        self.prefill_workspace_dir_field(&mut modal);
         self.new_session.spawn_config = Some(config);
         self.new_session.spawn_worktrees = worktrees;
+        self.new_session.sandbox_step_shown = false;
+        // The sandbox step comes first because it is the one that can be
+        // answered from the directories alone; skipped entirely when no profile
+        // exists, so a user who never opens the profile list never sees it.
+        let dirs = self.pending_spawn_dirs();
+        if self.open_sandbox_picker(&dirs) {
+            return;
+        }
+        self.new_session.sandbox_profile = None;
+        self.open_pending_session_name_modal();
+    }
+
+    /// [`pending_spawn_dirs`](Self::pending_spawn_dirs), reachable from the
+    /// key-handler cluster when Esc re-opens the sandbox step.
+    pub(super) fn pending_spawn_dirs_for_back(&self) -> Vec<PathBuf> {
+        self.pending_spawn_dirs()
+    }
+
+    /// Every directory the pending spawn will span — the launch cwd plus the
+    /// extra member dirs a multi-repo session gathers. What the sandbox step
+    /// checks a profile's paths against.
+    fn pending_spawn_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self
+            .new_session
+            .spawn_config
+            .as_ref()
+            .and_then(|c| c.cwd.clone())
+            .into_iter()
+            .collect();
+        dirs.extend(self.new_session.additional_dirs.iter().cloned());
+        dirs
+    }
+
+    /// Open the name modal for the spawn already parked on the wizard state.
+    /// Shared by [`prepare_spawn`](Self::prepare_spawn) and the sandbox step,
+    /// which is the step before it.
+    pub(crate) fn open_pending_session_name_modal(&mut self) {
+        let (cwd, backend_type) = self
+            .new_session
+            .spawn_config
+            .as_ref()
+            .map(|c| (c.cwd.clone(), c.backend.clone()))
+            .unwrap_or_default();
+        // Scoped to the backend the spawn will land on: a tmux window namespace
+        // belongs to its server, so a local `tb-foo` is no reason to suggest
+        // `foo-2` for a session being created on a remote host.
+        let backend = self.spawn_backend_name(backend_type.as_deref());
+        let mut modal = modals::SessionNameModal::default();
+        modal
+            .name
+            .set(&self.suggested_session_name(cwd.as_deref(), &backend));
+        self.prefill_workspace_dir_field(&mut modal);
         self.modal = modals::Modal::SessionName(modal);
     }
 
@@ -2186,6 +2236,17 @@ impl App {
         // Rebuild the process cwd: the primary repo for a single-repo session,
         // or the (idempotently rebuilt) symlink workspace for a multi-repo one.
         let cwd = self.session_process_cwd(&session.info);
+        // Re-read the profile rather than caching it on the session: a restart
+        // is when an edited profile takes effect, and a *deleted* one must fail
+        // loudly instead of relaunching the agent on the host.
+        let sandbox_profile = session.info.sandbox_profile.clone();
+        let sandbox = match self.load_session_sandbox(sandbox_profile.as_deref()) {
+            Ok(profile) => profile,
+            Err(message) => {
+                self.set_status(StatusLevel::Error, &message);
+                return;
+            }
+        };
 
         let mut config = SessionConfig {
             resume_session_id: None,
@@ -2198,6 +2259,7 @@ impl App {
             // Only reaches the args when the restart falls back to a fresh
             // conversation (new_session_args); a resume never renames.
             session_name: Some(session_name),
+            sandbox,
             ..SessionConfig::default()
         };
         // `Session::restart` replaces the session env wholesale, so re-inject the
@@ -3010,6 +3072,11 @@ impl App {
         session.info.worktrees = shared.worktrees.iter().cloned().map(Into::into).collect();
         session.info.parent_session_id = shared.parent_session_id;
         session.info.display_order = shared.display_order;
+        // Adopting reattaches to a pane whose wrapper is already running, so
+        // there is no launch to re-derive `sandbox_state` from — but the
+        // persisted profile must come across, or the next full-row write-back
+        // would clear the column and the session would relaunch unsandboxed.
+        session.info.sandbox_profile = shared.sandbox_profile.clone();
         resolve_repo_display_names(&mut session.info);
     }
 
@@ -3511,6 +3578,11 @@ impl App {
             modals::Modal::AutomationEditor(a) => {
                 if let Some(&field) = a.visible_fields().get(index) {
                     a.field = field;
+                }
+            }
+            modals::Modal::SandboxEditor(s) => {
+                if let Some(&field) = s.visible_fields().get(index) {
+                    s.field = field;
                 }
             }
             _ => {}
@@ -4695,6 +4767,20 @@ impl App {
         // task spawns track the task↔session link in-memory (`task_session_links`),
         // so only the headless `task run` path auto-tags messages with it.
         crate::session_ops::inject_friring_env(&mut config, &agent_session_id, None);
+
+        // The wizard's sandbox step (`None` = skipped, or it never ran). Loaded
+        // here rather than carried as a profile so a spawn always applies what
+        // storage holds *now* — the editor may have been open in between.
+        if config.sandbox.is_none() {
+            let chosen = self.new_session.sandbox_profile.take();
+            match self.load_session_sandbox(chosen.as_deref()) {
+                Ok(profile) => config.sandbox = profile,
+                Err(message) => {
+                    self.set_error(message);
+                    return None;
+                }
+            }
+        }
 
         // For a multi-repo session, launch the agent in a symlink workspace that
         // gathers every member dir; `info.cwd` keeps the primary repo (restored
@@ -7686,6 +7772,7 @@ impl App {
                 .map(Into::into)
                 .collect(),
             shell_backend_id: session.info.shell_backend_id.clone(),
+            sandbox_profile: session.info.sandbox_profile.clone(),
             parent_session_id: session.info.parent_session_id,
             display_order: session.info.display_order,
             tombstone: false,
@@ -7919,6 +8006,7 @@ impl App {
         info.parent_session_id = shared.parent_session_id;
         info.display_order = shared.display_order;
         info.remote_host = host_label_from_backend_type(&shared.backend_type);
+        info.sandbox_profile = shared.sandbox_profile.clone();
         resolve_repo_display_names(&mut info);
         (info, backend, provider)
     }
@@ -15174,6 +15262,31 @@ mod tests {
         assert_eq!(adopted.info.parent_session_id, Some(parent_id));
     }
 
+    /// A round trip through the shared row is what an adopt does, and the
+    /// full-row write-back that follows it would clear the column if the copy
+    /// dropped the profile — silently relaunching that agent on the host.
+    #[test]
+    fn session_to_shared_round_trips_the_sandbox_profile() {
+        let backend_arc = stub_backend_arc();
+        let provider = stub_provider();
+        let app = App::new(
+            24,
+            120,
+            BackendRegistry::new(backend_arc.clone()),
+            stub_agents(),
+            test_db(),
+        );
+
+        let mut session = Session::stub("boxed", &backend_arc, &provider);
+        session.info.sandbox_profile = Some("dev".into());
+        let shared = app.session_to_shared(&session);
+        assert_eq!(shared.sandbox_profile.as_deref(), Some("dev"));
+
+        let mut adopted = Session::stub("boxed", &backend_arc, &provider);
+        App::apply_shared_session_metadata(&mut adopted, &shared);
+        assert_eq!(adopted.info.sandbox_profile.as_deref(), Some("dev"));
+    }
+
     #[test]
     fn session_to_shared_maps_display_order() {
         // Regression guard: `save_state` upserts every session via
@@ -17654,6 +17767,7 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
             parent_session_id: None,
             display_order: None,
             tombstone: false,

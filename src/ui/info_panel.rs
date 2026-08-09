@@ -170,6 +170,23 @@ fn append_session_section<'a>(
             ),
         ]));
     }
+    // Sandbox profile; omitted entirely for an unsandboxed session. The
+    // resolved backend and the inner-sandbox state are the launch's answer, not
+    // the profile's, so they arrive as `sandbox_state` rather than being
+    // re-derived here — the view probes nothing.
+    if let Some(profile) = info.sandbox_profile.as_deref() {
+        let detail = info.sandbox_state.as_deref().map_or_else(
+            || profile.to_string(),
+            |state| format!("{profile} · {state}"),
+        );
+        lines.push(Line::from(vec![
+            Span::styled("Sandbox: ", Theme::label()),
+            Span::styled(
+                format!("\u{26e8} {detail}"),
+                Style::default().fg(Theme::tool_disallowed()),
+            ),
+        ]));
+    }
     // Live activity from the agent-emitted OSC terminal title.
     if let Some(activity) = info.agent_activity.as_deref() {
         lines.push(Line::from(vec![

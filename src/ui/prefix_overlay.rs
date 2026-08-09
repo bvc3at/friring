@@ -75,6 +75,7 @@ fn action_label(action: Action) -> &'static str {
         FocusTasks => "tasks",
         OpenInEditor => "open in $EDITOR",
         StartSync => "sync worktrees",
+        OpenSandboxProfiles => "sandbox profiles",
         QuitApp => "quit",
         ReloadApp => "reload friring",
         ToggleShell => "shell pane",
