@@ -2564,6 +2564,10 @@ impl App {
         let worktrees = session.info.worktrees.clone();
         let source_name = session.info.name.clone();
         let fork_session_id = session.info.agent_session_id.clone();
+        // A fork continues the parent's conversation, so it inherits the
+        // parent's boundary; `build_spawn_inputs` reloads the profile by name,
+        // and a deleted one fails the spawn instead of landing on the host.
+        let sandbox_profile = session.info.sandbox_profile.clone();
 
         let config = SessionConfig {
             resume_session_id: None,
@@ -2579,6 +2583,7 @@ impl App {
         self.new_session.spawn_worktrees = worktrees;
         self.new_session.fork = true;
         self.new_session.parent_session_id = Some(session.info.id);
+        self.new_session.sandbox_profile = sandbox_profile;
 
         // Deduped like any other prefill: forking the same session twice
         // otherwise proposes `<name>-fork` both times, and accepting it builds
@@ -19397,6 +19402,19 @@ mod tests {
         }
         assert!(!app.new_session.import);
         assert!(app.new_session.spawn_config.is_none());
+    }
+
+    #[test]
+    fn fork_inherits_the_parent_sandbox_profile() {
+        // The fork skips the wizard's sandbox step, so the parent's profile is
+        // the only thing that can put the child back inside a boundary.
+        let mut app = app_with_sessions(1);
+        app.sessions[0].info.sandbox_profile = Some("dev".into());
+
+        app.fork_active_session();
+
+        assert!(app.new_session.fork);
+        assert_eq!(app.new_session.sandbox_profile.as_deref(), Some("dev"));
     }
 
     #[test]
