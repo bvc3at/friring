@@ -38,9 +38,20 @@ const MODULE_RULES: &[ModuleRules] = &[
         allowed: &[],
         allowed_path_only: &[],
     },
-    // Side-effect layer (PTY/tmux). Never ui, git, or app.
+    // Side-effect layer (PTY/tmux). Never ui, git, or app. `sandbox` is a
+    // decorator on the launch it composes (ADR-26) — the dependency runs one
+    // way, so an isolation boundary never learns about panes or transports.
     ModuleRules {
         name: "agent",
+        allowed: &["session", "paths", "shell", "sandbox"],
+        allowed_path_only: &[],
+    },
+    // Isolation boundaries (ADR-25). Same tier as `agent`: a side-effect layer
+    // over pure `session` data — it probes hosts, generates sandbox profiles
+    // and wraps argv. `shell` for the ssh/wsl launchers a remote host is probed
+    // through, `paths` for the PATH lookup. Never ui, git, or app.
+    ModuleRules {
+        name: "sandbox",
         allowed: &["session", "paths", "shell"],
         allowed_path_only: &[],
     },
@@ -522,6 +533,15 @@ fn session_module_purity() {
 #[test]
 fn agent_module_isolation() {
     assert_module_clean("agent");
+}
+
+/// The sandbox layer sits beside `agent`: both wrap the launch with a side
+/// effect. A reference into `app` or `ui` would make an isolation decision
+/// depend on TUI state, and a reference into `agent` would fuse the boundary to
+/// one backend instead of leaving it a decorator the launch path applies.
+#[test]
+fn sandbox_module_isolation() {
+    assert_module_clean("sandbox");
 }
 
 #[test]
