@@ -127,9 +127,12 @@ actually needs and to an allowlist of domains.
   `tests/architecture_rules.rs`.
 
 The first pass ships the two policy backends only, for **local** sessions, with
-network `none`/`full` and host-passthrough credentials; the filtering proxy, the
-place backends and the status file channel follow. Design, delivery phases and
-ADR-25 through ADR-29 live in [`docs/SANDBOX.md`](docs/SANDBOX.md).
+network `none`/`full` and host-passthrough credentials. The filtering proxy's
+engine ships with it but is not yet wired to the backends, so `allowlist`
+currently grants nothing (it denies direct egress exactly as `none` does);
+sandboxed sessions likewise do not report status yet, because the file channel
+is still to come. The place backends follow. Design, delivery phases and ADR-25
+through ADR-29 live in [`docs/SANDBOX.md`](docs/SANDBOX.md).
 
 #### Lazy sessions & ghosts (July 2026)
 
