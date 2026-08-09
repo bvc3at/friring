@@ -2992,6 +2992,16 @@ impl App {
             return;
         };
 
+        // An undelete must come back inside the session's boundary; a profile
+        // deleted meanwhile fails the restore instead of landing on the host.
+        let sandbox = match self.load_session_sandbox(deleted.sandbox_profile.as_deref()) {
+            Ok(profile) => profile,
+            Err(message) => {
+                self.set_error(message);
+                return;
+            }
+        };
+
         // Reuse the existing SessionId + inject identity/dir env so the restored
         // session's status hooks can attribute their `session signal` (otherwise
         // it renders Idle forever).
@@ -3002,6 +3012,7 @@ impl App {
             deleted.name.clone(),
             cwd,
             &deleted.backend_type,
+            sandbox,
         );
         config.resume_session_id = deleted.agent_session_id;
 
@@ -7472,12 +7483,17 @@ impl App {
         name: String,
         cwd: Option<PathBuf>,
         backend_type: &str,
+        sandbox: Option<crate::session::SandboxProfile>,
     ) -> SessionConfig {
         let mut config = SessionConfig {
             agent_session_id: agent_session_id.clone(),
             session_id: Some(id),
             cwd,
             agent,
+            // A relaunch rebuilds the same boundary: without this the restored
+            // agent would come back on the host, outside the profile the
+            // session was created under.
+            sandbox,
             // Preserve a persisted off-local (`ssh:<host>` / `wsl:<distro>`)
             // backend — set *before* env injection, which skips the local-path
             // dir vars for remote sessions. Local stays `None`.
@@ -7517,6 +7533,16 @@ impl App {
             .map(|wt| wt.worktree_path.clone())
             .or(shared_session.cwd.clone());
 
+        // A dangling profile fails the restore loudly rather than relaunching
+        // the agent on the host (mirrors the restart path).
+        let sandbox = match self.load_session_sandbox(shared_session.sandbox_profile.as_deref()) {
+            Ok(profile) => profile,
+            Err(message) => {
+                self.set_error(message);
+                return;
+            }
+        };
+
         // Build the relaunch config reusing the existing SessionId and injecting
         // identity/dir env, so the agent's status hooks can attribute their
         // `session signal` (otherwise the row stays Idle). The injector runs
@@ -7528,6 +7554,7 @@ impl App {
             shared_session.name.clone(),
             cwd,
             &shared_session.backend_type,
+            sandbox,
         );
         let def = self.agent_def_for(&config.agent);
         config.resume_session_id =
@@ -8714,6 +8741,16 @@ impl App {
         // the local tmux, pointed at worktree paths that only exist remotely.
         let backend = crate::session::is_remote_backend(&shared.backend_type)
             .then(|| shared.backend_type.clone());
+        // After a reboot every sandboxed session comes back through here, so
+        // the profile has to be re-applied or the agent silently resumes on the
+        // host. A profile deleted meanwhile fails loudly, as at restart.
+        let sandbox = match self.load_session_sandbox(shared.sandbox_profile.as_deref()) {
+            Ok(profile) => profile,
+            Err(message) => {
+                self.set_error(message);
+                return;
+            }
+        };
         let mut config = SessionConfig {
             session_id: Some(shared.id),
             resume_session_id: None,
@@ -8722,6 +8759,7 @@ impl App {
             agent,
             fork_session_id: None,
             backend,
+            sandbox,
             ..SessionConfig::default()
         };
         let def = self.agent_def_for(&config.agent);
@@ -9704,6 +9742,7 @@ mod tests {
             "restored".into(),
             None,
             "local-tmux",
+            None,
         );
         assert_eq!(config.session_id, Some(id));
         assert_eq!(config.backend, None, "local backend stays None");
@@ -9737,6 +9776,7 @@ mod tests {
             "restored".into(),
             None,
             "local-tmux",
+            None,
         );
         assert_eq!(config.env.get("FRIRING_SESSION"), Some(&id.to_string()));
     }
@@ -9756,6 +9796,7 @@ mod tests {
             "restored".into(),
             None,
             "ssh:devbox",
+            None,
         );
         assert_eq!(config.backend.as_deref(), Some("ssh:devbox"));
         assert!(config.env.contains_key("FRIRING_SESSION"));
@@ -15285,6 +15326,36 @@ mod tests {
         let mut adopted = Session::stub("boxed", &backend_arc, &provider);
         App::apply_shared_session_metadata(&mut adopted, &shared);
         assert_eq!(adopted.info.sandbox_profile.as_deref(), Some("dev"));
+    }
+
+    /// After a reboot every persisted session comes back through
+    /// `respawn_stale_session`. A profile deleted in the meantime must stop the
+    /// respawn, not relaunch the agent on the host without its boundary.
+    #[test]
+    fn respawn_of_a_session_naming_a_deleted_profile_is_refused() {
+        let backend_arc = stub_backend_arc();
+        let mut app = App::new(
+            24,
+            120,
+            BackendRegistry::new(backend_arc.clone()),
+            stub_agents(),
+            test_db(),
+        );
+
+        let mut shared = make_shared_session("friring:@0", "boxed");
+        shared.sandbox_profile = Some("gone".into());
+        app.respawn_stale_session(
+            "boxed".to_string(),
+            shared,
+            "claude".to_string(),
+            "agent-123".to_string(),
+            Vec::new(),
+        );
+
+        assert!(app.sessions.is_empty(), "no unsandboxed session may spawn");
+        let msg = app.status_message.as_ref().expect("an error is surfaced");
+        assert_eq!(msg.level, StatusLevel::Error);
+        assert!(msg.text.contains("gone"), "{}", msg.text);
     }
 
     #[test]
