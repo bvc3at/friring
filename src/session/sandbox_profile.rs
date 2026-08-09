@@ -782,6 +782,18 @@ impl SandboxProfile {
             if normalized.is_empty() {
                 return Err("Path cannot be empty".to_string());
             }
+            // A control character does not survive the trip to the backend:
+            // shell escaping rewrites newlines, and an SBPL/bwrap argument
+            // built from the rewritten string names a *different* directory —
+            // either failing the launch or authorising the wrong path.
+            if let Some(bad) = normalized.chars().find(|c| c.is_control()) {
+                return Err(format!(
+                    "Path '{}' contains a control character ({}) and cannot be passed to \
+                     the sandbox intact",
+                    normalized.escape_debug(),
+                    bad.escape_debug()
+                ));
+            }
             if !seen.insert(normalized.clone()) {
                 return Err(format!("Path '{normalized}' is listed twice"));
             }
@@ -1349,6 +1361,18 @@ mod tests {
 
         p.paths = vec![SandboxPath::workspace("  ")];
         assert_eq!(p.validate().unwrap_err(), "Path cannot be empty");
+    }
+
+    #[test]
+    fn validation_rejects_paths_with_a_control_character() {
+        let mut p = profile();
+        p.paths = vec![SandboxPath::workspace("~/dev/app\nsecrets")];
+        let err = p.validate().unwrap_err();
+        assert!(err.contains("control character"), "{err}");
+
+        // Quoting handles the merely awkward, so those still validate.
+        p.paths = vec![SandboxPath::workspace("~/dev/my app/it's \"here\"")];
+        p.validate().unwrap();
     }
 
     #[test]
