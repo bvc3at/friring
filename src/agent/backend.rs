@@ -1228,12 +1228,10 @@ impl Session {
     /// placeholder/ghost flags — the frozen frame is simply replaced by the
     /// live stream, in place.
     pub fn restart(&mut self, config: &SessionConfig, rows: u16, cols: u16) -> Result<()> {
-        // A placeholder/ghost owns no live pane — killing its empty backend_id
-        // would only produce a tmux error.
-        if !self.placeholder {
-            self.backend.kill(&self.backend_id)?;
-        }
-
+        // Resolve the wrapped invocation *before* tearing the old pane down:
+        // applying a sandbox profile can fail (backend unavailable with
+        // fallback off, a policy this build can't express, an I/O error writing
+        // the profile), and a healthy session must survive that.
         let window_name = crate::agent::tmux::agent_window_name(&self.info.name);
         let Sandboxed {
             command,
@@ -1242,6 +1240,12 @@ impl Session {
             profile,
             state: sandbox_state,
         } = sandboxed_invocation(config, &self.provider)?;
+
+        // A placeholder/ghost owns no live pane — killing its empty backend_id
+        // would only produce a tmux error.
+        if !self.placeholder {
+            self.backend.kill(&self.backend_id)?;
+        }
 
         let spawned = self.backend.spawn(
             &window_name,
@@ -1556,6 +1560,94 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Inert backend that counts `kill`, so a failed restart can be shown not
+    /// to have torn the live pane down.
+    struct KillCountingBackend {
+        kills: Arc<AtomicU64>,
+    }
+    impl SessionBackend for KillCountingBackend {
+        fn name(&self) -> &str {
+            "kill-counting"
+        }
+        fn check_available(&self) -> Result<()> {
+            Ok(())
+        }
+        fn ensure_ready(&self) -> Result<()> {
+            Ok(())
+        }
+        fn spawn(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[String],
+            _: Option<&Path>,
+            _: &HashMap<String, String>,
+            _: u16,
+            _: u16,
+        ) -> Result<SpawnedSession> {
+            anyhow::bail!("stub backend does not spawn")
+        }
+        fn adopt(&self, _: &str, _: u16, _: u16, _: Option<Vec<u8>>) -> Result<AdoptedSession> {
+            anyhow::bail!("stub backend does not adopt")
+        }
+        fn discover(&self) -> Result<Vec<DiscoveredSession>> {
+            Ok(vec![])
+        }
+        fn resize(&self, _: &str, _: u16, _: u16) -> Result<()> {
+            Ok(())
+        }
+        fn is_dead(&self, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn kill(&self, _: &str) -> Result<()> {
+            self.kills.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn detach(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn pane_pid(&self, _: &str) -> Result<Option<u32>> {
+            Ok(None)
+        }
+    }
+
+    /// Applying a profile is fallible, so it has to happen before the old pane
+    /// is killed — otherwise a condition friring can detect up front destroys a
+    /// healthy session.
+    #[test]
+    fn restart_keeps_the_pane_when_the_sandbox_cannot_be_applied() {
+        let kills = Arc::new(AtomicU64::new(0));
+        let backend: Arc<dyn SessionBackend> = Arc::new(KillCountingBackend {
+            kills: Arc::clone(&kills),
+        });
+        let provider: Arc<dyn AgentProvider> = Arc::new(crate::agent::GenericProvider::new(
+            crate::agent::agent_config::builtin_registry()
+                .default_agent()
+                .unwrap()
+                .clone(),
+        ));
+        let mut session = Session::stub("boxed", &backend, &provider);
+
+        // A place backend is not in this build, and the profile refuses to fall
+        // back to an unsandboxed launch — so the wrap fails.
+        let mut profile = crate::session::SandboxProfile::new(
+            "dev",
+            vec![crate::session::SandboxPath::workspace("~/dev/app")],
+        );
+        profile.backend = crate::session::SandboxBackendKind::Docker;
+        let config = SessionConfig {
+            sandbox: Some(profile),
+            ..SessionConfig::default()
+        };
+
+        assert!(session.restart(&config, 24, 80).is_err());
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            0,
+            "the existing pane must still be alive"
+        );
+    }
 
     #[test]
     fn pane_clipboard_drops_oldest_and_drains_gen_gated() {
