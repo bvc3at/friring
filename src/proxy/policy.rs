@@ -74,12 +74,14 @@ impl MethodPolicy {
 /// The host half of a [`HostRule`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HostPattern {
-    /// `*` — every host.
+    /// `*` — every host. The proxy's own vocabulary: a sandbox profile cannot
+    /// store this spelling, so it only ever arrives from a caller that built
+    /// the policy in code.
     Any,
-    /// `example.com` — the name itself and every subdomain of it.
+    /// `example.com`, `*.example.com` or `.example.com` — the name itself and
+    /// every subdomain of it. The three spellings are one pattern; see
+    /// [`HostRule`] for why the wildcard does not narrow.
     Domain(String),
-    /// `*.example.com` or `.example.com` — subdomains only, never the apex.
-    Subdomains(String),
     /// `127.0.0.1`, `[::1]` — compared as a parsed address, never by suffix.
     Address(IpAddr),
 }
@@ -90,20 +92,33 @@ impl HostPattern {
         match self {
             Self::Any => true,
             Self::Address(ip) => host.parse::<IpAddr>().is_ok_and(|h| h == *ip),
-            Self::Domain(domain) => host.eq_ignore_ascii_case(domain) || is_subdomain(host, domain),
-            Self::Subdomains(domain) => is_subdomain(host, domain),
+            Self::Domain(domain) => covers(host, domain),
         }
     }
 }
 
-/// Whether `host` is a strict subdomain of `domain` — that is, whether it ends
-/// with `"." + domain`. The leading dot is the whole point: it forces the match
-/// onto a label boundary, so `evilgithub.com` is not under `github.com`.
-fn is_subdomain(host: &str, domain: &str) -> bool {
+/// Whether `host` is `domain` itself or sits under it on a label boundary.
+///
+/// The boundary is the whole point: `evilgithub.com` merely *ends with* the
+/// text of `github.com`, and reading that as a match is the classic allowlist
+/// bypass, so whatever precedes the suffix must be terminated by a `.`.
+///
+/// A candidate carrying an empty leading label (`.github.com`) is covered. That
+/// is the deny-safe reading — a rule refusing `github.com` must not be dodged
+/// by a spelling some resolvers accept — and it grants nothing extra, because
+/// no such name is registrable.
+///
+/// This must stay behaviourally identical to `session::DomainRule::matches_host`,
+/// which the two modules cannot share because the proxy is a leaf in the
+/// architecture allowlist. `tests/egress_matcher_conformance.rs` runs both over
+/// one table and fails when either side drifts.
+fn covers(host: &str, domain: &str) -> bool {
+    if host.eq_ignore_ascii_case(domain) {
+        return true;
+    }
     let (host_len, domain_len) = (host.len(), domain.len());
-    // The `.` separator must exist, so the host is strictly longer than
-    // `domain` plus that one byte.
-    host_len > domain_len + 1
+    // The `.` separator has to fit, so the host is strictly the longer string.
+    host_len > domain_len
         && host.as_bytes()[host_len - domain_len - 1] == b'.'
         // Safe to slice: the preceding byte is ASCII `.`, so this is a char
         // boundary.
@@ -131,16 +146,29 @@ fn normalise_host(host: &str) -> &str {
 ///
 /// | Rule | Matches | Does not match |
 /// |---|---|---|
-/// | `github.com` | `github.com`, `api.github.com`, `a.b.github.com` | `evilgithub.com`, `github.com.evil.net` |
-/// | `*.github.com` | `api.github.com` | `github.com` |
+/// | `github.com` | `github.com`, `api.github.com`, `a.b.github.com` | `evilgithub.com`, `github.com.evil.net`, `github.co` |
+/// | `*.github.com`, `.github.com` | exactly what `github.com` matches | exactly what `github.com` does not |
 /// | `github.com:443` | `api.github.com` port 443 | `github.com` port 8080 |
-/// | `127.0.0.1` | `127.0.0.1` | `10.127.0.0.1` (not a host), `localhost` |
+/// | `127.0.0.1` | `127.0.0.1` | `evil.127.0.0.1`, `localhost` |
 /// | `*` | every host | — |
 ///
 /// A bare name therefore covers itself **and** its subtree, which is what a
 /// user writing `github.com` means. An address rule is exact: suffix logic on
 /// digits would be nonsense, and `localhost` is a *name*, matched as one, so it
 /// does not cover `127.0.0.1` unless listed too.
+///
+/// **`*.` and `.` are spellings, not narrowings.** `*.github.com` covers the
+/// apex as well, because the deny direction settles the question: a user who
+/// denies `*.github.com` means "no github.com traffic", and a matcher that let
+/// the apex through would be a silent hole. Reading the same spelling two ways
+/// depending on which list it sits in would be worse still.
+///
+/// The accepted grammar is deliberately the one a sandbox profile's
+/// `network_allow` / `network_deny` accepts (`session::DomainRule`), minus `*`,
+/// which only this side has: ASCII labels of letters, digits, `-` and `_`, no
+/// empty label, none edged with `-`, 63 bytes per label and 253 overall. An
+/// international name must be written in punycode, because that is what a
+/// request host is spelled as on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRule {
     pattern: HostPattern,
@@ -168,15 +196,21 @@ impl FromStr for HostRule {
             bail!("empty host rule");
         }
         let (host, port) = split_host_port(entry)?;
-        let host = host.trim();
+        let host = normalise_host(host);
         let pattern = if host == "*" {
             HostPattern::Any
-        } else if let Some(domain) = host.strip_prefix("*.").or_else(|| host.strip_prefix('.')) {
-            HostPattern::Subdomains(validated_domain(domain, entry)?)
-        } else if let Ok(ip) = host.parse::<IpAddr>() {
-            HostPattern::Address(ip)
         } else {
-            HostPattern::Domain(validated_domain(host, entry)?)
+            // Normalise the spelling, then classify. Stripping `*.` before the
+            // address check is what keeps `*.127.0.0.1` and `127.0.0.1` one
+            // rule instead of an address and a suffix pattern over digits.
+            let bare = host
+                .strip_prefix("*.")
+                .or_else(|| host.strip_prefix('.'))
+                .unwrap_or(host);
+            match bare.parse::<IpAddr>() {
+                Ok(ip) => HostPattern::Address(ip),
+                Err(_) => HostPattern::Domain(validated_domain(bare, entry)?),
+            }
         };
         Ok(Self { pattern, port })
     }
@@ -187,7 +221,6 @@ impl fmt::Display for HostRule {
         match &self.pattern {
             HostPattern::Any => f.write_str("*")?,
             HostPattern::Domain(domain) => f.write_str(domain)?,
-            HostPattern::Subdomains(domain) => write!(f, "*.{domain}")?,
             // Re-bracket IPv6 so the rendering parses back to the same rule.
             HostPattern::Address(ip @ IpAddr::V6(_)) if self.port.is_some() => write!(f, "[{ip}]")?,
             HostPattern::Address(ip) => write!(f, "{ip}")?,
@@ -199,23 +232,49 @@ impl fmt::Display for HostRule {
     }
 }
 
-/// Reject the shapes that would silently never match — an empty label, a
-/// stray wildcard, or a URL pasted in where a host belongs.
+/// The DNS limits, which double as the reason a longer rule is a typo rather
+/// than a host: nothing on the wire can be spelled that way, so the rule would
+/// never match — and a deny rule that never matches is a hole.
+const MAX_HOST_LEN: usize = 253;
+const MAX_LABEL_LEN: usize = 63;
+
+/// Reject the shapes that would silently never match — an empty label, a stray
+/// wildcard, a URL pasted in where a host belongs, an international name in
+/// U-label form.
+///
+/// The grammar is deliberately the one `session::DomainRule` enforces on a
+/// stored profile, so a spelling the profile editor refuses is also one this
+/// proxy refuses to load rather than accepting as a rule that can match
+/// nothing. Punctuation is rejected outright as well as being useless: a rule
+/// is echoed back in denial text and in the UI.
 fn validated_domain(domain: &str, entry: &str) -> Result<String> {
     let domain = normalise_host(domain);
     if domain.is_empty() {
         bail!("host rule `{entry}` has no host");
     }
-    // Control characters are rejected as well as the obvious punctuation: a
-    // rule is echoed back in denial text and in the UI.
-    if let Some(bad) = domain
-        .chars()
-        .find(|c| c.is_control() || "*/@ ?#".contains(*c))
-    {
-        bail!(
-            "host rule `{entry}` contains `{}`: write a bare host, e.g. `api.github.com:443`",
-            bad.escape_debug()
-        );
+    if domain.len() > MAX_HOST_LEN {
+        bail!("host rule `{entry}` is longer than {MAX_HOST_LEN} characters");
+    }
+    for label in domain.split('.') {
+        if label.is_empty() {
+            bail!("host rule `{entry}` has an empty label");
+        }
+        if label.len() > MAX_LABEL_LEN {
+            bail!("host rule `{entry}` has a label longer than {MAX_LABEL_LEN} characters");
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            bail!("host rule `{entry}` has a label edged with `-`");
+        }
+        if let Some(bad) = label
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+        {
+            bail!(
+                "host rule `{entry}` contains `{}`: write a bare ASCII host, e.g. \
+                 `api.github.com:443` (an international name in punycode)",
+                bad.escape_debug()
+            );
+        }
     }
     Ok(domain.to_ascii_lowercase())
 }
@@ -274,7 +333,9 @@ fn parse_port(digits: &str, entry: &str) -> Result<u16> {
 pub enum DenyReason {
     /// The sandbox is running with [`NetworkMode::None`].
     NetworkDisabled,
-    /// The host matched a deny-list entry, quoted back as written.
+    /// The host matched a deny-list entry, quoted back in its canonical
+    /// spelling — `*.github.com` reads back as `github.com`, which is what the
+    /// rule means and what the profile's own renderer prints for it.
     DeniedByRule(String),
     /// [`NetworkMode::Allowlist`] and nothing in the allow list matched. This
     /// is the reason that drives the first-use domain prompt.
@@ -482,13 +543,46 @@ mod tests {
         assert!(github.matches("github.com.", 443));
     }
 
+    /// `*.x` and `.x` are spellings of `x`, apex included. The deny direction
+    /// decides it: refusing `*.github.com` has to refuse `github.com` too.
+    /// `tests/egress_matcher_conformance.rs` holds the profile-side matcher to
+    /// the same reading.
     #[test]
-    fn wildcard_prefix_excludes_the_apex() {
+    fn a_wildcard_prefix_is_a_spelling_not_a_narrowing() {
+        let bare = rule("github.com");
         for text in ["*.github.com", ".github.com"] {
-            let subdomains = rule(text);
-            assert!(subdomains.matches("api.github.com", 443));
-            assert!(!subdomains.matches("github.com", 443));
+            let wildcard = rule(text);
+            for host in ["github.com", "api.github.com", "a.b.github.com"] {
+                assert!(wildcard.matches(host, 443), "`{text}` must cover {host}");
+            }
+            for host in ["evilgithub.com", "github.com.evil.net", "github.co"] {
+                assert!(
+                    !wildcard.matches(host, 443),
+                    "`{text}` must not cover {host}"
+                );
+            }
+            assert_eq!(wildcard, bare, "`{text}` is `github.com`");
         }
+    }
+
+    /// An empty leading label is the deny-dodge the equality branch alone would
+    /// miss: some resolvers accept `.github.com` for `github.com`.
+    #[test]
+    fn an_empty_leading_label_is_covered() {
+        assert!(rule("github.com").matches(".github.com", 443));
+        assert!(!rule("github.com").matches(".evilgithub.com", 443));
+    }
+
+    /// A request host reaches the proxy as an A-label, so a rule is written the
+    /// same way. The U-label spelling is refused rather than accepted as a rule
+    /// nothing can match.
+    #[test]
+    fn international_names_are_written_in_punycode() {
+        let bucher = rule("xn--bcher-kva.example");
+        assert!(bucher.matches("xn--bcher-kva.example", 443));
+        assert!(bucher.matches("WWW.XN--BCHER-KVA.EXAMPLE", 443));
+        assert!(!bucher.matches("evilxn--bcher-kva.example", 443));
+        assert!("b\u{fc}cher.example".parse::<HostRule>().is_err());
     }
 
     #[test]
@@ -504,9 +598,14 @@ mod tests {
         assert!(loopback.matches("127.0.0.1", 80));
         assert!(!loopback.matches("localhost", 80));
         assert!(!loopback.matches("10.127.0.0.1", 80));
+        assert!(!loopback.matches("evil.127.0.0.1", 80));
         assert!(rule("::1").matches("[::1]", 80));
         assert!(rule("[::1]:443").matches("::1", 443));
         assert!(!rule("[::1]:443").matches("::1", 80));
+        // The wildcard prefix normalises away before the address check, so it
+        // cannot turn an address into a suffix pattern over digits.
+        assert_eq!(rule("*.127.0.0.1"), loopback);
+        assert!(!rule("*.127.0.0.1").matches("evil.127.0.0.1", 80));
     }
 
     #[test]
@@ -522,20 +621,23 @@ mod tests {
         for text in [
             "*",
             "github.com",
-            "*.github.com",
             "github.com:443",
             "[::1]:443",
             "127.0.0.1",
         ] {
             assert_eq!(rule(text).to_string(), text, "round-trip of `{text}`");
         }
-        // Normalising forms collapse onto the canonical rendering.
-        assert_eq!(rule(".github.com").to_string(), "*.github.com");
+        // Normalising forms collapse onto the canonical rendering — including
+        // the wildcard, which is a spelling rather than a pattern of its own.
+        assert_eq!(rule("*.github.com").to_string(), "github.com");
+        assert_eq!(rule(".github.com").to_string(), "github.com");
         assert_eq!(rule("GitHub.com.").to_string(), "github.com");
     }
 
     #[test]
     fn malformed_rules_are_rejected_with_the_entry_named() {
+        let long_label = format!("{}.com", "a".repeat(64));
+        let long_host = ["averyverylonglabelindeed"; 12].join(".");
         let malformed = [
             "",
             "   ",
@@ -549,6 +651,15 @@ mod tests {
             "api.*.com",
             "git\thub.com",
             "github.com\u{1b}[2J",
+            // Shapes no request host can ever be spelled as, so a rule written
+            // this way would sit in a deny list matching nothing.
+            "github..com",
+            "-github.com",
+            "github.com-",
+            ".*",
+            "b\u{fc}cher.example",
+            long_label.as_str(),
+            long_host.as_str(),
         ];
         for text in malformed {
             let error = text.parse::<HostRule>().err().map(|e| e.to_string());

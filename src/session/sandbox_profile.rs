@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::net::IpAddr;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -458,10 +459,25 @@ impl FromStr for ReadScope {
 ///
 /// Comparison is case-insensitive and a trailing root dot (`github.com.`) is
 /// ignored on both sides. A rule written `*.github.com` or `.github.com` means
-/// the same as the bare form.
+/// the same as the bare form — **the wildcard is a spelling, not a narrowing,
+/// and it covers the apex**. The deny direction settles that: someone who
+/// denies `*.github.com` means "no github.com traffic", and excluding the apex
+/// would be a silent hole. An address rule (`127.0.0.1`, `[::1]`) is exact
+/// instead, compared as a parsed address so `::1` and `::0001` are one host and
+/// `evil.127.0.0.1` is not "under" `127.0.0.1`.
 ///
 /// A rule without a port matches every port; a rule with one matches only that
 /// port, so `github.com:443` permits HTTPS and nothing else.
+///
+/// Hosts are ASCII: an international name must be written in punycode
+/// (`xn--bcher-kva.example`), which is how it is spelled on the wire. A request
+/// in U-label form therefore matches nothing here, and under
+/// [`NetworkMode::Allowlist`] that fails closed.
+///
+/// The egress proxy enforces this vocabulary at connection time with its own
+/// matcher (`proxy::HostRule`) — the two cannot share a type, because the proxy
+/// is a leaf in the architecture allowlist. `tests/egress_matcher_conformance.rs`
+/// runs both over one table of stored spellings and fails when either drifts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainRule {
     /// Lower-cased host, no wildcard prefix and no trailing dot.
@@ -521,6 +537,13 @@ impl DomainRule {
             .strip_prefix('[')
             .and_then(|c| c.strip_suffix(']'))
             .unwrap_or(&candidate);
+        // An address rule is exact, and exact on the *parsed* address: suffix
+        // logic over digits would put `evil.127.0.0.1` under `127.0.0.1`, and
+        // a textual comparison would let `::0001` slip past a deny rule on
+        // `::1`.
+        if let Ok(address) = self.host.parse::<IpAddr>() {
+            return candidate.parse::<IpAddr>().is_ok_and(|c| c == address);
+        }
         candidate == self.host
             || candidate
                 .strip_suffix(&self.host)
@@ -531,6 +554,9 @@ impl DomainRule {
 impl fmt::Display for DomainRule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.port {
+            // Re-bracket an IPv6 literal, so what is printed parses back to the
+            // same rule instead of tripping the "several ':'" rejection.
+            Some(p) if self.host.contains(':') => write!(f, "[{}]:{p}", self.host),
             Some(p) => write!(f, "{}:{p}", self.host),
             None => f.write_str(&self.host),
         }
@@ -554,7 +580,15 @@ fn split_host_port(entry: &str) -> Result<(&str, Option<u16>), String> {
         };
         let port = match tail {
             "" => None,
-            _ => Some(parse_port(tail.strip_prefix(':').unwrap_or(tail), entry)?),
+            // The `:` is required: reading `[::1]443` as port 443 invents a
+            // scoping the writer did not spell, and the proxy's parser refuses
+            // that shape outright.
+            _ => {
+                let digits = tail.strip_prefix(':').ok_or_else(|| {
+                    format!("Domain '{entry}' has trailing text after ']': '{tail}'")
+                })?;
+                Some(parse_port(digits, entry)?)
+            }
         };
         return Ok((host, port));
     }
@@ -580,8 +614,8 @@ fn parse_port(raw: &str, entry: &str) -> Result<u16, String> {
 }
 
 /// Reject host strings that could never match: empty, over-long, or with a
-/// label that is empty or edged with `-`. IPv6 literals (which arrive already
-/// unbracketed) are checked only for their character set.
+/// label that is empty, non-ASCII or edged with `-`. An IPv6 literal (which
+/// arrives already unbracketed) has to parse as an address.
 fn validate_host(host: &str, entry: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err(format!("Domain '{entry}' has no host"));
@@ -590,15 +624,13 @@ fn validate_host(host: &str, entry: &str) -> Result<(), String> {
         return Err(format!("Domain '{entry}' is too long (max 253 characters)"));
     }
     if host.contains(':') {
-        // An IPv6 literal: hex digits, colons and the IPv4-mapped tail.
-        let ok = host
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
-        return if ok {
-            Ok(())
-        } else {
-            Err(format!("Domain '{entry}' is not a valid IPv6 literal"))
-        };
+        // An IPv6 literal, arriving already unbracketed. Parsing it *is* the
+        // check: a character-set test accepts `::::`, which no request host can
+        // ever be, so the rule would sit in a deny list matching nothing.
+        return host
+            .parse::<IpAddr>()
+            .map(|_| ())
+            .map_err(|_| format!("Domain '{entry}' is not a valid IPv6 literal"));
     }
     for label in host.split('.') {
         if label.is_empty() {
@@ -1137,6 +1169,46 @@ mod tests {
         assert_eq!(DomainRule::parse("[::1]").unwrap().host, "::1");
         let v6 = DomainRule::parse("[::1]:8080").unwrap();
         assert_eq!((v6.host.as_str(), v6.port), ("::1", Some(8080)));
+        // Rendering an IPv6 rule re-brackets it, so what the UI prints is what
+        // the parser accepts back.
+        assert_eq!(v6.to_string(), "[::1]:8080");
+        assert_eq!(DomainRule::parse(&v6.to_string()).unwrap(), v6);
+    }
+
+    /// `*.x` and `.x` are the bare rule, apex included, because the deny
+    /// direction has to reach the apex. The egress proxy's matcher reads them
+    /// the same way — see `tests/egress_matcher_conformance.rs`.
+    #[test]
+    fn a_wildcard_prefix_is_a_spelling_not_a_narrowing() {
+        let bare = DomainRule::parse("github.com").unwrap();
+        for spelling in ["*.github.com", ".github.com"] {
+            let rule = DomainRule::parse(spelling).unwrap();
+            assert_eq!(rule, bare, "'{spelling}' is 'github.com'");
+            assert!(
+                rule.matches("github.com", 443),
+                "{spelling} covers the apex"
+            );
+            assert!(rule.matches("api.github.com", 443));
+            assert!(!rule.matches("evilgithub.com", 443));
+        }
+    }
+
+    /// Address rules are exact, on the parsed address: no pseudo-subdomain, and
+    /// no alternative spelling that slips past a deny entry.
+    #[test]
+    fn address_rules_match_the_address_not_a_suffix() {
+        let v4 = DomainRule::parse("127.0.0.1").unwrap();
+        assert!(v4.matches("127.0.0.1", 80));
+        assert!(v4.matches("127.0.0.1.", 80));
+        assert!(!v4.matches("evil.127.0.0.1", 80));
+        assert!(!v4.matches("10.127.0.0.1", 80));
+        assert!(!v4.matches("localhost", 80));
+
+        let v6 = DomainRule::parse("[::1]").unwrap();
+        assert!(v6.matches("::1", 80));
+        assert!(v6.matches("[::1]", 80));
+        assert!(v6.matches("::0001", 80));
+        assert!(!v6.matches("::2", 80));
     }
 
     #[test]
@@ -1156,7 +1228,14 @@ mod tests {
             "github.com-",
             "::1:443",
             "[::1",
+            // A port needs its ':': reading this as 443 invents a scoping.
+            "[::1]443",
+            // Hex-ish but not an address, so it could never be a request host.
+            "[::::]",
             "*",
+            // An international name is stored in punycode, because that is how
+            // a request host is spelled.
+            "b\u{fc}cher.example",
         ] {
             assert!(
                 DomainRule::parse(bad).is_err(),
