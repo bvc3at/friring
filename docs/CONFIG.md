@@ -120,6 +120,17 @@ resume_latest = false       # true = id-less "resume last session in cwd"
 # hook_schema = "claude"    # optional: name the hook FAMILY this CLI speaks so
                             #   the built-in hooks extension wires its status
                             #   hooks under this custom agent's name too
+
+[agents.sandbox]            # optional: what this CLI needs inside a sandbox
+auth = "host-passthrough"   # host-passthrough | env-token | volume-login | seed-file
+config_dir_env = "CLAUDE_CONFIG_DIR"  # env var relocating its state (place backends)
+state_rw = ["~/.claude", "~/.claude.json"]  # dirs it writes and must keep
+bypass = ["--dangerously-skip-permissions"]  # flags turning its OWN sandbox off
+# copy_in = []              # config safe to project into a place
+# env = { DISABLE_AUTOUPDATER = "1" }  # static env while a sandbox is active
+# secret_env = []           # token names friring may inject from its keychain
+# writeback = false         # refreshed credentials must persist back out
+# login_fallback = "…"      # how to log in in-pane when the state is empty
 ```
 
 `{id}` is substituted with the friring-generated session UUID. Groups
@@ -187,6 +198,17 @@ host. It names the *family* to imitate, not a boolean; today the useful value is
 `"claude"` (the only family wired via a per-agent arg patch — codex/opencode/
 antigravity/vibe/copilot are wired through their own config dir, so a rebrand
 sharing that dir already reports status).
+
+`[agents.<name>.sandbox]` is optional and every field inside it is too. It is
+how friring stays agent-neutral about sandboxing: the flags that turn an agent's
+*own* sandbox off (nesting is denied outright under seatbelt) and the state
+directories it must keep writable are **your** declaration, never code. It is
+applied only while a sandbox profile is active, so an agent that declares
+nothing still launches — it just gets no help, which the profile editor says
+rather than papering over. An `agents.toml` written before sandboxing existed
+loads unchanged. Full semantics: [`docs/SANDBOX.md`](SANDBOX.md) §Credentials
+and §Inner agent sandboxes. Sandbox *profiles* themselves are UI-edited and live
+in SQLite, not here.
 
 The seeded file also ships two commented, copy-pasteable templates
 below the built-ins — **Add your own agent** (every field annotated)

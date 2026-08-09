@@ -85,11 +85,14 @@ migration), not in a TOML file. Only `settings.toml` has config write-back in
 this codebase, and it is a fixed-schema file rather than a collection. A
 `friring-cli sandbox export|import` command covers portability.
 
-The dormant upstream `containers`, `project_container_config` and `vms` tables
-(created by schema v8/v10/v11, referenced nowhere in live code) are
-**superseded**: this feature adds its own tables and the old ones are dropped
-in the same migration. Recorded in `FORK.md`; upstream merges touching those
-tables conflict and resolve toward the Friring tables.
+The dormant upstream `containers`, `project_container_config`, `vms` and
+`project_vm_config` tables (created by schema v8/v10/v11, referenced nowhere in
+live code) are **superseded**: this feature adds its own tables and drops the
+old ones in the same migration. Schema v22 already dropped all four, so the drop
+is a safety net for a database that reacquired one (an upstream merge, a
+hand-restored backup) rather than a cleanup — no reachable database still holds
+that data. Recorded in `FORK.md`; upstream merges touching those tables conflict
+and resolve toward the Friring tables.
 
 ### `sandbox_profiles`
 
@@ -107,10 +110,32 @@ tables conflict and resolve toward the Friring tables.
 | `image` | TEXT | Place backends: image reference |
 | `containerfile` | TEXT | Place backends: build source, alternative to `image` |
 | `allow_unsandboxed_fallback` | INTEGER | Whether the agent may escape for a specific command |
-| `created_at`, `updated_at` | TEXT | Automations convention |
+| `created_at`, `updated_at` | INTEGER | Unix millis, the convention every other table uses |
 
 Paths are stored as written (`~` preserved) and expanded at launch, so a
 profile stays meaningful if `$HOME` differs on a remote host.
+
+`name` is a **case-insensitive identifier** (`COLLATE NOCASE`): two spellings
+would be one container/distro name, so the database enforces the same rule the
+validator does.
+
+Because the name is the key, **renaming is its own operation** with referential
+consequences: `rename_sandbox_profile` rewrites the profile row, its instances,
+`sessions.sandbox_profile` and a place-backed session's `backend_type` in one
+transaction, and the plain upsert deliberately refuses to move identity. The
+editor calls the rename when the name field changed.
+
+**Deleting a profile leaves referencing sessions dangling on purpose.** Clearing
+the link would silently relaunch those agents on the host with no boundary; a
+dangling name fails the next launch loudly instead, and the delete confirmation
+reports how many sessions are affected. Deleting does not stop any real place —
+tear those down first or they leak.
+
+`allow_unsandboxed_fallback` is the visible, per-profile escape hatch. In P1 it
+decides what happens when the profile **cannot be applied** at launch: off (the
+default) fails the spawn, on starts the agent unsandboxed with the reason in
+front of the user. The per-command escape the name also suggests arrives with
+the place backends.
 
 ### `sandbox_instances`
 
@@ -118,9 +143,20 @@ Tracks live places for the manager view and for garbage collection:
 `profile`, `engine`, `external_id` (container id / distro name), `state`,
 `created_at`, `last_used_at`. Policy backends never create rows here.
 
+Keyed on `(engine, external_id)`, **not** on the profile: a rebuild leaves the
+old container behind, and keying on the profile would overwrite the previous id
+into an unfindable leak — precisely what the garbage-collection purpose exists
+to prevent. One profile may therefore own several rows. `state` is free text
+until a place backend exists to define the vocabulary.
+
 ### Session linkage
 
-`sessions` gains a nullable `sandbox_profile` column. Place-backed sessions
+`sessions` gains a nullable `sandbox_profile` column, carried end to end like
+`backend_type`: written by the full-row session upsert, preserved through
+soft-delete so a restore comes back inside its boundary, and re-read on every
+relaunch so an edited profile takes effect and a deleted one fails loudly.
+A policy backend leaves `backend_type` alone — the boundary is invisible to the
+session layer — so the column is the only record of it. Place-backed sessions
 additionally set `backend_type = "sandbox:<profile>"`, mirroring how `ssh:<host>`
 and `wsl:<host>` already drive restore and reattach. Both are written in the
 same migration that adds the tables.
@@ -248,23 +284,47 @@ credential passthrough and zero image maintenance. The user overrides per
 profile, and the session-creation step shows the resolved backend so the choice
 is never invisible.
 
+A **pinned** backend never falls back: silently running an isolation technology
+the user did not choose is worse than refusing to launch. An exhausted `auto`
+ladder fails with every rung's reason attached.
+
 `SandboxBackend` is the trait every backend implements:
 
 ```rust
 trait SandboxBackend {
-    /// Cheap, cached, per host: is this usable, and if not, why (actionably)?
-    fn probe(&self, host: &HostRef) -> Availability;
-    /// What the UI may offer: limits, network modes, persistence, passthrough.
+    fn kind(&self) -> SandboxBackendKind;
+    /// Cheap and cached: is this usable, and if not, why (actionably)?
+    /// The host is injected at construction, which is also what makes probing
+    /// testable on a machine with nothing installed.
+    fn probe(&self) -> Availability;
+    /// What the UI may offer: shape, limits, network modes, read scopes,
+    /// persistence, host-credential passthrough, inner-sandbox verdict.
     fn capabilities(&self) -> Caps;
-    /// Policy backends: argv in, wrapped argv out.
-    fn wrap(&self, argv: Argv, policy: &Policy) -> Result<Argv>;
+    /// Policy backends: argv in, wrapped argv out. Takes the whole launch, not
+    /// just the policy — a generated profile file needs a session key, and the
+    /// per-session paths and the proxy hole are launch inputs.
+    fn wrap(&self, argv: Argv, launch: &SandboxLaunch<'_>) -> SandboxResult<Argv>;
     /// Place backends: ensure the environment exists and is running.
-    fn ensure(&self, profile: &SandboxProfile) -> Result<Instance>;
+    fn ensure(&self, profile: &SandboxProfile) -> SandboxResult<SandboxInstance>;
 }
 ```
 
-A backend implements `wrap` or `ensure`, never both. `probe` results are what
-the UI renders — a backend is never silently skipped.
+A backend implements `wrap` or `ensure`, never both; the default bodies fail
+with the shape mismatch, so forgetting the right half is loud. `probe` results
+are what the UI renders — a backend is never silently skipped, and a backend the
+*build* does not have yet says so in the same shape as one the host is missing.
+
+Two things a default-deny profile breaks that are easy to miss, and that both
+policy backends therefore handle explicitly: the pane's pseudo-terminal
+(read/write/`ioctl` on the tty, without which the agent renders nothing), and
+bwrap's `--new-session`, which calls `setsid()` and detaches the agent from the
+pane. `--new-session` is deliberately **not** used.
+
+The `wsl-distro` rung sits below `bwrap` for a Windows host reached through the
+WSL transport, as the table says — but the platform detected *inside* a distro
+is the distro itself, and cloning a new one is a Windows-side operation a
+sandbox running in one cannot perform. The rung is reachable only from the
+Windows side.
 
 ## Egress firewall
 
@@ -280,10 +340,29 @@ friring proxy  ──  allow?  ──►  upstream
 ```
 
 Per backend the "no direct network" half is: seatbelt denies all outbound
-except the loopback proxy port; bwrap uses `--unshare-net` with a socket bridge;
-containers use `--network none` plus a bridge or an internal network. Because
-the kernel blocks everything else, a process that ignores the proxy environment
-variables gets *no* network rather than an escape route.
+except the loopback proxy port; bwrap uses `--unshare-net` with a **unix socket**
+bridge; containers use `--network none` plus a bridge or an internal network.
+Because the kernel blocks everything else, a process that ignores the proxy
+environment variables gets *no* network rather than an escape route.
+
+The endpoint shape is not uniform, and the difference is load-bearing:
+`--unshare-net` gives the sandbox its own empty network stack, so *host*
+loopback is unreachable from inside it. Seatbelt takes a loopback port; bwrap
+must take a socket bound across the boundary and refuses a loopback endpoint
+with that explanation.
+
+Until the proxy exists, `allowlist` configures the kernel exactly like `none`
+(ADR-27's claim that the two are identical at that layer), so it grants nothing
+— which is why a new profile can default to `allowlist` with an empty list and
+still start closed.
+
+**Allowlist matching** is suffix matching on label boundaries, case-insensitive:
+`github.com` covers `api.github.com` but not `evilgithub.com`, `github.com.evil.net`
+or `github.co`. `*.x` and `.x` are spellings of `x`; a rule without a port covers
+every port. Denies are checked **first in every mode**, so a deny entry narrows
+`full` too. `prompt_new_domains` is meaningful only under `allowlist` — nothing
+is unlisted under `full` and nothing leaves under `none` — and the editor greys
+it out elsewhere.
 
 This is chosen over IP-based `iptables`/`ipset` allowlists (the pattern in
 Anthropic's devcontainer reference and in the `friring-autonomous` rig) because
@@ -338,6 +417,15 @@ Therefore, in resolution order:
    the host home is readable except a deny list (SSH keys, cloud credentials,
    other agents' credential files), writes confined to the workspace plus the
    agent's own state directory.
+
+   "Other" is decided by **credential family**: the agent's registry name, or
+   its `hook_schema` when it is a rebrand of a built-in. Getting that wrong
+   either logs the agent out or lets it read a sibling's token.
+
+   The deny list covers `~/.ssh`, which **breaks git over SSH inside every
+   sandbox** — and `host-minus-secrets` is the default read policy. Use HTTPS
+   with a token for pushes from inside a profile, or add the key path back
+   deliberately.
 2. **`env-token`** — a long-lived token the user supplies once. Friring stores
    it in its own OS keychain entry and injects it at instance creation. No
    rotation, no races. This is the recommended path for place backends.
@@ -419,19 +507,40 @@ reachable by whatever the agent runs. That is an argument for narrow profiles
 and for `env-token` credentials with a limited blast radius, not an argument for
 double sandboxing that does not work.
 
-Where a backend supports it, the workspace's `.git/hooks` and the agent's own
-configuration stay write-protected even inside read-write paths, so a
-compromised agent cannot rewrite the rules it runs under.
+Where a backend supports it, `.git/hooks` stays write-protected inside **every**
+writable root — a shared constant both policy backends apply, and a no-op when
+the root is not a repository. Hook scripts are run by whichever git touches the
+repository next, including the *host's*, outside the boundary.
+
+`.git/config` is deliberately **not** protected despite naming commands
+(`core.pager`, `core.fsmonitor`, aliases): `git config` and `git remote add` are
+ordinary sandboxed work, and a profile that breaks git gets turned off, which
+protects nothing.
+
+The agent's own configuration is likewise not blanket-protected, because
+`state_rw` exists: an agent that cannot write its state directory dies on first
+launch. The narrow rule wins over the broad one.
 
 ## Launch integration
 
-**Policy backends** are a decorating provider applied where the invocation is
-composed (`build_agent_invocation` in `session_ops`, and the equivalent path in
-`Session::spawn`). Argv in, wrapped argv out. Wrapping happens *before*
-per-transport composition, because transports differ in how they quote and fold
-the command — the Windows multiplexer path collapses everything into a single
-token, so wrapping at the shell-string level would not survive. Spawn, restart
-and resume are all covered by the one seam.
+**Policy backends** are a decorator applied where the invocation is composed
+(`build_agent_invocation` in `session_ops`, and `Session::spawn`/`Session::restart`
+in `agent::backend`, both through `agent::sandboxing`). Argv in, wrapped argv
+out. Wrapping happens *before* per-transport composition, because transports
+differ in how they quote and fold the command — the Windows multiplexer path
+collapses everything into a single token, so wrapping at the shell-string level
+would not survive. Spawn, restart and resume are all covered by the one seam.
+
+The call order is fixed: resolve the backend from the profile's `auto` ladder →
+resolve the profile against it → fold in what the agent declares
+(`state_rw`, `bypass`, `env`) → build the launch → wrap. The agent's bypass
+flags go on the *agent's* own argv, inside the wrapper.
+
+**A policy backend applies to a local session only, in P1.** Both shipped
+backends generate their artefacts (a `.sb` profile file, an argv naming local
+paths) on the machine friring runs on, so an `ssh:`/`wsl:` session with a
+profile is refused rather than wrapped with the wrong machine's answers.
+Sandboxing a remote session arrives with the place backends.
 
 **Place backends** add an ensure-instance step before spawn and then use a new
 `TmuxTransport::Sandbox` variant, built exactly like the existing SSH transport
@@ -443,10 +552,13 @@ remote-argument adaptation: a sandbox is a third kind of "elsewhere".
 Two details that silently break things if missed:
 
 - **Environment forwarding.** Session environment is set on the tmux window,
-  which is *outside* a policy sandbox and on the *host* side of a place. The
-  session identity variables must be forwarded inward explicitly, and host-only
-  path variables must be skipped or translated exactly as the remote path
-  already does. Without this, status reporting dies quietly.
+  which is *outside* a policy sandbox and on the *host* side of a place. Neither
+  policy backend applies environment in argv — a policy is a rule on a process,
+  so the wrapped agent inherits the window — which makes the window the only
+  channel inward, and makes "the wrap only ever **adds** environment" an
+  invariant with a test on it. Host-only path variables must be skipped or
+  translated exactly as the remote path already does. Without this, status
+  reporting dies quietly.
 - **Resume identity.** A place keeps agent transcripts inside its own volume,
   so a resume by id can target a transcript that does not exist there. The
   launch path detects this and starts a fresh session under the requested id
@@ -471,36 +583,65 @@ poll. The database stays outside every boundary — see
 through a transport may alternatively reuse the existing remote hook rewrite,
 which already solves the same problem for SSH hosts.
 
+The file channel ships with the place backends. **Until it does, a sandboxed
+session does not report status**: the database path is denied on every launch
+(with its `-wal`/`-shm` siblings), so `friring-cli session signal` from inside
+fails and the session shows as idle. That is the correct trade — a session that
+looks idle is recoverable, a sandbox that can schedule host commands is not.
+The database path is a *launch input*, not something the sandbox layer resolves:
+the friring that owns the session is not necessarily on the host where the agent
+runs.
+
 ## UI
 
 Everything below clones machinery that already exists, so the feature adds
 screens rather than patterns.
 
-**Profile list** (`Modal::SandboxList`) — the automations list: `n` new, `Enter`
-edit, `d` delete, empty-state hint, instance state and memory for place
-backends, with stop / rebuild / prune actions.
+**Profile list** (`Modal::SandboxList`, `F11` or `<leader> S`) — the automations
+list: `n` new, `e`/`Enter` edit, `d` delete, empty-state hint. Each row shows the
+resolved backend (`auto → seatbelt`), the path count and the network mode; the
+resolution is as invisible-free here as at the creation step. Instance state and
+the stop / rebuild / prune actions arrive with the place backends.
 
 **Profile editor** (`Modal::SandboxEditor`) — the automation editor's shape:
-text fields, `‹ ›` selectors for backend and network mode, and its add/remove
-sub-list (`n add · d remove`) twice, once for paths (each row a path plus a
-`‹ ro | rw ›` selector) and once for allowed domains. Path entry reuses the repo
-picker's live path completion. Validation returns a message that surfaces
-through the existing error toast; there is no inline form-error widget today
-and adding one is deferred.
+text fields, `‹ ›` selectors, and its add/remove sub-list (`n add · d remove`,
+`[`/`]` reorder) twice, once for paths (each row a path plus a `‹ ro | rw ›`
+selector) and once for allowed domains. The profile has more selector-shaped
+knobs than the two the sketch above named, and all of them are rendered:
+backend, network mode, read scope, per-path mode, the `prompt_new_domains` and
+`allow_unsandboxed_fallback` toggles, and `containerfile`. A capability the
+chosen backend cannot honour stays **visible but inert**, with the reason in
+place of its value, and drops out of the saved profile so an invisible value can
+never decide a save. An unresolved `auto` rules nothing out.
+
+`network_deny` has no editor: denies beat allows in every mode, and the list
+is carried through a save untouched rather than dropped, but authoring one is
+import/CLI-only for now. The allow list stays editable under `none`/`full`,
+annotated `(inactive — network is full)`.
+
+Path entry is a plain text field. Reusing the repo picker's live completion
+needs a refactor first — that code is a private `App` method bound to
+`Modal::RepoPicker` — so it follows rather than ships with the screen.
+
+Validation returns a message that surfaces through the existing error toast;
+there is no inline form-error widget today and adding one is deferred.
 
 **Session creation** — a dedicated step in the `Ctrl+N` sequence, after
-directory selection so it can filter profiles to those covering the chosen
-directories, warn on a mismatch, and offer *create a sandbox for this
-selection* with the paths pre-filled from the repo picker's multi-select and
-worktree flags. The step shows the resolved backend and is skippable; like every
-other step it keeps its choice in the wizard state, contributes a breadcrumb
-line, and supports stepping back.
+directory selection so it can rank profiles covering the chosen directories
+first and label the ones that do not. Every profile stays selectable: the wizard
+knows the launch cwd, not what the user intends to reach from it. The step shows
+each profile's resolved backend, is skipped entirely when no profile exists,
+keeps its choice in the wizard state, contributes a breadcrumb line, and steps
+back to the repo palette (Esc from the name modal returns to it with the
+previous answer selected). *Create a sandbox for this selection* with pre-filled
+paths is not built yet — the step offers the stored profiles and `none`.
 
-**Indicators** — a `SessionInfo` field carries the profile, following the
-existing remote-host field end to end: a glyph in the session-list row prefix
-marks (beside the remote and worktree marks), a row in the info panel naming
-the profile, its backend and the inner-sandbox state, and the profile in the
-creation breadcrumb.
+**Indicators** — two `SessionInfo` fields carry it, following the existing
+remote-host field end to end: `sandbox_profile` (persisted) drives a `⛨` glyph
+in the session-list row prefix marks, beside the remote and worktree marks, and
+`sandbox_state` (not persisted — it describes a running process) adds the
+resolved backend and the inner-sandbox composition to the info panel's
+`Sandbox:` row. The profile also appears in the creation breadcrumb.
 
 **Firewall prompts** — a denial for an unlisted domain raises a notification and
 a confirm modal naming the domain and the command that wanted it; the answer is
@@ -555,7 +696,9 @@ Each phase is independently useful and lands with its own tests, docs and
 **P1 — Policy sandboxes.** The `sandbox` module, profile storage and migration,
 the profile list and editor, the session-creation step, the session indicator,
 `seatbelt` and `bwrap` backends, network `none` and `full` only,
-`host-passthrough` credentials.
+`host-passthrough` credentials. Local sessions only, and no status reporting
+from inside a boundary until P3's file channel — see
+[Launch integration](#launch-integration) and [Status signals](#status-signals).
 
 **P2 — The firewall.** The Rust filtering proxy, `allowlist` network mode,
 first-use domain prompts and their persistence, wiring into both policy

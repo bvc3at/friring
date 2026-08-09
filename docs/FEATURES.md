@@ -853,6 +853,7 @@ applicable: `h/j/k/l` for navigation, semantic letters for actions
 | `Ctrl+S` | Global | Sync all worktree sessions with their base branch | **S**ync |
 | `Ctrl+Z` | Global | Undo session delete | **Z** = undo |
 | `Ctrl+U` | Global | Restore deleted sessions list | **U**ndelete |
+| `Alt+S` / `<leader> Shift+S` | Global | Sandbox profiles (list + editor) — see [Sandboxed agents](#sandboxed-agents) | **S**andbox; `Ctrl+S` is worktree sync |
 | `Ctrl+Y` / `F4` | Global | Pick TUI theme | Color **Y**oke |
 | `Ctrl+,` / `F6` | Global | Settings panel (edit settings.toml) | **,** = preferences |
 | `F1` / `Ctrl+G` | Global | Keybindings help + interactive editor | Universal help |
@@ -2965,6 +2966,71 @@ The status bar summarizes results: `"3 worktree(s) synced"` or
 Sync runs on background threads via an `mpsc` channel. The main
 event loop polls `try_recv()` each tick to collect results as they
 complete. The TUI remains fully interactive during sync.
+
+---
+
+## Sandboxed agents
+
+**Friring — fork-only.** Upstream has no sandboxing: an agent it launches has
+whatever reach the user's shell has. Full design contract, per-backend detail
+and every ADR: [`docs/SANDBOX.md`](SANDBOX.md).
+
+A **sandbox profile** scopes what an agent can touch — a set of paths with
+per-path read-only / read-write intent, a network mode, and a read scope — and a
+session runs its agent inside it. Profiles are a UI-edited collection, so they
+live in SQLite beside automations rather than in a TOML file: `Alt+S` (or
+`<leader> Shift+S`) opens the list, `n` creates, `e`/`Enter` edits, `d` deletes.
+
+The honest framing, which the editor's own footer repeats: this **reduces blast
+radius, it does not prove containment**. The policy backends share the host
+kernel, and a domain allowlist is bypassable through domain fronting and through
+any allowed domain that can host arbitrary content.
+
+**What ships in the first pass.** The two *policy* backends — `sandbox-exec`
+(macOS) and `bwrap` (Linux/WSL) — which wrap the agent's argv with tmux
+outside, so nothing about window discovery, reattach, scrollback or restart
+changes. Network `none` and `full` are enforced; `allowlist` configures the
+kernel identically to `none` until the filtering proxy lands, so a profile that
+selects it starts closed rather than open. Credentials are host passthrough:
+the agent sees its real credential store subject to path policy, so the macOS
+Keychain keeps working and there is no login to redo. Container, VM and
+distro-clone backends are declared and probed — the picker says why each one is
+unavailable rather than hiding it — but not built.
+
+**Friring is agent-neutral about it.** What an agent needs in order to survive
+being sandboxed is declared data in `agents.toml`
+([`[agents.<name>.sandbox]`](CONFIG.md#agentstoml)), never special-cased code:
+the state directories it must keep writable, and the flags that turn its *own*
+sandbox off. That last one is not optional under `sandbox-exec` — a nested
+`sandbox_apply` under a profile containing a deny rule is denied outright by the
+kernel — and it is a real trade: with the inner sandbox off, everything inside
+the boundary, the agent's own credentials included, is reachable by whatever the
+agent runs. That argues for narrow profiles, not for double sandboxing that
+cannot work. The info panel states the composition in full.
+
+**Where it shows up.** A sandbox step in the `Ctrl+N` sequence, after directory
+selection, so it can rank the profiles that cover the chosen directories first
+and label the ones that do not; a `⛨` glyph in the session-list row beside the
+remote and worktree marks; a `Sandbox:` row in the info panel naming the
+profile, the resolved backend and the inner-sandbox state; and the profile in
+the creation breadcrumb. `friring-cli session create --sandbox <profile>` does
+the same headlessly.
+
+**Failure is loud on purpose.** A profile whose backend is unavailable fails the
+spawn rather than launching the agent on the host — unless the profile's own
+`allow_unsandboxed_fallback` switch is on, which makes the escape hatch visible
+and per-profile instead of ambient, and puts the reason in front of the user
+when it fires. Deleting a profile that sessions still reference leaves the
+reference dangling for the same reason: clearing it would silently unsandbox
+those sessions on their next launch.
+
+**Two limits worth knowing.** A sandboxed session is **local-only** for now —
+both policy backends generate their artefacts on the machine friring runs on, so
+an SSH/WSL session with a profile is refused rather than wrapped with the wrong
+machine's paths. And a sandboxed session **does not report status**: the
+database is denied inside every boundary (writing it is arbitrary host command
+execution — see ADR-29), and the file channel that replaces `friring-cli session
+signal` arrives with the place backends. The session shows as idle until then.
 
 ---
 

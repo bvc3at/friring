@@ -92,11 +92,13 @@ actually needs and to an allowlist of domains.
 
 - **Sandbox profiles** — a UI-edited collection in SQLite (the automations
   pattern): per-path read-only/read-write scope, network mode, domain
-  allowlist, resource limits, backend choice. New tables **supersede** the
-  dormant upstream `containers` / `project_container_config` / `vms` tables
-  (created by upstream schema v8/v10/v11 and referenced nowhere in live code),
-  which this feature's migration drops. Merges touching those tables resolve
-  toward the Friring tables.
+  allowlist, resource limits, backend choice. New tables (schema v47)
+  **supersede** the dormant upstream `containers` / `project_container_config` /
+  `vms` / `project_vm_config` tables (created by upstream schema v8/v10/v11 and
+  referenced nowhere in live code), which this feature's migration drops.
+  Merges touching those tables resolve toward the Friring tables. `sessions`
+  also gains a `sandbox_profile` column, carried end to end like
+  `backend_type`.
 - **Two sandbox shapes** — *policy* backends (`seatbelt`, `bwrap`) wrap the
   agent's argv with tmux outside; *place* backends (`docker`/`podman`,
   `apple-container`, `wsl-distro`) run tmux inside and are reached through a
@@ -113,8 +115,21 @@ actually needs and to an allowlist of domains.
 - **The database never enters a sandbox** — sandboxed sessions report status
   through a polled file channel, because automations make database write access
   equivalent to arbitrary host command execution.
+- **Agent requirements are declared data** — an optional
+  `[agents.<name>.sandbox]` block in `agents.toml` carries the state
+  directories an agent must keep writable and the flags that turn its *own*
+  sandbox off (mandatory under `seatbelt`, where nesting is denied by the
+  kernel). Upstream's `agents.toml` has no such key and loads unchanged; the
+  fork bakes in no agent knowledge.
+- **A new module in the architecture allowlist** — `sandbox` may reference
+  `session`, `paths` and `shell`, and `agent` may reference `sandbox` (the wrap
+  is a decorator on the launch `agent` composes). Enforced in
+  `tests/architecture_rules.rs`.
 
-Design and ADR-25 through ADR-29 live in [`docs/SANDBOX.md`](docs/SANDBOX.md).
+The first pass ships the two policy backends only, for **local** sessions, with
+network `none`/`full` and host-passthrough credentials; the filtering proxy, the
+place backends and the status file channel follow. Design, delivery phases and
+ADR-25 through ADR-29 live in [`docs/SANDBOX.md`](docs/SANDBOX.md).
 
 #### Lazy sessions & ghosts (July 2026)
 

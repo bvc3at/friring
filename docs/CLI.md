@@ -21,6 +21,10 @@ friring-cli session create --name worker --repo-path /path \
 friring-cli session create --name demo --repo-path /a \
     --agent claude --worktree-branch feat/x \
     --add-repo /b@main --add-repo /c@master --add-dir /reference
+# Run the agent inside a sandbox profile (docs/SANDBOX.md). The profile is
+# authored in the TUI; an unknown name fails the spawn rather than silently
+# running on the host, and the profile is persisted so a restart rebuilds it.
+friring-cli session create --name demo --repo-path /path --sandbox dev
 friring-cli session list                       # human-readable table
 friring-cli session list --json | jq           # machine output for scripts
 friring-cli session list --parent <lead-uuid> --json | jq  # direct children only
