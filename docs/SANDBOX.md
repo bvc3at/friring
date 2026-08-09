@@ -40,6 +40,22 @@ change. Fork-visible divergences are also listed in [`FORK.md`](../FORK.md).
 - Native Windows process sandboxing (restricted tokens / AppContainer). Windows
   isolation is delivered through WSL2 and through containers. See
   [Backend catalogue](#backend-catalogue).
+- **Detecting a pre-existing hardlink alias.** Both policy backends protect a
+  file by *name*: seatbelt denies a pathname, bwrap covers one with a mask. A
+  hard link made on the host *before* the launch — sitting inside a read-write
+  grant, pointing at the database or at a secret — is a second name for the
+  same inode that neither rule mentions, and it is reachable. This is the one
+  stated exception to ADR-29's absolute, and it is written here rather than
+  implied. What narrows it: the profile that would most plausibly host such a
+  link is refused outright, because read-write roots may not enclose the data
+  directory; a rename cannot bring a protected path under a grant, because
+  `file-write-unlink` is denied on every writable anchor and on every ancestor
+  of a protected path; and under bwrap the protected pathname resolves to
+  `/dev/null`, so a link made from inside would alias that, not the database.
+  What remains is a link the user planted themselves, and friring does not go
+  looking for one. Closing it needs inode identity rather than pathnames — a
+  Landlock or overlay-based boundary — which is a backend change, not a rule
+  change.
 
 ## The two sandbox shapes
 
@@ -76,6 +92,22 @@ Consequences worth internalising:
   UX. When a place dies, every session in it dies at once.
 - Only place backends can enforce memory/CPU limits, and only place backends
   give a filesystem the host cannot see.
+
+Overlapping paths resolve **most-specific-first on both backends**: `repo`
+read-only with `repo/work` read-write leaves `repo/work` writable, and the
+reverse nesting leaves the descendant read-only. Each backend gets there its own
+way — seatbelt emits both sets in one ancestor-before-descendant pass, because
+the last matching SBPL rule wins; bwrap binds them in the same order, because
+the last mount over a path wins — so the shared rule is a conformance test over
+one table of profiles, not a shared implementation. The database and secret
+denies are still final and win over any path grant, including one naming the
+protected path itself.
+
+Neither backend may grant more than the other for the same profile. Where a
+kernel primitive is quietly wider, the wider backend takes the difference back
+explicitly: bwrap's read-only host bind would leave the control-socket trees
+connectable, and seatbelt's `(deny default)` would not, so bwrap masks them (see
+its bullets below).
 
 ## Data model
 
@@ -116,6 +148,17 @@ and resolve toward the Friring tables.
 Paths are stored as written (`~` preserved) and expanded at launch, so a
 profile stays meaningful if `$HOME` differs on a remote host.
 
+A read-write path is refused at launch if it encloses the friring data directory
+(ADR-29) or reaches a tmux server socket directory; a security-relevant path
+that is not valid UTF-8 is refused too, because a rule built from a lossy
+conversion names a different file. The first of those is also checked when the
+editor saves — the check needs the data directory and the database path, which
+the `session` layer may not resolve, so it lives in the save path rather than in
+`SandboxProfile::validate` — so a profile that cannot launch is never stored in
+the first place. Refusing rather than trimming is deliberate: a profile that
+says "my home is writable" and silently is not produces a boundary nobody can
+reason about.
+
 `name` is a **case-insensitive identifier** (`COLLATE NOCASE`): two spellings
 would be one container/distro name, so the database enforces the same rule the
 validator does.
@@ -137,6 +180,26 @@ decides what happens when the profile **cannot be applied** at launch: off (the
 default) fails the spawn, on starts the agent unsandboxed with the reason in
 front of the user. The per-command escape the name also suggests arrives with
 the place backends.
+
+Falling back **never clears** `sessions.sandbox_profile`. The profile is the
+desired boundary and the escape hatch is a property of one launch, so a
+session that started on the host because its backend was momentarily missing
+is sandboxed again on the next relaunch. What the fallback does instead is
+record `SandboxState::Unenforced` on the live session and put the reason in
+front of the user.
+
+**A row friring cannot decode is listed, not launched.** Reading a profile is
+deliberately lenient — a hand-edited or imported value must not hide the row
+from the list modal, which is the only place it can be repaired or deleted —
+but leniency has to pick a value, and the value it would otherwise pick is the
+wider one: an unrecognised `read_scope` is `host-minus-secrets`, a malformed
+`network_deny` is an empty deny list. So each undecodable column is recorded
+beside the profile, the substituted value is the **narrowest** its column
+allows (`workspace`, network `none`, empty lists, uncapped limits), the list
+row reports `unreadable <columns>` in place of a summary of values friring
+invented, the editor's footer names them and states that saving replaces them,
+and every launch path refuses the profile with a message naming each column
+and the text it refused.
 
 ### `sandbox_instances`
 
@@ -181,8 +244,19 @@ processes. Treat the deprecation as a real but low-probability risk mitigated
 by the backend being pluggable.
 
 - Per-path `file-read*` / `file-write*` scoping with `subpath` filters, plus
-  `file-write-unlink` and ancestor-directory rules so a move cannot escape a
-  write boundary.
+  `file-write-unlink` denies so a move cannot escape a write boundary. SBPL
+  matches by pathname, so a deny is only as good as the path staying put: the
+  unlink of every writable anchor *and* of every directory leading to a
+  protected path (the database, each secret) is denied, which is what stops a
+  rename from bringing a protected file out from under the rule naming it.
+  bwrap needs no counterpart — a directory holding a mount point cannot be
+  renamed.
+- The generated profile is written under `<data dir>/sandbox/profiles/`, `0600`,
+  refusing a symlink at the final component and staged through an `O_EXCL`
+  sibling so a link planted in the race window is replaced rather than followed.
+  It is *the policy*: a sandbox that could write it could rewrite what
+  constrains it, which is why it does not live in the host temp directory and
+  why no profile may enclose the data directory.
 - **Keychain works.** Under a restrictive profile a process can still reach
   `securityd`, so Claude Code's Keychain-stored OAuth keeps working with no
   credential handling at all. A default-deny profile must explicitly allow
@@ -222,6 +296,25 @@ made bwrap its primary Linux backend and Claude Code's sandbox uses it too.
 - Landlock is available as optional in-process hardening (per-hierarchy
   filesystem rights, port-level TCP from ABI v4). It cannot express host
   allowlists and is never the primary boundary.
+- `/tmp` is a private tmpfs and is never re-bound from the host: it is where
+  friring's own tmux server listens, and `--unshare-net` does not stop
+  `connect(2)` on a pathname unix socket. The agent's scratch is a per-session
+  directory friring mints under the data directory instead.
+- The control-socket trees — `/run`, the user runtime directory, `/var/run`,
+  and the directory tmux keeps its sockets in — are covered with an empty tmpfs
+  under `host-minus-secrets`. A read-only bind is no barrier to a socket, and
+  seatbelt's `(deny default)` already refuses unix-domain sockets, so without
+  this bwrap would grant strictly more than seatbelt for the same profile. A
+  path the profile lists inside one of them still wins. The cost is real and
+  stated: masking `/run` breaks DNS on a systemd-resolved host under
+  `network = full`, because `/etc/resolv.conf` points into it. The fix is
+  first-class — list `/run/systemd/resolve` read-only in the profile.
+- `bwrap` is resolved to an absolute path once, at probe time, and a copy
+  living anywhere a sandboxed agent could rewrite (`$HOME`, `/tmp`, `/var/tmp`,
+  `/dev/shm`, friring's own sandbox tree) is refused with the fix; so is one the
+  profile itself makes writable. The user's environment must not choose what
+  applies the policy — the same rule `/usr/bin/sandbox-exec` follows by being
+  absolute.
 
 ### `docker` / `podman` — everywhere, place
 
@@ -349,19 +442,6 @@ except the loopback proxy port; bwrap uses `--unshare-net`; containers use
 ignores the proxy environment variables gets *no* network rather than an escape
 route.
 
-Until the proxy is wired into a launch, `allowlist` configures the kernel
-exactly like `none` (ADR-27's claim that the two are identical at that layer),
-so it grants nothing — which is why a new profile can default to `allowlist`
-with an empty list and still start closed.
-
-**Allowlist matching** is suffix matching on label boundaries, case-insensitive:
-`github.com` covers `api.github.com` but not `evilgithub.com`, `github.com.evil.net`
-or `github.co`. `*.x` and `.x` are spellings of `x`; a rule without a port covers
-every port. Denies are checked **first in every mode**, so a deny entry narrows
-`full` too. `prompt_new_domains` is meaningful only under `allowlist` — nothing
-is unlisted under `full` and nothing leaves under `none` — and the editor greys
-it out elsewhere.
-
 ### Reaching the proxy
 
 That same denial is why the arrow above is not one mechanism. **A sandbox with
@@ -400,6 +480,38 @@ The socket is `0o600` by default. It is a credential-bearing endpoint, and a
 backend whose sandbox runs as a different uid (containers usually do) has to
 widen that deliberately rather than inherit a world-connectable socket.
 
+Because the endpoint shape differs, a backend rejects the wrong one rather than
+silently failing later: `bwrap` refuses a loopback endpoint and says why.
+
+Until a backend is wired to the proxy, `allowlist` configures the kernel exactly
+like `none` — the two are identical at that layer, so `allowlist` grants nothing
+on its own. That is why a new profile can default to `allowlist` with an empty
+list and still start closed.
+
+**Allowlist matching** is suffix matching on label boundaries, case-insensitive:
+`github.com` covers `api.github.com` but not `evilgithub.com`,
+`github.com.evil.net` or `github.co`. `*.x` and `.x` are spellings of `x`,
+apex included — the deny direction decides it, because a user refusing `*.x`
+means "no x traffic" and a matcher sparing the apex would be a silent hole.
+A rule without a port covers every port. Denies are checked **first in every
+mode**, so a deny entry narrows `full` too — and until the proxy exists, a
+`full` profile that carries denies is **refused at launch** rather than started
+with rules no kernel policy can express. `prompt_new_domains` is meaningful
+only under `allowlist` — nothing is unlisted under `full` and nothing leaves
+under `none` — and the editor greys it out elsewhere.
+
+Two matchers implement this vocabulary: `session::DomainRule`, which the
+profile validator and the UI use, and `proxy::HostRule`, which the proxy
+enforces at connection time. They deliberately do not share a type — the proxy
+is a leaf in the architecture allowlist — so
+`tests/egress_matcher_conformance.rs` runs both over one table of stored
+spellings and fails if either drifts. Both accept the same grammar: ASCII
+labels of letters, digits, `-` and `_`, no empty label, none edged with `-`,
+63 bytes per label and 253 overall. A spelling no request host could ever
+carry is refused rather than stored as a rule that matches nothing, and an
+international name is written in punycode because that is how it is spelled on
+the wire.
+
 This is chosen over IP-based `iptables`/`ipset` allowlists (the pattern in
 Anthropic's devcontainer reference and in the `friring-autonomous` rig) because
 resolved-IP snapshots break mid-run when a CDN rotates addresses, and because
@@ -417,8 +529,9 @@ allowlist and testable without a session, a database or a backend.
 - HTTP `CONNECT` and SOCKS5, allowlist matched on the requested host, with
   optional `:port` scoping; denies win over allows, in every network mode. A
   bare rule covers its own subtree on a label boundary (`github.com` matches
-  `api.github.com`, never `evilgithub.com`); `*.github.com` excludes the apex;
-  an address rule is exact.
+  `api.github.com`, never `evilgithub.com`); `*.github.com` and `.github.com`
+  are spellings of that same rule and cover the apex with it; an address rule
+  is exact.
 - Both protocols share **one listener**, selected by the first byte (`0x05` is
   a SOCKS greeting, anything else starts an HTTP request line), on either
   transport. `ALL_PROXY` must be **`socks5h://`**, not `socks5://`: the `h`
@@ -442,6 +555,12 @@ allowlist and testable without a session, a database or a backend.
 - No TLS interception in the first release. Allow decisions therefore trust the
   client-supplied hostname, so domain fronting can bypass them — documented in
   the UI, not hidden.
+- Both matchers compare ASCII, and neither treats `127.1` or `2130706433` as
+  the address `getaddrinfo` resolves them to. Under `allowlist` that fails
+  closed: an unlisted spelling is denied. It becomes a real gap only for a
+  *deny* list under `full`, which is refused at launch until the proxy is wired
+  — and the fix belongs in the proxy's request path (normalise the host to
+  A-labels, or refuse a non-ASCII request host outright), not in the matchers.
 
 Written in Rust rather than shelling out to an external runtime: Friring ships
 as a self-contained binary, and a CONNECT/SOCKS filter is a small, testable
@@ -620,6 +739,13 @@ Two details that silently break things if missed:
   launch path detects this and starts a fresh session under the requested id
   instead, so later restarts resume normally. (The `friring-autonomous` rig
   proved this pattern in a wrapper script; it belongs in core.)
+- **Scratch and policy files.** friring mints a per-session directory under
+  `<data dir>/sandbox/tmp/` for the agent's scratch and writes the generated
+  seatbelt profile to `<data dir>/sandbox/profiles/`, both `0700`, both refusing
+  a symlink. Neither may be the host temp root, and a profile is refused if its
+  read-write roots enclose the data directory or reach a tmux socket directory.
+  The scratch is keyed on the session and adopted, not recreated, so a crashed
+  run's files survive into the next launch; session teardown drops both.
 
 ## Status signals
 
@@ -692,12 +818,28 @@ back to the repo palette (Esc from the name modal returns to it with the
 previous answer selected). *Create a sandbox for this selection* with pre-filled
 paths is not built yet — the step offers the stored profiles and `none`.
 
-**Indicators** — two `SessionInfo` fields carry it, following the existing
-remote-host field end to end: `sandbox_profile` (persisted) drives a `⛨` glyph
-in the session-list row prefix marks, beside the remote and worktree marks, and
-`sandbox_state` (not persisted — it describes a running process) adds the
-resolved backend and the inner-sandbox composition to the info panel's
-`Sandbox:` row. The profile also appears in the creation breadcrumb.
+**Indicators** — two `SessionInfo` fields carry it, and they say different
+things. `sandbox_profile` (persisted) is the boundary the session **asked
+for**: it survives a deleted profile and a fallback launch alike, because it
+is what the next relaunch rebuilds from. `sandbox_state` (not persisted — it
+describes a running process) is what the last launch **applied**: `Applied`
+carries the resolved backend and the inner-sandbox composition, `Unenforced`
+carries the reason there is no boundary. The session-list prefix marks read
+the applied state, not the desired one — `⛨` beside the remote and worktree
+marks for a boundary that is in effect, `⚠` for a session running on the host
+under a profile that could not be applied — and the info panel's `Sandbox:`
+row spells the same distinction out. A fallback also raises an error toast at
+the moment of the launch, and `friring-cli session create|restart` prints it
+(`sandbox_unenforced` in the JSON). `sandbox_state` is `None` for a session
+friring only adopted: it did not make that launch, so the persisted profile
+is the only evidence it has. The profile also appears in the creation
+breadcrumb.
+
+Because the applied state is not persisted, an adopted session renders as `⛨`
+even if the launch friring is adopting had fallen back to the host. The window
+is bounded — any relaunch re-derives the truth and re-reports it — and closing
+it needs a persisted column, which is a schema migration rather than a
+rendering fix.
 
 **Firewall prompts** — with the firewall (P2 — see
 [Delivery phases](#delivery-phases)), a denial for an unlisted domain will raise
@@ -719,7 +861,19 @@ complete and consistent with existing screens.
 - **Escape hatch.** Every profile carries an explicit
   `allow_unsandboxed_fallback` switch. Escape hatches exist in every comparable
   product; the design makes this one visible and per-profile instead of
-  ambient.
+  ambient. When it fires the session keeps its profile, the indicator switches
+  from `⛨` to `⚠`, and the reason reaches the user as an error toast (TUI) or
+  on the command's own output (`friring-cli`) — not only the log.
+- **An unreadable profile** is refused at launch, named column by column, and
+  repaired by re-saving it in the editor. Listing it permissively and
+  launching it permissively are different decisions: the first keeps it
+  fixable, the second would run a policy nobody wrote.
+- **A boundary friring will not grant** fails the launch with the reason and
+  the fix, whatever the profile asked for: read-write roots reaching the
+  database or a tmux socket directory, denies under a network mode that cannot
+  enforce them, a path that cannot be spelled exactly. Refusing is the whole
+  point — every one of these has a silent alternative that grants more than the
+  profile says.
 
 ## Testing and privacy
 
@@ -864,4 +1018,9 @@ host command execution — a complete escape.
 
 **Consequences**: One more signal path to maintain, reusing the existing poll.
 Transport-reached places may instead reuse the remote hook rewrite, which
-already avoids database access for SSH hosts.
+already avoids database access for SSH hosts. The database and its `-wal`/`-shm`
+siblings are masked unconditionally wherever an ancestor is writable — a `-wal`
+created after launch is replayed by the host on next open — and a profile whose
+read-write roots enclose the data directory is refused outright. The one
+residual is a hardlink alias planted on the host before the launch; see
+[Goals and non-goals](#goals-and-non-goals).

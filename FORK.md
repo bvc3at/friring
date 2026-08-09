@@ -107,14 +107,38 @@ actually needs and to an allowlist of domains.
   allowlist while the kernel denies direct egress, so ignoring the proxy means
   no network rather than a bypass. Chosen over resolved-IP `iptables`
   allowlists, which break on CDN address rotation and cannot work under
-  seatbelt or in WSL's shared network namespace.
+  seatbelt or in WSL's shared network namespace. `x`, `*.x` and `.x` are one
+  rule, apex included, in both the profile validator and the proxy — two
+  matchers held to one table by `tests/egress_matcher_conformance.rs`.
 - **Credential handling** — never copies rotating OAuth credentials per
   sandbox (copies invalidate each other on first refresh); prefers host
   passthrough under policy backends (the macOS Keychain keeps working), then an
   injected long-lived token, then one login per profile in a named volume.
 - **The database never enters a sandbox** — sandboxed sessions report status
   through a polled file channel, because automations make database write access
-  equivalent to arbitrary host command execution.
+  equivalent to arbitrary host command execution. The database and its
+  `-wal`/`-shm` siblings are masked wherever a writable root could create the
+  mount point, whether or not they exist yet.
+- **A launch is refused rather than quietly narrowed** — friring will not start
+  a session whose profile hands over more than the boundary can hold: read-write
+  roots enclosing the data directory (ADR-29) or reaching a tmux server socket
+  directory, domain denies under `full` that no kernel policy can express, or a
+  security-relevant path that is not valid UTF-8 (a rule built from a lossy
+  spelling names a different file). The profile editor applies the first of
+  those at save, so such a profile never becomes a stored row.
+- **A per-session scratch directory** — the agent's writable temp space is
+  `<data dir>/sandbox/tmp/<session id>`, minted `0700`, adopted after a crash
+  and dropped with the session; generated seatbelt profiles sit beside it under
+  `<data dir>/sandbox/profiles/`. The host temp root is never granted: friring's
+  own tmux server socket lives there, and a network namespace does not stop
+  `connect(2)` on a pathname unix socket.
+- **Desired vs applied boundary** — a session records the profile it asked for
+  *and* what the launch did with it. A launch that falls back to the host keeps
+  the profile (so the next relaunch is sandboxed again) and is marked `⚠`
+  rather than `⛨`, with the reason in the info panel, in an error toast, and on
+  `friring-cli session create|restart` output. A profile whose stored row
+  friring cannot decode is still listed and repairable but is refused at
+  launch, naming each column that failed.
 - **Agent requirements are declared data** — an optional
   `[agents.<name>.sandbox]` block in `agents.toml` carries the state
   directories an agent must keep writable and the flags that turn its *own*
