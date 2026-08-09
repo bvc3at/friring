@@ -459,6 +459,11 @@ themes, switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
 
 **Also in the box:**
 
+- **[Sandboxed agents](docs/SANDBOX.md)** *(Friring — fork-only)* — run any
+  agent from the registry inside an isolation boundary scoped to the directories
+  you choose, each read-only or read-write: `Alt+S` authors the profiles, and
+  `Ctrl+N` picks one per session. This release ships the policy backends —
+  macOS `seatbelt` and Linux `bubblewrap` — on local sessions.
 - **[Leader key](#leader-key)** *(Friring — fork-only)* — `Ctrl+F` arms a
   tmux-style prefix and paints a which-key overlay naming everything reachable;
   the next key runs it. Every global command is on it, plus jump-to-session by
@@ -507,6 +512,9 @@ themes, switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
   [claude](https://github.com/anthropics/claude-code), codex,
   antigravity, opencode, or aider (whichever agents you plan to run)
 - **git** (required for worktree features)
+- **[bubblewrap](https://github.com/containers/bubblewrap)** (`bwrap`) — only
+  for [sandboxed agents](docs/SANDBOX.md) on Linux; macOS uses the system
+  `sandbox-exec`
 - **Rust 1.75+** (only to build from source)
 
 ## Uninstall
@@ -770,6 +778,7 @@ overlay delay are configurable — see [docs/CONFIG.md](docs/CONFIG.md)
 | `Ctrl+C` / `Cmd+C` | Copy selection / SIGINT (terminal; `Cmd+C` never SIGINTs) | **C**opy |
 | `Ctrl+V` / `Cmd+V` | Paste from clipboard | Paste |
 | `Ctrl+P` | Automations (list/new/edit/toggle/run/delete) | **P**rogram |
+| `Alt+S` / `<leader> S` | Sandbox profiles (list/new/edit/delete) | **S**andbox |
 | `Ctrl+/` / `Shift Shift` | Session switcher (ranked, most-recent first); `Tab` widens it to every scope (tasks/automations/files/buffer content) and back | **/** = search; JetBrains double-shift |
 | `Ctrl+W` / `F5` | Toggle tasks panel (todo list) | **W**ork items |
 | `Ctrl+T` / `F8` | Toggle shell pane | **T**erminal |
@@ -881,6 +890,7 @@ friring-cli session create \
   --worktree-branch feat/x \
   --base-branch main \
   --host devbox          # optional — run on a remote host from hosts.toml
+friring-cli session create --name demo --repo-path /path --sandbox dev
 friring-cli session send <uuid> "run the test suite"
 friring-cli session capture <uuid> --lines 500
 friring-cli session restart <uuid>       # kill + re-spawn with --resume
