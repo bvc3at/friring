@@ -8671,6 +8671,10 @@ impl App {
         session.info.worktrees = worktrees;
         session.info.parent_session_id = shared.parent_session_id;
         session.info.display_order = shared.display_order;
+        // Without this the adopted session has no profile, and the full-row
+        // write-back that follows clears the column — the next restart would
+        // relaunch the agent on the host.
+        session.info.sandbox_profile = shared.sandbox_profile.clone();
         resolve_repo_display_names(&mut session.info);
 
         // Re-adopt shell pane if one was persisted
@@ -15310,7 +15314,7 @@ mod tests {
     fn session_to_shared_round_trips_the_sandbox_profile() {
         let backend_arc = stub_backend_arc();
         let provider = stub_provider();
-        let app = App::new(
+        let mut app = App::new(
             24,
             120,
             BackendRegistry::new(backend_arc.clone()),
@@ -15326,6 +15330,11 @@ mod tests {
         let mut adopted = Session::stub("boxed", &backend_arc, &provider);
         App::apply_shared_session_metadata(&mut adopted, &shared);
         assert_eq!(adopted.info.sandbox_profile.as_deref(), Some("dev"));
+
+        // The startup-adoption path copies the same metadata.
+        let fresh = Session::stub("boxed", &backend_arc, &provider);
+        app.finish_adopted_session(fresh, &shared, "claude".to_string(), Vec::new(), &[]);
+        assert_eq!(app.sessions[0].info.sandbox_profile.as_deref(), Some("dev"));
     }
 
     /// After a reboot every persisted session comes back through
