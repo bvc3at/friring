@@ -63,6 +63,13 @@ between it and the `app` coordinator.
   `Arc<Mutex<vt100::Parser>>` on a `spawn_blocking` reader; input is
   written over an mpsc channel (ADR-3), translated from crossterm
   `KeyCode` to xterm ANSI by `input.rs` (ADR-4).
+- **`sandbox/`** — isolation boundaries: host probing, policy generation
+  (SBPL / bwrap argv) and the wrap of a composed launch. Same tier as
+  `agent`, which depends on it and never the reverse (ADR-25/ADR-26 in
+  [`SANDBOX.md`](SANDBOX.md)).
+- **`proxy/`** — the egress filtering proxy (HTTP CONNECT + SOCKS5, TCP and
+  unix transports), a self-contained leaf that enforces the policy it is
+  handed (ADR-27 in [`SANDBOX.md`](SANDBOX.md)).
 - **`session/`** — plain data types, the dependency sink (no
   crate-internal references): `SessionId`, `SessionStatus`, `SessionInfo`
   (carries the `agent` name), `SessionConfig` (agent/backend names, ids,
