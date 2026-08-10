@@ -1048,6 +1048,67 @@ mod tests {
         }
     }
 
+    /// The only function here that destroys anything, over the four shapes a
+    /// planned id can turn out to have by the time it is reached.
+    ///
+    /// The load-bearing one is the second: the label is re-checked immediately
+    /// before removal, so a container that lost friring's label (or an id that
+    /// now names somebody else's container) is left alone and said out loud
+    /// rather than removed.
+    #[test]
+    fn reaping_removes_only_what_is_still_friring_s_and_reports_the_rest() {
+        use crate::sandbox::probe::ProbeOutput;
+
+        let inspect =
+            |id: &str| format!("{PROGRAM} inspect --type container --format {INSPECT_FORMAT} {id}");
+        let host = host()
+            // Ours, and it goes.
+            .with_command(
+                &inspect("mine"),
+                ProbeOutput::success("mine|running|1|dev|aaaa\n"),
+            )
+            .with_command(
+                &format!("{PROGRAM} rm --force mine"),
+                ProbeOutput::success("mine\n"),
+            )
+            // Not ours any more: no owner label, so no `rm` is scripted — one
+            // reaching the engine would fail this test with "No such file".
+            .with_command(
+                &inspect("theirs"),
+                ProbeOutput::success("theirs|running|<no value>|<no value>|<no value>\n"),
+            )
+            // Gone between planning and reaping, which is the outcome the pass
+            // wanted.
+            .with_command(
+                &inspect("vanished"),
+                ProbeOutput::failure(1, "no such container\n"),
+            )
+            // Ours, and the engine will not let go of it.
+            .with_command(
+                &inspect("stuck"),
+                ProbeOutput::success("stuck|running|1|dev|aaaa\n"),
+            )
+            .with_command(
+                &format!("{PROGRAM} rm --force stuck"),
+                ProbeOutput::failure(1, "container is in use\nand a second line nobody needs\n"),
+            );
+
+        let plan = GcPlan {
+            remove: ["mine", "theirs", "vanished", "stuck"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            ..GcPlan::default()
+        };
+        let failures = backend(host).reap(&plan);
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            failures[0].starts_with("theirs: ") && failures[0].contains("left alone"),
+            "{failures:?}"
+        );
+        assert_eq!(failures[1], "stuck: container is in use");
+    }
+
     /// Nothing may be ensured on a host without the engine, and the reason is
     /// the probe's own sentence rather than a later, stranger failure.
     #[test]
