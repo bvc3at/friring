@@ -82,6 +82,7 @@
 //! awaits every one of them.
 
 mod auth;
+mod host;
 mod http;
 mod policy;
 #[cfg(unix)]
@@ -313,8 +314,11 @@ impl Shared {
         self.policy.write().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn decide(&self, host: &str, port: u16) -> Decision {
-        self.read_policy().decide(host, port)
+    /// The host is canonical already: both protocol handlers canonicalise at
+    /// their edge, so the policy is asked about the same spelling the socket
+    /// will be opened to.
+    fn decide(&self, host: &host::CanonicalHost, port: u16) -> Decision {
+        self.read_policy().decide_host(host, port)
     }
 
     fn decide_method(&self, method: &str) -> Decision {

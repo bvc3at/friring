@@ -20,6 +20,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use super::auth;
+use super::host::{self, CanonicalHost};
 use super::policy::{Decision, DenyReason};
 use super::stream::Client;
 use super::{Protocol, Shared};
@@ -74,13 +75,15 @@ pub(super) async fn serve(mut client: Client, shared: Arc<Shared>) -> io::Result
         )
         .await;
     };
-    let (host, port) = (route.host(), route.port());
+    // The host as the client spelled it: what a denial reports, and all there
+    // is to report when it turns out not to canonicalise.
+    let (asked, port) = (route.host(), route.port());
 
     // Authentication precedes policy so a caller without the token learns
     // nothing about what the allowlist contains.
     let presented = request.header("proxy-authorization");
     if !presented.is_some_and(|value| auth::header_presents_token(value, shared.token())) {
-        shared.report(Protocol::Http, host, port, DenyReason::Unauthorized);
+        shared.report(Protocol::Http, asked, port, DenyReason::Unauthorized);
         let challenge = ["Proxy-Authenticate: Basic realm=\"friring\""];
         let body = format!("friring proxy: {}\n", DenyReason::Unauthorized);
         return respond(
@@ -93,20 +96,29 @@ pub(super) async fn serve(mut client: Client, shared: Arc<Shared>) -> io::Result
         .await;
     }
 
-    if let Decision::Deny(reason) = shared.decide(host, port) {
-        shared.report(Protocol::Http, host, port, reason.clone());
+    // One canonicalisation, at the edge, before anything is compared — and the
+    // result is what gets dialled below.
+    let host = match CanonicalHost::parse(asked) {
+        Ok(host) => host,
+        Err(fault) => {
+            let reason = DenyReason::UnsupportedHost(fault.detail());
+            shared.report(Protocol::Http, asked, port, reason.clone());
+            return refuse(&mut client, 403, "Forbidden", &reason.to_string()).await;
+        }
+    };
+    if let Decision::Deny(reason) = shared.decide(&host, port) {
+        shared.report(Protocol::Http, asked, port, reason.clone());
         return refuse(&mut client, 403, "Forbidden", &reason.to_string()).await;
     }
     // A tunnel's method is unknowable, so the restriction only applies here.
     if matches!(route, Route::Forward { .. }) {
         if let Decision::Deny(reason) = shared.decide_method(&request.method) {
-            shared.report(Protocol::Http, host, port, reason.clone());
+            shared.report(Protocol::Http, asked, port, reason.clone());
             return refuse(&mut client, 403, "Forbidden", &reason.to_string()).await;
         }
     }
 
-    let mut upstream = match timeout(limits.connect_timeout, TcpStream::connect((host, port))).await
-    {
+    let mut upstream = match timeout(limits.connect_timeout, host::connect(&host, port)).await {
         Ok(Ok(upstream)) => upstream,
         Ok(Err(error)) => {
             let detail = format!("cannot reach {host}:{port}: {error}");
@@ -127,7 +139,7 @@ pub(super) async fn serve(mut client: Client, shared: Arc<Shared>) -> io::Result
         }
         Route::Forward { path, .. } => {
             upstream
-                .write_all(&request.forwarded_head(path, host, port))
+                .write_all(&request.forwarded_head(path, &host.to_string(), port))
                 .await?;
         }
     }

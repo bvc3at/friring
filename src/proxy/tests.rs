@@ -419,6 +419,85 @@ async fn a_lookalike_of_an_allowed_domain_is_refused() {
     proxy.shutdown().await;
 }
 
+/// The deny-list gap, on the wire: `getaddrinfo(3)` reads `127.1` and
+/// `2130706433` as `127.0.0.1` and would have connected there, so a spelling
+/// that walked past the rule would be an unfiltered route to the denied host.
+/// Both protocols canonicalise at their own edge, so both are checked.
+#[tokio::test]
+async fn an_address_spelled_differently_does_not_walk_past_a_deny_rule() {
+    let policy = Policy::new(NetworkMode::Full)
+        .with_deny(["127.0.0.1"])
+        .expect("valid rules");
+    let (proxy, mut denials) = start(policy).await;
+
+    let (_stream, head) = send_connect(&proxy, "127.1:80", Some(&bearer(&proxy))).await;
+    assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+    let denial = next_denial(&mut denials).await;
+    // The event carries the spelling the sandbox chose — that is what the user
+    // needs to see — while the reason names the rule it actually hit.
+    assert_eq!(denial.host, "127.1");
+    assert_eq!(
+        denial.reason,
+        DenyReason::DeniedByRule("127.0.0.1".to_string())
+    );
+
+    let (_socks, reply) = socks_tunnel(&proxy, "2130706433", 80).await;
+    assert_eq!(reply[1], 0x02, "connection not allowed by ruleset");
+    let denial = next_denial(&mut denials).await;
+    assert_eq!(denial.host, "2130706433");
+    assert_eq!(
+        denial.reason,
+        DenyReason::DeniedByRule("127.0.0.1".to_string())
+    );
+    proxy.shutdown().await;
+}
+
+/// A host with no canonical spelling is refused with a reason of its own,
+/// under `full` — where no rule would have stopped it — and the refusal names
+/// the fix. Reporting it as merely unlisted would raise the first-use prompt
+/// and offer to store a rule the profile validator refuses.
+#[tokio::test]
+async fn an_international_host_is_refused_with_the_punycode_fix_named() {
+    let (proxy, mut denials) = start(Policy::new(NetworkMode::Full)).await;
+    let (mut stream, head) =
+        send_connect(&proxy, "b\u{fc}cher.example:443", Some(&bearer(&proxy))).await;
+    assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+    let body = read_body(&mut stream).await;
+    assert!(body.contains("punycode"), "{body}");
+
+    let denial = next_denial(&mut denials).await;
+    assert_eq!(denial.host, "b\u{fc}cher.example");
+    assert!(
+        matches!(denial.reason, DenyReason::UnsupportedHost(_)),
+        "{:?}",
+        denial.reason
+    );
+
+    let (_socks, reply) = socks_tunnel(&proxy, "b\u{fc}cher.example", 443).await;
+    assert_eq!(reply[1], 0x02, "connection not allowed by ruleset");
+    assert!(matches!(
+        next_denial(&mut denials).await.reason,
+        DenyReason::UnsupportedHost(_)
+    ));
+    proxy.shutdown().await;
+}
+
+/// The other side of canonicalising: an allowed address stays reachable
+/// whichever way it was spelled, and the bytes prove the proxy dialled the
+/// address it decided on rather than handing the spelling back to the resolver.
+#[tokio::test]
+async fn an_allowlisted_address_is_reachable_by_any_spelling() {
+    let echo = spawn_echo_server().await;
+    let (proxy, _denials) = start(loopback_only()).await;
+    for spelling in ["127.1", "2130706433", "0x7f.0.0.1"] {
+        let target = format!("{spelling}:{}", echo.port());
+        let (mut tunnel, head) = send_connect(&proxy, &target, Some(&bearer(&proxy))).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{spelling}: {head}");
+        assert_tunnels(&mut tunnel, spelling.as_bytes()).await;
+    }
+    proxy.shutdown().await;
+}
+
 /// The positive case, over the wire: an allowlisted *name* is resolved by the
 /// proxy and connected to. `localhost` is the one name that resolves without a
 /// network.

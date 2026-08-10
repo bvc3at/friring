@@ -12,6 +12,8 @@ use std::str::FromStr;
 use anyhow::{bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
 
+use super::host::CanonicalHost;
+
 /// How much network a sandbox gets.
 ///
 /// The serde representation is the lowercase word stored in the profile's
@@ -87,12 +89,17 @@ enum HostPattern {
 }
 
 impl HostPattern {
-    fn matches(&self, host: &str) -> bool {
-        let host = normalise_host(host);
-        match self {
-            Self::Any => true,
-            Self::Address(ip) => host.parse::<IpAddr>().is_ok_and(|h| h == *ip),
-            Self::Domain(domain) => covers(host, domain),
+    /// Both sides are already canonical here — one spelling per host, decided
+    /// by [`CanonicalHost`] before any rule was consulted.
+    fn matches(&self, host: &CanonicalHost) -> bool {
+        match (self, host) {
+            (Self::Any, _) => true,
+            (Self::Address(rule), CanonicalHost::Address(host)) => rule == host,
+            (Self::Domain(rule), CanonicalHost::Domain(host)) => covers(host, rule),
+            // A name rule never covers an address and an address rule never
+            // covers a name: `localhost` is a name, matched as one.
+            (Self::Address(_), CanonicalHost::Domain(_))
+            | (Self::Domain(_), CanonicalHost::Address(_)) => false,
         }
     }
 }
@@ -103,35 +110,19 @@ impl HostPattern {
 /// text of `github.com`, and reading that as a match is the classic allowlist
 /// bypass, so whatever precedes the suffix must be terminated by a `.`.
 ///
-/// A candidate carrying an empty leading label (`.github.com`) is covered. That
-/// is the deny-safe reading — a rule refusing `github.com` must not be dodged
-/// by a spelling some resolvers accept — and it grants nothing extra, because
-/// no such name is registrable.
+/// Both arguments are canonical, so this is a byte comparison: case was folded
+/// and the root dot dropped where the host was canonicalised, and doing either
+/// again here is how the two would drift apart.
 ///
 /// This must stay behaviourally identical to `session::DomainRule::matches_host`,
 /// which the two modules cannot share because the proxy is a leaf in the
 /// architecture allowlist. `tests/egress_matcher_conformance.rs` runs both over
 /// one table and fails when either side drifts.
 fn covers(host: &str, domain: &str) -> bool {
-    if host.eq_ignore_ascii_case(domain) {
-        return true;
-    }
-    let (host_len, domain_len) = (host.len(), domain.len());
-    // The `.` separator has to fit, so the host is strictly the longer string.
-    host_len > domain_len
-        && host.as_bytes()[host_len - domain_len - 1] == b'.'
-        // Safe to slice: the preceding byte is ASCII `.`, so this is a char
-        // boundary.
-        && host[host_len - domain_len..].eq_ignore_ascii_case(domain)
-}
-
-/// Strip the presentation noise a request host can carry: the root label's
-/// trailing dot (`github.com.`) and the brackets around an IPv6 literal.
-fn normalise_host(host: &str) -> &str {
-    let host = host.trim().trim_end_matches('.');
-    host.strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host)
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 /// One entry of an allow or deny list: a host pattern with an optional port.
@@ -141,21 +132,24 @@ fn normalise_host(host: &str) -> &str {
 ///
 /// # Matching
 ///
-/// The request host is compared case-insensitively after a trailing root dot
-/// and IPv6 brackets are stripped:
+/// Rule and request host are both reduced to one canonical spelling first (see
+/// the `host` module): case folded, the root dot and IPv6 brackets dropped, and
+/// every address spelling read as the address it denotes.
 ///
 /// | Rule | Matches | Does not match |
 /// |---|---|---|
 /// | `github.com` | `github.com`, `api.github.com`, `a.b.github.com` | `evilgithub.com`, `github.com.evil.net`, `github.co` |
 /// | `*.github.com`, `.github.com` | exactly what `github.com` matches | exactly what `github.com` does not |
 /// | `github.com:443` | `api.github.com` port 443 | `github.com` port 8080 |
-/// | `127.0.0.1` | `127.0.0.1` | `evil.127.0.0.1`, `localhost` |
-/// | `*` | every host | — |
+/// | `127.0.0.1` | `127.0.0.1`, `127.1`, `2130706433`, `::ffff:127.0.0.1` | `evil.127.0.0.1`, `127.0.0.1.evil.net`, `localhost` |
+/// | `*` | every host that canonicalises | — |
 ///
 /// A bare name therefore covers itself **and** its subtree, which is what a
 /// user writing `github.com` means. An address rule is exact: suffix logic on
 /// digits would be nonsense, and `localhost` is a *name*, matched as one, so it
-/// does not cover `127.0.0.1` unless listed too.
+/// does not cover `127.0.0.1` unless listed too. An address rule does cover
+/// every *spelling* of its address, because those all reach one endpoint — a
+/// deny on `127.0.0.1` that `127.1` walked past would be no deny at all.
 ///
 /// **`*.` and `.` are spellings, not narrowings.** `*.github.com` covers the
 /// apex as well, because the deny direction settles the question: a user who
@@ -168,7 +162,8 @@ fn normalise_host(host: &str) -> &str {
 /// which only this side has: ASCII labels of letters, digits, `-` and `_`, no
 /// empty label, none edged with `-`, 63 bytes per label and 253 overall. An
 /// international name must be written in punycode, because that is what a
-/// request host is spelled as on the wire.
+/// request host is spelled as on the wire and because canonicalising a U-label
+/// correctly needs Unicode tables this crate does not carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRule {
     pattern: HostPattern,
@@ -177,7 +172,18 @@ pub struct HostRule {
 
 impl HostRule {
     /// Whether this rule covers `host` on `port`.
+    ///
+    /// A host that does not canonicalise matches nothing — but that is not how
+    /// it is refused: [`Policy::decide`] turns it into
+    /// [`DenyReason::UnsupportedHost`] before any rule is consulted, so the
+    /// answer never depends on which list it was compared against.
     pub fn matches(&self, host: &str, port: u16) -> bool {
+        CanonicalHost::parse(host).is_ok_and(|host| self.matches_canonical(&host, port))
+    }
+
+    /// [`HostRule::matches`] against a host already canonicalised at the edge,
+    /// which is how the request path avoids canonicalising once per rule.
+    pub(super) fn matches_canonical(&self, host: &CanonicalHost, port: u16) -> bool {
         self.port.map_or(true, |scoped| scoped == port) && self.pattern.matches(host)
     }
 
@@ -196,21 +202,23 @@ impl FromStr for HostRule {
             bail!("empty host rule");
         }
         let (host, port) = split_host_port(entry)?;
-        let host = normalise_host(host);
-        let pattern = if host == "*" {
-            HostPattern::Any
-        } else {
-            // Normalise the spelling, then classify. Stripping `*.` before the
-            // address check is what keeps `*.127.0.0.1` and `127.0.0.1` one
-            // rule instead of an address and a suffix pattern over digits.
-            let bare = host
-                .strip_prefix("*.")
-                .or_else(|| host.strip_prefix('.'))
-                .unwrap_or(host);
-            match bare.parse::<IpAddr>() {
-                Ok(ip) => HostPattern::Address(ip),
-                Err(_) => HostPattern::Domain(validated_domain(bare, entry)?),
-            }
+        // `*` is this side's own vocabulary rather than a host, so it is read
+        // before canonicalisation — which would refuse it.
+        if host.trim() == "*" {
+            return Ok(Self {
+                pattern: HostPattern::Any,
+                port,
+            });
+        }
+        // Stripping `*.` before canonicalising is what keeps `*.127.0.0.1` and
+        // `127.0.0.1` one rule instead of an address and a suffix pattern over
+        // digits. A leading `.` needs no stripping here: it is presentation
+        // that the canonicaliser already folds away.
+        let bare = host.strip_prefix("*.").unwrap_or(host);
+        let pattern = match CanonicalHost::parse(bare) {
+            Ok(CanonicalHost::Address(address)) => HostPattern::Address(address),
+            Ok(CanonicalHost::Domain(domain)) => HostPattern::Domain(domain),
+            Err(fault) => bail!("host rule `{entry}` {}", fault.detail()),
         };
         Ok(Self { pattern, port })
     }
@@ -221,8 +229,11 @@ impl fmt::Display for HostRule {
         match &self.pattern {
             HostPattern::Any => f.write_str("*")?,
             HostPattern::Domain(domain) => f.write_str(domain)?,
-            // Re-bracket IPv6 so the rendering parses back to the same rule.
-            HostPattern::Address(ip @ IpAddr::V6(_)) if self.port.is_some() => write!(f, "[{ip}]")?,
+            // Re-bracket IPv6, with or without a port: a rendering is quoted
+            // into a denial and from there into a profile, and `::1` is a
+            // spelling `session::DomainRule` refuses (it cannot tell the
+            // colons apart from a port).
+            HostPattern::Address(ip @ IpAddr::V6(_)) => write!(f, "[{ip}]")?,
             HostPattern::Address(ip) => write!(f, "{ip}")?,
         }
         if let Some(port) = self.port {
@@ -232,55 +243,11 @@ impl fmt::Display for HostRule {
     }
 }
 
-/// The DNS limits, which double as the reason a longer rule is a typo rather
-/// than a host: nothing on the wire can be spelled that way, so the rule would
-/// never match — and a deny rule that never matches is a hole.
-const MAX_HOST_LEN: usize = 253;
-const MAX_LABEL_LEN: usize = 63;
-
-/// Reject the shapes that would silently never match — an empty label, a stray
-/// wildcard, a URL pasted in where a host belongs, an international name in
-/// U-label form.
-///
-/// The grammar is deliberately the one `session::DomainRule` enforces on a
-/// stored profile, so a spelling the profile editor refuses is also one this
-/// proxy refuses to load rather than accepting as a rule that can match
-/// nothing. Punctuation is rejected outright as well as being useless: a rule
-/// is echoed back in denial text and in the UI.
-fn validated_domain(domain: &str, entry: &str) -> Result<String> {
-    let domain = normalise_host(domain);
-    if domain.is_empty() {
-        bail!("host rule `{entry}` has no host");
-    }
-    if domain.len() > MAX_HOST_LEN {
-        bail!("host rule `{entry}` is longer than {MAX_HOST_LEN} characters");
-    }
-    for label in domain.split('.') {
-        if label.is_empty() {
-            bail!("host rule `{entry}` has an empty label");
-        }
-        if label.len() > MAX_LABEL_LEN {
-            bail!("host rule `{entry}` has a label longer than {MAX_LABEL_LEN} characters");
-        }
-        if label.starts_with('-') || label.ends_with('-') {
-            bail!("host rule `{entry}` has a label edged with `-`");
-        }
-        if let Some(bad) = label
-            .chars()
-            .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
-        {
-            bail!(
-                "host rule `{entry}` contains `{}`: write a bare ASCII host, e.g. \
-                 `api.github.com:443` (an international name in punycode)",
-                bad.escape_debug()
-            );
-        }
-    }
-    Ok(domain.to_ascii_lowercase())
-}
-
 /// Split `host[:port]`, handling the bracketed IPv6 form and refusing the
 /// ambiguous bare one (`::1:443` could be either).
+///
+/// The brackets stay on the host: they are address syntax, and
+/// [`CanonicalHost`] is where that is enforced rather than here.
 fn split_host_port(entry: &str) -> Result<(&str, Option<u16>)> {
     if let Some(rest) = entry.strip_prefix('[') {
         let (inside, after) = rest
@@ -295,7 +262,7 @@ fn split_host_port(entry: &str) -> Result<(&str, Option<u16>)> {
                 Some(parse_port(digits, entry)?)
             }
         };
-        return Ok((inside, port));
+        return Ok((&entry[..inside.len() + 2], port));
     }
     // An unbracketed IPv6 literal is all colons and carries no port — `::1:443`
     // is one address, not `::1` on port 443. Testing it first is what decides
@@ -340,7 +307,22 @@ pub enum DenyReason {
     /// [`NetworkMode::Allowlist`] and nothing in the allow list matched. This
     /// is the reason that drives the first-use domain prompt.
     NotAllowlisted,
-    /// The request line carried a method [`MethodPolicy::ReadOnly`] withholds.
+    /// The client named a host that has no single spelling to compare — a
+    /// U-label, or a shape no host can carry (see the `host` module).
+    ///
+    /// Refused in **every** mode, [`NetworkMode::Full`] included: a host nobody
+    /// can canonicalise is precisely the one a deny rule would be dodged with,
+    /// and guessing at what it denotes is how a rule ends up compared against a
+    /// different destination than the one dialled. Distinct from
+    /// [`DenyReason::NotAllowlisted`] on purpose — it must never raise the
+    /// first-use prompt, whose answer would be a rule the profile validator
+    /// then refuses to store.
+    ///
+    /// The payload is Friring's own explanation, never the client's bytes: a
+    /// denial is rendered in the user's terminal.
+    UnsupportedHost(&'static str),
+    /// The request line carried a method [`MethodPolicy::ReadOnly`] withholds,
+    /// quoted back with anything a terminal would act on replaced.
     MethodNotAllowed(String),
     /// Missing or wrong proxy credentials — something other than the sandbox
     /// this proxy was started for.
@@ -353,6 +335,7 @@ impl fmt::Display for DenyReason {
             Self::NetworkDisabled => f.write_str("network access is disabled for this sandbox"),
             Self::DeniedByRule(rule) => write!(f, "host matches the deny rule `{rule}`"),
             Self::NotAllowlisted => f.write_str("host is not in the sandbox allowlist"),
+            Self::UnsupportedHost(detail) => write!(f, "the requested host {detail}"),
             Self::MethodNotAllowed(method) => {
                 write!(
                     f,
@@ -471,16 +454,42 @@ impl Policy {
     }
 
     /// Decide whether `host:port` may be reached.
+    ///
+    /// `host` is canonicalised first, exactly once, and a host that cannot be
+    /// is refused rather than compared — see [`DenyReason::UnsupportedHost`].
+    /// The request path canonicalises at its edge and calls
+    /// `decide_host`; this entry point exists for callers holding a
+    /// host as text.
     pub fn decide(&self, host: &str, port: u16) -> Decision {
+        match CanonicalHost::parse(host) {
+            Ok(host) => self.decide_host(&host, port),
+            Err(fault) => Decision::Deny(DenyReason::UnsupportedHost(fault.detail())),
+        }
+    }
+
+    /// [`Policy::decide`] on a host already canonicalised at the edge, which is
+    /// also the host that will be dialled — deciding on one spelling and
+    /// connecting to another is the gap this whole path exists to close.
+    pub(super) fn decide_host(&self, host: &CanonicalHost, port: u16) -> Decision {
         if self.mode == NetworkMode::None {
             return Decision::Deny(DenyReason::NetworkDisabled);
         }
-        if let Some(rule) = self.deny.iter().find(|rule| rule.matches(host, port)) {
+        if let Some(rule) = self
+            .deny
+            .iter()
+            .find(|rule| rule.matches_canonical(host, port))
+        {
             return Decision::Deny(DenyReason::DeniedByRule(rule.to_string()));
         }
         match self.mode {
             NetworkMode::Full => Decision::Allow,
-            _ if self.allow.iter().any(|rule| rule.matches(host, port)) => Decision::Allow,
+            _ if self
+                .allow
+                .iter()
+                .any(|rule| rule.matches_canonical(host, port)) =>
+            {
+                Decision::Allow
+            }
             _ => Decision::Deny(DenyReason::NotAllowlisted),
         }
     }
@@ -492,9 +501,35 @@ impl Policy {
         if self.methods.permits(method) {
             Decision::Allow
         } else {
-            Decision::Deny(DenyReason::MethodNotAllowed(method.to_string()))
+            Decision::Deny(DenyReason::MethodNotAllowed(displayable_method(method)))
         }
     }
+}
+
+/// Longest method quoted back on a denial. Every real method is far shorter —
+/// WebDAV's `VERSION-CONTROL` is the longest in any registry.
+const MAX_REPORTED_METHOD: usize = 24;
+
+/// Make a client-supplied method safe to quote back.
+///
+/// The method reaches the agent's transcript, a log line and a TUI notification
+/// through [`DenyReason::MethodNotAllowed`], and it is chosen by the *sandboxed*
+/// process — so, like the host on a denial, it must not be able to carry an
+/// escape sequence into the user's terminal or an unbounded string into a
+/// modal. RFC 9110 token characters survive unchanged.
+fn displayable_method(method: &str) -> String {
+    method
+        .chars()
+        .take(MAX_REPORTED_METHOD)
+        .map(|character| {
+            let token = character.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(character);
+            if token {
+                character
+            } else {
+                char::REPLACEMENT_CHARACTER
+            }
+        })
+        .collect()
 }
 
 fn parse_rules<I, S>(entries: I) -> Result<Vec<HostRule>>
@@ -608,6 +643,65 @@ mod tests {
         assert!(!rule("*.127.0.0.1").matches("evil.127.0.0.1", 80));
     }
 
+    /// An address rule is one rule per *address*, not per spelling: every row
+    /// here is what `getaddrinfo(3)` reads as `127.0.0.1` and connects to, so a
+    /// deny rule any of them walked past would be no deny at all.
+    /// `tests/egress_matcher_conformance.rs` holds the profile-side matcher to
+    /// the same table.
+    #[test]
+    fn one_address_rule_covers_every_spelling_of_that_address() {
+        let loopback = rule("127.0.0.1");
+        for spelling in [
+            "127.1",
+            "2130706433",
+            "0x7f.0.0.1",
+            "0177.0.0.1",
+            "127.000.000.001",
+            "::ffff:127.0.0.1",
+            "::ffff:7f00:1",
+        ] {
+            assert!(loopback.matches(spelling, 80), "`{spelling}`");
+            // …and a rule written that way is the same rule, so the two lists
+            // cannot disagree about which one the user meant.
+            assert_eq!(rule(spelling), loopback, "rule `{spelling}`");
+        }
+        // Folding must not reach past the address: a *name* carrying the digits
+        // is still a name, and the deprecated IPv4-compatible form is a
+        // different destination (`::1` lives in that range).
+        for spelling in ["127.0.0.1.evil.net", "127.1.evil.net", "::127.0.0.1", "::1"] {
+            assert!(!loopback.matches(spelling, 80), "`{spelling}`");
+        }
+    }
+
+    /// The deny direction under `full`, where a rule is the only thing between
+    /// the agent and the host: a spelling nobody can canonicalise is refused
+    /// outright rather than compared, and with a reason of its own — reporting
+    /// it as merely unlisted would raise the first-use prompt and offer to
+    /// store a rule the profile validator refuses.
+    #[test]
+    fn a_host_that_does_not_canonicalise_is_refused_in_every_mode() {
+        let policy = Policy::new(NetworkMode::Full)
+            .with_deny(["xn--bcher-kva.example"])
+            .expect("valid rules");
+        for host in ["b\u{fc}cher.example", "evil.example..", "[evil.example]"] {
+            assert!(
+                matches!(
+                    policy.decide(host, 443),
+                    Decision::Deny(DenyReason::UnsupportedHost(_))
+                ),
+                "`{host}` was not refused"
+            );
+        }
+        assert!(policy.decide("example.test", 443).is_allowed());
+        assert_eq!(
+            Policy::new(NetworkMode::Allowlist).decide("b\u{fc}cher.example", 443),
+            Decision::Deny(DenyReason::UnsupportedHost(
+                "is an international name and must be written in punycode, e.g. \
+                 `xn--bcher-kva.example`"
+            ))
+        );
+    }
+
     #[test]
     fn port_scoping_narrows_a_rule() {
         let https_only = rule("github.com:443");
@@ -622,16 +716,21 @@ mod tests {
             "*",
             "github.com",
             "github.com:443",
+            "[::1]",
             "[::1]:443",
             "127.0.0.1",
         ] {
             assert_eq!(rule(text).to_string(), text, "round-trip of `{text}`");
         }
         // Normalising forms collapse onto the canonical rendering — including
-        // the wildcard, which is a spelling rather than a pattern of its own.
+        // the wildcard, which is a spelling rather than a pattern of its own,
+        // and every spelling of an address.
         assert_eq!(rule("*.github.com").to_string(), "github.com");
         assert_eq!(rule(".github.com").to_string(), "github.com");
         assert_eq!(rule("GitHub.com.").to_string(), "github.com");
+        assert_eq!(rule("127.1").to_string(), "127.0.0.1");
+        assert_eq!(rule("[::ffff:127.0.0.1]").to_string(), "127.0.0.1");
+        assert_eq!(rule("::0001").to_string(), "[::1]");
     }
 
     #[test]
@@ -767,6 +866,31 @@ mod tests {
         assert!(Policy::new(NetworkMode::Full)
             .decide_method("POST")
             .is_allowed());
+    }
+
+    /// The method on a denial is chosen by the *sandboxed* process and is
+    /// rendered by the TUI, exactly like the host on one — so it must not carry
+    /// an escape sequence out of the sandbox, nor an unbounded string into a
+    /// modal.
+    #[test]
+    fn a_refused_method_cannot_smuggle_control_characters() {
+        let policy = Policy::new(NetworkMode::Full).with_methods(MethodPolicy::ReadOnly);
+        let Decision::Deny(DenyReason::MethodNotAllowed(quoted)) =
+            policy.decide_method("PO\u{1b}[2JST")
+        else {
+            panic!("a method outside the read-only set must be refused");
+        };
+        // Every character outside an RFC 9110 token goes, not just the escape:
+        // a method has no use for the rest, and `[` is half of the sequence.
+        assert_eq!(quoted, "PO\u{fffd}\u{fffd}2JST");
+        assert!(!quoted.chars().any(char::is_control));
+
+        let Decision::Deny(DenyReason::MethodNotAllowed(capped)) =
+            policy.decide_method(&"M".repeat(4096))
+        else {
+            panic!("an over-long method must be refused");
+        };
+        assert_eq!(capped.chars().count(), MAX_REPORTED_METHOD);
     }
 
     #[test]

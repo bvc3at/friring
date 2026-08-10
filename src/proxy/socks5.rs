@@ -19,10 +19,10 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use super::auth;
+use super::host::{self, CanonicalHost};
 use super::policy::{Decision, DenyReason};
 use super::stream::Client;
 use super::{Protocol, Shared};
@@ -73,13 +73,30 @@ pub(super) async fn serve(mut client: Client, shared: Arc<Shared>) -> io::Result
         Err(_elapsed) => return Ok(()),
     };
 
-    let (host, port) = (target.host.as_str(), target.port);
-    if let Decision::Deny(reason) = shared.decide(host, port) {
-        shared.report(Protocol::Socks5, host, port, reason);
+    // The host as the client spelled it — a SOCKS5 domain field carries
+    // whatever bytes the client chose, so it is canonicalised at this edge
+    // before any rule sees it, and the canonical form is what gets dialled. An
+    // address field is already an address and needs none of this; a *domain*
+    // field spelling one (`127.1`) is exactly the dodge this closes.
+    let (asked, port) = (target.host.as_str(), target.port);
+    let host = match CanonicalHost::parse(asked) {
+        Ok(host) => host,
+        Err(fault) => {
+            shared.report(
+                Protocol::Socks5,
+                asked,
+                port,
+                DenyReason::UnsupportedHost(fault.detail()),
+            );
+            return refuse(&mut client, REPLY_NOT_ALLOWED).await;
+        }
+    };
+    if let Decision::Deny(reason) = shared.decide(&host, port) {
+        shared.report(Protocol::Socks5, asked, port, reason);
         return refuse(&mut client, REPLY_NOT_ALLOWED).await;
     }
 
-    let upstream = match timeout(limits.connect_timeout, TcpStream::connect((host, port))).await {
+    let upstream = match timeout(limits.connect_timeout, host::connect(&host, port)).await {
         Ok(Ok(upstream)) => upstream,
         Ok(Err(error)) => return refuse(&mut client, reply_code_for(&error)).await,
         Err(_elapsed) => return refuse(&mut client, REPLY_TTL_EXPIRED).await,
@@ -244,7 +261,7 @@ fn reply_code_for(error: &io::Error) -> u8 {
 mod tests {
     use std::net::{Ipv4Addr, SocketAddrV4};
 
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
 

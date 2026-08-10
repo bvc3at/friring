@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -457,22 +457,28 @@ impl FromStr for ReadScope {
 /// equal the rule or end with `.` + the rule. Getting that boundary wrong is
 /// the classic allowlist bypass, so it is tested in both directions.
 ///
-/// Comparison is case-insensitive and a trailing root dot (`github.com.`) is
-/// ignored on both sides. A rule written `*.github.com` or `.github.com` means
-/// the same as the bare form — **the wildcard is a spelling, not a narrowing,
-/// and it covers the apex**. The deny direction settles that: someone who
-/// denies `*.github.com` means "no github.com traffic", and excluding the apex
-/// would be a silent hole. An address rule (`127.0.0.1`, `[::1]`) is exact
-/// instead, compared as a parsed address so `::1` and `::0001` are one host and
-/// `evil.127.0.0.1` is not "under" `127.0.0.1`.
+/// Rule and candidate are both reduced to one canonical spelling first (see
+/// `canonical_host`): case folded, the root dot and IPv6 brackets dropped,
+/// and every address spelling read as the address it denotes. A rule written
+/// `*.github.com` or `.github.com` means the same as the bare form — **the
+/// wildcard is a spelling, not a narrowing, and it covers the apex**. The deny
+/// direction settles that: someone who denies `*.github.com` means "no
+/// github.com traffic", and excluding the apex would be a silent hole.
+///
+/// An address rule (`127.0.0.1`, `[::1]`) is exact instead, compared as a
+/// parsed address — so `::1` and `::0001` are one host, `127.1`,
+/// `2130706433` and `::ffff:127.0.0.1` are all `127.0.0.1` (they reach one
+/// endpoint, so a deny they walked past would be no deny), and
+/// `evil.127.0.0.1` is still not "under" `127.0.0.1`.
 ///
 /// A rule without a port matches every port; a rule with one matches only that
 /// port, so `github.com:443` permits HTTPS and nothing else.
 ///
 /// Hosts are ASCII: an international name must be written in punycode
-/// (`xn--bcher-kva.example`), which is how it is spelled on the wire. A request
-/// in U-label form therefore matches nothing here, and under
-/// [`NetworkMode::Allowlist`] that fails closed.
+/// (`xn--bcher-kva.example`), which is how it is spelled on the wire.
+/// Canonicalising a U-label correctly needs Unicode tables this crate does not
+/// carry, so one is refused rather than guessed at — in a stored rule here, and
+/// in a request the proxy refuses outright.
 ///
 /// The egress proxy enforces this vocabulary at connection time with its own
 /// matcher (`proxy::HostRule`) — the two cannot share a type, because the proxy
@@ -480,7 +486,8 @@ impl FromStr for ReadScope {
 /// runs both over one table of stored spellings and fails when either drifts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainRule {
-    /// Lower-cased host, no wildcard prefix and no trailing dot.
+    /// Canonical host: lower-cased, no wildcard prefix, no trailing dot, and an
+    /// address in the one spelling every spelling of it reduces to.
     pub host: String,
     /// Port this rule is scoped to, or `None` for any port.
     pub port: Option<u16>,
@@ -511,12 +518,16 @@ impl DomainRule {
         }
 
         let (host, port) = split_host_port(entry)?;
-        let host = host
-            .strip_prefix("*.")
-            .or_else(|| host.strip_prefix('.'))
-            .unwrap_or(host);
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
-        validate_host(&host, entry)?;
+        // Only `*.` is stripped here; a leading `.` is presentation that
+        // `canonical_host` already folds away, and stripping it twice would
+        // make `..github.com` a rule.
+        let bare = host.strip_prefix("*.").unwrap_or(host);
+        let host = match canonical_host(bare)
+            .map_err(|fault| format!("Domain '{entry}' {}", fault.detail()))?
+        {
+            CanonicalHost::Address(address) => address.to_string(),
+            CanonicalHost::Domain(domain) => domain,
+        };
         Ok(Self { host, port })
     }
 
@@ -531,34 +542,50 @@ impl DomainRule {
     /// Whether this rule covers `host` on any port — the port-blind half of
     /// [`matches`](Self::matches), for UI questions like "is this domain
     /// covered at all?".
+    ///
+    /// Both sides are canonicalised here rather than only at
+    /// [`parse`](Self::parse), because [`host`](Self::host) is a public field a
+    /// caller (or a deserialised profile) can fill with any spelling, and a
+    /// rule whose semantics depended on how it was built would be a rule that
+    /// means one thing in the editor and another at launch. A rule that does
+    /// not canonicalise covers nothing — [`SandboxProfile::validate`] is what
+    /// keeps one from being stored.
     pub fn matches_host(&self, host: &str) -> bool {
-        let candidate = host.trim().trim_end_matches('.').to_ascii_lowercase();
-        let candidate = candidate
-            .strip_prefix('[')
-            .and_then(|c| c.strip_suffix(']'))
-            .unwrap_or(&candidate);
-        // An address rule is exact, and exact on the *parsed* address: suffix
-        // logic over digits would put `evil.127.0.0.1` under `127.0.0.1`, and
-        // a textual comparison would let `::0001` slip past a deny rule on
-        // `::1`.
-        if let Ok(address) = self.host.parse::<IpAddr>() {
-            return candidate.parse::<IpAddr>().is_ok_and(|c| c == address);
+        let (Ok(rule), Ok(candidate)) = (canonical_host(&self.host), canonical_host(host)) else {
+            return false;
+        };
+        match (rule, candidate) {
+            // An address rule is exact, and exact on the *parsed* address:
+            // suffix logic over digits would put `evil.127.0.0.1` under
+            // `127.0.0.1`, and a textual comparison would let `::0001` slip
+            // past a deny rule on `::1`.
+            (CanonicalHost::Address(rule), CanonicalHost::Address(candidate)) => rule == candidate,
+            (CanonicalHost::Domain(rule), CanonicalHost::Domain(candidate)) => {
+                candidate == rule
+                    || candidate
+                        .strip_suffix(&rule)
+                        .is_some_and(|prefix| prefix.ends_with('.'))
+            }
+            // A name rule never covers an address and an address rule never
+            // covers a name: `localhost` is a name, matched as one.
+            _ => false,
         }
-        candidate == self.host
-            || candidate
-                .strip_suffix(&self.host)
-                .is_some_and(|prefix| prefix.ends_with('.'))
     }
 }
 
 impl fmt::Display for DomainRule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Re-bracket an IPv6 literal whether or not it carries a port, so what
+        // is printed parses back to the same rule instead of tripping the
+        // "several ':'" rejection.
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
         match self.port {
-            // Re-bracket an IPv6 literal, so what is printed parses back to the
-            // same rule instead of tripping the "several ':'" rejection.
-            Some(p) if self.host.contains(':') => write!(f, "[{}]:{p}", self.host),
-            Some(p) => write!(f, "{}:{p}", self.host),
-            None => f.write_str(&self.host),
+            Some(port) => write!(f, "{host}:{port}"),
+            None => f.write_str(&host),
         }
     }
 }
@@ -573,6 +600,9 @@ impl FromStr for DomainRule {
 
 /// Split `host[:port]`, handling the bracketed IPv6 form. An unbracketed entry
 /// with several colons is rejected rather than guessed at.
+///
+/// The brackets stay on the host: they are address syntax, and
+/// [`canonical_host`] is where that is enforced rather than here.
 fn split_host_port(entry: &str) -> Result<(&str, Option<u16>), String> {
     if let Some(rest) = entry.strip_prefix('[') {
         let Some((host, tail)) = rest.split_once(']') else {
@@ -590,7 +620,7 @@ fn split_host_port(entry: &str) -> Result<(&str, Option<u16>), String> {
                 Some(parse_port(digits, entry)?)
             }
         };
-        return Ok((host, port));
+        return Ok((&entry[..host.len() + 2], port));
     }
     match entry.split_once(':') {
         None => Ok((entry, None)),
@@ -613,42 +643,216 @@ fn parse_port(raw: &str, entry: &str) -> Result<u16, String> {
         })
 }
 
-/// Reject host strings that could never match: empty, over-long, or with a
-/// label that is empty, non-ASCII or edged with `-`. An IPv6 literal (which
-/// arrives already unbracketed) has to parse as an address.
-fn validate_host(host: &str, entry: &str) -> Result<(), String> {
+/// The DNS limits (RFC 1035 §2.3.4), which double as the reason a longer
+/// string is a typo rather than a host: nothing on the wire can be spelled that
+/// way, so the rule would match nothing — and a deny rule that matches nothing
+/// is a hole.
+const MAX_HOST_LEN: usize = 253;
+const MAX_LABEL_LEN: usize = 63;
+
+/// A host reduced to the one spelling a rule and a candidate are compared in.
+///
+/// The two variants never match each other, which is what keeps `localhost` a
+/// name and `127.0.0.1` an address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CanonicalHost {
+    /// Compared as a parsed address, so every spelling reaching one endpoint is
+    /// one host.
+    Address(IpAddr),
+    /// Lowercase, no trailing root dot, no brackets, ASCII only.
+    Domain(String),
+}
+
+/// Canonicalise one host, as a rule stores it or as a request carries it.
+///
+/// A host is read the way the *resolver* reads it, because that is what the
+/// connection will do: `127.1`, `2130706433` and `::ffff:127.0.0.1` are all
+/// `127.0.0.1`, so a deny rule on the address cannot be walked past by
+/// spelling it differently. Case, the root dot and IPv6 brackets are
+/// presentation and go the same way.
+///
+/// **A host containing any non-ASCII byte is refused.** Canonicalising an
+/// international name correctly means UTS-46 — case folding, NFC
+/// normalisation, and tables of disallowed and deviation characters — and only
+/// the punycode *encoding* half of that is table-free. Encoding without mapping
+/// would be worse than refusing: `café.example` with a combining accent and the
+/// same name pre-composed encode to different A-labels, so a deny rule on the
+/// punycode form would still be dodged while looking closed. The A-label is
+/// what travels on the wire, so that is what a rule is written as.
+///
+/// This must stay behaviourally identical to the proxy's `CanonicalHost`, which
+/// the two modules cannot share because the proxy is a leaf in the architecture
+/// allowlist. `tests/egress_matcher_conformance.rs` runs both over one table of
+/// spellings and fails when either side drifts.
+fn canonical_host(raw: &str) -> Result<CanonicalHost, HostFault> {
+    let host = raw.trim();
+    // Checked over the whole string, and first, so an international name is
+    // told to use punycode rather than reported as a stray character.
+    if !host.is_ascii() {
+        return Err(HostFault::International);
+    }
+    let (host, bracketed) = match host.strip_prefix('[') {
+        Some(inside) => (inside.strip_suffix(']').ok_or(HostFault::Brackets)?, true),
+        None => (host, false),
+    };
+    // The root label is presentation: `github.com.` and `github.com` are one
+    // name. Exactly one dot goes — a second would leave an empty label, which
+    // no name has and no resolver answers for.
+    let host = host.strip_suffix('.').unwrap_or(host);
+    // An empty *leading* label is the deny-safe reading of `.github.com`: the
+    // resolvers that accept that spelling resolve the apex, so a rule on the
+    // apex has to reach it. It grants nothing extra, because no such name is
+    // registrable.
+    let host = host.strip_prefix('.').unwrap_or(host);
     if host.is_empty() {
-        return Err(format!("Domain '{entry}' has no host"));
+        return Err(HostFault::Empty);
     }
-    if host.len() > 253 {
-        return Err(format!("Domain '{entry}' is too long (max 253 characters)"));
+    // Address readings come first, exactly as they do in the resolver.
+    if let Some(address) = parse_address(host) {
+        return Ok(CanonicalHost::Address(address));
     }
-    if host.contains(':') {
-        // An IPv6 literal, arriving already unbracketed. Parsing it *is* the
-        // check: a character-set test accepts `::::`, which no request host can
-        // ever be, so the rule would sit in a deny list matching nothing.
-        return host
-            .parse::<IpAddr>()
-            .map(|_| ())
-            .map_err(|_| format!("Domain '{entry}' is not a valid IPv6 literal"));
+    if bracketed {
+        // Brackets are address syntax. `[github.com]` is not a host any client
+        // writes, and reading it as a name would be a second spelling of one
+        // rule.
+        return Err(HostFault::Brackets);
+    }
+    validate_domain(host)?;
+    Ok(CanonicalHost::Domain(host.to_ascii_lowercase()))
+}
+
+/// Why a host could not be canonicalised. [`HostFault::detail`] is a clause
+/// written to follow `Domain '<entry>'`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostFault {
+    Empty,
+    TooLong,
+    LabelTooLong,
+    EmptyLabel,
+    HyphenEdge,
+    /// A U-label — see [`canonical_host`] on the IDNA subset.
+    International,
+    Character,
+    Brackets,
+}
+
+impl HostFault {
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Empty => "has no host",
+            Self::TooLong => "is too long (max 253 characters)",
+            Self::LabelTooLong => "has a label longer than 63 characters",
+            Self::EmptyLabel => "has an empty label",
+            Self::HyphenEdge => "has a label edged with '-'",
+            Self::International => {
+                "is an international name and must be written in punycode, e.g. \
+                 'xn--bcher-kva.example'"
+            }
+            Self::Character => "has an invalid character",
+            Self::Brackets => "has brackets around something that is not an address",
+        }
+    }
+}
+
+/// Every address spelling that reaches the same endpoint, read as that endpoint.
+fn parse_address(host: &str) -> Option<IpAddr> {
+    if let Ok(address) = host.parse::<IpAddr>() {
+        return Some(fold_mapped(address));
+    }
+    parse_legacy_ipv4(host).map(IpAddr::V4)
+}
+
+/// Fold an IPv4-mapped IPv6 address onto the IPv4 address it *is*:
+/// `::ffff:127.0.0.1` and `::ffff:7f00:1` reach the same endpoint as
+/// `127.0.0.1`, so a deny rule on one has to catch the others.
+///
+/// The deprecated IPv4-**compatible** form (`::127.0.0.1`) is deliberately not
+/// folded: it is a distinct IPv6 destination that no mainstream stack
+/// translates, and `::1` itself sits inside that range — folding it would read
+/// loopback as `0.0.0.1`.
+fn fold_mapped(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map_or(IpAddr::V6(address), IpAddr::V4),
+        address => address,
+    }
+}
+
+/// Parse the pre-CIDR spellings `inet_aton(3)` accepts and every mainstream
+/// resolver still honours: `127.1`, `2130706433`, `0x7f.0.0.1`, `0177.0.0.1`,
+/// `127.000.000.001`.
+///
+/// One to four parts; each decimal, octal (a leading `0`) or hex (`0x`); every
+/// part but the last is one octet and the last fills what remains. Anything
+/// else is `None` and goes on to be read as a name — which is also what the
+/// resolver does with it.
+fn parse_legacy_ipv4(host: &str) -> Option<Ipv4Addr> {
+    let mut parts = [0u32; 4];
+    let mut count = 0usize;
+    for part in host.split('.') {
+        let slot = parts.get_mut(count)?;
+        *slot = parse_ipv4_part(part)?;
+        count += 1;
+    }
+    let (last, leading) = parts[..count].split_last()?;
+    if leading.iter().any(|octet| *octet > 0xff) {
+        return None;
+    }
+    // The last part carries every octet the leading ones did not name, so
+    // `127.1` is `127.0.0.1` and `2130706433` is the whole address.
+    let remaining_bits = 32 - 8 * u32::try_from(leading.len()).ok()?;
+    if u64::from(*last) > (1u64 << remaining_bits) - 1 {
+        return None;
+    }
+    let mut value = *last;
+    for (index, octet) in leading.iter().enumerate() {
+        value |= octet << (24 - 8 * index);
+    }
+    Some(Ipv4Addr::from(value))
+}
+
+/// One part of a legacy IPv4 literal, in the radix its prefix names.
+fn parse_ipv4_part(part: &str) -> Option<u32> {
+    let (digits, radix) = match part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+        Some(hex) => (hex, 16),
+        // A leading zero is octal, which is why `010.0.0.1` is `8.0.0.1` and
+        // stripping zeros would be wrong. A lone `0` is just zero.
+        None if part.len() > 1 && part.starts_with('0') => (&part[1..], 8),
+        None => (part, 10),
+    };
+    if digits.is_empty() || !digits.chars().all(|digit| digit.is_digit(radix)) {
+        return None;
+    }
+    u32::from_str_radix(digits, radix).ok()
+}
+
+/// The one grammar a stored rule and a request host share: ASCII labels of
+/// letters, digits, `-` and `_`, none empty, none edged with `-`, 63 bytes per
+/// label and 253 overall.
+///
+/// One grammar on both sides is the point: a spelling that could never be
+/// written as a rule can never be *allowed* either. `_` stays legal because
+/// service names use it.
+fn validate_domain(host: &str) -> Result<(), HostFault> {
+    if host.len() > MAX_HOST_LEN {
+        return Err(HostFault::TooLong);
     }
     for label in host.split('.') {
         if label.is_empty() {
-            return Err(format!("Domain '{entry}' has an empty label"));
+            return Err(HostFault::EmptyLabel);
         }
-        if label.len() > 63 {
-            return Err(format!(
-                "Domain '{entry}' has a label longer than 63 characters"
-            ));
+        if label.len() > MAX_LABEL_LEN {
+            return Err(HostFault::LabelTooLong);
         }
         if label.starts_with('-') || label.ends_with('-') {
-            return Err(format!("Domain '{entry}' has a label edged with '-'"));
+            return Err(HostFault::HyphenEdge);
         }
         if !label
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
         {
-            return Err(format!("Domain '{entry}' has an invalid character"));
+            return Err(HostFault::Character);
         }
     }
     Ok(())
@@ -659,8 +863,9 @@ fn validate_host(host: &str, entry: &str) -> Result<(), String> {
 pub enum EgressDecision {
     /// Permitted: [`NetworkMode::Full`], or an allow rule matched.
     Allow,
-    /// Refused by a deny rule, or by [`NetworkMode::None`]. Final — denies beat
-    /// allows, so this never becomes a prompt.
+    /// Refused by a deny rule, by [`NetworkMode::None`], or because the host
+    /// has no single spelling to compare. Final — denies beat allows, so this
+    /// never becomes a prompt.
     Denied,
     /// Under [`NetworkMode::Allowlist`] and matched by nothing. Refused, but
     /// this is the outcome
@@ -1037,7 +1242,16 @@ impl SandboxPolicy {
     /// [`EgressDecision::Unlisted`] rather than
     /// [`Denied`](EgressDecision::Denied), which is what
     /// [`should_prompt`](Self::should_prompt) keys off.
+    ///
+    /// A host that does not canonicalise is refused before any rule is
+    /// consulted, in every mode — it is exactly the host a deny rule would be
+    /// dodged with, and no rule can honestly be compared against it. The proxy
+    /// answers the same request with `DenyReason::UnsupportedHost`; this is the
+    /// same verdict, reached where the UI and the CLI can preview it.
     pub fn decide_egress(&self, host: &str, port: u16) -> EgressDecision {
+        if canonical_host(host).is_err() {
+            return EgressDecision::Denied;
+        }
         if self.deny.iter().any(|r| r.matches(host, port)) {
             return EgressDecision::Denied;
         }
@@ -1211,6 +1425,107 @@ mod tests {
         assert!(!v6.matches("::2", 80));
     }
 
+    /// One rule per *address*, not per spelling: every row here is what
+    /// `getaddrinfo(3)` reads as `127.0.0.1` and connects to, so a deny rule
+    /// any of them walked past would be no deny at all. The proxy's matcher is
+    /// held to the same table by `tests/egress_matcher_conformance.rs`.
+    #[test]
+    fn one_address_rule_covers_every_spelling_of_that_address() {
+        let loopback = DomainRule::parse("127.0.0.1").unwrap();
+        for spelling in [
+            "127.1",
+            "2130706433",
+            "0x7f.0.0.1",
+            "0177.0.0.1",
+            "127.000.000.001",
+            "::ffff:127.0.0.1",
+            "::ffff:7f00:1",
+            "[::ffff:127.0.0.1]",
+        ] {
+            assert!(loopback.matches(spelling, 80), "'{spelling}'");
+        }
+        // …and a rule written that way is the same rule, so the two lists
+        // cannot disagree about which address the user meant. An IPv6 literal
+        // is bracketed here as it is anywhere else a rule is stored: this side
+        // reads several ':' as a mis-written port rather than guessing.
+        for spelling in [
+            "127.1",
+            "2130706433",
+            "0x7f.0.0.1",
+            "127.000.000.001",
+            "[::ffff:127.0.0.1]",
+        ] {
+            assert_eq!(
+                DomainRule::parse(spelling).unwrap(),
+                loopback,
+                "'{spelling}'"
+            );
+        }
+        // Folding must not reach past the address: a *name* carrying the digits
+        // is still a name, a leading zero is octal (so `010.` is 8), and the
+        // deprecated IPv4-compatible form is a different destination — `::1`
+        // itself lives in that range.
+        for spelling in [
+            "127.0.0.1.evil.net",
+            "127.1.evil.net",
+            "010.0.0.1",
+            "::127.0.0.1",
+            "::1",
+        ] {
+            assert!(!loopback.matches(spelling, 80), "'{spelling}'");
+        }
+    }
+
+    /// A rule whose `host` was filled in directly — by a caller, or by
+    /// deserialising a profile — means what the same text would have meant had
+    /// it gone through `parse`. Anything else is a rule that reads one way in
+    /// the editor and another at launch.
+    #[test]
+    fn an_unparsed_rule_still_matches_by_the_canonical_reading() {
+        let hand_built = DomainRule {
+            host: "127.1".to_string(),
+            port: None,
+        };
+        assert!(hand_built.matches("127.0.0.1", 80));
+        assert!(!hand_built.matches("127.1.evil.net", 80));
+        // A host no spelling can canonicalise covers nothing; `validate` is
+        // what keeps such a rule from being stored in the first place.
+        let unstorable = DomainRule {
+            host: "b\u{fc}cher.example".to_string(),
+            port: None,
+        };
+        assert!(!unstorable.matches("b\u{fc}cher.example", 443));
+    }
+
+    /// A host that does not canonicalise is refused before any rule is
+    /// consulted, in every mode — the same verdict the proxy reaches with
+    /// `DenyReason::UnsupportedHost`, and never a prompt.
+    #[test]
+    fn egress_refuses_a_host_that_does_not_canonicalise() {
+        let mut p = profile();
+        p.network_mode = NetworkMode::Full;
+        p.network_deny = vec!["xn--bcher-kva.example".into()];
+        let policy = p.resolve(SandboxBackendKind::Seatbelt, "/home/u").unwrap();
+
+        for host in [
+            "b\u{fc}cher.example",
+            "www.b\u{fc}cher.example",
+            "example.test..",
+            "[example.test]",
+        ] {
+            let decision = policy.decide_egress(host, 443);
+            assert_eq!(decision, EgressDecision::Denied, "'{host}'");
+            assert!(!policy.should_prompt(decision), "'{host}'");
+        }
+        // The punycode form is ordinary ASCII and is caught by the rule itself,
+        // and an unrelated host is still reachable under `full`.
+        assert_eq!(
+            policy.decide_egress("www.xn--bcher-kva.example", 443),
+            EgressDecision::Denied
+        );
+        assert!(policy.decide_egress("example.test", 443).is_allowed());
+    }
+
     #[test]
     fn domain_rule_rejects_unmatched_shapes() {
         for bad in [
@@ -1234,8 +1549,19 @@ mod tests {
             "[::::]",
             "*",
             // An international name is stored in punycode, because that is how
-            // a request host is spelled.
+            // a request host is spelled — and because canonicalising Unicode
+            // correctly needs UTS-46 tables this crate does not carry, so the
+            // alternative is guessing.
             "b\u{fc}cher.example",
+            // Exactly one root dot is presentation; a second is an empty label.
+            "github.com..",
+            "..github.com",
+            // Brackets are address syntax, not decoration.
+            "[github.com]",
+            // A zone identifier scopes an address to one interface, which is
+            // not something a destination rule can mean.
+            "fe80::1%eth0",
+            "[fe80::1%eth0]",
         ] {
             assert!(
                 DomainRule::parse(bad).is_err(),
