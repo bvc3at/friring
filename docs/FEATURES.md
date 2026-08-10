@@ -3037,8 +3037,10 @@ retries, one host is one question.
 **Friring is agent-neutral about it.** What an agent needs in order to survive
 being sandboxed is declared data in `agents.toml`
 ([`[agents.<name>.sandbox]`](CONFIG.md#agentstoml)), never special-cased code:
-the state directories it must keep writable, and the flags that turn its *own*
-sandbox off. That last one is not optional under `sandbox-exec` — a nested
+the state directories it must keep writable, how it authenticates inside a
+boundary, which of your configuration is safe to carry into a container, and the
+flags that turn its *own* sandbox off. That last one is not optional under
+`sandbox-exec` — a nested
 `sandbox_apply` under a profile containing a deny rule is denied outright by the
 kernel — and it is a real trade: with the inner sandbox off, everything inside
 the boundary, the agent's own credentials included, is reachable by whatever the
@@ -3064,6 +3066,35 @@ when it fires. Deleting a profile that sessions still reference leaves the
 reference dangling for the same reason: clearing it would silently unsandbox
 those sessions on their next launch.
 
+**Credentials, without copying any.** A rotating OAuth refresh token is
+single-use, so copying one into a container gives you two consumers that
+invalidate each other on the first refresh — friring never does it. Under a
+policy backend the real credential store is right where it was (the macOS
+Keychain included), and there is no login to redo. In a container friring
+injects a long-lived token from **its own** OS keychain entry if you have stored
+one — the registry declares variable names, never values — and otherwise the
+agent signs in **once per profile**, inside the session pane, into a home that
+is shared by every session of that profile and survives a container rebuild. The
+token's value never touches a command line in either direction, which is also
+why a launch that would have to put one there is refused instead. No credential
+problem ever fails a launch: the agent starts signed out, an ordinary notice
+says so, and a `Login:` row on the info panel says exactly what to type.
+
+**Your configuration follows you in.** A container gets a synthetic home, so the
+safe subset of your agent configuration is projected into it at the same
+`~`-relative path — instructions, skills, commands, settings — through a lint
+pass, because configuration routinely names the host filesystem and a container
+is a different filesystem. Every JSON and TOML document is parsed and each host
+reference classified: kept, rewritten to where it landed inside, "grant this
+path read-only and it works unchanged", or host-only (a script the image cannot
+run). What cannot cross is removed as a whole entry, because a hook with no
+command is a broken agent rather than a projected one. Prose is copied byte for
+byte. Nothing that is a credential crosses, and nothing that reaches friring's
+database does. Friring also writes one highest-precedence settings layer of its
+own, which is what pre-seeds the workspace trust an agent would otherwise prompt
+for in a fresh home. The counts and what needs a mount land on the session's
+`Sandbox:` row.
+
 **How a sandboxed session reports status.** The database is denied inside every
 boundary, because writing it is arbitrary host command execution (ADR-29). A
 policy-sandboxed session signals through a narrow file channel instead: friring
@@ -3071,20 +3102,20 @@ mints one directory per session, exposes only that, and the bundled hooks append
 a state word there rather than calling `friring-cli session signal`. The host
 takes the file with a single atomic rename into a directory no sandbox can see
 before it looks at it, reads only a small regular UTF-8 file, and writes only one
-of four known words — never anything the file said.
+of four known words — never anything the file said. A **place** uses neither:
+friring's hook payload is projected in with every signal command rewritten to a
+`tmux set-option -p`, which the control-mode connection already delivers — the
+same rewrite that gives an SSH host its status.
 
 **Three limits worth knowing.** A **policy**-sandboxed session is local-only:
 both policy backends generate their artefacts on the machine friring runs on, so
 an SSH/WSL session with a policy profile is refused rather than wrapped with the
-wrong machine's paths (a place is exempt — a place *is* the elsewhere). A place
-has **no agent configuration in it yet**: config projection is the next slice, so
-the agent starts logged out and signs in inside its own pane, friring's hook
-configuration is dropped rather than pointed at a host path the container does
-not have, and a place-backed session therefore reports no status. All three are
-stated on the session's `Sandbox:` row. And an egress proxy **lives in the
-friring that started it**, so a filtered session created by
-`friring-cli session create` has no way out until a running friring relaunches
-it — closed, not open, but closed.
+wrong machine's paths (a place is exempt — a place *is* the elsewhere). Nothing
+**stores** a sandbox token yet: `env-token` reads the entry, and creating one is
+a command friring prints for you to run until `friring-cli sandbox token` lands.
+And an egress proxy **lives in the friring that started it**, so a filtered
+session created by `friring-cli session create` has no way out until a running
+friring relaunches it — closed, not open, but closed.
 
 ---
 

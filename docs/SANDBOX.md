@@ -846,17 +846,54 @@ Therefore, in resolution order:
    sandbox** — and `host-minus-secrets` is the default read policy. Use HTTPS
    with a token for pushes from inside a profile, or add the key path back
    deliberately.
-2. **`env-token`** — a long-lived token the user supplies once. Friring stores
-   it in its own OS keychain entry and injects it at instance creation. No
-   rotation, no races. This is the recommended path for place backends.
-3. **`volume-login`** — a per-profile named volume holding the agent's state
-   directory, with one interactive login per *profile*. Both major agents have
-   TUI-compatible headless flows (paste-code, device-code), so the login
-   happens inside the session pane. Sessions sharing a profile share the
-   volume, which is the safe single-writer case. This is the answer to "logging
-   in for each sandbox is bad UX": login is per profile and effectively annual.
+2. **`env-token`** — a long-lived token the user supplies once. Friring keeps it
+   in its own OS keychain entry (service `dev.friring.sandbox`, account
+   `<credential family>/<variable>`) and injects it into the sandbox's window
+   environment at launch. Never in the database, never in a config file, never
+   in the registry — the registry declares the variable *names* (`secret_env`)
+   and nothing else. No rotation, no races. This is the recommended path for
+   place backends.
+
+   The value never reaches a command line, in either direction. Reads use the
+   platform tool's stdout; the write uses its stdin where one exists
+   (`secret-tool store`), and where none does (`security` takes a new item's
+   value only as `-w <value>`) friring refuses to write and prints the
+   prompting command instead. Injection is the control-mode window
+   environment, so a headless launch — which passes window environment as
+   `tmux -e KEY=VALUE` argv — refuses rather than exposes it.
+3. **`volume-login`** — the profile's own persistent state directory, with one
+   interactive login per *profile*, done inside the session pane. The
+   "volume" is friring's synthetic per-profile home, which is already
+   per profile, already mounted and already survives a container rebuild;
+   `config_dir_env` relocates the agent's state (`state_dir`) into it. Every
+   session of that profile shares one credential rather than holding copies of
+   it, which is the safe single-writer case and the answer to "logging in for
+   each sandbox is bad UX": login is per profile and effectively annual.
 4. **`seed-file`** — copy a credential file in once and honour write-back.
-   Opt-in, and only for agents whose vendor documents it.
+   Opt-in (`auth = "seed-file"`; `auto` never picks it) and gated on the
+   declaration asserting vendor support (`seed_file_supported`), which a
+   rotating single-use refresh token can never do. **At most one profile per
+   credential family, per host**: friring records which profile holds the copy
+   under `<data dir>/sandbox/seeds/`, outside every boundary, and refuses a
+   second copy with the reason. Deleting the profile that holds it releases the
+   family again, because the boundary the copy lived in went with it. Honouring
+   write-back means the sandbox's copy is the durable one — friring never writes
+   a refreshed credential back to the host store, because host and sandbox would
+   then be two writers of one rotating token.
+
+A credential problem never fails a launch. A missing token, an unreadable
+store, a refused copy and an agent that declares nothing all resolve to the
+same thing: the agent starts signed out and the session's `Sandbox:` row says
+so and says what to type. Refusing would route the launch through
+`allow_unsandboxed_fallback`, and answering a missing token by running the
+agent outside the boundary is worse than an agent that asks you to log in.
+
+Friring answers "is this sandbox signed in?" from the declared
+`credential_file` alone, and only by asking whether it exists — never by
+opening it. Where an agent declares no such file the answer is *unknown*, which
+is what is reported: the state directory having something in it would be a
+guess, and since config projection writes the user's own settings into exactly
+that directory it would be a guess that is wrong on every first launch.
 
 Never: bind-mounting the host agent configuration directory read-write into a
 place. It is useless on macOS (the credentials are not in the file) and it is
@@ -867,16 +904,26 @@ Each agent declares what it needs, in the registry, as data:
 
 ```toml
 [agents.<name>.sandbox]
-config_dir_env = "…"     # env var relocating agent state into the sandbox
-auth           = "auto"  # host-passthrough | env-token | volume-login | seed-file
-state_rw       = […]     # directories the agent writes and must keep
-copy_in        = […]     # config safe to project, subject to the lint pass
-env            = { … }   # static env (e.g. disable self-update in a place)
-secret_env     = […]     # names of tokens Friring may inject from its keychain
-bypass         = […]     # flags meaning "the outer boundary is the sandbox"
-writeback      = true    # refreshed credentials must persist
-login_fallback = "…"     # how to log in inside the pane when state is empty
+config_dir_env      = "…"     # env var relocating agent state into the sandbox
+state_dir           = "~/.x"  # the directory that variable names, home-relative
+auth                = "auto"  # auto | host-passthrough | env-token | volume-login | seed-file
+state_rw            = […]     # directories the agent writes and must keep (policy backends)
+copy_in             = […]     # config safe to project, subject to the lint pass
+env                 = { … }   # static env (e.g. disable self-update in a place)
+secret_env          = […]     # NAMES of tokens Friring may inject from its keychain
+credential_file     = "~/.x/auth.json"  # the vendor credential file
+seed_file_supported = false   # true only where the vendor documents copying it
+bypass              = […]     # flags meaning "the outer boundary is the sandbox"
+writeback           = true    # a refreshed credential must survive the sandbox
+login_fallback      = "…"     # what to type in the pane when state is empty
 ```
+
+`auth` is a *request*, not a verdict. A policy backend is always
+`host-passthrough` — it returns before any lookup, copy or relocation — and a
+place can never be, so a declaration asking for it there degrades to the ladder
+with the reason in front of the user. In a place, `auto` takes `env-token` when
+friring holds a token for that agent's credential family and `volume-login`
+otherwise; it never chooses `seed-file`, because that one copies.
 
 Friring never reads a credential file to inspect it, and never logs credential
 contents. That covers the boundary's *own* token too, not just the agent's —
@@ -887,31 +934,79 @@ deferred: `volume-login` removes the urgency.
 
 ## Config projection
 
-**Not built yet — this is the next slice.** What ships today is the first half of
-it: a place sandbox gets a **synthetic per-profile home**
-(`<data dir>/sandbox/pl/<profile>/home`) and nothing is copied into it, so an
-agent in a place starts logged out and signs in inside its own pane, and an
-argument naming friring's own hook configuration is dropped rather than pointed
-at a host path the container does not have. Both are said out loud on the
-session's `Sandbox:` row rather than left to be discovered.
+A place gets a **synthetic per-profile home**, and the safe subset of the user's
+agent configuration is copied into it — never a bind of the host's agent
+directory (ADR-28), which is useless on macOS (the credentials are not in the
+file) and an escape channel through hooks the *host* agent later runs.
 
-Safe configuration will be copied in through a lint pass, because agent config
-routinely references the host filesystem:
+Every entry is home-relative on both sides: `~/.claude/skills` lands at
+`$HOME/.claude/skills` inside. A place already relocates `$HOME`, so nothing
+about an agent's layout has to change and no path inside the boundary has to be
+invented. What crosses is declared data (`copy_in`), never a list of one
+vendor's file names.
+
+Copying is not enough, because agent configuration routinely names the host
+filesystem and a place is a different filesystem — usually a different operating
+system:
 
 - Lifecycle hook commands, status-line commands and credential-helper scripts
   are arbitrary shell, usually with absolute host paths.
 - Plugin, skill and rule directories may live outside the config directory.
 - Stdio MCP servers name host binaries.
 
-The lint pass classifies every such entry as *projectable*, *needs a mount*, or
-*host-only*, and the profile editor surfaces the result ("3 hooks reference
-host paths — mount read-only, drop, or rewrite?"). The `friring-autonomous`
-rig's hard-coded read-only hooks mount becomes a per-entry choice.
+So a **lint pass** classifies every entry, with a reason, and only what crosses
+is written. Structured documents (JSON, TOML) are parsed and every string in
+them examined; everything else is content — instructions, skills, commands —
+and is copied byte for byte, because a path mentioned in prose names nothing and
+executes nothing.
 
-Enforced settings go in through each agent's highest-precedence configuration
-layer, so a repository-level file cannot override the orchestrator's intent —
-including pre-seeded workspace trust, which several agents otherwise prompt for
-on first run inside a fresh home.
+| Verdict | What it means |
+|---|---|
+| `projected` | Crossed as it stands. |
+| `rewritten` | Crossed, with a reference to projected content pointed at where it lands inside. |
+| `needs a mount` | Did not cross; a read-only grant for that path in the profile brings it in, and the reference then works unchanged, because a place mounts every path at exactly its host path. |
+| `host-only` | Did not cross, and no grant would help — a host script or binary is not one the image can run, and a credential never crosses at all. |
+
+The rule for what is *removed* is structural rather than schema-driven, because
+friring bakes in no agent knowledge: the smallest whole entry around the
+offending string goes — an array element alone, a nested object's own slot
+(`mcpServers.docs.command` takes `mcpServers.docs`), a root member alone.
+Removing only the string would leave a hook with no command, which is a broken
+agent rather than a projected one. The session's `Sandbox:` row carries the
+counts and the launch log carries the verdicts; the profile editor does not
+surface them yet ("3 hooks reference host paths — mount read-only, drop, or
+rewrite?" is `ProjectionPlan::actionable`, which nothing in the editor calls).
+The `friring-autonomous` rig's hard-coded read-only hooks mount becomes a
+per-entry choice.
+
+**Enforced settings** go in through each agent's highest-precedence
+configuration layer, so a repository-level file cannot override the
+orchestrator's intent. The declaration is a template with two placeholders
+friring fills — `{workspaces}`, the paths the profile granted, and `{path}`,
+repeated once per granted path — which is what pre-seeds the workspace trust
+several agents otherwise prompt for on first run in a fresh home. The rendered
+document is parsed before it is written and merged *over* whatever projected to
+the same path, so friring's keys win and a template typo writes nothing rather
+than a file the agent fails to parse on startup.
+
+**Projection is a boundary in both directions.** No credential file crosses,
+ever — not even the launching agent's own, because a rotating refresh token with
+two consumers invalidates itself on the first refresh (ADR-28), so a place's
+agent signs in inside its own pane. Nothing reaching the data directory or a
+tmux socket directory crosses, in a declared entry or in a document's text
+(ADR-29). Projection adds no mount: "needs a mount" is a sentence for the user,
+and widening the boundary stays a deliberate profile edit. And every write
+refuses a symlink at every component — the synthetic home is writable by the
+sandbox, so a link from its own home to the host's real agent directory would
+turn the next projection into a write into the one directory ADR-28 keeps out of
+reach. Projected files are `0600`, or `0700` where the source was executable:
+content crosses, and nothing else does. A projected JSON or TOML document is
+friring's re-rendering of the user's file rather than a byte copy, so comments
+are lost and keys are ordered.
+
+Nothing is pruned. A file the user deletes on the host lingers in the place,
+deliberately: the projected tree is also the agent's writable state directory,
+and a launch that wiped it would sign the agent out on every restart.
 
 Policy backends need none of this: the real home is already visible, subject to
 path policy.
@@ -1138,15 +1233,20 @@ once and consumes what a crashed run left behind; minting clears the file, so a
 The directory is minted and torn down with the session's other per-launch state,
 alongside the scratch directory and the egress proxy.
 
-**A place reports no status yet**, and for a different reason: the channel a
-place would use is the existing remote hook rewrite — the same one that already
-solves this for SSH hosts, writing a tmux pane option the control-mode
-subscription delivers — but the rewrite happens where friring *materialises* its
-hook configuration on the far side, and projecting configuration into a place is
-the next slice. Until then a place-backed launch drops the argument naming
-friring's hook file rather than handing the agent a path that does not exist
-there, and says so on the session's sandbox row. A session that looks idle is
-recoverable; a pane that dies on startup with "settings file not found" is not.
+**A place reports through a tmux pane option**, not through the file channel.
+The rewrite is the one that already solves this for SSH hosts: friring's own
+hook configuration is projected into the place with every
+`friring-cli session signal --state X` turned into
+`tmux set-option -p @friring_state X`, which the control-mode subscription
+delivers. Both halves of the CLI call are unavailable in there — the binary need
+not be in the image, and the database is what ADR-29 keeps outside every
+boundary — while `set-option -p` needs no socket, no pane id and no identity.
+The launch points the agent's own argument at the projected copy instead of
+dropping it. One marker spells `friring-cli session signal --state` for both
+paths, so the SSH rewrite and the place rewrite cannot drift apart and kill
+status on one of them. A launch whose hook payload could not be projected says
+so on the session's `Sandbox:` row, because a session that silently never leaves
+`idle` looks like a broken session.
 
 ## UI
 
@@ -1204,6 +1304,16 @@ turns every session in it into an unreachable placeholder whose pane says so —
 naming the place, and saying that they all stopped together — while friring keeps
 trying to start it again. They carry no remote-host mark: a place runs on this
 machine and mounts its paths, so calling it remote would be untrue.
+
+**Credentials and configuration** are on the same panel, one row each. The
+`Sandbox:` row carries what the launch decided — the strategy in force, and for
+a place what the lint pass did with the user's configuration (`config
+projected: 14 files · 2 need a read-only mount`). A boundary the agent has no
+credential in adds a `Login:` row naming the exact command to type in that pane,
+and raises an ordinary status notice at the launch; both are absent whenever
+there is nothing to do, and neither is persisted, so an adopted session claims
+nothing about a launch it did not make. The profile editor shows no lint
+verdicts yet — `plan()` reads the filesystem and nothing calls it from there.
 
 **Indicators** — two `SessionInfo` fields carry it, and they say different
 things. `sandbox_profile` (persisted) is the boundary the session **asked
@@ -1291,13 +1401,27 @@ complete and consistent with existing screens.
   become unreachable placeholders naming the place rather than a host, friring
   keeps trying to start it again, and they reattach by themselves when it comes
   back.
-- **A place has no agent configuration in it yet.** Config projection is the
-  next slice, so a place starts from an empty per-profile home: the agent has to
-  sign in inside the pane, and friring's own hook configuration is dropped from
-  the launch rather than pointed at a host path the container does not have — so
-  the session reports no status. Both are stated on the session's `Sandbox:` row
-  and in the launch's log line, because a session that silently never leaves
-  `idle` looks like a broken session.
+- **A place carries the safe subset of the user's configuration, and says what
+  it left behind.** Instructions, skills and commands cross; a hook or an MCP
+  server naming a host path does not, and neither does any credential (ADR-28),
+  so the agent signs in inside the pane. The session's `Sandbox:` row and the
+  launch's log line carry the count and the verdicts, because an agent that
+  silently has none of the user's setup looks like a broken one.
+- **A place starts signed out until somebody signs it in.** The synthetic home
+  is per profile and fresh the first time, so unless friring holds a token for
+  that agent the first session in a new profile opens at a sign-in prompt. That
+  is stated three times over rather than left to be discovered: an ordinary
+  status notice at the launch, a `Login:` row on the info panel naming the exact
+  command, and a line on `friring-cli session create`'s own output
+  (`sandbox_login` in its JSON). One login serves every session of the profile,
+  and it survives a container rebuild.
+- **A credential never rides a command line, so a launch that has only one is
+  refused.** The local headless spawn passes a window's environment as
+  `tmux -e KEY=VALUE` argv; a launch carrying an injected token there is
+  refused with "start the session from the TUI" rather than exposed on the
+  process table or quietly started without its token. Unreachable today —
+  only a place injects one, and a place never spawns through that path — and
+  checked anyway, so the next strategy cannot make it reachable in silence.
 - **An unreadable profile** is refused at launch, named column by column, and
   repaired by re-saving it in the editor. Listing it permissively and
   launching it permissively are different decisions: the first keeps it
@@ -1379,17 +1503,26 @@ transport, instance lifecycle and garbage collection, identical-path mounts, the
 default image (`packaging/sandbox/Containerfile`, tag `friring/sandbox:1` —
 friring publishes no registry image, so a missing one is refused with the build
 command), resource limits, the per-profile synthetic home, and the signal-file
-channel for policy backends. Not in it: `env-token` and `volume-login`
-credential flows, config projection and its lint pass — so a place starts from an
-empty home and the agent signs in inside the pane, and friring's own hook
-configuration is dropped rather than projected, which is why a place-backed
-session reports no status. A place on a remote host is not wired: the backend
-probes and creates where friring runs.
+channel for policy backends. Not in it: a place on a remote host is not wired —
+the backend probes and creates where friring runs.
+
+**P3b — A usable place.** Shipped: the credential strategies
+(`host-passthrough`, `env-token`, `volume-login`, `seed-file`) resolved against
+the boundary, friring's own OS keychain entry with the value never on a command
+line in either direction, config projection and its lint pass, enforced settings
+with pre-seeded workspace trust, and the projected hook payload that makes a
+place report status. Not in it: nothing stores a token yet — `friring-cli
+sandbox token` is P4, so `env-token` only fires for an entry created by hand
+with the command friring prints — the profile editor does not surface the lint
+verdicts, only JSON and TOML are linted (anything else is copied verbatim), and
+nothing prunes a projected file the user has since deleted on the host.
 
 **P4 — Breadth.** `apple-container` and `wsl-distro` backends, copy-on-write
 workspaces, resource limits, the sandbox manager view, the user-facing
-`friring-cli sandbox` management subcommands (profile and instance management;
-the internal `sandbox relay` shipped in P2), and profile export/import.
+`friring-cli sandbox` management subcommands (profile and instance management,
+and `sandbox token` to store the `env-token` value; the internal `sandbox relay`
+shipped in P2), the profile editor's view of the lint verdicts, and profile
+export/import.
 
 ## ADR-25: Sandboxing is a core feature, not an extension
 
@@ -1483,7 +1616,10 @@ through hooks the host agent later runs.
 
 **Consequences**: Place backends need one login per profile, or a token the
 user supplies once. Each agent declares its credential strategy as registry
-data.
+data. Enforced rather than advised: `host-passthrough` is structurally
+unreachable in a place, `auto` never chooses a strategy that copies, and a
+second profile seeding one credential family is refused by a marker friring
+keeps outside every boundary.
 
 ## ADR-29: The database never enters a sandbox
 

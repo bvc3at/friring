@@ -122,15 +122,36 @@ resume_latest = false       # true = id-less "resume last session in cwd"
                             #   hooks under this custom agent's name too
 
 [agents.sandbox]            # optional: what this CLI needs inside a sandbox
-auth = "host-passthrough"   # host-passthrough | env-token | volume-login | seed-file
+auth = "auto"               # auto | host-passthrough | env-token | volume-login
+                            #   | seed-file. A request, not a verdict: a policy
+                            #   sandbox is always host-passthrough, and a
+                            #   container never can be
 config_dir_env = "CLAUDE_CONFIG_DIR"  # env var relocating its state (place backends)
+state_dir = "~/.claude"     # the directory that variable names, `~`-anchored
 state_rw = ["~/.claude", "~/.claude.json"]  # dirs it writes and must keep
 bypass = ["--dangerously-skip-permissions"]  # flags turning its OWN sandbox off
-# copy_in = []              # config safe to project into a place
+copy_in = ["~/.claude/skills"]   # config safe to project into a container,
+                            #   `~`-anchored: it lands at the same home-relative
+                            #   path inside. Linted first — a hook or MCP server
+                            #   naming a host path is dropped, and a credential
+                            #   never crosses (ADR-28)
 # env = { DISABLE_AUTOUPDATER = "1" }  # static env while a sandbox is active
-# secret_env = []           # token names friring may inject from its keychain
-# writeback = false         # refreshed credentials must persist back out
-# login_fallback = "…"      # how to log in in-pane when the state is empty
+# secret_env = ["ANTHROPIC_API_KEY"]   # token variable NAMES only; the value
+                            #   lives in your OS keychain under the service
+                            #   "dev.friring.sandbox", never here
+# credential_file = "~/.claude/.credentials.json"  # the vendor credential file
+# seed_file_supported = false  # true ONLY where the vendor documents copying it
+# writeback = true          # a refreshed credential must survive the sandbox
+# login_fallback = "/login" # what to type in the pane when the state is empty
+
+[[agents.sandbox.enforced]]  # friring's highest-precedence layer inside a container
+path = "~/.codex/config.toml"  # `~`-anchored: a container's only writable
+                               #   surface is its own synthetic home
+format = "toml"                # json | toml
+per_path = "[projects.\"{path}\"]\ntrust_level = \"trusted\""
+# `content` is written once ({workspaces} → the granted paths as a list);
+# `per_path` is repeated once per granted path ({path} → that path). JSON takes
+# `content` only, because two JSON documents cannot be concatenated.
 ```
 
 `{id}` is substituted with the friring-generated session UUID. Groups
@@ -201,14 +222,16 @@ sharing that dir already reports status).
 
 `[agents.<name>.sandbox]` is optional and every field inside it is too. It is
 how friring stays agent-neutral about sandboxing: the flags that turn an agent's
-*own* sandbox off (nesting is denied outright under seatbelt) and the state
-directories it must keep writable are **your** declaration, never code. It is
-applied only while a sandbox profile is active, so an agent that declares
-nothing still launches — it just gets no help, which the profile editor says
-rather than papering over. An `agents.toml` written before sandboxing existed
-loads unchanged. Full semantics: [`docs/SANDBOX.md`](SANDBOX.md) §Credentials
-and §Inner agent sandboxes. Sandbox *profiles* themselves are UI-edited and live
-in SQLite, not here.
+*own* sandbox off (nesting is denied outright under seatbelt), the state
+directories it must keep writable, how it authenticates inside a boundary and
+which of your configuration is safe to carry into a container are **your**
+declaration, never code. It is applied only while a sandbox profile is active,
+so an agent that declares nothing still launches — it just gets no help, which
+the profile editor says rather than papering over. An `agents.toml` written
+before sandboxing existed loads unchanged. Full semantics:
+[`docs/SANDBOX.md`](SANDBOX.md) §Credentials, §Config projection and §Inner
+agent sandboxes. Sandbox *profiles* themselves are UI-edited and live in SQLite,
+not here.
 
 The seeded file also ships two commented, copy-pasteable templates
 below the built-ins — **Add your own agent** (every field annotated)

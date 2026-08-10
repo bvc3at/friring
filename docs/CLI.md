@@ -318,6 +318,13 @@ different questions (`docs/SANDBOX.md`):
   agent start on the host anyway. `null` = no launch recorded a complaint.
   `session create`/`session restart` report their own launch's verdict under
   the same key, and print `NOT sandboxed — <reason>` on the human output.
+- `sandbox_login` (`session create` only) — what to type **in the session's
+  pane** to sign the agent in, when the boundary went on and the agent has no
+  credential inside it. `null` whenever there is nothing to do, which is every
+  policy-backed launch and every container that already holds a login. Not
+  persisted and not on `session get`/`session list`: it is only true of the
+  launch that computed it, and a stale "sign in" against an agent that has since
+  signed itself in is a prompt for work nobody needs to do.
 
 A non-null `sandbox_profile` therefore does **not** mean the agent is
 sandboxed — check `sandbox_unenforced` too. Both are persisted, so they answer
@@ -335,7 +342,9 @@ that `tmux` client's argv to anything on the machine that can read a process
 list. Both are covered under
 [Failure modes](SANDBOX.md#failure-modes). A **place**-backed session is exempt
 from the second: it spawns over the same control-mode connection the TUI uses,
-so nothing of its environment reaches a process table.
+so nothing of its environment reaches a process table. A launch that would have
+to put a **credential** on that argv is refused outright rather than exposed —
+"start the session from the TUI instead".
 
 A place-backed session persists `backend_type = sandbox:<profile>`, which is why
 `session restart` refuses one exactly as it refuses an `ssh:` session: the

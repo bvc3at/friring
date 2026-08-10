@@ -167,8 +167,35 @@ actually needs and to an allowlist of domains.
   once per session however hard the agent retries.
 - **Credential handling** — never copies rotating OAuth credentials per
   sandbox (copies invalidate each other on first refresh); prefers host
-  passthrough under policy backends (the macOS Keychain keeps working), then an
-  injected long-lived token, then one login per profile in a named volume.
+  passthrough under policy backends (the macOS Keychain keeps working), then a
+  long-lived token friring holds in its **own** OS keychain entry (service
+  `dev.friring.sandbox`; the registry declares variable *names* only), then one
+  login per profile inside the session pane, shared by every session of that
+  profile and surviving a container rebuild. `seed-file` copies a credential
+  file exactly once per credential family per host, only where the declaration
+  asserts the vendor documents it, and never writes a refreshed one back to the
+  host. The token's value never reaches a command line in either direction:
+  reads use the platform tool's stdout, the write uses its stdin where one
+  exists and is refused (with the prompting command printed) where none does,
+  and injection is the control-mode window environment — so the headless launch
+  path, which passes window environment as `tmux -e` argv, refuses instead. No
+  credential problem ever fails a launch: the agent starts signed out and the
+  session says so and says what to type.
+- **The safe subset of the user's agent configuration is projected into a
+  place** — instructions, skills and commands land in the synthetic home at
+  the same `~`-relative path, through a lint pass that parses every JSON/TOML
+  document and classifies each host reference as projectable, rewritten,
+  needs-a-read-only-mount or host-only, dropping the smallest whole entry around
+  anything that cannot cross. No credential ever crosses (not even the launching
+  agent's own), nothing reaching the data directory or a tmux socket does, and
+  every write refuses a symlink at every component. friring's own hook payload
+  crosses too, with each `friring-cli session signal` rewritten to
+  `tmux set-option -p @friring_state` — the same rewrite the SSH path uses — so
+  a place-backed session reports working/blocked/done through the control-mode
+  subscription instead of reporting nothing. Enforced settings are a declared
+  template friring fills with the paths the profile granted, merged over the
+  user's own file, which pre-seeds the workspace trust an agent would otherwise
+  prompt for in a fresh home.
 - **The database never enters a sandbox** — a policy-sandboxed session reports
   status through a narrow file channel instead, because automations make database
   write access equivalent to arbitrary host command execution: the launch mints
@@ -204,10 +231,12 @@ actually needs and to an allowlist of domains.
   launch, naming each column that failed.
 - **Agent requirements are declared data** — an optional
   `[agents.<name>.sandbox]` block in `agents.toml` carries the state
-  directories an agent must keep writable and the flags that turn its *own*
+  directories an agent must keep writable, the flags that turn its *own*
   sandbox off (mandatory under `seatbelt`, where nesting is denied by the
-  kernel). Upstream's `agents.toml` has no such key and loads unchanged; the
-  fork bakes in no agent knowledge.
+  kernel), the credential strategy and the names of the token variables it
+  accepts, the configuration safe to project into a container, and the
+  highest-precedence settings friring writes in there. Upstream's `agents.toml`
+  has no such key and loads unchanged; the fork bakes in no agent knowledge.
 - **A new module in the architecture allowlist** — `sandbox` may reference
   `session`, `paths` and `shell`, and `agent` may reference `sandbox` (the wrap
   is a decorator on the launch `agent` composes). Enforced in
