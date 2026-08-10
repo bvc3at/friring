@@ -36,10 +36,16 @@ pub struct SandboxProfileRow {
     /// profile; anything in it means the summary below would be describing
     /// substituted values, so the row reports the damage instead.
     pub undecoded: Vec<String>,
-    /// Live place state for a place backend (`running`, `stopped`), rendered
-    /// when present. Policy backends never create an instance, so this stays
-    /// `None` for them — as it does everywhere until instance tracking lands.
+    /// Live place state for a place backend (`running`), rendered when present.
+    /// Policy backends never create an instance, so this stays `None` for them.
     pub instance: Option<String>,
+    /// Why the backend this profile would run on is **not available here**, from
+    /// the probe. `None` when it is available, and when an `auto` ladder has not
+    /// resolved — an unresolved `auto` rules nothing out.
+    ///
+    /// Rendered wherever a profile is offered, because the alternative is a user
+    /// picking `docker` on a machine with no engine and finding out at launch.
+    pub unavailable: Option<String>,
 }
 
 impl SandboxProfileRow {
@@ -65,6 +71,13 @@ impl SandboxProfileRow {
         out.push_str(&format!(" · {} {unit} · {}", self.paths, self.network));
         if let Some(state) = &self.instance {
             out.push_str(&format!(" · {state}"));
+        }
+        // Last, and phrased as the probe phrased it: a profile that cannot run
+        // here is still worth offering — the user may be about to install the
+        // engine, or may be editing it for another machine — but never worth
+        // offering silently.
+        if let Some(reason) = &self.unavailable {
+            out.push_str(&format!(" · unavailable — {reason}"));
         }
         out
     }
@@ -164,6 +177,7 @@ mod tests {
             network: NetworkMode::Allowlist,
             undecoded: Vec::new(),
             instance: None,
+            unavailable: None,
         }
     }
 

@@ -2582,6 +2582,10 @@ pub struct SandboxEditorModal {
     /// `None` until probed, which keeps every capability editable — the same
     /// exemption the profile validator makes for `auto`.
     pub resolved: Option<crate::session::SandboxBackendKind>,
+    /// Why the backend this profile would run on is not usable here, from the
+    /// probe — the actionable half of the same question `resolved` answers.
+    /// `None` when it is usable, and while an `auto` ladder is unresolved.
+    pub backend_unavailable: Option<String>,
     pub paths: Vec<SandboxPathDraft>,
     /// Index into `paths` of the row `PathText`/`PathMode` edit.
     pub path_index: usize,
@@ -2652,6 +2656,7 @@ impl SandboxEditorModal {
             name,
             backend: profile.backend,
             resolved: None,
+            backend_unavailable: None,
             paths: profile
                 .paths
                 .iter()
@@ -4909,6 +4914,7 @@ mod tests {
             network: crate::session::NetworkMode::Allowlist,
             undecoded: Vec::new(),
             instance: None,
+            unavailable: None,
         }
     }
 

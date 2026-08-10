@@ -50,6 +50,8 @@ pub struct SandboxEditorState<'a> {
     pub backend: SandboxBackendKind,
     /// What `auto` resolved to on this host, if it has been probed.
     pub resolved: Option<SandboxBackendKind>,
+    /// Why the resolved backend cannot be used here, from the probe.
+    pub backend_unavailable: Option<&'a str>,
     /// The backend that will actually run — `backend`, or what `auto` resolved
     /// to. Its [`SandboxShape`] decides which capabilities are available.
     pub effective_backend: SandboxBackendKind,
@@ -83,6 +85,7 @@ impl<'a> SandboxEditorState<'a> {
             name: m.name.value(),
             backend: m.backend,
             resolved: m.resolved,
+            backend_unavailable: m.backend_unavailable.as_deref(),
             effective_backend: m.effective_backend(),
             paths: m.paths.iter().map(|p| (p.text.value(), p.mode)).collect(),
             path_index: m.path_index,
@@ -462,6 +465,15 @@ fn backend_line<'a>(state: &SandboxEditorState<'a>, active: bool) -> Line<'a> {
             Style::default().fg(Theme::text_muted()),
         ));
     }
+    // A backend the host cannot offer is still selectable — the user may be
+    // about to install the engine, or authoring a profile for another machine —
+    // but the probe's reason belongs on the row, not at launch time.
+    if let Some(reason) = state.backend_unavailable {
+        line.spans.push(Span::styled(
+            format!("  ⚠ {reason}"),
+            Style::default().fg(Theme::status_error()),
+        ));
+    }
     line
 }
 
@@ -677,6 +689,7 @@ mod tests {
             cursor: 0,
             name: "",
             backend: SandboxBackendKind::Auto,
+            backend_unavailable: None,
             resolved: None,
             effective_backend: SandboxBackendKind::Auto,
             paths: Vec::new(),
