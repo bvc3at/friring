@@ -48,6 +48,7 @@
 //! ```
 
 pub mod agent;
+pub mod auth;
 pub mod backend;
 pub mod bwrap;
 pub mod container;
@@ -62,6 +63,9 @@ pub mod select;
 use std::sync::{Arc, OnceLock};
 
 pub use agent::{apply_agent_requirements, compose_inner_sandbox, InnerSandboxPlan};
+pub use auth::{
+    Boundary, CredentialInput, CredentialPlan, CredentialStrategy, LoginState, StateDir,
+};
 pub use backend::{
     Argv, Availability, Caps, Egress, InnerSandboxVerdict, PlaceLaunch, PlaceRelay, ProxyEndpoint,
     ProxyTransport, SandboxBackend, SandboxError, SandboxLaunch, SandboxResult,

@@ -79,6 +79,12 @@ pub struct AgentDef {
 
 /// How an agent gets its credentials inside a sandbox (`docs/SANDBOX.md`
 /// §Credentials, in resolution order).
+///
+/// A *request*, not a verdict: what a launch actually does is
+/// [`crate::sandbox::auth::CredentialStrategy`], which resolves this
+/// against the boundary's shape. A policy backend is always host passthrough,
+/// and a place cannot be one — so a declaration naming a strategy its boundary
+/// cannot give it degrades to one it can, with the reason in front of the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxAuth {
@@ -116,28 +122,83 @@ pub struct AgentSandboxDef {
     pub config_dir_env: Option<String>,
     #[serde(default)]
     pub auth: SandboxAuth,
+    /// The one directory [`config_dir_env`](Self::config_dir_env) names — the
+    /// agent's own state, where its login lands. Written home-relative (`~/.x`),
+    /// because a place relocates it under that place's synthetic home and the
+    /// host's home path does not exist in there.
+    ///
+    /// Distinct from [`state_rw`](Self::state_rw), which is a *policy* input
+    /// (paths to keep writable on the host): this is the single directory a
+    /// place persists per profile, and the one an agent signs into once.
+    #[serde(default)]
+    pub state_dir: Option<String>,
+    /// The vendor's credential file, home-relative — the file `seed-file`
+    /// copies and the file whose presence says the sandbox has a login already.
+    ///
+    /// friring never reads its contents to inspect them (ADR-28); it is named
+    /// here so a strategy can copy it whole and so "is this sandbox signed in?"
+    /// can be answered without opening anything.
+    #[serde(default)]
+    pub credential_file: Option<String>,
+    /// Whether the vendor documents copying
+    /// [`credential_file`](Self::credential_file) into another environment.
+    ///
+    /// The gate on `seed-file`, and deliberately a separate assertion from
+    /// asking for that strategy: a **rotating single-use refresh token can
+    /// never be declared here**, because the copy and the original invalidate
+    /// each other on the first refresh (ADR-28). Left `false`, `seed-file` is
+    /// refused and the launch falls back to signing in inside the pane.
+    #[serde(default)]
+    pub seed_file_supported: bool,
     /// Directories the agent writes and must keep. Added to the policy's
     /// writable set: an agent that cannot write its own state directory dies on
     /// first launch under an otherwise correct profile.
     #[serde(default)]
     pub state_rw: Vec<String>,
     /// Configuration safe to project into a place, subject to the lint pass.
+    ///
+    /// Written `~`-anchored (`"~/.claude/skills"`) and projected to the
+    /// *identical* home-relative path inside the boundary, because a place gives
+    /// the agent a synthetic `$HOME` and nothing else about the layout has to
+    /// change. Each entry is a file or a directory tree;
+    /// [`crate::sandbox::projection`] classifies every member before any of it
+    /// crosses, and a credential file never does (ADR-28).
     #[serde(default)]
     pub copy_in: Vec<String>,
+    /// The highest-precedence configuration layer friring writes inside the
+    /// boundary — what must hold there whatever a repository-level file says,
+    /// including the workspace trust several agents otherwise prompt for on
+    /// first run in a fresh home. See
+    /// [`EnforcedSettings`](super::agent_projection::EnforcedSettings).
+    #[serde(default)]
+    pub enforced: Vec<super::agent_projection::EnforcedSettings>,
     /// Static environment applied whenever a sandbox is active.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// Names of tokens friring may inject from its own keychain entry.
+    /// Names of the environment variables that carry a long-lived token this
+    /// agent accepts (`ANTHROPIC_API_KEY`, …) — **names only**. The values live
+    /// in friring's own OS keychain entry and never in the registry, the
+    /// database or a config file, and they are what `env-token` injects.
     #[serde(default)]
     pub secret_env: Vec<String>,
     /// Flags that mean "the outer boundary is the sandbox" — the agent's own
     /// sandbox off. Applied only when a profile is active.
     #[serde(default)]
     pub bypass: Vec<String>,
-    /// Whether refreshed credentials must persist back out of the sandbox.
+    /// Whether a credential the agent refreshes has to survive the sandbox it
+    /// was refreshed in.
+    ///
+    /// It does so by living in the profile's own persistent state directory
+    /// rather than by being written back to the host: two writers of one
+    /// rotating token is the failure ADR-28 exists to prevent, and the host is
+    /// one of them.
     #[serde(default)]
     pub writeback: bool,
-    /// How to log in inside the pane when the agent's state is empty.
+    /// What the user has to do inside the pane when this agent has no
+    /// credential in the sandbox — the agent's own words for it (`/login`,
+    /// `codex login`). friring composes the sentence around it, so a place with
+    /// no credential reads as "sign in here, like this" rather than as a broken
+    /// session.
     #[serde(default)]
     pub login_fallback: Option<String>,
 }
@@ -544,6 +605,11 @@ command = "claude"
 [sandbox]
 config_dir_env = "CLAUDE_CONFIG_DIR"
 auth = "host-passthrough"
+state_dir = "~/.claude"
+credential_file = "~/.claude/.credentials.json"
+seed_file_supported = false
+secret_env = ["ANTHROPIC_API_KEY"]
+login_fallback = "/login"
 state_rw = ["~/.claude"]
 bypass = ["--dangerously-skip-permissions"]
 writeback = true
@@ -554,6 +620,14 @@ DISABLE_AUTOUPDATER = "1"
         let sandbox = def.sandbox.expect("declared block parses");
         assert_eq!(sandbox.auth, SandboxAuth::HostPassthrough);
         assert_eq!(sandbox.config_dir_env.as_deref(), Some("CLAUDE_CONFIG_DIR"));
+        assert_eq!(sandbox.state_dir.as_deref(), Some("~/.claude"));
+        assert_eq!(
+            sandbox.credential_file.as_deref(),
+            Some("~/.claude/.credentials.json")
+        );
+        assert!(!sandbox.seed_file_supported);
+        assert_eq!(sandbox.secret_env, ["ANTHROPIC_API_KEY"]);
+        assert_eq!(sandbox.login_fallback.as_deref(), Some("/login"));
         assert_eq!(sandbox.state_rw, ["~/.claude"]);
         assert_eq!(sandbox.bypass, ["--dangerously-skip-permissions"]);
         assert_eq!(sandbox.env.get("DISABLE_AUTOUPDATER").unwrap(), "1");
@@ -567,6 +641,20 @@ DISABLE_AUTOUPDATER = "1"
         // An empty block is valid and means "declare nothing".
         let bare: AgentDef = toml::from_str("name = \"x\"\ncommand = \"x\"\n[sandbox]\n").unwrap();
         assert_eq!(bare.sandbox, Some(AgentSandboxDef::default()));
+
+        // …and so is one written before the credential fields existed: every
+        // addition here is `#[serde(default)]`, so a registry that predates
+        // this slice keeps loading and simply declares nothing about
+        // credentials.
+        let p3: AgentDef = toml::from_str(
+            "name = \"x\"\ncommand = \"x\"\n[sandbox]\nauth = \"auto\"\nstate_rw = [\"~/.x\"]\n",
+        )
+        .unwrap();
+        let p3 = p3.sandbox.expect("the older block still parses");
+        assert_eq!(p3.state_dir, None);
+        assert_eq!(p3.credential_file, None);
+        assert!(!p3.seed_file_supported);
+        assert!(p3.secret_env.is_empty());
     }
 
     #[test]
