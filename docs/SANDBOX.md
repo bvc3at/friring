@@ -1067,8 +1067,9 @@ image, `env-token` and `volume-login` credentials, config projection and its
 lint pass, and the signal-file channel.
 
 **P4 — Breadth.** `apple-container` and `wsl-distro` backends, copy-on-write
-workspaces, resource limits, the sandbox manager view, `friring-cli sandbox`
-subcommands, and profile export/import.
+workspaces, resource limits, the sandbox manager view, the user-facing
+`friring-cli sandbox` management subcommands (profile and instance management;
+the internal `sandbox relay` shipped in P2), and profile export/import.
 
 ## ADR-25: Sandboxing is a core feature, not an extension
 
