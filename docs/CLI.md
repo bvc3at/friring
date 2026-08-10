@@ -101,9 +101,12 @@ history**: the statusline file holds current totals and is overwritten in
 place, so cost-over-time is not derivable from them.
 
 Coverage matches the TUI's, including its gaps. All three per-session commands
-are **local-only** and report `null` with a `note` (never a zero) for a remote
-session: friring never injects `FRIRING_METRICS_DIR` into an ssh/wsl agent, and
-the process table and transcripts live on the host. `usage` is the exception —
+are **local-only** and report `null` with a `note` (never a zero) for any
+**off-host** session — an ssh/wsl host *or* a sandbox place. friring never
+injects `FRIRING_METRICS_DIR` into an off-host agent, and the process table and
+transcripts are not on this machine either: for ssh/wsl the sources live on the
+host, and for a place the metrics directory sits under friring's data directory,
+which no sandbox is ever given (ADR-29). `usage` is the exception —
 it reads credentials wherever they are, so `--host <name>` queries a host from
 `hosts.toml`. One gap is the CLI's own: `session activity` reads the session's
 **main transcript only** — the F9 view folds Claude subagent and workflow

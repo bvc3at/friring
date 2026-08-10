@@ -971,8 +971,10 @@ friring-cli usage [--agent <name>] [--host <name>] [--timeout <secs>]
 
 Each reads the same source the TUI reads, so they work with **no TUI
 running** and write nothing to SQLite (and therefore keep no history).
-The three per-session readers are local-only — a remote session reports
-`null` plus a `note` — and `session metrics` needs an agent-side
+The three per-session readers are local-only — an off-host session (an
+ssh/wsl host, or a sandbox place, which is never given the data directory
+the metrics dir lives under) reports `null` plus a `note` — and
+`session metrics` needs an agent-side
 statusLine writing `$FRIRING_METRICS_DIR/$FRIRING_SESSION_ID.json`. See
 [`docs/CLI.md`](docs/CLI.md#agent-metrics).
 

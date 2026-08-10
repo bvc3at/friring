@@ -16,8 +16,10 @@
 //!
 //! Coverage therefore matches the TUI's exactly, including its gaps: the
 //! statusline dir is local-only (`session_ops::inject_friring_env` skips it for
-//! ssh/wsl sessions), and the process table and transcripts are local too. A
-//! remote session reports `null` with a note, never a zero.
+//! off-host sessions), and the process table and transcripts are local too. An
+//! off-host session — an ssh/wsl host, or a sandbox place, whose boundary is
+//! never given the data directory the metrics dir lives under (ADR-29) —
+//! reports `null` with a note, never a zero.
 
 use clap::Args;
 use serde_json::{json, Value};
@@ -121,7 +123,7 @@ pub fn run_metrics(target: TargetArgs, db: &Database) -> Result<CommandOutput, S
 
 /// One session's statusline metrics, or a note explaining the absence.
 ///
-/// The three absences are deliberately distinct: a remote session can never
+/// The three absences are deliberately distinct: an off-host session can never
 /// have a file, a session with no conversation id has nothing to key one by,
 /// and a missing file is the ordinary "the agent hasn't rendered its statusline
 /// into friring's metrics dir" case (it needs a `statusLine` writing
@@ -141,7 +143,7 @@ fn read_statusline(s: &SharedSession) -> (Option<AgentMetrics>, Option<String>) 
     let note = |s: &str| (None, Some(s.to_string()));
 
     if is_remote(s) {
-        return note("remote session: metrics are written on the host");
+        return note("off-host session: no metrics directory is written outside this machine");
     }
     let Some(agent_session_id) = s.agent_session_id.as_deref() else {
         return note("session has no agent conversation id yet");
@@ -277,7 +279,10 @@ fn activity_row(s: &SharedSession, agents: &crate::session::AgentRegistry) -> Va
     // An unmeasured row still carries every key, explicitly null: absent is not
     // zero, and a jq pipeline sees one stable shape across both outcomes.
     if is_remote(s) {
-        return unmeasured_activity(s, "remote session: its transcripts live on the host".into());
+        return unmeasured_activity(
+            s,
+            "off-host session: its transcripts are not on this machine".into(),
+        );
     }
     let Some(provider) = crate::activity::ProviderKind::for_command(&command) else {
         let note = crate::activity::unsupported_reason(&command)
@@ -789,7 +794,7 @@ fn resource_note(
     table_empty: bool,
 ) -> Option<&'static str> {
     if is_remote(s) {
-        return Some("remote session: its process tree lives on the host");
+        return Some("off-host session: its process tree is not on this machine");
     }
     if root.is_none() {
         return Some("no live tmux pane (unloaded, or the window is gone)");
@@ -925,7 +930,7 @@ mod tests {
         let (metrics, note) = read_statusline(&session("remote-1", "ssh:box"));
         assert!(metrics.is_none());
         assert!(
-            note.as_deref().unwrap_or_default().contains("remote"),
+            note.as_deref().unwrap_or_default().contains("off-host"),
             "got {note:?}"
         );
 
@@ -988,7 +993,7 @@ mod tests {
         // PROVIDER, the six counts and TOKENS I/O: dashed, never a `0` that
         // would read as "measured, and it did nothing".
         assert!(fields[1..9].iter().all(|f| *f == "-"), "got {rendered}");
-        assert!(rendered.contains("remote session"), "note: {rendered}");
+        assert!(rendered.contains("off-host session"), "note: {rendered}");
     }
 
     #[test]
@@ -1001,7 +1006,7 @@ mod tests {
         assert_eq!(fields[0], "remote-1");
         // MODEL, COST, TOKENS I/O, CTX and LINES +/-.
         assert!(fields[1..6].iter().all(|f| *f == "-"), "got {rendered}");
-        assert!(rendered.contains("remote session"), "note: {rendered}");
+        assert!(rendered.contains("off-host session"), "note: {rendered}");
     }
 
     /// A read that fails for a reason other than absence must not be reported
