@@ -289,8 +289,9 @@ by the backend being pluggable.
 Apple's `container` CLI (Containerization.framework): one lightweight VM per
 container, sub-second boot, OCI images, virtiofs mounts. Apple Silicon only;
 macOS 26 or newer for isolated networks. Strongest isolation available on
-macOS, and the backend most likely to improve over time, which is why it ships
-alongside `seatbelt` rather than after it. No Compose and no Docker socket API,
+macOS, and the backend most likely to improve over time, which is why the design
+*intends* it as the preferred macOS backend — ranked above `seatbelt` on
+supported hardware — once it lands in P4. No Compose and no Docker socket API,
 which this feature does not need. amd64 images run under Rosetta.
 
 ### `bwrap` — Linux and WSL2, policy
