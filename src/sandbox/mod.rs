@@ -56,6 +56,7 @@ pub mod dirs;
 pub mod egress;
 pub mod launcher;
 pub mod probe;
+pub mod projection;
 pub mod seatbelt;
 pub mod secrets;
 pub mod select;
@@ -78,6 +79,7 @@ pub use dirs::{
 };
 pub use egress::{proxy_required, PendingEgress, Prepared, ProxyGrant, SessionDenial};
 pub use probe::{detect_platform, HostPlatform, LocalProbeHost, ProbeHost, RemoteProbeHost};
+pub use projection::{plan as plan_projection, Finding, ProjectionInput, ProjectionPlan, Verdict};
 pub use seatbelt::SeatbeltBackend;
 pub use secrets::{secrets_for, SecretKind, SecretPath, SecretPlatform, SECRET_PATHS};
 pub use select::{ladder, select_backend, RejectedRung, Selection};

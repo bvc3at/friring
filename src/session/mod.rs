@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod agent_def;
+pub mod agent_projection;
 pub mod automation;
 pub mod cc_activity;
 pub mod extension_def;
@@ -15,6 +16,9 @@ pub mod task;
 pub mod theme_config;
 
 pub use agent_def::{AgentDef, AgentRegistry, AgentSandboxDef, SandboxAuth};
+pub use agent_projection::{
+    rewrite_status_signals_for_tmux, EnforcedSettings, SettingsFormat, STATUS_SIGNAL_MARKER,
+};
 pub use automation::{
     parse_hhmm, preset_to_cron, Automation, AutomationAction, AutomationRun, AutomationRunStatus,
     AutomationSchedule, ExtraRepo, PromptStep, SchedulePreset, SendTarget, SpawnSessionMode,
