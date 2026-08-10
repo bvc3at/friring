@@ -737,11 +737,13 @@ mod tests {
         assert!(http.ends_with(&format!("@127.0.0.1:{port}")), "{http}");
         // The credential rides in the URL, which is the only channel every HTTP
         // client understands — and the reason this value is never logged.
-        let token = http
-            .strip_prefix("http://friring:")
-            .and_then(|rest| rest.split_once('@'))
-            .map(|(token, _)| token)
-            .unwrap_or_else(|| panic!("no credential in {http}"));
+        fn token_of(url: &str) -> &str {
+            url.strip_prefix("http://friring:")
+                .and_then(|rest| rest.split_once('@'))
+                .map(|(token, _)| token)
+                .unwrap_or_else(|| panic!("no credential in {url}"))
+        }
+        let token = token_of(http);
         assert!(token.len() >= 16, "a guessable token: {token}");
 
         // `socks5h`, from the proxy's own renderer: with plain `socks5` the
@@ -759,7 +761,11 @@ mod tests {
             &scratch,
         )
         .expect("the replacement binds");
-        assert_ne!(again.env.get("HTTP_PROXY"), grant.env.get("HTTP_PROXY"));
+        assert_ne!(
+            token_of(again.env.get("HTTP_PROXY").unwrap()),
+            token_of(grant.env.get("HTTP_PROXY").unwrap()),
+            "a relaunch must mint a fresh credential, not just a fresh port"
+        );
         stop("egress-loopback");
     }
 
