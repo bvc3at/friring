@@ -12,7 +12,7 @@ use std::str::FromStr;
 use anyhow::{bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-use super::host::{CanonicalHost, HostFault};
+use super::host::{self, CanonicalHost, HostFault};
 
 /// How much network a sandbox gets.
 ///
@@ -366,6 +366,20 @@ pub enum DenyReason {
     /// The payload is Friring's own explanation, never the client's bytes: a
     /// denial is rendered in the user's terminal.
     UnsupportedHost(&'static str),
+    /// The destination is the *host's* own loopback, its unspecified address or
+    /// a link-local one, and no address rule in the allow list names it.
+    ///
+    /// The proxy dials on friring's network stack, not the sandbox's, so
+    /// forwarding one of these would give the boundary back the route it exists
+    /// to remove — see [`crate::proxy::host_is_local`]. Refused in **every**
+    /// mode, [`NetworkMode::Full`] included, because `full` describes the
+    /// network the sandbox may reach and these addresses are not on it.
+    ///
+    /// Distinct from [`DenyReason::NotAllowlisted`] on purpose: it must never
+    /// raise the first-use prompt, whose answer would be the user granting the
+    /// host's own services to a sandbox on the strength of a question that
+    /// looked like it was about the agent's dev server.
+    HostLocal,
     /// The request line carried a method [`MethodPolicy::ReadOnly`] withholds,
     /// quoted back with anything a terminal would act on replaced.
     MethodNotAllowed(String),
@@ -381,6 +395,10 @@ impl fmt::Display for DenyReason {
             Self::DeniedByRule(rule) => write!(f, "host matches the deny rule `{rule}`"),
             Self::NotAllowlisted => f.write_str("host is not in the sandbox allowlist"),
             Self::UnsupportedHost(detail) => write!(f, "the requested host {detail}"),
+            Self::HostLocal => f.write_str(
+                "the destination is local to the machine running friring, which is outside \
+                 this sandbox; add the address itself to the allowlist if that is intended",
+            ),
             Self::MethodNotAllowed(method) => {
                 write!(
                     f,
@@ -526,6 +544,13 @@ impl Policy {
         {
             return Decision::Deny(DenyReason::DeniedByRule(rule.to_string()));
         }
+        // Before the mode, so `full` grants it no more than an allowlist does,
+        // and after the denies, so a deny still wins and still names its rule.
+        if let CanonicalHost::Address(address) = host {
+            if host::is_host_local(*address) && !self.names_host_local(*address, port) {
+                return Decision::Deny(DenyReason::HostLocal);
+            }
+        }
         match self.mode {
             NetworkMode::Full => Decision::Allow,
             _ if self
@@ -537,6 +562,35 @@ impl Policy {
             }
             _ => Decision::Deny(DenyReason::NotAllowlisted),
         }
+    }
+
+    /// Whether an allow rule names this host-local address *as an address*.
+    ///
+    /// The only way to reach one of them through the proxy, and deliberately
+    /// the narrowest: the user wrote the literal address into the profile's
+    /// allow list, so the grant is a sentence they typed rather than one the
+    /// grammar handed them. Everything wider is refused —
+    ///
+    /// - `*` does not, because it means "the network" and this is not on it;
+    /// - a **name** does not, however it resolves, because a name is a claim
+    ///   somebody else controls, checked where the socket is opened;
+    /// - a **deny** entry does not, because a deny list only ever narrows;
+    /// - and [`NetworkMode::Full`] does not, because it consults no list.
+    ///
+    /// The port scope is honoured, so `127.0.0.1:11434` opens one local service
+    /// rather than every one of them.
+    fn names_host_local(&self, address: IpAddr, port: u16) -> bool {
+        self.allow.iter().any(|rule| {
+            matches!(rule.pattern, HostPattern::Address(named) if named == address)
+                && rule.port.map_or(true, |scoped| scoped == port)
+        })
+    }
+
+    /// Whether the proxy may open a socket to `address` for this sandbox —
+    /// the `host::connect` vetting of what a name actually resolved to,
+    /// answered by the same rule the decision used.
+    pub(super) fn permits_address(&self, address: IpAddr, port: u16) -> bool {
+        !host::is_host_local(address) || self.names_host_local(address, port)
     }
 
     /// Decide whether a plaintext HTTP request using `method` may be

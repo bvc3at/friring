@@ -173,20 +173,109 @@ impl HostFault {
     }
 }
 
-/// Dial exactly the host the policy decided on.
+/// Whether this address is one the proxy must never reach on a sandbox's
+/// behalf unless a rule names it outright.
+///
+/// The proxy runs *outside* the boundary, on friring's own network stack, so
+/// every destination it dials is dialled with the host's reachability rather
+/// than the sandbox's. For most of the internet that is the whole point. For
+/// these three ranges it inverts the boundary:
+///
+/// - **Loopback** (`127.0.0.0/8`, `::1`) is the host's own private services —
+///   a rootless docker or podman API, a language server, an SSH forward, the
+///   user's own dev servers. A namespaced sandbox has its own empty `127.0.0.1`
+///   precisely so it cannot see them, and a seatbelt sandbox is given one hole
+///   that goes to the proxy. Letting the request through the proxy would hand
+///   back the one route `--unshare-net` exists to remove, and with a container
+///   daemon on the other end that is arbitrary host command execution.
+/// - **Unspecified** (`0.0.0.0`, `::`) is loopback by another name: `connect(2)`
+///   to it reaches a local listener.
+/// - **Link-local** (`169.254.0.0/16`, `fe80::/10`) is per-interface and
+///   unroutable, so nothing beyond this machine's own segment answers there.
+///   `169.254.169.254` in particular is the cloud metadata endpoint, which
+///   hands out the *host's* instance credentials to anything that asks.
+///
+/// Deliberately **not** here: RFC 1918 and IPv6 unique-local. Those are the
+/// user's network rather than the user's machine — an internal registry, a LAN
+/// git remote — and refusing them by default would break a legitimate
+/// `full`-mode sandbox without closing a boundary the sandbox was promised.
+pub(super) fn is_host_local(address: IpAddr) -> bool {
+    match fold_mapped(address) {
+        IpAddr::V4(address) => {
+            address.is_loopback() || address.is_unspecified() || address.is_link_local()
+        }
+        // `is_unicast_link_local` is unstable, so `fe80::/10` is matched by its
+        // prefix; the multicast link-local scope is covered by `is_multicast`,
+        // which nothing dials over TCP anyway.
+        IpAddr::V6(address) => {
+            address.is_loopback()
+                || address.is_unspecified()
+                || (address.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Why a dial did not happen.
+pub(super) enum DialError {
+    /// Every address the destination denotes is one the proxy will not reach
+    /// for this sandbox — see [`is_host_local`]. A refusal, not a failure: the
+    /// caller answers it as a policy denial rather than a bad gateway.
+    HostLocal,
+    Io(io::Error),
+}
+
+/// Dial exactly the host the policy decided on, and nothing the sandbox is not
+/// allowed to reach through friring's own network stack.
 ///
 /// An address is dialled *as* an address, so the resolver never gets a second
 /// look at a spelling like `127.1` after the decision was taken on
 /// `127.0.0.1`. A name is resolved here and nowhere else, which is the
 /// `socks5h` half of the contract: the proxy sees the name, the client never
 /// resolves one behind its back.
-pub(super) async fn connect(host: &CanonicalHost, port: u16) -> io::Result<TcpStream> {
-    match host {
-        CanonicalHost::Address(address) => {
-            TcpStream::connect(SocketAddr::new(*address, port)).await
-        }
-        CanonicalHost::Domain(name) => TcpStream::connect((name.as_str(), port)).await,
+///
+/// `permitted` vets every address the destination actually resolves to, which
+/// is the half a decision taken on the *name* cannot do. A name is a promise
+/// about an address, and the promise is checked after the resolver answers and
+/// before the socket opens — so `127.0.0.1.nip.io`, a name whose record was
+/// changed to point inward, and a rebinding TTL all land on the same refusal.
+/// Resolving once and connecting to what was resolved is what makes that hold:
+/// there is no second lookup for a different answer to arrive in.
+///
+/// A refused address is dropped from the candidates rather than failing the
+/// whole destination, and a destination with none left is refused. That is the
+/// same guarantee stated the other way round — no socket is opened to an
+/// address `permitted` rejected — while leaving a name that answers with both
+/// families usable: `localhost` is `::1` *and* `127.0.0.1`, and an allow list
+/// naming one of them means that one.
+pub(super) async fn connect(
+    host: &CanonicalHost,
+    port: u16,
+    permitted: &(dyn Fn(IpAddr) -> bool + Sync),
+) -> Result<TcpStream, DialError> {
+    let resolved: Vec<SocketAddr> = match host {
+        CanonicalHost::Address(address) => vec![SocketAddr::new(*address, port)],
+        CanonicalHost::Domain(name) => tokio::net::lookup_host((name.as_str(), port))
+            .await
+            .map_err(DialError::Io)?
+            .collect(),
+    };
+    let candidates: Vec<SocketAddr> = resolved
+        .into_iter()
+        .filter(|address| permitted(address.ip()))
+        .collect();
+    if candidates.is_empty() {
+        return Err(DialError::HostLocal);
     }
+    let mut last = None;
+    for address in &candidates {
+        match TcpStream::connect(address).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(DialError::Io(last.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::AddrNotAvailable, "no address to connect to")
+    })))
 }
 
 /// Every address spelling that reaches the same endpoint, read as that endpoint.

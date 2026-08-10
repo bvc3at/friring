@@ -96,9 +96,19 @@ pub(super) async fn serve(mut client: Client, shared: Arc<Shared>) -> io::Result
         return refuse(&mut client, REPLY_NOT_ALLOWED).await;
     }
 
-    let upstream = match timeout(limits.connect_timeout, host::connect(&host, port)).await {
+    let permitted = |address| shared.permits_address(address, port);
+    let dial = host::connect(&host, port, &permitted);
+    let upstream = match timeout(limits.connect_timeout, dial).await {
         Ok(Ok(upstream)) => upstream,
-        Ok(Err(error)) => return refuse(&mut client, reply_code_for(&error)).await,
+        // Only the resolver could have caught this one, so it is reported as
+        // the policy refusal it is rather than as an unreachable host.
+        Ok(Err(host::DialError::HostLocal)) => {
+            shared.report(Protocol::Socks5, asked, port, DenyReason::HostLocal);
+            return refuse(&mut client, REPLY_NOT_ALLOWED).await;
+        }
+        Ok(Err(host::DialError::Io(error))) => {
+            return refuse(&mut client, reply_code_for(&error)).await
+        }
         Err(_elapsed) => return refuse(&mut client, REPLY_TTL_EXPIRED).await,
     };
     let _ = upstream.set_nodelay(true);

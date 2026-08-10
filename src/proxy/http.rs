@@ -118,9 +118,19 @@ pub(super) async fn serve(mut client: Client, shared: Arc<Shared>) -> io::Result
         }
     }
 
-    let mut upstream = match timeout(limits.connect_timeout, host::connect(&host, port)).await {
+    let permitted = |address| shared.permits_address(address, port);
+    let dial = host::connect(&host, port, &permitted);
+    let mut upstream = match timeout(limits.connect_timeout, dial).await {
         Ok(Ok(upstream)) => upstream,
-        Ok(Err(error)) => {
+        // The name was allowed and its address was not: a policy refusal that
+        // only the resolver could reach, so it is reported and answered like
+        // one rather than dressed up as an upstream failure.
+        Ok(Err(host::DialError::HostLocal)) => {
+            let reason = DenyReason::HostLocal;
+            shared.report(Protocol::Http, asked, port, reason.clone());
+            return refuse(&mut client, 403, "Forbidden", &reason.to_string()).await;
+        }
+        Ok(Err(host::DialError::Io(error))) => {
             let detail = format!("cannot reach {host}:{port}: {error}");
             return refuse(&mut client, 502, "Bad Gateway", &detail).await;
         }

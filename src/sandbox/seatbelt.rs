@@ -441,6 +441,8 @@ fn render_network(out: &mut Vec<String>, launch: &SandboxLaunch<'_>) {
                     "ignores the proxy environment gets no network rather than an",
                     "escape route. DNS is deliberately absent: the proxy resolves,",
                     "so name lookups cannot become an exfiltration channel.",
+                    "`localhost` here covers ::1 as well as 127.0.0.1 and SBPL has",
+                    "no way to say which, so the proxy holds the port on both.",
                 ],
             );
             out.push(format!(

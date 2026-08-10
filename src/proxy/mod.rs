@@ -108,9 +108,29 @@ use tokio::task::{JoinHandle, JoinSet};
 
 pub use auth::PROXY_USERNAME;
 pub use policy::{Decision, DenyReason, HostRule, MethodPolicy, NetworkMode, Policy};
+
 #[cfg(unix)]
 pub use relay::{Relay, RelayConfig};
 use stream::{Client, Listener};
+
+/// Whether `host` names a destination local to the machine friring runs on:
+/// its loopback, its unspecified address, or a link-local one.
+///
+/// The proxy refuses these unless an allow rule names the address outright
+/// ([`DenyReason::HostLocal`]), because it dials on friring's network stack
+/// rather than the sandbox's. Exported so a caller that is about to *offer* a
+/// destination to the user — the first-use domain prompt — can decline to
+/// offer one whose answer the proxy would refuse anyway, and which reads in a
+/// modal like the agent's own dev server rather than the host's.
+///
+/// A name is never one of these, whatever it resolves to: what a name denotes
+/// is settled by the resolver at connect time, not here.
+pub fn host_is_local(host: &str) -> bool {
+    matches!(
+        host::CanonicalHost::parse(host),
+        Ok(host::CanonicalHost::Address(address)) if host::is_host_local(address)
+    )
+}
 
 /// Which protocol a refused request arrived on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,6 +366,12 @@ impl Shared {
         self.read_policy().decide_method(method)
     }
 
+    /// Whether a resolved address may be dialled — the second half of the
+    /// decision, taken after the resolver has answered.
+    fn permits_address(&self, address: std::net::IpAddr, port: u16) -> bool {
+        self.read_policy().permits_address(address, port)
+    }
+
     fn token(&self) -> &str {
         &self.token
     }
@@ -439,13 +465,12 @@ impl Proxy {
     /// If no listener was configured, if an address or socket path cannot be
     /// bound, or if a unix socket was asked for on a platform without them.
     pub async fn start(config: ProxyConfig) -> Result<(Self, mpsc::Receiver<DenialEvent>)> {
-        let tcp = match config.bind.tcp {
-            Some(addr) => Some(
-                TcpListener::bind(addr)
-                    .await
-                    .with_context(|| format!("binding the sandbox proxy to {addr}"))?,
-            ),
-            None => None,
+        let (tcp, companion) = match config.bind.tcp {
+            Some(addr) => {
+                let (primary, companion) = bind_loopback_pair(addr).await?;
+                (Some(primary), companion)
+            }
+            None => (None, None),
         };
         let tcp_addr = match &tcp {
             Some(listener) => Some(
@@ -479,6 +504,7 @@ impl Proxy {
         let (shutdown, stop) = watch::channel(false);
         let accept = tokio::spawn(accept_loop(
             tcp.map(Listener::Tcp),
+            companion.map(Listener::Tcp),
             unix,
             Arc::clone(&shared),
             stop,
@@ -665,6 +691,90 @@ fn bind_unix_socket(bind: &UnixBind) -> Result<Listener> {
     )
 }
 
+/// Attempts to find a port free on **both** loopback families before giving up.
+///
+/// Each attempt asks for a fresh ephemeral port, so a port lost to another
+/// process is not retried; a handful is far more than enough on a machine that
+/// is not out of ports altogether.
+const LOOPBACK_PAIR_ATTEMPTS: usize = 8;
+
+/// Bind `addr`, and — when it is loopback — the other family's loopback on the
+/// same port, so the port belongs to this proxy on both.
+///
+/// A seatbelt sandbox is given exactly one network hole, written
+/// `(allow network-outbound (remote ip "localhost:<port>"))`. SBPL's `localhost`
+/// is a *semantic* loopback predicate: it covers `::1` as well as `127.0.0.1`,
+/// and the language has no vocabulary for one family — a literal address is a
+/// parse error, so the profile cannot be narrowed. Meanwhile a listener on
+/// `[::1]:P` does not conflict with one on `127.0.0.1:P`, so the kernel will
+/// happily hand this proxy a port an unrelated local service is already serving
+/// over IPv6 — and the sandbox's single hole would reach *that*, with no token
+/// and no policy. Claiming both is what makes the hole go only where the
+/// profile says it does.
+///
+/// A companion that cannot exist is not a hole: if the host has no IPv6
+/// loopback at all, nothing inside the sandbox can reach one either, so that
+/// case proceeds with the single listener. A port that is *taken* on the other
+/// family is a different matter, and the answer is another port rather than a
+/// smaller guarantee.
+async fn bind_loopback_pair(addr: SocketAddr) -> Result<(TcpListener, Option<TcpListener>)> {
+    let mut last: Option<anyhow::Error> = None;
+    for _ in 0..LOOPBACK_PAIR_ATTEMPTS {
+        let primary = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("binding the sandbox proxy to {addr}"))?;
+        let Some(companion_ip) = companion_loopback(addr.ip()) else {
+            return Ok((primary, None));
+        };
+        let port = primary
+            .local_addr()
+            .context("reading the sandbox proxy's bound address")?
+            .port();
+        match TcpListener::bind(SocketAddr::new(companion_ip, port)).await {
+            Ok(companion) => return Ok((primary, Some(companion))),
+            // No such address on this host: there is no listener for the
+            // sandbox to reach either, so the pair is not needed.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
+                ) =>
+            {
+                return Ok((primary, None))
+            }
+            Err(error) => {
+                // Drop this port before asking for another, or the next
+                // attempt competes with the listener just opened.
+                drop(primary);
+                last = Some(anyhow::Error::new(error).context(format!(
+                    "claiming {companion_ip} port {port} for the sandbox proxy"
+                )));
+            }
+        }
+    }
+    Err(last
+        .unwrap_or_else(|| anyhow::anyhow!("no loopback port was free on both families"))
+        .context(
+            "the sandbox proxy could not take a port on both loopback families, which its \
+             seatbelt rule cannot tell apart",
+        ))
+}
+
+/// The other loopback family's address for a loopback bind, or `None` when the
+/// requested address is not loopback (nothing else is reachable through a
+/// `localhost` rule, so nothing else needs a pair).
+fn companion_loopback(ip: std::net::IpAddr) -> Option<std::net::IpAddr> {
+    match ip {
+        std::net::IpAddr::V4(v4) if v4.is_loopback() => {
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        }
+        std::net::IpAddr::V6(v6) if v6.is_loopback() => {
+            Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST))
+        }
+        _ => None,
+    }
+}
+
 /// Remove a socket file left behind by a previous run, and refuse to touch
 /// anything else.
 ///
@@ -697,6 +807,11 @@ fn clear_stale_socket(path: &Path) -> Result<()> {
 /// abort what is still running.
 async fn accept_loop(
     tcp: Option<Listener>,
+    // `tcp_companion` is the other loopback family on the same port (see
+    // `bind_loopback_pair`). Served rather than merely held: a sandbox that
+    // reaches it is reaching this proxy, and gets the policy and the token
+    // demand it would have got on the primary.
+    tcp_companion: Option<Listener>,
     unix: Option<Listener>,
     shared: Arc<Shared>,
     mut stop: watch::Receiver<bool>,
@@ -719,6 +834,7 @@ async fn accept_loop(
                 continue;
             }
             accepted = stream::accept_next(&tcp) => accepted,
+            accepted = stream::accept_next(&tcp_companion) => accepted,
             accepted = stream::accept_next(&unix) => accepted,
         };
         let client = match accepted {

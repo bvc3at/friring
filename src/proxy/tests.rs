@@ -6,6 +6,7 @@
 //! the proxy under test, and hosts that must be *denied* are refused before a
 //! name is ever resolved — which is also what makes those tests hermetic.
 
+use std::net::Ipv6Addr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -551,14 +552,204 @@ async fn network_mode_none_refuses_even_an_allowlisted_host() {
     proxy.shutdown().await;
 }
 
+/// The seatbelt hole is one port, and the kernel cannot be told which family
+/// it means.
+///
+/// `(allow network-outbound (remote ip "localhost:<port>"))` is a semantic
+/// loopback predicate covering `::1` as well as `127.0.0.1`, and SBPL rejects a
+/// literal address, so the profile cannot be narrowed. A listener on `[::1]:P`
+/// does not conflict with one on `127.0.0.1:P`, so unless the proxy claims
+/// both, the sandbox's single hole can reach whatever local service happens to
+/// own the other one — with no token and no policy.
 #[tokio::test]
-async fn network_mode_full_allows_a_host_no_rule_mentions() {
+async fn the_loopback_port_belongs_to_the_proxy_on_both_families() {
+    let (proxy, _denials) = start(loopback_only()).await;
+    let port = tcp_addr(&proxy).port();
+
+    // Nothing else can take the companion: the proxy is holding it.
+    let stolen = TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, port))).await;
+    assert!(
+        stolen.is_err(),
+        "[::1]:{port} was free for something other than the proxy"
+    );
+
+    // And it is served, not merely held — a sandbox that dials it is talking
+    // to the proxy, so it meets the same token demand.
+    let mut client = TcpStream::connect((Ipv6Addr::LOCALHOST, port))
+        .await
+        .expect("the companion accepts");
+    client
+        .write_all(b"CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n")
+        .await
+        .expect("write");
+    let mut head = vec![0u8; 64];
+    let read = client.read(&mut head).await.expect("read");
+    let head = String::from_utf8_lossy(&head[..read]).into_owned();
+    assert!(head.starts_with("HTTP/1.1 407 "), "{head}");
+    proxy.shutdown().await;
+}
+
+/// `full` consults no allow list for an ordinary destination — asserted on the
+/// decision, because every upstream a hermetic test can reach is on loopback
+/// and loopback is the one thing `full` does *not* carry (below).
+#[test]
+fn network_mode_full_allows_a_host_no_rule_mentions() {
+    let policy = Policy::new(NetworkMode::Full);
+    assert_eq!(policy.decide("example.test", 443), Decision::Allow);
+    assert_eq!(policy.decide("192.0.2.10", 443), Decision::Allow);
+}
+
+/// The same thing on the wire, with the host-local exception that is the only
+/// reason an in-process upstream is reachable at all.
+#[tokio::test]
+async fn network_mode_full_tunnels_without_a_domain_rule() {
     let echo = spawn_echo_server().await;
-    let (proxy, _denials) = start(Policy::new(NetworkMode::Full)).await;
+    let policy = Policy::new(NetworkMode::Full)
+        .with_allow(["127.0.0.1"])
+        .expect("valid rules");
+    let (proxy, _denials) = start(policy).await;
     let (mut tunnel, head) = send_connect(&proxy, &echo.to_string(), Some(&bearer(&proxy))).await;
     assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
     assert_tunnels(&mut tunnel, b"open").await;
     proxy.shutdown().await;
+}
+
+/// The route `--unshare-net` exists to remove, offered back by the proxy.
+///
+/// A `full`-with-denies profile is exactly the shape P2 newly routes through
+/// the proxy, and the sandbox it wraps has no network stack of its own — so a
+/// `CONNECT 127.0.0.1:<port>` that the proxy honoured would reach a service on
+/// the *host*: a rootless container API, a language server, an SSH forward.
+/// Both protocols are driven, because both dial.
+#[tokio::test]
+async fn a_full_sandbox_is_not_lent_the_hosts_own_loopback() {
+    let echo = spawn_echo_server().await;
+    let policy = Policy::new(NetworkMode::Full)
+        .with_deny(["telemetry.example"])
+        .expect("valid rules");
+    let (proxy, mut denials) = start(policy).await;
+
+    let (mut stream, head) = send_connect(&proxy, &echo.to_string(), Some(&bearer(&proxy))).await;
+    assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+    assert!(read_body(&mut stream)
+        .await
+        .contains("local to the machine"));
+    assert_eq!(
+        next_denial(&mut denials).await.reason,
+        DenyReason::HostLocal
+    );
+
+    let (_socks, reply) = socks_tunnel(&proxy, "127.0.0.1", echo.port()).await;
+    assert_eq!(reply[1], 0x02, "connection not allowed by ruleset");
+    assert_eq!(
+        next_denial(&mut denials).await.reason,
+        DenyReason::HostLocal
+    );
+    proxy.shutdown().await;
+}
+
+/// The same refusal reached through a *name*, which is the half a decision
+/// taken before the resolver answers cannot make: `localhost` is allowlisted
+/// here, matches, and is still refused once its address is known. A name whose
+/// record points inward — `127.0.0.1.nip.io`, a rebinding TTL on an allowed
+/// domain — lands on this same check, without the test needing a resolver that
+/// answers for one.
+#[tokio::test]
+async fn a_name_that_resolves_inward_is_refused_after_it_resolves() {
+    let echo = spawn_echo_server().await;
+    let policy = Policy::new(NetworkMode::Allowlist)
+        .with_allow(["localhost"])
+        .expect("valid rules");
+    let (proxy, mut denials) = start(policy).await;
+    let target = format!("localhost:{}", echo.port());
+
+    let (_stream, head) = send_connect(&proxy, &target, Some(&bearer(&proxy))).await;
+    assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+    let denial = next_denial(&mut denials).await;
+    assert_eq!(denial.host, "localhost");
+    assert_eq!(denial.reason, DenyReason::HostLocal);
+    proxy.shutdown().await;
+}
+
+/// The one way in, and its shape: the literal address, written by the user
+/// into the allow list, and scoped to the port they wrote. A rule for another
+/// port on the same address does not carry it.
+#[tokio::test]
+async fn an_address_rule_is_the_only_grant_of_a_local_service() {
+    let echo = spawn_echo_server().await;
+    let policy = Policy::new(NetworkMode::Allowlist)
+        .with_allow([format!("127.0.0.1:{}", echo.port())])
+        .expect("valid rules");
+    let (proxy, mut denials) = start(policy).await;
+
+    let (mut tunnel, head) = send_connect(&proxy, &echo.to_string(), Some(&bearer(&proxy))).await;
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert_tunnels(&mut tunnel, b"granted").await;
+
+    let elsewhere = format!("127.0.0.1:{}", echo.port() + 1);
+    let (_refused, head) = send_connect(&proxy, &elsewhere, Some(&bearer(&proxy))).await;
+    assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+    assert_eq!(
+        next_denial(&mut denials).await.reason,
+        DenyReason::HostLocal
+    );
+    proxy.shutdown().await;
+}
+
+/// `*` is the proxy's own "every host" rule, and a *deny* entry only ever
+/// narrows. Neither is the user naming an address, so neither opens one.
+#[test]
+fn neither_a_wildcard_nor_a_deny_entry_opens_a_local_service() {
+    let wildcard = Policy::new(NetworkMode::Allowlist)
+        .with_allow(["*"])
+        .expect("valid rules");
+    assert_eq!(
+        wildcard.decide("127.0.0.1", 2375),
+        Decision::Deny(DenyReason::HostLocal)
+    );
+    let denied = Policy::new(NetworkMode::Full)
+        .with_deny(["127.0.0.1"])
+        .expect("valid rules");
+    assert_eq!(
+        denied.decide("127.0.0.1", 2375),
+        Decision::Deny(DenyReason::DeniedByRule("127.0.0.1".into()))
+    );
+}
+
+/// Every spelling of a host-local destination, and the addresses that are not
+/// one. A sandbox picks the spelling, so `127.1` and `::ffff:127.0.0.1` have to
+/// land where `127.0.0.1` does — and the user's own network is not refused,
+/// because that is their network rather than their machine.
+#[test]
+fn every_spelling_of_a_local_destination_is_refused_and_no_others_are() {
+    let policy = Policy::new(NetworkMode::Full);
+    for host in [
+        "127.0.0.1",
+        "127.1",
+        "2130706433",
+        "0x7f.0.0.1",
+        "[::1]",
+        "[::ffff:127.0.0.1]",
+        "0.0.0.0",
+        "[::]",
+        "169.254.169.254",
+        "[fe80::1]",
+    ] {
+        assert_eq!(
+            policy.decide(host, 80),
+            Decision::Deny(DenyReason::HostLocal),
+            "{host} reached the host's own stack"
+        );
+    }
+    for host in [
+        "10.0.0.1",
+        "192.168.1.5",
+        "172.16.0.1",
+        "[fd00::1]",
+        "8.8.8.8",
+    ] {
+        assert_eq!(policy.decide(host, 80), Decision::Allow, "{host}");
+    }
 }
 
 #[tokio::test]
