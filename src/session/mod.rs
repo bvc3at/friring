@@ -468,6 +468,20 @@ pub struct SessionInfo {
     /// it only adopted it, and no warning was ever recorded — so the persisted
     /// profile is the only evidence there is.
     pub sandbox_state: Option<SandboxState>,
+    /// What the user has to type **in this pane** to sign the agent in, when
+    /// the last launch left it signed out inside its boundary.
+    ///
+    /// `None` is "nothing to do": every policy-backed session (the host's own
+    /// credential store is right where it was, ADR-28), every place friring
+    /// injected a token into or that already holds a login, and every session
+    /// with no profile at all.
+    ///
+    /// Never persisted, for [`sandbox_state`](Self::sandbox_state)'s reason
+    /// turned around: the answer is only true of the launch that computed it,
+    /// and a stale "sign in" against an agent that has since signed itself in
+    /// is a prompt for work nobody needs to do. An adopted session shows
+    /// nothing rather than guessing.
+    pub sandbox_login: Option<String>,
     /// Agent metrics from the agent's statusline (Claude only).
     pub agent_metrics: Option<AgentMetrics>,
     /// Latest OSC window title the agent emitted (live activity text),
@@ -519,6 +533,7 @@ impl SessionInfo {
             remote_host: None,
             sandbox_profile: None,
             sandbox_state: None,
+            sandbox_login: None,
             agent_metrics: None,
             agent_activity: None,
             cc_activity: None,

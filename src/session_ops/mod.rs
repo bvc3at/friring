@@ -492,6 +492,12 @@ pub(crate) struct AgentInvocation {
     /// The program to run: the agent, or the sandbox wrapper around it.
     pub command: String,
     pub args: Vec<String>,
+    /// The credential a sandboxed launch injects, kept **out** of `config.env`
+    /// so the caller has to place it deliberately. It may only reach the window
+    /// over a control-mode connection, never as a `tmux -e KEY=VALUE` argument
+    /// on a client's command line (`docs/SANDBOX.md` §Failure modes) — so a
+    /// caller holding only the argv channel refuses the launch instead.
+    pub secret_env: Vec<(String, String)>,
     /// What the launch did with `config.sandbox`. `None` = the session carries
     /// no profile; [`SandboxState::Unenforced`] = it carries one that could not
     /// be applied and whose escape hatch let the agent run on the host anyway.
@@ -504,6 +510,9 @@ pub(crate) struct AgentInvocation {
     /// The row to record in `sandbox_instances` once the launch has a window,
     /// so garbage collection can find the container it created.
     pub instance: Option<crate::session::SandboxInstance>,
+    /// What the user types in the session's pane to sign the agent in, when the
+    /// boundary starts it signed out. `None` when there is nothing to do.
+    pub login: Option<String>,
 }
 
 /// Build the invocation for an already-resolved [`AgentDef`], with the
@@ -542,9 +551,11 @@ fn build_agent_invocation(
         crate::agent::sandboxing::SandboxDecision::Unsandboxed => Ok(AgentInvocation {
             command,
             args,
+            secret_env: Vec::new(),
             sandbox: None,
             place: None,
             instance: None,
+            login: None,
         }),
         // The escape hatch fired: this agent runs on the host. The session's
         // link to its profile is left alone by the caller — a relaunch once the
@@ -555,9 +566,11 @@ fn build_agent_invocation(
             Ok(AgentInvocation {
                 command,
                 args,
+                secret_env: Vec::new(),
                 sandbox: Some(crate::session::SandboxState::Unenforced(reason)),
                 place: None,
                 instance: None,
+                login: None,
             })
         }
         crate::agent::sandboxing::SandboxDecision::Wrapped(wrapped) => {
@@ -565,9 +578,11 @@ fn build_agent_invocation(
             Ok(AgentInvocation {
                 command: wrapped.command,
                 args: wrapped.args,
+                secret_env: wrapped.secret_env,
                 sandbox: Some(crate::session::SandboxState::Applied(wrapped.state)),
                 place: wrapped.place,
                 instance: wrapped.instance,
+                login: wrapped.login,
             })
         }
     }

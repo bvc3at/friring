@@ -125,6 +125,13 @@ pub struct InstancePlan {
     pub user: Option<String>,
     /// `--userns=keep-id`, for rootless Podman.
     pub userns_keep_id: bool,
+    /// The host directory mounted at [`CONTAINER_HOME`] — the synthetic
+    /// per-profile home, carried on the plan so a launch can write into the
+    /// exact directory this place mounts rather than re-deriving it.
+    ///
+    /// Not hashed into [`spec`](Self::spec) separately: it is already there as
+    /// the source of the `CONTAINER_HOME` mount.
+    pub home_dir: String,
     /// The digest behind [`LABEL_SPEC`].
     pub spec: String,
 }
@@ -211,6 +218,7 @@ pub fn plan_instance(input: PlanInput<'_>) -> SandboxResult<InstancePlan> {
         cpus: policy.cpus,
         user: input.user.map(str::to_string),
         userns_keep_id: input.userns_keep_id,
+        home_dir: input.home_dir.to_string(),
         spec: String::new(),
     };
     plan.spec = spec_digest(&plan);
@@ -302,6 +310,12 @@ fn check_mounts(
 /// Per *profile*, so nothing session-specific belongs here: an `exec` carries
 /// what one session needs (its proxy URLs, its identity), and this carries what
 /// the place is.
+///
+/// **Never a credential.** Everything here reaches the engine through
+/// [`create_argv`], which is a command line on the host's process table; a
+/// token, a proxy bearer or anything else secret travels over the control-mode
+/// `new-window` that opens the session's own window inside the place, and
+/// nowhere else (`docs/SANDBOX.md` §Failure modes).
 ///
 /// `safe.directory` and a committer identity are both required rather than
 /// polite. A bind mount surfaces the host's ownership, which git refuses to act
@@ -400,6 +414,11 @@ fn container_name(profile: &str, spec: &str) -> String {
 /// should be able to gain one through a setuid binary. Neither is configurable:
 /// a profile that needed them would be a profile whose blast radius is the
 /// host's.
+///
+/// Everything this emits — every `--env` among it — is visible on the host's
+/// process table for as long as the engine runs, so **no credential may ever be
+/// added here**. The session's own secrets go into its window's environment over
+/// the control connection instead (`docs/SANDBOX.md` §Failure modes).
 pub fn create_argv(program: &str, plan: &InstancePlan) -> Vec<String> {
     let mut argv: Vec<String> = vec![program.to_string(), "run".to_string()];
     let mut push = |tokens: &[&str]| argv.extend(tokens.iter().map(|t| (*t).to_string()));

@@ -97,6 +97,11 @@ pub struct EnsuredPlace {
     /// reclaims it.
     pub spec: String,
     pub image: String,
+    /// The synthetic per-profile home **on the host**, which this place mounts
+    /// at [`CONTAINER_HOME`]. What a launch projects configuration into and
+    /// keeps the profile's login in — taken from the plan rather than re-derived,
+    /// so it is by construction the directory that was mounted.
+    pub home_dir: String,
     /// Whether this call created the place, as opposed to adopting one that was
     /// already running.
     pub created: bool,
@@ -192,6 +197,7 @@ impl ContainerBackend {
             name: plan.name.clone(),
             spec: plan.spec.clone(),
             image: plan.image.clone(),
+            home_dir: plan.home_dir.clone(),
             created,
             relay_program,
         })

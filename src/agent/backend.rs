@@ -522,6 +522,9 @@ struct Sandboxed {
     /// The place row to record in `sandbox_instances` once the launch has a
     /// pane, so garbage collection can find the container it created.
     instance: Option<crate::sandbox::SandboxInstance>,
+    /// What the user types in the pane to sign the agent in, when the boundary
+    /// starts it signed out. For `SessionInfo::sandbox_login`.
+    login: Option<String>,
 }
 
 /// Bring a place's own tmux up before spawning into it.
@@ -624,6 +627,7 @@ fn sandboxed_invocation(
         state: None,
         place: None,
         instance: None,
+        login: None,
         // Claimed here rather than left parked so the invocation and the
         // boundary it names travel together: whatever happens to one of them
         // from now on happens to both.
@@ -646,6 +650,13 @@ fn sandboxed_invocation(
         crate::agent::sandboxing::SandboxDecision::Wrapped(wrapped) => {
             let mut env = plain.env;
             env.extend(wrapped.env);
+            // Every spawn from this module goes through a control-mode
+            // `new-window`, whose environment travels in a command over the tmux
+            // socket rather than on any process's command line — which is the
+            // one channel a credential may use (`docs/SANDBOX.md` §Failure
+            // modes). The headless one-shot spawner has no such connection and
+            // refuses instead of injecting.
+            env.extend(wrapped.secret_env);
             debug!(sandbox = %wrapped.label, "Wrapping agent invocation");
             Ok(Sandboxed {
                 command: wrapped.command,
@@ -656,6 +667,7 @@ fn sandboxed_invocation(
                 egress: plain.egress,
                 place: wrapped.place,
                 instance: wrapped.instance,
+                login: wrapped.login,
             })
         }
     }
@@ -745,6 +757,7 @@ impl Session {
             egress,
             place,
             instance,
+            login,
         } = sandboxed_invocation(config, provider)?;
 
         // A place is a transport, so a place-backed launch spawns *into* the
@@ -790,6 +803,7 @@ impl Session {
         info.remote_host = remote_host_from_backend(backend);
         info.sandbox_profile = profile;
         info.sandbox_state = state;
+        info.sandbox_login = login;
         debug!(session_id = %info.id, backend_id = %spawned.backend_id, "Spawned session via backend");
 
         let mut session = Self::wire_io(
@@ -1409,6 +1423,7 @@ impl Session {
             egress,
             place,
             instance,
+            login,
         } = sandboxed_invocation(config, &self.provider)?;
 
         // A relaunch re-reads the profile, so an edited one asks for a *new*
@@ -1510,6 +1525,10 @@ impl Session {
         self.info.backend_id = Some(self.backend_id.clone());
         self.info.sandbox_profile = profile;
         self.info.sandbox_state = sandbox_state;
+        // Overwritten rather than merged: a relaunch re-reads the profile, so a
+        // sign-in that has since happened — or a token stored since — clears the
+        // prompt, and one that has not restates it.
+        self.info.sandbox_login = login;
         if !config.agent.is_empty() {
             self.info.agent = config.agent.clone();
         }

@@ -70,6 +70,12 @@ pub struct SpawnResult {
     /// because a session the user believes is sandboxed and is not is the worst
     /// outcome this feature has.
     pub sandbox: Option<crate::session::SandboxState>,
+    /// What the user has to type in the session's pane to sign the agent in,
+    /// when the boundary started it signed out. `None` when there is nothing to
+    /// do — every policy-backed launch, and every place that already holds a
+    /// credential. Reported for the reason the fallback is: an agent parked at
+    /// a sign-in prompt with nothing said about it reads as a broken session.
+    pub sandbox_login: Option<String>,
 }
 
 /// How a headless spawn creates the session's window, and what it learns: the
@@ -127,6 +133,37 @@ fn spawn_launch_window(
                 .map_err(|e| format!("Failed to spawn tmux window: {e}"))
         }
     }
+}
+
+/// Refuse a launch that would put a credential on a command line.
+///
+/// A window's environment reaches an off-host target — an SSH host, a sandbox
+/// place — inside a control-mode command sent over the tmux socket, which never
+/// touches a process table. The **local** one-shot spawn has no control
+/// connection and passes each variable as a `tmux -e KEY=VALUE` argument
+/// instead, readable by any local user through `/proc/<pid>/cmdline`
+/// (`docs/SANDBOX.md` §Failure modes). Refusing is the point: the alternative is
+/// exposing the token in order to satisfy the launch, and the quieter
+/// alternative — dropping it — starts an agent that will fail to authenticate
+/// with nothing on screen saying why.
+///
+/// Unreachable today by construction (only a place injects a credential, and a
+/// place is never the local target), which is exactly why it is a check rather
+/// than a comment: the next credential strategy must not be able to make it
+/// reachable silently.
+fn credential_channel(
+    target: LaunchTarget<'_>,
+    secret_env: &[(String, String)],
+) -> Result<(), String> {
+    if secret_env.is_empty() || !matches!(target, LaunchTarget::Local) {
+        return Ok(());
+    }
+    Err(
+        "This sandbox profile injects a credential, which friring will not pass on a tmux \
+         client's command line where another local user could read it; start the session from \
+         the TUI instead"
+            .to_string(),
+    )
 }
 
 /// Spawn a new session inside `tmux -L friring`, persisting its state to the
@@ -228,8 +265,11 @@ fn spawn_session_with(
     // A filtered profile bound an egress proxy to compose that invocation
     // against, and it is nobody's until this session exists. Held from here to
     // the upsert so every failure in between releases it, rather than leaving a
-    // live credential for a session that never happened.
+    // live credential for a session that never happened — which is why it is
+    // claimed *before* the refusal below rather than after it.
     let egress = crate::agent::sandboxing::pending_egress(&config);
+    credential_channel(target, &invocation.secret_env)?;
+    config.env.extend(invocation.secret_env.iter().cloned());
 
     let backend_id =
         match spawn_window(target, &req.name, &command, &args, &launch_cwd, &config.env) {
@@ -331,6 +371,7 @@ fn spawn_session_with(
         worktrees,
         parent_session_id: req.parent_session_id,
         sandbox: invocation.sandbox,
+        sandbox_login: invocation.login,
     })
 }
 
@@ -682,6 +723,30 @@ mod tests {
             extra_repos: Vec::new(),
             sandbox_profile: None,
         }
+    }
+
+    /// A credential goes over a control connection or not at all. The local
+    /// one-shot spawner puts its whole environment in a `tmux` client's argv,
+    /// so a launch carrying one is refused there and injected everywhere else.
+    #[test]
+    fn a_credential_never_rides_a_tmux_clients_command_line() {
+        let secret = vec![("ANTHROPIC_API_KEY".to_string(), "sk-fabricated".to_string())];
+        let host = HostDef {
+            name: "devbox".into(),
+            destination: "devbox".into(),
+            ..HostDef::default()
+        };
+        let place = crate::agent::transport::Place::new("/usr/bin/podman", "abc123", "dev")
+            .expect("a spellable place");
+
+        let err = credential_channel(LaunchTarget::Local, &secret).unwrap_err();
+        assert!(err.contains("command line"), "{err}");
+        assert!(err.contains("from the TUI"), "{err}");
+
+        assert!(credential_channel(LaunchTarget::Place(&place), &secret).is_ok());
+        assert!(credential_channel(LaunchTarget::Host(&host), &secret).is_ok());
+        // Nothing to protect, nothing to refuse.
+        assert!(credential_channel(LaunchTarget::Local, &[]).is_ok());
     }
 
     #[test]

@@ -127,8 +127,22 @@ fn build_restart_plan(
     let invocation = super::build_agent_invocation(&def, &mut config)?;
     // Composing a filtered profile binds a fresh proxy; claiming it here is
     // what makes it this *plan's*, so it lives exactly as long as the plan does
-    // and the running agent's own boundary is left where it is.
+    // and the running agent's own boundary is left where it is. Claimed before
+    // the refusal below, so refusing releases it too.
     let egress = crate::agent::sandboxing::pending_egress(&config);
+    // This path re-spawns through the local one-shot `tmux -e KEY=VALUE`, whose
+    // argv is readable by other local users — so a launch carrying a credential
+    // is refused rather than either exposed there or silently started without
+    // it (`docs/SANDBOX.md` §Failure modes). Off-host sessions, which is where
+    // an injected credential actually arises, never reach here: they are refused
+    // by `restart_session_with` before the plan is built.
+    if !invocation.secret_env.is_empty() {
+        return Err(format!(
+            "Session '{}' has a sandbox profile that injects a credential, which friring will \
+             not pass on a tmux client's command line; restart it from the TUI instead",
+            session.name
+        ));
+    }
 
     Ok(RestartPlan {
         window_name: session.name.clone(),

@@ -13,16 +13,24 @@
 //!
 //! - a **remote** spawn translates the path onto the host and copies the file
 //!   there, falling back to dropping it (`session_ops::spawn`);
-//! - a **place**-backed launch drops it outright, because config projection into
-//!   a sandbox is a later slice and ADR-28 forbids binding the host's agent
-//!   configuration in ([`crate::agent::sandboxing`]).
+//! - a **place**-backed launch projects the file into the place's synthetic home
+//!   and points the argument at where it landed, falling back to dropping it
+//!   when it could not cross ([`crate::agent::sandboxing`],
+//!   [`crate::sandbox::projection`]).
 
 /// True when `path` is `root` itself or a descendant — a plain `starts_with`
 /// would also claim sibling directories sharing the prefix
 /// (`…/friring-backup` under root `…/friring`).
+///
+/// An **empty** root is nothing rather than everything: read literally it is a
+/// prefix of every absolute path, which would put every argument the agent was
+/// given — a repository, a user's file — inside the narrow scope this rewrite is
+/// allowed. A caller with no config directory has nothing to recognise.
 pub(crate) fn path_under_root(path: &str, root: &str) -> bool {
-    path.strip_prefix(root)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    !root.is_empty()
+        && path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// Every arg (or `--flag=value` value) under `config_root` is passed to `map`;
@@ -72,30 +80,27 @@ pub(crate) fn rewrite_config_path_args(
     out
 }
 
-/// `argv` with every friring-managed config path — and the flag introducing it —
-/// removed, plus the paths that went.
+/// Every friring-managed config path `argv` names, in the order they appear.
 ///
-/// The answer for a launch that has nowhere to put the file: a place sandbox
-/// today, and any future "elsewhere" that cannot be written to. Returning what
-/// was dropped rather than only logging it is what lets the caller say so in
-/// front of the user; a session whose hooks silently vanished looks like a
-/// session that never reports status, and there is nothing on screen connecting
-/// the two.
-///
-/// Answers `(argv, [])` unchanged when friring cannot resolve its own config
-/// directory — nothing can be recognised as managed, so nothing is dropped.
-pub(crate) fn without_config_paths(argv: Vec<String>) -> (Vec<String>, Vec<String>) {
-    let Some(config_root) = crate::paths::config_file()
-        .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
-    else {
-        return (argv, Vec::new());
-    };
-    let mut dropped = Vec::new();
-    let kept = rewrite_config_path_args(argv, &config_root, |path| {
-        dropped.push(path.to_string());
-        None
+/// Read-only: the answer is what a launch has to *materialise* somewhere else
+/// before it can point the agent at it — the projection pass takes this list,
+/// classifies each file and reports where each one landed.
+pub(crate) fn collect_config_paths(argv: &[String], config_root: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let _ = rewrite_config_path_args(argv.to_vec(), config_root, |path| {
+        found.push(path.to_string());
+        Some(path.to_string())
     });
-    (kept, dropped)
+    found
+}
+
+/// friring's own configuration directory, the root under which an argument
+/// counts as naming a file friring manages.
+///
+/// `None` when friring cannot resolve one, which makes every argument the
+/// agent's own: nothing is recognised, so nothing is rewritten or dropped.
+pub(crate) fn managed_root() -> Option<String> {
+    crate::paths::config_file().and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
 }
 
 #[cfg(test)]
@@ -129,11 +134,34 @@ mod tests {
         assert_eq!(out, ["--resume", "--verbose"]);
     }
 
-    /// A sibling directory sharing the prefix is a different directory.
+    /// The collector sees exactly what the rewriter would rewrite — both forms
+    /// of the token, and nothing that is merely a path.
+    #[test]
+    fn every_managed_path_is_collected_and_nothing_else_is() {
+        let root = "/fabricated/config/friring";
+        let args = vec![
+            "--settings".to_string(),
+            format!("{root}/hooks/claude.json"),
+            format!("--config={root}/hooks/extra.json"),
+            "--add-dir".to_string(),
+            "/repo".to_string(),
+        ];
+        assert_eq!(
+            collect_config_paths(&args, root),
+            [
+                format!("{root}/hooks/claude.json"),
+                format!("{root}/hooks/extra.json")
+            ]
+        );
+    }
+
+    /// A sibling directory sharing the prefix is a different directory, and no
+    /// root at all claims nothing rather than everything.
     #[test]
     fn a_prefix_neighbour_is_not_under_the_root() {
         assert!(path_under_root("/a/friring", "/a/friring"));
         assert!(path_under_root("/a/friring/hooks/x.json", "/a/friring"));
         assert!(!path_under_root("/a/friring-backup/x.json", "/a/friring"));
+        assert!(!path_under_root("/repo/src/main.rs", ""));
     }
 }

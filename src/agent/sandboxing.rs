@@ -24,7 +24,7 @@ use crate::session::{AgentDef, SessionConfig};
 pub use crate::sandbox::PendingEgress;
 
 /// A launch with its sandbox profile applied.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SandboxedInvocation {
     /// The wrapper program (`sandbox-exec`, `bwrap`, …).
     pub command: String,
@@ -35,6 +35,20 @@ pub struct SandboxedInvocation {
     /// nothing in argv — a policy is a rule on a process, so the wrapped agent
     /// inherits the window — which makes this the only channel inward.
     pub env: HashMap<String, String>,
+    /// The credential half of that environment, kept **out** of
+    /// [`env`](Self::env) so a caller has to decide about it rather than
+    /// inherit it.
+    ///
+    /// A value here may only travel over a channel that is not a command line:
+    /// the control-mode `new-window` the TUI and every off-host spawn use puts
+    /// it in a command sent over the tmux socket, where `friring-cli`'s local
+    /// one-shot spawn would put it in a `tmux -e KEY=VALUE` argument any local
+    /// user can read out of `/proc/<pid>/cmdline` (`docs/SANDBOX.md` §Failure
+    /// modes). A caller holding only that channel refuses the launch.
+    ///
+    /// Empty for every policy backend: the host's own credential store is
+    /// already reachable there, so nothing is injected (ADR-28).
+    pub secret_env: Vec<(String, String)>,
     /// The whole composition, for the log line: `sandbox: dev (seatbelt) ·
     /// inner agent sandbox: off — Friring is the boundary`.
     pub label: String,
@@ -56,6 +70,38 @@ pub struct SandboxedInvocation {
     /// can find a container this launch created. `None` for a policy backend,
     /// which creates nothing that outlives the process.
     pub instance: Option<crate::sandbox::SandboxInstance>,
+    /// What the user has to type in the pane to sign this agent in, when the
+    /// boundary starts it signed out — for
+    /// [`SessionInfo::sandbox_login`](crate::session::SessionInfo::sandbox_login).
+    ///
+    /// `None` whenever there is nothing to do, which is every policy launch and
+    /// every place that already has a credential. It is an *instruction*, never
+    /// a credential: the agent's own login command, plus how to store a token.
+    pub login: Option<String>,
+}
+
+impl std::fmt::Debug for SandboxedInvocation {
+    /// Hand-written, for the reason
+    /// [`CredentialPlan`](crate::sandbox::CredentialPlan)'s is: a derived
+    /// `Debug` would put a vendor token in every `{:?}` — an `expect`, a
+    /// tracing field, a failing assertion's own message. The variable *names*
+    /// are the diagnostic; the values are the secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxedInvocation")
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("env", &self.env)
+            .field(
+                "secret_env",
+                &self.secret_env.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            )
+            .field("label", &self.label)
+            .field("state", &self.state)
+            .field("place", &self.place)
+            .field("instance", &self.instance)
+            .field("login", &self.login)
+            .finish()
+    }
 }
 
 /// What [`apply`] decided about one launch.
@@ -323,10 +369,10 @@ fn build(
     // The one channel out of a policy boundary (ADR-29): the agent's hooks
     // append a state word to a file here and the status poll takes it, because
     // the database `friring-cli session signal` writes is what a sandbox may
-    // never reach. A place needs no such directory — its hooks are not
-    // projected in at all yet (see `place_note`), and when they are they will
-    // reach friring the way an SSH host's do, over the tmux window it already
-    // owns.
+    // never reach. A place needs no such directory: its hooks are projected in
+    // with every signal command rewritten to `tmux set-option -p`, which reaches
+    // friring over the control-mode subscription it already holds — the same
+    // channel an SSH host's hooks use.
     let signals = match &ensured {
         None => Some(
             crate::paths::create_session_signal_dir(&session_key)
@@ -411,6 +457,38 @@ fn build(
         (None, None, PendingEgress::clearing(&session_key))
     };
 
+    // Credentials, once the boundary they have to survive exists: a policy
+    // backend returns before any lookup — the host's own store, keychain
+    // included, is already reachable subject to the path policy — and a place
+    // gets whichever strategy resolves, a token from friring's own keychain
+    // entry or the profile's persistent login (ADR-28). A credential problem
+    // never fails a launch; it becomes a login the user is told how to do, and
+    // refusing would answer "your token is missing" by running the agent
+    // *outside* the boundary through `allow_unsandboxed_fallback`.
+    //
+    // Its non-secret half goes on the **policy**, whose environment is the
+    // launch's last word, so a hand-edited registry cannot point an agent's
+    // state directory somewhere friring did not create. The secret half never
+    // touches the policy, argv or a log: it leaves on `secret_env` alone.
+    let credentials = crate::sandbox::auth::prepare(&crate::sandbox::CredentialInput {
+        profile: &profile.name,
+        boundary: match &ensured {
+            Some(ensured) => crate::sandbox::Boundary::Place {
+                home_dir: &ensured.home_dir,
+                inside_home: crate::sandbox::container::CONTAINER_HOME,
+            },
+            None => crate::sandbox::Boundary::Policy,
+        },
+        family,
+        declaration: agent_sandbox,
+        host_home: home,
+        store: crate::sandbox::auth::keychain::system_store(),
+    })
+    .map_err(|e| e.to_string())?;
+    for (key, value) in &credentials.env {
+        policy.insert_env(key.clone(), value.clone());
+    }
+
     let mut launch = SandboxLaunch::new(&policy, home, &session_key).with_tmp_dir(&tmp_dir);
     if let Some(endpoint) = proxy {
         launch = launch.with_proxy(endpoint);
@@ -454,18 +532,58 @@ fn build(
     argv.push(command.to_string());
     argv.extend(args.iter().cloned());
     argv.extend(plan.extra_args.iter().cloned());
-    // A place has none of the host's filesystem it did not ask for, so an arg
-    // naming a friring-managed config file (claude's `--settings <config
-    // dir>/hooks/claude.json`) points at nothing in there — and an agent handed
-    // a settings path that does not exist dies on startup. Until config
-    // projection lands the flag is dropped, which is the same treatment a host
-    // with no POSIX place for the file already gets.
-    let dropped_config = if ensured.is_some() {
-        let (kept, dropped) = crate::agent::config_args::without_config_paths(argv);
-        argv = kept;
-        dropped
-    } else {
-        Vec::new()
+
+    // A place has none of the host's filesystem it did not ask for, so the
+    // user's agent configuration has to be carried in — including friring's own
+    // hook payload, which an argument names by a host path (claude's
+    // `--settings <config dir>/hooks/claude.json`) that points at nothing in
+    // there. An agent handed a settings path that does not exist dies on
+    // startup, so the argument follows the file: it is repointed where the
+    // projection landed it, and dropped only where nothing crossed.
+    let projected = match &ensured {
+        Some(ensured) => {
+            // No config directory means nothing can be *recognised* as
+            // friring's, so nothing is rewritten or dropped. An empty root
+            // would match every absolute path instead, which is the opposite
+            // of the narrow scope this rewrite is allowed.
+            let config_root = crate::agent::config_args::managed_root();
+            let managed = config_root
+                .as_deref()
+                .map(|root| crate::agent::config_args::collect_config_paths(&argv, root))
+                .unwrap_or_default();
+            // The paths the place actually **mounts**: `profile.resolve`, not
+            // `policy`, which has had the agent's `state_rw` host paths folded
+            // into it and a place mounts none of those. Getting this wrong would
+            // tell the user a host reference resolves inside when it does not.
+            let mounted = profile.resolve(backend, home).map_err(|e| e.to_string())?;
+            let granted: Vec<String> = mounted
+                .rw_paths
+                .iter()
+                .chain(mounted.ro_paths.iter())
+                .cloned()
+                .collect();
+            let projection = crate::sandbox::plan_projection(&crate::sandbox::ProjectionInput {
+                profile: &profile.name,
+                agent: agent_sandbox,
+                granted: &granted,
+                home,
+                inside_home: crate::sandbox::container::CONTAINER_HOME,
+                platform: crate::sandbox::SecretPlatform::of(host.platform()),
+                friring_db: database.as_deref(),
+                managed_root: config_root.as_deref().unwrap_or_default(),
+                managed: &managed,
+            });
+            projection
+                .apply(std::path::Path::new(&ensured.home_dir))
+                .map_err(|e| e.to_string())?;
+            if let Some(root) = config_root.as_deref() {
+                argv = crate::agent::config_args::rewrite_config_path_args(argv, root, |p| {
+                    projection.inside_path(p).map(str::to_string)
+                });
+            }
+            Some(projection)
+        }
+        None => None,
     };
 
     // A wrap that fails takes `pending` down with the stack: nothing is going to
@@ -514,35 +632,50 @@ fn build(
     // `pending_egress` and commits it once there is something behind it.
     pending.park();
 
-    let note = place_note(ensured.is_some(), &dropped_config);
+    let note = composition_note(&credentials, projected.as_ref());
     Ok(SandboxedInvocation {
         command,
         args: wrapped.collect(),
         env,
+        secret_env: credentials
+            .secret_env()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
         state: format!("{backend} · inner agent sandbox: {}{note}", plan.state),
         label: format!("{}{note}", plan.label),
         place,
         instance: ensured.map(|ensured| ensured.instance),
+        // Only where there is something to do. An agent whose state friring
+        // cannot inspect (`LoginState::Unknown`) is *not* a prompt: telling a
+        // user to sign in every launch when they may already be signed in is
+        // the indicator lying in the other direction.
+        login: credentials
+            .login
+            .needs_login()
+            .then(|| credentials.login.how().unwrap_or_default().to_string()),
     })
 }
 
-/// What a place-backed launch has to say for itself beyond the boundary it
-/// applied, or `""` for a policy launch.
+/// What a launch has to say for itself beyond the boundary it applied: how the
+/// agent authenticates in there, and — for a place — what became of the user's
+/// configuration.
 ///
-/// Config projection is not built yet, so a place starts from a synthetic
-/// per-profile home with none of the host's agent configuration in it (ADR-28
-/// forbids binding the real one): the agent has to sign in inside the pane, and
-/// where friring's own hook config was among the arguments it was dropped, so
-/// the session reports no status. Both are recoverable and neither is
-/// self-explanatory, so the composition says so wherever it is shown rather than
-/// leaving the user with a session that silently never leaves `idle`.
-fn place_note(place: bool, dropped_config: &[String]) -> String {
-    if !place {
-        return String::new();
-    }
-    let mut note = " · no host config projected — sign in inside the pane".to_string();
-    if !dropped_config.is_empty() {
-        note.push_str("; friring's hooks were dropped, so it reports no status");
+/// Both are recoverable and neither is self-explanatory, so the composition
+/// carries them wherever it is shown rather than leaving the user with an agent
+/// that mysteriously has no skills, or a session that silently never leaves
+/// `idle`. Never carries a credential: [`CredentialPlan::note`] is names, paths
+/// and reasons only.
+///
+/// [`CredentialPlan::note`]: crate::sandbox::CredentialPlan::note
+fn composition_note(
+    credentials: &crate::sandbox::CredentialPlan,
+    projected: Option<&crate::sandbox::ProjectionPlan>,
+) -> String {
+    let mut note = format!(" · {}", credentials.note);
+    if let Some(projection) = projected {
+        note.push_str(" · ");
+        note.push_str(&projection.summary());
     }
     note
 }
@@ -1537,19 +1670,37 @@ mod tests {
         .expect("a place-backed session relaunches into its place");
     }
 
-    /// Config projection is a later slice, so a place has none of the host's
-    /// agent configuration in it. An argument naming a friring-managed file
-    /// would point at nothing inside and kill the pane on startup, so it is
-    /// dropped — and the composition says so, because a session that silently
-    /// stops reporting status looks like a broken session.
-    #[test]
-    fn a_place_drops_host_config_arguments_and_says_it_did() {
-        let _guard = fabricated_data_dir("place-config");
-        let config_arg = crate::paths::config_file()
+    /// friring's own hook payload, written where a launch would find it: a
+    /// fabricated config directory under the guard's root, never the machine
+    /// owner's.
+    fn fabricated_hook_payload() -> String {
+        let path = crate::paths::config_file()
             .and_then(|p| p.parent().map(|d| d.join("hooks").join("claude.json")))
-            .expect("a config directory")
-            .display()
-            .to_string();
+            .expect("a config directory");
+        std::fs::create_dir_all(path.parent().expect("a hooks directory")).unwrap();
+        std::fs::write(
+            &path,
+            "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\
+             \"friring-cli session signal --state done || true\"}]}]}}",
+        )
+        .unwrap();
+        path.display().to_string()
+    }
+
+    /// The whole of what P3b buys a place-backed session, end to end: friring's
+    /// own hook payload crosses with its signal commands rewritten for a
+    /// boundary that has neither `friring-cli` nor the database (ADR-29), the
+    /// launch points the agent's own argument at where it landed instead of
+    /// dropping it, and the composition says both what crossed and how the
+    /// agent authenticates in there.
+    ///
+    /// The regression this pins: "the indicator lies". A session whose hooks
+    /// silently vanished never leaves `idle` and nothing on screen connects the
+    /// two.
+    #[test]
+    fn a_place_carries_frirings_hooks_and_reports_through_the_pane() {
+        let _guard = fabricated_data_dir("place-config");
+        let config_arg = fabricated_hook_payload();
         let mut config = config_with(Some(place_profile(|p| {
             p.network_mode = crate::session::NetworkMode::None;
         })));
@@ -1558,46 +1709,328 @@ mod tests {
         let wrapped = build(
             &place_host(),
             "/fabricated/home",
-            None,
+            Some(&agent_def()),
             &config,
             "claude",
             &["--settings".into(), config_arg.clone(), "--verbose".into()],
         )
         .unwrap();
 
+        // The argument follows the file rather than naming a host path the
+        // container does not have — an agent handed a settings path that does
+        // not exist dies on startup.
+        let inside = wrapped
+            .args
+            .iter()
+            .find(|a| a.ends_with("claude.json"))
+            .unwrap_or_else(|| panic!("the settings argument survived: {:?}", wrapped.args));
         assert!(
-            !wrapped
-                .args
-                .iter()
-                .any(|a| *a == config_arg || a == "--settings"),
-            "the flag and its path must go together: {:?}",
-            wrapped.args
+            inside.starts_with(crate::sandbox::container::CONTAINER_HOME),
+            "{inside}"
         );
+        assert_ne!(*inside, config_arg);
+        assert!(wrapped.args.contains(&"--settings".to_string()));
         assert!(wrapped.args.contains(&"--verbose".to_string()));
+
+        // And the file is really in the place's home, with the one rewrite that
+        // makes a status signal reach friring from in there.
+        let rel = inside
+            .trim_start_matches(crate::sandbox::container::CONTAINER_HOME)
+            .trim_start_matches('/');
+        let landed = crate::sandbox::dirs::place_home_dir("dev")
+            .expect("a data directory")
+            .join(rel);
+        let text = std::fs::read_to_string(&landed)
+            .unwrap_or_else(|e| panic!("{} was not written: {e}", landed.display()));
         assert!(
-            wrapped.state.contains("sign in inside the pane"),
+            text.contains("tmux set-option -p @friring_state done"),
+            "{text}"
+        );
+        assert!(!text.contains("friring-cli session signal"), "{text}");
+
+        assert!(
+            wrapped.state.contains("config projected"),
             "{}",
             wrapped.state
         );
         assert!(
-            wrapped.state.contains("reports no status"),
+            !wrapped.state.contains("reports no state"),
+            "a place whose hooks crossed must not claim otherwise: {}",
+            wrapped.state
+        );
+        // The agent has no login in there yet, and the row says what to type.
+        assert!(
+            wrapped.state.contains("credentials (volume-login)"),
             "{}",
             wrapped.state
         );
 
-        // A policy sandbox keeps them: the host's filesystem is what it is
-        // subject to a policy, so the file is right where the argument says.
+        // A policy sandbox keeps the host path: its filesystem is the host's
+        // subject to a policy, so the file is right where the argument says —
+        // and nothing is projected anywhere.
         let policy = build(
             &stub_host(),
             "/fabricated/home",
-            None,
+            Some(&agent_def()),
             &config_with(Some(closed_profile())),
             "claude",
             &["--settings".into(), config_arg.clone()],
         )
         .unwrap();
         assert!(policy.args.contains(&config_arg));
-        assert!(!policy.state.contains("sign in inside the pane"));
+        assert!(
+            !policy.state.contains("config projected"),
+            "{}",
+            policy.state
+        );
+        assert!(
+            policy.state.contains("credentials (host-passthrough)"),
+            "{}",
+            policy.state
+        );
+    }
+
+    /// An agent that declares a token, a state directory and configuration to
+    /// project — the shape the seeded registry ships.
+    fn declaring_agent() -> AgentDef {
+        AgentDef {
+            sandbox: Some(AgentSandboxDef {
+                config_dir_env: Some("CLAUDE_CONFIG_DIR".into()),
+                state_dir: Some("~/.claude".into()),
+                credential_file: Some("~/.claude/.credentials.json".into()),
+                secret_env: vec!["ANTHROPIC_API_KEY".into()],
+                login_fallback: Some("/login".into()),
+                copy_in: vec!["~/.claude/CLAUDE.md".into()],
+                bypass: vec!["--dangerously-skip-permissions".into()],
+                ..Default::default()
+            }),
+            ..agent_def()
+        }
+    }
+
+    /// A fabricated `$HOME` with one instruction file in it, standing in for the
+    /// user's agent configuration. Never the machine owner's: every path here is
+    /// under the test's own temporary directory.
+    fn fabricated_agent_home(root: &std::path::Path) -> String {
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(
+            home.join(".claude/CLAUDE.md"),
+            "# fabricated instructions\n",
+        )
+        .unwrap();
+        home.display().to_string()
+    }
+
+    /// The token reaches the launch on the one channel that is not a command
+    /// line, and appears in nothing else the launch produces.
+    ///
+    /// The store is a stub: no test may consult a real keychain, and this one
+    /// holds a fabricated value in memory.
+    #[test]
+    fn a_stored_token_is_injected_off_the_command_line_and_named_nowhere_else() {
+        const FABRICATED: &str = "sk-fabricated-not-a-real-token";
+        let _guard = fabricated_data_dir("place-token");
+        let _store = crate::sandbox::auth::keychain::TestSecretStore::install(
+            crate::sandbox::auth::keychain::StubStore::new().with_token(
+                "claude",
+                "ANTHROPIC_API_KEY",
+                FABRICATED,
+            ),
+        );
+        let mut config = config_with(Some(place_profile(|p| {
+            p.network_mode = crate::session::NetworkMode::None;
+        })));
+        config.agent_session_id = Some("place-token".into());
+
+        let wrapped = build(
+            &place_host(),
+            "/fabricated/home",
+            Some(&declaring_agent()),
+            &config,
+            "claude",
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            wrapped.secret_env,
+            [("ANTHROPIC_API_KEY".to_string(), FABRICATED.to_string())]
+        );
+        // Everything else a launch hands out, and none of it carries the value.
+        let rendered = format!(
+            "{} {} {:?} {:?} {} {}",
+            wrapped.command,
+            wrapped.args.join(" "),
+            wrapped.env,
+            wrapped,
+            wrapped.label,
+            wrapped.state
+        );
+        assert!(
+            !rendered.contains(FABRICATED),
+            "a token leaked into: {rendered}"
+        );
+        assert!(!wrapped.env.contains_key("ANTHROPIC_API_KEY"));
+        // The name is diagnostic and stays; the strategy is on the row.
+        assert!(
+            wrapped.state.contains("credentials (env-token)"),
+            "{}",
+            wrapped.state
+        );
+        assert!(
+            wrapped.state.contains("ANTHROPIC_API_KEY"),
+            "{}",
+            wrapped.state
+        );
+        // …and the agent's state directory is relocated into the place's own
+        // home, which is what makes the login survive a container rebuild.
+        assert_eq!(
+            wrapped.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some("/home/agent/.claude")
+        );
+    }
+
+    /// Every relaunch of a place-backed session — restart, restore, a fork's
+    /// first spawn — re-derives the whole boundary from the profile, so the
+    /// projected configuration follows the host's and the login state follows
+    /// the place's.
+    ///
+    /// The regression this pins is the one this feature keeps re-breaking:
+    /// sandbox state silently dropped on a path that is not the first spawn. A
+    /// session that logged in once must not be told to log in again, and a hook
+    /// payload friring has since changed must not stay stale inside the place.
+    #[test]
+    fn a_relaunch_reprojects_the_config_and_keeps_the_one_login() {
+        let _guard = fabricated_data_dir("place-relaunch");
+        let config_arg = fabricated_hook_payload();
+        let mut config = config_with(Some(place_profile(|p| {
+            p.network_mode = crate::session::NetworkMode::None;
+        })));
+        config.agent_session_id = Some("place-relaunch".into());
+        let launch = |args: &[String]| {
+            build(
+                &place_host(),
+                "/fabricated/home",
+                Some(&declaring_agent()),
+                &config,
+                "claude",
+                args,
+            )
+            .unwrap()
+        };
+
+        let args = vec!["--settings".to_string(), config_arg.clone()];
+        let first = launch(&args);
+        assert!(first.login.is_some(), "a fresh place has no login in it");
+
+        // The host's payload changes (a friring upgrade, an extension heal) and
+        // the relaunch carries the new one rather than leaving the place on the
+        // copy the first spawn made.
+        std::fs::write(
+            &config_arg,
+            "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\
+             \"friring-cli session signal --state blocked || true\"}]}]}}",
+        )
+        .unwrap();
+        let second = launch(&args);
+        let inside = second
+            .args
+            .iter()
+            .find(|a| a.ends_with("claude.json"))
+            .expect("the settings argument survived");
+        let landed = crate::sandbox::dirs::place_home_dir("dev")
+            .expect("a data directory")
+            .join(
+                inside
+                    .trim_start_matches(crate::sandbox::container::CONTAINER_HOME)
+                    .trim_start_matches('/'),
+            );
+        assert!(std::fs::read_to_string(&landed)
+            .unwrap()
+            .contains("@friring_state blocked"));
+
+        // A login done inside the pane lands in the profile's own home, and the
+        // next relaunch stops asking for one. Fabricated: this is friring's own
+        // per-profile directory under a temp data dir, never a real credential.
+        let credential = crate::sandbox::dirs::place_home_dir("dev")
+            .expect("a data directory")
+            .join(".claude/.credentials.json");
+        std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+        std::fs::write(&credential, "{\"fabricated\":true}").unwrap();
+        let third = launch(&args);
+        assert!(third.login.is_none(), "{:?}", third.login);
+        assert!(third.state.contains("already signed in"), "{}", third.state);
+    }
+
+    /// A policy backend uses the host's own store, so nothing is looked up and
+    /// nothing is injected — structurally, not by luck.
+    #[test]
+    fn a_policy_launch_injects_no_credential_and_consults_no_store() {
+        let _guard = fabricated_data_dir("policy-creds");
+        let _store = crate::sandbox::auth::keychain::TestSecretStore::install(
+            crate::sandbox::auth::keychain::StubStore::new().with_token(
+                "claude",
+                "ANTHROPIC_API_KEY",
+                "sk-fabricated-not-a-real-token",
+            ),
+        );
+        let wrapped = build(
+            &stub_host(),
+            "/fabricated/home",
+            Some(&declaring_agent()),
+            &config_with(Some(closed_profile())),
+            "claude",
+            &[],
+        )
+        .unwrap();
+
+        assert!(wrapped.secret_env.is_empty());
+        assert!(!wrapped.env.contains_key("ANTHROPIC_API_KEY"));
+        // Relocating the state directory under a policy backend would strand the
+        // login the user already has — host passthrough means the real one.
+        assert!(!wrapped.env.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(
+            wrapped.state.contains("credentials (host-passthrough)"),
+            "{}",
+            wrapped.state
+        );
+    }
+
+    /// The user's own configuration crosses into the place's home, at the same
+    /// home-relative path — which is the whole point of a synthetic `$HOME`.
+    #[test]
+    fn a_declared_config_entry_lands_in_the_places_home() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = fabricated_data_dir("place-copyin");
+        let home = fabricated_agent_home(temp.path());
+        let mut config = config_with(Some(place_profile(|p| {
+            p.network_mode = crate::session::NetworkMode::None;
+        })));
+        config.agent_session_id = Some("place-copyin".into());
+
+        let wrapped = build(
+            &place_host(),
+            &home,
+            Some(&declaring_agent()),
+            &config,
+            "claude",
+            &[],
+        )
+        .unwrap();
+
+        let landed = crate::sandbox::dirs::place_home_dir("dev")
+            .expect("a data directory")
+            .join(".claude/CLAUDE.md");
+        assert_eq!(
+            std::fs::read_to_string(&landed).unwrap(),
+            "# fabricated instructions\n"
+        );
+        assert!(
+            wrapped.state.contains("config projected: 1 files"),
+            "{}",
+            wrapped.state
+        );
     }
 
     /// Sessions of one profile share a place and therefore its loopback, so the
