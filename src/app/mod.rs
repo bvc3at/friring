@@ -10109,28 +10109,42 @@ mod tests {
     }
 
     #[test]
-    fn restored_session_config_remote_backend_carries_and_skips_local_dirs() {
+    fn restored_session_config_offhost_backend_carries_and_skips_local_dirs() {
         // A restored off-local session must set `backend` *before* env injection
         // so the local-path dir vars are skipped (they don't exist on the host)
         // — and so the relaunch provider adapts the def's args for the host.
+        // A place is the same shape with a sharper reason: a forwarded
+        // `FRIRING_DATA_DIR` would name what the boundary exists to keep out
+        // (ADR-29), and the profile must survive the rebuild or the agent comes
+        // back on the host.
         let tmp = tempfile::tempdir().unwrap();
         let _guard = crate::paths::TestPathGuard::new(tmp.path());
-        let id = crate::session::SessionId::default();
-        let config = App::restored_session_config(
-            id,
-            Some("agent-conv-uuid".into()),
-            "claude".into(),
-            "restored".into(),
-            None,
-            "ssh:devbox",
-            None,
-        );
-        assert_eq!(config.backend.as_deref(), Some("ssh:devbox"));
-        assert!(config.env.contains_key("FRIRING_SESSION"));
-        assert!(!config
-            .env
-            .contains_key(crate::paths::CONFIG_DIR_OVERRIDE_ENV));
-        assert!(!config.env.contains_key(crate::paths::DATA_DIR_OVERRIDE_ENV));
+        for backend_type in ["ssh:devbox", "sandbox:dev"] {
+            let id = crate::session::SessionId::default();
+            let config = App::restored_session_config(
+                id,
+                Some("agent-conv-uuid".into()),
+                "claude".into(),
+                "restored".into(),
+                None,
+                backend_type,
+                Some(crate::session::SandboxProfile::new(
+                    "dev",
+                    vec![crate::session::SandboxPath::workspace("~/dev/app")],
+                )),
+            );
+            assert_eq!(config.backend.as_deref(), Some(backend_type));
+            assert_eq!(
+                config.sandbox.as_ref().map(|p| p.name.as_str()),
+                Some("dev"),
+                "{backend_type} must relaunch under the profile it was created with"
+            );
+            assert!(config.env.contains_key("FRIRING_SESSION"));
+            assert!(!config
+                .env
+                .contains_key(crate::paths::CONFIG_DIR_OVERRIDE_ENV));
+            assert!(!config.env.contains_key(crate::paths::DATA_DIR_OVERRIDE_ENV));
+        }
     }
 
     #[test]
