@@ -83,7 +83,7 @@ what it may reference):
 ```text
 session  ← pure data types, no crate-internal references
 agent    ← session + sandbox (+ paths/shell utils; NEVER ui, git, app)
-sandbox  ← session + paths + shell (NEVER ui, git, app)
+sandbox  ← session + proxy + paths + shell (NEVER ui, git, app)
 proxy    ← leaf: no crate-internal references
 ui       ← session + app model/view state (+ fuzzy/paths; NEVER agent or git)
 app      ← coordinator, imports all modules
