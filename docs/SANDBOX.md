@@ -965,13 +965,16 @@ resolve the profile against it → fold in what the agent declares
 (`state_rw`, `bypass`, `env`) → build the launch → wrap. The agent's bypass
 flags go on the *agent's* own argv, inside the wrapper.
 
-**A policy backend applies to a local session only.** Both policy backends
-generate their artefacts (a `.sb` profile file, an argv naming local paths) on
-the machine friring runs on, so an `ssh:`/`wsl:` session with a policy profile is
-refused rather than wrapped with the wrong machine's answers. A **place** is
-exempt, and not by omission: a place *is* the elsewhere — friring reaches it
-through its own transport rather than through the session's — so the session's
-backend says nothing about where the boundary is applied.
+**A sandbox profile applies to a local session only.** Both shapes are built on
+the machine friring runs on: a policy backend generates its artefacts here (a
+`.sb` profile file, an argv naming local paths), and a place is created by an
+engine here, with *this* machine's paths mounted. Either one applied to a
+session whose worktrees and tmux are on another host would be a boundary around
+the wrong filesystem, so an `ssh:`/`wsl:` session with a profile is refused
+rather than composed. Sandboxing a remote session needs a place created *on*
+that host, which is not wired. A place-backed session's own
+`sandbox:<profile>` backend is not a remote one and never trips this: it says
+where the boundary is, not where the session's machine is.
 
 **Place backends** add an ensure-instance step before spawn and then reach the
 place through `TmuxTransport::Sandbox`, a launch prefix in front of the tmux argv

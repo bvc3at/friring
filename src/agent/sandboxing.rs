@@ -251,22 +251,23 @@ fn build(
         .map_err(|e| format!("{e}\n{}", selection.rejection_summary()))?;
     let shape = backend.shape();
 
-    // Both policy backends generate their artefacts (a `.sb` profile file, an
-    // argv referring to local paths) on the machine friring runs on, so wrapping
-    // a remote invocation would build them here and hand them to a shell over
-    // there. A **place** is exempt, and not by omission: a place *is* the
-    // elsewhere — friring reaches it through its own transport rather than
-    // through the session's, so the session's own backend says nothing about
-    // where the boundary is applied.
-    if shape != Some(crate::session::SandboxShape::Place)
-        && config
-            .backend
-            .as_deref()
-            .is_some_and(crate::session::is_remote_backend)
+    // Both shapes are built on the machine friring runs on: a policy backend
+    // generates its artefacts here (a `.sb` profile file, an argv naming local
+    // paths), and a place is created by an engine here, with *this* machine's
+    // paths mounted. Either one around a session whose worktrees and tmux are on
+    // another host would be a boundary around the wrong filesystem.
+    //
+    // A place-backed session's own `sandbox:<profile>` backend never trips this
+    // — it is not a remote backend, and it says where the *boundary* is rather
+    // than where the session's machine is — so a relaunch composes normally.
+    if config
+        .backend
+        .as_deref()
+        .is_some_and(crate::session::is_remote_backend)
     {
         return Err(format!(
-            "Sandbox profile '{}' cannot be applied to a remote session: the policy backends \
-             run on the machine friring runs on",
+            "Sandbox profile '{}' cannot be applied to a session on a remote host: friring \
+             builds the boundary on the machine it runs on",
             profile.name
         ));
     }
@@ -782,7 +783,7 @@ mod tests {
         let mut config = config_with(Some(profile));
         config.backend = Some("ssh:devbox".into());
         let err = apply(Some(&agent_def()), &config, "claude", &[]).unwrap_err();
-        assert!(err.contains("remote session"), "{err}");
+        assert!(err.contains("remote host"), "{err}");
     }
 
     /// A host with bwrap and nothing else, so the whole composition runs on a
@@ -1488,17 +1489,43 @@ mod tests {
         assert!(wrapped.instance.is_none());
     }
 
-    /// A place *is* the elsewhere, so the refusal that keeps a policy backend
-    /// off a remote session must not apply to it — otherwise a sandbox profile
-    /// could never be used from a session friring reaches over a transport.
+    /// friring builds both shapes of boundary on the machine it runs on, so
+    /// neither can wrap a session whose worktrees and tmux are on another host:
+    /// a place created here would mount *this* machine's paths around an agent
+    /// working over there.
     #[test]
-    fn a_place_is_not_refused_for_being_a_remote_session() {
+    fn a_remote_session_is_refused_whichever_shape_the_profile_resolves_to() {
         let _guard = fabricated_data_dir("place-remote");
+        for profile in [
+            place_profile(|p| p.network_mode = crate::session::NetworkMode::None),
+            closed_profile(),
+        ] {
+            let mut config = config_with(Some(profile));
+            config.agent_session_id = Some("place-remote".into());
+            config.backend = Some("ssh:devbox".into());
+            let err = build(
+                &place_host(),
+                "/fabricated/home",
+                None,
+                &config,
+                "claude",
+                &[],
+            )
+            .expect_err("a boundary friring builds here cannot hold a session over there");
+            assert!(err.contains("remote host"), "{err}");
+        }
+    }
+
+    /// …and a place-backed session's *own* backend is not a remote one, so the
+    /// refusal above must not catch its every relaunch.
+    #[test]
+    fn a_places_own_backend_is_not_mistaken_for_a_remote_host() {
+        let _guard = fabricated_data_dir("place-relaunch");
         let mut config = config_with(Some(place_profile(|p| {
             p.network_mode = crate::session::NetworkMode::None;
         })));
-        config.agent_session_id = Some("place-remote".into());
-        config.backend = Some("ssh:devbox".into());
+        config.agent_session_id = Some("place-relaunch".into());
+        config.backend = Some("sandbox:dev".into());
         build(
             &place_host(),
             "/fabricated/home",
@@ -1507,22 +1534,7 @@ mod tests {
             "claude",
             &[],
         )
-        .expect("a place composes for a session friring reached elsewhere");
-
-        // The policy half still refuses, which is the rule this exempts a place
-        // from rather than deletes.
-        let mut policy = config_with(Some(closed_profile()));
-        policy.backend = Some("ssh:devbox".into());
-        let err = build(
-            &stub_host(),
-            "/fabricated/home",
-            None,
-            &policy,
-            "claude",
-            &[],
-        )
-        .unwrap_err();
-        assert!(err.contains("remote session"), "{err}");
+        .expect("a place-backed session relaunches into its place");
     }
 
     /// Config projection is a later slice, so a place has none of the host's
