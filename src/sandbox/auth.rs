@@ -594,19 +594,7 @@ fn seed(input: &CredentialInput<'_>, home_dir: &str) -> Result<Seeded, String> {
     }
 
     let marker = marker_path(family)?;
-    let holder = std::fs::read_to_string(&marker)
-        .ok()
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty());
-    if let Some(holder) = holder.filter(|held| held != input.profile) {
-        return Err(format!(
-            "'seed-file' is refused: profile '{holder}' already holds a copy of this agent's \
-             credential, and a second copy would make two consumers of one token — the first \
-             refresh invalidates the other (ADR-28). Use 'env-token' or 'volume-login' for \
-             profile '{}', or stop seeding it into '{holder}'",
-            input.profile
-        ));
-    }
+    let fresh_claim = claim(&marker, input.profile)?;
 
     // `writeback` is what decides whether the copy or the host file is the
     // durable one. Set, the sandbox's copy is never overwritten again: the agent
@@ -619,15 +607,81 @@ fn seed(input: &CredentialInput<'_>, home_dir: &str) -> Result<Seeded, String> {
         // Read and write whole, and never look at it: the contents are a
         // credential, so nothing here parses, logs or reports them. A file that
         // is not UTF-8 is refused rather than mangled through a lossy copy.
-        let contents = std::fs::read_to_string(&source).map_err(|e| {
-            format!("'seed-file' could not read '{source}': {e}. Nothing was copied")
-        })?;
-        dirs::write_private(std::path::Path::new(&target), &contents)
-            .map_err(|e| format!("'seed-file' could not write the copy: {e}"))?;
+        let copied = std::fs::read_to_string(&source)
+            .map_err(|e| format!("'seed-file' could not read '{source}': {e}. Nothing was copied"))
+            .and_then(|contents| {
+                dirs::write_private(std::path::Path::new(&target), &contents)
+                    .map_err(|e| format!("'seed-file' could not write the copy: {e}"))
+            });
+        if let Err(reason) = copied {
+            // Nothing was copied, so a claim this call made must not outlive the
+            // attempt — it would hold the family's one permitted copy for a
+            // profile that has none.
+            if fresh_claim {
+                let _ = std::fs::remove_file(&marker);
+            }
+            return Err(reason);
+        }
     }
-    dirs::write_private(&marker, input.profile)
-        .map_err(|e| format!("'seed-file' could not record which profile holds the copy: {e}"))?;
     Ok(Seeded { source })
+}
+
+/// Take the family's marker for `profile`, answering whether *this* call created
+/// it.
+///
+/// The claim is made **before** the copy, and by creating the marker
+/// exclusively, because that is the only step that can decide between two
+/// friring instances launching different profiles at the same moment: reading
+/// the marker first and writing it after the copy would let both pass the holder
+/// check and both copy one rotating credential, which is the second consumer
+/// ADR-28 exists to prevent.
+///
+/// A marker already naming `profile` is that profile re-launching, not a second
+/// copy, so it continues; any other holder is the refusal.
+fn claim(marker: &std::path::Path, profile: &str) -> Result<bool, String> {
+    fn recording(e: impl std::fmt::Display) -> String {
+        format!("'seed-file' could not record which profile holds the copy: {e}")
+    }
+    if let Some(parent) = marker.parent() {
+        dirs::create_private_dir(parent).map_err(recording)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    match options.open(marker) {
+        Ok(mut file) => {
+            use std::io::Write as _;
+            file.write_all(profile.as_bytes()).map_err(recording)?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let holder = std::fs::read_to_string(marker)
+                .ok()
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty());
+            match holder {
+                Some(holder) if holder != profile => Err(format!(
+                    "'seed-file' is refused: profile '{holder}' already holds a copy of this \
+                     agent's credential, and a second copy would make two consumers of one token \
+                     — the first refresh invalidates the other (ADR-28). Use 'env-token' or \
+                     'volume-login' for profile '{profile}', or stop seeding it into '{holder}'"
+                )),
+                Some(_) => Ok(false),
+                // A marker left empty or unreadable by an interrupted claim
+                // names nobody, so it is taken over rather than left to refuse
+                // every profile forever.
+                None => {
+                    std::fs::write(marker, profile).map_err(recording)?;
+                    Ok(false)
+                }
+            }
+        }
+        Err(e) => Err(recording(e)),
+    }
 }
 
 /// Which profile holds the one permitted copy of a family's credential.
@@ -1182,6 +1236,45 @@ mod tests {
             std::fs::read_to_string(&copied).unwrap(),
             "{\"fabricated\":\"rotated\"}",
             "a relaunch overwrote a credential the sandbox had refreshed"
+        );
+    }
+
+    /// The claim is taken *before* the copy, so a marker with no copy behind it
+    /// yet still refuses the second profile — which is what a second friring
+    /// instance sees in the window where the first has decided to seed and not
+    /// yet written anything (ADR-28).
+    #[test]
+    fn a_claim_with_no_copy_behind_it_yet_still_refuses_the_second_profile() {
+        let fixture = Fixture::new("seed-claimed");
+        let store = StubStore::new();
+        let declaration = seeding_codex();
+        fixture.with_host_credential(".codex/auth.json", "{\"fabricated\":\"token\"}");
+
+        // What the other instance's claim looks like from here: the family is
+        // held by 'dev' and nothing has been copied into any place.
+        let marker = marker_path("codex").unwrap();
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "dev").unwrap();
+
+        let other_home = fixture.other_place("other");
+        let other_home = other_home.display().to_string();
+        let refused = prepare(&CredentialInput {
+            profile: "other",
+            family: Some("codex"),
+            ..input(&fixture, &other_home, Some(&declaration), &store)
+        })
+        .unwrap();
+        assert_eq!(refused.strategy, CredentialStrategy::VolumeLogin);
+        assert!(
+            refused.note.contains("already holds a copy"),
+            "{}",
+            refused.note
+        );
+        assert!(
+            !std::path::Path::new(&other_home)
+                .join(".codex/auth.json")
+                .exists(),
+            "the refused copy was made anyway"
         );
     }
 
