@@ -829,6 +829,38 @@ async fn a_plaintext_request_is_forwarded_without_this_hop_s_headers() {
     proxy.shutdown().await;
 }
 
+/// Domain fronting over plaintext: the policy authorises the authority in the
+/// absolute-form URI, so a `Host` header naming somewhere else would have the
+/// proxy dial the allowed origin and ask it to serve a different virtual host.
+/// Inside a `CONNECT` tunnel the proxy cannot see that; here it can, so the
+/// header it forwards is the authority it authorised.
+#[tokio::test]
+async fn a_plaintext_request_cannot_front_a_second_host_past_the_policy() {
+    let server = HttpServer::spawn().await;
+    let (proxy, _denials) = start(loopback_only()).await;
+    let request = format!(
+        "GET http://{}/hello HTTP/1.1\r\nHost: exfil.attacker.example\r\nProxy-Authorization: {}\r\n\r\n",
+        server.addr,
+        bearer(&proxy),
+    );
+    let (_stream, head) = send_request(&proxy, &request).await;
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+
+    let seen = server.heads();
+    let forwarded = seen.first().expect("the upstream saw the request");
+    assert!(
+        !forwarded.to_ascii_lowercase().contains("attacker.example"),
+        "the client's host header was forwarded: {forwarded}"
+    );
+    assert!(
+        forwarded
+            .to_ascii_lowercase()
+            .contains(&format!("host: {}\r\n", server.addr)),
+        "{forwarded}"
+    );
+    proxy.shutdown().await;
+}
+
 #[tokio::test]
 async fn the_method_restriction_stops_a_plaintext_write() {
     let server = HttpServer::spawn().await;

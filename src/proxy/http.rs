@@ -273,7 +273,16 @@ impl RequestHead {
     }
 
     /// Rebuild the request for the upstream server: origin-form target,
-    /// hop-by-hop headers dropped, and a guaranteed `Host`.
+    /// hop-by-hop headers dropped, and a `Host` that is the authority the
+    /// policy authorised.
+    ///
+    /// The client's own `Host` is **replaced**, never forwarded. An absolute-form
+    /// request carries the destination twice — in the URI the proxy decided on
+    /// and in a header the proxy does not need — and letting the two disagree is
+    /// domain fronting: `GET http://allowed.example/` with `Host: elsewhere.test`
+    /// would be allowed against one name and served by the virtual host of
+    /// another. Inside a `CONNECT` tunnel the proxy genuinely cannot see that
+    /// mismatch; here it can, so it does not forward one.
     ///
     /// `Connection: close` is forced so each plaintext request opens its own
     /// proxy connection and is policed on its own. Reusing the connection would
@@ -284,18 +293,16 @@ impl RequestHead {
     fn forwarded_head(&self, path: &str, host: &str, port: u16) -> Vec<u8> {
         let mut head = format!("{} {} HTTP/1.1\r\n", self.method, path);
         for (name, value) in &self.headers {
-            if !HOP_BY_HOP.contains(&name.as_str()) {
+            if !HOP_BY_HOP.contains(&name.as_str()) && name != "host" {
                 head.push_str(&format!("{name}: {value}\r\n"));
             }
         }
-        if self.header("host").is_none() {
-            let authority = if port == 80 {
-                host.to_string()
-            } else {
-                format!("{host}:{port}")
-            };
-            head.push_str(&format!("host: {authority}\r\n"));
-        }
+        let authority = if port == 80 {
+            host.to_string()
+        } else {
+            format!("{host}:{port}")
+        };
+        head.push_str(&format!("host: {authority}\r\n"));
         head.push_str("connection: close\r\n\r\n");
         head.into_bytes()
     }
