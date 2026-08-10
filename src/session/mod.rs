@@ -10,6 +10,7 @@ pub mod message;
 pub mod review;
 pub mod sandbox_profile;
 pub mod settings;
+pub mod status_signal;
 pub mod task;
 pub mod theme_config;
 
@@ -27,8 +28,8 @@ pub use extension_def::{
     ExtensionSymlink, ExternalFile, PromptStepDecl,
 };
 pub use host_def::{
-    is_remote_backend, is_ssh_backend, is_wsl_backend, HostDef, HostKind, HostRegistry,
-    SSH_BACKEND_PREFIX, WSL_BACKEND_PREFIX,
+    is_offhost_backend, is_remote_backend, is_ssh_backend, is_wsl_backend, HostDef, HostKind,
+    HostRegistry, SSH_BACKEND_PREFIX, WSL_BACKEND_PREFIX,
 };
 pub use keybindings::{
     compact_shortcut, prefix_sections, Action, KeyBindings, KeyChord, KeyContext, PrefixEntry,
@@ -42,9 +43,10 @@ pub use review::{
 };
 pub use sandbox_profile::{
     expand_tilde, is_sandbox_backend, sandbox_backend_profile, DomainRule, EgressDecision,
-    NetworkMode, PathMode, ReadScope, SandboxBackendKind, SandboxPath, SandboxPolicy,
-    SandboxProfile, SandboxShape, SANDBOX_BACKEND_PREFIX,
+    NetworkMode, PathMode, ReadScope, SandboxBackendKind, SandboxInstance, SandboxPath,
+    SandboxPolicy, SandboxProfile, SandboxShape, SANDBOX_BACKEND_PREFIX,
 };
+pub use status_signal::{parse_status_signal, SignalState};
 pub use task::{Task, TaskStatus, SOURCE_LOCAL};
 pub use theme_config::{ThemePalette, ThemePreset};
 

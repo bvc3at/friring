@@ -346,6 +346,9 @@ pub struct StubHost {
     existing: Vec<String>,
     files: Vec<(String, String)>,
     commands: Vec<(String, ProbeOutput)>,
+    /// Prefix matches, tried after every exact one — see
+    /// [`StubHost::with_command_prefix`].
+    command_prefixes: Vec<(String, ProbeOutput)>,
     home: Option<String>,
 }
 
@@ -404,6 +407,17 @@ impl StubHost {
             }
         }
         self.commands.push((command_line.to_string(), output));
+        self
+    }
+
+    /// Answer any command line **starting with** `prefix` with `output`.
+    ///
+    /// For the commands a test cannot spell exactly: a container `run` argv
+    /// carries a spec digest of the machine's own data directory, and pinning
+    /// the whole line would be asserting the plan rather than exercising it.
+    /// Exact matches are tried first, so a prefix never shadows one.
+    pub fn with_command_prefix(mut self, prefix: &str, output: ProbeOutput) -> Self {
+        self.command_prefixes.push((prefix.to_string(), output));
         self
     }
 
@@ -480,6 +494,11 @@ impl ProbeHost for StubHost {
         self.commands
             .iter()
             .find(|(c, _)| c == &line)
+            .or_else(|| {
+                self.command_prefixes
+                    .iter()
+                    .find(|(prefix, _)| line.starts_with(prefix.as_str()))
+            })
             .map(|(_, o)| o.clone())
             .ok_or_else(|| format!("{line}: No such file or directory"))
     }

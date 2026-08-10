@@ -56,6 +56,145 @@ pub fn scratch_root() -> Option<PathBuf> {
     sandbox_root().map(|root| root.join("tmp"))
 }
 
+/// Parent of every place's own tree — one directory per profile, because a
+/// place backend's environment is per profile and outlives any single session.
+///
+/// Short on purpose (`pl`, not `places`): everything under here is a candidate
+/// prefix for a unix socket path, and `sun_path` is 104 bytes including the
+/// NUL on the tightest supported platform.
+pub fn place_root() -> Option<PathBuf> {
+    sandbox_root().map(|root| root.join("pl"))
+}
+
+/// One profile's place tree, whether or not it exists yet.
+pub fn place_dir(profile: &str) -> Option<PathBuf> {
+    place_root().map(|root| root.join(sanitize_component(profile)))
+}
+
+/// The synthetic home a profile's place gives the agent.
+///
+/// A place gets a **per-profile home, never a bind of the host's** agent
+/// configuration (ADR-28): the host's credentials are rotating single-use
+/// tokens, and a writable host agent configuration is an escape channel through
+/// hooks the *host* agent later runs. This directory is friring's, created by
+/// friring, and mounted at a fixed path inside — the one deliberate exception to
+/// identical absolute paths, because `$HOME` is not a path an agent keys project
+/// state by, and the host's own home path may not even exist inside a place.
+pub fn place_home_dir(profile: &str) -> Option<PathBuf> {
+    place_dir(profile).map(|dir| dir.join("home"))
+}
+
+/// The per-session directory a place-backed launch keeps its egress socket in,
+/// mounted into the place at **exactly this path** so one string names the
+/// socket on both sides of the boundary.
+///
+/// Keyed by a hash of the session rather than by the session id itself: a place
+/// mounts one directory per profile and the socket path underneath it has to fit
+/// `sun_path`, which a 36-character UUID plus the data directory does not
+/// reliably leave room for. The hash is [`digest`], so the same session gets the
+/// same directory across a relaunch and a friring restart.
+pub fn place_session_dir(profile: &str, session_key: &str) -> Option<PathBuf> {
+    place_dir(profile).map(|dir| dir.join(digest(session_key)))
+}
+
+/// Create (or adopt) the per-profile place tree: the directory mounted into the
+/// place for egress sockets, and the synthetic home. Both `0700`, both refusing
+/// a symlink, exactly like the per-session scratch.
+///
+/// Returns `(place directory, home directory)`. Called before a place is
+/// created, because a bind mount's source has to exist first — an engine that
+/// creates a missing source does it as root, and a directory the sandbox's user
+/// cannot write is a place whose agent dies on first launch.
+pub fn create_place_dirs(profile: &str) -> SandboxResult<(PathBuf, PathBuf)> {
+    let dir = place_dir(profile).ok_or_else(no_data_dir)?;
+    let home = place_home_dir(profile).ok_or_else(no_data_dir)?;
+    create_private_dir(&dir)?;
+    create_private_dir(&home)?;
+    Ok((dir, home))
+}
+
+/// Create (or adopt) one place-backed session's egress directory, `0700`.
+///
+/// Idempotent for the same reason [`create_session_scratch`] is: a relaunch of a
+/// session that crashed has to reuse what is there rather than fail.
+pub fn create_place_session_dir(profile: &str, session_key: &str) -> SandboxResult<PathBuf> {
+    let dir = place_session_dir(profile, session_key).ok_or_else(no_data_dir)?;
+    create_private_dir(&dir)?;
+    Ok(dir)
+}
+
+/// Drop one session's directory inside whichever place it ran in.
+///
+/// Teardown holds a session key and not a profile: the place outlives the
+/// session, and an edited profile may have moved the session into a different
+/// one since. So the directory is found by its digest under every place rather
+/// than by a profile the caller would have to have kept. Best effort — what is
+/// left behind costs disk, and the next launch of the same session adopts it.
+pub fn cleanup_place_session(session_key: &str) {
+    let Some(root) = place_root() else {
+        return;
+    };
+    let digest = digest(session_key);
+    let Ok(places) = std::fs::read_dir(root) else {
+        return;
+    };
+    for place in places.flatten() {
+        let _ = std::fs::remove_dir_all(place.path().join(&digest));
+    }
+}
+
+/// Drop one profile's whole place tree — its synthetic home and every session
+/// directory under it.
+///
+/// Best effort, and *not* something a session teardown does: the tree belongs to
+/// the profile, so it outlives every session in it and goes when the place does.
+pub fn cleanup_place(profile: &str) {
+    if let Some(dir) = place_dir(profile) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A stable 64-bit digest of `value`, as 16 lowercase hex digits.
+///
+/// FNV-1a, written out rather than taken from `DefaultHasher`: the standard
+/// library's hasher is explicitly allowed to change between releases, and two of
+/// the things this names — a place's session directory and the label that
+/// decides whether an existing container still matches its profile — have to
+/// mean the same thing to the friring that created them and the one that finds
+/// them later. Not a security primitive: nothing here resists a collision an
+/// attacker chooses, it only has to be stable and cheap.
+pub fn digest(value: &str) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+/// Where `program` sits if it is somewhere a sandboxed agent could rewrite, and
+/// `None` when it is not.
+///
+/// The rule every backend applies to the binary that *is* its boundary: bwrap
+/// applies the policy, and a container engine's CLI is what asks the daemon for
+/// the isolation. A copy under the home directory (`~/.local/bin` is on most
+/// users' `PATH` and inside the default read scope's writable set) or in a
+/// world-writable scratch directory is a boundary the sandboxed agent chooses,
+/// so a backend that resolves one refuses rather than falling back to the next
+/// `PATH` entry — which would still be running whatever an attacker arranged to
+/// be found.
+pub fn rewritable_root(program: &str, home: Option<&str>) -> Option<String> {
+    let mut roots: Vec<String> = ["/tmp", "/var/tmp", "/dev/shm"]
+        .iter()
+        .map(|d| (*d).to_string())
+        .collect();
+    roots.extend(home.map(str::to_string));
+    roots.extend(sandbox_root().map(|p| p.display().to_string()));
+    roots.into_iter().find(|root| encloses(root, program))
+}
+
 /// The scratch directory one session's agent may write, whether or not it
 /// exists yet.
 pub fn session_scratch_dir(session_key: &str) -> Option<PathBuf> {
@@ -150,7 +289,7 @@ fn grants_tmux_sockets(root: &str, socket_root: &str) -> bool {
 /// nobody can reason about. Refusing names the directory and the fix.
 pub fn check_writable_roots(writable: &[String], db: Option<&str>) -> Result<(), String> {
     let socket_root = tmux_socket_root().display().to_string();
-    let protected_data = data_directories(db);
+    let protected_data = protected_data_dirs(db);
     for root in writable {
         if grants_tmux_sockets(root, &socket_root) {
             return Err(format!(
@@ -176,7 +315,13 @@ pub fn check_writable_roots(writable: &[String], db: Option<&str>) -> Result<(),
 
 /// The data directories to protect: the launch's own (derived from the database
 /// path it was given) and this machine's, de-duplicated.
-fn data_directories(db: Option<&str>) -> Vec<String> {
+///
+/// Public because ADR-29's rule is not only about the *writable* set. A policy
+/// backend can only be handed a path by making it writable, so
+/// [`check_writable_roots`] is the whole check there; a place backend mounts
+/// read-only paths too, and a read-only bind of the data directory still carries
+/// the automation commands the host executes across the boundary.
+pub fn protected_data_dirs(db: Option<&str>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let from_db = db
         .and_then(|db| Path::new(db).parent().map(Path::to_path_buf))

@@ -7,9 +7,12 @@
 //! - A **policy backend** ([`seatbelt`], [`bwrap`]) applies a kernel policy to
 //!   a process tree by wrapping the agent's argv. tmux stays outside, so
 //!   discovery, reattach and scrollback are untouched.
-//! - A **place backend** (containers, VMs, distro clones) is an environment
-//!   reached through a transport, with tmux inside. Its half of
-//!   [`SandboxBackend`] is declared and left for the stage that builds it.
+//! - A **place backend** ([`container`], and the VMs and distro clones still to
+//!   come) is an environment reached through a transport, with tmux inside. It
+//!   is created once per profile and shared by every session that picks it, so
+//!   it implements [`SandboxBackend::ensure`] — and, because its egress relay
+//!   runs *in* the place, [`SandboxBackend::wrap`] for the command that runs
+//!   there.
 //!
 //! What lives where: [`crate::session::sandbox_profile`] holds the pure profile
 //! and policy data (what the user edits, what storage persists); this module
@@ -47,8 +50,10 @@
 pub mod agent;
 pub mod backend;
 pub mod bwrap;
+pub mod container;
 pub mod dirs;
 pub mod egress;
+pub mod launcher;
 pub mod probe;
 pub mod seatbelt;
 pub mod secrets;
@@ -58,11 +63,15 @@ use std::sync::{Arc, OnceLock};
 
 pub use agent::{apply_agent_requirements, compose_inner_sandbox, InnerSandboxPlan};
 pub use backend::{
-    Argv, Availability, Caps, Egress, InnerSandboxVerdict, ProxyEndpoint, ProxyTransport,
-    SandboxBackend, SandboxError, SandboxInstance, SandboxLaunch, SandboxResult,
+    Argv, Availability, Caps, Egress, InnerSandboxVerdict, PlaceLaunch, PlaceRelay, ProxyEndpoint,
+    ProxyTransport, SandboxBackend, SandboxError, SandboxLaunch, SandboxResult,
 };
 pub use bwrap::{BwrapBackend, BwrapDetails};
-pub use dirs::{check_writable_roots, cleanup_session, create_session_scratch};
+pub use container::{ContainerBackend, ContainerEngine, EnsuredPlace};
+pub use dirs::{
+    check_writable_roots, cleanup_place, cleanup_session, create_place_dirs,
+    create_place_session_dir, create_session_scratch,
+};
 pub use egress::{proxy_required, PendingEgress, Prepared, ProxyGrant, SessionDenial};
 pub use probe::{detect_platform, HostPlatform, LocalProbeHost, ProbeHost, RemoteProbeHost};
 pub use seatbelt::SeatbeltBackend;
@@ -70,6 +79,11 @@ pub use secrets::{secrets_for, SecretKind, SecretPath, SecretPlatform, SECRET_PA
 pub use select::{ladder, select_backend, RejectedRung, Selection};
 
 use crate::session::{AgentSandboxDef, HostDef, SandboxBackendKind};
+
+/// Re-exported where the backends use it: the pure record lives in
+/// [`crate::session`], because `storage` and `agent` name it too and neither
+/// may reference this module.
+pub use crate::session::SandboxInstance;
 
 /// Every backend friring can offer on one host, with their probes cached.
 ///
@@ -81,6 +95,8 @@ pub struct SandboxHost {
     probe_host: Arc<dyn ProbeHost>,
     seatbelt: SeatbeltBackend,
     bwrap: BwrapBackend,
+    docker: ContainerBackend,
+    podman: ContainerBackend,
 }
 
 impl SandboxHost {
@@ -93,6 +109,8 @@ impl SandboxHost {
                 seatbelt::default_profile_dir(),
             ),
             bwrap: BwrapBackend::new(Arc::clone(&probe_host)),
+            docker: ContainerBackend::new(ContainerEngine::Docker, Arc::clone(&probe_host)),
+            podman: ContainerBackend::new(ContainerEngine::Podman, Arc::clone(&probe_host)),
             probe_host,
         }
     }
@@ -129,11 +147,25 @@ impl SandboxHost {
     }
 
     /// The backend object for `kind`, or `None` when this build does not have
-    /// one — which is every place backend until the sandbox transport lands.
+    /// one — which is `apple-container` and `wsl-distro`, the two place backends
+    /// still to come.
     pub fn backend(&self, kind: SandboxBackendKind) -> Option<&dyn SandboxBackend> {
         match kind {
             SandboxBackendKind::Seatbelt => Some(&self.seatbelt),
             SandboxBackendKind::Bwrap => Some(&self.bwrap),
+            SandboxBackendKind::Docker => Some(&self.docker),
+            SandboxBackendKind::Podman => Some(&self.podman),
+            _ => None,
+        }
+    }
+
+    /// The container backend behind `kind`, for the operations only a place has:
+    /// ensuring an instance, reaching it through the transport, reclaiming it.
+    /// `None` for anything that is not a container engine.
+    pub fn container(&self, kind: SandboxBackendKind) -> Option<&ContainerBackend> {
+        match kind {
+            SandboxBackendKind::Docker => Some(&self.docker),
+            SandboxBackendKind::Podman => Some(&self.podman),
             _ => None,
         }
     }
@@ -148,8 +180,8 @@ impl SandboxHost {
                 Availability::unavailable("'auto' is resolved by the ladder, never probed")
             }
             None => Availability::unavailable(format!(
-                "the {kind} backend lands with the sandbox transport; this build has the \
-                 policy backends only"
+                "the {kind} backend is not built yet; this friring has seatbelt, bwrap, docker \
+                 and podman"
             )),
         }
     }
@@ -202,7 +234,8 @@ mod tests {
         assert_eq!(host.platform(), HostPlatform::Linux);
         assert!(host.probe(SandboxBackendKind::Bwrap).is_available());
 
-        // seatbelt is the wrong OS; docker is the right OS and the wrong stage.
+        // seatbelt is the wrong OS; docker is the right OS with nothing
+        // installed; apple-container is a backend this build does not have.
         assert!(host
             .probe(SandboxBackendKind::Seatbelt)
             .message()
@@ -210,7 +243,11 @@ mod tests {
         assert!(host
             .probe(SandboxBackendKind::Docker)
             .message()
-            .contains("sandbox transport"));
+            .contains("docker is not installed"));
+        assert!(host
+            .probe(SandboxBackendKind::AppleContainer)
+            .message()
+            .contains("not built yet"));
 
         let selection = host.select(SandboxBackendKind::Auto);
         assert_eq!(selection.chosen, Some(SandboxBackendKind::Bwrap));
@@ -239,8 +276,11 @@ mod tests {
         let _ = std::fs::remove_file(host.seatbelt.profile_path(&launch).unwrap());
     }
 
+    /// A place backend composes the command that runs *inside* the place, so
+    /// handing it one policy resolved for another backend — or a launch with no
+    /// place at all — is refused rather than wrapped.
     #[test]
-    fn a_place_backend_cannot_be_asked_to_wrap() {
+    fn a_place_backend_will_not_wrap_another_backends_policy() {
         let host = SandboxHost::new(Arc::new(StubHost::linux_with_bwrap("0.11.0")));
         let profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
         let policy = profile
@@ -250,7 +290,18 @@ mod tests {
         let err = host
             .wrap(SandboxBackendKind::Podman, vec!["claude".into()], &launch)
             .unwrap_err();
-        assert!(matches!(err, SandboxError::NotInThisStage { .. }));
+        assert!(matches!(err, SandboxError::Unsupported { .. }), "{err}");
+
+        // And a backend this build has no object for still says so in the same
+        // shape as one the host is missing.
+        let err = host
+            .wrap(
+                SandboxBackendKind::AppleContainer,
+                vec!["claude".into()],
+                &launch,
+            )
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::NotInThisStage { .. }), "{err}");
     }
 
     /// One profile must mean one thing on both backends.
@@ -479,7 +530,7 @@ mod tests {
         assert_eq!(plan.verdict, InnerSandboxVerdict::Redundant);
         // A backend this build has no object for has no verdict to give.
         assert!(linux
-            .inner_sandbox(SandboxBackendKind::Docker, &policy, Some(&agent))
+            .inner_sandbox(SandboxBackendKind::WslDistro, &policy, Some(&agent))
             .is_none());
     }
 }

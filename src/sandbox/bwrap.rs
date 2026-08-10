@@ -25,6 +25,7 @@ use crate::sandbox::backend::{
 };
 use crate::sandbox::dirs;
 use crate::sandbox::egress::relay_addr;
+use crate::sandbox::launcher::relay_launcher_argv;
 use crate::sandbox::probe::{detect_platform, HostPlatform, LocalProbeHost, ProbeHost};
 use crate::sandbox::secrets::{secrets_for, SecretKind, SecretPlatform};
 use crate::session::{NetworkMode, ReadScope, SandboxBackendKind, SandboxShape};
@@ -72,32 +73,6 @@ const SYSTEM_RO_BINDS: &[&str] = &[
 /// keeps it — the mask is a default, and the profile's own paths are bound
 /// after it (most specific wins).
 const MASKED_SOCKET_DIRS: &[&str] = &["/run", "/var/run"];
-
-/// The shell that starts the relay beside the agent inside the sandbox.
-///
-/// An absolute path, and one every read scope already carries: `/bin` is in
-/// [`SYSTEM_RO_BINDS`], and the host read scope binds the whole root.
-const SHELL: &str = "/bin/sh";
-
-/// `$0` for that shell, so a `ps` inside the sandbox says what the process is.
-const RELAY_LAUNCHER_NAME: &str = "friring-sandbox-launcher";
-
-/// Start the relay, then become the agent.
-///
-/// Every value arrives as a positional parameter, so nothing here is quoted or
-/// re-parsed: `$1` is friring's own CLI, `$2` the address to offer inside the
-/// namespace, `$3` the bind-mounted socket, and everything after them is the
-/// agent's argv exactly as the launch composed it.
-///
-/// Both of the relay's streams go to `/dev/null`: the pane belongs to the
-/// agent's TUI, and a line written across it corrupts the display. A relay that
-/// fails to start surfaces as the agent's own connection error instead.
-///
-/// `exec` matters twice — the agent replaces the shell as pid 1 of bwrap's pid
-/// namespace, so the pane's process *is* the agent, and when it exits the
-/// namespace dies and takes the relay with it.
-const RELAY_LAUNCHER: &str = "\"$1\" sandbox relay --listen \"$2\" --socket \"$3\" \
-                              >/dev/null 2>&1 &\nshift 3\nexec \"$@\"\n";
 
 /// A parsed `bwrap --version`, and what the version implies.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,11 +284,7 @@ pub fn build_argv(
         // no decision — the proxy still demands its credential at the far end —
         // so what runs in here is a pipe, not a policy.
         let listen = relay_addr().to_string();
-        push(
-            &mut argv,
-            &[SHELL, "-c", RELAY_LAUNCHER, RELAY_LAUNCHER_NAME],
-        );
-        push(&mut argv, &[relay, listen.as_str(), inside_path.as_str()]);
+        argv.extend(relay_launcher_argv(relay, &listen, inside_path));
     }
     Ok(argv)
 }
@@ -534,31 +505,19 @@ impl BwrapBackend {
         }
     }
 
-    /// Whether `program` sits somewhere a sandboxed agent can write, and where.
-    ///
-    /// The home directory is the one that matters — `~/.local/bin` is on most
-    /// users' `PATH` and inside the default read scope's writable set — with the
-    /// shared scratch directories alongside it because they are writable by
-    /// anyone. friring's own sandbox tree is included for completeness; it lives
-    /// under the data directory, which no profile may make writable.
+    /// Whether `program` sits somewhere a sandboxed agent can write, phrased for
+    /// the probe message. The rule itself is
+    /// [`dirs::rewritable_root`](crate::sandbox::dirs::rewritable_root), which
+    /// the container engines apply to their own CLI for the same reason.
     fn rewritable_location(&self, program: &str) -> Option<String> {
         let home = self.host.home();
-        let mut roots: Vec<String> = ["/tmp", "/var/tmp", "/dev/shm"]
-            .iter()
-            .map(|d| (*d).to_string())
-            .collect();
-        roots.extend(home.clone());
-        roots.extend(dirs::sandbox_root().map(|p| p.display().to_string()));
-        roots
-            .into_iter()
-            .find(|root| dirs::encloses(root, program))
-            .map(|root| {
-                if home.as_deref() == Some(root.as_str()) {
-                    format!("the home directory ('{root}')")
-                } else {
-                    format!("'{root}'")
-                }
-            })
+        dirs::rewritable_root(program, home.as_deref()).map(|root| {
+            if home.as_deref() == Some(root.as_str()) {
+                format!("the home directory ('{root}')")
+            } else {
+                format!("'{root}'")
+            }
+        })
     }
 
     /// Turn a failed namespace creation into the setting that would fix it.
@@ -676,6 +635,7 @@ impl SandboxBackend for BwrapBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::launcher::{RELAY_LAUNCHER, RELAY_LAUNCHER_NAME, SHELL};
     use crate::sandbox::probe::{ProbeOutput, StubHost};
     use crate::session::{SandboxPath, SandboxPolicy, SandboxProfile};
 

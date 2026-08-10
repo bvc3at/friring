@@ -390,6 +390,34 @@ pub fn prepare(
     transport: ProxyTransport,
     scratch: &Path,
 ) -> SandboxResult<Prepared> {
+    prepare_at(session_key, policy, transport, scratch, relay_addr())
+}
+
+/// [`prepare`] for a sandbox whose relay does **not** listen on
+/// [`relay_addr`].
+///
+/// A namespaced policy sandbox gets a private `127.0.0.1`, so one fixed port is
+/// enough and [`prepare`] is the whole story. A **place** is created once per
+/// profile and shared by that profile's sessions, so they share one loopback and
+/// a fixed port would collide: each takes its own port out of a span and passes
+/// it here, and the address is what the proxy environment is composed against.
+/// Getting this wrong is silent — the second session's agent would dial a port
+/// nothing listens on and fail closed, with the profile still claiming a
+/// filtered network.
+///
+/// `relay` is where the *sandbox* reaches its relay, never where friring binds
+/// anything: the proxy still listens on the unix socket in `scratch`.
+///
+/// # Errors
+///
+/// As [`prepare`].
+pub fn prepare_at(
+    session_key: &str,
+    policy: &SandboxPolicy,
+    transport: ProxyTransport,
+    scratch: &Path,
+    relay: SocketAddr,
+) -> SandboxResult<Prepared> {
     let refuse = |detail: String| SandboxError::Refused {
         profile: policy.profile.clone(),
         detail,
@@ -404,7 +432,11 @@ pub fn prepare(
         ProxyTransport::Loopback => StartBind::Loopback,
         ProxyTransport::UnixSocket => {
             let (primary, alternate) = socket_paths(scratch).map_err(&refuse)?;
-            StartBind::UnixSocket { primary, alternate }
+            StartBind::UnixSocket {
+                primary,
+                alternate,
+                relay,
+            }
         }
     };
 
@@ -645,7 +677,16 @@ enum StartBind {
     /// A unix socket in the session's scratch directory, bound at the first of
     /// these paths the session's *running* instance is not already using. See
     /// [`PROXY_SOCKET_ALT_NAME`] for why there are two.
-    UnixSocket { primary: String, alternate: String },
+    ///
+    /// `relay` is the address the sandbox's own relay offers — [`relay_addr`]
+    /// for a namespaced policy sandbox, a per-session port for a place (see
+    /// [`prepare_at`]). It decides nothing about the listener; it is what the
+    /// proxy environment names.
+    UnixSocket {
+        primary: String,
+        alternate: String,
+        relay: SocketAddr,
+    },
 }
 
 /// One instruction for the supervisor thread.
@@ -782,15 +823,20 @@ async fn serve(mut commands: mpsc::UnboundedReceiver<Command>) {
                 if let Some((_, superseded)) = pending.remove(&key) {
                     superseded.shutdown().await;
                 }
-                let socket = match &bind {
-                    StartBind::Loopback => None,
-                    StartBind::UnixSocket { primary, alternate } => {
+                let (socket, relay) = match &bind {
+                    StartBind::Loopback => (None, None),
+                    StartBind::UnixSocket {
+                        primary,
+                        alternate,
+                        relay,
+                    } => {
                         let held = proxies.get(&key).and_then(|proxy| proxy.unix_path());
-                        Some(if held == Some(Path::new(primary)) {
+                        let path = if held == Some(Path::new(primary)) {
                             alternate.clone()
                         } else {
                             primary.clone()
-                        })
+                        };
+                        (Some(path), Some(*relay))
                     }
                 };
                 let config = ProxyConfig {
@@ -810,11 +856,10 @@ async fn serve(mut commands: mpsc::UnboundedReceiver<Command>) {
                 let (proxy, denials) = started;
                 // A socket-only instance is dialled through the relay inside
                 // the sandbox's own namespace; the socket is what the relay
-                // forwards to, and no HTTP client can name it.
-                let endpoint = socket
-                    .as_ref()
-                    .map(|_| relay_addr())
-                    .or_else(|| proxy.tcp_addr());
+                // forwards to, and no HTTP client can name it. The relay's
+                // address comes from the launch, because a place's sessions
+                // share one loopback and cannot share one port.
+                let endpoint = relay.or_else(|| proxy.tcp_addr());
                 next_id += 1;
                 let bound = Bound {
                     id: next_id,

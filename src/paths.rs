@@ -40,6 +40,36 @@ pub const CONFIG_DIR_OVERRIDE_ENV: &str = "FRIRING_CONFIG_DIR";
 /// Data counterpart of [`CONFIG_DIR_OVERRIDE_ENV`] (`FRIRING_DATA_DIR`).
 pub const DATA_DIR_OVERRIDE_ENV: &str = "FRIRING_DATA_DIR";
 
+/// Env var naming the file a **sandboxed** agent's hooks append their state to
+/// ([`session_signal_file`]).
+///
+/// Set only where a boundary is actually applied, and only by the launch that
+/// applies it, because its presence is what the shipped hook payloads branch
+/// on: unset means "call `friring-cli session signal`", which is what every
+/// unsandboxed session keeps doing. It is *not* injected with the other
+/// `FRIRING_*` identity variables for that reason.
+///
+/// The whole path travels, rather than the directory plus a name the payloads
+/// would have to spell themselves: the hook and this module then cannot disagree
+/// about which file the channel is, and a rename here can never leave a shipped
+/// payload writing somewhere nothing reads.
+pub const SIGNAL_FILE_ENV: &str = "FRIRING_SIGNAL_FILE";
+
+/// The file inside [`session_signal_dir`] the hook appends a state word to.
+///
+/// One fixed name, so the poll opens exactly one path per session rather than
+/// listing a directory whose entries an agent chooses.
+pub const SIGNAL_FILE_NAME: &str = "status";
+
+/// Largest status file friring will read, in bytes.
+///
+/// The channel carries a word per hook event (8 bytes at most), and the poll
+/// takes the file every ~100 ms, so this leaves room for hundreds of events
+/// between two sweeps and none at all for a file worth streaming. A larger one
+/// is dropped rather than truncated: the writer is inside the boundary, so a
+/// file this size is not an agent reporting its state.
+pub const MAX_SIGNAL_BYTES: u64 = 4096;
+
 /// Returns "friring-dev" for dev builds, "friring" for release builds.
 #[cfg_attr(test, allow(dead_code))] // only used by the non-test XDG fallback
 fn app_dir_name() -> &'static str {
@@ -189,6 +219,9 @@ pub enum PathKind {
     /// Per-session multi-repo symlink workspaces:
     /// `~/.local/share/friring/workspaces/`
     WorkspacesDir,
+    /// Per-session sandbox status-signal directories:
+    /// `~/.local/share/friring/signals/`
+    SignalsDir,
     /// User keybindings JSON file: `~/.config/friring/keybindings.json`
     KeybindingsFile,
 }
@@ -232,6 +265,7 @@ fn resolve_xdg(kind: PathKind) -> Option<PathBuf> {
         PathKind::BuiltinExtensionsDir => xdg_data_subpath(&["builtin-extensions"]),
         PathKind::WorktreesDir => xdg_data_subpath(&["worktrees"]),
         PathKind::WorkspacesDir => xdg_data_subpath(&["workspaces"]),
+        PathKind::SignalsDir => xdg_data_subpath(&["signals"]),
         PathKind::KeybindingsFile => xdg_config_subpath("keybindings.json"),
     }
 }
@@ -246,6 +280,7 @@ fn resolve_override(base: &Path, kind: PathKind) -> PathBuf {
         PathKind::BuiltinExtensionsDir => base.join("builtin-extensions"),
         PathKind::WorktreesDir => base.join("worktrees"),
         PathKind::WorkspacesDir => base.join("workspaces"),
+        PathKind::SignalsDir => base.join("signals"),
         PathKind::KeybindingsFile => base.join("keybindings.json"),
     }
 }
@@ -347,6 +382,258 @@ pub fn session_workspace_dir(agent_session_id: &str) -> Option<PathBuf> {
     }
     Some(workspaces_directory()?.join(segment))
 }
+
+/// Resolve the sandbox status-signal root: `<data>/signals/`.
+///
+/// Host-only, and deliberately **not** under the sandbox's own tree: a launch
+/// grants one directory beneath this root and nothing else, so the root itself
+/// stays a place only friring writes — which is what makes
+/// [`take_session_signal`]'s staging step safe.
+pub fn signals_directory() -> Option<PathBuf> {
+    resolve(PathKind::SignalsDir)
+}
+
+/// The status-signal directory of one session, whether or not it exists yet:
+/// `<data>/signals/<key>`.
+///
+/// `session_key` is the same key the rest of a sandboxed launch is filed under
+/// (friring's session id in practice), reduced to a single path segment.
+pub fn session_signal_dir(session_key: &str) -> Option<PathBuf> {
+    Some(signals_directory()?.join(sanitize_signal_key(session_key)))
+}
+
+/// The status file itself: `<data>/signals/<key>/status`.
+///
+/// The value of [`SIGNAL_FILE_ENV`], and the one path a sandboxed agent's hooks
+/// are told about. The directory around it is what a launch grants read-write —
+/// see [`create_session_signal_dir`].
+pub fn session_signal_file(session_key: &str) -> Option<PathBuf> {
+    Some(session_signal_dir(session_key)?.join(SIGNAL_FILE_NAME))
+}
+
+/// Where [`take_session_signal`] moves a status file before reading it.
+///
+/// A sibling of the session's directory rather than a child of it, because the
+/// whole point is to land somewhere the agent cannot reach: it holds the one
+/// directory, not this root.
+///
+/// One name per session rather than per process, so a friring that died
+/// mid-take leaves at most one file and the next take overwrites it. Two live
+/// instances watching one session can therefore take from under each other —
+/// which costs a duplicate or a dropped report of a state they both derive the
+/// same way, and never a wrong one.
+fn signal_staging_path(session_key: &str) -> Option<PathBuf> {
+    Some(signals_directory()?.join(format!("{}.taken", sanitize_signal_key(session_key))))
+}
+
+/// Reduce a session key to one path segment that cannot become a path.
+///
+/// Every character outside `[A-Za-z0-9._-]` becomes `-`, so no separator, drive
+/// letter or NUL survives; a name made only of dots (`..`) is replaced outright,
+/// because those *are* legal segments and `join`ing one would walk upwards.
+/// Keys are UUIDs in practice — this is the guard that keeps that from being
+/// load-bearing.
+fn sanitize_signal_key(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
+        "session".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Create `path` and its parents `0700`, adopting a directory that is already
+/// there.
+///
+/// The shared primitive for every directory friring mints on a sandbox's
+/// behalf. Two properties, both because what lands inside is either a security
+/// policy or a channel out of a boundary:
+///
+/// - A **symlink** at the final component is refused rather than followed, so
+///   nothing planted there can redirect the writes that follow it elsewhere.
+/// - An adopted directory has its mode **re-asserted**: `DirBuilder::mode`
+///   applies only to the components it actually creates, so a directory left
+///   behind by an older, laxer build would otherwise keep its old permissions.
+pub fn create_private_dir(path: &Path) -> Result<(), String> {
+    let io_err = |detail: String| format!("{}: {detail}", path.display());
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(io_err(
+                "is a symlink; friring will not write a private directory through one".to_string(),
+            ))
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(io_err("exists and is not a directory".to_string()))
+        }
+        _ => {}
+    }
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path).map_err(|e| io_err(e.to_string()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| io_err(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// The two paths a sandboxed launch needs: what to expose, and what to name.
+///
+/// Separate fields rather than one path plus a `join` at the call site, so the
+/// launch never spells [`SIGNAL_FILE_NAME`] itself and cannot drift from the
+/// poll that reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalChannel {
+    /// The per-session directory to expose read-write, and **only** this.
+    pub dir: PathBuf,
+    /// The file inside it, for [`SIGNAL_FILE_ENV`].
+    pub file: PathBuf,
+}
+
+/// Mint the status-signal channel for one sandboxed launch.
+///
+/// The directory is `0700` and is the **only** thing a launch exposes read-write
+/// for this purpose — see `docs/SANDBOX.md` §Status signals and ADR-29, which is
+/// why the database is not.
+///
+/// It starts empty: whatever the previous run of this session left behind is
+/// dropped here, so a `done` written before a restart cannot be replayed as the
+/// new run's first report. The *directory* is adopted rather than recreated —
+/// the launch is about to hand its path to a sandbox, and a fresh inode would
+/// leave an already-running agent writing into an unlinked one.
+///
+/// # Errors
+///
+/// No data directory resolves, or something that is not a directory friring
+/// owns — a symlink above all — sits where the directory belongs. Both fail the
+/// launch: a signal directory friring cannot vouch for is worse than none,
+/// because the poll would act on whatever it collected.
+pub fn create_session_signal_dir(session_key: &str) -> Result<SignalChannel, String> {
+    let root = signals_directory().ok_or(NO_SIGNAL_ROOT)?;
+    create_private_dir(&root)?;
+    let dir = session_signal_dir(session_key).ok_or(NO_SIGNAL_ROOT)?;
+    create_private_dir(&dir)?;
+    let file = dir.join(SIGNAL_FILE_NAME);
+    remove_anything_at(&file);
+    if let Some(staged) = signal_staging_path(session_key) {
+        remove_anything_at(&staged);
+    }
+    Ok(SignalChannel { dir, file })
+}
+
+/// Drop one session's signal directory and anything staged out of it.
+///
+/// Best effort, and called where the rest of a session's per-launch state is
+/// dropped: failing to clean up must never be the thing that reports an error.
+/// Nothing here follows a symlink — `remove_dir_all` refuses one, and unlinking
+/// never traverses the final component.
+pub fn remove_session_signal_dir(session_key: &str) {
+    if let Some(dir) = session_signal_dir(session_key) {
+        remove_anything_at(&dir);
+    }
+    if let Some(staged) = signal_staging_path(session_key) {
+        remove_anything_at(&staged);
+    }
+}
+
+/// Take one session's status file and return its text, or `None` when there is
+/// nothing to take or nothing friring will read.
+///
+/// The take is a `rename(2)` out of the session's directory into the signals
+/// root, and that single syscall is what makes the rest of this safe. It is
+/// atomic, it never follows a symlink, and it never opens anything — so once it
+/// returns, the object friring is about to inspect sits in a directory no
+/// sandbox was granted, and the agent cannot swap it for something else between
+/// the check and the read. Everything after the rename is therefore a decision
+/// about a fixed inode rather than a race:
+///
+/// - **Not a regular file** — a symlink, a FIFO, a directory, a device node —
+///   is dropped unread. The FIFO is the one that matters: opening one blocks
+///   until a writer appears, and this runs on the render loop, so reading it in
+///   place would let an agent freeze the whole TUI with `mkfifo`.
+/// - **Too large** is dropped, checked before the open *and* enforced during the
+///   read: a descriptor the agent still holds keeps writing to the same inode
+///   after the rename, so the size at `stat` time is not a bound on what an
+///   unbounded read would return.
+/// - **Not UTF-8** is dropped rather than lossily converted, so no byte sequence
+///   is reshaped into something that might parse.
+///
+/// Taking rather than peeking is also what keeps the channel honest in time:
+/// each write is delivered once, and a file left behind by a crashed run is
+/// consumed instead of re-reported forever.
+///
+/// The returned text is still hostile — it is the agent's own bytes. Only
+/// `session::status_signal::parse_status_signal` decides what it means, and it
+/// answers with an enum.
+pub fn take_session_signal(session_key: &str) -> Option<String> {
+    let inbox = session_signal_file(session_key)?;
+    let staged = signal_staging_path(session_key)?;
+    // A leftover from a run that died mid-take would make the rename fail (or,
+    // if it is a directory, keep failing forever).
+    remove_anything_at(&staged);
+    std::fs::rename(&inbox, &staged).ok()?;
+    let text = read_taken_signal(&staged);
+    remove_anything_at(&staged);
+    text
+}
+
+/// Read a status file that has already been taken out of the agent's reach.
+fn read_taken_signal(staged: &Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let meta = std::fs::symlink_metadata(staged).ok()?;
+    if !meta.file_type().is_file() || meta.len() > MAX_SIGNAL_BYTES {
+        return None;
+    }
+    let file = std::fs::File::open(staged).ok()?;
+    let mut bytes = Vec::new();
+    // One byte past the cap, so a file that grew under an open descriptor is
+    // detected rather than silently truncated into something that parses.
+    file.take(MAX_SIGNAL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_SIGNAL_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Unlink whatever is at `path`, whichever kind of thing it turned out to be.
+///
+/// `remove_file` covers every non-directory — a regular file, a FIFO, a socket,
+/// and a symlink, which it unlinks itself rather than following;
+/// `remove_dir_all` covers the directory an agent planted instead, and refuses
+/// to descend through a symlink. Best effort: every caller is either cleaning up
+/// or about to overwrite.
+fn remove_anything_at(path: &Path) {
+    if std::fs::remove_file(path).is_ok() {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(path);
+}
+
+/// The failure both signal-directory callers share.
+const NO_SIGNAL_ROOT: &str = "friring cannot resolve its data directory, so it has nowhere to \
+                              keep a sandboxed session's status signals";
 
 /// Resolve the user keybindings file path.
 ///
@@ -1010,6 +1297,215 @@ mod tests {
             resolve_override(base, PathKind::WorktreesDir),
             PathBuf::from("/data/worktrees")
         );
+    }
+
+    /// A fabricated data directory for the signal-channel tests. Nothing here
+    /// touches a real home: every path resolves under the temp dir the guard
+    /// pins, and the "agent" is this test writing a file. The base is returned
+    /// too, for the one test that needs a second thread to resolve the same
+    /// paths (the override is thread-local).
+    fn signal_sandbox(name: &str) -> (tempfile::TempDir, PathBuf, TestPathGuard) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().join(name);
+        let guard = TestPathGuard::new(&base);
+        (tmp, base, guard)
+    }
+
+    #[test]
+    fn a_session_signal_directory_is_private_and_starts_empty() {
+        let (_tmp, _base, _guard) = signal_sandbox("mint");
+        let channel = create_session_signal_dir("s1").unwrap();
+        let dir = channel.dir.clone();
+        assert_eq!(dir, signals_directory().unwrap().join("s1"));
+        // The path handed to the agent is the one the poll takes from.
+        assert_eq!(channel.file, dir.join(SIGNAL_FILE_NAME));
+        assert_eq!(session_signal_file("s1"), Some(channel.file));
+        assert!(dir.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for probe in [signals_directory().unwrap(), dir.clone()] {
+                let mode = std::fs::metadata(&probe).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o700, "{} must be private", probe.display());
+            }
+        }
+
+        // A status left behind by the previous run is dropped, not replayed:
+        // the directory is adopted (the agent may already hold its path) but
+        // the channel starts empty.
+        std::fs::write(dir.join(SIGNAL_FILE_NAME), "done\n").unwrap();
+        let again = create_session_signal_dir("s1").unwrap();
+        assert_eq!(again.dir, dir);
+        assert!(!dir.join(SIGNAL_FILE_NAME).exists());
+        assert_eq!(take_session_signal("s1"), None);
+    }
+
+    #[test]
+    fn a_well_formed_status_file_is_taken_exactly_once() {
+        let (_tmp, _base, _guard) = signal_sandbox("take");
+        let dir = create_session_signal_dir("s1").unwrap().dir;
+        std::fs::write(dir.join(SIGNAL_FILE_NAME), "working\ndone\n").unwrap();
+
+        assert_eq!(
+            take_session_signal("s1").as_deref(),
+            Some("working\ndone\n")
+        );
+        // Taken, not peeked: the same write is never delivered twice, so a file
+        // a crashed run left behind cannot be re-reported forever.
+        assert_eq!(take_session_signal("s1"), None);
+        assert!(!dir.join(SIGNAL_FILE_NAME).exists());
+        // And nothing is left staged in the root beside the session's dir.
+        let leftovers: Vec<_> = std::fs::read_dir(signals_directory().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(leftovers, ["s1"]);
+    }
+
+    /// The file types an agent can leave in a directory it may write, none of
+    /// which friring will read. A symlink would redirect the read outside the
+    /// boundary; a FIFO would block the render loop that polls it until a
+    /// writer appeared, which is a frozen TUI on demand.
+    #[cfg(unix)]
+    #[test]
+    fn a_status_file_that_is_not_a_regular_file_is_dropped_unread() {
+        let (_tmp, _base, _guard) = signal_sandbox("kinds");
+        let dir = create_session_signal_dir("s1").unwrap().dir;
+        let status = dir.join(SIGNAL_FILE_NAME);
+        let outside = signals_directory().unwrap().join("host-secret");
+        std::fs::write(&outside, "done\n").unwrap();
+
+        std::os::unix::fs::symlink(&outside, &status).unwrap();
+        assert_eq!(take_session_signal("s1"), None, "followed a symlink");
+        // The file it pointed at is intact: taking never touches the target.
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "done\n");
+        assert!(!status.exists(), "the symlink itself must be consumed");
+
+        std::fs::create_dir(&status).unwrap();
+        std::fs::write(status.join("done"), "done\n").unwrap();
+        assert_eq!(take_session_signal("s1"), None, "read a directory");
+        assert!(!status.exists());
+
+        // A working file after all that: the channel is not wedged by any of it.
+        std::fs::write(&status, "done\n").unwrap();
+        assert_eq!(take_session_signal("s1").as_deref(), Some("done\n"));
+    }
+
+    /// A FIFO where the status file goes is the hostile case with teeth:
+    /// `open(2)` on one blocks until a writer appears, and the poll that reads
+    /// this runs on the render loop — so an agent could freeze the whole TUI
+    /// with one `mkfifo`. The take must therefore decide on the *kind* of thing
+    /// it moved, in a directory the agent cannot reach, before opening it.
+    ///
+    /// Run on a second thread with a deadline, so a regression fails the test
+    /// instead of hanging it. The thread installs the same path override
+    /// because it is thread-local.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_where_the_status_file_goes_cannot_block_the_poll() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (_tmp, base, _guard) = signal_sandbox("fifo");
+        let dir = create_session_signal_dir("s1").unwrap().dir;
+        let status = dir.join(SIGNAL_FILE_NAME);
+        let made = std::process::Command::new("mkfifo")
+            .arg(&status)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            // No `mkfifo` on this machine; the rest of the suite still covers
+            // every kind of file that can be created without one.
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _guard = TestPathGuard::new(base);
+            let _ = tx.send(take_session_signal("s1"));
+        });
+        let taken = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("taking a FIFO blocked the poll");
+        assert_eq!(taken, None);
+
+        // And the channel is not wedged by it.
+        std::fs::write(&status, "done\n").unwrap();
+        assert_eq!(take_session_signal("s1").as_deref(), Some("done\n"));
+    }
+
+    #[test]
+    fn an_oversized_or_non_utf8_status_file_is_dropped() {
+        let (_tmp, _base, _guard) = signal_sandbox("caps");
+        let dir = create_session_signal_dir("s1").unwrap().dir;
+        let status = dir.join(SIGNAL_FILE_NAME);
+
+        let huge = format!("{}done\n", "working\n".repeat(2000));
+        assert!(huge.len() as u64 > MAX_SIGNAL_BYTES);
+        std::fs::write(&status, &huge).unwrap();
+        assert_eq!(take_session_signal("s1"), None, "read past the cap");
+
+        std::fs::write(&status, b"done\n\xff\xfe").unwrap();
+        assert_eq!(take_session_signal("s1"), None, "accepted invalid UTF-8");
+
+        // Exactly at the cap still reads: the bound is a bound, not a margin.
+        let tail = "\ndone\n";
+        let mut at_cap = "x".repeat(MAX_SIGNAL_BYTES as usize - tail.len());
+        at_cap.push_str(tail);
+        assert_eq!(at_cap.len() as u64, MAX_SIGNAL_BYTES);
+        std::fs::write(&status, &at_cap).unwrap();
+        assert_eq!(take_session_signal("s1").as_deref(), Some(at_cap.as_str()));
+    }
+
+    /// The directory is minted for the launch and dropped with the session; a
+    /// symlink planted where it belongs fails the mint rather than being
+    /// written through.
+    #[cfg(unix)]
+    #[test]
+    fn the_signal_directory_refuses_a_symlink_and_is_removed_on_cleanup() {
+        let (tmp, _base, _guard) = signal_sandbox("lifecycle");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        create_private_dir(&signals_directory().unwrap()).unwrap();
+        let dir = session_signal_dir("s1").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+
+        let err = create_session_signal_dir("s1").unwrap_err();
+        assert!(err.contains("is a symlink"), "{err}");
+        assert!(elsewhere.exists(), "the link target must be untouched");
+
+        // Cleanup takes the link itself, and then a real directory.
+        remove_session_signal_dir("s1");
+        assert!(!dir.exists());
+        assert!(elsewhere.exists());
+
+        let dir = create_session_signal_dir("s1").unwrap().dir;
+        std::fs::write(dir.join(SIGNAL_FILE_NAME), "done\n").unwrap();
+        remove_session_signal_dir("s1");
+        assert!(!dir.exists());
+        // Another session's channel is untouched by that.
+        let other = create_session_signal_dir("s2").unwrap();
+        assert!(other.dir.is_dir());
+    }
+
+    #[test]
+    fn a_session_key_cannot_become_a_path() {
+        let (_tmp, _base, _guard) = signal_sandbox("keys");
+        let root = signals_directory().unwrap();
+        for key in ["../escape", "..", ".", "a/b", "a\\b", "", "  "] {
+            let dir = session_signal_dir(key).unwrap();
+            assert_eq!(dir.parent(), Some(root.as_path()), "{key} escaped the root");
+            assert!(
+                dir.strip_prefix(&root)
+                    .is_ok_and(|rest| rest.components().count() == 1),
+                "{key} is not one segment"
+            );
+        }
+        assert_eq!(sanitize_signal_key("../../etc"), "..-..-etc");
+        assert_eq!(sanitize_signal_key(".."), "session");
+        assert_eq!(sanitize_signal_key(""), "session");
     }
 
     #[test]

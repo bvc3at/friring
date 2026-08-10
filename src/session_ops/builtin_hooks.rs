@@ -282,11 +282,15 @@ mod tests {
                 "missing rewritten {state} command"
             );
         }
-        // The surrounding hook shape (`|| true`, the blocked `case`) survives
-        // the prefix replace, and the result is still valid JSON with all five
-        // hook events.
+        // The surrounding hook shape survives the prefix replace — `|| true`,
+        // the `if`/`else` the sandbox file channel added around the CLI call,
+        // and the blocked `case` arm that closes it — and the result is still
+        // valid JSON with all five hook events.
         assert!(rewritten.contains("tmux set-option -p @friring_state idle || true"));
-        assert!(rewritten.contains("tmux set-option -p @friring_state blocked ;;"));
+        assert!(
+            rewritten.contains("tmux set-option -p @friring_state blocked || true; fi ;; esac"),
+            "the rewritten blocked command lost its shell shape"
+        );
         let json: serde_json::Value = serde_json::from_str(&rewritten).expect("still valid JSON");
         let hooks = json.get("hooks").and_then(|h| h.as_object()).unwrap();
         for event in [

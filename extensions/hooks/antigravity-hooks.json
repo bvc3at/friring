@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "friring-cli session signal --state idle || true"
+            "command": "if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'idle\\n' >> \"$FRIRING_SIGNAL_FILE\" || true; else friring-cli session signal --state idle || true; fi"
           }
         ]
       }
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "friring-cli session signal --state working || true"
+            "command": "if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'working\\n' >> \"$FRIRING_SIGNAL_FILE\" || true; else friring-cli session signal --state working || true; fi"
           }
         ]
       }
@@ -25,7 +25,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "case \"$(cat)\" in *permission*|*Permission*|*approval*|*approve*) friring-cli session signal --state blocked ;; esac; true"
+            "command": "case \"$(cat)\" in *permission*|*Permission*|*approval*|*approve*) if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'blocked\\n' >> \"$FRIRING_SIGNAL_FILE\" || true; else friring-cli session signal --state blocked || true; fi ;; esac; true"
           }
         ]
       }
@@ -35,7 +35,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "friring-cli session signal --state done || true"
+            "command": "if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'done\\n' >> \"$FRIRING_SIGNAL_FILE\" || true; else friring-cli session signal --state done || true; fi"
           }
         ]
       }

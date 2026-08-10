@@ -1,9 +1,12 @@
 # Managed by friring `extension install` (the built-in "hooks" extension).
 # Reinstalling or updating overwrites this file — do not edit; uninstalling
 # removes it. Reports Mistral Vibe's lifecycle state to friring via
-# `friring-cli session signal`. Identity comes from the inherited
-# $FRIRING_SESSION env var; every call is best-effort (`|| true`) so it can
-# never break a session running outside friring.
+# `friring-cli session signal`, or — inside a sandbox, where that binary need
+# not exist and the database is out of reach by design — by appending the state
+# to $FRIRING_SIGNAL_FILE, which friring polls (docs/SANDBOX.md §Status
+# signals). Identity comes from the inherited $FRIRING_SESSION env var; every
+# call is best-effort (`|| true`) so it can never break a session running
+# outside friring.
 #
 # EXPERIMENTAL: the hooks.toml schema below is not verified against the live
 # `vibe` binary. If the event/key names differ, edit this file (no code change
@@ -13,12 +16,12 @@
 
 [[hooks]]
 event = "before_tool"
-command = "friring-cli session signal --state working || true"
+command = "if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'working\\n' >> \"$FRIRING_SIGNAL_FILE\" || true; else friring-cli session signal --state working || true; fi"
 
 [[hooks]]
 event = "after_turn"
-command = "friring-cli session signal --state done || true"
+command = "if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'done\\n' >> \"$FRIRING_SIGNAL_FILE\" || true; else friring-cli session signal --state done || true; fi"
 
 [[hooks]]
 event = "notification"
-command = "friring-cli session signal --state blocked || true"
+command = "if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'blocked\\n' >> \"$FRIRING_SIGNAL_FILE\" || true; else friring-cli session signal --state blocked || true; fi"

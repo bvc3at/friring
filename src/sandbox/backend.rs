@@ -8,7 +8,8 @@
 use std::fmt;
 
 use crate::session::{
-    NetworkMode, ReadScope, SandboxBackendKind, SandboxPolicy, SandboxProfile, SandboxShape,
+    NetworkMode, ReadScope, SandboxBackendKind, SandboxInstance, SandboxPolicy, SandboxProfile,
+    SandboxShape,
 };
 
 /// A command line as the launch path passes it around: program first, then its
@@ -283,20 +284,34 @@ pub enum Egress<'a> {
     Proxied(&'a ProxyEndpoint),
 }
 
-/// One live place: a container, a VM, a distro clone.
+/// What a launch into a **place** knows that a policy launch does not.
 ///
-/// Minimal on purpose — P3 owns instance lifecycle and the `sandbox_instances`
-/// table, and may well move this type into `storage` when it adds the state and
-/// timestamp columns. It exists here so [`SandboxBackend::ensure`] has a
-/// signature to be declared with.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SandboxInstance {
-    /// The profile the place was built for.
-    pub profile: String,
-    /// Which engine created it.
-    pub engine: SandboxBackendKind,
-    /// The engine's own handle: a container id, a distro name.
-    pub external_id: String,
+/// Carried on the launch rather than looked up by the backend, because it comes
+/// from the place that was ensured for this session. A place backend that finds
+/// this missing refuses the launch — an argv composed without it would run on
+/// the host under a profile that says otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaceLaunch<'a> {
+    /// The egress relay to start inside the place beside the agent. `None` when
+    /// the profile's network mode is one the kernel enforces on its own
+    /// (`none`, or `full` with no denies): there is no proxy, so there is
+    /// nothing to relay to.
+    pub relay: Option<PlaceRelay<'a>>,
+}
+
+/// The in-place half of the egress boundary — see
+/// `docs/SANDBOX.md` §Reaching the proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaceRelay<'a> {
+    /// Absolute path of friring's own CLI *inside* the place, resolved when the
+    /// place was created rather than named on the command line: the relay is a
+    /// binary of the **image's**, and the host's copy is the wrong architecture
+    /// as often as not.
+    pub program: &'a str,
+    /// The loopback port the relay offers inside the place. Not a constant the
+    /// way it is for a namespaced policy sandbox: a place is shared by the
+    /// sessions of its profile, and they share its loopback.
+    pub port: u16,
 }
 
 /// Everything one launch knows that the profile does not.
@@ -342,6 +357,9 @@ pub struct SandboxLaunch<'a> {
     pub friring_db: Option<&'a str>,
     /// The egress proxy, once P2 runs one.
     pub proxy: Option<ProxyEndpoint>,
+    /// The place this launch runs in, for a place backend. `None` for a policy
+    /// backend, whose sandbox is the wrapped process itself.
+    pub place: Option<PlaceLaunch<'a>>,
 }
 
 impl<'a> SandboxLaunch<'a> {
@@ -357,6 +375,7 @@ impl<'a> SandboxLaunch<'a> {
             tmp_dir: None,
             friring_db: None,
             proxy: None,
+            place: None,
         }
     }
 
@@ -393,6 +412,12 @@ impl<'a> SandboxLaunch<'a> {
     /// The egress proxy friring started alongside the session.
     pub fn with_proxy(mut self, proxy: ProxyEndpoint) -> Self {
         self.proxy = Some(proxy);
+        self
+    }
+
+    /// The place this launch runs in — see [`PlaceLaunch`].
+    pub fn with_place(mut self, place: PlaceLaunch<'a>) -> Self {
+        self.place = Some(place);
         self
     }
 
@@ -541,16 +566,17 @@ pub trait SandboxBackend {
         Err(self.wrong_half())
     }
 
-    /// The error for calling the half this backend does not implement: a shape
-    /// mismatch for a backend of the other shape, and "not built yet" for a
-    /// place backend, whose half lands in P3.
+    /// The error for calling a half this backend does not implement: a shape
+    /// mismatch for a policy backend asked to be a place, and "not built yet"
+    /// for a place backend that implements neither — `apple-container` and
+    /// `wsl-distro`, which land in P4.
     fn wrong_half(&self) -> SandboxError {
         let kind = self.kind();
         match kind.shape() {
             Some(SandboxShape::Place) => SandboxError::NotInThisStage {
                 backend: kind,
-                detail: "place backends (containers, VMs, distro clones) land with the sandbox \
-                         transport; this build has the policy backends only"
+                detail: "place backends (containers, VMs, distro clones) are reached through the \
+                         sandbox transport, and this build has no implementation of that one"
                     .to_string(),
             },
             _ => SandboxError::WrongShape {

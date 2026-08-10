@@ -959,6 +959,32 @@ impl EgressDecision {
     }
 }
 
+/// One live **place**: a container, a VM, a distro clone.
+///
+/// The pure record of one, which is why it lives here rather than in
+/// [`crate::sandbox`]: the backend that created it, the launch path that
+/// reports it and the storage layer that persists it all name it, and only one
+/// of those three may reference the others. `storage` keeps its own row type
+/// with the timestamps it owns.
+///
+/// Policy backends never produce one — their boundary is a kernel policy over a
+/// process tree, with nothing that outlives the launch (ADR-26).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxInstance {
+    /// The profile the place was built for.
+    pub profile: String,
+    /// Which engine created it. Never a policy backend, and never
+    /// [`SandboxBackendKind::Auto`] — the ladder has resolved by the time a
+    /// place exists.
+    pub engine: SandboxBackendKind,
+    /// The engine's own handle: a container id, a distro name.
+    pub external_id: String,
+    /// Backend-defined lifecycle state. Free text on purpose: the vocabulary
+    /// belongs to whichever backend wrote it, so a place backend friring gains
+    /// later needs no migration to describe itself.
+    pub state: String,
+}
+
 /// A named, user-edited isolation recipe.
 ///
 /// Identity is [`name`](Self::name): it is the storage primary key, the label

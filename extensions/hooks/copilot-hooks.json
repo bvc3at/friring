@@ -4,7 +4,7 @@
     "sessionStart": [
       {
         "type": "command",
-        "bash": "friring-cli session signal --state idle || true  # managed by friring `extension install` — do not edit",
+        "bash": "if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'idle\\n' >> \"$FRIRING_SIGNAL_FILE\" || true; else friring-cli session signal --state idle || true; fi  # managed by friring `extension install` — do not edit",
         "powershell": "friring-cli session signal --state idle 2>$null; exit 0  # managed by friring `extension install`",
         "timeoutSec": 10
       }
@@ -12,7 +12,7 @@
     "userPromptSubmitted": [
       {
         "type": "command",
-        "bash": "friring-cli session signal --state working || true",
+        "bash": "if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'working\\n' >> \"$FRIRING_SIGNAL_FILE\" || true; else friring-cli session signal --state working || true; fi",
         "powershell": "friring-cli session signal --state working 2>$null; exit 0",
         "timeoutSec": 10
       }
@@ -20,7 +20,7 @@
     "preToolUse": [
       {
         "type": "command",
-        "bash": "friring-cli session signal --state working || true",
+        "bash": "if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'working\\n' >> \"$FRIRING_SIGNAL_FILE\" || true; else friring-cli session signal --state working || true; fi",
         "powershell": "friring-cli session signal --state working 2>$null; exit 0",
         "timeoutSec": 10
       }
@@ -29,7 +29,7 @@
       {
         "type": "command",
         "matcher": "permission_prompt",
-        "bash": "friring-cli session signal --state blocked || true",
+        "bash": "if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'blocked\\n' >> \"$FRIRING_SIGNAL_FILE\" || true; else friring-cli session signal --state blocked || true; fi",
         "powershell": "friring-cli session signal --state blocked 2>$null; exit 0",
         "timeoutSec": 10
       }
@@ -37,7 +37,7 @@
     "agentStop": [
       {
         "type": "command",
-        "bash": "friring-cli session signal --state done || true",
+        "bash": "if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'done\\n' >> \"$FRIRING_SIGNAL_FILE\" || true; else friring-cli session signal --state done || true; fi",
         "powershell": "friring-cli session signal --state done 2>$null; exit 0",
         "timeoutSec": 10
       }

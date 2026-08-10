@@ -50,10 +50,11 @@ pub struct SandboxInstance {
     /// The engine's own handle: a container id, a distro name. Unique per
     /// engine, and the key this row is stored under.
     pub external_id: String,
-    /// Backend-defined lifecycle state (`running`, `stopped`, …). Free text on
-    /// purpose: the vocabulary belongs to whichever backend wrote the row, and
-    /// storage has no business narrowing it before a backend exists to define
-    /// it.
+    /// Backend-defined lifecycle state. Free text on purpose: the vocabulary
+    /// belongs to whichever backend wrote the row, and a place backend friring
+    /// gains later must not need a migration to describe itself. The container
+    /// backend writes `running` — the only state it ever hands back, because
+    /// `ensure` returns when the place is up or not at all.
     pub state: String,
     /// Unix millis, set on insert.
     pub created_at: u64,
@@ -538,6 +539,50 @@ impl Database {
         Ok(())
     }
 
+    /// Refresh an existing record's `state` and `last_used_at` — and **only** an
+    /// existing one. Answers whether there was a row.
+    ///
+    /// The difference from
+    /// [`upsert_sandbox_instance`](Self::upsert_sandbox_instance) is the whole
+    /// point: a launch that reuses a place it did not create must not re-insert
+    /// a row garbage collection has just deleted, which would resurrect a record
+    /// of a container that is on its way out. Recording a *new* place is an
+    /// upsert; saying "this one is still in use" is this.
+    pub fn touch_sandbox_instance(
+        &self,
+        engine: SandboxBackendKind,
+        external_id: &str,
+        state: &str,
+    ) -> rusqlite::Result<bool> {
+        let now = current_time_millis() as i64;
+        let updated = self.conn.execute(
+            "UPDATE sandbox_instances SET state = ?3, last_used_at = ?4 \
+             WHERE engine = ?1 AND external_id = ?2",
+            params![engine.as_str(), external_id, state, now],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// The places recorded for one engine, oldest use first — the order garbage
+    /// collection reclaims in, so the least recently used place goes first when
+    /// a pass reclaims several.
+    ///
+    /// Per engine because that is what can be reconciled: the list of containers
+    /// a `docker` can be asked for says nothing about a `podman` one, and a row
+    /// whose engine is not running must not be read as a place that has
+    /// vanished.
+    pub fn list_sandbox_instances_for_engine(
+        &self,
+        engine: SandboxBackendKind,
+    ) -> rusqlite::Result<Vec<SandboxInstance>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {INSTANCE_COLS} FROM sandbox_instances WHERE engine = ?1 \
+             ORDER BY last_used_at, external_id"
+        ))?;
+        let rows = stmt.query_map(params![engine.as_str()], map_instance)?;
+        rows.collect()
+    }
+
     /// Every recorded place, ordered by profile then engine then id — stable,
     /// so the manager view does not reshuffle when a state changes.
     pub fn list_sandbox_instances(&self) -> rusqlite::Result<Vec<SandboxInstance>> {
@@ -981,6 +1026,87 @@ mod tests {
         assert_eq!(all[0].state, "running");
         assert_eq!(all[0].created_at, first.created_at);
         assert!(all[0].last_used_at >= first.last_used_at);
+    }
+
+    /// The distinction garbage collection depends on: saying "still in use"
+    /// must never *create* a record, or a launch that reuses a place would
+    /// resurrect the row a collection pass had just deleted.
+    #[test]
+    fn touching_a_place_refreshes_a_record_and_never_invents_one() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_sandbox_profile(&profile("dev")).unwrap();
+        assert!(!db
+            .touch_sandbox_instance(SandboxBackendKind::Podman, "ctr-1", "running")
+            .unwrap());
+        assert!(db.list_sandbox_instances().unwrap().is_empty());
+
+        db.upsert_sandbox_instance(&SandboxInstance::new(
+            "dev",
+            SandboxBackendKind::Podman,
+            "ctr-1",
+            "created",
+        ))
+        .unwrap();
+        let before = db.list_sandbox_instances().unwrap().remove(0);
+        assert!(db
+            .touch_sandbox_instance(SandboxBackendKind::Podman, "ctr-1", "running")
+            .unwrap());
+        let after = db.list_sandbox_instances().unwrap().remove(0);
+        assert_eq!(after.state, "running");
+        assert_eq!(after.created_at, before.created_at);
+        assert!(after.last_used_at >= before.last_used_at);
+    }
+
+    /// Garbage collection reconciles one engine's rows against that engine's
+    /// containers, so it asks for them least recently used first — and never
+    /// sees another engine's, which it could not have asked about.
+    #[test]
+    fn instances_are_listed_per_engine_oldest_use_first() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_sandbox_profile(&profile("dev")).unwrap();
+        for id in ["ctr-a", "ctr-b"] {
+            db.upsert_sandbox_instance(&SandboxInstance::new(
+                "dev",
+                SandboxBackendKind::Podman,
+                id,
+                "running",
+            ))
+            .unwrap();
+        }
+        db.upsert_sandbox_instance(&SandboxInstance::new(
+            "dev",
+            SandboxBackendKind::Docker,
+            "ctr-docker",
+            "running",
+        ))
+        .unwrap();
+        // `ctr-b` is used first and `ctr-a` last, so a list that came back
+        // alphabetically rather than by use would read the other way round.
+        db.touch_sandbox_instance(SandboxBackendKind::Podman, "ctr-b", "running")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        db.touch_sandbox_instance(SandboxBackendKind::Podman, "ctr-a", "running")
+            .unwrap();
+
+        let podman = db
+            .list_sandbox_instances_for_engine(SandboxBackendKind::Podman)
+            .unwrap();
+        assert_eq!(
+            podman
+                .iter()
+                .map(|i| i.external_id.as_str())
+                .collect::<Vec<_>>(),
+            ["ctr-b", "ctr-a"]
+        );
+        let docker = db
+            .list_sandbox_instances_for_engine(SandboxBackendKind::Docker)
+            .unwrap();
+        assert_eq!(docker.len(), 1);
+        assert_eq!(docker[0].external_id, "ctr-docker");
+        assert!(db
+            .list_sandbox_instances_for_engine(SandboxBackendKind::WslDistro)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
