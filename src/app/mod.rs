@@ -2292,7 +2292,11 @@ impl App {
             cwd,
             agent,
             fork_session_id: None,
-            backend: crate::session::is_remote_backend(&backend_type).then_some(backend_type),
+            // Preserved for every off-host backend, and a **place** counts:
+            // env injection below skips the local-path dir variables for one,
+            // and a forwarded `FRIRING_DATA_DIR` would point the in-place
+            // `friring-cli` at the host's database (ADR-29).
+            backend: crate::session::is_offhost_backend(&backend_type).then_some(backend_type),
             // Only reaches the args when the restart falls back to a fresh
             // conversation (new_session_args); a resume never renames.
             session_name: Some(session_name),
@@ -4880,6 +4884,17 @@ impl App {
                 .backends
                 .get(name)
                 .cloned()
+                // A place this instance has not opened yet is not an unknown
+                // backend: the launch is about to ensure it and spawn through
+                // the transport it hands back
+                // ([`crate::agent::backend::Session::spawn`]), so what is
+                // resolved here is only what a launch that turns out *not* to
+                // be place-backed would fall back to. Refusing would make a
+                // first spawn after a restart impossible.
+                .or_else(|| {
+                    crate::session::is_sandbox_backend(name)
+                        .then(|| self.backends.default_backend().clone())
+                })
                 .ok_or_else(|| format!("Unknown backend '{name}'")),
             _ => Ok(self.backends.default_backend().clone()),
         }
@@ -7660,10 +7675,13 @@ impl App {
             // agent would come back on the host, outside the profile the
             // session was created under.
             sandbox,
-            // Preserve a persisted off-local (`ssh:<host>` / `wsl:<distro>`)
-            // backend — set *before* env injection, which skips the local-path
-            // dir vars for remote sessions. Local stays `None`.
-            backend: crate::session::is_remote_backend(backend_type)
+            // Preserve a persisted off-host (`ssh:<host>` / `wsl:<distro>` /
+            // `sandbox:<profile>`) backend — set *before* env injection, which
+            // skips the local-path dir vars for one. A place skips them for a
+            // stronger reason than a host: a forwarded `FRIRING_DATA_DIR` would
+            // name the one thing the boundary exists to keep out (ADR-29).
+            // Local stays `None`.
+            backend: crate::session::is_offhost_backend(backend_type)
                 .then(|| backend_type.to_string()),
             // Only reaches the args when the relaunch starts a fresh
             // conversation (new_session_args); a resume never renames.
@@ -7857,7 +7875,10 @@ impl App {
             if session.is_placeholder() {
                 continue;
             }
-            let frame = if crate::session::is_remote_backend(session.backend_name()) {
+            // A place counts as off-host here for the same reason a host does:
+            // the capture would be an `<engine> exec` round trip on the way out,
+            // and a container that is already going down would hang the exit.
+            let frame = if crate::session::is_offhost_backend(session.backend_name()) {
                 session.serialize_visible_frame()
             } else {
                 session.capture_unload_frame()
@@ -9018,10 +9039,12 @@ impl App {
         // restarts: `do_spawn_session` upserts in place (no soft-delete + new-row
         // churn), and `FRIRING_SESSION` is re-injected with the same id. Any
         // cached id / queued message addressed to this session stays valid.
-        // Preserving a remote `backend` keeps the respawn on its own host —
-        // without it `do_spawn_session` would silently relaunch the session on
-        // the local tmux, pointed at worktree paths that only exist remotely.
-        let backend = crate::session::is_remote_backend(&shared.backend_type)
+        // Preserving an off-host `backend` keeps the respawn where the session
+        // lives — without it `do_spawn_session` would silently relaunch on the
+        // local tmux, pointed at worktree paths that only exist remotely, and
+        // would forward the local-path environment variables into a place
+        // (ADR-29).
+        let backend = crate::session::is_offhost_backend(&shared.backend_type)
             .then(|| shared.backend_type.clone());
         // After a reboot every sandboxed session comes back through here, so
         // the profile has to be re-applied or the agent silently resumes on the
@@ -10622,6 +10645,29 @@ mod tests {
         // lives inside a container onto the host's tmux would corrupt its
         // `backend_type` and could collide with an unrelated local `%N`.
         assert!(app.resolve_persisted_backend("sandbox:dev").is_none());
+    }
+
+    /// ADR-29 in the relaunch config: a place-backed session must keep its
+    /// `sandbox:<profile>` backend through a restart and a restore, because that
+    /// is what makes `inject_friring_env` skip the variables pointing at the
+    /// host's data directory.
+    #[test]
+    fn a_relaunch_keeps_the_backend_that_decides_what_env_travels() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        for backend_type in ["sandbox:dev", "ssh:devbox", "wsl:Ubuntu"] {
+            let mut config = SessionConfig {
+                session_id: Some(SessionId::default()),
+                backend: crate::session::is_offhost_backend(backend_type)
+                    .then(|| backend_type.to_string()),
+                ..SessionConfig::default()
+            };
+            crate::session_ops::inject_friring_env(&mut config, "conv", None);
+            assert!(
+                !config.env.contains_key(crate::paths::DATA_DIR_OVERRIDE_ENV),
+                "{backend_type} was handed the host's data directory"
+            );
+        }
     }
 
     /// A place and a host both go down, and a message has to say which: a host
