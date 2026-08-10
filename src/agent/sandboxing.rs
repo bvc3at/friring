@@ -18,6 +18,11 @@ use std::collections::HashMap;
 use crate::sandbox::{SandboxHost, SandboxLaunch};
 use crate::session::{AgentDef, SessionConfig};
 
+/// Re-exported because `session_ops` may not reference [`crate::sandbox`] at
+/// all (`tests/architecture_rules.rs`), and the headless launch paths have to
+/// name the handle they hold across a kill and a spawn.
+pub use crate::sandbox::PendingEgress;
+
 /// A launch with its sandbox profile applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxedInvocation {
@@ -63,6 +68,13 @@ pub enum SandboxDecision {
 /// readable. `None` is an agent friring could not resolve a definition for; the
 /// profile still applies, the agent just gets no help.
 ///
+/// A filtered profile binds an egress proxy here, because argv has to name the
+/// port or the socket. That instance is **provisional**: the session keeps
+/// whatever it is already using until the launch this composed for is running.
+/// Every caller must therefore take [`pending_egress`] before it can fail and
+/// [`commit`](PendingEgress::commit) it once the pane exists — the boundary is
+/// released, and the session's own left alone, on every path that does not.
+///
 /// # Errors
 ///
 /// The profile named a backend that is unavailable here, resolved to a policy
@@ -80,10 +92,11 @@ pub fn apply(
     args: &[String],
 ) -> Result<SandboxDecision, String> {
     let Some(profile) = config.sandbox.as_ref() else {
-        // A session whose profile was cleared keeps nothing running: this is a
-        // no-op for the overwhelmingly common case, because it never starts the
-        // egress supervisor to ask.
-        crate::sandbox::egress::stop(&session_key(config));
+        // A session whose profile was cleared keeps nothing running — but not
+        // before this launch happens, because until then the agent still
+        // running is the one that boundary belongs to. Free for the
+        // overwhelmingly common case: no supervisor is started to say so.
+        PendingEgress::clearing(&session_key(config)).park();
         return Ok(SandboxDecision::Unsandboxed);
     };
     let fallback = profile.allow_unsandboxed_fallback;
@@ -100,17 +113,80 @@ pub fn apply(
         }
         None => return Err(NO_HOME.to_string()),
     };
-    match build(
-        SandboxHost::local_shared(),
-        &home,
-        def,
-        config,
-        command,
-        args,
-    ) {
+    match with_host(|host| build(host, &home, def, config, command, args)) {
         Ok(invocation) => Ok(SandboxDecision::Wrapped(Box::new(invocation))),
         Err(reason) if fallback => Ok(SandboxDecision::Skipped { reason }),
         Err(reason) => Err(reason),
+    }
+}
+
+/// Take the egress instance the composition for this session prepared, so the
+/// launch that is about to happen owns it.
+///
+/// Always answers, so a launch path treats every session the same way: a
+/// session with no profile — or one whose network mode the kernel enforces on
+/// its own — gets a handle with nothing to commit. Call it immediately after
+/// [`apply`], before anything that can fail, and
+/// [`commit`](PendingEgress::commit) it once the agent's pane exists.
+pub fn pending_egress(config: &SessionConfig) -> PendingEgress {
+    crate::sandbox::egress::claim(&session_key(config))
+}
+
+/// Run `wrap` against the host friring itself runs on — or, in a test, the one
+/// it installed.
+fn with_host<R>(wrap: impl FnOnce(&SandboxHost) -> R) -> R {
+    #[cfg(test)]
+    if let Some(host) = TEST_HOST.with(|installed| installed.borrow().clone()) {
+        return wrap(&host);
+    }
+    wrap(SandboxHost::local_shared())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// See [`TestSandboxHost`].
+    static TEST_HOST: std::cell::RefCell<Option<std::sync::Arc<SandboxHost>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Compose against a fabricated host for as long as this guard lives — the
+/// sandbox twin of [`crate::paths::TestPathGuard`], and thread-local for the
+/// same reason.
+///
+/// [`apply`] resolves the backend from the machine friring runs on, so without
+/// this every test of a *launch* would assert something different depending on
+/// whether the host it ran on happened to have seatbelt or bubblewrap
+/// installed. Nothing here executes a sandbox: the wrapped argv is composed and
+/// handed to a stub.
+#[cfg(test)]
+pub(crate) struct TestSandboxHost;
+
+#[cfg(test)]
+impl TestSandboxHost {
+    pub(crate) fn new(host: SandboxHost) -> Self {
+        let host = std::sync::Arc::new(host);
+        TEST_HOST.with(|installed| *installed.borrow_mut() = Some(host));
+        Self
+    }
+
+    /// A host offering seatbelt, whatever this machine is.
+    ///
+    /// The one shape that composes end to end inside a test process: the
+    /// transport is host loopback, so no relay — and therefore no
+    /// `friring-cli` beside the test binary — is involved. Named rather than
+    /// built by the caller because `session_ops` may not reference
+    /// [`crate::sandbox`] at all, and its launch paths need this too.
+    pub(crate) fn seatbelt() -> Self {
+        Self::new(SandboxHost::new(std::sync::Arc::new(
+            crate::sandbox::probe::StubHost::macos(26, true),
+        )))
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestSandboxHost {
+    fn drop(&mut self) {
+        TEST_HOST.with(|installed| *installed.borrow_mut() = None);
     }
 }
 
@@ -216,23 +292,41 @@ fn build(
     // listening. A failure here refuses the launch — `apply` turns that into
     // the profile's own `allow_unsandboxed_fallback` decision — rather than
     // starting an agent that believes it is filtered and is not.
-    let proxy = if crate::sandbox::egress::proxy_required(&policy) {
-        let grant = crate::sandbox::egress::establish(
+    //
+    // `pending` is what keeps the instance from being the session's before the
+    // launch is: holding it here means every `?` below releases it, and the
+    // session's current boundary — a healthy agent's way out — is untouched
+    // until the launch path commits.
+    let (proxy, pending) = if crate::sandbox::egress::proxy_required(&policy) {
+        // The key is the boundary's identity: the token, the socket and the
+        // first-use answers are all per session, and two launches sharing one
+        // key share all three — starting the second would replace the first's
+        // instance mid-run, and one session's "allow this domain?" would widen
+        // the other's. A launch with no id of its own has no boundary to be
+        // told apart by, so it is refused rather than filed under the fallback.
+        if session_key == UNIDENTIFIED_SESSION {
+            return Err(
+                "This launch has no session id, so its egress boundary could not be told \
+                 apart from another's"
+                    .to_string(),
+            );
+        }
+        let prepared = crate::sandbox::egress::prepare(
             &session_key,
             &policy,
             transport,
             std::path::Path::new(&tmp_dir),
         )
         .map_err(|e| e.to_string())?;
-        for (key, value) in grant.env {
+        for (key, value) in prepared.grant.env {
             policy.insert_env(key, value);
         }
-        Some(grant.endpoint)
+        (Some(prepared.grant.endpoint), prepared.pending)
     } else {
         // A profile edited from `allowlist` to `full` or `none` must not leave
-        // the previous launch's listener behind.
-        crate::sandbox::egress::stop(&session_key);
-        None
+        // the previous launch's listener behind — once this launch is the one
+        // running, and not before.
+        (None, PendingEgress::clearing(&session_key))
     };
 
     let mut launch = SandboxLaunch::new(&policy, home, &session_key).with_tmp_dir(&tmp_dir);
@@ -256,13 +350,12 @@ fn build(
     argv.extend(args.iter().cloned());
     argv.extend(plan.extra_args.iter().cloned());
 
-    let wrapped = host.wrap(backend, argv, &launch).map_err(|e| {
-        // Nothing is going to use the proxy that was started for this launch:
-        // the caller either fails the spawn or falls back to the host, and a
-        // listener with no session behind it is a token left lying around.
-        crate::sandbox::egress::stop(&session_key);
-        e.to_string()
-    })?;
+    // A wrap that fails takes `pending` down with the stack: nothing is going to
+    // use the instance prepared for this launch, and the session's own — which
+    // this composition has not touched — keeps serving whatever is running.
+    let wrapped = host
+        .wrap(backend, argv, &launch)
+        .map_err(|e| e.to_string())?;
     let mut wrapped = wrapped.into_iter();
     let command = wrapped
         .next()
@@ -280,6 +373,11 @@ fn build(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     env.extend(policy.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+    // Composed, so the instance survives this stack — but as the *launch's*,
+    // not the session's. Whoever spawns the pane claims it with
+    // `pending_egress` and commits it once there is something behind it.
+    pending.park();
 
     Ok(SandboxedInvocation {
         command,
@@ -320,16 +418,25 @@ pub fn cleanup_by_session_id(session_id: crate::session::SessionId) {
     crate::sandbox::cleanup_session(&key);
 }
 
+/// The key a launch that pinned neither id falls back to.
+///
+/// A constant, so two such launches collide — which for the scratch directory
+/// is a shared writable directory and no worse, and for the egress boundary
+/// would be a shared credential and a shared socket. `build` refuses a proxied
+/// launch under this key rather than filing two boundaries under one name.
+const UNIDENTIFIED_SESSION: &str = "session";
+
 /// Names the generated profile file and the scratch directory, so two sessions
 /// of one profile never race on either. The friring session id when the caller
 /// pinned one (it always does on a real spawn, because it is also
-/// `FRIRING_SESSION`), otherwise the agent's own conversation id.
+/// `FRIRING_SESSION`), otherwise the agent's own conversation id, and
+/// [`UNIDENTIFIED_SESSION`] when there is neither.
 fn session_key(config: &SessionConfig) -> String {
     config
         .session_id
         .map(|id| id.to_string())
         .or_else(|| config.agent_session_id.clone())
-        .unwrap_or_else(|| "session".to_string())
+        .unwrap_or_else(|| UNIDENTIFIED_SESSION.to_string())
 }
 
 #[cfg(test)]
@@ -637,6 +744,215 @@ mod tests {
         )))
     }
 
+    /// The seatbelt port the kernel policy opens — which is the one the
+    /// composed launch would dial.
+    fn proxy_port(wrapped: &SandboxedInvocation) -> u16 {
+        let param = wrapped
+            .args
+            .iter()
+            .find(|a| a.starts_with("PROXY="))
+            .unwrap_or_else(|| panic!("no proxy parameter in {:?}", wrapped.args));
+        param
+            .trim_start_matches("PROXY=localhost:")
+            .parse()
+            .unwrap_or_else(|e| panic!("{param}: {e}"))
+    }
+
+    /// Wait for every egress command queued so far to have been handled: the
+    /// supervisor answers one at a time, so a reply to a later one is proof the
+    /// earlier ones are done.
+    fn settle(session_key: &str) -> Option<Vec<String>> {
+        crate::sandbox::egress::running_allow_rules(session_key)
+    }
+
+    /// A boundary needs a name of its own, and a launch that has none is
+    /// refused rather than filed under the shared fallback.
+    ///
+    /// Two such launches would share one key, and everything the key owns is
+    /// per boundary: starting the second replaces the first's instance while
+    /// its agent is still running, they hold one token and one socket, and one
+    /// session's first-use answer widens the other's allowlist. The scratch
+    /// directory tolerates the collision; the boundary must not.
+    #[test]
+    fn a_launch_with_no_session_id_gets_no_boundary_to_share() {
+        let _guard = fabricated_data_dir("unidentified");
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.network_allow = vec!["api.anthropic.com".into()];
+        let config = config_with(Some(profile));
+        assert_eq!(session_key(&config), UNIDENTIFIED_SESSION);
+
+        let refusal = build(
+            &mac_host(),
+            "/fabricated/home",
+            None,
+            &config,
+            "claude",
+            &[],
+        )
+        .expect_err("an unidentifiable boundary must not be composed");
+        assert!(refusal.contains("no session id"), "{refusal}");
+        assert_eq!(
+            settle(UNIDENTIFIED_SESSION),
+            None,
+            "a refused launch left an instance behind"
+        );
+
+        // The same profile with an id composes: it is the anonymity that is
+        // refused, not the profile.
+        let mut identified = config.clone();
+        identified.agent_session_id = Some("egress-identified".into());
+        build(
+            &mac_host(),
+            "/fabricated/home",
+            None,
+            &identified,
+            "claude",
+            &[],
+        )
+        .expect("an identified launch composes");
+        cleanup(&identified);
+    }
+
+    /// Composing is not launching. The instance is bound — argv has to name its
+    /// port — but it belongs to nobody until a pane exists, so the launch path
+    /// claims it and commits it, and a composition thrown away in between
+    /// leaves nothing running.
+    #[test]
+    fn a_composition_leaves_its_boundary_for_the_launch_to_claim() {
+        let _guard = fabricated_data_dir("claim");
+        let key = "egress-claim";
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.network_allow = vec!["api.anthropic.com".into()];
+        let mut config = config_with(Some(profile));
+        config.agent_session_id = Some(key.into());
+
+        let wrapped = build(
+            &mac_host(),
+            "/fabricated/home",
+            None,
+            &config,
+            "claude",
+            &[],
+        )
+        .unwrap();
+        let port = proxy_port(&wrapped);
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+        assert_eq!(
+            settle(key),
+            None,
+            "composing must not hand the session a boundary it is not running behind"
+        );
+
+        let pending = pending_egress(&config);
+        assert!(pending.is_pending(), "the launch found nothing to claim");
+        assert!(
+            !pending_egress(&config).is_pending(),
+            "a second claim must not take the same instance twice"
+        );
+        pending.commit();
+        assert_eq!(
+            settle(key),
+            Some(vec!["api.anthropic.com".to_string()]),
+            "the launch's boundary is the session's once it has a pane"
+        );
+
+        cleanup(&config);
+    }
+
+    /// The other half: a launch that never happens releases what it composed,
+    /// rather than leaving a listener and a token with no session behind them.
+    #[test]
+    fn a_launch_that_never_happens_releases_the_boundary_it_composed() {
+        let _guard = fabricated_data_dir("released");
+        let key = "egress-released";
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.network_allow = vec!["api.anthropic.com".into()];
+        let mut config = config_with(Some(profile));
+        config.agent_session_id = Some(key.into());
+
+        let wrapped = build(
+            &mac_host(),
+            "/fabricated/home",
+            None,
+            &config,
+            "claude",
+            &[],
+        )
+        .unwrap();
+        let port = proxy_port(&wrapped);
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+
+        drop(pending_egress(&config));
+        settle(key);
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "the proxy for a launch that never happened is still listening"
+        );
+        assert_eq!(settle(key), None);
+    }
+
+    /// Editing a profile down to a mode the kernel enforces on its own is a
+    /// composition that needs no proxy — and it must not take the running
+    /// agent's away either, for exactly the same reason: the launch that
+    /// replaces that agent may never happen.
+    #[test]
+    fn a_profile_that_no_longer_needs_a_proxy_keeps_the_running_one_until_the_relaunch() {
+        let _guard = fabricated_data_dir("cleared");
+        let key = "egress-cleared";
+        let compose = |profile: SandboxProfile| {
+            let mut config = config_with(Some(profile));
+            config.agent_session_id = Some(key.into());
+            let wrapped = build(
+                &mac_host(),
+                "/fabricated/home",
+                None,
+                &config,
+                "claude",
+                &[],
+            )
+            .expect("the boundary composes");
+            (config, wrapped)
+        };
+        let filtered = || {
+            let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+            profile.network_allow = vec!["api.anthropic.com".into()];
+            profile
+        };
+        let unfiltered = || {
+            let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+            profile.network_mode = crate::session::NetworkMode::None;
+            profile
+        };
+
+        // The instance the running agent was launched with.
+        let (config, wrapped) = compose(filtered());
+        let port = proxy_port(&wrapped);
+        pending_egress(&config).commit();
+        assert_eq!(settle(key), Some(vec!["api.anthropic.com".to_string()]));
+
+        // The profile is edited, and a relaunch composed against it — twice,
+        // once thrown away and once launched.
+        let (config, _) = compose(unfiltered());
+        assert_eq!(
+            settle(key),
+            Some(vec!["api.anthropic.com".to_string()]),
+            "composing retired a boundary the running agent is still reaching"
+        );
+        drop(pending_egress(&config));
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+            "a relaunch that never happened cost the running agent its egress"
+        );
+
+        let (config, _) = compose(unfiltered());
+        pending_egress(&config).commit();
+        assert_eq!(settle(key), None, "the relaunch needs no proxy");
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "the boundary the session no longer has is still listening"
+        );
+    }
+
     /// The whole of P2 in one launch: a filtered profile starts a proxy before
     /// the agent exists, the kernel policy opens exactly that port, and the
     /// agent is handed every spelling of the proxy environment.
@@ -666,15 +982,7 @@ mod tests {
 
         // The one hole the profile leaves open names the port the proxy is
         // already listening on: nothing can race a listener that is not bound.
-        let param = wrapped
-            .args
-            .iter()
-            .find(|a| a.starts_with("PROXY="))
-            .unwrap_or_else(|| panic!("no proxy parameter in {:?}", wrapped.args));
-        let port: u16 = param
-            .trim_start_matches("PROXY=localhost:")
-            .parse()
-            .unwrap_or_else(|e| panic!("{param}: {e}"));
+        let port = proxy_port(&wrapped);
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
 
         let expected = format!("127.0.0.1:{port}");

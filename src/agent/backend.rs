@@ -13,6 +13,7 @@ use tracing::{debug, error, warn};
 
 use crate::agent::osc52::Osc52Scanner;
 use crate::agent::provider::AgentProvider;
+use crate::sandbox::PendingEgress;
 use crate::session::{SandboxState, SessionConfig, SessionInfo};
 
 pub(crate) fn now_millis() -> u64 {
@@ -497,6 +498,12 @@ struct Sandboxed {
     command: String,
     args: Vec<String>,
     env: HashMap<String, String>,
+    /// The egress proxy this invocation was composed against, if the profile
+    /// needs one. Provisional: the session keeps the instance it is already
+    /// using until [`PendingEgress::commit`], and a launch that fails between
+    /// composing and spawning releases this one by dropping it. Every field
+    /// above is useless without a pane, and so is this.
+    egress: PendingEgress,
     /// The profile the session **asked for**, for
     /// `SessionInfo::sandbox_profile`. Carried through whether or not the
     /// boundary went on: a launch that fell back to the host must not erase the
@@ -520,18 +527,23 @@ fn sandboxed_invocation(
     config: &SessionConfig,
     provider: &Arc<dyn AgentProvider>,
 ) -> Result<Sandboxed> {
+    let command = provider.command().to_string();
+    let args = provider.build_args(config);
+    let decision = crate::agent::sandboxing::apply(provider.agent_def(), config, &command, &args)
+        .map_err(anyhow::Error::msg)?;
     let plain = Sandboxed {
-        command: provider.command().to_string(),
-        args: provider.build_args(config),
+        command,
+        args,
         env: config.env.clone(),
         // The desired profile, regardless of what the decision turns out to be:
         // it is `None` exactly when the session carries none.
         profile: config.sandbox.as_ref().map(|p| p.name.clone()),
         state: None,
+        // Claimed here rather than left parked so the invocation and the
+        // boundary it names travel together: whatever happens to one of them
+        // from now on happens to both.
+        egress: crate::agent::sandboxing::pending_egress(config),
     };
-    let decision =
-        crate::agent::sandboxing::apply(provider.agent_def(), config, &plain.command, &plain.args)
-            .map_err(anyhow::Error::msg)?;
 
     match decision {
         crate::agent::sandboxing::SandboxDecision::Unsandboxed => Ok(plain),
@@ -556,6 +568,7 @@ fn sandboxed_invocation(
                 env,
                 profile: plain.profile,
                 state: Some(SandboxState::Applied(wrapped.state)),
+                egress: plain.egress,
             })
         }
     }
@@ -636,6 +649,7 @@ impl Session {
             env,
             profile,
             state,
+            egress,
         } = sandboxed_invocation(config, provider)?;
 
         let spawned = backend.spawn(
@@ -647,6 +661,9 @@ impl Session {
             rows,
             cols,
         )?;
+        // There is a pane now, so the boundary composed above has something to
+        // be the boundary *of*. A spawn that failed dropped it instead.
+        egress.commit();
 
         let mut info = SessionInfo::new(name);
         // Reuse the caller-supplied id when present (stable identity across a
@@ -1243,6 +1260,11 @@ impl Session {
         // applying a sandbox profile can fail (backend unavailable with
         // fallback off, a policy this build can't express, an I/O error writing
         // the profile), and a healthy session must survive that.
+        //
+        // Which is also why `egress` is a *provisional* boundary held across
+        // the kill and the spawn: composing binds a fresh proxy, and until this
+        // relaunch has a pane the session's agent — still running if the kill
+        // failed — must keep the instance it was launched with.
         let window_name = crate::agent::tmux::agent_window_name(&self.info.name);
         let Sandboxed {
             command,
@@ -1250,6 +1272,7 @@ impl Session {
             env,
             profile,
             state: sandbox_state,
+            egress,
         } = sandboxed_invocation(config, &self.provider)?;
 
         // A placeholder/ghost owns no live pane — killing its empty backend_id
@@ -1267,6 +1290,10 @@ impl Session {
             rows,
             cols,
         )?;
+        // The relaunch has a pane: the boundary composed for it replaces the
+        // one the retired pane was using, and that one is shut down. Every
+        // failure above dropped it instead, leaving the session's own alone.
+        egress.commit();
 
         let (state, backend_id) = Self::wire_up(
             rows,
@@ -1572,14 +1599,37 @@ impl Session {
 mod tests {
     use super::*;
 
-    /// Inert backend that counts `kill`, so a failed restart can be shown not
-    /// to have torn the live pane down.
-    struct KillCountingBackend {
+    /// A backend scripted for one outcome, counting `kill` and recording the
+    /// environment a `spawn` was handed.
+    ///
+    /// The environment is where a launch's boundary names itself — the port is
+    /// inside `HTTP_PROXY` — so recording it is what lets a test prove the
+    /// listener a failed launch composed is *gone*, rather than merely
+    /// uncommitted.
+    struct ScriptedBackend {
         kills: Arc<AtomicU64>,
+        kill_fails: bool,
+        /// A spawn that fails is what the launch-failure tests need; one that
+        /// succeeds hands back a pane whose output ends immediately.
+        spawn_succeeds: bool,
+        spawn_env: Arc<Mutex<HashMap<String, String>>>,
     }
-    impl SessionBackend for KillCountingBackend {
+
+    impl ScriptedBackend {
+        /// Kills succeed, spawns fail, nothing recorded yet.
+        fn new() -> Self {
+            Self {
+                kills: Arc::new(AtomicU64::new(0)),
+                kill_fails: false,
+                spawn_succeeds: false,
+                spawn_env: Arc::default(),
+            }
+        }
+    }
+
+    impl SessionBackend for ScriptedBackend {
         fn name(&self) -> &str {
-            "kill-counting"
+            "scripted"
         }
         fn check_available(&self) -> Result<()> {
             Ok(())
@@ -1593,11 +1643,21 @@ mod tests {
             _: &str,
             _: &[String],
             _: Option<&Path>,
-            _: &HashMap<String, String>,
+            env: &HashMap<String, String>,
             _: u16,
             _: u16,
         ) -> Result<SpawnedSession> {
-            anyhow::bail!("stub backend does not spawn")
+            if let Ok(mut recorded) = self.spawn_env.lock() {
+                recorded.clone_from(env);
+            }
+            if !self.spawn_succeeds {
+                anyhow::bail!("stub backend does not spawn");
+            }
+            Ok(SpawnedSession {
+                backend_id: "%scripted".to_string(),
+                output: Box::new(std::io::empty()),
+                input: Box::new(std::io::sink()),
+            })
         }
         fn adopt(&self, _: &str, _: u16, _: u16, _: Option<Vec<u8>>) -> Result<AdoptedSession> {
             anyhow::bail!("stub backend does not adopt")
@@ -1613,6 +1673,9 @@ mod tests {
         }
         fn kill(&self, _: &str) -> Result<()> {
             self.kills.fetch_add(1, Ordering::SeqCst);
+            if self.kill_fails {
+                anyhow::bail!("stub backend cannot kill that pane");
+            }
             Ok(())
         }
         fn detach(&self, _: &str) -> Result<()> {
@@ -1629,8 +1692,9 @@ mod tests {
     #[test]
     fn restart_keeps_the_pane_when_the_sandbox_cannot_be_applied() {
         let kills = Arc::new(AtomicU64::new(0));
-        let backend: Arc<dyn SessionBackend> = Arc::new(KillCountingBackend {
+        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptedBackend {
             kills: Arc::clone(&kills),
+            ..ScriptedBackend::new()
         });
         let provider: Arc<dyn AgentProvider> = Arc::new(crate::agent::GenericProvider::new(
             crate::agent::agent_config::builtin_registry()
@@ -1728,6 +1792,10 @@ mod tests {
         profile.backend = crate::session::SandboxBackendKind::Auto;
         let config = SessionConfig {
             sandbox: Some(profile),
+            // As a real spawn always does. The default profile's `allowlist`
+            // needs the egress proxy, and a boundary with no session to be
+            // named by is refused rather than sharing the fallback key.
+            session_id: Some(crate::session::SessionId::default()),
             ..SessionConfig::default()
         };
 
@@ -1751,6 +1819,236 @@ mod tests {
                 "this host offers a backend, so the wrap should have applied: {e:#}"
             ),
         }
+    }
+
+    /// Everything the egress tests below need to be about the boundary rather
+    /// than about the machine they run on: a fabricated data directory, and a
+    /// host that offers seatbelt whether or not this one does. Held together
+    /// because dropping either mid-test would move the ground under the launch.
+    struct EgressFixture {
+        _paths: crate::paths::TestPathGuard,
+        _host: crate::agent::sandboxing::TestSandboxHost,
+        _dir: tempfile::TempDir,
+        session_id: crate::session::SessionId,
+        /// Where a scripted spawn records the environment it was handed.
+        spawn_env: Arc<Mutex<HashMap<String, String>>>,
+    }
+
+    impl EgressFixture {
+        fn new() -> Self {
+            let dir = tempfile::TempDir::new().expect("a private test directory");
+            Self {
+                _paths: crate::paths::TestPathGuard::new(dir.path()),
+                _host: crate::agent::sandboxing::TestSandboxHost::seatbelt(),
+                _dir: dir,
+                session_id: crate::session::SessionId::default(),
+                spawn_env: Arc::default(),
+            }
+        }
+
+        fn key(&self) -> String {
+            self.session_id.to_string()
+        }
+
+        /// A session pinned to this fixture's id, filtered to one domain — so
+        /// the composition binds a real proxy, and the rule it enforces says
+        /// which instance a later assertion is looking at.
+        fn config(&self, allow: &str) -> SessionConfig {
+            let mut profile = crate::session::SandboxProfile::new(
+                "dev",
+                vec![crate::session::SandboxPath::workspace(
+                    "/fabricated/dev/app",
+                )],
+            );
+            profile.network_allow = vec![allow.to_string()];
+            SessionConfig {
+                session_id: Some(self.session_id),
+                sandbox: Some(profile),
+                ..SessionConfig::default()
+            }
+        }
+
+        /// The proxy already serving this session, as one launched earlier
+        /// would have left it: committed, listening, and enforcing `allow`.
+        fn running_proxy(&self, allow: &str) -> u16 {
+            let config = self.config(allow);
+            let policy = config
+                .sandbox
+                .as_ref()
+                .expect("the fixture's profile")
+                .resolve(
+                    crate::session::SandboxBackendKind::Seatbelt,
+                    "/fabricated/home",
+                )
+                .expect("a valid profile");
+            let scratch =
+                crate::sandbox::create_session_scratch(&self.key()).expect("a scratch directory");
+            let grant = crate::sandbox::egress::establish(
+                &self.key(),
+                &policy,
+                crate::sandbox::ProxyTransport::Loopback,
+                &scratch,
+            )
+            .expect("the session's own proxy binds");
+            match grant.endpoint {
+                crate::sandbox::ProxyEndpoint::Loopback { port } => port,
+                other => panic!("expected a loopback endpoint, got {other:?}"),
+            }
+        }
+
+        fn backend(&self, scripted: ScriptedBackend) -> Arc<dyn SessionBackend> {
+            Arc::new(ScriptedBackend {
+                spawn_env: Arc::clone(&self.spawn_env),
+                ..scripted
+            })
+        }
+
+        /// The port the launch was composed against, read out of the
+        /// environment the spawn was handed.
+        fn composed_proxy_port(&self) -> u16 {
+            let env = self.spawn_env.lock().expect("the recorded environment");
+            let url = env
+                .get("HTTP_PROXY")
+                .unwrap_or_else(|| panic!("no HTTP_PROXY in the spawn environment: {env:?}"));
+            url.rsplit(':')
+                .next()
+                .and_then(|port| port.parse().ok())
+                .unwrap_or_else(|| panic!("no port in {url}"))
+        }
+    }
+
+    /// Wait for every egress command queued so far to have been handled, and
+    /// answer with the rules the session's own instance is enforcing: the
+    /// supervisor takes one command at a time, so its reply is proof the
+    /// earlier ones are done.
+    fn settled_rules(session_key: &str) -> Option<Vec<String>> {
+        crate::sandbox::egress::running_allow_rules(session_key)
+    }
+
+    fn listening(port: u16) -> bool {
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+    }
+
+    /// A launch binds its proxy before it has a pane, so a spawn that fails
+    /// must take the proxy with it. What it left behind before was a listener
+    /// and a live credential belonging to a session that never existed.
+    #[test]
+    fn a_spawn_that_fails_leaves_no_listener_behind() {
+        let fixture = EgressFixture::new();
+        let backend = fixture.backend(ScriptedBackend::new());
+        let config = fixture.config("api.anthropic.com");
+
+        let Err(err) = Session::spawn(
+            "boxed".to_string(),
+            24,
+            80,
+            &config,
+            &backend,
+            &default_provider(),
+        ) else {
+            panic!("the scripted backend refuses to spawn");
+        };
+        assert!(err.to_string().contains("does not spawn"), "{err:#}");
+
+        assert_eq!(
+            settled_rules(&fixture.key()),
+            None,
+            "a session that never existed was given a boundary"
+        );
+        let port = fixture.composed_proxy_port();
+        assert!(
+            !listening(port),
+            "the proxy composed for a session that never existed is still listening"
+        );
+    }
+
+    /// The restart half, and the worse one: composing happens *before* the kill
+    /// precisely so a healthy session survives a composition failure — which
+    /// means a kill that fails leaves the old agent running. Its way out must
+    /// still be there.
+    #[test]
+    fn a_restart_whose_kill_fails_leaves_the_running_agent_its_egress() {
+        let fixture = EgressFixture::new();
+        let old_port = fixture.running_proxy("old.example");
+        let backend = fixture.backend(ScriptedBackend {
+            kill_fails: true,
+            ..ScriptedBackend::new()
+        });
+        let mut session = Session::stub("boxed", &backend, &default_provider());
+
+        let err = session
+            .restart(&fixture.config("new.example"), 24, 80)
+            .expect_err("the scripted backend cannot kill the pane");
+        assert!(err.to_string().contains("cannot kill"), "{err:#}");
+
+        assert_eq!(
+            settled_rules(&fixture.key()),
+            Some(vec!["old.example".to_string()]),
+            "the still-running agent's boundary was replaced by a relaunch that never happened"
+        );
+        assert!(
+            listening(old_port),
+            "the still-running agent lost its way out"
+        );
+        crate::sandbox::egress::stop(&fixture.key());
+    }
+
+    /// And when the kill succeeds but the spawn does not: the session keeps the
+    /// instance it had — the next relaunch replaces it — and the one composed
+    /// for the launch that failed is gone.
+    #[test]
+    fn a_restart_whose_spawn_fails_keeps_the_boundary_it_had() {
+        let fixture = EgressFixture::new();
+        let old_port = fixture.running_proxy("old.example");
+        let backend = fixture.backend(ScriptedBackend::new());
+        let mut session = Session::stub("boxed", &backend, &default_provider());
+
+        session
+            .restart(&fixture.config("new.example"), 24, 80)
+            .expect_err("the scripted backend refuses to spawn");
+
+        assert_eq!(
+            settled_rules(&fixture.key()),
+            Some(vec!["old.example".to_string()])
+        );
+        assert!(listening(old_port));
+        assert!(
+            !listening(fixture.composed_proxy_port()),
+            "the proxy composed for a pane that never spawned is still listening"
+        );
+        crate::sandbox::egress::stop(&fixture.key());
+    }
+
+    /// The success path, which is what makes the two above more than "never
+    /// commit anything": a relaunch that reaches its pane takes over, exactly
+    /// once, and the instance it replaced is shut down.
+    #[tokio::test]
+    async fn a_restart_that_succeeds_replaces_the_boundary_exactly_once() {
+        let fixture = EgressFixture::new();
+        let old_port = fixture.running_proxy("old.example");
+        let backend = fixture.backend(ScriptedBackend {
+            spawn_succeeds: true,
+            ..ScriptedBackend::new()
+        });
+        let mut session = Session::stub("boxed", &backend, &default_provider());
+        let config = fixture.config("new.example");
+
+        session
+            .restart(&config, 24, 80)
+            .expect("the relaunch spawns");
+
+        assert_eq!(
+            settled_rules(&fixture.key()),
+            Some(vec!["new.example".to_string()]),
+            "the session is still on the retired agent's boundary"
+        );
+        assert!(listening(fixture.composed_proxy_port()));
+        assert!(!listening(old_port), "the replaced instance kept running");
+        assert!(
+            !crate::agent::sandboxing::pending_egress(&config).is_pending(),
+            "the relaunch left a second instance behind it"
+        );
+        crate::sandbox::egress::stop(&fixture.key());
     }
 
     #[test]

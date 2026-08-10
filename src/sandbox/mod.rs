@@ -29,14 +29,18 @@
 //! let backend = host.select(profile.backend).backend()?;
 //! let policy = profile.resolve(backend, "/home/u")?;
 //! // A filtered network mode is enforced by a proxy *outside* the boundary
-//! // (ADR-27), so one is started — on the transport this backend can reach —
+//! // (ADR-27), so one is bound — on the transport this backend can reach —
 //! // before the launch that opens a hole to it is composed.
 //! let caps = host.backend(backend).expect("a built-in backend").capabilities();
 //! let scratch = create_session_scratch("session-id")?;
-//! let grant = egress::establish("session-id", &policy, caps.proxy_transport, &scratch)?;
-//! let launch =
-//!     SandboxLaunch::new(&policy, "/home/u", "session-id").with_proxy(grant.endpoint);
+//! let prepared = egress::prepare("session-id", &policy, caps.proxy_transport, &scratch)?;
+//! let launch = SandboxLaunch::new(&policy, "/home/u", "session-id")
+//!     .with_proxy(prepared.grant.endpoint);
 //! let _argv = host.wrap(backend, vec!["claude".to_string()], &launch)?;
+//! // The instance belongs to no session until something is running behind it:
+//! // dropping the handle instead releases it and leaves the session's own
+//! // boundary alone.
+//! prepared.pending.commit();
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
@@ -59,7 +63,7 @@ pub use backend::{
 };
 pub use bwrap::{BwrapBackend, BwrapDetails};
 pub use dirs::{check_writable_roots, cleanup_session, create_session_scratch};
-pub use egress::{proxy_required, ProxyGrant, SessionDenial};
+pub use egress::{proxy_required, PendingEgress, Prepared, ProxyGrant, SessionDenial};
 pub use probe::{detect_platform, HostPlatform, LocalProbeHost, ProbeHost, RemoteProbeHost};
 pub use seatbelt::SeatbeltBackend;
 pub use secrets::{secrets_for, SecretKind, SecretPath, SecretPlatform, SECRET_PATHS};

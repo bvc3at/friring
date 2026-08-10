@@ -14,7 +14,7 @@ use crate::sync::SharedSession;
 /// side-effecting [`restart_session_headless`] so the resolution logic (env
 /// injection, resume trigger, multi-repo workspace cwd) is unit-testable
 /// without driving tmux.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 struct RestartPlan {
     window_name: String,
     command: String,
@@ -27,6 +27,47 @@ struct RestartPlan {
     /// not be applied last time comes back, and when one that used to hold
     /// stops holding.
     sandbox: Option<crate::session::SandboxState>,
+    /// The egress proxy this plan was composed against, if the profile needs
+    /// one — bound already, and belonging to nobody. The agent this restart
+    /// replaces is *still running* while the plan is built, and keeps the
+    /// instance it was launched with until this one is committed; a restart
+    /// that never reaches its spawn drops the plan and releases it.
+    egress: crate::agent::sandboxing::PendingEgress,
+}
+
+/// The multiplexer calls a headless restart makes.
+///
+/// Injected so the two failure paths that matter — a kill that fails, leaving
+/// the old agent alive, and a spawn that fails, leaving no agent at all — can
+/// be exercised without a tmux server. Driving the real ones in a test would
+/// either talk to the user's own friring socket or launch an agent.
+struct WindowOps<'a> {
+    kill: &'a dyn Fn(&RestartPlan) -> Result<(), String>,
+    spawn: &'a dyn Fn(&RestartPlan) -> Result<(), String>,
+}
+
+/// The real ones, on the local tmux server.
+fn tmux_windows() -> WindowOps<'static> {
+    WindowOps {
+        kill: &kill_agent_window,
+        spawn: &spawn_agent_window,
+    }
+}
+
+fn kill_agent_window(plan: &RestartPlan) -> Result<(), String> {
+    crate::agent::tmux::kill_window(&plan.window_name)
+        .map_err(|e| format!("Failed to kill tmux window: {e}"))
+}
+
+fn spawn_agent_window(plan: &RestartPlan) -> Result<(), String> {
+    crate::agent::tmux::spawn_window(
+        &plan.window_name,
+        &plan.command,
+        &plan.args,
+        plan.cwd.as_deref(),
+        &plan.env,
+    )
+    .map_err(|e| format!("Failed to re-spawn tmux window: {e}"))
 }
 
 /// Build the [`RestartPlan`] for a persisted session: keep its identity stable,
@@ -84,6 +125,10 @@ fn build_restart_plan(
     }
 
     let invocation = super::build_agent_invocation(&def, &mut config)?;
+    // Composing a filtered profile binds a fresh proxy; claiming it here is
+    // what makes it this *plan's*, so it lives exactly as long as the plan does
+    // and the running agent's own boundary is left where it is.
+    let egress = crate::agent::sandboxing::pending_egress(&config);
 
     Ok(RestartPlan {
         window_name: session.name.clone(),
@@ -92,6 +137,7 @@ fn build_restart_plan(
         cwd: config.cwd,
         env: config.env,
         sandbox: invocation.sandbox,
+        egress,
     })
 }
 
@@ -115,6 +161,15 @@ pub fn restart_session_headless(
     db: &Database,
     session_id: SessionId,
 ) -> Result<Option<crate::session::SandboxState>, String> {
+    restart_session_with(db, session_id, &tmux_windows())
+}
+
+/// [`restart_session_headless`] against `windows`. See [`WindowOps`].
+fn restart_session_with(
+    db: &Database,
+    session_id: SessionId,
+    windows: &WindowOps<'_>,
+) -> Result<Option<crate::session::SandboxState>, String> {
     let session = db
         .get_session_by_id(session_id)
         .map_err(|e| format!("Failed to load session: {e}"))?
@@ -134,16 +189,15 @@ pub fn restart_session_headless(
     let sandbox = super::load_sandbox_profile(db, session.sandbox_profile.as_deref())?;
     let plan = build_restart_plan(&session, sandbox)?;
 
-    crate::agent::tmux::kill_window(&plan.window_name)
-        .map_err(|e| format!("Failed to kill tmux window: {e}"))?;
-    crate::agent::tmux::spawn_window(
-        &plan.window_name,
-        &plan.command,
-        &plan.args,
-        plan.cwd.as_deref(),
-        &plan.env,
-    )
-    .map_err(|e| format!("Failed to re-spawn tmux window: {e}"))?;
+    // Neither of these may commit the plan's boundary. A kill that fails leaves
+    // the old agent running on the instance it was launched with, and a spawn
+    // that fails leaves nothing to hand a new one to; in both cases dropping
+    // `plan` releases what was prepared and changes nothing else.
+    (windows.kill)(&plan)?;
+    (windows.spawn)(&plan)?;
+    // The window exists, so the boundary composed for it is now the session's,
+    // and the one the retired agent was using is shut down.
+    plan.egress.commit();
 
     // The agent was re-spawned fresh; clear any stale hook-driven status so it
     // doesn't show a leftover Blocked/Working/Done until the agent re-reports
@@ -346,6 +400,190 @@ mod tests {
         let sess = session(Some("sid-strict"), Some(temp.path().join("repo")));
         let err = build_restart_plan(&sess, Some(profile)).unwrap_err();
         assert!(err.contains("wsl-distro"), "got: {err}");
+    }
+
+    /// A filtered session, stored, with the boundary composable wherever the
+    /// suite runs — the shape the egress tests below need.
+    fn filtered_session(db: &Database, allow: &str) -> SharedSession {
+        let mut profile = crate::session::SandboxProfile::new(
+            "dev",
+            vec![crate::session::SandboxPath::workspace(
+                "/fabricated/dev/app",
+            )],
+        );
+        profile.network_allow = vec![allow.to_string()];
+        db.upsert_sandbox_profile(&profile).unwrap();
+
+        let mut sess = session(Some("sid-egress"), Some(PathBuf::from("/fabricated/repo")));
+        sess.sandbox_profile = Some("dev".into());
+        db.upsert_session(&sess).unwrap();
+        sess
+    }
+
+    /// The loopback port a composed relaunch would dial, out of the
+    /// environment it hands the window.
+    fn composed_proxy_port(env: &HashMap<String, String>) -> u16 {
+        let url = env
+            .get("HTTP_PROXY")
+            .unwrap_or_else(|| panic!("no HTTP_PROXY in the relaunch environment: {env:?}"));
+        url.rsplit(':')
+            .next()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or_else(|| panic!("no port in {url}"))
+    }
+
+    fn listening(port: u16) -> bool {
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+    }
+
+    /// A released instance is shut down on the supervisor's own thread, so the
+    /// assertion is that it happens, not that it has already happened.
+    fn closes(port: u16) -> bool {
+        (0..200).any(|_| {
+            if !listening(port) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        })
+    }
+
+    /// Composing happens before the kill on purpose — a healthy session must
+    /// survive a composition failure — so a kill that fails leaves the old
+    /// agent running. Its boundary is the one that was there before, and the
+    /// one this relaunch bound goes away with the relaunch.
+    #[test]
+    fn a_headless_restart_whose_kill_fails_leaves_the_running_boundary_alone() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _paths = crate::paths::TestPathGuard::new(temp.path());
+        let _host = crate::agent::sandboxing::TestSandboxHost::seatbelt();
+        let db = Database::open_in_memory().unwrap();
+        let sess = filtered_session(&db, "api.anthropic.com");
+
+        // The instance the running agent was launched with: the same
+        // composition a previous restart made, committed as that one would
+        // have committed it.
+        let previous = build_restart_plan(
+            &sess,
+            super::super::load_sandbox_profile(&db, Some("dev")).unwrap(),
+        )
+        .expect("the boundary composes");
+        let running_port = composed_proxy_port(&previous.env);
+        previous.egress.commit();
+        assert!(listening(running_port));
+
+        let relaunch_env = std::sync::Mutex::new(HashMap::new());
+        let err = restart_session_with(
+            &db,
+            sess.id,
+            &WindowOps {
+                kill: &|plan| {
+                    relaunch_env.lock().unwrap().clone_from(&plan.env);
+                    Err("Failed to kill tmux window: no such window".to_string())
+                },
+                spawn: &|_| panic!("a restart must not spawn after a failed kill"),
+            },
+        )
+        .expect_err("the kill fails");
+        assert!(err.contains("kill"), "{err}");
+
+        let relaunch_port = composed_proxy_port(&relaunch_env.lock().unwrap());
+        assert_ne!(
+            running_port, relaunch_port,
+            "a second instance, not the same"
+        );
+        assert!(
+            closes(relaunch_port),
+            "the relaunch that never happened left its listener behind"
+        );
+        assert!(
+            listening(running_port),
+            "the still-running agent lost the way out it was launched with"
+        );
+    }
+
+    /// The same for a spawn that fails: the session keeps the instance it had
+    /// — the next restart replaces it — rather than being left pointing at a
+    /// boundary composed for a pane that does not exist.
+    #[test]
+    fn a_headless_restart_whose_spawn_fails_keeps_the_boundary_it_had() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _paths = crate::paths::TestPathGuard::new(temp.path());
+        let _host = crate::agent::sandboxing::TestSandboxHost::seatbelt();
+        let db = Database::open_in_memory().unwrap();
+        let sess = filtered_session(&db, "api.anthropic.com");
+
+        let previous = build_restart_plan(
+            &sess,
+            super::super::load_sandbox_profile(&db, Some("dev")).unwrap(),
+        )
+        .expect("the boundary composes");
+        let running_port = composed_proxy_port(&previous.env);
+        previous.egress.commit();
+
+        let relaunch_env = std::sync::Mutex::new(HashMap::new());
+        restart_session_with(
+            &db,
+            sess.id,
+            &WindowOps {
+                kill: &|_| Ok(()),
+                spawn: &|plan| {
+                    relaunch_env.lock().unwrap().clone_from(&plan.env);
+                    Err("Failed to re-spawn tmux window: no server".to_string())
+                },
+            },
+        )
+        .expect_err("the spawn fails");
+
+        assert!(
+            closes(composed_proxy_port(&relaunch_env.lock().unwrap())),
+            "the relaunch that never happened left its listener behind"
+        );
+        assert!(
+            listening(running_port),
+            "the session's boundary was retired for one nothing uses"
+        );
+    }
+
+    /// And the success path, which is what keeps the two above from being
+    /// satisfied by never committing at all: a relaunch that reaches its
+    /// window takes over, and the instance it replaced is shut down.
+    #[test]
+    fn a_headless_restart_that_succeeds_replaces_the_boundary() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _paths = crate::paths::TestPathGuard::new(temp.path());
+        let _host = crate::agent::sandboxing::TestSandboxHost::seatbelt();
+        let db = Database::open_in_memory().unwrap();
+        let sess = filtered_session(&db, "api.anthropic.com");
+
+        let previous = build_restart_plan(
+            &sess,
+            super::super::load_sandbox_profile(&db, Some("dev")).unwrap(),
+        )
+        .expect("the boundary composes");
+        let running_port = composed_proxy_port(&previous.env);
+        previous.egress.commit();
+
+        let relaunch_env = std::sync::Mutex::new(HashMap::new());
+        restart_session_with(
+            &db,
+            sess.id,
+            &WindowOps {
+                kill: &|_| Ok(()),
+                spawn: &|plan| {
+                    relaunch_env.lock().unwrap().clone_from(&plan.env);
+                    Ok(())
+                },
+            },
+        )
+        .expect("the relaunch spawns");
+
+        let relaunch_port = composed_proxy_port(&relaunch_env.lock().unwrap());
+        assert!(listening(relaunch_port), "the relaunch has no way out");
+        assert!(
+            closes(running_port),
+            "the instance the retired agent was using kept running"
+        );
     }
 
     /// The other half of the same wiring: a session's profile survives the

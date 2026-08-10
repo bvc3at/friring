@@ -19,11 +19,16 @@
 //! first, and would make one session's "allow this domain?" answer silently
 //! widen another's boundary. Duplicating the policy costs nothing.
 //!
-//! An instance is started *before* the agent launches, so nothing can race a
-//! listener that is not bound yet; it is replaced on every relaunch, because
+//! An instance is bound *before* the agent launches, so nothing can race a
+//! listener that is not bound yet — but it belongs to no session until the
+//! launch it was composed for has a pane. Until that moment the session keeps
+//! whatever it is already using, and a launch that fails anywhere in between
+//! releases what it prepared rather than leaving a live credential behind:
+//! [`prepare`] and [`PendingEgress`] are the two halves of that. Committing is
+//! what replaces the previous instance, which every relaunch does, because
 //! `Ctrl+R` re-derives the whole wrapper from the database and a profile edited
-//! in between has to take effect; and it is stopped where the session's scratch
-//! directory is dropped, so a socket cannot outlive its session.
+//! in between has to take effect. The last one is stopped where the session's
+//! scratch directory is dropped, so a socket cannot outlive its session.
 //!
 //! # Where the instances live
 //!
@@ -40,18 +45,31 @@
 //! friring restores egress.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use tokio::sync::mpsc;
 
-use crate::proxy::{DenialEvent, HostRule, Proxy, ProxyBind, ProxyConfig};
+use crate::proxy::{DenialEvent, HostRule, Policy, Proxy, ProxyBind, ProxyConfig};
 use crate::sandbox::backend::{ProxyEndpoint, ProxyTransport, SandboxError, SandboxResult};
 use crate::session::{NetworkMode, SandboxPolicy};
 
 /// File name of the unix socket inside a session's scratch directory.
 pub const PROXY_SOCKET_NAME: &str = "proxy.sock";
+
+/// The name a launch takes while [`PROXY_SOCKET_NAME`] is still held by the
+/// instance the session is using.
+///
+/// A relaunch binds its socket while the previous one is still serving the
+/// agent that is running *now*, and two listeners cannot share a path —
+/// [`Proxy::start`] refuses one that something is serving, which is what keeps
+/// it from unlinking a live sibling. Two names are enough because only one
+/// launch of a session is ever being prepared at a time; which of them a launch
+/// gets is the supervisor's decision, since it is the only place that knows
+/// what the session already holds.
+pub const PROXY_SOCKET_ALT_NAME: &str = "proxy-b.sock";
 
 /// The port the in-sandbox relay listens on, inside the sandbox's **own**
 /// loopback.
@@ -94,9 +112,15 @@ pub const NO_PROXY_VARS: &[&str] = &["NO_PROXY", "no_proxy"];
 /// The consequence under a filtered mode is that local traffic is decided by
 /// the kernel policy rather than by the allowlist, and both backends refuse it:
 /// seatbelt opens the proxy port and nothing else, and a namespaced sandbox has
-/// only what it started itself. That is the tighter reading, and the one that
-/// does not turn "allow 127.0.0.1" in a profile into a route to the host's own
-/// loopback services.
+/// only what it started itself.
+///
+/// This is a convention the agent's own HTTP client honours, so it is a
+/// *convenience* and never the boundary. What makes the boundary hold is that
+/// the proxy refuses a host-local destination itself
+/// ([`crate::proxy::host_is_local`]): a client that ignores `NO_PROXY` and
+/// tunnels `127.0.0.1` reaches friring's refusal rather than the host's own
+/// services. Reaching one on purpose takes the literal address in the profile's
+/// allow list.
 pub const NO_PROXY_VALUE: &str = "localhost,127.0.0.1,::1";
 
 /// Whether this policy can only be honoured with the proxy running.
@@ -122,13 +146,29 @@ pub fn relay_addr() -> SocketAddr {
 }
 
 /// A running proxy, as the launch that asked for it sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProxyGrant {
     /// The one hole the backend's kernel policy must leave open.
     pub endpoint: ProxyEndpoint,
     /// The environment the agent needs in order to use it. Carries the
-    /// instance's token inside the proxy URLs, so it is never logged.
+    /// instance's token inside the proxy URLs, which is why `Debug` prints the
+    /// variable names and not their values.
     pub env: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for ProxyGrant {
+    /// Hand-written, because this is the type that actually *holds* the
+    /// credential: the proxy URLs in [`ProxyGrant::env`] carry the instance's
+    /// token, and a derived `Debug` puts them in every log line, panic message
+    /// and `expect` failure that mentions a grant. The variable names are the
+    /// diagnostic — which spellings a launch was given — and the values are the
+    /// secret.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyGrant")
+            .field("endpoint", &self.endpoint)
+            .field("env", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 /// One refusal, tagged with the session whose sandbox provoked it.
@@ -142,7 +182,169 @@ pub struct SessionDenial {
     pub event: DenialEvent,
 }
 
-/// Start (or replace) the egress proxy for one session.
+/// A bound instance and the grant that names it, before either belongs to the
+/// session. Returned by [`prepare`].
+#[derive(Debug)]
+pub struct Prepared {
+    /// Where the sandbox reaches the proxy, and the environment that lets it —
+    /// what the launch is composed against.
+    pub grant: ProxyGrant,
+    /// The instance itself, provisional until the launch commits it.
+    pub pending: PendingEgress,
+}
+
+/// One launch's claim on the instance [`prepare`] bound for it.
+///
+/// A proxy is composed into an invocation long before that invocation is
+/// running: argv has to name the port or the socket, so the listener exists
+/// first. Everything between the two can fail — a wrapper that will not
+/// compose, a pane that will not spawn, a row that will not persist — and none
+/// of those failures may cost the session the boundary it is *already* using,
+/// nor leave a listener with no session behind it.
+///
+/// So the instance is nobody's until this handle says otherwise:
+///
+/// - [`commit`](Self::commit) hands it to the session, retiring whatever it
+///   replaced. Only the code that has seen the pane exist calls it.
+/// - Dropping it shuts the new instance down — listener, token and socket —
+///   and leaves the session's own untouched.
+///
+/// The launch path holds one for the whole of its fallible stretch, so *every*
+/// early return releases it without having to remember to.
+#[derive(Debug)]
+pub struct PendingEgress {
+    /// The session this launch is for. Kept whatever the outcome, because
+    /// [`park`](Self::park) is keyed on it.
+    key: String,
+    outcome: Outcome,
+}
+
+/// What committing a launch does to the session's egress instance.
+#[derive(Debug)]
+enum Outcome {
+    /// Nothing: this launch neither bound an instance nor asked for the
+    /// session's to go.
+    Keep,
+    /// Take over. The identifier is which pending instance is this launch's, so
+    /// a commit or a release names the one it prepared rather than whatever is
+    /// pending now.
+    Take(u64),
+    /// Stop the instance the session is still using, and put nothing in its
+    /// place: this launch needs no proxy at all.
+    Clear,
+}
+
+impl PendingEgress {
+    /// A handle with nothing to commit: this launch prepared no instance and
+    /// wants none of the session's stopped.
+    fn none(session_key: &str) -> Self {
+        Self {
+            key: session_key.to_string(),
+            outcome: Outcome::Keep,
+        }
+    }
+
+    /// A launch that needs no proxy — its profile was removed, or its network
+    /// mode is one the kernel enforces on its own.
+    ///
+    /// Committing stops whatever the session is still using, so a profile
+    /// edited from `allowlist` to `full` does not leave the previous launch's
+    /// listener behind. Deferring that to the commit is the same rule as
+    /// everywhere else here: until the relaunch has a pane, the agent running
+    /// now is still the one the boundary belongs to.
+    pub fn clearing(session_key: &str) -> Self {
+        Self {
+            key: session_key.to_string(),
+            outcome: Outcome::Clear,
+        }
+    }
+
+    /// Whether this launch has an instance waiting on it.
+    pub fn is_pending(&self) -> bool {
+        matches!(self.outcome, Outcome::Take(_))
+    }
+
+    /// Apply this launch's outcome to the session: an instance it bound becomes
+    /// the one [`stop`] stops and [`allow_domain`] answers, and the one it
+    /// replaces is shut down.
+    ///
+    /// Call this only once the launch has succeeded. Committing a launch that
+    /// then fails is the bug this type exists to prevent: it would retire a
+    /// healthy session's proxy in favour of one nothing is using.
+    pub fn commit(mut self) {
+        // Taken, so the drop that follows this call has nothing left to release.
+        let outcome = std::mem::replace(&mut self.outcome, Outcome::Keep);
+        let key = std::mem::take(&mut self.key);
+        match outcome {
+            Outcome::Keep => (),
+            Outcome::Take(id) => {
+                if let Some(supervisor) = SUPERVISOR.get() {
+                    supervisor.send(Command::Commit { key, id });
+                }
+            }
+            // Not `stop`, which would also release a parked handle: nothing is
+            // parked under this key any more, because this handle *was* what
+            // was parked.
+            Outcome::Clear => {
+                if let Some(supervisor) = SUPERVISOR.get() {
+                    supervisor.send(Command::Stop { key });
+                }
+            }
+        }
+    }
+
+    /// Leave the instance for the launch path to [`claim`], keyed by session.
+    ///
+    /// Composition and launch are two calls apart, and the invocation travels
+    /// between them through a layer that must not own a boundary, so the
+    /// handle waits here in between. Parking a second one for the same session
+    /// releases the first: a composition nobody launched has no claim on a
+    /// listener.
+    pub fn park(self) {
+        let displaced = parked()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(self.key.clone(), self);
+        drop(displaced);
+    }
+}
+
+impl Drop for PendingEgress {
+    /// Releasing is the default, because failing is: only an outcome that was
+    /// asked for by name survives this.
+    fn drop(&mut self) {
+        let Outcome::Take(id) = self.outcome else {
+            return;
+        };
+        if let Some(supervisor) = SUPERVISOR.get() {
+            supervisor.send(Command::Discard {
+                key: std::mem::take(&mut self.key),
+                id,
+            });
+        }
+    }
+}
+
+/// Instances that are bound and waiting for the launch that composed them.
+fn parked() -> &'static Mutex<HashMap<String, PendingEgress>> {
+    static PARKED: OnceLock<Mutex<HashMap<String, PendingEgress>>> = OnceLock::new();
+    PARKED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Take the instance a composition [`parked`](PendingEgress::park) for this
+/// session, so the launch about to happen owns it.
+///
+/// Always answers: a session whose composition prepared nothing gets a handle
+/// with nothing to commit, which every launch path can treat identically.
+pub fn claim(session_key: &str) -> PendingEgress {
+    parked()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(session_key)
+        .unwrap_or_else(|| PendingEgress::none(session_key))
+}
+
+/// Bind the egress proxy one launch will be composed against.
 ///
 /// `transport` comes from the chosen backend's
 /// [`Caps::proxy_transport`](crate::sandbox::Caps::proxy_transport), and
@@ -150,9 +352,13 @@ pub struct SessionDenial {
 /// only place a unix socket may live, because it is private to friring, private
 /// to the session, and dropped with it.
 ///
-/// Replacing rather than reusing is deliberate: the profile may have been
-/// edited between launches, and a fresh instance means a fresh token, so a
-/// process left over from the previous launch cannot keep using the tunnel.
+/// The instance is listening when this returns and enforcing the policy, but it
+/// is not the session's: whatever that session is already using keeps running
+/// until [`PendingEgress::commit`], and is left alone entirely if the launch
+/// fails instead. Replacing rather than reusing is deliberate — the profile may
+/// have been edited between launches, and a fresh instance means a fresh token,
+/// so a process left over from the previous launch cannot keep using the
+/// tunnel.
 ///
 /// The scratch directory is writable by the sandbox, which is the point of it —
 /// and the reason the socket cannot be hijacked from in there is worth stating.
@@ -161,20 +367,29 @@ pub struct SessionDenial {
 /// the path, and the next start refuses to touch it: [`Proxy::start`] replaces
 /// only a socket that nothing is serving, and bails on anything else. Both ends
 /// of that are fail-closed — the worst an agent achieves is refusing its own
-/// next launch, and friring never connects to the socket itself.
+/// next launch.
+///
+/// Friring does connect to that path, once, and only to find out whether
+/// something is already serving it: a socket file outlives a crash, and
+/// unlinking one blindly could take a live sibling's listener out from under a
+/// running agent. The probe `lstat`s first and refuses a symlink or a non-socket
+/// without touching it, sends and reads nothing, and treats a peer that answers
+/// as a reason to *abort the launch* rather than to proceed. So a socket an
+/// agent plants is never a channel to friring — the most it can do is be
+/// answered once and stop its own next launch.
 ///
 /// # Errors
 ///
-/// The policy carries a rule the proxy will not load, the socket path is longer
+/// The policy carries a rule the proxy will not load, a socket path is longer
 /// than any platform's `sun_path`, or the listener could not be bound. Every
 /// one of them refuses the launch: a sandbox that silently has no filtered way
 /// out is a session the user believes is proxied and is not.
-pub fn establish(
+pub fn prepare(
     session_key: &str,
     policy: &SandboxPolicy,
     transport: ProxyTransport,
     scratch: &Path,
-) -> SandboxResult<ProxyGrant> {
+) -> SandboxResult<Prepared> {
     let refuse = |detail: String| SandboxError::Refused {
         profile: policy.profile.clone(),
         detail,
@@ -185,41 +400,30 @@ pub fn establish(
         ))
     })?;
 
-    let (bind, client, socket) = match transport {
-        ProxyTransport::Loopback => (
-            ProxyBind::tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-            None,
-            None,
-        ),
+    let bind = match transport {
+        ProxyTransport::Loopback => StartBind::Loopback,
         ProxyTransport::UnixSocket => {
-            let socket = socket_path(scratch).map_err(&refuse)?;
-            (
-                ProxyBind::unix(&socket),
-                // The agent dials the relay inside its own namespace; the
-                // socket is what the relay forwards to.
-                Some(relay_addr()),
-                Some(socket),
-            )
+            let (primary, alternate) = socket_paths(scratch).map_err(&refuse)?;
+            StartBind::UnixSocket { primary, alternate }
         }
     };
 
     let bound = supervisor()
-        .start(
-            session_key,
-            ProxyConfig {
-                bind,
-                ..ProxyConfig::new(rules)
-            },
-            client,
-        )
+        .start(session_key, rules, bind)
         .map_err(|error| {
             refuse(format!(
                 "the egress proxy could not start, so this sandbox would have no filtered way \
                  out: {error}"
             ))
         })?;
+    // A listener is bound from here on, so every remaining way out of this
+    // function has to release it. The handle is built before the first of them.
+    let pending = PendingEgress {
+        key: session_key.to_string(),
+        outcome: Outcome::Take(bound.id),
+    };
 
-    let endpoint = match (socket, bound.tcp) {
+    let endpoint = match (bound.unix, bound.tcp) {
         (Some(socket), _) => ProxyEndpoint::UnixSocket {
             // Bind-mounted at its own path, so every rule and every log line
             // names one string on both sides of the boundary.
@@ -233,18 +437,41 @@ pub fn establish(
             ))
         }
     };
-    Ok(ProxyGrant {
-        endpoint,
-        env: bound.env,
+    Ok(Prepared {
+        grant: ProxyGrant {
+            endpoint,
+            env: bound.env,
+        },
+        pending,
     })
 }
 
-/// Stop the proxy a session was given, if it has one.
+/// [`prepare`] a proxy and give it to the session in one step, for a caller
+/// with no launch to guard: nothing is composed against this grant, so there is
+/// no window in which committing it could turn out to be wrong.
+///
+/// # Errors
+///
+/// As [`prepare`].
+pub fn establish(
+    session_key: &str,
+    policy: &SandboxPolicy,
+    transport: ProxyTransport,
+    scratch: &Path,
+) -> SandboxResult<ProxyGrant> {
+    let prepared = prepare(session_key, policy, transport, scratch)?;
+    prepared.pending.commit();
+    Ok(prepared.grant)
+}
+
+/// Stop the proxy a session was given, if it has one — and release a prepared
+/// instance nobody claimed, since a session being torn down will not launch it.
 ///
 /// Never starts the supervisor: a friring that has sandboxed nothing has
 /// nothing to stop, and spawning a thread to say so would cost every session
 /// the feature is not used for.
 pub fn stop(session_key: &str) {
+    drop(claim(session_key));
     let Some(supervisor) = SUPERVISOR.get() else {
         return;
     };
@@ -256,6 +483,10 @@ pub fn stop(session_key: &str) {
 /// Stop every running instance and wait for them, for a friring shutting down
 /// while sandboxed sessions are alive.
 pub fn shutdown_all() {
+    parked()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
     let Some(supervisor) = SUPERVISOR.get() else {
         return;
     };
@@ -321,9 +552,22 @@ fn proxy_policy(policy: &SandboxPolicy) -> anyhow::Result<crate::proxy::Policy> 
         .with_deny(policy.deny.iter().map(ToString::to_string))
 }
 
-/// The socket path for a launch whose scratch directory is `scratch`.
-fn socket_path(scratch: &Path) -> Result<String, String> {
-    let socket = scratch.join(PROXY_SOCKET_NAME);
+/// Both socket paths a launch in `scratch` may be given, canonical first.
+///
+/// Both are checked against `sun_path` here rather than one at a time: a
+/// directory that fits only the shorter name would launch once and then refuse
+/// the relaunch that has to take the other, which is a failure the user would
+/// meet at the worst possible moment. See [`PROXY_SOCKET_ALT_NAME`].
+fn socket_paths(scratch: &Path) -> Result<(String, String), String> {
+    Ok((
+        socket_path(scratch, PROXY_SOCKET_NAME)?,
+        socket_path(scratch, PROXY_SOCKET_ALT_NAME)?,
+    ))
+}
+
+/// One socket path for a launch whose scratch directory is `scratch`.
+fn socket_path(scratch: &Path, name: &str) -> Result<String, String> {
+    let socket = scratch.join(name);
     let path = socket.to_str().ok_or_else(|| {
         format!(
             "the sandbox scratch directory ('{}') is not valid UTF-8, and the proxy socket inside \
@@ -367,22 +611,61 @@ fn proxy_env(http: &str, socks: &str) -> BTreeMap<String, String> {
 
 /// What one [`Command::Start`] hands back: where the sandbox reaches the proxy,
 /// and the environment that lets it. The token itself never leaves the
-/// supervisor except inside those URLs.
-#[derive(Debug)]
+/// supervisor except inside those URLs — which is why `Debug` is hand-written
+/// here too, on the same reasoning as [`ProxyGrant`]'s.
 struct Bound {
+    /// Which pending instance this is. Carried by the launch's
+    /// [`PendingEgress`] so a commit or a release names the instance that
+    /// launch prepared, never a later one.
+    id: u64,
     tcp: Option<SocketAddr>,
+    /// The socket path the supervisor chose. See [`StartBind::UnixSocket`].
+    unix: Option<String>,
     env: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for Bound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Bound")
+            .field("id", &self.id)
+            .field("tcp", &self.tcp)
+            .field("unix", &self.unix)
+            .field("env", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// Which listener one instance opens.
+#[derive(Debug)]
+enum StartBind {
+    /// An ephemeral host loopback port — what a sandbox that still shares the
+    /// host's network stack dials. Two of them never collide, so there is
+    /// nothing to choose between.
+    Loopback,
+    /// A unix socket in the session's scratch directory, bound at the first of
+    /// these paths the session's *running* instance is not already using. See
+    /// [`PROXY_SOCKET_ALT_NAME`] for why there are two.
+    UnixSocket { primary: String, alternate: String },
 }
 
 /// One instruction for the supervisor thread.
 enum Command {
     Start {
         key: String,
-        config: Box<ProxyConfig>,
-        /// Where the *sandbox* dials, when that is not the proxy's own address
-        /// — the relay's, for a namespaced backend.
-        client: Option<SocketAddr>,
+        /// Boxed to keep every variant the size of the smallest one.
+        policy: Box<Policy>,
+        bind: StartBind,
         reply: std::sync::mpsc::Sender<Result<Bound, String>>,
+    },
+    /// Give a prepared instance to its session, retiring the one it replaces.
+    Commit {
+        key: String,
+        id: u64,
+    },
+    /// Shut down a prepared instance the launch that asked for it will not use.
+    Discard {
+        key: String,
+        id: u64,
     },
     Stop {
         key: String,
@@ -457,17 +740,12 @@ impl Supervisor {
         let _ = self.commands.send(command);
     }
 
-    fn start(
-        &self,
-        key: &str,
-        config: ProxyConfig,
-        client: Option<SocketAddr>,
-    ) -> Result<Bound, String> {
+    fn start(&self, key: &str, policy: Policy, bind: StartBind) -> Result<Bound, String> {
         let (reply, answer) = std::sync::mpsc::channel();
         self.send(Command::Start {
             key: key.to_string(),
-            config: Box::new(config),
-            client,
+            policy: Box::new(policy),
+            bind,
             reply,
         });
         // A plain blocking receive, not `tokio::sync`: this runs on whatever
@@ -481,23 +759,48 @@ impl Supervisor {
 
 /// Own every running proxy, one command at a time.
 ///
-/// Serialising the commands is what makes replacement safe: a `Start` for a key
-/// that already has an instance shuts the old one down — and unlinks its socket
-/// — strictly before the new one binds the same path.
+/// Two maps, because an instance has two lives: `proxies` is what each session
+/// is using, and `pending` is what a launch has prepared and not yet committed
+/// — at most one per session, since a session composes one launch at a time.
+/// Serialising the commands is what makes replacement safe: a `Commit` shuts the
+/// instance it replaces down — and unlinks its socket — before the new one takes
+/// its place, and nothing tears down a listener the session is still reaching.
 async fn serve(mut commands: mpsc::UnboundedReceiver<Command>) {
     let mut proxies: HashMap<String, Proxy> = HashMap::new();
+    let mut pending: HashMap<String, (u64, Proxy)> = HashMap::new();
+    let mut next_id: u64 = 0;
     while let Some(command) = commands.recv().await {
         match command {
             Command::Start {
                 key,
-                config,
-                client,
+                policy,
+                bind,
                 reply,
             } => {
-                if let Some(previous) = proxies.remove(&key) {
-                    previous.shutdown().await;
+                // A composition nobody launched has no claim on a listener —
+                // and it may be holding the socket path this one needs.
+                if let Some((_, superseded)) = pending.remove(&key) {
+                    superseded.shutdown().await;
                 }
-                let started = match Proxy::start(*config).await {
+                let socket = match &bind {
+                    StartBind::Loopback => None,
+                    StartBind::UnixSocket { primary, alternate } => {
+                        let held = proxies.get(&key).and_then(|proxy| proxy.unix_path());
+                        Some(if held == Some(Path::new(primary)) {
+                            alternate.clone()
+                        } else {
+                            primary.clone()
+                        })
+                    }
+                };
+                let config = ProxyConfig {
+                    bind: match &socket {
+                        Some(path) => ProxyBind::unix(path),
+                        None => ProxyBind::tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+                    },
+                    ..ProxyConfig::new(*policy)
+                };
+                let started = match Proxy::start(config).await {
                     Ok(started) => started,
                     Err(error) => {
                         let _ = reply.send(Err(format!("{error:#}")));
@@ -505,9 +808,18 @@ async fn serve(mut commands: mpsc::UnboundedReceiver<Command>) {
                     }
                 };
                 let (proxy, denials) = started;
-                let endpoint = client.or_else(|| proxy.tcp_addr());
+                // A socket-only instance is dialled through the relay inside
+                // the sandbox's own namespace; the socket is what the relay
+                // forwards to, and no HTTP client can name it.
+                let endpoint = socket
+                    .as_ref()
+                    .map(|_| relay_addr())
+                    .or_else(|| proxy.tcp_addr());
+                next_id += 1;
                 let bound = Bound {
+                    id: next_id,
                     tcp: proxy.tcp_addr(),
+                    unix: socket,
                     env: match endpoint {
                         Some(addr) => proxy_env(
                             &proxy.http_proxy_url_at(addr),
@@ -516,16 +828,43 @@ async fn serve(mut commands: mpsc::UnboundedReceiver<Command>) {
                         None => BTreeMap::new(),
                     },
                 };
+                // Refusals are the *session's*, whether or not its launch has
+                // committed yet: nothing else could explain them.
                 tokio::spawn(collect_denials(key.clone(), denials));
-                proxies.insert(key, proxy);
+                pending.insert(key, (next_id, proxy));
                 let _ = reply.send(Ok(bound));
             }
+            Command::Commit { key, id } => {
+                // Only when it is still the instance that launch prepared: a
+                // handle outlived by a newer composition must not adopt it.
+                if pending.get(&key).is_some_and(|(held, _)| *held == id) {
+                    if let Some((_, proxy)) = pending.remove(&key) {
+                        if let Some(previous) = proxies.remove(&key) {
+                            previous.shutdown().await;
+                        }
+                        proxies.insert(key, proxy);
+                    }
+                }
+            }
+            Command::Discard { key, id } => {
+                if pending.get(&key).is_some_and(|(held, _)| *held == id) {
+                    if let Some((_, proxy)) = pending.remove(&key) {
+                        proxy.shutdown().await;
+                    }
+                }
+            }
             Command::Stop { key } => {
+                if let Some((_, proxy)) = pending.remove(&key) {
+                    proxy.shutdown().await;
+                }
                 if let Some(proxy) = proxies.remove(&key) {
                     proxy.shutdown().await;
                 }
             }
             Command::StopAll { reply } => {
+                for (_, (_, proxy)) in pending.drain() {
+                    proxy.shutdown().await;
+                }
                 for (_, proxy) in proxies.drain() {
                     proxy.shutdown().await;
                 }
@@ -551,6 +890,9 @@ async fn serve(mut commands: mpsc::UnboundedReceiver<Command>) {
                 let _ = reply.send(rules);
             }
         }
+    }
+    for (_, (_, proxy)) in pending.drain() {
+        proxy.shutdown().await;
     }
     for (_, proxy) in proxies.drain() {
         proxy.shutdown().await;
@@ -672,14 +1014,14 @@ mod tests {
         ))
         .expect("the proxy loads the profile's rules");
         assert_eq!(rules.mode(), crate::proxy::NetworkMode::Allowlist);
-        // The wildcard is a spelling, so it arrives as the bare rule and still
-        // covers the apex; the port scope survives.
+        // The wildcard is the subtree spelling, and it crosses as written; the
+        // port scope survives too.
         let allow: Vec<String> = rules
             .allow_rules()
             .iter()
             .map(ToString::to_string)
             .collect();
-        assert_eq!(allow, ["github.com", "api.anthropic.com:443"]);
+        assert_eq!(allow, ["*.github.com", "api.anthropic.com:443"]);
         let deny: Vec<String> = rules.deny_rules().iter().map(ToString::to_string).collect();
         assert_eq!(deny, ["gist.github.com"]);
     }
@@ -713,6 +1055,48 @@ mod tests {
         for name in NO_PROXY_VARS {
             assert_eq!(env.get(*name).map(String::as_str), Some(NO_PROXY_VALUE));
         }
+    }
+
+    /// The grant is the type that actually holds the credential, and `Debug`
+    /// output is the cheapest way for one to escape: a `?grant` in a log line,
+    /// a `{grant:?}` in an error, an `expect` on a result that carries one.
+    /// The variable *names* are the diagnostic and survive; the URLs do not.
+    #[test]
+    fn a_grant_does_not_print_the_credential_it_carries() {
+        let grant = ProxyGrant {
+            endpoint: ProxyEndpoint::Loopback { port: 9 },
+            env: proxy_env(
+                "http://friring:s3cr3t@127.0.0.1:9",
+                "socks5h://friring:s3cr3t@127.0.0.1:9",
+            ),
+        };
+        let printed = format!("{grant:?}");
+        assert!(!printed.contains("s3cr3t"), "{printed}");
+        assert!(!printed.contains("friring:"), "{printed}");
+        // Still worth reading: which endpoint, and which spellings were set.
+        assert!(printed.contains("Loopback"), "{printed}");
+        assert!(printed.contains("HTTP_PROXY"), "{printed}");
+        assert!(printed.contains("NO_PROXY"), "{printed}");
+    }
+
+    /// The same guarantee for the config the supervisor builds one from: the
+    /// token is handed in there, and a derived `Debug` would print it verbatim.
+    #[test]
+    fn a_proxy_config_does_not_print_the_token_it_was_handed() {
+        let config = ProxyConfig {
+            token: Some("s3cr3t".to_string()),
+            ..ProxyConfig::new(Policy::new(crate::proxy::NetworkMode::Allowlist))
+        };
+        let printed = format!("{config:?}");
+        assert!(!printed.contains("s3cr3t"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+        // A config with no token says so, because "supplied or minted" is a
+        // real difference between two launches.
+        let minted = ProxyConfig {
+            token: None,
+            ..ProxyConfig::default()
+        };
+        assert!(format!("{minted:?}").contains("token: None"));
     }
 
     /// A real proxy, bound on an ephemeral loopback port, reached the way a
@@ -829,14 +1213,27 @@ mod tests {
     #[test]
     fn an_over_long_socket_path_is_refused_with_the_fix() {
         let deep = PathBuf::from("/").join("d".repeat(MAX_SOCKET_PATH));
-        let error = socket_path(&deep).unwrap_err();
+        let error = socket_paths(&deep).unwrap_err();
         assert!(error.contains("at most 103"), "{error}");
         assert!(error.contains("XDG_DATA_HOME"), "{error}");
-        // A realistic one fits.
-        socket_path(Path::new(
+        // A realistic one fits, and both names are checked: a directory that
+        // only fits the canonical one would launch once and refuse the
+        // relaunch that has to take the other.
+        let (primary, alternate) = socket_paths(Path::new(
             "/home/u/.local/share/friring/sandbox/tmp/session",
         ))
         .unwrap();
+        assert!(primary.ends_with(PROXY_SOCKET_NAME), "{primary}");
+        assert!(alternate.ends_with(PROXY_SOCKET_ALT_NAME), "{alternate}");
+        // Long enough that `<dir>/proxy.sock` is exactly the limit, which
+        // leaves no room for the two extra bytes the other name costs.
+        let snug =
+            PathBuf::from("/").join("d".repeat(MAX_SOCKET_PATH - PROXY_SOCKET_NAME.len() - 2));
+        socket_path(&snug, PROXY_SOCKET_NAME).expect("the canonical name fits");
+        assert!(
+            socket_paths(&snug).is_err(),
+            "a directory only the shorter name fits is refused up front"
+        );
     }
 
     /// A rule the proxy will not load refuses the launch instead of starting an
@@ -901,6 +1298,184 @@ mod tests {
         assert!(running_allow_rules("egress-allow").is_none());
         let stale = allow_domain("egress-allow", "api.github.com").unwrap_err();
         assert!(stale.contains("no egress proxy running"), "{stale}");
+    }
+
+    /// Wait for every command queued so far to have been handled.
+    ///
+    /// The supervisor answers one command at a time, so a reply to a later one
+    /// is proof the earlier ones are done — which is what makes "this listener
+    /// is gone" and "that one is still there" assertable without sleeping.
+    fn settle(session_key: &str) {
+        let _ = running_allow_rules(session_key);
+    }
+
+    fn is_listening(port: u16) -> bool {
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+    }
+
+    fn port_of(endpoint: &ProxyEndpoint) -> u16 {
+        match endpoint {
+            ProxyEndpoint::Loopback { port } => *port,
+            other => panic!("expected a loopback endpoint, got {other:?}"),
+        }
+    }
+
+    /// The whole point of preparing rather than establishing: composing a
+    /// launch must not take the boundary away from the agent that is running
+    /// *now*, because the launch it is being composed for may never happen.
+    #[test]
+    fn a_prepared_instance_leaves_the_running_one_alone_until_it_is_committed() {
+        let key = "egress-provisional";
+        let scratch = test_scratch("provisional");
+        let running = policy(NetworkMode::Allowlist, &["old.example"], &[]);
+        let relaunch = policy(NetworkMode::Allowlist, &["new.example"], &[]);
+
+        let old = establish(key, &running, ProxyTransport::Loopback, &scratch)
+            .expect("the session's own proxy binds");
+        let old_port = port_of(&old.endpoint);
+
+        // A relaunch is composed: bound and enforcing, and nobody's.
+        let prepared = prepare(key, &relaunch, ProxyTransport::Loopback, &scratch)
+            .expect("the relaunch's proxy binds");
+        let new_port = port_of(&prepared.grant.endpoint);
+        assert_ne!(old_port, new_port, "a second listener, not the same one");
+        assert!(is_listening(old_port), "the running agent lost its way out");
+        assert_eq!(
+            running_allow_rules(key),
+            Some(vec!["old.example".to_string()]),
+            "the session's boundary is still the one it is using"
+        );
+
+        // The launch failed: dropping the handle is what every error path does.
+        drop(prepared);
+        settle(key);
+        assert!(
+            !is_listening(new_port),
+            "a launch that never happened left a listener behind"
+        );
+        assert!(
+            is_listening(old_port),
+            "a launch that never happened cost the running agent its egress"
+        );
+        assert_eq!(
+            running_allow_rules(key),
+            Some(vec!["old.example".to_string()])
+        );
+
+        // A relaunch that *does* happen replaces it, exactly once.
+        let prepared = prepare(key, &relaunch, ProxyTransport::Loopback, &scratch)
+            .expect("the relaunch's proxy binds");
+        let new_port = port_of(&prepared.grant.endpoint);
+        prepared.pending.commit();
+        settle(key);
+        assert!(
+            !is_listening(old_port),
+            "the replaced instance kept running"
+        );
+        assert!(is_listening(new_port));
+        assert_eq!(
+            running_allow_rules(key),
+            Some(vec!["new.example".to_string()])
+        );
+
+        stop(key);
+        settle(key);
+        assert!(!is_listening(new_port));
+    }
+
+    /// A composition that is never claimed is not a leak either: the next one
+    /// for the same session releases it, and so does tearing the session down.
+    #[test]
+    fn a_parked_instance_is_released_by_the_next_one_and_by_teardown() {
+        let key = "egress-parked";
+        let scratch = test_scratch("parked");
+        let profile = policy(NetworkMode::Allowlist, &[], &[]);
+
+        let first = prepare(key, &profile, ProxyTransport::Loopback, &scratch).unwrap();
+        let first_port = port_of(&first.grant.endpoint);
+        first.pending.park();
+
+        let second = prepare(key, &profile, ProxyTransport::Loopback, &scratch).unwrap();
+        let second_port = port_of(&second.grant.endpoint);
+        second.pending.park();
+        settle(key);
+        assert!(
+            !is_listening(first_port),
+            "the superseded composition kept its listener"
+        );
+        assert!(is_listening(second_port));
+
+        // Claiming hands ownership to the launch; nothing is parked afterwards.
+        let claimed = claim(key);
+        assert!(claimed.is_pending());
+        assert!(!claim(key).is_pending(), "claimed twice");
+        drop(claimed);
+        settle(key);
+        assert!(!is_listening(second_port));
+
+        // And a teardown releases one nobody claimed at all.
+        let third = prepare(key, &profile, ProxyTransport::Loopback, &scratch).unwrap();
+        let third_port = port_of(&third.grant.endpoint);
+        third.pending.park();
+        stop(key);
+        settle(key);
+        assert!(!is_listening(third_port));
+    }
+
+    /// The bwrap shape of the same claim. Two live instances of one session
+    /// cannot share a socket path — [`Proxy::start`] refuses a path something
+    /// is serving, which is what stops it unlinking a live sibling — so the
+    /// launch being prepared takes the other name.
+    #[cfg(unix)]
+    #[test]
+    fn a_prepared_socket_takes_the_name_the_running_one_is_not_using() {
+        let key = "egress-two-sockets";
+        let scratch = test_scratch("two-sockets");
+        let profile = policy(NetworkMode::Allowlist, &[], &[]);
+        let canonical = scratch.join(PROXY_SOCKET_NAME);
+        let alternate = scratch.join(PROXY_SOCKET_ALT_NAME);
+        let _ = std::fs::remove_file(&canonical);
+        let _ = std::fs::remove_file(&alternate);
+
+        establish(key, &profile, ProxyTransport::UnixSocket, &scratch)
+            .expect("the session's own proxy binds");
+        assert!(
+            canonical.exists(),
+            "the first instance takes the plain name"
+        );
+
+        let prepared = prepare(key, &profile, ProxyTransport::UnixSocket, &scratch)
+            .expect("the relaunch binds");
+        assert!(
+            alternate.exists(),
+            "the relaunch must not need the path the running agent reaches"
+        );
+        assert!(
+            canonical.exists(),
+            "the running agent's socket was unlinked"
+        );
+
+        // Released: its socket goes with it, and the live one is untouched.
+        drop(prepared);
+        settle(key);
+        assert!(!alternate.exists(), "a released instance left its socket");
+        assert!(canonical.exists());
+
+        // Committed: now the *old* socket is the one that goes, and the name it
+        // frees is available to the launch after this one.
+        let prepared = prepare(key, &profile, ProxyTransport::UnixSocket, &scratch)
+            .expect("the relaunch binds");
+        prepared.pending.commit();
+        settle(key);
+        assert!(!canonical.exists(), "the replaced instance left its socket");
+        assert!(alternate.exists());
+
+        let prepared = prepare(key, &profile, ProxyTransport::UnixSocket, &scratch).unwrap();
+        assert!(canonical.exists(), "the freed name is reused");
+        drop(prepared);
+        stop(key);
+        settle(key);
+        assert!(!canonical.exists() && !alternate.exists());
     }
 
     #[test]

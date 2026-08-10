@@ -72,9 +72,55 @@ pub struct SpawnResult {
     pub sandbox: Option<crate::session::SandboxState>,
 }
 
+/// How a headless spawn creates the session's window, and what it learns: the
+/// remote pane id, or an empty string for a local spawn (whose pane the TUI
+/// resolves by name).
+///
+/// Injected so the failure path — the one that must leave behind no egress
+/// proxy, no scratch directory and no generated policy file — is exercised
+/// without a tmux server. Driving the real one in a test would either talk to
+/// the user's own friring socket or launch an agent.
+type WindowSpawner<'a> = &'a dyn Fn(
+    Option<&HostDef>,
+    &str,
+    &str,
+    &[String],
+    &std::path::Path,
+    &std::collections::HashMap<String, String>,
+) -> Result<String, String>;
+
+/// The real one: a window on the local tmux server, or on the host's over SSH.
+fn spawn_launch_window(
+    host: Option<&HostDef>,
+    name: &str,
+    command: &str,
+    args: &[String],
+    cwd: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<String, String> {
+    // Remote spawns drive the SSH backend's control mode to learn the real pane
+    // id; local spawns leave `backend_id` empty for the TUI to resolve by name.
+    match host {
+        Some(h) => crate::agent::tmux::spawn_window_remote(h, name, command, args, Some(cwd), env)
+            .map_err(|e| format!("Failed to spawn remote tmux window: {e:#}")),
+        None => crate::agent::tmux::spawn_window(name, command, args, Some(cwd), env)
+            .map(|()| String::new())
+            .map_err(|e| format!("Failed to spawn tmux window: {e}")),
+    }
+}
+
 /// Spawn a new session inside `tmux -L friring`, persisting its state to the
 /// shared SQLite database.
 pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnResult, String> {
+    spawn_session_with(db, req, &spawn_launch_window)
+}
+
+/// [`spawn_session_headless`] against `spawn_window`. See [`WindowSpawner`].
+fn spawn_session_with(
+    db: &Database,
+    req: SpawnRequest,
+    spawn_window: WindowSpawner<'_>,
+) -> Result<SpawnResult, String> {
     crate::paths::validate_safe_name(&req.name)?;
     validate_parent_session(db, req.parent_session_id)?;
 
@@ -147,29 +193,27 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
 
     let invocation = super::build_agent_invocation(&agent_def, &mut config)?;
     let (command, args) = (invocation.command, invocation.args);
+    // A filtered profile bound an egress proxy to compose that invocation
+    // against, and it is nobody's until this session exists. Held from here to
+    // the upsert so every failure in between releases it, rather than leaving a
+    // live credential for a session that never happened.
+    let egress = crate::agent::sandboxing::pending_egress(&config);
 
-    // Remote spawns drive the SSH backend's control mode to learn the real pane
-    // id; local spawns leave `backend_id` empty for the TUI to resolve by name.
-    let backend_id = match host.as_ref() {
-        Some(h) => crate::agent::tmux::spawn_window_remote(
-            h,
-            &req.name,
-            &command,
-            &args,
-            Some(&launch_cwd),
-            &config.env,
-        )
-        .map_err(|e| format!("Failed to spawn remote tmux window: {e:#}"))?,
-        None => {
-            crate::agent::tmux::spawn_window(
-                &req.name,
-                &command,
-                &args,
-                Some(&launch_cwd),
-                &config.env,
-            )
-            .map_err(|e| format!("Failed to spawn tmux window: {e}"))?;
-            String::new()
+    let backend_id = match spawn_window(
+        host.as_ref(),
+        &req.name,
+        &command,
+        &args,
+        &launch_cwd,
+        &config.env,
+    ) {
+        Ok(backend_id) => backend_id,
+        Err(e) => {
+            // Nothing will adopt what this launch minted. The proxy goes with
+            // `egress`; the scratch directory the agent would have written and
+            // the policy file generated for it have to be said out loud.
+            crate::agent::sandboxing::cleanup_by_session_id(session_id);
+            return Err(e);
         }
     };
 
@@ -223,8 +267,15 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
                 req.name
             );
         }
+        // The window is gone with the row that would have tracked it, so the
+        // boundary minted for it goes too: `egress` releases the proxy as this
+        // returns, and the id-keyed cleanup takes the rest.
+        crate::agent::sandboxing::cleanup_by_session_id(session_id);
         return Err(format!("Failed to persist session: {e}"));
     }
+    // The window is live and the row that owns it is committed: this session
+    // exists, so its boundary is the session's now.
+    egress.commit();
 
     // Record the worktree's fork point so the code-review view can scope its
     // diff to `<base>..HEAD`. Only meaningful for worktree sessions; a bare-repo
@@ -671,6 +722,77 @@ mod tests {
                 spawn_session_headless(&db, req(bad)).is_err(),
                 "should reject {bad}"
             );
+        }
+    }
+
+    /// A headless spawn binds its egress proxy while composing — argv has to
+    /// name the port — so a window that never spawns must leave nothing at all
+    /// behind: no listener, no writable scratch directory, and no generated
+    /// policy file, for a session that does not exist.
+    #[test]
+    fn a_spawn_that_fails_leaves_no_boundary_behind() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _paths = crate::paths::TestPathGuard::new(temp.path());
+        let _host = crate::agent::sandboxing::TestSandboxHost::seatbelt();
+        let db = empty_db();
+
+        let mut profile = crate::session::SandboxProfile::new(
+            "dev",
+            vec![crate::session::SandboxPath::workspace(
+                "/fabricated/dev/app",
+            )],
+        );
+        profile.network_allow = vec!["api.anthropic.com".into()];
+        db.upsert_sandbox_profile(&profile).unwrap();
+
+        let mut request = req("boxed");
+        // Not the host temp root the default carries: a read-write grant over
+        // it reaches friring's own tmux socket, which the launch refuses.
+        request.repo_path = PathBuf::from("/fabricated/repo");
+        request.sandbox_profile = Some("dev".into());
+
+        let composed = std::sync::Mutex::new(std::collections::HashMap::new());
+        let err = spawn_session_with(&db, request, &|_, _, _, _, _, env| {
+            composed.lock().unwrap().clone_from(env);
+            Err("Failed to spawn tmux window: no server".to_string())
+        })
+        .expect_err("the window cannot be spawned");
+        assert!(err.contains("tmux window"), "{err}");
+
+        // The listener is closed on the egress supervisor's own thread, so the
+        // assertion is that it happens, not that it already has.
+        let url = composed
+            .lock()
+            .unwrap()
+            .get("HTTP_PROXY")
+            .cloned()
+            .expect("the launch was composed against a proxy");
+        let port: u16 = url
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or_else(|| panic!("no port in {url}"));
+        let closed = (0..200).any(|_| {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        });
+        assert!(
+            closed,
+            "the proxy for a session that never existed is still listening"
+        );
+
+        let data = crate::paths::log_directory().expect("the fabricated data directory");
+        for (what, dir) in [
+            ("scratch directory", data.join("sandbox").join("tmp")),
+            ("policy file", data.join("sandbox").join("profiles")),
+        ] {
+            let left: Vec<_> = std::fs::read_dir(&dir)
+                .map(|entries| entries.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default();
+            assert!(left.is_empty(), "a failed spawn left a {what}: {left:?}");
         }
     }
 
