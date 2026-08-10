@@ -407,7 +407,12 @@ pub fn sanitize_component(raw: &str) -> String {
             }
         })
         .collect();
-    if cleaned.is_empty() {
+    // `.` and `..` survive the charset filter and are the two components that
+    // are not names at all: joining `..` onto the scratch root would put a
+    // sandbox's writable directory *above* it. Neither value can be one today —
+    // a profile name is validated and a session key is a UUID — which is exactly
+    // why the guard belongs here rather than in each caller's head.
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
         "sandbox".to_string()
     } else {
         cleaned
@@ -702,6 +707,11 @@ mod tests {
     fn a_session_key_cannot_become_a_path() {
         assert_eq!(sanitize_component("../../etc"), "..-..-etc");
         assert_eq!(sanitize_component(""), "sandbox");
+        // The two components that are not names: `..` would put a sandbox's
+        // writable directory above the root friring mints it under.
+        assert_eq!(sanitize_component(".."), "sandbox");
+        assert_eq!(sanitize_component("."), "sandbox");
+        assert_eq!(sanitize_component("..."), "sandbox");
         let dir = session_scratch_dir("../escape").unwrap();
         assert_eq!(dir.parent().unwrap(), scratch_root().unwrap());
     }
