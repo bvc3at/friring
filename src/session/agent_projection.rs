@@ -139,8 +139,27 @@ impl EnforcedSettings {
                  cannot write"
             ));
         }
-        if path.split('/').any(|part| part == ".." || part == ".") {
-            return Some(format!("'{path}' carries a '.' or '..' component"));
+        // The next three mirror `sandbox::projection::unsafe_relative`, which
+        // re-checks this path when the document is written. The rules are
+        // restated rather than shared because `session` may not reference
+        // `sandbox`; keeping them in step is what stops a declaration passing
+        // here and failing the whole launch there instead of being reported as
+        // one host-only finding.
+        if path.contains('\\') {
+            return Some(format!(
+                "'{path}' is not a POSIX path; a '\\' names a different file inside the boundary \
+                 than the declaration reads as"
+            ));
+        }
+        if path.contains('\0') {
+            return Some(format!("'{path}' contains a NUL byte"));
+        }
+        if path
+            .split('/')
+            .skip(1)
+            .any(|part| part.is_empty() || part == ".." || part == ".")
+        {
+            return Some(format!("'{path}' carries an empty, '.' or '..' component"));
         }
         if self.content.is_none() && self.per_path.is_none() {
             return Some(format!(
@@ -306,6 +325,36 @@ mod tests {
                     ..claude()
                 },
                 "'..' component",
+            ),
+            // The four the projection writer refuses: caught here, so they are
+            // one host-only finding rather than a failed launch.
+            (
+                EnforcedSettings {
+                    path: "~/.codex//config.toml".into(),
+                    ..claude()
+                },
+                "empty, '.' or '..' component",
+            ),
+            (
+                EnforcedSettings {
+                    path: "~/.codex/".into(),
+                    ..claude()
+                },
+                "empty, '.' or '..' component",
+            ),
+            (
+                EnforcedSettings {
+                    path: "~/a\\b".into(),
+                    ..claude()
+                },
+                "not a POSIX path",
+            ),
+            (
+                EnforcedSettings {
+                    path: "~/.claude/settings.json\0".into(),
+                    ..claude()
+                },
+                "NUL byte",
             ),
             (
                 EnforcedSettings {
