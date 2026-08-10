@@ -231,7 +231,9 @@ impl ProxyBind {
 /// The defaults are the intended configuration: loopback, an ephemeral port, a
 /// freshly minted token, and a policy that denies everything until one is
 /// supplied.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written and withholds the token — see the impl below.
+#[derive(Clone)]
 pub struct ProxyConfig {
     /// Which listeners to open. Defaults to an ephemeral loopback port.
     pub bind: ProxyBind,
@@ -257,6 +259,25 @@ pub struct ProxyConfig {
     /// logged as well, so a slow consumer loses notifications, never the
     /// record.
     pub event_capacity: usize,
+}
+
+impl fmt::Debug for ProxyConfig {
+    /// Hand-written for the same reason [`Proxy`]'s is: the token must never
+    /// reach a log, a panic message or an `expect` failure. Whether one was
+    /// *supplied* is worth seeing, because that is a real difference between
+    /// two launches; its value never is.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("bind", &self.bind)
+            .field("policy", &self.policy)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("max_connections", &self.max_connections)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("event_capacity", &self.event_capacity)
+            .finish()
+    }
 }
 
 impl Default for ProxyConfig {

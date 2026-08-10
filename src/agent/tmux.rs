@@ -11,8 +11,8 @@ use tracing::{debug, warn};
 
 use crate::agent::backend::{AdoptedSession, DiscoveredSession, SessionBackend, SpawnedSession};
 use crate::agent::control_mode::{
-    self, shell_escape, CommandResponse, ControlModeReader, ControlModeWriter, Notification,
-    PaneSendersMapShared, PANE_CHANNEL_CAPACITY,
+    self, redact_secrets, shell_escape, CommandResponse, ControlModeReader, ControlModeWriter,
+    Notification, PaneSendersMapShared, PANE_CHANNEL_CAPACITY,
 };
 use crate::agent::transport::{TmuxTransport, DEFAULT_MUX};
 
@@ -553,12 +553,14 @@ impl ControlMode {
             stdin.flush()?;
         }
 
+        // Lazy `with_context`: the redaction (and the whole message) is built
+        // only when the command actually stalls, not on every command sent.
         let response = rx
             .recv_timeout(COMMAND_TIMEOUT)
-            .context(format!("Timeout waiting for response to: {cmd}"))?;
+            .with_context(|| timeout_context(cmd))?;
 
         if response.is_error {
-            bail!("tmux command failed: {cmd}: {}", response.lines.join("\n"));
+            bail!("{}", command_failed(cmd, &response.lines.join("\n")));
         }
 
         Ok(response.lines.join("\n"))
@@ -620,6 +622,29 @@ impl Drop for ControlMode {
             }
         }
     }
+}
+
+/// The two ways a control-mode command reports itself when it goes wrong: a
+/// stall and a `%error` reply. Both quote the command, and for a sandboxed
+/// launch the command carries the egress boundary's bearer token, so both go
+/// through [`redact_secrets`] on their way to the log file and the error toast.
+///
+/// They are separate named functions rather than inline `format!`s so the
+/// redaction cannot be forgotten by a third failure path added later, and so
+/// the guarantee is testable without a live tmux server.
+fn timeout_context(cmd: &str) -> String {
+    format!("Timeout waiting for response to: {}", redact_secrets(cmd))
+}
+
+/// See [`timeout_context`]. tmux's own reply is redacted too: an error is free
+/// to quote the argument it objected to, which for a rejected `-e` is the
+/// credential itself.
+fn command_failed(cmd: &str, response: &str) -> String {
+    format!(
+        "tmux command failed: {}: {}",
+        redact_secrets(cmd),
+        redact_secrets(response)
+    )
 }
 
 /// Check if an error is caused by a broken pipe (control mode stdin closed).
@@ -725,7 +750,16 @@ impl TmuxBackend {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("tmux {} failed: {}", args.join(" "), stderr.trim());
+            // Redacted for the same reason the control-mode failures are: this
+            // reports an argv, and an argv is where a `-e` value would be. No
+            // caller passes one today, which is exactly why the guarantee
+            // belongs here rather than in each caller's head — the shapes that
+            // *are* passed come through untouched (see the tests).
+            bail!(
+                "tmux {} failed: {}",
+                redact_secrets(&args.join(" ")),
+                redact_secrets(stderr.trim())
+            );
         }
 
         Ok(output)
@@ -991,6 +1025,68 @@ impl TmuxBackend {
         format!("\"{}\"", Self::psmux_window_powershell(command, args, env))
     }
 
+    /// The control-mode `new-window` line that launches an agent.
+    ///
+    /// Split out of [`spawn`](SessionBackend::spawn) because this is the one
+    /// command friring sends that carries an environment, and therefore the one
+    /// that can carry a credential (a sandboxed launch's proxy URL). Building it
+    /// separately lets a test assert what the line contains *and* what its
+    /// failure reports do not — see [`timeout_context`] / [`command_failed`].
+    fn new_window_command(
+        &self,
+        window_name: &str,
+        command: &str,
+        args: &[String],
+        cwd: Option<&Path>,
+        env: &HashMap<String, String>,
+    ) -> String {
+        // psmux can't take the command as joined trailing tokens nor env via
+        // `-e` (see `psmux_window_command`); everything is folded into one
+        // token there. tmux keeps the byte-identical multi-token + `-e` path.
+        let psmux = self.transport.uses_psmux();
+        // A remote/WSL companion shell pane (`tbs-` window) opens the user's own
+        // interactive login shell — the SSH-login environment — instead of the
+        // bare `/bin/sh` the generic login-wrap would produce (see
+        // `remote_shell_pane_command`). Agent windows (`tb-`) and psmux hosts
+        // keep the standard path.
+        let is_remote_shell_pane =
+            self.transport.is_remote() && !psmux && window_name.starts_with(SHELL_WINDOW_PREFIX);
+        let shell_cmd = if psmux {
+            Self::psmux_window_command(command, args, env)
+        } else if is_remote_shell_pane {
+            self.remote_shell_pane_command()
+        } else {
+            self.login_wrap_for_remote(&Self::build_shell_command(command, args))
+        };
+
+        // psmux's tokenizer can't read POSIX `'\''` escapes (see
+        // `psmux_quote`), so its `-c`/`-n` values get the double-quote framing
+        // it does parse; tmux keeps the byte-identical single-quote path.
+        let quote_arg = |s: &str| {
+            if psmux {
+                control_mode::psmux_quote(s)
+            } else {
+                control_mode::shell_escape(s)
+            }
+        };
+        let cwd_part = match cwd {
+            Some(dir) => format!(" -c {}", quote_arg(&dir.to_string_lossy())),
+            None => String::new(),
+        };
+        let env_part: String = if psmux {
+            String::new()
+        } else {
+            env.iter()
+                .map(|(k, v)| format!(" -e {}", shell_escape(&format!("{k}={v}"))))
+                .collect()
+        };
+        let escaped_window_name = quote_arg(window_name);
+        let session = &self.session;
+        format!(
+            "new-window -t {session} -n {escaped_window_name} -P -F '#{{pane_id}}'{cwd_part}{env_part} {shell_cmd}"
+        )
+    }
+
     /// Run a closure with a reference to the active control mode, or bail if
     /// it has not been started yet.
     ///
@@ -1242,51 +1338,7 @@ impl SessionBackend for TmuxBackend {
         rows: u16,
         cols: u16,
     ) -> Result<SpawnedSession> {
-        // psmux can't take the command as joined trailing tokens nor env via
-        // `-e` (see `psmux_window_command`); everything is folded into one
-        // token there. tmux keeps the byte-identical multi-token + `-e` path.
-        let psmux = self.transport.uses_psmux();
-        // A remote/WSL companion shell pane (`tbs-` window) opens the user's own
-        // interactive login shell — the SSH-login environment — instead of the
-        // bare `/bin/sh` the generic login-wrap would produce (see
-        // `remote_shell_pane_command`). Agent windows (`tb-`) and psmux hosts
-        // keep the standard path.
-        let is_remote_shell_pane =
-            self.transport.is_remote() && !psmux && window_name.starts_with(SHELL_WINDOW_PREFIX);
-        let shell_cmd = if psmux {
-            Self::psmux_window_command(command, args, env)
-        } else if is_remote_shell_pane {
-            self.remote_shell_pane_command()
-        } else {
-            self.login_wrap_for_remote(&Self::build_shell_command(command, args))
-        };
-
-        // psmux's tokenizer can't read POSIX `'\''` escapes (see
-        // `psmux_quote`), so its `-c`/`-n` values get the double-quote framing
-        // it does parse; tmux keeps the byte-identical single-quote path.
-        let quote_arg = |s: &str| {
-            if psmux {
-                control_mode::psmux_quote(s)
-            } else {
-                control_mode::shell_escape(s)
-            }
-        };
-        let cwd_part = match cwd {
-            Some(dir) => format!(" -c {}", quote_arg(&dir.to_string_lossy())),
-            None => String::new(),
-        };
-        let env_part: String = if psmux {
-            String::new()
-        } else {
-            env.iter()
-                .map(|(k, v)| format!(" -e {}", shell_escape(&format!("{k}={v}"))))
-                .collect()
-        };
-        let escaped_window_name = quote_arg(window_name);
-        let session = &self.session;
-        let cmd = format!(
-            "new-window -t {session} -n {escaped_window_name} -P -F '#{{pane_id}}'{cwd_part}{env_part} {shell_cmd}"
-        );
+        let cmd = self.new_window_command(window_name, command, args, cwd, env);
         let result = self.ctrl_command(&cmd)?;
         let pane_id = result.trim().to_string();
         if !control_mode::is_valid_pane_id(&pane_id) {
@@ -2332,11 +2384,15 @@ pub fn spawn_window(
         .context("Failed to run tmux new-window for headless spawn")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // This path reports the window and tmux's own words, never the argv —
+        // but tmux is free to quote the argument it objected to, and on this
+        // path that includes every `-e` value. Redact for the same reason the
+        // control-mode failures do.
         bail!(
             "tmux new-window exited {} for window {}: {}",
             output.status,
             window_name,
-            stderr.trim()
+            redact_secrets(stderr.trim())
         );
     }
     Ok(())
@@ -2935,6 +2991,89 @@ mod tests {
         let cmd =
             LocalTmuxBackend::build_shell_command("/opt/My Agents/codex", &["--foo".to_string()]);
         assert_eq!(cmd, "'/opt/My Agents/codex' --foo");
+    }
+
+    // --- credential redaction in failure reports ---
+    //
+    // A sandboxed launch hands the agent the egress boundary's proxy URL, whose
+    // userinfo is a live bearer token. It travels in the `new-window` line, and
+    // both failure paths of a control-mode command quote that line — into the
+    // log file and into an error toast. Neither may carry the credential.
+
+    /// A fabricated proxy grant, shaped exactly like the one
+    /// `sandbox::egress` mints (`http://friring:<token>@127.0.0.1:<port>`) but
+    /// authorising nothing. Nothing here touches a real credential.
+    fn sandboxed_launch_env() -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "HTTP_PROXY".to_string(),
+                "http://friring:fake-token-abc@127.0.0.1:54321".to_string(),
+            ),
+            (
+                "ALL_PROXY".to_string(),
+                "socks5h://friring:fake-token-abc@127.0.0.1:54321".to_string(),
+            ),
+            ("FRIRING_SESSION_ID".to_string(), "sess-1".to_string()),
+        ])
+    }
+
+    #[test]
+    fn control_mode_failures_withhold_the_proxy_credential() {
+        let backend = TmuxBackend::local();
+        let env = sandboxed_launch_env();
+        let cmd = backend.new_window_command("tb-work", "claude", &[], Some(Path::new("/w")), &env);
+        // The command friring actually sends must carry the credential — the
+        // redaction is on the report, not on the launch.
+        assert!(cmd.contains("fake-token-abc"), "{cmd}");
+
+        for message in [
+            timeout_context(&cmd),
+            command_failed(&cmd, "can't establish current session"),
+        ] {
+            assert!(!message.contains("fake-token-abc"), "{message}");
+            // The port is the other half of a usable endpoint.
+            assert!(!message.contains("54321"), "{message}");
+            assert!(!message.contains("socks5h://friring"), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_redacted_failure_is_still_worth_reading() {
+        let backend = TmuxBackend::local();
+        let env = sandboxed_launch_env();
+        let cmd = backend.new_window_command("tb-work", "claude", &[], Some(Path::new("/w")), &env);
+
+        for message in [
+            timeout_context(&cmd),
+            command_failed(&cmd, "can't establish current session"),
+        ] {
+            // The verb, the window, the directory and the agent: what a stalled
+            // spawn is diagnosed from.
+            assert!(message.contains("new-window"), "{message}");
+            assert!(message.contains("tb-work"), "{message}");
+            assert!(message.contains("-c /w"), "{message}");
+            assert!(message.contains("claude"), "{message}");
+            // Which keys were set, even for the ones whose values went.
+            assert!(message.contains("HTTP_PROXY=<redacted>"), "{message}");
+            // A non-secret entry is shown in full.
+            assert!(message.contains("FRIRING_SESSION_ID=sess-1"), "{message}");
+        }
+        // tmux's own words survive; only the command around them is rewritten.
+        assert!(command_failed("kill-pane -t %1", "no such pane")
+            .ends_with("tmux command failed: kill-pane -t %1: no such pane"));
+    }
+
+    #[test]
+    fn tmux_error_text_is_redacted_as_well_as_the_command() {
+        // A tmux error is free to quote the argument it rejected, which on the
+        // one command that carries an environment is the credential itself.
+        let message = command_failed(
+            "new-window -t friring -n tb-work",
+            "bad value: HTTP_PROXY=http://friring:fake-token-abc@127.0.0.1:54321",
+        );
+        assert!(!message.contains("fake-token-abc"), "{message}");
+        assert!(message.contains("HTTP_PROXY=<redacted>"), "{message}");
+        assert!(message.contains("tb-work"), "{message}");
     }
 
     #[test]

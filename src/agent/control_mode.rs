@@ -411,6 +411,259 @@ pub fn shell_escape(s: &str) -> String {
     crate::shell::posix_quote(&s.replace('\n', " "))
 }
 
+/// What a withheld value is replaced by in diagnostic text.
+///
+/// Distinctive on purpose: a log line or a pasted bug report should show *that*
+/// something was withheld, rather than reading like a truncated value.
+pub const REDACTED: &str = "<redacted>";
+
+/// Name fragments that make the value they label a presumed credential.
+///
+/// Matched case-insensitively as substrings, so `HTTPS_PROXY`,
+/// `ANTHROPIC_API_KEY`, `GH_TOKEN` and `--auth-header` are all covered without
+/// this list naming any of them. It errs wide deliberately — see
+/// [`redact_secrets`].
+const SECRET_NAME_FRAGMENTS: &[&str] = &[
+    "auth",
+    "credential",
+    "key",
+    "passwd",
+    "password",
+    "proxy",
+    "secret",
+    "token",
+];
+
+/// Rewrite a control-mode command line so it is safe to log or show in a toast.
+///
+/// A sandboxed launch carries the egress boundary's bearer token in the command
+/// itself — `new-window … -e 'HTTP_PROXY=http://friring:<token>@127.0.0.1:<port>'`
+/// — and the failure paths that report a command quote it verbatim. Log files
+/// persist, get shared and get pasted into bug reports, and that token together
+/// with the port it names is a working local egress channel for any other
+/// process on the machine, so the text is rewritten before it is reported.
+///
+/// The policy is by **shape**, never by variable name: this is shared plumbing
+/// that every subsystem's launch flows through, so a credential can arrive from
+/// an agent's registry environment, an extension's, or a user's own argv, and
+/// special-casing the one variable that motivated this would miss all of them.
+/// Four shapes are treated as secret:
+///
+/// - an assignment whose name reads like a credential (`SECRET_NAME_FRAGMENTS`)
+///   → `NAME=<redacted>`, so *which* keys were set is still legible;
+/// - a URL carrying userinfo (`scheme://user:pass@host:port`) →
+///   `scheme://<redacted>`, host and port included, since they are the other
+///   half of a usable endpoint;
+/// - the word after one that *labels* a credential — a flag (`--api-key sk-…`)
+///   or a qualified name (psmux's `Set-Item Env:GH_TOKEN '…'`);
+/// - anything matching the above *inside* a quoted compound word, found by
+///   re-running the policy on the unquoted content. A remote launch nests the
+///   whole command in `/bin/sh -lc '…'` and a psmux one nests it in a
+///   PowerShell string; quoting must not be a way to smuggle a value past this.
+///
+/// Everything else survives verbatim — the tmux verb, the target session, the
+/// window name, the flags, the paths, the names of the environment entries. A
+/// blanket `<redacted>` would be safe and useless; a stalled spawn still has to
+/// be diagnosable from its error. Where the two pull against each other,
+/// redaction wins: over-redacting a diagnostic costs a detail, under-redacting
+/// one leaks a credential, so values that are merely credential-*shaped*
+/// (`NO_PROXY`, a hostname behind `--auth-server`) go too.
+///
+/// The result is **not** a runnable command: quoting around a replaced value is
+/// dropped, and nothing can be re-run from a redacted line anyway.
+pub fn redact_secrets(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut copied = 0;
+    let mut after_label = false;
+    for word in word_ranges(command) {
+        let raw = &command[word.clone()];
+        let bare = unquote(raw);
+        let replacement = if after_label {
+            Some(REDACTED.to_string())
+        } else if let Some(assignment) = redact_assignment(&bare) {
+            Some(assignment)
+        } else if bare != *raw {
+            // A quoted compound: strip one layer and apply the whole policy to
+            // what it was hiding. Each step removes at least one character, so
+            // the recursion is bounded by the word's length.
+            let inner = redact_secrets(&bare);
+            (inner != bare).then(|| requote(raw, &inner))
+        } else {
+            redact_userinfo_urls(raw)
+        };
+        if let Some(replacement) = replacement {
+            out.push_str(&command[copied..word.start]);
+            out.push_str(&replacement);
+            copied = word.end;
+        }
+        after_label = labels_a_secret(&bare);
+    }
+    out.push_str(&command[copied..]);
+    out
+}
+
+/// Byte ranges of the whitespace-separated words of `s`, with a quoted run
+/// (`'…'` or `"…"`) counting as part of the word it sits in — so an escaped
+/// argument stays one word however much whitespace it contains.
+fn word_ranges(s: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut quote: Option<char> = None;
+    for (i, c) in s.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c.is_whitespace() => {
+                if let Some(begin) = start.take() {
+                    ranges.push(begin..i);
+                }
+                continue;
+            }
+            None => {}
+        }
+        start.get_or_insert(i);
+    }
+    if let Some(begin) = start {
+        ranges.push(begin..s.len());
+    }
+    ranges
+}
+
+/// The value a quoted word stands for, so the policy matches whatever framing
+/// the caller used.
+///
+/// Approximate by design — it reads POSIX `'…'`, double quotes and a
+/// backslash escape, which covers every quoting style this crate emits
+/// ([`shell_escape`], [`psmux_quote`]) and is only ever used to *decide* on a
+/// redaction, never to rebuild a command.
+fn unquote(word: &str) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut quote: Option<char> = None;
+    let mut chars = word.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => out.push(c),
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == '\\' => out.extend(chars.next()),
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+/// Put `inner` back inside the framing `raw` had, so a redacted compound still
+/// reads as one argument.
+fn requote(raw: &str, inner: &str) -> String {
+    let mut chars = raw.chars();
+    match (chars.next(), chars.next_back()) {
+        (Some(q), Some(last)) if (q == '\'' || q == '"') && q == last => format!("{q}{inner}{q}"),
+        _ => inner.to_string(),
+    }
+}
+
+/// `NAME=<redacted>` when `word` assigns a value to a credential-shaped name.
+fn redact_assignment(word: &str) -> Option<String> {
+    let (name, value) = word.split_once('=')?;
+    (!value.is_empty() && is_secret_name(name)).then(|| format!("{name}={REDACTED}"))
+}
+
+/// Whether `word` names a credential whose value is the *next* word.
+///
+/// Only a flag (`--api-key`) or a qualified name (`Env:GH_TOKEN`) counts. A
+/// bare word does not: a window named `tb-api-keys` would otherwise blank the
+/// flag that follows it, and tmux's own option names (`extended-keys`) would
+/// blank their values.
+fn labels_a_secret(word: &str) -> bool {
+    if word.contains('=') {
+        return false;
+    }
+    if let Some(flag) = word.strip_prefix('-') {
+        return is_secret_name(flag);
+    }
+    match word.rsplit_once(':') {
+        Some((prefix, name)) => !prefix.is_empty() && is_secret_name(name),
+        None => false,
+    }
+}
+
+/// Whether `name` reads as the name of a credential rather than of anything
+/// else. Leading dashes are ignored so a flag and an environment key are judged
+/// the same way; anything that is not plausibly a name (a URL, a tmux format, a
+/// path) is rejected before the fragments are consulted.
+fn is_secret_name(name: &str) -> bool {
+    let name = name.trim_start_matches('-');
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    SECRET_NAME_FRAGMENTS.iter().any(|f| lower.contains(f))
+}
+
+/// Replace every `scheme://user[:pass]@host[:port]` in `word` with
+/// `scheme://<redacted>`, or `None` if it holds no such URL.
+///
+/// Userinfo is the giveaway that a URL is credential-bearing, and the authority
+/// goes with it rather than only the `user:pass` part: an endpoint's host and
+/// port are what make a leaked token spendable. The scheme is kept because it
+/// is not a secret and it is what tells an HTTP proxy from a SOCKS one.
+fn redact_userinfo_urls(word: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut cursor = 0;
+    let mut found = false;
+    while let Some(offset) = word[cursor..].find("://") {
+        let separator = cursor + offset;
+        let authority = separator + 3;
+        let end = authority
+            + word[authority..]
+                .find(ends_authority)
+                .unwrap_or(word.len() - authority);
+        if word[authority..end].contains('@') && has_scheme(word, separator) {
+            // Everything up to the `://` — any leading text plus the scheme —
+            // is not secret and is kept; the authority after it is dropped.
+            out.push_str(&word[copied..separator]);
+            out.push_str("://");
+            out.push_str(REDACTED);
+            copied = end;
+            found = true;
+        }
+        cursor = end.max(separator + 3);
+    }
+    found.then(|| {
+        out.push_str(&word[copied..]);
+        out
+    })
+}
+
+/// Characters that cannot appear in a URL authority, so the first one ends it.
+fn ends_authority(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '/' | '?' | '#' | '\'' | '"' | '`' | ';' | ',' | '<' | '>' | '|' | '\\' | ')' | ']'
+        )
+}
+
+/// Whether a scheme precedes the `://` at `separator` — otherwise the `://` is
+/// incidental text and the run after it is not a URL authority.
+fn has_scheme(word: &str, separator: usize) -> bool {
+    let mut start = separator;
+    for (i, c) in word[..separator].char_indices().rev() {
+        if c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.') {
+            start = i;
+        } else {
+            break;
+        }
+    }
+    word[start..separator].starts_with(|c: char| c.is_ascii_alphabetic())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc::sync_channel;
@@ -493,6 +746,198 @@ mod tests {
     #[test]
     fn shell_escape_newline_only() {
         assert_eq!(shell_escape("\n"), "' '");
+    }
+
+    // --- redact_secrets tests ---
+    //
+    // The command line of a sandboxed launch carries the egress proxy's bearer
+    // token. These pin the two halves of the bargain: no credential survives
+    // into diagnostic text, and everything that is not one does.
+
+    /// The exact shape the egress boundary produces, quoted the way
+    /// `new-window -e` quotes it.
+    #[test]
+    fn redact_drops_a_proxy_url_but_keeps_its_key() {
+        assert_eq!(
+            redact_secrets("-e 'HTTP_PROXY=http://friring:s3cr3t@127.0.0.1:54321'"),
+            "-e HTTP_PROXY=<redacted>"
+        );
+        assert_eq!(
+            redact_secrets("-e 'ALL_PROXY=socks5h://friring:s3cr3t@127.0.0.1:54321'"),
+            "-e ALL_PROXY=<redacted>"
+        );
+    }
+
+    /// Neither the token nor the port it names may reach a log: together they
+    /// are a usable local egress channel for anything else on the machine.
+    #[test]
+    fn redact_removes_token_and_port_together() {
+        let out = redact_secrets("-e HTTP_PROXY=http://friring:s3cr3t@127.0.0.1:54321");
+        assert!(!out.contains("s3cr3t"), "{out}");
+        assert!(!out.contains("54321"), "{out}");
+    }
+
+    /// A credential-bearing URL is redacted wherever it appears, not only in an
+    /// assignment — and the scheme stays, since it tells an HTTP proxy from a
+    /// SOCKS one and is not itself a secret.
+    #[test]
+    fn redact_handles_a_bare_userinfo_url() {
+        assert_eq!(
+            redact_secrets("curl socks5h://friring:s3cr3t@127.0.0.1:9"),
+            "curl socks5h://<redacted>"
+        );
+        assert_eq!(
+            redact_secrets("git clone https://x-token:ghp_abc@github.com/o/r.git"),
+            "git clone https://<redacted>/o/r.git"
+        );
+    }
+
+    /// A URL with no userinfo is not credential-bearing and stays whole — most
+    /// of them are the allowlist entries the diagnostic is about.
+    #[test]
+    fn redact_keeps_a_url_without_userinfo() {
+        let cmd = "new-window -n tb-x claude --url https://api.anthropic.com/v1";
+        assert_eq!(redact_secrets(cmd), cmd);
+    }
+
+    /// The point of redacting the value rather than the line: a stalled spawn
+    /// still names its verb, its target, its window, its directory, and which
+    /// environment keys were set.
+    #[test]
+    fn redact_keeps_the_command_readable() {
+        let out = redact_secrets(
+            "new-window -t friring -n tb-work -P -F '#{pane_id}' -c /w \
+             -e 'HTTP_PROXY=http://friring:s3cr3t@127.0.0.1:9' -e FRIRING_SESSION_ID=abc claude",
+        );
+        assert_eq!(
+            out,
+            "new-window -t friring -n tb-work -P -F '#{pane_id}' -c /w \
+             -e HTTP_PROXY=<redacted> -e FRIRING_SESSION_ID=abc claude"
+        );
+    }
+
+    /// Every tmux command friring actually sends outside a sandboxed launch —
+    /// control-mode lines and the one-shot argvs alike — is reported verbatim.
+    /// The redactor must not turn ordinary tmux traffic into a puzzle.
+    /// `extended-keys` is the trap: it contains a secret fragment but is an
+    /// option name, and its value must survive.
+    #[test]
+    fn redact_leaves_ordinary_tmux_commands_alone() {
+        for cmd in [
+            "refresh-client",
+            "refresh-client -f pause-after=5",
+            "refresh-client -A '%1:continue'",
+            "refresh-client -B 'friring-status:%*:#{@friring_agent_state}'",
+            "set-option -s extended-keys on",
+            "set-option -s extended-keys-format csi-u",
+            "set-option -s default-command /bin/zsh",
+            "set-option -t friring history-limit 5000",
+            "new-session -d -s friring -x 80 -y 24",
+            "has-session -t friring",
+            "capture-pane -e -p -J -S -5000 -t %1",
+            "list-windows -t friring -F '#{pane_id}|#{window_name}|#{pane_dead}'",
+            "display-message -t %1 -p '#{pane_dead}'",
+            "resize-pane -t %1 -x 80 -y 24",
+            "kill-pane -t %1",
+            "send-keys -t %1 -H 41 42 43",
+            "",
+        ] {
+            assert_eq!(redact_secrets(cmd), cmd, "rewrote: {cmd}");
+        }
+    }
+
+    /// The two rules cover for each other: a name the fragments don't know
+    /// still loses a userinfo URL, and the surviving path keeps enough of the
+    /// remote to be recognisable.
+    #[test]
+    fn redact_catches_a_credential_under_an_unremarkable_name() {
+        assert_eq!(
+            redact_secrets("-e 'GIT_REMOTE=https://u:ghp_abc@github.com/o/r.git'"),
+            "-e 'GIT_REMOTE=https://<redacted>/o/r.git'"
+        );
+    }
+
+    /// The seatbelt profile parameter naming the port the proxy listens on.
+    /// The token is elsewhere, but the port is the other half of the endpoint.
+    #[test]
+    fn redact_covers_the_sandbox_proxy_parameter() {
+        assert_eq!(
+            redact_secrets("sandbox-exec -f /d/p.sb -D PROXY=localhost:54321 claude"),
+            "sandbox-exec -f /d/p.sb -D PROXY=<redacted> claude"
+        );
+    }
+
+    /// A flag names its value, so the word after a credential-shaped flag goes
+    /// even when the value itself looks innocuous.
+    #[test]
+    fn redact_covers_a_value_behind_a_credential_flag() {
+        assert_eq!(
+            redact_secrets("claude --api-key sk-live-01 --model opus"),
+            "claude --api-key <redacted> --model opus"
+        );
+    }
+
+    /// Quoting must not be a way to smuggle a value past the policy: the
+    /// remote path nests the whole launch in `/bin/sh -lc '…'`.
+    #[test]
+    fn redact_reaches_inside_a_quoted_compound() {
+        assert_eq!(
+            redact_secrets("/bin/sh -lc 'exec sandbox-exec -D PROXY=localhost:54321 claude'"),
+            "/bin/sh -lc 'exec sandbox-exec -D PROXY=<redacted> claude'"
+        );
+    }
+
+    /// The psmux shape: env folded into one double-quoted PowerShell token,
+    /// where the key is a `Set-Item Env:NAME` label rather than an assignment.
+    #[test]
+    fn redact_reaches_inside_the_psmux_window_command() {
+        let out = redact_secrets(
+            "new-window -n tb-x \"Set-Item Env:GH_TOKEN 'ghp_abc'; \
+             Set-Item Env:TERM 'xterm'; & 'claude'\"",
+        );
+        assert!(!out.contains("ghp_abc"), "{out}");
+        assert!(out.contains("Env:GH_TOKEN <redacted>"), "{out}");
+        assert!(out.contains("Set-Item Env:TERM 'xterm'"), "{out}");
+        assert!(out.contains("tb-x"), "{out}");
+    }
+
+    /// Over-redacting a diagnostic costs a detail; under-redacting one leaks a
+    /// credential. Values that are only credential-*shaped* go too.
+    #[test]
+    fn redact_errs_wide_on_credential_shaped_names() {
+        assert_eq!(
+            redact_secrets("-e NO_PROXY=localhost,127.0.0.1,::1"),
+            "-e NO_PROXY=<redacted>"
+        );
+        assert_eq!(
+            redact_secrets("-e ANTHROPIC_API_KEY=sk-ant-01"),
+            "-e ANTHROPIC_API_KEY=<redacted>"
+        );
+        assert_eq!(
+            redact_secrets("-e aws_secret_access_key=AKIA"),
+            "-e aws_secret_access_key=<redacted>"
+        );
+    }
+
+    /// Redacting twice must not eat the marker or the command around it — the
+    /// text passes through this on more than one path.
+    #[test]
+    fn redact_is_idempotent() {
+        for cmd in [
+            "-e 'HTTP_PROXY=http://friring:s3cr3t@127.0.0.1:9' -e TERM=xterm",
+            "/bin/sh -lc 'exec claude --api-key sk-1'",
+            "socks5h://u:p@h:1",
+        ] {
+            let once = redact_secrets(cmd);
+            assert_eq!(redact_secrets(&once), once, "not idempotent: {cmd}");
+        }
+    }
+
+    /// An empty value carries nothing to leak, and blanking it would hide that
+    /// the key was set to nothing at all — a real cause of a broken launch.
+    #[test]
+    fn redact_keeps_an_empty_assignment_visible() {
+        assert_eq!(redact_secrets("-e HTTP_PROXY="), "-e HTTP_PROXY=");
     }
 
     // --- decode_octal tests ---
@@ -1237,6 +1682,74 @@ mod transport_proptests {
         fn format_send_keys_round_trips(bytes in prop::collection::vec(any::<u8>(), 0..256)) {
             let cmd = format_send_keys("%1", &bytes);
             prop_assert_eq!(parse_send_keys_hex(&cmd), bytes);
+        }
+    }
+}
+
+/// Property tests for [`redact_secrets`], the one function standing between a
+/// sandboxed launch's bearer token and the log file. A unit test can only pin
+/// the shapes someone thought of; these pin the invariant itself — a credential
+/// placed anywhere in a command does not survive, whatever surrounds it.
+#[cfg(test)]
+mod redaction_proptests {
+    use proptest::prelude::*;
+
+    use super::redact_secrets;
+
+    /// A token that cannot collide with anything else in a generated command,
+    /// so "the output still contains it" can only mean it leaked.
+    fn token() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9_-]{8,32}".prop_map(|s| format!("tok-{s}"))
+    }
+
+    proptest! {
+        /// Wherever the proxy grant is spelled — in either case, as either
+        /// scheme, quoted or bare — the token does not reach the diagnostic,
+        /// and what is left still identifies the launch.
+        #[test]
+        fn a_proxy_credential_never_survives_redaction(
+            token in token(),
+            key in prop::sample::select(vec!["HTTP_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]),
+            scheme in prop::sample::select(vec!["http", "socks5h"]),
+            port in 1024u16..65535,
+            quoted in any::<bool>(),
+        ) {
+            let entry = format!("{key}={scheme}://friring:{token}@127.0.0.1:{port}");
+            let entry = if quoted { format!("'{entry}'") } else { entry };
+            let cmd = format!(
+                "new-window -t friring -n tb-work -P -F '#{{pane_id}}' -c /w -e {entry} claude"
+            );
+            prop_assert!(cmd.contains(&token), "the launch itself must carry it");
+
+            let out = redact_secrets(&cmd);
+            prop_assert!(!out.contains(&token), "leaked: {}", out);
+            prop_assert!(!out.contains(&port.to_string()), "leaked the port: {}", out);
+            // Still a diagnostic: the verb, the window and the key survive.
+            prop_assert!(out.contains("new-window"), "{}", out);
+            prop_assert!(out.contains("tb-work"), "{}", out);
+            prop_assert!(out.contains(key), "{}", out);
+        }
+
+        /// A credential nested inside the quoting a remote or psmux launch adds
+        /// is no more visible than one at the top level.
+        #[test]
+        fn nesting_does_not_hide_a_credential(token in token(), depth in 1usize..4) {
+            let mut inner = format!("claude --api-key {token}");
+            for _ in 0..depth {
+                inner = format!("/bin/sh -lc '{}'", inner.replace('\'', ""));
+            }
+            let out = redact_secrets(&inner);
+            prop_assert!(!out.contains(&token), "leaked at depth {}: {}", depth, out);
+        }
+
+        /// Arbitrary text — a malformed command, unbalanced quotes, non-ASCII —
+        /// must neither panic nor change meaning on a second pass. This runs
+        /// over anything that reaches a failure path, including tmux's own
+        /// error replies.
+        #[test]
+        fn redaction_is_total_and_stable(text in ".{0,200}") {
+            let once = redact_secrets(&text);
+            prop_assert_eq!(redact_secrets(&once), once);
         }
     }
 }
