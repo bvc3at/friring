@@ -244,18 +244,22 @@ actually needs and to an allowlist of domains.
 
 What ships is the two policy backends and the `docker`/`podman` place backend,
 with every network mode enforced, host-passthrough credentials under a policy
-backend, and status reporting out of a policy boundary. What does not: config
-projection into a place, so a place starts from an empty per-profile home — the
-agent signs in inside its own pane, friring's hook configuration is dropped
-rather than pointed at a host path the container does not have, and a
-place-backed session therefore reports no status (all three are said on the
-session's `Sandbox:` row rather than left to be discovered). Neither
-`env-token` nor `volume-login` credentials are built, a place on a *remote* host
-is not wired, and `apple-container`/`wsl-distro` still probe as unavailable. An
-egress proxy dies with the friring process that started it, so a session created
-by the short-lived `friring-cli` starts with no way out (kernel-closed, which
-fails closed) until a running friring relaunches it. Design, delivery phases and
-ADR-25 through ADR-29 live in [`docs/SANDBOX.md`](docs/SANDBOX.md).
+backend, and status reporting out of either kind of boundary — a place gets the
+safe subset of the user's agent configuration projected into its synthetic home,
+including friring's own hook payload rewritten to report through tmux, so a
+place-backed session says working/blocked/done like any other. All three place
+credential strategies are built: `env-token`, `volume-login` and `seed-file`.
+
+What does not: a place on a *remote* host is refused rather than supported
+(friring creates the container locally, with this machine's paths), nothing
+*stores* a token yet — the `friring-cli sandbox` subcommands are the next phase,
+so `env-token` only fires for a keychain entry created by hand with the command
+friring prints — there is no sandbox manager view, and
+`apple-container`/`wsl-distro` still probe as unavailable. An egress proxy dies
+with the friring process that started it, so a session created by the short-lived
+`friring-cli` starts with no way out (kernel-closed, which fails closed) until a
+running friring relaunches it. Design, delivery phases and ADR-25 through ADR-29
+live in [`docs/SANDBOX.md`](docs/SANDBOX.md).
 
 #### Lazy sessions & ghosts (July 2026)
 
