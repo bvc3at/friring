@@ -129,10 +129,6 @@ impl EgressPromptState {
         self.queue.pop_front()
     }
 
-    pub fn has_queued(&self) -> bool {
-        !self.queue.is_empty()
-    }
-
     /// Forget everything about one session.
     ///
     /// Called where the boundary is rebuilt: a relaunch mints a fresh proxy
@@ -198,7 +194,7 @@ mod tests {
         assert_eq!(asked.host, "tracker.example");
         // The user said no; the agent keeps trying.
         assert_eq!(state.observe("s1", "tracker.example"), Observed::Repeat);
-        assert!(!state.has_queued());
+        assert!(state.next_prompt().is_none());
     }
 
     /// Spelling is presentation. Two cases of one name are one question.

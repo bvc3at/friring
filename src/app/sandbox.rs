@@ -369,7 +369,7 @@ impl App {
     /// the profile editor (or answering the previous question) waits its turn
     /// instead of stealing the screen mid-edit.
     fn open_next_domain_prompt(&mut self) {
-        if self.modal.is_open() || !self.egress_prompts.has_queued() {
+        if self.modal.is_open() {
             return;
         }
         if let Some(prompt) = self.egress_prompts.next_prompt() {
