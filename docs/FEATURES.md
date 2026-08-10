@@ -2986,16 +2986,33 @@ radius, it does not prove containment**. The policy backends share the host
 kernel, and a domain allowlist is bypassable through domain fronting and through
 any allowed domain that can host arbitrary content.
 
-**What ships in the first pass.** The two *policy* backends — `sandbox-exec`
-(macOS) and `bwrap` (Linux/WSL) — which wrap the agent's argv with tmux
-outside, so nothing about window discovery, reattach, scrollback or restart
-changes. Network `none` and `full` are enforced; `allowlist` configures the
-kernel identically to `none` until the filtering proxy lands, so a profile that
-selects it starts closed rather than open. Credentials are host passthrough:
-the agent sees its real credential store subject to path policy, so the macOS
-Keychain keeps working and there is no login to redo. Container, VM and
-distro-clone backends are declared and probed — the picker says why each one is
-unavailable rather than hiding it — but not built.
+**What ships.** The two *policy* backends — `sandbox-exec` (macOS) and `bwrap`
+(Linux/WSL) — which wrap the agent's argv with tmux outside, so nothing about
+window discovery, reattach, scrollback or restart changes. Every network mode is
+enforced, including `allowlist` (see the egress firewall below). Credentials are
+host passthrough: the agent sees its real credential store subject to path
+policy, so the macOS Keychain keeps working and there is no login to redo.
+Container, VM and distro-clone backends are declared and probed — the picker
+says why each one is unavailable rather than hiding it — but not built.
+
+**The egress firewall.** Under `allowlist` the kernel denies the sandbox *all*
+direct egress, and a Friring-owned filtering proxy outside the boundary lets
+through exactly the domains the profile lists — so an agent that ignores the
+proxy environment gets no network at all rather than a way around it. A rule is
+a host with an optional port; `github.com` covers `api.github.com` but never
+`evilgithub.com`, and denies beat allows in every mode (which is why `full`
+with denies is proxied too). Each session gets its own token-authenticated
+instance, started before the agent and stopped with it.
+
+When the agent reaches for a host the profile does not list, friring **asks
+once**: a confirm modal naming the session, the host and the port, whose "allow"
+applies to the running proxy immediately — the agent's retry succeeds, nothing
+restarts — and writes the rule into the profile so the next launch has it too.
+The rule is scoped to the port that was refused, so the grant is never wider
+than the question. Turn the asking off per profile with `prompt_new_domains`;
+refusals are still reported, because an agent that cannot reach the network is
+failing and the reason is the only way to know why. However hard the agent
+retries, one host is one question.
 
 **Friring is agent-neutral about it.** What an agent needs in order to survive
 being sandboxed is declared data in `agents.toml`
@@ -3024,13 +3041,16 @@ when it fires. Deleting a profile that sessions still reference leaves the
 reference dangling for the same reason: clearing it would silently unsandbox
 those sessions on their next launch.
 
-**Two limits worth knowing.** A sandboxed session is **local-only** for now —
+**Three limits worth knowing.** A sandboxed session is **local-only** for now —
 both policy backends generate their artefacts on the machine friring runs on, so
 an SSH/WSL session with a profile is refused rather than wrapped with the wrong
-machine's paths. And a sandboxed session **does not report status**: the
-database is denied inside every boundary (writing it is arbitrary host command
-execution — see ADR-29), and the file channel that replaces `friring-cli session
-signal` arrives with the place backends. The session shows as idle until then.
+machine's paths. A sandboxed session **does not report status**: the database is
+denied inside every boundary (writing it is arbitrary host command execution —
+see ADR-29), and the file channel that replaces `friring-cli session signal`
+arrives with the place backends. The session shows as idle until then. And an
+egress proxy **lives in the friring that started it**, so a filtered session
+created by `friring-cli session create` has no way out until a running friring
+relaunches it — closed, not open, but closed.
 
 ---
 

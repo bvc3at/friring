@@ -225,6 +225,13 @@ additionally set `backend_type = "sandbox:<profile>"`, mirroring how `ssh:<host>
 and `wsl:<host>` already drive restore and reattach. Both are written in the
 same migration that adds the tables.
 
+Schema v48 adds `sessions.sandbox_unenforced` beside it: the reason the last
+launch could not apply the profile, or `NULL`. Unlike `sandbox_profile` it is
+**not** part of the full-row upsert's unconditional write — a writer with no
+launch verdict leaves it untouched, the same protection the hook columns get —
+and a relaunch that does not rewrite the row (`restart_session_headless`)
+records it with a targeted update.
+
 ## Backend catalogue
 
 Every backend below is part of the design; **this release ships the two policy
@@ -476,41 +483,71 @@ policy**: the proxy's token is still demanded at the far end, and the decision
 is still made outside the boundary. Giving the relay either would put both
 inside the boundary they exist to constrain.
 
-The socket is `0o600` by default. It is a credential-bearing endpoint, and a
-backend whose sandbox runs as a different uid (containers usually do) has to
-widen that deliberately rather than inherit a world-connectable socket.
+The relay is `friring-cli sandbox relay --listen 127.0.0.1:8118 --socket <path>`,
+started inside the namespace beside the agent by a two-line `/bin/sh` launcher
+that takes every value as a positional parameter and then `exec`s the agent, so
+the agent is still pid 1 of the sandbox's pid namespace and the relay dies with
+it. The port is fixed because each `--unshare-net` sandbox has a private
+loopback. friring's own CLI is the relay: it is resolved from the running
+binary, never from `PATH`, bound read-only into a `workspace`-scope sandbox,
+and a launch that cannot find it is refused. The socket is bound read-write —
+`connect(2)` on a unix socket needs write permission — which also makes it a
+mount point, so a sandbox cannot unlink its own way out.
+
+The socket lives in the **per-session scratch directory**, `0o600` under a
+`0o700` directory. That directory is writable by the sandbox by design; the
+socket is safe there because it is a mount point while the launch is live, and
+because the next start replaces only a socket nothing is serving and refuses
+anything else — an agent that plants a file at the path refuses its own next
+launch and nothing more.
+
+`0o600` is the default rather than a fixed rule: the socket is a
+credential-bearing endpoint, and a backend whose sandbox runs as a different uid
+(containers usually do) has to widen it deliberately rather than inherit a
+world-connectable socket.
 
 Because the endpoint shape differs, a backend rejects the wrong one rather than
 silently failing later: `bwrap` refuses a loopback endpoint and says why.
 
-Until a backend is wired to the proxy, `allowlist` configures the kernel exactly
-like `none` — the two are identical at that layer, so `allowlist` grants nothing
-on its own. That is why a new profile can default to `allowlist` with an empty
-list and still start closed.
+Both policy backends are wired to the proxy. A launch whose mode the kernel
+cannot express on its own — `allowlist` always, and `full` when it carries
+denies — is **refused** unless an instance is running for it, so a sandbox is
+never started believing it is filtered. The refusal goes through the profile's
+own `allow_unsandboxed_fallback` switch, like every other boundary friring
+will not grant. `full` with no denies needs no proxy and keeps direct egress.
 
-**Allowlist matching** is suffix matching on label boundaries, case-insensitive:
+At the kernel layer `allowlist` and `none` are still identical — both deny
+direct egress — so the allowlist is entirely the proxy's doing, and a profile
+that defaults to `allowlist` with an empty list starts closed.
+
+**Allowlist matching** is suffix matching on label boundaries, over a host
+canonicalised first (see below) and therefore case-insensitively:
 `github.com` covers `api.github.com` but not `evilgithub.com`,
 `github.com.evil.net` or `github.co`. `*.x` and `.x` are spellings of `x`,
 apex included — the deny direction decides it, because a user refusing `*.x`
 means "no x traffic" and a matcher sparing the apex would be a silent hole.
 A rule without a port covers every port. Denies are checked **first in every
-mode**, so a deny entry narrows `full` too — and until the proxy exists, a
-`full` profile that carries denies is **refused at launch** rather than started
-with rules no kernel policy can express. `prompt_new_domains` is meaningful
-only under `allowlist` — nothing is unlisted under `full` and nothing leaves
-under `none` — and the editor greys it out elsewhere.
+mode**, so a deny entry narrows `full` too — and a `full` profile that carries
+denies is proxied exactly like an allowlist, because a deny list is enforceable
+nowhere else: the kernel blocks direct egress and the proxy applies the denies
+with mode `full`. `prompt_new_domains` is meaningful only under `allowlist` —
+nothing is unlisted under `full` and nothing leaves under `none` — and the
+editor greys it out elsewhere.
 
 Two matchers implement this vocabulary: `session::DomainRule`, which the
 profile validator and the UI use, and `proxy::HostRule`, which the proxy
 enforces at connection time. They deliberately do not share a type — the proxy
 is a leaf in the architecture allowlist — so
 `tests/egress_matcher_conformance.rs` runs both over one table of stored
-spellings and fails if either drifts. Both accept the same grammar: ASCII
-labels of letters, digits, `-` and `_`, no empty label, none edged with `-`,
-63 bytes per label and 253 overall. A spelling no request host could ever
-carry is refused rather than stored as a rule that matches nothing, and an
-international name is written in punycode because that is how it is spelled on
-the wire.
+spellings and fails if either drifts. Both accept the same grammar, and hold a
+*request* host to it too — a spelling that could never be written as a rule can
+never be allowed: ASCII labels of letters, digits, `-` and `_`, no empty label,
+none edged with `-`, 63 bytes per label and 253 overall, with brackets reserved
+for an address. Both also canonicalise before comparing, so a rule and a request
+meet in one spelling. A shape no request host could ever carry is refused rather
+than stored as a rule that matches nothing, and an international name is written
+in punycode because that is how it is spelled on the wire — and because guessing
+at a U-label would compare a rule against one name and dial another.
 
 This is chosen over IP-based `iptables`/`ipset` allowlists (the pattern in
 Anthropic's devcontainer reference and in the `friring-autonomous` rig) because
@@ -546,21 +583,45 @@ allowlist and testable without a session, a database or a backend.
 - Denials carry a reason and surface as a TUI event; with
   `prompt_new_domains`, an unlisted domain raises a confirm modal whose answer
   is written back to the profile and applied to the running proxy without a
-  restart.
+  restart. See [First-use domain prompts](#first-use-domain-prompts).
 - Optional HTTP-method restriction (`GET`/`HEAD`/`OPTIONS` only) as a cheap
   brake on exfiltration through allowed hosts. It reaches **plaintext HTTP
   only** — a `CONNECT` tunnel is opaque, so the method inside it is unknowable
   — and each forwarded plaintext request gets its own connection, so every one
-  of them is policed rather than only the first on a reused socket.
+  of them is policed rather than only the first on a reused socket. The proxy
+  implements it; no profile column selects it yet, so every launch runs with it
+  off. Adding the column is a profile change, not a proxy change.
 - No TLS interception in the first release. Allow decisions therefore trust the
   client-supplied hostname, so domain fronting can bypass them — documented in
   the UI, not hidden.
-- Both matchers compare ASCII, and neither treats `127.1` or `2130706433` as
-  the address `getaddrinfo` resolves them to. Under `allowlist` that fails
-  closed: an unlisted spelling is denied. It becomes a real gap only for a
-  *deny* list under `full`, which is refused at launch until the proxy is wired
-  — and the fix belongs in the proxy's request path (normalise the host to
-  A-labels, or refuse a non-ASCII request host outright), not in the matchers.
+- Both matchers **canonicalise a host before comparing it**, and the request
+  path canonicalises once at its edge — so the host the policy decided on is
+  the host the socket is opened to, and an address is dialled as an address
+  rather than handed back to the resolver. Case, one root dot, IPv6 brackets
+  and a leading empty label are presentation; `127.1`, `2130706433`,
+  `0x7f.0.0.1`, `0177.0.0.1` and `127.000.000.001` are the address
+  `getaddrinfo(3)` reads them as; `::ffff:127.0.0.1` folds onto `127.0.0.1`.
+  The deprecated IPv4-*compatible* form (`::127.0.0.1`) deliberately does not
+  fold: it is a different destination, and `::1` lives in that range. An
+  address rule therefore covers every spelling of its address and nothing else
+  — `127.0.0.1.evil.net` is still a name.
+- **A host with any non-ASCII byte is refused**, in a request and in a stored
+  rule alike, with the punycode form named as the fix. Canonicalising a U-label
+  correctly means UTS-46 — case folding, NFC normalisation, and tables of
+  disallowed and deviation characters — and only the punycode *encoding* half
+  of that is table-free. Encoding without mapping would be worse than refusing:
+  two spellings of one name encode to two A-labels, so a deny rule on the
+  punycode form would still be dodged while the feature looked closed. A UTS-46
+  dependency would buy exactly that and nothing else. The refusal carries its
+  own reason (`UnsupportedHost`), distinct from "not allowlisted" so it never
+  raises the first-use prompt — whose answer would be a rule the profile
+  validator refuses.
+
+The environment friring injects is `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`
+and `NO_PROXY` in both cases, because tools disagree about which spelling they
+read. `NO_PROXY` is `localhost,127.0.0.1,::1`: for a namespaced sandbox that is
+a boundary rule rather than a convenience, since a tunnelled local request
+would be dialled by the proxy on the *host's* loopback.
 
 Written in Rust rather than shelling out to an external runtime: Friring ships
 as a self-contained binary, and a CONNECT/SOCKS filter is a small, testable
@@ -568,6 +629,58 @@ component. The policy vocabulary deliberately mirrors the de-facto standard
 (`allowRead`/`denyRead`/`allowWrite`/`denyWrite`/`allowedDomains`/
 `deniedDomains`/`allowUnixSockets`) so profiles stay legible to anyone who
 knows the ecosystem.
+
+### First-use domain prompts
+
+An allowlist nobody can extend without stopping the agent is an allowlist
+people turn off. So a refusal under `prompt_new_domains` becomes a question:
+the TUI drains the proxy's denial stream on its own tick, and an unlisted host
+raises a confirm modal naming the session, the host, the port, and the rule an
+answer would store.
+
+**Allow does both halves.** It reaches the *running* proxy first
+(`update_policy`, no restart — the agent's next attempt succeeds), and then
+writes the rule into the profile so the next launch still has it. That order is
+also the check: a session torn down while the question waited, or a rule the
+proxy will not load, must not leave the stored profile permanently wider on the
+strength of an answer that reached no boundary. If the profile write is the half
+that fails — deleted, or no longer decodable — the live grant stands and the
+message says the profile did not keep it.
+
+**The rule is scoped to the port that was refused**, and stored canonically.
+`api.github.com:443` grants that host on that port, not every port on it, and
+not the host's subtree; a wider grant is an edit to the profile, made
+deliberately. Canonically because the *sandbox* chose the spelling: the question
+shows `127.1` because that is what the agent asked for and what the user has to
+recognise, and stores `127.0.0.1`, which is what every later request
+canonicalises to.
+
+**Every refusal is reported; only some are asked about.** An agent that cannot
+reach the network is failing, and the reason is the only way to know why — so a
+newly refused host reaches the status bar whatever its reason and whatever the
+profile says. It becomes a *question* only when all four hold: the reason is
+"not in the allowlist" (a deny rule, `network = none` and a rejected token are
+answers the user already gave, and `UnsupportedHost` must never be asked about
+— its answer would be a rule the profile validator then refuses to store);
+friring still holds the session, so there is a profile to write to; that profile
+decodes and carries `prompt_new_domains`; and the host can be spelled as a rule
+at all. Each of the four fails towards *not* asking.
+
+**Asked once.** The far side of this prompt is an agent, and an agent that
+wanted a domain wants it again a millisecond later. A refusal is therefore
+turned into something the user sees exactly once per `(session, host)`: the
+first is reported and asked about, every later one is silent — which is also
+how a refusal is remembered, since "no" needs no separate record. Two bounds
+guard the rest, and both fail towards saying less: a session refused more than
+256 distinct hosts is scanning rather than asking, and is told so once and then
+ignored; and at most eight questions wait at a time, past which a refusal is
+reported without being asked, because a queue the user clears one keypress at a
+time is worse than a message.
+
+A question waits for the single modal slot rather than taking the screen from
+an open editor, and a relaunch clears the session's history — a fresh proxy
+from a re-read profile is a new boundary, not the one the earlier answers were
+about.
 
 ## Credentials
 
@@ -747,6 +860,15 @@ Two details that silently break things if missed:
   The scratch is keyed on the session and adopted, not recreated, so a crashed
   run's files survive into the next launch; session teardown drops both.
 
+  A proxy instance is **per session, not per profile**: the policy is per
+  profile, but the bearer token and the socket are per boundary, and sharing them
+  would put every sibling session's way out behind one compromised agent and let
+  one first-use answer widen another session's boundary. It is started before the
+  agent, replaced on every relaunch (so an edited profile takes effect and the
+  token rotates), and stopped where the scratch directory is dropped. It lives in
+  the friring process that launched it: a session created by the short-lived
+  `friring-cli` starts with no egress until a running friring relaunches it.
+
 ## Status signals
 
 Agents report working/blocked/done by running `friring-cli session signal`,
@@ -821,30 +943,38 @@ paths is not built yet — the step offers the stored profiles and `none`.
 **Indicators** — two `SessionInfo` fields carry it, and they say different
 things. `sandbox_profile` (persisted) is the boundary the session **asked
 for**: it survives a deleted profile and a fallback launch alike, because it
-is what the next relaunch rebuilds from. `sandbox_state` (not persisted — it
-describes a running process) is what the last launch **applied**: `Applied`
-carries the resolved backend and the inner-sandbox composition, `Unenforced`
-carries the reason there is no boundary. The session-list prefix marks read
+is what the next relaunch rebuilds from. `sandbox_state` (half-persisted) is
+what the last launch **applied**: `Applied` carries the resolved backend and
+the inner-sandbox composition, `Unenforced` carries the reason there is no
+boundary. The session-list prefix marks read
 the applied state, not the desired one — `⛨` beside the remote and worktree
 marks for a boundary that is in effect, `⚠` for a session running on the host
 under a profile that could not be applied — and the info panel's `Sandbox:`
 row spells the same distinction out. A fallback also raises an error toast at
 the moment of the launch, and `friring-cli session create|restart` prints it
-(`sandbox_unenforced` in the JSON). `sandbox_state` is `None` for a session
-friring only adopted: it did not make that launch, so the persisted profile
-is the only evidence it has. The profile also appears in the creation
-breadcrumb.
+(`sandbox_unenforced` in the JSON, which `session get|list` now also report per
+session). An `Unenforced` reason is persisted
+(`sessions.sandbox_unenforced`, schema v48); an `Applied` composition is not,
+because the next launch re-derives it and a stale positive claim is the one
+thing worse than no mark at all. So a session friring only adopted still
+inherits the warning the launch recorded, and `sandbox_state` is `None` — the
+persisted profile the only evidence — just when no launch ever recorded one.
+The profile also appears in the creation breadcrumb.
 
-Because the applied state is not persisted, an adopted session renders as `⛨`
-even if the launch friring is adopting had fallen back to the host. The window
-is bounded — any relaunch re-derives the truth and re-reports it — and closing
-it needs a persisted column, which is a schema migration rather than a
-rendering fix.
+The applied state survives friring itself, so an adopted session shows what the
+launch it is adopting really did. Only the negative half is stored: the column
+is a reason or nothing, which means no value it could ever hold — hand-edited,
+truncated, written by an older binary — can manufacture a claim of protection,
+and the write is skipped entirely by a writer that has no launch of its own to
+report, so a full-row write-back can preserve a warning but never erase one. A
+launch that regains the boundary clears it.
 
-**Firewall prompts** — with the firewall (P2 — see
-[Delivery phases](#delivery-phases)), a denial for an unlisted domain will raise
-a notification and a confirm modal naming the domain and the command that wanted
-it; the answer is persisted to the profile.
+**Firewall prompts** — a refusal for an unlisted domain raises a status line
+and, under `prompt_new_domains`, a confirm modal naming the session, the host
+and the port; the answer applies to the running proxy and is written back to
+the profile. See
+[First-use domain prompts](#first-use-domain-prompts) for what is asked, what
+is only reported, and why the same host is never asked about twice.
 
 UI polish is explicitly a later pass. The first implementation aims for correct,
 complete and consistent with existing screens.
@@ -862,8 +992,10 @@ complete and consistent with existing screens.
   `allow_unsandboxed_fallback` switch. Escape hatches exist in every comparable
   product; the design makes this one visible and per-profile instead of
   ambient. When it fires the session keeps its profile, the indicator switches
-  from `⛨` to `⚠`, and the reason reaches the user as an error toast (TUI) or
-  on the command's own output (`friring-cli`) — not only the log.
+  from `⛨` to `⚠` — and that switch is persisted, so it survives a friring
+  restart and reaches another instance that adopts the session — and the reason
+  reaches the user as an error toast (TUI) or on the command's own output
+  (`friring-cli`) — not only the log.
 - **An unreadable profile** is refused at launch, named column by column, and
   repaired by re-saving it in the editor. Listing it permissively and
   launching it permissively are different decisions: the first keeps it
@@ -893,7 +1025,16 @@ Concretely:
   reads a real credential store, including through the keychain-extraction
   path, which is exercised against a stubbed command.
 - The proxy is tested against a local test server: allow, deny, deny-reason,
-  token rejection, SOCKS and CONNECT parity, method restriction.
+  token rejection, SOCKS and CONNECT parity, method restriction, a live policy
+  update turning a refusal into a tunnel, and the same three through the relay
+  and its unix socket. Every listener binds `127.0.0.1:0` or a path in the test
+  temporary directory, and no test opens a connection off the machine.
+- The first-use prompt is tested at the seam it actually spans: a refusal on the
+  proxy's own channel, through the TUI tick, to a modal — and an answer through
+  a real proxy instance to both the running policy and the stored profile.
+- The bubblewrap relay launcher is *run*, not read: `/bin/sh` with the argv the
+  backend composes, a non-existent path where the relay goes and `echo` where
+  the agent goes, so a miscounted `shift` fails the test instead of shipping.
 - Backend probes and argv/profile generation are unit-testable without running
   the backend; where a backend is present in CI, integration tests run behind a
   capability check and are skipped with a reason otherwise.
@@ -911,9 +1052,14 @@ the profile list and editor, the session-creation step, the session indicator,
 from inside a boundary until P3's file channel — see
 [Launch integration](#launch-integration) and [Status signals](#status-signals).
 
-**P2 — The firewall.** The Rust filtering proxy, `allowlist` network mode,
-first-use domain prompts and their persistence, wiring into both policy
-backends.
+**P2 — The firewall.** Shipped: the Rust filtering proxy and its in-namespace
+relay, the `allowlist` network mode, `full`-with-denies proxied, both policy
+backends wired to a per-session instance, host canonicalisation on both sides of
+the matcher, first-use domain prompts and their persistence, and the persisted
+applied state. Not in it: an HTTP-method restriction has no profile column (the
+proxy supports one; nothing sets it), a proxy dies with the friring process that
+started it, and the relay binds a few milliseconds after the agent starts — a
+request in that window gets one connection refused, which fails closed.
 
 **P3 — Place sandboxes.** The `docker`/`podman` backend, the sandbox transport,
 instance lifecycle and garbage collection, identical-path mounts, the default
@@ -981,9 +1127,12 @@ distribution.
 **Consequences**: Friring runs a network service while a sandbox is alive,
 token-authenticated and scoped to host loopback, to a `0o600` unix socket, or
 to both — a sandbox in its own network namespace can only reach the socket, and
-reaches it through a Friring-run relay inside the namespace. Allow decisions
-trust the client-supplied hostname until TLS termination is added, which the UI
-discloses.
+reaches it through a Friring-run relay inside the namespace. One instance per
+session, not per profile: the token and the socket are per boundary. Allow and
+deny decisions are taken on a canonicalised host, and a host with no single
+canonical spelling is refused in every mode rather than compared. Allow
+decisions trust the client-supplied hostname until TLS termination is added,
+which the UI discloses.
 
 ## ADR-28: Credentials are never copied per sandbox
 

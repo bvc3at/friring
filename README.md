@@ -461,9 +461,12 @@ themes, switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
 
 - **[Sandboxed agents](docs/SANDBOX.md)** *(Friring — fork-only)* — run any
   agent from the registry inside an isolation boundary scoped to the directories
-  you choose, each read-only or read-write: `Alt+S` authors the profiles, and
-  `Ctrl+N` picks one per session. This release ships the policy backends —
-  macOS `seatbelt` and Linux `bubblewrap` — on local sessions.
+  you choose, each read-only or read-write, and to an allowlist of domains a
+  Friring-owned proxy enforces while the kernel denies everything else: `Alt+S`
+  authors the profiles, and `Ctrl+N` picks one per session. Reach for a host
+  that isn't listed and friring asks once, then remembers. This release ships
+  the policy backends — macOS `seatbelt` and Linux `bubblewrap` — on local
+  sessions.
 - **[Leader key](#leader-key)** *(Friring — fork-only)* — `Ctrl+F` arms a
   tmux-style prefix and paints a which-key overlay naming everything reachable;
   the next key runs it. Every global command is on it, plus jump-to-session by

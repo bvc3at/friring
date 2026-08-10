@@ -98,7 +98,10 @@ actually needs and to an allowlist of domains.
   referenced nowhere in live code), which this feature's migration drops.
   Merges touching those tables resolve toward the Friring tables. `sessions`
   also gains a `sandbox_profile` column, carried end to end like
-  `backend_type`.
+  `backend_type`, and (schema v48) a `sandbox_unenforced` column recording why
+  the last launch could *not* apply that profile, so a restart or a
+  cross-instance adopt inherits the warning instead of rendering the sandboxed
+  mark over an agent on the host.
 - **Two sandbox shapes** — *policy* backends (`seatbelt`, `bwrap`) wrap the
   agent's argv with tmux outside; *place* backends (`docker`/`podman`,
   `apple-container`, `wsl-distro`) run tmux inside and are reached through a
@@ -109,7 +112,19 @@ actually needs and to an allowlist of domains.
   allowlists, which break on CDN address rotation and cannot work under
   seatbelt or in WSL's shared network namespace. `x`, `*.x` and `.x` are one
   rule, apex included, in both the profile validator and the proxy — two
-  matchers held to one table by `tests/egress_matcher_conformance.rs`.
+  matchers held to one table by `tests/egress_matcher_conformance.rs`, both
+  canonicalising a host before they compare it (`127.1` and `2130706433` are
+  `127.0.0.1`) and both refusing a non-ASCII host outright rather than guessing
+  at a U-label. Both policy backends are wired to it: `allowlist` is enforced
+  for real, and `full` with denies is proxied too, because a deny list is
+  enforceable nowhere else. An instance is **per session** (the bearer token and
+  the unix socket are per boundary, not per profile); seatbelt reaches it on host
+  loopback, a `--unshare-net` sandbox through a bind-mounted socket fronted by
+  `friring-cli sandbox relay` running inside the namespace.
+- **First-use domain prompts** — a refused host raises a status line and, under
+  `prompt_new_domains`, a confirm modal; allowing applies to the running proxy
+  immediately (no restart) *and* writes a port-scoped rule back to the profile.
+  The same host is asked about once per session however hard the agent retries.
 - **Credential handling** — never copies rotating OAuth credentials per
   sandbox (copies invalidate each other on first refresh); prefers host
   passthrough under policy backends (the macOS Keychain keeps working), then an
@@ -122,7 +137,7 @@ actually needs and to an allowlist of domains.
 - **A launch is refused rather than quietly narrowed** — friring will not start
   a session whose profile hands over more than the boundary can hold: read-write
   roots enclosing the data directory (ADR-29) or reaching a tmux server socket
-  directory, domain denies under `full` that no kernel policy can express, or a
+  directory, a filtered network mode with no proxy running to enforce it, or a
   security-relevant path that is not valid UTF-8 (a rule built from a lossy
   spelling names a different file). The profile editor applies the first of
   those at save, so such a profile never becomes a stored row.
@@ -150,13 +165,14 @@ actually needs and to an allowlist of domains.
   is a decorator on the launch `agent` composes). Enforced in
   `tests/architecture_rules.rs`.
 
-The first pass ships the two policy backends only, for **local** sessions, with
-network `none`/`full` and host-passthrough credentials. The filtering proxy's
-engine ships with it but is not yet wired to the backends, so `allowlist`
-currently grants nothing (it denies direct egress exactly as `none` does);
-sandboxed sessions likewise do not report status yet, because the file channel
-is still to come. The place backends follow. Design, delivery phases and ADR-25
-through ADR-29 live in [`docs/SANDBOX.md`](docs/SANDBOX.md).
+What ships is the two policy backends, for **local** sessions, with every
+network mode enforced and host-passthrough credentials. Sandboxed sessions do
+not report status yet, because the file channel comes with the place backends;
+an egress proxy dies with the friring process that started it, so a session
+created by the short-lived `friring-cli` starts with no way out (kernel-closed,
+which fails closed) until a running friring relaunches it. The place backends
+follow. Design, delivery phases and ADR-25 through ADR-29 live in
+[`docs/SANDBOX.md`](docs/SANDBOX.md).
 
 #### Lazy sessions & ghosts (July 2026)
 
