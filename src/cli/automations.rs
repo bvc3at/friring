@@ -943,11 +943,27 @@ fn fire_send(
     // here made the TUI and this path disagree about the same automation: the
     // TUI routes through the session's backend and succeeds, while this found
     // no local window and skipped.
-    let mux = match crate::agent::tmux::MuxTarget::for_backend(&session.backend_type) {
-        Ok(m) => m,
-        // A host that vanished from hosts.toml is a loud failure, never a
-        // silent skip or a delivery to the wrong machine.
-        Err(e) => return (AutomationRunStatus::Error, e.to_string(), None),
+    let mux = match crate::session::sandbox_backend_profile(&session.backend_type) {
+        // A place-backed session's tmux is inside the container, which is found
+        // by friring's own label rather than from a config file — and a place
+        // that is not running has no window to deliver to, which is a skip
+        // rather than an error, exactly like a session that is not running.
+        Some(profile) => match crate::agent::sandboxing::running_place(profile) {
+            Some(place) => crate::agent::tmux::MuxTarget::for_place(&place),
+            None => {
+                return (
+                    AutomationRunStatus::Skipped,
+                    format!("sandbox place '{profile}' is not running"),
+                    None,
+                )
+            }
+        },
+        None => match crate::agent::tmux::MuxTarget::for_backend(&session.backend_type) {
+            Ok(m) => m,
+            // A host that vanished from hosts.toml is a loud failure, never a
+            // silent skip or a delivery to the wrong machine.
+            Err(e) => return (AutomationRunStatus::Error, e.to_string(), None),
+        },
     };
     if !crate::agent::tmux::window_exists_on(&mux, &name) {
         return (

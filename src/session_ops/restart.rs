@@ -175,12 +175,15 @@ fn restart_session_with(
         .map_err(|e| format!("Failed to load session: {e}"))?
         .ok_or_else(|| format!("Session not found: {session_id}"))?;
 
-    // The kill/spawn below drive the *local* tmux only. Silently "restarting"
-    // a remote session would leave its real window running on the host and
-    // spawn a stray local one (with a locally-built workspace), so refuse.
-    if crate::session::is_remote_backend(&session.backend_type) {
+    // The kill/spawn below drive the *local* tmux only. Silently "restarting" an
+    // off-host session would leave its real window running where it is and spawn
+    // a stray local one, so refuse. A **sandbox place** is off-host in exactly
+    // the way that matters here: its tmux is inside the container, so the local
+    // kill would find nothing and the local spawn would put an unsandboxed agent
+    // on the host under a profile that says otherwise.
+    if crate::session::is_offhost_backend(&session.backend_type) {
         return Err(format!(
-            "Session '{}' runs on remote backend '{}'; headless restart is \
+            "Session '{}' runs on backend '{}'; headless restart is \
              local-only — restart it from the TUI instead",
             session.name, session.backend_type
         ));
@@ -230,6 +233,24 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+        }
+    }
+
+    /// A place-backed session's tmux is inside the container, so the local
+    /// kill/spawn pair would find nothing to kill and would put an
+    /// **unsandboxed** agent on the host under a profile that says otherwise.
+    #[test]
+    fn a_headless_restart_refuses_an_offhost_session_of_either_shape() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let db = Database::open_in_memory().unwrap();
+        for backend_type in ["sandbox:dev", "ssh:devbox"] {
+            let mut sess = session(Some("agent-conv-uuid"), Some(PathBuf::from("/tmp/repo")));
+            sess.backend_type = backend_type.to_string();
+            db.upsert_session(&sess).unwrap();
+            let err = restart_session_with(&db, sess.id, &tmux_windows()).unwrap_err();
+            assert!(err.contains(backend_type), "{err}");
+            assert!(err.contains("local-only"), "{err}");
         }
     }
 

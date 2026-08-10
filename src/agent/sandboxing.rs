@@ -43,6 +43,19 @@ pub struct SandboxedInvocation {
     /// [`SessionInfo::sandbox_state`](crate::session::SessionInfo::sandbox_state)
     /// — the info panel already labels the row with the profile.
     pub state: String,
+    /// The **place** this invocation runs in, for a place backend (ADR-26).
+    /// `None` for a policy backend, whose boundary is the wrapped process and
+    /// whose tmux window is on the host.
+    ///
+    /// The caller spawns through this instead of the session's own backend: it
+    /// is the transport, and its [`name`](crate::agent::SessionBackend::name)
+    /// is the `sandbox:<profile>` that lands in `backend_type` and drives
+    /// restore.
+    pub place: Option<crate::agent::transport::Place>,
+    /// The place row to record in `sandbox_instances`, so garbage collection
+    /// can find a container this launch created. `None` for a policy backend,
+    /// which creates nothing that outlives the process.
+    pub instance: Option<crate::sandbox::SandboxInstance>,
 }
 
 /// What [`apply`] decided about one launch.
@@ -232,14 +245,24 @@ fn build(
         .as_ref()
         .ok_or_else(|| "no sandbox profile on this session".to_string())?;
 
-    // P1 ships policy backends only, and both of them generate their artefacts
-    // (a `.sb` profile file, an argv referring to local paths) on the machine
-    // friring runs on. Wrapping a remote invocation would build them here and
-    // hand them to a shell over there.
-    if config
-        .backend
-        .as_deref()
-        .is_some_and(crate::session::is_remote_backend)
+    let selection = host.select(profile.backend);
+    let backend = selection
+        .backend()
+        .map_err(|e| format!("{e}\n{}", selection.rejection_summary()))?;
+    let shape = backend.shape();
+
+    // Both policy backends generate their artefacts (a `.sb` profile file, an
+    // argv referring to local paths) on the machine friring runs on, so wrapping
+    // a remote invocation would build them here and hand them to a shell over
+    // there. A **place** is exempt, and not by omission: a place *is* the
+    // elsewhere — friring reaches it through its own transport rather than
+    // through the session's, so the session's own backend says nothing about
+    // where the boundary is applied.
+    if shape != Some(crate::session::SandboxShape::Place)
+        && config
+            .backend
+            .as_deref()
+            .is_some_and(crate::session::is_remote_backend)
     {
         return Err(format!(
             "Sandbox profile '{}' cannot be applied to a remote session: the policy backends \
@@ -247,11 +270,6 @@ fn build(
             profile.name
         ));
     }
-
-    let selection = host.select(profile.backend);
-    let backend = selection
-        .backend()
-        .map_err(|e| format!("{e}\n{}", selection.rejection_summary()))?;
 
     let agent_sandbox = def.and_then(|d| d.sandbox.as_ref());
     let mut policy = profile.resolve(backend, home).map_err(|e| e.to_string())?;
@@ -272,13 +290,61 @@ fn build(
         .as_ref()
         .map(|p| representable("the session's working directory", p))
         .transpose()?;
+
+    // A place exists before the launch does: the container has to be running
+    // for the transport to reach its tmux, for the relay port to be one no
+    // sibling session holds, and for the relay binary inside it to be resolved.
+    // Ensuring is idempotent, so a relaunch adopts the same place.
+    let ensured = match shape {
+        Some(crate::session::SandboxShape::Place) => Some(
+            host.container(backend)
+                .ok_or_else(|| {
+                    format!("Sandbox backend '{backend}' is a place this friring cannot create")
+                })?
+                .ensure_place(profile)
+                .map_err(|e| e.to_string())?,
+        ),
+        _ => None,
+    };
+
     // Never the host temp root: `/tmp` holds friring's own tmux socket, and a
     // read-write grant over it is a complete escape (ADR-29's sibling problem —
     // see `crate::sandbox::dirs`). friring mints a private per-session directory
-    // instead, adopting one left behind by a crashed run.
-    let tmp_dir = crate::sandbox::create_session_scratch(&session_key)
-        .map_err(|e| e.to_string())
-        .and_then(|dir| representable("the sandbox scratch directory", &dir))?;
+    // instead, adopting one left behind by a crashed run. A place's lives under
+    // that place's own tree, because the whole tree is what is mounted in.
+    let tmp_dir = match &ensured {
+        Some(_) => crate::sandbox::create_place_session_dir(&profile.name, &session_key),
+        None => crate::sandbox::create_session_scratch(&session_key),
+    }
+    .map_err(|e| e.to_string())
+    .and_then(|dir| representable("the sandbox scratch directory", &dir))?;
+
+    // The one channel out of a policy boundary (ADR-29): the agent's hooks
+    // append a state word to a file here and the status poll takes it, because
+    // the database `friring-cli session signal` writes is what a sandbox may
+    // never reach. A place needs no such directory — its hooks are not
+    // projected in at all yet (see `place_note`), and when they are they will
+    // reach friring the way an SSH host's do, over the tmux window it already
+    // owns.
+    let signals = match &ensured {
+        None => Some(
+            crate::paths::create_session_signal_dir(&session_key)
+                .map_err(|e| format!("Cannot apply a sandbox profile: {e}"))?,
+        ),
+        Some(_) => None,
+    };
+    let signal_dir = signals
+        .as_ref()
+        .map(|channel| representable("the sandbox signal directory", &channel.dir))
+        .transpose()?;
+    if let Some(channel) = &signals {
+        let file = representable("the sandbox signal file", &channel.file)?;
+        // Inserted on the *policy*, whose environment is the launch's last word,
+        // so an agent that declares `FRIRING_SIGNAL_FILE` in the registry cannot
+        // point the channel somewhere friring does not read.
+        policy.insert_env(crate::paths::SIGNAL_FILE_ENV, file);
+    }
+
     let database = crate::paths::database_file()
         .map(|p| representable("friring's database", &p))
         .transpose()?;
@@ -297,7 +363,7 @@ fn build(
     // launch is: holding it here means every `?` below releases it, and the
     // session's current boundary — a healthy agent's way out — is untouched
     // until the launch path commits.
-    let (proxy, pending) = if crate::sandbox::egress::proxy_required(&policy) {
+    let (proxy, relay_port, pending) = if crate::sandbox::egress::proxy_required(&policy) {
         // The key is the boundary's identity: the token, the socket and the
         // first-use answers are all per session, and two launches sharing one
         // key share all three — starting the second would replace the first's
@@ -311,27 +377,65 @@ fn build(
                     .to_string(),
             );
         }
-        let prepared = crate::sandbox::egress::prepare(
+        // A namespaced policy sandbox gets a private loopback, so its relay can
+        // use one fixed port. A place is shared by its profile's sessions and so
+        // is its loopback, so each takes a port of its own and keeps it across
+        // relaunches — and the address the proxy environment names has to be
+        // that one, or every session after the first would fail closed.
+        let relay = match (&ensured, host.container(backend)) {
+            (Some(place), Some(container)) => container
+                .relay_port(&place.instance.external_id, &session_key)
+                .map(Some)
+                .map_err(|e| e.to_string())?,
+            _ => None,
+        };
+        let prepared = crate::sandbox::egress::prepare_at(
             &session_key,
             &policy,
             transport,
             std::path::Path::new(&tmp_dir),
+            relay.map_or_else(crate::sandbox::egress::relay_addr, |port| {
+                (std::net::Ipv4Addr::LOCALHOST, port).into()
+            }),
         )
         .map_err(|e| e.to_string())?;
         for (key, value) in prepared.grant.env {
             policy.insert_env(key, value);
         }
-        (Some(prepared.grant.endpoint), prepared.pending)
+        (Some(prepared.grant.endpoint), relay, prepared.pending)
     } else {
         // A profile edited from `allowlist` to `full` or `none` must not leave
         // the previous launch's listener behind — once this launch is the one
         // running, and not before.
-        (None, PendingEgress::clearing(&session_key))
+        (None, None, PendingEgress::clearing(&session_key))
     };
 
     let mut launch = SandboxLaunch::new(&policy, home, &session_key).with_tmp_dir(&tmp_dir);
     if let Some(endpoint) = proxy {
         launch = launch.with_proxy(endpoint);
+    }
+    if let Some(dir) = signal_dir.as_deref() {
+        launch = launch.with_signal_dir(dir);
+    }
+    if let Some(place) = &ensured {
+        // A relay exactly when the launch is proxied. `ensure_place` refuses a
+        // filtered profile whose image carries no `friring-cli`, so the two are
+        // already consistent — refusing here rather than composing an empty
+        // program keeps that an invariant of this function too.
+        let relay = match relay_port {
+            Some(port) => Some(crate::sandbox::PlaceRelay {
+                program: place.relay_program.as_deref().ok_or_else(|| {
+                    format!(
+                        "Sandbox profile '{}' filters egress, and the place friring ensured for \
+                         it reported no relay binary inside it",
+                        profile.name
+                    )
+                })?,
+                port,
+            }),
+            None => None,
+        };
+        launch = launch.with_place(crate::sandbox::PlaceLaunch { relay });
     }
     if let Some(workspace) = workspace.as_deref() {
         launch = launch.with_workspace(workspace);
@@ -349,6 +453,19 @@ fn build(
     argv.push(command.to_string());
     argv.extend(args.iter().cloned());
     argv.extend(plan.extra_args.iter().cloned());
+    // A place has none of the host's filesystem it did not ask for, so an arg
+    // naming a friring-managed config file (claude's `--settings <config
+    // dir>/hooks/claude.json`) points at nothing in there — and an agent handed
+    // a settings path that does not exist dies on startup. Until config
+    // projection lands the flag is dropped, which is the same treatment a host
+    // with no POSIX place for the file already gets.
+    let dropped_config = if ensured.is_some() {
+        let (kept, dropped) = crate::agent::config_args::without_config_paths(argv);
+        argv = kept;
+        dropped
+    } else {
+        Vec::new()
+    };
 
     // A wrap that fails takes `pending` down with the stack: nothing is going to
     // use the instance prepared for this launch, and the session's own — which
@@ -374,18 +491,59 @@ fn build(
         .collect();
     env.extend(policy.env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
+    // The place's address for the transport, built from the engine path the
+    // probe vetted rather than a bare name an inherited `PATH` could re-resolve.
+    let place = match &ensured {
+        Some(ensured) => Some(
+            crate::agent::transport::Place::new(
+                host.container(backend)
+                    .ok_or_else(|| format!("Sandbox backend '{backend}' is not a place"))?
+                    .engine_program()
+                    .map_err(|e| e.to_string())?,
+                &ensured.instance.external_id,
+                &profile.name,
+            )
+            .map_err(|e| format!("Cannot reach the sandbox place: {e:#}"))?,
+        ),
+        None => None,
+    };
+
     // Composed, so the instance survives this stack — but as the *launch's*,
     // not the session's. Whoever spawns the pane claims it with
     // `pending_egress` and commits it once there is something behind it.
     pending.park();
 
+    let note = place_note(ensured.is_some(), &dropped_config);
     Ok(SandboxedInvocation {
         command,
         args: wrapped.collect(),
         env,
-        state: format!("{backend} · inner agent sandbox: {}", plan.state),
-        label: plan.label,
+        state: format!("{backend} · inner agent sandbox: {}{note}", plan.state),
+        label: format!("{}{note}", plan.label),
+        place,
+        instance: ensured.map(|ensured| ensured.instance),
     })
+}
+
+/// What a place-backed launch has to say for itself beyond the boundary it
+/// applied, or `""` for a policy launch.
+///
+/// Config projection is not built yet, so a place starts from a synthetic
+/// per-profile home with none of the host's agent configuration in it (ADR-28
+/// forbids binding the real one): the agent has to sign in inside the pane, and
+/// where friring's own hook config was among the arguments it was dropped, so
+/// the session reports no status. Both are recoverable and neither is
+/// self-explanatory, so the composition says so wherever it is shown rather than
+/// leaving the user with a session that silently never leaves `idle`.
+fn place_note(place: bool, dropped_config: &[String]) -> String {
+    if !place {
+        return String::new();
+    }
+    let mut note = " · no host config projected — sign in inside the pane".to_string();
+    if !dropped_config.is_empty() {
+        note.push_str("; friring's hooks were dropped, so it reports no status");
+    }
+    note
 }
 
 /// Drop the per-session state a sandboxed launch minted: its egress proxy, the
@@ -399,9 +557,7 @@ fn build(
 /// unlinked by the process that bound it rather than pulled out from under a
 /// live listener. Harmless for a session that never had a profile.
 pub fn cleanup(config: &SessionConfig) {
-    let key = session_key(config);
-    crate::sandbox::egress::stop(&key);
-    crate::sandbox::cleanup_session(&key);
+    cleanup_key(&session_key(config));
 }
 
 /// The same cleanup for a teardown path that holds a persisted session row
@@ -413,9 +569,126 @@ pub fn cleanup(config: &SessionConfig) {
 /// nothing to drop. Exists so `session_ops`, which may not reference
 /// [`crate::sandbox`], still reaches the key derivation that lives here.
 pub fn cleanup_by_session_id(session_id: crate::session::SessionId) {
-    let key = session_id.to_string();
-    crate::sandbox::egress::stop(&key);
-    crate::sandbox::cleanup_session(&key);
+    cleanup_key(&session_id.to_string());
+}
+
+/// Everything one launch key owns, in the order that keeps a live listener from
+/// being pulled out from under itself.
+fn cleanup_key(key: &str) {
+    crate::sandbox::egress::stop(key);
+    crate::sandbox::cleanup_session(key);
+    // A place-backed session's writable directory is inside the place's tree
+    // rather than the policy scratch root, because the whole tree is what is
+    // mounted in — so both are dropped, and each is a no-op for the shape that
+    // did not use it.
+    crate::sandbox::dirs::cleanup_place_session(key);
+    crate::paths::remove_session_signal_dir(key);
+    // A place outlives its sessions, so nothing here removes one — but the
+    // loopback port this session held inside it is the place's to hand out
+    // again, and a place with a bounded span of them would otherwise run out
+    // after enough sessions had come and gone.
+    with_host(|host| {
+        for kind in [
+            crate::session::SandboxBackendKind::Docker,
+            crate::session::SandboxBackendKind::Podman,
+        ] {
+            if let Some(container) = host.container(kind) {
+                container.release_relay_ports(key);
+            }
+        }
+    });
+}
+
+/// Ensure `profile`'s place exists and answer with the transport that reaches
+/// it, plus the instance to record.
+///
+/// The restore path's half of the launch composition: a session persisted with
+/// `backend_type = sandbox:<profile>` has to be reached before it can be
+/// adopted, and the place it names may be stopped (a host reboot) or gone (an
+/// engine that was pruned). Ensuring is idempotent, so a place that is already
+/// running costs one `inspect`.
+///
+/// Blocking, and deliberately so: this runs a container engine, which on a cold
+/// place is seconds. Callers keep it off the render path.
+///
+/// # Errors
+///
+/// The engine is unavailable, the profile cannot be resolved against it, or the
+/// place will not start — each with the backend's own actionable sentence.
+pub fn open_place(
+    profile: &crate::session::SandboxProfile,
+) -> Result<
+    (
+        std::sync::Arc<dyn crate::agent::SessionBackend>,
+        crate::sandbox::SandboxInstance,
+    ),
+    String,
+> {
+    with_host(|host| {
+        let backend = host
+            .select(profile.backend)
+            .backend()
+            .map_err(|e| e.to_string())?;
+        let container = host.container(backend).ok_or_else(|| {
+            format!(
+                "Sandbox profile '{}' resolves to '{backend}', which is not a place this friring \
+                 can open",
+                profile.name
+            )
+        })?;
+        let ensured = container.ensure_place(profile).map_err(|e| e.to_string())?;
+        let place = crate::agent::transport::Place::new(
+            container.engine_program().map_err(|e| e.to_string())?,
+            &ensured.instance.external_id,
+            &profile.name,
+        )
+        .map_err(|e| format!("Cannot reach the sandbox place: {e:#}"))?;
+        Ok((
+            crate::agent::backend::place_backend(&place),
+            ensured.instance,
+        ))
+    })
+}
+
+/// The place a profile's sessions are running in **right now**, or `None`.
+///
+/// Deliberately does not create one: the callers are teardown paths, and
+/// starting a container in order to kill a pane inside it — or in order to
+/// discover there is none — is the opposite of what they are for. It asks each
+/// engine friring can drive for the containers *it* created, and picks the one
+/// carrying this profile's label, so a profile whose `auto` backend has changed
+/// since the launch is still found.
+///
+/// Exists here because `session_ops` may not reference [`crate::sandbox`] at
+/// all, and the transport address is assembled from two things only this layer
+/// holds: the engine path the probe vetted, and the engine's own container id.
+pub fn running_place(profile: &str) -> Option<crate::agent::transport::Place> {
+    with_host(|host| {
+        for kind in [
+            crate::session::SandboxBackendKind::Docker,
+            crate::session::SandboxBackendKind::Podman,
+        ] {
+            let Some(container) = host.container(kind) else {
+                continue;
+            };
+            let Ok(engine) = container.engine_program() else {
+                continue;
+            };
+            let Ok(places) = container.live_places() else {
+                continue;
+            };
+            let found = places
+                .into_iter()
+                .find(|place| place.owned && place.profile.as_deref() == Some(profile))
+                .and_then(|place| {
+                    crate::agent::transport::Place::new(engine, &place.id, profile).ok()
+                });
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    })
 }
 
 /// The key a launch that pinned neither id falls back to.
@@ -1060,6 +1333,307 @@ mod tests {
         assert!(err.contains("egress proxy"), "{err}");
         assert!(err.contains("at most"), "{err}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A place-backed session's writable directory lives inside the place's
+    /// tree, not in the policy scratch root — so teardown has to reach it there
+    /// or the socket, and everything the agent wrote beside it, outlives the
+    /// session forever.
+    #[test]
+    fn deleting_a_place_backed_session_drops_its_directory_inside_the_place() {
+        let _guard = fabricated_data_dir("place-teardown");
+        let key = "place-teardown-session";
+        let minted = crate::sandbox::create_place_session_dir("dev", key).unwrap();
+        std::fs::write(minted.join("agent-scratch"), "x").unwrap();
+        assert!(minted.is_dir());
+
+        cleanup_key(key);
+        assert!(
+            !minted.exists(),
+            "{} outlived the session",
+            minted.display()
+        );
+        // The place itself is the profile's and outlives every session in it.
+        assert!(crate::sandbox::dirs::place_dir("dev").unwrap().is_dir());
+    }
+
+    // ---- Place backends ---------------------------------------------------
+
+    /// The container id the stub engine hands back for a freshly created place.
+    const STUB_CONTAINER: &str = "1f2e3d4c5b6a798807162534435261708192a3b4c5d6e7f8091a2b3c4d5e6f70";
+
+    /// A host with a working rootless podman and nothing else, scripted far
+    /// enough to create a place and resolve the relay inside it.
+    ///
+    /// Nothing here starts, pulls or builds anything: every engine command goes
+    /// through the injected probe host, and the paths are all fabricated or
+    /// friring's own under the test's data directory.
+    fn place_host() -> SandboxHost {
+        use crate::sandbox::probe::ProbeOutput;
+        const PODMAN: &str = "/usr/bin/podman";
+        let place_dir = crate::sandbox::dirs::place_dir("dev").expect("a data directory");
+        let home_dir = crate::sandbox::dirs::place_home_dir("dev").expect("a data directory");
+        let stub = crate::sandbox::probe::StubHost::new()
+            .with_home("/fabricated/home")
+            .with_command("uname -s", ProbeOutput::success("Linux\n"))
+            .with_file("/proc/sys/kernel/osrelease", "6.8.0-generic\n")
+            .with_binary("podman")
+            .with_command("id -u", ProbeOutput::success("1000\n"))
+            .with_command("id -g", ProbeOutput::success("1000\n"))
+            .with_command(
+                &format!(
+                    "{PODMAN} info --format {}",
+                    "{{.Version.Version}}|{{.Host.Security.Rootless}}"
+                ),
+                ProbeOutput::success("5.2.2|true\n"),
+            )
+            .with_path("/fabricated/home/dev/app")
+            .with_path(&place_dir.display().to_string())
+            .with_path(&home_dir.display().to_string())
+            .with_command_prefix(
+                &format!("{PODMAN} image inspect"),
+                ProbeOutput::success("[{}]\n"),
+            )
+            .with_command_prefix(
+                &format!("{PODMAN} run"),
+                ProbeOutput::success(format!("{STUB_CONTAINER}\n")),
+            )
+            .with_command_prefix(
+                &format!("{PODMAN} exec"),
+                ProbeOutput::success("/usr/local/bin/friring-cli\n"),
+            );
+        SandboxHost::new(std::sync::Arc::new(stub))
+    }
+
+    /// A data directory short enough for a **place's** unix socket path.
+    ///
+    /// A place nests its per-session directory one level deeper than a policy
+    /// sandbox's (`sandbox/pl/<profile>/<digest>/proxy.sock`), and macOS's
+    /// per-user temp root is ~49 bytes before anything is appended — together
+    /// they overrun `sun_path`'s 103. The real data directory
+    /// (`~/.local/share/friring`) is nowhere near it; this is the test
+    /// environment's problem, and the launch says so with the fix when it is
+    /// anyone's.
+    #[cfg(unix)]
+    fn short_data_dir(name: &str) -> crate::paths::TestPathGuard {
+        crate::paths::TestPathGuard::new(
+            std::path::Path::new("/tmp").join(format!("fr{}{name}", std::process::id())),
+        )
+    }
+
+    fn place_profile(mutate: impl FnOnce(&mut SandboxProfile)) -> SandboxProfile {
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.backend = SandboxBackendKind::Podman;
+        mutate(&mut profile);
+        profile
+    }
+
+    /// The whole of a place launch in one composition: the place is ensured,
+    /// the command composed for the *inside* of it, and the transport that
+    /// reaches it handed back with the row to record.
+    #[test]
+    fn a_place_profile_composes_a_transport_and_an_in_place_command() {
+        let _guard = fabricated_data_dir("place-compose");
+        let profile = place_profile(|p| p.network_mode = crate::session::NetworkMode::None);
+        let mut config = config_with(Some(profile));
+        config.agent_session_id = Some("place-compose".into());
+        config.cwd = Some("/fabricated/home/dev/app".into());
+
+        let wrapped = build(
+            &place_host(),
+            "/fabricated/home",
+            Some(&agent_def()),
+            &config,
+            "claude",
+            &["--resume".into()],
+        )
+        .expect("a place composes");
+
+        // Nothing the in-place command says names the engine: reaching the
+        // place is the transport's business, and this runs inside it.
+        assert_eq!(wrapped.command, "claude");
+        assert_eq!(wrapped.args.first().map(String::as_str), Some("--resume"));
+        assert!(!wrapped.args.iter().any(|a| a.contains("podman")));
+
+        // The transport, built from the vetted engine path and the id the
+        // engine minted, named the way `backend_type` will record it.
+        let place = wrapped.place.expect("a place-backed launch has a place");
+        assert_eq!(place.engine(), "/usr/bin/podman");
+        assert_eq!(place.container(), STUB_CONTAINER);
+        assert_eq!(place.backend_name(), "sandbox:dev");
+
+        // …and the row garbage collection finds the container by.
+        let instance = wrapped
+            .instance
+            .expect("a place launch records an instance");
+        assert_eq!(instance.profile, "dev");
+        assert_eq!(instance.engine, SandboxBackendKind::Podman);
+        assert_eq!(instance.external_id, STUB_CONTAINER);
+    }
+
+    /// A policy launch composes no place, and that is what stops the two halves
+    /// of ADR-26 from being confused for one another.
+    #[test]
+    fn a_policy_profile_composes_no_place() {
+        let wrapped = build(
+            &stub_host(),
+            "/fabricated/home",
+            None,
+            &config_with(Some(closed_profile())),
+            "claude",
+            &[],
+        )
+        .unwrap();
+        assert!(wrapped.place.is_none());
+        assert!(wrapped.instance.is_none());
+    }
+
+    /// A place *is* the elsewhere, so the refusal that keeps a policy backend
+    /// off a remote session must not apply to it — otherwise a sandbox profile
+    /// could never be used from a session friring reaches over a transport.
+    #[test]
+    fn a_place_is_not_refused_for_being_a_remote_session() {
+        let _guard = fabricated_data_dir("place-remote");
+        let mut config = config_with(Some(place_profile(|p| {
+            p.network_mode = crate::session::NetworkMode::None;
+        })));
+        config.agent_session_id = Some("place-remote".into());
+        config.backend = Some("ssh:devbox".into());
+        build(
+            &place_host(),
+            "/fabricated/home",
+            None,
+            &config,
+            "claude",
+            &[],
+        )
+        .expect("a place composes for a session friring reached elsewhere");
+
+        // The policy half still refuses, which is the rule this exempts a place
+        // from rather than deletes.
+        let mut policy = config_with(Some(closed_profile()));
+        policy.backend = Some("ssh:devbox".into());
+        let err = build(
+            &stub_host(),
+            "/fabricated/home",
+            None,
+            &policy,
+            "claude",
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.contains("remote session"), "{err}");
+    }
+
+    /// Config projection is a later slice, so a place has none of the host's
+    /// agent configuration in it. An argument naming a friring-managed file
+    /// would point at nothing inside and kill the pane on startup, so it is
+    /// dropped — and the composition says so, because a session that silently
+    /// stops reporting status looks like a broken session.
+    #[test]
+    fn a_place_drops_host_config_arguments_and_says_it_did() {
+        let _guard = fabricated_data_dir("place-config");
+        let config_arg = crate::paths::config_file()
+            .and_then(|p| p.parent().map(|d| d.join("hooks").join("claude.json")))
+            .expect("a config directory")
+            .display()
+            .to_string();
+        let mut config = config_with(Some(place_profile(|p| {
+            p.network_mode = crate::session::NetworkMode::None;
+        })));
+        config.agent_session_id = Some("place-config".into());
+
+        let wrapped = build(
+            &place_host(),
+            "/fabricated/home",
+            None,
+            &config,
+            "claude",
+            &["--settings".into(), config_arg.clone(), "--verbose".into()],
+        )
+        .unwrap();
+
+        assert!(
+            !wrapped
+                .args
+                .iter()
+                .any(|a| *a == config_arg || a == "--settings"),
+            "the flag and its path must go together: {:?}",
+            wrapped.args
+        );
+        assert!(wrapped.args.contains(&"--verbose".to_string()));
+        assert!(
+            wrapped.state.contains("sign in inside the pane"),
+            "{}",
+            wrapped.state
+        );
+        assert!(
+            wrapped.state.contains("reports no status"),
+            "{}",
+            wrapped.state
+        );
+
+        // A policy sandbox keeps them: the host's filesystem is what it is
+        // subject to a policy, so the file is right where the argument says.
+        let policy = build(
+            &stub_host(),
+            "/fabricated/home",
+            None,
+            &config_with(Some(closed_profile())),
+            "claude",
+            &["--settings".into(), config_arg.clone()],
+        )
+        .unwrap();
+        assert!(policy.args.contains(&config_arg));
+        assert!(!policy.state.contains("sign in inside the pane"));
+    }
+
+    /// Sessions of one profile share a place and therefore its loopback, so the
+    /// address each one's proxy environment names has to be that session's own
+    /// relay port — the second session would otherwise be handed the first's
+    /// and fail closed while the profile still claimed a filtered network.
+    #[test]
+    fn every_session_in_a_place_gets_its_own_proxy_address() {
+        let _guard = short_data_dir("pe");
+        let host = place_host();
+        let compose = |key: &str| {
+            let mut config = config_with(Some(place_profile(|p| {
+                p.network_allow = vec!["api.anthropic.com".into()];
+            })));
+            config.agent_session_id = Some(key.to_string());
+            let wrapped = build(&host, "/fabricated/home", None, &config, "claude", &[])
+                .expect("a filtered place composes");
+            pending_egress(&config).commit();
+            (config, wrapped)
+        };
+
+        let (first_config, first) = compose("place-egress-a");
+        let (second_config, second) = compose("place-egress-b");
+        let address = |wrapped: &SandboxedInvocation| {
+            wrapped
+                .env
+                .get("HTTP_PROXY")
+                .expect("a filtered launch is given the proxy environment")
+                .rsplit_once(':')
+                .map(|(_, port)| port.to_string())
+                .expect("a proxy URL names a port")
+        };
+        assert_ne!(
+            address(&first),
+            address(&second),
+            "two sessions in one place were handed one loopback port"
+        );
+        // …and each keeps its own across a relaunch, because the environment of
+        // the launch that is still running names it.
+        let (_, again) = compose("place-egress-a");
+        assert_eq!(address(&first), address(&again));
+
+        // The relay runs beside the agent, inside the place.
+        assert_eq!(first.command, "/bin/sh");
+        assert!(first.args.iter().any(|a| a == "/usr/local/bin/friring-cli"));
+
+        cleanup(&first_config);
+        cleanup(&second_config);
     }
 
     /// The one shape assertion that does not need a backend to be installed:

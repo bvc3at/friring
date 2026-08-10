@@ -3,11 +3,11 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use std::time::SystemTime;
 
-use anyhow::Result;
+use anyhow::{bail, Context as _, Result};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
@@ -513,6 +513,89 @@ struct Sandboxed {
     /// What the launch **applied**, for `SessionInfo::sandbox_state`. `None`
     /// only when the session carries no profile at all.
     state: Option<SandboxState>,
+    /// The **place** the invocation runs in, when the profile resolved to a
+    /// place backend (ADR-26). It is a transport, so the launch spawns through
+    /// it rather than through the backend the caller passed in: tmux is inside
+    /// the place, and its `sandbox:<profile>` name is what lands in
+    /// `backend_type` and drives restore.
+    place: Option<crate::agent::transport::Place>,
+    /// The place row to record in `sandbox_instances` once the launch has a
+    /// pane, so garbage collection can find the container it created.
+    instance: Option<crate::sandbox::SandboxInstance>,
+}
+
+/// Bring a place's own tmux up before spawning into it.
+///
+/// Separate from the caller's `ensure_backend_ready` because a place-backed
+/// launch resolves its transport *during* the composition — the container has to
+/// exist before there is anything to ready — so by the time this backend is
+/// known the caller's readiness step is already behind us.
+fn ready_place(backend: &Arc<dyn SessionBackend>) -> Result<()> {
+    backend
+        .ensure_ready()
+        .with_context(|| format!("sandbox place '{}' has no reachable tmux", backend.name()))
+}
+
+/// What an unreachable placeholder's pane says while friring keeps trying.
+///
+/// The two off-host shapes fail differently and the pane has to say which
+/// (ADR-26's stated consequence). A remote host takes down the sessions it was
+/// running; a **place** takes down *every* session using its profile at once,
+/// because they share one container — so a user looking at three frozen panes
+/// needs to know whether that is three problems or one, and where to look.
+fn unreachable_notice(backend: &str, host: Option<&str>) -> String {
+    match crate::session::sandbox_backend_profile(backend) {
+        Some(profile) => format!(
+            "\r\n  \u{2298} Sandbox place '{profile}' is not running \u{2014} \
+             retrying\u{2026}\r\n\r\n  \
+             Every session using this profile shares one place, so they all stopped\r\n  \
+             together. friring starts it again and reattaches by itself.\r\n  \
+             Press restart to retry now, or delete to remove this session.\r\n"
+        ),
+        None => {
+            let host = host.unwrap_or("?");
+            format!(
+                "\r\n  \u{2298} Remote host '{host}' unreachable \u{2014} retrying\u{2026}\r\n\r\n  \
+                 This session will reconnect automatically when the host comes back.\r\n  \
+                 Press restart to retry now, or delete to remove it.\r\n"
+            )
+        }
+    }
+}
+
+/// The transport for a place a launch composed against — **one per place**,
+/// shared by every session in it.
+///
+/// `TmuxBackend::for_place` is the whole of the transport: everything above that
+/// seam — control mode, discovery, adoption, input, scrollback — is the SSH
+/// path's, unchanged (ADR-26). What is not free is the connection it opens: a
+/// backend per session would be one `<engine> exec -i` process, one tmux client
+/// and one reader thread each, where a place is created once per profile and
+/// shared by that profile's sessions. So is this.
+///
+/// Keyed on the profile and compared on the whole address, so a rebuilt
+/// container (an edited profile asks for a new one) retires the connection into
+/// the container it replaced rather than keeping both.
+pub(crate) fn place_backend(place: &crate::agent::transport::Place) -> Arc<dyn SessionBackend> {
+    /// Open places by their `sandbox:<profile>` name, each with the engine and
+    /// container it was built for so a rebuild is noticed.
+    type OpenPlaces = Mutex<HashMap<String, (String, Arc<dyn SessionBackend>)>>;
+    static PLACES: OnceLock<OpenPlaces> = OnceLock::new();
+
+    let address = format!("{}\u{1}{}", place.engine(), place.container());
+    let mut open = PLACES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((held, backend)) = open.get(&place.backend_name()) {
+        if *held == address {
+            return Arc::clone(backend);
+        }
+    }
+    let backend: Arc<dyn SessionBackend> =
+        Arc::new(crate::agent::tmux::TmuxBackend::for_place(place));
+    open.insert(place.backend_name(), (address, Arc::clone(&backend)));
+    backend
 }
 
 /// Compose the invocation for a spawn or a restart, wrapping it in the
@@ -539,6 +622,8 @@ fn sandboxed_invocation(
         // it is `None` exactly when the session carries none.
         profile: config.sandbox.as_ref().map(|p| p.name.clone()),
         state: None,
+        place: None,
+        instance: None,
         // Claimed here rather than left parked so the invocation and the
         // boundary it names travel together: whatever happens to one of them
         // from now on happens to both.
@@ -569,6 +654,8 @@ fn sandboxed_invocation(
                 profile: plain.profile,
                 state: Some(SandboxState::Applied(wrapped.state)),
                 egress: plain.egress,
+                place: wrapped.place,
+                instance: wrapped.instance,
             })
         }
     }
@@ -620,6 +707,12 @@ pub struct Session {
     /// Its parser is seeded with the session's saved last frame, rendered
     /// greyed; [`Self::restart`] spawns the agent and clears both flags.
     ghost: bool,
+    /// The place this session's last launch created or adopted, when its
+    /// profile resolved to a place backend. The launch path records it in
+    /// `sandbox_instances` once the pane exists, so garbage collection can find
+    /// the container; `None` for every policy-backed and unsandboxed session,
+    /// which create nothing that outlives the process.
+    place_instance: Option<crate::sandbox::SandboxInstance>,
     /// The bytes a placeholder's parser was seeded with (a ghost's saved frame,
     /// or the unreachable-host notice). Retained so [`Self::resize`] can
     /// **re-render** rather than `set_size`: vt100 resizes by truncating each
@@ -650,7 +743,24 @@ impl Session {
             profile,
             state,
             egress,
+            place,
+            instance,
         } = sandboxed_invocation(config, provider)?;
+
+        // A place is a transport, so a place-backed launch spawns *into* the
+        // place rather than onto the backend the caller resolved from
+        // `backend_type` — which for a first spawn does not name it yet, and
+        // for a relaunch may name a container an edited profile has replaced.
+        let in_place = place.as_ref().map(place_backend);
+        let backend = in_place.as_ref().unwrap_or(backend);
+        if in_place.is_some() {
+            // The caller readied the backend the session's row named, which is
+            // not this one: the place was ensured a moment ago and its tmux
+            // server is inside it. Idempotent once the connection is up, and
+            // this is where the *first* session in a place pays for starting
+            // that server.
+            ready_place(backend)?;
+        }
 
         let spawned = backend.spawn(
             &window_name,
@@ -682,7 +792,7 @@ impl Session {
         info.sandbox_state = state;
         debug!(session_id = %info.id, backend_id = %spawned.backend_id, "Spawned session via backend");
 
-        Ok(Self::wire_io(
+        let mut session = Self::wire_io(
             info,
             rows,
             cols,
@@ -695,7 +805,9 @@ impl Session {
             backend,
             provider,
             env,
-        ))
+        );
+        session.place_instance = instance;
+        Ok(session)
     }
 
     /// Reconnect to an existing backend session. `seed` is optional
@@ -827,6 +939,7 @@ impl Session {
             env,
             placeholder: false,
             ghost: false,
+            place_instance: None,
             placeholder_seed: None,
         }
     }
@@ -839,11 +952,19 @@ impl Session {
     /// `info`) but shows `SessionStatus::Unreachable` until the host recovers and
     /// [`Self::adopt`] replaces it in place. `info.status` is forced to
     /// `Unreachable` here regardless of the caller's value.
+    ///
+    /// `backend_type` is what the session's row *says* it runs on, which is not
+    /// always what `backend` is: a place friring has not opened has no transport
+    /// in the registry, so the caller falls back to the local backend to have
+    /// something renderable — and the pane would otherwise claim a remote host
+    /// went away when a container did.
+    #[allow(clippy::too_many_arguments)]
     pub fn placeholder(
         mut info: SessionInfo,
         rows: u16,
         cols: u16,
         backend: &Arc<dyn SessionBackend>,
+        backend_type: &str,
         provider: &Arc<dyn AgentProvider>,
         env: HashMap<String, String>,
     ) -> Self {
@@ -865,12 +986,7 @@ impl Session {
                 meta_gen: Arc::clone(&meta_gen),
             },
         )));
-        let host = info.remote_host.clone().unwrap_or_else(|| "?".into());
-        let notice = format!(
-            "\r\n  \u{2298} Remote host '{host}' unreachable \u{2014} retrying\u{2026}\r\n\r\n  \
-             This session will reconnect automatically when the host comes back.\r\n  \
-             Press restart to retry now, or delete to remove it.\r\n"
-        );
+        let notice = unreachable_notice(backend_type, info.remote_host.as_deref());
         if let Ok(mut p) = parser.lock() {
             p.process(notice.as_bytes());
         }
@@ -900,6 +1016,7 @@ impl Session {
             env,
             placeholder: true,
             ghost: false,
+            place_instance: None,
             placeholder_seed: Some(notice.into_bytes()),
         }
     }
@@ -921,8 +1038,11 @@ impl Session {
         env: HashMap<String, String>,
         frame: Option<&[u8]>,
     ) -> Self {
-        // `placeholder` forces `Unreachable`, so the status is set after it.
-        let mut session = Self::placeholder(info, rows, cols, backend, provider, env);
+        // `placeholder` forces `Unreachable`, so the status is set after it. Its
+        // notice is replaced by the saved frame below, so which backend name it
+        // was composed from makes no difference here.
+        let mut session =
+            Self::placeholder(info, rows, cols, backend, backend.name(), provider, env);
         session.info.status = crate::session::SessionStatus::Unloaded;
         session.ghost = true;
         // Re-seed the parser: replace the placeholder's "host unreachable"
@@ -1218,6 +1338,20 @@ impl Session {
         self.backend.name()
     }
 
+    /// The backend this session is wired to, for a caller that has to register
+    /// it: a place-backed launch builds its own transport
+    /// ([`crate::agent::transport::Place`]) rather than taking one from the
+    /// registry, so the registry only learns about it from here.
+    pub fn backend_arc(&self) -> &Arc<dyn SessionBackend> {
+        &self.backend
+    }
+
+    /// The place this session's last launch created or adopted, if any — the
+    /// row to record in `sandbox_instances` now that the pane exists.
+    pub fn place_instance(&self) -> Option<&crate::sandbox::SandboxInstance> {
+        self.place_instance.as_ref()
+    }
+
     /// The session's current environment — the env it was last (re)spawned
     /// with. Used by acceptance tests to assert the identity env (`FRIRING_*`)
     /// is preserved across a restart.
@@ -1273,15 +1407,53 @@ impl Session {
             profile,
             state: sandbox_state,
             egress,
+            place,
+            instance,
         } = sandboxed_invocation(config, &self.provider)?;
+
+        // A relaunch re-reads the profile, so an edited one asks for a *new*
+        // container and this session moves into it. The old pane is killed
+        // where it still is, and the new one spawned where the launch says.
+        let in_place = place.as_ref().map(place_backend);
+        let moved = in_place
+            .as_ref()
+            .is_some_and(|next| next.name() != self.backend.name());
+        // The other direction — a profile edited from a place backend to a
+        // policy one, or off a place entirely — has no home to relaunch into:
+        // this session's tmux is *inside* the place, and a policy backend's
+        // argv (`sandbox-exec …`, `bwrap …`) names host binaries a container
+        // image does not have. Refusing says so; relaunching would kill the
+        // pane and put a dead one in its place.
+        if in_place.is_none() && crate::session::is_sandbox_backend(self.backend.name()) {
+            bail!(
+                "This session runs inside sandbox place '{}', and its profile no longer resolves \
+                 to a place. Create a new session to move it back onto the host.",
+                self.backend.name()
+            );
+        }
 
         // A placeholder/ghost owns no live pane — killing its empty backend_id
         // would only produce a tmux error.
         if !self.placeholder {
-            self.backend.kill(&self.backend_id)?;
+            match self.backend.kill(&self.backend_id) {
+                Ok(()) => {}
+                // The pane lived in a place this launch is not going back to —
+                // a rebuilt container, or one that died and took every session
+                // in it. Not reaching it is the outcome, not a failure; a
+                // relaunch that refused here would strand the session in a
+                // place that no longer exists.
+                Err(e) if moved => {
+                    warn!(session_id = %self.info.id, "Old sandbox place is gone: {e:#}");
+                }
+                Err(e) => return Err(e),
+            }
         }
 
-        let spawned = self.backend.spawn(
+        let backend = in_place.as_ref().unwrap_or(&self.backend);
+        if in_place.is_some() {
+            ready_place(backend)?;
+        }
+        let spawned = backend.spawn(
             &window_name,
             &command,
             &args,
@@ -1328,6 +1500,13 @@ impl Session {
         self.last_synced_meta_gen = u64::MAX;
         self.attention_ack_at = 0;
         self.env = env;
+        // Only now, past every fallible step: a restart that failed leaves the
+        // session pointing at the pane it still has.
+        if let Some(next) = in_place {
+            self.backend = next;
+            self.info.remote_host = remote_host_from_backend(&self.backend);
+        }
+        self.place_instance = instance;
         self.info.backend_id = Some(self.backend_id.clone());
         self.info.sandbox_profile = profile;
         self.info.sandbox_state = sandbox_state;
@@ -1567,6 +1746,7 @@ impl Session {
             env: HashMap::new(),
             placeholder: false,
             ghost: false,
+            place_instance: None,
             placeholder_seed: None,
         };
         (session, input_rx)
@@ -2456,6 +2636,45 @@ mod tests {
                 assert_eq!(bytes, visible);
             }
         }
+    }
+
+    /// ADR-26's stated consequence, in the one place a user meets it: the two
+    /// off-host shapes lose sessions differently, and a frozen pane has to say
+    /// which — three panes dying together is one problem, not three.
+    #[test]
+    fn an_unreachable_pane_says_which_shape_went() {
+        let place = unreachable_notice("sandbox:dev", None);
+        assert!(place.contains("Sandbox place 'dev'"), "{place}");
+        assert!(place.contains("they all stopped"), "{place}");
+        assert!(!place.contains("Remote host"), "{place}");
+
+        let host = unreachable_notice("ssh:devbox", Some("devbox"));
+        assert!(host.contains("Remote host 'devbox'"), "{host}");
+        assert!(!host.contains("Sandbox place"), "{host}");
+
+        // A local backend has no host name to fall back on, and must not
+        // invent one.
+        assert!(unreachable_notice("local-tmux", None).contains("'?'"));
+    }
+
+    /// A place is created once per profile and shared, so one transport reaches
+    /// it however many sessions are in it — and a rebuild retires the one that
+    /// reached the container it replaced.
+    #[test]
+    fn one_transport_per_place_and_a_rebuild_replaces_it() {
+        let first =
+            crate::agent::transport::Place::new("/usr/bin/podman", "ctr1", "shared").unwrap();
+        let again =
+            crate::agent::transport::Place::new("/usr/bin/podman", "ctr1", "shared").unwrap();
+        assert!(Arc::ptr_eq(&place_backend(&first), &place_backend(&again)));
+
+        let rebuilt =
+            crate::agent::transport::Place::new("/usr/bin/podman", "ctr2", "shared").unwrap();
+        let rebuilt = place_backend(&rebuilt);
+        assert!(!Arc::ptr_eq(&place_backend(&first), &rebuilt));
+        // Still one name, so the registry entry is replaced rather than
+        // duplicated.
+        assert_eq!(rebuilt.name(), "sandbox:shared");
     }
 
     #[test]

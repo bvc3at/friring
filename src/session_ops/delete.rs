@@ -78,7 +78,26 @@ pub fn teardown_runtime_resources(
     session: &crate::sync::SharedSession,
     report: &mut ForceDeleteReport,
 ) {
-    if crate::session::is_remote_backend(&session.backend_type) {
+    if let Some(profile) = crate::session::sandbox_backend_profile(&session.backend_type) {
+        // A **place**-backed session: its pane is inside the container, so the
+        // local kill would find nothing and leave the agent running. Worktree
+        // removal stays local — a place mounts every path at exactly its host
+        // path, so the checkout the container sees *is* the host's.
+        match crate::agent::sandboxing::running_place(profile) {
+            Some(place) => kill_place_window(&place, session, report),
+            None => {
+                // Not an error: a place that is not running took every pane in
+                // it with it, which is the outcome this call wanted.
+                tracing::info!(
+                    "sandbox place '{profile}' is not running; session '{}' had no pane to kill",
+                    session.name
+                );
+            }
+        }
+        for wt in &session.worktrees {
+            remove_worktree_into(None, wt, report);
+        }
+    } else if crate::session::is_remote_backend(&session.backend_type) {
         // Off-local session: kill the pane + remove worktrees on the host. An
         // unresolvable/unreachable host is expected — record it, never abort.
         let registry = crate::agent::host_config::load_all();
@@ -161,6 +180,38 @@ fn kill_local_window(session: &crate::sync::SharedSession, report: &mut ForceDel
     #[cfg(windows)]
     if let Some(pid) = pane_pid {
         reap_pane_process(pid);
+    }
+}
+
+/// Kill the session's pane **inside a sandbox place** by its persisted pane id.
+///
+/// The place twin of [`kill_remote_window`], and best-effort for the same
+/// reasons: the pane id is what a place is addressed by (there is no cheap
+/// "window by friring name" lookup over the transport), and a place that has
+/// gone away since the row was written is recorded rather than fatal.
+fn kill_place_window(
+    place: &crate::agent::transport::Place,
+    session: &crate::sync::SharedSession,
+    report: &mut ForceDeleteReport,
+) {
+    let pane = session.backend_id.trim();
+    if pane.is_empty() {
+        let msg = format!(
+            "session '{}' in sandbox place '{}' has no pane id; could not kill its window",
+            session.name,
+            place.profile()
+        );
+        tracing::warn!("{msg}");
+        report.remote_teardown_error = Some(msg);
+        return;
+    }
+    match crate::agent::tmux::kill_pane_place(place, pane) {
+        Ok(()) => report.killed_window = true,
+        Err(e) => {
+            let msg = format!("kill_pane_place({}, {pane}) failed: {e}", place.profile());
+            tracing::warn!("{msg}");
+            report.remote_teardown_error = Some(msg);
+        }
     }
 }
 

@@ -1,5 +1,6 @@
 pub mod agent_config;
 pub mod backend;
+pub mod config_args;
 pub mod control_mode;
 pub mod extension_config;
 pub mod generic;

@@ -78,8 +78,27 @@ impl App {
         let host = SandboxHost::local_shared();
         profiles
             .into_iter()
-            .map(|p| profile_row(host, &p))
+            .map(|p| {
+                let instance = self.place_state(&p.profile.name);
+                profile_row(host, &p, instance)
+            })
             .collect()
+    }
+
+    /// What the profile list says about a profile's live place: the state of
+    /// its most recently used instance, or `None` when it has none.
+    ///
+    /// A profile may own several rows — a rebuild adds one rather than
+    /// overwriting the previous id, which is what keeps the superseded container
+    /// findable — so the most recent is the one that describes the place
+    /// sessions are actually in.
+    fn place_state(&self, profile: &str) -> Option<String> {
+        self.db
+            .list_sandbox_instances_for_profile(profile)
+            .ok()?
+            .into_iter()
+            .max_by_key(|row| row.last_used_at)
+            .map(|row| row.state)
     }
 
     /// Open the sandbox-profile list modal.
@@ -136,7 +155,9 @@ impl App {
     /// nothing is available: an unresolved `auto` rules nothing out, which is
     /// the same exemption the profile validator makes.
     fn resolve_sandbox_editor_backend(&self, m: &mut modals::SandboxEditorModal) {
-        m.resolved = resolve_backend(SandboxHost::local_shared(), m.backend);
+        let host = SandboxHost::local_shared();
+        m.resolved = resolve_backend(host, m.backend);
+        m.backend_unavailable = backend_unavailable(host, m.backend, m.resolved);
     }
 
     /// Persist the editor's profile. Returns whether the modal may close: a
@@ -219,6 +240,12 @@ impl App {
             .unwrap_or(0);
         match self.db.delete_sandbox_profile(name) {
             Ok(true) => {
+                // The profile's own tree — its synthetic home and every
+                // session directory inside it — belongs to the profile, so it
+                // goes with it. The *place* does not: nothing here stops a
+                // running container, and the reclaiming pass is what removes
+                // one whose profile is gone.
+                crate::sandbox::dirs::cleanup_place(name);
                 let message = if in_use > 0 {
                     format!(
                         "Sandbox profile '{name}' deleted — {in_use} session(s) still \
@@ -241,6 +268,144 @@ impl App {
                 error!("Failed to delete sandbox profile '{name}': {e}");
                 self.set_error("Failed to delete sandbox profile");
             }
+        }
+    }
+
+    // ---- Reclaiming places -------------------------------------------------
+
+    /// Reclaim the places nothing needs any more, on a slow background pass.
+    ///
+    /// A place outlives the launch that made it and the friring that made it, so
+    /// something has to reconcile the `sandbox_instances` table against what the
+    /// engines actually hold: rows whose container is gone, containers whose
+    /// profile is gone, and containers a profile edit superseded — an edited
+    /// profile builds a *new* container by design (the spec digest is in the
+    /// name), which is precisely what leaves the old one behind.
+    ///
+    /// Every step is a container-engine command, so the whole pass runs on a
+    /// worker; the decision itself is pure
+    /// ([`gc_plan`](crate::sandbox::container::gc_plan)) and the worker only
+    /// carries it out.
+    pub(crate) fn tick_sandbox_gc(&mut self) {
+        if self.metrics.tick_count % SANDBOX_GC_INTERVAL_TICKS != SANDBOX_GC_OFFSET_TICKS {
+            return;
+        }
+        if self.sandbox_gc.in_progress() {
+            return;
+        }
+        let Some(sweep) = self.sandbox_gc_input() else {
+            return;
+        };
+        let tx = self.sandbox_gc.start();
+        std::thread::spawn(move || {
+            let _ = tx.send(sweep.run());
+        });
+    }
+
+    /// Everything the pass needs from this instance, gathered on the UI thread:
+    /// the profiles that could own a place, the recorded rows, and the places
+    /// that must survive whatever else is true of them.
+    ///
+    /// `None` when there is nothing a pass could act on, so an installation with
+    /// no place profiles never spawns a worker.
+    fn sandbox_gc_input(&self) -> Option<GcSweep> {
+        let profiles: Vec<SandboxProfile> = self
+            .db
+            .list_sandbox_profiles()
+            .unwrap_or_default()
+            .into_iter()
+            // A row friring could not decode is repairable, not runnable — and
+            // guessing at its spec here would compare a place against a policy
+            // nobody wrote. Left alone, which keeps its place alive.
+            .filter(super::super::storage::sandboxes::StoredSandboxProfile::is_intact)
+            .map(|stored| stored.profile)
+            // A profile pinned to a policy backend can never own a place, so it
+            // is not a reason to ask an engine anything. `auto` stays in: on a
+            // host with no policy backend its ladder ends at one.
+            .filter(|profile| profile.backend.shape() != Some(crate::session::SandboxShape::Policy))
+            .collect();
+        let records: Vec<(
+            SandboxBackendKind,
+            crate::sandbox::container::InstanceRecord,
+        )> = [SandboxBackendKind::Docker, SandboxBackendKind::Podman]
+            .into_iter()
+            .flat_map(|engine| {
+                self.db
+                    .list_sandbox_instances_for_engine(engine)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(move |row| {
+                        (
+                            engine,
+                            crate::sandbox::container::InstanceRecord {
+                                profile: row.profile,
+                                external_id: row.external_id,
+                                last_used_at: row.last_used_at,
+                            },
+                        )
+                    })
+            })
+            .collect();
+        if profiles.is_empty() && records.is_empty() {
+            return None;
+        }
+        Some(GcSweep {
+            profiles,
+            records,
+            in_use: self.places_in_use(),
+        })
+    }
+
+    /// What a pass may not touch: the places live sessions are in.
+    ///
+    /// Two sources, and the second is the careful one. This instance knows
+    /// exactly which container each of *its* place-backed sessions is in. It
+    /// knows nothing about a session another friring is driving — only that a
+    /// row for it exists — so a profile with a live session row this instance is
+    /// not driving protects **every** container of that profile by name. The
+    /// cost is a superseded container surviving until that session ends; the
+    /// alternative is pulling a place out from under somebody else's agent.
+    fn places_in_use(&self) -> PlacesInUse {
+        let mut ids: HashSet<String> = HashSet::new();
+        let mut profiles: HashSet<String> = HashSet::new();
+        for shared in self.db.list_active_sessions().unwrap_or_default() {
+            let Some(profile) = crate::session::sandbox_backend_profile(&shared.backend_type)
+            else {
+                continue;
+            };
+            match self.place_containers.get(&shared.backend_type) {
+                Some(id) => {
+                    ids.insert(id.clone());
+                }
+                None => {
+                    profiles.insert(profile.to_string());
+                }
+            }
+        }
+        PlacesInUse { ids, profiles }
+    }
+
+    /// Apply a finished pass: forget the rows it reconciled away, re-record the
+    /// containers it adopted, and report only what went wrong.
+    pub(crate) fn poll_sandbox_gc(&mut self) {
+        let super::background::TaskPoll::Done(outcome) = self.sandbox_gc.poll() else {
+            return;
+        };
+        for (engine, external_id) in outcome.forget {
+            if let Err(e) = self.db.delete_sandbox_instance(engine, &external_id) {
+                error!("Failed to forget sandbox instance: {e}");
+            }
+        }
+        for row in outcome.adopt {
+            if let Err(e) = self.db.upsert_sandbox_instance(&row) {
+                error!("Failed to adopt sandbox instance: {e}");
+            }
+        }
+        for failure in outcome.failures {
+            // A place that will not go is the next pass's problem, but the user
+            // is the one paying for the disk, so it is said once rather than
+            // only logged.
+            self.set_error(format!("Could not reclaim a sandbox place: {failure}"));
         }
     }
 
@@ -535,7 +700,7 @@ impl App {
                 let covers = dirs
                     .iter()
                     .all(|dir| stored.profile.covers(&dir.to_string_lossy(), &home));
-                let row = profile_row(host, &stored);
+                let row = profile_row(host, &stored, None);
                 SandboxChoice {
                     label: stored.profile.name,
                     profile: row.name.clone(),
@@ -723,6 +888,124 @@ impl App {
 /// The state is on the session and in the info panel, but a toast is what gets
 /// noticed at the moment of the launch, and the escape hatch firing is exactly
 /// the event the design wants visible rather than ambient (`docs/SANDBOX.md`
+/// How often the place-reclaiming pass runs, in ticks (~10 ms each), and where
+/// in the cycle it starts.
+///
+/// Slow on purpose: a place is created once per profile and superseded only by a
+/// profile edit, so nothing accumulates between passes. The offset keeps it off
+/// the tick that already does the periodic session-list refresh.
+const SANDBOX_GC_INTERVAL_TICKS: u64 = 30_000;
+const SANDBOX_GC_OFFSET_TICKS: u64 = 1_500;
+
+/// One pass's inputs, moved to the worker whole so the UI thread does no engine
+/// work and the worker does no database work.
+pub(crate) struct GcSweep {
+    profiles: Vec<SandboxProfile>,
+    records: Vec<(
+        SandboxBackendKind,
+        crate::sandbox::container::InstanceRecord,
+    )>,
+    in_use: PlacesInUse,
+}
+
+/// What a pass must leave alone — see [`App::places_in_use`].
+struct PlacesInUse {
+    ids: HashSet<String>,
+    profiles: HashSet<String>,
+}
+
+/// What a finished pass leaves for the UI thread to write down.
+pub(crate) struct GcOutcome {
+    forget: Vec<(SandboxBackendKind, String)>,
+    adopt: Vec<crate::storage::sandboxes::SandboxInstance>,
+    failures: Vec<String>,
+}
+
+impl GcSweep {
+    /// Run the pass: ask each engine what it holds, decide, and carry it out.
+    ///
+    /// Per engine, because that is the only unit that can be reconciled: what a
+    /// `docker` reports says nothing about a `podman` container, and a row whose
+    /// engine is not installed must not be read as a place that has vanished —
+    /// which is why an engine that will not answer is skipped whole rather than
+    /// treated as holding nothing.
+    fn run(self) -> GcOutcome {
+        let mut outcome = GcOutcome {
+            forget: Vec::new(),
+            adopt: Vec::new(),
+            failures: Vec::new(),
+        };
+        let host = SandboxHost::local_shared();
+        for engine in [SandboxBackendKind::Docker, SandboxBackendKind::Podman] {
+            let Some(backend) = host.container(engine) else {
+                continue;
+            };
+            let Ok(live) = backend.live_places() else {
+                continue;
+            };
+            let records: Vec<crate::sandbox::container::InstanceRecord> = self
+                .records
+                .iter()
+                .filter(|(kind, _)| *kind == engine)
+                .map(|(_, record)| record.clone())
+                .collect();
+            // A profile with no opinion (its engine could not plan it) is left
+            // out of `current`, which would read as "the profile is gone" — so
+            // its containers are protected by name instead.
+            let mut current = std::collections::BTreeMap::new();
+            let mut unplannable: HashSet<String> = HashSet::new();
+            for profile in &self.profiles {
+                match backend.current_spec(profile) {
+                    Some(spec) => {
+                        current.insert(profile.name.clone(), spec);
+                    }
+                    None => {
+                        unplannable.insert(profile.name.clone());
+                    }
+                }
+            }
+            let in_use: Vec<String> = live
+                .iter()
+                .filter(|container| {
+                    self.in_use.ids.contains(&container.id)
+                        || container.profile.as_ref().is_some_and(|profile| {
+                            self.in_use.profiles.contains(profile) || unplannable.contains(profile)
+                        })
+                })
+                .map(|container| container.id.clone())
+                .collect();
+
+            let plan = crate::sandbox::container::gc_plan(crate::sandbox::container::GcInput {
+                records: &records,
+                live: &live,
+                current: &current,
+                in_use: &in_use,
+                now: crate::sync::current_time_millis(),
+                // Idleness never reclaims a place. A place is the environment a
+                // session lives in, not a cache, and "unused for a while" is
+                // indistinguishable from "the user is on holiday". Only a
+                // deleted profile or a rebuild takes one.
+                idle_after_ms: None,
+            });
+            outcome.failures.extend(backend.reap(&plan));
+            outcome
+                .forget
+                .extend(plan.forget.into_iter().map(|id| (engine, id)));
+            outcome
+                .adopt
+                .extend(plan.adopt.into_iter().filter_map(|container| {
+                    Some(crate::storage::sandboxes::SandboxInstance::new(
+                        container.profile?,
+                        engine,
+                        container.id,
+                        crate::sandbox::container::INSTANCE_STATE_RUNNING,
+                    ))
+                }));
+        }
+        outcome
+    }
+}
+
 /// §Failure modes). A free function rather than a method so a caller that has
 /// already moved the session into `self.sessions` can compose the message first
 /// and set it afterwards.
@@ -814,10 +1097,12 @@ fn describe_destination(host: &str, port: u16) -> String {
 fn profile_row(
     host: &SandboxHost,
     stored: &crate::storage::sandboxes::StoredSandboxProfile,
+    instance: Option<String>,
 ) -> SandboxProfileRow {
     let p = &stored.profile;
+    let resolved = resolve_backend(host, p.backend);
     SandboxProfileRow {
-        resolved: resolve_backend(host, p.backend),
+        resolved,
         name: p.name.clone(),
         backend: p.backend,
         paths: p.paths.len(),
@@ -827,9 +1112,8 @@ fn profile_row(
             .into_iter()
             .map(str::to_string)
             .collect(),
-        // Place instances land with the sandbox transport (P3); until then no
-        // profile has one and the column stays empty.
-        instance: None,
+        instance,
+        unavailable: backend_unavailable(host, p.backend, resolved),
     }
 }
 
@@ -846,12 +1130,106 @@ fn resolve_backend(
     }
 }
 
+/// Why the backend a profile would run on cannot be used here, or `None` when
+/// it can.
+///
+/// Two shapes of "no", and they read differently: a **pinned** backend that is
+/// not installed reports the probe's own actionable sentence, because the user
+/// chose it and a pin never falls back; an **`auto`** whose whole ladder came up
+/// empty reports every rung's reason, because "nothing here can sandbox" is the
+/// only useful summary of it. An `auto` that resolved is available by
+/// construction — the ladder only ever picks an available rung.
+pub(crate) fn backend_unavailable(
+    host: &SandboxHost,
+    requested: SandboxBackendKind,
+    resolved: Option<SandboxBackendKind>,
+) -> Option<String> {
+    match (requested, resolved) {
+        (SandboxBackendKind::Auto, Some(_)) => None,
+        (SandboxBackendKind::Auto, None) => Some(
+            host.select(requested)
+                .rejection_summary()
+                .replace('\n', "; "),
+        ),
+        (explicit, _) => {
+            let availability = host.probe(explicit);
+            (!availability.is_available()).then(|| availability.message())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::proxy::{DenialEvent, Protocol};
     use crate::sandbox::SessionDenial;
     use crate::session::{NetworkMode, SandboxPath};
+
+    /// The pass may not take a place out from under a running agent, and the
+    /// careful half is what it does *not* know: a session another friring is
+    /// driving is a row and nothing more, so every container of that profile is
+    /// protected by name rather than by id.
+    #[test]
+    fn a_place_a_live_session_is_in_is_never_reclaimed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let mut app = crate::app::tests::app_with_sessions(0);
+        let profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        app.db.upsert_sandbox_profile(&profile).unwrap();
+
+        let shared = crate::sync::SharedSession {
+            id: crate::session::SessionId::default(),
+            name: "demo".into(),
+            agent: "claude".into(),
+            backend_id: String::new(),
+            backend_type: "sandbox:dev".into(),
+            agent_session_id: Some("conv".into()),
+            cwd: None,
+            additional_dirs: Vec::new(),
+            workspace_dir: None,
+            worktrees: Vec::new(),
+            shell_backend_id: None,
+            sandbox_profile: Some("dev".into()),
+            sandbox_enforcement: Default::default(),
+            parent_session_id: None,
+            display_order: None,
+            tombstone: false,
+            tombstone_at: None,
+        };
+        app.db.upsert_session(&shared).unwrap();
+
+        // Nothing opened this place here, so the profile is protected whole.
+        let in_use = app.places_in_use();
+        assert!(in_use.ids.is_empty());
+        assert!(in_use.profiles.contains("dev"));
+
+        // Once this instance knows which container the session is in, the
+        // protection narrows to that one — which is what lets a superseded
+        // container be reclaimed while its replacement is in use.
+        app.place_containers
+            .insert("sandbox:dev".into(), "ctr1".into());
+        let in_use = app.places_in_use();
+        assert!(in_use.ids.contains("ctr1"));
+        assert!(in_use.profiles.is_empty());
+    }
+
+    /// A pass costs an engine command, so an installation whose profiles could
+    /// never own a place does not start one.
+    #[test]
+    fn a_policy_only_installation_never_asks_an_engine_anything() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let app = crate::app::tests::app_with_sessions(0);
+        let mut policy = SandboxProfile::new("mac", vec![SandboxPath::workspace("~/dev/app")]);
+        policy.backend = SandboxBackendKind::Seatbelt;
+        app.db.upsert_sandbox_profile(&policy).unwrap();
+        assert!(app.sandbox_gc_input().is_none());
+
+        let mut place = SandboxProfile::new("box", vec![SandboxPath::workspace("~/dev/app")]);
+        place.backend = SandboxBackendKind::Podman;
+        app.db.upsert_sandbox_profile(&place).unwrap();
+        assert!(app.sandbox_gc_input().is_some());
+    }
 
     /// A profile whose whole point is the allowlist: nothing permitted, and the
     /// firewall told to ask before it refuses something new.
@@ -1546,7 +1924,10 @@ mod tests {
         let host = SandboxHost::new(std::sync::Arc::new(
             crate::sandbox::probe::StubHost::linux_with_bwrap("0.11.0"),
         ));
-        let rows: Vec<SandboxProfileRow> = profiles.iter().map(|p| profile_row(&host, p)).collect();
+        let rows: Vec<SandboxProfileRow> = profiles
+            .iter()
+            .map(|p| profile_row(&host, p, None))
+            .collect();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "dev");
@@ -1570,7 +1951,8 @@ mod tests {
         ));
 
         let stored = db.list_sandbox_profiles().unwrap();
-        let rows: Vec<SandboxProfileRow> = stored.iter().map(|p| profile_row(&host, p)).collect();
+        let rows: Vec<SandboxProfileRow> =
+            stored.iter().map(|p| profile_row(&host, p, None)).collect();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "broken");

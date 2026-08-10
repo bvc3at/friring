@@ -19,6 +19,7 @@ mod notify_state;
 mod sandbox;
 pub(crate) mod search;
 mod state;
+mod status_signals;
 mod sync_state;
 mod task_state;
 mod tasks;
@@ -208,7 +209,25 @@ struct PendingSessionSpawn {
 /// was **reachable** (its `ensure_ready` succeeded — distinguishes "host down"
 /// from "host up but no windows"), plus the windows it reported. Sent once per
 /// discovery attempt by the restore threads.
-type RemoteDiscovery = (String, bool, Vec<crate::agent::backend::DiscoveredSession>);
+/// What a restore's discovery thread has to reach: a backend the registry
+/// already holds (an SSH host, a WSL distro), or a sandbox **place** it has to
+/// open first. Opening one runs a container engine, which is why it happens on
+/// that thread rather than where the restore is planned.
+enum DiscoveryTarget {
+    Ready(Arc<dyn SessionBackend>),
+    Place(crate::session::SandboxProfile),
+}
+
+struct RemoteDiscovery {
+    backend_type: String,
+    reachable: bool,
+    windows: Vec<crate::agent::backend::DiscoveredSession>,
+    /// The transport a **place** discovery opened on its way in, for the
+    /// registry to adopt. `None` for an SSH/WSL host, whose backend was already
+    /// registered from `hosts.toml`, and for a place that could not be opened —
+    /// which is what `reachable = false` says.
+    opened: Option<(Arc<dyn SessionBackend>, crate::sandbox::SandboxInstance)>,
+}
 
 /// How long to wait between retry sweeps for a still-unreachable remote backend.
 const REMOTE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
@@ -995,6 +1014,15 @@ pub struct App {
     /// [`Self::poll_remote_restore`]. `None` once every remote backend has
     /// reported (or when there was nothing remote to restore).
     remote_restore: Option<RemoteRestore>,
+    /// The place-reclaiming pass ([`sandbox::App::tick_sandbox_gc`]) while it
+    /// runs: every step is a container-engine command, so none of it is on the
+    /// render path.
+    sandbox_gc: background::BackgroundTask<sandbox::GcOutcome>,
+    /// Which container each opened place is running in, keyed by its
+    /// `sandbox:<profile>` backend name. What tells the reclaiming pass which
+    /// places this instance's sessions are in — the session row records the
+    /// profile, and only the launch that opened the place knows the id.
+    place_containers: HashMap<String, String>,
     /// Deferred inputs: `(session_id, data, tick_at_which_to_send)`.
     /// Used to introduce a small delay between pasting text and pressing Enter.
     deferred_inputs: Vec<(SessionId, Vec<u8>, u64)>,
@@ -1491,6 +1519,8 @@ impl App {
             last_active_session_id: None,
             cached_hook_states: HashMap::new(),
             pending_remote_hook_events: Vec::new(),
+            sandbox_gc: background::BackgroundTask::default(),
+            place_containers: HashMap::new(),
             hook_states_version: None,
             last_draw_at: clock::now(),
             last_output_gen: 0,
@@ -2315,6 +2345,19 @@ impl App {
                 // load it was the ghost's `—`. Back to unknown until the next
                 // scan prices the new pane.
                 session.info.memory = None;
+                // An edited profile builds a new container, so a relaunch can
+                // move the session into a different place: the registry has to
+                // learn the one it is in *now*, or restore would later reach for
+                // the container it left.
+                let place = crate::session::is_sandbox_backend(session.backend_name()).then(|| {
+                    (
+                        Arc::clone(session.backend_arc()),
+                        session.place_instance().cloned(),
+                    )
+                });
+                if let Some((backend, instance)) = place {
+                    self.adopt_place_backend(backend, instance.as_ref());
+                }
                 // A relaunch mints a fresh proxy from a re-read profile, so the
                 // answers given about the previous boundary — a refusal above
                 // all — are not the user's standing position on this one.
@@ -3060,6 +3103,7 @@ impl App {
             &provider,
         ) {
             Ok(mut session) => {
+                self.learn_launched_place(&session);
                 session.info.id = deleted.id;
                 session.info.worktrees = worktree_infos;
                 session.info.parent_session_id = deleted.parent_session_id;
@@ -4754,10 +4798,61 @@ impl App {
         if let Some(b) = self.backends.get(backend_type) {
             return Some(b.clone());
         }
-        if crate::session::is_remote_backend(backend_type) {
+        if crate::session::is_offhost_backend(backend_type) {
+            // A `sandbox:<profile>` this instance has not opened a place for
+            // yet is skipped exactly like an unconfigured host: falling back to
+            // the local backend would adopt a pane that lives inside a
+            // container onto the host's tmux. [`Self::open_place_backend`] is
+            // what puts one in the registry, and it runs off the UI thread.
             return None;
         }
         Some(self.backends.default_backend().clone())
+    }
+
+    /// Ensure the place a `sandbox:<profile>` backend names and answer with its
+    /// transport, without touching `self` — this runs on a restore worker,
+    /// because ensuring a place starts a container engine command and a cold one
+    /// can take seconds.
+    ///
+    /// The caller registers the result ([`Self::adopt_place_backend`]); until
+    /// then [`Self::resolve_persisted_backend`] answers `None` for it and the
+    /// session keeps its placeholder.
+    fn open_place_backend(
+        profile: crate::session::SandboxProfile,
+    ) -> Result<(Arc<dyn SessionBackend>, crate::sandbox::SandboxInstance), String> {
+        crate::agent::sandboxing::open_place(&profile)
+    }
+
+    /// Register the transport for a place a launch or a restore opened, and
+    /// record the instance so garbage collection can find the container.
+    ///
+    /// Registering by the backend's own name (`sandbox:<profile>`) is what makes
+    /// every later lookup — restore, adoption, teardown, the session list —
+    /// resolve, and re-registering replaces the entry when an edited profile
+    /// built a new container.
+    fn adopt_place_backend(
+        &mut self,
+        backend: Arc<dyn SessionBackend>,
+        instance: Option<&crate::sandbox::SandboxInstance>,
+    ) {
+        if !crate::session::is_sandbox_backend(backend.name()) {
+            return;
+        }
+        if let Some(instance) = instance {
+            self.place_containers
+                .insert(backend.name().to_string(), instance.external_id.clone());
+            crate::session_ops::record_sandbox_instance(&self.db, instance);
+        }
+        self.backends.register(backend);
+    }
+
+    /// The place half of finishing a launch: a place-backed session spawns
+    /// through a transport it built itself, so this is where the registry and
+    /// the instance table learn about it.
+    fn learn_launched_place(&mut self, session: &Session) {
+        let backend = Arc::clone(session.backend_arc());
+        let instance = session.place_instance().cloned();
+        self.adopt_place_backend(backend, instance.as_ref());
     }
 
     /// Resolve the backend a session should spawn on, ensuring it is ready —
@@ -4918,6 +5013,7 @@ impl App {
         // `status_message = None` — a launch that landed outside its boundary
         // is what the status bar must be left showing.
         let unenforced_sandbox = crate::app::sandbox::unenforced_sandbox_message(&session.info);
+        self.learn_launched_place(&session);
         self.sessions.push(session);
         self.set_active_index(self.sessions.len() - 1);
         self.focus = InputFocus::Terminal;
@@ -6045,6 +6141,10 @@ impl App {
         // profile wants to be asked about.
         self.tick_sandbox_egress();
 
+        // Reclaim superseded and orphaned places on their own slow cadence.
+        self.tick_sandbox_gc();
+        self.poll_sandbox_gc();
+
         self.tick_expire_timers();
 
         self.poll_external_changes();
@@ -6412,17 +6512,22 @@ impl App {
     /// Recompute each session's status/activity/notification for this tick.
     ///
     /// Status is **hooks-driven**: agents report `working`/`blocked`/`done` via
-    /// `friring-cli session signal` (local sessions) or a tmux pane user option
-    /// pushed over the control-mode subscription (remote sessions — drained
-    /// below into the same hook columns), persisted in `sessions` and read here
-    /// in one batch (see [`derive_session_status`]). A `done` session stays
-    /// `Done` until the user moves focus *off* it (acknowledged → `Idle`). The
-    /// OSC terminal title is still captured for the live activity line, but no
-    /// longer drives status.
+    /// `friring-cli session signal` (local sessions), a tmux pane user option
+    /// pushed over the control-mode subscription (remote sessions), or a status
+    /// file under the data directory (sandboxed sessions, whose agents are kept
+    /// out of the database by ADR-29) — the last two drained below into the same
+    /// hook columns, persisted in `sessions` and read here in one batch (see
+    /// [`derive_session_status`]). A `done` session stays `Done` until the user
+    /// moves focus *off* it (acknowledged → `Idle`). The OSC terminal title is
+    /// still captured for the live activity line, but no longer drives status.
     fn refresh_session_statuses(&mut self) {
         // Before the data_version gate, so a persisted remote event reloads the
-        // cache in this same tick.
+        // cache in this same tick. The sandbox file channel is drained on the
+        // same terms: a boundary keeps its agent out of the database, so a
+        // status word in a file is the only report a sandboxed session makes
+        // (see [`Self::drain_sandbox_status_signals`] and ADR-29).
         self.drain_remote_hook_events();
+        self.drain_sandbox_status_signals();
         self.metrics.bump(|p| &mut p.status_refreshes);
         let active_index = self.active_index;
         // Reload the persisted hook columns only when the DB actually changed —
@@ -7630,6 +7735,7 @@ impl App {
             backend,
             &provider,
         ) {
+            self.learn_launched_place(&spawned);
             spawned.info.id = shared_session.id;
             spawned.info.worktrees = worktree_infos;
             spawned.info.additional_dirs = shared_session.additional_dirs.clone();
@@ -7934,9 +8040,12 @@ impl App {
             .filter(|s| s.agent_session_id.is_some())
             .collect();
 
+        // A sandbox **place** restores exactly like a remote host: its tmux is
+        // reached through a transport, and opening the place (a container
+        // engine command on a cold one) must not block the first frame.
         let (remote, local): (Vec<_>, Vec<_>) = resumable
             .into_iter()
-            .partition(|s| crate::session::is_remote_backend(&s.backend_type));
+            .partition(|s| crate::session::is_offhost_backend(&s.backend_type));
 
         // Sessions to ghost instead of respawn: everything explicitly unloaded,
         // plus — with lazy restore on — every session whose pane is gone. Read
@@ -8036,12 +8145,13 @@ impl App {
             for shared in &sessions {
                 self.insert_remote_placeholder(shared);
             }
-            // A backend we can resolve gets a discovery thread + retry tracking.
-            // An unknown host (no config) keeps its placeholder but can't be
-            // adopted, so it isn't queued for retries.
-            if let Some(backend) = self.resolve_persisted_backend(&backend_type) {
+            // A backend we can reach gets a discovery thread + retry tracking.
+            // An unknown host (no config) or a place whose profile is gone keeps
+            // its placeholder but can't be adopted, so it isn't queued for
+            // retries.
+            if let Some(target) = self.discovery_target(&backend_type) {
                 Self::spawn_remote_discovery(
-                    backend,
+                    target,
                     backend_type.clone(),
                     perf_log,
                     restore.tx.clone(),
@@ -8055,28 +8165,80 @@ impl App {
         }
     }
 
-    /// Ready + discover one remote backend on its own thread, reporting the
+    /// Ready + discover one off-host backend on its own thread, reporting the
     /// result over `tx` (a dropped receiver — app shut down — is fine).
+    ///
+    /// For a place this is also where the place is *opened*: ensuring a
+    /// container is a subprocess and, on a cold one, seconds — the same reason
+    /// an SSH connect is not done on the UI thread.
     fn spawn_remote_discovery(
-        backend: Arc<dyn SessionBackend>,
+        target: DiscoveryTarget,
         backend_type: String,
         perf_log: bool,
         tx: mpsc::Sender<RemoteDiscovery>,
     ) {
         std::thread::spawn(move || {
             let start = std::time::Instant::now();
-            let (reachable, discovered) = Self::ready_and_discover(&backend);
+            let (backend, opened) = match target {
+                DiscoveryTarget::Ready(backend) => (Some(backend), None),
+                DiscoveryTarget::Place(profile) => match Self::open_place_backend(profile) {
+                    Ok((backend, instance)) => {
+                        (Some(Arc::clone(&backend)), Some((backend, instance)))
+                    }
+                    Err(e) => {
+                        // Not fatal and not silent: the sessions in this place
+                        // keep their placeholders, and the retry sweep tries
+                        // again — a place is exactly as recoverable as a host
+                        // that came back.
+                        tracing::warn!(backend = %backend_type, "Could not open sandbox place: {e}");
+                        (None, None)
+                    }
+                },
+            };
+            let (reachable, windows) = match &backend {
+                Some(backend) => Self::ready_and_discover(backend),
+                None => (false, Vec::new()),
+            };
             if perf_log {
                 tracing::info!(
                     backend = %backend_type,
                     reachable,
-                    windows = discovered.len() as u64,
+                    windows = windows.len() as u64,
                     discover_ms = start.elapsed().as_millis() as u64,
                     "restore_discover"
                 );
             }
-            let _ = tx.send((backend_type, reachable, discovered));
+            let _ = tx.send(RemoteDiscovery {
+                backend_type,
+                reachable,
+                windows,
+                opened,
+            });
         });
+    }
+
+    /// How to reach `backend_type` for a restore, or `None` when this instance
+    /// cannot manage it at all.
+    ///
+    /// A **place** is always re-opened rather than taken from the registry, and
+    /// that is the recovery path: a container stopped by a host reboot or an
+    /// engine restart is started again here, which is what makes a place-backed
+    /// session come back the way a returning SSH host's does. Ensuring is
+    /// idempotent, so a place that is already up costs one `inspect`.
+    fn discovery_target(&self, backend_type: &str) -> Option<DiscoveryTarget> {
+        if let Some(name) = crate::session::sandbox_backend_profile(backend_type) {
+            return match self.load_session_sandbox(Some(name)) {
+                Ok(Some(profile)) => Some(DiscoveryTarget::Place(profile)),
+                // A profile that was deleted, or will not decode, has no place
+                // to open — the same refusal a launch gets, and for the same
+                // reason: friring will not guess at a boundary nobody wrote.
+                _ => None,
+            };
+        }
+        self.backends
+            .get(backend_type)
+            .cloned()
+            .map(DiscoveryTarget::Ready)
     }
 
     /// Rebuild the `(info, backend, provider)` triple for a persisted session
@@ -8127,7 +8289,15 @@ impl App {
     fn build_placeholder_session(&self, shared: &sync::SharedSession) -> Session {
         let (info, backend, provider) = self.persisted_session_parts(shared);
         let (rows, cols) = self.content_area_size();
-        Session::placeholder(info, rows, cols, &backend, &provider, HashMap::new())
+        Session::placeholder(
+            info,
+            rows,
+            cols,
+            &backend,
+            &shared.backend_type,
+            &provider,
+            HashMap::new(),
+        )
     }
 
     /// Build (but don't insert) a **ghost** [`Session`] for a persisted row:
@@ -8179,22 +8349,31 @@ impl App {
             .filter(|(_, s)| {
                 !s.is_placeholder()
                     && s.has_exited()
-                    && crate::session::is_remote_backend(s.backend_name())
+                    && crate::session::is_offhost_backend(s.backend_name())
             })
             .map(|(i, _)| i)
             .collect();
         if lost.is_empty() {
             return;
         }
+        let mut lost_labels: Vec<String> = Vec::new();
         for i in lost {
             // Capture the persisted shape before swapping in the placeholder, so
             // the reconnect keeps the real `backend_id` / worktrees / identity.
             let shared = self.session_to_shared(&self.sessions[i]);
+            if let Some(label) = offhost_label(&shared.backend_type) {
+                if !lost_labels.contains(&label) {
+                    lost_labels.push(label);
+                }
+            }
             // Replace in place (same index) so the active selection is undisturbed.
             self.sessions[i] = self.build_placeholder_session(&shared);
             self.enqueue_remote_reconnect(shared);
         }
-        self.set_error("Remote host connection lost — reconnecting…");
+        // Named, because the two shapes lose sessions differently: a host takes
+        // the sessions it was running, a place takes every session of its
+        // profile at once. One message per thing that went, not one per pane.
+        self.set_error(format!("{} lost — reconnecting…", lost_labels.join(", ")));
         self.request_redraw();
     }
 
@@ -8249,8 +8428,8 @@ impl App {
 
         // Each reported backend's discovery thread has finished.
         if let Some(state) = &mut self.remote_restore {
-            for (backend_type, _, _) in &ready {
-                state.inflight.remove(backend_type);
+            for discovery in &ready {
+                state.inflight.remove(&discovery.backend_type);
             }
         }
 
@@ -8292,12 +8471,12 @@ impl App {
             None => return,
         };
         for backend_type in to_retry {
-            if let Some(backend) = self.resolve_persisted_backend(&backend_type) {
+            if let Some(target) = self.discovery_target(&backend_type) {
                 let (tx, perf_log) = match &self.remote_restore {
                     Some(s) => (s.tx.clone(), s.perf_log),
                     None => return,
                 };
-                Self::spawn_remote_discovery(backend, backend_type.clone(), perf_log, tx);
+                Self::spawn_remote_discovery(target, backend_type.clone(), perf_log, tx);
                 if let Some(s) = self.remote_restore.as_mut() {
                     s.inflight.insert(backend_type);
                 }
@@ -8337,15 +8516,28 @@ impl App {
             .unwrap_or_default()
             .into_iter()
             .collect();
-        for (backend_type, reachable, discovered) in ready {
+        for RemoteDiscovery {
+            backend_type,
+            reachable,
+            windows: discovered,
+            opened,
+        } in ready
+        {
+            // Registered before anything resolves a backend from it: the
+            // adoption below looks the transport up by `backend_type`, and a
+            // place that has just been opened is only in the registry because
+            // of this.
+            if let Some((backend, instance)) = opened {
+                self.adopt_place_backend(backend, Some(&instance));
+            }
             if !reachable {
                 let first_time = self
                     .remote_restore
                     .as_mut()
                     .is_some_and(|s| s.notified_unreachable.insert(backend_type.clone()));
                 if first_time {
-                    if let Some(h) = host_label_from_backend_type(&backend_type) {
-                        unreachable_hosts.push(h);
+                    if let Some(label) = offhost_label(&backend_type) {
+                        unreachable_hosts.push(label);
                     }
                 }
                 continue;
@@ -8445,8 +8637,8 @@ impl App {
             }
         }
 
-        for host in &unreachable_hosts {
-            self.set_error(format!("Remote host '{host}' unavailable"));
+        for label in &unreachable_hosts {
+            self.set_error(format!("{label} unavailable"));
         }
         if restored > 0 {
             self.save_state();
@@ -9261,12 +9453,26 @@ fn resolve_repo_display_names(info: &mut SessionInfo) {
 
 /// The bare host name behind a remote `backend_type` (`ssh:<name>` /
 /// `wsl:<name>`), used to label a placeholder/unreachable session. `None` for a
-/// local backend.
+/// local backend — and for a sandbox place, which is not a *host*: it runs on
+/// this machine and mounts its paths, so the remote mark would say something
+/// untrue. [`offhost_label`] is what names one in a message.
 fn host_label_from_backend_type(backend_type: &str) -> Option<String> {
     backend_type
         .strip_prefix(crate::session::SSH_BACKEND_PREFIX)
         .or_else(|| backend_type.strip_prefix(crate::session::WSL_BACKEND_PREFIX))
         .map(str::to_string)
+}
+
+/// How a message names the thing an off-host `backend_type` could not reach.
+///
+/// The two shapes are worth telling apart in front of the user: a host is
+/// somewhere else and comes back on its own, a place is here and friring is the
+/// one that starts it. `None` for a local backend, which is never unreachable.
+fn offhost_label(backend_type: &str) -> Option<String> {
+    if let Some(profile) = crate::session::sandbox_backend_profile(backend_type) {
+        return Some(format!("Sandbox place '{profile}'"));
+    }
+    host_label_from_backend_type(backend_type).map(|host| format!("Remote host '{host}'"))
 }
 
 /// The `(display_name, directory)` pairs a session spans, in display order:
@@ -9780,7 +9986,7 @@ mod tests {
         }
     }
 
-    fn app_with_sessions(count: usize) -> App {
+    pub(crate) fn app_with_sessions(count: usize) -> App {
         let backend_arc = stub_backend_arc();
         let provider = stub_provider();
         let mut app = App::new(
@@ -10338,6 +10544,7 @@ mod tests {
             24,
             80,
             &backend_arc,
+            "ssh:devbox",
             &provider,
             HashMap::new(),
         ));
@@ -10373,8 +10580,15 @@ mod tests {
         let mut info = crate::session::SessionInfo::new("remote".into());
         info.agent = "claude".into();
         info.remote_host = Some("devbox".into());
-        let placeholder =
-            Session::placeholder(info, 24, 80, &backend_arc, &provider, HashMap::new());
+        let placeholder = Session::placeholder(
+            info,
+            24,
+            80,
+            &backend_arc,
+            "ssh:devbox",
+            &provider,
+            HashMap::new(),
+        );
         app.sessions.insert(0, placeholder);
         app.sessions[1].info.agent = "claude".into();
         app.sessions[1].info.remote_host = Some("devbox".into());
@@ -10404,6 +10618,43 @@ mod tests {
         }
         // Unknown remote backend → skipped (None), never misadopted on local.
         assert!(app.resolve_persisted_backend("ssh:nope").is_none());
+        // …and so is a place this instance has not opened: adopting a pane that
+        // lives inside a container onto the host's tmux would corrupt its
+        // `backend_type` and could collide with an unrelated local `%N`.
+        assert!(app.resolve_persisted_backend("sandbox:dev").is_none());
+    }
+
+    /// A place and a host both go down, and a message has to say which: a host
+    /// takes the sessions it was running, a place takes every session of its
+    /// profile at once (ADR-26). A place is deliberately *not* given the remote
+    /// mark — it runs on this machine and mounts its paths.
+    #[test]
+    fn an_offhost_backend_is_labelled_by_its_shape() {
+        assert_eq!(
+            offhost_label("sandbox:dev").as_deref(),
+            Some("Sandbox place 'dev'")
+        );
+        assert_eq!(
+            offhost_label("ssh:devbox").as_deref(),
+            Some("Remote host 'devbox'")
+        );
+        assert_eq!(offhost_label("local-tmux"), None);
+        assert_eq!(host_label_from_backend_type("sandbox:dev"), None);
+    }
+
+    /// Restore partitions on where the multiplexer is, not on whether the
+    /// machine is somebody else's: a place-backed session must take the
+    /// background path, because opening its container is a subprocess that
+    /// cannot run before the first frame.
+    #[test]
+    fn a_place_backed_session_restores_through_the_background_path() {
+        for backend_type in ["sandbox:dev", "ssh:devbox", "wsl:Ubuntu"] {
+            assert!(
+                crate::session::is_offhost_backend(backend_type),
+                "{backend_type} must not restore synchronously"
+            );
+        }
+        assert!(!crate::session::is_offhost_backend("local-tmux"));
     }
 
     #[test]

@@ -98,10 +98,15 @@ fn with_identity(s: &SharedSession, extra: Value) -> Value {
     row
 }
 
-/// Whether this session runs on a remote host, whose local-only sources
-/// friring never writes or reads (see the module docs).
+/// Whether this session runs somewhere other than this machine — a remote host,
+/// or inside a sandbox place — whose local-only sources friring never writes or
+/// reads (see the module docs).
+///
+/// A place counts for the same reason a host does, and one stronger: the
+/// metrics directory is under friring's data directory, which no sandbox may be
+/// given (ADR-29), so a place-backed session has nowhere to write one.
 fn is_remote(s: &SharedSession) -> bool {
-    crate::session::is_remote_backend(&s.backend_type)
+    crate::session::is_offhost_backend(&s.backend_type)
 }
 
 // --- session metrics (statusline) -------------------------------------------

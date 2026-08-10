@@ -81,7 +81,7 @@ pub struct SpawnResult {
 /// without a tmux server. Driving the real one in a test would either talk to
 /// the user's own friring socket or launch an agent.
 type WindowSpawner<'a> = &'a dyn Fn(
-    Option<&HostDef>,
+    LaunchTarget<'_>,
     &str,
     &str,
     &[String],
@@ -89,23 +89,43 @@ type WindowSpawner<'a> = &'a dyn Fn(
     &std::collections::HashMap<String, String>,
 ) -> Result<String, String>;
 
-/// The real one: a window on the local tmux server, or on the host's over SSH.
+/// Where a headless launch puts its window: this machine's tmux, a host's over
+/// SSH/WSL, or the tmux **inside a sandbox place**. The three multiplexers are
+/// reached differently and nothing else about the launch changes, which is
+/// exactly the transport seam ADR-26 leans on.
+#[derive(Clone, Copy)]
+pub(crate) enum LaunchTarget<'a> {
+    Local,
+    Host(&'a HostDef),
+    Place(&'a crate::agent::transport::Place),
+}
+
+/// The real one: a window on the local tmux server, on the host's over SSH, or
+/// on the one running inside a place.
 fn spawn_launch_window(
-    host: Option<&HostDef>,
+    target: LaunchTarget<'_>,
     name: &str,
     command: &str,
     args: &[String],
     cwd: &std::path::Path,
     env: &std::collections::HashMap<String, String>,
 ) -> Result<String, String> {
-    // Remote spawns drive the SSH backend's control mode to learn the real pane
-    // id; local spawns leave `backend_id` empty for the TUI to resolve by name.
-    match host {
-        Some(h) => crate::agent::tmux::spawn_window_remote(h, name, command, args, Some(cwd), env)
-            .map_err(|e| format!("Failed to spawn remote tmux window: {e:#}")),
-        None => crate::agent::tmux::spawn_window(name, command, args, Some(cwd), env)
-            .map(|()| String::new())
-            .map_err(|e| format!("Failed to spawn tmux window: {e}")),
+    // Off-host spawns drive control mode to learn the real pane id; local spawns
+    // leave `backend_id` empty for the TUI to resolve by name.
+    match target {
+        LaunchTarget::Host(h) => {
+            crate::agent::tmux::spawn_window_remote(h, name, command, args, Some(cwd), env)
+                .map_err(|e| format!("Failed to spawn remote tmux window: {e:#}"))
+        }
+        LaunchTarget::Place(place) => {
+            crate::agent::tmux::spawn_window_place(place, name, command, args, Some(cwd), env)
+                .map_err(|e| format!("Failed to spawn tmux window in the sandbox place: {e:#}"))
+        }
+        LaunchTarget::Local => {
+            crate::agent::tmux::spawn_window(name, command, args, Some(cwd), env)
+                .map(|()| String::new())
+                .map_err(|e| format!("Failed to spawn tmux window: {e}"))
+        }
     }
 }
 
@@ -193,29 +213,35 @@ fn spawn_session_with(
 
     let invocation = super::build_agent_invocation(&agent_def, &mut config)?;
     let (command, args) = (invocation.command, invocation.args);
+    // A place is where this session lives from now on, so it is what
+    // `backend_type` records — mirroring `ssh:<host>`, and for the same reason:
+    // restore and reattach re-derive the transport from it.
+    let backend_type = match &invocation.place {
+        Some(place) => place.backend_name(),
+        None => backend_type,
+    };
+    let target = match (&invocation.place, host.as_ref()) {
+        (Some(place), _) => LaunchTarget::Place(place),
+        (None, Some(h)) => LaunchTarget::Host(h),
+        (None, None) => LaunchTarget::Local,
+    };
     // A filtered profile bound an egress proxy to compose that invocation
     // against, and it is nobody's until this session exists. Held from here to
     // the upsert so every failure in between releases it, rather than leaving a
     // live credential for a session that never happened.
     let egress = crate::agent::sandboxing::pending_egress(&config);
 
-    let backend_id = match spawn_window(
-        host.as_ref(),
-        &req.name,
-        &command,
-        &args,
-        &launch_cwd,
-        &config.env,
-    ) {
-        Ok(backend_id) => backend_id,
-        Err(e) => {
-            // Nothing will adopt what this launch minted. The proxy goes with
-            // `egress`; the scratch directory the agent would have written and
-            // the policy file generated for it have to be said out loud.
-            crate::agent::sandboxing::cleanup_by_session_id(session_id);
-            return Err(e);
-        }
-    };
+    let backend_id =
+        match spawn_window(target, &req.name, &command, &args, &launch_cwd, &config.env) {
+            Ok(backend_id) => backend_id,
+            Err(e) => {
+                // Nothing will adopt what this launch minted. The proxy goes with
+                // `egress`; the scratch directory the agent would have written and
+                // the policy file generated for it have to be said out loud.
+                crate::agent::sandboxing::cleanup_by_session_id(session_id);
+                return Err(e);
+            }
+        };
 
     let shared = SharedSession {
         id: session_id,
@@ -257,9 +283,10 @@ fn spawn_session_with(
              tearing down the orphaned window: {e}",
             req.name
         );
-        let cleanup = match host.as_ref() {
-            Some(h) => crate::agent::tmux::kill_pane_remote(h, &backend_id),
-            None => crate::agent::tmux::kill_window(&req.name),
+        let cleanup = match target {
+            LaunchTarget::Host(h) => crate::agent::tmux::kill_pane_remote(h, &backend_id),
+            LaunchTarget::Place(place) => crate::agent::tmux::kill_pane_place(place, &backend_id),
+            LaunchTarget::Local => crate::agent::tmux::kill_window(&req.name),
         };
         if let Err(kill_err) = cleanup {
             tracing::error!(
@@ -276,6 +303,9 @@ fn spawn_session_with(
     // The window is live and the row that owns it is committed: this session
     // exists, so its boundary is the session's now.
     egress.commit();
+    if let Some(instance) = &invocation.instance {
+        super::record_sandbox_instance(db, instance);
+    }
 
     // Record the worktree's fork point so the code-review view can scope its
     // diff to `<base>..HEAD`. Only meaningful for worktree sessions; a bare-repo
@@ -535,7 +565,7 @@ pub(crate) fn adapt_agent_args_for_remote(host: &HostDef, args: Vec<String>) -> 
     // Resolve the translation target lazily (one ssh round-trip) and at most
     // once; `None` = strip mode.
     let mut remote_root: Option<Option<String>> = None;
-    rewrite_config_path_args(args, &config_root, |local_path| {
+    crate::agent::config_args::rewrite_config_path_args(args, &config_root, |local_path| {
         let root = remote_root
             .get_or_insert_with(|| remote_config_root(host, &config_root))
             .clone()?;
@@ -596,59 +626,6 @@ fn remote_config_root(host: &HostDef, config_root: &str) -> Option<String> {
             None
         }
     }
-}
-
-/// True when `path` is `root` itself or a descendant — a plain
-/// `starts_with` would also claim sibling dirs sharing the prefix
-/// (`…/friring-backup` under root `…/friring`).
-fn path_under_root(path: &str, root: &str) -> bool {
-    path.strip_prefix(root)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-}
-
-/// Pure arg-rewriting core of [`adapt_agent_args_for_remote`]: every arg (or
-/// `--flag=value` value) under `config_root` is passed to `map`; `Some(new)`
-/// substitutes the path, `None` drops the arg **and** its preceding token when
-/// that token is a flag (so a `--settings <path>` pair vanishes together).
-fn rewrite_config_path_args(
-    args: Vec<String>,
-    config_root: &str,
-    mut map: impl FnMut(&str) -> Option<String>,
-) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(args.len());
-    for arg in args {
-        if path_under_root(&arg, config_root) {
-            match map(&arg) {
-                Some(new) => out.push(new),
-                None => {
-                    tracing::warn!("dropping agent arg for remote spawn: {arg}");
-                    // A `--flag=value` token is self-contained — never a
-                    // dangling flag for the dropped path — so popping it would
-                    // eat an unrelated (possibly already-rewritten) arg.
-                    if out
-                        .last()
-                        .is_some_and(|prev| prev.starts_with('-') && !prev.contains('='))
-                    {
-                        out.pop();
-                    }
-                }
-            }
-            continue;
-        }
-        // `--flag=<path>` form: rewrite the value in place, or drop the whole
-        // token (it is self-contained — nothing precedes it to pop).
-        if let Some((flag, value)) = arg.split_once('=') {
-            if flag.starts_with('-') && path_under_root(value, config_root) {
-                match map(value) {
-                    Some(new) => out.push(format!("{flag}={new}")),
-                    None => tracing::warn!("dropping agent arg for remote spawn: {arg}"),
-                }
-                continue;
-            }
-        }
-        out.push(arg);
-    }
-    out
 }
 
 /// A human-friendly label for a member directory in the symlink workspace:
@@ -899,9 +876,11 @@ mod tests {
         let args: Vec<String> = ["--settings", "/home/a/.config/friring/hooks/claude.json"]
             .map(String::from)
             .into();
-        let out = rewrite_config_path_args(args, "/home/a/.config/friring", |p| {
-            Some(p.replace("/home/a/", "/home/b/"))
-        });
+        let out = crate::agent::config_args::rewrite_config_path_args(
+            args,
+            "/home/a/.config/friring",
+            |p| Some(p.replace("/home/a/", "/home/b/")),
+        );
         assert_eq!(
             out,
             ["--settings", "/home/b/.config/friring/hooks/claude.json"].map(String::from)
@@ -921,7 +900,11 @@ mod tests {
         ]
         .map(String::from)
         .into();
-        let out = rewrite_config_path_args(args, "/home/a/.config/friring", |_| None);
+        let out = crate::agent::config_args::rewrite_config_path_args(
+            args,
+            "/home/a/.config/friring",
+            |_| None,
+        );
         assert_eq!(out, ["--verbose", "--session-id", "x"].map(String::from));
     }
 
@@ -933,12 +916,14 @@ mod tests {
             .map(String::from)
             .into();
         let rewritten =
-            rewrite_config_path_args(args.clone(), "/cfg", |p| Some(format!("/rem{p}")));
+            crate::agent::config_args::rewrite_config_path_args(args.clone(), "/cfg", |p| {
+                Some(format!("/rem{p}"))
+            });
         assert_eq!(
             rewritten,
             ["--settings=/rem/cfg/hooks/x.json", "/rem/cfg/seed.toml"].map(String::from)
         );
-        let stripped = rewrite_config_path_args(args, "/cfg", |_| None);
+        let stripped = crate::agent::config_args::rewrite_config_path_args(args, "/cfg", |_| None);
         assert!(stripped.is_empty());
     }
 
@@ -950,7 +935,7 @@ mod tests {
         let args: Vec<String> = ["--settings=/cfg/a.json", "/cfg/b.json"]
             .map(String::from)
             .into();
-        let out = rewrite_config_path_args(args, "/cfg", |p| {
+        let out = crate::agent::config_args::rewrite_config_path_args(args, "/cfg", |p| {
             (p == "/cfg/a.json").then(|| format!("/rem{p}"))
         });
         assert_eq!(out, ["--settings=/rem/cfg/a.json"].map(String::from));
@@ -963,7 +948,7 @@ mod tests {
         let args: Vec<String> = ["--settings", "/cfg-backup/notes.md"]
             .map(String::from)
             .into();
-        let out = rewrite_config_path_args(args.clone(), "/cfg", |_| {
+        let out = crate::agent::config_args::rewrite_config_path_args(args.clone(), "/cfg", |_| {
             panic!("map must not be called for a sibling-prefixed path")
         });
         assert_eq!(out, args);
@@ -974,9 +959,11 @@ mod tests {
         let args: Vec<String> = ["--model", "opus", "--add-dir", "/home/a/repo"]
             .map(String::from)
             .into();
-        let out = rewrite_config_path_args(args.clone(), "/home/a/.config/friring", |_| {
-            panic!("map must not be called for non-config args")
-        });
+        let out = crate::agent::config_args::rewrite_config_path_args(
+            args.clone(),
+            "/home/a/.config/friring",
+            |_| panic!("map must not be called for non-config args"),
+        );
         assert_eq!(out, args);
     }
 
