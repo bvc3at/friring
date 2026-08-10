@@ -175,11 +175,11 @@ dangling name fails the next launch loudly instead, and the delete confirmation
 reports how many sessions are affected. Deleting does not stop any real place —
 tear those down first or they leak.
 
-`allow_unsandboxed_fallback` is the visible, per-profile escape hatch. In P1 it
-decides what happens when the profile **cannot be applied** at launch: off (the
-default) fails the spawn, on starts the agent unsandboxed with the reason in
-front of the user. The per-command escape the name also suggests arrives with
-the place backends.
+`allow_unsandboxed_fallback` is the visible, per-profile escape hatch. It decides
+what happens when the profile **cannot be applied** at launch — an engine that is
+not running, a mount that cannot be honoured, an image that is not there: off
+(the default) fails the spawn, on starts the agent unsandboxed with the reason in
+front of the user. The per-command escape the name also suggests is not built.
 
 Falling back **never clears** `sessions.sandbox_profile`. The profile is the
 desired boundary and the escape hatch is a property of one launch, so a
@@ -210,8 +210,13 @@ Tracks live places for the manager view and for garbage collection:
 Keyed on `(engine, external_id)`, **not** on the profile: a rebuild leaves the
 old container behind, and keying on the profile would overwrite the previous id
 into an unfindable leak — precisely what the garbage-collection purpose exists
-to prevent. One profile may therefore own several rows. `state` is free text
-until a place backend exists to define the vocabulary.
+to prevent. One profile may therefore own several rows. `state` is free text: the vocabulary
+belongs to whichever backend wrote the row, so a place backend friring gains
+later needs no migration to describe itself. The container backend writes
+`running` and nothing else — `ensure` returns when the place is up or not at
+all. Refreshing a row is deliberately not an upsert (`touch_sandbox_instance`):
+a launch reusing a place must not re-insert a row a collection pass has just
+deleted.
 
 ### Session linkage
 
@@ -235,11 +240,12 @@ records it with a targeted update.
 ## Backend catalogue
 
 Every backend below is part of the design; **this release ships the two policy
-backends (`seatbelt`, `bwrap`) only** — the place backends are probed as
-unavailable with the reason, and land in P3/P4 (see
-[Delivery phases](#delivery-phases)). Availability is probed per host, and the
-session-creation UI shows what is available with the reason a backend was
-excluded.
+backends (`seatbelt`, `bwrap`) and the `docker`/`podman` place backend**.
+`apple-container` and `wsl-distro` are probed as unavailable with the reason and
+land in P4 (see [Delivery phases](#delivery-phases)). Availability is probed per
+host, and the profile editor, the profile list and the session-creation step all
+show the reason a backend cannot be used here rather than leaving it to fail at
+launch.
 
 ### `seatbelt` — macOS, policy
 
@@ -331,11 +337,44 @@ workload needs a toolchain the host does not have.
 
 - Podman rootless is preferred on shared and remote hosts (no daemon, no root
   socket). It is CLI-compatible enough that one backend implementation covers
-  both, with a probe distinguishing them.
-- Mounts use **identical absolute paths** (see below). Network is `none` plus a
-  bridge to the proxy.
-- The agent runs as a non-root user; several agents refuse permissive modes as
-  root.
+  both, with a probe distinguishing them: the `info` template that names a
+  version differs, and so does how a container is given the host user's
+  identity.
+- Mounts use **identical absolute paths**, `--mount type=bind` rather than `-v`
+  so a missing source is refused rather than invented as a root-owned directory,
+  and every refusal is friring's own sentence naming the profile's path. A path
+  that cannot be spelled in a `--mount` value (a comma, a quote), one that would
+  carry the data directory or a tmux socket directory across, and two paths
+  landing on one target inside are all refused (ADR-29).
+- Network is `--network none` for every mode but an unrestricted `full`, plus
+  the bind-mounted proxy socket.
+- **The container runs as the host user** — `--user uid:gid` under a rootful
+  engine, `--userns=keep-id` under rootless Podman, and nothing under rootless
+  Docker, whose container root already *is* the unprivileged host user. That is
+  what keeps an identical-path bind mount writable and what lets the sandbox
+  connect to the `0o600` proxy socket **without widening it**.
+- `--cap-drop ALL`, `--security-opt no-new-privileges` and `--init`, none of
+  them configurable. The stated cost: a place cannot `sudo apt-get install` at
+  runtime; tools belong in the image.
+- **One instance per profile**, lazily started and shared by that profile's
+  sessions. The container's name carries a digest of everything a profile edit
+  could change (mounts, limits, image, network, user), so an edited profile asks
+  for a *new* container rather than silently reusing one whose mounts no longer
+  describe it, and the superseded one stays findable until garbage collection
+  reclaims it.
+- friring touches **only what it created**: an owner label is set at creation,
+  every lookup filters on it, every removal re-checks it, and a same-named
+  container without it is neither adopted nor removed — the launch is refused
+  instead.
+- `memory_mb` and `cpus` become `--memory` and `--cpus` here, the one shape that
+  can enforce them.
+- Reached with `<engine> exec -i <container> tmux …`: `-i` carries the
+  control-mode protocol, and `-t` is deliberately absent because a pty makes the
+  engine translate line endings through a line-delimited protocol.
+- The image is the profile's `image`, the image built from its `containerfile`,
+  or the default tag `friring/sandbox:1`. friring publishes no registry image,
+  so a missing default is refused with the command that builds it from
+  `packaging/sandbox/Containerfile`.
 
 ### `wsl-distro` — Windows, place
 
@@ -366,6 +405,13 @@ is not a convenience:
 - Claude Code keys session transcripts by absolute project path, and Codex keys
   `projects.<path>.trust_level` the same way. A path mismatch silently breaks
   resume and re-triggers trust prompts.
+
+The one deliberate exception is `$HOME`. A place gets a **synthetic per-profile
+home** — friring's own directory under `<data dir>/sandbox/pl/<profile>/home`,
+mounted at a fixed path inside — never a bind of the host's agent configuration
+(ADR-28), and never the host's home path, which an image built for another user
+may not even be able to create. Nothing keys project state by `$HOME`; agents
+key it by the *project* path, which is identical.
 
 Place instances also set `safe.directory = *` (bind mounts surface foreign
 ownership) and a per-sandbox committer identity so agent commits are
@@ -413,8 +459,16 @@ trait SandboxBackend {
 }
 ```
 
-A backend implements `wrap` or `ensure`, never both; the default bodies fail
-with the shape mismatch, so forgetting the right half is loud. `probe` results
+A policy backend implements `wrap` and a place backend implements `ensure`. A
+place backend implements `wrap` **as well**, and this is not a contradiction: a
+place's command is composed for the *inside* of the environment, where the egress
+relay has to run beside the agent because the network namespace is the place's.
+Reaching the place stays entirely the transport's business — nothing a place's
+`wrap` returns names the engine. What the default bodies still catch is a backend
+implementing neither half, and a place backend refuses a launch composed without
+a `PlaceLaunch` rather than returning the argv unchanged: for a policy backend an
+unwrapped argv is a bug, for a place it would be an agent running on the host
+under a profile that says otherwise. `probe` results
 are what the UI renders — a backend is never silently skipped, and a backend the
 *build* does not have yet says so in the same shape as one the host is missing.
 
@@ -490,7 +544,17 @@ the agent is still pid 1 of the sandbox's pid namespace and the relay dies with
 it. The port is fixed because each `--unshare-net` sandbox has a private
 loopback. friring's own CLI is the relay: it is resolved from the running
 binary, never from `PATH`, bound read-only into a `workspace`-scope sandbox,
-and a launch that cannot find it is refused. The socket is bound read-write —
+and a launch that cannot find it is refused.
+
+A **place** is the exception, and for the same reason stated the other way
+round: it is created once per profile and shared by that profile's sessions, so
+they share one loopback and a fixed port would collide. Each session's relay
+takes the lowest free port in a span of 64 from the same base and keeps it across
+relaunches, and the address is composed into that session's proxy environment. In
+a place the relay is a binary of the **image's**, resolved once inside the
+container when the place is ensured, so a filtered profile whose image carries no
+`friring-cli` is refused with the fix rather than started believing it is
+proxied. The socket is bound read-write —
 `connect(2)` on a unix socket needs write permission — which also makes it a
 mount point, so a sandbox cannot unlink its own way out.
 
@@ -502,9 +566,10 @@ anything else — an agent that plants a file at the path refuses its own next
 launch and nothing more.
 
 `0o600` is the default rather than a fixed rule: the socket is a
-credential-bearing endpoint, and a backend whose sandbox runs as a different uid
-(containers usually do) has to widen it deliberately rather than inherit a
-world-connectable socket.
+credential-bearing endpoint, and a backend whose sandbox could run as a different
+uid has to answer for it rather than inherit a world-connectable socket. The
+container backend answers by giving the container the host user's identity
+instead of widening the socket, so `0o600` holds on every backend.
 
 Because the endpoint shape differs, a backend rejects the wrong one rather than
 silently failing later: `bwrap` refuses a loopback endpoint and says why.
@@ -822,9 +887,16 @@ deferred: `volume-login` removes the urgency.
 
 ## Config projection
 
-A place sandbox gets a **synthetic per-profile home**, never a bind of the
-host's agent configuration. Safe configuration is copied in through a lint
-pass, because agent config routinely references the host filesystem:
+**Not built yet — this is the next slice.** What ships today is the first half of
+it: a place sandbox gets a **synthetic per-profile home**
+(`<data dir>/sandbox/pl/<profile>/home`) and nothing is copied into it, so an
+agent in a place starts logged out and signs in inside its own pane, and an
+argument naming friring's own hook configuration is dropped rather than pointed
+at a host path the container does not have. Both are said out loud on the
+session's `Sandbox:` row rather than left to be discovered.
+
+Safe configuration will be copied in through a lint pass, because agent config
+routinely references the host filesystem:
 
 - Lifecycle hook commands, status-line commands and credential-helper scripts
   are arbitrary shell, usually with absolute host paths.
@@ -893,29 +965,98 @@ resolve the profile against it → fold in what the agent declares
 (`state_rw`, `bypass`, `env`) → build the launch → wrap. The agent's bypass
 flags go on the *agent's* own argv, inside the wrapper.
 
-**A policy backend applies to a local session only, in P1.** Both shipped
-backends generate their artefacts (a `.sb` profile file, an argv naming local
-paths) on the machine friring runs on, so an `ssh:`/`wsl:` session with a
-profile is refused rather than wrapped with the wrong machine's answers.
-Sandboxing a remote session arrives with the place backends.
+**A policy backend applies to a local session only.** Both policy backends
+generate their artefacts (a `.sb` profile file, an argv naming local paths) on
+the machine friring runs on, so an `ssh:`/`wsl:` session with a policy profile is
+refused rather than wrapped with the wrong machine's answers. A **place** is
+exempt, and not by omission: a place *is* the elsewhere — friring reaches it
+through its own transport rather than through the session's — so the session's
+backend says nothing about where the boundary is applied.
 
-**Place backends** add an ensure-instance step before spawn and then use a new
-`TmuxTransport::Sandbox` variant, built exactly like the existing SSH transport
-(a command prefix wrapping the tmux argv). Control mode is transport-agnostic
-by design, so discovery, adoption, input and scrollback need no changes.
-Materialising agent configuration into a place generalises the existing
-remote-argument adaptation: a sandbox is a third kind of "elsewhere".
+**Place backends** add an ensure-instance step before spawn and then reach the
+place through `TmuxTransport::Sandbox`, a launch prefix in front of the tmux argv
+exactly as `ssh <dest>` is — `<engine> exec -i <container> tmux -L friring …`.
+Control mode is transport-agnostic by design, so discovery, adoption, input,
+scrollback and the `tb-`/`tbs-` window naming are the SSH path's, unchanged. Two
+things do differ, and both would break silently the other way round: the tokens
+are **not** shell-quoted, because an engine `exec` takes an argv rather than a
+command string a login shell re-splits (a quoted `-F '#{pane_id}|…'` would arrive
+with its quotes and discovery would find nothing); and the window command is
+**not** wrapped in a login shell, because a place's `PATH` comes from its image
+rather than from an account profile, and `sh -l` inside a container commonly
+replaces it with `/etc/profile`'s. The engine is named by absolute path, resolved
+once where the backend was probed, for the reason `bwrap` is. Materialising agent
+configuration into a place generalises the existing remote-argument adaptation: a
+sandbox is a third kind of "elsewhere".
+
+### A place-backed session's lifecycle
+
+`backend_type` carries `sandbox:<profile>` the way `ssh:<host>` does, and every
+lifecycle path keys off it:
+
+- **Spawn.** Composing the launch ensures the place (idempotent — one `inspect`
+  when it is already running), takes this session's relay port, mints its egress
+  directory *inside* the place's own tree, and hands back the transport. The
+  spawn goes through that transport rather than through the backend the session's
+  row named, which on a first spawn does not name it yet. The container is
+  recorded in `sandbox_instances` once the pane exists.
+- **Restart.** The profile is re-read, so an edited one asks for a *new*
+  container and the session moves into it: the old pane is killed where it still
+  is (a kill that cannot reach a container that has gone is the outcome, not a
+  failure), the new one is spawned where the launch says, and the registry learns
+  the place it is in now. A profile edited *off* a place backend is refused
+  rather than relaunched — this session's tmux is inside the container, and a
+  policy backend's argv names host binaries the image does not have.
+- **Restore and adopt.** Place-backed sessions restore on the background path
+  with the remote ones, one worker per place, because opening a cold container
+  is seconds and must not block the first frame. The worker ensures the place
+  first — which is also the recovery: a container stopped by a host reboot is
+  started again there — and the retry sweep keeps trying, so a place that comes
+  back adopts its sessions without a restart.
+- **Delete.** The pane is killed inside the place, found by friring's own owner
+  and profile labels rather than by starting anything. Worktree removal stays
+  local: a place mounts every path at exactly its host path, so the checkout the
+  container sees *is* the host's.
+- **Headless.** `friring-cli session create --sandbox <profile>` spawns into the
+  place and persists `sandbox:<profile>`; `session restart` refuses a
+  place-backed session for the same reason it refuses a remote one — the local
+  kill would find nothing and the local spawn would put an unsandboxed agent on
+  the host. Automation delivery resolves the running place and sends into it,
+  and skips (rather than errors) when the place is not running.
+
+### Reclaiming places
+
+A place outlives its launch and the friring that made it, so a slow background
+pass reconciles `sandbox_instances` against what the engines hold: a row whose
+container is gone is forgotten, a container whose profile is gone is removed, a
+container a profile edit superseded is removed, and one of friring's that no row
+describes is adopted rather than leaked. Every candidate is checked against
+friring's owner label twice — once in the engine query, once again immediately
+before removal — so nothing friring did not create is ever named.
+
+Two rules keep the pass from taking a place out from under a running agent.
+**Idleness never reclaims one**: a place is the environment a session lives in,
+not a cache, and "unused for a while" is indistinguishable from "the user is on
+holiday". And a profile whose live sessions this instance is *not* driving —
+another friring's — protects every container of that profile by name, because
+this instance knows the container ids only of the places it opened itself. The
+cost is a superseded container surviving until that session ends.
 
 Two details that silently break things if missed:
 
-- **Environment forwarding.** Session environment is set on the tmux window,
-  which is *outside* a policy sandbox and on the *host* side of a place. Neither
-  policy backend applies environment in argv — a policy is a rule on a process,
-  so the wrapped agent inherits the window — which makes the window the only
-  channel inward, and makes "the wrap only ever **adds** environment" an
-  invariant with a test on it. Host-only path variables must be skipped or
-  translated exactly as the remote path already does. Without this, status
-  reporting dies quietly.
+- **Environment forwarding.** Session environment is set on the tmux window.
+  That window is *outside* a policy sandbox and *inside* a place, and in both
+  cases it is the only channel inward: neither policy backend applies
+  environment in argv — a policy is a rule on a process, so the wrapped agent
+  inherits the window — and a place inherits nothing from friring at all,
+  because `<engine> exec` gives the process the image's environment. So "the
+  wrap only ever **adds** environment" is an invariant with a test on it.
+  Host-only path variables are skipped for a place exactly as they are for an
+  SSH host — the data directory is not in there (ADR-29), so a forwarded
+  `FRIRING_DATA_DIR` would name nothing or name the one thing the boundary
+  exists to keep out. Without this, status reporting dies quietly. The
+  environment never rides in the engine's own command line: that is on the
+  host's process table, and one of its values is the proxy credential.
 - **Resume identity.** A place keeps agent transcripts inside its own volume,
   so a resume by id can target a transcript that does not exist there. The
   launch path detects this and starts a fresh session under the requested id
@@ -968,22 +1109,41 @@ which writes SQLite directly. Neither half of that works inside a sandbox:
   database carry shell commands that the *host* Friring executes. An agent that
   can write the database can schedule arbitrary host commands.
 
-Sandboxed sessions therefore signal through a narrow file channel: a
-per-session directory under the data directory, mounted read-write, into which
-the hook writes a small status file that host Friring picks up on its existing
-poll. The database stays outside every boundary — see
-[ADR-29](#adr-29-the-database-never-enters-a-sandbox). Place backends reached
-through a transport may alternatively reuse the existing remote hook rewrite,
-which already solves the same problem for SSH hosts.
+Sandboxed sessions therefore signal through a narrow file channel. Every
+**policy** launch mints `<data dir>/signals/<session>/`, `0700`, exposes **that
+directory and nothing else** read-write, and exports the file inside it as
+`FRIRING_SIGNAL_FILE`. The bundled hook payloads branch on that variable: set,
+they append a state word to the file; unset — every unsandboxed session — they
+run `friring-cli session signal` exactly as before. The database stays outside
+every boundary, see [ADR-29](#adr-29-the-database-never-enters-a-sandbox).
 
-The file channel ships with the place backends. **Until it does, a sandboxed
-session does not report status**: the database path is denied on every launch
-(with its `-wal`/`-shm` siblings), so `friring-cli session signal` from inside
-fails and the session shows as idle. That is the correct trade — a session that
-looks idle is recoverable, a sandbox that can schedule host commands is not.
-The database path is a *launch input*, not something the sandbox layer resolves:
-the friring that owns the session is not necessarily on the host where the agent
-runs.
+The file is written from inside the boundary, so it is read as hostile input.
+The host's status poll **takes** it with a `rename(2)` into the signals root —
+which no sandbox is granted — before inspecting anything: that one syscall is
+atomic, follows no symlink and opens nothing, so what friring then examines is a
+fixed inode the agent can no longer swap. Only a regular file is read (a FIFO
+would block the render loop until a writer appeared; a symlink would redirect the
+read out of the boundary), only up to 4 KiB (enforced again during the read,
+because a descriptor the agent still holds keeps writing after the rename), and
+only as UTF-8. The text is then matched against a closed vocabulary — `idle`,
+`working`, `blocked`, `done` — and what reaches the database is the matched
+constant, never the file's own bytes. Anything else is dropped whole, and the
+next file is read normally. Taking rather than peeking also delivers each write
+once and consumes what a crashed run left behind; minting clears the file, so a
+`done` from before a restart is never replayed.
+
+The directory is minted and torn down with the session's other per-launch state,
+alongside the scratch directory and the egress proxy.
+
+**A place reports no status yet**, and for a different reason: the channel a
+place would use is the existing remote hook rewrite — the same one that already
+solves this for SSH hosts, writing a tmux pane option the control-mode
+subscription delivers — but the rewrite happens where friring *materialises* its
+hook configuration on the far side, and projecting configuration into a place is
+the next slice. Until then a place-backed launch drops the argument naming
+friring's hook file rather than handing the agent a path that does not exist
+there, and says so on the session's sandbox row. A session that looks idle is
+recoverable; a pane that dies on startup with "settings file not found" is not.
 
 ## UI
 
@@ -992,9 +1152,12 @@ screens rather than patterns.
 
 **Profile list** (`Modal::SandboxList`, `Alt+S` or `<leader> S`) — the automations
 list: `n` new, `e`/`Enter` edit, `d` delete, empty-state hint. Each row shows the
-resolved backend (`auto → seatbelt`), the path count and the network mode; the
-resolution is as invisible-free here as at the creation step. Instance state and
-the stop / rebuild / prune actions arrive with the place backends.
+resolved backend (`auto → seatbelt`), the path count, the network mode, the state
+of its live place when it has one, and — when the backend it would run on is not
+available here — the probe's own reason. The resolution is as invisible-free here
+as at the creation step, and so is the availability: picking `docker` on a machine
+with no engine says so on the row rather than at launch. The stop / rebuild /
+prune actions are still P4; reclaiming happens on its own background pass.
 
 **Profile editor** (`Modal::SandboxEditor`) — the automation editor's shape:
 text fields, `‹ ›` selectors, and its add/remove sub-list (`n add · d remove`,
@@ -1005,7 +1168,9 @@ backend, network mode, read scope, per-path mode, the `prompt_new_domains` and
 `allow_unsandboxed_fallback` toggles, and `containerfile`. A capability the
 chosen backend cannot honour stays **visible but inert**, with the reason in
 place of its value, and drops out of the saved profile so an invisible value can
-never decide a save. An unresolved `auto` rules nothing out.
+never decide a save. An unresolved `auto` rules nothing out. A backend the host
+cannot offer stays selectable — the user may be about to install the engine, or
+authoring a profile for another machine — with the probe's reason on the row.
 
 `network_deny` has no editor: denies beat allows in every mode, and the list
 is carried through a save untouched rather than dropped, but authoring one is
@@ -1023,11 +1188,19 @@ there is no inline form-error widget today and adding one is deferred.
 directory selection so it can rank profiles covering the chosen directories
 first and label the ones that do not. Every profile stays selectable: the wizard
 knows the launch cwd, not what the user intends to reach from it. The step shows
-each profile's resolved backend, is skipped entirely when no profile exists,
+each profile's resolved backend and the reason it is unavailable when it is,
+is skipped entirely when no profile exists,
 keeps its choice in the wizard state, contributes a breadcrumb line, and steps
 back to the repo palette (Esc from the name modal returns to it with the
 previous answer selected). *Create a sandbox for this selection* with pre-filled
 paths is not built yet — the step offers the stored profiles and `none`.
+
+**Place-backed sessions** are marked by their backend rather than by a second
+indicator: `backend_type` is `sandbox:<profile>`, and a place that is not running
+turns every session in it into an unreachable placeholder whose pane says so —
+naming the place, and saying that they all stopped together — while friring keeps
+trying to start it again. They carry no remote-host mark: a place runs on this
+machine and mounts its paths, so calling it remote would be untrue.
 
 **Indicators** — two `SessionInfo` fields carry it, and they say different
 things. `sandbox_profile` (persisted) is the boundary the session **asked
@@ -1105,7 +1278,23 @@ complete and consistent with existing screens.
   it, so a `friring-cli`-created sandbox's instance is gone the moment the
   command exits — and macOS restricts cross-uid argv reads. Closing it properly
   needs a route into the window's environment that is not argv, which tmux does
-  not offer; it is called out here rather than papered over.
+  not offer; it is called out here rather than papered over. A place-backed
+  launch is not affected: it spawns through the same control-mode `new-window`
+  the TUI uses, so its environment reaches the window over the connection rather
+  than through any client's argv.
+- **A place that goes takes every session in it.** The two shapes fail
+  differently and the UI says which (ADR-26): a policy sandbox's death is one
+  dead pane, and a place's is every pane of that profile at once. Those panes
+  become unreachable placeholders naming the place rather than a host, friring
+  keeps trying to start it again, and they reattach by themselves when it comes
+  back.
+- **A place has no agent configuration in it yet.** Config projection is the
+  next slice, so a place starts from an empty per-profile home: the agent has to
+  sign in inside the pane, and friring's own hook configuration is dropped from
+  the launch rather than pointed at a host path the container does not have — so
+  the session reports no status. Both are stated on the session's `Sandbox:` row
+  and in the launch's log line, because a session that silently never leaves
+  `idle` looks like a broken session.
 - **An unreadable profile** is refused at launch, named column by column, and
   repaired by re-saving it in the editor. Listing it permissively and
   launching it permissively are different decisions: the first keeps it
@@ -1148,6 +1337,15 @@ Concretely:
 - Backend probes and argv/profile generation are unit-testable without running
   the backend; where a backend is present in CI, integration tests run behind a
   capability check and are skipped with a reason otherwise.
+- **No test starts, pulls or builds a container.** Every engine command in the
+  place backend's tests goes through the injected probe host, so the argv, the
+  plan, the garbage-collection decision and the whole launch composition are
+  exercised with no engine installed. The one capability-gated test runs `info`
+  and the label-filtered `ps` against a real engine when there is one and skips
+  with a printed reason otherwise; it creates nothing and only ever sees
+  friring-labelled containers. Nothing is ever bind-mounted from the author's
+  own agent configuration, in a test or anywhere else — a place's home is
+  friring's own directory (ADR-28).
 - Documentation examples use placeholder paths, never the author's own.
 
 ## Delivery phases
@@ -1158,8 +1356,7 @@ Each phase is independently useful and lands with its own tests, docs and
 **P1 — Policy sandboxes.** The `sandbox` module, profile storage and migration,
 the profile list and editor, the session-creation step, the session indicator,
 `seatbelt` and `bwrap` backends, network `none` and `full` only,
-`host-passthrough` credentials. Local sessions only, and no status reporting
-from inside a boundary until P3's file channel — see
+`host-passthrough` credentials. Local sessions only — see
 [Launch integration](#launch-integration) and [Status signals](#status-signals).
 
 **P2 — The firewall.** Shipped: the Rust filtering proxy and its in-namespace
@@ -1174,10 +1371,17 @@ launch path still passes the proxy environment as `tmux` client argv (see
 the agent starts — a request in that window gets one connection refused, which
 fails closed.
 
-**P3 — Place sandboxes.** The `docker`/`podman` backend, the sandbox transport,
-instance lifecycle and garbage collection, identical-path mounts, the default
-image, `env-token` and `volume-login` credentials, config projection and its
-lint pass, and the signal-file channel.
+**P3 — Place sandboxes.** Shipped: the `docker`/`podman` backend and the sandbox
+transport, instance lifecycle and garbage collection, identical-path mounts, the
+default image (`packaging/sandbox/Containerfile`, tag `friring/sandbox:1` —
+friring publishes no registry image, so a missing one is refused with the build
+command), resource limits, the per-profile synthetic home, and the signal-file
+channel for policy backends. Not in it: `env-token` and `volume-login`
+credential flows, config projection and its lint pass — so a place starts from an
+empty home and the agent signs in inside the pane, and friring's own hook
+configuration is dropped rather than projected, which is why a place-backed
+session reports no status. A place on a remote host is not wired: the backend
+probes and creates where friring runs.
 
 **P4 — Breadth.** `apple-container` and `wsl-distro` backends, copy-on-write
 workspaces, resource limits, the sandbox manager view, the user-facing
@@ -1221,7 +1425,11 @@ transport-agnostic at the control-mode layer, so a place backend is
 substantially free.
 
 **Consequences**: Two code paths, one profile model. Crash-survival semantics
-differ per shape and the UI says which is in effect.
+differ per shape and the UI says which is in effect. A place backend also
+composes the command that runs inside it, so "one shape, one half of the trait"
+holds for policy backends and is one half short for places: the egress relay
+lives inside the boundary, and only the backend that built the boundary knows the
+binary and the port it gets.
 
 ## ADR-27: One egress engine — a Friring-owned filtering proxy
 

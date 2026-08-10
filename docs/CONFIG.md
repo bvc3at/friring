@@ -1124,6 +1124,14 @@ these to prove its own identity without scraping panes or names:
 | `FRIRING_TASK` | the originating task id; task-spawned sessions only (headless `task run`) |
 | `FRIRING_METRICS_DIR` | metrics output dir |
 | `FRIRING_CONFIG_DIR` / `FRIRING_DATA_DIR` | the resolved config/data dirs, so the agent's `friring-cli` (its status hook) targets the same DB the TUI reads — independent of XDG, which `friring-cli` is on PATH, or a stale tmux-server env. Also honored if you set them yourself to relocate friring's state. |
+| `FRIRING_SIGNAL_FILE` | **sandboxed sessions only.** The one file a policy boundary may write status into: the bundled hooks append a state word here instead of calling `friring-cli session signal`, because the database is denied inside every sandbox (see [`docs/SANDBOX.md`](SANDBOX.md) §Status signals). Unset for every unsandboxed session, which is what makes those hooks byte-identical to before. |
+
+The three *path* variables (`FRIRING_METRICS_DIR`, `FRIRING_CONFIG_DIR`,
+`FRIRING_DATA_DIR`) are set only for a session running on **this** machine's
+filesystem. An SSH/WSL session and a sandbox place both skip them: over there
+those paths name nothing, and for a place the data directory is precisely what
+the boundary exists to keep out (ADR-29). The identity variables are opaque and
+travel everywhere.
 
 Set **at build time** (not runtime):
 

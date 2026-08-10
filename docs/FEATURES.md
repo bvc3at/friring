@@ -2986,14 +2986,26 @@ radius, it does not prove containment**. The policy backends share the host
 kernel, and a domain allowlist is bypassable through domain fronting and through
 any allowed domain that can host arbitrary content.
 
-**What ships.** The two *policy* backends — `sandbox-exec` (macOS) and `bwrap`
-(Linux/WSL) — which wrap the agent's argv with tmux outside, so nothing about
-window discovery, reattach, scrollback or restart changes. Every network mode is
-enforced, including `allowlist` (see the egress firewall below). Credentials are
-host passthrough: the agent sees its real credential store subject to path
-policy, so the macOS Keychain keeps working and there is no login to redo.
-Container, VM and distro-clone backends are declared and probed — the picker
-says why each one is unavailable rather than hiding it — but not built.
+**What ships.** Two shapes of boundary. The *policy* backends — `sandbox-exec`
+(macOS) and `bwrap` (Linux/WSL) — wrap the agent's argv with tmux outside, so
+nothing about window discovery, reattach, scrollback or restart changes;
+credentials are host passthrough, so the macOS Keychain keeps working and there
+is no login to redo. The *place* backend — `docker`/`podman` — runs the agent in
+a container with tmux **inside** it, reached through a transport exactly as an
+SSH host is, and gives you a filesystem the host cannot see plus memory and CPU
+caps that a policy backend cannot enforce. Every network mode is enforced on
+both, including `allowlist` (see the egress firewall below). The VM and
+distro-clone backends are declared and probed — every surface that offers a
+profile says why a backend is unavailable rather than hiding it — but not built.
+
+**A place is shared, and that changes what its failure looks like.** One
+container per profile, started on first use and shared by every session using
+that profile, mounted at **identical absolute paths** so `git status` and an
+agent's own session transcripts keep working inside. Editing the profile builds a
+new container rather than reusing mounts that no longer describe it, and a
+background pass reclaims the one it replaced. When a place goes — a reboot, a
+`docker system prune` — *every* session in it goes at once, so those panes say
+exactly that and reattach by themselves once friring has started it again.
 
 **The egress firewall.** Under `allowlist` the kernel denies the sandbox *all*
 direct egress, and a Friring-owned filtering proxy outside the boundary lets
@@ -3038,7 +3050,10 @@ selection, so it can rank the profiles that cover the chosen directories first
 and label the ones that do not; a `⛨` glyph in the session-list row beside the
 remote and worktree marks; a `Sandbox:` row in the info panel naming the
 profile, the resolved backend and the inner-sandbox state; and the profile in
-the creation breadcrumb. `friring-cli session create --sandbox <profile>` does
+the creation breadcrumb. A place-backed session carries no *remote* mark — a
+place runs on this machine and mounts its paths — but its backend is
+`sandbox:<profile>`, which is what restore, restart and delete re-derive the
+transport from. `friring-cli session create --sandbox <profile>` does
 the same headlessly.
 
 **Failure is loud on purpose.** A profile whose backend is unavailable fails the
@@ -3049,16 +3064,27 @@ when it fires. Deleting a profile that sessions still reference leaves the
 reference dangling for the same reason: clearing it would silently unsandbox
 those sessions on their next launch.
 
-**Three limits worth knowing.** A sandboxed session is **local-only** for now —
+**How a sandboxed session reports status.** The database is denied inside every
+boundary, because writing it is arbitrary host command execution (ADR-29). A
+policy-sandboxed session signals through a narrow file channel instead: friring
+mints one directory per session, exposes only that, and the bundled hooks append
+a state word there rather than calling `friring-cli session signal`. The host
+takes the file with a single atomic rename into a directory no sandbox can see
+before it looks at it, reads only a small regular UTF-8 file, and writes only one
+of four known words — never anything the file said.
+
+**Three limits worth knowing.** A **policy**-sandboxed session is local-only:
 both policy backends generate their artefacts on the machine friring runs on, so
-an SSH/WSL session with a profile is refused rather than wrapped with the wrong
-machine's paths. A sandboxed session **does not report status**: the database is
-denied inside every boundary (writing it is arbitrary host command execution —
-see ADR-29), and the file channel that replaces `friring-cli session signal`
-arrives with the place backends. The session shows as idle until then. And an
-egress proxy **lives in the friring that started it**, so a filtered session
-created by `friring-cli session create` has no way out until a running friring
-relaunches it — closed, not open, but closed.
+an SSH/WSL session with a policy profile is refused rather than wrapped with the
+wrong machine's paths (a place is exempt — a place *is* the elsewhere). A place
+has **no agent configuration in it yet**: config projection is the next slice, so
+the agent starts logged out and signs in inside its own pane, friring's hook
+configuration is dropped rather than pointed at a host path the container does
+not have, and a place-backed session therefore reports no status. All three are
+stated on the session's `Sandbox:` row. And an egress proxy **lives in the
+friring that started it**, so a filtered session created by
+`friring-cli session create` has no way out until a running friring relaunches
+it — closed, not open, but closed.
 
 ---
 

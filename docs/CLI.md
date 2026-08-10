@@ -333,7 +333,15 @@ environment as `tmux -e KEY=VALUE` arguments rather than over a control-mode
 socket, so while the command runs the proxy URL — token included — is visible in
 that `tmux` client's argv to anything on the machine that can read a process
 list. Both are covered under
-[Failure modes](SANDBOX.md#failure-modes).
+[Failure modes](SANDBOX.md#failure-modes). A **place**-backed session is exempt
+from the second: it spawns over the same control-mode connection the TUI uses,
+so nothing of its environment reaches a process table.
+
+A place-backed session persists `backend_type = sandbox:<profile>`, which is why
+`session restart` refuses one exactly as it refuses an `ssh:` session: the
+headless restart drives the *local* tmux, so it would find no window to kill and
+would spawn an unsandboxed agent on the host. Restart it from the TUI, which
+reaches the place through its transport.
 
 ## Delete and restore semantics
 

@@ -103,9 +103,34 @@ actually needs and to an allowlist of domains.
   cross-instance adopt inherits the warning instead of rendering the sandboxed
   mark over an agent on the host.
 - **Two sandbox shapes** — *policy* backends (`seatbelt`, `bwrap`) wrap the
-  agent's argv with tmux outside; *place* backends (`docker`/`podman`,
-  `apple-container`, `wsl-distro`) run tmux inside and are reached through a
+  agent's argv with tmux outside; *place* backends (`docker`/`podman`, and later
+  `apple-container` and `wsl-distro`) run tmux inside and are reached through a
   new sandbox transport that mirrors the fork's SSH/WSL transports.
+- **Place backends: `docker`/`podman`** — one container per profile, shared by
+  that profile's sessions and reached with `<engine> exec -i <ctr> tmux …`.
+  `backend_type` carries `sandbox:<profile>` the way `ssh:<host>` does, so
+  restore, adoption, restart and delete all re-derive the transport from it, and
+  a place that is down turns its sessions into unreachable placeholders that
+  reattach when friring starts it again. Mounts are **identical absolute paths**
+  (a git worktree references its main repository by absolute path, and agents key
+  transcripts and trust by project path), `--mount type=bind` so a missing source
+  is refused rather than invented, and the container is given the host user's
+  identity — `--user uid:gid`, or `--userns=keep-id` under rootless Podman —
+  rather than widening the `0o600` proxy socket. `--cap-drop ALL`,
+  `--security-opt no-new-privileges` and `--init` are not configurable. The
+  container's name carries a digest of everything a profile edit could change, so
+  an edited profile builds a new place instead of reusing mounts that no longer
+  describe it. The image is the profile's, one built from its `containerfile`, or
+  the default `friring/sandbox:1` built from
+  [`packaging/sandbox/Containerfile`](packaging/sandbox/Containerfile) — friring
+  publishes no registry image, so a missing one is refused with the build command.
+- **friring touches only the places it created** — an owner label is set at
+  creation, every lookup filters on it, every removal re-checks it, and a
+  same-named container without it is neither adopted nor removed. A background
+  pass reclaims superseded and orphaned places and reconciles the
+  `sandbox_instances` table; idleness never reclaims one, and a profile whose
+  live sessions this instance is not driving protects every container of that
+  profile by name.
 - **Egress firewall** — a Friring-owned Rust filtering proxy enforces a domain
   allowlist while the kernel denies direct egress, so ignoring the proxy means
   no network rather than a bypass. Chosen over resolved-IP `iptables`
@@ -144,11 +169,19 @@ actually needs and to an allowlist of domains.
   sandbox (copies invalidate each other on first refresh); prefers host
   passthrough under policy backends (the macOS Keychain keeps working), then an
   injected long-lived token, then one login per profile in a named volume.
-- **The database never enters a sandbox** — sandboxed sessions report status
-  through a polled file channel, because automations make database write access
-  equivalent to arbitrary host command execution. The database and its
-  `-wal`/`-shm` siblings are masked wherever a writable root could create the
-  mount point, whether or not they exist yet.
+- **The database never enters a sandbox** — a policy-sandboxed session reports
+  status through a narrow file channel instead, because automations make database
+  write access equivalent to arbitrary host command execution: the launch mints
+  `<data dir>/signals/<session>/`, exposes that one directory read-write, and the
+  bundled hooks append a state word there when `FRIRING_SIGNAL_FILE` is set
+  (unsandboxed sessions run the CLI exactly as before). The host **takes** the
+  file with a `rename(2)` into a directory no sandbox is granted before reading
+  it, refuses anything that is not a regular file under 4 KiB of UTF-8, and
+  writes only a matched constant from a closed vocabulary — never the file's own
+  bytes. The database and its `-wal`/`-shm` siblings are masked wherever a
+  writable root could create the mount point, whether or not they exist yet, and
+  no place is ever given the data directory or the metrics/config/data
+  environment variables that point at it.
 - **A launch is refused rather than quietly narrowed** — friring will not start
   a session whose profile hands over more than the boundary can hold: read-write
   roots enclosing the data directory (ADR-29) or reaching a tmux server socket
@@ -180,14 +213,20 @@ actually needs and to an allowlist of domains.
   is a decorator on the launch `agent` composes). Enforced in
   `tests/architecture_rules.rs`.
 
-What ships is the two policy backends, for **local** sessions, with every
-network mode enforced and host-passthrough credentials. Sandboxed sessions do
-not report status yet, because the file channel comes with the place backends;
-an egress proxy dies with the friring process that started it, so a session
-created by the short-lived `friring-cli` starts with no way out (kernel-closed,
-which fails closed) until a running friring relaunches it. The place backends
-follow. Design, delivery phases and ADR-25 through ADR-29 live in
-[`docs/SANDBOX.md`](docs/SANDBOX.md).
+What ships is the two policy backends and the `docker`/`podman` place backend,
+with every network mode enforced, host-passthrough credentials under a policy
+backend, and status reporting out of a policy boundary. What does not: config
+projection into a place, so a place starts from an empty per-profile home — the
+agent signs in inside its own pane, friring's hook configuration is dropped
+rather than pointed at a host path the container does not have, and a
+place-backed session therefore reports no status (all three are said on the
+session's `Sandbox:` row rather than left to be discovered). Neither
+`env-token` nor `volume-login` credentials are built, a place on a *remote* host
+is not wired, and `apple-container`/`wsl-distro` still probe as unavailable. An
+egress proxy dies with the friring process that started it, so a session created
+by the short-lived `friring-cli` starts with no way out (kernel-closed, which
+fails closed) until a running friring relaunches it. Design, delivery phases and
+ADR-25 through ADR-29 live in [`docs/SANDBOX.md`](docs/SANDBOX.md).
 
 #### Lazy sessions & ghosts (July 2026)
 
