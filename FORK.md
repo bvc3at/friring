@@ -110,21 +110,36 @@ actually needs and to an allowlist of domains.
   allowlist while the kernel denies direct egress, so ignoring the proxy means
   no network rather than a bypass. Chosen over resolved-IP `iptables`
   allowlists, which break on CDN address rotation and cannot work under
-  seatbelt or in WSL's shared network namespace. `x`, `*.x` and `.x` are one
-  rule, apex included, in both the profile validator and the proxy — two
-  matchers held to one table by `tests/egress_matcher_conformance.rs`, both
-  canonicalising a host before they compare it (`127.1` and `2130706433` are
-  `127.0.0.1`) and both refusing a non-ASCII host outright rather than guessing
-  at a U-label. Both policy backends are wired to it: `allowlist` is enforced
-  for real, and `full` with denies is proxied too, because a deny list is
-  enforceable nowhere else. An instance is **per session** (the bearer token and
-  the unix socket are per boundary, not per profile); seatbelt reaches it on host
-  loopback, a `--unshare-net` sandbox through a bind-mounted socket fronted by
-  `friring-cli sandbox relay` running inside the namespace.
+  seatbelt or in WSL's shared network namespace. A bare `x` is that host alone
+  and `*.x`/`.x` are one spelling of its subtree, apex included, in both the
+  profile validator and the proxy — two matchers held to one table by
+  `tests/egress_matcher_conformance.rs`, both canonicalising a host before they
+  compare it (`127.1` and `2130706433` are `127.0.0.1`) and both refusing a
+  non-ASCII host outright rather than guessing at a U-label. The proxy dials on
+  the *host's* network stack, so it refuses destinations local to the host —
+  loopback, unspecified, link-local, the cloud metadata address — in every mode
+  including `full`, re-checking after a name resolves, unless an allow rule
+  names the literal address; and it replaces a plaintext request's `Host` header
+  with the authority it authorised. Both policy backends are wired to it:
+  `allowlist` is enforced for real, and `full` with denies is proxied too,
+  because a deny list is enforceable nowhere else. An instance is **per session**
+  (the bearer token and the unix socket are per boundary, not per profile), and
+  a launch with no session identity is refused rather than sharing one; it is
+  bound before the agent but belongs to the session only once that launch has a
+  pane, so a failed launch never costs a running agent its egress. Seatbelt
+  reaches it on host loopback — on both loopback families, because SBPL's
+  `localhost` cannot be told which one it means — and a `--unshare-net` sandbox
+  through a bind-mounted socket fronted by `friring-cli sandbox relay` running
+  inside the namespace.
 - **First-use domain prompts** — a refused host raises a status line and, under
   `prompt_new_domains`, a confirm modal; allowing applies to the running proxy
-  immediately (no restart) *and* writes a port-scoped rule back to the profile.
-  The same host is asked about once per session however hard the agent retries.
+  immediately (no restart) *and* writes a port-scoped rule for that host alone
+  back to the profile. It is the only confirmation in friring that grants on `y`
+  rather than `Enter` and ignores keys until it has been on screen, because it
+  is the only one an agent can raise while the user is typing into a pane. A
+  relaunch withdraws a question still on screen, since its answer would land on
+  the boundary that replaced the one it was about. The same host is asked about
+  once per session however hard the agent retries.
 - **Credential handling** — never copies rotating OAuth credentials per
   sandbox (copies invalidate each other on first refresh); prefers host
   passthrough under policy backends (the macOS Keychain keeps working), then an

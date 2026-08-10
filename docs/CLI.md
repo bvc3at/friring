@@ -324,6 +324,17 @@ sandboxed — check `sandbox_unenforced` too. Both are persisted, so they answer
 for a session this friring only adopted, and `session get`'s human output folds
 them into one `sandbox` row (`dev — NOT enforced: <reason>`).
 
+Two things about a **sandboxed** session created from the CLI rather than the
+TUI. An egress proxy lives in the process that started it, so one started here
+dies when the command exits: the agent keeps running under tmux with the kernel
+policy still denying everything, which fails closed, and a relaunch from a
+running friring restores its egress. And this path hands the window its
+environment as `tmux -e KEY=VALUE` arguments rather than over a control-mode
+socket, so while the command runs the proxy URL — token included — is visible in
+that `tmux` client's argv to anything on the machine that can read a process
+list. Both are covered under
+[Failure modes](SANDBOX.md#failure-modes).
+
 ## Delete and restore semantics
 
 `session delete <uuid>` **soft-deletes** by default — only the DB row is marked

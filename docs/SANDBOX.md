@@ -459,7 +459,7 @@ transports, and each backend uses the one its kernel primitive leaves open:
 
 | Backend | Transport | Why |
 |---|---|---|
-| `seatbelt` | host TCP loopback | Shares the host network stack; the profile denies non-loopback traffic but leaves the proxy port reachable. |
+| `seatbelt` | host TCP loopback | Shares the host network stack; the profile denies non-loopback traffic but leaves the proxy port reachable. SBPL's `localhost` covers both loopback families and cannot be told which, so the proxy holds the port on both. |
 | `bwrap`, `docker`/`podman` on `--network none` | unix socket + relay | A new network namespace has no route to the host. A unix socket is a filesystem object, so a bind mount carries it across. |
 | `wsl-distro` | as `bwrap`, inside the distro | Per-distro firewalling is impossible (one shared VM network namespace), so egress control comes from `bwrap` inside the distro — and so does its transport. |
 
@@ -471,7 +471,7 @@ connection to the bind-mounted socket:
 ```text
 agent  →  127.0.0.1:PORT   (the sandbox's own loopback)
        →  friring-cli sandbox relay
-       →  /…/proxy.sock    (bind-mounted from the host)
+       →  /…/proxy.sock    (bind-mounted; `proxy-b.sock` across a relaunch)
        →  friring proxy    →  policy  →  upstream
 ```
 
@@ -520,13 +520,16 @@ At the kernel layer `allowlist` and `none` are still identical — both deny
 direct egress — so the allowlist is entirely the proxy's doing, and a profile
 that defaults to `allowlist` with an empty list starts closed.
 
-**Allowlist matching** is suffix matching on label boundaries, over a host
-canonicalised first (see below) and therefore case-insensitively:
-`github.com` covers `api.github.com` but not `evilgithub.com`,
-`github.com.evil.net` or `github.co`. `*.x` and `.x` are spellings of `x`,
-apex included — the deny direction decides it, because a user refusing `*.x`
-means "no x traffic" and a matcher sparing the apex would be a silent hole.
-A rule without a port covers every port. Denies are checked **first in every
+**Allowlist matching** is exact, over a host canonicalised first (see below)
+and therefore case-insensitively: `github.com` covers `github.com` and nothing
+else. A subtree is spelled out — `*.x`, or `.x`, one pattern — and covers `x`
+and every subdomain of it on a label boundary, so `*.github.com` covers
+`api.github.com` but not `evilgithub.com`, `github.com.evil.net` or
+`github.co`. Bare-is-exact is what makes the first-use prompt's promise true
+("that host on that port only"); the wildcard covers the apex because the deny
+direction decides it, since a user refusing `*.x` means "no x traffic" and a
+matcher sparing the apex would be a silent hole. A rule without a port covers
+every port. Denies are checked **first in every
 mode**, so a deny entry narrows `full` too — and a `full` profile that carries
 denies is proxied exactly like an allowlist, because a deny list is enforceable
 nowhere else: the kernel blocks direct egress and the proxy applies the denies
@@ -565,10 +568,11 @@ allowlist and testable without a session, a database or a backend.
 
 - HTTP `CONNECT` and SOCKS5, allowlist matched on the requested host, with
   optional `:port` scoping; denies win over allows, in every network mode. A
-  bare rule covers its own subtree on a label boundary (`github.com` matches
-  `api.github.com`, never `evilgithub.com`); `*.github.com` and `.github.com`
-  are spellings of that same rule and cover the apex with it; an address rule
-  is exact.
+  bare rule is one host (`github.com` matches `github.com` alone);
+  `*.github.com` and `.github.com` are one spelling of its subtree, on a label
+  boundary (`api.github.com`, never `evilgithub.com`) and apex included; an
+  address rule is exact, prefix or no prefix — there is nothing under an
+  address, so `*.127.0.0.1` is the address rule.
 - Both protocols share **one listener**, selected by the first byte (`0x05` is
   a SOCKS greeting, anything else starts an HTTP request line), on either
   transport. `ALL_PROXY` must be **`socks5h://`**, not `socks5://`: the `h`
@@ -580,6 +584,38 @@ allowlist and testable without a session, a database or a backend.
   the proxy URL) over HTTP, username/password over SOCKS5. Unauthenticated
   callers are refused before any policy is consulted, so they learn nothing
   about the allowlist.
+- The token never reaches a log or a toast. It is handed to the sandbox inside
+  the proxy URL, which travels in the tmux `new-window` command line, and the
+  two paths that report a failed control-mode command — a stall and a `%error`
+  — quoted that line verbatim. Both now run it through a redactor that
+  withholds any userinfo-bearing URL and any value whose name reads like a
+  credential, while keeping the verb, the window and the environment *keys*, so
+  a stalled launch is still diagnosable. The policy is by shape rather than by
+  variable name: this is shared tmux plumbing, so a credential arrives from an
+  agent's registry environment or a user's argv just as easily as from the
+  boundary. The types that carry the token in memory (`ProxyConfig`,
+  `ProxyGrant`, the supervisor's `Bound`) hand-write `Debug` to withhold it,
+  because a derived one puts it in every `{:?}` and every `expect`.
+- **The proxy will not dial the machine it runs on.** It connects with
+  friring's reachability, not the sandbox's, so a `CONNECT 127.0.0.1:2375`
+  honoured on the sandbox's behalf would hand back exactly the route
+  `--unshare-net` exists to remove — a rootless container API, a language
+  server, an SSH forward. Loopback, the unspecified address and link-local
+  (including `169.254.169.254`, the cloud metadata endpoint) are refused with a
+  reason of their own, in **every** mode including `full`, and the check runs
+  again on the address a *name* resolved to — so `127.0.0.1.nip.io`, a record
+  pointed inward and a rebinding TTL all land on it, and the socket only ever
+  opens to an address that was vetted. The single exception is an allow rule
+  naming the literal address (`127.0.0.1:11434`): the user wrote it, it is
+  scoped to the port they wrote, and neither `*` nor a name nor `full` is that
+  sentence. RFC 1918 and IPv6 unique-local are **not** refused — those are the
+  user's network rather than the user's machine.
+- A plaintext request is forwarded with the `Host` header **replaced** by the
+  authority the policy authorised. An absolute-form request carries the
+  destination twice, and letting the two disagree is domain fronting the proxy
+  can actually see: allowed against `raw.githubusercontent.com`, served by
+  whatever virtual host the header named. Inside a `CONNECT` tunnel it cannot
+  see the mismatch, which is the disclosure below.
 - Denials carry a reason and surface as a TUI event; with
   `prompt_new_domains`, an unlisted domain raises a confirm modal whose answer
   is written back to the profile and applied to the running proxy without a
@@ -591,9 +627,11 @@ allowlist and testable without a session, a database or a backend.
   of them is policed rather than only the first on a reused socket. The proxy
   implements it; no profile column selects it yet, so every launch runs with it
   off. Adding the column is a profile change, not a proxy change.
-- No TLS interception in the first release. Allow decisions therefore trust the
-  client-supplied hostname, so domain fronting can bypass them — documented in
-  the UI, not hidden.
+- No TLS interception in the first release. Inside a `CONNECT` tunnel the allow
+  decision therefore trusts the client-supplied hostname and cannot see the SNI
+  or `Host` that follows, so domain fronting can bypass it there — documented in
+  the UI, not hidden. Plaintext is the case the proxy *can* see, and it does
+  (the `Host` bullet above).
 - Both matchers **canonicalise a host before comparing it**, and the request
   path canonicalises once at its edge — so the host the policy decided on is
   the host the socket is opened to, and an address is dialled as an address
@@ -619,9 +657,11 @@ allowlist and testable without a session, a database or a backend.
 
 The environment friring injects is `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`
 and `NO_PROXY` in both cases, because tools disagree about which spelling they
-read. `NO_PROXY` is `localhost,127.0.0.1,::1`: for a namespaced sandbox that is
-a boundary rule rather than a convenience, since a tunnelled local request
-would be dialled by the proxy on the *host's* loopback.
+read. `NO_PROXY` is `localhost,127.0.0.1,::1`, so an agent's own local traffic
+— a dev server it started, a language server — is not tunnelled through a
+filter that would refuse it for not being in a domain allowlist. That is a
+convenience and not the boundary: a client is free to ignore it, and what makes
+the boundary hold is the proxy's own refusal to dial the host it runs on.
 
 Written in Rust rather than shelling out to an external runtime: Friring ships
 as a self-contained binary, and a CONNECT/SOCKS filter is a small, testable
@@ -650,10 +690,33 @@ message says the profile did not keep it.
 **The rule is scoped to the port that was refused**, and stored canonically.
 `api.github.com:443` grants that host on that port, not every port on it, and
 not the host's subtree; a wider grant is an edit to the profile, made
-deliberately. Canonically because the *sandbox* chose the spelling: the question
-shows `127.1` because that is what the agent asked for and what the user has to
-recognise, and stores `127.0.0.1`, which is what every later request
-canonicalises to.
+deliberately. The grammar does that work rather than a second code path: a bare
+rule *is* one host, so the stored rule and the sentence in the modal say the
+same thing. It is also why the answer is built from the host alone
+(`DomainRule::exact`) and not by parsing the client's text as a rule — the
+sandbox picks the spelling it is refused under, and a request for `.github.com`
+(which resolves to the apex) must not be answered with the subtree that text
+would mean in a profile. Canonically because the *sandbox* chose the spelling:
+the question shows `192.0.2.10` for whatever legacy notation the agent wrote,
+and stores the address every later request canonicalises to.
+
+**Answering takes a deliberate key, on a question that has been read.** This is
+the only modal in friring that is not opened by a keypress — a sandboxed
+agent's request raises it, from the background tick, while the user's focus is
+a terminal pane and their hands are mid-sentence in it. So `y` grants and
+`Enter` does not: `Enter` is the most-pressed key in an agent pane, and here it
+means "leave it blocked". And nothing at all is answered until the question has
+been on screen for a moment; keystrokes before that are swallowed rather than
+acted on, because a key already in flight belongs to the pane behind the modal.
+Without both, typing "yes, go ahead" into an agent pane is a security grant,
+and an agent that can provoke a refusal can choose the moment it lands.
+
+**A destination on the host itself is never offered.** `NO_PROXY` exists so the
+agent's own local traffic bypasses the filter, which means a question about
+`127.0.0.1:2375` reads like the agent asking for a dev server it started — while
+the address the proxy would dial is on the machine outside the boundary. The
+proxy refuses those with a reason that does not raise this prompt, and the rule
+builder declines to construct one anyway.
 
 **Every refusal is reported; only some are asked about.** An agent that cannot
 reach the network is failing, and the reason is the only way to know why — so a
@@ -680,7 +743,11 @@ time is worse than a message.
 A question waits for the single modal slot rather than taking the screen from
 an open editor, and a relaunch clears the session's history — a fresh proxy
 from a re-read profile is a new boundary, not the one the earlier answers were
-about.
+about. That includes a question already **on screen**: the session key is
+stable across a relaunch by design, so an answer given then would apply a grant
+to the instance that replaced the one it was about, and write it into whatever
+profile the question named rather than the one now in force. The question is
+withdrawn instead, and the new boundary asks for itself if the agent asks again.
 
 ## Credentials
 
@@ -747,9 +814,11 @@ login_fallback = "…"     # how to log in inside the pane when state is empty
 ```
 
 Friring never reads a credential file to inspect it, and never logs credential
-contents. A future host-side credential broker (the sandbox asks, the host
-refreshes) is the theoretically cleanest endpoint and is deliberately deferred:
-`volume-login` removes the urgency.
+contents. That covers the boundary's *own* token too, not just the agent's —
+see the redaction bullet under [Egress firewall](#egress-firewall) and the
+matching entry in [Failure modes](#failure-modes). A future host-side credential broker (the sandbox asks,
+the host refreshes) is the theoretically cleanest endpoint and is deliberately
+deferred: `volume-login` removes the urgency.
 
 ## Config projection
 
@@ -863,11 +932,31 @@ Two details that silently break things if missed:
   A proxy instance is **per session, not per profile**: the policy is per
   profile, but the bearer token and the socket are per boundary, and sharing them
   would put every sibling session's way out behind one compromised agent and let
-  one first-use answer widen another session's boundary. It is started before the
-  agent, replaced on every relaunch (so an edited profile takes effect and the
-  token rotates), and stopped where the scratch directory is dropped. It lives in
+  one first-use answer widen another session's boundary. A launch that cannot be
+  told apart — no friring session id and no agent conversation id — is refused
+  rather than filed under a shared fallback name, because two boundaries under
+  one key is exactly what that rule forbids.
+
+  It is bound before the agent — argv has to name the port or the socket — but
+  it belongs to no session until that launch has a pane: the session keeps the
+  instance it is already using, and a launch that fails in between (a wrapper
+  that will not compose, a pane that will not spawn, a row that will not
+  persist) releases what it bound instead of taking a healthy agent's way out.
+  Committing is what replaces the previous instance, so an edited profile takes
+  effect and the token rotates on every relaunch, and the last one is stopped
+  where the scratch directory is dropped. A relaunch therefore binds its socket
+  while the previous one is still serving, so the two alternate between
+  `proxy.sock` and `proxy-b.sock` in the session's scratch directory. It lives in
   the friring process that launched it: a session created by the short-lived
   `friring-cli` starts with no egress until a running friring relaunches it.
+
+  On the loopback transport the instance holds its port on **both** loopback
+  families. Seatbelt's one hole is written `(remote ip "localhost:<port>")`, and
+  SBPL's `localhost` is a semantic predicate covering `::1` as well as
+  `127.0.0.1` with no way to name one family — while a listener on `[::1]:P`
+  does not conflict with one on `127.0.0.1:P`. Claiming both is what keeps that
+  hole pointing only at the proxy instead of at whatever local service happened
+  to own the other one.
 
 ## Status signals
 
@@ -972,7 +1061,9 @@ launch that regains the boundary clears it.
 **Firewall prompts** — a refusal for an unlisted domain raises a status line
 and, under `prompt_new_domains`, a confirm modal naming the session, the host
 and the port; the answer applies to the running proxy and is written back to
-the profile. See
+the profile. It is the one confirmation whose grant key is `y` rather than
+`Enter`, and the one that ignores keys for a moment after it appears, because
+it is the one an agent can put under the user's hands unasked. See
 [First-use domain prompts](#first-use-domain-prompts) for what is asked, what
 is only reported, and why the same host is never asked about twice.
 
@@ -996,6 +1087,25 @@ complete and consistent with existing screens.
   restart and reaches another instance that adopts the session — and the reason
   reaches the user as an error toast (TUI) or on the command's own output
   (`friring-cli`) — not only the log.
+- **A failure never spends the credential it reports.** Log files persist, get
+  shared, and get pasted into bug reports, and the proxy's token plus the port
+  it names is a working local egress channel for anything else on the machine.
+  Every tmux failure that quotes a command redacts it first, and where
+  legibility and redaction pull against each other redaction wins:
+  over-redacting a diagnostic costs a detail, under-redacting one costs the
+  boundary.
+- **The headless launch path still puts the proxy variables in a tmux client's
+  argv.** The TUI composes a window's environment into a control-mode command
+  over the tmux socket, which never reaches a process table; `friring-cli`
+  has no control connection and passes each variable as a `-e KEY=VALUE`
+  argument instead. On Linux and WSL another local user can read
+  `/proc/<pid>/cmdline` by default, so for as long as that `tmux` client runs
+  they can read the sandbox's proxy URL and use its egress. The exposure is
+  bounded by the CLI's own lifetime — a proxy lives in the process that started
+  it, so a `friring-cli`-created sandbox's instance is gone the moment the
+  command exits — and macOS restricts cross-uid argv reads. Closing it properly
+  needs a route into the window's environment that is not argv, which tmux does
+  not offer; it is called out here rather than papered over.
 - **An unreadable profile** is refused at launch, named column by column, and
   repaired by re-saving it in the editor. Listing it permissively and
   launching it permissively are different decisions: the first keeps it
@@ -1055,11 +1165,14 @@ from inside a boundary until P3's file channel — see
 **P2 — The firewall.** Shipped: the Rust filtering proxy and its in-namespace
 relay, the `allowlist` network mode, `full`-with-denies proxied, both policy
 backends wired to a per-session instance, host canonicalisation on both sides of
-the matcher, first-use domain prompts and their persistence, and the persisted
-applied state. Not in it: an HTTP-method restriction has no profile column (the
-proxy supports one; nothing sets it), a proxy dies with the friring process that
-started it, and the relay binds a few milliseconds after the agent starts — a
-request in that window gets one connection refused, which fails closed.
+the matcher, the refusal to dial the host's own loopback, first-use domain
+prompts and their persistence, and the persisted applied state. Not in it: an
+HTTP-method restriction has no profile column (the proxy supports one; nothing
+sets it), a proxy dies with the friring process that started it, the headless
+launch path still passes the proxy environment as `tmux` client argv (see
+[Failure modes](#failure-modes)), and the relay binds a few milliseconds after
+the agent starts — a request in that window gets one connection refused, which
+fails closed.
 
 **P3 — Place sandboxes.** The `docker`/`podman` backend, the sandbox transport,
 instance lifecycle and garbage collection, identical-path mounts, the default
@@ -1129,11 +1242,19 @@ distribution.
 token-authenticated and scoped to host loopback, to a `0o600` unix socket, or
 to both — a sandbox in its own network namespace can only reach the socket, and
 reaches it through a Friring-run relay inside the namespace. One instance per
-session, not per profile: the token and the socket are per boundary. Allow and
+session, not per profile: the token and the socket are per boundary, and a
+launch with no identity of its own is refused rather than sharing one. Allow and
 deny decisions are taken on a canonicalised host, and a host with no single
-canonical spelling is refused in every mode rather than compared. Allow
-decisions trust the client-supplied hostname until TLS termination is added,
-which the UI discloses.
+canonical spelling is refused in every mode rather than compared. A bare rule
+names one host and the subtree is spelled `*.x`/`.x`, so the narrow reading is
+the default and the wide one is written down. Because the proxy dials with the
+host's reachability rather than the sandbox's, it refuses destinations local to
+the host — loopback, unspecified, link-local — in every mode, and re-checks
+after resolving a name, unless an allow rule names the literal address. Allow
+decisions trust the client-supplied hostname inside a `CONNECT` tunnel until
+TLS termination is added, which the UI discloses; on a plaintext request, where
+the proxy *can* see a `Host` that disagrees with the authority it authorised,
+it replaces it.
 
 ## ADR-28: Credentials are never copied per sandbox
 

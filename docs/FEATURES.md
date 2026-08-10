@@ -2999,17 +2999,25 @@ says why each one is unavailable rather than hiding it — but not built.
 direct egress, and a Friring-owned filtering proxy outside the boundary lets
 through exactly the domains the profile lists — so an agent that ignores the
 proxy environment gets no network at all rather than a way around it. A rule is
-a host with an optional port; `github.com` covers `api.github.com` but never
-`evilgithub.com`, and denies beat allows in every mode (which is why `full`
-with denies is proxied too). Each session gets its own token-authenticated
-instance, started before the agent and stopped with it.
+a host with an optional port; `github.com` is that host alone and
+`*.github.com` adds its subdomains (never `evilgithub.com`), and denies beat
+allows in every mode (which is why `full` with denies is proxied too). The
+proxy will not dial the machine it runs on — loopback, link-local and the cloud
+metadata address are refused in every mode unless a rule names the address
+itself — so it cannot be turned into a route back to the host's own services.
+Each session gets its own token-authenticated instance, bound before the agent,
+handed to the session only once the launch has a pane, and stopped with it.
 
 When the agent reaches for a host the profile does not list, friring **asks
 once**: a confirm modal naming the session, the host and the port, whose "allow"
 applies to the running proxy immediately — the agent's retry succeeds, nothing
 restarts — and writes the rule into the profile so the next launch has it too.
-The rule is scoped to the port that was refused, so the grant is never wider
-than the question. Turn the asking off per profile with `prompt_new_domains`;
+The rule is scoped to the port that was refused *and* to that host alone, so
+the grant is never wider than the question. Answering takes `y` rather than
+`Enter`, and only once the question has been on screen for a moment: this is
+the one modal an agent can raise while your hands are in a terminal pane, and a
+keystroke already in flight must not be what widens a sandbox. Turn the asking
+off per profile with `prompt_new_domains`;
 refusals are still reported, because an agent that cannot reach the network is
 failing and the reason is the only way to know why. However hard the agent
 retries, one host is one question.
