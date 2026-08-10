@@ -240,12 +240,17 @@ impl App {
             .unwrap_or(0);
         match self.db.delete_sandbox_profile(name) {
             Ok(true) => {
-                // The profile's own tree — its synthetic home and every
-                // session directory inside it — belongs to the profile, so it
-                // goes with it. The *place* does not: nothing here stops a
-                // running container, and the reclaiming pass is what removes
-                // one whose profile is gone.
+                // The profile's own tree — its synthetic home, the credential
+                // it was signed into and every session directory inside it —
+                // belongs to the profile, so it goes with it. The *place* does
+                // not: nothing here stops a running container, and the
+                // reclaiming pass is what removes one whose profile is gone.
                 crate::sandbox::dirs::cleanup_place(name);
+                // …and with the copy gone, so is friring's record that this
+                // profile held the one permitted seed of a credential family.
+                // Leaving it would refuse every future profile a `seed-file`
+                // on behalf of a boundary that no longer exists (ADR-28).
+                crate::sandbox::auth::release_seeds(name);
                 let message = if in_use > 0 {
                     format!(
                         "Sandbox profile '{name}' deleted — {in_use} session(s) still \
@@ -1020,6 +1025,36 @@ pub(crate) fn unenforced_sandbox_message(info: &crate::session::SessionInfo) -> 
     Some(format!(
         "'{}' is NOT sandboxed — profile '{profile}' could not be applied: {reason}",
         info.name
+    ))
+}
+
+/// What a launch has to say about the session's boundary, if anything, and how
+/// loudly.
+///
+/// Two different facts, in priority order, because only one status line exists
+/// and one of them is worse than the other:
+///
+/// - the boundary was **not applied** and the agent is on the host — an error,
+///   and the more serious fact whenever both are true;
+/// - the boundary holds and the agent has **no credential in it** — an
+///   ordinary notice, because the fix is a command typed in the pane. Said at
+///   the launch as well as on the info panel: a place is a fresh home, and an
+///   agent sitting at a sign-in prompt with no explanation reads as a broken
+///   session.
+pub(crate) fn sandbox_launch_notice(
+    info: &crate::session::SessionInfo,
+) -> Option<(super::StatusLevel, String)> {
+    if let Some(message) = unenforced_sandbox_message(info) {
+        return Some((super::StatusLevel::Error, message));
+    }
+    let how = info.sandbox_login.as_deref()?;
+    let profile = info.sandbox_profile.as_deref()?;
+    Some((
+        super::StatusLevel::Info,
+        format!(
+            "'{}' started signed out inside sandbox '{profile}' — {how}",
+            info.name
+        ),
     ))
 }
 
@@ -1988,5 +2023,35 @@ mod tests {
         assert!(message.contains("NOT sandboxed"), "{message}");
         assert!(message.contains("'dev'"), "{message}");
         assert!(message.contains("bwrap is not installed"), "{message}");
+    }
+
+    /// A boundary that holds and an agent with no credential in it is a notice,
+    /// not an error — and an agent on the host outranks it, because only one
+    /// status line exists and that is the more serious fact.
+    #[test]
+    fn a_missing_login_is_reported_but_never_over_a_missing_boundary() {
+        let mut info = crate::session::SessionInfo::new("api".to_string());
+        info.sandbox_profile = Some("dev".to_string());
+        info.sandbox_state = Some(crate::session::SandboxState::Applied(
+            "podman · inner agent sandbox: off".to_string(),
+        ));
+        // A boundary that holds and nothing to do is silent.
+        assert!(sandbox_launch_notice(&info).is_none());
+
+        info.sandbox_login = Some("sign in inside this pane: /login".to_string());
+        let (level, message) = sandbox_launch_notice(&info).expect("a login is reported");
+        assert_eq!(level, super::super::StatusLevel::Info);
+        assert!(message.contains("'api'"), "{message}");
+        assert!(message.contains("'dev'"), "{message}");
+        assert!(message.contains("/login"), "{message}");
+
+        // The fallback wins while both are true: an agent outside its boundary
+        // is worse news than one that has to log in.
+        info.sandbox_state = Some(crate::session::SandboxState::Unenforced(
+            "podman is not installed".to_string(),
+        ));
+        let (level, message) = sandbox_launch_notice(&info).expect("the fallback is reported");
+        assert_eq!(level, super::super::StatusLevel::Error);
+        assert!(message.contains("NOT sandboxed"), "{message}");
     }
 }

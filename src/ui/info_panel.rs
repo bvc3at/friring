@@ -193,6 +193,19 @@ fn append_session_section<'a>(
             Span::styled("Sandbox: ", Theme::label()),
             Span::styled(detail, Style::default().fg(color)),
         ]));
+        // A boundary the agent has no credential in is a session that looks
+        // broken until you know it is only signed out. Its own row, because it
+        // is the one thing on this panel the user has to *act* on, and the
+        // action is a command typed in this pane.
+        if let Some(how) = info.sandbox_login.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("Login:   ", Theme::label()),
+                Span::styled(
+                    how.to_string(),
+                    Style::default().fg(Theme::status_blocked()),
+                ),
+            ]));
+        }
     }
     // Live activity from the agent-emitted OSC terminal title.
     if let Some(activity) = info.agent_activity.as_deref() {
@@ -774,6 +787,45 @@ mod tests {
         assert!(fell_back.contains("NOT APPLIED"), "{fell_back}");
         assert!(fell_back.contains("running on the host"), "{fell_back}");
         assert!(fell_back.contains("bwrap is not installed"), "{fell_back}");
+    }
+
+    /// A boundary the agent has no credential in gets a row of its own, saying
+    /// what to type. Without it a place-backed session reads as broken, because
+    /// the agent is sitting at a sign-in prompt with nothing to explain it.
+    #[test]
+    fn a_boundary_with_no_login_says_what_to_type_in_the_pane() {
+        let mut info = SessionInfo::new("api".to_string());
+        info.sandbox_profile = Some("dev".to_string());
+        info.sandbox_state = Some(crate::session::SandboxState::Applied(
+            "podman · credentials (volume-login): none in this sandbox yet".to_string(),
+        ));
+        info.sandbox_login = Some("sign in inside this pane: /login".to_string());
+        let mut lines = Vec::new();
+        append_session_section(&mut lines, &info, None);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let login = text
+            .iter()
+            .find(|t| t.starts_with("Login:"))
+            .unwrap_or_else(|| panic!("no login row in {text:?}"));
+        assert!(login.contains("/login"), "{login}");
+
+        // Nothing to do, no row: an agent that is signed in must not be told to
+        // sign in, and neither must one friring never launched.
+        info.sandbox_login = None;
+        let mut lines = Vec::new();
+        append_session_section(&mut lines, &info, None);
+        assert!(!lines.iter().any(|l| l
+            .spans
+            .first()
+            .is_some_and(|s| s.content.starts_with("Login:"))));
     }
 
     /// An adopted session: friring did not launch this process, so all it can

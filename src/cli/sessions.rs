@@ -231,6 +231,12 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
             if let Some(reason) = unenforced.as_deref() {
                 human.push_str(&format!("\nNOT sandboxed — {reason}"));
             }
+            // A boundary that holds and an agent with no credential in it: the
+            // session works, and nothing will happen in that pane until somebody
+            // signs in there.
+            if let Some(how) = res.sandbox_login.as_deref() {
+                human.push_str(&format!("\nSigned out inside the sandbox — {how}"));
+            }
             Ok(CommandOutput::new(
                 json!({
                     "id": res.session_id.to_string(),
@@ -240,6 +246,7 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
                     "cwd": res.cwd.display().to_string(),
                     "parent_session_id": res.parent_session_id.map(|id| id.to_string()),
                     "sandbox_unenforced": unenforced,
+                    "sandbox_login": res.sandbox_login,
                 }),
                 human,
             ))
