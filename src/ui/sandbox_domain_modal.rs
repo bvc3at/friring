@@ -33,6 +33,13 @@ pub struct SandboxDomainState<'a> {
 /// whole host), and that the filter believes the name the agent supplied. The
 /// second is ADR-27's disclosure: without TLS interception an allowed host is
 /// an allowed *name*, and this modal is where that grant is made.
+///
+/// The footer names `y` and not `Enter`, which is the only confirmation in
+/// friring that does. This is also the only one that appears without the user
+/// having pressed anything — a sandboxed agent's request raises it, on top of
+/// whatever pane they were typing into — so the key that grants is one that
+/// cannot be the standing default, and `Enter` cancels
+/// (`App::handle_sandbox_domain_prompt_key`).
 pub fn render_sandbox_domain_modal(
     frame: &mut Frame,
     state: &SandboxDomainState<'_>,
@@ -73,7 +80,7 @@ pub fn render_sandbox_domain_modal(
         body,
         (
             "Allow",
-            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyCode::Char('y'),
             crossterm::event::KeyModifiers::NONE,
         ),
     )
@@ -124,6 +131,12 @@ mod tests {
     /// The grant is narrower than "allow github.com", and the filter is weaker
     /// than "only that host can be reached". Both are stated where the grant is
     /// made, not only in the docs (ADR-27).
+    ///
+    /// This pins the sentence; what makes it *true* is that a bare rule matches
+    /// one host — `tests/egress_matcher_conformance.rs`'s
+    /// `an_approved_rule_grants_that_host_on_that_port_only`, measured on both
+    /// matchers. The two must move together: soften the grammar and this copy
+    /// becomes a lie.
     #[test]
     fn states_the_scope_of_the_grant_and_the_limit_of_the_filter() {
         let out = rendered_text(&SandboxDomainState {

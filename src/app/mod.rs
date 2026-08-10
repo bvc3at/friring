@@ -2318,7 +2318,7 @@ impl App {
                 // A relaunch mints a fresh proxy from a re-read profile, so the
                 // answers given about the previous boundary — a refusal above
                 // all — are not the user's standing position on this one.
-                self.egress_prompts.forget(&session_id.to_string());
+                self.forget_egress_prompts(&session_id.to_string());
                 // Re-spawned fresh: clear stale hook-driven status so it doesn't
                 // linger as Blocked/Working/Done until the agent re-reports (a
                 // resumed agent may not re-fire its boot hook). Mirrors the
@@ -3071,7 +3071,7 @@ impl App {
                 // The restore reuses the deleted session's id, which is also the
                 // proxy's key: start its egress history clean rather than
                 // inheriting what the previous incarnation was asked.
-                self.egress_prompts.forget(&deleted.id.to_string());
+                self.forget_egress_prompts(&deleted.id.to_string());
                 self.sessions.push(session);
                 self.set_active_index(self.sessions.len() - 1);
                 self.focus = InputFocus::Terminal;

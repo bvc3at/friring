@@ -19,6 +19,21 @@
 //! one by one. Each bound fails towards saying less, never towards asking more.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
+
+/// How long a question ignores every key after it appears.
+///
+/// Unlike every other confirmation in friring this modal is not opened by a
+/// keypress: it is raised from the background tick, because a *sandboxed agent*
+/// made a request — while the user's focus is a terminal pane and they are
+/// typing into it. Without a guard, the keystroke already on its way when the
+/// modal appears answers a question the user has not read, and an agent can
+/// provoke that window whenever it likes by timing a request.
+///
+/// So the question is inert until it has been on screen long enough to have
+/// been seen. Long enough to outlast a keystroke in flight and the burst of a
+/// fast typist; short enough that answering deliberately never feels blocked.
+pub const PROMPT_ARMING: Duration = Duration::from_millis(600);
 
 /// Distinct hosts tracked per session before friring stops asking about new
 /// ones. Reaching it is reported once and then ignored: past this many refused
@@ -53,6 +68,22 @@ pub struct DomainPrompt {
     /// The rule an "allow" applies and stores — canonical, and scoped to the
     /// port that was refused, so granting is never wider than the question.
     pub rule: String,
+    /// When this question reached the screen, or `None` while it is still
+    /// queued. Stamped by the opener, so the [`PROMPT_ARMING`] window measures
+    /// time the user could have *read* it rather than time it spent waiting
+    /// behind another modal.
+    pub shown_at: Option<Instant>,
+}
+
+impl DomainPrompt {
+    /// Whether this question has been on screen long enough to be answered.
+    ///
+    /// A question that never reached the screen is never armed: there is no
+    /// keypress it could be answering.
+    pub fn is_armed(&self) -> bool {
+        self.shown_at
+            .is_some_and(|shown| shown.elapsed() >= PROMPT_ARMING)
+    }
 }
 
 /// What a refusal turned out to be worth telling the user.
@@ -162,7 +193,21 @@ mod tests {
             host: host.to_string(),
             port: 443,
             rule: format!("{host}:443"),
+            shown_at: None,
         }
+    }
+
+    /// A queued question is not an answerable one: the arming window measures
+    /// time on screen, and a question waiting behind another modal has had
+    /// none.
+    #[test]
+    fn a_question_is_inert_until_it_has_been_seen() {
+        let mut queued = prompt("s1", "github.com");
+        assert!(!queued.is_armed());
+        queued.shown_at = Some(Instant::now());
+        assert!(!queued.is_armed(), "answerable the instant it appeared");
+        queued.shown_at = Instant::now().checked_sub(PROMPT_ARMING);
+        assert!(queued.is_armed());
     }
 
     /// The rule the whole screen rests on: an agent retrying a blocked host

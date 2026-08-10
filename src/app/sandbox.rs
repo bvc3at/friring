@@ -360,7 +360,30 @@ impl App {
             host: denial.event.host.clone(),
             port: denial.event.port,
             rule,
+            shown_at: None,
         });
+    }
+
+    /// Drop everything friring is holding about one session's refusals,
+    /// including a question already on screen.
+    ///
+    /// Called where the boundary is rebuilt. [`EgressPromptState::forget`]
+    /// clears the history and the queue, but a question that has been *popped*
+    /// into the modal is in neither — and the session key is stable across a
+    /// relaunch by design, so answering it would apply a grant to the instance
+    /// that replaced the one the question was about, and write it into whatever
+    /// profile the question named rather than the one now in force. The
+    /// question is withdrawn instead: the new boundary will ask again if the
+    /// agent asks again.
+    pub(crate) fn forget_egress_prompts(&mut self, session_key: &str) {
+        self.egress_prompts.forget(session_key);
+        if matches!(
+            self.modal,
+            modals::Modal::SandboxDomainPrompt(ref prompt) if prompt.session_key == session_key
+        ) {
+            self.modal.close();
+            self.request_redraw();
+        }
     }
 
     /// Put the next queued question on screen once nothing else is.
@@ -372,7 +395,11 @@ impl App {
         if self.modal.is_open() {
             return;
         }
-        if let Some(prompt) = self.egress_prompts.next_prompt() {
+        if let Some(mut prompt) = self.egress_prompts.next_prompt() {
+            // Stamped here rather than where it was queued: the arming window
+            // is time on screen, and a question can wait behind another modal
+            // for minutes.
+            prompt.shown_at = Some(std::time::Instant::now());
             self.modal = modals::Modal::SandboxDomainPrompt(prompt);
             self.request_redraw();
         }
@@ -642,17 +669,33 @@ impl App {
         }
     }
 
-    /// Keys for the first-use domain question: `Enter`/`y` allows the host and
-    /// writes it into the profile, `Esc`/`n` leaves it blocked. Either answer
+    /// Keys for the first-use domain question: `y` allows the host and writes
+    /// it into the profile, `Esc`/`n`/`Enter` leave it blocked. Either answer
     /// closes the question for good — the host is already settled, so a retry
     /// will not raise it again.
+    ///
+    /// Two departures from every other confirmation in friring, both because
+    /// this is the only one an *agent* can cause to appear (see
+    /// [`PROMPT_ARMING`]):
+    ///
+    /// - **`Enter` does not grant.** It is the most-pressed key in an agent
+    ///   pane, which is where the user's hands are when this arrives, so it
+    ///   means the safe answer instead of the standing-default one.
+    /// - **Nothing is answered until the question has been on screen.** Before
+    ///   that every key is swallowed rather than acted on: a keystroke already
+    ///   in flight when the modal appeared belongs to the pane behind it, not
+    ///   to a security grant. Swallowed rather than passed through, so it does
+    ///   not reach the agent either.
     pub(crate) fn handle_sandbox_domain_prompt_key(&mut self, code: KeyCode) {
         let modals::Modal::SandboxDomainPrompt(ref prompt) = self.modal else {
             return;
         };
+        if !prompt.is_armed() {
+            return;
+        }
         let allow = match code {
-            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => true,
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => false,
+            KeyCode::Char('y') | KeyCode::Char('Y') => true,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n') | KeyCode::Char('N') => false,
             _ => return,
         };
         let prompt = prompt.clone();
@@ -701,30 +744,34 @@ pub(crate) fn unenforced_sandbox_message(info: &crate::session::SessionInfo) -> 
 /// could never store one — a name that does not canonicalise, or a shape the
 /// profile's own grammar rejects.
 ///
-/// Scoped to the port that was refused, because that is what the question named:
-/// a bare host rule would cover every port, which is wider than the user was
-/// asked to grant.
+/// **Exactly what the modal promises: that host, on that port.** Both halves are
+/// narrowings the user did not have to ask for, and both are load-bearing. The
+/// port is the one that was refused, because that is what the question named.
+/// The host is exact — [`DomainRule::exact`], never [`DomainRule::parse`] —
+/// because the *sandbox* chose the spelling it was refused under, and
+/// `.github.com` read as a rule would mean the whole subtree; a client would
+/// then be picking how wide its own grant is.
 ///
 /// A SOCKS5 client names an IPv6 destination unbracketed — the address is the
-/// address, not a URL authority — while an HTTP `CONNECT` line brackets it, so
-/// both spellings are accepted and the rule renders in the single one a profile
-/// stores.
+/// address, not a URL authority — while an HTTP `CONNECT` line brackets it. Both
+/// spellings canonicalise to the address, and the rule renders in the single
+/// spelling a profile stores.
+///
+/// A destination local to the *host* is never offered. `NO_PROXY` is set so the
+/// agent's own local traffic bypasses the filter entirely, so a question about
+/// `127.0.0.1:2375` reads like the agent asking for a dev server it started —
+/// while the address the proxy would dial is on the machine outside the
+/// boundary. The proxy refuses those with a reason of its own
+/// ([`DenyReason::HostLocal`]) and never raises this prompt for one; declining
+/// to build the rule is the second lock, so no path can mint the grant by
+/// accident. Reaching one deliberately is an edit to the profile.
 fn allow_rule_for(host: &str, port: u16) -> Option<String> {
     // Port 0 has no meaning as a destination; the proxy only reports one
     // alongside an empty host, which is never an allowlist question.
-    if port == 0 {
+    if port == 0 || crate::proxy::host_is_local(host) {
         return None;
     }
-    let parsed = DomainRule::parse(host)
-        .or_else(|_| DomainRule::parse(&format!("[{host}]")))
-        .ok()?;
-    Some(
-        DomainRule {
-            host: parsed.host,
-            port: Some(port),
-        }
-        .to_string(),
-    )
+    Some(DomainRule::exact(host, Some(port)).ok()?.to_string())
 }
 
 /// The key one refused host is remembered under, so that the same destination
@@ -732,14 +779,19 @@ fn allow_rule_for(host: &str, port: u16) -> Option<String> {
 ///
 /// The proxy reports the host as the client wrote it, and a client picks the
 /// spelling: `github.com.`, `GitHub.com`, `127.1` and `2130706433` all reach one
-/// place. Canonicalising with the same parse [`allow_rule_for`] uses keeps the
-/// dedup key and the rule the answer stores in step. A host that does not
+/// place. Canonicalising with the same constructor [`allow_rule_for`] uses keeps
+/// the dedup key and the rule the answer stores in step. A host that does not
 /// canonicalise (a U-label, the empty host) has no canonical form to key on, so
 /// it falls back to its lowercased spelling — still deduplicated, just only
 /// against itself.
+///
+/// Reading the client's spelling as a *rule* would break the dedup as well as
+/// the grant: `github.com` and `.github.com` are one destination but two
+/// patterns, so a client alternating them would raise two questions about the
+/// same place. [`DomainRule::exact`] never yields a pattern, and takes the host
+/// alone — so an unbracketed IPv6 literal needs no brackets added first.
 fn prompt_key(host: &str) -> String {
-    DomainRule::parse(host)
-        .or_else(|_| DomainRule::parse(&format!("[{host}]")))
+    DomainRule::exact(host, None)
         .map(|parsed| parsed.host)
         .unwrap_or_else(|_| host.to_ascii_lowercase())
 }
@@ -842,6 +894,18 @@ mod tests {
         }
     }
 
+    /// Answer the open question the way a user who has read it would: the
+    /// arming window is wound back rather than waited out, so a test measures
+    /// the answer instead of the clock. A test about the window itself presses
+    /// the key without this.
+    fn answer_prompt(app: &mut App, code: KeyCode) {
+        if let modals::Modal::SandboxDomainPrompt(ref mut prompt) = app.modal {
+            prompt.shown_at =
+                std::time::Instant::now().checked_sub(crate::app::egress_prompts::PROMPT_ARMING);
+        }
+        app.handle_sandbox_domain_prompt_key(code);
+    }
+
     fn stored_allow(app: &App, name: &str) -> Vec<String> {
         app.db
             .get_sandbox_profile(name)
@@ -914,7 +978,7 @@ mod tests {
             DenyReason::NotAllowlisted,
         )]);
         app.open_next_domain_prompt();
-        app.handle_sandbox_domain_prompt_key(KeyCode::Enter);
+        answer_prompt(&mut app, KeyCode::Char('y'));
 
         assert!(!app.modal.is_open(), "answering closes the question");
         assert_eq!(
@@ -927,6 +991,52 @@ mod tests {
         assert_eq!(status.level, StatusLevel::Success);
 
         crate::sandbox::egress::stop(&key);
+    }
+
+    /// The keystroke already in flight when the question appeared belongs to
+    /// the pane behind it.
+    ///
+    /// This is the one modal in friring an *agent* can raise: the user's focus
+    /// is a terminal pane, they are typing into it, and the tick puts a
+    /// security grant under their hands between two keystrokes. Typing "yes, go
+    /// ahead" into a Claude pane must not be what widens a sandbox — and an
+    /// agent that can provoke a refusal can choose the moment. So nothing is
+    /// answered until the question has been on screen, and the key that grants
+    /// is not the one an agent pane is full of.
+    #[test]
+    fn a_question_that_just_appeared_is_not_answered_by_the_next_keystroke() {
+        let profile = allowlist_profile("dev", true);
+        let (mut app, key, _g, _t) = boxed_app(&profile);
+
+        app.report_sandbox_denials(vec![denial(
+            &key,
+            "evil.example",
+            443,
+            DenyReason::NotAllowlisted,
+        )]);
+        app.open_next_domain_prompt();
+
+        // Mid-word in the pane behind: every one of these arrives before the
+        // question could have been read, and none of them answers it.
+        for code in [
+            KeyCode::Char('y'),
+            KeyCode::Char('e'),
+            KeyCode::Char('s'),
+            KeyCode::Enter,
+        ] {
+            app.handle_sandbox_domain_prompt_key(code);
+            assert!(app.modal.is_open(), "{code:?} answered an unread question");
+        }
+        assert!(stored_allow(&app, "dev").is_empty());
+
+        // And once it has been on screen, `Enter` — the key that used to grant,
+        // and the one an agent pane is full of — is the safe answer.
+        answer_prompt(&mut app, KeyCode::Enter);
+        assert!(!app.modal.is_open());
+        assert!(
+            stored_allow(&app, "dev").is_empty(),
+            "Enter widened the profile"
+        );
     }
 
     /// Refusing writes nothing, anywhere — and the same host never asks again,
@@ -943,7 +1053,7 @@ mod tests {
             DenyReason::NotAllowlisted,
         )]);
         app.open_next_domain_prompt();
-        app.handle_sandbox_domain_prompt_key(KeyCode::Esc);
+        answer_prompt(&mut app, KeyCode::Esc);
 
         assert!(!app.modal.is_open());
         assert!(stored_allow(&app, "dev").is_empty());
@@ -983,7 +1093,7 @@ mod tests {
         app.open_next_domain_prompt();
         assert_eq!(open_prompt(&app).host, "api.github.com");
 
-        app.handle_sandbox_domain_prompt_key(KeyCode::Esc);
+        answer_prompt(&mut app, KeyCode::Esc);
         app.open_next_domain_prompt();
         assert_eq!(open_prompt(&app).host, "pypi.org");
     }
@@ -1036,6 +1146,11 @@ mod tests {
             ),
             denial(&key, "anywhere.example", 443, DenyReason::NetworkDisabled),
             denial(&key, "", 0, DenyReason::Unauthorized),
+            // The machine friring runs on. Offering this one would be asking
+            // the user to hand a sandbox the host's own services, in words
+            // ("'session-0' asked for 127.0.0.1:2375") that read like the
+            // agent's own dev server.
+            denial(&key, "127.0.0.1", 2375, DenyReason::HostLocal),
         ]);
         app.open_next_domain_prompt();
 
@@ -1045,7 +1160,7 @@ mod tests {
             .as_ref()
             .expect("they are still reported");
         assert_eq!(status.level, StatusLevel::Error);
-        assert!(status.text.contains("+3 more blocked"), "{}", status.text);
+        assert!(status.text.contains("+4 more blocked"), "{}", status.text);
     }
 
     /// `prompt_new_domains` off means "refuse quietly, do not ask me" — the
@@ -1119,7 +1234,7 @@ mod tests {
         )]);
         app.open_next_domain_prompt();
         app.db.delete_sandbox_profile("dev").unwrap();
-        app.handle_sandbox_domain_prompt_key(KeyCode::Enter);
+        answer_prompt(&mut app, KeyCode::Char('y'));
 
         let status = app.status_message.as_ref().expect("a status line");
         assert_eq!(status.level, StatusLevel::Error);
@@ -1151,12 +1266,71 @@ mod tests {
         app.open_next_domain_prompt();
         // No proxy was ever started for this key, which is what a torn-down
         // session looks like from here.
-        app.handle_sandbox_domain_prompt_key(KeyCode::Enter);
+        answer_prompt(&mut app, KeyCode::Char('y'));
 
         assert!(stored_allow(&app, "dev").is_empty());
         let status = app.status_message.as_ref().expect("a status line");
         assert_eq!(status.level, StatusLevel::Error);
         assert!(status.text.contains("Could not allow"), "{}", status.text);
+    }
+
+    /// The other stale answer, and the one that is *not* harmless: the session
+    /// is relaunched while its question is on screen.
+    ///
+    /// The key is stable across a relaunch by design, so an answer given then
+    /// would reach the boundary that replaced the one the question was about —
+    /// a question about instance N applied to instance N+1, and written into
+    /// whatever profile the question named rather than the one now in force.
+    /// Clearing the history is not enough, because a question already on screen
+    /// is in neither the history nor the queue.
+    #[test]
+    fn relaunching_a_session_withdraws_the_question_on_screen() {
+        let profile = allowlist_profile("dev", true);
+        let (mut app, key, _g, tmp) = boxed_app(&profile);
+        let policy = profile
+            .resolve(SandboxBackendKind::Seatbelt, "/home/u")
+            .expect("a valid profile");
+        crate::sandbox::egress::establish(
+            &key,
+            &policy,
+            crate::sandbox::ProxyTransport::Loopback,
+            tmp.path(),
+        )
+        .expect("the proxy binds");
+
+        app.report_sandbox_denials(vec![denial(
+            &key,
+            "evil.example",
+            443,
+            DenyReason::NotAllowlisted,
+        )]);
+        app.open_next_domain_prompt();
+        assert_eq!(open_prompt(&app).host, "evil.example");
+
+        // The relaunch: a fresh instance under the same key, from a re-read
+        // profile the user may have narrowed in the meantime.
+        app.forget_egress_prompts(&key);
+        assert!(!app.modal.is_open(), "the question outlived its boundary");
+
+        // A keypress now lands on nothing, and neither boundary is widened.
+        app.handle_sandbox_domain_prompt_key(KeyCode::Char('y'));
+        assert_eq!(
+            crate::sandbox::egress::running_allow_rules(&key),
+            Some(vec![])
+        );
+        assert!(stored_allow(&app, "dev").is_empty());
+
+        // The new boundary asks for itself when the agent asks again.
+        app.report_sandbox_denials(vec![denial(
+            &key,
+            "evil.example",
+            443,
+            DenyReason::NotAllowlisted,
+        )]);
+        app.open_next_domain_prompt();
+        assert_eq!(open_prompt(&app).host, "evil.example");
+
+        crate::sandbox::egress::stop(&key);
     }
 
     /// The rule is stored canonically, so the profile holds one spelling of an
@@ -1172,15 +1346,21 @@ mod tests {
             allow_rule_for("github.com.", 80).as_deref(),
             Some("github.com:80")
         );
+        // A client that spells its destination `.github.com` is asking for the
+        // apex; the grant must not be its subtree.
+        assert_eq!(
+            allow_rule_for(".github.com", 443).as_deref(),
+            Some("github.com:443")
+        );
         // Every legacy spelling of one address reduces to the address, so the
         // rule the profile keeps is the one every request canonicalises to.
         assert_eq!(
-            allow_rule_for("127.1", 8080).as_deref(),
-            Some("127.0.0.1:8080")
+            allow_rule_for("192.0.2.10", 8080).as_deref(),
+            Some("192.0.2.10:8080")
         );
         assert_eq!(
-            allow_rule_for("2130706433", 8080).as_deref(),
-            Some("127.0.0.1:8080")
+            allow_rule_for("3221225994", 8080).as_deref(),
+            Some("192.0.2.10:8080")
         );
         // A SOCKS client names IPv6 bare, a CONNECT line brackets it; both end
         // up as the single spelling `DomainRule` parses back.
@@ -1194,12 +1374,40 @@ mod tests {
         );
         // Whatever a rule renders as has to parse back, or the profile stores
         // an entry its own validator would refuse.
-        for rendered in ["api.github.com:443", "127.0.0.1:8080", "[2001:db8::1]:443"] {
+        for rendered in ["api.github.com:443", "192.0.2.10:8080", "[2001:db8::1]:443"] {
             assert_eq!(DomainRule::parse(rendered).unwrap().to_string(), rendered);
         }
         // Nothing storable: a U-label, and a refusal with no destination.
         assert_eq!(allow_rule_for("b\u{fc}cher.example", 443), None);
         assert_eq!(allow_rule_for("", 0), None);
+    }
+
+    /// The prompt cannot mint a grant on the machine friring runs on. The proxy
+    /// refuses these with a reason that never reaches this path, so this is the
+    /// second lock rather than the first — and the one that matters, because the
+    /// modal would ask about `127.0.0.1:2375` in words the user would read as
+    /// the agent's own dev server while granting the host's container daemon.
+    #[test]
+    fn a_destination_on_the_host_itself_is_never_offered() {
+        for host in [
+            "127.0.0.1",
+            "127.1",
+            "2130706433",
+            "::1",
+            "[::1]",
+            "::ffff:127.0.0.1",
+            "0.0.0.0",
+            "169.254.169.254",
+            "fe80::1",
+        ] {
+            assert_eq!(allow_rule_for(host, 2375), None, "{host} was offered");
+        }
+        // A name is not one of these, whatever it resolves to: the resolver
+        // settles that at connect time, where the proxy checks it.
+        assert_eq!(
+            allow_rule_for("localhost", 2375).as_deref(),
+            Some("localhost:2375")
+        );
     }
 
     /// One destination is one question, however the sandbox spelled it: the
