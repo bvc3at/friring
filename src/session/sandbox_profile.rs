@@ -451,25 +451,38 @@ impl FromStr for ReadScope {
 
 /// One `host[:port]` entry of an allow or deny list.
 ///
-/// **Matching is by domain suffix, on label boundaries.** A rule for
-/// `github.com` matches `github.com` and `api.github.com`, and does *not* match
-/// `evilgithub.com` or `github.com.example.net` — the candidate must either
-/// equal the rule or end with `.` + the rule. Getting that boundary wrong is
-/// the classic allowlist bypass, so it is tested in both directions.
+/// **A bare host is exactly that host; `*.host` is that host and its
+/// subdomains.** `github.com` matches `github.com` and nothing else;
+/// `*.github.com` — or `.github.com`, one spelling of the other — matches
+/// `github.com`, `api.github.com` and `a.b.github.com`.
+///
+/// Bare-is-exact is the reading the rest of the feature promises: the first-use
+/// prompt grants "that host on that port only", and a grammar under which a
+/// bare name quietly carried the subtree would make every such grant wider than
+/// the question asked. A subtree is therefore something a user spells.
+///
+/// **The wildcard covers the apex.** The deny direction settles it: someone who
+/// denies `*.github.com` means "no github.com traffic", and sparing the apex
+/// would be a silent hole. Reading one spelling two ways depending on which
+/// list it sits in would be worse still.
+///
+/// The subtree match is on **label boundaries**: the candidate must equal the
+/// rule or end with `.` + the rule, so `*.github.com` never covers
+/// `evilgithub.com`, `github.com.evil.net` or `github.co`. Getting that
+/// boundary wrong is the classic allowlist bypass, so it is tested in both
+/// directions.
 ///
 /// Rule and candidate are both reduced to one canonical spelling first (see
 /// `canonical_host`): case folded, the root dot and IPv6 brackets dropped,
-/// and every address spelling read as the address it denotes. A rule written
-/// `*.github.com` or `.github.com` means the same as the bare form — **the
-/// wildcard is a spelling, not a narrowing, and it covers the apex**. The deny
-/// direction settles that: someone who denies `*.github.com` means "no
-/// github.com traffic", and excluding the apex would be a silent hole.
+/// and every address spelling read as the address it denotes.
 ///
-/// An address rule (`127.0.0.1`, `[::1]`) is exact instead, compared as a
-/// parsed address — so `::1` and `::0001` are one host, `127.1`,
-/// `2130706433` and `::ffff:127.0.0.1` are all `127.0.0.1` (they reach one
-/// endpoint, so a deny they walked past would be no deny), and
-/// `evil.127.0.0.1` is still not "under" `127.0.0.1`.
+/// An address rule (`127.0.0.1`, `[::1]`) is exact whatever prefix it was
+/// written with, compared as a parsed address — so `::1` and `::0001` are one
+/// host, `127.1`, `2130706433` and `::ffff:127.0.0.1` are all `127.0.0.1` (they
+/// reach one endpoint, so a deny they walked past would be no deny), and
+/// `evil.127.0.0.1` is still not "under" `127.0.0.1`. An address has no
+/// subtree to grant, so `*.127.0.0.1` is the address rule rather than an error:
+/// it is what the writer can only have meant, and the wider reading of the two.
 ///
 /// A rule without a port matches every port; a rule with one matches only that
 /// port, so `github.com:443` permits HTTPS and nothing else.
@@ -486,8 +499,16 @@ impl FromStr for ReadScope {
 /// runs both over one table of stored spellings and fails when either drifts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainRule {
-    /// Canonical host: lower-cased, no wildcard prefix, no trailing dot, and an
-    /// address in the one spelling every spelling of it reduces to.
+    /// The canonical **pattern**: a lower-cased host for an exact rule, `*.`
+    /// and that host for a subtree, or an address in the one spelling every
+    /// spelling of it reduces to. Never a trailing dot, never `.host` (which
+    /// canonicalises to `*.host`).
+    ///
+    /// The prefix lives in the pattern rather than in a flag beside it so a
+    /// rule has one source of truth — the same text the profile stores and the
+    /// same text the proxy is handed. A separate flag could contradict the
+    /// host, and [`matches_host`](Self::matches_host) would have to pick a
+    /// winner.
     pub host: String,
     /// Port this rule is scoped to, or `None` for any port.
     pub port: Option<u16>,
@@ -518,12 +539,39 @@ impl DomainRule {
         }
 
         let (host, port) = split_host_port(entry)?;
-        // Only `*.` is stripped here; a leading `.` is presentation that
-        // `canonical_host` already folds away, and stripping it twice would
-        // make `..github.com` a rule.
-        let bare = host.strip_prefix("*.").unwrap_or(host);
-        let host = match canonical_host(bare)
-            .map_err(|fault| format!("Domain '{entry}' {}", fault.detail()))?
+        let fault = |fault: HostFault| format!("Domain '{entry}' {}", fault.detail());
+        let (bare, subtree) = split_subtree(host).map_err(fault)?;
+        let host = match canonical_host(bare).map_err(fault)? {
+            // An address has no subtree, so the prefix is dropped rather than
+            // stored — one rule per address, however it was written.
+            CanonicalHost::Address(address) => address.to_string(),
+            CanonicalHost::Domain(domain) if subtree => format!("{SUBTREE_PREFIX}{domain}"),
+            CanonicalHost::Domain(domain) => domain,
+        };
+        Ok(Self { host, port })
+    }
+
+    /// The exact-host rule for one **request** host, scoped to `port`.
+    ///
+    /// This is what a first-use prompt grants and what a refused destination is
+    /// remembered under. A request host is never a pattern: `*.` and a leading
+    /// `.` are *rule* grammar, and a client that spells its destination
+    /// `.github.com` is asking for `github.com` — which is what the resolver
+    /// makes of it, and what the proxy dials. Reading it as a rule instead
+    /// would answer a prompt that offered one host by storing its whole
+    /// subtree.
+    ///
+    /// Unlike [`parse`](Self::parse) this takes the host alone, so an
+    /// unbracketed IPv6 literal (how a SOCKS5 client names one) needs no
+    /// brackets added first.
+    ///
+    /// # Errors
+    ///
+    /// The host cannot be canonicalised — a U-label, or a shape no request host
+    /// can carry.
+    pub fn exact(host: &str, port: Option<u16>) -> Result<Self, String> {
+        let host = match canonical_host(host)
+            .map_err(|fault| format!("Host '{host}' {}", fault.detail()))?
         {
             CanonicalHost::Address(address) => address.to_string(),
             CanonicalHost::Domain(domain) => domain,
@@ -543,28 +591,33 @@ impl DomainRule {
     /// [`matches`](Self::matches), for UI questions like "is this domain
     /// covered at all?".
     ///
-    /// Both sides are canonicalised here rather than only at
-    /// [`parse`](Self::parse), because [`host`](Self::host) is a public field a
-    /// caller (or a deserialised profile) can fill with any spelling, and a
-    /// rule whose semantics depended on how it was built would be a rule that
-    /// means one thing in the editor and another at launch. A rule that does
-    /// not canonicalise covers nothing — [`SandboxProfile::validate`] is what
-    /// keeps one from being stored.
+    /// The pattern is re-read here rather than only at [`parse`](Self::parse),
+    /// because [`host`](Self::host) is a public field a caller (or a
+    /// deserialised profile) can fill with any spelling, and a rule whose
+    /// semantics depended on how it was built would be a rule that means one
+    /// thing in the editor and another at launch. A rule that does not
+    /// canonicalise covers nothing — [`SandboxProfile::validate`] is what keeps
+    /// one from being stored.
     pub fn matches_host(&self, host: &str) -> bool {
-        let (Ok(rule), Ok(candidate)) = (canonical_host(&self.host), canonical_host(host)) else {
+        let Ok((pattern, subtree)) = split_subtree(self.host.trim()) else {
+            return false;
+        };
+        let (Ok(rule), Ok(candidate)) = (canonical_host(pattern), canonical_host(host)) else {
             return false;
         };
         match (rule, candidate) {
             // An address rule is exact, and exact on the *parsed* address:
             // suffix logic over digits would put `evil.127.0.0.1` under
             // `127.0.0.1`, and a textual comparison would let `::0001` slip
-            // past a deny rule on `::1`.
+            // past a deny rule on `::1`. A subtree prefix changes nothing —
+            // there is nothing under an address.
             (CanonicalHost::Address(rule), CanonicalHost::Address(candidate)) => rule == candidate,
             (CanonicalHost::Domain(rule), CanonicalHost::Domain(candidate)) => {
                 candidate == rule
-                    || candidate
-                        .strip_suffix(&rule)
-                        .is_some_and(|prefix| prefix.ends_with('.'))
+                    || (subtree
+                        && candidate
+                            .strip_suffix(&rule)
+                            .is_some_and(|prefix| prefix.ends_with('.')))
             }
             // A name rule never covers an address and an address rule never
             // covers a name: `localhost` is a name, matched as one.
@@ -596,6 +649,32 @@ impl FromStr for DomainRule {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::parse(s)
     }
+}
+
+/// The prefix that widens a rule from one host to that host and its
+/// subdomains. `.host` is the same pattern spelled without the star and
+/// canonicalises to this form, so a stored rule has one spelling.
+const SUBTREE_PREFIX: &str = "*.";
+
+/// Split a pattern into the host it names and whether it covers that host's
+/// subtree.
+///
+/// A second leading dot is not a third spelling of the same thing: it is an
+/// empty label, which no name has and no resolver answers for, so `..github.com`
+/// is refused here rather than folded away by [`canonical_host`] — whose
+/// leading-dot rule exists for *request* hosts, where the resolvers that accept
+/// the spelling resolve the apex.
+fn split_subtree(host: &str) -> Result<(&str, bool), HostFault> {
+    let Some(rest) = host
+        .strip_prefix(SUBTREE_PREFIX)
+        .or_else(|| host.strip_prefix('.'))
+    else {
+        return Ok((host, false));
+    };
+    if rest.starts_with('.') {
+        return Err(HostFault::EmptyLabel);
+    }
+    Ok((rest, true))
 }
 
 /// Split `host[:port]`, handling the bracketed IPv6 form. An unbracketed entry
@@ -699,10 +778,10 @@ fn canonical_host(raw: &str) -> Result<CanonicalHost, HostFault> {
     // name. Exactly one dot goes — a second would leave an empty label, which
     // no name has and no resolver answers for.
     let host = host.strip_suffix('.').unwrap_or(host);
-    // An empty *leading* label is the deny-safe reading of `.github.com`: the
-    // resolvers that accept that spelling resolve the apex, so a rule on the
-    // apex has to reach it. It grants nothing extra, because no such name is
-    // registrable.
+    // An empty *leading* label is presentation on a request host: the resolvers
+    // that accept `.github.com` resolve the apex, so that is what it is compared
+    // (and dialled) as. On a *rule* the same spelling means the subtree and is
+    // taken off by `split_subtree` before this, so the two readings never meet.
     let host = host.strip_prefix('.').unwrap_or(host);
     if host.is_empty() {
         return Err(HostFault::Empty);
@@ -1374,10 +1453,16 @@ mod tests {
         assert_eq!(scoped.port, Some(443));
         assert_eq!(scoped.to_string(), "github.com:443");
 
-        // Wildcard and dot prefixes, and the FQDN root dot, are spellings of
-        // the same rule.
-        for spelling in ["*.github.com", ".github.com", "github.com."] {
-            assert_eq!(DomainRule::parse(spelling).unwrap().host, "github.com");
+        // The FQDN root dot is presentation; the two wildcard spellings are one
+        // pattern, and a *different* one from the bare host.
+        assert_eq!(DomainRule::parse("github.com.").unwrap().host, "github.com");
+        for spelling in ["*.github.com", ".github.com"] {
+            let rule = DomainRule::parse(spelling).unwrap();
+            assert_eq!(rule.host, "*.github.com", "'{spelling}'");
+            // What it renders as is what it parses back to, so a subtree rule
+            // survives the trip through the profile and on to the proxy.
+            assert_eq!(rule.to_string(), "*.github.com");
+            assert_eq!(DomainRule::parse(&rule.to_string()).unwrap(), rule);
         }
 
         assert_eq!(DomainRule::parse("[::1]").unwrap().host, "::1");
@@ -1389,21 +1474,59 @@ mod tests {
         assert_eq!(DomainRule::parse(&v6.to_string()).unwrap(), v6);
     }
 
-    /// `*.x` and `.x` are the bare rule, apex included, because the deny
-    /// direction has to reach the apex. The egress proxy's matcher reads them
-    /// the same way — see `tests/egress_matcher_conformance.rs`.
+    /// A bare host is that host and nothing else. The subtree is a wildcard the
+    /// user spells, because the first-use prompt grants a bare rule and
+    /// promises "that host only" — a bare name that carried the subtree would
+    /// make every one of those grants wider than the question. The egress
+    /// proxy's matcher reads it the same way; see
+    /// `tests/egress_matcher_conformance.rs`.
     #[test]
-    fn a_wildcard_prefix_is_a_spelling_not_a_narrowing() {
+    fn a_bare_host_is_exact_and_the_wildcard_is_the_subtree() {
         let bare = DomainRule::parse("github.com").unwrap();
+        assert!(bare.matches("github.com", 443));
+        assert!(!bare.matches("api.github.com", 443));
+        assert!(!bare.matches("deep.api.github.com", 443));
+
+        // `*.x` and `.x` are one pattern, and it covers the apex: a deny on
+        // `*.github.com` that spared `github.com` would be a silent hole.
         for spelling in ["*.github.com", ".github.com"] {
             let rule = DomainRule::parse(spelling).unwrap();
-            assert_eq!(rule, bare, "'{spelling}' is 'github.com'");
+            assert_ne!(rule, bare, "'{spelling}' is wider than the bare host");
             assert!(
                 rule.matches("github.com", 443),
-                "{spelling} covers the apex"
+                "'{spelling}' covers the apex"
             );
-            assert!(rule.matches("api.github.com", 443));
-            assert!(!rule.matches("evilgithub.com", 443));
+            assert!(rule.matches("api.github.com", 443), "'{spelling}'");
+            assert!(rule.matches("deep.api.github.com", 443), "'{spelling}'");
+            // The label boundary holds for the wildcard too.
+            assert!(!rule.matches("evilgithub.com", 443), "'{spelling}'");
+            assert!(!rule.matches("github.com.evil.net", 443), "'{spelling}'");
+            assert!(!rule.matches("github.co", 443), "'{spelling}'");
+        }
+    }
+
+    /// The rule a first-use prompt stores: whatever spelling the *sandbox* chose
+    /// for its destination, the grant is one host on one port. A client that
+    /// wrote `.github.com` — which resolves to the apex — must not be answered
+    /// with the wildcard rule that same text would mean in a profile.
+    #[test]
+    fn an_exact_rule_is_never_widened_by_the_clients_spelling() {
+        for spelling in ["github.com", "GitHub.COM", "github.com.", ".github.com"] {
+            let rule = DomainRule::exact(spelling, Some(443)).unwrap();
+            assert_eq!(rule.to_string(), "github.com:443", "'{spelling}'");
+            assert!(!rule.matches("api.github.com", 443), "'{spelling}'");
+        }
+        // A SOCKS5 client names an IPv6 destination unbracketed and a CONNECT
+        // line brackets it; both are the address, in the one spelling a profile
+        // stores.
+        for spelling in ["2001:db8::1", "[2001:db8::1]", "[2001:DB8:0:0:0:0:0:1]"] {
+            let rule = DomainRule::exact(spelling, Some(443)).unwrap();
+            assert_eq!(rule.to_string(), "[2001:db8::1]:443", "'{spelling}'");
+        }
+        assert_eq!(DomainRule::exact("127.1", None).unwrap().host, "127.0.0.1");
+        // A host with no canonical spelling has no rule either.
+        for bad in ["b\u{fc}cher.example", "", "*.github.com", "github..com"] {
+            assert!(DomainRule::exact(bad, Some(443)).is_err(), "'{bad}'");
         }
     }
 
@@ -1488,6 +1611,19 @@ mod tests {
         };
         assert!(hand_built.matches("127.0.0.1", 80));
         assert!(!hand_built.matches("127.1.evil.net", 80));
+        // Both wildcard spellings are read as the subtree even unparsed. A
+        // deny rule reaching here as `.github.com` — from an older profile, or
+        // a caller that filled the field itself — must not be narrowed to the
+        // apex, which is the direction that opens a hole.
+        for spelling in ["*.github.com", ".github.com"] {
+            let subtree = DomainRule {
+                host: spelling.to_string(),
+                port: None,
+            };
+            assert!(subtree.matches("api.github.com", 443), "'{spelling}'");
+            assert!(subtree.matches("github.com", 443), "'{spelling}'");
+            assert!(!subtree.matches("evilgithub.com", 443), "'{spelling}'");
+        }
         // A host no spelling can canonicalise covers nothing; `validate` is
         // what keeps such a rule from being stored in the first place.
         let unstorable = DomainRule {
@@ -1495,6 +1631,13 @@ mod tests {
             port: None,
         };
         assert!(!unstorable.matches("b\u{fc}cher.example", 443));
+        // An empty label is not a second wildcard spelling, unparsed either.
+        let empty_label = DomainRule {
+            host: "..github.com".to_string(),
+            port: None,
+        };
+        assert!(!empty_label.matches("github.com", 443));
+        assert!(!empty_label.matches("api.github.com", 443));
     }
 
     /// A host that does not canonicalise is refused before any rule is
@@ -1504,7 +1647,7 @@ mod tests {
     fn egress_refuses_a_host_that_does_not_canonicalise() {
         let mut p = profile();
         p.network_mode = NetworkMode::Full;
-        p.network_deny = vec!["xn--bcher-kva.example".into()];
+        p.network_deny = vec!["*.xn--bcher-kva.example".into()];
         let policy = p.resolve(SandboxBackendKind::Seatbelt, "/home/u").unwrap();
 
         for host in [
@@ -1553,9 +1696,14 @@ mod tests {
             // correctly needs UTS-46 tables this crate does not carry, so the
             // alternative is guessing.
             "b\u{fc}cher.example",
-            // Exactly one root dot is presentation; a second is an empty label.
+            // Exactly one root dot is presentation, and exactly one leading dot
+            // is the subtree prefix; a second of either is an empty label.
             "github.com..",
             "..github.com",
+            "*..github.com",
+            // A prefix with nothing to widen, and a pattern that is all prefix.
+            "*.",
+            "*.*.github.com",
             // Brackets are address syntax, not decoration.
             "[github.com]",
             // A zone identifier scopes an address to one interface, which is
@@ -1572,8 +1720,8 @@ mod tests {
 
     #[test]
     fn domain_matching_respects_label_boundaries() {
-        let rule = DomainRule::parse("github.com").unwrap();
-        // A suffix rule covers the host itself and its subdomains…
+        let rule = DomainRule::parse("*.github.com").unwrap();
+        // A subtree rule covers the host itself and its subdomains…
         assert!(rule.matches("github.com", 443));
         assert!(rule.matches("api.github.com", 443));
         assert!(rule.matches("deep.api.github.com", 443));
@@ -1594,19 +1742,22 @@ mod tests {
         assert!(any.matches("github.com", 443));
         assert!(any.matches("github.com", 80));
 
-        let https = DomainRule::parse("github.com:443").unwrap();
+        let https = DomainRule::parse("*.github.com:443").unwrap();
         assert!(https.matches("github.com", 443));
         assert!(!https.matches("github.com", 80));
-        // The port-blind question ignores the scope.
+        // The port-blind question ignores the scope, not the pattern.
         assert!(https.matches_host("api.github.com"));
         assert!(!https.matches_host("evilgithub.com"));
+        assert!(!DomainRule::parse("github.com:443")
+            .unwrap()
+            .matches_host("api.github.com"));
     }
 
     #[test]
     fn egress_denies_beat_allows_in_every_mode() {
         let mut p = profile();
         p.network_mode = NetworkMode::Allowlist;
-        p.network_allow = vec!["github.com".into(), "api.anthropic.com".into()];
+        p.network_allow = vec!["*.github.com".into(), "api.anthropic.com".into()];
         p.network_deny = vec!["gist.github.com".into()];
         let policy = p.resolve(SandboxBackendKind::Seatbelt, "/home/u").unwrap();
 
@@ -1789,6 +1940,38 @@ mod tests {
         p.network_allow.clear();
         p.network_deny = vec!["github.com:port".into()];
         assert!(p.validate().unwrap_err().contains("invalid port"));
+    }
+
+    /// Both scopes are storable, in either list, and both survive the trip
+    /// through [`SandboxProfile::resolve`] — the entries are text until a
+    /// launch parses them, so a profile that validated with a wildcard and
+    /// resolved without one would enforce something else.
+    #[test]
+    fn validation_takes_both_scopes_and_resolve_keeps_them_apart() {
+        let mut p = profile();
+        p.network_allow = vec!["github.com".into(), "*.pypi.org".into()];
+        p.network_deny = vec![".gist.github.com".into()];
+        p.validate().unwrap();
+
+        let policy = p.resolve(SandboxBackendKind::Seatbelt, "/home/u").unwrap();
+        let allow: Vec<String> = policy.allow.iter().map(ToString::to_string).collect();
+        assert_eq!(allow, ["github.com", "*.pypi.org"]);
+        // The dotted spelling is stored as written and read as the subtree.
+        let deny: Vec<String> = policy.deny.iter().map(ToString::to_string).collect();
+        assert_eq!(deny, ["*.gist.github.com"]);
+        assert!(policy.decide_egress("files.pypi.org", 443).is_allowed());
+        assert_eq!(
+            policy.decide_egress("api.github.com", 443),
+            EgressDecision::Unlisted
+        );
+        assert_eq!(
+            policy.decide_egress("api.gist.github.com", 443),
+            EgressDecision::Denied
+        );
+
+        // A prefix the grammar has no reading for is a typo, not a third scope.
+        p.network_allow = vec!["*..github.com".into()];
+        assert!(p.validate().unwrap_err().contains("empty label"));
     }
 
     #[test]

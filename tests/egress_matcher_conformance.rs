@@ -14,10 +14,24 @@
 //! spelling as "subdomains only, never the apex" — so a deny list written with
 //! a wildcard would have let the apex straight through.
 //!
+//! The grammar they are now held to distinguishes the two scopes instead of
+//! reconciling them:
+//!
+//! - **A bare host is exactly that host.** `github.com` is `github.com` and not
+//!   `api.github.com`. This is what the first-use prompt grants and what it
+//!   tells the user it grants ("that host on that port only"), so a bare rule
+//!   that carried the subtree would make every one of those grants wider than
+//!   the question asked.
+//! - **`*.host` and `.host` are one spelling of the subtree, apex included.**
+//!   The deny direction decides the apex: refusing `*.github.com` has to refuse
+//!   `github.com`.
+//!
 //! **This file is the alignment mechanism.** It is the only place both types
 //! are visible at once, so a change to either matcher that is not made to both
 //! fails here. Add a spelling by adding a row; change a verdict by changing it
-//! in both matchers.
+//! in both matchers. Every spelling below is measured for *both* scopes, apex,
+//! subdomain and deep subdomain, because the difference between them is the
+//! whole grammar.
 //!
 //! Each side canonicalises a host before comparing it — case, the root dot,
 //! IPv6 brackets, and every spelling `getaddrinfo(3)` reads as an address
@@ -33,21 +47,23 @@ use friring::session::{
 /// A candidate `host:port` and the verdict both matchers must reach on it.
 type Probe = (&'static str, u16, bool);
 
-/// The probes every spelling of `github.com` must answer identically. Kept in
-/// one constant so `x`, `*.x` and `.x` are measured by literally one standard.
-const GITHUB: &[Probe] = &[
-    // Apex, subdomain, deep subdomain.
+/// The probes an **exact** rule for `github.com` must answer identically on
+/// both sides — the shape a first-use prompt stores.
+const GITHUB_EXACT: &[Probe] = &[
+    // The apex, and only the apex: a subdomain is a different host.
     ("github.com", 443, true),
-    ("api.github.com", 443, true),
-    ("a.b.api.github.com", 443, true),
+    ("api.github.com", 443, false),
+    ("a.b.api.github.com", 443, false),
     // Case is folded on both sides, and a root dot is presentation.
     ("GitHub.COM", 443, true),
-    ("API.GitHub.Com", 8080, true),
     ("github.com.", 443, true),
-    ("api.github.com.", 443, true),
-    // An empty leading label: resolvers that accept it resolve the apex, so a
-    // deny rule has to reach it.
+    ("API.GitHub.Com", 8080, false),
+    // An empty leading label on a *request*: the resolvers that accept it
+    // resolve the apex, so a rule on the apex has to reach it. (The same text
+    // in a *rule* is the subtree — that asymmetry is deliberate, and pinned by
+    // the `.github.com` case below.)
     (".github.com", 443, true),
+    (".api.github.com", 443, false),
     // The three classic allowlist bypasses: sibling prefix, suffix injection,
     // truncation.
     ("evilgithub.com", 443, false),
@@ -64,9 +80,45 @@ const GITHUB: &[Probe] = &[
     ("git hub.com", 443, false),
 ];
 
-/// `GITHUB` narrowed to one port. Every spelling scoped with `:443` must agree
-/// on these.
-const GITHUB_443: &[Probe] = &[
+/// The probes a **subtree** rule for `github.com` must answer identically. Kept
+/// in one constant so `*.x` and `.x` are measured by literally one standard.
+const GITHUB_SUBTREE: &[Probe] = &[
+    // Apex, subdomain, deep subdomain. The apex is in because the deny
+    // direction needs it: refusing `*.github.com` has to refuse `github.com`.
+    ("github.com", 443, true),
+    ("api.github.com", 443, true),
+    ("a.b.api.github.com", 443, true),
+    ("GitHub.COM", 443, true),
+    ("API.GitHub.Com", 8080, true),
+    ("github.com.", 443, true),
+    ("api.github.com.", 443, true),
+    (".github.com", 443, true),
+    (".api.github.com", 443, true),
+    // The boundary holds for the subtree too — that is what makes it a subtree
+    // and not a suffix.
+    ("evilgithub.com", 443, false),
+    ("xgithub.com", 443, false),
+    ("github.com.evil.net", 443, false),
+    ("github.co", 443, false),
+    ("ithub.com", 443, false),
+    ("com", 443, false),
+    ("", 443, false),
+    ("github.com..", 443, false),
+    ("git hub.com", 443, false),
+];
+
+/// `GITHUB_EXACT` narrowed to one port.
+const GITHUB_EXACT_443: &[Probe] = &[
+    ("github.com", 443, true),
+    ("GitHub.COM.", 443, true),
+    ("api.github.com", 443, false),
+    ("github.com", 80, false),
+    ("evilgithub.com", 443, false),
+];
+
+/// `GITHUB_SUBTREE` narrowed to one port. The scope and the port narrow
+/// independently: one does not imply the other.
+const GITHUB_SUBTREE_443: &[Probe] = &[
     ("github.com", 443, true),
     ("api.github.com", 443, true),
     ("GitHub.COM.", 443, true),
@@ -134,51 +186,73 @@ struct Case {
 }
 
 const CASES: &[Case] = &[
-    // `*.x` and `.x` are spellings of `x`, apex included. This is the finding
-    // the file exists for.
+    // Bare is exact, `*.x` and `.x` are the subtree. These six rows are the
+    // grammar; everything else in the table is a detail of one of them.
     Case {
         rule: "github.com",
         display: "github.com",
-        probes: GITHUB,
+        probes: GITHUB_EXACT,
     },
     Case {
         rule: "*.github.com",
-        display: "github.com",
-        probes: GITHUB,
+        display: "*.github.com",
+        probes: GITHUB_SUBTREE,
     },
     Case {
         rule: ".github.com",
-        display: "github.com",
-        probes: GITHUB,
+        display: "*.github.com",
+        probes: GITHUB_SUBTREE,
     },
     // Storage keeps what the user typed, so an upper-case or fully-qualified
-    // spelling reaches both parsers unchanged.
+    // spelling reaches both parsers unchanged — and the scope survives it.
     Case {
         rule: "GitHub.COM.",
         display: "github.com",
-        probes: GITHUB,
+        probes: GITHUB_EXACT,
+    },
+    Case {
+        rule: ".GitHub.COM.",
+        display: "*.github.com",
+        probes: GITHUB_SUBTREE,
     },
     Case {
         rule: "github.com:443",
         display: "github.com:443",
-        probes: GITHUB_443,
+        probes: GITHUB_EXACT_443,
     },
     Case {
         rule: "*.github.com:443",
-        display: "github.com:443",
-        probes: GITHUB_443,
+        display: "*.github.com:443",
+        probes: GITHUB_SUBTREE_443,
     },
-    // A rule that is itself a subdomain covers its own subtree and not its
-    // parent.
+    Case {
+        rule: ".github.com:443",
+        display: "*.github.com:443",
+        probes: GITHUB_SUBTREE_443,
+    },
+    // A rule that is itself a subdomain is still just that host…
     Case {
         rule: "API.GitHub.COM",
         display: "api.github.com",
         probes: &[
             ("api.github.com", 443, true),
-            ("deep.api.github.com", 443, true),
             ("API.GITHUB.COM", 443, true),
+            ("deep.api.github.com", 443, false),
             ("github.com", 443, false),
             ("xapi.github.com", 443, false),
+        ],
+    },
+    // …and its wildcard covers its own subtree, never its parent.
+    Case {
+        rule: "*.API.GitHub.COM",
+        display: "*.api.github.com",
+        probes: &[
+            ("api.github.com", 443, true),
+            ("deep.api.github.com", 443, true),
+            ("a.b.api.github.com", 443, true),
+            ("github.com", 443, false),
+            ("xapi.github.com", 443, false),
+            ("api.github.com.evil.net", 443, false),
         ],
     },
     // Punycode is the only way an international name is spelled on the wire,
@@ -188,8 +262,8 @@ const CASES: &[Case] = &[
         display: "xn--bcher-kva.example",
         probes: &[
             ("xn--bcher-kva.example", 443, true),
-            ("www.xn--bcher-kva.example", 443, true),
             ("XN--BCHER-KVA.EXAMPLE", 443, true),
+            ("www.xn--bcher-kva.example", 443, false),
             ("evilxn--bcher-kva.example", 443, false),
             ("xn--bcher-kva.example.evil.net", 443, false),
             // One encoded character apart is a different name, not a near miss.
@@ -197,6 +271,17 @@ const CASES: &[Case] = &[
             // The U-label the A-label encodes is *not* quietly matched: neither
             // matcher canonicalises Unicode, so it is refused rather than
             // guessed at, and the proxy denies the request outright.
+            ("b\u{fc}cher.example", 443, false),
+        ],
+    },
+    Case {
+        rule: "*.xn--bcher-kva.example",
+        display: "*.xn--bcher-kva.example",
+        probes: &[
+            ("xn--bcher-kva.example", 443, true),
+            ("www.xn--bcher-kva.example", 443, true),
+            ("WWW.XN--BCHER-KVA.EXAMPLE", 443, true),
+            ("evilxn--bcher-kva.example", 443, false),
             ("b\u{fc}cher.example", 443, false),
         ],
     },
@@ -261,6 +346,14 @@ const CASES: &[Case] = &[
     },
     Case {
         rule: "[::ffff:127.0.0.1]",
+        display: "127.0.0.1",
+        probes: LOOPBACK,
+    },
+    // An address has no subtree to widen, so the prefix is dropped rather than
+    // honoured — otherwise `*.127.0.0.1` would be a suffix pattern over digits,
+    // and `evil.127.0.0.1` would sit "under" the address.
+    Case {
+        rule: "*.127.0.0.1",
         display: "127.0.0.1",
         probes: LOOPBACK,
     },
@@ -336,6 +429,67 @@ fn both_matchers_agree_on_every_stored_spelling() {
     }
 }
 
+/// **The grant is what the prompt promised.** A first-use answer stores the
+/// bare, port-scoped rule the modal shows and calls "that host on that port
+/// only" (`ui::sandbox_domain_modal`), so a bare rule that reached past the
+/// host it names — to a subdomain, or to another port — would make every
+/// approval wider than the question. Both enforcement paths are measured,
+/// because either one reading it as a subtree is the whole defect.
+#[test]
+fn an_approved_rule_grants_that_host_on_that_port_only() {
+    let stored = DomainRule::exact("api.github.com", Some(443)).expect("a storable host");
+    assert_eq!(stored.to_string(), "api.github.com:443");
+    let enforced: HostRule = stored.to_string().parse().expect("a loadable rule");
+
+    for (host, port, expected) in [
+        ("api.github.com", 443, true),
+        // The subtree of the approved host — the over-grant this pins shut.
+        ("deep.api.github.com", 443, false),
+        ("a.b.api.github.com", 443, false),
+        // Its parent, and the sibling that merely ends with the same text.
+        ("github.com", 443, false),
+        ("xapi.github.com", 443, false),
+        // Another port on the approved host.
+        ("api.github.com", 80, false),
+        ("api.github.com", 8443, false),
+    ] {
+        assert_eq!(
+            stored.matches(host, port),
+            expected,
+            "profile matcher: stored grant vs {host}:{port}"
+        );
+        assert_eq!(
+            enforced.matches(host, port),
+            expected,
+            "proxy matcher: stored grant vs {host}:{port}"
+        );
+    }
+
+    // Widening is an edit the user makes deliberately, and it is one character.
+    let widened: HostRule = "*.api.github.com:443".parse().expect("a loadable rule");
+    assert!(widened.matches("deep.api.github.com", 443));
+    assert!(DomainRule::parse("*.api.github.com:443")
+        .expect("a storable rule")
+        .matches("deep.api.github.com", 443));
+}
+
+/// The sandbox picks the spelling it is refused under, so it must not be able
+/// to pick how wide the answer is. `.github.com` is *rule* grammar for the
+/// subtree and a *request* for the apex; a prompt raised by the request must
+/// grant the apex.
+#[test]
+fn a_clients_wildcard_spelling_cannot_widen_its_own_grant() {
+    for spelling in [".github.com", "github.com.", "GitHub.COM"] {
+        let stored = DomainRule::exact(spelling, Some(443)).expect("a storable host");
+        assert_eq!(stored.to_string(), "github.com:443", "'{spelling}'");
+        let enforced: HostRule = stored.to_string().parse().expect("a loadable rule");
+        assert!(!stored.matches("api.github.com", 443), "'{spelling}'");
+        assert!(!enforced.matches("api.github.com", 443), "'{spelling}'");
+        // …and the host that *was* refused is now reachable, on that port.
+        assert!(enforced.matches(spelling, 443), "'{spelling}'");
+    }
+}
+
 /// What both sides render is what both sides parse. A rule that printed one way
 /// and read back another would drift the moment a denial quoted it into a
 /// profile.
@@ -396,10 +550,15 @@ const NOT_STORABLE: &[(&str, bool)] = &[
     ("[::1", true),
     ("[::1]443", true),
     ("[::::]", true),
-    // Exactly one root dot is presentation; a second is an empty label, which
-    // no name has and no resolver answers for.
+    // Exactly one root dot is presentation, and exactly one leading dot is the
+    // subtree prefix; a second of either is an empty label, which no name has
+    // and no resolver answers for.
     ("github.com..", true),
     ("..github.com", true),
+    ("*..github.com", true),
+    // A prefix with nothing to widen, and a pattern that is all prefix.
+    ("*.", true),
+    ("*.*.github.com", true),
     // Brackets are address syntax. Reading them as decoration would give one
     // rule a second spelling.
     ("[github.com]", true),
@@ -495,7 +654,7 @@ fn a_denied_address_cannot_be_reached_by_spelling_it_differently() {
     }
     // The other direction: the deny must not have grown into a suffix rule over
     // the digits, or a name a CDN could register would be unreachable.
-    for allowed in ["127.0.0.1.evil.net", "evil.127.0.0.1", "127.0.0.2"] {
+    for allowed in ["127.0.0.1.evil.net", "evil.127.0.0.1"] {
         assert!(
             proxy.decide(allowed, 80).is_allowed(),
             "proxy read `{allowed}` as the denied address"
@@ -505,6 +664,20 @@ fn a_denied_address_cannot_be_reached_by_spelling_it_differently() {
             "profile read `{allowed}` as the denied address"
         );
     }
+    // A neighbouring address is a different rule to both matchers. Asserted on
+    // the *reason* for the proxy, because it refuses this one anyway for
+    // something the matchers know nothing about: every `127.x` is local to the
+    // machine the proxy dials from, and that is a property of who opens the
+    // socket rather than of the rule grammar this file holds the two sides to.
+    assert_ne!(
+        proxy.decide("127.0.0.2", 80),
+        Decision::Deny(DenyReason::DeniedByRule("127.0.0.1".into())),
+        "proxy read `127.0.0.2` as the denied address"
+    );
+    assert!(
+        sandbox.decide_egress("127.0.0.2", 80).is_allowed(),
+        "profile read `127.0.0.2` as the denied address"
+    );
 }
 
 /// A host neither side can canonicalise is refused **before** any rule is
@@ -517,7 +690,7 @@ fn a_denied_address_cannot_be_reached_by_spelling_it_differently() {
 /// offer to store a rule the profile validator then refuses.
 #[test]
 fn a_host_that_does_not_canonicalise_is_refused_in_every_mode() {
-    let (proxy, sandbox) = full_access_denying("xn--bcher-kva.example");
+    let (proxy, sandbox) = full_access_denying("*.xn--bcher-kva.example");
     let over_long_label = format!("{}.xn--bcher-kva.example", "a".repeat(64));
     for spelling in [
         "b\u{fc}cher.example",
@@ -541,10 +714,11 @@ fn a_host_that_does_not_canonicalise_is_refused_in_every_mode() {
         assert!(!sandbox.should_prompt(sandbox.decide_egress(spelling, 443)));
     }
     // The punycode form of the same name is ordinary ASCII, and the deny rule
-    // catches it exactly as written.
+    // catches it exactly as written — quoted back with its prefix, because that
+    // is what the rule says.
     assert_eq!(
         proxy.decide("www.xn--bcher-kva.example", 443),
-        Decision::Deny(DenyReason::DeniedByRule("xn--bcher-kva.example".into()))
+        Decision::Deny(DenyReason::DeniedByRule("*.xn--bcher-kva.example".into()))
     );
     assert_eq!(
         sandbox.decide_egress("www.xn--bcher-kva.example", 443),

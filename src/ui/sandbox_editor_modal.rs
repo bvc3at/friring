@@ -262,6 +262,7 @@ fn editor_body_lines<'a>(
         match field {
             SandboxField::Paths => lines.extend(paths_block(state, active, width)),
             SandboxField::Domains => lines.extend(domains_block(state, active, width)),
+            SandboxField::DomainText => lines.extend(domain_text_block(state, active, width)),
             other => lines.push(field_line(*other, state, active)),
         }
         field_spans.push((start, lines.len() - start));
@@ -543,6 +544,33 @@ fn domains_block<'a>(state: &SandboxEditorState<'a>, active: bool, width: u16) -
     lines
 }
 
+/// What a hand-written entry means, in the two scopes it can have.
+///
+/// The difference is invisible in the user's own text and it goes wrong in both
+/// directions: an allow entry read as the subtree grants more than the author
+/// meant, and a deny entry read as one host stops less. The rule the first-use
+/// prompt writes is the bare form, and the modal that offers it says "that host
+/// on that port only" — so the editor has to agree, where the rules are typed.
+const DOMAIN_SCOPE_HINT: &str = "bare = that host · *.host = subdomains too";
+
+/// The `domain` text row, with the scope hint under it.
+///
+/// Under it, and whenever the row is shown: the placeholder cannot carry this
+/// (it yields to the caret exactly when a rule is being typed), and a line that
+/// came and went with focus would resize a modal that is centred on its own
+/// measured height — so tabbing past the field would shift the whole dialog.
+fn domain_text_block<'a>(
+    state: &SandboxEditorState<'a>,
+    active: bool,
+    width: u16,
+) -> Vec<Line<'a>> {
+    let hint = super::truncate_ellipsis(&format!("  {DOMAIN_SCOPE_HINT}"), width as usize);
+    vec![
+        field_line(SandboxField::DomainText, state, active),
+        Line::from(Span::styled(hint, Style::default().fg(Theme::text_muted()))),
+    ]
+}
+
 /// The anchor row's value: the position in the list, plus the chords that edit
 /// it while the anchor is focused (where letters are safe — nothing types into
 /// a selector).
@@ -752,6 +780,37 @@ mod tests {
         assert!(!text(&domains_block(&s, false, 60)[0]).contains("inactive"));
         s.network = NetworkMode::Full;
         assert!(text(&domains_block(&s, false, 60)[0]).contains("inactive — network is full"));
+    }
+
+    /// A hand-written rule has a scope its own text does not show, and the
+    /// wrong assumption is an over-grant in an allow list or a hole in a deny
+    /// list. The row that types one says which is which — and says it whether
+    /// or not the row is focused, so tabbing past does not resize the modal.
+    #[test]
+    fn the_domain_row_states_the_scope_of_what_is_typed() {
+        let mut s = state();
+        s.domains = vec!["github.com"];
+        s.visible_fields = modal_with_one_entry_each().visible_fields();
+        s.field = F::DomainText;
+
+        for active in [true, false] {
+            let rows = domain_text_block(&s, active, 60);
+            assert_eq!(rows.len(), 2, "the value row plus its hint");
+            let hint = text(&rows[1]);
+            assert!(hint.contains("bare = that host"), "{hint}");
+            assert!(hint.contains("*.host = subdomains too"), "{hint}");
+        }
+
+        // The editor is 60% of the frame, so an 80-column terminal leaves 46
+        // columns inside the border — and the body is clipped there, not
+        // wrapped, so the whole sentence has to fit.
+        let narrow = text(&domain_text_block(&s, true, 46)[1]);
+        assert!(narrow.width() <= 46, "{narrow}");
+        assert!(!narrow.contains('…'), "{narrow}");
+
+        // The hint reaches the rendered body, not just this builder.
+        let body = body_text(&s).join("\n");
+        assert!(body.contains(DOMAIN_SCOPE_HINT), "{body}");
     }
 
     #[test]
