@@ -23,6 +23,7 @@ pub mod prefix_overlay;
 pub mod project_list;
 pub mod repo_picker_modal;
 pub mod restore_sessions_modal;
+pub mod sandbox_domain_modal;
 pub mod sandbox_editor_modal;
 pub mod sandbox_list_modal;
 pub mod sandbox_picker_modal;

@@ -3103,6 +3103,10 @@ pub enum Modal {
     /// Boxed for the same reason as [`Modal::AutomationEditor`]: an editor form
     /// is a large payload and `Modal` is moved around per frame.
     SandboxEditor(Box<SandboxEditorModal>),
+    /// The egress firewall's first-use question: a sandboxed agent reached for
+    /// a host its profile does not allow. Raised from the tick rather than by a
+    /// keypress — see [`super::egress_prompts`].
+    SandboxDomainPrompt(super::egress_prompts::DomainPrompt),
     RepoPicker(RepoPickerModal),
     ConversationPicker(super::cc_import::ConversationPickerModal),
     SessionName(SessionNameModal),

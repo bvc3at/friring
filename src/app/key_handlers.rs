@@ -655,6 +655,7 @@ impl App {
             Modal::AutomationsList(_) => self.handle_automations_list_key(code),
             Modal::SandboxList(_) => self.handle_sandbox_list_key(code),
             Modal::SandboxEditor(_) => self.handle_sandbox_editor_key(code, mods),
+            Modal::SandboxDomainPrompt(_) => self.handle_sandbox_domain_prompt_key(code),
             // Read-only, so only the usual dismissal keys close it. Closing on
             // *any* key would contradict the overlay's own `Esc` hint and would
             // fight a future scrolling pass, where j/k have to reach the plan.

@@ -8,6 +8,7 @@ mod clipboard;
 pub(crate) mod clock;
 pub(crate) mod code_review;
 mod config_reload;
+pub(crate) mod egress_prompts;
 mod helpers;
 mod key_handlers;
 mod memory;
@@ -1090,6 +1091,11 @@ pub struct App {
     /// starts. The wrapper tracks per-session prior status + last-fired-at so
     /// dedup and "only on transition" logic live next to the sender.
     notification_state: Option<NotificationState>,
+    /// Which egress refusals the user has already been told about, and the
+    /// first-use questions waiting for the modal slot
+    /// ([`egress_prompts`]). Empty unless a sandboxed session
+    /// under a filtered network mode is running.
+    egress_prompts: egress_prompts::EgressPromptState,
     /// Redraw-throttling dirty flag. The render loop paints only when this is
     /// set (or `FORCE_REDRAW_INTERVAL` elapsed). Starts `true` so the first
     /// frame always paints. Set by [`Self::request_redraw`] from `update`,
@@ -1479,6 +1485,7 @@ impl App {
                 settings_mtime: config_reload::settings_mtime(),
             },
             notification_state: build_notification_state(),
+            egress_prompts: egress_prompts::EgressPromptState::default(),
             needs_redraw: true,
             spinner_frame: 0,
             last_active_session_id: None,
@@ -2308,6 +2315,10 @@ impl App {
                 // load it was the ghost's `—`. Back to unknown until the next
                 // scan prices the new pane.
                 session.info.memory = None;
+                // A relaunch mints a fresh proxy from a re-read profile, so the
+                // answers given about the previous boundary — a refusal above
+                // all — are not the user's standing position on this one.
+                self.egress_prompts.forget(&session_id.to_string());
                 // Re-spawned fresh: clear stale hook-driven status so it doesn't
                 // linger as Blocked/Working/Done until the agent re-reports (a
                 // resumed agent may not re-fire its boot hook). Mirrors the
@@ -3050,6 +3061,10 @@ impl App {
                 resolve_repo_display_names(&mut session.info);
                 let unenforced_sandbox =
                     crate::app::sandbox::unenforced_sandbox_message(&session.info);
+                // The restore reuses the deleted session's id, which is also the
+                // proxy's key: start its egress history clean rather than
+                // inheriting what the previous incarnation was asked.
+                self.egress_prompts.forget(&deleted.id.to_string());
                 self.sessions.push(session);
                 self.set_active_index(self.sessions.len() - 1);
                 self.focus = InputFocus::Terminal;
@@ -6019,6 +6034,10 @@ impl App {
         // Send deferred inputs whose delay has elapsed
         self.drain_deferred_inputs();
 
+        // Surface what the egress firewall refused, and ask about a host a
+        // profile wants to be asked about.
+        self.tick_sandbox_egress();
+
         self.tick_expire_timers();
 
         self.poll_external_changes();
@@ -7650,6 +7669,10 @@ impl App {
         self.finalize_pending_delete();
         self.save_state();
         self.persist_shutdown_frames();
+        // Every egress proxy dies with this process anyway; stopping them first
+        // unlinks their sockets, so a sandbox that outlives friring under tmux
+        // finds nothing to connect to rather than a path with no listener.
+        crate::sandbox::egress::shutdown_all();
         // Do NOT remove worktrees — they persist for resume.
         // Detach from backend sessions without killing them — they persist in tmux.
         // `take` rather than consuming `self.sessions`: that would partially move

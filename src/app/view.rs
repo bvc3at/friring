@@ -1396,6 +1396,20 @@ impl App {
             );
         }
 
+        // The egress firewall's first-use question, raised from the tick.
+        if let super::modals::Modal::SandboxDomainPrompt(ref prompt) = self.modal {
+            return crate::ui::sandbox_domain_modal::render_sandbox_domain_modal(
+                frame,
+                &crate::ui::sandbox_domain_modal::SandboxDomainState {
+                    session_name: &prompt.session_name,
+                    profile: &prompt.profile,
+                    host: &prompt.host,
+                    port: prompt.port,
+                    rule: &prompt.rule,
+                },
+            );
+        }
+
         // Best-effort restore confirmation (a force-deleted session)
         if let super::modals::Modal::ConfirmRestore(ref cr) = self.modal {
             return crate::ui::confirm_restore_modal::render_confirm_restore_modal(

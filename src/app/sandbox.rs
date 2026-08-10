@@ -5,17 +5,28 @@
 //! [`crate::storage::sandboxes`]. Mirrors [`super::automation`], which is the
 //! collection-editing pattern this screen clones.
 //!
-//! Rendering lives in [`crate::ui::sandbox_list_modal`] and
-//! [`crate::ui::sandbox_editor_modal`]; the form state itself is
-//! [`modals::SandboxEditorModal`].
+//! It is also where the egress firewall reaches the user: the tick drains
+//! [`crate::sandbox::egress`]'s refusals here, turns them into status lines and
+//! first-use questions, and writes an answer back to both the running proxy and
+//! the stored profile.
+//!
+//! Rendering lives in [`crate::ui::sandbox_list_modal`],
+//! [`crate::ui::sandbox_editor_modal`] and
+//! [`crate::ui::sandbox_domain_modal`]; the form state itself is
+//! [`modals::SandboxEditorModal`] and the question is
+//! [`DomainPrompt`](super::egress_prompts::DomainPrompt).
+
+use std::collections::HashSet;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use tracing::error;
 
+use super::egress_prompts::{DomainPrompt, Observed};
 use super::modals;
 use super::{App, StatusLevel};
+use crate::proxy::DenyReason;
 use crate::sandbox::SandboxHost;
-use crate::session::{SandboxBackendKind, SandboxProfile};
+use crate::session::{DomainRule, SandboxBackendKind, SandboxProfile};
 use crate::ui::sandbox_list_modal::SandboxProfileRow;
 use crate::ui::sandbox_picker_modal::SandboxChoice;
 
@@ -233,6 +244,235 @@ impl App {
         }
     }
 
+    // ---- The egress firewall's first-use prompt ---------------------------
+
+    /// Drain the egress proxy's refusals and act on them, then raise the next
+    /// queued question if the single modal slot is free.
+    ///
+    /// Polled from the tick rather than pushed, because the proxies run on
+    /// their own runtime and the TUI owns no async context here — the same
+    /// shape every other background signal arrives in.
+    ///
+    /// Every newly refused host reaches the status bar, whatever the reason and
+    /// whatever the profile says: an agent that cannot reach the network is
+    /// failing, and the user needs the reason more than the silence. Only
+    /// [`DenyReason::NotAllowlisted`] on a profile that asked to be asked also
+    /// becomes a question.
+    pub(crate) fn tick_sandbox_egress(&mut self) {
+        let denials = crate::sandbox::egress::take_denials();
+        if !denials.is_empty() {
+            self.report_sandbox_denials(denials);
+        }
+        self.open_next_domain_prompt();
+    }
+
+    /// Report one drain's refusals: one status line, and a queued question for
+    /// each host a profile asked about.
+    fn report_sandbox_denials(&mut self, denials: Vec<crate::sandbox::SessionDenial>) {
+        // This is the only path that grows the history, so it is where a
+        // session that has gone away stops being remembered.
+        let live: HashSet<String> = self
+            .sessions
+            .iter()
+            .map(|s| s.info.id.to_string())
+            .collect();
+        self.egress_prompts.retain_sessions(&live);
+
+        let mut reported: Vec<String> = Vec::new();
+        for denial in denials {
+            match self
+                .egress_prompts
+                .observe(&denial.session_key, &denial.event.host)
+            {
+                // Said once already. An agent retrying a blocked host in a loop
+                // must not own the status bar.
+                Observed::Repeat => continue,
+                Observed::Saturated => {
+                    reported.push(format!(
+                        "{} was refused too many different hosts — friring has stopped \
+                         reporting them",
+                        self.sandbox_session_label(&denial.session_key)
+                    ));
+                    continue;
+                }
+                Observed::First => {}
+            }
+            self.queue_domain_prompt(&denial);
+            reported.push(format!(
+                "{} was blocked reaching {} — {}",
+                self.sandbox_session_label(&denial.session_key),
+                describe_destination(&denial.event.host, denial.event.port),
+                denial.event.reason
+            ));
+        }
+
+        let Some(first) = reported.first() else {
+            return;
+        };
+        // One line per drain, not per refusal: the status bar holds one message,
+        // and a burst that overwrote itself would leave whichever arrived last.
+        let message = match reported.len() {
+            1 => first.clone(),
+            n => format!("{first} (+{} more blocked)", n - 1),
+        };
+        self.set_status(StatusLevel::Error, message);
+    }
+
+    /// Queue a first-use question for this refusal, if it is one.
+    ///
+    /// Four things have to hold, and each of them fails towards *not* asking:
+    /// the reason is "not in the allowlist" (a deny rule, `network = none` or a
+    /// rejected token are answers the user already gave, and
+    /// [`DenyReason::UnsupportedHost`] must never be asked about — its answer
+    /// would be a rule the profile validator refuses to store); friring still
+    /// holds the session, so there is a profile to write to; that profile
+    /// decodes and carries `prompt_new_domains`; and the host can be spelled as
+    /// a rule at all.
+    fn queue_domain_prompt(&mut self, denial: &crate::sandbox::SessionDenial) {
+        if !matches!(denial.event.reason, DenyReason::NotAllowlisted) {
+            return;
+        }
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|s| s.info.id.to_string() == denial.session_key)
+        else {
+            return;
+        };
+        let session_name = session.info.name.clone();
+        let Some(profile_name) = session.info.sandbox_profile.clone() else {
+            return;
+        };
+        let Some(rule) = allow_rule_for(&denial.event.host, denial.event.port) else {
+            return;
+        };
+        // Re-read rather than trusting the launch: this is the profile the
+        // answer is written back to, and a deleted or undecodable one has
+        // nowhere to put it.
+        match self.load_session_sandbox(Some(&profile_name)) {
+            Ok(Some(profile)) if profile.prompt_new_domains => {}
+            _ => return,
+        }
+        self.egress_prompts.enqueue(DomainPrompt {
+            session_key: denial.session_key.clone(),
+            session_name,
+            profile: profile_name,
+            host: denial.event.host.clone(),
+            port: denial.event.port,
+            rule,
+        });
+    }
+
+    /// Put the next queued question on screen once nothing else is.
+    ///
+    /// Only one modal is ever open, so a refusal arriving while the user is in
+    /// the profile editor (or answering the previous question) waits its turn
+    /// instead of stealing the screen mid-edit.
+    fn open_next_domain_prompt(&mut self) {
+        if self.modal.is_open() || !self.egress_prompts.has_queued() {
+            return;
+        }
+        if let Some(prompt) = self.egress_prompts.next_prompt() {
+            self.modal = modals::Modal::SandboxDomainPrompt(prompt);
+            self.request_redraw();
+        }
+    }
+
+    /// How a refusal names its session: its display name, or the launch key for
+    /// one friring no longer holds (a session deleted between the request and
+    /// the drain).
+    fn sandbox_session_label(&self, session_key: &str) -> String {
+        self.sessions
+            .iter()
+            .find(|s| s.info.id.to_string() == session_key)
+            .map(|s| format!("Sandboxed session '{}'", s.info.name))
+            .unwrap_or_else(|| format!("Sandboxed session {session_key}"))
+    }
+
+    /// Act on the answer to a first-use question.
+    ///
+    /// "Allow" reaches the running proxy **first**. That order is what makes the
+    /// agent's next attempt succeed with no restart, and it is also the check:
+    /// a session torn down since the question was raised, or a rule the proxy
+    /// will not load, must not leave the stored profile permanently wider on the
+    /// strength of an answer that changed nothing. The profile write follows,
+    /// and if *it* fails the live grant stands — the user allowed it, this run
+    /// has it, and the message says the profile did not keep it.
+    fn answer_domain_prompt(&mut self, prompt: DomainPrompt, allow: bool) {
+        if !allow {
+            self.set_status(
+                StatusLevel::Info,
+                format!(
+                    "{} stays blocked for '{}'",
+                    describe_destination(&prompt.host, prompt.port),
+                    prompt.session_name
+                ),
+            );
+            return;
+        }
+        if let Err(message) =
+            crate::sandbox::egress::allow_domain(&prompt.session_key, &prompt.rule)
+        {
+            self.set_error(format!(
+                "Could not allow {} for '{}': {message}",
+                prompt.rule, prompt.session_name
+            ));
+            return;
+        }
+        match self.add_domain_to_profile(&prompt.profile, &prompt.rule) {
+            Ok(()) => self.set_status(
+                StatusLevel::Success,
+                format!(
+                    "Allowed {} for '{}' and added it to sandbox profile '{}'",
+                    prompt.rule, prompt.session_name, prompt.profile
+                ),
+            ),
+            Err(message) => self.set_error(format!(
+                "Allowed {} for '{}' for this run only — {message}",
+                prompt.rule, prompt.session_name
+            )),
+        }
+    }
+
+    /// Add one allow rule to a stored profile, so the grant survives the next
+    /// launch.
+    ///
+    /// The profile is re-read here rather than carried on the prompt: it may
+    /// have been edited (or deleted) while the question waited, and writing a
+    /// stale copy back would silently undo those edits. A profile that no longer
+    /// decodes is refused for the same reason — the full-row write would replace
+    /// the user's unreadable values with the narrow ones storage substituted for
+    /// them.
+    fn add_domain_to_profile(&self, name: &str, rule: &str) -> Result<(), String> {
+        let mut profile = match self.db.get_sandbox_profile(name) {
+            Ok(Some(stored)) if stored.launch_refusal().is_none() => stored.profile,
+            Ok(Some(_)) => {
+                return Err(format!(
+                    "sandbox profile '{name}' no longer reads back, so it was left alone"
+                ))
+            }
+            Ok(None) => return Err(format!("sandbox profile '{name}' no longer exists")),
+            Err(e) => {
+                error!("Failed to load sandbox profile '{name}': {e}");
+                return Err(format!("sandbox profile '{name}' could not be read"));
+            }
+        };
+        // An entry that already means this is left alone: two spellings of one
+        // rule read as two grants in the editor and enforce exactly one.
+        let covered = profile
+            .network_allow
+            .iter()
+            .any(|entry| DomainRule::parse(entry).is_ok_and(|parsed| parsed.to_string() == rule));
+        if covered {
+            return Ok(());
+        }
+        profile.network_allow.push(rule.to_string());
+        self.db.upsert_sandbox_profile(&profile).map_err(|e| {
+            error!("Failed to save sandbox profile '{name}': {e}");
+            format!("sandbox profile '{name}' could not be saved")
+        })
+    }
+
     // ---- The new-session wizard's sandbox step ---------------------------
 
     /// Open the wizard's sandbox step for a session spanning `dirs`, or return
@@ -402,6 +642,24 @@ impl App {
         }
     }
 
+    /// Keys for the first-use domain question: `Enter`/`y` allows the host and
+    /// writes it into the profile, `Esc`/`n` leaves it blocked. Either answer
+    /// closes the question for good — the host is already settled, so a retry
+    /// will not raise it again.
+    pub(crate) fn handle_sandbox_domain_prompt_key(&mut self, code: KeyCode) {
+        let modals::Modal::SandboxDomainPrompt(ref prompt) = self.modal else {
+            return;
+        };
+        let allow = match code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => true,
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => false,
+            _ => return,
+        };
+        let prompt = prompt.clone();
+        self.modal.close();
+        self.answer_domain_prompt(prompt, allow);
+    }
+
     /// Re-resolve the open editor's `auto` after a backend change.
     fn refresh_sandbox_editor_resolution(&mut self) {
         let resolved = match self.modal {
@@ -437,6 +695,46 @@ pub(crate) fn unenforced_sandbox_message(info: &crate::session::SessionInfo) -> 
         "'{}' is NOT sandboxed — profile '{profile}' could not be applied: {reason}",
         info.name
     ))
+}
+
+/// The rule an "allow" would store for `host` on `port`, or `None` when friring
+/// could never store one — a name that does not canonicalise, or a shape the
+/// profile's own grammar rejects.
+///
+/// Scoped to the port that was refused, because that is what the question named:
+/// a bare host rule would cover every port, which is wider than the user was
+/// asked to grant.
+///
+/// A SOCKS5 client names an IPv6 destination unbracketed — the address is the
+/// address, not a URL authority — while an HTTP `CONNECT` line brackets it, so
+/// both spellings are accepted and the rule renders in the single one a profile
+/// stores.
+fn allow_rule_for(host: &str, port: u16) -> Option<String> {
+    // Port 0 has no meaning as a destination; the proxy only reports one
+    // alongside an empty host, which is never an allowlist question.
+    if port == 0 {
+        return None;
+    }
+    let parsed = DomainRule::parse(host)
+        .or_else(|_| DomainRule::parse(&format!("[{host}]")))
+        .ok()?;
+    Some(
+        DomainRule {
+            host: parsed.host,
+            port: Some(port),
+        }
+        .to_string(),
+    )
+}
+
+/// A refused destination, as a line of prose. The host is empty when a request
+/// was refused before one was named — a SOCKS5 client that fails
+/// authentication, which the protocol checks before it asks where to go.
+fn describe_destination(host: &str, port: u16) -> String {
+    if host.is_empty() {
+        return "an unnamed destination".to_string();
+    }
+    format!("{host}:{port}")
 }
 
 /// One stored profile as a list row, with `auto` resolved against `host`.
@@ -482,7 +780,480 @@ fn resolve_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::{DenialEvent, Protocol};
+    use crate::sandbox::SessionDenial;
     use crate::session::{NetworkMode, SandboxPath};
+
+    /// A profile whose whole point is the allowlist: nothing permitted, and the
+    /// firewall told to ask before it refuses something new.
+    fn allowlist_profile(name: &str, ask: bool) -> SandboxProfile {
+        let mut profile = SandboxProfile::new(name, vec![SandboxPath::workspace("~/dev/app")]);
+        profile.network_mode = NetworkMode::Allowlist;
+        profile.prompt_new_domains = ask;
+        profile
+    }
+
+    /// An [`App`] holding one sandboxed session under `profile`, plus that
+    /// session's launch key — which is what the proxy is registered under and
+    /// what a denial is tagged with.
+    fn boxed_app(
+        profile: &SandboxProfile,
+    ) -> (App, String, crate::paths::TestPathGuard, tempfile::TempDir) {
+        let (mut app, guard, tmp) = crate::app::state::tests::app_with_sessions(1);
+        app.db.upsert_sandbox_profile(profile).unwrap();
+        app.sessions[0].info.sandbox_profile = Some(profile.name.clone());
+        let key = app.sessions[0].info.id.to_string();
+        (app, key, guard, tmp)
+    }
+
+    fn denial(key: &str, host: &str, port: u16, reason: DenyReason) -> SessionDenial {
+        SessionDenial {
+            session_key: key.to_string(),
+            event: DenialEvent {
+                protocol: Protocol::Http,
+                host: host.to_string(),
+                port,
+                reason,
+            },
+        }
+    }
+
+    fn open_prompt(app: &App) -> &DomainPrompt {
+        match app.modal {
+            modals::Modal::SandboxDomainPrompt(ref prompt) => prompt,
+            ref other => panic!("expected the domain prompt, got {other:?}"),
+        }
+    }
+
+    fn stored_allow(app: &App, name: &str) -> Vec<String> {
+        app.db
+            .get_sandbox_profile(name)
+            .unwrap()
+            .expect("the profile is stored")
+            .profile
+            .network_allow
+    }
+
+    /// The question names everything the answer depends on, and the refusal
+    /// reaches the status bar whether or not it becomes a question.
+    #[test]
+    fn an_unlisted_domain_raises_a_question_and_a_status_line() {
+        let profile = allowlist_profile("dev", true);
+        let (mut app, key, _g, _t) = boxed_app(&profile);
+
+        app.report_sandbox_denials(vec![denial(
+            &key,
+            "api.github.com",
+            443,
+            DenyReason::NotAllowlisted,
+        )]);
+        app.open_next_domain_prompt();
+
+        let prompt = open_prompt(&app);
+        assert_eq!(prompt.session_key, key);
+        assert_eq!(prompt.session_name, "session-0");
+        assert_eq!(prompt.profile, "dev");
+        assert_eq!(prompt.host, "api.github.com");
+        assert_eq!(prompt.port, 443);
+        // Scoped to the port that was refused: the question said `:443`, so the
+        // grant is `:443` and not every port on that host.
+        assert_eq!(prompt.rule, "api.github.com:443");
+
+        let status = app.status_message.as_ref().expect("a status line");
+        assert_eq!(status.level, StatusLevel::Error);
+        assert!(status.text.contains("session-0"), "{}", status.text);
+        assert!(
+            status.text.contains("api.github.com:443"),
+            "{}",
+            status.text
+        );
+    }
+
+    /// Allowing has to do both halves: apply to the boundary that is running
+    /// (so the agent's retry succeeds with nothing restarted) and write the rule
+    /// into the profile (so the next launch still has it).
+    #[test]
+    fn allowing_applies_to_the_running_proxy_and_the_stored_profile() {
+        let profile = allowlist_profile("dev", true);
+        let (mut app, key, _g, tmp) = boxed_app(&profile);
+        // A real instance for this session, bound on an ephemeral loopback port
+        // exactly as a seatbelt launch would leave it. Nothing connects through
+        // it; the wire-level half is `proxy::tests`.
+        let policy = profile
+            .resolve(SandboxBackendKind::Seatbelt, "/home/u")
+            .expect("a valid profile");
+        crate::sandbox::egress::establish(
+            &key,
+            &policy,
+            crate::sandbox::ProxyTransport::Loopback,
+            tmp.path(),
+        )
+        .expect("the proxy binds");
+
+        app.report_sandbox_denials(vec![denial(
+            &key,
+            "api.github.com",
+            443,
+            DenyReason::NotAllowlisted,
+        )]);
+        app.open_next_domain_prompt();
+        app.handle_sandbox_domain_prompt_key(KeyCode::Enter);
+
+        assert!(!app.modal.is_open(), "answering closes the question");
+        assert_eq!(
+            crate::sandbox::egress::running_allow_rules(&key),
+            Some(vec!["api.github.com:443".to_string()]),
+            "the running boundary learned the rule"
+        );
+        assert_eq!(stored_allow(&app, "dev"), ["api.github.com:443"]);
+        let status = app.status_message.as_ref().expect("a status line");
+        assert_eq!(status.level, StatusLevel::Success);
+
+        crate::sandbox::egress::stop(&key);
+    }
+
+    /// Refusing writes nothing, anywhere — and the same host never asks again,
+    /// however hard the agent retries.
+    #[test]
+    fn refusing_writes_nothing_and_is_not_asked_twice() {
+        let profile = allowlist_profile("dev", true);
+        let (mut app, key, _g, _t) = boxed_app(&profile);
+
+        app.report_sandbox_denials(vec![denial(
+            &key,
+            "tracker.example",
+            443,
+            DenyReason::NotAllowlisted,
+        )]);
+        app.open_next_domain_prompt();
+        app.handle_sandbox_domain_prompt_key(KeyCode::Esc);
+
+        assert!(!app.modal.is_open());
+        assert!(stored_allow(&app, "dev").is_empty());
+
+        // The agent keeps trying; the user is not asked again and the status
+        // bar is not overwritten by the retries.
+        app.set_info("something else");
+        for _ in 0..20 {
+            app.report_sandbox_denials(vec![denial(
+                &key,
+                "tracker.example",
+                443,
+                DenyReason::NotAllowlisted,
+            )]);
+            app.open_next_domain_prompt();
+        }
+        assert!(!app.modal.is_open(), "a refused host does not re-prompt");
+        assert_eq!(app.status_message.as_ref().unwrap().text, "something else");
+    }
+
+    /// A burst faster than anyone can answer is one question, and the questions
+    /// for other hosts wait their turn behind whatever is already on screen.
+    #[test]
+    fn a_burst_becomes_one_question_and_the_rest_queue_behind_the_open_modal() {
+        let profile = allowlist_profile("dev", true);
+        let (mut app, key, _g, _t) = boxed_app(&profile);
+
+        let mut burst: Vec<SessionDenial> = (0..25)
+            .map(|_| denial(&key, "api.github.com", 443, DenyReason::NotAllowlisted))
+            .collect();
+        burst.push(denial(&key, "pypi.org", 443, DenyReason::NotAllowlisted));
+        app.report_sandbox_denials(burst);
+
+        app.open_next_domain_prompt();
+        assert_eq!(open_prompt(&app).host, "api.github.com");
+        // A second question does not replace the one being answered.
+        app.open_next_domain_prompt();
+        assert_eq!(open_prompt(&app).host, "api.github.com");
+
+        app.handle_sandbox_domain_prompt_key(KeyCode::Esc);
+        app.open_next_domain_prompt();
+        assert_eq!(open_prompt(&app).host, "pypi.org");
+    }
+
+    /// The user is mid-edit in another modal. A refusal must not throw the
+    /// editor away — it waits.
+    #[test]
+    fn a_refusal_never_steals_an_open_modal() {
+        let profile = allowlist_profile("dev", true);
+        let (mut app, key, _g, _t) = boxed_app(&profile);
+        app.open_sandbox_editor();
+
+        app.report_sandbox_denials(vec![denial(
+            &key,
+            "api.github.com",
+            443,
+            DenyReason::NotAllowlisted,
+        )]);
+        app.open_next_domain_prompt();
+        assert!(
+            matches!(app.modal, modals::Modal::SandboxEditor(_)),
+            "the editor kept the screen"
+        );
+
+        app.modal.close();
+        app.open_next_domain_prompt();
+        assert_eq!(open_prompt(&app).host, "api.github.com");
+    }
+
+    /// Every other reason is an answer the user already gave, so it is reported
+    /// and never asked about. `UnsupportedHost` above all: its answer would be a
+    /// rule the profile validator refuses to store.
+    #[test]
+    fn only_an_unlisted_host_becomes_a_question() {
+        let profile = allowlist_profile("dev", true);
+        let (mut app, key, _g, _t) = boxed_app(&profile);
+
+        app.report_sandbox_denials(vec![
+            denial(
+                &key,
+                "b\u{fffd}cher.example",
+                443,
+                DenyReason::UnsupportedHost("is not ASCII; write it in punycode"),
+            ),
+            denial(
+                &key,
+                "gist.github.com",
+                443,
+                DenyReason::DeniedByRule("gist.github.com".into()),
+            ),
+            denial(&key, "anywhere.example", 443, DenyReason::NetworkDisabled),
+            denial(&key, "", 0, DenyReason::Unauthorized),
+        ]);
+        app.open_next_domain_prompt();
+
+        assert!(!app.modal.is_open(), "none of those is a question");
+        let status = app
+            .status_message
+            .as_ref()
+            .expect("they are still reported");
+        assert_eq!(status.level, StatusLevel::Error);
+        assert!(status.text.contains("+3 more blocked"), "{}", status.text);
+    }
+
+    /// `prompt_new_domains` off means "refuse quietly, do not ask me" — the
+    /// refusal is still visible, because an agent that cannot reach the network
+    /// is failing and the reason is the only way to know why.
+    #[test]
+    fn a_profile_that_asked_not_to_be_asked_is_only_reported() {
+        let profile = allowlist_profile("quiet", false);
+        let (mut app, key, _g, _t) = boxed_app(&profile);
+
+        app.report_sandbox_denials(vec![denial(
+            &key,
+            "api.github.com",
+            443,
+            DenyReason::NotAllowlisted,
+        )]);
+        app.open_next_domain_prompt();
+
+        assert!(!app.modal.is_open());
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|s| s.text.contains("api.github.com:443")));
+    }
+
+    /// A session friring no longer holds cannot be asked about — there is no
+    /// profile to write an answer to — but the refusal is still reported.
+    #[test]
+    fn a_refusal_from_an_unknown_session_is_reported_without_a_question() {
+        let profile = allowlist_profile("dev", true);
+        let (mut app, _key, _g, _t) = boxed_app(&profile);
+
+        app.report_sandbox_denials(vec![denial(
+            "a-session-that-is-gone",
+            "api.github.com",
+            443,
+            DenyReason::NotAllowlisted,
+        )]);
+        app.open_next_domain_prompt();
+
+        assert!(!app.modal.is_open());
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|s| s.text.contains("a-session-that-is-gone")));
+    }
+
+    /// A profile deleted while the question waited has nowhere to keep the
+    /// answer, so nothing is written and the message says so rather than
+    /// reporting a grant that did not happen.
+    #[test]
+    fn allowing_against_a_deleted_profile_reports_the_failure() {
+        let profile = allowlist_profile("dev", true);
+        let (mut app, key, _g, tmp) = boxed_app(&profile);
+        let policy = profile
+            .resolve(SandboxBackendKind::Seatbelt, "/home/u")
+            .expect("a valid profile");
+        crate::sandbox::egress::establish(
+            &key,
+            &policy,
+            crate::sandbox::ProxyTransport::Loopback,
+            tmp.path(),
+        )
+        .expect("the proxy binds");
+
+        app.report_sandbox_denials(vec![denial(
+            &key,
+            "api.github.com",
+            443,
+            DenyReason::NotAllowlisted,
+        )]);
+        app.open_next_domain_prompt();
+        app.db.delete_sandbox_profile("dev").unwrap();
+        app.handle_sandbox_domain_prompt_key(KeyCode::Enter);
+
+        let status = app.status_message.as_ref().expect("a status line");
+        assert_eq!(status.level, StatusLevel::Error);
+        assert!(status.text.contains("no longer exists"), "{}", status.text);
+        // The running boundary still learned it: the user allowed it, and this
+        // run has it — only the persistence failed.
+        assert_eq!(
+            crate::sandbox::egress::running_allow_rules(&key),
+            Some(vec!["api.github.com:443".to_string()])
+        );
+
+        crate::sandbox::egress::stop(&key);
+    }
+
+    /// A stale question — the session was torn down while it waited — must not
+    /// widen the stored profile on the strength of an answer that reached no
+    /// boundary at all.
+    #[test]
+    fn a_stale_answer_widens_nothing() {
+        let profile = allowlist_profile("dev", true);
+        let (mut app, key, _g, _t) = boxed_app(&profile);
+
+        app.report_sandbox_denials(vec![denial(
+            &key,
+            "api.github.com",
+            443,
+            DenyReason::NotAllowlisted,
+        )]);
+        app.open_next_domain_prompt();
+        // No proxy was ever started for this key, which is what a torn-down
+        // session looks like from here.
+        app.handle_sandbox_domain_prompt_key(KeyCode::Enter);
+
+        assert!(stored_allow(&app, "dev").is_empty());
+        let status = app.status_message.as_ref().expect("a status line");
+        assert_eq!(status.level, StatusLevel::Error);
+        assert!(status.text.contains("Could not allow"), "{}", status.text);
+    }
+
+    /// The rule is stored canonically, so the profile holds one spelling of an
+    /// address however the sandbox asked for it — and a host with no canonical
+    /// spelling is never asked about, because the answer could not be stored.
+    #[test]
+    fn the_stored_rule_is_canonical_and_port_scoped() {
+        assert_eq!(
+            allow_rule_for("API.GitHub.COM", 443).as_deref(),
+            Some("api.github.com:443")
+        );
+        assert_eq!(
+            allow_rule_for("github.com.", 80).as_deref(),
+            Some("github.com:80")
+        );
+        // Every legacy spelling of one address reduces to the address, so the
+        // rule the profile keeps is the one every request canonicalises to.
+        assert_eq!(
+            allow_rule_for("127.1", 8080).as_deref(),
+            Some("127.0.0.1:8080")
+        );
+        assert_eq!(
+            allow_rule_for("2130706433", 8080).as_deref(),
+            Some("127.0.0.1:8080")
+        );
+        // A SOCKS client names IPv6 bare, a CONNECT line brackets it; both end
+        // up as the single spelling `DomainRule` parses back.
+        assert_eq!(
+            allow_rule_for("2001:db8::1", 443).as_deref(),
+            Some("[2001:db8::1]:443")
+        );
+        assert_eq!(
+            allow_rule_for("[2001:db8::1]", 443).as_deref(),
+            Some("[2001:db8::1]:443")
+        );
+        // Whatever a rule renders as has to parse back, or the profile stores
+        // an entry its own validator would refuse.
+        for rendered in ["api.github.com:443", "127.0.0.1:8080", "[2001:db8::1]:443"] {
+            assert_eq!(DomainRule::parse(rendered).unwrap().to_string(), rendered);
+        }
+        // Nothing storable: a U-label, and a refusal with no destination.
+        assert_eq!(allow_rule_for("b\u{fc}cher.example", 443), None);
+        assert_eq!(allow_rule_for("", 0), None);
+    }
+
+    /// The wiring itself: a refusal arriving on the proxy's own channel reaches
+    /// the user through the ordinary tick, with nothing hand-fed.
+    ///
+    /// Runs one process per test under the repo's runner, which is what makes a
+    /// process-wide buffer safe to assert on.
+    #[test]
+    fn the_tick_drains_the_proxys_own_denial_channel() {
+        let profile = allowlist_profile("dev", true);
+        let (mut app, key, _g, _t) = boxed_app(&profile);
+        let _ = crate::sandbox::egress::take_denials();
+
+        crate::sandbox::egress::record_denial_for_test(denial(
+            &key,
+            "api.github.com",
+            443,
+            DenyReason::NotAllowlisted,
+        ));
+        app.tick_core();
+
+        assert_eq!(open_prompt(&app).rule, "api.github.com:443");
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|s| s.text.contains("api.github.com:443")));
+    }
+
+    /// Quitting takes every boundary's way out with it, rather than leaving a
+    /// listener and a socket behind for a sandbox that outlives friring under
+    /// tmux.
+    #[test]
+    fn quitting_stops_the_proxies_it_started() {
+        let profile = allowlist_profile("dev", true);
+        let (app, key, _g, tmp) = boxed_app(&profile);
+        let policy = profile
+            .resolve(SandboxBackendKind::Seatbelt, "/home/u")
+            .expect("a valid profile");
+        crate::sandbox::egress::establish(
+            &key,
+            &policy,
+            crate::sandbox::ProxyTransport::Loopback,
+            tmp.path(),
+        )
+        .expect("the proxy binds");
+        assert!(crate::sandbox::egress::running_allow_rules(&key).is_some());
+
+        app.shutdown();
+
+        assert!(
+            crate::sandbox::egress::running_allow_rules(&key).is_none(),
+            "the session's proxy outlived the friring that started it"
+        );
+    }
+
+    #[test]
+    fn an_unstorable_host_is_reported_but_never_asked_about() {
+        let profile = allowlist_profile("dev", true);
+        let (mut app, key, _g, _t) = boxed_app(&profile);
+
+        app.report_sandbox_denials(vec![denial(
+            &key,
+            "b\u{fc}cher.example",
+            443,
+            DenyReason::NotAllowlisted,
+        )]);
+        app.open_next_domain_prompt();
+
+        assert!(!app.modal.is_open(), "its answer could not be stored");
+        assert!(app.status_message.is_some());
+    }
 
     #[test]
     fn an_explicit_backend_resolves_to_itself_without_probing() {
