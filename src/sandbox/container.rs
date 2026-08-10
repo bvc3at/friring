@@ -90,21 +90,11 @@ pub const INSTANCE_STATE_RUNNING: &str = "running";
 pub struct EnsuredPlace {
     /// What the caller records in `sandbox_instances`.
     pub instance: SandboxInstance,
-    /// The container's name, which carries the profile and its spec digest.
-    pub name: String,
-    /// The digest of everything a profile edit could change. A place whose
-    /// digest no longer matches its profile is superseded, and [`gc_plan`]
-    /// reclaims it.
-    pub spec: String,
-    pub image: String,
     /// The synthetic per-profile home **on the host**, which this place mounts
     /// at [`CONTAINER_HOME`]. What a launch projects configuration into and
     /// keeps the profile's login in — taken from the plan rather than re-derived,
     /// so it is by construction the directory that was mounted.
     pub home_dir: String,
-    /// Whether this call created the place, as opposed to adopting one that was
-    /// already running.
-    pub created: bool,
     /// The absolute path of [`RELAY_BINARY`] inside the place, when the profile
     /// needs one.
     pub relay_program: Option<String>,
@@ -180,7 +170,7 @@ impl ContainerBackend {
         let (plan, source, policy) = self.plan_for(profile)?;
         self.ensure_image(&policy.profile, &source)?;
 
-        let (id, created) = self.start_or_create(&plan, &refuse)?;
+        let id = self.start_or_create(&plan, &refuse)?;
         let relay_program = if proxy_required(&policy) {
             Some(self.resolve_relay(&id, &plan.image, &refuse)?)
         } else {
@@ -194,11 +184,7 @@ impl ContainerBackend {
                 external_id: id,
                 state: INSTANCE_STATE_RUNNING.to_string(),
             },
-            name: plan.name.clone(),
-            spec: plan.spec.clone(),
-            image: plan.image.clone(),
             home_dir: plan.home_dir.clone(),
-            created,
             relay_program,
         })
     }
@@ -274,14 +260,14 @@ impl ContainerBackend {
         self.plan_for(profile).ok().map(|(plan, _, _)| plan.spec)
     }
 
-    /// Adopt the place this plan names, or build it. Answers `(id, created)`.
+    /// Adopt the place this plan names, or build it. Answers with its id.
     fn start_or_create(
         &self,
         plan: &InstancePlan,
         refuse: &dyn Fn(String) -> SandboxError,
-    ) -> SandboxResult<(String, bool)> {
+    ) -> SandboxResult<String> {
         let Some(existing) = self.inspect(&plan.name) else {
-            return Ok((self.create(plan, refuse)?, true));
+            return self.create(plan, refuse);
         };
         if !existing.owned {
             // Somebody else's container is sitting on the name friring wants.
@@ -298,19 +284,19 @@ impl ContainerBackend {
         // different container rather than silently reusing mounts it no longer
         // describes.
         if existing.running() {
-            return Ok((existing.id, false));
+            return Ok(existing.id);
         }
         if self
             .engine_run(&["start", &plan.name])
             .is_ok_and(|output| output.ok())
         {
-            return Ok((existing.id, false));
+            return Ok(existing.id);
         }
         // It will not start — a place whose kernel resources went with a host
         // reboot, or one wedged in `dead`. Remove it by name (the name is what
         // the replacement needs) and build again.
         let _ = self.engine_run(&["rm", "--force", &existing.id]);
-        Ok((self.create(plan, refuse)?, true))
+        self.create(plan, refuse)
     }
 
     fn create(
