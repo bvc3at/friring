@@ -49,10 +49,15 @@ const MODULE_RULES: &[ModuleRules] = &[
     // Isolation boundaries (ADR-25). Same tier as `agent`: a side-effect layer
     // over pure `session` data — it probes hosts, generates sandbox profiles
     // and wraps argv. `shell` for the ssh/wsl launchers a remote host is probed
-    // through, `paths` for the PATH lookup. Never ui, git, or app.
+    // through, `paths` for the PATH lookup. `proxy` is the egress half of the
+    // boundary (ADR-27): the filtering proxy is a leaf that enforces a policy
+    // it is handed, and this is the layer that hands it one, keeps it alive for
+    // a session and tells each backend which transport to open — the dependency
+    // runs one way, so the proxy still knows nothing about sessions or
+    // backends. Never ui, git, or app.
     ModuleRules {
         name: "sandbox",
-        allowed: &["session", "paths", "shell"],
+        allowed: &["session", "paths", "shell", "proxy"],
         allowed_path_only: &[],
     },
     // Rendering. `app` is allowed read-only model/view state (TEA
@@ -99,6 +104,9 @@ const MODULE_RULES: &[ModuleRules] = &[
     // `friring-cli usage` and `session resources`/`activity`: each reads the
     // same source the TUI reads, so the commands work with no TUI running and
     // nothing has to be cached into SQLite for them.
+    // `proxy` is the in-sandbox relay behind `friring-cli sandbox relay`: the
+    // one command that runs *inside* a boundary, which is why it is dispatched
+    // before the database is opened at all (ADR-29).
     ModuleRules {
         name: "cli",
         allowed: &[
@@ -111,6 +119,7 @@ const MODULE_RULES: &[ModuleRules] = &[
             "usage",
             "proctable",
             "activity",
+            "proxy",
         ],
         allowed_path_only: &["agent"],
     },

@@ -215,17 +215,40 @@ pub struct Caps {
     pub host_credentials: bool,
     /// What happens to the agent's own sandbox inside this one.
     pub inner_agent_sandbox: InnerSandboxVerdict,
+    /// Which way out to the egress proxy this backend's kernel primitive
+    /// leaves open — the per-backend table in `docs/SANDBOX.md` §Reaching the
+    /// proxy, declared where the primitive is rather than in a lookup beside
+    /// it.
+    pub proxy_transport: ProxyTransport,
 }
 
-/// Where the friring egress proxy listens, for the one hole a sandbox with
-/// [`NetworkMode::Allowlist`] is allowed to keep (ADR-27).
+/// How a sandbox reaches the friring egress proxy, which is decided by what its
+/// own network isolation leaves reachable (ADR-27).
+///
+/// Not a preference: a backend that shares the host's network stack **can only**
+/// be given a port, and one with its own namespace **can only** be given a
+/// socket, because inside a fresh namespace `127.0.0.1` is that namespace's own
+/// loopback and no address reaches the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyTransport {
+    /// Host TCP loopback: the sandbox dials `127.0.0.1:<port>` directly
+    /// (seatbelt, which shares the host's network stack).
+    Loopback,
+    /// A unix socket, bind-mounted across the boundary and reached through the
+    /// relay friring runs inside the namespace (`bwrap --unshare-net`, and the
+    /// containers that land with the place backends).
+    UnixSocket,
+}
+
+/// Where the friring egress proxy listens, for the one hole a sandbox that is
+/// filtered rather than cut off is allowed to keep (ADR-27).
 ///
 /// Both spellings exist because the backends differ in what they can reach: a
 /// seatbelt process still shares the host's network stack and can dial
 /// loopback, while a `--unshare-net` bwrap sandbox has its own empty stack and
-/// can only be handed a socket. P2 builds the proxy; P1 passes `None` and every
-/// backend then treats [`NetworkMode::Allowlist`] exactly like
-/// [`NetworkMode::None`], which grants nothing.
+/// can only be handed a socket. Which one a backend takes is its
+/// [`Caps::proxy_transport`]; a backend handed the other refuses the launch
+/// rather than opening a hole that leads nowhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyEndpoint {
     /// A TCP listener on host loopback.
@@ -236,6 +259,28 @@ pub enum ProxyEndpoint {
         host_path: String,
         inside_path: String,
     },
+}
+
+/// What one launch's network mode comes to, once it is known whether a proxy is
+/// running for it.
+///
+/// The single value both policy backends read, so they cannot disagree about
+/// what a profile means: the same three shapes turn into `(allow network*)` or
+/// `--unshare-net` on their own terms. Every case that is not positively open
+/// or positively proxied is [`Closed`](Self::Closed), which is what makes the
+/// absence of a proxy a sandbox with no way out rather than one with an
+/// unfiltered one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Egress<'a> {
+    /// No way out at all: [`NetworkMode::None`], or a mode that needs the proxy
+    /// with none running.
+    Closed,
+    /// Direct, unfiltered egress: [`NetworkMode::Full`] carrying no denies —
+    /// the one mode no proxy is needed to keep honest.
+    Open,
+    /// Everything through the friring proxy at this endpoint, which enforces
+    /// the domain rules outside the boundary.
+    Proxied(&'a ProxyEndpoint),
 }
 
 /// One live place: a container, a VM, a distro clone.
@@ -345,10 +390,30 @@ impl<'a> SandboxLaunch<'a> {
         self
     }
 
-    /// The egress proxy P2 starts alongside the session.
+    /// The egress proxy friring started alongside the session.
     pub fn with_proxy(mut self, proxy: ProxyEndpoint) -> Self {
         self.proxy = Some(proxy);
         self
+    }
+
+    /// What this launch's network policy comes to — see [`Egress`].
+    ///
+    /// Fails closed by construction: a mode that can only be honoured with the
+    /// proxy ([`crate::sandbox::egress::proxy_required`]) and no endpoint to
+    /// point at is [`Egress::Closed`], never [`Egress::Open`].
+    /// [`validate`](Self::validate) refuses that combination before a backend
+    /// ever asks, so a caller sees it only by building a launch by hand.
+    pub fn egress(&self) -> Egress<'_> {
+        if !crate::sandbox::egress::proxy_required(self.policy) {
+            return match self.policy.network {
+                NetworkMode::Full => Egress::Open,
+                _ => Egress::Closed,
+            };
+        }
+        match self.proxy.as_ref() {
+            Some(endpoint) => Egress::Proxied(endpoint),
+            None => Egress::Closed,
+        }
     }
 
     /// Every writable path this launch grants: the profile's own read-write
@@ -374,33 +439,46 @@ impl<'a> SandboxLaunch<'a> {
     /// Both checks fail closed, and both exist because the alternative is a
     /// boundary the user cannot reason about:
     ///
-    /// - **Denies under [`NetworkMode::Full`] are inert.** No kernel policy has
-    ///   a host-name predicate (`docs/SANDBOX.md` §Egress firewall), so `full`
-    ///   is all-or-nothing at this layer while the contract says denies are
-    ///   checked first *in every mode*. Until the egress proxy enforces them,
-    ///   carrying denies under `full` is refused rather than silently dropped.
     /// - **Some read-write roots are escapes**, whatever the profile intended:
     ///   one enclosing friring's data directory reaches the database, which
     ///   ADR-29 keeps outside every boundary, and one reaching a tmux socket
     ///   directory drives the host's own multiplexer. See
-    ///   [`crate::sandbox::dirs::check_writable_roots`].
+    ///   [`crate::sandbox::dirs::check_writable_roots`]. Checked first: it is
+    ///   the profile's own doing, and fixable by editing it.
+    /// - **A filtered mode with no filter** is refused. No kernel policy has a
+    ///   host-name predicate (`docs/SANDBOX.md` §Egress firewall), so an
+    ///   allowlist — and a deny list under `full` — mean nothing without the
+    ///   proxy that enforces them. Launching anyway would give an `allowlist`
+    ///   sandbox no way out at all and a `full` one no denies, in both cases
+    ///   silently; refusing routes it through the profile's own
+    ///   `allow_unsandboxed_fallback` switch instead.
     pub fn validate(&self) -> SandboxResult<()> {
         let refuse = |detail: String| SandboxError::Refused {
             profile: self.policy.profile.clone(),
             detail,
         };
-        if self.policy.network == NetworkMode::Full && !self.policy.deny.is_empty() {
+        crate::sandbox::dirs::check_writable_roots(&self.writable_paths(), self.friring_db)
+            .map_err(&refuse)?;
+        if crate::sandbox::egress::proxy_required(self.policy) && self.proxy.is_none() {
             let denied: Vec<String> = self.policy.deny.iter().map(|r| r.to_string()).collect();
+            let what = if self.policy.network == NetworkMode::Full {
+                format!(
+                    "the domain denies it carries ({}) are enforced by that proxy and by nothing \
+                     else, so 'full' would run with them silently inert",
+                    denied.join(", ")
+                )
+            } else {
+                "an 'allowlist' sandbox reaches its allowed domains only through that proxy, so \
+                 it would run with no way out at all"
+                    .to_string()
+            };
             return Err(refuse(format!(
-                "network mode 'full' cannot enforce the domain denies it carries ({}). A kernel \
-                 policy has no host-name predicate, so those denies become enforceable only once \
-                 the egress proxy is wired in — until then use the 'allowlist' mode, or clear the \
-                 denies, rather than run with them silently inert",
-                denied.join(", ")
+                "network mode '{}' is enforced by the friring egress proxy, and none is running \
+                 for this launch: {what}",
+                self.policy.network
             )));
         }
-        crate::sandbox::dirs::check_writable_roots(&self.writable_paths(), self.friring_db)
-            .map_err(refuse)
+        Ok(())
     }
 
     /// The profile's read-only paths, minus any the launch made writable.
@@ -519,8 +597,15 @@ mod tests {
                 persistent: true,
                 host_credentials: false,
                 inner_agent_sandbox: InnerSandboxVerdict::Redundant,
+                proxy_transport: ProxyTransport::UnixSocket,
             }
         }
+    }
+
+    /// A proxy endpoint standing in for a running instance, so a test can build
+    /// the launches a filtered mode now requires.
+    fn endpoint() -> ProxyEndpoint {
+        ProxyEndpoint::Loopback { port: 8123 }
     }
 
     #[test]
@@ -620,7 +705,8 @@ mod tests {
                         .with_workspace("/home/u/dev/app")
                         .with_signal_dir("/home/u/.local/share/friring/signals/s1")
                         .with_tmp_dir(&scratch)
-                        .with_friring_db("/home/u/.local/share/friring/friring.db");
+                        .with_friring_db("/home/u/.local/share/friring/friring.db")
+                        .with_proxy(endpoint());
                     let writable = launch.writable_paths();
                     for forbidden in [&temp_root, &socket_root] {
                         assert!(
@@ -652,12 +738,20 @@ mod tests {
             .unwrap();
         SandboxLaunch::new(&ok, "/home/u", "s1")
             .with_friring_db("/home/u/.local/share/friring/friring.db")
+            .with_proxy(endpoint())
             .validate()
             .unwrap();
     }
 
+    /// A mode the kernel cannot express on its own is refused unless the proxy
+    /// that *can* express it is running — and is honoured once it is.
+    ///
+    /// The hole this closes is the one P1 papered over by refusing `full` with
+    /// denies outright: a rule the user wrote, carried by a launch, enforced by
+    /// nothing. The answer is now the proxy rather than a refusal, and the
+    /// refusal moved to the case where there is no proxy to enforce it with.
     #[test]
-    fn full_network_with_denies_is_refused_rather_than_silently_inert() {
+    fn a_filtered_mode_needs_the_proxy_that_enforces_it() {
         let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
         profile.network_mode = NetworkMode::Full;
         profile.network_deny = vec!["evil.example".into()];
@@ -670,24 +764,67 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("evil.example"), "{text}");
         assert!(text.contains("egress proxy"), "{text}");
+        // With one running, the denies are enforceable and `full` no longer
+        // means unrestricted: everything goes through the proxy.
+        let proxied = SandboxLaunch::new(&policy, "/home/u", "s1").with_proxy(endpoint());
+        proxied.validate().unwrap();
+        assert_eq!(proxied.egress(), Egress::Proxied(&endpoint()));
 
-        // The same denies under `allowlist` are the mode the proxy will enforce,
-        // and `full` without denies promises nothing it cannot keep.
+        // An allowlist is the same bargain, and says so in its own words.
         profile.network_mode = NetworkMode::Allowlist;
         let policy = profile
             .resolve(SandboxBackendKind::Bwrap, "/home/u")
             .unwrap();
+        let err = SandboxLaunch::new(&policy, "/home/u", "s1")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("no way out at all"), "{err}");
         SandboxLaunch::new(&policy, "/home/u", "s1")
+            .with_proxy(endpoint())
             .validate()
             .unwrap();
+
+        // `full` with nothing to take back is the one mode that needs no help,
+        // and `none` has nothing to reach.
         profile.network_mode = NetworkMode::Full;
         profile.network_deny.clear();
         let policy = profile
             .resolve(SandboxBackendKind::Bwrap, "/home/u")
             .unwrap();
-        SandboxLaunch::new(&policy, "/home/u", "s1")
-            .validate()
+        let open = SandboxLaunch::new(&policy, "/home/u", "s1");
+        open.validate().unwrap();
+        assert_eq!(open.egress(), Egress::Open);
+
+        profile.network_mode = NetworkMode::None;
+        let policy = profile
+            .resolve(SandboxBackendKind::Bwrap, "/home/u")
             .unwrap();
+        let closed = SandboxLaunch::new(&policy, "/home/u", "s1");
+        closed.validate().unwrap();
+        assert_eq!(closed.egress(), Egress::Closed);
+    }
+
+    /// A launch built by hand, with a filtered mode and no endpoint, must read
+    /// as *closed* rather than open — the direction that turns a missing proxy
+    /// into a sandbox with no network instead of one with unfiltered network.
+    #[test]
+    fn a_filtered_mode_without_a_proxy_reads_as_closed() {
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        for (mode, deny) in [
+            (NetworkMode::Allowlist, Vec::new()),
+            (NetworkMode::Full, vec!["evil.example".to_string()]),
+        ] {
+            profile.network_mode = mode;
+            profile.network_deny = deny;
+            let policy = profile
+                .resolve(SandboxBackendKind::Seatbelt, "/home/u")
+                .unwrap();
+            assert_eq!(
+                SandboxLaunch::new(&policy, "/home/u", "s1").egress(),
+                Egress::Closed,
+                "{mode} without a proxy must not read as open"
+            );
+        }
     }
 
     #[test]

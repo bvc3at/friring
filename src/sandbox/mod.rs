@@ -20,7 +20,7 @@
 //! `session`, `paths` and `shell`, and never `ui`, `git` or `app`.
 //!
 //! ```no_run
-//! use friring::sandbox::{SandboxHost, SandboxLaunch};
+//! use friring::sandbox::{create_session_scratch, egress, SandboxHost, SandboxLaunch};
 //! use friring::session::{SandboxPath, SandboxProfile};
 //!
 //! let host = SandboxHost::local();
@@ -28,7 +28,14 @@
 //! // Run the ladder first: a policy names the backend that will actually run.
 //! let backend = host.select(profile.backend).backend()?;
 //! let policy = profile.resolve(backend, "/home/u")?;
-//! let launch = SandboxLaunch::new(&policy, "/home/u", "session-id");
+//! // A filtered network mode is enforced by a proxy *outside* the boundary
+//! // (ADR-27), so one is started — on the transport this backend can reach —
+//! // before the launch that opens a hole to it is composed.
+//! let caps = host.backend(backend).expect("a built-in backend").capabilities();
+//! let scratch = create_session_scratch("session-id")?;
+//! let grant = egress::establish("session-id", &policy, caps.proxy_transport, &scratch)?;
+//! let launch =
+//!     SandboxLaunch::new(&policy, "/home/u", "session-id").with_proxy(grant.endpoint);
 //! let _argv = host.wrap(backend, vec!["claude".to_string()], &launch)?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -37,6 +44,7 @@ pub mod agent;
 pub mod backend;
 pub mod bwrap;
 pub mod dirs;
+pub mod egress;
 pub mod probe;
 pub mod seatbelt;
 pub mod secrets;
@@ -46,11 +54,12 @@ use std::sync::{Arc, OnceLock};
 
 pub use agent::{apply_agent_requirements, compose_inner_sandbox, InnerSandboxPlan};
 pub use backend::{
-    Argv, Availability, Caps, InnerSandboxVerdict, ProxyEndpoint, SandboxBackend, SandboxError,
-    SandboxInstance, SandboxLaunch, SandboxResult,
+    Argv, Availability, Caps, Egress, InnerSandboxVerdict, ProxyEndpoint, ProxyTransport,
+    SandboxBackend, SandboxError, SandboxInstance, SandboxLaunch, SandboxResult,
 };
 pub use bwrap::{BwrapBackend, BwrapDetails};
 pub use dirs::{check_writable_roots, cleanup_session, create_session_scratch};
+pub use egress::{proxy_required, ProxyGrant, SessionDenial};
 pub use probe::{detect_platform, HostPlatform, LocalProbeHost, ProbeHost, RemoteProbeHost};
 pub use seatbelt::SeatbeltBackend;
 pub use secrets::{secrets_for, SecretKind, SecretPath, SecretPlatform, SECRET_PATHS};
@@ -211,7 +220,10 @@ mod tests {
         assert_eq!(chosen, SandboxBackendKind::Seatbelt);
 
         let policy = profile.resolve(chosen, "/Users/u").unwrap();
-        let launch = SandboxLaunch::new(&policy, "/Users/u", "host-test");
+        // The default profile is `allowlist`, which only means anything with
+        // the proxy that enforces it.
+        let launch = SandboxLaunch::new(&policy, "/Users/u", "host-test")
+            .with_proxy(ProxyEndpoint::Loopback { port: 8123 });
         let argv = host
             .wrap(chosen, vec!["claude".to_string()], &launch)
             .unwrap();
@@ -364,6 +376,7 @@ mod tests {
                 let argv = bwrap::build_argv(
                     "/usr/bin/bwrap",
                     &SandboxLaunch::new(&linux, "/home/u", "s1"),
+                    None,
                     &|_| false,
                 )
                 .unwrap();
@@ -402,12 +415,14 @@ mod tests {
 
             let mut reaching_the_database =
                 SandboxProfile::new("dev", vec![SandboxPath::workspace("~")]);
-            let mut inert_denies =
+            // Denies that only the egress proxy can enforce, with no proxy
+            // started for the launch: refused on both backends, in one sentence.
+            let mut unenforceable_denies =
                 SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
-            inert_denies.network_mode = NetworkMode::Full;
-            inert_denies.network_deny = vec!["evil.example".into()];
+            unenforceable_denies.network_mode = NetworkMode::Full;
+            unenforceable_denies.network_deny = vec!["evil.example".into()];
 
-            for profile in [&mut reaching_the_database, &mut inert_denies] {
+            for profile in [&mut reaching_the_database, &mut unenforceable_denies] {
                 let mac_policy = profile
                     .resolve(SandboxBackendKind::Seatbelt, "/home/u")
                     .unwrap();

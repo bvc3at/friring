@@ -66,13 +66,13 @@ pub enum SandboxDecision {
 /// # Errors
 ///
 /// The profile named a backend that is unavailable here, resolved to a policy
-/// this build cannot express, could not write its generated profile, or asks
-/// for a boundary friring will not grant — a read-write path reaching the
-/// database or the host's tmux socket, domain denies under a network mode that
-/// cannot enforce them, a path that is not valid UTF-8 — and the profile does
-/// not permit running unsandboxed. Failing the spawn is deliberate: quietly
-/// launching an agent outside the boundary the user asked for is a security
-/// regression, not a degraded mode.
+/// this build cannot express, could not write its generated profile, could not
+/// be given the egress proxy its network mode is enforced by, or asks for a
+/// boundary friring will not grant — a read-write path reaching the database or
+/// the host's tmux socket, a path that is not valid UTF-8 — and the profile
+/// does not permit running unsandboxed. Failing the spawn is deliberate:
+/// quietly launching an agent outside the boundary the user asked for is a
+/// security regression, not a degraded mode.
 pub fn apply(
     def: Option<&AgentDef>,
     config: &SessionConfig,
@@ -80,6 +80,10 @@ pub fn apply(
     args: &[String],
 ) -> Result<SandboxDecision, String> {
     let Some(profile) = config.sandbox.as_ref() else {
+        // A session whose profile was cleared keeps nothing running: this is a
+        // no-op for the overwhelmingly common case, because it never starts the
+        // egress supervisor to ask.
+        crate::sandbox::egress::stop(&session_key(config));
         return Ok(SandboxDecision::Unsandboxed);
     };
     let fallback = profile.allow_unsandboxed_fallback;
@@ -180,6 +184,11 @@ fn build(
     let plan = host
         .inner_sandbox(backend, &policy, agent_sandbox)
         .ok_or_else(|| format!("Sandbox backend '{backend}' has no inner-sandbox verdict"))?;
+    let transport = host
+        .backend(backend)
+        .ok_or_else(|| format!("Sandbox backend '{backend}' is not built into this friring"))?
+        .capabilities()
+        .proxy_transport;
 
     let session_key = session_key(config);
     let workspace = config
@@ -201,7 +210,35 @@ fn build(
     // claude's credential file, and denying it would log the agent out.
     let family = def.map(|d| d.hook_schema.as_deref().unwrap_or(&d.name));
 
+    // The egress proxy, before anything is launched: a mode the kernel cannot
+    // express on its own (an allowlist, or denies under `full`) is enforced
+    // there and nowhere else, so the boundary is not composable until it is
+    // listening. A failure here refuses the launch — `apply` turns that into
+    // the profile's own `allow_unsandboxed_fallback` decision — rather than
+    // starting an agent that believes it is filtered and is not.
+    let proxy = if crate::sandbox::egress::proxy_required(&policy) {
+        let grant = crate::sandbox::egress::establish(
+            &session_key,
+            &policy,
+            transport,
+            std::path::Path::new(&tmp_dir),
+        )
+        .map_err(|e| e.to_string())?;
+        for (key, value) in grant.env {
+            policy.insert_env(key, value);
+        }
+        Some(grant.endpoint)
+    } else {
+        // A profile edited from `allowlist` to `full` or `none` must not leave
+        // the previous launch's listener behind.
+        crate::sandbox::egress::stop(&session_key);
+        None
+    };
+
     let mut launch = SandboxLaunch::new(&policy, home, &session_key).with_tmp_dir(&tmp_dir);
+    if let Some(endpoint) = proxy {
+        launch = launch.with_proxy(endpoint);
+    }
     if let Some(workspace) = workspace.as_deref() {
         launch = launch.with_workspace(workspace);
     }
@@ -219,20 +256,30 @@ fn build(
     argv.extend(args.iter().cloned());
     argv.extend(plan.extra_args.iter().cloned());
 
-    let wrapped = host
-        .wrap(backend, argv, &launch)
-        .map_err(|e| e.to_string())?;
+    let wrapped = host.wrap(backend, argv, &launch).map_err(|e| {
+        // Nothing is going to use the proxy that was started for this launch:
+        // the caller either fails the spawn or falls back to the host, and a
+        // listener with no session behind it is a token left lying around.
+        crate::sandbox::egress::stop(&session_key);
+        e.to_string()
+    })?;
     let mut wrapped = wrapped.into_iter();
     let command = wrapped
         .next()
         .ok_or_else(|| format!("Sandbox backend '{backend}' produced an empty command line"))?;
 
-    let mut env: HashMap<String, String> = policy
+    // The agent's declared environment first, the *policy's* last: an agent
+    // that declares `HTTP_PROXY` in the registry must not shadow the boundary's
+    // own, which would route it around the allowlist. `apply_agent_requirements`
+    // has already folded the agent's declarations into the policy, so nothing
+    // an agent asked for is lost by the precedence — only overruled where the
+    // boundary has an answer of its own.
+    let mut env: HashMap<String, String> = plan
         .env
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    env.extend(plan.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env.extend(policy.env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
     Ok(SandboxedInvocation {
         command,
@@ -243,16 +290,20 @@ fn build(
     })
 }
 
-/// Drop the per-session state a sandboxed launch minted: the scratch directory
-/// the agent wrote and the policy file generated for it.
+/// Drop the per-session state a sandboxed launch minted: its egress proxy, the
+/// scratch directory the agent wrote, and the policy file generated for it.
 ///
-/// Call this when a session ends or is deleted. Skipping it costs disk rather
-/// than correctness — the next launch of the same session adopts what is there,
-/// which is what makes a crashed run recoverable — but an agent's writable
-/// scratch should not outlive the agent. Harmless for a session that never had
-/// a profile.
+/// Call this when a session ends or is deleted. Skipping the directories costs
+/// disk rather than correctness — the next launch of the same session adopts
+/// what is there, which is what makes a crashed run recoverable — but an
+/// agent's writable scratch should not outlive the agent, and its way out
+/// certainly should not: the proxy is stopped **first**, so the socket is
+/// unlinked by the process that bound it rather than pulled out from under a
+/// live listener. Harmless for a session that never had a profile.
 pub fn cleanup(config: &SessionConfig) {
-    crate::sandbox::cleanup_session(&session_key(config));
+    let key = session_key(config);
+    crate::sandbox::egress::stop(&key);
+    crate::sandbox::cleanup_session(&key);
 }
 
 /// The same cleanup for a teardown path that holds a persisted session row
@@ -264,7 +315,9 @@ pub fn cleanup(config: &SessionConfig) {
 /// nothing to drop. Exists so `session_ops`, which may not reference
 /// [`crate::sandbox`], still reaches the key derivation that lives here.
 pub fn cleanup_by_session_id(session_id: crate::session::SessionId) {
-    crate::sandbox::cleanup_session(&session_id.to_string());
+    let key = session_id.to_string();
+    crate::sandbox::egress::stop(&key);
+    crate::sandbox::cleanup_session(&key);
 }
 
 /// Names the generated profile file and the scratch directory, so two sessions
@@ -345,7 +398,7 @@ mod tests {
 
     #[test]
     fn a_remote_session_is_refused_rather_than_wrapped_locally() {
-        let profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        let profile = closed_profile();
         let mut config = config_with(Some(profile));
         config.backend = Some("ssh:devbox".into());
         let err = apply(Some(&agent_def()), &config, "claude", &[]).unwrap_err();
@@ -362,13 +415,37 @@ mod tests {
         ))
     }
 
+    /// Pin friring's data directory somewhere short, private and fabricated,
+    /// for the tests that compose a real launch.
+    ///
+    /// A bubblewrap launch binds `<data>/sandbox/tmp/<key>/proxy.sock`, and a
+    /// unix socket path has to fit in `sun_path` (103 bytes) — which the
+    /// default unit-test base, several directories under the platform temp
+    /// directory, does not leave room for on macOS. Held for the test's
+    /// lifetime: the override is thread-local and resets on drop.
+    fn fabricated_data_dir(name: &str) -> crate::paths::TestPathGuard {
+        let base = std::env::temp_dir().join(format!("frs{}-{name}", std::process::id()));
+        crate::paths::TestPathGuard::new(base)
+    }
+
+    /// A profile with no egress at all.
+    ///
+    /// The tests about argv and environment *shape* use this so they compose
+    /// one thing: the default `allowlist` starts a proxy and — under bwrap —
+    /// a relay, which the egress tests below exercise deliberately.
+    fn closed_profile() -> SandboxProfile {
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.network_mode = crate::session::NetworkMode::None;
+        profile
+    }
+
     /// Where the stub host's bubblewrap lives. A launch runs the path the probe
     /// resolved, never the bare [`crate::sandbox::bwrap::BWRAP`] name.
     const STUB_BWRAP: &str = "/usr/bin/bwrap";
 
     #[test]
     fn the_wrapper_surrounds_the_agent_and_appends_its_bypass_flags() {
-        let profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        let profile = closed_profile();
         let mut config = config_with(Some(profile));
         config.cwd = Some("/fabricated/home/dev/app".into());
         let def = agent_def();
@@ -414,7 +491,7 @@ mod tests {
     /// dropping `FRIRING_SESSION` kills status reporting silently.
     #[test]
     fn wrapping_adds_environment_and_never_replaces_the_sessions_own() {
-        let profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        let profile = closed_profile();
         let mut config = config_with(Some(profile));
         config
             .env
@@ -468,7 +545,7 @@ mod tests {
     /// just gets no help, which is the agent-neutrality rule.
     #[test]
     fn an_agent_that_declares_nothing_is_still_wrapped() {
-        let profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        let profile = closed_profile();
         let config = config_with(Some(profile));
         let wrapped = build(
             &stub_host(),
@@ -493,7 +570,7 @@ mod tests {
     fn a_path_that_cannot_be_spelled_exactly_refuses_the_launch() {
         use std::os::unix::ffi::OsStringExt as _;
 
-        let profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        let profile = closed_profile();
         let mut config = config_with(Some(profile));
         config.cwd = Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(
             vec![b'/', b'w', 0xff, b'k'],
@@ -516,7 +593,7 @@ mod tests {
     /// not the host temp root, which holds friring's tmux socket.
     #[test]
     fn the_launch_mints_its_own_scratch_directory() {
-        let profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        let profile = closed_profile();
         let mut config = config_with(Some(profile));
         config.agent_session_id = Some("scratch-mint-test".into());
         let def = agent_def();
@@ -550,6 +627,131 @@ mod tests {
 
         crate::agent::sandboxing::cleanup(&config);
         assert!(!std::path::Path::new(&scratch).exists());
+    }
+
+    /// A macOS host, where the egress transport is host loopback and no relay
+    /// is involved — the shape that composes end to end in a test process.
+    fn mac_host() -> SandboxHost {
+        SandboxHost::new(std::sync::Arc::new(crate::sandbox::probe::StubHost::macos(
+            26, true,
+        )))
+    }
+
+    /// The whole of P2 in one launch: a filtered profile starts a proxy before
+    /// the agent exists, the kernel policy opens exactly that port, and the
+    /// agent is handed every spelling of the proxy environment.
+    ///
+    /// `ALL_PROXY` is asserted to be **`socks5h`**, which is the one detail
+    /// that fails silently: with plain `socks5` the client resolves the
+    /// hostname itself and hands the proxy an address, so every domain rule
+    /// stops matching and the allowlist enforces nothing at all.
+    #[test]
+    fn a_filtered_profile_is_launched_with_a_proxy_and_the_environment_to_use_it() {
+        let _guard = fabricated_data_dir("egress");
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.network_allow = vec!["api.anthropic.com".into()];
+        let mut config = config_with(Some(profile));
+        config.agent_session_id = Some("egress-launch".into());
+        let def = agent_def();
+
+        let wrapped = build(
+            &mac_host(),
+            "/fabricated/home",
+            Some(&def),
+            &config,
+            "claude",
+            &[],
+        )
+        .unwrap();
+
+        // The one hole the profile leaves open names the port the proxy is
+        // already listening on: nothing can race a listener that is not bound.
+        let param = wrapped
+            .args
+            .iter()
+            .find(|a| a.starts_with("PROXY="))
+            .unwrap_or_else(|| panic!("no proxy parameter in {:?}", wrapped.args));
+        let port: u16 = param
+            .trim_start_matches("PROXY=localhost:")
+            .parse()
+            .unwrap_or_else(|e| panic!("{param}: {e}"));
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+
+        let expected = format!("127.0.0.1:{port}");
+        for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            let value = wrapped
+                .env
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is unset: {:?}", wrapped.env));
+            assert!(value.starts_with("http://"), "{name} = {value}");
+            assert!(value.ends_with(&expected), "{name} = {value}");
+        }
+        for name in ["ALL_PROXY", "all_proxy"] {
+            let value = wrapped.env.get(name).expect("ALL_PROXY is set");
+            assert!(
+                value.starts_with("socks5h://"),
+                "{name} must keep resolution on the proxy's side: {value}"
+            );
+        }
+        for name in ["NO_PROXY", "no_proxy"] {
+            assert_eq!(
+                wrapped.env.get(name).map(String::as_str),
+                Some("localhost,127.0.0.1,::1"),
+                "the agent's own local traffic must not be tunnelled"
+            );
+        }
+        // The agent's declared environment still arrives; the boundary's
+        // variables are simply the last word.
+        assert_eq!(
+            wrapped.env.get("DISABLE_AUTOUPDATER").map(String::as_str),
+            Some("1")
+        );
+
+        // Teardown takes the proxy with the scratch directory, so no listener
+        // outlives the session that was given it. The stop is queued rather
+        // than waited on — teardown must not block a UI thread — so the
+        // assertion is that it happens, not that it has already happened.
+        cleanup(&config);
+        let closed = (0..200).any(|_| {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        });
+        assert!(closed, "the proxy outlived its session");
+    }
+
+    /// Fail closed: a proxy that cannot start refuses the launch, so an
+    /// `allowlist` sandbox is never started believing it is filtered. The
+    /// profile's own escape hatch decides what happens next — and a fallback
+    /// keeps the desired profile, which is what the next relaunch rebuilds
+    /// from.
+    #[test]
+    fn a_proxy_that_cannot_start_refuses_the_launch() {
+        // A data directory deep enough that the socket path cannot fit in
+        // `sun_path`, which is a failure with no host and no network in it.
+        let base =
+            std::env::temp_dir().join(format!("frs{}-{}", std::process::id(), "d".repeat(120)));
+        let _guard = crate::paths::TestPathGuard::new(&base);
+        let mut config = config_with(Some(SandboxProfile::new(
+            "dev",
+            vec![SandboxPath::workspace("~/dev/app")],
+        )));
+        config.agent_session_id = Some("egress-refused".into());
+
+        let err = build(
+            &stub_host(),
+            "/fabricated/home",
+            None,
+            &config,
+            "claude",
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.contains("egress proxy"), "{err}");
+        assert!(err.contains("at most"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The one shape assertion that does not need a backend to be installed:

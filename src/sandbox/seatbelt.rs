@@ -26,8 +26,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use crate::sandbox::backend::{
-    Argv, Availability, Caps, InnerSandboxVerdict, ProxyEndpoint, SandboxBackend, SandboxError,
-    SandboxLaunch, SandboxResult, PROTECTED_IN_WRITABLE_ROOT,
+    Argv, Availability, Caps, Egress, InnerSandboxVerdict, ProxyEndpoint, ProxyTransport,
+    SandboxBackend, SandboxError, SandboxLaunch, SandboxResult, PROTECTED_IN_WRITABLE_ROOT,
 };
 use crate::sandbox::dirs::{self, sanitize_component, write_private};
 use crate::sandbox::probe::{detect_platform, HostPlatform, LocalProbeHost, ProbeHost};
@@ -195,15 +195,15 @@ pub fn params(launch: &SandboxLaunch<'_>) -> Vec<(&'static str, String)> {
 }
 
 /// The proxy parameter's value, or `None` when this launch has no hole to
-/// punch — either the mode grants nothing ([`NetworkMode::None`]) or
-/// everything ([`NetworkMode::Full`]), or P2's proxy is not running yet.
+/// punch — the mode grants nothing, or everything, or no proxy is running.
+///
+/// A seatbelt sandbox shares the host's filesystem, so the socket spelling is
+/// the socket's *host* path: there is no boundary for it to be carried across.
 fn proxy_value(launch: &SandboxLaunch<'_>) -> Option<String> {
-    if launch.policy.network != NetworkMode::Allowlist {
-        return None;
-    }
-    match launch.proxy.as_ref()? {
-        ProxyEndpoint::Loopback { port } => Some(format!("localhost:{port}")),
-        ProxyEndpoint::UnixSocket { host_path, .. } => Some(host_path.clone()),
+    match launch.egress() {
+        Egress::Proxied(ProxyEndpoint::Loopback { port }) => Some(format!("localhost:{port}")),
+        Egress::Proxied(ProxyEndpoint::UnixSocket { host_path, .. }) => Some(host_path.clone()),
+        Egress::Open | Egress::Closed => None,
     }
 }
 
@@ -407,16 +407,17 @@ fn render_path_rules(out: &mut Vec<String>, readable: &[PathSlot], writable: &[P
 }
 
 fn render_network(out: &mut Vec<String>, launch: &SandboxLaunch<'_>) {
-    match launch.policy.network {
-        NetworkMode::Full => {
+    let mode = launch.policy.network;
+    match launch.egress() {
+        Egress::Open => {
             section(
                 out,
                 "network: full",
                 &[
-                    "Unrestricted egress. Domain denies cannot be expressed here —",
-                    "SBPL has no host predicate — so a profile carrying them under",
-                    "`full` is refused before this point (`SandboxLaunch::validate`)",
-                    "rather than launched with a rule it silently cannot keep.",
+                    "Unrestricted egress, which `full` means only while it carries no",
+                    "denies: SBPL has no host predicate, so a deny list is enforceable",
+                    "only by routing everything through the proxy instead — which is",
+                    "what a `full` profile with denies renders as (see below).",
                 ],
             );
             out.push("(allow network*)".to_string());
@@ -430,7 +431,37 @@ fn render_network(out: &mut Vec<String>, launch: &SandboxLaunch<'_>) {
                 services.join("\n    ")
             ));
         }
-        NetworkMode::None => {
+        Egress::Proxied(ProxyEndpoint::Loopback { .. }) => {
+            section(
+                out,
+                &format!("network: {mode} (proxied)"),
+                &[
+                    "One hole, to the friring proxy on loopback, which enforces the",
+                    "domain rules outside the boundary (ADR-27). A process that",
+                    "ignores the proxy environment gets no network rather than an",
+                    "escape route. DNS is deliberately absent: the proxy resolves,",
+                    "so name lookups cannot become an exfiltration channel.",
+                ],
+            );
+            out.push(format!(
+                "(allow network-outbound (remote ip (param {PARAM_PROXY:?})))"
+            ));
+        }
+        Egress::Proxied(ProxyEndpoint::UnixSocket { .. }) => {
+            section(
+                out,
+                &format!("network: {mode} (proxied)"),
+                &[
+                    "One hole, to the friring proxy's unix socket (ADR-27). A seatbelt",
+                    "sandbox shares the host's filesystem, so it connects to the socket",
+                    "directly and needs no relay.",
+                ],
+            );
+            out.push(format!(
+                "(allow network-outbound (literal (param {PARAM_PROXY:?})))"
+            ));
+        }
+        Egress::Closed if mode == NetworkMode::None => {
             section(
                 out,
                 "network: none",
@@ -442,45 +473,18 @@ fn render_network(out: &mut Vec<String>, launch: &SandboxLaunch<'_>) {
                 ],
             );
         }
-        NetworkMode::Allowlist => match launch.proxy.as_ref() {
-            Some(ProxyEndpoint::Loopback { .. }) => {
-                section(
-                    out,
-                    "network: allowlist",
-                    &[
-                        "One hole, to the friring proxy on loopback, which enforces the",
-                        "domain list outside the boundary (ADR-27). A process that",
-                        "ignores the proxy environment gets no network rather than an",
-                        "escape route. DNS is deliberately absent: the proxy resolves,",
-                        "so name lookups cannot become an exfiltration channel.",
-                    ],
-                );
-                out.push(format!(
-                    "(allow network-outbound (remote ip (param {PARAM_PROXY:?})))"
-                ));
-            }
-            Some(ProxyEndpoint::UnixSocket { .. }) => {
-                section(
-                    out,
-                    "network: allowlist",
-                    &["One hole, to the friring proxy's unix socket (ADR-27)."],
-                );
-                out.push(format!(
-                    "(allow network-outbound (literal (param {PARAM_PROXY:?})))"
-                ));
-            }
-            None => {
-                section(
-                    out,
-                    "network: allowlist (no proxy running)",
-                    &[
-                        "Configured identically to `none` until the proxy exists: every",
-                        "backend blocks direct egress in both modes, so treating the two",
-                        "alike grants nothing and the profile still starts closed.",
-                    ],
-                );
-            }
-        },
+        Egress::Closed => {
+            section(
+                out,
+                &format!("network: {mode} (no proxy running)"),
+                &[
+                    "Configured identically to `none`: this mode is enforced by the",
+                    "friring proxy, and without one there is nothing to open a hole to.",
+                    "`SandboxLaunch::validate` refuses such a launch, so this is what a",
+                    "profile generated outside that path renders as — closed.",
+                ],
+            );
+        }
     }
 }
 
@@ -724,6 +728,9 @@ impl SandboxBackend for SeatbeltBackend {
             persistent: false,
             host_credentials: true,
             inner_agent_sandbox: InnerSandboxVerdict::Denied,
+            // A seatbelt process keeps the host's network stack, so host
+            // loopback is reachable and the profile opens exactly that port.
+            proxy_transport: ProxyTransport::Loopback,
         }
     }
 
@@ -1099,36 +1106,64 @@ mod tests {
         assert!(text.contains("com.apple.mDNSResponder"));
     }
 
+    /// A filtered mode with no proxy is refused at launch; the generator is
+    /// pure and answers anyway, and its answer must be *closed*. Opening
+    /// `network*` here — the shape `full` uses — would turn a missing proxy
+    /// into unrestricted egress.
     #[test]
-    fn allowlist_without_a_proxy_grants_exactly_what_none_does() {
-        // The default profile is already `allowlist`; P1 runs no proxy.
-        let policy = workspace_policy();
-        let launch = SandboxLaunch::new(&policy, "/Users/u", "s1");
-        let text = render_profile(&launch);
-        assert!(!text.contains("(allow network"));
-        assert!(text.contains("no proxy running"));
-        assert!(params(&launch).iter().all(|(n, _)| *n != PARAM_PROXY));
+    fn a_filtered_mode_without_a_proxy_grants_exactly_what_none_does() {
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.network_deny = vec!["evil.example".into()];
+        for mode in [NetworkMode::Allowlist, NetworkMode::Full] {
+            profile.network_mode = mode;
+            let policy = profile
+                .resolve(SandboxBackendKind::Seatbelt, "/Users/u")
+                .unwrap();
+            let launch = SandboxLaunch::new(&policy, "/Users/u", "s1");
+            let text = render_profile(&launch);
+            assert!(!text.contains("(allow network"), "{mode}: {text}");
+            assert!(text.contains("no proxy running"), "{mode}");
+            assert!(params(&launch).iter().all(|(n, _)| *n != PARAM_PROXY));
+            // And the launch itself is refused rather than quietly started.
+            assert!(launch.validate().is_err(), "{mode}");
+        }
     }
 
     #[test]
-    fn allowlist_with_a_proxy_opens_only_that_endpoint() {
-        let policy = workspace_policy();
-        let launch = SandboxLaunch::new(&policy, "/Users/u", "s1")
-            .with_proxy(ProxyEndpoint::Loopback { port: 8123 });
-        let text = render_profile(&launch);
-        assert!(text.contains(r#"(allow network-outbound (remote ip (param "PROXY")))"#));
-        // No DNS: the proxy resolves, so the sandbox cannot use name lookups as
-        // a side channel.
-        assert!(!text.contains("mDNSResponder"));
-        assert_eq!(
-            params(&launch).last(),
-            Some(&("PROXY", "localhost:8123".to_string()))
-        );
+    fn a_proxied_mode_opens_only_that_endpoint() {
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.network_deny = vec!["evil.example".into()];
+        // `full` with denies is proxied exactly like `allowlist`: the denies
+        // are enforceable only outside the boundary, so nothing else may leave.
+        for mode in [NetworkMode::Allowlist, NetworkMode::Full] {
+            profile.network_mode = mode;
+            let policy = profile
+                .resolve(SandboxBackendKind::Seatbelt, "/Users/u")
+                .unwrap();
+            let launch = SandboxLaunch::new(&policy, "/Users/u", "s1")
+                .with_proxy(ProxyEndpoint::Loopback { port: 8123 });
+            let text = render_profile(&launch);
+            assert!(
+                text.contains(r#"(allow network-outbound (remote ip (param "PROXY")))"#),
+                "{mode}: {text}"
+            );
+            // Not the `full` shape: unrestricted egress would ignore the rules
+            // the proxy exists to apply.
+            assert!(!text.contains("(allow network*)"), "{mode}: {text}");
+            // No DNS: the proxy resolves, so name lookups cannot become a side
+            // channel.
+            assert!(!text.contains("mDNSResponder"), "{mode}");
+            assert_eq!(
+                params(&launch).last(),
+                Some(&("PROXY", "localhost:8123".to_string()))
+            );
+        }
 
+        let policy = workspace_policy();
         let socket =
             SandboxLaunch::new(&policy, "/Users/u", "s1").with_proxy(ProxyEndpoint::UnixSocket {
-                host_path: "/tmp/friring-proxy.sock".into(),
-                inside_path: "/tmp/friring-proxy.sock".into(),
+                host_path: "/Users/u/.local/share/friring/sandbox/tmp/s1/proxy.sock".into(),
+                inside_path: "/Users/u/.local/share/friring/sandbox/tmp/s1/proxy.sock".into(),
             });
         assert!(render_profile(&socket)
             .contains(r#"(allow network-outbound (literal (param "PROXY")))"#));
@@ -1187,7 +1222,8 @@ mod tests {
         let policy = workspace_policy();
         let backend = backend();
         let launch = SandboxLaunch::new(&policy, "/Users/u", "wrap-test")
-            .with_workspace("/Users/u/work/repo");
+            .with_workspace("/Users/u/work/repo")
+            .with_proxy(ProxyEndpoint::Loopback { port: 8123 });
         let argv = backend
             .wrap(
                 vec!["claude".into(), "--resume".into(), "abc".into()],
