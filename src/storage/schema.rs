@@ -34,9 +34,13 @@ use rusqlite::{Connection, OptionalExtension};
 /// the deferred wake nudge the modal guard leaves behind), both nullable for
 /// the same reason; v47 adds the sandbox tables (`sandbox_profiles` +
 /// `sandbox_instances`) and a nullable `sessions.sandbox_profile`, and drops
-/// the dormant upstream container/VM tables this feature supersedes.
+/// the dormant upstream container/VM tables this feature supersedes; v48 adds
+/// `sessions.sandbox_unenforced` (nullable) — the reason the last launch could
+/// *not* apply that profile, so a restart or a cross-instance adopt inherits
+/// the warning instead of rendering the sandboxed mark over an agent that is
+/// running on the host.
 /// Gaps in the step table are fine (there is no v18 step either).
-pub const SCHEMA_VERSION: u32 = 47;
+pub const SCHEMA_VERSION: u32 = 48;
 
 /// A single migration step: applied when the stored version is below `target`.
 type MigrationStep = (u32, fn(&Connection) -> rusqlite::Result<()>);
@@ -107,6 +111,7 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             frame_saved_at    INTEGER,
             unloaded          INTEGER NOT NULL DEFAULT 0,
             sandbox_profile   TEXT,
+            sandbox_unenforced TEXT,
             created_at        INTEGER NOT NULL,
             updated_at        INTEGER NOT NULL,
             deleted_at        INTEGER
@@ -421,6 +426,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         (45, migrate_v45_ghost_frames),
         (46, migrate_v46_message_threading),
         (47, migrate_v47_sandbox_profiles),
+        (48, migrate_v48_sandbox_unenforced),
     ];
 
     for &(target, step) in steps {
@@ -1450,6 +1456,29 @@ fn migrate_v47_sandbox_profiles(conn: &Connection) -> rusqlite::Result<()> {
          DROP TABLE IF EXISTS vms;
          DROP TABLE IF EXISTS project_vm_config;",
     )
+}
+
+/// v47 → v48: add `sessions.sandbox_unenforced` — the reason the last launch
+/// could **not** apply the session's `sandbox_profile`, or `NULL`.
+///
+/// v47 persisted only the boundary a session *asked for*. The agent process
+/// outlives friring (tmux keeps it alive), so a restart and a cross-instance
+/// adopt both rebuild the session from this table and had no evidence of what
+/// the launch actually did — and a session with a profile and no evidence
+/// renders as protected. This column is that evidence, and it is deliberately
+/// only the **negative** half: an applied boundary's composition would go stale
+/// the moment its profile was edited, and a stale claim of protection is the
+/// one outcome `docs/SANDBOX.md` §Indicators calls worse than no mark at all.
+/// See [`crate::session::SandboxEnforcement`].
+///
+/// Nullable with no default, so the `ALTER` cannot rewrite existing rows: every
+/// pre-v48 session is "nothing recorded", which is exactly its old behaviour.
+/// A database that predates the sandbox tables entirely reaches this step with
+/// `sessions.sandbox_profile` already added by
+/// [`migrate_v47_sandbox_profiles`], and a `sessions` table that somehow is not
+/// there at all makes it a no-op rather than an error.
+fn migrate_v48_sandbox_unenforced(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(conn, "sessions", "sandbox_unenforced", "TEXT")
 }
 
 #[cfg(test)]
@@ -2505,6 +2534,114 @@ mod tests {
         migrate(&conn).unwrap();
 
         assert!(table_exists(&conn, "sandbox_profiles").unwrap());
+        assert_eq!(stored_version(&conn), SCHEMA_VERSION.to_string());
+    }
+
+    /// Minimal pre-v48 state: a v47 `sessions` table (so `sandbox_profile` is
+    /// already there) holding one sandboxed row, which the v48 assertions need
+    /// to survive the upgrade untouched.
+    fn seed_v47(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO metadata (key, value) VALUES ('schema_version', '47');
+             CREATE TABLE sessions (
+                id                TEXT PRIMARY KEY,
+                name              TEXT NOT NULL,
+                agent             TEXT NOT NULL DEFAULT 'claude',
+                backend_id        TEXT NOT NULL DEFAULT '',
+                backend_type      TEXT NOT NULL DEFAULT 'tmux',
+                sandbox_profile   TEXT,
+                created_at        INTEGER NOT NULL,
+                updated_at        INTEGER NOT NULL,
+                deleted_at        INTEGER);
+             INSERT INTO sessions (id, name, backend_type, sandbox_profile, created_at, updated_at)
+                VALUES ('s-1', 'boxed', 'local-tmux', 'dev', 11, 22);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migrate_from_v47_adds_the_sandbox_unenforced_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        seed_v47(&conn);
+        assert!(!column_exists(&conn, "sessions", "sandbox_unenforced").unwrap());
+
+        migrate(&conn).unwrap();
+
+        // Nullable with no default: the ALTER must not rewrite existing rows,
+        // and "nothing recorded" has to stay distinguishable from a reason.
+        let (notnull, dflt): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT \"notnull\", dflt_value FROM pragma_table_info('sessions') \
+                 WHERE name = 'sandbox_unenforced'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("sessions.sandbox_unenforced should be added at v48");
+        assert_eq!(notnull, 0);
+        assert_eq!(dflt, None);
+
+        // The row survives, still asking for its profile and recording nothing
+        // about the launch — a v47 database never knew.
+        let (name, profile, unenforced): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT name, sandbox_profile, sandbox_unenforced FROM sessions WHERE id = 's-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "boxed");
+        assert_eq!(profile.as_deref(), Some("dev"));
+        assert_eq!(unenforced, None);
+
+        assert_eq!(stored_version(&conn), SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn migrate_from_v46_adds_the_sandbox_unenforced_column_too() {
+        // The long upgrade: a database that predates the sandbox tables
+        // entirely gets `sandbox_profile` from v47 and this column from v48,
+        // in that order, in one pass.
+        let conn = Connection::open_in_memory().unwrap();
+        seed_v46(&conn);
+
+        migrate(&conn).unwrap();
+
+        assert!(column_exists(&conn, "sessions", "sandbox_profile").unwrap());
+        assert!(column_exists(&conn, "sessions", "sandbox_unenforced").unwrap());
+        assert_eq!(stored_version(&conn), SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn migrate_v48_re_run_keeps_a_recorded_reason() {
+        // A crash between the step and the version bump re-runs the step over
+        // its own output. Re-adding the column would wipe the verdicts already
+        // recorded in it — a session that fell back would come back looking
+        // protected — so the step has to be a true no-op when it is present.
+        let conn = Connection::open_in_memory().unwrap();
+        seed_v47(&conn);
+        migrate(&conn).unwrap();
+        conn.execute(
+            "UPDATE sessions SET sandbox_unenforced = 'bwrap is not installed' WHERE id = 's-1'",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "UPDATE metadata SET value = '47' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        let unenforced: Option<String> = conn
+            .query_row(
+                "SELECT sandbox_unenforced FROM sessions WHERE id = 's-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unenforced.as_deref(), Some("bwrap is not installed"));
         assert_eq!(stored_version(&conn), SCHEMA_VERSION.to_string());
     }
 

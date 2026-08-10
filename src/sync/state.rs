@@ -78,6 +78,17 @@ pub struct SharedSession {
     /// of it, and the only way a restart re-derives the same wrapper.
     pub sandbox_profile: Option<String>,
 
+    /// Whether the last launch actually put that boundary in force
+    /// (`sessions.sandbox_unenforced`). The profile says what the session asked
+    /// for; this says what it got, and is what stops a restored or adopted
+    /// session wearing the shield over an agent running on the host.
+    ///
+    /// [`Unrecorded`](crate::session::SandboxEnforcement::Unrecorded) is **not**
+    /// "applied": it means the writer has no launch to report, and
+    /// [`upsert_session`](crate::storage::Database::upsert_session) leaves the
+    /// stored verdict alone rather than clearing it.
+    pub sandbox_enforcement: crate::session::SandboxEnforcement,
+
     /// Parent session (lead/worker relationship for orchestration).
     /// `None` for top-level sessions. Purely informational: deleting the
     /// parent does not cascade to children.

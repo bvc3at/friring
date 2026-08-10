@@ -192,6 +192,12 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         // its boundary for good, where keeping it makes the next relaunch
         // sandboxed again as soon as the backend is available.
         sandbox_profile: config.sandbox.as_ref().map(|p| p.name.clone()),
+        // …and what this launch managed to apply. A headless spawn writes the
+        // row once and never comes back to it, so a fallback that went
+        // unrecorded here would render as a boundary that holds.
+        sandbox_enforcement: crate::session::SandboxEnforcement::from_launch(
+            invocation.sandbox.as_ref(),
+        ),
         parent_session_id: req.parent_session_id,
         display_order: None,
         tombstone: false,
@@ -695,6 +701,7 @@ mod tests {
             worktrees: Vec::new(),
             shell_backend_id: None,
             sandbox_profile: None,
+            sandbox_enforcement: Default::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,

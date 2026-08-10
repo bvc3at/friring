@@ -307,6 +307,23 @@ transitions instead of reading SQLite. Multi-repo sessions additionally expose
 user-chosen symlink-workspace directory from the wizard's `Ctrl+O` field;
 `null` = the default id-derived path).
 
+The same JSON carries both halves of a session's sandbox, and they answer
+different questions (`docs/SANDBOX.md`):
+
+- `sandbox_profile` — the boundary the session **asked for**. It survives a
+  launch that could not deliver it, because that is what the next relaunch
+  rebuilds from; `null` = the agent asked for no boundary.
+- `sandbox_unenforced` — why the last launch did **not** deliver it: the reason
+  the profile could not be applied and `allow_unsandboxed_fallback` let the
+  agent start on the host anyway. `null` = no launch recorded a complaint.
+  `session create`/`session restart` report their own launch's verdict under
+  the same key, and print `NOT sandboxed — <reason>` on the human output.
+
+A non-null `sandbox_profile` therefore does **not** mean the agent is
+sandboxed — check `sandbox_unenforced` too. Both are persisted, so they answer
+for a session this friring only adopted, and `session get`'s human output folds
+them into one `sandbox` row (`dev — NOT enforced: <reason>`).
+
 ## Delete and restore semantics
 
 `session delete <uuid>` **soft-deletes** by default — only the DB row is marked

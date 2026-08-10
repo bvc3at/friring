@@ -339,6 +339,85 @@ impl SandboxState {
     }
 }
 
+/// What the **persisted row** records about a session's boundary — the half of
+/// [`SandboxState`] that outlives the friring that launched it.
+///
+/// A sandboxed agent runs in tmux, so the wrapped process survives a friring
+/// restart and is adopted by any instance that opens the same database. Both
+/// paths rebuild the session from SQLite, which knows the *desired* profile;
+/// without this the applied state would be evidence-free after every restart,
+/// and the mark rendered from no evidence is the **protected** one
+/// (`docs/SANDBOX.md` §Indicators).
+///
+/// Only the **negative** verdict is stored, as `sessions.sandbox_unenforced`:
+/// a reason string, or `NULL`. The composition an applied boundary produced
+/// (`seatbelt · inner agent sandbox: off …`) is deliberately not persisted —
+/// the next launch re-derives it, and a stale *positive* claim is the exact
+/// failure this feature exists to prevent, where a stale warning is at worst
+/// noise. Reading a row therefore only ever yields [`Unrecorded`](Self::Unrecorded)
+/// or [`Unenforced`](Self::Unenforced); [`Enforced`](Self::Enforced) is the
+/// write direction's way of saying "clear the warning".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SandboxEnforcement {
+    /// Nothing to report: this writer did not launch the agent (a session it
+    /// only adopted, a row rebuilt from storage, a session with no profile).
+    /// A write of it **leaves the stored verdict exactly as it found it**.
+    ///
+    /// The default on purpose: a construction site that has no launch to report
+    /// cannot erase one that did — the full-row write-back hazard that has
+    /// already cost this feature a lying indicator once.
+    #[default]
+    Unrecorded,
+    /// A launch put the boundary in force. Stored as the *absence* of a reason,
+    /// so nothing about the composition can go stale.
+    Enforced,
+    /// A launch could not apply the profile and `allow_unsandboxed_fallback`
+    /// let the agent start on the host anyway. Carries the reason, which the
+    /// indicators show in place of the composition.
+    Unenforced(String),
+}
+
+impl SandboxEnforcement {
+    /// What a launch learned, read off the live
+    /// [`SessionInfo::sandbox_state`]. `None` — a session friring did not
+    /// launch, or one that asked for no boundary — records nothing rather than
+    /// claiming anything.
+    pub fn from_launch(state: Option<&SandboxState>) -> Self {
+        match state {
+            None => Self::Unrecorded,
+            Some(SandboxState::Applied(_)) => Self::Enforced,
+            Some(SandboxState::Unenforced(reason)) => Self::Unenforced(reason.clone()),
+        }
+    }
+
+    /// Decode the `sessions.sandbox_unenforced` column. Any text is a reason —
+    /// the column has no encoding that could fail to parse, and therefore none
+    /// that could be corrupted into a claim of protection.
+    pub fn from_column(reason: Option<String>) -> Self {
+        match reason {
+            Some(reason) => Self::Unenforced(reason),
+            None => Self::Unrecorded,
+        }
+    }
+
+    /// The recorded reason the boundary is not in force, if there is one.
+    pub fn unenforced_reason(&self) -> Option<&str> {
+        match self {
+            Self::Unenforced(reason) => Some(reason),
+            Self::Unrecorded | Self::Enforced => None,
+        }
+    }
+
+    /// The live [`SandboxState`] a **restored or adopted** session inherits
+    /// from the row. Only a recorded warning crosses: an applied boundary's
+    /// composition is not persisted, so the alternative to `None` would be a
+    /// composition friring never applied.
+    pub fn launch_state(&self) -> Option<SandboxState> {
+        self.unenforced_reason()
+            .map(|reason| SandboxState::Unenforced(reason.to_string()))
+    }
+}
+
 pub struct SessionInfo {
     pub id: SessionId,
     pub name: String,
@@ -374,10 +453,14 @@ pub struct SessionInfo {
     /// What the last launch did with that profile — whether the boundary is
     /// actually in effect, and why it is not when it is not.
     ///
-    /// Not persisted: it describes a running process, and a restart recomputes
-    /// it from the profile and the host. `None` means friring did not launch
-    /// this process — a session it only adopted — so the applied state is
-    /// unknown and the persisted profile is the only evidence there is.
+    /// Half-persisted, as [`SandboxEnforcement`]: an `Unenforced` reason is
+    /// stored (`sessions.sandbox_unenforced`) so a restore or a cross-instance
+    /// adopt inherits the warning instead of rendering the shield over an agent
+    /// on the host; an `Applied` composition is not, because the next launch
+    /// re-derives it and a stale one would claim a boundary nobody checked.
+    /// `None` therefore means friring has no launch verdict for this process —
+    /// it only adopted it, and no warning was ever recorded — so the persisted
+    /// profile is the only evidence there is.
     pub sandbox_state: Option<SandboxState>,
     /// Agent metrics from the agent's statusline (Claude only).
     pub agent_metrics: Option<AgentMetrics>,
@@ -617,6 +700,73 @@ mod tests {
         assert!(config.cwd.is_none());
         assert_eq!(config.agent, "");
         assert!(config.env.is_empty());
+    }
+
+    /// The write direction: a launch's verdict maps onto the row, and a session
+    /// friring did not launch records *nothing* — the default that keeps a
+    /// full-row write-back from erasing a verdict it never had.
+    #[test]
+    fn sandbox_enforcement_from_a_launch() {
+        assert_eq!(
+            SandboxEnforcement::from_launch(None),
+            SandboxEnforcement::Unrecorded
+        );
+        assert_eq!(
+            SandboxEnforcement::default(),
+            SandboxEnforcement::Unrecorded
+        );
+        assert_eq!(
+            SandboxEnforcement::from_launch(Some(&SandboxState::Applied(
+                "seatbelt · inner agent sandbox: off".to_string()
+            ))),
+            SandboxEnforcement::Enforced,
+        );
+        assert_eq!(
+            SandboxEnforcement::from_launch(Some(&SandboxState::Unenforced(
+                "bwrap is not installed".to_string()
+            ))),
+            SandboxEnforcement::Unenforced("bwrap is not installed".to_string()),
+        );
+    }
+
+    /// The read direction: the column is a reason or nothing, and only a reason
+    /// crosses back into a live session. An applied boundary's composition is
+    /// deliberately not persisted, so a restored session inherits no claim.
+    #[test]
+    fn sandbox_enforcement_column_round_trip() {
+        assert_eq!(
+            SandboxEnforcement::from_column(None),
+            SandboxEnforcement::Unrecorded
+        );
+        assert_eq!(SandboxEnforcement::Unrecorded.unenforced_reason(), None);
+        assert_eq!(SandboxEnforcement::Unrecorded.launch_state(), None);
+
+        // An applied launch stores the absence of a reason, so it reads back as
+        // "nothing recorded" — never as a composition friring cannot re-verify.
+        assert_eq!(SandboxEnforcement::Enforced.unenforced_reason(), None);
+        assert_eq!(SandboxEnforcement::Enforced.launch_state(), None);
+        assert_eq!(
+            SandboxEnforcement::from_column(
+                SandboxEnforcement::Enforced
+                    .unenforced_reason()
+                    .map(str::to_string)
+            ),
+            SandboxEnforcement::Unrecorded,
+        );
+
+        let stored = SandboxEnforcement::Unenforced("bwrap is not installed".to_string());
+        assert_eq!(stored.unenforced_reason(), Some("bwrap is not installed"));
+        assert_eq!(
+            SandboxEnforcement::from_column(stored.unenforced_reason().map(str::to_string)),
+            stored,
+        );
+        assert_eq!(
+            stored.launch_state(),
+            Some(SandboxState::Unenforced(
+                "bwrap is not installed".to_string()
+            )),
+        );
+        assert!(!stored.launch_state().unwrap().is_applied());
     }
 
     #[test]

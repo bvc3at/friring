@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use rusqlite::{params, OptionalExtension};
 
-use crate::session::SessionId;
+use crate::session::{SandboxEnforcement, SessionId};
 use crate::sync::{current_time_millis, SharedSession, SharedWorktree};
 
 use super::audit::{AuditAction, EntityType};
@@ -72,6 +72,16 @@ impl Database {
     /// only on insert; a conflict revives a soft-deleted row (`deleted_at =
     /// NULL`). The pre-write existence check decides only the audit label and
     /// can't make the write race — the UPSERT handles both cases regardless.
+    ///
+    /// `sandbox_unenforced` is written **only when the caller has a launch to
+    /// report** ([`SandboxEnforcement::Unrecorded`] leaves the stored verdict
+    /// exactly as it was). A session friring merely adopted, or a row rebuilt
+    /// from storage, has no verdict of its own, and writing its default back
+    /// would erase a warning another launch recorded — leaving a session that
+    /// is running on the host wearing the sandboxed mark. The one exception is
+    /// a write that clears `sandbox_profile`: the warning goes with the
+    /// boundary it was about, because a session that asks for nothing cannot be
+    /// failing to get it.
     pub fn upsert_session(&self, session: &SharedSession) -> rusqlite::Result<()> {
         let now = current_time_millis() as i64;
         let id_str = session.id.to_string();
@@ -86,12 +96,20 @@ impl Database {
             .optional()?
             .is_some();
 
+        let (records_launch, unenforced) =
+            match (&session.sandbox_profile, &session.sandbox_enforcement) {
+                (None, _) => (true, None),
+                (Some(_), SandboxEnforcement::Unrecorded) => (false, None),
+                (Some(_), SandboxEnforcement::Enforced) => (true, None),
+                (Some(_), SandboxEnforcement::Unenforced(reason)) => (true, Some(reason.as_str())),
+            };
+
         self.conn.execute(
             "INSERT INTO sessions (id, name, agent, backend_id, backend_type, \
              agent_session_id, cwd, additional_dirs, workspace_dir, \
              shell_backend_id, parent_session_id, display_order, \
-             sandbox_profile, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14) \
+             sandbox_profile, sandbox_unenforced, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15) \
              ON CONFLICT(id) DO UPDATE SET \
                  name = excluded.name, agent = excluded.agent, \
                  backend_id = excluded.backend_id, \
@@ -103,6 +121,8 @@ impl Database {
                  parent_session_id = excluded.parent_session_id, \
                  display_order = excluded.display_order, \
                  sandbox_profile = excluded.sandbox_profile, \
+                 sandbox_unenforced = CASE WHEN ?16 THEN excluded.sandbox_unenforced \
+                                           ELSE sessions.sandbox_unenforced END, \
                  updated_at = excluded.updated_at, deleted_at = NULL",
             params![
                 id_str,
@@ -124,7 +144,9 @@ impl Database {
                 session.parent_session_id.map(|id| id.to_string()),
                 session.display_order,
                 session.sandbox_profile,
+                unenforced,
                 now,
+                records_launch,
             ],
         )?;
 
@@ -296,7 +318,8 @@ impl Database {
             "SELECT s.id, s.name, s.agent, s.backend_id, s.backend_type, \
              s.agent_session_id, s.cwd, s.additional_dirs, s.workspace_dir, \
              s.shell_backend_id, s.parent_session_id, s.display_order, \
-             s.sandbox_profile, w.repo_path, w.worktree_path, w.branch \
+             s.sandbox_profile, s.sandbox_unenforced, \
+             w.repo_path, w.worktree_path, w.branch \
              FROM sessions s \
              LEFT JOIN worktrees w ON s.id = w.session_id AND w.deleted_at IS NULL \
              WHERE {condition} \
@@ -519,6 +542,34 @@ impl Database {
         Ok(())
     }
 
+    /// Record what a launch did with a session's sandbox profile: the reason
+    /// the boundary is **not** in force, or `NULL` when it is.
+    ///
+    /// A targeted UPDATE for the relaunch paths that do not rewrite the row —
+    /// `session_ops::restart_session_headless` kills and re-spawns the window
+    /// without an upsert. Every relaunch re-decides the boundary, and a stale
+    /// verdict lies in both directions: a session that used to be sandboxed and
+    /// now is not would keep the shield, and one that has been fixed would keep
+    /// the warning. Paths that *do* rewrite the row carry it through
+    /// [`upsert_session`](Self::upsert_session) instead.
+    ///
+    /// [`SandboxEnforcement::Unrecorded`] writes nothing: a caller with no
+    /// launch to report must not be able to erase one.
+    pub fn set_session_sandbox_enforcement(
+        &self,
+        id: SessionId,
+        enforcement: &SandboxEnforcement,
+    ) -> rusqlite::Result<()> {
+        if *enforcement == SandboxEnforcement::Unrecorded {
+            return Ok(());
+        }
+        self.conn.execute(
+            "UPDATE sessions SET sandbox_unenforced = ?1 WHERE id = ?2",
+            params![enforcement.unenforced_reason(), id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Read a session's persisted base branch (the fork point of its worktree),
     /// or `None` when never recorded (legacy rows / non-worktree sessions).
     pub fn get_session_base_branch(&self, id: SessionId) -> rusqlite::Result<Option<String>> {
@@ -669,9 +720,10 @@ fn row_to_shared_session(
     let parent_str: Option<String> = row.get(10)?;
     let display_order: Option<i64> = row.get(11)?;
     let sandbox_profile: Option<String> = row.get(12)?;
-    let wt_repo: Option<String> = row.get(13)?;
-    let wt_path: Option<String> = row.get(14)?;
-    let wt_branch: Option<String> = row.get(15)?;
+    let sandbox_unenforced: Option<String> = row.get(13)?;
+    let wt_repo: Option<String> = row.get(14)?;
+    let wt_path: Option<String> = row.get(15)?;
+    let wt_branch: Option<String> = row.get(16)?;
 
     let additional_dirs = additional_dirs_from_db(&dirs_str);
 
@@ -691,6 +743,7 @@ fn row_to_shared_session(
             worktrees: Vec::new(),
             shell_backend_id,
             sandbox_profile,
+            sandbox_enforcement: SandboxEnforcement::from_column(sandbox_unenforced),
             parent_session_id: parent_str.and_then(|s| s.parse().ok()),
             display_order,
             tombstone: false,
@@ -718,11 +771,27 @@ mod tests {
             worktrees: Vec::new(),
             shell_backend_id: None,
             sandbox_profile: None,
+            sandbox_enforcement: SandboxEnforcement::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,
             tombstone_at: None,
         }
+    }
+
+    /// A session under profile `dev` whose launch reported `enforcement`.
+    fn boxed_session(name: &str, enforcement: SandboxEnforcement) -> SharedSession {
+        let mut s = make_session(name);
+        s.sandbox_profile = Some("dev".to_string());
+        s.sandbox_enforcement = enforcement;
+        s
+    }
+
+    fn stored_enforcement(db: &Database, id: SessionId) -> SandboxEnforcement {
+        db.get_session_by_id(id)
+            .unwrap()
+            .expect("session row")
+            .sandbox_enforcement
     }
 
     #[test]
@@ -1211,6 +1280,172 @@ mod tests {
 
         let deleted = db.get_deleted_session_by_id(sid).unwrap().unwrap();
         assert_eq!(deleted.sandbox_profile.as_deref(), Some("dev"));
+    }
+
+    /// The spawn path: a launch that fell back to the host records the reason
+    /// on the row it inserts, so the very first restart already knows the agent
+    /// is not inside its boundary.
+    #[test]
+    fn a_fallback_launch_persists_its_reason_at_insert() {
+        let db = Database::open_in_memory().unwrap();
+        let s = boxed_session(
+            "boxed",
+            SandboxEnforcement::Unenforced("bwrap is not installed".to_string()),
+        );
+        db.upsert_session(&s).unwrap();
+
+        let restored = db.get_session_by_id(s.id).unwrap().unwrap();
+        assert_eq!(restored.sandbox_profile.as_deref(), Some("dev"));
+        assert_eq!(
+            restored.sandbox_enforcement.unenforced_reason(),
+            Some("bwrap is not installed"),
+        );
+        // …and it comes back as a live warning, not as a boundary in force.
+        assert_eq!(
+            restored.sandbox_enforcement.launch_state(),
+            Some(crate::session::SandboxState::Unenforced(
+                "bwrap is not installed".to_string()
+            )),
+        );
+    }
+
+    /// The adopt path — and the whole reason the write is conditional. A row
+    /// rebuilt from storage (or a second instance adopting the session) has no
+    /// launch of its own: its default `Unrecorded` must leave the recorded
+    /// verdict alone. Writing it back as "no reason" would turn a session
+    /// running on the host into one that renders as sandboxed.
+    #[test]
+    fn a_write_back_with_no_launch_preserves_the_recorded_reason() {
+        let db = Database::open_in_memory().unwrap();
+        let launched = boxed_session(
+            "boxed",
+            SandboxEnforcement::Unenforced("seatbelt is macOS-only".to_string()),
+        );
+        db.upsert_session(&launched).unwrap();
+
+        // What an adopting instance writes: every other field, nothing about a
+        // launch it did not make.
+        let mut adopted = db.get_session_by_id(launched.id).unwrap().unwrap();
+        adopted.sandbox_enforcement = SandboxEnforcement::Unrecorded;
+        adopted.name = "renamed by the other instance".to_string();
+        db.upsert_session(&adopted).unwrap();
+
+        assert_eq!(
+            stored_enforcement(&db, launched.id).unenforced_reason(),
+            Some("seatbelt is macOS-only"),
+        );
+    }
+
+    /// The relaunch path: the boundary comes back, and the warning goes with
+    /// the launch that no longer needs it.
+    #[test]
+    fn a_later_applied_launch_clears_the_reason() {
+        let db = Database::open_in_memory().unwrap();
+        let mut s = boxed_session(
+            "boxed",
+            SandboxEnforcement::Unenforced("bwrap is not installed".to_string()),
+        );
+        db.upsert_session(&s).unwrap();
+
+        s.sandbox_enforcement = SandboxEnforcement::Enforced;
+        db.upsert_session(&s).unwrap();
+
+        assert_eq!(
+            stored_enforcement(&db, s.id),
+            SandboxEnforcement::Unrecorded,
+            "an applied boundary is stored as the absence of a reason"
+        );
+        assert_eq!(
+            db.get_session_by_id(s.id)
+                .unwrap()
+                .unwrap()
+                .sandbox_profile
+                .as_deref(),
+            Some("dev"),
+            "clearing the warning must not detach the session from its profile"
+        );
+    }
+
+    /// A warning needs a subject: detaching a session from its profile takes
+    /// the reason with it, so no session can warn about a boundary it never
+    /// asked for.
+    #[test]
+    fn clearing_the_profile_clears_the_reason() {
+        let db = Database::open_in_memory().unwrap();
+        let mut s = boxed_session(
+            "boxed",
+            SandboxEnforcement::Unenforced("bwrap is not installed".to_string()),
+        );
+        db.upsert_session(&s).unwrap();
+
+        s.sandbox_profile = None;
+        s.sandbox_enforcement = SandboxEnforcement::Unrecorded;
+        db.upsert_session(&s).unwrap();
+
+        let row = db.get_session_by_id(s.id).unwrap().unwrap();
+        assert_eq!(row.sandbox_profile, None);
+        assert_eq!(row.sandbox_enforcement, SandboxEnforcement::Unrecorded);
+    }
+
+    /// The headless relaunch path, which kills and re-spawns the window without
+    /// rewriting the row. Both directions have to land, and a caller with no
+    /// launch to report must not be able to erase one.
+    #[test]
+    fn targeted_enforcement_write_records_both_directions() {
+        let db = Database::open_in_memory().unwrap();
+        let s = boxed_session("boxed", SandboxEnforcement::Unrecorded);
+        db.upsert_session(&s).unwrap();
+        assert_eq!(
+            stored_enforcement(&db, s.id),
+            SandboxEnforcement::Unrecorded
+        );
+
+        db.set_session_sandbox_enforcement(
+            s.id,
+            &SandboxEnforcement::Unenforced("bwrap is not installed".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            stored_enforcement(&db, s.id).unenforced_reason(),
+            Some("bwrap is not installed")
+        );
+
+        // A caller with nothing to report leaves it standing…
+        db.set_session_sandbox_enforcement(s.id, &SandboxEnforcement::Unrecorded)
+            .unwrap();
+        assert_eq!(
+            stored_enforcement(&db, s.id).unenforced_reason(),
+            Some("bwrap is not installed")
+        );
+
+        // …and a relaunch that got its boundary back clears it.
+        db.set_session_sandbox_enforcement(s.id, &SandboxEnforcement::Enforced)
+            .unwrap();
+        assert_eq!(
+            stored_enforcement(&db, s.id),
+            SandboxEnforcement::Unrecorded
+        );
+    }
+
+    /// A restore has to come back with the truth about the *last* launch, for
+    /// the same reason it comes back inside its boundary: the respawn overwrites
+    /// it, but until then the row must not claim a boundary that was never
+    /// applied.
+    #[test]
+    fn soft_delete_and_restore_preserve_the_recorded_reason() {
+        let db = Database::open_in_memory().unwrap();
+        let s = boxed_session(
+            "boxed",
+            SandboxEnforcement::Unenforced("bwrap is not installed".to_string()),
+        );
+        db.upsert_session(&s).unwrap();
+        db.soft_delete_session(s.id).unwrap();
+        db.restore_session(s.id).unwrap();
+
+        assert_eq!(
+            stored_enforcement(&db, s.id).unenforced_reason(),
+            Some("bwrap is not installed"),
+        );
     }
 
     #[test]

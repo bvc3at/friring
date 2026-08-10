@@ -6,7 +6,7 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::cli::output::{self, CommandOutput};
-use crate::session::SessionId;
+use crate::session::{SandboxEnforcement, SessionId};
 use crate::storage::{Database, HookRow};
 use crate::sync::SharedSession;
 
@@ -327,6 +327,24 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
         Action::Restart { uuid } => {
             let session = resolve(db, &uuid)?;
             let sandbox = crate::session_ops::restart_session_headless(db, session.id)?;
+            // A relaunch re-decides the boundary, and the restart re-spawns the
+            // window without rewriting the row — so record the verdict here or
+            // the TUI adopting this pane later would render the *previous*
+            // launch's answer: the shield over an agent that just landed on the
+            // host, or a warning about one that is back inside its sandbox.
+            if let Err(e) = db.set_session_sandbox_enforcement(
+                session.id,
+                &SandboxEnforcement::from_launch(sandbox.as_ref()),
+            ) {
+                // The window is already back up, so say what really happened:
+                // the restart worked and the record of its boundary did not.
+                return Err(format!(
+                    "Restarted '{}' but failed to record what the relaunch did with its \
+                     sandbox ({e}) — the stored state is the previous launch's until the \
+                     next relaunch",
+                    session.name
+                ));
+            }
             let unenforced = unenforced_sandbox_reason(sandbox.as_ref());
             let mut human = format!("Restarted session '{}' ({})", session.name, session.id);
             if let Some(reason) = unenforced.as_deref() {
@@ -489,6 +507,7 @@ fn render_session_detail(s: &SharedSession) -> String {
             "parent",
             output::dash(s.parent_session_id.map(|id| id.to_string()).as_deref()),
         ),
+        ("sandbox", render_sandbox(s)),
     ];
     let mut block = output::kv(&pairs);
     for w in &s.worktrees {
@@ -499,6 +518,20 @@ fn render_session_detail(s: &SharedSession) -> String {
         ));
     }
     block
+}
+
+/// The `sandbox` line of `session get`: the profile the session asked for, and
+/// — when the last launch could not deliver it — that it is **not** in force,
+/// with the reason. A human reading this row must not have to know that a
+/// profile name alone says nothing about whether the boundary went on.
+fn render_sandbox(s: &SharedSession) -> String {
+    let Some(profile) = s.sandbox_profile.as_deref() else {
+        return output::dash(None);
+    };
+    match s.sandbox_enforcement.unenforced_reason() {
+        Some(reason) => format!("{profile} — NOT enforced: {reason}"),
+        None => profile.to_string(),
+    }
 }
 
 fn parse_session_id(uuid: &str) -> Result<SessionId, String> {
@@ -518,12 +551,13 @@ fn resolve(db: &Database, uuid: &str) -> Result<SharedSession, String> {
 ///
 /// The session keeps its profile through a fallback so the next relaunch tries
 /// again, which is exactly why the fallback itself has to be reported rather
-/// than inferred from the row.
+/// than inferred from the row. Goes through [`SandboxEnforcement`] rather than
+/// matching the state itself so what a command *reports* and what the row
+/// *records* can never be two different answers to the same question.
 fn unenforced_sandbox_reason(state: Option<&crate::session::SandboxState>) -> Option<String> {
-    match state? {
-        crate::session::SandboxState::Unenforced(reason) => Some(reason.clone()),
-        crate::session::SandboxState::Applied(_) => None,
-    }
+    SandboxEnforcement::from_launch(state)
+        .unenforced_reason()
+        .map(str::to_string)
 }
 
 /// Why typing into `session` is refused right now, if it is.
@@ -545,6 +579,13 @@ fn refuse_send(db: &Database, session: &SharedSession) -> Option<String> {
 // v34), not the TUI's derived status: an external observer (automation, the
 // agent-e2e harness) must see exactly what `session signal` wrote, without
 // the TUI's quiescence downgrade. Null until the first hook fires.
+//
+// `sandbox_profile` and `sandbox_unenforced` are the two halves of the boundary
+// and answer different questions: the profile is what the session asked for
+// (it survives a fallback, because the next relaunch tries again), the reason
+// is why the last launch did not deliver it. `null` there means no launch
+// recorded a complaint — `create`/`restart` report their own launch's verdict
+// under the same key.
 fn shared_session_to_json(s: &SharedSession, hook: Option<&HookRow>) -> Value {
     json!({
         "id": s.id.to_string(),
@@ -557,6 +598,7 @@ fn shared_session_to_json(s: &SharedSession, hook: Option<&HookRow>) -> Value {
         "workspace_dir": s.workspace_dir.as_ref().map(|p| p.display().to_string()),
         "parent_session_id": s.parent_session_id.map(|id| id.to_string()),
         "sandbox_profile": s.sandbox_profile,
+        "sandbox_unenforced": s.sandbox_enforcement.unenforced_reason(),
         "display_order": s.display_order,
         "hook_state": hook.and_then(|h| h.state.as_deref()),
         "hook_state_at": hook.and_then(|h| h.state_at),
@@ -651,6 +693,71 @@ mod tests {
         assert!(v["workspace_dir"].is_null(), "got {v}");
     }
 
+    /// The two halves of the boundary are separate keys because they answer
+    /// separate questions. A consumer that only saw `sandbox_profile` would
+    /// report a session as sandboxed while its agent runs on the host.
+    #[test]
+    fn get_and_list_report_the_profile_and_whether_it_is_enforced() {
+        let db = db();
+        let mut shared = make_test_session("boxed");
+        shared.sandbox_profile = Some("dev".to_string());
+        let id = shared.id;
+        db.upsert_session(&shared).unwrap();
+
+        // Nothing recorded: the profile is reported, with no complaint.
+        let v = run(
+            Action::Get {
+                uuid: id.to_string(),
+            },
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["sandbox_profile"], "dev");
+        assert!(v["sandbox_unenforced"].is_null(), "got {v}");
+        assert!(v.human.contains("sandbox"), "{}", v.human);
+        assert!(!v.human.contains("NOT enforced"), "{}", v.human);
+
+        // A launch that fell back to the host says so, in both shapes.
+        db.set_session_sandbox_enforcement(
+            id,
+            &SandboxEnforcement::Unenforced("bwrap is not installed".to_string()),
+        )
+        .unwrap();
+        let v = run(
+            Action::Get {
+                uuid: id.to_string(),
+            },
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["sandbox_profile"], "dev");
+        assert_eq!(v["sandbox_unenforced"], "bwrap is not installed");
+        assert!(
+            v.human.contains("NOT enforced: bwrap is not installed"),
+            "{}",
+            v.human
+        );
+
+        let v = run(Action::List { parent: None }, &db).unwrap();
+        let row = &v.as_array().unwrap()[0];
+        assert_eq!(row["sandbox_unenforced"], "bwrap is not installed");
+
+        // An unsandboxed session carries the key, empty — a stable key set for
+        // a consumer that greps for it.
+        let plain = make_test_session("plain");
+        let plain_id = plain.id;
+        db.upsert_session(&plain).unwrap();
+        let v = run(
+            Action::Get {
+                uuid: plain_id.to_string(),
+            },
+            &db,
+        )
+        .unwrap();
+        assert!(v["sandbox_profile"].is_null(), "got {v}");
+        assert!(v["sandbox_unenforced"].is_null(), "got {v}");
+    }
+
     #[test]
     fn signal_explicit_session_sets_hook_state() {
         let db = db();
@@ -704,6 +811,7 @@ mod tests {
             worktrees: Vec::new(),
             shell_backend_id: None,
             sandbox_profile: None,
+            sandbox_enforcement: Default::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -726,6 +834,7 @@ mod tests {
             worktrees: Vec::new(),
             shell_backend_id: None,
             sandbox_profile: None,
+            sandbox_enforcement: Default::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -756,6 +865,7 @@ mod tests {
             worktrees: Vec::new(),
             shell_backend_id: None,
             sandbox_profile: None,
+            sandbox_enforcement: Default::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -795,6 +905,7 @@ mod tests {
             worktrees: Vec::new(),
             shell_backend_id: None,
             sandbox_profile: None,
+            sandbox_enforcement: Default::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -870,6 +981,7 @@ mod tests {
             worktrees: Vec::new(),
             shell_backend_id: None,
             sandbox_profile: None,
+            sandbox_enforcement: Default::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -910,6 +1022,7 @@ mod tests {
             worktrees: Vec::new(),
             shell_backend_id: None,
             sandbox_profile: None,
+            sandbox_enforcement: Default::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,

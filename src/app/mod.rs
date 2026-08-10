@@ -3108,6 +3108,13 @@ impl App {
         // persisted profile must come across, or the next full-row write-back
         // would clear the column and the session would relaunch unsandboxed.
         session.info.sandbox_profile = shared.sandbox_profile.clone();
+        // Merged, not assigned: `Unrecorded` on the row cannot tell "the
+        // boundary held" from "nobody looked", so an absent verdict must leave
+        // this instance's own launch composition alone. A recorded warning
+        // always wins — another instance saw a launch this one did not.
+        if let Some(state) = shared.sandbox_enforcement.launch_state() {
+            session.info.sandbox_state = Some(state);
+        }
         resolve_repo_display_names(&mut session.info);
     }
 
@@ -7835,6 +7842,13 @@ impl App {
                 .collect(),
             shell_backend_id: session.info.shell_backend_id.clone(),
             sandbox_profile: session.info.sandbox_profile.clone(),
+            // What the last launch actually *applied*. Deriving it here rather
+            // than at each launch site is what makes every path — spawn,
+            // restart, restore, reload-from-ghost — persist its verdict through
+            // the one `save_state()` they all already go through.
+            sandbox_enforcement: crate::session::SandboxEnforcement::from_launch(
+                session.info.sandbox_state.as_ref(),
+            ),
             parent_session_id: session.info.parent_session_id,
             display_order: session.info.display_order,
             tombstone: false,
@@ -8069,6 +8083,10 @@ impl App {
         info.display_order = shared.display_order;
         info.remote_host = host_label_from_backend_type(&shared.backend_type);
         info.sandbox_profile = shared.sandbox_profile.clone();
+        // A ghost or a placeholder has no launch of its own, so the row's
+        // recorded warning is the only verdict there is. Only the negative half
+        // is stored, so this can surface `⚠` but never invent `⛨`.
+        info.sandbox_state = shared.sandbox_enforcement.launch_state();
         resolve_repo_display_names(&mut info);
         (info, backend, provider)
     }
@@ -8708,8 +8726,11 @@ impl App {
         session.info.display_order = shared.display_order;
         // Without this the adopted session has no profile, and the full-row
         // write-back that follows clears the column — the next restart would
-        // relaunch the agent on the host.
+        // relaunch the agent on the host. The recorded verdict comes with it:
+        // friring did not make this launch, so the row is the only evidence of
+        // whether the boundary it is adopting ever held.
         session.info.sandbox_profile = shared.sandbox_profile.clone();
+        session.info.sandbox_state = shared.sandbox_enforcement.launch_state();
         resolve_repo_display_names(&mut session.info);
 
         // Re-adopt shell pane if one was persisted
@@ -17883,6 +17904,7 @@ mod tests {
             worktrees: Vec::new(),
             shell_backend_id: None,
             sandbox_profile: None,
+            sandbox_enforcement: Default::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,
