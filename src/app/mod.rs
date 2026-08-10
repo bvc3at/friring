@@ -2395,6 +2395,13 @@ impl App {
             self.set_error(format!("Failed to unload '{name}': {e:#}"));
             return;
         }
+        // The agent is gone, so its boundary's way out goes with it: a listener,
+        // a bearer token and a unix socket outliving the process they were
+        // minted for are a tunnel nothing is using and anything local could.
+        // A reload re-establishes one from the profile as it reads then. The
+        // scratch directory is deliberately left alone — the next launch adopts
+        // it — so this is not the full `sandboxing::cleanup_by_session_id`.
+        crate::sandbox::egress::stop(&id.to_string());
         if let Err(e) = self.db.set_session_unloaded(id, true) {
             error!("Failed to flag session '{name}' unloaded: {e}");
         }
