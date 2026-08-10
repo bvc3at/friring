@@ -25,6 +25,7 @@ pub mod notify;
 pub mod output;
 pub mod pane_guard;
 pub mod perf;
+pub mod sandbox;
 pub mod sessions;
 pub mod tasks;
 pub mod update;
@@ -114,6 +115,14 @@ pub enum Command {
     /// Print the perf snapshot a running TUI publishes (FRIRING_PERF_LOG or
     /// the perf HUD must be active in that TUI).
     Perf,
+    /// Sandbox-internal commands, run inside a boundary friring built.
+    ///
+    /// Dispatched before the database is opened, because ADR-29 keeps the
+    /// database out of every sandbox.
+    Sandbox {
+        #[command(subcommand)]
+        action: sandbox::Action,
+    },
 }
 
 /// Build the additional-repo list for a multi-repo `Spawn` from the repeatable
@@ -168,6 +177,12 @@ pub fn run(cli: Cli, db: &Database) -> Result<(), String> {
         Command::Notify(args) => Ok(notify::run(args)),
         Command::Usage(args) => metrics::run_usage(args, db),
         Command::Perf => perf::run(db),
+        // Long-running and database-free: it runs inside a sandbox, where
+        // ADR-29 keeps the database out. `main` dispatches it before opening
+        // one at all; reaching it here means that dispatch was removed, and
+        // returning early keeps the command correct rather than rendering an
+        // empty result for something that never finishes.
+        Command::Sandbox { action } => return sandbox::run(&action),
     }?;
 
     println!("{}", format.render(&output));

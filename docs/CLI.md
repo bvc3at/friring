@@ -63,6 +63,15 @@ friring-cli session list --parent <lead-uuid> --json | jq  # direct children onl
 - **`notify`** — diagnose OS desktop notifications: prints the detected delivery
   backend and last error; `--test` fires a sample. See the OS Notifications
   section of `docs/FEATURES.md`.
+- **`sandbox relay`** — **internal.** The half of the egress firewall that runs
+  *inside* a boundary: it offers a TCP endpoint on the sandbox's own loopback
+  and forwards each connection to the bind-mounted proxy socket, because no
+  HTTP or SOCKS client can dial a unix socket. Friring composes this command
+  itself as part of a bubblewrap launch; there is nothing to run by hand. It is
+  the one subcommand dispatched **before the database is opened** — ADR-29
+  keeps the database out of every sandbox — and it holds no credential and
+  makes no policy decision. See the "Reaching the proxy" section of
+  `docs/SANDBOX.md`.
 - **`usage`** — account-level rate-limit windows for an agent (see Agent
   metrics below).
 - **`perf`** — prints the perf snapshot a running TUI publishes while
