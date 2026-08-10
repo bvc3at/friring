@@ -1018,11 +1018,17 @@ pub struct App {
     /// runs: every step is a container-engine command, so none of it is on the
     /// render path.
     sandbox_gc: background::BackgroundTask<sandbox::GcOutcome>,
-    /// Which container each opened place is running in, keyed by its
+    /// Which containers this instance has opened for each place, keyed by its
     /// `sandbox:<profile>` backend name. What tells the reclaiming pass which
     /// places this instance's sessions are in — the session row records the
     /// profile, and only the launch that opened the place knows the id.
-    place_containers: HashMap<String, String>,
+    ///
+    /// Every id ever opened for a profile is kept, not just the newest: editing
+    /// a profile builds a *new* container for the next session while the
+    /// sessions already attached to the old one keep running in it, and a
+    /// session row names only the profile, so forgetting the superseded id
+    /// would let the pass reclaim a place out from under a live agent.
+    place_containers: HashMap<String, HashSet<String>>,
     /// Deferred inputs: `(session_id, data, tick_at_which_to_send)`.
     /// Used to introduce a small delay between pasting text and pressing Enter.
     deferred_inputs: Vec<(SessionId, Vec<u8>, u64)>,
@@ -4830,8 +4836,10 @@ impl App {
     ///
     /// Registering by the backend's own name (`sandbox:<profile>`) is what makes
     /// every later lookup — restore, adoption, teardown, the session list —
-    /// resolve, and re-registering replaces the entry when an edited profile
-    /// built a new container.
+    /// resolve, and re-registering replaces the transport when an edited profile
+    /// built a new container. The container *id* is added rather than replaced:
+    /// the sessions already running in the superseded container still need it
+    /// protected from the reclaiming pass.
     fn adopt_place_backend(
         &mut self,
         backend: Arc<dyn SessionBackend>,
@@ -4842,7 +4850,9 @@ impl App {
         }
         if let Some(instance) = instance {
             self.place_containers
-                .insert(backend.name().to_string(), instance.external_id.clone());
+                .entry(backend.name().to_string())
+                .or_default()
+                .insert(instance.external_id.clone());
             crate::session_ops::record_sandbox_instance(&self.db, instance);
         }
         self.backends.register(backend);

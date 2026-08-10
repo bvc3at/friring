@@ -363,13 +363,16 @@ impl App {
 
     /// What a pass may not touch: the places live sessions are in.
     ///
-    /// Two sources, and the second is the careful one. This instance knows
-    /// exactly which container each of *its* place-backed sessions is in. It
-    /// knows nothing about a session another friring is driving — only that a
-    /// row for it exists — so a profile with a live session row this instance is
-    /// not driving protects **every** container of that profile by name. The
-    /// cost is a superseded container surviving until that session ends; the
-    /// alternative is pulling a place out from under somebody else's agent.
+    /// Two sources, and the second is the careful one. This instance knows every
+    /// container it has opened for a profile, so a live session of that profile
+    /// protects **all** of them: a session row names only the profile, and an
+    /// edited profile leaves earlier sessions running in the container they were
+    /// launched into. It knows nothing about a session another friring is
+    /// driving — only that a row for it exists — so a profile with a live
+    /// session row this instance never opened a place for protects **every**
+    /// container of that profile by name. Either way the cost is a superseded
+    /// container surviving until those sessions end; the alternative is pulling
+    /// a place out from under a running agent.
     fn places_in_use(&self) -> PlacesInUse {
         let mut ids: HashSet<String> = HashSet::new();
         let mut profiles: HashSet<String> = HashSet::new();
@@ -379,9 +382,7 @@ impl App {
                 continue;
             };
             match self.place_containers.get(&shared.backend_type) {
-                Some(id) => {
-                    ids.insert(id.clone());
-                }
+                Some(opened) => ids.extend(opened.iter().cloned()),
                 None => {
                     profiles.insert(profile.to_string());
                 }
@@ -1239,12 +1240,25 @@ mod tests {
         assert!(in_use.profiles.contains("dev"));
 
         // Once this instance knows which container the session is in, the
-        // protection narrows to that one — which is what lets a superseded
-        // container be reclaimed while its replacement is in use.
+        // protection narrows to the places it opened — which is what lets a
+        // container no session of this instance is in be reclaimed.
         app.place_containers
-            .insert("sandbox:dev".into(), "ctr1".into());
+            .entry("sandbox:dev".into())
+            .or_default()
+            .insert("ctr1".into());
         let in_use = app.places_in_use();
         assert!(in_use.ids.contains("ctr1"));
+        assert!(in_use.profiles.is_empty());
+
+        // Editing the profile builds a new container for the next session, but
+        // the session above is still running in the old one, so both stay.
+        app.place_containers
+            .entry("sandbox:dev".into())
+            .or_default()
+            .insert("ctr2".into());
+        let in_use = app.places_in_use();
+        assert!(in_use.ids.contains("ctr1"));
+        assert!(in_use.ids.contains("ctr2"));
         assert!(in_use.profiles.is_empty());
     }
 

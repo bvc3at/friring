@@ -1135,10 +1135,13 @@ before removal — so nothing friring did not create is ever named.
 Two rules keep the pass from taking a place out from under a running agent.
 **Idleness never reclaims one**: a place is the environment a session lives in,
 not a cache, and "unused for a while" is indistinguishable from "the user is on
-holiday". And a profile whose live sessions this instance is *not* driving —
-another friring's — protects every container of that profile by name, because
-this instance knows the container ids only of the places it opened itself. The
-cost is a superseded container surviving until that session ends.
+holiday". And **a live session protects every place it could be in**: this
+instance knows container ids only for the places it opened itself, so a live
+session of a profile protects *all* of those ids — a profile edit builds a new
+container while the sessions already launched keep running in the old one — and
+a profile whose live sessions this instance is not driving, another friring's,
+protects every container of that profile by name. The cost either way is a
+superseded container surviving until those sessions end.
 
 Two details that silently break things if missed:
 
