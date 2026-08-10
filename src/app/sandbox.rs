@@ -282,7 +282,7 @@ impl App {
         for denial in denials {
             match self
                 .egress_prompts
-                .observe(&denial.session_key, &denial.event.host)
+                .observe(&denial.session_key, &prompt_key(&denial.event.host))
             {
                 // Said once already. An agent retrying a blocked host in a loop
                 // must not own the status bar.
@@ -725,6 +725,23 @@ fn allow_rule_for(host: &str, port: u16) -> Option<String> {
         }
         .to_string(),
     )
+}
+
+/// The key one refused host is remembered under, so that the same destination
+/// spelled two ways is one question rather than two.
+///
+/// The proxy reports the host as the client wrote it, and a client picks the
+/// spelling: `github.com.`, `GitHub.com`, `127.1` and `2130706433` all reach one
+/// place. Canonicalising with the same parse [`allow_rule_for`] uses keeps the
+/// dedup key and the rule the answer stores in step. A host that does not
+/// canonicalise (a U-label, the empty host) has no canonical form to key on, so
+/// it falls back to its lowercased spelling — still deduplicated, just only
+/// against itself.
+fn prompt_key(host: &str) -> String {
+    DomainRule::parse(host)
+        .or_else(|_| DomainRule::parse(&format!("[{host}]")))
+        .map(|parsed| parsed.host)
+        .unwrap_or_else(|_| host.to_ascii_lowercase())
 }
 
 /// A refused destination, as a line of prose. The host is empty when a request
@@ -1183,6 +1200,27 @@ mod tests {
         // Nothing storable: a U-label, and a refusal with no destination.
         assert_eq!(allow_rule_for("b\u{fc}cher.example", 443), None);
         assert_eq!(allow_rule_for("", 0), None);
+    }
+
+    /// One destination is one question, however the sandbox spelled it: the
+    /// dedup key is canonicalised the same way the stored rule is, so a client
+    /// cannot turn a single refused host into a stream of questions by varying
+    /// case, the root dot, or an address's notation.
+    #[test]
+    fn one_destination_in_two_spellings_is_one_question() {
+        let mut state = crate::app::egress_prompts::EgressPromptState::default();
+        for (first, again) in [
+            ("github.com", "GitHub.com."),
+            ("127.1", "2130706433"),
+            ("2001:db8::1", "[2001:DB8:0:0:0:0:0:1]"),
+        ] {
+            assert_eq!(state.observe("s1", &prompt_key(first)), Observed::First);
+            assert_eq!(state.observe("s1", &prompt_key(again)), Observed::Repeat);
+        }
+        // A host with no canonical form still deduplicates against itself.
+        let u_label = "b\u{fc}cher.example";
+        assert_eq!(state.observe("s1", &prompt_key(u_label)), Observed::First);
+        assert_eq!(state.observe("s1", &prompt_key(u_label)), Observed::Repeat);
     }
 
     /// The wiring itself: a refusal arriving on the proxy's own channel reaches

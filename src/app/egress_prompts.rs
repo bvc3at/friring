@@ -89,8 +89,10 @@ impl EgressPromptState {
     /// Record that `session_key`'s sandbox was refused `host`, and say what
     /// that is worth.
     ///
-    /// The host is matched case-insensitively, because the same name refused in
-    /// two spellings is one thing to tell the user about.
+    /// `host` is the caller's canonical key, not the spelling the client used:
+    /// the same name refused in two spellings is one thing to tell the user
+    /// about, and only the caller knows how a host canonicalises. The lowercase
+    /// here is the floor under that, not the whole of it.
     pub fn observe(&mut self, session_key: &str, host: &str) -> Observed {
         let record = self.sessions.entry(session_key.to_string()).or_default();
         let host = host.to_ascii_lowercase();
