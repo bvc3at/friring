@@ -948,16 +948,29 @@ fn fire_send(
         // by friring's own label rather than from a config file — and a place
         // that is not running has no window to deliver to, which is a skip
         // rather than an error, exactly like a session that is not running.
-        Some(profile) => match crate::agent::sandboxing::running_place(profile) {
-            Some(place) => crate::agent::tmux::MuxTarget::for_place(&place),
-            None => {
-                return (
-                    AutomationRunStatus::Skipped,
-                    format!("sandbox place '{profile}' is not running"),
-                    None,
-                )
+        //
+        // Every place of the profile is asked for the session's window rather
+        // than the first one being assumed to hold it: a profile can have
+        // several live containers at once (an edited profile builds a new one
+        // while the already-launched sessions stay in the old), and picking the
+        // wrong one would report a running session as not running and never
+        // fire.
+        Some(profile) => {
+            let found = crate::agent::sandboxing::running_places(profile)
+                .iter()
+                .map(crate::agent::tmux::MuxTarget::for_place)
+                .find(|target| crate::agent::tmux::window_exists_on(target, &name));
+            match found {
+                Some(target) => target,
+                None => {
+                    return (
+                        AutomationRunStatus::Skipped,
+                        format!("no window for this session in sandbox place '{profile}'"),
+                        None,
+                    )
+                }
             }
-        },
+        }
         None => match crate::agent::tmux::MuxTarget::for_backend(&session.backend_type) {
             Ok(m) => m,
             // A host that vanished from hosts.toml is a loud failure, never a

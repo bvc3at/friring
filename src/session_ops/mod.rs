@@ -575,6 +575,18 @@ fn build_agent_invocation(
         }
         crate::agent::sandboxing::SandboxDecision::Wrapped(wrapped) => {
             config.env.extend(wrapped.env);
+            // The headless twin of the TUI's own seam. `inject_friring_env`
+            // withholds the variables naming friring's config, data and metrics
+            // directories from every off-host launch, but it decides from
+            // `SessionConfig::backend`, which does not say `sandbox:<profile>`
+            // until a session has been launched into a place once — so the
+            // *first* spawn of a place-backed session is composed as a local one
+            // and carries them. This is where the launch learns it is
+            // place-bound, so this is where they come back out (ADR-29).
+            config.env = crate::agent::backend::window_env(
+                std::mem::take(&mut config.env),
+                wrapped.place.as_ref(),
+            );
             Ok(AgentInvocation {
                 command: wrapped.command,
                 args: wrapped.args,
@@ -677,9 +689,10 @@ pub(crate) fn inject_friring_env(
         return;
     }
     if let Some(dir) = crate::paths::metrics_directory() {
-        config
-            .env
-            .insert("FRIRING_METRICS_DIR".into(), dir.to_string_lossy().into());
+        config.env.insert(
+            crate::paths::METRICS_DIR_ENV.into(),
+            dir.to_string_lossy().into(),
+        );
     }
     // Pin the agent's `friring-cli` (its status hook) to the *same* config/data
     // dirs this friring resolved, so a status `signal` always lands in the DB
@@ -975,6 +988,82 @@ mod tests {
             .env
             .contains_key(crate::paths::CONFIG_DIR_OVERRIDE_ENV));
         assert!(!config.env.contains_key(crate::paths::DATA_DIR_OVERRIDE_ENV));
+    }
+
+    /// The **first** launch of a place-backed session is composed as a local
+    /// one, so the guard above has not fired for it — and the window env it
+    /// carries is the one set inside the container.
+    ///
+    /// `sessions.backend_type` does not say `sandbox:<profile>` until a session
+    /// has been launched into a place once, so `friring-cli session create
+    /// --sandbox <place profile>` reaches [`build_agent_invocation`] with
+    /// `backend: None`, is treated as local, and picks up the host's own
+    /// directories. They come back out where the invocation learns it is
+    /// place-bound (ADR-29).
+    #[test]
+    fn a_first_headless_place_launch_leaves_the_hosts_directories_out_of_the_window() {
+        // Short, private and fabricated: a place's socket path is one level
+        // deeper than a policy sandbox's and has to fit `sun_path`.
+        //
+        // Resolved, because a mount source that travels through a symlink is
+        // refused — and on macOS the platform temp root is behind `/var` →
+        // `/private/var`, which is the profile's problem to spell, not this
+        // test's subject.
+        let base = std::env::temp_dir().join(format!("frso{}-place", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let _guard = crate::paths::TestPathGuard::new(&base);
+        let workspace = base.join("app");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let _host = crate::agent::sandboxing::TestSandboxHost::place(
+            "dev",
+            &workspace.display().to_string(),
+        );
+
+        let mut profile = crate::session::SandboxProfile::new(
+            "dev",
+            vec![crate::session::SandboxPath::workspace(
+                workspace.display().to_string(),
+            )],
+        );
+        profile.backend = crate::session::SandboxBackendKind::Podman;
+        profile.network_mode = crate::session::NetworkMode::None;
+        let mut config = SessionConfig {
+            session_id: Some(SessionId::default()),
+            // What a create path composes: a place-backed session's row does not
+            // say so yet.
+            backend: None,
+            sandbox: Some(profile),
+            cwd: Some(workspace.clone()),
+            ..SessionConfig::default()
+        };
+        inject_friring_env(&mut config, "agent-conv-uuid", None);
+        assert!(
+            config.env.contains_key(crate::paths::DATA_DIR_OVERRIDE_ENV),
+            "the injector treats a first place launch as local, which is the defect's setup"
+        );
+
+        let def = crate::agent::agent_config::builtin_registry()
+            .default_agent()
+            .expect("a built-in agent")
+            .clone();
+        let invocation = build_agent_invocation(&def, &mut config).expect("a place composes");
+        assert!(invocation.place.is_some(), "this launch is place-backed");
+        for var in [
+            crate::paths::METRICS_DIR_ENV,
+            crate::paths::CONFIG_DIR_OVERRIDE_ENV,
+            crate::paths::DATA_DIR_OVERRIDE_ENV,
+        ] {
+            assert!(
+                !config.env.contains_key(var),
+                "{var} names a host path inside the place: {:?}",
+                config.env.get(var)
+            );
+        }
+        // The identity variables are not host paths and still travel.
+        assert!(config.env.contains_key("FRIRING_SESSION"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A place is recorded on first sight and only *refreshed* afterwards: a

@@ -83,16 +83,16 @@ pub fn teardown_runtime_resources(
         // local kill would find nothing and leave the agent running. Worktree
         // removal stays local — a place mounts every path at exactly its host
         // path, so the checkout the container sees *is* the host's.
-        match crate::agent::sandboxing::running_place(profile) {
-            Some(place) => kill_place_window(&place, session, report),
-            None => {
-                // Not an error: a place that is not running took every pane in
-                // it with it, which is the outcome this call wanted.
-                tracing::info!(
-                    "sandbox place '{profile}' is not running; session '{}' had no pane to kill",
-                    session.name
-                );
-            }
+        let places = crate::agent::sandboxing::running_places(profile);
+        if places.is_empty() {
+            // Not an error: a place that is not running took every pane in it
+            // with it, which is the outcome this call wanted.
+            tracing::info!(
+                "sandbox place '{profile}' is not running; session '{}' had no pane to kill",
+                session.name
+            );
+        } else {
+            kill_place_window(&places, session, report);
         }
         for wt in &session.worktrees {
             remove_worktree_into(None, wt, report);
@@ -183,35 +183,44 @@ fn kill_local_window(session: &crate::sync::SharedSession, report: &mut ForceDel
     }
 }
 
-/// Kill the session's pane **inside a sandbox place** by its persisted pane id.
+/// Kill the session's window **inside a sandbox place**, by name, in every place
+/// the profile currently has.
 ///
-/// The place twin of [`kill_remote_window`], and best-effort for the same
-/// reasons: the pane id is what a place is addressed by (there is no cheap
-/// "window by friring name" lookup over the transport), and a place that has
-/// gone away since the row was written is recorded rather than fatal.
+/// The place twin of [`kill_remote_window`] and best-effort like it, but
+/// addressed by `tb-<session>` rather than by the persisted pane id — because
+/// unlike a remote host, a profile can have **several live containers at once**
+/// (an edited profile builds a new one while the sessions already launched stay
+/// in the old), the session row records no container, and a pane id is per tmux
+/// server. Killing `%1` in the wrong container of the right profile kills a
+/// different session's agent; killing `tb-<session>` there kills nothing,
+/// because the name is unique to the session wherever it lives.
+///
+/// So every place is asked, and a window found in none of them is not a failure:
+/// a place that has gone away since the row was written took its panes with it,
+/// which is the outcome this call wanted.
 fn kill_place_window(
-    place: &crate::agent::transport::Place,
+    places: &[crate::agent::transport::Place],
     session: &crate::sync::SharedSession,
     report: &mut ForceDeleteReport,
 ) {
-    let pane = session.backend_id.trim();
-    if pane.is_empty() {
+    let mut failures: Vec<String> = Vec::new();
+    for place in places {
+        let target = crate::agent::tmux::MuxTarget::for_place(place);
+        match crate::agent::tmux::kill_window_on(&target, &session.name) {
+            Ok(true) => report.killed_window = true,
+            Ok(false) => {}
+            Err(e) => failures.push(format!("{}: {e}", place.container())),
+        }
+    }
+    if !report.killed_window && !failures.is_empty() {
         let msg = format!(
-            "session '{}' in sandbox place '{}' has no pane id; could not kill its window",
+            "could not kill session '{}' in sandbox place '{}': {}",
             session.name,
-            place.profile()
+            places[0].profile(),
+            failures.join("; ")
         );
         tracing::warn!("{msg}");
         report.remote_teardown_error = Some(msg);
-        return;
-    }
-    match crate::agent::tmux::kill_pane_place(place, pane) {
-        Ok(()) => report.killed_window = true,
-        Err(e) => {
-            let msg = format!("kill_pane_place({}, {pane}) failed: {e}", place.profile());
-            tracing::warn!("{msg}");
-            report.remote_teardown_error = Some(msg);
-        }
     }
 }
 

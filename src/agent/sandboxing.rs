@@ -174,8 +174,60 @@ pub fn apply(
     };
     match with_host(|host| build(host, &home, def, config, command, args)) {
         Ok(invocation) => Ok(SandboxDecision::Wrapped(Box::new(invocation))),
-        Err(reason) if fallback => Ok(SandboxDecision::Skipped { reason }),
-        Err(reason) => Err(reason),
+        // The switch's meaning is "this host cannot apply this profile" — not
+        // "the boundary's own state is wrong, so run outside it". A launch
+        // refused because something inside a sandbox interfered with what
+        // friring builds the next boundary out of is failed, whatever the
+        // profile says, because otherwise the way for an agent to leave its
+        // sandbox is to break it (`SandboxError::Tampered`).
+        Err(refusal) if fallback && !refusal.integrity => Ok(SandboxDecision::Skipped {
+            reason: refusal.reason,
+        }),
+        Err(refusal) => Err(refusal.reason),
+    }
+}
+
+/// Why a launch could not be composed, and whether the profile's
+/// `allow_unsandboxed_fallback` is allowed to answer it.
+///
+/// `integrity` marks the refusals that must fail the launch outright: a mount
+/// source that turned out to travel through a symlink, a directory friring mints
+/// that is now a link, an egress socket something else is holding. Every one of
+/// those is reachable from *inside* a boundary, so answering them by launching
+/// on the host would hand a sandboxed agent a way out that it can take on
+/// purpose. See [`crate::sandbox::SandboxError::Tampered`].
+///
+/// Most of `build` refuses with a plain `String`; `From` keeps those sites
+/// unchanged and files them as ordinary refusals, which is what they are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// The sentence shown to whoever asked for the launch.
+    pub reason: String,
+    /// Set when the fallback may not answer this.
+    pub integrity: bool,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl From<String> for Refusal {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            integrity: false,
+        }
+    }
+}
+
+impl From<crate::sandbox::SandboxError> for Refusal {
+    fn from(error: crate::sandbox::SandboxError) -> Self {
+        Self {
+            integrity: error.is_tampering(),
+            reason: error.to_string(),
+        }
     }
 }
 
@@ -240,6 +292,56 @@ impl TestSandboxHost {
             crate::sandbox::probe::StubHost::macos(26, true),
         )))
     }
+
+    /// A host offering rootless podman, so a launch resolves to a **place**.
+    ///
+    /// The other shape a launch path has to be tested against, and named here
+    /// for the same reason [`Self::seatbelt`] is: `session_ops` may not
+    /// reference [`crate::sandbox`], and one of the things a place changes is
+    /// what its launch is allowed to put in the window's environment (ADR-29).
+    /// Nothing is pulled, built or started — every engine command is answered by
+    /// the injected probe host, and the place's own directories are friring's,
+    /// under whatever data directory the test pinned.
+    pub(crate) fn place(profile: &str, workspace: &str) -> Self {
+        use crate::sandbox::probe::ProbeOutput;
+        const PODMAN: &str = "/usr/bin/podman";
+        let (place_dir, home_dir) = crate::sandbox::create_place_dirs(profile)
+            .expect("a data directory to mint the place tree under");
+        let stub = crate::sandbox::probe::StubHost::new()
+            .with_home("/fabricated/home")
+            .with_command("uname -s", ProbeOutput::success("Linux\n"))
+            .with_file("/proc/sys/kernel/osrelease", "6.8.0-generic\n")
+            .with_binary("podman")
+            .with_command("id -u", ProbeOutput::success("1000\n"))
+            .with_command("id -g", ProbeOutput::success("1000\n"))
+            .with_command(
+                &format!(
+                    "{PODMAN} info --format {}",
+                    "{{.Version.Version}}|{{.Host.Security.Rootless}}"
+                ),
+                ProbeOutput::success("5.2.2|true\n"),
+            )
+            .with_path(workspace)
+            .with_path(&place_dir.display().to_string())
+            .with_path(&home_dir.display().to_string())
+            .with_command_prefix(
+                &format!("{PODMAN} image inspect"),
+                ProbeOutput::success("[{}]\n"),
+            )
+            .with_command_prefix(
+                &format!("{PODMAN} run"),
+                ProbeOutput::success(
+                    "1f2e3d4c5b6a798807162534435261708192a3b4c5d6e7f8091a2b3c4d5e6f70\n",
+                ),
+            )
+            // Answers both `command -v` questions a launch asks of a place: the
+            // relay binary and the agent it is about to run.
+            .with_command_prefix(
+                &format!("{PODMAN} exec"),
+                ProbeOutput::success("/usr/local/bin/friring-cli\n"),
+            );
+        Self::new(SandboxHost::new(std::sync::Arc::new(stub)))
+    }
 }
 
 #[cfg(test)]
@@ -285,7 +387,7 @@ fn build(
     config: &SessionConfig,
     command: &str,
     args: &[String],
-) -> Result<SandboxedInvocation, String> {
+) -> Result<SandboxedInvocation, Refusal> {
     let profile = config
         .sandbox
         .as_ref()
@@ -315,7 +417,8 @@ fn build(
             "Sandbox profile '{}' cannot be applied to a session on a remote host: friring \
              builds the boundary on the machine it runs on",
             profile.name
-        ));
+        )
+        .into());
     }
 
     let agent_sandbox = def.and_then(|d| d.sandbox.as_ref());
@@ -348,11 +451,22 @@ fn build(
                 .ok_or_else(|| {
                     format!("Sandbox backend '{backend}' is a place this friring cannot create")
                 })?
-                .ensure_place(profile)
-                .map_err(|e| e.to_string())?,
+                .ensure_place(profile)?,
         ),
         _ => None,
     };
+
+    // A place runs the agent *inside* itself, so an image with no agent CLI is a
+    // pane that dies the instant it opens — and the sign-in `volume-login` does
+    // in that same pane goes with it. Checked per launch rather than folded into
+    // `ensure_place`: a place is shared by every session of its profile, and
+    // those sessions need not run the same agent. Before the scratch directory
+    // is minted and the proxy is bound, so a refusal costs nothing.
+    if let Some(place) = &ensured {
+        host.container(backend)
+            .ok_or_else(|| format!("Sandbox backend '{backend}' is not a place"))?
+            .ensure_agent_program(&policy, place, command)?;
+    }
 
     // Never the host temp root: `/tmp` holds friring's own tmux socket, and a
     // read-write grant over it is a complete escape (ADR-29's sibling problem —
@@ -363,8 +477,8 @@ fn build(
         Some(_) => crate::sandbox::create_place_session_dir(&profile.name, &session_key),
         None => crate::sandbox::create_session_scratch(&session_key),
     }
-    .map_err(|e| e.to_string())
-    .and_then(|dir| representable("the sandbox scratch directory", &dir))?;
+    .map_err(Refusal::from)
+    .and_then(|dir| representable("the sandbox scratch directory", &dir).map_err(Refusal::from))?;
 
     // The one channel out of a policy boundary (ADR-29): the agent's hooks
     // append a state word to a file here and the status poll takes it, because
@@ -417,11 +531,15 @@ fn build(
         // instance mid-run, and one session's "allow this domain?" would widen
         // the other's. A launch with no id of its own has no boundary to be
         // told apart by, so it is refused rather than filed under the fallback.
+        // Which is attribution and lifetime, not isolation between the sessions
+        // of a *place*: they share a uid and a pid namespace, so the place is
+        // the trust domain (`crate::sandbox::egress`).
         if session_key == UNIDENTIFIED_SESSION {
             return Err(
                 "This launch has no session id, so its egress boundary could not be told \
                  apart from another's"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             );
         }
         // A namespaced policy sandbox gets a private loopback, so its relay can
@@ -444,8 +562,7 @@ fn build(
             relay.map_or_else(crate::sandbox::egress::relay_addr, |port| {
                 (std::net::Ipv4Addr::LOCALHOST, port).into()
             }),
-        )
-        .map_err(|e| e.to_string())?;
+        )?;
         for (key, value) in prepared.grant.env {
             policy.insert_env(key, value);
         }
@@ -573,9 +690,7 @@ fn build(
                 managed_root: config_root.as_deref().unwrap_or_default(),
                 managed: &managed,
             });
-            projection
-                .apply(std::path::Path::new(&ensured.home_dir))
-                .map_err(|e| e.to_string())?;
+            projection.apply(std::path::Path::new(&ensured.home_dir))?;
             if let Some(root) = config_root.as_deref() {
                 argv = crate::agent::config_args::rewrite_config_path_args(argv, root, |p| {
                     projection.inside_path(p).map(str::to_string)
@@ -784,20 +899,32 @@ pub fn open_place(
     })
 }
 
-/// The place a profile's sessions are running in **right now**, or `None`.
+/// **Every** place a profile's sessions may be running in right now.
 ///
-/// Deliberately does not create one: the callers are teardown paths, and
-/// starting a container in order to kill a pane inside it — or in order to
-/// discover there is none — is the opposite of what they are for. It asks each
-/// engine friring can drive for the containers *it* created, and picks the one
-/// carrying this profile's label, so a profile whose `auto` backend has changed
-/// since the launch is still found.
+/// Deliberately does not create one: the callers are teardown and delivery
+/// paths, and starting a container in order to kill a pane inside it — or in
+/// order to discover there is none — is the opposite of what they are for. It
+/// asks each engine friring can drive for the containers *it* created and keeps
+/// the ones carrying this profile's label, so a profile whose `auto` backend has
+/// changed since the launch is still found.
+///
+/// **A profile can have more than one live place, and answering with just one is
+/// how a caller acts on a stranger.** An edited profile asks for a new container
+/// while the sessions already launched keep running in the old one — that is
+/// what `gc_plan`'s in-use rule exists to protect — and `sessions` records no
+/// container, so nothing here can say which of them a given session is in. The
+/// pane id it *does* record is per tmux server and therefore per container, so
+/// the same `%1` names a different session's pane in each. Callers must address
+/// a place-backed window by its `tb-<session>` **name**, which is unique to the
+/// session across every container of the profile, and try every place rather
+/// than guessing at one.
 ///
 /// Exists here because `session_ops` may not reference [`crate::sandbox`] at
 /// all, and the transport address is assembled from two things only this layer
 /// holds: the engine path the probe vetted, and the engine's own container id.
-pub fn running_place(profile: &str) -> Option<crate::agent::transport::Place> {
+pub fn running_places(profile: &str) -> Vec<crate::agent::transport::Place> {
     with_host(|host| {
+        let mut found = Vec::new();
         for kind in [
             crate::session::SandboxBackendKind::Docker,
             crate::session::SandboxBackendKind::Podman,
@@ -811,17 +938,16 @@ pub fn running_place(profile: &str) -> Option<crate::agent::transport::Place> {
             let Ok(places) = container.live_places() else {
                 continue;
             };
-            let found = places
-                .into_iter()
-                .find(|place| place.owned && place.profile.as_deref() == Some(profile))
-                .and_then(|place| {
-                    crate::agent::transport::Place::new(engine, &place.id, profile).ok()
-                });
-            if found.is_some() {
-                return found;
-            }
+            found.extend(
+                places
+                    .into_iter()
+                    .filter(|place| place.owned && place.profile.as_deref() == Some(profile))
+                    .filter_map(|place| {
+                        crate::agent::transport::Place::new(engine, &place.id, profile).ok()
+                    }),
+            );
         }
-        None
+        found
     })
 }
 
@@ -908,6 +1034,49 @@ mod tests {
             panic!("expected a skip, got {decision:?}");
         };
         assert!(reason.contains("wsl-distro"), "{reason}");
+    }
+
+    /// The escape hatch answers "this host cannot apply this profile". It must
+    /// not answer "the boundary's own state is not what friring left it as" —
+    /// otherwise an agent's way out of its sandbox is to break it.
+    #[test]
+    #[cfg(unix)]
+    fn a_sandbox_that_breaks_its_own_scratch_directory_may_not_fall_back_onto_the_host() {
+        let _paths = fabricated_data_dir("tampered-scratch");
+        let _host = TestSandboxHost::new(stub_host());
+        let scratch = crate::sandbox::dirs::session_scratch_dir("session").unwrap();
+        std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&scratch);
+        // What an agent inside a place does to the per-session directory under
+        // the tree its own container mounts read-write.
+        std::os::unix::fs::symlink("/tmp", &scratch).unwrap();
+
+        let mut profile = closed_profile();
+        profile.allow_unsandboxed_fallback = true;
+        let config = config_with(Some(profile));
+        let err = apply(Some(&agent_def()), &config, "claude", &[])
+            .expect_err("a broken boundary must fail the launch, not skip the sandbox");
+        assert!(err.contains("is a symlink"), "{err}");
+        assert!(
+            err.contains("not what friring left it as"),
+            "the refusal says why the fallback did not apply: {err}"
+        );
+
+        // The same switch still answers an ordinary "not on this host".
+        let _ = std::fs::remove_file(&scratch);
+        let mut absent = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        absent.backend = SandboxBackendKind::WslDistro;
+        absent.allow_unsandboxed_fallback = true;
+        assert!(matches!(
+            apply(
+                Some(&agent_def()),
+                &config_with(Some(absent)),
+                "claude",
+                &[]
+            )
+            .unwrap(),
+            SandboxDecision::Skipped { .. }
+        ));
     }
 
     #[test]
@@ -1098,8 +1267,8 @@ mod tests {
             &[],
         )
         .unwrap_err();
-        assert!(err.contains("not valid UTF-8"), "{err}");
-        assert!(err.contains("working directory"), "{err}");
+        assert!(err.reason.contains("not valid UTF-8"), "{err}");
+        assert!(err.reason.contains("working directory"), "{err}");
     }
 
     /// The scratch directory is friring's own, per session, and adopted rather
@@ -1197,7 +1366,7 @@ mod tests {
             &[],
         )
         .expect_err("an unidentifiable boundary must not be composed");
-        assert!(refusal.contains("no session id"), "{refusal}");
+        assert!(refusal.reason.contains("no session id"), "{refusal}");
         assert_eq!(
             settle(UNIDENTIFIED_SESSION),
             None,
@@ -1464,8 +1633,8 @@ mod tests {
             &[],
         )
         .unwrap_err();
-        assert!(err.contains("egress proxy"), "{err}");
-        assert!(err.contains("at most"), "{err}");
+        assert!(err.reason.contains("egress proxy"), "{err}");
+        assert!(err.reason.contains("at most"), "{err}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1503,6 +1672,17 @@ mod tests {
     /// through the injected probe host, and the paths are all fabricated or
     /// friring's own under the test's data directory.
     fn place_host() -> SandboxHost {
+        place_host_answering_exec(crate::sandbox::probe::ProbeOutput::success(
+            "/usr/local/bin/friring-cli\n",
+        ))
+    }
+
+    /// [`place_host`] with the place's answer to `command -v` scripted.
+    ///
+    /// One `exec` answers both questions a launch asks of a place — where the
+    /// relay binary is, and whether the agent it is about to run is in there —
+    /// so a test of either scripts it here.
+    fn place_host_answering_exec(exec: crate::sandbox::probe::ProbeOutput) -> SandboxHost {
         use crate::sandbox::probe::ProbeOutput;
         const PODMAN: &str = "/usr/bin/podman";
         let place_dir = crate::sandbox::dirs::place_dir("dev").expect("a data directory");
@@ -1532,11 +1712,96 @@ mod tests {
                 &format!("{PODMAN} run"),
                 ProbeOutput::success(format!("{STUB_CONTAINER}\n")),
             )
-            .with_command_prefix(
-                &format!("{PODMAN} exec"),
-                ProbeOutput::success("/usr/local/bin/friring-cli\n"),
-            );
+            .with_command_prefix(&format!("{PODMAN} exec"), exec);
         SandboxHost::new(std::sync::Arc::new(stub))
+    }
+
+    /// A place runs the agent *inside* itself, so a launch whose agent is not in
+    /// there is refused with the command that installs one — rather than opening
+    /// a pane that dies the instant it appears, taking the sign-in that happens
+    /// in that same pane with it.
+    ///
+    /// Asked per launch and not per place: a place is shared by every session of
+    /// its profile, and those sessions need not run the same agent.
+    #[test]
+    #[cfg(unix)]
+    fn a_place_without_the_agent_refuses_the_launch_rather_than_opening_a_dead_pane() {
+        use crate::sandbox::probe::ProbeOutput;
+        let _paths = short_data_dir("no-agent");
+        // `command -v` says nothing at all when it finds nothing, and the
+        // profile asks for no egress so the relay is never looked up.
+        let host = place_host_answering_exec(ProbeOutput::success("\n"));
+        let _host = TestSandboxHost::new(host);
+
+        let config = config_with(Some(place_profile(|profile| {
+            profile.network_mode = crate::session::NetworkMode::None;
+        })));
+        let err = apply(Some(&agent_def()), &config, "claude", &[])
+            .expect_err("a place with no agent must not compose");
+        assert!(err.contains("has no 'claude' on PATH"), "{err}");
+        assert!(
+            err.contains("install yours once into this profile's home"),
+            "the refusal carries the fix, not just the problem: {err}"
+        );
+        // The same place with the agent in it composes.
+        let _host = TestSandboxHost::new(place_host_answering_exec(ProbeOutput::success(
+            "/home/agent/.npm-global/bin/claude\n",
+        )));
+        apply(Some(&agent_def()), &config, "claude", &[]).expect("an installed agent composes");
+    }
+
+    /// A profile can have **several live places at once** — an edited profile
+    /// builds a new container while the sessions already launched keep running
+    /// in the old one — so teardown and delivery must be given all of them.
+    ///
+    /// Answering with one is how a caller acts on a stranger: a pane id is per
+    /// tmux server and therefore per container, so `%1` in the container a
+    /// session is *not* in names a different session's agent.
+    #[test]
+    fn every_live_place_of_a_profile_is_answered_with_not_just_the_first() {
+        use crate::sandbox::probe::ProbeOutput;
+        const PODMAN: &str = "/usr/bin/podman";
+        const SUPERSEDED: &str = "aa11bb22cc33dd44ee55ff6677889900aabbccddeeff00112233445566778899";
+        const REBUILT: &str = "99887766554433221100ffeeddccbbaa00998877665544332211ffeeddccbbaa";
+
+        let inspect = |id: &str, spec: &str| {
+            (
+                format!(
+                    "{PODMAN} inspect --type container --format {} {id}",
+                    crate::sandbox::container::INSPECT_FORMAT
+                ),
+                ProbeOutput::success(format!("{id}|running|1|dev|{spec}\n")),
+            )
+        };
+        let (old_line, old_out) = inspect(SUPERSEDED, "specold");
+        let (new_line, new_out) = inspect(REBUILT, "specnew");
+        let stub = crate::sandbox::probe::StubHost::new()
+            .with_home("/fabricated/home")
+            .with_command("uname -s", ProbeOutput::success("Linux\n"))
+            .with_file("/proc/sys/kernel/osrelease", "6.8.0-generic\n")
+            .with_binary("podman")
+            .with_command(
+                &format!(
+                    "{PODMAN} info --format {}",
+                    "{{.Version.Version}}|{{.Host.Security.Rootless}}"
+                ),
+                ProbeOutput::success("5.2.2|true\n"),
+            )
+            .with_command_prefix(
+                &format!("{PODMAN} ps"),
+                ProbeOutput::success(format!("{SUPERSEDED}\n{REBUILT}\n")),
+            )
+            .with_command(&old_line, old_out)
+            .with_command(&new_line, new_out);
+        let _host = TestSandboxHost::new(SandboxHost::new(std::sync::Arc::new(stub)));
+
+        let found: Vec<String> = running_places("dev")
+            .iter()
+            .map(|place| place.container().to_string())
+            .collect();
+        assert_eq!(found, [SUPERSEDED, REBUILT], "both places, in engine order");
+        // A profile with no place of its own gets none of somebody else's.
+        assert!(running_places("other").is_empty());
     }
 
     /// A data directory short enough for a **place's** unix socket path.
@@ -1645,7 +1910,7 @@ mod tests {
                 &[],
             )
             .expect_err("a boundary friring builds here cannot hold a session over there");
-            assert!(err.contains("remote host"), "{err}");
+            assert!(err.reason.contains("remote host"), "{err}");
         }
     }
 
