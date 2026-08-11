@@ -516,6 +516,12 @@ fn signed_in(input: &CredentialInput<'_>, home_dir: &str) -> Option<bool> {
 /// `0700` and friring's own, like every other directory a launch mints — and
 /// created here rather than by the engine, because a bind mount's source has to
 /// exist first and an engine that invents one does it as root.
+///
+/// Every component below the home is judged
+/// ([`dirs::create_private_dir_under`]): the home is bind-mounted read-write
+/// into a place that a *sibling* session may already be running in, so a live
+/// agent can replace a directory on the way down with a link to somewhere on the
+/// host and have friring create the tail of the declaration there.
 fn relocate_state(
     declaration: Option<&AgentSandboxDef>,
     host_home: &str,
@@ -528,8 +534,9 @@ fn relocate_state(
     else {
         return Ok(None);
     };
-    let host_path = join(home_dir, &tail);
-    dirs::create_private_dir(std::path::Path::new(&host_path))?;
+    let host_path = dirs::create_private_dir_under(std::path::Path::new(home_dir), &tail)?
+        .display()
+        .to_string();
     Ok(Some(StateDir {
         host_path,
         inside_path: join(inside_home, &tail),
@@ -610,7 +617,12 @@ fn seed(input: &CredentialInput<'_>, home_dir: &str) -> Result<Seeded, String> {
         let copied = std::fs::read_to_string(&source)
             .map_err(|e| format!("'seed-file' could not read '{source}': {e}. Nothing was copied"))
             .and_then(|contents| {
-                dirs::write_private(std::path::Path::new(&target), &contents)
+                // Under the home, component by component: the credential's own
+                // directory is one a sibling agent in this place can replace
+                // with a link, and following it would copy the credential onto
+                // the host outside the boundary (`dirs::write_private_under`).
+                dirs::write_private_under(std::path::Path::new(home_dir), &tail, &contents)
+                    .map(|_| ())
                     .map_err(|e| format!("'seed-file' could not write the copy: {e}"))
             });
         if let Err(reason) = copied {
@@ -690,12 +702,10 @@ fn claim(marker: &std::path::Path, profile: &str) -> Result<bool, String> {
 /// of every boundary — so no sandbox can rewrite the record that stops a second
 /// copy being made.
 fn marker_path(family: &str) -> Result<std::path::PathBuf, String> {
-    let root = dirs::sandbox_root()
-        .ok_or(
-            "friring cannot resolve its data directory, so it has nowhere to record which \
+    let root = dirs::seeds_root().ok_or(
+        "friring cannot resolve its data directory, so it has nowhere to record which \
                 profile holds a seeded credential",
-        )?
-        .join("seeds");
+    )?;
     Ok(root.join(dirs::sanitize_component(family)))
 }
 

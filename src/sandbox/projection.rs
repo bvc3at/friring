@@ -1309,6 +1309,15 @@ fn verify_root(root: &Path) -> SandboxResult<()> {
 /// create because `mkdir(2)` never creates or follows a symlink: it either makes
 /// the directory (and friring knows what it is) or fails, and the failure is
 /// checked rather than assumed.
+///
+/// The private mode is `mkdir(2)`'s own rather than a `chmod` afterwards.
+/// `set_permissions` *follows* a symlink and resolves the whole path again, so a
+/// directory this walk had just checked and a directory it then chmodded were
+/// not necessarily the same one: an agent that swapped the component in between
+/// got `0700` applied to whatever its link named. Born with the mode there is
+/// nothing to re-resolve, and an adopted directory is checked rather than
+/// re-moded — friring did not create it, and the useful thing to know about it
+/// is that it is not a link.
 fn write_into(root: &Path, rel: &str, contents: &[u8], executable: bool) -> SandboxResult<()> {
     use std::io::Write as _;
 
@@ -1323,7 +1332,13 @@ fn write_into(root: &Path, rel: &str, contents: &[u8], executable: bool) -> Sand
     let mut at = root.to_path_buf();
     for component in components {
         at.push(component);
-        match std::fs::create_dir(&at) {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        match builder.create(&at) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 match std::fs::symlink_metadata(&at) {
@@ -1341,7 +1356,6 @@ fn write_into(root: &Path, rel: &str, contents: &[u8], executable: bool) -> Sand
             }
             Err(e) => return Err(io_error(&at, e.to_string())),
         }
-        set_private(&at, false)?;
     }
 
     let path = at.join(name);
