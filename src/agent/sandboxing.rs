@@ -1025,8 +1025,10 @@ mod tests {
 
     #[test]
     fn an_unavailable_backend_fails_the_launch_and_names_every_rung() {
-        // `wsl-distro` is a place backend: unavailable in this build on every
-        // host, so the assertion holds wherever the suite runs.
+        // `wsl-distro` is the one backend that is unavailable off Windows
+        // whatever else the host has, so this exercises the platform probe
+        // wherever the suite runs. The refusal a Windows host gets instead is
+        // `a_windows_host_is_told_a_wsl_place_cannot_be_launched_into` below.
         let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
         profile.backend = SandboxBackendKind::WslDistro;
         let config = config_with(Some(profile));
@@ -1045,6 +1047,81 @@ mod tests {
             panic!("expected a skip, got {decision:?}");
         };
         assert!(reason.contains("wsl-distro"), "{reason}");
+    }
+
+    /// The refusal a host that *has* WSL gets, which is the intentional one: a
+    /// distro is a place friring registers and hardens but cannot yet run a
+    /// session in, so the launch says so and names what to pick instead rather
+    /// than opening a pane nothing reaches.
+    ///
+    /// Not covered by the probe test above — off Windows that one never gets
+    /// past "the wsl-distro backend needs Windows", which is a different
+    /// sentence about a different thing. This one drives the ladder to the rung
+    /// where the transport is missing, on either kind of machine.
+    #[test]
+    fn a_windows_host_is_told_a_wsl_place_cannot_be_launched_into() {
+        // A Windows host with a Store WSL and one WSL2 distro to clone: enough
+        // for the backend to probe as *available*, which is what puts the
+        // launch on the rung this refusal belongs to.
+        const WSL_EXE: &str = "C:/Windows/System32/wsl.exe";
+        let utf16 = |text: &str| {
+            let mut bytes: Vec<u8> = vec![0xff, 0xfe];
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            crate::sandbox::probe::ProbeOutput::success(
+                String::from_utf8_lossy(&bytes).into_owned(),
+            )
+        };
+        let windows = crate::sandbox::probe::StubHost::new()
+            .with_home("C:/Users/me")
+            // No `uname`; `cmd.exe` is what settles the platform.
+            .with_binary("cmd.exe")
+            .with_binary_at("wsl.exe", WSL_EXE)
+            .with_command(
+                &format!("{WSL_EXE} --version"),
+                utf16("WSL version: 2.3.26.0\nKernel version: 5.15.167.4-1\n"),
+            )
+            .with_command(
+                &format!("{WSL_EXE} --list --verbose"),
+                utf16(
+                    "  NAME             STATE           VERSION\n* Ubuntu-24.04     Running    \
+                       2\n",
+                ),
+            );
+        let _host = TestSandboxHost::new(SandboxHost::new(std::sync::Arc::new(windows)));
+
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.backend = SandboxBackendKind::WslDistro;
+        profile.read_scope = crate::session::ReadScope::Workspace;
+
+        let err = apply(
+            Some(&agent_def()),
+            &config_with(Some(profile.clone())),
+            "claude",
+            &[],
+        )
+        .expect_err("a launch into a WSL place must be refused");
+        assert!(err.contains("cannot yet run a session in"), "{err}");
+        assert!(err.contains("bwrap"), "{err}");
+        assert!(err.contains("docker"), "{err}");
+
+        // A boundary friring cannot compose is not a host that lacks one, so the
+        // escape hatch does answer it — with the same sentence, and still
+        // without registering anything: every `wsl.exe` beyond the probe is
+        // unscripted, so an ensure would have failed the stub instead.
+        profile.allow_unsandboxed_fallback = true;
+        let decision = apply(
+            Some(&agent_def()),
+            &config_with(Some(profile)),
+            "claude",
+            &[],
+        )
+        .unwrap();
+        let SandboxDecision::Skipped { reason } = decision else {
+            panic!("expected a skip, got {decision:?}");
+        };
+        assert!(reason.contains("cannot yet run a session in"), "{reason}");
     }
 
     /// The escape hatch answers "this host cannot apply this profile". It must
