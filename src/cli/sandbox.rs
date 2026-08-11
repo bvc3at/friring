@@ -2401,6 +2401,47 @@ mod tests {
         }
     }
 
+    /// The third rung of the same ladder, which is the one an import must not
+    /// let past: anything that can speak to an engine's control socket can
+    /// start a privileged container with the whole host in it, and a read-only
+    /// bind is no defence — it does not take write permission off a socket
+    /// inode.
+    #[test]
+    fn an_imported_profile_reaching_an_engine_control_socket_is_refused() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let target = db_with(&[profile("dev", vec![SandboxPath::workspace("/srv/app")])]);
+
+        for (label, socket) in [
+            (
+                "read-only docker",
+                SandboxPath::read_only("/var/run/docker.sock"),
+            ),
+            (
+                "read-write podman",
+                SandboxPath::workspace("/run/podman/podman.sock"),
+            ),
+        ] {
+            let file = temp.path().join("socket.toml");
+            let _ = std::fs::remove_file(&file);
+            let bad = profile(
+                "bad",
+                vec![SandboxPath::workspace("/srv/app"), socket.clone()],
+            );
+            std::fs::write(&file, render_bundle(&[bad])).unwrap();
+
+            let error = import(&target, &file, false).unwrap_err();
+            assert!(error.contains("control socket"), "{label}: {error}");
+            assert!(error.contains(&socket.path), "{label}: {error}");
+            assert!(error.contains("nothing was imported"), "{label}: {error}");
+            assert_eq!(
+                target.list_sandbox_profile_names().unwrap(),
+                ["dev"],
+                "{label}: the stored profiles changed"
+            );
+        }
+    }
+
     /// One bad entry stops the whole document: the alternative is a half-applied
     /// import nobody can reason about.
     #[test]
