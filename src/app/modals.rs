@@ -2998,16 +2998,19 @@ impl SandboxEditorModal {
     }
 }
 
-/// Why this profile's read-write paths may not be stored, or `None` when they
-/// are grantable.
+/// Why this profile's paths may not be stored, or `None` when they are
+/// grantable.
 ///
-/// The same refusal
+/// The same refusals
 /// [`SandboxLaunch::validate`](crate::sandbox::SandboxLaunch::validate) makes,
-/// moved forward to the save: a path enclosing friring's data directory reaches
-/// the database (ADR-29), and one reaching a tmux socket directory drives the
-/// host's own multiplexer. Catching it here turns "a stored profile that
-/// refuses every session picking it" into "a form that will not save", with the
-/// same sentence.
+/// moved forward to the save: a *read-write* path enclosing friring's data
+/// directory reaches the database (ADR-29) or drives the host's own multiplexer
+/// through a tmux socket directory, and a path in **either** mode may reach
+/// neither friring's own sandbox state — the other profiles' logins, the
+/// generated policies, the other sessions' sockets — nor a container engine's
+/// control socket, both of which are taken by being *readable*. Catching it here
+/// turns "a stored profile that refuses every session picking it" into "a form
+/// that will not save", with the same sentence.
 ///
 /// It cannot live in
 /// [`SandboxProfile::validate`](crate::session::SandboxProfile::validate): the
@@ -3021,6 +3024,7 @@ fn writable_roots_refusal(profile: &crate::session::SandboxProfile) -> Option<St
         .and_then(std::path::Path::to_str)
         .unwrap_or_default()
         .to_string();
+    let declared: Vec<String> = profile.paths.iter().map(|p| p.expanded(&home)).collect();
     let writable: Vec<String> = profile
         .paths
         .iter()
@@ -3030,6 +3034,8 @@ fn writable_roots_refusal(profile: &crate::session::SandboxProfile) -> Option<St
     let db = crate::paths::database_file();
     crate::sandbox::check_writable_roots(&writable, db.as_deref().and_then(std::path::Path::to_str))
         .err()
+        .or_else(|| crate::sandbox::check_declared_paths(&declared).err())
+        .or_else(|| crate::sandbox::check_engine_socket_paths(&declared, Some(&home)).err())
 }
 
 /// Where an `n`-added sub-list row lands: after the selection, or at the end of
@@ -5249,15 +5255,36 @@ mod tests {
             "{err}"
         );
 
-        // Read-only is not the escape — only a writable root reaches the
-        // database — and a path *inside* the data directory reaches nothing
-        // above it.
-        m.paths[0].mode = crate::session::PathMode::ReadOnly;
-        m.validated_profile(&[]).unwrap();
+        // A path *inside* the data directory encloses nothing above it, so the
+        // ADR-29 rule passes it — and it is refused anyway, in **either** mode:
+        // `<data>/sandbox` holds the other profiles' sandbox logins, the markers
+        // that keep one credential to one boundary, the generated policies and
+        // the other sessions' egress sockets, every one of which is taken by
+        // being read.
+        for path in [
+            ancestor.clone(),
+            data_dir.join("sandbox").to_string_lossy().into_owned(),
+            data_dir
+                .join("sandbox/pl/other/home")
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            for mode in [
+                crate::session::PathMode::ReadOnly,
+                crate::session::PathMode::ReadWrite,
+            ] {
+                m.paths[0].text.set(&path);
+                m.paths[0].mode = mode;
+                assert!(
+                    m.validated_profile(&[]).is_err(),
+                    "'{path}' must not be storable as {mode:?}"
+                );
+            }
+        }
+
+        // A path that is none of friring's own still saves in either mode.
+        m.paths[0].text.set("/fabricated/home/dev/app");
         m.paths[0].mode = crate::session::PathMode::ReadWrite;
-        m.paths[0]
-            .text
-            .set(&data_dir.join("sandbox").to_string_lossy());
         m.validated_profile(&[]).unwrap();
     }
 

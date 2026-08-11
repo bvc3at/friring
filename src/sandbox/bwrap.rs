@@ -223,6 +223,27 @@ pub fn build_argv(
                 SecretKind::File => push(&mut argv, &["--ro-bind", "/dev/null", &path]),
             }
         }
+        // The state friring keeps for its *other* sandboxes: the logins their
+        // places hold, the markers that keep one credential to one boundary
+        // (ADR-28), and the generated policies that constrain other sessions.
+        // The host read scope binds the host root, so without these it carries
+        // all of it — and every one of them is taken by being read. Masked after
+        // the profile's own paths rather than before, unlike the socket trees:
+        // a profile naming one of these is refused outright
+        // (`dirs::check_declared_paths`), so there is no listed path to lose to
+        // the mask, and there is no ordering left in which the scope can win.
+        //
+        // Not `<data>/sandbox` whole: this launch's own scratch is under
+        // `<data>/sandbox/tmp` and the agent needs it to start.
+        for dir in [dirs::place_root(), dirs::profile_dir(), dirs::seeds_root()]
+            .into_iter()
+            .flatten()
+            .map(|dir| dir.display().to_string())
+        {
+            if exists(&dir) {
+                push(&mut argv, &["--tmpfs", &dir]);
+            }
+        }
     }
 
     if let Some(db) = launch.friring_db {
@@ -835,6 +856,61 @@ mod tests {
             .with_tmp_dir(&sockets)
             .validate()
             .is_err());
+    }
+
+    /// The host read scope binds the host root, which carries the state friring
+    /// keeps for its **other** sandboxes: their places' logins (ADR-28), the
+    /// markers that keep one credential to one boundary, and the generated
+    /// policies constraining other sessions. Reading any of them is taking it,
+    /// so they are covered rather than left readable.
+    #[test]
+    fn the_other_sandboxes_state_is_masked_under_the_host_read_scope() {
+        let host_scope = workspace_policy();
+        let scratch = dirs::session_scratch_dir("s1")
+            .unwrap()
+            .display()
+            .to_string();
+        let launch = SandboxLaunch::new(&host_scope, "/home/u", "s1").with_tmp_dir(&scratch);
+        let argv = build_argv(PROGRAM, &launch, None, &|_| true).unwrap();
+        for dir in [dirs::place_root(), dirs::profile_dir(), dirs::seeds_root()]
+            .into_iter()
+            .flatten()
+            .map(|d| d.display().to_string())
+        {
+            assert!(has_flag(&argv, "--tmpfs", &dir), "missing mask for {dir}");
+            // After the profile's own paths: a profile naming one of these is
+            // refused outright, so there is no listed path to lose to the mask
+            // and no ordering left in which the scope can win.
+            assert!(index_of(&argv, &dir) > index_of(&argv, "--ro-bind"));
+            assert!(
+                !dirs::encloses(&dir, &scratch),
+                "{dir} must not cover this launch's own scratch {scratch}"
+            );
+        }
+        // The launch's own scratch is still writable, in the same tree.
+        assert!(has_flag(&argv, "--bind", &scratch), "{argv:?}");
+
+        // The workspace scope binds no host root, so it has nothing to take
+        // back here either.
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.read_scope = ReadScope::Workspace;
+        let narrow = profile
+            .resolve(SandboxBackendKind::Bwrap, "/home/u")
+            .unwrap();
+        let argv = build_argv(
+            PROGRAM,
+            &SandboxLaunch::new(&narrow, "/home/u", "s1"),
+            None,
+            &|_| true,
+        )
+        .unwrap();
+        for dir in [dirs::place_root(), dirs::profile_dir(), dirs::seeds_root()]
+            .into_iter()
+            .flatten()
+            .map(|d| d.display().to_string())
+        {
+            assert!(!has_flag(&argv, "--tmpfs", &dir), "{dir} needs no mask");
+        }
     }
 
     /// A read-only bind is no barrier to `connect(2)`, and `--unshare-net`

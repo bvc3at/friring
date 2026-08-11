@@ -74,8 +74,8 @@ pub use backend::{
 pub use bwrap::{BwrapBackend, BwrapDetails};
 pub use container::{ContainerBackend, ContainerEngine, EnsuredPlace};
 pub use dirs::{
-    check_writable_roots, cleanup_place, cleanup_session, create_place_dirs,
-    create_place_session_dir, create_session_scratch,
+    check_declared_paths, check_engine_socket_paths, check_writable_roots, cleanup_place,
+    cleanup_session, create_place_dirs, create_place_session_dir, create_session_scratch,
 };
 pub use egress::{proxy_required, PendingEgress, Prepared, ProxyGrant, SessionDenial};
 pub use probe::{detect_platform, HostPlatform, LocalProbeHost, ProbeHost, RemoteProbeHost};

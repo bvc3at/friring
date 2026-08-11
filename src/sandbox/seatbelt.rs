@@ -280,6 +280,7 @@ pub fn render_profile(launch: &SandboxLaunch<'_>) -> String {
     render_protected_subdirectories(&mut out, launch, &writable);
     render_rename_boundaries(&mut out, launch, &writable);
     render_secrets(&mut out, launch);
+    render_other_sandboxes(&mut out);
     render_database(&mut out, launch);
 
     out.push(String::new());
@@ -603,6 +604,52 @@ fn render_secrets(out: &mut Vec<String>, launch: &SandboxLaunch<'_>) {
         out.push(format!(";; {}", secret.why));
         out.push(format!("(deny file-read* file-write* (subpath {path:?}))"));
     }
+}
+
+/// Deny the state friring keeps for its **other** sandboxes.
+///
+/// `host-minus-secrets` makes the host filesystem readable and takes back a
+/// named list — which covered the host's own credential files and not the ones
+/// a *sandbox* holds. Those live beside the database, and every one of them is
+/// taken by being read: another profile's synthetic home holds the credential
+/// its `volume-login` signed in with and the copy a `seed-file` made (ADR-28),
+/// the seed markers are what keep one credential to one boundary, and a
+/// generated `.sb` file is the policy constraining some other session.
+///
+/// Deliberately **not** the whole of `<data>/sandbox`: this launch's own scratch
+/// directory lives under `<data>/sandbox/tmp`, and denying that would take away
+/// the temp directory the agent needs to start. `<data>/sandbox/pl` is a place's
+/// tree, which no policy launch is ever given — a place is a container, and its
+/// paths are mounts rather than SBPL rules.
+///
+/// Denied last with the database, so no path grant can re-open it. A profile
+/// that *names* one of these is refused before it gets here
+/// ([`crate::sandbox::dirs::check_declared_paths`]); this is the scope, which
+/// names nothing and grants everything.
+fn render_other_sandboxes(out: &mut Vec<String>) {
+    let denied: Vec<String> = [dirs::place_root(), dirs::profile_dir(), dirs::seeds_root()]
+        .into_iter()
+        .flatten()
+        .map(|dir| format!("(subpath {:?})", dir.display().to_string()))
+        .collect();
+    if denied.is_empty() {
+        return;
+    }
+    section(
+        out,
+        "friring's other sandboxes",
+        &[
+            "The logins the other profiles' places hold, the markers that keep one",
+            "credential to one boundary (ADR-28), and the generated policies that",
+            "constrain other sessions. Reading any of them is taking it, so the",
+            "host read scope takes them back here rather than trusting the list of",
+            "host credential paths to cover them.",
+        ],
+    );
+    out.push(format!(
+        "(deny file-read* file-write*\n    {})",
+        denied.join("\n    ")
+    ));
 }
 
 fn render_database(out: &mut Vec<String>, launch: &SandboxLaunch<'_>) {
@@ -964,6 +1011,52 @@ mod tests {
             .unwrap();
         let db_deny = text.find(&format!(r#"(literal "{db}")"#)).unwrap();
         assert!(data_grant < db_deny, "ADR-29 must stay denied");
+    }
+
+    /// `host-minus-secrets` makes the host readable and takes back a *named*
+    /// list, which named the host's own credential files and not the ones a
+    /// sandbox holds. Another profile's synthetic home holds the login its
+    /// `volume-login` signed in with, and reading it is taking it (ADR-28).
+    #[test]
+    fn the_host_read_scope_does_not_carry_the_other_sandboxes_logins_or_policies() {
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.read_scope = ReadScope::HostMinusSecrets;
+        let policy = profile
+            .resolve(SandboxBackendKind::Seatbelt, "/Users/u")
+            .unwrap();
+        let scratch = dirs::session_scratch_dir("s1")
+            .unwrap()
+            .display()
+            .to_string();
+        let launch = SandboxLaunch::new(&policy, "/Users/u", "s1")
+            .with_agent("claude")
+            .with_tmp_dir(&scratch);
+        let text = render_profile(&launch);
+
+        let host_read = text.find("(allow file-read*)").expect("the host scope");
+        for dir in [dirs::place_root(), dirs::profile_dir(), dirs::seeds_root()]
+            .into_iter()
+            .flatten()
+        {
+            let rule = format!("(subpath {:?})", dir.display().to_string());
+            let at = text
+                .find(&rule)
+                .unwrap_or_else(|| panic!("{rule} must be denied:\n{text}"));
+            assert!(at > host_read, "{rule} must be taken back after the scope");
+        }
+        // …and the launch's own scratch, which lives in the same tree, is not
+        // taken with them: an agent that cannot write a temp file dies on
+        // startup, and this deny is emitted last so anything it covers is gone.
+        for dir in [dirs::place_root(), dirs::profile_dir(), dirs::seeds_root()]
+            .into_iter()
+            .flatten()
+        {
+            let dir = dir.display().to_string();
+            assert!(
+                !dirs::encloses(&dir, &scratch),
+                "{dir} must not cover this launch's own scratch {scratch}"
+            );
+        }
     }
 
     /// SBPL denies by pathname, so a deny is only as good as the path staying

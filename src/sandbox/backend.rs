@@ -70,8 +70,57 @@ pub enum SandboxError {
     /// policy is generated: a boundary that quietly differs from what the user
     /// wrote is worse than one that refuses and says why.
     Refused { profile: String, detail: String },
+    /// The boundary's **own state** is not what friring left it as: a path
+    /// friring mints turned out to be a symlink, a mount source travels through
+    /// one, or the socket a filtered launch needs is held by something else.
+    ///
+    /// A separate variant because it is the one refusal that must **not** route
+    /// through a profile's `allow_unsandboxed_fallback`. That switch means "this
+    /// host cannot apply this profile, run on the host instead" — a backend that
+    /// is not installed, a policy this build cannot express. This means
+    /// something that was *inside* a boundary changed the state friring builds
+    /// the next one out of, and turning that into "so run outside the boundary"
+    /// would let a sandboxed agent choose to be unsandboxed. See
+    /// `docs/SANDBOX.md` §Failure modes.
+    ///
+    /// `subject` is whatever the refusal it came from named: the profile for a
+    /// [`Refused`](Self::Refused), the path for an [`Io`](Self::Io).
+    Tampered { subject: String, detail: String },
     /// Writing or reading a generated artefact failed.
     Io { path: String, detail: String },
+}
+
+impl SandboxError {
+    /// Re-label a refusal as evidence that something inside a boundary
+    /// interfered with friring's own state.
+    ///
+    /// Written this way round so the refusal's sentence is composed once, where
+    /// the check is, and the *classification* is applied by whichever branch
+    /// knows it is looking at interference rather than at a profile a user
+    /// should edit. Anything that is not a [`Refused`](Self::Refused) is
+    /// returned unchanged: an unavailable backend does not become tampering by
+    /// passing through here.
+    #[must_use]
+    pub fn tampered(self) -> Self {
+        match self {
+            Self::Refused { profile, detail } => Self::Tampered {
+                subject: profile,
+                detail,
+            },
+            Self::Io { path, detail } => Self::Tampered {
+                subject: path,
+                detail,
+            },
+            other => other,
+        }
+    }
+
+    /// Whether this is a boundary-integrity failure, which no fallback may
+    /// convert into an unsandboxed launch.
+    #[must_use]
+    pub fn is_tampering(&self) -> bool {
+        matches!(self, Self::Tampered { .. })
+    }
 }
 
 impl fmt::Display for SandboxError {
@@ -97,6 +146,11 @@ impl fmt::Display for SandboxError {
                     "Sandbox profile '{profile}' cannot be launched: {detail}"
                 )
             }
+            Self::Tampered { subject, detail } => write!(
+                f,
+                "Sandbox boundary '{subject}' is not what friring left it as, so this launch is \
+                 refused rather than run without a sandbox: {detail}"
+            ),
             Self::Io { path, detail } => write!(f, "Sandbox file '{path}': {detail}"),
         }
     }
@@ -470,6 +524,23 @@ impl<'a> SandboxLaunch<'a> {
     ///   directory drives the host's own multiplexer. See
     ///   [`crate::sandbox::dirs::check_writable_roots`]. Checked first: it is
     ///   the profile's own doing, and fixable by editing it.
+    /// - **friring's own sandbox state is off limits in either mode.** The tree
+    ///   beside the database holds the other profiles' logins, the generated
+    ///   policies and the other sessions' sockets, and read-only is no defence
+    ///   for any of them. See
+    ///   [`crate::sandbox::dirs::check_declared_paths`], which is given the
+    ///   profile's own paths rather than [`Self::writable_paths`] — this
+    ///   launch's minted directories live in exactly that tree and are the point
+    ///   of it.
+    /// - **The container engine's control socket is off limits in either
+    ///   mode**, and not only to the place backends. bwrap masks `/run` and
+    ///   `/var/run` under `host-minus-secrets` alone, and a path the profile
+    ///   lists explicitly wins that mask — so a policy profile naming
+    ///   `/var/run/docker.sock` would get it, and read-only is no defence for a
+    ///   socket: a read-only bind does not take write permission off the inode,
+    ///   so `connect(2)` still succeeds. Anything that can speak to that socket
+    ///   can start a privileged container with the host's filesystem in it. See
+    ///   [`crate::sandbox::dirs::grants_engine_socket`].
     /// - **A filtered mode with no filter** is refused. No kernel policy has a
     ///   host-name predicate (`docs/SANDBOX.md` §Egress firewall), so an
     ///   allowlist — and a deny list under `full` — mean nothing without the
@@ -483,6 +554,16 @@ impl<'a> SandboxLaunch<'a> {
             detail,
         };
         crate::sandbox::dirs::check_writable_roots(&self.writable_paths(), self.friring_db)
+            .map_err(&refuse)?;
+        let declared: Vec<String> = self
+            .policy
+            .rw_paths
+            .iter()
+            .chain(self.policy.ro_paths.iter())
+            .cloned()
+            .collect();
+        crate::sandbox::dirs::check_declared_paths(&declared).map_err(&refuse)?;
+        crate::sandbox::dirs::check_engine_socket_paths(&declared, Some(self.home))
             .map_err(&refuse)?;
         if crate::sandbox::egress::proxy_required(self.policy) && self.proxy.is_none() {
             let denied: Vec<String> = self.policy.deny.iter().map(|r| r.to_string()).collect();
@@ -764,6 +845,56 @@ mod tests {
             .unwrap();
         SandboxLaunch::new(&ok, "/home/u", "s1")
             .with_friring_db("/home/u/.local/share/friring/friring.db")
+            .with_proxy(endpoint())
+            .validate()
+            .unwrap();
+    }
+
+    /// A **read-only** path may reach neither friring's own sandbox state nor a
+    /// container engine's control socket — the two grants that are taken by
+    /// being readable, so `check_writable_roots` is the wrong gate for both.
+    #[test]
+    fn a_read_only_path_may_not_reach_other_sandboxes_state_or_the_engine_socket() {
+        let sandbox_state = crate::sandbox::dirs::sandbox_root()
+            .unwrap()
+            .join("pl")
+            .display()
+            .to_string();
+        for (path, expected) in [
+            // Another profile's synthetic home holds the login it signed in
+            // with, and the seatbelt policy beside it is what constrains this
+            // sandbox (ADR-28).
+            (sandbox_state.as_str(), "friring's own"),
+            // The socket is the whole of the engine's authorisation, and a
+            // read-only bind does not take write permission off an inode.
+            ("/var/run/docker.sock", "control socket"),
+        ] {
+            let policy = SandboxProfile::new(
+                "dev",
+                vec![
+                    SandboxPath::workspace("~/dev/app"),
+                    SandboxPath::read_only(path),
+                ],
+            )
+            .resolve(SandboxBackendKind::Seatbelt, "/home/u")
+            .unwrap();
+            let err = SandboxLaunch::new(&policy, "/home/u", "s1")
+                .with_proxy(endpoint())
+                .validate()
+                .expect_err(&format!("'{path}' must not be grantable read-only"));
+            assert!(matches!(err, SandboxError::Refused { .. }), "{err}");
+            let text = err.to_string();
+            assert!(text.contains(expected), "{path}: {text}");
+            assert!(text.contains(path), "{path}: {text}");
+        }
+        // The launch's *own* minted directories live in exactly that tree and
+        // are the point of it, so they are not what this refuses.
+        let scratch = crate::sandbox::dirs::session_scratch_dir("s1")
+            .unwrap()
+            .display()
+            .to_string();
+        SandboxLaunch::new(&policy(), "/home/u", "s1")
+            .with_tmp_dir(&scratch)
             .with_proxy(endpoint())
             .validate()
             .unwrap();
