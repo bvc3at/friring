@@ -1242,6 +1242,215 @@ mod tests {
         dirs::cleanup_place("lifecycle");
     }
 
+    /// A host that remembers what the tool was asked, and lets a `run` change
+    /// what a later `inspect` describes.
+    ///
+    /// `StubHost` answers the same thing however often it is asked, which
+    /// cannot express a lifecycle: whether a stopped place was started or
+    /// replaced is a question about the *sequence* of commands and about which
+    /// container exists afterwards, not about any one answer.
+    struct Recording {
+        base: StubHost,
+        log: std::sync::Mutex<Vec<String>>,
+        /// What `inspect` describes once a `run` has succeeded — the container
+        /// the recovery built, which is a different one.
+        replacement: Option<String>,
+        created: std::sync::Mutex<bool>,
+    }
+
+    impl Recording {
+        fn new(base: StubHost, replacement: Option<String>) -> Arc<Self> {
+            Arc::new(Self {
+                base,
+                log: std::sync::Mutex::new(Vec::new()),
+                replacement,
+                created: std::sync::Mutex::new(false),
+            })
+        }
+
+        /// The lifecycle commands only: the probe's own `--version`,
+        /// `system status` and the two `--help` reads are not what these tests
+        /// are about.
+        fn lifecycle(&self) -> Vec<String> {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| {
+                    matches!(call.split(' ').next(), Some("start" | "stop" | "delete"))
+                        || (call.starts_with("run ") && !call.contains("--help"))
+                })
+                .map(|call| match call.starts_with("run ") {
+                    // The create argv carries the whole mount plan; the verb is
+                    // what this assertion is about.
+                    true => "run".to_string(),
+                    false => call.clone(),
+                })
+                .collect()
+        }
+    }
+
+    impl ProbeHost for Recording {
+        fn which(&self, program: &str) -> Option<String> {
+            self.base.which(program)
+        }
+
+        fn home(&self) -> Option<String> {
+            self.base.home()
+        }
+
+        fn path_exists(&self, path: &str) -> bool {
+            self.base.path_exists(path)
+        }
+
+        fn read_file(&self, path: &str) -> Option<String> {
+            self.base.read_file(path)
+        }
+
+        fn run(&self, program: &str, args: &[&str]) -> Result<ProbeOutput, String> {
+            if program != PROGRAM {
+                return self.base.run(program, args);
+            }
+            self.log.lock().unwrap().push(args.join(" "));
+            let verb = args.first().copied().unwrap_or_default();
+            if verb == "run" && args.get(1) != Some(&"--help") {
+                *self.created.lock().unwrap() = true;
+            }
+            if verb == "inspect" && *self.created.lock().unwrap() {
+                if let Some(json) = &self.replacement {
+                    return Ok(ProbeOutput::success(json));
+                }
+            }
+            self.base.run(program, args)
+        }
+    }
+
+    /// An owned place that is not running, with everything an ensure needs
+    /// around it. `id` is deliberately not the container's name: the name is
+    /// friring's handle, the id is what the tool answers with.
+    fn stopped_place(name: &str, id: &str) -> (InstancePlan, StubHost) {
+        let planned = backend(host_for(name)).plan_for(&profile(name)).unwrap().0;
+        let host = host_for(name)
+            .with_command(
+                &format!("{PROGRAM} network ls"),
+                ProbeOutput::success(format!("{}\n", plan::NETWORK)),
+            )
+            .with_command(
+                &format!("{PROGRAM} images inspect {IMAGE}"),
+                ProbeOutput::success("{}"),
+            )
+            .with_command(
+                &format!("{PROGRAM} inspect {}", planned.name),
+                ProbeOutput::success(container_json(
+                    id,
+                    "stopped",
+                    &friring_labels(name, &planned.spec),
+                )),
+            );
+        (planned, host)
+    }
+
+    /// A stopped place friring owns is started again, and the session lands in
+    /// the same one: a restart must not throw away the work in it.
+    #[test]
+    fn a_stopped_place_is_started_rather_than_rebuilt() {
+        let (_planned, host) = stopped_place("restarted", "stoppedplace1");
+        let host = Recording::new(
+            host.with_command(
+                &format!("{PROGRAM} start stoppedplace1"),
+                ProbeOutput::success(""),
+            ),
+            None,
+        );
+        let place = AppleContainerBackend::new(host.clone())
+            .ensure_place(&profile("restarted"))
+            .unwrap();
+
+        assert_eq!(place.instance.external_id, "stoppedplace1");
+        assert_eq!(host.lifecycle(), ["start stoppedplace1"]);
+        dirs::cleanup_place("restarted");
+    }
+
+    /// A place that will not start is one whose VM went with a host reboot.
+    /// It is taken away by name and built again — `stop` first, because a
+    /// delete of a running container is refused — and the session lands in the
+    /// replacement rather than on a dead handle.
+    #[test]
+    fn a_place_that_will_not_start_is_replaced_and_the_new_id_is_the_one_recorded() {
+        let (planned, host) = stopped_place("wedged", "wedgedplace1");
+        let replacement = container_json(
+            "freshplace2",
+            "running",
+            &friring_labels("wedged", &planned.spec),
+        );
+        let host = Recording::new(
+            host.with_command(
+                &format!("{PROGRAM} start wedgedplace1"),
+                ProbeOutput::failure(1, "the container could not be started\n"),
+            )
+            .with_command(
+                &format!("{PROGRAM} stop wedgedplace1"),
+                ProbeOutput::success(""),
+            )
+            .with_command(
+                &format!("{PROGRAM} delete wedgedplace1"),
+                ProbeOutput::success(""),
+            )
+            .with_command_prefix(&format!("{PROGRAM} run "), ProbeOutput::success("")),
+            Some(replacement),
+        );
+        let place = AppleContainerBackend::new(host.clone())
+            .ensure_place(&profile("wedged"))
+            .unwrap();
+
+        assert_eq!(place.instance.external_id, "freshplace2");
+        assert_eq!(
+            host.lifecycle(),
+            [
+                "start wedgedplace1",
+                "stop wedgedplace1",
+                "delete wedgedplace1",
+                "run"
+            ]
+        );
+        dirs::cleanup_place("wedged");
+    }
+
+    /// And when the replacement will not build either, the ensure refuses with
+    /// the tool's own reason rather than handing back the id it just deleted.
+    #[test]
+    fn a_replacement_that_will_not_build_refuses_the_ensure() {
+        let (_planned, host) = stopped_place("doomed", "doomedplace1");
+        let host = Recording::new(
+            host.with_command(
+                &format!("{PROGRAM} start doomedplace1"),
+                ProbeOutput::failure(1, "the container could not be started\n"),
+            )
+            .with_command(
+                &format!("{PROGRAM} stop doomedplace1"),
+                ProbeOutput::success(""),
+            )
+            .with_command(
+                &format!("{PROGRAM} delete doomedplace1"),
+                ProbeOutput::success(""),
+            )
+            .with_command_prefix(
+                &format!("{PROGRAM} run "),
+                ProbeOutput::failure(1, "no space left on device\n"),
+            ),
+            None,
+        );
+        let err = AppleContainerBackend::new(host.clone())
+            .ensure_place(&profile("doomed"))
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, SandboxError::Refused { .. }), "{text}");
+        assert!(text.contains("no space left on device"), "{text}");
+        // Nothing after the create it could not do.
+        assert_eq!(host.lifecycle().last().unwrap(), "run");
+        dirs::cleanup_place("doomed");
+    }
+
     /// friring only ever reuses or removes what it can prove it created, and the
     /// proof is its own label.
     #[test]
