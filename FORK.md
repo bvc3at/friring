@@ -144,11 +144,17 @@ actually needs and to an allowlist of domains.
   promise friring cannot keep there — is refused, leaving an unrestricted `full`
   as the only mode it can honour.
 - **Place backend: `wsl-distro`** — one hardened clone per profile
-  (`friring-sbx-<profile>`, `automount` and `interop` off, an ownership marker,
-  bubblewrap required inside it), with VHD export/import and reclaiming. **No
-  session launches into one yet**: reaching it needs the `wsl:` transport rather
-  than the container one, so pinning it refuses at the launch with the two ways
-  to get a boundary today rather than opening a pane with no hooks and no login.
+  (`friring-sbx-<profile>`, `automount` and `interop` off, an ownership marker, a
+  *checked* `wsl --terminate` before the hardening is verified, bubblewrap
+  required inside it), with VHD export/import and reclaiming. **None of that runs
+  in this build.** Reaching a distro needs the `wsl:` transport rather than the
+  container one, so the launch path was deliberately not wired — and with it
+  unwired nothing else calls the backend either: registering, adopting and
+  reclaiming are reached through `SandboxHost::wsl_distro` (no caller) or
+  `PLACE_KINDS` (the three container engines). What runs is the probe, the
+  capabilities the editor gates on, and a launch refusal naming the two ways to
+  get a boundary on Windows today. Its refusals are held to the shared
+  conformance table anyway, through its own two seams.
 - **Copy-on-write workspaces on `bwrap`** — the real directory as a read-only
   lower layer and the agent's writes in an inspectable upper layer outside the
   sandbox's own writable scratch. Availability is probed by *mounting* one, since
@@ -242,11 +248,18 @@ actually needs and to an allowlist of domains.
   environment variables that point at it.
 - **A launch is refused rather than quietly narrowed** — friring will not start
   a session whose profile hands over more than the boundary can hold: read-write
-  roots enclosing the data directory (ADR-29) or reaching a tmux server socket
-  directory, a filtered network mode with no proxy running to enforce it, or a
-  security-relevant path that is not valid UTF-8 (a rule built from a lossy
-  spelling names a different file). The profile editor applies the first of
-  those at save, so such a profile never becomes a stored row.
+  roots reaching the data directory (ADR-29 — the directory judged from above,
+  the database file and its `-wal`/`-shm` siblings from either side, because a
+  path naming a file encloses no directory), reaching a tmux server socket
+  directory, or reaching friring's own `agents.toml`/`hosts.toml`/`config.toml`,
+  which write down the command lines the host launches every agent with; a
+  filtered network mode with no proxy running to enforce it; a `docker`/`podman`
+  place that cannot be *shown* to reach the proxy's socket, measured by having
+  the place dial a listener friring binds outside it rather than guessed from the
+  engine's name; and a security-relevant path that is not valid UTF-8 (a rule
+  built from a lossy spelling names a different file). The profile editor applies
+  the path refusals at save, so such a profile never becomes a stored row, and
+  `sandbox import` applies them before it writes any of a document.
 - **A per-session scratch directory** — the agent's writable temp space is
   `<data dir>/sandbox/tmp/<session id>`, minted `0700`, adopted after a crash
   and dropped with the session; generated seatbelt profiles sit beside it under
@@ -284,7 +297,8 @@ actually needs and to an allowlist of domains.
   running in it are confirmed in the footer, and `y` alone answers, because
   `Enter` and `d` already mean edit and delete there.
 
-What ships is both policy backends and all three place backends, with every
+What ships and runs is both policy backends and the two *container* place
+backends (`docker`/`podman` and `apple-container`), with every
 network mode enforced where the backend can enforce it, host-passthrough
 credentials under a policy backend, and status reporting out of either kind of
 boundary — a place gets the safe subset of the user's agent configuration
@@ -294,15 +308,21 @@ any other. All three place credential strategies are built: `env-token`,
 `volume-login` and `seed-file`.
 
 What does not: a place on a *remote* host is refused rather than supported
-(friring creates the container locally, with this machine's paths); **no session
-launches into a `wsl-distro` place** — the distro is built, hardened and
-reclaimed, and the launch path into it is not, so pinning it refuses with the
-alternatives; **`apple-container` honours no filtered network mode**, because
-the egress proxy is not reachable across a VM boundary; and no profile column
-selects a copy-on-write workspace yet. An egress proxy dies with the friring
-process that started it, so a session created by the short-lived `friring-cli`
-starts with no way out (kernel-closed, which fails closed) until a running
-friring relaunches it. Design, delivery phases and ADR-25 through ADR-29 live in
+(friring creates the container locally, with this machine's paths); **nothing
+drives the `wsl-distro` backend** — it is built and stub-tested with no
+production caller, so no distro is registered, hardened or reclaimed and no
+session runs in one, and pinning it refuses with the alternatives;
+**`apple-container` honours no filtered network mode**, because the egress proxy
+is not reachable across a VM boundary — and a `docker`/`podman` place whose
+daemon is in a VM (Docker Desktop, `podman machine`, colima) is refused a
+filtered mode for the same reason, now that friring measures it rather than
+assuming; and no profile column selects a copy-on-write workspace yet. An egress
+proxy dies with the friring process that started it, so a session created by the
+short-lived `friring-cli` starts with no way out (kernel-closed, which fails
+closed) until a running friring relaunches it. Renaming a profile that has a
+place means signing in again: the place tree is named by profile name and the
+rename is a database transaction. Design, delivery phases, the full "not in it"
+list and ADR-25 through ADR-29 live in
 [`docs/SANDBOX.md`](docs/SANDBOX.md).
 
 #### Lazy sessions & ghosts (July 2026)
