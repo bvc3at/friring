@@ -6,7 +6,7 @@
 //! anything, so the whole shape of a container is assertable in a unit test and
 //! no test has to start one.
 //!
-//! Two rules drive the mounts:
+//! Three rules drive the mounts:
 //!
 //! - **Identical absolute paths.** Every profile path is mounted at exactly its
 //!   host path. A git linked worktree names its main repository by absolute path
@@ -19,6 +19,13 @@
 //!   instead of inventing a root-owned directory — and each refusal is checked
 //!   here first, so the message names the profile's path and the reason rather
 //!   than quoting an engine error.
+//! - **A source is judged as the kernel resolves it.** The literal string is
+//!   what reaches `--mount`, and the kernel resolves it *again* when it sets the
+//!   bind up, so a source travelling through a symlink means one thing to the
+//!   check and another to the mount. [`MountCheck`] therefore refuses any source
+//!   that does not already spell its own canonical path, and compares the
+//!   canonical form against the canonical spelling of every directory a place
+//!   may not be handed.
 
 use std::collections::BTreeMap;
 
@@ -148,25 +155,43 @@ pub struct PlanInput<'a> {
     pub place_dir: &'a str,
     /// The per-profile synthetic home, mounted at [`CONTAINER_HOME`].
     pub home_dir: &'a str,
+    pub user: Option<&'a str>,
+    pub userns_keep_id: bool,
+    /// What every mount source is judged against.
+    pub check: MountCheck<'a>,
+}
+
+/// Everything a mount source is judged against, injected so the whole check is
+/// a pure function of its inputs and no test consults the developer's own
+/// filesystem.
+///
+/// Carried on [`PlanInput`] and re-usable on its own, because the check has to
+/// happen **twice**: once while the plan is built, and once immediately before
+/// the engine is asked to create the container (see [`MountCheck::check`]).
+pub struct MountCheck<'a> {
     /// friring's database, to keep *out* (ADR-29). A launch input rather than
     /// something resolved here: the friring that owns the session is not
     /// necessarily the one on the host where the agent runs.
     pub friring_db: Option<&'a str>,
-    pub user: Option<&'a str>,
-    pub userns_keep_id: bool,
-    /// Whether a path exists on the host the engine runs on. Injected, so the
-    /// plan is a pure function of its inputs and no test consults the
-    /// developer's own filesystem.
+    /// The home directory on the host the engine runs on, for the per-user
+    /// engine sockets a desktop or rootless install keeps under it.
+    pub home: Option<&'a str>,
+    /// Whether a path exists on the host the engine runs on.
     pub exists: &'a dyn Fn(&str) -> bool,
+    /// A mount source as the kernel will resolve it, or the reason friring will
+    /// not name it — [`dirs::canonical_source`] in production.
+    pub resolve: &'a dyn Fn(&str) -> Result<String, String>,
 }
 
 /// Build the plan for one profile's place, or refuse with the reason.
 ///
 /// # Errors
 ///
-/// A path that cannot be mounted at its own path (relative, unspellable in a
-/// `--mount` value, absent on the host), a mount that would reach friring's data
-/// directory or a tmux socket directory, or two mounts landing on one target.
+/// Everything [`MountCheck::check`] refuses: a path that cannot be mounted at
+/// its own path (relative, unspellable in a `--mount` value, absent on the host,
+/// or reached through a symlink), a mount that would reach friring's data
+/// directory, a tmux socket directory or a container engine's control socket, or
+/// two mounts landing on one target.
 pub fn plan_instance(input: PlanInput<'_>) -> SandboxResult<InstancePlan> {
     let policy = input.policy;
     let refuse = |detail: String| SandboxError::Refused {
@@ -193,17 +218,20 @@ pub fn plan_instance(input: PlanInput<'_>) -> SandboxResult<InstancePlan> {
     // directory inside somebody's repository.
     for root in &policy.rw_paths {
         let hooks = format!("{root}/{PROTECTED_IN_WRITABLE_ROOT}");
-        if (input.exists)(&hooks) {
+        if (input.check.exists)(&hooks) {
             mounts.push(Mount::identical(&hooks, false));
         }
     }
 
     // friring's own two: the egress directory at its own path (the socket inside
-    // it is named identically on both sides), and the synthetic home.
+    // it is named identically on both sides), and the synthetic home. Checked
+    // like every other source rather than trusted: the place directory is
+    // mounted read-write, so an agent inside can replace the `home` directory
+    // under it with a symlink and have the next ensure mount whatever it names.
     mounts.push(Mount::identical(input.place_dir, true));
     mounts.push(Mount::new(input.home_dir, CONTAINER_HOME, true));
 
-    check_mounts(&mounts, &input, &refuse)?;
+    input.check.check(&mounts, &refuse)?;
 
     let env = place_env(policy);
     let network = network_setting(policy);
@@ -231,78 +259,138 @@ pub fn plan_instance(input: PlanInput<'_>) -> SandboxResult<InstancePlan> {
     Ok(plan)
 }
 
-/// Refuse a mount set that cannot be honoured, or that would carry something
-/// across the boundary that never may.
-fn check_mounts(
-    mounts: &[Mount],
-    input: &PlanInput<'_>,
-    refuse: &dyn Fn(String) -> SandboxError,
-) -> SandboxResult<()> {
-    let protected = dirs::protected_data_dirs(input.friring_db);
-    let socket_root = dirs::tmux_socket_root().display().to_string();
-    let mut targets: Vec<&str> = Vec::new();
+impl MountCheck<'_> {
+    /// Refuse a mount set that cannot be honoured, or that would carry something
+    /// across the boundary that never may.
+    ///
+    /// Called twice per place: once from [`plan_instance`], and once by the
+    /// backend immediately before it runs the engine's `create`. The second call
+    /// is what narrows the check-to-create race — the mounts of a plan are
+    /// decided long before the container is made (an image may be pulled or
+    /// built in between, which takes minutes), and every source in it is a path
+    /// a sandboxed agent of some *other* place may be writing the whole time.
+    ///
+    /// What is left after that is one window nothing outside the engine can
+    /// close: between friring's last `lstat`/`realpath` of a source and the
+    /// engine's own resolution of the same string as it sets the bind up. The
+    /// engine — or, for a rootful Docker, its daemon — is what performs that
+    /// resolution, so no check on this side can be the last word; the window is
+    /// the `fork`/`exec` of the CLI plus the daemon's own handling of the
+    /// request. Two things make it hard to land in: the mount sources are
+    /// re-resolved with nothing between them and the spawn, and any source that
+    /// is a symlink at *either* check is refused outright rather than followed.
+    ///
+    /// # Errors
+    ///
+    /// A source that is relative, unspellable in a `--mount` value, absent, or
+    /// reached through a symlink; one that reaches friring's data directory
+    /// (ADR-29), a tmux socket directory or a container engine's control socket;
+    /// or two mounts landing on one target.
+    pub fn check(
+        &self,
+        mounts: &[Mount],
+        refuse: &dyn Fn(String) -> SandboxError,
+    ) -> SandboxResult<()> {
+        let protected = dirs::protected_data_dirs(self.friring_db);
+        let mut targets: Vec<&str> = Vec::new();
 
-    for mount in mounts {
-        let source = mount.source.as_str();
-        if !source.starts_with('/') {
-            return Err(refuse(format!(
-                "'{source}' is not an absolute path, and a place mounts every path at exactly \
-                 its host path"
-            )));
-        }
-        if let Some(bad) = source
-            .chars()
-            .chain(mount.target.chars())
-            .find(|c| *c == ',' || *c == '"' || c.is_control())
-        {
-            // The engines parse a `--mount` value as comma-separated key=value
-            // and disagree about quoting inside it, so a path carrying one of
-            // these characters cannot be named exactly. Refusing beats mounting
-            // whatever the parser makes of the fragments.
-            return Err(refuse(format!(
-                "'{source}' contains {} , which cannot be spelled in a container mount",
-                bad.escape_debug()
-            )));
-        }
-        // ADR-29, and it is *not* only about the writable set: the database is
-        // never mounted into a sandbox, read-only or otherwise. A read-only bind
-        // of the data directory still exposes the automation commands the host
-        // executes, and a `-wal` written through any writable route is replayed
-        // by the host on next open.
-        for dir in &protected {
-            if dirs::encloses(source, dir) {
+        for mount in mounts {
+            let source = mount.source.as_str();
+            if !source.starts_with('/') {
                 return Err(refuse(format!(
-                    "mounting '{source}' would carry friring's data directory '{dir}' into the \
-                     sandbox. The database there holds automation commands the host executes, so \
-                     it never enters a boundary, read-only or otherwise (ADR-29) — mount the \
-                     directories the agent needs instead of an ancestor of the data directory"
+                    "'{source}' is not an absolute path, and a place mounts every path at \
+                     exactly its host path"
                 )));
             }
+            if let Some(bad) = source
+                .chars()
+                .chain(mount.target.chars())
+                .find(|c| *c == ',' || *c == '"' || c.is_control())
+            {
+                // The engines parse a `--mount` value as comma-separated
+                // key=value and disagree about quoting inside it, so a path
+                // carrying one of these characters cannot be named exactly.
+                // Refusing beats mounting whatever the parser makes of the
+                // fragments.
+                return Err(refuse(format!(
+                    "'{source}' contains {} , which cannot be spelled in a container mount",
+                    bad.escape_debug()
+                )));
+            }
+            if !(self.exists)(source) {
+                return Err(refuse(format!(
+                    "'{source}' does not exist on this host, so it cannot be mounted into the \
+                     sandbox. Create it, or take it out of the profile — a place that silently \
+                     drops a path is a boundary nobody can reason about"
+                )));
+            }
+            // Everything below compares the *canonical* source, because that is
+            // what the kernel will bind. A source that is not already its own
+            // canonical path is refused rather than rewritten: rewriting it
+            // would mount a directory the profile does not name, and following
+            // it would mount whatever the link points at by the time the engine
+            // gets there.
+            let canonical = (self.resolve)(source).map_err(|reason| {
+                // Tampering rather than an ordinary refusal: the commonest way
+                // to land here is an agent inside a place planting a link at a
+                // path the plan adds by itself, and a profile's
+                // `allow_unsandboxed_fallback` must not turn that into a launch
+                // on the host. A user's own symlinked path is refused the same
+                // way — friring cannot tell them apart, and the message says
+                // what to change.
+                refuse(format!(
+                    "{reason}, and a place mounts every path at exactly its host path — friring \
+                     will not bind a source whose meaning a symlink can change between the check \
+                     and the mount. Name the resolved path in the profile, or take the link out"
+                ))
+                .tampered()
+            })?;
+            // ADR-29, and it is *not* only about the writable set: the database
+            // is never mounted into a sandbox, read-only or otherwise. A
+            // read-only bind of the data directory still exposes the automation
+            // commands the host executes, and a `-wal` written through any
+            // writable route is replayed by the host on next open.
+            for dir in &protected {
+                if dirs::reaches(&canonical, dir) {
+                    return Err(refuse(format!(
+                        "mounting '{source}' would carry friring's data directory '{dir}' into \
+                         the sandbox. The database there holds automation commands the host \
+                         executes, so it never enters a boundary, read-only or otherwise \
+                         (ADR-29) — mount the directories the agent needs instead of an ancestor \
+                         of the data directory"
+                    )));
+                }
+            }
+            if let Some(socket_root) = dirs::grants_tmux_socket_tree(&canonical) {
+                // Read-only is no defence: a read-only superblock does not take
+                // write permission away from a socket inode, so `connect(2)`
+                // still succeeds and the agent drives the host's tmux server.
+                return Err(refuse(format!(
+                    "mounting '{source}' would carry the tmux socket directory '{socket_root}' \
+                     into the sandbox, and a sandbox that can reach friring's own tmux socket \
+                     can run commands in any pane, outside the boundary"
+                )));
+            }
+            if let Some(socket) = dirs::grants_engine_socket(&canonical, self.home) {
+                return Err(refuse(format!(
+                    "mounting '{source}' would carry the container engine's control socket \
+                     '{socket}' into the sandbox. Anything that can speak to it can start a \
+                     privileged container with the host's filesystem in it, which is the whole \
+                     host — no profile may grant that, so it is refused rather than offered as \
+                     an exception"
+                )));
+            }
+            if targets.contains(&mount.target.as_str()) {
+                return Err(refuse(format!(
+                    "two paths would be mounted at '{}' inside the sandbox, and only one of them \
+                     could win",
+                    mount.target
+                )));
+            }
+            targets.push(mount.target.as_str());
         }
-        if dirs::encloses(source, &socket_root) {
-            return Err(refuse(format!(
-                "mounting '{source}' would carry the tmux socket directory '{socket_root}' into \
-                 the sandbox, and a sandbox that can reach friring's own tmux socket can run \
-                 commands in any pane, outside the boundary"
-            )));
-        }
-        if !(input.exists)(source) {
-            return Err(refuse(format!(
-                "'{source}' does not exist on this host, so it cannot be mounted into the \
-                 sandbox. Create it, or take it out of the profile — a place that silently drops \
-                 a path is a boundary nobody can reason about"
-            )));
-        }
-        if targets.contains(&mount.target.as_str()) {
-            return Err(refuse(format!(
-                "two paths would be mounted at '{}' inside the sandbox, and only one of them \
-                 could win",
-                mount.target
-            )));
-        }
-        targets.push(mount.target.as_str());
+        Ok(())
     }
-    Ok(())
 }
 
 /// The environment every session in a place inherits.
@@ -461,6 +549,7 @@ mod tests {
     use crate::session::{ReadScope, SandboxBackendKind, SandboxPath, SandboxProfile};
 
     const DB: &str = "/home/u/.local/share/friring/friring.db";
+    const HOME: &str = "/home/u";
     const IMAGE: &str = "friring/sandbox:1";
 
     fn resolved(profile: SandboxProfile) -> SandboxPolicy {
@@ -493,16 +582,27 @@ mod tests {
         true
     }
 
+    /// Every source already spells its own canonical path, which is what the
+    /// check demands of a real one. The test about symlinks passes the
+    /// production resolver and a filesystem it planted itself.
+    fn itself(path: &str) -> Result<String, String> {
+        Ok(path.to_string())
+    }
+
     fn input<'a>(policy: &'a SandboxPolicy, place: &'a str, home: &'a str) -> PlanInput<'a> {
         PlanInput {
             policy,
             image: IMAGE,
             place_dir: place,
             home_dir: home,
-            friring_db: Some(DB),
             user: Some("1000:1000"),
             userns_keep_id: false,
-            exists: &everything,
+            check: MountCheck {
+                friring_db: Some(DB),
+                home: Some(HOME),
+                exists: &everything,
+                resolve: &itself,
+            },
         }
     }
 
@@ -649,7 +749,7 @@ mod tests {
         // root-owned directory. Neither is a boundary anyone can reason about.
         let missing = |path: &str| path != "/home/u/dev/app";
         let mut plan_input = input(&policy, &place, &home);
-        plan_input.exists = &missing;
+        plan_input.check.exists = &missing;
         let err = plan_instance(plan_input).unwrap_err();
         assert!(err.to_string().contains("does not exist"), "{err}");
 
@@ -668,6 +768,248 @@ mod tests {
         ));
         let err = plan_for(&clash).unwrap_err();
         assert!(err.to_string().contains("only one of them"), "{err}");
+    }
+
+    /// The tmux socket directory is refused from **below** as well as from
+    /// above: a profile naming one server's `tmux-<uid>` directory does not
+    /// enclose the socket root, and mounting it read-only is still a socket the
+    /// agent can `connect(2)` — a read-only superblock does not take write
+    /// permission away from a socket inode.
+    #[test]
+    fn no_mount_may_reach_a_tmux_socket_directory_from_either_side() {
+        let socket_root = dirs::tmux_socket_root().display().to_string();
+        for path in [
+            socket_root.clone(),
+            format!("{socket_root}/tmux-1000"),
+            format!("{socket_root}/tmux-1000/default"),
+        ] {
+            let policy = resolved(SandboxProfile::new(
+                "dev",
+                vec![SandboxPath::read_only(&path)],
+            ));
+            let err = plan_for(&policy).unwrap_err();
+            assert!(err.to_string().contains("tmux socket"), "{path}: {err}");
+        }
+        // Something else under the same root is ordinary scratch space.
+        let ordinary = resolved(SandboxProfile::new(
+            "dev",
+            vec![SandboxPath::read_only(format!("{socket_root}/build-cache"))],
+        ));
+        plan_for(&ordinary).unwrap();
+    }
+
+    /// A sandbox holding the engine's own control socket owns the host: it can
+    /// start a privileged container with the host's filesystem in it. So this is
+    /// refused outright rather than treated as a service the profile chose to
+    /// share.
+    #[test]
+    fn no_mount_may_carry_the_engine_s_own_control_socket() {
+        for path in [
+            "/var/run/docker.sock",
+            "/var/run",
+            "/run",
+            "/run/docker.sock",
+            "/run/podman/podman.sock",
+            "/run/user",
+            "/run/user/1000",
+            "/run/user/1000/podman",
+            "/run/user/1000/podman/podman.sock",
+            "/home/u/.docker",
+            "/home/u/.docker/run/docker.sock",
+            "/home/u/.local/share/containers/podman/machine/qemu/podman.sock",
+        ] {
+            for paths in [
+                vec![SandboxPath::read_only(path)],
+                vec![SandboxPath::workspace(path)],
+            ] {
+                let policy = resolved(SandboxProfile::new("dev", paths));
+                let err = plan_for(&policy).unwrap_err();
+                assert!(err.to_string().contains("control socket"), "{path}: {err}");
+            }
+        }
+        // A path that merely lives near one is ordinary.
+        let ordinary = resolved(SandboxProfile::new(
+            "dev",
+            vec![SandboxPath::read_only("/var/lib/docker")],
+        ));
+        plan_for(&ordinary).unwrap();
+    }
+
+    /// Resolving a mount source may never *rewrite* one: a plan mounts each
+    /// path at exactly the string the profile wrote, and a git linked worktree
+    /// is why.
+    ///
+    /// A worktree names its main repository by absolute path and the repository
+    /// names the worktree back the same way, so a place that mounted either at
+    /// its canonical spelling instead would leave `git status` looking for a
+    /// path that is not there. Which is exactly the case canonicalisation is
+    /// about — so the rule is fail-closed rather than helpful: a source that is
+    /// not already its own resolved spelling is *refused*, never silently
+    /// swapped, and the check's answer is used only to compare against the
+    /// directories no mount may carry.
+    #[cfg(unix)]
+    #[test]
+    fn resolving_a_source_never_rewrites_it_so_a_linked_worktree_still_works() {
+        let base = dirs::test_temp_base("worktree-identity");
+        // The layout a git linked worktree makes: a main repository and a
+        // checkout elsewhere, each referring to the other by absolute path.
+        let repo = base.join("repo");
+        let tree = base.join("wt/feature");
+        std::fs::create_dir_all(repo.join(".git/hooks")).unwrap();
+        std::fs::create_dir_all(repo.join(".git/worktrees/feature")).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join(".git"), format!("gitdir: {}\n", repo.display())).unwrap();
+        let (place, home) = dirs::create_place_dirs("worktree-identity").unwrap();
+
+        let declared = [repo.display().to_string(), tree.display().to_string()];
+        let policy = resolved(SandboxProfile::new(
+            "worktree-identity",
+            declared
+                .iter()
+                .map(SandboxPath::workspace)
+                .collect::<Vec<_>>(),
+        ));
+        let real_exists = |path: &str| std::path::Path::new(path).exists();
+        let planned = plan_instance(PlanInput {
+            policy: &policy,
+            image: IMAGE,
+            place_dir: &place.display().to_string(),
+            home_dir: &home.display().to_string(),
+            user: None,
+            userns_keep_id: false,
+            check: MountCheck {
+                friring_db: None,
+                home: Some(&base.display().to_string()),
+                exists: &real_exists,
+                resolve: &dirs::place_mount_source,
+            },
+        })
+        .expect("an ordinary worktree layout plans");
+
+        for path in &declared {
+            let mount = planned
+                .mounts
+                .iter()
+                .find(|m| m.source == *path)
+                .unwrap_or_else(|| panic!("'{path}' must be mounted under its own name"));
+            assert_eq!(
+                mount.target, mount.source,
+                "identical absolute paths: the profile's spelling on both sides"
+            );
+        }
+        // Nothing was invented either: every source a plan carries is one the
+        // profile named or one friring minted, never a resolved variant of one.
+        let minted = [place.display().to_string(), home.display().to_string()];
+        for mount in &planned.mounts {
+            let known = declared.iter().chain(&minted).any(|path| {
+                mount.source == *path
+                    || mount.source == format!("{path}/{PROTECTED_IN_WRITABLE_ROOT}")
+            });
+            assert!(known, "unexpected mount source {}", mount.source);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        dirs::cleanup_place("worktree-identity");
+    }
+
+    /// The escape, end to end at the plan level and against a real filesystem.
+    ///
+    /// `plan_instance` adds `<writable root>/.git/hooks` wherever it exists, so
+    /// an agent inside a place can plant that path as a link to friring's tmux
+    /// socket directory and have the *next* ensure mount it — no user error
+    /// anywhere. friring's own two mounts are no different: the place directory
+    /// is mounted read-write, so the synthetic home underneath it is a path the
+    /// sandbox can replace with a link of its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_never_becomes_a_mount() {
+        let base = dirs::test_temp_base("planted-mount");
+        let repo = base.join("repo");
+        let hooks = repo.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        // friring's own two directories, named exactly as a place mounts them —
+        // which on macOS is through the temp root's `/var` link, so this is also
+        // the case that must *not* be refused. A tree of this test's own:
+        // they are keyed by profile name, and a sibling test cleaning up "dev"
+        // would take these away mid-test.
+        let (place, home) = dirs::create_place_dirs("planted").unwrap();
+        let place_dir = place.display().to_string();
+        let home_dir = home.display().to_string();
+
+        let policy = resolved(SandboxProfile::new(
+            "planted",
+            vec![SandboxPath::workspace(repo.display().to_string())],
+        ));
+        let real_exists = |path: &str| std::path::Path::new(path).exists();
+        let plan = |policy: &SandboxPolicy| {
+            plan_instance(PlanInput {
+                policy,
+                image: IMAGE,
+                place_dir: &place_dir,
+                home_dir: &home_dir,
+                user: None,
+                userns_keep_id: false,
+                check: MountCheck {
+                    friring_db: None,
+                    home: Some(&base.display().to_string()),
+                    exists: &real_exists,
+                    // The real thing, against the filesystem this test planted.
+                    resolve: &dirs::place_mount_source,
+                },
+            })
+        };
+
+        // The control: an ordinary repository, and friring's own directories,
+        // all plan cleanly.
+        let planned = plan(&policy).unwrap();
+        assert!(planned
+            .mounts
+            .iter()
+            .any(|m| m.source == hooks.display().to_string() && !m.writable));
+
+        // Act one: the agent replaces `.git/hooks` with a link to the directory
+        // friring's own tmux server listens in. A read-only bind of it would be
+        // arbitrary command execution on the host.
+        std::fs::remove_dir(&hooks).unwrap();
+        let sockets = dirs::tmux_socket_root();
+        std::os::unix::fs::symlink(&sockets, &hooks).unwrap();
+        let err = plan(&policy).unwrap_err().to_string();
+        assert!(err.contains(&hooks.display().to_string()), "{err}");
+        assert!(err.contains("symlink"), "{err}");
+        // Named, not merely refused: the message says what to act on.
+        assert!(err.contains(&sockets.display().to_string()), "{err}");
+
+        // Act two: the same trick on friring's own synthetic home, which lives
+        // inside the read-write place directory the agent already has.
+        // (`remove_file` unlinks the link itself; `remove_dir` on one is
+        // `ENOTDIR`.)
+        std::fs::remove_file(&hooks).unwrap();
+        std::fs::create_dir(&hooks).unwrap();
+        plan(&policy).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&sockets, &home).unwrap();
+        let err = plan(&policy).unwrap_err().to_string();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(err.contains(&home_dir), "{err}");
+
+        // Act three: a legitimately symlinked profile path — a repository
+        // reached through a link somebody meant to be there. friring cannot
+        // tell it from the planted one, so it is refused too, with a message
+        // naming the link and where it goes.
+        let _ = std::fs::remove_file(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let linked = base.join("checkouts");
+        std::os::unix::fs::symlink(&repo, &linked).unwrap();
+        let via_link = resolved(SandboxProfile::new(
+            "planted",
+            vec![SandboxPath::workspace(linked.display().to_string())],
+        ));
+        let err = plan(&via_link).unwrap_err().to_string();
+        assert!(err.contains(&linked.display().to_string()), "{err}");
+        assert!(err.contains(&repo.display().to_string()), "{err}");
+        assert!(err.contains("Name the resolved path"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&base);
+        dirs::cleanup_place("planted");
     }
 
     #[test]

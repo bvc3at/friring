@@ -53,7 +53,7 @@ use crate::session::{
 pub use engine::{ContainerEngine, EngineDetails};
 pub use gc::{gc_plan, GcInput, GcPlan, InstanceRecord, LiveContainer};
 pub use image::{ImageSource, DEFAULT_IMAGE};
-pub use plan::{create_argv, plan_instance, InstancePlan, PlanInput, CONTAINER_HOME};
+pub use plan::{create_argv, plan_instance, InstancePlan, MountCheck, PlanInput, CONTAINER_HOME};
 
 /// friring's own CLI, as a place's image must provide it.
 ///
@@ -224,6 +224,10 @@ impl ContainerBackend {
         let policy = profile
             .resolve(self.kind(), &home)
             .map_err(|detail| refuse(detail.to_string()))?;
+        // Before anything is minted on disk, for the same reason the engine's
+        // availability is: a profile that hands the sandbox the engine binary
+        // has no place worth building.
+        self.check_engine_containment(&policy, &refuse)?;
 
         let (place_dir, home_dir) = dirs::create_place_dirs(&policy.profile)?;
         let (place_dir, home_dir) = (
@@ -232,20 +236,65 @@ impl ContainerBackend {
         );
         let source = image::resolve(&policy)?;
         let details = self.details();
+        let exists = |path: &str| self.host.path_exists(path);
         let plan = plan_instance(PlanInput {
             policy: &policy,
             image: source.reference(),
             place_dir: &place_dir,
             home_dir: &home_dir,
-            // No launch here, so no other machine's data directory to protect:
-            // `protected_data_dirs` still covers this host's own, which is the
-            // one a container on it could reach.
-            friring_db: None,
             user: details.run_as_user(),
             userns_keep_id: details.userns_keep_id(self.engine),
-            exists: &|path| self.host.path_exists(path),
+            check: MountCheck {
+                // No launch here, so no other machine's data directory to
+                // protect: `protected_data_dirs` still covers this host's own,
+                // which is the one a container on it could reach.
+                friring_db: None,
+                home: Some(&home),
+                exists: &exists,
+                resolve: &dirs::place_mount_source,
+            },
         })?;
         Ok((plan, source, policy))
+    }
+
+    /// Refuse a profile that hands the sandbox the engine's own binary.
+    ///
+    /// The probe vetted the CLI against the *host* (see
+    /// [`dirs::rewritable_root`]); this profile decides what the agent can
+    /// write, and one granting the directory the engine lives in grants the
+    /// program that asks for the isolation — an engine at a user-writable
+    /// prefix (`/usr/local/bin`, `/opt/homebrew/bin`) plus a profile making that
+    /// prefix read-write is the sandbox choosing what the *next* launch runs.
+    /// The check and its sentence mirror
+    /// [`BwrapBackend::wrap`](crate::sandbox::bwrap::BwrapBackend), which
+    /// refuses the same shape for the same reason.
+    ///
+    /// The rule is [`engine_in_writable_root`]; a program this friring cannot
+    /// resolve — a remote host's, which is not on this filesystem — leaves the
+    /// literal comparison standing rather than refusing a launch over a question
+    /// friring could not ask.
+    fn check_engine_containment(
+        &self,
+        policy: &crate::session::SandboxPolicy,
+        refuse: &dyn Fn(String) -> SandboxError,
+    ) -> SandboxResult<()> {
+        let program = self.program()?;
+        let resolved = dirs::canonical(program);
+        let Some((root, found)) =
+            engine_in_writable_root(&policy.rw_paths, program, resolved.as_deref())
+        else {
+            return Ok(());
+        };
+        let named = if found == program {
+            format!("'{program}'")
+        } else {
+            format!("'{program}', which resolves to '{found}'")
+        };
+        Err(refuse(format!(
+            "the read-write path '{root}' contains {} itself ({named}), so the sandbox could \
+             replace the program that applies its own boundary",
+            self.engine
+        )))
     }
 
     /// The spec digest `profile` resolves to **right now** — what decides
@@ -305,6 +354,21 @@ impl ContainerBackend {
         refuse: &dyn Fn(String) -> SandboxError,
     ) -> SandboxResult<String> {
         let program = self.program()?;
+        // The mounts were decided when the plan was built, and that can be
+        // minutes ago: an image pull or a build sits between the two, and every
+        // source in the plan is a path some *other* place's agent may be writing
+        // the whole time. So they are re-checked here, with nothing between the
+        // check and the spawn but composing the argv — see
+        // [`MountCheck::check`] for the window that remains.
+        let home = self.host.home();
+        let exists = |path: &str| self.host.path_exists(path);
+        MountCheck {
+            friring_db: None,
+            home: home.as_deref(),
+            exists: &exists,
+            resolve: &dirs::place_mount_source,
+        }
+        .check(&plan.mounts, refuse)?;
         let argv = create_argv(program, plan);
         let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
         let output = self
@@ -503,9 +567,13 @@ impl ContainerBackend {
 
     /// The loopback port this session's relay listens on inside `container`.
     ///
-    /// Stable for a session across relaunches, and never shared with a sibling
-    /// session of the same profile — see [`RELAY_PORT_SPAN`] for why a place
-    /// cannot use one fixed port the way a bubblewrap sandbox can.
+    /// Stable for a session across relaunches, and never handed to two sessions
+    /// at once — see [`RELAY_PORT_SPAN`] for why a place cannot use one fixed
+    /// port the way a bubblewrap sandbox can.
+    ///
+    /// That is **addressing, not separation**: the loopback belongs to the place
+    /// and every session in it can dial any of these ports (`docs/SANDBOX.md`
+    /// §The two sandbox shapes).
     ///
     /// # Errors
     ///
@@ -662,7 +730,10 @@ impl SandboxBackend for ContainerBackend {
 /// One line, `|`-separated, because both engines render the same container JSON
 /// and neither guarantees the same *list* template — `ps --format` differs
 /// between them, `inspect --format` does not.
-const INSPECT_FORMAT: &str = "{{.Id}}|{{.State.Status}}|{{index .Config.Labels \
+///
+/// `pub(crate)` so a test elsewhere can script an engine's answer for a named
+/// container rather than for whatever the first `inspect` happens to be.
+pub(crate) const INSPECT_FORMAT: &str = "{{.Id}}|{{.State.Status}}|{{index .Config.Labels \
                               \"dev.friring.sandbox\"}}|{{index .Config.Labels \
                               \"dev.friring.sandbox.profile\"}}|{{index .Config.Labels \
                               \"dev.friring.sandbox.spec\"}}";
@@ -754,6 +825,34 @@ fn assign_port(
         return Some(*port);
     }
     (base..base.saturating_add(span)).find(|port| !taken.values().any(|held| held == port))
+}
+
+/// Which read-write root would let a sandbox replace the engine binary, and the
+/// spelling of the program that root contains.
+///
+/// Both spellings are compared, because replacing the symlink an engine is
+/// reached through redirects the host's next launch exactly as replacing the
+/// binary does: an engine on `PATH` at a system prefix that points into a
+/// prefix the profile makes writable is the obvious bypass of a check that only
+/// read the name. `resolved` is the program as the kernel resolves it, or `None`
+/// where that could not be asked.
+fn engine_in_writable_root<'a>(
+    rw_paths: &'a [String],
+    program: &str,
+    resolved: Option<&str>,
+) -> Option<(&'a str, String)> {
+    [
+        Some(program),
+        resolved.filter(|resolved| *resolved != program),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|path| {
+        rw_paths
+            .iter()
+            .find(|root| dirs::encloses(root, path))
+            .map(|root| (root.as_str(), path.to_string()))
+    })
 }
 
 /// A path the sandbox layer can name exactly, or a refusal.
@@ -1093,6 +1192,132 @@ mod tests {
             "{failures:?}"
         );
         assert_eq!(failures[1], "stuck: container is in use");
+    }
+
+    /// bwrap refuses a launch whose writable roots enclose the program applying
+    /// its boundary; a place is no different, and the engine CLI is that
+    /// program — it is what asks the daemon for the isolation, and an engine at
+    /// a user-writable prefix (`/usr/local/bin`, `/opt/homebrew/bin`) plus a
+    /// profile granting that prefix is the sandbox choosing what the host runs
+    /// next.
+    #[test]
+    fn a_profile_that_hands_over_the_engine_binary_is_refused_before_anything_is_built() {
+        let backend = backend(host());
+        let mut granted = profile();
+        granted.name = "handover".to_string();
+        granted.paths = vec![SandboxPath::workspace("/usr/bin")];
+        let err = backend.plan_for(&granted).unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, SandboxError::Refused { .. }), "{text}");
+        assert!(text.contains(PROGRAM), "{text}");
+        assert!(
+            text.contains("replace the program that applies its own boundary"),
+            "{text}"
+        );
+
+        // Read-only is a different grant: nothing there can replace anything,
+        // so this one gets as far as the ordinary mount checks.
+        let mut readable = profile();
+        readable.name = "handover".to_string();
+        readable.paths = vec![SandboxPath::read_only("/usr/bin")];
+        let text = backend.plan_for(&readable).unwrap_err().to_string();
+        assert!(!text.contains("replace the program"), "{text}");
+        dirs::cleanup_place("handover");
+    }
+
+    /// A plan's mounts are decided long before the container is made — an image
+    /// pull or build sits in between — and every source in it is a path some
+    /// other place's agent may be writing the whole time. So they are checked
+    /// again with nothing between the check and the spawn.
+    ///
+    /// The engine here is scripted to create the container happily: the only
+    /// thing that refuses the second call is the re-check.
+    #[cfg(unix)]
+    #[test]
+    fn a_source_that_became_a_symlink_after_planning_is_refused_at_create() {
+        let base = dirs::test_temp_base("create-recheck");
+        let repo = base.join("repo");
+        let hooks = repo.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        // A place tree of this test's own: the directories are keyed by profile
+        // name, and a sibling test cleaning up "dev" would take them away.
+        let (place, home) = dirs::create_place_dirs("recheck").unwrap();
+        let place = place.display().to_string();
+        let home_dir = home.display().to_string();
+        let policy = resolved(|profile| {
+            profile.name = "recheck".to_string();
+            profile.paths = vec![SandboxPath::workspace(repo.display().to_string())];
+        });
+
+        // Planned when everything was still what it claimed to be.
+        let identity = |path: &str| Ok(path.to_string());
+        let plan = plan_instance(PlanInput {
+            policy: &policy,
+            image: "friring/sandbox:1",
+            place_dir: &place,
+            home_dir: &home_dir,
+            user: None,
+            userns_keep_id: false,
+            check: MountCheck {
+                friring_db: None,
+                home: None,
+                exists: &|_| true,
+                resolve: &identity,
+            },
+        })
+        .unwrap();
+
+        let mut scripted = host().with_command_prefix(
+            &format!("{PROGRAM} run "),
+            crate::sandbox::probe::ProbeOutput::success("abc123\n"),
+        );
+        for path in [&repo.display().to_string(), &hooks.display().to_string()] {
+            scripted = scripted.with_path(path);
+        }
+        let backend = backend(scripted.with_path(&place).with_path(&home_dir));
+        let refuse = |detail: String| SandboxError::Refused {
+            profile: "recheck".to_string(),
+            detail,
+        };
+        assert_eq!(backend.create(&plan, &refuse).unwrap(), "abc123");
+
+        // And now a source changes meaning underneath the plan.
+        std::fs::remove_dir(&hooks).unwrap();
+        std::os::unix::fs::symlink(dirs::tmux_socket_root(), &hooks).unwrap();
+        let err = backend.create(&plan, &refuse).unwrap_err().to_string();
+        assert!(err.contains("symlink"), "{err}");
+        assert!(err.contains(&hooks.display().to_string()), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+        dirs::cleanup_place("recheck");
+    }
+
+    /// The bypass a check that only read the name on `PATH` would miss: an
+    /// engine reached through a symlink is replaceable wherever it *lands*.
+    #[cfg(unix)]
+    #[test]
+    fn an_engine_reached_through_a_symlink_is_judged_by_where_it_lands() {
+        let base = dirs::test_temp_base("engine-symlink");
+        let real = base.join("opt");
+        let bin = base.join("usr/bin");
+        for dir in [&real, &bin] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let binary = real.join("podman");
+        std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+        let link = bin.join("podman");
+        std::os::unix::fs::symlink(&binary, &link).unwrap();
+
+        let granted = vec![real.display().to_string()];
+        let program = link.display().to_string();
+        // The name on `PATH` is nowhere near the granted root…
+        assert!(engine_in_writable_root(&granted, &program, None).is_none());
+        // …and the binary it actually runs is inside it.
+        let resolved = dirs::canonical(&program);
+        let (root, found) =
+            engine_in_writable_root(&granted, &program, resolved.as_deref()).expect("refused");
+        assert_eq!(root, granted[0]);
+        assert_eq!(found, binary.display().to_string());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Nothing may be ensured on a host without the engine, and the reason is

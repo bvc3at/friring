@@ -176,14 +176,31 @@ pub fn probe(engine: ContainerEngine, host: &dyn ProbeHost) -> EngineDetails {
             engine.install_fix(),
         ));
     };
-    if let Some(root) = dirs::rewritable_root(&program, host.home().as_deref()) {
-        // The CLI is what asks for the isolation. A copy inside a directory the
-        // sandboxed agent can write is a boundary the sandboxed agent chooses,
-        // and falling back to the next `PATH` entry would still be running
-        // whatever an attacker arranged to be found.
+    // The CLI is what asks for the isolation. A copy inside a directory the
+    // sandboxed agent can write is a boundary the sandboxed agent chooses, and
+    // falling back to the next `PATH` entry would still be running whatever an
+    // attacker arranged to be found.
+    //
+    // Judged on both spellings: a name on `PATH` under a system prefix that is
+    // really a symlink into a writable one is the obvious way past a check that
+    // only reads the name. A path this friring cannot resolve — a remote host's,
+    // which is not on this filesystem — leaves the literal check standing rather
+    // than refusing an engine over a question it could not ask.
+    let home = host.home();
+    let resolved = dirs::canonical(&program).filter(|resolved| *resolved != program);
+    let planted = [Some(program.clone()), resolved]
+        .into_iter()
+        .flatten()
+        .find_map(|path| dirs::rewritable_root(&path, home.as_deref()).map(|root| (path, root)));
+    if let Some((path, root)) = planted {
+        let where_from = if path == program {
+            format!("'{program}'")
+        } else {
+            format!("'{program}' and from there to '{path}'")
+        };
         return unavailable(Availability::needs_fix(
             format!(
-                "{engine} resolves to '{program}', inside '{root}' — a sandboxed agent could \
+                "{engine} resolves to {where_from}, inside '{root}' — a sandboxed agent could \
                  replace it and the next launch would run whatever it planted"
             ),
             format!("install {engine} system-wide and take the writable copy off PATH"),
