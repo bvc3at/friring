@@ -2576,6 +2576,33 @@ fn backend_enforces_limits(backend: crate::session::SandboxBackendKind) -> bool 
         .map_or(true, |backend| backend.capabilities().limits)
 }
 
+/// The network modes `backend` can actually enforce, in selector order.
+///
+/// The same question [`backend_enforces_limits`] asks about a resource cap, put
+/// to the same place — the backend's own
+/// [`Caps::network_modes`](crate::sandbox::Caps) — because the answer differs
+/// per backend rather than per shape: an `apple-container` place can enforce
+/// only `full`, and a `wsl-distro` cannot enforce `allowlist`, since the
+/// filtered modes are enforced by friring's proxy over a socket neither can be
+/// handed. A launch refuses a profile asking for one of them, so the editor
+/// offers only these — and says which are missing rather than shortening the
+/// selector in silence.
+///
+/// Costs no probe: capabilities are constants per backend, and an unresolved
+/// `auto` rules nothing out.
+pub fn backend_network_modes(
+    backend: crate::session::SandboxBackendKind,
+) -> &'static [crate::session::NetworkMode] {
+    if backend.shape().is_none() {
+        return crate::session::NetworkMode::ALL;
+    }
+    crate::sandbox::SandboxHost::local_shared()
+        .backend(backend)
+        .map_or(crate::session::NetworkMode::ALL, |backend| {
+            backend.capabilities().network_modes
+        })
+}
+
 /// What the config-projection lint said about the profile in the form, in the
 /// words the editor renders.
 ///
@@ -2874,7 +2901,7 @@ impl SandboxEditorModal {
     /// Input to an unavailable field is dropped, so a capability the backend
     /// cannot honour cannot be edited into a meaningless state.
     pub fn adjust(&mut self, delta: i32) {
-        use crate::session::{NetworkMode, PathMode, ReadScope, SandboxBackendKind};
+        use crate::session::{PathMode, ReadScope, SandboxBackendKind};
         use SandboxField::*;
         if !self.field_available(self.field) {
             return;
@@ -2887,7 +2914,17 @@ impl SandboxEditorModal {
                     p.mode = cycle_value(PathMode::ALL, p.mode, delta);
                 }
             }
-            Network => self.network_mode = cycle_value(NetworkMode::ALL, self.network_mode, delta),
+            // Only the modes the backend can enforce, so a mode its launch
+            // would refuse cannot be selected into a saved profile. A form
+            // already carrying one — imported, or left behind by a change of
+            // backend — steps out of it onto the first mode that is offered.
+            Network => {
+                self.network_mode = cycle_value(
+                    backend_network_modes(self.effective_backend()),
+                    self.network_mode,
+                    delta,
+                );
+            }
             Domains => self.domain_index = wrap_index(self.domain_index, delta, self.domains.len()),
             PromptDomains => self.prompt_new_domains = !self.prompt_new_domains,
             ReadScope => self.read_scope = cycle_value(ReadScope::ALL, self.read_scope, delta),
@@ -3029,8 +3066,9 @@ impl SandboxEditorModal {
 
     /// The profile these fields describe, validated against `existing_names`
     /// (every stored profile's name, the edited one included — it is filtered
-    /// out here so re-saving under its own name is not a collision) and against
-    /// the host locations no sandbox may be handed.
+    /// out here so re-saving under its own name is not a collision), against the
+    /// host locations no sandbox may be handed, and against what the chosen
+    /// backend can enforce.
     ///
     /// The error is one sentence for the footer toast: the editor has no inline
     /// form-error widget.
@@ -3046,7 +3084,37 @@ impl SandboxEditorModal {
             .cloned()
             .collect();
         profile.validate_unique(&others)?;
+        if let Some(refusal) = self.network_mode_refusal(profile.network_mode) {
+            return Err(refusal);
+        }
         writable_roots_refusal(&profile).map_or(Ok(profile), Err)
+    }
+
+    /// Why this form's network mode may not be stored against its backend, or
+    /// `None` when the backend can enforce it.
+    ///
+    /// A refusal rather than a substitution, unlike the capability rows
+    /// [`build_profile`](Self::build_profile) drops: which mode to fall back to
+    /// is not friring's to choose. Down from `allowlist` to `none` would take
+    /// the network away from an agent that needs it, and up to `full` would open
+    /// egress the profile's author never granted — so the form stays open with
+    /// the sentence, and the two ways out (a mode this backend enforces, or a
+    /// backend that enforces this mode) are the user's.
+    ///
+    /// Never fires for an unresolved `auto`, which rules nothing out for the
+    /// same reason every other capability gate here exempts it.
+    fn network_mode_refusal(&self, mode: crate::session::NetworkMode) -> Option<String> {
+        let backend = self.effective_backend();
+        let offered = backend_network_modes(backend);
+        if offered.contains(&mode) {
+            return None;
+        }
+        let list: Vec<String> = offered.iter().map(ToString::to_string).collect();
+        Some(format!(
+            "Sandbox backend '{backend}' cannot enforce network '{mode}' — it can enforce only \
+             {}. Pick one of those, or a backend that enforces '{mode}'",
+            list.join(", ")
+        ))
     }
 }
 
@@ -5179,6 +5247,87 @@ mod tests {
         m.resolved = Some(SandboxBackendKind::Bwrap);
         assert!(!m.field_available(SandboxField::Memory));
         assert_eq!(m.effective_backend(), SandboxBackendKind::Bwrap);
+    }
+
+    /// A backend that can enforce only some of the modes offers only those.
+    ///
+    /// The same gate the resource caps get, on the same authority
+    /// ([`crate::sandbox::Caps`]): the selector cannot step onto a mode the
+    /// launch would refuse, and a form already carrying one steps *out* of it
+    /// rather than being stuck.
+    #[test]
+    fn sandbox_network_selector_offers_only_what_the_backend_enforces() {
+        use crate::session::{NetworkMode, SandboxBackendKind};
+        let mut m = sandbox_editor();
+        m.field = SandboxField::Network;
+
+        // An unresolved `auto` rules nothing out, so every mode is on the wheel.
+        assert_eq!(
+            backend_network_modes(SandboxBackendKind::Auto),
+            NetworkMode::ALL
+        );
+
+        // Apple's `container` can only run `full`: the filtered modes need a
+        // proxy socket a place there cannot be handed.
+        m.backend = SandboxBackendKind::AppleContainer;
+        assert_eq!(
+            backend_network_modes(SandboxBackendKind::AppleContainer),
+            &[NetworkMode::Full]
+        );
+        m.network_mode = NetworkMode::Allowlist;
+        m.adjust(1);
+        assert_eq!(m.network_mode, NetworkMode::Full);
+        // …and there is nowhere else to go, in either direction.
+        m.adjust(1);
+        m.adjust(-1);
+        assert_eq!(m.network_mode, NetworkMode::Full);
+
+        // A WSL distro enforces two of the three, so the wheel is two long and
+        // never stops on `allowlist`.
+        m.backend = SandboxBackendKind::WslDistro;
+        m.network_mode = NetworkMode::Allowlist;
+        for _ in 0..4 {
+            m.adjust(1);
+            assert_ne!(m.network_mode, NetworkMode::Allowlist);
+        }
+
+        // A backend that enforces all three still walks all three.
+        m.backend = SandboxBackendKind::Seatbelt;
+        m.network_mode = NetworkMode::None;
+        m.adjust(1);
+        assert_eq!(m.network_mode, NetworkMode::Allowlist);
+    }
+
+    /// A mode the backend cannot enforce is refused at the **save**, rather than
+    /// swapped for one friring picked.
+    ///
+    /// Unlike a memory cap, which is dropped from the saved profile, neither
+    /// substitution is friring's to make: down takes the network away from an
+    /// agent that needs it and up grants egress nobody authorised. Without this
+    /// the form stores a profile whose own launch refuses it.
+    #[test]
+    fn sandbox_save_refuses_a_network_mode_the_backend_cannot_enforce() {
+        use crate::session::{NetworkMode, SandboxBackendKind};
+        let mut m = sandbox_editor();
+        m.backend = SandboxBackendKind::AppleContainer;
+        m.network_mode = NetworkMode::Allowlist;
+
+        let error = m.validated_profile(&[]).unwrap_err();
+        assert!(error.contains("apple-container"), "{error}");
+        assert!(error.contains("allowlist"), "{error}");
+        assert!(error.contains("full"), "{error}");
+
+        // The two ways out, both the user's.
+        m.network_mode = NetworkMode::Full;
+        assert!(m.validated_profile(&[]).is_ok());
+        m.network_mode = NetworkMode::Allowlist;
+        m.backend = SandboxBackendKind::Podman;
+        assert!(m.validated_profile(&[]).is_ok());
+
+        // An unresolved `auto` refuses nothing, exactly as it rules no
+        // capability out.
+        m.backend = SandboxBackendKind::Auto;
+        assert!(m.validated_profile(&[]).is_ok());
     }
 
     #[test]

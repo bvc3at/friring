@@ -59,6 +59,11 @@ pub struct SandboxEditorState<'a> {
     pub paths: Vec<(&'a str, PathMode)>,
     pub path_index: usize,
     pub network: NetworkMode,
+    /// The modes [`effective_backend`](Self::effective_backend) can actually
+    /// enforce, in selector order — the editor's `‹ ›` walks these alone. A
+    /// narrower set than [`NetworkMode::ALL`] is annotated on the row rather
+    /// than quietly shortening the selector.
+    pub network_modes: &'static [NetworkMode],
     /// Allowed `host[:port]` entries, as typed.
     pub domains: Vec<&'a str>,
     pub domain_index: usize,
@@ -95,6 +100,7 @@ impl<'a> SandboxEditorState<'a> {
             paths: m.paths.iter().map(|p| (p.text.value(), p.mode)).collect(),
             path_index: m.path_index,
             network: m.network_mode,
+            network_modes: crate::app::modals::backend_network_modes(m.effective_backend()),
             domains: m.domains.iter().map(|d| d.value()).collect(),
             domain_index: m.domain_index,
             prompt_new_domains: m.prompt_new_domains,
@@ -437,6 +443,7 @@ fn field_line<'a>(field: SandboxField, state: &SandboxEditorState<'a>, active: b
     }
     match field {
         SandboxField::Backend => backend_line(state, active),
+        SandboxField::Network => network_line(state, active),
         SandboxField::PromptDomains => toggle_line(label, state.prompt_new_domains, active),
         SandboxField::Fallback => toggle_line(label, state.allow_unsandboxed_fallback, active),
         _ => {
@@ -488,7 +495,6 @@ fn field_value(
                 .map_or_else(|| PathMode::default().to_string(), |(_, m)| m.to_string()),
             true,
         ),
-        SandboxField::Network => (state.network.to_string(), true),
         SandboxField::DomainText => (
             placeholder(
                 state.domains.get(state.domain_index).copied().unwrap_or(""),
@@ -507,6 +513,7 @@ fn field_value(
         SandboxField::Containerfile => (placeholder(state.containerfile, "(none)", active), false),
         // Rendered by their own builders; `field_line` never routes them here.
         SandboxField::Backend
+        | SandboxField::Network
         | SandboxField::Paths
         | SandboxField::Domains
         | SandboxField::PromptDomains
@@ -562,6 +569,59 @@ fn backend_line<'a>(state: &SandboxEditorState<'a>, active: bool) -> Line<'a> {
             Style::default().fg(Theme::status_error()),
         ));
     }
+    line
+}
+
+/// The network selector, with what the backend cannot enforce said on the row.
+///
+/// A backend that can only honour some of the modes is the same situation as a
+/// backend that cannot honour a memory cap, and it gets the same treatment: the
+/// missing capability is *shown*, never silently absent. Two shapes, because the
+/// selector still has a value to display and the row cannot be replaced by its
+/// reason the way an inert field's is:
+///
+/// - the mode is one the backend enforces → a muted note naming the ones it can,
+///   so a selector that will not step onto `allowlist` explains itself before it
+///   is pressed;
+/// - the mode is one it cannot → the same list as a warning, because this form
+///   describes a profile whose own launch would refuse it (the save says so too,
+///   in [`SandboxEditorModal::validated_profile`]).
+///
+/// [`SandboxEditorModal::validated_profile`]:
+///     crate::app::modals::SandboxEditorModal::validated_profile
+fn network_line<'a>(state: &SandboxEditorState<'a>, active: bool) -> Line<'a> {
+    let mut line = editor_field_line_with_cursor(
+        field_label(SandboxField::Network),
+        state.network.to_string(),
+        true,
+        active,
+        None,
+    );
+    if state.network_modes.len() == NetworkMode::ALL.len() {
+        return line;
+    }
+    let offered: Vec<String> = state
+        .network_modes
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let offered = offered.join(" | ");
+    let backend = state.effective_backend;
+    let (text, style) = if state.network_modes.contains(&state.network) {
+        (
+            format!("  ({backend} can enforce only {offered})"),
+            Style::default().fg(Theme::text_muted()),
+        )
+    } else {
+        (
+            format!(
+                "  ⚠ {backend} cannot enforce {} — only {offered}",
+                state.network
+            ),
+            Style::default().fg(Theme::status_error()),
+        )
+    };
+    line.spans.push(Span::styled(text, style));
     line
 }
 
@@ -783,6 +843,7 @@ mod tests {
             paths: Vec::new(),
             path_index: 0,
             network: NetworkMode::Allowlist,
+            network_modes: NetworkMode::ALL,
             domains: Vec::new(),
             domain_index: 0,
             prompt_new_domains: true,
@@ -952,6 +1013,49 @@ mod tests {
         s.resolved = Some(SandboxBackendKind::Bwrap);
         s.effective_backend = SandboxBackendKind::Bwrap;
         assert!(body_text(&s).join("\n").contains("unavailable"));
+    }
+
+    /// A shortened network selector says so, and says which modes are left.
+    ///
+    /// The same "unavailable, and here is why" the inert capability rows get:
+    /// modes silently missing from a `‹ ›` wheel are indistinguishable from a
+    /// broken key, and a mode the profile already carries that this backend
+    /// cannot enforce is a profile its own launch would refuse — so that one is
+    /// a warning rather than a note.
+    #[test]
+    fn a_network_mode_the_backend_cannot_enforce_is_named_on_the_row() {
+        let mut s = state();
+        s.effective_backend = SandboxBackendKind::AppleContainer;
+        s.network_modes = &[NetworkMode::Full];
+
+        s.network = NetworkMode::Full;
+        let row = text(&field_line(F::Network, &s, false));
+        assert!(row.contains("full"), "{row}");
+        assert!(
+            row.contains("apple-container can enforce only full"),
+            "{row}"
+        );
+
+        s.network = NetworkMode::Allowlist;
+        let row = text(&field_line(F::Network, &s, false));
+        // The value the profile actually carries is still shown: hiding it
+        // would hide that this profile will not launch.
+        assert!(row.contains("allowlist"), "{row}");
+        assert!(
+            row.contains("apple-container cannot enforce allowlist"),
+            "{row}"
+        );
+        assert!(row.contains("only full"), "{row}");
+        // …and it reaches the rendered body, not just this builder.
+        assert!(body_text(&s)
+            .join("\n")
+            .contains("cannot enforce allowlist"));
+
+        // A backend that enforces every mode says nothing at all.
+        s.effective_backend = SandboxBackendKind::Seatbelt;
+        s.network_modes = NetworkMode::ALL;
+        let row = text(&field_line(F::Network, &s, false));
+        assert!(!row.contains("enforce"), "{row}");
     }
 
     #[test]
