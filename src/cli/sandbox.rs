@@ -609,12 +609,12 @@ fn prune(
             });
         }
 
-        removed.extend(
-            plan.remove
-                .iter()
-                .map(|id| json!({ "engine": engine.as_str(), "id": id })),
-        );
         if dry_run {
+            removed.extend(
+                plan.remove
+                    .iter()
+                    .map(|id| json!({ "engine": engine.as_str(), "id": id })),
+            );
             forgotten.extend(
                 plan.forget
                     .iter()
@@ -629,6 +629,31 @@ fn prune(
         }
 
         failures.extend(backend.reap(&plan));
+        // What was actually reclaimed is decided by asking the engine again
+        // rather than by assuming the removals worked: a row forgotten for a
+        // container that is still there loses the only id anything has for it,
+        // which is the leak `sandbox_instances` exists to prevent. Same rule as
+        // the TUI's pass (`crate::app::sandbox`'s place job).
+        match backend.live_places() {
+            Ok(after) => {
+                let gone = |id: &String| !after.iter().any(|container| container.id == *id);
+                plan.remove.retain(gone);
+                plan.forget.retain(gone);
+            }
+            // The engine reaped and then would not say what it still holds, so
+            // nothing here can be called gone. Every row stays, which costs a
+            // stale row the next pass clears and keeps every id findable.
+            Err(e) => {
+                failures.push(format!("{engine}: {e}"));
+                plan.remove.clear();
+                plan.forget.clear();
+            }
+        }
+        removed.extend(
+            plan.remove
+                .iter()
+                .map(|id| json!({ "engine": engine.as_str(), "id": id })),
+        );
         for id in &plan.forget {
             match db.delete_sandbox_instance(engine, id) {
                 Ok(_) => forgotten.push(json!({ "engine": engine.as_str(), "id": id })),
