@@ -803,6 +803,68 @@ mod tests {
             .contains("claude/ANTHROPIC_API_KEY"));
     }
 
+    /// The rule this module exists for, asserted where it is actually kept: at
+    /// the process boundary.
+    ///
+    /// Every other credential test answers with a stub, so none of them observes
+    /// what a spawned tool is *handed*. This one points [`SystemKeychain`] at a
+    /// script that records its own argv and stdin, so "the token never reaches
+    /// argv" is checked against a real `Command` rather than against a
+    /// convention. Nothing here goes near a keychain — the script is the whole
+    /// tool.
+    #[cfg(unix)]
+    #[test]
+    fn the_value_reaches_the_tool_on_stdin_and_never_on_its_command_line() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let argv_log = dir.path().join("argv");
+        let stdin_log = dir.path().join("stdin");
+        let script = dir.path().join("fake-secret-tool");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\n",
+                argv_log.display(),
+                stdin_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let store = SystemKeychain::new(KeychainKind::Libsecret, script.to_str().unwrap());
+        let key = SecretKey::new("claude", "ANTHROPIC_API_KEY").unwrap();
+        let ok = store.set(&key, &Secret::new(FAKE));
+        assert!(ok.is_ok(), "{ok:?}");
+
+        let argv = std::fs::read_to_string(&argv_log).unwrap();
+        let stdin = std::fs::read_to_string(&stdin_log).unwrap();
+        // The value, once, with nothing after it: `secret-tool` stores stdin
+        // verbatim, so a trailing newline would become part of the token.
+        assert_eq!(stdin, FAKE);
+        assert_eq!(stdin.matches(FAKE).count(), 1);
+        assert!(!argv.contains(FAKE), "{argv}");
+        assert!(argv.contains(SERVICE), "{argv}");
+        assert!(!format!("{ok:?}").contains(FAKE));
+
+        // …and a tool that takes the value and then fails carries its own
+        // reason back, still without what it was handed.
+        let failing = dir.path().join("angry-secret-tool");
+        std::fs::write(
+            &failing,
+            format!(
+                "#!/bin/sh\ncat > '{}'\nprintf 'the keyring is locked\\n' >&2\nexit 1\n",
+                dir.path().join("angry-stdin").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let store = SystemKeychain::new(KeychainKind::Libsecret, failing.to_str().unwrap());
+        let err = store.set(&key, &Secret::new(FAKE)).unwrap_err();
+        assert!(err.contains("locked"), "{err}");
+        assert!(!err.contains(FAKE), "{err}");
+    }
+
     #[test]
     fn a_missing_entry_is_not_a_failure_but_a_locked_store_is() {
         assert!(missing_entry(""));
