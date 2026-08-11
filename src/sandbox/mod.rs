@@ -197,43 +197,15 @@ impl SandboxHost {
         }
     }
 
-    /// The container backend behind `kind`, for what only the engines have:
-    /// which engine it is, and the details its probe read.
-    ///
-    /// [`place`](Self::place) is what drives a place's lifecycle; this stays for
-    /// the two callers that need the concrete type. `None` for anything that is
-    /// not a container engine.
-    pub fn container(&self, kind: SandboxBackendKind) -> Option<&ContainerBackend> {
-        match kind {
-            SandboxBackendKind::Docker => Some(&self.docker),
-            SandboxBackendKind::Podman => Some(&self.podman),
-            _ => None,
-        }
-    }
-
-    /// The Apple container backend, for the same place operations
-    /// [`container`](Self::container) exposes for the engines.
-    ///
-    /// A second accessor rather than a widening of that one: the two are
-    /// different types because their command lines are different, and the shared
-    /// half — the mount plan, the labels, the spec digest, the collection
-    /// decision — is shared as *code* (`crate::sandbox::container::plan` and
-    /// `::gc`) rather than as one struct pretending both tools are one tool.
-    /// `None` for anything that is not this backend.
-    pub fn apple_container(&self, kind: SandboxBackendKind) -> Option<&AppleContainerBackend> {
-        match kind {
-            SandboxBackendKind::AppleContainer => Some(&self.apple),
-            _ => None,
-        }
-    }
-
     /// The WSL distro backend, for the place operations the trait has no room
     /// for: registering a distro, listing the ones friring owns, destroying one.
     ///
-    /// A third accessor for the reason there is a second — a distro is
+    /// The one accessor that hands back a concrete backend, because this is the
+    /// one whose operations [`PlaceBackend`] has no shape for — a distro is
     /// registered by `wsl.exe` and reached by the `wsl:` transport friring
     /// already has, so it shares no command line with either container backend.
-    /// `None` for anything that is not this backend.
+    /// Everything the engines and Apple's tool do goes through
+    /// [`place`](Self::place). `None` for anything that is not this backend.
     pub fn wsl_distro(&self, kind: SandboxBackendKind) -> Option<&WslDistroBackend> {
         match kind {
             SandboxBackendKind::WslDistro => Some(&self.wsl),
