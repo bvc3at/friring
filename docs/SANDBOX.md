@@ -1432,9 +1432,12 @@ Two details that silently break things if missed:
   point of it. `host-minus-secrets` names no path and grants the whole host, so
   it is taken back separately: both policy backends deny `<data>/sandbox/pl`,
   `<data>/sandbox/profiles` and `<data>/sandbox/seeds` under that scope,
-  alongside the host credential list. Not `<data>/sandbox` whole — the launch's
-  own scratch is under `<data>/sandbox/tmp`, and an agent that cannot write a
-  temp file dies on startup.
+  alongside the host credential list, and bubblewrap denies
+  `<data>/sandbox/overlay` as well — the copy-on-write layers every write inside
+  a boundary lands in, which the scope would otherwise expose at their host
+  paths. Not `<data>/sandbox` whole — the launch's own scratch is under
+  `<data>/sandbox/tmp`, and an agent that cannot write a temp file dies on
+  startup.
   The scratch is keyed on the session and adopted, not recreated, so a crashed
   run's files survive into the next launch; session teardown drops both.
 

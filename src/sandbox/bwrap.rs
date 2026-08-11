@@ -403,10 +403,22 @@ pub fn build_argv_with(
         //
         // Not `<data>/sandbox` whole: this launch's own scratch is under
         // `<data>/sandbox/tmp` and the agent needs it to start.
-        for dir in [dirs::place_root(), dirs::profile_dir(), dirs::seeds_root()]
-            .into_iter()
-            .flatten()
-            .map(|dir| dir.display().to_string())
+        //
+        // The overlay root is here for the same reason and lands after the
+        // `--overlay-src`/`--overlay` pair above, so the merged view survives:
+        // the backing upper layers are what every write inside this boundary and
+        // every other session's lands in, and this scope binds the host root, so
+        // without the mask they are readable at their real paths — see
+        // [`overlay_root`].
+        for dir in [
+            dirs::place_root(),
+            dirs::profile_dir(),
+            dirs::seeds_root(),
+            overlay_root(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|dir| dir.display().to_string())
         {
             if exists(&dir) {
                 push(&mut argv, &["--tmpfs", &dir]);
@@ -1250,6 +1262,28 @@ mod tests {
         }
         // The launch's own scratch is still writable, in the same tree.
         assert!(has_flag(&argv, "--bind", &scratch), "{argv:?}");
+
+        // A copy-on-write launch has one more of these: the layers every write
+        // inside this boundary — and every other session's — lands in. Masked
+        // *after* the overlay is established, so the merged view survives while
+        // the backing tree is not readable at its host path.
+        let overlays = [OverlayWorkspace {
+            root: "/home/u/dev/app".to_string(),
+            upper: format!("{}/s1/x/upper", overlay_root().unwrap().display()),
+            work: format!("{}/s1/x/work", overlay_root().unwrap().display()),
+        }];
+        let argv = build_argv_with(
+            PROGRAM,
+            &SandboxLaunch::new(&host_scope, "/home/u", "s1").with_tmp_dir(&scratch),
+            None,
+            &|_| true,
+            &overlays,
+        )
+        .unwrap();
+        let layers = overlay_root().unwrap().display().to_string();
+        assert!(has_flag(&argv, "--tmpfs", &layers), "{argv:?}");
+        assert!(index_of(&argv, &layers) > index_of(&argv, "--overlay"));
+        assert!(has_flag(&argv, "--overlay-src", "/home/u/dev/app"));
 
         // The workspace scope binds no host root, so it has nothing to take
         // back here either.
