@@ -319,6 +319,43 @@ fn registering_a_distro_hardens_it_before_anything_runs_in_it() {
     cleanup();
 }
 
+/// The stop between writing the hardening and checking it is **checked**, and
+/// a registration whose distro would not stop is refused.
+///
+/// WSL applies `/etc/wsl.conf` when a distro starts, and writing the file
+/// started this one. So a `--terminate` nobody looked at leaves the bytes on
+/// disk saying "hardened" while the instance every later command reaches is the
+/// unhardened one the import left running — every Windows drive mounted,
+/// friring's own data directory among them, and the interop bridge open.
+/// Reading the file back then confirms the file and nothing else: a
+/// verification against a distro that may still be running is not one.
+#[test]
+fn a_distro_that_would_not_stop_is_not_accepted_as_hardened() {
+    // Scripted *before* `registers`, whose `clones` half answers the same
+    // command line with a success: the stub takes the first match, so a later
+    // entry would never be reached.
+    let stuck = registers(windows().with_command(
+        &format!("{WSL_EXE} --terminate {DISTRO}"),
+        ProbeOutput::failure(
+            1,
+            as_utf16("There is no distribution with the supplied name.\n"),
+        ),
+    ));
+    let err = backend(stuck).ensure_distro(&profile()).unwrap_err();
+    let text = err.to_string();
+    assert!(matches!(err, SandboxError::Refused { .. }), "{text}");
+    assert!(text.contains("could not stop it"), "{text}");
+    // Says what is still true of the distro that did not stop, rather than
+    // reporting a hardening that is only on disk.
+    assert!(text.contains("Windows drive"), "{text}");
+    assert!(text.contains("wsl --terminate"), "{text}");
+    assert!(
+        text.contains("no distribution with the supplied name"),
+        "{text}"
+    );
+    cleanup();
+}
+
 /// A second launch of the same profile reuses the distro — and the ownership
 /// check is what makes that safe, because the name alone is something anyone
 /// can `wsl --import` under.

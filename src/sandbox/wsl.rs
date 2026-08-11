@@ -282,8 +282,10 @@ impl WslDistroBackend {
     /// WSL is unavailable; the profile asks for something a WSL place cannot
     /// enforce (a memory or CPU cap, a filtered network mode, a containerfile);
     /// the template is missing or is WSL1; the distro exists and is not
-    /// friring's; the export or import failed; or the distro carries no
-    /// bubblewrap, which is what would apply the profile's paths.
+    /// friring's; the export or import failed; the distro carries no
+    /// bubblewrap, which is what would apply the profile's paths; or one of the
+    /// profile's read-write paths encloses that bubblewrap, which would let the
+    /// sandbox replace the program applying its own boundary.
     pub fn ensure_distro(&self, profile: &SandboxProfile) -> SandboxResult<EnsuredDistro> {
         let refuse = |detail: String| SandboxError::Refused {
             profile: profile.name.clone(),
@@ -320,6 +322,7 @@ impl WslDistroBackend {
             .resolve(SandboxBackendKind::WslDistro, &home)
             .map_err(|detail| refuse(detail.to_string()))?;
         let bwrap = self.inside_bwrap(&distro, &home, &refuse)?;
+        check_bwrap_containment(&policy.rw_paths, &distro, &bwrap, &refuse)?;
 
         self.bwrap_programs
             .lock()
@@ -448,11 +451,30 @@ impl WslDistroBackend {
 
     /// Refuse a distro whose `/etc/wsl.conf` is no longer the one friring wrote.
     ///
-    /// That file *is* the boundary: with `automount` back on, every Windows
-    /// drive — and with it friring's data directory and the database ADR-29
-    /// keeps out of every sandbox — is mounted inside the place; with `interop`
-    /// back on, a process in there can `execve` a Windows binary that runs
-    /// outside the VM altogether.
+    /// That file is what removes the *default* exposure: with `automount` back
+    /// on, every Windows drive — and with it friring's data directory and the
+    /// database ADR-29 keeps out of every sandbox — is mounted inside the place;
+    /// with `interop` back on, a process in there can `execve` a Windows binary
+    /// that runs outside the VM altogether.
+    ///
+    /// **What this proves, exactly.** WSL reads `/etc/wsl.conf` when a distro
+    /// *starts*, so a file check is a statement about the next start rather than
+    /// about a running instance. On the registering path that is the whole
+    /// story: [`finish`](Self::finish) stops the distro and refuses when the
+    /// stop failed, so the instance a launch would meet is one that started from
+    /// exactly these bytes. On the adopting path the distro may already be
+    /// running, and friring does not restart it to find out — it cannot ask
+    /// `wsl --list` either, whose states are localised strings nothing here
+    /// compares (see [`plan::DistroInfo::state`]). So this is a **tamper
+    /// detector on the file**, not a measurement of a live kernel.
+    ///
+    /// It is also not a containment boundary. A process that is already root
+    /// inside the distro — which the distro's own user is — can mount a Windows
+    /// drive by hand whatever `wsl.conf` says. Per-path containment inside a
+    /// distro is bubblewrap's, which is why it is required rather than optional;
+    /// this keeps the *default* filesystem and the interop bridge out of a
+    /// freshly registered place, and says when somebody changed friring's answer
+    /// to that.
     ///
     /// Classified as interference rather than as a profile a user should edit,
     /// so it never routes through `allow_unsandboxed_fallback`: answering "the
@@ -543,6 +565,16 @@ impl WslDistroBackend {
 
     /// Harden a freshly imported distro, mark it as friring's, and check that
     /// both stuck.
+    ///
+    /// The stop between the two is **checked**, and that is the whole reason
+    /// [`verify_hardening`](Self::verify_hardening) means anything here. WSL
+    /// applies `/etc/wsl.conf` when a distro starts, and writing the file
+    /// started this one — so without a stop that friring knows succeeded, the
+    /// bytes on disk say "hardened" while the instance every later command
+    /// reaches is the unhardened one the import left running, with every
+    /// Windows drive in it. Reading the file back would confirm the file and
+    /// nothing else: a verification against a distro that may still be running
+    /// is not a verification.
     fn finish(
         &self,
         distro: &str,
@@ -553,9 +585,16 @@ impl WslDistroBackend {
         outcome(hardened, refuse, || {
             format!("friring could not harden the sandbox distro '{distro}'")
         })?;
-        // WSL reads `/etc/wsl.conf` when a distro starts, so it is stopped here
-        // and starts hardened the next time anything runs in it.
-        let _ = self.wsl_run(&["--terminate", distro]);
+        let stopped = self.wsl_run(&["--terminate", distro]);
+        outcome(stopped, refuse, || {
+            format!(
+                "friring hardened the sandbox distro '{distro}' but could not stop it, and WSL \
+                 reads '{}' only when a distro starts — so the running distro still has every \
+                 Windows drive mounted and the interop bridge open. Stop it and let friring \
+                 register it again: wsl --terminate '{distro}'",
+                plan::WSL_CONF
+            )
+        })?;
         self.verify_hardening(distro, refuse)
     }
 
@@ -586,9 +625,12 @@ impl WslDistroBackend {
     /// is one filesystem and one identity, so without bwrap the agent would see
     /// all of it read-write whatever the profile's paths say, which is a
     /// boundary that grants more than the words it was written with. Resolved
-    /// once here and pinned, and refused where it sits somewhere the sandbox
-    /// could rewrite it — the rule every backend applies to the binary that is
-    /// its boundary.
+    /// once here and pinned, and refused where it sits under one of the fixed
+    /// prefixes anything can write ([`dirs::rewritable_root`]).
+    ///
+    /// That is half the rule every backend applies to the binary that *is* its
+    /// boundary; the other half asks whether this **profile's own** read-write
+    /// paths enclose it, and is [`check_bwrap_containment`].
     fn inside_bwrap(
         &self,
         distro: &str,
@@ -851,8 +893,10 @@ impl SandboxBackend for WslDistroBackend {
     /// # Errors
     ///
     /// The policy was resolved for another backend, the launch carries no place,
-    /// the distro was never ensured, or the profile's network mode is one a WSL
-    /// place cannot enforce.
+    /// the distro was never ensured, the profile's network mode is one a WSL
+    /// place cannot enforce, or a writable path encloses the bubblewrap that
+    /// applies the boundary — including one this launch minted, which the
+    /// profile never named and `ensure_distro` therefore never saw.
     fn wrap(&self, argv: Argv, launch: &SandboxLaunch<'_>) -> SandboxResult<Argv> {
         if launch.policy.backend != SandboxBackendKind::WslDistro {
             return Err(SandboxError::Unsupported {
@@ -909,6 +953,12 @@ impl SandboxBackend for WslDistroBackend {
                      without one is a distro the agent sees all of"
                 ))
             })?;
+        // Against the *launch's* writable set rather than the profile's, and
+        // before anything is asked of the distro: the minted directories a
+        // launch adds are writable too, and this is the last gate before the
+        // argv is composed — `bwrap::build_argv` is reached directly here, so
+        // `BwrapBackend::wrap`'s own copy of this check never runs.
+        check_bwrap_containment(&launch.writable_paths(), &distro, &bwrap_program, &refuse)?;
         self.check_present(&distro, launch, &refuse)?;
 
         // Every path in the plan is a path in the *distro's* filesystem, so the
@@ -933,6 +983,45 @@ const UNFILTERED: &str = "a WSL place's egress relay is not wired: the proxy enf
                           in. Use network 'none' or 'full', or run friring inside a distro and \
                           pick the bwrap backend, whose sandbox is on the same filesystem as its \
                           proxy";
+
+/// Refuse a set of read-write paths that encloses the bubblewrap applying this
+/// place's boundary.
+///
+/// The rule the other three place backends apply to their engine's CLI
+/// ([`dirs::program_in_writable_root`]) and bubblewrap applies to itself, said
+/// once here for both of the seams a WSL place has:
+/// [`ensure_distro`](WslDistroBackend::ensure_distro), where the program is
+/// resolved and pinned, and [`wrap`](SandboxBackend::wrap), which composes the
+/// argv from the pinned one and reaches [`bwrap::build_argv`] without passing
+/// [`bwrap::BwrapBackend::wrap`]'s own copy of the check.
+///
+/// Both, rather than either: the profile is what the first sees, and the launch
+/// adds writable directories of its own that the profile never named — so a
+/// check in one place would answer about the wrong set.
+///
+/// The program is compared **as the distro spelled it**, with no resolved
+/// second spelling. `command -v` inside the distro answers with a `PATH`
+/// lookup, and asking the distro to resolve it further is a command friring
+/// cannot add without starting the place again; the container backends leave
+/// the same literal comparison standing for a remote engine, for the same
+/// reason. What is left is a symlink *inside* the distro pointing from a system
+/// prefix into a writable one, which the distro's own owner planted.
+fn check_bwrap_containment(
+    rw_paths: &[String],
+    distro: &str,
+    program: &str,
+    refuse: &dyn Fn(String) -> SandboxError,
+) -> SandboxResult<()> {
+    let Some((root, _)) = dirs::program_in_writable_root(rw_paths, program, None) else {
+        return Ok(());
+    };
+    Err(refuse(format!(
+        "the read-write path '{root}' contains bubblewrap itself ('{program}' in the distro \
+         '{distro}'), so the sandbox could replace the program that applies its own boundary. A \
+         WSL distro is one filesystem and one identity — bubblewrap is the whole of the boundary \
+         in there, so it is refused rather than granted"
+    )))
+}
 
 /// Refuse a profile asking for something a WSL place cannot enforce.
 ///
