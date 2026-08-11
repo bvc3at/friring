@@ -527,14 +527,20 @@ themes, switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
 - **[bubblewrap](https://github.com/containers/bubblewrap)** (`bwrap`) — only
   for [sandboxed agents](docs/SANDBOX.md) on Linux; macOS uses the system
   `sandbox-exec`
-- **Docker or Podman** — only for *place*-backed
-  [sandboxed agents](docs/SANDBOX.md) (a container instead of a host policy).
+- **Docker or Podman** — one way to run a *place*-backed
+  [sandboxed agent](docs/SANDBOX.md) (a container instead of a host policy).
   friring publishes no image: the default tag is built locally with
   `docker build -t friring/sandbox:1 - < packaging/sandbox/Containerfile`, and
   that file is self-contained, so a binary install only needs a copy of it. That
   image carries **no agent CLI** — friring prints the one-time command that
   installs yours into the profile's own home, which outlives every container it
   rebuilds. A profile may name its own `image` or `containerfile` instead
+- **[Apple's `container` CLI](https://github.com/apple/container)** — the other
+  way to run a *place*-backed sandboxed agent, and macOS-only in the narrow
+  sense: Apple Silicon, macOS 26 or newer, the CLI on `PATH`, and its service
+  running (`container system start`). Only network `full` is enforceable in one
+  — friring's egress proxy is reached over a socket that does not cross the VM
+  boundary, so a filtered profile is refused rather than run unfiltered
 - **Rust 1.75+** (only to build from source)
 
 ## Uninstall
