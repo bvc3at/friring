@@ -90,9 +90,11 @@ app      ← coordinator, imports all modules
 ```
 
 `ui → app` is the TEA `view(model)` coupling (ui renders app-owned state, never
-triggers side effects); `session_ops` and `cli` may reach `crate::agent::…` via
-fully-qualified paths only (never `use`). Module responsibilities, the event
-loop, and every ADR are in **`docs/ARCHITECTURE.md`**.
+triggers side effects); `session_ops` may reach `crate::agent::…` via
+fully-qualified paths only (never `use`), and `cli` may reach both
+`crate::agent::…` and `crate::sandbox::…` the same way. Module
+responsibilities, the event loop, and every ADR are in
+**`docs/ARCHITECTURE.md`**.
 
 Key facts:
 

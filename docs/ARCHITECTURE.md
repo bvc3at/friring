@@ -93,7 +93,10 @@ between it and the `app` coordinator.
   never importing `app`/`ui` (ADR-15). `friring-cli sandbox relay` is the
   one subcommand that runs *inside* a boundary, and is dispatched before
   the database is opened (ADR-29 in [`SANDBOX.md`](SANDBOX.md)) — which is
-  why `cli` may reference `proxy`.
+  why `cli` may reference `proxy`. The rest of `friring-cli sandbox` is
+  host-side management — profiles, places, prune, export/import, keychain
+  tokens — and asks the same layer the TUI asks, reaching `crate::sandbox::…`
+  by fully-qualified path only, never `use`.
 - **`activity/`** — agent-neutral activity: which provider reads a
   session's records, where each agent CLI keeps them, and the incremental
   stat-gated scan that turns them into the `session::activity` event
