@@ -12,7 +12,9 @@
 # when what a place may assume about this image changes, so an image built under
 # an older contract is never silently reused under a newer one.
 #
-# What a place needs from any image, this one or your own:
+# What a place needs from any image, this one or your own — the same list
+# `src/sandbox/container/image.rs` states from the other side, with a test
+# holding the two together:
 #
 #   1. `tmux` — the transport runs tmux INSIDE the place (ADR-26). Without it a
 #      session has nothing to attach to.
@@ -26,8 +28,46 @@
 #      user's uid so that identical-path bind mounts stay writable — friring
 #      mounts its own per-profile directory over it, and the mode only matters
 #      until it does.
+#   5. The agent's own CLI — which this image deliberately does not carry. See
+#      below: friring refuses a launch whose agent is missing from the place,
+#      with the command that puts one there, rather than opening a pane that
+#      dies at once.
 #
-# What it deliberately does NOT contain: any credential, any agent
+# NO AGENT CLI, DELIBERATELY. Baking one in would put a vendor's release train
+# inside this file's contract: the tag would have to move on every agent update,
+# each move costs everyone a rebuild (which includes a source build of
+# friring-cli), and the set of agents friring blesses would be decided here
+# rather than in the user's own registry. friring is agent-neutral by design,
+# and every runtime added here is inside every boundary built from this image.
+#
+# So an agent gets into a place one of two ways:
+#
+#   a. Installed once into the profile's home. That home is friring's own
+#      directory on the host — `<data dir>/sandbox/pl/<profile>/home`, mounted
+#      here at /home/agent — so it survives a container rebuild and a change of
+#      this image, and it is the same directory the profile's login lives in
+#      (ADR-28): one install and one sign-in per profile, not per session.
+#      Do it in a throwaway container of this image, which has a network the
+#      profile does not grant the place and an architecture the host may not
+#      share:
+#
+#        docker run --rm -it \
+#          --mount type=bind,src=<that home>,dst=/home/agent \
+#          friring/sandbox:1 npm install -g <the package your agent ships as>
+#
+#      friring prints that command, filled in, when a launch finds no agent.
+#      `NPM_CONFIG_PREFIX` and `PATH` below are what make the result visible to
+#      the next launch; `~/.local/bin` is on `PATH` for the installers that use
+#      that instead (`pip --user`, `uv`, most `curl | sh` scripts). A place
+#      cannot install *system* packages at runtime — `--cap-drop ALL`,
+#      `--security-opt no-new-privileges` and a non-root user are not
+#      negotiable — so an agent that needs more than this image has belongs in
+#      an image of your own.
+#
+#   b. Brought in an image of your own: set the profile's `image` or
+#      `containerfile`. The list above is then the contract to satisfy.
+#
+# What it deliberately does NOT contain, beyond that: any credential, any agent
 # configuration, anything from the host. A place gets a synthetic per-profile
 # home and logs in once (ADR-28); nothing here is baked with a token.
 
@@ -66,6 +106,10 @@ ARG NODE_MAJOR
 # The toolchain a coding agent expects to find, plus tmux. Keep this list as the
 # smallest thing that works: every package here is inside the boundary, and an
 # agent that can run it can run it against whatever the profile mounted.
+#
+# Node is the one runtime that is not merely expected but load-bearing: it is
+# what the documented one-time install above runs on, so the lean-base decision
+# rests on npm being here.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -99,12 +143,14 @@ RUN set -eux; \
     mkdir -p /home/agent; \
     chmod 1777 /home/agent
 
-# `NPM_CONFIG_PREFIX` points into the home friring mounts, because that is the
-# one place an agent installing itself can write.
+# The two bin directories a one-time install lands in come first on `PATH`, so
+# an agent installed into the profile's home wins over anything of the same name
+# in the image. Both are inside the mounted home, which is the only place a
+# place can write that outlives it.
 ENV HOME=/home/agent \
     LANG=C.UTF-8 \
     NPM_CONFIG_PREFIX=/home/agent/.npm-global \
-    PATH=/home/agent/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+    PATH=/home/agent/.npm-global/bin:/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 WORKDIR /home/agent
 
