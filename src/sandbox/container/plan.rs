@@ -187,11 +187,13 @@ pub struct MountCheck<'a> {
 ///
 /// # Errors
 ///
-/// Everything [`MountCheck::check`] refuses: a path that cannot be mounted at
-/// its own path (relative, unspellable in a `--mount` value, absent on the host,
-/// or reached through a symlink), a mount that would reach friring's data
-/// directory, a tmux socket directory or a container engine's control socket, or
-/// two mounts landing on one target.
+/// A profile naming friring's own sandbox state or status-signal tree
+/// ([`dirs::check_declared_paths`]), plus everything [`MountCheck::check`]
+/// refuses: a path that cannot be mounted at its own path (relative, unspellable
+/// in a `--mount` value, absent on the host, or reached through a symlink), a
+/// mount that would reach friring's data directory or database, a tmux socket
+/// directory or a container engine's control socket, or two mounts landing on
+/// one target.
 pub fn plan_instance(input: PlanInput<'_>) -> SandboxResult<InstancePlan> {
     let policy = input.policy;
     let refuse = |detail: String| SandboxError::Refused {
@@ -232,6 +234,27 @@ pub fn plan_instance(input: PlanInput<'_>) -> SandboxResult<InstancePlan> {
     mounts.push(Mount::new(input.home_dir, CONTAINER_HOME, true));
 
     input.check.check(&mounts, &refuse)?;
+    // The rule the editor and `sandbox import` apply when a profile is stored,
+    // asked again here because a place is ensured from a profile that is
+    // **already stored** and the editor is not the only thing that can put one
+    // there — a schema migration, or a write path added later, reaches
+    // `ensure_place` without ever passing it. Given the profile's own declared
+    // paths: the two mounts friring adds above live inside exactly that tree and
+    // are the point of it.
+    //
+    // After the mount check rather than before, because the data directory
+    // *encloses* this tree: a profile naming it has to be told about the
+    // database (ADR-29), which is the sharper sentence and the one every other
+    // gate gives.
+    dirs::check_declared_paths(
+        &policy
+            .rw_paths
+            .iter()
+            .chain(policy.ro_paths.iter())
+            .cloned()
+            .collect::<Vec<String>>(),
+    )
+    .map_err(&refuse)?;
 
     let env = place_env(policy);
     let network = network_setting(policy);
@@ -291,7 +314,6 @@ impl MountCheck<'_> {
         mounts: &[Mount],
         refuse: &dyn Fn(String) -> SandboxError,
     ) -> SandboxResult<()> {
-        let protected = dirs::protected_data_dirs(self.friring_db);
         let mut targets: Vec<&str> = Vec::new();
 
         for mount in mounts {
@@ -350,16 +372,19 @@ impl MountCheck<'_> {
             // read-only bind of the data directory still exposes the automation
             // commands the host executes, and a `-wal` written through any
             // writable route is replayed by the host on next open.
-            for dir in &protected {
-                if dirs::reaches(&canonical, dir) {
-                    return Err(refuse(format!(
-                        "mounting '{source}' would carry friring's data directory '{dir}' into \
-                         the sandbox. The database there holds automation commands the host \
-                         executes, so it never enters a boundary, read-only or otherwise \
-                         (ADR-29) — mount the directories the agent needs instead of an ancestor \
-                         of the data directory"
-                    )));
-                }
+            //
+            // Asked as `dirs::grants_database` rather than as ancestry alone: a
+            // profile naming the database *file* encloses no directory, and a
+            // place has no mask to take a mount back with — the policy backends
+            // survive that gap on an unconditional `/dev/null` bind and a final
+            // deny, and this refusal is all a place has.
+            if let Some((what, protected)) = dirs::grants_database(&canonical, self.friring_db) {
+                return Err(refuse(format!(
+                    "mounting '{source}' would carry friring's {what} '{protected}' into the \
+                     sandbox. The database holds automation commands the host executes, so it \
+                     never enters a boundary, read-only or otherwise (ADR-29) — mount the \
+                     directories the agent needs instead of friring's own"
+                )));
             }
             if let Some(socket_root) = dirs::grants_tmux_socket_tree(&canonical) {
                 // Read-only is no defence: a read-only superblock does not take
@@ -676,9 +701,17 @@ mod tests {
     /// ADR-29 is absolute, and a container makes the read-only half matter: a
     /// read-only bind of the data directory would still carry the automation
     /// commands the *host* executes.
+    ///
+    /// The cases run from the ancestors down to the **file**, which is the one
+    /// this test used not to have: `encloses("<data>/friring.db", "<data>")` is
+    /// false, so a profile naming the database itself reached every ADR-29 gate
+    /// and was told it enclosed nothing. A place has no mask to take a mount
+    /// back with, so that refusal is the whole of the rule here.
     #[test]
     fn no_mount_may_reach_the_data_directory() {
         let data = dirs::data_dir().unwrap().display().to_string();
+        let wal = format!("{DB}-wal");
+        let shm = format!("{DB}-shm");
         for (paths, needle) in [
             (vec![SandboxPath::workspace("~")], "/home/u"),
             (vec![SandboxPath::read_only("~")], "/home/u"),
@@ -688,6 +721,13 @@ mod tests {
             ),
             (vec![SandboxPath::read_only(&data)], data.as_str()),
             (vec![SandboxPath::workspace("/")], "/"),
+            // The database itself, in either mode, and the sidecars SQLite
+            // writes beside it — a `-wal` written from inside is replayed by
+            // the host on next open.
+            (vec![SandboxPath::workspace(DB)], DB),
+            (vec![SandboxPath::read_only(DB)], DB),
+            (vec![SandboxPath::workspace(&wal)], wal.as_str()),
+            (vec![SandboxPath::read_only(&shm)], shm.as_str()),
         ] {
             let policy = resolved(SandboxProfile::new("dev", paths));
             let err = plan_for(&policy).unwrap_err();
@@ -710,13 +750,10 @@ mod tests {
                 SandboxPath::read_only("/srv/shared"),
             ],
         );
-        let protected = [
-            DB.to_string(),
-            format!("{DB}-wal"),
-            format!("{DB}-shm"),
-            data.clone(),
-            "/home/u/.local/share/friring".to_string(),
-        ];
+        // Asked through the gate itself rather than through a hand-written list
+        // of paths: the list is what missed the database file in the first
+        // place, and this way a location added to `grants_database` is checked
+        // here without anyone remembering to add it twice.
         for scope in ReadScope::ALL {
             for network in NetworkMode::ALL {
                 for limits in [None, Some(2048)] {
@@ -726,13 +763,12 @@ mod tests {
                     let policy = resolved(profile.clone());
                     let plan = plan_for(&policy).unwrap();
                     for mount in &plan.mounts {
-                        for path in &protected {
-                            assert!(
-                                !dirs::encloses(&mount.source, path),
-                                "{scope}/{network} mounted '{}', which reaches '{path}'",
-                                mount.source
-                            );
-                        }
+                        assert_eq!(
+                            dirs::grants_database(&mount.source, Some(DB)),
+                            None,
+                            "{scope}/{network} mounted '{}', which reaches friring's own",
+                            mount.source
+                        );
                     }
                 }
             }

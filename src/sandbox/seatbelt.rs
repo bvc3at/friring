@@ -666,7 +666,9 @@ fn render_database(out: &mut Vec<String>, launch: &SandboxLaunch<'_>) {
             "covering the data directory cannot re-open it.",
         ],
     );
-    let files: Vec<String> = [db.to_string(), format!("{db}-wal"), format!("{db}-shm")]
+    // What "the database" is comes from one place, so a deny here and a mount
+    // refusal in `dirs` cannot end up meaning different sets of files.
+    let files: Vec<String> = dirs::database_files(db)
         .iter()
         .map(|f| format!("(literal {f:?})"))
         .collect();

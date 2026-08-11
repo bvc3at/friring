@@ -14,14 +14,24 @@
 //! sandbox could swap the policy that constrains it.
 //!
 //! **What friring refuses to hand over** is [`check_writable_roots`]: a
-//! read-write root that encloses the data directory reaches the database, which
-//! ADR-29 keeps outside every boundary because automations stored in it are
-//! shell commands the *host* runs; one that reaches a tmux socket directory is
-//! the escape above. Both are refused at launch rather than trimmed, because a
-//! boundary that silently grants less than it was asked for is as surprising as
-//! one that grants more. [`grants_engine_socket`] is the third of those
-//! locations and belongs to the place backends: a sandbox holding a container
-//! engine's control socket can start a privileged container of its own.
+//! read-write root that reaches the database, which ADR-29 keeps outside every
+//! boundary because automations stored in it are shell commands the *host* runs;
+//! one that reaches a tmux socket directory is the escape above; and one that
+//! reaches friring's own configuration ([`grants_config_file`]), where
+//! `agents.toml` writes down the command line the host launches every agent
+//! with. All three are refused at launch rather than trimmed, because a boundary
+//! that silently grants less than it was asked for is as surprising as one that
+//! grants more. [`grants_engine_socket`] is the fourth of those locations and
+//! belongs to the place backends: a sandbox holding a container engine's control
+//! socket can start a privileged container of its own.
+//!
+//! "Reaches" is [`grants_database`], and it is deliberately **two** questions.
+//! The data *directory* is refused to anything above it, because friring mints a
+//! launch's own scratch and signal directories underneath it and those have to
+//! stay grantable. The database *file* — and its [sidecars](DB_SIDECARS) — is
+//! refused in **both** directions, because a path naming a file encloses no
+//! directory: `encloses("<data>/friring.db", "<data>")` is false, so an ancestry
+//! test on its own passes the one path ADR-29 exists to refuse.
 //!
 //! Every one of those comparisons is made against a path **as the kernel
 //! resolves it** ([`canonical`], [`canonical_source`], [`reaches`]). A guard
@@ -466,9 +476,15 @@ pub fn reaches(path: &str, protected: &str) -> bool {
 /// Whether `path` and `tree` overlap at all — either enclosing the other, in
 /// either spelling.
 ///
-/// For the trees whose *contents* are the danger rather than one named file:
-/// naming `/run/user/1000` hands over the engine socket inside it, and naming
-/// `/run/user` hands over every user's.
+/// The question to ask about anything whose *contents* are the danger rather
+/// than one named file: naming `/run/user/1000` hands over the engine socket
+/// inside it, and naming `/run/user` hands over every user's.
+///
+/// And the question to ask about a **file**, where the two directions are not
+/// symmetric at all: a path naming one is an ancestor of nothing, so an
+/// `encloses(path, file)` gate answers "reaches nothing" about the file itself.
+/// That is how a profile naming friring's database passed every ADR-29 gate —
+/// see [`grants_database`].
 fn overlaps(path: &str, tree: &str) -> bool {
     let resolved = canonical(tree);
     encloses(path, tree)
@@ -646,7 +662,6 @@ fn unix_socket_path(value: &str) -> Option<String> {
 /// that says "my home is writable" and silently is not produces a boundary
 /// nobody can reason about. Refusing names the directory and the fix.
 pub fn check_writable_roots(writable: &[String], db: Option<&str>) -> Result<(), String> {
-    let protected_data = protected_data_dirs(db);
     for root in writable {
         if let Some(socket_root) = grants_tmux_socket_tree(root) {
             return Err(format!(
@@ -656,27 +671,170 @@ pub fn check_writable_roots(writable: &[String], db: Option<&str>) -> Result<(),
                  needs instead"
             ));
         }
-        for protected in &protected_data {
-            if encloses(root, protected) {
-                return Err(format!(
-                    "the read-write path '{root}' encloses friring's data directory \
-                     '{protected}'. The database there carries automation commands the host \
-                     executes, so reaching it is host command execution (ADR-29) — list the \
-                     directories the agent needs instead of an ancestor of the data directory"
-                ));
-            }
+        if let Some((what, protected)) = grants_database(root, db) {
+            return Err(format!(
+                "the read-write path '{root}' reaches friring's {what} '{protected}'. The \
+                 database carries automation commands the host executes, so a sandbox that can \
+                 write it runs commands outside the boundary (ADR-29) — list the directories the \
+                 agent needs instead of friring's own"
+            ));
+        }
+        if let Some(file) = grants_config_file(root) {
+            return Err(format!(
+                "the read-write path '{root}' reaches friring's own '{file}'. Every agent's \
+                 command line is written in the 'agents.toml' beside it and the host runs it, so \
+                 a sandbox that can write friring's configuration chooses what friring launches \
+                 next — outside the boundary, exactly as the database would. List the directories \
+                 the agent needs instead of friring's own"
+            ));
         }
     }
     Ok(())
 }
 
+/// Which of friring's own configuration files `path` would let a sandbox write,
+/// or `None`.
+///
+/// The third location whose *contents* are host command execution, beside the
+/// database and the tmux socket: `agents.toml` writes down the `command + args`
+/// friring launches every agent with, `hosts.toml` how a remote one is reached,
+/// and both are read and run on the host, outside every boundary.
+///
+/// Judged as the **files** rather than as the tree around them, and from above
+/// only ([`reaches`], the shape [`grants_engine_socket`] uses for a socket file)
+/// — which is not a weaker rule, because a root that hands over any of these is
+/// a root that encloses one of them. Refusing the whole directory in both
+/// directions would refuse anything that happens to sit under the same parent,
+/// and a deployment that points `FRIRING_CONFIG_DIR` and `FRIRING_DATA_DIR` at
+/// one directory has a launch's own scratch directory in there.
+///
+/// Read access is a separate question and deliberately not asked here: an
+/// `agents.toml` entry may carry an environment variable the user chose to put a
+/// token in, but the file is also ordinary configuration a profile could
+/// reasonably want to read, and refusing that is a product decision rather than
+/// a boundary one.
+pub fn grants_config_file(path: &str) -> Option<String> {
+    config_files().into_iter().find(|file| reaches(path, file))
+}
+
+/// friring's own configuration files, in whatever directory this host resolves
+/// them to.
+///
+/// Anchored on [`crate::paths::config_file`], which names `config.toml`: the
+/// others are its siblings by construction (see
+/// `crate::agent::agent_config::agents_file`), and deriving them from it keeps
+/// this rule pinned to whatever that resolves to — a `FRIRING_CONFIG_DIR`
+/// override included.
+fn config_files() -> Vec<String> {
+    let Some(config) = crate::paths::config_file() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = ["agents.toml", "hosts.toml"]
+        .iter()
+        .map(|name| config.with_file_name(name).display().to_string())
+        .collect();
+    out.push(config.display().to_string());
+    out
+}
+
+/// Which of the locations ADR-29 keeps outside every boundary `path` would hand
+/// over: the noun to name it by, and the location itself.
+///
+/// One predicate for every gate, because the two halves of the question are easy
+/// to get half-right and were:
+///
+/// - the data **directory** is reached from **above** ([`reaches`]), and only
+///   from above — a launch's own scratch and signal directories live inside it
+///   and are exactly what it hands the sandbox;
+/// - the **database** and its [sidecars](DB_SIDECARS) are reached from either
+///   side, because a profile naming the file is an ancestor of nothing and
+///   `encloses("<data>/friring.db", "<data>")` is false.
+///
+/// A policy backend survives a missing second half by accident — bubblewrap
+/// masks the database over `/dev/null` unconditionally and seatbelt denies it
+/// last — but a **place has no mask**: it bind-mounts what the profile names, so
+/// this refusal is the whole of the rule there.
+pub fn grants_database(path: &str, db: Option<&str>) -> Option<(&'static str, String)> {
+    protected_data_dirs(db)
+        .into_iter()
+        .find(|dir| reaches(path, dir))
+        .map(|dir| ("data directory", dir))
+        .or_else(|| {
+            protected_data_files(db)
+                .into_iter()
+                .find(|file| overlaps(path, file))
+                .map(|file| ("database", file))
+        })
+}
+
+/// The suffixes SQLite writes beside the database file.
+///
+/// Part of the database rather than files that happen to sit near it: a `-wal`
+/// written from inside a boundary is replayed by the host on next open, so a
+/// rule naming `friring.db` alone would keep the automation rows out through one
+/// path and let them back in through another.
+pub const DB_SIDECARS: [&str; 2] = ["-wal", "-shm"];
+
+/// One database, spelled as every file it is made of.
+///
+/// The one answer to "what is *the database*", shared by the two policy
+/// backends' unconditional masks and by the refusals here, so a mask and a
+/// refusal can never disagree about which files ADR-29 is talking about.
+#[must_use]
+pub fn database_files(db: &str) -> Vec<String> {
+    std::iter::once(db.to_string())
+        .chain(DB_SIDECARS.iter().map(|suffix| format!("{db}{suffix}")))
+        .collect()
+}
+
+/// The database files no sandbox may be handed: the launch's own and this
+/// machine's, each with its [sidecars](DB_SIDECARS).
+///
+/// The companion to [`protected_data_dirs`] — see [`grants_database`] for why
+/// the two are asked differently.
+///
+/// Each directory contributes both its spelling as written and as the kernel
+/// resolves it. The file itself need not exist (a fresh install, a launch on
+/// another host), and [`canonical`] has no answer for a path that is not there —
+/// so on a machine whose data directory sits behind a link (`/var` →
+/// `/private/var` on macOS) a resolved mount source would otherwise be compared
+/// against an unresolved database and miss it. The directories do exist, so
+/// resolving *them* is what sharpens the file paths.
+pub fn protected_data_files(db: Option<&str>) -> Vec<String> {
+    let local = crate::paths::database_file().map(|path| path.display().to_string());
+    let mut out: Vec<String> = Vec::new();
+    for file in [db.map(str::to_string), local].into_iter().flatten() {
+        let file = PathBuf::from(&file);
+        let Some(name) = file.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let spellings: Vec<String> = file
+            .parent()
+            .map(|dir| dir.display().to_string())
+            .filter(|dir| !dir.is_empty())
+            .into_iter()
+            .flat_map(|dir| [canonical(&dir), Some(dir)])
+            .flatten()
+            .collect();
+        for dir in spellings {
+            for path in database_files(&format!("{}/{name}", dir.trim_end_matches('/'))) {
+                if !out.contains(&path) {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Refuse a **profile-declared** path that reaches the state friring keeps for
 /// its *other* sandboxes, whatever mode it was declared in.
 ///
-/// [`check_writable_roots`] asks whether a path is an *ancestor* of the data
-/// directory, which is the right question for the database and the wrong one for
-/// everything friring mints beside it. `<data>/sandbox` encloses no data
-/// directory and passes that check, and it holds:
+/// [`check_writable_roots`] asks [`grants_database`], which judges the data
+/// directory by ancestry and the database file itself in both directions — the
+/// right pair of questions for ADR-29 and the wrong one for everything friring
+/// mints beside it. `<data>/sandbox` encloses no data directory, is not the
+/// database, and passes that check; it holds:
 ///
 /// - every *other* profile's synthetic home, and therefore the credential its
 ///   `volume-login` signed in with and the copy a `seed-file` made (ADR-28's
@@ -757,6 +915,10 @@ pub fn check_engine_socket_paths(paths: &[String], home: Option<&str>) -> Result
 /// [`check_writable_roots`] is the whole check there; a place backend mounts
 /// read-only paths too, and a read-only bind of the data directory still carries
 /// the automation commands the host executes across the boundary.
+///
+/// Half of what ADR-29 protects, and the half that is judged by ancestry.
+/// [`grants_database`] is what a gate asks: a profile naming the database *file*
+/// reaches it while enclosing this directory not at all.
 pub fn protected_data_dirs(db: Option<&str>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let from_db = db
@@ -1257,6 +1419,117 @@ mod tests {
         .unwrap();
         // A path that merely shares a prefix is not an ancestor.
         check_writable_roots(&["/home/us".to_string()], Some(db)).unwrap();
+    }
+
+    /// The leaf every ancestry test misses: a profile naming the database
+    /// **file** encloses no directory at all, so `encloses(root, <data>)` — the
+    /// question every ADR-29 gate used to ask — answers "reaches nothing" about
+    /// the one path ADR-29 exists to refuse.
+    ///
+    /// A place is where that matters most: a policy backend masks the database
+    /// over `/dev/null` whatever the profile says, and a place has no mask to
+    /// take a mount back with.
+    #[test]
+    fn a_writable_root_naming_the_database_file_itself_is_refused() {
+        let db = "/home/u/.local/share/friring/friring.db";
+        // The file, and the sidecars SQLite writes beside it: a `-wal` written
+        // from inside is replayed by the host on next open, which is the same
+        // escape by a slower route.
+        for root in [db.to_string(), format!("{db}-wal"), format!("{db}-shm")] {
+            let err = check_writable_roots(std::slice::from_ref(&root), Some(db)).unwrap_err();
+            assert!(
+                err.contains(&root) && err.contains("ADR-29"),
+                "{root}: {err}"
+            );
+            // And the predicate underneath it names the file rather than the
+            // directory, because the directory is not what was asked for.
+            assert_eq!(
+                grants_database(&root, Some(db)),
+                Some(("database", root.clone())),
+                "{root}"
+            );
+        }
+        // A file whose name merely starts the same way is somebody else's.
+        check_writable_roots(&[format!("{db}-backup")], Some(db)).unwrap();
+        check_writable_roots(&["/home/u/.local/share/friring2".to_string()], Some(db)).unwrap();
+        // The launch's own database is not the only one: this machine's is
+        // protected even when the launch names none, because a place on it is
+        // the one that could reach it.
+        let local = crate::paths::database_file().unwrap().display().to_string();
+        let err = check_writable_roots(std::slice::from_ref(&local), None).unwrap_err();
+        assert!(err.contains("ADR-29"), "{local}: {err}");
+    }
+
+    /// The third location whose contents are host command execution, and the
+    /// one no gate asked about at all: `agents.toml` carries the `command +
+    /// args` friring runs for every agent, and friring runs them on the host.
+    /// A profile granting the directory it sits in chooses what the *next*
+    /// session launches, outside the boundary — the database escape with a
+    /// different file.
+    #[test]
+    fn a_writable_root_naming_frirings_configuration_is_refused() {
+        let config = crate::paths::config_file().unwrap();
+        let dir = config.parent().unwrap().display().to_string();
+        let agents = config.with_file_name("agents.toml").display().to_string();
+        // The file itself, the directory holding it, and an ancestor of that:
+        // one escape with three spellings, and every one of them is a root that
+        // *encloses* the file — which is why an ancestry test is the whole rule
+        // here and not half of one.
+        for root in [
+            agents.clone(),
+            dir.clone(),
+            Path::new(&dir).parent().unwrap().display().to_string(),
+        ] {
+            assert!(grants_config_file(&root).is_some(), "{root}");
+        }
+        assert_eq!(
+            grants_config_file(&agents).as_deref(),
+            Some(agents.as_str())
+        );
+
+        // And the sentence the user is shown. Asserted on the file rather than
+        // on the directory: an ancestor of the directory is an ancestor of the
+        // data directory too on any ordinary layout, and ADR-29's sentence wins
+        // there — which is right, because the database is the sharper thing to
+        // be told about.
+        let err = check_writable_roots(std::slice::from_ref(&agents), None).unwrap_err();
+        assert!(err.contains("agents.toml"), "{err}");
+
+        // What the rule must *not* refuse: anything that merely shares the
+        // directory. A launch's own scratch is minted under the data directory,
+        // and a deployment pointing `FRIRING_CONFIG_DIR` and `FRIRING_DATA_DIR`
+        // at one place has it sitting right beside `agents.toml`.
+        for ordinary in [
+            format!("{dir}/sandbox/tmp/s1"),
+            format!("{dir}/signals/s1"),
+            format!("{agents}-elsewhere"),
+            format!("{dir}/agents.toml.bak"),
+        ] {
+            assert_eq!(grants_config_file(&ordinary), None, "{ordinary}");
+        }
+    }
+
+    /// The database file is judged under **both** spellings of the directory it
+    /// sits in, which is not belt and braces on macOS: the temp root every test
+    /// build pins the data directory under is itself reached through a symlink,
+    /// so a mount source that has already been resolved would be compared
+    /// against an unresolved database and match nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_database_is_refused_under_the_resolved_spelling_of_its_directory() {
+        let local = crate::paths::database_file().unwrap();
+        let dir = local.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        let resolved = std::fs::canonicalize(dir).unwrap();
+        let resolved_db = resolved
+            .join(local.file_name().unwrap())
+            .display()
+            .to_string();
+        // The point of the fixture: on this platform the two spellings differ,
+        // and on one where they do not the assertion below is simply the
+        // literal case again.
+        let err = check_writable_roots(std::slice::from_ref(&resolved_db), None).unwrap_err();
+        assert!(err.contains("ADR-29"), "{resolved_db}: {err}");
     }
 
     use super::test_temp_base as temp_base;
