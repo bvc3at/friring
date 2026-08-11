@@ -5,7 +5,14 @@
 //! Each row names the profile, the backend it will actually run (an `auto`
 //! profile shows what the host's ladder resolved to, so the choice is never
 //! invisible), how many paths it exposes, how much network it allows, and —
-//! for a place — that every session on it lands in one shared place.
+//! for a place — that every session on it lands in one shared place, plus the
+//! places it is actually running right now.
+//!
+//! It is also the manager view: `s` stops a profile's places, `r` rebuilds
+//! them and `p` reclaims the ones nothing needs. Each of the first two takes a
+//! container away from whatever is running in it, so it is confirmed first —
+//! the question lands in the footer, `y` carries it out and anything else
+//! cancels ([`PendingPlaceAction`]).
 
 use ratatui::{
     style::Style,
@@ -30,10 +37,64 @@ use super::theme::Theme;
 /// it costs.
 const SHARED_PLACE: &str = "shared place";
 
+/// One live place of a profile, as the list shows it.
+///
+/// A profile may own several at once — a profile edit asks for a *new*
+/// container while the sessions already launched keep running in the old one —
+/// so this is a list rather than a state word, and the manager's actions act on
+/// all of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaceRow {
+    /// Which engine holds it.
+    pub engine: SandboxBackendKind,
+    /// The engine's own handle, as `sandbox_instances` recorded it.
+    pub id: String,
+    /// Backend-defined lifecycle state, free text (the container backend writes
+    /// `running` and nothing else).
+    pub state: String,
+}
+
+/// What a destructive place action is waiting to be told.
+///
+/// Lives on the row rather than in a modal of its own because the list holds
+/// nothing but its rows, and because a question that belongs to a row must go
+/// away with it: rebuilding the list drops the pending action, which fails
+/// towards *not* removing a container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPlaceAction {
+    pub action: PlaceAction,
+    /// The profile the answer acts on, carried rather than re-read from the
+    /// selection: what is confirmed and what is done have to be the same
+    /// profile even if the list is rebuilt between the two.
+    pub profile: String,
+    /// The question, composed where the counts are known
+    /// (`crate::app::sandbox`) so the renderer states no policy of its own.
+    pub question: String,
+}
+
+/// A manager action against a profile's places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceAction {
+    /// Remove every place this profile owns. Whatever is running in them stops.
+    Stop,
+    /// Remove them and start a fresh one from the profile as it is now.
+    Rebuild,
+}
+
+impl PlaceAction {
+    /// The word the confirmation and the status line use.
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Stop => "Stop",
+            Self::Rebuild => "Rebuild",
+        }
+    }
+}
+
 /// One profile as the list shows it. Owned by the modal state
 /// (`crate::app::modals::SandboxListModal`), which holds nothing else: a
 /// second app-side copy of these columns could only drift from this one.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SandboxProfileRow {
     pub name: String,
     /// The profile's own choice, `auto` included.
@@ -48,9 +109,9 @@ pub struct SandboxProfileRow {
     /// profile; anything in it means the summary below would be describing
     /// substituted values, so the row reports the damage instead.
     pub undecoded: Vec<String>,
-    /// Live place state for a place backend (`running`), rendered when present.
-    /// Policy backends never create an instance, so this stays `None` for them.
-    pub instance: Option<String>,
+    /// The places this profile owns right now, most recently used first. Policy
+    /// backends never create one, so this stays empty for them.
+    pub places: Vec<PlaceRow>,
     /// Why the backend this profile would run on is **not available here**, from
     /// the probe. `None` when it is available, and when an `auto` ladder has not
     /// resolved — an unresolved `auto` rules nothing out.
@@ -58,6 +119,9 @@ pub struct SandboxProfileRow {
     /// Rendered wherever a profile is offered, because the alternative is a user
     /// picking `docker` on a machine with no engine and finding out at launch.
     pub unavailable: Option<String>,
+    /// A destructive place action this row is waiting to be confirmed. Only the
+    /// selected row can carry one, and only until the next keystroke.
+    pub pending: Option<PendingPlaceAction>,
 }
 
 impl SandboxProfileRow {
@@ -97,8 +161,8 @@ impl SandboxProfileRow {
         {
             out.push_str(&format!(" · {SHARED_PLACE}"));
         }
-        if let Some(state) = &self.instance {
-            out.push_str(&format!(" · {state}"));
+        if let Some(places) = self.places_summary() {
+            out.push_str(&format!(" · {places}"));
         }
         // Last, and phrased as the probe phrased it: a profile that cannot run
         // here is still worth offering — the user may be about to install the
@@ -115,6 +179,20 @@ impl SandboxProfileRow {
     /// entry.
     pub fn is_intact(&self) -> bool {
         self.undecoded.is_empty()
+    }
+
+    /// What this profile's places are doing, or `None` when it has none.
+    ///
+    /// One place reports its state; several report how many there are as well,
+    /// because that is the thing worth noticing — a profile edit left a
+    /// superseded container behind, and the manager's actions cover all of
+    /// them.
+    pub fn places_summary(&self) -> Option<String> {
+        match self.places.as_slice() {
+            [] => None,
+            [one] => Some(one.state.clone()),
+            many => Some(format!("{} places · {}", many.len(), many[0].state)),
+        }
     }
 }
 
@@ -157,16 +235,39 @@ pub fn render_sandbox_list_modal(
 
     let hits = super::render_selector_rows(frame, list_area, lines, state.selected_index);
 
+    // A pending place action owns the footer, and takes the buttons with it: a
+    // click that replayed `Enter` while a container removal was waiting would
+    // be a mouse answering a question about somebody's running agent.
+    if let Some(pending) = state
+        .entries
+        .get(state.selected_index)
+        .and_then(|entry| entry.pending.as_ref())
+    {
+        frame.render_widget(
+            Paragraph::new(confirm_line(&pending.question, inner_width)),
+            footer_area,
+        );
+        return (hits, Vec::new());
+    }
+
     let help = Line::from(vec![
         Span::styled("n", Theme::keybind()),
         Span::styled(" new  ", Theme::keybind_desc()),
         Span::styled("d", Theme::keybind()),
-        Span::styled(" delete", Theme::keybind_desc()),
+        Span::styled(" delete  ", Theme::keybind_desc()),
+        Span::styled("s", Theme::keybind()),
+        Span::styled(" stop  ", Theme::keybind_desc()),
+        Span::styled("r", Theme::keybind()),
+        Span::styled(" rebuild  ", Theme::keybind_desc()),
+        Span::styled("p", Theme::keybind()),
+        Span::styled(" prune", Theme::keybind_desc()),
     ]);
-    frame.render_widget(Paragraph::new(help), footer_area);
-    let buttons = super::render_action_footer(
+    // The hint-aware footer, because the manager's five keys are wide enough to
+    // reach the buttons on a narrow terminal.
+    let buttons = super::render_hint_action_footer(
         frame,
         footer_area,
+        help,
         (
             "Edit",
             crossterm::event::KeyCode::Enter,
@@ -175,6 +276,24 @@ pub fn render_sandbox_list_modal(
         "Close",
     );
     (hits, buttons)
+}
+
+/// The confirmation footer: the question, then the two answers.
+///
+/// `y` and nothing else confirms. The list's own keys are `Enter` (edit) and
+/// `d` (delete), so letting either double as "yes" would carry out a container
+/// removal with a keystroke that means something else everywhere in friring —
+/// the same reason the firewall's question does not take `Enter`.
+fn confirm_line<'a>(question: &str, width: usize) -> Line<'a> {
+    const ANSWERS: &str = "  y confirm · any other key cancels";
+    let room = width.saturating_sub(ANSWERS.chars().count());
+    Line::from(vec![
+        Span::styled(
+            super::truncate_ellipsis(question, room),
+            Style::default().fg(Theme::danger()),
+        ),
+        Span::styled(ANSWERS, Theme::keybind_desc()),
+    ])
 }
 
 /// One list row, fitted to `width` display columns.
@@ -199,13 +318,17 @@ mod tests {
     fn row() -> SandboxProfileRow {
         SandboxProfileRow {
             name: "dev".to_string(),
-            backend: SandboxBackendKind::Auto,
-            resolved: None,
             paths: 2,
             network: NetworkMode::Allowlist,
-            undecoded: Vec::new(),
-            instance: None,
-            unavailable: None,
+            ..Default::default()
+        }
+    }
+
+    fn place(id: &str, state: &str) -> PlaceRow {
+        PlaceRow {
+            engine: SandboxBackendKind::Docker,
+            id: id.to_string(),
+            state: state.to_string(),
         }
     }
 
@@ -238,11 +361,32 @@ mod tests {
     fn summary_appends_instance_state_when_present() {
         let mut r = row();
         r.backend = SandboxBackendKind::Docker;
-        r.instance = Some("running".to_string());
+        r.places = vec![place("ctr-1", "running")];
         assert_eq!(
             r.summary(),
             "docker · 2 paths · allowlist · shared place · running"
         );
+    }
+
+    /// A profile edit builds a *new* container while the sessions already
+    /// launched keep running in the old one, so a profile can own several at
+    /// once — and the count is the thing worth noticing, since the manager's
+    /// actions cover all of them.
+    #[test]
+    fn summary_counts_a_profiles_places_when_it_has_more_than_one() {
+        let mut r = row();
+        r.backend = SandboxBackendKind::Podman;
+        r.places = vec![place("ctr-2", "running"), place("ctr-1", "running")];
+        assert!(
+            r.summary().ends_with("· 2 places · running"),
+            "{}",
+            r.summary()
+        );
+        // A policy backend never creates one, and says nothing about places.
+        let mut policy = row();
+        policy.backend = SandboxBackendKind::Seatbelt;
+        assert!(policy.places_summary().is_none());
+        assert!(!policy.summary().contains("place"), "{}", policy.summary());
     }
 
     /// A place is created once per profile and shared by every session that
@@ -303,9 +447,10 @@ mod tests {
         assert!(text.ends_with('…'));
     }
 
-    fn draw(width: u16, height: u16, entries: &[SandboxProfileRow], selected: usize) {
+    fn draw(width: u16, height: u16, entries: &[SandboxProfileRow], selected: usize) -> usize {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut buttons = 0;
         terminal
             .draw(|f| {
                 let render = render_sandbox_list_modal(
@@ -315,21 +460,67 @@ mod tests {
                         selected_index: selected,
                     },
                 );
-                let ((hits, _), _) = &render;
+                let ((hits, _), footer) = &render;
+                buttons = footer.len();
                 for h in hits {
                     assert!(h.rect.right() <= Rect::new(0, 0, width, height).right());
                 }
             })
             .unwrap();
+        buttons
     }
 
     #[test]
     fn renders_without_panicking_at_small_sizes() {
-        let entries = vec![row(), row(), row()];
+        let mut pending = row();
+        pending.pending = Some(PendingPlaceAction {
+            action: PlaceAction::Stop,
+            profile: "dev".to_string(),
+            question: "Stop 2 place(s) of 'dev'?".to_string(),
+        });
+        let entries = vec![row(), row(), pending];
         for (w, h) in [(1, 1), (4, 3), (20, 5), (40, 8), (120, 40)] {
             draw(w, h, &entries, 2);
             // The empty state takes a different path through the frame.
             draw(w, h, &[], 0);
         }
+    }
+
+    /// A pending removal takes the footer buttons away: a click that replayed
+    /// `Enter` would be a mouse answering a question about a running agent's
+    /// container.
+    #[test]
+    fn a_pending_action_replaces_the_footer_and_its_buttons() {
+        let entries = vec![row()];
+        assert!(
+            draw(80, 10, &entries, 0) > 0,
+            "the ordinary footer has buttons"
+        );
+
+        let mut pending = row();
+        pending.pending = Some(PendingPlaceAction {
+            action: PlaceAction::Rebuild,
+            profile: "dev".to_string(),
+            question: "Rebuild 'dev'?".to_string(),
+        });
+        assert_eq!(draw(80, 10, &[pending], 0), 0);
+    }
+
+    /// The question is what the app composed, and the answer keys are spelled
+    /// out beside it — `y`, never `Enter`.
+    #[test]
+    fn the_confirmation_states_the_question_and_the_key_that_answers_it() {
+        let line = confirm_line("Stop 2 place(s) of 'dev'?", 80);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("Stop 2 place(s) of 'dev'?"), "{text}");
+        assert!(text.contains("y confirm"), "{text}");
+        assert!(!text.contains("Enter"), "{text}");
+        // The answers survive a width the question does not.
+        let narrow: String = confirm_line("Stop 2 place(s) of 'dev'?", 40)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(narrow.contains("y confirm"), "{narrow}");
     }
 }

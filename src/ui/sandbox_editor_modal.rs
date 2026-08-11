@@ -72,6 +72,11 @@ pub struct SandboxEditorState<'a> {
     /// Columns of the stored row friring could not decode, as
     /// `column = 'value'`. Empty for a healthy profile.
     pub undecoded: &'a [String],
+    /// What the config-projection lint last answered, or `None` until the user
+    /// asks. A snapshot of the form at the moment it was asked for, which is
+    /// what the panel says — the pass reads the user's configuration off disk,
+    /// so it is not recomputed per keystroke.
+    pub lint: Option<&'a [crate::app::modals::SandboxLintReport]>,
 }
 
 impl<'a> SandboxEditorState<'a> {
@@ -100,6 +105,7 @@ impl<'a> SandboxEditorState<'a> {
             containerfile: m.containerfile.value(),
             allow_unsandboxed_fallback: m.allow_unsandboxed_fallback,
             undecoded: &m.undecoded,
+            lint: m.lint.as_deref(),
         }
     }
 
@@ -120,13 +126,21 @@ impl<'a> SandboxEditorState<'a> {
 pub fn unavailable_reason(
     field: SandboxField,
     backend: SandboxBackendKind,
-    shape: Option<SandboxShape>,
     network: NetworkMode,
 ) -> Option<String> {
-    if sandbox_field_available(field, shape, network) {
+    if sandbox_field_available(field, backend, network) {
         return None;
     }
     Some(match field {
+        // Two different reasons a backend cannot cap a sandbox, and the second
+        // is the one a user would otherwise read as a bug: a WSL place *is* a
+        // virtual machine, and its memory is the one every distro on the host
+        // shares.
+        SandboxField::Memory | SandboxField::Cpus if backend == SandboxBackendKind::WslDistro => {
+            "unavailable — every WSL distro shares one utility VM, so a cap on it is set \
+             machine-wide in .wslconfig"
+                .to_string()
+        }
         SandboxField::Memory | SandboxField::Cpus => {
             format!("unavailable — {backend} applies a policy to a host process")
         }
@@ -323,11 +337,60 @@ fn editor_footer_lines<'a>(state: &SandboxEditorState<'a>) -> Vec<Line<'a>> {
         Style::default().fg(Theme::text_muted()),
     )));
 
-    lines.push(super::key_hint_line(&[
+    lines.extend(lint_lines(state));
+
+    let mut hints = vec![
         ("Tab/↑↓", " move  "),
         ("←→", " adjust  "),
         ("Space", " toggle"),
-    ]));
+    ];
+    // Offered only where there is something to project: a policy sandbox reads
+    // the host's own configuration, so nothing crosses and nothing is classified.
+    if state.shape() == Some(SandboxShape::Place) {
+        hints.push(("  ^L", " check config"));
+    }
+    lines.push(super::key_hint_line(&hints));
+    lines
+}
+
+/// What the config-projection lint answered, or the offer to ask.
+///
+/// Says *when* it was answered rather than pretending to be live: the pass
+/// reads the user's configuration off disk and classifies every entry, so it
+/// runs when it is asked for and describes the form as it read then. The
+/// actionable entries are the whole point — a `NeedsMount` is a read-only path
+/// the user can add right here, on this screen, and a `HostOnly` is a piece of
+/// their setup the agent in there will not have.
+fn lint_lines<'a>(state: &SandboxEditorState<'a>) -> Vec<Line<'a>> {
+    let Some(reports) = state.lint else {
+        return Vec::new();
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        "  config    checked against this form",
+        Theme::label(),
+    ))];
+    if reports.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    no agent declares configuration to project",
+            Style::default().fg(Theme::text_muted()),
+        )));
+        return lines;
+    }
+    for report in reports {
+        lines.push(Line::from(vec![
+            Span::styled(format!("    {}  ", report.agent), Theme::label()),
+            Span::styled(
+                report.summary.clone(),
+                Style::default().fg(Theme::text_secondary()),
+            ),
+        ]));
+        for (entry, reason) in &report.actionable {
+            lines.push(Line::from(Span::styled(
+                format!("      {entry} — {reason}"),
+                Style::default().fg(Theme::status_blocked()),
+            )));
+        }
+    }
     lines
 }
 
@@ -369,9 +432,7 @@ fn shape_summary(state: &SandboxEditorState<'_>) -> String {
 /// of a value.
 fn field_line<'a>(field: SandboxField, state: &SandboxEditorState<'a>, active: bool) -> Line<'a> {
     let label = field_label(field);
-    if let Some(reason) =
-        unavailable_reason(field, state.effective_backend, state.shape(), state.network)
-    {
+    if let Some(reason) = unavailable_reason(field, state.effective_backend, state.network) {
         return unavailable_line(label, &reason, active);
     }
     match field {
@@ -732,6 +793,7 @@ mod tests {
             containerfile: "",
             allow_unsandboxed_fallback: false,
             undecoded: &[],
+            lint: None,
         }
     }
 
@@ -905,17 +967,70 @@ mod tests {
         assert!(text(&field_line(F::PromptDomains, &s, false)).contains("lets nothing out"));
     }
 
+    /// The lint panel appears only once it has been asked for, and then says
+    /// which agent each verdict is about and what is still to decide.
+    #[test]
+    fn the_config_lint_shows_what_was_asked_for_and_nothing_before() {
+        use crate::app::modals::SandboxLintReport;
+
+        let mut s = state();
+        s.effective_backend = SandboxBackendKind::Docker;
+        let before = editor_footer_lines(&s);
+        assert!(
+            !before
+                .iter()
+                .any(|l| text(l).contains("checked against this form")),
+            "nothing is claimed before the pass has run"
+        );
+        // The offer is there, because this profile is a place.
+        assert!(before.iter().any(|l| text(l).contains("check config")));
+
+        let reports = vec![SandboxLintReport {
+            agent: "fabricated".to_string(),
+            summary: "config projected: 3 files · 1 need a read-only mount".to_string(),
+            actionable: vec![(
+                "~/.fabricated/mcp.json → mcpServers.docs".to_string(),
+                "names a host path the place does not mount".to_string(),
+            )],
+        }];
+        s.lint = Some(&reports);
+        let after: Vec<String> = editor_footer_lines(&s).iter().map(text).collect();
+        assert!(
+            after
+                .iter()
+                .any(|l| l.contains("checked against this form")),
+            "{after:?}"
+        );
+        assert!(after.iter().any(|l| l.contains("fabricated")), "{after:?}");
+        assert!(
+            after.iter().any(|l| l.contains("mcpServers.docs")),
+            "{after:?}"
+        );
+    }
+
+    /// A policy profile is not offered the pass at all: nothing of the user's
+    /// configuration is projected, because the agent reads the host's own.
+    #[test]
+    fn a_policy_profile_is_not_offered_the_config_check() {
+        let mut s = state();
+        s.effective_backend = SandboxBackendKind::Seatbelt;
+        let lines: Vec<String> = editor_footer_lines(&s).iter().map(text).collect();
+        assert!(
+            !lines.iter().any(|l| l.contains("check config")),
+            "{lines:?}"
+        );
+    }
+
     #[test]
     fn wording_exists_exactly_when_the_rule_refuses_input() {
         let fields = SandboxEditorModal::default().visible_fields();
         for backend in SandboxBackendKind::ALL {
             for network in NetworkMode::ALL {
                 for field in &fields {
-                    let shape = backend.shape();
-                    let reason = unavailable_reason(*field, *backend, shape, *network);
+                    let reason = unavailable_reason(*field, *backend, *network);
                     assert_eq!(
                         reason.is_none(),
-                        sandbox_field_available(*field, shape, *network),
+                        sandbox_field_available(*field, *backend, *network),
                         "{field:?} on {backend} with {network}"
                     );
                     // Every reason is specific, never the generic fallback.

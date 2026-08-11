@@ -2533,13 +2533,12 @@ pub enum SandboxField {
 /// which exempts it for the same reason.
 pub fn sandbox_field_available(
     field: SandboxField,
-    shape: Option<crate::session::SandboxShape>,
+    backend: crate::session::SandboxBackendKind,
     network: crate::session::NetworkMode,
 ) -> bool {
+    let shape = backend.shape();
     match field {
-        SandboxField::Memory | SandboxField::Cpus => {
-            shape.map_or(true, crate::session::SandboxShape::supports_limits)
-        }
+        SandboxField::Memory | SandboxField::Cpus => backend_enforces_limits(backend),
         SandboxField::Image | SandboxField::Containerfile => {
             shape.map_or(true, crate::session::SandboxShape::supports_image)
         }
@@ -2553,6 +2552,49 @@ pub fn sandbox_field_available(
         }
         _ => true,
     }
+}
+
+/// Whether `backend` can enforce a memory or CPU cap, asked of the backend
+/// itself rather than of its shape.
+///
+/// Shape stopped being enough when a third place backend landed: every *place*
+/// can carry a cap in principle, and a WSL distro cannot — all of a host's
+/// distros share one utility VM, and a cap on it is set machine-wide in
+/// `.wslconfig`. Reading the backend's own
+/// [`Caps::limits`](crate::sandbox::Caps) is what keeps this editor from storing
+/// a value the launch would then refuse; a profile that carries one anyway
+/// (imported, or written by an older friring) is still refused there.
+///
+/// Costs no probe: capabilities are constants per backend, and an unresolved
+/// `auto` rules nothing out.
+fn backend_enforces_limits(backend: crate::session::SandboxBackendKind) -> bool {
+    if backend.shape().is_none() {
+        return true;
+    }
+    crate::sandbox::SandboxHost::local_shared()
+        .backend(backend)
+        .map_or(true, |backend| backend.capabilities().limits)
+}
+
+/// What the config-projection lint said about the profile in the form, in the
+/// words the editor renders.
+///
+/// Pre-rendered strings rather than [`crate::sandbox::Finding`]s: `ui` may not
+/// reference `sandbox` (see `tests/architecture_rules.rs`), and the verdicts are
+/// text by the time anything paints them anyway.
+///
+/// One report per agent that declares configuration, because the answer is the
+/// agent's: a profile is not tied to one, and "does this cross?" is decided by
+/// what that agent declares and where it keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxLintReport {
+    /// Whose configuration this is about.
+    pub agent: String,
+    /// The composition line — what crossed and what did not.
+    pub summary: String,
+    /// The entries the user still has a decision to make about: `(entry,
+    /// reason)`, already phrased to stand alone.
+    pub actionable: Vec<(String, String)>,
 }
 
 /// One path row being edited: the text exactly as typed (`~` kept, expanded
@@ -2620,6 +2662,15 @@ pub struct SandboxEditorModal {
     /// than theirs. Filled in by the caller that loaded the row; a form has no
     /// database.
     pub undecoded: Vec<String>,
+    /// What the config-projection lint last said, per agent, or `None` until
+    /// the user asks for it with `Ctrl+L`.
+    ///
+    /// A **snapshot of the form as it read when it was asked for**, not live
+    /// state: the pass reads the user's configuration off disk, so recomputing
+    /// it on every keystroke would make the editor stat and parse a dozen files
+    /// per character. Asking again is one keystroke, and the panel says which
+    /// question it answered.
+    pub lint: Option<Vec<SandboxLintReport>>,
 }
 
 impl Default for SandboxEditorModal {
@@ -2689,6 +2740,7 @@ impl SandboxEditorModal {
             field: SandboxField::default(),
             created_at: profile.created_at,
             undecoded: Vec::new(),
+            lint: None,
         }
     }
 
@@ -2735,7 +2787,7 @@ impl SandboxEditorModal {
     /// Whether `field` accepts input right now (see
     /// [`sandbox_field_available`]).
     pub fn field_available(&self, field: SandboxField) -> bool {
-        sandbox_field_available(field, self.effective_shape(), self.network_mode)
+        sandbox_field_available(field, self.effective_backend(), self.network_mode)
     }
 
     /// The path row `PathText`/`PathMode` edit.
@@ -4914,13 +4966,8 @@ mod tests {
     fn sandbox_row(name: &str) -> crate::ui::sandbox_list_modal::SandboxProfileRow {
         crate::ui::sandbox_list_modal::SandboxProfileRow {
             name: name.to_string(),
-            backend: crate::session::SandboxBackendKind::Auto,
-            resolved: None,
             paths: 1,
-            network: crate::session::NetworkMode::Allowlist,
-            undecoded: Vec::new(),
-            instance: None,
-            unavailable: None,
+            ..Default::default()
         }
     }
 
