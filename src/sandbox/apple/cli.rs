@@ -259,11 +259,17 @@ pub fn probe(host: &dyn ProbeHost) -> AppleDetails {
     // The transport reaches a place with `<tool> exec -i <container> tmux …`;
     // `-i` is what carries the control-mode protocol, and without it every
     // session in a place opens on a pane that never speaks.
+    //
+    // Judged with the same option scan the `run` flags are, not on the word
+    // appearing anywhere: help that mentions only `--non-interactive`, or that
+    // uses the word in a sentence, would otherwise authorise a transport that
+    // always passes `-i` — and a place whose panes never speak is the dead pane
+    // this probe exists to refuse instead.
     let interactive = host
         .run(&program, &["exec", "--help"])
         .ok()
         .filter(ProbeOutput::ok)
-        .is_some_and(|output| output.stdout.to_ascii_lowercase().contains("interactive"));
+        .is_some_and(|output| documented_flags(&output.stdout).contains("interactive"));
     if !interactive {
         return unavailable(
             Availability::needs_fix(
@@ -506,6 +512,27 @@ mod tests {
         );
         let message = probe(&without_i).availability.message();
         assert!(message.contains("interactive"), "{message}");
+
+        // The word alone is not the option. Help that documents the opposite
+        // flag, or that only uses the word in a sentence, would authorise a
+        // transport that always passes `-i` — and a place whose every pane is
+        // silent is what this refusal exists to prevent.
+        for help in [
+            "USAGE: container exec <container-id> ...\nOPTIONS:\n  --non-interactive  Do not \
+             attach\n",
+            "USAGE: container exec <container-id> ...\nRuns a command; the session is not \
+             interactive.\n",
+        ] {
+            let message = probe(&host_answering(&run_help(None), help))
+                .availability
+                .message();
+            assert!(message.contains("does not document"), "{message}");
+        }
+
+        // …and the option itself still authorises it.
+        assert!(probe(&host_answering(&run_help(None), EXEC_HELP))
+            .availability
+            .is_available());
     }
 
     /// The rule every binary that *is* a boundary follows: a copy the sandboxed
