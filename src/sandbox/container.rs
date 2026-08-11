@@ -27,14 +27,22 @@
 //! environment and a command line; [`gc`] decides what to reclaim; [`image`]
 //! decides what to run. Only this file runs a process, and everything it runs
 //! goes through the injected [`ProbeHost`], so no test starts a container.
+//!
+//! One thing here is neither pure nor a process: a filtered profile's place has
+//! to be *shown* to reach the egress proxy's socket before it is used as
+//! though it were filtered, because these engines run their daemon on this
+//! kernel on a Linux host and inside a Linux VM on a Mac or a Windows box, and
+//! nothing about the engine's name says which. See
+//! `ContainerBackend::check_proxy_reachable`.
 
 pub mod engine;
 pub mod gc;
 pub mod image;
 pub mod plan;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
 use std::sync::Arc;
 
@@ -77,6 +85,48 @@ pub const RELAY_BINARY: &str = "friring-cli";
 /// bigger problems than egress.
 pub const RELAY_PORT_SPAN: u16 = 64;
 
+/// What friring asks the place to dial its probe listener with.
+///
+/// tmux rather than a socket tool of friring's own, for two reasons that both
+/// come down to what an image is allowed to be. It is already the first line of
+/// the image contract (`packaging/sandbox/Containerfile`) — the transport runs
+/// tmux *inside* the place — so a place that cannot run it has no session
+/// anyway; and it is a unix-socket client whose whole job is "is a server
+/// listening on this path", which is exactly the question. A one-shot connect
+/// in friring's own CLI would read better and be unusable: `friring-cli` inside
+/// a place is the **image's** copy, so a subcommand added today is absent from
+/// every image built before it, and a probe that refused those would take a
+/// working sandbox away for lack of a binary friring cannot ship into it.
+///
+/// [`DIAL_COMMAND`] is chosen to be one that never starts a server: this asks a
+/// question of a socket, it does not put anything on one.
+const DIALER: &str = "tmux";
+
+/// The tmux command the probe runs, and tmux's own answer when the connect
+/// failed.
+///
+/// `list-sessions` carries no `CMD_STARTSERVER`, so a socket it cannot reach
+/// leaves nothing behind — it prints [`DIAL_REFUSED`] and exits. That sentence
+/// is how the probe tells "the place tried and the kernel said no" from "the
+/// place never got to try", which are two different refusals with two different
+/// fixes.
+const DIAL_COMMAND: &str = "list-sessions";
+
+/// tmux's wording for a `connect(2)` that did not reach a listener.
+const DIAL_REFUSED: &str = "no server running on";
+
+/// How often the probe's listener is polled while the place is being asked to
+/// dial it.
+const DIAL_POLL: Duration = Duration::from_millis(5);
+
+/// How long the probe keeps listening after the dial command has returned.
+///
+/// `listen(2)` queues a connection the moment the client's `connect(2)`
+/// completes, so a client that came and went while the loop was asleep is still
+/// there to accept — but only if the loop is still running. Paid solely on the
+/// failing path: a probe that has already seen its connection stops at once.
+const DIAL_GRACE: Duration = Duration::from_millis(250);
+
 /// The `state` a `sandbox_instances` row carries for a place this backend
 /// handed back.
 ///
@@ -114,6 +164,15 @@ pub struct ContainerBackend {
     /// so the set of relays that exist is exactly the set this process
     /// composed.
     ports: Mutex<HashMap<String, BTreeMap<String, u16>>>,
+    /// The places that have been *shown* to reach a unix socket friring bound
+    /// outside them — see [`ContainerBackend::check_proxy_reachable`].
+    ///
+    /// Keyed on the container id, so a rebuilt place is asked again. Only the
+    /// affirmative answer is kept: it is a property of a live container's kernel
+    /// and mount, and cannot change while that container exists, whereas a
+    /// failure may be a wedged daemon that the next launch should re-ask rather
+    /// than inherit a refusal from.
+    reached: Mutex<HashSet<String>>,
 }
 
 impl ContainerBackend {
@@ -123,6 +182,7 @@ impl ContainerBackend {
             host,
             details: OnceLock::new(),
             ports: Mutex::new(HashMap::new()),
+            reached: Mutex::new(HashSet::new()),
         }
     }
 
@@ -162,7 +222,8 @@ impl ContainerBackend {
     ///
     /// The engine is unavailable, the profile cannot be resolved, a mount cannot
     /// be honoured (`plan::plan_instance`), the image is missing and cannot be
-    /// built, or the container will not start.
+    /// built, the container will not start, or a filtered profile's place cannot
+    /// be shown to reach the egress proxy's socket (`check_proxy_reachable`).
     pub fn ensure_place(&self, profile: &SandboxProfile) -> SandboxResult<EnsuredPlace> {
         let refuse = |detail: String| SandboxError::Refused {
             profile: profile.name.clone(),
@@ -173,7 +234,14 @@ impl ContainerBackend {
 
         let id = self.start_or_create(&plan, &refuse)?;
         let relay_program = if proxy_required(&policy) {
-            Some(self.resolve_relay(&id, &plan.image, &refuse)?)
+            // Order matters to the sentence a user reads: the image contract is
+            // asked first, because "your image has no friring-cli" is a fix in
+            // the image and "this place cannot dial a socket friring bound" is a
+            // fix in the host or the profile, and quoting the second at someone
+            // whose image is simply incomplete would send them the wrong way.
+            let relay = self.resolve_relay(&id, &plan.image, &refuse)?;
+            self.check_proxy_reachable(&id, &policy, &refuse)?;
+            Some(relay)
         } else {
             None
         };
@@ -466,6 +534,100 @@ impl ContainerBackend {
         })
     }
 
+    /// Prove that this place can reach a unix socket friring binds outside it,
+    /// and refuse the profile when it cannot.
+    ///
+    /// Every filtered mode is enforced by friring's proxy *outside* the
+    /// boundary, reached over a bind-mounted unix socket and a relay inside the
+    /// namespace (ADR-27). That works where the place shares friring's kernel,
+    /// because an `AF_UNIX` listener lives in the kernel that called `bind(2)`
+    /// — and **docker and podman are not always on this kernel**. Docker
+    /// Desktop, `podman machine` and colima all run the daemon in a Linux VM, so
+    /// a mount carries the socket *file* across and `connect(2)` on it inside
+    /// finds no listener in the guest's own table. The place would then be
+    /// started on `--network none` with a relay dialling nothing: no egress at
+    /// all, under a profile whose UI says the allowlist is being applied.
+    ///
+    /// So it is **asked rather than assumed**. friring binds a listener under
+    /// the place's own directory — which the plan mounts at the same absolute
+    /// path — and has the place dial it ([`DIALER`]). The observation is
+    /// friring's own accept on the host side, not a guest tool's exit status:
+    /// what is being measured is whether the connection crossed at all.
+    /// Assuming instead would mean keeping a list of which engines are
+    /// VM-backed on which hosts, which is a list that goes stale.
+    ///
+    /// Both failing answers refuse, and neither is silent. The place is left
+    /// running: it is the profile's, shared by its sessions, and a profile whose
+    /// network the user sets to `full` uses the very same container.
+    ///
+    /// A place's own agent can write that directory, so it can unlink or replace
+    /// the probe socket. Neither buys anything: the worst it can do is make the
+    /// probe fail (a refusal), or make it pass on a host where the socket does
+    /// not really carry — which starts a place with *less* network than the
+    /// profile claims, never more.
+    ///
+    /// # Errors
+    ///
+    /// The place dialled and the connect was refused, friring could not get it
+    /// to dial at all, or the listener could not be bound.
+    fn check_proxy_reachable(
+        &self,
+        container: &str,
+        policy: &crate::session::SandboxPolicy,
+        refuse: &dyn Fn(String) -> SandboxError,
+    ) -> SandboxResult<()> {
+        if self
+            .reached
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(container)
+        {
+            return Ok(());
+        }
+        let place_dir = dirs::place_dir(&policy.profile).ok_or_else(|| {
+            refuse(
+                "friring could not resolve its data directory, so it has nowhere to bind the \
+                 socket this place would have to dial"
+                    .to_string(),
+            )
+        })?;
+        let place_dir = representable(&place_dir, "the place directory", refuse)?;
+
+        let dial = |socket: &str| self.dial_from_place(container, socket);
+        match probe_socket_reach(&place_dir, &dial) {
+            Ok((Reach::Crossed, _)) => {
+                self.reached
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(container.to_string());
+                Ok(())
+            }
+            Ok((Reach::Refused, socket)) => {
+                Err(refuse(socket_does_not_carry(policy, self.engine, &socket)))
+            }
+            Ok((Reach::Unprovable, socket)) => Err(refuse(reach_unprovable(
+                policy,
+                &format!(
+                    "friring bound a listener at '{socket}' and asked the place to connect to it \
+                     with '{DIALER}', which answered with nothing friring can read"
+                ),
+            ))),
+            Err(detail) => Err(refuse(reach_unprovable(policy, &detail))),
+        }
+    }
+
+    /// Ask the place to connect to `socket`, which is at the same absolute path
+    /// inside it as on the host.
+    ///
+    /// The exit status is deliberately ignored — a dialer that reached friring's
+    /// listener and then failed to speak its protocol to it has still answered
+    /// the only question being asked. Its *output* is read for one thing:
+    /// [`DIAL_REFUSED`], which separates a connect the kernel turned down from a
+    /// dialer that never ran.
+    fn dial_from_place(&self, container: &str, socket: &str) -> Result<ProbeOutput, String> {
+        self.engine_run(&["exec", container, DIALER, "-S", socket, DIAL_COMMAND])
+    }
+
     /// What the engine says about one container, or `None` when it has none.
     fn inspect(&self, name_or_id: &str) -> Option<Inspected> {
         let output = self
@@ -689,6 +851,16 @@ impl SandboxBackend for ContainerBackend {
             // The one shape that can: a cgroup is the engine's to set, and both
             // engines take `--memory` and `--cpus`.
             limits: true,
+            // Every mode, because these engines can express every mode — but a
+            // *filtered* one also needs the proxy's socket to carry a listener
+            // into the place, which is a property of the host this engine's
+            // daemon happens to run on rather than of the engine. Nothing here
+            // can consult that: capabilities are static and are read while the
+            // UI paints, and the answer needs a running place. It is measured
+            // once per place instead, in
+            // [`ContainerBackend::check_proxy_reachable`], which refuses the
+            // profile with the fix rather than letting this list promise
+            // something the boundary would not deliver.
             network_modes: NetworkMode::ALL,
             // A place has no host filesystem to read. `host-minus-secrets` is a
             // statement about the machine friring runs on, and none of it is in
@@ -701,7 +873,9 @@ impl SandboxBackend for ContainerBackend {
             host_credentials: false,
             inner_agent_sandbox: InnerSandboxVerdict::Redundant,
             // `--network none` leaves the place its own loopback and no route to
-            // the host's, so only a bind-mounted socket crosses.
+            // the host's, so a bind-mounted socket is the only transport that
+            // *could* cross. Whether it does on this host is the question
+            // `check_proxy_reachable` settles.
             proxy_transport: ProxyTransport::UnixSocket,
         }
     }
@@ -855,6 +1029,199 @@ fn assign_port(
         return Some(*port);
     }
     (base..base.saturating_add(span)).find(|port| !taken.values().any(|held| held == port))
+}
+
+/// What one reachability probe settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// The place dialled friring's listener: a unix socket carries a *listener*
+    /// across this boundary, which is what a filtered mode is built on.
+    Crossed,
+    /// The place tried and the connect was turned down. The socket file crosses;
+    /// what is bound behind it does not.
+    Refused,
+    /// friring could not get the place to try, so it knows nothing either way —
+    /// which is not the same as knowing it works, and is refused for that
+    /// reason.
+    Unprovable,
+}
+
+/// Decide a probe from what friring saw and what the dialer said.
+///
+/// Separated from the IO so the whole decision is assertable: `observed` is
+/// friring's own accept on the host side, which is the measurement; the dialer's
+/// output only ever downgrades "friring saw nothing" into the more precise
+/// [`Reach::Refused`].
+fn dial_verdict(observed: bool, dialled: &Result<ProbeOutput, String>) -> Reach {
+    if observed {
+        return Reach::Crossed;
+    }
+    let said = match dialled {
+        Ok(output) => format!("{}{}", output.stdout, output.stderr),
+        Err(detail) => detail.clone(),
+    };
+    if said.contains(DIAL_REFUSED) {
+        Reach::Refused
+    } else {
+        Reach::Unprovable
+    }
+}
+
+/// Bind a listener under `place_dir`, have `dial` reach for it from inside the
+/// place, and answer with what happened and the path that was dialled.
+///
+/// The listener is friring's, on the host, in a directory the place mounts at
+/// the same absolute path — so the only thing standing between the two is the
+/// boundary itself. Bound `0600` inside a `0700` directory, removed before this
+/// returns, and named with a nonce so two friring processes probing the same
+/// place at once do not collide on it (and so nothing planted at a predictable
+/// name is ever adopted: `bind(2)` fails on an existing path rather than
+/// replacing it, which refuses the launch instead of dialling a socket somebody
+/// else is holding).
+///
+/// The accept runs on a thread of its own because the dial blocks: a client's
+/// `connect(2)` completes as soon as the kernel queues it, but a dialer that
+/// then waits for a reply waits until something accepts.
+///
+/// # Errors
+///
+/// The path cannot be named exactly, or the listener cannot be bound.
+#[cfg(unix)]
+fn probe_socket_reach(
+    place_dir: &str,
+    dial: &dyn Fn(&str) -> Result<ProbeOutput, String>,
+) -> Result<(Reach, String), String> {
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nonce = format!(
+        "{}-{}-{:?}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
+        std::time::SystemTime::now()
+    );
+    let path = std::path::Path::new(place_dir).join(format!("re{}.sock", dirs::digest(&nonce)));
+    let socket = path
+        .to_str()
+        .ok_or_else(|| {
+            format!(
+                "the probe socket path ('{}') is not valid UTF-8, so friring cannot name it to \
+                 the place",
+                path.display()
+            )
+        })?
+        .to_string();
+
+    let listener = UnixListener::bind(&path).map_err(|e| {
+        format!(
+            "friring could not bind the listener it would have the place dial, at '{socket}': {e}"
+        )
+    })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("friring could not poll its listener at '{socket}': {e}"))?;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    let observed = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let accepting = std::thread::spawn({
+        let (observed, stop) = (Arc::clone(&observed), Arc::clone(&stop));
+        move || {
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    // Accepted and dropped at once. The measurement *is* the
+                    // arrival: nothing is read from the connection, so nothing
+                    // the place sends can influence the answer, and closing it
+                    // is what lets the dialer stop waiting and exit.
+                    Ok(_) => {
+                        observed.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(DIAL_POLL);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+
+    let dialled = dial(&socket);
+    if !observed.load(Ordering::Relaxed) {
+        std::thread::sleep(DIAL_GRACE);
+    }
+    stop.store(true, Ordering::Relaxed);
+    let _ = accepting.join();
+    let _ = std::fs::remove_file(&path);
+    Ok((
+        dial_verdict(observed.load(Ordering::Relaxed), &dialled),
+        socket,
+    ))
+}
+
+/// A host with no unix sockets has nothing for a place to dial, and nothing for
+/// the proxy to listen on either (ADR-27) — so the question is answered without
+/// asking it.
+#[cfg(not(unix))]
+fn probe_socket_reach(
+    _place_dir: &str,
+    _dial: &dyn Fn(&str) -> Result<ProbeOutput, String>,
+) -> Result<(Reach, String), String> {
+    Err(
+        "this host has no unix sockets, and the egress proxy a filtered mode needs is reached \
+         over one"
+            .to_string(),
+    )
+}
+
+/// The refusal for a place that dialled and was turned down.
+///
+/// The container engines' [`crate::sandbox::apple::plan::egress_refusal`],
+/// which says the same thing about a VM whose kernel is not the host's — the
+/// difference is only that this one had to be measured, because docker and
+/// podman are on this kernel on a Linux host and in a Linux VM on a Mac or a
+/// Windows box, and the engine's own name says nothing about which.
+fn socket_does_not_carry(
+    policy: &crate::session::SandboxPolicy,
+    engine: ContainerEngine,
+    socket: &str,
+) -> String {
+    format!(
+        "network mode '{}' is enforced by friring's egress proxy outside the boundary, which a \
+         place reaches over a bind-mounted unix socket — and this place cannot dial one. friring \
+         bound a listener at '{socket}', in a directory the place mounts at that same path, and a \
+         connect from inside it was refused: an AF_UNIX listener lives in the kernel that bound \
+         it, so where {engine} runs its daemon in a Linux VM (Docker Desktop, podman machine, \
+         colima) the mount carries the socket file across and nothing is listening on the far \
+         side. Starting the place anyway would give it '--network none' and a relay dialling \
+         nothing — no egress at all, under a profile that says otherwise. Run this profile on a \
+         {engine} whose daemon is on this machine's kernel, or set its network to 'full' with no \
+         denies here, or run it on seatbelt (which shares the host's network stack) or on bwrap",
+        policy.network
+    )
+}
+
+/// The refusal for a place friring could not get an answer out of.
+///
+/// Separate from [`socket_does_not_carry`] because the fix is: the boundary may
+/// well carry a socket, and what failed is the asking. Refusing anyway is the
+/// same fail-closed rule the rest of this feature applies — "not shown to work"
+/// is not "works". `detail` is a whole clause, because what could not be asked
+/// differs (a listener that would not bind names a path this one never had).
+fn reach_unprovable(policy: &crate::session::SandboxPolicy, detail: &str) -> String {
+    format!(
+        "network mode '{}' is enforced by friring's egress proxy outside the boundary, which a \
+         place reaches over a bind-mounted unix socket — and friring could not prove this place \
+         can dial one: {detail}. A place that cannot be shown to reach the proxy is not started \
+         believing it is filtered, so clear what that reason names — '{DIALER}' has to run inside \
+         the place, which it already has to for the transport — or set this profile's network to \
+         'full' with no denies here, or run it on seatbelt or on bwrap",
+        policy.network
+    )
 }
 
 /// A path the sandbox layer can name exactly, or a refusal.
@@ -1320,6 +1687,155 @@ mod tests {
         assert_eq!(root, granted[0]);
         assert_eq!(found, binary.display().to_string());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A data directory short enough that a socket path under it fits in
+    /// `sun_path`, which the macOS unit-test temp directory does not.
+    fn short_data_dir(name: &str) -> crate::paths::TestPathGuard {
+        crate::paths::TestPathGuard::new(
+            std::path::Path::new("/tmp").join(format!("frc{}{name}", std::process::id())),
+        )
+    }
+
+    /// Whether a place can reach a socket friring bound outside it is
+    /// **measured**, and friring's own accept is the measurement.
+    ///
+    /// The three answers are three different launches: one that may be composed
+    /// as filtered, one that may not because the boundary demonstrably does not
+    /// carry a listener (a VM-backed engine — Docker Desktop, podman machine,
+    /// colima — where the mount carries the socket file and nothing else), and
+    /// one friring could not settle, which is refused for being unsettled
+    /// rather than assumed to work.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_place_that_dials_friring_s_listener_may_be_composed_as_filtered() {
+        use crate::sandbox::probe::ProbeOutput;
+        let dir = std::env::temp_dir().join(format!("frr{}-reach", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let place = dir.display().to_string();
+
+        // Something inside connected. Nothing is read from the connection, so
+        // the dialer's own exit status and output cannot influence this.
+        let (reach, socket) = probe_socket_reach(&place, &|path| {
+            std::os::unix::net::UnixStream::connect(path).map_err(|e| e.to_string())?;
+            Ok(ProbeOutput::failure(1, "protocol version mismatch\n"))
+        })
+        .unwrap();
+        assert_eq!(reach, Reach::Crossed);
+        // And the probe leaves nothing behind in a directory the place mounts.
+        assert!(!std::path::Path::new(&socket).exists(), "{socket}");
+
+        // The connect was turned down: the file crossed, the listener did not.
+        let (reach, _) = probe_socket_reach(&place, &|path| {
+            Ok(ProbeOutput::failure(1, format!("{DIAL_REFUSED} {path}\n")))
+        })
+        .unwrap();
+        assert_eq!(reach, Reach::Refused);
+
+        // Nobody dialled and nobody said why — which is not "it works".
+        for dial in [
+            &|_: &str| Ok(ProbeOutput::success("")) as Result<ProbeOutput, String>,
+            &|_: &str| Err("exec: executable file not found in $PATH".to_string()),
+        ] as [&dyn Fn(&str) -> Result<ProbeOutput, String>; 2]
+        {
+            let (reach, _) = probe_socket_reach(&place, dial).unwrap();
+            assert_eq!(reach, Reach::Unprovable);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole point, at the level a user meets it: a filtered profile whose
+    /// place cannot dial the proxy's socket is refused, with what is unreachable
+    /// named — rather than started on `--network none` with a relay forwarding
+    /// to nothing while the UI reports the allowlist applied.
+    #[cfg(unix)]
+    #[test]
+    fn a_filtered_profile_whose_place_cannot_reach_the_proxy_is_refused() {
+        use crate::sandbox::probe::ProbeOutput;
+        let _paths = short_data_dir("reach");
+        // A real directory of this test's own, resolved: a mount source whose
+        // meaning a symlink could change is refused long before the probe, and
+        // on macOS `/home` is one.
+        let repo = dirs::test_temp_base("reach").join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo = repo.display().to_string();
+        let filtered = SandboxProfile::new("reach", vec![SandboxPath::workspace(repo.clone())]);
+        assert!(
+            proxy_required(
+                &filtered
+                    .resolve(SandboxBackendKind::Podman, "/home/u")
+                    .unwrap()
+            ),
+            "the default network mode is the filtered one this test is about"
+        );
+        let (place, home) = dirs::create_place_dirs("reach").unwrap();
+
+        let scripted = host()
+            .with_path(&repo)
+            .with_path(&place.display().to_string())
+            .with_path(&home.display().to_string())
+            .with_command_prefix(
+                &format!("{PROGRAM} image inspect"),
+                ProbeOutput::success("[{}]\n"),
+            )
+            .with_command_prefix(&format!("{PROGRAM} run"), ProbeOutput::success("abc123\n"))
+            .with_command(
+                &format!("{PROGRAM} exec abc123 /bin/sh -c command -v {RELAY_BINARY}"),
+                ProbeOutput::success("/usr/local/bin/friring-cli\n"),
+            )
+            // The dial: this place is a VM's, so the connect is refused.
+            .with_command_prefix(
+                &format!("{PROGRAM} exec abc123 {DIALER}"),
+                ProbeOutput::failure(1, format!("{DIAL_REFUSED} /sock\n")),
+            );
+        let backend = backend(scripted);
+        let err = backend.ensure_place(&filtered).unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, SandboxError::Refused { .. }), "{text}");
+        // Names the mode, what could not be dialled, and the way out.
+        assert!(text.contains("cannot dial one"), "{text}");
+        assert!(text.contains("/sandbox/pl/reach/"), "{text}");
+        assert!(
+            text.contains("AF_UNIX listener lives in the kernel"),
+            "{text}"
+        );
+        assert!(text.contains("seatbelt"), "{text}");
+
+        // A profile whose mode needs no proxy uses the very same place and is
+        // never asked the question — the place is not torn down over it.
+        let mut open = filtered.clone();
+        open.network_mode = NetworkMode::None;
+        backend.ensure_place(&open).expect("no proxy, no probe");
+        dirs::cleanup_place("reach");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Once per place, not once per session: the answer is a property of a live
+    /// container's kernel and mounts, and re-dialling on every launch would put
+    /// an `exec` on the path of every relaunch of every session in it.
+    #[cfg(unix)]
+    #[test]
+    fn a_place_already_shown_to_reach_the_proxy_is_not_dialled_again() {
+        let _paths = short_data_dir("reach-cache");
+        let backend = backend(host());
+        let policy = resolved(|_| {});
+        let refuse = |detail: String| SandboxError::Refused {
+            profile: policy.profile.clone(),
+            detail,
+        };
+        // Nothing is scripted to answer an `exec`, so a second dial could only
+        // fail: reaching `Ok` proves none was made.
+        backend
+            .reached
+            .lock()
+            .unwrap()
+            .insert("already-proven".to_string());
+        backend
+            .check_proxy_reachable("already-proven", &policy, &refuse)
+            .expect("a place proven once is not asked again");
+        assert!(backend
+            .check_proxy_reachable("never-asked", &policy, &refuse)
+            .is_err());
     }
 
     /// Nothing may be ensured on a host without the engine, and the reason is
