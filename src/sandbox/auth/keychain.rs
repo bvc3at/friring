@@ -172,6 +172,31 @@ pub trait SecretStore: Send + Sync {
     /// decides whether the user is told to sign in or told to unlock something.
     fn get(&self, key: &SecretKey) -> Result<Option<Secret>, String>;
 
+    /// Whether an entry exists under `key`, **without extracting its value**.
+    ///
+    /// A listing only ever needs this much, and asking it with
+    /// [`get`](Self::get) costs more than the answer is worth: on macOS the
+    /// value flag is what makes `security` open the item, so a caller checking
+    /// every declared variable pulls every one of the user's tokens into
+    /// friring's address space and can raise a keychain prompt per entry — for a
+    /// yes/no it never prints.
+    ///
+    /// The default *does* read, because a store whose tool has no metadata-only
+    /// query has no other way to ask; an implementation with one overrides this.
+    /// Where they differ is an entry holding nothing but whitespace: `get`
+    /// reports that as absent (a cleared entry is not a token), while a query
+    /// that never sees the value can only say the entry is there. So this
+    /// answers "friring holds an entry", not "a launch would find a token in
+    /// it".
+    ///
+    /// # Errors
+    ///
+    /// The store is there and would not answer — the same distinction
+    /// [`get`](Self::get) draws between a missing entry and a locked store.
+    fn contains(&self, key: &SecretKey) -> Result<bool, String> {
+        Ok(self.get(key)?.is_some())
+    }
+
     /// Whether [`set`](Self::set) can write `key` at all, or `Err` with the
     /// reason and the command that can.
     ///
@@ -350,6 +375,31 @@ impl SecretStore for SystemKeychain {
             .trim_end_matches(['\n', '\r'])
             .to_string();
         Ok(Some(Secret::new(value)).filter(|s| !s.is_empty()))
+    }
+
+    /// The same query as [`get`](SecretStore::get) **minus `-w`** on macOS: the
+    /// value flag is the one that makes `security` open the item, so without it
+    /// the tool matches on the attributes alone and prints no token — nothing to
+    /// scrub out of a buffer, and no per-item keychain prompt for a caller that
+    /// only wanted a yes.
+    ///
+    /// `secret-tool` has no metadata-only form (`search` prints `secret = …`
+    /// alongside the attributes), so Linux keeps the default, which reads the
+    /// value and drops it.
+    fn contains(&self, key: &SecretKey) -> Result<bool, String> {
+        let KeychainKind::MacSecurity = self.kind else {
+            return Ok(self.get(key)?.is_some());
+        };
+        let account = key.account();
+        let output = self.run(&["find-generic-password", "-s", SERVICE, "-a", &account])?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match missing_entry(&stderr) {
+            true => Ok(false),
+            false => Err(first_line(&stderr, "the credential store would not answer")),
+        }
     }
 
     fn can_store(&self, key: &SecretKey) -> Result<(), String> {
@@ -600,6 +650,10 @@ pub struct StubStore {
     /// How many times [`SecretStore::get`] was called — the assertion behind
     /// "a policy backend never looks for a token".
     reads: std::sync::atomic::AtomicUsize,
+    /// How many times [`SecretStore::contains`] was called. Counted apart from
+    /// [`reads`](Self::reads) so a test can assert a caller asked whether an
+    /// entry exists *instead of* taking its value.
+    existence_checks: std::sync::atomic::AtomicUsize,
     /// A store that is present but will not answer (a locked keychain).
     failure: Option<String>,
     /// A store that can be read but not written — the macOS shape, where
@@ -641,6 +695,11 @@ impl StubStore {
     pub fn reads(&self) -> usize {
         self.reads.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    pub fn existence_checks(&self) -> usize {
+        self.existence_checks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -668,6 +727,21 @@ impl SecretStore for StubStore {
             .expect("uncontended")
             .get(&key.account())
             .map(|value| Secret::new(value.clone())))
+    }
+
+    /// Answers without going through [`get`](SecretStore::get), so `reads`
+    /// stays at zero for a caller that only asked whether an entry exists.
+    fn contains(&self, key: &SecretKey) -> Result<bool, String> {
+        self.existence_checks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(reason) = &self.failure {
+            return Err(reason.clone());
+        }
+        Ok(self
+            .entries
+            .lock()
+            .expect("uncontended")
+            .contains_key(&key.account()))
     }
 
     fn set(&self, key: &SecretKey, secret: &Secret) -> Result<(), String> {
@@ -863,6 +937,76 @@ mod tests {
         let err = store.set(&key, &Secret::new(FAKE)).unwrap_err();
         assert!(err.contains("locked"), "{err}");
         assert!(!err.contains(FAKE), "{err}");
+    }
+
+    /// "Is there one?" is asked without the flag that hands the value over.
+    ///
+    /// The same shape as the stdin test above, and for the same reason: every
+    /// other test here answers with a stub, so none of them observes what a
+    /// spawned tool is actually *handed*. This one points [`SystemKeychain`] at
+    /// a script that records its own argv, so "the existence check never asks
+    /// for the value" is checked against a real `Command`. Nothing here goes
+    /// near a keychain — the script is the whole tool, and the one it stands in
+    /// for is macOS's `security`, whose `-w` is what opens the item, prints the
+    /// token and can raise a per-entry prompt.
+    #[cfg(unix)]
+    #[test]
+    fn an_existence_check_never_asks_the_tool_for_the_value() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let argv_log = dir.path().join("argv");
+        let script = dir.path().join("fake-security");
+        let write = |path: &std::path::Path, body: &str| {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        write(
+            &script,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'password has been \
+                 deleted.\\n'\n",
+                argv_log.display()
+            ),
+        );
+
+        let store = SystemKeychain::new(KeychainKind::MacSecurity, script.to_str().unwrap());
+        let key = SecretKey::new("claude", "ANTHROPIC_API_KEY").unwrap();
+        assert!(store.contains(&key).unwrap());
+
+        let argv = std::fs::read_to_string(&argv_log).unwrap();
+        assert!(argv.contains("find-generic-password"), "{argv}");
+        assert!(argv.contains(SERVICE), "{argv}");
+        assert!(argv.contains("claude/ANTHROPIC_API_KEY"), "{argv}");
+        // The whole point: no `-w`, so the tool matches on attributes and hands
+        // back no token.
+        assert!(
+            !argv.lines().any(|arg| arg == "-w"),
+            "the existence check asked for the value: {argv}"
+        );
+
+        // A tool that exits non-zero saying the entry is not there is an
+        // absence, and one that exits non-zero for any other reason is a
+        // condition the user can act on — the same split `get` makes.
+        let missing = dir.path().join("empty-security");
+        write(
+            &missing,
+            "#!/bin/sh\nprintf 'security: SecKeychainSearchCopyNext: The specified item could \
+             not be found in the keychain.\\n' >&2\nexit 44\n",
+        );
+        let store = SystemKeychain::new(KeychainKind::MacSecurity, missing.to_str().unwrap());
+        assert!(!store.contains(&key).unwrap());
+
+        let locked = dir.path().join("locked-security");
+        write(
+            &locked,
+            "#!/bin/sh\nprintf 'User interaction is not allowed.\\n' >&2\nexit 36\n",
+        );
+        let store = SystemKeychain::new(KeychainKind::MacSecurity, locked.to_str().unwrap());
+        assert_eq!(
+            store.contains(&key).unwrap_err(),
+            "User interaction is not allowed."
+        );
     }
 
     #[test]
