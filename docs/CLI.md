@@ -79,7 +79,7 @@ the same places its manager view drives, and the same refusals a launch makes.
 | Command | Does |
 |---|---|
 | `sandbox list [--instances]` | Every profile: resolved backend, path count, network mode, and why the backend is unavailable here when it is. `--instances` adds each profile's live places. |
-| `sandbox show <name>` | One profile in full, with its places and the launch refusals it would hit. |
+| `sandbox show <name>` | One profile in full: its places, any columns friring could not decode, and whether its backend is available here. |
 | `sandbox rm <name> [--force]` | Delete a profile. Refused while sessions reference it unless `--force`; the place tree and the profile's login are kept while anything still names it. |
 | `sandbox prune [--profile <name>] [--dry-run]` | Reclaim superseded and orphaned places, through the same decision the TUI's background pass makes. |
 | `sandbox export [<name>] [--output <file>]` | One profile, or every profile, as a `[[profile]]` TOML document. `--output` refuses to overwrite. |
@@ -87,7 +87,7 @@ the same places its manager view drives, and the same refusals a launch makes.
 | `sandbox token set <agent> [VAR]` / `token rm <agent> [VAR]` / `token list` | The `env-token` value in friring's own OS keychain entry. `VAR` may be omitted when the agent declares exactly one. |
 | `sandbox relay` | **Internal** — see below. |
 
-Four things about it are deliberate:
+Five things about it are deliberate:
 
 - **A token is never an argument.** `token set` takes no value: it reads stdin
   when one is piped, otherwise it prompts with echo off, and the value is never
@@ -97,6 +97,11 @@ Four things about it are deliberate:
   value is asked for, and so is "this host's store cannot be written to", so a
   refused token is never one you have to rotate. `token list` answers whether
   friring holds each variable an agent declares, never what it holds.
+- **`show` renders a profile; it does not validate one.** It prints the stored
+  fields, the profile's places, any column friring could not decode, and whether
+  the backend is available on this host. The path and boundary refusals are made
+  where a profile is written or used — the editor's save and an import, and again
+  at the launch itself — so a legacy row a launch would refuse still prints here.
 - **An import is refused for anything a launch would refuse**, in the launch's
   own words: a read-write root enclosing the data directory, a path in either
   mode reaching friring's sandbox state or a container engine's control socket.
