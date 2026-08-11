@@ -220,6 +220,13 @@ impl App {
     /// rows; the live [`SessionInfo`](crate::session::SessionInfo)s are a
     /// separate copy, and the next full-row write-back would put the old name
     /// straight back.
+    ///
+    /// The opened-container map is keyed on the same `sandbox:<profile>` name
+    /// `sessions.backend_type` holds, so it moves with the rename too: left
+    /// behind, its ids would be filed under a backend name no session has any
+    /// more, and the reclaiming pass would fall back to protecting the profile
+    /// whole ([`places_in_use`](Self::places_in_use)) rather than the containers
+    /// this instance actually opened.
     fn rename_sandbox_profile_in_sessions(&mut self, from: &str, to: &str) {
         for session in &mut self.sessions {
             if session
@@ -230,6 +237,13 @@ impl App {
             {
                 session.info.sandbox_profile = Some(to.to_string());
             }
+        }
+        let old = format!("{}{from}", crate::session::SANDBOX_BACKEND_PREFIX);
+        if let Some(opened) = self.place_containers.remove(&old) {
+            self.place_containers
+                .entry(format!("{}{to}", crate::session::SANDBOX_BACKEND_PREFIX))
+                .or_default()
+                .extend(opened);
         }
     }
 
@@ -421,6 +435,11 @@ impl App {
     /// container of that profile by name. Either way the cost is a superseded
     /// container surviving until those sessions end; the alternative is pulling
     /// a place out from under a running agent.
+    ///
+    /// The names are lowercased, because the three spellings this has to line up
+    /// need not agree: a session records the spelling it was created with, a
+    /// container carries the one its label was baked with, and the profile row
+    /// carries the one it is stored under.
     fn places_in_use(&self) -> PlacesInUse {
         let mut ids: HashSet<String> = HashSet::new();
         let mut profiles: HashSet<String> = HashSet::new();
@@ -432,7 +451,7 @@ impl App {
             match self.place_containers.get(&shared.backend_type) {
                 Some(opened) => ids.extend(opened.iter().cloned()),
                 None => {
-                    profiles.insert(profile.to_string());
+                    profiles.insert(profile.to_ascii_lowercase());
                 }
             }
         }
@@ -489,15 +508,31 @@ impl App {
     ///
     /// The counts are read here rather than in the renderer, so the sentence the
     /// user reads is the one friring is actually about to act on.
+    ///
+    /// The place count comes from the **engines**, not from `sandbox_instances`:
+    /// a row whose container is already gone would inflate it and an adopted
+    /// container no row describes would hide from it, and the job this question
+    /// authorises acts on what the engines hold either way. Asked here, on the
+    /// keystroke, rather than on the background slot the job itself takes: a
+    /// destructive confirmation that armed itself asynchronously could land on
+    /// whichever row the selection had reached by then. It costs one container
+    /// listing per **installed** engine — [`live_places_here`] asks the cached
+    /// probe first, so a host with no engine spawns nothing.
+    ///
+    /// The recorded ids go with the profile name for the reason the job's own
+    /// filter takes them: an engine cannot relabel a running container, so
+    /// after a rename the row is the only half that says the new name.
+    ///
+    /// [`live_places_here`]: crate::sandbox::live_places_here
     fn request_place_action(&mut self, action: PlaceAction) {
-        let Some((name, places)) = (match self.modal {
-            modals::Modal::SandboxList(ref sl) => sl
-                .selected()
-                .map(|row| (row.name.clone(), row.places.len())),
+        let Some(name) = (match self.modal {
+            modals::Modal::SandboxList(ref sl) => sl.selected().map(|row| row.name.clone()),
             _ => None,
         }) else {
             return;
         };
+        let recorded = self.recorded_place_ids(&name);
+        let places = crate::agent::sandboxing::running_places(&name, &recorded).len();
         if action == PlaceAction::Stop && places == 0 {
             self.set_status(
                 StatusLevel::Info,
@@ -519,11 +554,11 @@ impl App {
         };
         let question = match action {
             PlaceAction::Stop => {
-                format!("Stop and remove {places} place(s) of '{name}'? {cost}.")
+                format!("Stop and remove the {places} place(s) '{name}' is running? {cost}.")
             }
             PlaceAction::Rebuild => format!(
-                "Rebuild '{name}'? its {places} place(s) go and a fresh one starts from the \
-                 profile as it is now — {cost}."
+                "Rebuild '{name}'? the {places} place(s) it is running go and a fresh one starts \
+                 from the profile as it is now — {cost}."
             ),
         };
         self.clear_place_confirmations();
@@ -578,6 +613,18 @@ impl App {
                 }
             }
         }
+    }
+
+    /// The `sandbox_instances` ids friring holds for `name`, without their
+    /// engines — what a question and a teardown need to find a container whose
+    /// label a rename left behind.
+    fn recorded_place_ids(&self, name: &str) -> Vec<String> {
+        self.db
+            .list_sandbox_instances_for_profile(name)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| row.external_id)
+            .collect()
     }
 
     /// Remove a profile's places, and for a rebuild start a fresh one.
@@ -1294,9 +1341,39 @@ pub(crate) struct GcSweep {
 }
 
 /// What a pass must leave alone — see [`App::places_in_use`].
+///
+/// Both name sets are lowercased;
+/// [`profile_names_of`](crate::sandbox::container::gc::profile_names_of)
+/// lowercases what it compares against them.
 struct PlacesInUse {
     ids: HashSet<String>,
     profiles: HashSet<String>,
+}
+
+/// The live containers a pass must keep, whatever else is true of them.
+///
+/// Split out of [`GcSweep::run`] because it is the whole of the "would this
+/// reap a place an agent is working in?" question and the rest of `run` needs
+/// an engine: this way the answer is a unit test rather than a container.
+///
+/// A container is tested against **both** names it could answer to
+/// ([`profile_names_of`](crate::sandbox::container::gc::profile_names_of)), the
+/// row's and the label's, because a rename keeps only the first current.
+fn protected_ids(
+    live: &[crate::sandbox::container::LiveContainer],
+    records: &[crate::sandbox::container::InstanceRecord],
+    in_use: &PlacesInUse,
+    unplannable: &HashSet<String>,
+) -> Vec<String> {
+    live.iter()
+        .filter(|container| {
+            in_use.ids.contains(&container.id)
+                || crate::sandbox::container::gc::profile_names_of(container, records)
+                    .iter()
+                    .any(|name| in_use.profiles.contains(name) || unplannable.contains(name))
+        })
+        .map(|container| container.id.clone())
+        .collect()
 }
 
 /// What a finished pass leaves for the UI thread to write down.
@@ -1363,20 +1440,11 @@ impl GcSweep {
                         current.insert(profile.name.clone(), spec);
                     }
                     None => {
-                        unplannable.insert(profile.name.clone());
+                        unplannable.insert(profile.name.to_ascii_lowercase());
                     }
                 }
             }
-            let in_use: Vec<String> = live
-                .iter()
-                .filter(|container| {
-                    self.in_use.ids.contains(&container.id)
-                        || container.profile.as_ref().is_some_and(|profile| {
-                            self.in_use.profiles.contains(profile) || unplannable.contains(profile)
-                        })
-                })
-                .map(|container| container.id.clone())
-                .collect();
+            let in_use = protected_ids(&live, &records, &self.in_use, &unplannable);
 
             let mut plan = crate::sandbox::container::gc_plan(crate::sandbox::container::GcInput {
                 records: &records,
@@ -1443,6 +1511,43 @@ impl GcSweep {
     }
 }
 
+/// Which of one engine's live containers a [`PlaceJob`] is about to remove.
+///
+/// Split out of [`PlaceJob::run`] for the reason [`protected_ids`] is split out
+/// of [`GcSweep::run`]: the rest of `run` needs an engine, and this is the whole
+/// of "does the job act on exactly what the question promised?".
+///
+/// Both names a container can answer to, and that is what keeps it in step with
+/// the confirmation the user gave — `request_place_action` counts through
+/// [`running_places`](crate::agent::sandboxing::running_places), which asks the
+/// same pair. An engine cannot relabel a running container, so after a rename
+/// the label carries the old name and only the recorded rows carry the new one:
+/// matched on the label alone this job would report a renamed profile's places
+/// stopped while leaving every one of them running.
+///
+/// The record match is scoped to `engine`, because an id is only unique within
+/// one of them.
+fn job_targets(
+    live: &[crate::sandbox::container::LiveContainer],
+    profile: &str,
+    records: &[(SandboxBackendKind, String)],
+    engine: SandboxBackendKind,
+) -> Vec<String> {
+    live.iter()
+        .filter(|container| container.owned)
+        .filter(|container| {
+            container
+                .profile
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(profile))
+                || records
+                    .iter()
+                    .any(|(kind, id)| *kind == engine && *id == container.id)
+        })
+        .map(|container| container.id.clone())
+        .collect()
+}
+
 /// The manager view's stop and rebuild, on the same background slot as the
 /// reclaiming pass and answering with the same outcome.
 ///
@@ -1489,17 +1594,7 @@ impl PlaceJob {
                     continue;
                 }
             };
-            let mine: Vec<String> = live
-                .iter()
-                .filter(|container| container.owned)
-                .filter(|container| {
-                    container
-                        .profile
-                        .as_deref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(&self.profile.name))
-                })
-                .map(|container| container.id.clone())
-                .collect();
+            let mine = job_targets(&live, &self.profile.name, &self.records, engine);
             if mine.is_empty() {
                 continue;
             }
@@ -1933,26 +2028,9 @@ mod tests {
         let profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
         app.db.upsert_sandbox_profile(&profile).unwrap();
 
-        let shared = crate::sync::SharedSession {
-            id: crate::session::SessionId::default(),
-            name: "demo".into(),
-            agent: "claude".into(),
-            backend_id: String::new(),
-            backend_type: "sandbox:dev".into(),
-            agent_session_id: Some("conv".into()),
-            cwd: None,
-            additional_dirs: Vec::new(),
-            workspace_dir: None,
-            worktrees: Vec::new(),
-            shell_backend_id: None,
-            sandbox_profile: Some("dev".into()),
-            sandbox_enforcement: Default::default(),
-            parent_session_id: None,
-            display_order: None,
-            tombstone: false,
-            tombstone_at: None,
-        };
-        app.db.upsert_session(&shared).unwrap();
+        app.db
+            .upsert_session(&sandboxed_session("demo", "dev"))
+            .unwrap();
 
         // Nothing opened this place here, so the profile is protected whole.
         let in_use = app.places_in_use();
@@ -1982,6 +2060,191 @@ mod tests {
         assert!(in_use.profiles.is_empty());
     }
 
+    /// A live session's `SharedSession` row, sandboxed under `profile`.
+    fn sandboxed_session(name: &str, profile: &str) -> crate::sync::SharedSession {
+        crate::sync::SharedSession {
+            id: crate::session::SessionId::default(),
+            name: name.into(),
+            agent: "claude".into(),
+            backend_id: String::new(),
+            backend_type: format!("sandbox:{profile}"),
+            agent_session_id: None,
+            cwd: None,
+            additional_dirs: Vec::new(),
+            workspace_dir: None,
+            worktrees: Vec::new(),
+            shell_backend_id: None,
+            sandbox_profile: Some(profile.into()),
+            sandbox_enforcement: Default::default(),
+            parent_session_id: None,
+            display_order: None,
+            tombstone: false,
+            tombstone_at: None,
+        }
+    }
+
+    /// Renaming a profile must not hand its running place to the pass.
+    ///
+    /// A container's profile label is baked in at create and cannot be
+    /// relabelled, while the rename rewrites the profile row, the instance rows
+    /// and the session's `sandbox:<profile>` in one transaction — so the
+    /// protection set holds the new name and the container still answers to the
+    /// old one. Matched on the label alone, the place an agent is working in
+    /// reads as a place whose profile is gone, and rule 3 stops and removes it.
+    ///
+    /// Driven through the manager's `p`, which is
+    /// [`sandbox_gc_input`](App::sandbox_gc_input) plus the pure decision:
+    /// running the sweep itself would ask a real engine, and this is the whole
+    /// of what it would decide.
+    #[test]
+    fn a_renamed_profiles_live_place_is_not_reclaimed_out_from_under_it() {
+        use crate::sandbox::container::{InstanceRecord, LiveContainer};
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let mut app = crate::app::tests::app_with_sessions(0);
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.backend = SandboxBackendKind::Podman;
+        app.db.upsert_sandbox_profile(&profile).unwrap();
+        app.db
+            .upsert_sandbox_instance(&crate::storage::sandboxes::SandboxInstance::new(
+                "dev",
+                SandboxBackendKind::Podman,
+                "ctr",
+                "running",
+            ))
+            .unwrap();
+        // A session this instance did not open the place for — another
+        // friring's, or one restored across a restart — which is the case that
+        // protects by name rather than by id.
+        app.db
+            .upsert_session(&sandboxed_session("boxed", "dev"))
+            .unwrap();
+
+        // What the editor does when the name changes.
+        assert!(app.db.rename_sandbox_profile("dev", "dev2").unwrap());
+        app.rename_sandbox_profile_in_sessions("dev", "dev2");
+
+        let sweep = app
+            .sandbox_gc_input(Some("dev2".to_string()))
+            .expect("a sweep with one place profile");
+        let records: Vec<InstanceRecord> = sweep
+            .records
+            .iter()
+            .map(|(_, record)| record.clone())
+            .collect();
+        assert_eq!(records[0].profile, "dev2", "the row moved with the rename");
+        // The container cannot be relabelled, so it still says `dev`.
+        let live = [LiveContainer {
+            id: "ctr".to_string(),
+            profile: Some("dev".to_string()),
+            spec: Some("a-spec".to_string()),
+            owned: true,
+        }];
+
+        let in_use = protected_ids(&live, &records, &sweep.in_use, &HashSet::new());
+        assert_eq!(in_use, ["ctr"], "the live place is protected");
+
+        // …and that is the only thing standing between it and removal: to every
+        // other rule this is a container whose profile no longer exists.
+        let current =
+            std::collections::BTreeMap::from([("dev2".to_string(), "another-spec".to_string())]);
+        let plan = crate::sandbox::container::gc_plan(crate::sandbox::container::GcInput {
+            records: &records,
+            live: &live,
+            current: &current,
+            in_use: &in_use,
+            now: 10_000,
+            idle_after_ms: None,
+        });
+        assert!(plan.remove.is_empty(), "{plan:?}");
+        assert!(plan.forget.is_empty(), "{plan:?}");
+    }
+
+    /// The manager view's stop and rebuild act on **exactly** what the
+    /// confirmation counted, across a rename.
+    ///
+    /// The question is asked through `running_places`, which matches a container
+    /// on the recorded row as well as on the label. So this must too, or a
+    /// renamed profile's `s` reports "stopped 0 place(s)" while every one of them
+    /// keeps running with an agent inside — a job that says it did something it
+    /// did not.
+    #[test]
+    fn a_place_job_removes_the_containers_the_question_counted_after_a_rename() {
+        use crate::sandbox::container::LiveContainer;
+        let owned = |id: &str, label: Option<&str>| LiveContainer {
+            id: id.to_string(),
+            profile: label.map(str::to_string),
+            spec: Some("a-spec".to_string()),
+            owned: true,
+        };
+        // `ours` still carries the label it was created with; the rename moved
+        // its row to `dev2`. `adopted` carries the label and no row — a place
+        // this friring found after a crash. `stranger` is somebody else's.
+        let live = [
+            owned("ours", Some("dev")),
+            owned("adopted", Some("dev2")),
+            LiveContainer {
+                owned: false,
+                ..owned("stranger", Some("dev2"))
+            },
+            owned("elsewhere", Some("other")),
+        ];
+        let records = vec![(SandboxBackendKind::Podman, "ours".to_string())];
+
+        assert_eq!(
+            job_targets(&live, "dev2", &records, SandboxBackendKind::Podman),
+            ["ours", "adopted"]
+        );
+        // An id is unique within one engine only, so a row recorded against
+        // another engine names nothing here.
+        assert_eq!(
+            job_targets(&live, "dev2", &records, SandboxBackendKind::Docker),
+            ["adopted"]
+        );
+        // And the label half still stands on its own, for a place with no row.
+        assert_eq!(
+            job_targets(&live, "DEV", &[], SandboxBackendKind::Podman),
+            ["ours"],
+            "the label is compared case-insensitively, like every other name here"
+        );
+    }
+
+    /// The narrow protection has to survive a rename too: the ids this instance
+    /// opened are filed under the `sandbox:<profile>` name the session carries,
+    /// and a map left behind at the old name protects nothing.
+    #[test]
+    fn a_rename_carries_the_opened_containers_to_the_new_backend_name() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let mut app = crate::app::tests::app_with_sessions(0);
+        app.db
+            .upsert_session(&sandboxed_session("boxed", "dev"))
+            .unwrap();
+        app.place_containers
+            .entry("sandbox:dev".into())
+            .or_default()
+            .insert("ctr".into());
+        app.db
+            .upsert_sandbox_profile(&SandboxProfile::new(
+                "dev",
+                vec![SandboxPath::workspace("~/dev/app")],
+            ))
+            .unwrap();
+
+        assert!(app.db.rename_sandbox_profile("dev", "dev2").unwrap());
+        app.rename_sandbox_profile_in_sessions("dev", "dev2");
+
+        let in_use = app.places_in_use();
+        assert!(
+            in_use.ids.contains("ctr"),
+            "the opened id followed the name"
+        );
+        assert!(
+            in_use.profiles.is_empty(),
+            "and the protection stayed narrow rather than widening to the profile"
+        );
+    }
+
     /// A pass costs an engine command, so an installation whose profiles could
     /// never own a place does not start one.
     #[test]
@@ -2002,25 +2265,132 @@ mod tests {
 
     // ---- The manager view -------------------------------------------------
 
-    /// An [`App`] holding one place profile with `places` recorded instances,
-    /// with the profile list open on it.
-    fn manager(places: usize) -> (App, crate::paths::TestPathGuard, tempfile::TempDir) {
+    const PODMAN: &str = "/usr/bin/podman";
+
+    /// A podman holding `ids`, every one of them labelled for one profile.
+    ///
+    /// [`StubHost`](crate::sandbox::probe::StubHost) matches a whole command
+    /// line and an `inspect` differs only in the id it ends with, so the two
+    /// commands a listing makes are answered here and everything else is
+    /// delegated. Nothing is started, pulled or built: this *is* the engine, and
+    /// it is a table.
+    struct FakePlaces {
+        base: crate::sandbox::probe::StubHost,
+        ids: Vec<String>,
+        label: String,
+    }
+
+    impl FakePlaces {
+        fn new(label: &str, ids: Vec<String>) -> Self {
+            use crate::sandbox::probe::ProbeOutput;
+            Self {
+                base: crate::sandbox::probe::StubHost::new()
+                    .with_home("/fabricated/home")
+                    .with_command("uname -s", ProbeOutput::success("Linux\n"))
+                    .with_file("/proc/sys/kernel/osrelease", "6.8.0-generic\n")
+                    .with_binary("podman")
+                    .with_command("id -u", ProbeOutput::success("1000\n"))
+                    .with_command("id -g", ProbeOutput::success("1000\n"))
+                    .with_command(
+                        &format!(
+                            "{PODMAN} info --format {}",
+                            "{{.Version.Version}}|{{.Host.Security.Rootless}}"
+                        ),
+                        ProbeOutput::success("5.2.2|true\n"),
+                    ),
+                ids,
+                label: label.to_string(),
+            }
+        }
+    }
+
+    impl crate::sandbox::probe::ProbeHost for FakePlaces {
+        fn which(&self, program: &str) -> Option<String> {
+            crate::sandbox::probe::ProbeHost::which(&self.base, program)
+        }
+
+        fn home(&self) -> Option<String> {
+            crate::sandbox::probe::ProbeHost::home(&self.base)
+        }
+
+        fn path_exists(&self, path: &str) -> bool {
+            crate::sandbox::probe::ProbeHost::path_exists(&self.base, path)
+        }
+
+        fn read_file(&self, path: &str) -> Option<String> {
+            crate::sandbox::probe::ProbeHost::read_file(&self.base, path)
+        }
+
+        fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+        ) -> Result<crate::sandbox::probe::ProbeOutput, String> {
+            type ProbeOutput = crate::sandbox::probe::ProbeOutput;
+            let last = args.last().copied().unwrap_or_default();
+            match (program, args.first().copied()) {
+                (PODMAN, Some("ps")) => Ok(ProbeOutput::success(self.ids.join("\n"))),
+                (PODMAN, Some("inspect")) => Ok(match self.ids.iter().any(|id| id == last) {
+                    true => {
+                        ProbeOutput::success(format!("{last}|running|1|{}|a-spec\n", self.label))
+                    }
+                    false => ProbeOutput::failure(125, "no such container\n"),
+                }),
+                _ => crate::sandbox::probe::ProbeHost::run(&self.base, program, args),
+            }
+        }
+    }
+
+    /// The manager's fixture, with the recorded rows and the running containers
+    /// in step — which is the case a test about anything *else* wants.
+    fn manager(
+        places: usize,
+    ) -> (
+        App,
+        crate::paths::TestPathGuard,
+        tempfile::TempDir,
+        crate::agent::sandboxing::TestSandboxHost,
+    ) {
+        manager_with(places, places)
+    }
+
+    /// An [`App`] holding one place profile with `recorded` instance rows, on an
+    /// engine holding `live` containers of it, with the profile list open.
+    ///
+    /// The two counts are separate because they genuinely disagree in the field:
+    /// a row outlives the container a rebuild replaced until a pass reconciles
+    /// it away, and a container friring adopted after a crash has no row at all.
+    fn manager_with(
+        recorded: usize,
+        live: usize,
+    ) -> (
+        App,
+        crate::paths::TestPathGuard,
+        tempfile::TempDir,
+        crate::agent::sandboxing::TestSandboxHost,
+    ) {
         let (mut app, guard, tmp) = crate::app::state::tests::app_with_sessions(0);
         let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
-        profile.backend = SandboxBackendKind::Docker;
+        profile.backend = SandboxBackendKind::Podman;
         app.db.upsert_sandbox_profile(&profile).unwrap();
-        for n in 0..places {
+        for n in 0..recorded {
             app.db
                 .upsert_sandbox_instance(&crate::storage::sandboxes::SandboxInstance::new(
                     "dev",
-                    SandboxBackendKind::Docker,
+                    SandboxBackendKind::Podman,
                     format!("ctr-{n}"),
                     "running",
                 ))
                 .unwrap();
         }
+        // Every engine question this fixture answers is the stub's, so no test
+        // here depends on what the machine running it happens to have installed.
+        let host =
+            crate::agent::sandboxing::TestSandboxHost::new(SandboxHost::new(std::sync::Arc::new(
+                FakePlaces::new("dev", (0..live).map(|n| format!("ctr-{n}")).collect()),
+            )));
         app.open_sandbox_list();
-        (app, guard, tmp)
+        (app, guard, tmp, host)
     }
 
     fn selected_row(app: &App) -> &SandboxProfileRow {
@@ -2035,10 +2405,10 @@ mod tests {
     /// container running beside the new one.
     #[test]
     fn the_list_shows_every_place_a_profile_owns() {
-        let (app, _g, _t) = manager(2);
+        let (app, _g, _t, _h) = manager(2);
         let row = selected_row(&app);
         assert_eq!(row.places.len(), 2);
-        assert_eq!(row.places[0].engine, SandboxBackendKind::Docker);
+        assert_eq!(row.places[0].engine, SandboxBackendKind::Podman);
         assert!(
             row.summary().contains("2 places · running"),
             "{}",
@@ -2051,28 +2421,10 @@ mod tests {
     /// what the answer costs.
     #[test]
     fn stopping_a_place_asks_first_and_names_what_it_costs() {
-        let (mut app, _g, _t) = manager(2);
+        let (mut app, _g, _t, _h) = manager(2);
         app.sessions.clear();
         app.db
-            .upsert_session(&crate::sync::SharedSession {
-                id: crate::session::SessionId::default(),
-                name: "boxed".into(),
-                agent: "claude".into(),
-                backend_id: String::new(),
-                backend_type: "sandbox:dev".into(),
-                agent_session_id: None,
-                cwd: None,
-                additional_dirs: Vec::new(),
-                workspace_dir: None,
-                worktrees: Vec::new(),
-                shell_backend_id: None,
-                sandbox_profile: Some("dev".into()),
-                sandbox_enforcement: Default::default(),
-                parent_session_id: None,
-                display_order: None,
-                tombstone: false,
-                tombstone_at: None,
-            })
+            .upsert_session(&sandboxed_session("boxed", "dev"))
             .unwrap();
 
         app.handle_sandbox_list_key(KeyCode::Char('s'));
@@ -2095,6 +2447,58 @@ mod tests {
         );
     }
 
+    /// The question counts what the **engines** hold, not what
+    /// `sandbox_instances` records.
+    ///
+    /// The two disagree in both directions, and the job this question authorises
+    /// acts on the engines either way — so a count taken from the rows can
+    /// promise to remove places that are already gone, or refuse to offer a
+    /// container that is right there.
+    #[test]
+    fn the_confirmation_counts_the_places_that_are_actually_running() {
+        // Three rows, one container: two rebuilds nothing has reconciled away.
+        let (mut app, _g, _t, _h) = manager_with(3, 1);
+        assert_eq!(selected_row(&app).places.len(), 3, "the rows say three");
+
+        app.handle_sandbox_list_key(KeyCode::Char('s'));
+
+        let pending = selected_row(&app)
+            .pending
+            .clone()
+            .expect("stopping asks first");
+        assert!(
+            pending.question.contains("1 place(s)"),
+            "{}",
+            pending.question
+        );
+        assert!(
+            !pending.question.contains("3 place(s)"),
+            "{}",
+            pending.question
+        );
+    }
+
+    /// The other direction: a container friring adopted after a crash has no row
+    /// at all, and it is still a place the stop would remove — so the question
+    /// is asked rather than answered with "there is nothing to stop".
+    #[test]
+    fn a_running_place_with_no_row_is_still_offered_for_stopping() {
+        let (mut app, _g, _t, _h) = manager_with(0, 1);
+        assert!(selected_row(&app).places.is_empty(), "no row describes it");
+
+        app.handle_sandbox_list_key(KeyCode::Char('s'));
+
+        let pending = selected_row(&app)
+            .pending
+            .clone()
+            .expect("a running place is stoppable whether or not a row names it");
+        assert!(
+            pending.question.contains("1 place(s)"),
+            "{}",
+            pending.question
+        );
+    }
+
     /// `y` is the only answer that carries it out. `Enter` and `d` already mean
     /// edit and delete on this list, so neither may double as "yes" — and while
     /// a question is armed they do not do their own job either.
@@ -2107,7 +2511,7 @@ mod tests {
             KeyCode::Esc,
             KeyCode::Char('j'),
         ] {
-            let (mut app, _g, _t) = manager(1);
+            let (mut app, _g, _t, _h) = manager(1);
             app.handle_sandbox_list_key(KeyCode::Char('s'));
             assert!(selected_row(&app).pending.is_some());
 
@@ -2136,7 +2540,7 @@ mod tests {
     /// a row whose footer nobody can see.
     #[test]
     fn a_question_the_selection_moved_away_from_is_dropped() {
-        let (mut app, _g, _t) = manager(1);
+        let (mut app, _g, _t, _h) = manager(1);
         let mut second = SandboxProfile::new("other", vec![SandboxPath::workspace("~/dev/lib")]);
         second.backend = SandboxBackendKind::Docker;
         app.db.upsert_sandbox_profile(&second).unwrap();
@@ -2165,7 +2569,7 @@ mod tests {
     /// arming a question whose answer would do nothing.
     #[test]
     fn stopping_a_profile_with_no_place_is_a_message_not_a_question() {
-        let (mut app, _g, _t) = manager(0);
+        let (mut app, _g, _t, _h) = manager(0);
         app.handle_sandbox_list_key(KeyCode::Char('s'));
         assert!(selected_row(&app).pending.is_none());
         assert!(app
@@ -2180,7 +2584,7 @@ mod tests {
     /// stale copy.
     #[test]
     fn confirming_against_a_deleted_profile_refuses_rather_than_acting() {
-        let (mut app, _g, _t) = manager(1);
+        let (mut app, _g, _t, _h) = manager(1);
         app.handle_sandbox_list_key(KeyCode::Char('r'));
         assert!(selected_row(&app).pending.is_some());
         app.db.delete_sandbox_profile("dev").unwrap();
@@ -2199,7 +2603,7 @@ mod tests {
     /// opinions about what to remove.
     #[test]
     fn a_second_place_job_waits_for_the_first() {
-        let (mut app, _g, _t) = manager(1);
+        let (mut app, _g, _t, _h) = manager(1);
         let _busy = app.sandbox_gc.start();
         app.handle_sandbox_list_key(KeyCode::Char('s'));
         app.handle_sandbox_list_key(KeyCode::Char('y'));

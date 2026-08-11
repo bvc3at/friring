@@ -2843,9 +2843,18 @@ impl App {
         removed_session.kill();
 
         if let Some(shared) = shared {
+            // Read here, on the thread that holds the database: the teardown
+            // itself touches no SQLite, and these ids are what find a
+            // place-backed session's container after its profile was renamed.
+            let recorded =
+                crate::session_ops::delete::recorded_places(&self.db, &shared.backend_type);
             tokio::task::spawn_blocking(move || {
                 let mut report = crate::session_ops::delete::ForceDeleteReport::default();
-                crate::session_ops::delete::teardown_runtime_resources(&shared, &mut report);
+                crate::session_ops::delete::teardown_runtime_resources(
+                    &shared,
+                    &recorded,
+                    &mut report,
+                );
             });
         }
 

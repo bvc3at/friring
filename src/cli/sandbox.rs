@@ -565,10 +565,9 @@ fn prune(
         let in_use: Vec<String> = live
             .iter()
             .filter(|container| {
-                container.profile.as_ref().is_some_and(|profile| {
-                    let key = profile.to_ascii_lowercase();
-                    protected.contains(&key) || unplannable.contains(&key)
-                })
+                crate::sandbox::container::gc::profile_names_of(container, &records)
+                    .iter()
+                    .any(|key| protected.contains(key) || unplannable.contains(key))
             })
             .map(|container| container.id.clone())
             .collect();
@@ -1410,9 +1409,11 @@ fn list_tokens(
         agents.sort();
         agents.dedup();
         let key = secret_key(&family, &variable)?;
-        // Presence only. The value is deliberately dropped here rather than
-        // carried anywhere it could be rendered.
-        let stored = store.get(&key)?.is_some();
+        // Presence only, and asked as presence: `contains` omits the flag that
+        // makes a keychain tool hand back the value, so a listing over every
+        // declared variable neither pulls the user's tokens into this process
+        // nor raises a prompt per entry for an answer it does not print.
+        let stored = store.contains(&key)?;
         rows.push(json!({
             "family": family,
             "variable": variable,
@@ -2236,6 +2237,42 @@ mod tests {
         assert_eq!(fixture.engine.ids().len(), 4);
     }
 
+    /// Renaming a profile must not hand its running place to the reclaiming
+    /// pass.
+    ///
+    /// A container's profile label is written at create and cannot be changed,
+    /// while the rename rewrites the profile row, the instance rows and the
+    /// session's `sandbox:<profile>` in one transaction. So the protection set
+    /// holds the new name and the running container still answers to the old
+    /// one: matched on the label alone, the place an agent is working in reads
+    /// as belonging to a profile that no longer exists, and is stopped and
+    /// removed with its row forgotten.
+    #[test]
+    fn a_renamed_profiles_live_place_is_not_reclaimed_out_from_under_it() {
+        let fixture = prune_fixture(FakeEngine::new());
+        fixture.engine.holding(&prune_places(&fixture.spec));
+        for (id, profile) in [
+            ("superseded", "dev"),
+            ("current", "dev"),
+            ("busyplace", "busy"),
+        ] {
+            record(&fixture.db, id, profile);
+        }
+        // What the editor's rename does. `busy` is the profile whose session is
+        // live, so `busyplace` is the container an agent is in.
+        assert!(fixture.db.rename_sandbox_profile("busy", "busy2").unwrap());
+
+        let out = prune(&fixture.db, &fixture.host, None, false).unwrap();
+
+        assert_eq!(ids_in(&out.json["removed"]), ["superseded"]);
+        assert_eq!(ids_in(&out.json["forgotten"]), ["superseded"]);
+        // The place is still there, and so is the only id anything has for it.
+        let mut left = fixture.engine.ids();
+        left.sort();
+        assert_eq!(left, ["busyplace", "current", "foreign"]);
+        assert_eq!(recorded(&fixture.db), ["busyplace", "current"]);
+    }
+
     /// The protection a headless prune applies: it drives no session, so it
     /// cannot know which container one is in and protects every place of every
     /// profile a live session names.
@@ -2689,6 +2726,14 @@ mod tests {
         assert_eq!(claude["agents"], json!(["claude", "fleet"]));
         assert_eq!(tokens[1]["stored"], false);
         assert!(out.human.contains("yes"), "{}", out.human);
+
+        // …and it asked whether an entry is there rather than taking what is in
+        // it. Not printing a value is not the same as not extracting one: the
+        // value-extracting form pulls every declared secret into this process
+        // and can raise a keychain prompt per entry, for an answer that is a
+        // yes/no.
+        assert_eq!(store.reads(), 0, "the listing extracted a value");
+        assert_eq!(store.existence_checks(), tokens.len());
     }
 
     /// A declared name that could never be a keychain entry is reported rather

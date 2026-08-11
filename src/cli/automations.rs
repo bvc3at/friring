@@ -956,7 +956,10 @@ fn fire_send(
         // wrong one would report a running session as not running and never
         // fire.
         Some(profile) => {
-            let found = crate::agent::sandboxing::running_places(profile)
+            // Both names a container could answer to: the label it was created
+            // with, and the rows a profile rename rewrote.
+            let recorded = crate::session_ops::delete::recorded_places(db, &session.backend_type);
+            let found = crate::agent::sandboxing::running_places(profile, &recorded)
                 .iter()
                 .map(crate::agent::tmux::MuxTarget::for_place)
                 .find(|target| crate::agent::tmux::window_exists_on(target, &name));

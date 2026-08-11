@@ -86,11 +86,33 @@ impl std::fmt::Debug for SandboxedInvocation {
     /// `Debug` would put a vendor token in every `{:?}` — an `expect`, a
     /// tracing field, a failing assertion's own message. The variable *names*
     /// are the diagnostic; the values are the secret.
+    ///
+    /// [`env`](Self::env)'s proxy variables are held back for the same reason,
+    /// and that is not belt-and-braces: [`secret_env`](Self::secret_env) is the
+    /// channel for an *agent's* token, and the egress proxy's credential does
+    /// not travel there at all — it is inside the proxy URLs friring composes
+    /// into `env` (see [`ProxyGrant`](crate::sandbox::ProxyGrant), whose own
+    /// `Debug` withholds them). Printing this struct's `env` whole would undo
+    /// that one field further out, which is how a live credential for the
+    /// boundary a session is running behind ends up in a log somebody pastes
+    /// into a bug report.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env: std::collections::BTreeMap<&str, &str> = self
+            .env
+            .iter()
+            .map(|(key, value)| {
+                let credential = crate::sandbox::egress::HTTP_PROXY_VARS
+                    .iter()
+                    .chain(crate::sandbox::egress::SOCKS_PROXY_VARS)
+                    .any(|name| name == key);
+                let shown = if credential { "<proxy url>" } else { value };
+                (key.as_str(), shown)
+            })
+            .collect();
         f.debug_struct("SandboxedInvocation")
             .field("command", &self.command)
             .field("args", &self.args)
-            .field("env", &self.env)
+            .field("env", &env)
             .field(
                 "secret_env",
                 &self.secret_env.iter().map(|(k, _)| k).collect::<Vec<_>>(),
@@ -788,7 +810,8 @@ fn composition_note(
 }
 
 /// Drop the per-session state a sandboxed launch minted: its egress proxy, the
-/// scratch directory the agent wrote, and the policy file generated for it.
+/// scratch directory the agent wrote, the copy-on-write layers it wrote through,
+/// and the policy file generated for it.
 ///
 /// Call this when a session ends or is deleted. Skipping the directories costs
 /// disk rather than correctness — the next launch of the same session adopts
@@ -823,6 +846,14 @@ fn cleanup_key(key: &str) {
     // mounted in — so both are dropped, and each is a no-op for the shape that
     // did not use it.
     crate::sandbox::dirs::cleanup_place_session(key);
+    // The copy-on-write layers are a third per-session tree, and the only one
+    // that holds what the agent *wrote*: a bubblewrap launch with a
+    // copy-on-write workspace lands every write in an upper layer under
+    // `<data>/sandbox/overlay/<key>`, deliberately outside the two roots above
+    // (a directory the sandbox can reach is an `upperdir` it can redirect). A
+    // layer left behind here would outlive the session that made it — see
+    // `crate::sandbox::bwrap::cleanup_overlays`.
+    crate::sandbox::bwrap::cleanup_overlays(key);
     crate::paths::remove_session_signal_dir(key);
     // A place outlives its sessions, so nothing here removes one — but the
     // loopback port this session held inside it is the place's to hand out
@@ -902,10 +933,21 @@ pub fn open_place(
 /// session across every container of the profile, and try every place rather
 /// than guessing at one.
 ///
+/// **A container answers to two names, and only one of them survives a
+/// rename.** The label is written at create and an engine cannot change it,
+/// while renaming a profile rewrites the profile row, its instance rows and
+/// every session's `sandbox:<profile>` in one transaction. So `recorded` — the
+/// `sandbox_instances` ids friring holds for this profile *now* — is asked
+/// beside the label. Matched on the label alone, a renamed profile's places all
+/// read as nothing running: teardown reports "no pane to kill" and leaves the
+/// agent working inside, automation delivery silently never fires, and the
+/// manager view's confirmation under-counts what it is about to stop. The ids
+/// have to be passed in because `agent` may not reach `storage`.
+///
 /// Exists here because `session_ops` may not reference [`crate::sandbox`] at
 /// all, and the transport address is assembled from two things only this layer
 /// holds: the engine path the probe vetted, and the engine's own container id.
-pub fn running_places(profile: &str) -> Vec<crate::agent::transport::Place> {
+pub fn running_places(profile: &str, recorded: &[String]) -> Vec<crate::agent::transport::Place> {
     with_host(|host| {
         let mut found = Vec::new();
         for kind in crate::sandbox::PLACE_KINDS.iter().copied() {
@@ -921,7 +963,14 @@ pub fn running_places(profile: &str) -> Vec<crate::agent::transport::Place> {
             found.extend(
                 places
                     .into_iter()
-                    .filter(|place| place.owned && place.profile.as_deref() == Some(profile))
+                    .filter(|place| {
+                        place.owned
+                            && (place
+                                .profile
+                                .as_deref()
+                                .is_some_and(|name| name.eq_ignore_ascii_case(profile))
+                                || recorded.contains(&place.id))
+                    })
                     .filter_map(|place| {
                         crate::agent::transport::Place::new(engine, &place.id, profile).ok()
                     }),
@@ -1748,6 +1797,32 @@ mod tests {
         assert!(crate::sandbox::dirs::place_dir("dev").unwrap().is_dir());
     }
 
+    /// A copy-on-write launch's layers are the third per-session tree, and the
+    /// only one holding what the agent *wrote*. They deliberately live outside
+    /// the two roots teardown already knew about — a directory the sandbox can
+    /// reach is an `upperdir` it can redirect — so teardown has to reach them
+    /// where they are, or every workspace the user asked to throw away stays on
+    /// disk for the life of the machine.
+    #[test]
+    fn deleting_a_session_drops_the_copy_on_write_layers_it_wrote_into() {
+        use crate::sandbox::bwrap::{cleanup_overlays, overlay_workspaces};
+        let _guard = fabricated_data_dir("overlay-teardown");
+        let roots = ["/repo".to_string()];
+        let mine = overlay_workspaces("overlay-teardown-a", &roots).unwrap();
+        let sibling = overlay_workspaces("overlay-teardown-b", &roots).unwrap();
+        let upper = std::path::PathBuf::from(&mine[0].upper);
+        let theirs = std::path::PathBuf::from(&sibling[0].upper);
+        std::fs::write(upper.join("what-the-agent-wrote"), "x").unwrap();
+        std::fs::write(theirs.join("what-the-agent-wrote"), "x").unwrap();
+
+        cleanup_key("overlay-teardown-a");
+        assert!(!upper.exists(), "{} outlived the session", upper.display());
+        // Teardown holds one session's key, and takes exactly that session's
+        // layers: the sibling is still running in its own.
+        assert!(theirs.join("what-the-agent-wrote").exists());
+        cleanup_overlays("overlay-teardown-b");
+    }
+
     // ---- Place backends ---------------------------------------------------
 
     /// The container id the stub engine hands back for a freshly created place.
@@ -1765,12 +1840,70 @@ mod tests {
         ))
     }
 
+    /// [`place_host`], for a place whose kernel is friring's own.
+    ///
+    /// What a filtered profile needs, and what a plain [`StubHost`] cannot be:
+    /// before it composes one, friring binds a listener outside the place and
+    /// has the place dial it, because the proxy's socket only carries a
+    /// *listener* where the two share a kernel (`ContainerBackend::
+    /// check_proxy_reachable`). A stub answers a command line with canned text,
+    /// so nothing ever dials and every filtered place is refused for a boundary
+    /// that was never really asked. This host answers the dial by dialling —
+    /// which is exactly what an `exec` into a container on this machine's own
+    /// kernel does, and is the case being modelled.
+    #[cfg(unix)]
+    fn place_host_on_this_kernel() -> SandboxHost {
+        use crate::sandbox::probe::{ProbeHost, ProbeOutput, StubHost};
+
+        /// Delegates everything but the dial.
+        struct OnThisKernel(StubHost);
+
+        impl ProbeHost for OnThisKernel {
+            fn which(&self, program: &str) -> Option<String> {
+                self.0.which(program)
+            }
+            fn home(&self) -> Option<String> {
+                self.0.home()
+            }
+            fn path_exists(&self, path: &str) -> bool {
+                self.0.path_exists(path)
+            }
+            fn read_file(&self, path: &str) -> Option<String> {
+                self.0.read_file(path)
+            }
+            fn run(&self, program: &str, args: &[&str]) -> Result<ProbeOutput, String> {
+                // `exec <ctr> tmux -S <socket> …`: the dialer's own exit status
+                // is never what friring reads, so this answers with the failure
+                // a real one gives after the listener accepts and closes.
+                let dialled = (args.first() == Some(&"exec"))
+                    .then(|| args.windows(2).find(|w| w[0] == "-S").map(|w| w[1]))
+                    .flatten();
+                if let Some(socket) = dialled {
+                    let _ = std::os::unix::net::UnixStream::connect(socket);
+                    return Ok(ProbeOutput::failure(1, "protocol version mismatch\n"));
+                }
+                self.0.run(program, args)
+            }
+        }
+
+        SandboxHost::new(std::sync::Arc::new(OnThisKernel(place_stub(
+            ProbeOutput::success("/usr/local/bin/friring-cli\n"),
+        ))))
+    }
+
     /// [`place_host`] with the place's answer to `command -v` scripted.
     ///
     /// One `exec` answers both questions a launch asks of a place — where the
     /// relay binary is, and whether the agent it is about to run is in there —
     /// so a test of either scripts it here.
     fn place_host_answering_exec(exec: crate::sandbox::probe::ProbeOutput) -> SandboxHost {
+        SandboxHost::new(std::sync::Arc::new(place_stub(exec)))
+    }
+
+    /// The scripted engine [`place_host_answering_exec`] is built from, before
+    /// it becomes a host — so a test that needs to answer one question itself
+    /// can wrap it rather than script the whole engine again.
+    fn place_stub(exec: crate::sandbox::probe::ProbeOutput) -> crate::sandbox::probe::StubHost {
         use crate::sandbox::probe::ProbeOutput;
         const PODMAN: &str = "/usr/bin/podman";
         let place_dir = crate::sandbox::dirs::place_dir("dev").expect("a data directory");
@@ -1801,7 +1934,7 @@ mod tests {
                 ProbeOutput::success(format!("{STUB_CONTAINER}\n")),
             )
             .with_command_prefix(&format!("{PODMAN} exec"), exec);
-        SandboxHost::new(std::sync::Arc::new(stub))
+        stub
     }
 
     /// A place runs the agent *inside* itself, so a launch whose agent is not in
@@ -1883,13 +2016,28 @@ mod tests {
             .with_command(&new_line, new_out);
         let _host = TestSandboxHost::new(SandboxHost::new(std::sync::Arc::new(stub)));
 
-        let found: Vec<String> = running_places("dev")
+        let found: Vec<String> = running_places("dev", &[])
             .iter()
             .map(|place| place.container().to_string())
             .collect();
         assert_eq!(found, [SUPERSEDED, REBUILT], "both places, in engine order");
         // A profile with no place of its own gets none of somebody else's.
-        assert!(running_places("other").is_empty());
+        assert!(running_places("other", &[]).is_empty());
+
+        // …and a profile that was **renamed** still finds its own. An engine
+        // cannot relabel a running container, so both of these still answer to
+        // `dev` while the rows, the profile and every session say `dev2`.
+        // Matched on the label alone this is "nothing is running": teardown
+        // leaves the agent working inside and automation delivery never fires.
+        let recorded = [SUPERSEDED.to_string(), REBUILT.to_string()];
+        let after_rename: Vec<String> = running_places("dev2", &recorded)
+            .iter()
+            .map(|place| place.container().to_string())
+            .collect();
+        assert_eq!(after_rename, [SUPERSEDED, REBUILT]);
+        // The ids are a second name for *these* containers, never a way to
+        // reach one no row of this profile's names.
+        assert!(running_places("other", &[]).is_empty());
     }
 
     /// A data directory short enough for a **place's** unix socket path.
@@ -2390,10 +2538,11 @@ mod tests {
     /// address each one's proxy environment names has to be that session's own
     /// relay port — the second session would otherwise be handed the first's
     /// and fail closed while the profile still claimed a filtered network.
+    #[cfg(unix)]
     #[test]
     fn every_session_in_a_place_gets_its_own_proxy_address() {
         let _guard = short_data_dir("pe");
-        let host = place_host();
+        let host = place_host_on_this_kernel();
         let compose = |key: &str| {
             let mut config = config_with(Some(place_profile(|p| {
                 p.network_allow = vec!["api.anthropic.com".into()];
@@ -2432,6 +2581,86 @@ mod tests {
 
         cleanup(&first_config);
         cleanup(&second_config);
+    }
+
+    /// And the other half of that, at the level a user meets it: where the place
+    /// cannot be shown to reach the proxy, the launch is refused rather than
+    /// composed.
+    ///
+    /// The failure this closes is not an escape — a place on `--network none`
+    /// whose relay forwards to nothing has *less* network than the profile
+    /// promises, not more — but "silently no network, while the UI reports the
+    /// allowlist applied" is a boundary lying about itself, and every one of
+    /// those in this feature's history was a bug.
+    #[cfg(unix)]
+    #[test]
+    fn a_filtered_place_that_cannot_reach_the_proxy_refuses_the_launch() {
+        let _guard = short_data_dir("pu");
+        // A plain stub engine: it answers the dial with text instead of dialling,
+        // which is a place friring cannot settle either way.
+        let host = place_host();
+        let mut config = config_with(Some(place_profile(|p| {
+            p.network_allow = vec!["api.anthropic.com".into()];
+        })));
+        config.agent_session_id = Some("place-unprovable".into());
+
+        let err = build(&host, "/fabricated/home", None, &config, "claude", &[])
+            .expect_err("a place that cannot be shown to reach the proxy must not compose");
+        assert!(
+            err.reason.contains("could not prove this place can dial"),
+            "{err}"
+        );
+        assert!(err.reason.contains("egress proxy"), "{err}");
+        // A profile refusal, so the profile's own `allow_unsandboxed_fallback`
+        // still decides what happens next — this is a host that cannot apply the
+        // profile, not evidence of interference.
+        assert!(!err.integrity, "{err}");
+        cleanup(&config);
+    }
+
+    /// The `Debug` that exists to keep a token out of `{:?}` has to keep the
+    /// **proxy's** credential out too.
+    ///
+    /// It does not travel in `secret_env` — that is the agent's own channel —
+    /// but inside the proxy URLs friring composes into `env`, which is why
+    /// `ProxyGrant`'s own `Debug` withholds them. Merging that env into this
+    /// struct puts it back within reach of one `{:?}`: a tracing field, an
+    /// `expect`, a failing assertion whose message goes into a log and then
+    /// into a bug report.
+    #[test]
+    fn the_debug_that_hides_a_token_hides_the_proxy_credential_too() {
+        const FAKE: &str = "totally-fake-proxy-token";
+        let mut env = HashMap::new();
+        env.insert("HOME".to_string(), "/home/agent".to_string());
+        for name in crate::sandbox::egress::HTTP_PROXY_VARS
+            .iter()
+            .chain(crate::sandbox::egress::SOCKS_PROXY_VARS)
+        {
+            env.insert(
+                (*name).to_string(),
+                format!("http://friring:{FAKE}@127.0.0.1:8118"),
+            );
+        }
+        let wrapped = SandboxedInvocation {
+            command: "/bin/sh".to_string(),
+            args: vec!["claude".to_string()],
+            env,
+            secret_env: vec![("ANTHROPIC_API_KEY".to_string(), FAKE.to_string())],
+            label: String::new(),
+            state: String::new(),
+            place: None,
+            instance: None,
+            login: None,
+        };
+
+        let rendered = format!("{wrapped:?}");
+        assert!(!rendered.contains(FAKE), "{rendered}");
+        // The names are the diagnostic and stay, and so does everything that is
+        // not a credential.
+        for name in ["HTTP_PROXY", "ALL_PROXY", "ANTHROPIC_API_KEY"] {
+            assert!(rendered.contains(name), "{rendered}");
+        }
+        assert!(rendered.contains("/home/agent"), "{rendered}");
     }
 
     /// The one shape assertion that does not need a backend to be installed:

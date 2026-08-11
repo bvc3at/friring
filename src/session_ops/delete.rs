@@ -42,7 +42,8 @@ pub fn delete_session_headless(
     let mut report = ForceDeleteReport::default();
 
     if force {
-        teardown_runtime_resources(&session, &mut report);
+        let recorded = recorded_places(db, &session.backend_type);
+        teardown_runtime_resources(&session, &recorded, &mut report);
         report.disabled_automations = db
             .disable_send_automations_for_session(session_id)
             .map_err(|e| format!("disable_send_automations_for_session: {e}"))?;
@@ -61,12 +62,34 @@ pub fn delete_session_headless(
     Ok(report)
 }
 
+/// The places friring has **recorded** for the profile a session is sandboxed
+/// under, or nothing when it is not sandboxed into one.
+///
+/// Read where a `Database` is in hand and handed to
+/// [`teardown_runtime_resources`], which deliberately touches no SQLite of its
+/// own. It is what keeps a place findable across a profile rename: the running
+/// container still carries the label it was created with, and only these rows
+/// were rewritten — see
+/// [`running_places`](crate::agent::sandboxing::running_places).
+pub fn recorded_places(db: &Database, backend_type: &str) -> Vec<String> {
+    let Some(profile) = crate::session::sandbox_backend_profile(backend_type) else {
+        return Vec::new();
+    };
+    db.list_sandbox_instances_for_profile(profile)
+        .map(|rows| rows.into_iter().map(|row| row.external_id).collect())
+        .unwrap_or_default()
+}
+
 /// Tear down a session's slow runtime resources: kill the tmux window, remove
 /// worktrees + the symlink workspace. Touches no SQLite — safe to call from a
 /// background thread after the row has been soft-deleted on the UI thread, so
 /// the TUI's hard-delete confirmation can close without blocking on a remote
 /// `kill-window` or a `git worktree remove`. Best-effort: failures are logged
 /// into `report` (or `tracing::warn`), never abort.
+///
+/// `recorded` is [`recorded_places`]' answer, read by the caller for exactly
+/// that reason: a place-backed session's container is found by profile name,
+/// and after a rename the rows are the only half that still says the new one.
 ///
 /// **Backend-aware.** The window kill and each worktree removal run on the
 /// server the session actually lives on, resolved from `session.backend_type`:
@@ -76,6 +99,7 @@ pub fn delete_session_headless(
 /// the local data dir), so it is torn down regardless of backend.
 pub fn teardown_runtime_resources(
     session: &crate::sync::SharedSession,
+    recorded: &[String],
     report: &mut ForceDeleteReport,
 ) {
     if let Some(profile) = crate::session::sandbox_backend_profile(&session.backend_type) {
@@ -83,7 +107,7 @@ pub fn teardown_runtime_resources(
         // local kill would find nothing and leave the agent running. Worktree
         // removal stays local — a place mounts every path at exactly its host
         // path, so the checkout the container sees *is* the host's.
-        let places = crate::agent::sandboxing::running_places(profile);
+        let places = crate::agent::sandboxing::running_places(profile, recorded);
         if places.is_empty() {
             // Not an error: a place that is not running took every pane in it
             // with it, which is the outcome this call wanted.
@@ -493,7 +517,7 @@ mod tests {
         };
 
         let mut report = ForceDeleteReport::default();
-        teardown_runtime_resources(&session, &mut report);
+        teardown_runtime_resources(&session, &[], &mut report);
 
         assert!(
             report.remote_teardown_error.is_some(),
@@ -549,8 +573,8 @@ mod tests {
         };
 
         let mut report = ForceDeleteReport::default();
-        teardown_runtime_resources(&session(sandboxed, Some("dev")), &mut report);
-        teardown_runtime_resources(&session(plain, None), &mut report);
+        teardown_runtime_resources(&session(sandboxed, Some("dev")), &[], &mut report);
+        teardown_runtime_resources(&session(plain, None), &[], &mut report);
 
         assert!(
             !scratch_root.join(sandboxed.to_string()).exists(),

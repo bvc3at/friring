@@ -81,6 +81,35 @@ pub struct GcInput<'a> {
     pub idle_after_ms: Option<u64>,
 }
 
+/// Every profile name a live container could answer to, lowercased — its own
+/// label **and** the row friring recorded it under.
+///
+/// The two disagree after a rename. A container's profile label is baked in at
+/// create and cannot be relabelled, while renaming a profile rewrites the
+/// profile row, its instance rows and the `sandbox:<profile>` of every session
+/// on it in one transaction — so the row says the new name and the running
+/// container still says the old one. A protection set tested against the label
+/// alone therefore reads a renamed profile's live place as belonging to a
+/// profile that no longer exists, and stops and removes it with an agent
+/// working inside.
+///
+/// Here rather than in each caller because the TUI's pass and
+/// `friring-cli sandbox prune` are two protection sets over one rule, and two
+/// copies of a protection rule is precisely how those two drifted apart before.
+///
+/// Ordered record-first because the record is the half a rename keeps current;
+/// the label is what covers a container friring adopted and has no row for.
+#[must_use]
+pub fn profile_names_of(container: &LiveContainer, records: &[InstanceRecord]) -> Vec<String> {
+    records
+        .iter()
+        .find(|record| record.external_id == container.id)
+        .map(|record| record.profile.to_ascii_lowercase())
+        .into_iter()
+        .chain(container.profile.as_deref().map(str::to_ascii_lowercase))
+        .collect()
+}
+
 /// Decide what to reclaim.
 ///
 /// The rules, in the order they are applied per container:
