@@ -1908,6 +1908,304 @@ mod tests {
         assert_eq!(db.list_sandbox_instances().unwrap().len(), 1);
     }
 
+    /// One container a scripted engine holds.
+    #[derive(Clone)]
+    struct FakePlace {
+        id: String,
+        owned: bool,
+        profile: String,
+        spec: String,
+    }
+
+    /// A podman that actually holds containers, and lets go of one when it is
+    /// told to.
+    ///
+    /// `StubHost` answers every question the same way however often it is
+    /// asked, which cannot express the one a prune turns on: what the engine
+    /// holds *after* the removals ran. This one drops a container on `rm` —
+    /// except the ids it was told to keep — so "reclaimed" is observed rather
+    /// than assumed.
+    struct FakeEngine {
+        base: crate::sandbox::probe::StubHost,
+        held: std::sync::Mutex<Vec<FakePlace>>,
+        stubborn: Vec<String>,
+    }
+
+    const PODMAN: &str = "/usr/bin/podman";
+
+    impl FakeEngine {
+        fn new() -> Self {
+            type ProbeOutput = crate::sandbox::probe::ProbeOutput;
+            Self {
+                base: crate::sandbox::probe::StubHost::new()
+                    .with_home("/home/u")
+                    .with_command("uname -s", ProbeOutput::success("Linux\n"))
+                    .with_file("/proc/sys/kernel/osrelease", "6.8.0-generic\n")
+                    .with_binary("podman")
+                    .with_command("id -u", ProbeOutput::success("1000\n"))
+                    .with_command("id -g", ProbeOutput::success("1000\n"))
+                    .with_command(
+                        &format!(
+                            "{PODMAN} info --format {}",
+                            "{{.Version.Version}}|{{.Host.Security.Rootless}}"
+                        ),
+                        ProbeOutput::success("5.2.2|true\n"),
+                    ),
+                held: std::sync::Mutex::new(Vec::new()),
+                stubborn: Vec::new(),
+            }
+        }
+
+        /// An engine that takes the removal and keeps the container anyway —
+        /// a place whose processes will not die, or a storage driver that is
+        /// busy.
+        fn refusing_to_remove(mut self, id: &str) -> Self {
+            self.stubborn.push(id.to_string());
+            self
+        }
+
+        fn holding(&self, places: &[FakePlace]) {
+            *self.held.lock().unwrap() = places.to_vec();
+        }
+
+        fn ids(&self) -> Vec<String> {
+            self.held
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|place| place.id.clone())
+                .collect()
+        }
+    }
+
+    impl crate::sandbox::probe::ProbeHost for FakeEngine {
+        fn which(&self, program: &str) -> Option<String> {
+            crate::sandbox::probe::ProbeHost::which(&self.base, program)
+        }
+
+        fn home(&self) -> Option<String> {
+            crate::sandbox::probe::ProbeHost::home(&self.base)
+        }
+
+        /// The real filesystem, because every mount source in these tests is a
+        /// directory the test itself made — and a plan refuses a source that is
+        /// not there, which is the whole reason the fixture creates them.
+        fn path_exists(&self, path: &str) -> bool {
+            std::path::Path::new(path).exists()
+        }
+
+        fn read_file(&self, path: &str) -> Option<String> {
+            crate::sandbox::probe::ProbeHost::read_file(&self.base, path)
+        }
+
+        fn run(
+            &self,
+            program: &str,
+            args: &[&str],
+        ) -> Result<crate::sandbox::probe::ProbeOutput, String> {
+            type ProbeOutput = crate::sandbox::probe::ProbeOutput;
+            let last = args.last().copied().unwrap_or_default();
+            match (program, args.first().copied()) {
+                (PODMAN, Some("ps")) => Ok(ProbeOutput::success(self.ids().join("\n"))),
+                (PODMAN, Some("inspect")) => Ok(self
+                    .held
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|place| place.id == last)
+                    .map(|place| {
+                        ProbeOutput::success(format!(
+                            "{}|running|{}|{}|{}\n",
+                            place.id,
+                            match place.owned {
+                                true => "1",
+                                false => "",
+                            },
+                            place.profile,
+                            place.spec
+                        ))
+                    })
+                    .unwrap_or_else(|| ProbeOutput::failure(125, "no such container\n"))),
+                (PODMAN, Some("rm")) => {
+                    if self.stubborn.iter().any(|id| id == last) {
+                        return Ok(ProbeOutput::failure(125, "container is in use\n"));
+                    }
+                    self.held.lock().unwrap().retain(|place| place.id != last);
+                    Ok(ProbeOutput::success(""))
+                }
+                _ => crate::sandbox::probe::ProbeHost::run(&self.base, program, args),
+            }
+        }
+    }
+
+    /// Everything a prune against a working engine needs: a data directory of
+    /// its own, a real workspace to mount, the two profiles, and the engine.
+    struct PruneFixture {
+        _temp: tempfile::TempDir,
+        _paths: crate::paths::TestPathGuard,
+        engine: std::sync::Arc<FakeEngine>,
+        host: crate::sandbox::SandboxHost,
+        db: Database,
+        /// The digest the profile currently resolves to — what tells a place
+        /// that is still the profile's from one a rebuild superseded.
+        spec: String,
+    }
+
+    fn prune_fixture(engine: FakeEngine) -> PruneFixture {
+        let temp = tempfile::TempDir::new().unwrap();
+        let paths = crate::paths::TestPathGuard::new(temp.path().join("data"));
+        // Canonical, because a place mounts every path at exactly its host path
+        // and refuses a source a symlink could redirect — which `/var` is on
+        // macOS.
+        let work = temp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let work = work.canonicalize().unwrap().display().to_string();
+
+        let engine = std::sync::Arc::new(engine);
+        let host = crate::sandbox::SandboxHost::new(engine.clone());
+        let db = db_with(&[
+            profile("dev", vec![SandboxPath::workspace(&work)]),
+            profile("busy", vec![SandboxPath::workspace(&work)]),
+        ]);
+        seed_session(&db, "s1", "sandbox:busy", Some("busy"));
+
+        let backend = host.place(SandboxBackendKind::Podman).expect("a place");
+        let spec = crate::sandbox::PlaceBackend::current_spec(
+            backend,
+            &profile("dev", vec![SandboxPath::workspace(&work)]),
+        )
+        .expect("the profile resolves to a spec");
+        PruneFixture {
+            _temp: temp,
+            _paths: paths,
+            engine,
+            host,
+            db,
+            spec,
+        }
+    }
+
+    /// The four kinds of container a prune has to tell apart, in one engine.
+    fn prune_places(spec: &str) -> Vec<FakePlace> {
+        let place = |id: &str, owned: bool, profile: &str, spec: &str| FakePlace {
+            id: id.to_string(),
+            owned,
+            profile: profile.to_string(),
+            spec: spec.to_string(),
+        };
+        vec![
+            place("superseded", true, "dev", "an-older-spec"),
+            place("current", true, "dev", spec),
+            place("foreign", false, "dev", "an-older-spec"),
+            place("busyplace", true, "busy", "an-older-spec"),
+        ]
+    }
+
+    fn record(db: &Database, id: &str, profile: &str) {
+        db.upsert_sandbox_instance(&crate::storage::sandboxes::SandboxInstance::new(
+            profile,
+            SandboxBackendKind::Podman,
+            id,
+            "running",
+        ))
+        .unwrap();
+    }
+
+    fn recorded(db: &Database) -> Vec<String> {
+        let mut ids: Vec<String> = db
+            .list_sandbox_instances()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.external_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    fn ids_in(value: &Value) -> Vec<String> {
+        let mut ids: Vec<String> = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// A dry run says what it would do and does none of it — neither to the
+    /// engine nor to the record of what the engine holds.
+    #[test]
+    fn a_dry_prune_names_the_superseded_place_and_touches_nothing() {
+        let fixture = prune_fixture(FakeEngine::new());
+        fixture.engine.holding(&prune_places(&fixture.spec));
+        for (id, profile) in [
+            ("superseded", "dev"),
+            ("current", "dev"),
+            ("busyplace", "busy"),
+        ] {
+            record(&fixture.db, id, profile);
+        }
+
+        let out = prune(&fixture.db, &fixture.host, None, true).unwrap();
+        assert_eq!(ids_in(&out.json["removed"]), ["superseded"]);
+        assert_eq!(ids_in(&out.json["forgotten"]), ["superseded"]);
+        assert_eq!(
+            recorded(&fixture.db),
+            ["busyplace", "current", "superseded"]
+        );
+        assert_eq!(fixture.engine.ids().len(), 4, "nothing was removed");
+    }
+
+    /// The rungs a real prune has to keep apart: a place a rebuild superseded
+    /// goes, the one that still matches the profile stays, a container friring
+    /// does not own is invisible, and every place of a profile a live session
+    /// names is protected by name.
+    #[test]
+    fn a_prune_reclaims_the_superseded_place_and_leaves_every_other_one() {
+        let fixture = prune_fixture(FakeEngine::new());
+        fixture.engine.holding(&prune_places(&fixture.spec));
+        for (id, profile) in [
+            ("superseded", "dev"),
+            ("current", "dev"),
+            ("busyplace", "busy"),
+        ] {
+            record(&fixture.db, id, profile);
+        }
+
+        let out = prune(&fixture.db, &fixture.host, None, false).unwrap();
+        assert_eq!(ids_in(&out.json["removed"]), ["superseded"]);
+        assert_eq!(ids_in(&out.json["forgotten"]), ["superseded"]);
+        assert!(out.json["failures"].as_array().unwrap().is_empty());
+        assert_eq!(recorded(&fixture.db), ["busyplace", "current"]);
+        let mut left = fixture.engine.ids();
+        left.sort();
+        assert_eq!(left, ["busyplace", "current", "foreign"]);
+    }
+
+    /// A container the engine would not remove keeps its row: the row holds the
+    /// only id anything has for it, and forgetting it turns a place that is
+    /// still there into one nothing can find again.
+    #[test]
+    fn a_place_the_engine_refuses_to_remove_keeps_its_record() {
+        let fixture = prune_fixture(FakeEngine::new().refusing_to_remove("superseded"));
+        fixture.engine.holding(&prune_places(&fixture.spec));
+        record(&fixture.db, "superseded", "dev");
+        record(&fixture.db, "current", "dev");
+
+        let out = prune(&fixture.db, &fixture.host, None, false).unwrap();
+        let failures = out.json["failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].as_str().unwrap().starts_with("superseded:"),
+            "{failures:?}"
+        );
+        assert!(ids_in(&out.json["removed"]).is_empty());
+        assert!(ids_in(&out.json["forgotten"]).is_empty());
+        assert_eq!(recorded(&fixture.db), ["current", "superseded"]);
+        assert_eq!(fixture.engine.ids().len(), 4);
+    }
+
     /// The protection a headless prune applies: it drives no session, so it
     /// cannot know which container one is in and protects every place of every
     /// profile a live session names.
