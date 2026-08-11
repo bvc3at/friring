@@ -914,13 +914,21 @@ fn export(
     let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
     let written = match output_path {
         Some(path) => {
-            if path.exists() {
-                return Err(format!(
-                    "'{}' already exists; export refuses to overwrite it",
-                    path.display()
-                ));
-            }
-            std::fs::write(path, &document)
+            // The refusal and the write are one operation: `exists()` follows a
+            // symlink (so a dangling one reads as absent) and anything between
+            // the two calls would be truncated by the open that followed.
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::AlreadyExists => format!(
+                        "'{}' already exists; export refuses to overwrite it",
+                        path.display()
+                    ),
+                    _ => format!("Failed to write '{}': {e}", path.display()),
+                })?;
+            file.write_all(document.as_bytes())
                 .map_err(|e| format!("Failed to write '{}': {e}", path.display()))?;
             Some(path.display().to_string())
         }
@@ -2309,6 +2317,19 @@ mod tests {
 
         let error = export(&db, None, Some(&path)).unwrap_err();
         assert!(error.contains("refuses to overwrite"), "{error}");
+
+        // A link to nothing is a destination that already exists: `exists()`
+        // follows it and reads as absent, and the write that followed would
+        // create whatever it points at.
+        #[cfg(unix)]
+        {
+            let dangling = temp.path().join("link.toml");
+            let target = temp.path().join("not-here.toml");
+            std::os::unix::fs::symlink(&target, &dangling).unwrap();
+            let error = export(&db, None, Some(&dangling)).unwrap_err();
+            assert!(error.contains("refuses to overwrite"), "{error}");
+            assert!(!target.exists(), "nothing was created through the link");
+        }
     }
 
     /// An unreadable row is not exportable: its columns hold friring's
