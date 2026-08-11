@@ -534,7 +534,12 @@ themes, switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
   that file is self-contained, so a binary install only needs a copy of it. That
   image carries **no agent CLI** — friring prints the one-time command that
   installs yours into the profile's own home, which outlives every container it
-  rebuilds. A profile may name its own `image` or `containerfile` instead
+  rebuilds. A profile may name its own `image` or `containerfile` instead.
+  A filtered network mode needs the engine's daemon on *this machine's* kernel:
+  friring's egress proxy is reached over a unix socket, and where the daemon runs
+  in a Linux VM (Docker Desktop, `podman machine`, colima) the mount carries the
+  socket file and nothing behind it. friring measures that per place and refuses
+  the profile rather than running it with no egress
 - **[Apple's `container` CLI](https://github.com/apple/container)** — the other
   way to run a *place*-backed sandboxed agent, and macOS-only in the narrow
   sense: Apple Silicon, macOS 26 or newer, the CLI on `PATH`, and its service

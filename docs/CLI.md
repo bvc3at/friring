@@ -96,7 +96,12 @@ Six things about it are deliberate:
   a spelling the platform tool would read as a flag — is raised **before** the
   value is asked for, and so is "this host's store cannot be written to", so a
   refused token is never one you have to rotate. `token list` answers whether
-  friring holds each variable an agent declares, never what it holds.
+  friring holds each variable an agent declares, never what it holds — and asks
+  the store's *existence* question rather than reading and discarding: on macOS
+  that is `security find-generic-password` without `-w`, so a listing over a
+  dozen declared variables neither pulls your tokens into friring's memory nor
+  raises a keychain prompt per entry. It therefore reports an entry cleared to
+  whitespace as held, while a launch treats it as absent.
 - **`show` renders a profile; it does not validate one.** It prints the stored
   fields, the profile's places, any column friring could not decode, and whether
   the backend is available on this host. The path and boundary refusals are made
@@ -108,14 +113,19 @@ Six things about it are deliberate:
   reads back are `friring-cli sandbox export --text > profiles.toml` and
   `friring-cli sandbox export --output profiles.toml`.
 - **An import is refused for anything a launch would refuse**, in the launch's
-  own words: a read-write root enclosing the data directory, a path in either
-  mode reaching friring's sandbox state or a container engine's control socket.
+  own words: a read-write root reaching the data directory or the database file
+  itself, one reaching friring's own `agents.toml`/`hosts.toml`/`config.toml`, a
+  path in either mode reaching friring's sandbox state or a container engine's
+  control socket.
   A key friring does not recognise is refused rather than ignored — a typo'd
   `network_alow` would otherwise import a boundary wider than the document says.
 - **A headless prune protects more than the TUI's pass does.** `friring-cli`
   drives no session, so it cannot know which container one is in: it protects
-  every place of every profile a live session names. An engine that will not
-  answer is skipped whole rather than read as holding nothing.
+  every place of every profile a live session names, matching a container on
+  **both** names it can answer to — the row friring recorded it under and the
+  label it was created with, which stop agreeing after a profile rename. An
+  engine that will not answer is skipped whole rather than read as holding
+  nothing. It never walks WSL distros: nothing in this build registers one.
 - **`sandbox relay` is internal.** It is the half of the egress firewall that
   runs *inside* a boundary, offering a TCP endpoint on the sandbox's own loopback
   and forwarding each connection to the bind-mounted proxy socket, because no

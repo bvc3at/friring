@@ -11,6 +11,9 @@ change. Fork-visible divergences are also listed in [`FORK.md`](../FORK.md).
 **Friring — fork-only.** Upstream has no sandboxing; see
 [`FORK.md`](../FORK.md).
 
+Deciding whether to rely on this? [**Not in it**](#not-in-it) is the complete
+list of what the feature does not do, in one place.
+
 ---
 
 ## Goals and non-goals
@@ -138,9 +141,11 @@ storage owns `created_at`/`updated_at`, and a profile holds no credential, so an
 export is safe to commit. Import **validates the whole document before it writes
 any of it**, in one transaction: the profile validator, the name collision
 (`--replace` is the deliberate answer), and the same path refusals a launch makes
-— a read-write root enclosing the data directory, a path in either mode reaching
-friring's own sandbox state or a container engine's control socket — in the same
-words, so a profile that could never launch is never stored. A key friring does
+— a read-write root reaching the data directory or the database file itself, one
+reaching friring's own `agents.toml`/`hosts.toml`/`config.toml`, a path in either
+mode reaching friring's own sandbox state or a container engine's control
+socket — in the same words, so a profile that could never launch is never
+stored. A key friring does
 not recognise is refused rather than ignored, because the ignored value may be
 part of the boundary; and a row that did not decode is not exported at all, since
 its columns hold friring's own substitutions.
@@ -175,8 +180,17 @@ and resolve toward the Friring tables.
 Paths are stored as written (`~` preserved) and expanded at launch, so a
 profile stays meaningful if `$HOME` differs on a remote host.
 
-A read-write path is refused at launch if it encloses the friring data directory
-(ADR-29) or reaches a tmux server socket directory; a security-relevant path
+A read-write path is refused at launch if it **reaches** the friring data
+directory (ADR-29), if it reaches a tmux server socket directory, or if it
+reaches friring's own `agents.toml`, `hosts.toml` or `config.toml` — those write
+down the command lines the host launches every agent with, so a sandbox that can
+write one chooses what friring runs next, outside the boundary. "Reaches the data
+directory" is deliberately **two** tests: enclosing the *directory*, or naming
+the *database file* or its `-wal`/`-shm` siblings. They cannot be one test,
+because friring mints a launch's own scratch and signal directories underneath
+the data directory — so the directory can only be judged from above — while a
+path naming a file encloses no directory at all and has to be judged from both
+sides. A security-relevant path
 that is not valid UTF-8 is refused too, because a rule built from a lossy
 conversion names a different file. The first of those is also checked when the
 editor saves — the check needs the data directory and the database path, which
@@ -266,23 +280,33 @@ records it with a targeted update.
 
 ## Backend catalogue
 
-**Every backend below is built.** The two policy backends (`seatbelt`, `bwrap`)
-and three place backends (`docker`/`podman`, `apple-container`, `wsl-distro`)
-each probe the host they would run on. One of them stops short of a launch:
-`wsl-distro` registers, hardens and reclaims a distro but has no session path
-into it yet, and says so where a launch would otherwise open a dead pane (see
-[its entry](#wsl-distro--windows-place) and
-[Delivery phases](#delivery-phases)). Availability is probed per host, and the
-profile editor, the profile list and the session-creation step all show the
-reason a backend cannot be used here rather than leaving it to fail at launch.
+**Four of the five backends below are wired end to end**: the two policy
+backends (`seatbelt`, `bwrap`) and the container places (`docker`/`podman`,
+`apple-container`) probe the host, are chosen by the ladder or by pinning, and
+run agents. Availability is probed per host, and the profile editor, the profile
+list and the session-creation step all show the reason a backend cannot be used
+here rather than leaving it to fail at launch.
 
-The three place backends share the parts a boundary is made of, as **code**
-rather than as three implementations of one description: one mount plan, one
-owner-label set, one spec digest, one garbage-collection decision, and one
+**`wsl-distro` is the exception, and the honest statement is narrower than
+"built".** Its code registers, hardens, adopts and reclaims a distro, and all of
+that is unit-tested against a stub `wsl.exe` — but **nothing in the running
+application calls any of it.** What is reachable in this build is the backend's
+*probe* and its *capabilities* (so the editor, the list and the session step say
+what a WSL place could and could not do, and a profile asking for something it
+cannot enforce is refused at the save) and the launch refusal that names the two
+ways to get a boundary on Windows today. No session launches into a distro, no
+distro is ever registered or hardened by the application, and the reclaiming pass
+does not walk distros at all — `PLACE_KINDS` lists the three container engines
+and nothing else. See [its entry](#wsl-distro--windows-place) and
+[Not in it](#not-in-it).
+
+The three *container* place backends share the parts a boundary is made of, as
+**code** rather than as three implementations of one description: one mount plan,
+one owner-label set, one spec digest, one garbage-collection decision, and one
 `PlaceBackend` seam that the launch path, teardown, the reclaiming pass and
 `friring-cli` all drive. A second copy of those rules would be a second set of
-escapes, and `sandbox::tests::place_conformance` holds every one of them to the
-same refusals.
+escapes, and `sandbox::tests::place_conformance` holds every one of them — and
+`wsl-distro`, through its own two seams — to the same refusals.
 
 ### `seatbelt` — macOS, policy
 
@@ -400,10 +424,22 @@ made bwrap its primary Linux backend and Claude Code's sandbox uses it too.
   which is the one outcome the mode exists to prevent. The layers deliberately do
   not live in the session scratch: that directory is writable from inside, and an
   `upperdir` a sandbox can redirect is every write in the boundary landing
-  wherever it points. The overlay is emitted in the same sorted mount pass as
-  every other path, so a nested read-only path still wins over it and everything
-  friring takes back afterwards — `.git/hooks`, the secret masks, the ADR-29
-  database masks — still wins over the overlay. **No profile column selects the
+  wherever it points.
+  The overlay is emitted in the same sorted mount pass as every other path, so
+  a nested read-only path still wins over it and everything friring takes back
+  afterwards — `.git/hooks`, the secret masks, the ADR-29 database masks —
+  still wins over the overlay. A nested read-**write** grant is that same
+  ordering pointed the other way, and is **refused** with the nested path
+  named: `--bind /repo/sub /repo/sub` lands after the overlay and puts the real
+  host directory back over the merged view, so every write the profile calls
+  discardable would land in the real repository. A profile that quietly means
+  the opposite of what it says is worse than one that will not load. The layers
+  go with the session: teardown drops `<data>/sandbox/overlay/<session>`
+  alongside the scratch directory and the place session directory, and the
+  per-session component carries a digest as well as the sanitised key — the
+  sanitiser folds every character it does not accept onto `-`, and a session
+  key is not always a UUID, so without it two sessions could share, or delete,
+  each other's layers. **No profile column selects the
   mode yet**: the capability is built and reachable through
   `BwrapBackend::wrap_copy_on_write`, and adding the third `‹ ro | rw | cow ›`
   value to a path row is a profile change rather than a backend one.
@@ -449,8 +485,11 @@ workload needs a toolchain the host does not have.
   so a missing source is refused rather than invented as a root-owned directory,
   and every refusal is friring's own sentence naming the profile's path. A path
   that cannot be spelled in a `--mount` value (a comma, a quote), one that would
-  carry the data directory (ADR-29), a tmux socket directory or the engine's own
-  control socket across, and two paths landing on one target inside are all
+  carry the data directory **or the database file itself** across (ADR-29 — the
+  directory refused from above, the file and its `-wal`/`-shm` siblings from
+  either side), one naming friring's own sandbox-state or status-signal tree, a
+  tmux socket directory or the engine's own
+  control socket, and two paths landing on one target inside are all
   refused. The tmux socket directory is refused from below as well as above: a
   profile naming one server's `tmux-<uid>` directory encloses nothing, and a
   read-only bind is no defence, because a read-only superblock does not take
@@ -477,6 +516,26 @@ workload needs a toolchain the host does not have.
   A refused source is never *rewritten* to its resolved spelling: rewriting one
   would mount a directory the profile does not name, and identical absolute paths
   are what keep a git linked worktree working (see below).
+- **A filtered mode is measured, not assumed.** These are the only backends
+  whose boundary may or may not carry the egress proxy's socket depending on
+  the *host*: an `AF_UNIX` listener lives in the kernel that called `bind(2)`,
+  and on a Mac or a Windows box the daemon's kernel is a VM's, not friring's.
+  Rather than keep a list of which engines are VM-backed where — a list that
+  goes stale — friring asks: when a filtered profile's place is ensured it
+  binds a listener in the place's own directory (mounted at the same absolute
+  path), has the place dial it, and treats its own `accept` as the answer.
+  Nothing is read from the connection, so no dialer's output can manufacture a
+  pass. A place that dials is remembered for as long as it lives; one that is
+  turned down, or that friring could not get an answer out of, refuses the
+  profile with the same argument `apple-container` makes and the same three
+  ways out — an engine on this machine's kernel, `full` with no denies, or
+  seatbelt/bwrap. Refusing costs a usable sandbox; starting it would give the
+  place `--network none` and a relay dialling nothing, with the UI reporting
+  the allowlist applied. The dialer is `tmux`, which the image contract
+  already requires and which is a unix-socket client by nature; a one-shot
+  connect in `friring-cli` would read better, but that binary inside a place
+  is the *image's*, so a new subcommand would refuse every image built before
+  it.
 - **The engine's control socket is never mounted**, wherever it lives:
   `/var/run/docker.sock`, `/run/podman/podman.sock`, the per-user trees a
   rootless engine or Docker Desktop keeps one in (`/run/user/<uid>`,
@@ -548,6 +607,20 @@ workload needs a toolchain the host does not have.
 
 ### `wsl-distro` — Windows, place
 
+**Nothing in the running application drives this backend.** Everything in this
+section describes code that exists and is tested against a stub `wsl.exe`, and
+that no code path outside the tests calls: `SandboxHost::wsl_distro` — the only
+accessor that hands the backend out as a place — has no caller, and
+`PLACE_KINDS`, which every lifecycle, teardown and reclaiming path walks, lists
+the three container engines only. So on a real machine **no distro is
+registered, hardened, adopted, reclaimed or unregistered by friring**, and no
+session runs inside one. What the running application does with this backend is
+exactly two things: it *probes* it (so the UI can say whether a WSL place is
+possible here and why not), and it *refuses a launch* pinned to it, naming the
+two ways to get a boundary on Windows today. Read the rest as the design and
+the tested implementation of a rung that is not yet plugged in — not as a
+boundary anything is relying on.
+
 One cloned distro per profile, addressed by the existing `wsl.exe -d <distro>`
 transport with no new plumbing. Templates come from `wsl --export --format vhd`
 plus `wsl --import --vhd`; teardown is `wsl --unregister`.
@@ -573,12 +646,29 @@ profile's whole filesystem, its agent's login included, into a second boundary
 The clone is `friring-sbx-<profile>`, and it is **hardened before anything runs
 in it**: `/etc/wsl.conf` gets `automount enabled = false` and `interop
 enabled = false` (with `appendWindowsPath = false`), written with the ownership
-marker `/etc/friring-sandbox` in one script, then `wsl --terminate` so WSL reads
-it at the next start. Both settings are the boundary rather than taste —
+marker `/etc/friring-sandbox` in one script, then `wsl --terminate` — **whose
+result is checked** — so WSL reads the file at the next start. That check is what
+makes the verification after it mean anything: WSL applies `wsl.conf` only when a
+distro *starts*, and writing the file started this one, so a stop nobody looked
+at would leave the bytes on disk saying "hardened" while every later command
+reaches the unhardened instance the import left running. Reading the file back
+then confirms the file and nothing else. A registration whose distro would not
+stop is refused, and rolled back.
+
+Both settings remove the *default* exposure rather than containing anything:
 automount puts every Windows drive, and friring's data directory with it, inside
 the place, and interop lets a process in there `execve` a Windows binary that
-runs outside the VM. A distro whose `/etc/wsl.conf` is no longer the one friring
-wrote is refused as interference, outside `allow_unsandboxed_fallback`. Ownership
+runs outside the VM. Neither is a boundary against a process that is already root
+inside the distro — which the distro's own user is, and which can mount a Windows
+drive by hand whatever `wsl.conf` says. Per-path containment in there is
+bubblewrap's, which is why it is required rather than optional.
+
+A distro whose `/etc/wsl.conf` is no longer the one friring
+wrote is refused as interference, outside `allow_unsandboxed_fallback`. That
+check is a **tamper detector on the file**: on the adopting path the distro may
+already be running, and friring neither restarts it to find out nor reads the
+state `wsl --list` reports, which is a localised string nothing here compares.
+Ownership
 is that marker plus the name prefix, both re-checked immediately before
 `wsl --unregister`; a distro that will not say who it belongs to is left alone
 and reported.
@@ -591,6 +681,15 @@ refuses the launch with the install command when the distro carries none. `$HOME
 is the distro's own, and every path a launch names is judged against the distro's
 filesystem — a host-side scratch or signal directory is not in there, and is
 refused with the way in rather than left to die in the pane.
+The same profile that says which paths are writable may not make bubblewrap
+itself one of them — the rule the three engine backends apply to their own CLI.
+It is checked where the distro is ensured, against the profile's read-write
+paths, and again where the command is composed, against the launch's whole
+writable set: a launch adds its workspace, its signal and its scratch
+directories, which the profile never named. The program is compared as the
+distro spelled it; friring does not ask the distro to resolve it further, so a
+link planted inside from a system prefix into a writable one is the residual,
+exactly as it is for a remote engine.
 
 Memory and CPU caps, a containerfile, and a filtered network mode are refused
 rather than accepted and ignored. **The egress relay is not wired**: the proxy
@@ -601,16 +700,33 @@ namespace) and `full` (the VM's network) are what a WSL place offers. Probed fro
 *inside* a distro the rung is unavailable, naming bwrap — the rung above it — as
 what to use instead.
 
-**No session launches into a WSL place in this release.** Everything above is
-built and tested, and the piece that is missing is the launch path's own: a
-distro is reached by the `wsl:` transport rather than the container one, and the
-projected hooks, the credentials and the per-session directories a place is
-launched with are all composed for a filesystem friring can write to directly.
+**Nothing above runs in this build**, and the launch path is only the largest of
+the reasons. A distro is reached by the `wsl:` transport rather than the
+container one, and the projected hooks, the credentials and the per-session
+directories a place is launched with are all composed for a filesystem friring
+can write to directly — so the launch path was deliberately not wired for this
+slice. With it unwired, nothing else calls the backend either: registering,
+hardening, adopting and reclaiming are all reached from `SandboxHost::wsl_distro`
+or from `PLACE_KINDS`, and neither leads here. Concretely, in this build:
+
+| Operation | Reachable? |
+|---|---|
+| Probe (is a WSL place possible here, and why not) | Yes — the editor, the profile list and the session-creation step all show it |
+| Capabilities (no caps, no `allowlist`, `workspace` scope only) | Yes — the editor gates its rows and refuses a save asking for more |
+| Refusing a launch pinned to `wsl-distro` | Yes — with the two ways to get a boundary today |
+| Register / harden / adopt a distro | **No caller** |
+| Run a session in a distro | **No caller** |
+| Reclaim, unregister, or list friring's distros | **No caller** — `PLACE_KINDS` is the three container engines |
+| `friring-cli sandbox` over WSL places | **No** — `prune` and the manager view walk `PLACE_KINDS`; `list`/`show` would print a recorded distro row, and none is ever written |
+
 Pinning `wsl-distro` therefore refuses at the launch, naming the two ways to get
 a boundary today — run friring *inside* the distro and use `bwrap`, or use
 `docker`/`podman`. Refusing rather than half-composing is the same rule as
 everywhere else here: a session that opens on a pane with no hooks, no login and
-no status is worse than one that does not open.
+no status is worse than one that does not open. The refusals this backend does
+implement are pinned by `sandbox::tests::place_conformance` **now**, while nobody
+is launching into them, because the moment that path is wired is the moment
+nobody is looking at them.
 
 ### Identical absolute paths
 
@@ -713,7 +829,12 @@ The `wsl-distro` rung sits below `bwrap` for a Windows host reached through the
 WSL transport, as the table says — but the platform detected *inside* a distro
 is the distro itself, and cloning a new one is a Windows-side operation a
 sandbox running in one cannot perform. The rung is reachable only from the
-Windows side.
+Windows side. And it does not resolve to a usable boundary even there: an `auto`
+ladder that reached it produces a launch refusal naming what to use instead,
+because nothing in this build launches into a distro (see
+[its entry](#wsl-distro--windows-place)). It stays on the ladder rather than
+being removed so that the reason is a sentence rather than a silently missing
+rung.
 
 ## Egress firewall
 
@@ -746,8 +867,9 @@ transports, and each backend uses the one its kernel primitive leaves open:
 | Backend | Transport | Why |
 |---|---|---|
 | `seatbelt` | host TCP loopback | Shares the host network stack; the profile denies non-loopback traffic but leaves the proxy port reachable. SBPL's `localhost` covers both loopback families and cannot be told which, so the proxy holds the port on both. |
-| `bwrap`, `docker`/`podman` on `--network none` | unix socket + relay | A new network namespace has no route to the host. A unix socket is a filesystem object, so a bind mount carries it across. |
-| `wsl-distro` | as `bwrap`, inside the distro | Per-distro firewalling is impossible (one shared VM network namespace), so egress control comes from `bwrap` inside the distro — and so does its transport. Not wired in this release; a filtered mode is refused rather than started unproxied. |
+| `bwrap` | unix socket + relay | A new network namespace has no route to the host. A unix socket is a filesystem object, so a bind mount carries it across — and the sandbox is a process on friring's own kernel, so the listener really is on the far side of the mount. |
+| `docker`/`podman` on `--network none` | unix socket + relay, **proved before it is relied on** | The same transport, but these engines are not always on this kernel: Docker Desktop, `podman machine` and colima run the daemon in a Linux VM, where the mount carries the socket *file* and the listener stays behind in the kernel that bound it. friring does not infer that from the engine's name. When a filtered profile's place is ensured it binds a listener under the place's own directory, has the place dial it once, and refuses the profile — naming what could not be reached — if nothing arrives. Measured once per place, not per session. |
+| `wsl-distro` | none — the mode is refused | Per-distro firewalling is impossible (one shared VM network namespace), so egress control would have to come from `bwrap` inside the distro — and friring is on the Windows side of the utility VM, so its socket does not reach in. A filtered mode is refused rather than started unproxied. Nothing launches into a distro in this build anyway. |
 | `apple-container` | none — the mode is refused | A place is a VM with its own kernel, so a bind-mounted socket carries no reachable listener across it. Every mode that needs the proxy is refused rather than started unfiltered. |
 
 No mainstream HTTP or SOCKS client can *dial* a proxy over a unix socket:
@@ -1101,7 +1223,16 @@ Therefore, in resolution order:
    or quoted back in a refusal — every refusal about *which* entry is raised
    before the value is asked for. `token rm` forgets one; `token list` answers
    whether friring holds each variable an agent declares, never what it holds,
-   and drives the store per declared entry rather than enumerating it. On a host
+   and drives the store per declared entry rather than enumerating it. It asks
+   the store's *existence* question, which on macOS is
+   `security find-generic-password` **without** `-w`: not printing a value is not
+   the same as not extracting one, and the value flag is what opens the item,
+   pulls every declared secret into friring's address space and can raise a
+   keychain prompt per entry. A tool with no metadata-only query —
+   `secret-tool search` prints the secret beside the attributes — still reads and
+   drops the value. The difference is stated rather than hidden: the check
+   answers "friring holds an entry", so an entry cleared to whitespace lists as
+   held while a launch treats it as absent. On a host
    whose store friring cannot write to, `token set` says so **before** asking for
    a value, so a secret is never typed into a command that was going to refuse.
 3. **`volume-login`** — the profile's own persistent state directory, with one
@@ -1396,6 +1527,35 @@ a profile whose live sessions this instance is not driving, another friring's,
 protects every container of that profile by name. The cost either way is a
 superseded container surviving until those sessions end.
 
+**A container's profile label is what it was created with; the record is what a
+rename keeps current.** An engine cannot relabel a running container, while
+renaming a profile rewrites the profile row, its instance rows and the
+`sandbox:<profile>` of every session on it in one transaction — so after a rename
+the protection set holds the new name and the container still answers to the old
+one. Every in-use test therefore matches a container on **both** names, the row's
+first and the label's second, in the TUI's pass and in `friring-cli sandbox
+prune` alike. Matched on the label alone, a renamed profile's live place reads as
+a place whose profile is gone, and rule 3 stops and removes it with an agent
+working inside. The same pair of names is what teardown, automation delivery and
+the manager view's stop/rebuild ask a running place by, so a rename does not
+leave a pane un-killed or an automation silently undelivered.
+
+**A rename does not move the profile's place tree, and the pass eventually
+collects the old one.** The tree is named by profile name
+(`<data>/sandbox/pl/<profile>`) while the rename is a database transaction, so
+the synthetic home — the login `volume-login` made, and the projected
+configuration — stays under the old name. It is spared for as long as a live
+container still carries the old *label*; once that container goes, the name is in
+no profile row and the sweep removes the tree by elimination, so the renamed
+profile's next launch builds a fresh home and opens signed out. Moving the tree
+at rename time is not safe for the reason deleting a profile does not remove it
+either — it is bind-mounted into a container that is still running. The
+`seed-file` marker files the *holder* profile's name for the same reason, so
+after a rename that credential family still reads as held by the old name and a
+seed for the renamed profile is refused naming it. **Renaming a profile that has
+a place is therefore a sign-in again**, and it is stated here rather than
+discovered.
+
 Two details that silently break things if missed:
 
 - **Environment forwarding.** Session environment is set on the tmux window.
@@ -1420,7 +1580,8 @@ Two details that silently break things if missed:
   `<data dir>/sandbox/tmp/` for the agent's scratch and writes the generated
   seatbelt profile to `<data dir>/sandbox/profiles/`, both `0700`, both refusing
   a symlink. Neither may be the host temp root, and a profile is refused if its
-  read-write roots enclose the data directory or reach a tmux socket directory.
+  read-write roots reach the data directory, the database file, a tmux socket
+  directory or friring's own configuration files.
   A profile may not name anything under `<data dir>/sandbox` or
   `<data dir>/signals` in **either** mode either: that tree holds the other
   profiles' synthetic homes — and therefore the logins in them — the markers that
@@ -1543,15 +1704,22 @@ resolved backend (`auto → seatbelt`), the path count, the network mode,
 profile is picked for a second session, and picking a shared one is the decision
 that puts two agents in one box — the state of its live places when it has any,
 and — when the backend it would run on is not available here — the probe's own
-reason. The resolution is as invisible-free here
+reason. The row's place count is what friring **recorded**
+(`sandbox_instances`), not what the engines hold now: making it live would cost
+an engine listing on every list open and every post-sweep refresh. So a row can
+read `3 places` while the confirmation below it says one — the row reports what
+friring wrote down, the question reports what it is about to act on, and the
+question is the one that is authoritative. The resolution is as invisible-free here
 as at the creation step, and so is the availability: picking `docker` on a machine
 with no engine says so on the row rather than at launch.
 
 `s` stops a profile's places, `r` rebuilds them — they go, and a fresh one starts
 from the profile as it reads *now* — and `p` runs the reclaiming pass for that
 row. The first two take a container away from whatever is running in it, so each
-is confirmed first: the question lands in the footer naming how many places go
-and how many sessions stop with them, and **`y` alone answers it**. `Enter` and
+is confirmed first: the question lands in the footer naming how many places go —
+counted by asking the **engines**, not `sandbox_instances`, so a row a rebuild
+left behind cannot inflate it and a container friring adopted cannot hide from it
+— and how many sessions stop with them, and **`y` alone answers it**. `Enter` and
 `d` already mean edit and delete on this list, so neither may double as yes;
 anything else cancels, and so does the list being rebuilt. All three share the
 reclaiming pass's single background slot, because two workers reconciling one
@@ -1566,7 +1734,17 @@ backend, network mode, read scope, per-path mode, the `prompt_new_domains` and
 `allow_unsandboxed_fallback` toggles, and `containerfile`. A capability the
 chosen backend cannot honour stays **visible but inert**, with the reason in
 place of its value, and drops out of the saved profile so an invisible value can
-never decide a save. An unresolved `auto` rules nothing out. A backend the host
+never decide a save. The **network mode** is gated on the same authority
+(`Caps::network_modes`) but keeps its row, because it is a value rather than a
+knob: the selector walks only the modes the backend enforces, and the row names
+what is missing — muted while the profile's mode is one of them
+(`apple-container can enforce only full`), and as a warning when it is not, since
+that profile's own launch would refuse it. Unlike a resource cap, an
+unenforceable mode is **refused at the save** rather than dropped: substituting
+`none` would take the network away from an agent that needs it and `full` would
+grant egress nobody authorised, so the two ways out — a mode this backend
+enforces, or a backend that enforces this mode — are the user's.
+An unresolved `auto` rules nothing out. A backend the host
 cannot offer stays selectable — the user may be about to install the engine, or
 authoring a profile for another machine — with the probe's reason on the row.
 
@@ -1589,9 +1767,11 @@ missed.
 Validation returns a message that surfaces through the existing error toast;
 there is no inline form-error widget today and adding one is deferred. It runs
 the launch's own path refusals at the *save*, so a profile that could never be
-launched is a form that will not store: a read-write root reaching the database
-or a tmux socket directory, and a path in either mode reaching Friring's own
-sandbox state or a container engine's control socket.
+launched is a form that will not store: a read-write root reaching the data
+directory, the database file, a tmux socket directory or Friring's own
+`agents.toml`/`hosts.toml`/`config.toml`, a path in either mode reaching
+Friring's own sandbox state or a container engine's control socket, and a network
+mode the chosen backend cannot enforce.
 
 **Session creation** — a dedicated step in the `Ctrl+N` sequence, after
 directory selection so it can rank profiles covering the chosen directories
@@ -1702,6 +1882,11 @@ complete and consistent with existing screens.
   legibility and redaction pull against each other redaction wins:
   over-redacting a diagnostic costs a detail, under-redacting one costs the
   boundary.
+  That covers `Debug` as much as log text. The composition a launch hands back
+  carries the proxy URLs in its environment — the proxy's credential is *in*
+  them, and never in the secret-environment channel an agent's own token uses —
+  so its `Debug` prints those variables by name with the values held back. One
+  `{:?}` in a tracing field or a failing assertion is a log line like any other.
 - **The headless launch path still puts the proxy variables in a tmux client's
   argv.** The TUI composes a window's environment into a control-mode command
   over the tmux socket, which never reaches a process table; `friring-cli`
@@ -1767,10 +1952,12 @@ complete and consistent with existing screens.
   launching it permissively are different decisions: the first keeps it
   fixable, the second would run a policy nobody wrote.
 - **A boundary friring will not grant** fails the launch with the reason and
-  the fix, whatever the profile asked for: read-write roots reaching the
-  database or a tmux socket directory, a path in either mode reaching friring's
-  own sandbox state or the container engine's control socket, denies under a
-  network mode that cannot enforce them, a path that cannot be spelled exactly.
+  the fix, whatever the profile asked for: read-write roots reaching the data
+  directory or the database file, a tmux socket directory, or friring's own
+  `agents.toml`/`hosts.toml`/`config.toml`; a path in either mode reaching
+  friring's own sandbox state or the container engine's control socket; denies
+  under a network mode that cannot enforce them; a filtered mode on a place that
+  could not be shown to reach the proxy; a path that cannot be spelled exactly.
   Refusing is the whole point — every one of these has a silent alternative that
   grants more than the profile says. A refusal routes through the profile's
   `allow_unsandboxed_fallback` switch like any other, so a profile with it on
@@ -1801,7 +1988,7 @@ complete and consistent with existing screens.
   created no place and is skipped in silence, and one that is installed and
   would not answer stops the pass collecting any place tree that sweep. Without
   the distinction a Mac with only Docker would never reclaim a tree, because two
-  of the three place backends can never answer there.
+  of the three engines the pass walks can never answer there.
 
 ## Testing and privacy
 
@@ -1832,13 +2019,22 @@ Concretely:
   backend composes, a non-existent path where the relay goes and `echo` where
   the agent goes, so a miscounted `shift` fails the test instead of shipping.
 - **Every place backend is held to the same refusals**
-  (`sandbox::tests::place_conformance`): friring's database (ADR-29), the tmux
-  socket directory, a container engine's control socket, a read-write root
+  (`sandbox::tests::place_conformance`): friring's data directory *and the
+  database file and `-wal` inside it* (ADR-29), another profile's place tree, the
+  tmux socket directory, a container engine's control socket, a read-write root
   containing the program that applies the boundary, a mount source reached
   through a symlink, and identical absolute paths in both renderers. Asserted
   through the seam the launch path uses, so a backend that skipped one would run
   on to an engine command the stub has no answer for and fail on the sentence
-  rather than on the refusal. The projection lint the editor runs is tested
+  rather than on the refusal. **`wsl-distro` is in that table**, driven through
+  its own two seams — `ensure_distro`, then `wrap` — because it hands back a
+  distro name rather than an `EnsuredPlace` and has no `PlaceBackend` to go
+  through. Its refusals are latent until a session launches into a distro, which
+  is exactly why they are pinned now: the moment that path is wired is the moment
+  nobody is looking at them. The WSL stub scripts an *existing* distro, so the
+  whole path exercised is `adopt`; registering one is not scripted at all, and a
+  refusal that stopped being one would fail on the unscripted `--export` rather
+  than import a distro. The projection lint the editor runs is tested
   against a **fabricated** home with synthetic files, never the author's own.
 - Backend probes and argv/profile generation are unit-testable without running
   the backend; where a backend is present in CI, integration tests run behind a
@@ -1909,9 +2105,12 @@ on the host.
   the tool, its system service and the `run`/`exec` options a place is built
   from; friring's own network; the container engines' mount plan, labels, spec
   digest and collection decision reused unchanged.
-- The **`wsl-distro`** backend's own half — a hardened clone per profile
-  (`automount` and `interop` off, ownership marker), bubblewrap required inside
-  it, VHD export/import, and the reclaiming primitives.
+- The **`wsl-distro`** backend's own half, as code with no caller — a hardened
+  clone per profile (`automount` and `interop` off, ownership marker, a checked
+  `--terminate` before the hardening is verified), bubblewrap required inside it,
+  VHD export/import, and the reclaiming primitives. Its probe and its
+  capabilities are wired to the UI; nothing else about it runs. See
+  [its entry](#wsl-distro--windows-place).
 - **Copy-on-write workspaces on `bwrap`**, with the overlay probed by mounting
   one and the layers kept outside the sandbox's own writable scratch.
 - The **`friring-cli sandbox`** commands — `list`/`show`/`rm`/`prune` over
@@ -1925,18 +2124,105 @@ on the host.
 - The **profile editor's lint verdicts**, on demand (`Ctrl+L`) rather than per
   keystroke, because the pass reads the user's configuration off disk.
 - **One `PlaceBackend` seam** every caller of a place drives, and a conformance
-  test holding all three place backends to the same refusals.
+  test holding all three container place backends — and, through its own two
+  seams, `wsl-distro` — to the same refusals.
 
-Not in it: **no session launches into a `wsl-distro` place** — the distro is
-built and reclaimed, and the launch path into it is not wired, so pinning it
-refuses with the two ways to get a boundary today; **no filtered network mode on
-`apple-container`**, because the proxy is unreachable across a VM boundary and
-closing that needs an ADR-27 endpoint change; one network per profile on that
-backend; **no profile column selects a copy-on-write workspace** yet, so the
-capability is reachable only through the backend's own entry point; `auto` never
-picks `wsl-distro` on a native-Windows host (it is chosen by pinning); and no
-pinned `container` CLI version — the option surface is read from `--help`
-instead.
+What P4 did **not** deliver is in the next section, along with everything else
+this feature does not do.
+
+## Not in it
+
+One list, because a reader deciding whether to rely on this needs the gaps in one
+place rather than spread through the phase notes above. Nothing here is a bug
+report: each is a deliberate stopping point with the reason it stopped there.
+
+### Backends and boundaries
+
+- **No session launches into a `wsl-distro` place, and nothing else drives that
+  backend either.** Registering, hardening, adopting, reclaiming and
+  unregistering a distro are implemented and stub-tested with **no production
+  caller**; `PLACE_KINDS` — which every lifecycle, teardown, reclaiming and
+  `friring-cli` path walks — is the three container engines. What runs is the
+  probe, the capabilities and the launch refusal. See
+  [its entry](#wsl-distro--windows-place).
+- **No filtered network mode on `apple-container`.** The proxy is unreachable
+  across a VM boundary; closing it needs an ADR-27 endpoint change, not a backend
+  change. `full` with no denies is the one mode that backend offers, and one
+  network per profile.
+- **A filtered place on a Mac or a Windows host is refused, not filtered.** The
+  probe settles it per place instead of guessing, but where the engine's daemon
+  is in a VM the answer is always no — and it needs the same ADR-27 endpoint
+  change `apple-container` needs.
+- **No native Windows process sandboxing.** Restricted tokens and AppContainer
+  are not built; Windows isolation is `docker`/`podman`.
+- **No place on a remote host.** A backend probes and creates where friring runs,
+  and an `ssh:`/`wsl:` session carrying a profile is refused rather than composed
+  around the wrong filesystem. The mount-source symlink rule has no authority
+  over another host's filesystem, so it does not apply there.
+- **No profile column selects a copy-on-write workspace.** The capability is
+  built and reachable only through `BwrapBackend::wrap_copy_on_write`.
+- **No pinned `container` CLI version.** Apple's option surface is read from
+  `--help` at probe time, and everything this feature says about that tool is
+  unverified against the real one — the fork was not written on Apple Silicon.
+- **No inode-level containment.** Both policy backends protect by pathname, so a
+  hardlink alias planted on the host before the launch is the one stated
+  exception to ADR-29; see [Goals and non-goals](#goals-and-non-goals).
+- **No isolation between the sessions sharing a place.** One uid, one pid
+  namespace, one filesystem — the trust domain is the place. A profile per
+  session is the lever.
+
+### Egress
+
+- **No TLS interception**, so inside a `CONNECT` tunnel the allow decision trusts
+  the client-supplied hostname and domain fronting can bypass it.
+- **No profile column for the HTTP-method restriction.** The proxy implements
+  one; nothing sets it, so every launch runs with it off.
+- **No `network_deny` editor.** Denies are carried through a save untouched, but
+  authoring one is import/CLI-only.
+- **A proxy dies with the friring process that started it**, so a session created
+  by `friring-cli` has no egress until a running friring relaunches it.
+- **The headless launch path passes the proxy environment as `tmux` client
+  argv**, readable through `/proc/<pid>/cmdline` on Linux and WSL for that
+  command's lifetime. See [Failure modes](#failure-modes).
+- **The relay binds a few milliseconds after the agent starts**; a request in
+  that window gets one connection refused, which fails closed.
+- **No IDN support.** A host with any non-ASCII byte is refused in a request and
+  in a stored rule alike, with the punycode form named as the fix.
+
+### Credentials and configuration
+
+- **Nothing installs an agent for you.** friring prints the command; the registry
+  declares no install, so `<the package that provides 'x'>` stays a placeholder.
+- **Only JSON and TOML are linted** by config projection; anything else is copied
+  byte for byte.
+- **Nothing prunes a projected file** the user has since deleted on the host.
+- **No host-side credential broker.** `volume-login` removes the urgency.
+- **`~/.ssh` is on the `host-minus-secrets` deny list**, which breaks git over
+  SSH inside every profile using the default read scope.
+
+### Lifecycle and UI
+
+- **A rename does not move a profile's place tree or its `seed-file` marker**, so
+  renaming a profile that has a place means signing in again. See
+  [Reclaiming places](#reclaiming-places).
+- **The profile list's place count is what friring recorded**, not what the
+  engines hold now; the confirmation is the number that is acted on.
+- **tmux and `/bin/sh` are assumed of an image**, not checked, so a tmux-less one
+  surfaces as a control-mode stall rather than a refusal.
+- **No orphan sweep for copy-on-write layers.** Teardown covers the normal path
+  and deletion-while-running; a friring killed between a launch and a teardown
+  leaves `<data>/sandbox/overlay/<key>` behind for the next launch of that
+  session to adopt.
+- **No "create a sandbox for this selection"** in the session wizard, and no live
+  path completion in the profile editor — the repo picker's completion is a
+  private `App` method that needs a refactor first.
+- **No inline form errors** in the profile editor; validation surfaces through
+  the error toast.
+- **`auto` never picks `wsl-distro` on a native-Windows host** — it is chosen by
+  pinning, which then refuses.
+- **The per-command escape `allow_unsandboxed_fallback`'s name suggests is not
+  built.** It decides what happens when the profile cannot be applied at launch,
+  and nothing finer.
 
 ## ADR-25: Sandboxing is a core feature, not an extension
 
@@ -2056,8 +2342,16 @@ host command execution — a complete escape.
 Transport-reached places may instead reuse the remote hook rewrite, which
 already avoids database access for SSH hosts. The database and its `-wal`/`-shm`
 siblings are masked unconditionally wherever an ancestor is writable — a `-wal`
-created after launch is replayed by the host on next open — and a profile whose
-read-write roots enclose the data directory is refused outright. The one
+created after launch is replayed by the host on next open — and a profile that
+**reaches** the data directory is refused outright: enclosing the directory, or
+naming the database file or a sidecar. Both spellings of the directory are
+compared, because the file need not exist yet and a data directory behind a
+symlink would otherwise be missed. The refusal is checked at the editor's save,
+at `sandbox import`, at the launch, and — for a place, twice — when the mount
+plan is built and again immediately before the container is created. A place is
+where it matters most: a policy backend has an unconditional mask underneath it,
+and a place bind-mounts what the profile names with no mask at all, so the
+refusal is the whole of the rule there. The one
 residual is a hardlink alias planted on the host before the launch; see
 [Goals and non-goals](#goals-and-non-goals).
 

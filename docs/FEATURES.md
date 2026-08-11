@@ -2994,15 +2994,22 @@ is no login to redo. The *place* backends — `docker`/`podman`, and Apple's own
 `container` on Apple Silicon running macOS 26 — run the agent in a container with
 tmux **inside** it, reached through a transport exactly as an SSH host is, and
 give you a filesystem the host cannot see plus memory and CPU caps that a policy
-backend cannot enforce. Every network mode is enforced on the policy backends and
-on `docker`/`podman`, including `allowlist` (see the egress firewall below);
-`apple-container` can honour only an unrestricted `full`, because a place there
-is a VM with its own kernel and the proxy socket carries no reachable listener
-across it — so a filtered profile is **refused** rather than started unfiltered.
-The `wsl-distro` backend clones, hardens and reclaims a distro per profile, but
-no session launches into one yet: pinning it refuses at the launch and names the
-two ways to get a boundary on Windows today. Every surface that offers a profile
-says why a backend is unavailable rather than hiding it.
+backend cannot enforce. Every network mode is enforced on the policy backends,
+including `allowlist` (see the egress firewall below); `apple-container` can
+honour only an unrestricted `full`, because a place there is a VM with its own
+kernel and the proxy socket carries no reachable listener across it — so a
+filtered profile is **refused** rather than started unfiltered. `docker`/`podman`
+enforce every mode *where their daemon is on this machine's kernel*, which is not
+something the engine's name says: on a Mac or a Windows box it is usually a Linux
+VM's, and the same socket problem applies. friring settles that per place by
+having it dial a listener friring binds outside it, and refuses a filtered
+profile it cannot get an answer from rather than starting a place with no egress
+while claiming an allowlist.
+The `wsl-distro` backend's code clones, hardens and reclaims a distro per
+profile — and **nothing in this build calls any of it**. What runs is its probe,
+its capabilities and a launch refusal naming the two ways to get a boundary on
+Windows today; no distro is registered and no session runs in one. Every surface
+that offers a profile says why a backend is unavailable rather than hiding it.
 friring's default image carries **no agent CLI**: baking one in would put a
 vendor's release train inside the image, so an agent gets into a place either
 through your own `image`/`containerfile` or through a one-time install into the
@@ -3141,16 +3148,19 @@ against the launch's own path refusals before it writes any of it — and stores
 the `env-token` value in friring's keychain entry with the token never on a
 command line in either direction. See [`docs/CLI.md`](CLI.md#sandboxes).
 
-**Three limits worth knowing.** A **policy**-sandboxed session is local-only:
+**Four limits worth knowing**, and the whole list is
+[Not in it](SANDBOX.md#not-in-it). A **policy**-sandboxed session is local-only:
 both policy backends generate their artefacts on the machine friring runs on, so
 an SSH/WSL session with a policy profile is refused rather than wrapped with the
-wrong machine's paths (a place is exempt — a place *is* the elsewhere). No
-session launches into a **`wsl-distro`** place: the distro is built and
-reclaimed, and the path that would put a session in it is not wired, so pinning
-it refuses with the alternatives rather than opening a pane with no hooks and no
-login. And an egress proxy **lives in the friring that started it**, so a
-filtered session created by `friring-cli session create` has no way out until a
-running friring relaunches it — closed, not open, but closed.
+wrong machine's paths (a place is exempt — a place *is* the elsewhere). Nothing
+drives the **`wsl-distro`** backend: the code that registers, hardens and
+reclaims a distro has no caller in this build, so pinning it refuses with the
+alternatives rather than opening a pane with no hooks and no login. An egress
+proxy **lives in the friring that started it**, so a filtered session created by
+`friring-cli session create` has no way out until a running friring relaunches it
+— closed, not open, but closed. And **renaming a profile that has a place means
+signing in again**: the place tree, which holds that profile's login, is named by
+profile name, while the rename is a database transaction.
 
 ---
 
