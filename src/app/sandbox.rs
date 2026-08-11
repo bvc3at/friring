@@ -1824,6 +1824,17 @@ mod tests {
         let outside = home.join(".fabricated-agent/notes");
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("n.md"), "notes\n").unwrap();
+        // A settings document pointing at a host directory the profile does not
+        // grant: the verdict a user has a decision to make about, and the one
+        // this test carries all the way into the editor's report.
+        let plugins = home.join(".fabricated-agent/plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        let plugins = plugins.display().to_string();
+        std::fs::write(
+            home.join(".fabricated-agent/settings.json"),
+            serde_json::json!({ "plugins": { "repositories": [&plugins] } }).to_string(),
+        )
+        .unwrap();
         let home = home.display().to_string();
 
         let agent = agent_def(
@@ -1832,6 +1843,7 @@ mod tests {
                 copy_in: vec![
                     "~/.fabricated-agent/skills".into(),
                     "~/.fabricated-agent/notes".into(),
+                    "~/.fabricated-agent/settings.json".into(),
                 ],
                 ..Default::default()
             }),
@@ -1853,6 +1865,27 @@ mod tests {
             reports[0].summary.contains("config projected"),
             "{reports:?}"
         );
+        // The verdict itself, not just the count: the entry the user has to
+        // decide about is named with the reason, which is the whole content of
+        // the editor's lint pane.
+        assert_eq!(reports[0].actionable.len(), 1, "{reports:?}");
+        let (entry, reason) = &reports[0].actionable[0];
+        assert!(entry.contains("settings.json"), "{entry}");
+        assert!(entry.contains("plugins.repositories"), "{entry}");
+        assert!(reason.contains(&plugins), "{reason}");
+        assert!(reason.contains("read-only"), "{reason}");
+
+        // …and granting exactly that path answers it: the reference resolves in
+        // the place, so there is nothing left to decide.
+        let granted = SandboxProfile::new(
+            "dev",
+            vec![
+                SandboxPath::workspace("/srv/work"),
+                SandboxPath::read_only(&plugins),
+            ],
+        );
+        let reports = sandbox_lint_reports(&granted, SandboxBackendKind::Docker, &agents, &home);
+        assert!(reports[0].actionable.is_empty(), "{reports:?}");
     }
 
     /// A policy backend has nothing to project, so the lint is not offered for
