@@ -82,12 +82,12 @@ the same places its manager view drives, and the same refusals a launch makes.
 | `sandbox show <name>` | One profile in full: its places, any columns friring could not decode, and whether its backend is available here. |
 | `sandbox rm <name> [--force]` | Delete a profile. Refused while sessions reference it unless `--force`; the place tree and the profile's login are kept while anything still names it. |
 | `sandbox prune [--profile <name>] [--dry-run]` | Reclaim superseded and orphaned places, through the same decision the TUI's background pass makes. |
-| `sandbox export [<name>] [--output <file>]` | One profile, or every profile, as a `[[profile]]` TOML document. `--output` refuses to overwrite. |
+| `sandbox export [<name>] [--output <file>]` | One profile, or every profile, as a `[[profile]]` TOML document — the *human* rendering, so a redirected stdout follows the CLI-wide JSON default. `--output` refuses to overwrite. |
 | `sandbox import <file> [--replace]` | Validate the **whole** document, then write it in one transaction. |
 | `sandbox token set <agent> [VAR]` / `token rm <agent> [VAR]` / `token list` | The `env-token` value in friring's own OS keychain entry. `VAR` may be omitted when the agent declares exactly one. |
 | `sandbox relay` | **Internal** — see below. |
 
-Five things about it are deliberate:
+Six things about it are deliberate:
 
 - **A token is never an argument.** `token set` takes no value: it reads stdin
   when one is piped, otherwise it prompts with echo off, and the value is never
@@ -102,6 +102,11 @@ Five things about it are deliberate:
   the backend is available on this host. The path and boundary refusals are made
   where a profile is written or used — the editor's save and an import, and again
   at the launch itself — so a legacy row a launch would refuse still prints here.
+- **An export is TOML for a human and JSON for a pipe.** The `[[profile]]`
+  document is the *text* rendering, so a redirected stdout follows the CLI-wide
+  JSON default like every other command. The two spellings `sandbox import`
+  reads back are `friring-cli sandbox export --text > profiles.toml` and
+  `friring-cli sandbox export --output profiles.toml`.
 - **An import is refused for anything a launch would refuse**, in the launch's
   own words: a read-write root enclosing the data directory, a path in either
   mode reaching friring's sandbox state or a container engine's control socket.
