@@ -245,16 +245,32 @@ impl App {
                 // belongs to the profile, so it goes with it. The *place* does
                 // not: nothing here stops a running container, and the
                 // reclaiming pass is what removes one whose profile is gone.
-                crate::sandbox::dirs::cleanup_place(name);
-                // …and with the copy gone, so is friring's record that this
-                // profile held the one permitted seed of a credential family.
-                // Leaving it would refuse every future profile a `seed-file`
-                // on behalf of a boundary that no longer exists (ADR-28).
-                crate::sandbox::auth::release_seeds(name);
+                //
+                // Which is exactly why a profile with sessions still on it keeps
+                // its tree. That tree is bind-mounted into a container this
+                // delete does not stop: removing it takes `$HOME` out from under
+                // an agent mid-turn, unlinks the egress sockets its siblings are
+                // talking through, and destroys the login. The reclaiming pass
+                // removes the container first and the tree goes with the next
+                // one, so the outcome is the same a moment later — without
+                // reaching inside a live boundary to get it.
+                let reclaimed = in_use == 0;
+                if reclaimed {
+                    crate::sandbox::dirs::cleanup_place(name);
+                    // …and with the copy gone, so is friring's record that this
+                    // profile held the one permitted seed of a credential
+                    // family. Leaving it would refuse every future profile a
+                    // `seed-file` on behalf of a boundary that no longer exists
+                    // (ADR-28). Kept while the tree is: the copy is still there,
+                    // and releasing the family would let a second profile take a
+                    // second copy of one credential.
+                    crate::sandbox::auth::release_seeds(name);
+                }
                 let message = if in_use > 0 {
                     format!(
                         "Sandbox profile '{name}' deleted — {in_use} session(s) still \
-                         reference it and will refuse to relaunch"
+                         reference it and will refuse to relaunch; its sandbox home and login \
+                         are kept until they stop"
                     )
                 } else {
                     format!("Sandbox profile '{name}' deleted")
@@ -314,10 +330,13 @@ impl App {
     /// `None` when there is nothing a pass could act on, so an installation with
     /// no place profiles never spawns a worker.
     fn sandbox_gc_input(&self) -> Option<GcSweep> {
-        let profiles: Vec<SandboxProfile> = self
-            .db
-            .list_sandbox_profiles()
-            .unwrap_or_default()
+        let stored = self.db.list_sandbox_profiles().unwrap_or_default();
+        // Every name, before either filter below narrows it: the pass reclaims a
+        // place *tree* by elimination, and a profile that is merely unreadable
+        // or has been edited onto a policy backend still owns the login in its
+        // own tree.
+        let known: Vec<String> = stored.iter().map(|row| row.profile.name.clone()).collect();
+        let profiles: Vec<SandboxProfile> = stored
             .into_iter()
             // A row friring could not decode is repairable, not runnable — and
             // guessing at its spec here would compare a place against a policy
@@ -356,6 +375,7 @@ impl App {
         }
         Some(GcSweep {
             profiles,
+            known,
             records,
             in_use: self.places_in_use(),
         })
@@ -907,6 +927,12 @@ const SANDBOX_GC_OFFSET_TICKS: u64 = 1_500;
 /// work and the worker does no database work.
 pub(crate) struct GcSweep {
     profiles: Vec<SandboxProfile>,
+    /// The names of **every** stored profile, including the ones `profiles`
+    /// filters out (policy-pinned, or a row friring could not decode). A place
+    /// tree is reclaimed by elimination, so a name missing from here reads as a
+    /// deleted profile — and a profile edited from a place backend to a policy
+    /// one still owns the login in its tree.
+    known: Vec<String>,
     records: Vec<(
         SandboxBackendKind,
         crate::sandbox::container::InstanceRecord,
@@ -941,12 +967,21 @@ impl GcSweep {
             adopt: Vec::new(),
             failures: Vec::new(),
         };
+        // The profiles still labelling a place this pass did *not* remove. A
+        // tree may only be collected once nothing is running out of it, so an
+        // engine that would not answer — or a removal that failed — has to read
+        // as "something may still be running in there" and stops every tree
+        // being collected this pass. An engine friring cannot drive at all is
+        // not that: it is holding nothing, because it created nothing.
+        let mut held: Vec<String> = Vec::new();
+        let mut settled = true;
         let host = SandboxHost::local_shared();
         for engine in [SandboxBackendKind::Docker, SandboxBackendKind::Podman] {
             let Some(backend) = host.container(engine) else {
                 continue;
             };
             let Ok(live) = backend.live_places() else {
+                settled = false;
                 continue;
             };
             let records: Vec<crate::sandbox::container::InstanceRecord> = self
@@ -993,7 +1028,14 @@ impl GcSweep {
                 // deleted profile or a rebuild takes one.
                 idle_after_ms: None,
             });
-            outcome.failures.extend(backend.reap(&plan));
+            held.extend(
+                live.iter()
+                    .filter(|container| !plan.remove.contains(&container.id))
+                    .filter_map(|container| container.profile.clone()),
+            );
+            let failures = backend.reap(&plan);
+            settled &= failures.is_empty();
+            outcome.failures.extend(failures);
             outcome
                 .forget
                 .extend(plan.forget.into_iter().map(|id| (engine, id)));
@@ -1007,6 +1049,13 @@ impl GcSweep {
                         crate::sandbox::container::INSTANCE_STATE_RUNNING,
                     ))
                 }));
+        }
+        // The place *trees*, after the containers and only when every engine
+        // agreed about what it holds. Deleting a profile deliberately leaves its
+        // tree behind while sessions are still running in it — the tree is that
+        // container's `$HOME` — so this is the only thing that collects one.
+        if settled {
+            crate::sandbox::dirs::reclaim_orphan_places(&self.known, &held);
         }
         outcome
     }
