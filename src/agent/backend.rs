@@ -236,6 +236,18 @@ pub trait SessionBackend: Send + Sync {
     /// Human-readable name (e.g., "local-tmux", "ssh-remote").
     fn name(&self) -> &str;
 
+    /// The engine's id for the **container this backend talks to**, for a
+    /// sandbox place; `None` for everything else (the default).
+    ///
+    /// Not derivable from [`Self::name`]: every place backend of one profile is
+    /// called `sandbox:<profile>`, whether it addresses the container the
+    /// profile had yesterday or the one an edit rebuilt this morning. A relaunch
+    /// has to tell those apart — the pane it is about to kill is in the old one
+    /// — so the identity has to come from here.
+    fn place_container(&self) -> Option<&str> {
+        None
+    }
+
     /// Check if the backend is available/healthy.
     fn check_available(&self) -> Result<()>;
 
@@ -601,6 +613,52 @@ pub(crate) fn place_backend(place: &crate::agent::transport::Place) -> Arc<dyn S
     backend
 }
 
+/// The `FRIRING_*` variables that name a **host path** rather than an identity:
+/// the metrics directory, and the config and data directory overrides that pin
+/// an agent's own `friring-cli` to the dirs this friring resolved.
+///
+/// Kept in step with `session_ops::inject_friring_env`, which withholds exactly
+/// these from every off-host launch — a place included, because the data
+/// directory is the one thing no sandbox may reach (ADR-29) and neither of the
+/// others is mounted in there either.
+pub(crate) const HOST_PATH_ENV: [&str; 3] = [
+    crate::paths::METRICS_DIR_ENV,
+    crate::paths::CONFIG_DIR_OVERRIDE_ENV,
+    crate::paths::DATA_DIR_OVERRIDE_ENV,
+];
+
+/// The environment a launch's window is given, with the host's own directories
+/// taken back out of a launch that turns out to run inside a **place**.
+///
+/// `inject_friring_env` decides from `SessionConfig::backend`, which does not
+/// say `sandbox:<profile>` until a session has been launched into a place once:
+/// a *first* spawn is composed as a local launch and only becomes place-backed
+/// here, where the profile resolves. So the first launch of a place-backed
+/// session — and only that one — arrived carrying paths that name nothing inside
+/// the place, or name what the boundary exists to keep out. This is the one seam
+/// that knows, so this is where they come out; every later relaunch is already
+/// composed from a `sandbox:<profile>` row and brings none of them.
+///
+/// A policy sandbox keeps them: its paths *are* the host's, the boundary denies
+/// the database by name rather than by hiding it, and the agent's status hook
+/// has to reach the same database the TUI reads.
+///
+/// `pub(crate)` because the headless launch path composes its own invocation and
+/// needs the same seam ([`crate::session_ops`] calls it fully-qualified, as the
+/// module boundary requires).
+pub(crate) fn window_env(
+    mut env: HashMap<String, String>,
+    place: Option<&crate::agent::transport::Place>,
+) -> HashMap<String, String> {
+    if place.is_none() {
+        return env;
+    }
+    for name in HOST_PATH_ENV {
+        env.remove(name);
+    }
+    env
+}
+
 /// Compose the invocation for a spawn or a restart, wrapping it in the
 /// session's sandbox profile when it has one.
 ///
@@ -656,7 +714,17 @@ fn sandboxed_invocation(
             // one channel a credential may use (`docs/SANDBOX.md` §Failure
             // modes). The headless one-shot spawner has no such connection and
             // refuses instead of injecting.
+            //
+            // Where that environment *lands* is the other half, and for a place
+            // it is a process table the profile's other sessions share: one uid,
+            // one pid namespace, so a sibling reads this window's proxy URL out
+            // of `/proc`. That is why the vendor credential a place is given is
+            // per profile rather than per session (ADR-28) — what goes in here
+            // is a place-wide secret by construction — and why the per-session
+            // proxy instance is attribution and lifetime rather than isolation
+            // (`crate::sandbox::egress`).
             env.extend(wrapped.secret_env);
+            let env = window_env(env, wrapped.place.as_ref());
             debug!(sandbox = %wrapped.label, "Wrapping agent invocation");
             Ok(Sandboxed {
                 command: wrapped.command,
@@ -1352,6 +1420,16 @@ impl Session {
         self.backend.name()
     }
 
+    /// The container this session's pane is currently in, for a place-backed
+    /// session; `None` for every other backend.
+    ///
+    /// The name a place backend answers to is `sandbox:<profile>` and stays that
+    /// across a rebuild, so it cannot be used to tell one container from
+    /// another. This can.
+    fn place_container(&self) -> Option<&str> {
+        self.backend.place_container()
+    }
+
     /// The backend this session is wired to, for a caller that has to register
     /// it: a place-backed launch builds its own transport
     /// ([`crate::agent::transport::Place`]) rather than taking one from the
@@ -1430,9 +1508,15 @@ impl Session {
         // container and this session moves into it. The old pane is killed
         // where it still is, and the new one spawned where the launch says.
         let in_place = place.as_ref().map(place_backend);
-        let moved = in_place
-            .as_ref()
-            .is_some_and(|next| next.name() != self.backend.name());
+        // Compared on the **container**, never on the backend name: every place
+        // backend of one profile is called `sandbox:<profile>`, so a name
+        // comparison is `false` in exactly the case this is for — a rebuilt
+        // container, whose profile did not change. A session moving onto a place
+        // from the host has no container behind it yet and is `None` here, which
+        // is the strict side, as it should be: that pane is on the host and a
+        // kill that fails there is a real failure.
+        let moved = self.place_container().is_some()
+            && in_place.as_ref().and_then(|next| next.place_container()) != self.place_container();
         // The other direction — a profile edited from a place backend to a
         // policy one, or off a place entirely — has no home to relaunch into:
         // this session's tmux is *inside* the place, and a policy backend's
@@ -2250,6 +2334,84 @@ mod tests {
         crate::sandbox::egress::stop(&fixture.key());
     }
 
+    /// ADR-29 on the launch that composes a place for the *first* time.
+    ///
+    /// `inject_friring_env` withholds the host's own directories from a place —
+    /// but it reads `SessionConfig::backend`, and a session only carries
+    /// `sandbox:<profile>` there once it has been launched into one. The first
+    /// spawn is therefore composed as a local launch, and this is the seam that
+    /// learns better. A place mounts none of these paths, and one of them names
+    /// the database.
+    ///
+    /// Composed against a fabricated [`Place`](crate::agent::transport::Place)
+    /// rather than through [`sandboxed_invocation`]: resolving a real one runs a
+    /// container engine, which no unit test may do.
+    #[test]
+    fn a_place_launch_leaves_the_hosts_own_directories_out_of_the_window() {
+        let env = || -> HashMap<String, String> {
+            [
+                ("FRIRING_SESSION", "42"),
+                ("FRIRING_SESSION_ID", "agent-conv-uuid"),
+                ("FRIRING_METRICS_DIR", "/fabricated/data/friring/metrics"),
+                (crate::paths::CONFIG_DIR_OVERRIDE_ENV, "/fabricated/config"),
+                (crate::paths::DATA_DIR_OVERRIDE_ENV, "/fabricated/data"),
+                ("HTTP_PROXY", "http://friring:tok@127.0.0.1:8118"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+        };
+        let place = crate::agent::transport::Place::new("/usr/bin/docker", "friring-dev", "dev")
+            .expect("a well-formed place address");
+
+        let inside = window_env(env(), Some(&place));
+        for name in HOST_PATH_ENV {
+            assert!(
+                !inside.contains_key(name),
+                "{name} named a host path inside the place: {inside:?}"
+            );
+        }
+        // The identity vars are opaque and travel everywhere, and the boundary's
+        // own environment is the whole point of the launch.
+        assert_eq!(
+            inside.get("FRIRING_SESSION").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            inside.get("FRIRING_SESSION_ID").map(String::as_str),
+            Some("agent-conv-uuid")
+        );
+        assert!(inside.contains_key("HTTP_PROXY"));
+
+        // A policy sandbox is on the host: its paths exist, the boundary denies
+        // the database by name, and the agent's status hook still has to reach
+        // the database the TUI reads.
+        assert_eq!(window_env(env(), None), env());
+    }
+
+    /// The other half of that, through the real composition: a seatbelt launch
+    /// hands the window every variable the caller put in `config.env`.
+    #[test]
+    fn a_policy_launch_keeps_the_environment_it_was_handed() {
+        let fixture = EgressFixture::new();
+        let mut config = fixture.config("api.anthropic.com");
+        config.env.insert(
+            crate::paths::DATA_DIR_OVERRIDE_ENV.to_string(),
+            "/fabricated/data".to_string(),
+        );
+
+        let out = sandboxed_invocation(&config, &default_provider())
+            .expect("seatbelt is installed by the fixture's host");
+
+        assert!(out.place.is_none(), "the fixture's host is policy-only");
+        assert_eq!(
+            out.env.get(crate::paths::DATA_DIR_OVERRIDE_ENV),
+            Some(&"/fabricated/data".to_string())
+        );
+        drop(out);
+        crate::sandbox::egress::stop(&fixture.key());
+    }
+
     #[test]
     fn pane_clipboard_drops_oldest_and_drains_gen_gated() {
         let pc = PaneClipboard::default();
@@ -2692,8 +2854,18 @@ mod tests {
         let rebuilt = place_backend(&rebuilt);
         assert!(!Arc::ptr_eq(&place_backend(&first), &rebuilt));
         // Still one name, so the registry entry is replaced rather than
-        // duplicated.
-        assert_eq!(rebuilt.name(), "sandbox:shared");
+        // duplicated — which is exactly why a relaunch may not use the name to
+        // tell a rebuilt container from the one the pane it is about to kill
+        // lives in. `place_container` is what can.
+        assert_eq!(rebuilt.name(), place_backend(&first).name());
+        assert_eq!(place_backend(&first).place_container(), Some("ctr1"));
+        assert_eq!(rebuilt.place_container(), Some("ctr2"));
+        // Every other backend has no container, so a session moving *onto* a
+        // place from the host stays on the strict side of the relaunch's kill.
+        assert_eq!(
+            crate::agent::tmux::LocalTmuxBackend::new().place_container(),
+            None
+        );
     }
 
     #[test]

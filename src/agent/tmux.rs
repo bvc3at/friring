@@ -1334,6 +1334,10 @@ impl SessionBackend for TmuxBackend {
         &self.name
     }
 
+    fn place_container(&self) -> Option<&str> {
+        self.transport.place().map(Place::container)
+    }
+
     fn check_available(&self) -> Result<()> {
         // `tmux -L <socket> -V` prints the version without connecting. Over the
         // SSH transport this verifies remote connectivity at the same time, and
@@ -2572,10 +2576,47 @@ pub fn kill_pane_remote(host: &crate::session::HostDef, backend_id: &str) -> Res
 /// The place twin of [`kill_pane_remote`], for the same failure: a window that
 /// was spawned but could not be tracked would otherwise stay alive in a place
 /// that outlives the launch.
+///
+/// Only ever for a place this launch itself just created a window in. A pane id
+/// is per tmux server and therefore per *container*, and a profile can have
+/// several live containers at once, so a teardown that knows only the profile
+/// must use [`kill_window_on`] instead — see
+/// [`crate::agent::sandboxing::running_places`].
 pub fn kill_pane_place(place: &Place, backend_id: &str) -> Result<()> {
     let backend = TmuxBackend::for_place(place);
     backend.ensure_ready()?;
     backend.kill(backend_id)
+}
+
+/// Kill the window `tb-<session_name>` on `target`'s server, answering whether
+/// there was one to kill.
+///
+/// The name is friring's own and unique to the session, so this is the
+/// addressing to use wherever the *server* is a guess: a place-backed session's
+/// profile may have several live containers, and the pane id friring recorded
+/// names an entirely different session's pane in each of the others. Missing the
+/// right one then costs a leaked window instead of a stranger's agent.
+pub fn kill_window_on(target: &MuxTarget, session_name: &str) -> Result<bool> {
+    let window = target.window_target(session_name);
+    let output = target
+        .command(&["kill-window", "-t", &window])
+        .output()
+        .with_context(|| format!("Failed to run tmux kill-window on {}", target.mux))?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Not this server's window — the outcome every caller wanted, and for a
+    // place the ordinary answer from the containers the session is not in.
+    if stderr.contains("can't find window") || stderr.contains("window not found") {
+        return Ok(false);
+    }
+    bail!(
+        "tmux kill-window exited {} for {window} on {}: {}",
+        output.status,
+        target.mux,
+        stderr.trim()
+    );
 }
 
 /// Kill the tmux window `tb-<session_name>` if it exists.

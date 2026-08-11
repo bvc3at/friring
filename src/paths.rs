@@ -39,6 +39,14 @@ use std::path::{Path, PathBuf};
 pub const CONFIG_DIR_OVERRIDE_ENV: &str = "FRIRING_CONFIG_DIR";
 /// Data counterpart of [`CONFIG_DIR_OVERRIDE_ENV`] (`FRIRING_DATA_DIR`).
 pub const DATA_DIR_OVERRIDE_ENV: &str = "FRIRING_DATA_DIR";
+/// Env var naming the directory an agent's hooks write their metrics samples
+/// into ([`metrics_directory`]).
+///
+/// Named here rather than spelled at each use because it is one of the three
+/// variables that carry a **host path**: they are injected only for a launch
+/// that runs on this machine, and taken back out of one that turns out to run
+/// inside a sandbox place (`crate::agent::backend::HOST_PATH_ENV`).
+pub const METRICS_DIR_ENV: &str = "FRIRING_METRICS_DIR";
 
 /// Env var naming the file a **sandboxed** agent's hooks append their state to
 /// ([`session_signal_file`]).
