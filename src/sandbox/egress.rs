@@ -11,13 +11,13 @@
 //! # One proxy per session
 //!
 //! A policy is per *profile*, but an instance is per **session**, because the
-//! other two things it owns are per boundary: the bearer token, which is that
-//! sandbox's credential and must not be held by a sibling, and — for a
-//! namespaced backend — the unix socket, which lives in the per-session scratch
-//! directory. Sharing one instance across the sessions of a profile would put
-//! every sibling's way out in the hands of whichever agent is compromised
-//! first, and would make one session's "allow this domain?" answer silently
-//! widen another's boundary. Duplicating the policy costs nothing.
+//! other two things it owns are per launch: the bearer token and — for a
+//! namespaced backend — the unix socket in that launch's scratch directory. So
+//! a refusal names the session that provoked it, a first-use answer reaches the
+//! session that was asked, an instance dies when its session does, and a
+//! relaunch rotates one session's credential without touching anybody else's.
+//! Duplicating the policy costs nothing, and one rule then holds on every
+//! backend.
 //!
 //! An instance is bound *before* the agent launches, so nothing can race a
 //! listener that is not bound yet — but it belongs to no session until the
@@ -29,6 +29,24 @@
 //! `Ctrl+R` re-derives the whole wrapper from the database and a profile edited
 //! in between has to take effect. The last one is stopped where the session's
 //! scratch directory is dropped, so a socket cannot outlive its session.
+//!
+//! # A place is the trust domain, not a session in it
+//!
+//! What an instance per session does **not** buy is isolation between the
+//! sessions of a *place*. A place is created once per profile and shared by
+//! that profile's sessions (ADR-26), and in there they run under one uid, in
+//! one pid namespace, over one filesystem — so a sibling reads the proxy URL,
+//! token and all, out of `/proc/<pid>/environ`, reaches every session's socket
+//! in the place tree that is mounted for all of them, and dials any relay port
+//! on the loopback they share. A first-use grant is theirs too, by that route
+//! and by the profile the answer is written back to.
+//!
+//! Per-session isolation is therefore real for a policy backend, and for a
+//! place holding one session; between siblings **in** a place it is not, and
+//! nothing here, in the UI or in `docs/SANDBOX.md` may say otherwise. Two
+//! agents that have to be kept apart get a profile each, which gives them a
+//! place each — the lever the profile editor and list state where a profile is
+//! chosen.
 //!
 //! # Where the instances live
 //!
@@ -349,8 +367,11 @@ pub fn claim(session_key: &str) -> PendingEgress {
 /// `transport` comes from the chosen backend's
 /// [`Caps::proxy_transport`](crate::sandbox::Caps::proxy_transport), and
 /// `scratch` is the per-session directory friring minted for the launch — the
-/// only place a unix socket may live, because it is private to friring, private
-/// to the session, and dropped with it.
+/// only place a unix socket may live, because it is private to friring and
+/// dropped with the session. Private to the *session* only where the boundary
+/// is: a place's scratch directories sit in the one tree that place mounts, so
+/// in there the socket is private to the place, which is the trust domain there
+/// (see this module's own docs).
 ///
 /// The instance is listening when this returns and enforcing the policy, but it
 /// is not the session's: whatever that session is already using keeps running
@@ -405,6 +426,10 @@ pub fn prepare(
 /// nothing listens on and fail closed, with the profile still claiming a
 /// filtered network.
 ///
+/// A port of its own is addressing, never separation: the loopback is the
+/// place's, so any session in it can dial any of these ports, and holds the
+/// token to be let through (this module's own docs).
+///
 /// `relay` is where the *sandbox* reaches its relay, never where friring binds
 /// anything: the proxy still listens on the unix socket in `scratch`.
 ///
@@ -443,10 +468,21 @@ pub fn prepare_at(
     let bound = supervisor()
         .start(session_key, rules, bind)
         .map_err(|error| {
+            // Never a fallback to running on the host. The reachable way to make
+            // this fail is an agent inside a place binding its own listener at
+            // the socket path its next launch needs — the scratch directory is
+            // sandbox-writable by design and, inside a place, shared with every
+            // sibling session — and a profile with
+            // `allow_unsandboxed_fallback` on would answer that by starting the
+            // agent outside the boundary. So it is classified as interference
+            // (see `SandboxError::Tampered`), which also covers the honest
+            // reading of a bind that simply fails: a filtered profile whose
+            // proxy is not listening must refuse, never run unfiltered.
             refuse(format!(
                 "the egress proxy could not start, so this sandbox would have no filtered way \
                  out: {error}"
             ))
+            .tampered()
         })?;
     // A listener is bound from here on, so every remaining way out of this
     // function has to release it. The handle is built before the first of them.
@@ -1356,6 +1392,69 @@ mod tests {
 
     fn is_listening(port: u16) -> bool {
         std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+    }
+
+    /// The shape this module keeps: **an instance per session**, even for two
+    /// sessions of one profile — which for a place means two instances inside
+    /// one trust domain rather than two boundaries.
+    ///
+    /// What it buys is asserted here, because it is the whole justification
+    /// left once the isolation claim is gone: a live grant lands on the session
+    /// that was asked and nowhere else, and one session ending does not take a
+    /// sibling's way out with it. What it does *not* buy — keeping a sibling in
+    /// the same place away from that token — is unassertable here for the
+    /// reason it is unfixable here: it is decided by the uid and the pid
+    /// namespace the place gives them, not by this module.
+    #[test]
+    fn two_sessions_of_one_profile_get_an_instance_each() {
+        let profile = policy(NetworkMode::Allowlist, &["github.com"], &[]);
+        let first = establish(
+            "egress-share-a",
+            &profile,
+            ProxyTransport::Loopback,
+            &test_scratch("share-a"),
+        )
+        .expect("the first session's proxy binds");
+        let second = establish(
+            "egress-share-b",
+            &profile,
+            ProxyTransport::Loopback,
+            &test_scratch("share-b"),
+        )
+        .expect("the second session's proxy binds");
+
+        let (first_port, second_port) = (port_of(&first.endpoint), port_of(&second.endpoint));
+        assert_ne!(first_port, second_port, "one listener served both sessions");
+        assert_ne!(
+            first.env.get("HTTP_PROXY"),
+            second.env.get("HTTP_PROXY"),
+            "one credential was handed to both sessions"
+        );
+
+        // A first-use answer applies to the instance of the session that was
+        // asked. (A sibling *in a place* still reaches the widened one — by
+        // taking its token, and at its own next launch through the profile the
+        // answer is written back to.)
+        allow_domain("egress-share-a", "api.github.com:443").expect("the answer applies live");
+        let widened = running_allow_rules("egress-share-a").expect("the asked session is running");
+        assert!(
+            widened.iter().any(|rule| rule == "api.github.com:443"),
+            "{widened:?}"
+        );
+        let untouched = running_allow_rules("egress-share-b").expect("the sibling is running");
+        assert_eq!(untouched, vec!["github.com".to_string()]);
+
+        // And a session ending takes its own instance only.
+        stop("egress-share-a");
+        settle("egress-share-b");
+        assert!(!is_listening(first_port));
+        assert!(
+            is_listening(second_port),
+            "tearing one session down cost the other its egress"
+        );
+        stop("egress-share-b");
+        settle("egress-share-b");
+        assert!(!is_listening(second_port));
     }
 
     fn port_of(endpoint: &ProxyEndpoint) -> u16 {

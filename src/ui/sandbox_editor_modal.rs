@@ -274,8 +274,9 @@ fn editor_body_lines<'a>(
 }
 
 /// The pinned footer: the repair notice when the stored row did not decode,
-/// which shape the profile will run as (and what that costs it), the honest
-/// scope of the boundary, and the key hints. Save and cancel are rendered as
+/// which shape the profile will run as (and what that costs it), what a place
+/// shares between the sessions on it ([`SHARED_PLACE_NOTE`]), the honest scope
+/// of the boundary, and the key hints. Save and cancel are rendered as
 /// clickable buttons over the last row, so the hints carry only the navigation
 /// chords.
 ///
@@ -301,18 +302,26 @@ fn editor_footer_lines<'a>(state: &SandboxEditorState<'a>) -> Vec<Line<'a>> {
             ),
         ]));
     }
-    lines.extend([
-        Line::from(vec![
-            Span::styled("  shape    ", Theme::label()),
-            Span::styled(shape_summary(state), Style::default().fg(Theme::accent())),
-        ]),
-        // Non-goal stated where the profile is authored: policy backends share
-        // the host kernel and a domain allowlist is bypassable.
-        Line::from(Span::styled(
-            "  a sandbox reduces blast radius; it does not prove containment",
-            Style::default().fg(Theme::text_muted()),
-        )),
-    ]);
+    lines.push(Line::from(vec![
+        Span::styled("  shape    ", Theme::label()),
+        Span::styled(shape_summary(state), Style::default().fg(Theme::accent())),
+    ]));
+    // What sharing a profile costs, said where a profile is authored — the one
+    // screen where the user decides whether two agents share a place at all.
+    if state.shape() == Some(SandboxShape::Place) {
+        for line in SHARED_PLACE_NOTE {
+            lines.push(Line::from(Span::styled(
+                *line,
+                Style::default().fg(Theme::text_secondary()),
+            )));
+        }
+    }
+    // Non-goal stated where the profile is authored: policy backends share
+    // the host kernel and a domain allowlist is bypassable.
+    lines.push(Line::from(Span::styled(
+        "  a sandbox reduces blast radius; it does not prove containment",
+        Style::default().fg(Theme::text_muted()),
+    )));
 
     lines.push(super::key_hint_line(&[
         ("Tab/↑↓", " move  "),
@@ -321,6 +330,24 @@ fn editor_footer_lines<'a>(state: &SandboxEditorState<'a>) -> Vec<Line<'a>> {
     ]));
     lines
 }
+
+/// What a place shares, and the lever that stops it sharing.
+///
+/// A place is created once per profile and shared by every session on it
+/// (ADR-26), and the sessions in one run under a single uid, pid namespace and
+/// filesystem: they are not isolated from each other, including from each
+/// other's egress credential and first-use grants. The boundary is the place.
+///
+/// Stated rather than implied, because the reasonable assumption is the
+/// opposite: a sandbox chosen per session reads as a boundary per session. And
+/// stated here because the profile is what decides it — a profile per session
+/// is a place per session. Two short lines, in the footer rather than the body,
+/// because the body scroll-windows: a caveat that can scroll out of sight is
+/// one that gets missed.
+const SHARED_PLACE_NOTE: &[&str] = &[
+    "  sessions sharing a place are not isolated from each other",
+    "  a profile per session gives each session a place of its own",
+];
 
 /// What the profile will run as, and the consequence that follows from it
 /// (ADR-26): a policy sandbox dies one pane at a time, a place dies whole.
@@ -970,12 +997,82 @@ mod tests {
         assert!(shape_summary(&s).starts_with("auto"));
         s.effective_backend = SandboxBackendKind::Seatbelt;
         assert!(shape_summary(&s).starts_with("policy"));
-        s.effective_backend = SandboxBackendKind::Podman;
-        assert!(shape_summary(&s).starts_with("place"));
         let footer = editor_footer_lines(&s);
         assert_eq!(footer.len(), 3);
         assert!(text(&footer[1]).contains("does not prove containment"));
         assert!(text(&footer[2]).contains("adjust"));
+
+        // A place carries the two extra lines below, between the two.
+        s.effective_backend = SandboxBackendKind::Podman;
+        assert!(shape_summary(&s).starts_with("place"));
+        let footer = editor_footer_lines(&s);
+        assert_eq!(footer.len(), 5);
+        assert!(text(&footer[3]).contains("does not prove containment"));
+        assert!(text(&footer[4]).contains("adjust"));
+    }
+
+    /// The promise this editor is allowed to make. A place is created once per
+    /// profile and shared by that profile's sessions, which run under one uid
+    /// and one pid namespace in there — so pointing a second session at this
+    /// profile is a decision about isolation, and it is made on this screen.
+    /// Saying nothing would leave the user with the reasonable assumption that
+    /// a sandbox per session is a boundary per session.
+    #[test]
+    fn a_place_profile_says_its_sessions_are_not_isolated_and_how_to_split_them() {
+        let mut s = state();
+        s.backend = SandboxBackendKind::Docker;
+        s.effective_backend = SandboxBackendKind::Docker;
+        let footer = editor_footer_lines(&s)
+            .iter()
+            .map(text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(footer.contains("every session on this profile shares one docker"));
+        assert!(
+            footer.contains("sessions sharing a place are not isolated from each other"),
+            "{footer}"
+        );
+        // The lever, not just the caveat: the user can act on this one.
+        assert!(
+            footer.contains("a profile per session gives each session a place of its own"),
+            "{footer}"
+        );
+    }
+
+    /// …and the same screen must not make it for a boundary that *is* per
+    /// session, nor claim an isolation a place cannot deliver. A policy sandbox
+    /// wraps one process, so it has nothing to warn about; an unresolved `auto`
+    /// has not chosen a shape yet and rules nothing in or out.
+    #[test]
+    fn no_shape_claims_an_isolation_it_does_not_have() {
+        for backend in SandboxBackendKind::ALL {
+            let mut s = state();
+            s.backend = *backend;
+            s.effective_backend = *backend;
+            let rendered = editor_footer_lines(&s)
+                .iter()
+                .chain(editor_body_lines(&s, 60).0.iter())
+                .map(text)
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            // The one claim the model cannot back: sessions kept apart from each
+            // other inside one place.
+            assert!(
+                !rendered.contains("isolated from each other")
+                    || rendered.contains("not isolated from each other"),
+                "{backend}: {rendered}"
+            );
+            assert!(!rendered.contains("private to this session"), "{backend}");
+
+            let place = backend.shape() == Some(SandboxShape::Place);
+            assert_eq!(
+                rendered.contains("not isolated from each other"),
+                place,
+                "{backend} says the wrong thing about sharing"
+            );
+        }
     }
 
     /// A profile whose stored row did not decode is repairable here and nowhere

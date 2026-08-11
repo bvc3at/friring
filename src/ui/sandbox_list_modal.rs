@@ -4,7 +4,8 @@
 //!
 //! Each row names the profile, the backend it will actually run (an `auto`
 //! profile shows what the host's ladder resolved to, so the choice is never
-//! invisible), how many paths it exposes and how much network it allows.
+//! invisible), how many paths it exposes, how much network it allows, and —
+//! for a place — that every session on it lands in one shared place.
 
 use ratatui::{
     style::Style,
@@ -13,10 +14,21 @@ use ratatui::{
     Frame,
 };
 
-use crate::session::{NetworkMode, SandboxBackendKind};
+use crate::session::{NetworkMode, SandboxBackendKind, SandboxShape};
 
 use super::render_list_modal_frame;
 use super::theme::Theme;
+
+/// What a row says about a profile whose backend is a **place**.
+///
+/// A place is created once per profile and shared by every session on it
+/// (ADR-26), and the sessions in one are not isolated from each other: one uid,
+/// one pid namespace, one filesystem, and therefore each other's egress
+/// credential. This row is where a profile is picked for a session — the list,
+/// and the new-session wizard's step, which renders the same summary — so
+/// "shared" belongs on it rather than only in the editor that spells out what
+/// it costs.
+const SHARED_PLACE: &str = "shared place";
 
 /// One profile as the list shows it. Owned by the modal state
 /// (`crate::app::modals::SandboxListModal`), which holds nothing else: a
@@ -49,6 +61,16 @@ pub struct SandboxProfileRow {
 }
 
 impl SandboxProfileRow {
+    /// The backend this profile would actually run — its own choice, or what
+    /// `auto` resolved to on this host. `None` for an `auto` nothing has probed,
+    /// which rules nothing in or out.
+    fn effective_backend(&self) -> Option<SandboxBackendKind> {
+        match self.backend {
+            SandboxBackendKind::Auto => self.resolved,
+            explicit => Some(explicit),
+        }
+    }
+
     /// The row's right-hand summary: `auto → seatbelt · 3 paths · allowlist`.
     ///
     /// A row that did not decode says so instead: its backend, path count and
@@ -69,6 +91,12 @@ impl SandboxProfileRow {
         }
         let unit = if self.paths == 1 { "path" } else { "paths" };
         out.push_str(&format!(" · {} {unit} · {}", self.paths, self.network));
+        // Before the live state, because it is a property of the profile rather
+        // than of whatever instance happens to be up.
+        if self.effective_backend().and_then(SandboxBackendKind::shape) == Some(SandboxShape::Place)
+        {
+            out.push_str(&format!(" · {SHARED_PLACE}"));
+        }
         if let Some(state) = &self.instance {
             out.push_str(&format!(" · {state}"));
         }
@@ -211,7 +239,41 @@ mod tests {
         let mut r = row();
         r.backend = SandboxBackendKind::Docker;
         r.instance = Some("running".to_string());
-        assert_eq!(r.summary(), "docker · 2 paths · allowlist · running");
+        assert_eq!(
+            r.summary(),
+            "docker · 2 paths · allowlist · shared place · running"
+        );
+    }
+
+    /// A place is created once per profile and shared by every session that
+    /// picks it, and the sessions in one are not isolated from each other. This
+    /// row is where a profile is picked — in the list, and in the new-session
+    /// wizard, which renders the same summary — so it says which profiles put
+    /// two agents in the same box. A policy backend wraps one process per
+    /// session and shares nothing, so it says nothing.
+    #[test]
+    fn summary_marks_a_place_as_shared_and_a_policy_backend_as_neither() {
+        let mut r = row();
+        for backend in SandboxBackendKind::ALL {
+            r.backend = *backend;
+            r.resolved = None;
+            let place = backend.shape() == Some(SandboxShape::Place);
+            assert_eq!(r.summary().contains("shared place"), place, "{backend}");
+            // Never the opposite claim, whatever the backend.
+            assert!(!r.summary().contains("isolated"), "{backend}");
+        }
+
+        // An `auto` profile is marked by what it *resolved* to, because that is
+        // what will run — and claims nothing until a host has been probed.
+        r.backend = SandboxBackendKind::Auto;
+        assert!(!r.summary().contains("shared place"));
+        r.resolved = Some(SandboxBackendKind::Seatbelt);
+        assert!(!r.summary().contains("shared place"));
+        r.resolved = Some(SandboxBackendKind::Podman);
+        assert_eq!(
+            r.summary(),
+            "auto → podman · 2 paths · allowlist · shared place"
+        );
     }
 
     /// A profile whose stored policy did not decode must not be summarised as
