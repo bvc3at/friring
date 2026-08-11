@@ -200,6 +200,12 @@ pub trait SecretStore: Send + Sync {
     fn set(&self, key: &SecretKey, secret: &Secret) -> Result<(), String>;
 
     /// Remove `key`'s entry. Removing one that is not there is not an error.
+    ///
+    /// # Errors
+    ///
+    /// The store itself is unavailable or the tool failed — an absent *store*
+    /// is not an absent entry, and reporting one as the other would tell a user
+    /// a token was revoked that is still wherever they put it.
     fn remove(&self, key: &SecretKey) -> Result<(), String>;
 
     /// The command a user runs to put a token in this store themselves.
@@ -444,6 +450,8 @@ impl SecretStore for Unavailable {
         Err(format!("{}: {}", self.reason, self.fix))
     }
 
+    /// Nothing is here to answer, which a launch degrades over by signing in —
+    /// so this alone is the absence rather than an error.
     fn get(&self, _key: &SecretKey) -> Result<Option<Secret>, String> {
         Ok(None)
     }
@@ -452,8 +460,11 @@ impl SecretStore for Unavailable {
         Err(format!("{}: {}", self.reason, self.fix))
     }
 
+    /// The same refusal as [`set`](Self::set), and for the same reason: an `Ok`
+    /// here would report a token removed from a store that was never consulted,
+    /// leaving whatever the user was trying to revoke wherever it actually is.
     fn remove(&self, _key: &SecretKey) -> Result<(), String> {
-        Ok(())
+        Err(format!("{}: {}", self.reason, self.fix))
     }
 
     fn how_to_store(&self, _key: &SecretKey) -> String {

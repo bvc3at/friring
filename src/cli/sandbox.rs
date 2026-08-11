@@ -2236,6 +2236,22 @@ mod tests {
         assert!(!out.human.contains(FAKE));
     }
 
+    /// A host with nowhere to keep a token cannot have removed one, and says so
+    /// rather than reporting a revocation that never happened — the user's token
+    /// is still wherever they actually put it.
+    #[test]
+    fn removing_a_token_where_there_is_no_store_is_an_error_not_a_summary() {
+        let store = crate::sandbox::auth::keychain::Unavailable::new(
+            "this host has no credential store friring can use",
+            "install libsecret-tools and run a Secret Service such as gnome-keyring",
+        );
+        let agents = vec![agent("claude", &["ANTHROPIC_API_KEY"])];
+
+        let error = remove_token("claude", None, &agents, &store).unwrap_err();
+        assert!(error.contains("no credential store"), "{error}");
+        assert!(error.contains("libsecret-tools"), "{error}");
+    }
+
     /// The listing answers "is there one?" and never "what is it?".
     #[test]
     fn listing_says_whether_a_token_exists_and_never_what_it_is() {
