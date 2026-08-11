@@ -534,6 +534,15 @@ remote SSH host can also pin `multiplexer = "psmux"`. psmux has known
   runs go out as `-l -N 1 "…"` (double-quoted, `\"`/`\\` escaped); the
   `-N` flag makes psmux's send-coalescing decoder bail so a typed `'`
   isn't mangled into `\` (`flush_psmux_literal` / `psmux_quote`).
+  Quoting alone can't carry every run, because psmux classifies arguments
+  *after* tokenizing (the quotes are gone by then): it drops each one
+  starting with `-` as an unknown flag, so a typed hyphen never reached the
+  pane, and it rewrites a `0xNN`-shaped argument into the character it
+  names, so a run spelling `0x41` would arrive as `A`. `psmux_literal_args`
+  escapes both by re-emitting the offending leading character *as* a `0xNN`
+  argument — psmux decodes it back and, in literal mode, joins the
+  arguments with no separator, so the run is reassembled exactly. Delivery
+  is probed by `scripts/dev/e2e/windows-vm.sh test` (probe D).
 - **`new-window` trailing tokens are not joined** (psmux keeps only the
   first, dropping the agent's args) and **`new-window -e` is ignored** (env
   vars never reach the process). `TmuxBackend::psmux_window_powershell`
