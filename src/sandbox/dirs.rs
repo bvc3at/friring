@@ -782,6 +782,42 @@ pub fn encloses(parent: &str, child: &str) -> bool {
     parent == child || strip_ancestor(&child, &parent).is_some()
 }
 
+/// Which read-write root would let a sandbox replace the program that applies
+/// the boundary, and the spelling of the program that root contains.
+///
+/// The rule bubblewrap applies to itself and every place backend applies to the
+/// engine it drives: a program at a user-writable prefix (`/usr/local/bin`,
+/// `/opt/homebrew/bin`) plus a profile granting that prefix read-write lets the
+/// sandbox replace what the host runs next. Shared rather than restated per
+/// backend, because a second copy is a second thing to forget when the rule
+/// changes.
+///
+/// Both spellings are compared, because replacing the symlink a program is
+/// reached through redirects the host's next launch exactly as replacing the
+/// binary does: a program on `PATH` at a system prefix pointing into a prefix
+/// the profile makes writable is the obvious bypass of a check that only read
+/// the name. `resolved` is the program as the kernel resolves it, or `None`
+/// where that could not be asked.
+#[must_use]
+pub fn program_in_writable_root<'a>(
+    rw_paths: &'a [String],
+    program: &str,
+    resolved: Option<&str>,
+) -> Option<(&'a str, String)> {
+    [
+        Some(program),
+        resolved.filter(|resolved| *resolved != program),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|path| {
+        rw_paths
+            .iter()
+            .find(|root| encloses(root, path))
+            .map(|root| (root.as_str(), path.to_string()))
+    })
+}
+
 /// `child` with `parent`'s prefix removed, or `None` when `parent` is not a
 /// strict ancestor of `child`.
 fn strip_ancestor(child: &str, parent: &str) -> Option<String> {

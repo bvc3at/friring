@@ -649,8 +649,8 @@ pub trait SandboxBackend {
 
     /// The error for calling a half this backend does not implement: a shape
     /// mismatch for a policy backend asked to be a place, and "not built yet"
-    /// for a place backend that implements neither — `apple-container` and
-    /// `wsl-distro`, which land in P4.
+    /// for a place backend that implements neither — `wsl-distro`, the one that
+    /// is still to come.
     fn wrong_half(&self) -> SandboxError {
         let kind = self.kind();
         match kind.shape() {

@@ -45,6 +45,7 @@ use crate::sandbox::backend::{
 use crate::sandbox::dirs;
 use crate::sandbox::egress::{proxy_required, RELAY_PORT};
 use crate::sandbox::launcher::relay_launcher_argv;
+use crate::sandbox::place::{valid_container_ref, PlaceBackend};
 use crate::sandbox::probe::{ProbeHost, ProbeOutput};
 use crate::session::{
     NetworkMode, ReadScope, SandboxBackendKind, SandboxInstance, SandboxProfile, SandboxShape,
@@ -269,7 +270,8 @@ impl ContainerBackend {
     /// [`BwrapBackend::wrap`](crate::sandbox::bwrap::BwrapBackend), which
     /// refuses the same shape for the same reason.
     ///
-    /// The rule is [`engine_in_writable_root`]; a program this friring cannot
+    /// The rule is [`dirs::program_in_writable_root`]; a program this friring
+    /// cannot
     /// resolve — a remote host's, which is not on this filesystem — leaves the
     /// literal comparison standing rather than refusing a launch over a question
     /// friring could not ask.
@@ -281,7 +283,7 @@ impl ContainerBackend {
         let program = self.program()?;
         let resolved = dirs::canonical(program);
         let Some((root, found)) =
-            engine_in_writable_root(&policy.rw_paths, program, resolved.as_deref())
+            dirs::program_in_writable_root(&policy.rw_paths, program, resolved.as_deref())
         else {
             return Ok(());
         };
@@ -627,6 +629,51 @@ impl ContainerBackend {
     }
 }
 
+/// The lifecycle seam every caller of a place shares (`crate::sandbox::place`).
+///
+/// Delegation rather than indirection: the inherent methods above are the
+/// implementations and stay this backend's documented API, and this block is
+/// what lets the launch path, teardown, the reclaiming pass and `friring-cli`
+/// name one interface instead of one accessor per tool.
+impl PlaceBackend for ContainerBackend {
+    fn ensure_place(&self, profile: &SandboxProfile) -> SandboxResult<EnsuredPlace> {
+        ContainerBackend::ensure_place(self, profile)
+    }
+
+    fn ensure_agent_program(
+        &self,
+        policy: &crate::session::SandboxPolicy,
+        place: &EnsuredPlace,
+        program: &str,
+    ) -> SandboxResult<()> {
+        ContainerBackend::ensure_agent_program(self, policy, place, program)
+    }
+
+    fn current_spec(&self, profile: &SandboxProfile) -> Option<String> {
+        ContainerBackend::current_spec(self, profile)
+    }
+
+    fn engine_program(&self) -> SandboxResult<&str> {
+        ContainerBackend::engine_program(self)
+    }
+
+    fn live_places(&self) -> SandboxResult<Vec<LiveContainer>> {
+        ContainerBackend::live_places(self)
+    }
+
+    fn reap(&self, plan: &GcPlan) -> Vec<String> {
+        ContainerBackend::reap(self, plan)
+    }
+
+    fn relay_port(&self, container: &str, session_key: &str) -> SandboxResult<u16> {
+        ContainerBackend::relay_port(self, container, session_key)
+    }
+
+    fn release_relay_ports(&self, session_key: &str) {
+        ContainerBackend::release_relay_ports(self, session_key);
+    }
+}
+
 impl SandboxBackend for ContainerBackend {
     fn kind(&self) -> SandboxBackendKind {
         self.engine.kind()
@@ -784,23 +831,6 @@ impl Inspected {
     }
 }
 
-/// Whether a string is a container name or id the engines could have minted:
-/// `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, at most 128 bytes (an id is 64 hex).
-///
-/// Everything friring learns about a place from an engine passes through here
-/// before it is recorded or used, because it reaches a command line as the
-/// argument right after `exec`'s own flags — a value that could pass for one
-/// (`-i`, `--rm`) must never get that far. The sandbox transport applies the
-/// same rule to what it is handed; this is the end that never hands one over.
-fn valid_container_ref(raw: &str) -> bool {
-    !raw.is_empty()
-        && raw.len() <= 128
-        && raw.starts_with(|c: char| c.is_ascii_alphanumeric())
-        && raw
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-}
-
 /// A label as a Go template renders a missing one.
 fn label(raw: Option<&str>) -> Option<String> {
     raw.map(str::trim)
@@ -825,34 +855,6 @@ fn assign_port(
         return Some(*port);
     }
     (base..base.saturating_add(span)).find(|port| !taken.values().any(|held| held == port))
-}
-
-/// Which read-write root would let a sandbox replace the engine binary, and the
-/// spelling of the program that root contains.
-///
-/// Both spellings are compared, because replacing the symlink an engine is
-/// reached through redirects the host's next launch exactly as replacing the
-/// binary does: an engine on `PATH` at a system prefix that points into a
-/// prefix the profile makes writable is the obvious bypass of a check that only
-/// read the name. `resolved` is the program as the kernel resolves it, or `None`
-/// where that could not be asked.
-fn engine_in_writable_root<'a>(
-    rw_paths: &'a [String],
-    program: &str,
-    resolved: Option<&str>,
-) -> Option<(&'a str, String)> {
-    [
-        Some(program),
-        resolved.filter(|resolved| *resolved != program),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(|path| {
-        rw_paths
-            .iter()
-            .find(|root| dirs::encloses(root, path))
-            .map(|root| (root.as_str(), path.to_string()))
-    })
 }
 
 /// A path the sandbox layer can name exactly, or a refusal.
@@ -1310,11 +1312,11 @@ mod tests {
         let granted = vec![real.display().to_string()];
         let program = link.display().to_string();
         // The name on `PATH` is nowhere near the granted root…
-        assert!(engine_in_writable_root(&granted, &program, None).is_none());
+        assert!(dirs::program_in_writable_root(&granted, &program, None).is_none());
         // …and the binary it actually runs is inside it.
         let resolved = dirs::canonical(&program);
-        let (root, found) =
-            engine_in_writable_root(&granted, &program, resolved.as_deref()).expect("refused");
+        let (root, found) = dirs::program_in_writable_root(&granted, &program, resolved.as_deref())
+            .expect("refused");
         assert_eq!(root, granted[0]);
         assert_eq!(found, binary.display().to_string());
         let _ = std::fs::remove_dir_all(&base);

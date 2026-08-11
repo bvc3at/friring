@@ -445,16 +445,13 @@ fn build(
     // for the transport to reach its tmux, for the relay port to be one no
     // sibling session holds, and for the relay binary inside it to be resolved.
     // Ensuring is idempotent, so a relaunch adopts the same place.
-    let ensured = match shape {
-        Some(crate::session::SandboxShape::Place) => Some(
-            host.container(backend)
-                .ok_or_else(|| {
-                    format!("Sandbox backend '{backend}' is a place this friring cannot create")
-                })?
-                .ensure_place(profile)?,
-        ),
+    let place_backend = match shape {
+        Some(crate::session::SandboxShape::Place) => Some(as_place(host, backend)?),
         _ => None,
     };
+    let ensured = place_backend
+        .map(|place| place.ensure_place(profile))
+        .transpose()?;
 
     // A place runs the agent *inside* itself, so an image with no agent CLI is a
     // pane that dies the instant it opens — and the sign-in `volume-login` does
@@ -462,10 +459,8 @@ fn build(
     // `ensure_place`: a place is shared by every session of its profile, and
     // those sessions need not run the same agent. Before the scratch directory
     // is minted and the proxy is bound, so a refusal costs nothing.
-    if let Some(place) = &ensured {
-        host.container(backend)
-            .ok_or_else(|| format!("Sandbox backend '{backend}' is not a place"))?
-            .ensure_agent_program(&policy, place, command)?;
+    if let (Some(backend), Some(place)) = (place_backend, &ensured) {
+        backend.ensure_agent_program(&policy, place, command)?;
     }
 
     // Never the host temp root: `/tmp` holds friring's own tmux socket, and a
@@ -547,8 +542,8 @@ fn build(
         // is its loopback, so each takes a port of its own and keeps it across
         // relaunches — and the address the proxy environment names has to be
         // that one, or every session after the first would fail closed.
-        let relay = match (&ensured, host.container(backend)) {
-            (Some(place), Some(container)) => container
+        let relay = match (&ensured, place_backend) {
+            (Some(place), Some(backend)) => backend
                 .relay_port(&place.instance.external_id, &session_key)
                 .map(Some)
                 .map_err(|e| e.to_string())?,
@@ -727,19 +722,16 @@ fn build(
 
     // The place's address for the transport, built from the engine path the
     // probe vetted rather than a bare name an inherited `PATH` could re-resolve.
-    let place = match &ensured {
-        Some(ensured) => Some(
+    let place = match (place_backend, &ensured) {
+        (Some(backend), Some(ensured)) => Some(
             crate::agent::transport::Place::new(
-                host.container(backend)
-                    .ok_or_else(|| format!("Sandbox backend '{backend}' is not a place"))?
-                    .engine_program()
-                    .map_err(|e| e.to_string())?,
+                backend.engine_program().map_err(|e| e.to_string())?,
                 &ensured.instance.external_id,
                 &profile.name,
             )
             .map_err(|e| format!("Cannot reach the sandbox place: {e:#}"))?,
         ),
-        None => None,
+        _ => None,
     };
 
     // Composed, so the instance survives this stack — but as the *launch's*,
@@ -837,12 +829,9 @@ fn cleanup_key(key: &str) {
     // again, and a place with a bounded span of them would otherwise run out
     // after enough sessions had come and gone.
     with_host(|host| {
-        for kind in [
-            crate::session::SandboxBackendKind::Docker,
-            crate::session::SandboxBackendKind::Podman,
-        ] {
-            if let Some(container) = host.container(kind) {
-                container.release_relay_ports(key);
+        for kind in crate::sandbox::PLACE_KINDS.iter().copied() {
+            if let Some(place) = host.place(kind) {
+                place.release_relay_ports(key);
             }
         }
     });
@@ -878,13 +867,7 @@ pub fn open_place(
             .select(profile.backend)
             .backend()
             .map_err(|e| e.to_string())?;
-        let container = host.container(backend).ok_or_else(|| {
-            format!(
-                "Sandbox profile '{}' resolves to '{backend}', which is not a place this friring \
-                 can open",
-                profile.name
-            )
-        })?;
+        let container = as_place(host, backend)?;
         let ensured = container.ensure_place(profile).map_err(|e| e.to_string())?;
         let place = crate::agent::transport::Place::new(
             container.engine_program().map_err(|e| e.to_string())?,
@@ -925,17 +908,14 @@ pub fn open_place(
 pub fn running_places(profile: &str) -> Vec<crate::agent::transport::Place> {
     with_host(|host| {
         let mut found = Vec::new();
-        for kind in [
-            crate::session::SandboxBackendKind::Docker,
-            crate::session::SandboxBackendKind::Podman,
-        ] {
-            let Some(container) = host.container(kind) else {
+        for kind in crate::sandbox::PLACE_KINDS.iter().copied() {
+            let Some(backend) = host.place(kind) else {
                 continue;
             };
-            let Ok(engine) = container.engine_program() else {
+            let Ok(engine) = backend.engine_program() else {
                 continue;
             };
-            let Ok(places) = container.live_places() else {
+            let Ok(places) = backend.live_places() else {
                 continue;
             };
             found.extend(
@@ -949,6 +929,37 @@ pub fn running_places(profile: &str) -> Vec<crate::agent::transport::Place> {
         }
         found
     })
+}
+
+/// The backend behind `kind` as a place, or the reason friring cannot launch
+/// into one.
+///
+/// One lookup for every path that opens a place, so the sentence a user gets is
+/// the same wherever the launch was composed from. The interesting case is a
+/// kind whose place friring can *build* but not yet *run a session in*: the
+/// refusal names what is missing and what to pick instead, because "never a
+/// silently dead pane" applies to the shapes friring has not finished as much as
+/// to the ones a host is missing.
+fn as_place(
+    host: &SandboxHost,
+    kind: crate::session::SandboxBackendKind,
+) -> Result<&dyn crate::sandbox::PlaceBackend, String> {
+    if let Some(place) = host.place(kind) {
+        return Ok(place);
+    }
+    if kind == crate::session::SandboxBackendKind::WslDistro {
+        return Err(
+            "A WSL distro is a place friring can create but cannot yet run a session in: \
+             reaching it needs the `wsl:` transport rather than the container one, and the \
+             projected hooks and credentials a place is launched with are not wired for a \
+             filesystem inside the utility VM. Run friring inside the distro and pick the \
+             'bwrap' backend, or pick 'docker'/'podman'"
+                .to_string(),
+        );
+    }
+    Err(format!(
+        "Sandbox backend '{kind}' is a place this friring cannot create"
+    ))
 }
 
 /// The key a launch that pinned neither id falls back to.
