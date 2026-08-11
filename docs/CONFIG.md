@@ -543,6 +543,28 @@ remote SSH host can also pin `multiplexer = "psmux"`. psmux has known
   throughout, with backslash literal so `C:\` paths survive); control-mode
   spawns (`psmux_window_command`) frame it in double quotes, and the
   headless local `spawn_window` passes it as a single argv arg.
+- **A paste cannot be key-encoded at all**, so it goes **out of band**
+  through psmux's own paste command (`control_mode::PsmuxPaste`). The key
+  encoding above has to emit an ESC byte as its own `Escape` key-name,
+  which reaches the pane as a standalone PTY write: the agent read a bare
+  Escape keypress instead of the `ESC[200~` opening marker and then took
+  every embedded CR as Enter, so a pasted stack trace was submitted one
+  line at a time. psmux's control-mode dispatcher implements **no** paste
+  command (`paste-buffer`/`set-buffer`/`send-paste` are CLI/server-only),
+  so a bracketed-paste payload (`bracketed_paste_text` unwraps one;
+  anything else keeps the key encoding) is handed to the one-shot CLI
+  `psmux send-paste -t <pane> <base64>` — the command psmux's own client
+  uses for a Ctrl+Shift+V, so psmux normalizes CRLF for ConPTY, writes the
+  markers contiguously, and adds them **only** when the pane's app enabled
+  bracketed paste. A failure falls back to the key encoding (degraded
+  beats dropped). The payload is base64 because a raw newline in a psmux
+  command argument is cut by the server's line-oriented read, which
+  truncates the payload *and* executes its tail as a psmux command
+  (psmux #560) — the same reason the headless one-shot prompt paths
+  (`paste_prompt_args`, feeding `send_prompt_unguarded_on` and the
+  PowerShell `deferred_prompt_script`) send `send-paste` to a psmux target
+  instead of the `send-keys -l <ESC[200~…>` that tmux still gets. Delivery
+  is probed by `scripts/dev/e2e/windows-vm.sh test` (probe C).
 
 The **local** socket name honours the `FRIRING_SOCKET` env override
 (`local_socket()`) — the only way to fully scope an instance on Windows,
