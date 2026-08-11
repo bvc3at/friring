@@ -138,7 +138,8 @@ copy_in = ["~/.claude/skills"]   # config safe to project into a container,
 # env = { DISABLE_AUTOUPDATER = "1" }  # static env while a sandbox is active
 # secret_env = ["ANTHROPIC_API_KEY"]   # token variable NAMES only; the value
                             #   lives in your OS keychain under the service
-                            #   "dev.friring.sandbox", never here
+                            #   "dev.friring.sandbox", never here — put one
+                            #   there with `friring-cli sandbox token set`
 # credential_file = "~/.claude/.credentials.json"  # the vendor credential file
 # seed_file_supported = false  # true ONLY where the vendor documents copying it
 # writeback = true          # a refreshed credential must survive the sandbox
@@ -231,7 +232,8 @@ the profile editor says rather than papering over. An `agents.toml` written
 before sandboxing existed loads unchanged. Full semantics:
 [`docs/SANDBOX.md`](SANDBOX.md) §Credentials, §Config projection and §Inner
 agent sandboxes. Sandbox *profiles* themselves are UI-edited and live in SQLite,
-not here.
+not here — `friring-cli sandbox export|import` is how one moves between machines
+([`docs/CLI.md`](CLI.md#sandboxes)).
 
 The seeded file also ships two commented, copy-pasteable templates
 below the built-ins — **Add your own agent** (every field annotated)

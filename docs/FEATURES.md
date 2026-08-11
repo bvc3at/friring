@@ -2990,13 +2990,19 @@ any allowed domain that can host arbitrary content.
 (macOS) and `bwrap` (Linux/WSL) — wrap the agent's argv with tmux outside, so
 nothing about window discovery, reattach, scrollback or restart changes;
 credentials are host passthrough, so the macOS Keychain keeps working and there
-is no login to redo. The *place* backend — `docker`/`podman` — runs the agent in
-a container with tmux **inside** it, reached through a transport exactly as an
-SSH host is, and gives you a filesystem the host cannot see plus memory and CPU
-caps that a policy backend cannot enforce. Every network mode is enforced on
-both, including `allowlist` (see the egress firewall below). The VM and
-distro-clone backends are declared and probed — every surface that offers a
-profile says why a backend is unavailable rather than hiding it — but not built.
+is no login to redo. The *place* backends — `docker`/`podman`, and Apple's own
+`container` on Apple Silicon running macOS 26 — run the agent in a container with
+tmux **inside** it, reached through a transport exactly as an SSH host is, and
+give you a filesystem the host cannot see plus memory and CPU caps that a policy
+backend cannot enforce. Every network mode is enforced on the policy backends and
+on `docker`/`podman`, including `allowlist` (see the egress firewall below);
+`apple-container` can honour only an unrestricted `full`, because a place there
+is a VM with its own kernel and the proxy socket carries no reachable listener
+across it — so a filtered profile is **refused** rather than started unfiltered.
+The `wsl-distro` backend clones, hardens and reclaims a distro per profile, but
+no session launches into one yet: pinning it refuses at the launch and names the
+two ways to get a boundary on Windows today. Every surface that offers a profile
+says why a backend is unavailable rather than hiding it.
 friring's default image carries **no agent CLI**: baking one in would put a
 vendor's release train inside the image, so an agent gets into a place either
 through your own `image`/`containerfile` or through a one-time install into the
@@ -3014,7 +3020,11 @@ egress credential. The boundary is around the place, not around a session in it;
 a profile per session is what gives each session a place of its own, and the
 profile editor and the profile list both say so where you pick one. Editing the profile builds a
 new container rather than reusing mounts that no longer describe it, and a
-background pass reclaims the one it replaced. When a place goes — a reboot, a
+background pass reclaims the one it replaced. The profile list doubles as the
+manager: `s` stops a profile's places, `r` rebuilds them from the profile as it
+reads now, and `p` runs the reclaiming pass for that row — the first two take a
+container away from whatever is running in it, so each asks first, in the footer,
+and only `y` answers. When a place goes — a reboot, a
 `docker system prune` — *every* session in it goes at once, so those panes say
 exactly that and reattach by themselves once friring has started it again.
 
@@ -3124,15 +3134,23 @@ friring's hook payload is projected in with every signal command rewritten to a
 `tmux set-option -p`, which the control-mode connection already delivers — the
 same rewrite that gives an SSH host its status.
 
+**Managing them without the TUI.** `friring-cli sandbox` (alias `sb`) lists and
+shows profiles with their live places, removes one, prunes the places nothing
+needs, exports and imports profiles as TOML — validating the *whole* document
+against the launch's own path refusals before it writes any of it — and stores
+the `env-token` value in friring's keychain entry with the token never on a
+command line in either direction. See [`docs/CLI.md`](CLI.md#sandboxes).
+
 **Three limits worth knowing.** A **policy**-sandboxed session is local-only:
 both policy backends generate their artefacts on the machine friring runs on, so
 an SSH/WSL session with a policy profile is refused rather than wrapped with the
-wrong machine's paths (a place is exempt — a place *is* the elsewhere). Nothing
-**stores** a sandbox token yet: `env-token` reads the entry, and creating one is
-a command friring prints for you to run until `friring-cli sandbox token` lands.
-And an egress proxy **lives in the friring that started it**, so a filtered
-session created by `friring-cli session create` has no way out until a running
-friring relaunches it — closed, not open, but closed.
+wrong machine's paths (a place is exempt — a place *is* the elsewhere). No
+session launches into a **`wsl-distro`** place: the distro is built and
+reclaimed, and the path that would put a session in it is not wired, so pinning
+it refuses with the alternatives rather than opening a pane with no hooks and no
+login. And an egress proxy **lives in the friring that started it**, so a
+filtered session created by `friring-cli session create` has no way out until a
+running friring relaunches it — closed, not open, but closed.
 
 ---
 

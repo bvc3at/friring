@@ -103,9 +103,12 @@ actually needs and to an allowlist of domains.
   cross-instance adopt inherits the warning instead of rendering the sandboxed
   mark over an agent on the host.
 - **Two sandbox shapes** — *policy* backends (`seatbelt`, `bwrap`) wrap the
-  agent's argv with tmux outside; *place* backends (`docker`/`podman`, and later
-  `apple-container` and `wsl-distro`) run tmux inside and are reached through a
-  new sandbox transport that mirrors the fork's SSH/WSL transports.
+  agent's argv with tmux outside; *place* backends (`docker`/`podman`,
+  `apple-container`, `wsl-distro`) run tmux inside and are reached through a new
+  sandbox transport that mirrors the fork's SSH/WSL transports. The place
+  backends share one `PlaceBackend` seam and one set of refusals as *code* — one
+  mount plan, one owner-label set, one spec digest, one collection decision — and
+  a conformance test holds all of them to it.
 - **Place backends: `docker`/`podman`** — one container per profile, shared by
   that profile's sessions and reached with `<engine> exec -i <ctr> tmux …`.
   `backend_type` carries `sandbox:<profile>` the way `ssh:<host>` does, so
@@ -130,6 +133,28 @@ actually needs and to an allowlist of domains.
   opening a pane that dies. Sessions sharing a place are **not** isolated from
   each other (one uid, one pid namespace, one filesystem); the trust domain is
   the place, and a profile per session is what gives each session one of its own.
+- **Place backend: `apple-container`** — Apple's `container` CLI on Apple
+  Silicon and macOS 26 or newer, one lightweight VM per place, on friring's own
+  `friring-sandbox` network rather than the one every container on the Mac
+  shares. It reuses the container engines' mount plan, labels, digest and
+  collection decision unchanged, and reads its option surface out of
+  `container run --help` at probe time because the CLI is young. Its one real
+  limit is stated rather than papered over: **the egress proxy cannot be reached
+  across a VM boundary**, so every filtered network mode — and `none`, whose
+  promise friring cannot keep there — is refused, leaving an unrestricted `full`
+  as the only mode it can honour.
+- **Place backend: `wsl-distro`** — one hardened clone per profile
+  (`friring-sbx-<profile>`, `automount` and `interop` off, an ownership marker,
+  bubblewrap required inside it), with VHD export/import and reclaiming. **No
+  session launches into one yet**: reaching it needs the `wsl:` transport rather
+  than the container one, so pinning it refuses at the launch with the two ways
+  to get a boundary today rather than opening a pane with no hooks and no login.
+- **Copy-on-write workspaces on `bwrap`** — the real directory as a read-only
+  lower layer and the agent's writes in an inspectable upper layer outside the
+  sandbox's own writable scratch. Availability is probed by *mounting* one, since
+  a setuid bubblewrap and a kernel that refuses unprivileged overlays are both
+  invisible to a version check, and a host that cannot refuses the profile rather
+  than binding the root read-write.
 - **friring touches only the places it created** — an owner label is set at
   creation, every lookup filters on it, every removal re-checks it, and a
   same-named container without it is neither adopted nor removed. A background
@@ -247,25 +272,38 @@ actually needs and to an allowlist of domains.
   `session`, `paths` and `shell`, and `agent` may reference `sandbox` (the wrap
   is a decorator on the launch `agent` composes). Enforced in
   `tests/architecture_rules.rs`.
+- **`friring-cli sandbox`** (fork-only, as the whole sandbox feature is) —
+  profile and place management (`list`, `show`, `rm`, `prune`), TOML
+  `export`/`import` that refuses at the *import* anything a launch would refuse,
+  and `token set|rm|list` for the `env-token` keychain entry, with the token
+  never on a command line in either direction and a store friring cannot write
+  to saying so before the value is asked for. The internal `sandbox relay` stays
+  the one subcommand dispatched before the database is opened (ADR-29).
+- **The profile list is a manager view** — places per profile, with `s` stop,
+  `r` rebuild and `p` prune. The two that take a container away from whatever is
+  running in it are confirmed in the footer, and `y` alone answers, because
+  `Enter` and `d` already mean edit and delete there.
 
-What ships is the two policy backends and the `docker`/`podman` place backend,
-with every network mode enforced, host-passthrough credentials under a policy
-backend, and status reporting out of either kind of boundary — a place gets the
-safe subset of the user's agent configuration projected into its synthetic home,
-including friring's own hook payload rewritten to report through tmux, so a
-place-backed session says working/blocked/done like any other. All three place
-credential strategies are built: `env-token`, `volume-login` and `seed-file`.
+What ships is both policy backends and all three place backends, with every
+network mode enforced where the backend can enforce it, host-passthrough
+credentials under a policy backend, and status reporting out of either kind of
+boundary — a place gets the safe subset of the user's agent configuration
+projected into its synthetic home, including friring's own hook payload rewritten
+to report through tmux, so a place-backed session says working/blocked/done like
+any other. All three place credential strategies are built: `env-token`,
+`volume-login` and `seed-file`.
 
 What does not: a place on a *remote* host is refused rather than supported
-(friring creates the container locally, with this machine's paths), nothing
-*stores* a token yet — the `friring-cli sandbox` subcommands are the next phase,
-so `env-token` only fires for a keychain entry created by hand with the command
-friring prints — there is no sandbox manager view, and
-`apple-container`/`wsl-distro` still probe as unavailable. An egress proxy dies
-with the friring process that started it, so a session created by the short-lived
-`friring-cli` starts with no way out (kernel-closed, which fails closed) until a
-running friring relaunches it. Design, delivery phases and ADR-25 through ADR-29
-live in [`docs/SANDBOX.md`](docs/SANDBOX.md).
+(friring creates the container locally, with this machine's paths); **no session
+launches into a `wsl-distro` place** — the distro is built, hardened and
+reclaimed, and the launch path into it is not, so pinning it refuses with the
+alternatives; **`apple-container` honours no filtered network mode**, because
+the egress proxy is not reachable across a VM boundary; and no profile column
+selects a copy-on-write workspace yet. An egress proxy dies with the friring
+process that started it, so a session created by the short-lived `friring-cli`
+starts with no way out (kernel-closed, which fails closed) until a running
+friring relaunches it. Design, delivery phases and ADR-25 through ADR-29 live in
+[`docs/SANDBOX.md`](docs/SANDBOX.md).
 
 #### Lazy sessions & ghosts (July 2026)
 

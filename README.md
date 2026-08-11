@@ -466,13 +466,16 @@ themes, switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
   authors the profiles, and `Ctrl+N` picks one per session. Reach for a host
   that isn't listed and friring asks once, then remembers. Two shapes ship: the
   policy backends — macOS `seatbelt` and Linux `bubblewrap` — which wrap the
-  agent on the host, and the `docker`/`podman` **place** backend, which runs it
-  in a container reached exactly the way an SSH host is, with your repositories
+  agent on the host, and the **place** backends — `docker`/`podman` and, on
+  Apple Silicon running macOS 26, Apple's own `container` — which run it in a
+  container reached exactly the way an SSH host is, with your repositories
   mounted at their real paths so git keeps working inside. A container gets the
   safe subset of your agent configuration projected in — instructions, skills,
   commands, minus anything naming a path that isn't in there — and the agent
   signs in once per profile inside its own pane, because a rotating credential
-  copied into two places invalidates itself.
+  copied into two places invalidates itself. `friring-cli sandbox` manages the
+  same profiles and places without a TUI, and exports them as TOML you can
+  commit.
 - **[Leader key](#leader-key)** *(Friring — fork-only)* — `Ctrl+F` arms a
   tmux-style prefix and paints a which-key overlay naming everything reachable;
   the next key runs it. Every global command is on it, plus jump-to-session by

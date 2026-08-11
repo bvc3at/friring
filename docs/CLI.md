@@ -63,19 +63,56 @@ friring-cli session list --parent <lead-uuid> --json | jq  # direct children onl
 - **`notify`** — diagnose OS desktop notifications: prints the detected delivery
   backend and last error; `--test` fires a sample. See the OS Notifications
   section of `docs/FEATURES.md`.
-- **`sandbox relay`** — **internal.** The half of the egress firewall that runs
-  *inside* a boundary: it offers a TCP endpoint on the sandbox's own loopback
-  and forwards each connection to the bind-mounted proxy socket, because no
-  HTTP or SOCKS client can dial a unix socket. Friring composes this command
-  itself as part of a bubblewrap launch; there is nothing to run by hand. It is
-  the one subcommand dispatched **before the database is opened** — ADR-29
-  keeps the database out of every sandbox — and it holds no credential and
-  makes no policy decision. See the "Reaching the proxy" section of
-  `docs/SANDBOX.md`.
+- **`sandbox`** (alias `sb`) — manage sandbox profiles and the places they run
+  in, without a TUI. See [Sandboxes](#sandboxes) below.
 - **`usage`** — account-level rate-limit windows for an agent (see Agent
   metrics below).
 - **`perf`** — prints the perf snapshot a running TUI publishes while
   `FRIRING_PERF_LOG` or its perf HUD is active. See `docs/PERFORMANCE.md`.
+
+## Sandboxes
+
+`friring-cli sandbox` (alias `sb`) is the headless half of
+[`docs/SANDBOX.md`](SANDBOX.md): the same profiles the TUI's `Alt+S` list edits,
+the same places its manager view drives, and the same refusals a launch makes.
+
+| Command | Does |
+|---|---|
+| `sandbox list [--instances]` | Every profile: resolved backend, path count, network mode, and why the backend is unavailable here when it is. `--instances` adds each profile's live places. |
+| `sandbox show <name>` | One profile in full, with its places and the launch refusals it would hit. |
+| `sandbox rm <name> [--force]` | Delete a profile. Refused while sessions reference it unless `--force`; the place tree and the profile's login are kept while anything still names it. |
+| `sandbox prune [--profile <name>] [--dry-run]` | Reclaim superseded and orphaned places, through the same decision the TUI's background pass makes. |
+| `sandbox export [<name>] [--output <file>]` | One profile, or every profile, as a `[[profile]]` TOML document. `--output` refuses to overwrite. |
+| `sandbox import <file> [--replace]` | Validate the **whole** document, then write it in one transaction. |
+| `sandbox token set <agent> [VAR]` / `token rm <agent> [VAR]` / `token list` | The `env-token` value in friring's own OS keychain entry. `VAR` may be omitted when the agent declares exactly one. |
+| `sandbox relay` | **Internal** — see below. |
+
+Four things about it are deliberate:
+
+- **A token is never an argument.** `token set` takes no value: it reads stdin
+  when one is piped, otherwise it prompts with echo off, and the value is never
+  rendered, logged or quoted back in a refusal. Every refusal about *which*
+  entry — an agent that declares no `secret_env`, a variable it does not declare,
+  a spelling the platform tool would read as a flag — is raised **before** the
+  value is asked for, and so is "this host's store cannot be written to", so a
+  refused token is never one you have to rotate. `token list` answers whether
+  friring holds each variable an agent declares, never what it holds.
+- **An import is refused for anything a launch would refuse**, in the launch's
+  own words: a read-write root enclosing the data directory, a path in either
+  mode reaching friring's sandbox state or a container engine's control socket.
+  A key friring does not recognise is refused rather than ignored — a typo'd
+  `network_alow` would otherwise import a boundary wider than the document says.
+- **A headless prune protects more than the TUI's pass does.** `friring-cli`
+  drives no session, so it cannot know which container one is in: it protects
+  every place of every profile a live session names. An engine that will not
+  answer is skipped whole rather than read as holding nothing.
+- **`sandbox relay` is internal.** It is the half of the egress firewall that
+  runs *inside* a boundary, offering a TCP endpoint on the sandbox's own loopback
+  and forwarding each connection to the bind-mounted proxy socket, because no
+  HTTP or SOCKS client can dial a unix socket. Friring composes the command
+  itself; there is nothing to run by hand. It is the one subcommand dispatched
+  **before the database is opened** — ADR-29 keeps the database out of every
+  sandbox — and it holds no credential and makes no policy decision.
 
 ## Agent metrics
 
