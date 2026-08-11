@@ -15,8 +15,13 @@
 //!   is already there. That is why hiding a secret is conditional on it
 //!   existing: a path that is not there needs no hiding, and trying anyway
 //!   would fail the launch instead of tightening it.
+//!
+//! Version 0.11 adds unprivileged overlays, which back the optional
+//! copy-on-write workspace: a writable root becomes an overlayfs whose lower
+//! layer is the real directory and whose upper layer is a directory friring
+//! mints — see [`OverlayWorkspace`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use crate::sandbox::backend::{
@@ -83,18 +88,25 @@ pub struct BwrapDetails {
     /// The absolute path the probe resolved and vetted, or `None` when the
     /// backend is unavailable. This — never [`BWRAP`] — is what a launch runs.
     pub program: Option<String>,
+    /// Whether this bwrap can give a launch a [copy-on-write
+    /// workspace](OverlayWorkspace), and — when it cannot — the reason a
+    /// refusal quotes and the profile editor shows in place of the option.
+    ///
+    /// Probed by *doing* it rather than inferred, because two of the three
+    /// answers are invisible to a version check: bubblewrap installed setuid
+    /// cannot mount an unprivileged overlay at all, and a kernel older than the
+    /// unprivileged-overlayfs work refuses one from a user namespace. Both would
+    /// otherwise surface as a dead pane on the first launch that asked for the
+    /// feature.
+    pub overlay: Availability,
 }
 
 impl BwrapDetails {
     /// Whether unprivileged overlays are available, which is what the optional
-    /// copy-on-write workspace mode needs.
-    ///
-    /// Version-only: overlays are also unavailable when bwrap is installed
-    /// setuid, which this does not detect — a setuid install is rare, and the
-    /// failure surfaces as bwrap's own error rather than as a wrong answer
-    /// here.
+    /// copy-on-write workspace mode needs. The reason behind a `false` is
+    /// [`overlay`](Self::overlay).
     pub fn supports_overlay(&self) -> bool {
-        self.version.is_some_and(|v| v >= OVERLAY_SINCE)
+        self.overlay.is_available()
     }
 }
 
@@ -113,6 +125,128 @@ pub fn parse_version(output: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+/// One writable root the sandbox sees through an overlay instead of directly.
+///
+/// The copy-on-write workspace of `docs/SANDBOX.md` §`bwrap`: the real
+/// directory is the overlay's **lower** layer and stays untouched, every write
+/// inside the boundary lands in [`upper`](Self::upper), and the merged view is
+/// mounted back at [`root`](Self::root) — identical absolute paths, so a git
+/// linked worktree and an agent's per-project state still resolve.
+///
+/// The upper layer is a plain directory rather than a tmpfs on purpose: what
+/// makes the mode useful is being able to read what the agent wrote after the
+/// fact, and to throw it away deliberately rather than on process exit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayWorkspace {
+    /// The path the sandbox sees, which is also the lower layer. Must be one of
+    /// the launch's own read-write paths — the overlay narrows a grant the
+    /// profile already made, and never invents one.
+    pub root: String,
+    /// Where writes land. friring's own directory, minted `0700`.
+    pub upper: String,
+    /// overlayfs's own scratch, which the kernel requires to be an empty
+    /// directory on [`upper`](Self::upper)'s filesystem.
+    pub work: String,
+}
+
+/// Where the copy-on-write layers live: `<data dir>/sandbox/overlay`.
+///
+/// Deliberately **not** under the session's scratch directory, which is the
+/// obvious home for a per-launch artefact and the wrong one. The scratch is
+/// bind-mounted read-write into the sandbox by design, so a layer directory
+/// under it is a path the agent can replace with a symlink between two launches
+/// — and the `upperdir` friring hands to `--overlay` is where *every* write
+/// inside the boundary lands, so a link to `/` would put the next launch's
+/// writes on the host root. Under here the tree is reachable from inside only
+/// through the overlay the agent is already writing through.
+///
+/// `None` when friring cannot resolve its data directory, which refuses the
+/// launch rather than falling back to somewhere writable.
+fn overlay_root() -> Option<PathBuf> {
+    dirs::sandbox_root().map(|root| root.join("overlay"))
+}
+
+/// Mint (or adopt) the layer directories for one launch's copy-on-write roots.
+///
+/// Adopted rather than recreated, like the per-session scratch: a relaunch of a
+/// crashed session must find the work its agent had already done, and wiping the
+/// upper layer on every start would make "discardable" mean "discarded without
+/// being asked". Every component is created by
+/// [`dirs::create_private_dir_under`], which refuses a symlink and classifies
+/// one as interference rather than as a profile a user should edit.
+///
+/// # Errors
+///
+/// friring has no data directory, or a layer directory exists as something
+/// other than a directory friring owns.
+pub fn overlay_workspaces(
+    session_key: &str,
+    roots: &[String],
+) -> SandboxResult<Vec<OverlayWorkspace>> {
+    let base = overlay_root().ok_or_else(|| SandboxError::Io {
+        path: "<data dir>/sandbox/overlay".to_string(),
+        detail: "friring could not resolve its data directory, so it has nowhere outside every \
+                 sandbox to keep a copy-on-write layer"
+            .to_string(),
+    })?;
+    let key = dirs::sanitize_component(session_key);
+    let mut out = Vec::with_capacity(roots.len());
+    for root in roots {
+        // Keyed on a digest of the path rather than on the path: a layer
+        // directory is named once and looked up again on every relaunch, and a
+        // sanitised absolute path collides (`/a/b` and `/a-b`) where a digest
+        // does not.
+        let leaf = format!("{key}/{}", dirs::digest(root));
+        let upper = dirs::create_private_dir_under(&base, &format!("{leaf}/upper"))?;
+        let work = dirs::create_private_dir_under(&base, &format!("{leaf}/work"))?;
+        out.push(OverlayWorkspace {
+            root: root.clone(),
+            upper: representable(&upper)?,
+            work: representable(&work)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Drop every copy-on-write layer one session left behind.
+///
+/// Session teardown's half of [`overlay_workspaces`], kept beside it rather than
+/// folded into [`dirs::cleanup_session`] because the layers deliberately do not
+/// live in the tree that function owns. Best effort: what will not go costs
+/// disk, and the next launch of the same session adopts it.
+pub fn cleanup_overlays(session_key: &str) {
+    let key = dirs::sanitize_component(session_key);
+    if let Some(dir) = overlay_root().map(|root| root.join(&key)) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A minted path the argv can name exactly, or a refusal — a lossy conversion
+/// would hand overlayfs a different directory than the one friring created.
+fn representable(path: &Path) -> SandboxResult<String> {
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| SandboxError::Io {
+            path: path.display().to_string(),
+            detail:
+                "is not valid UTF-8, and an overlay layer built from an approximation of it would \
+                 name a different directory"
+                    .to_string(),
+        })
+}
+
+/// Build the bubblewrap command line for one launch.
+///
+/// [`build_argv_with`] with no copy-on-write workspaces.
+pub fn build_argv(
+    program: &str,
+    launch: &SandboxLaunch<'_>,
+    relay: Option<&str>,
+    exists: &dyn Fn(&str) -> bool,
+) -> SandboxResult<Argv> {
+    build_argv_with(program, launch, relay, exists, &[])
+}
+
 /// Build the bubblewrap command line for one launch.
 ///
 /// `program` is the absolute path the probe resolved and vetted — see
@@ -127,13 +261,30 @@ pub fn parse_version(output: &str) -> Option<(u32, u32)> {
 /// database mask and the relay binary consult it — everything else either must
 /// exist (a path the user listed, which should fail loudly) or is bound with
 /// `-try`.
-pub fn build_argv(
+///
+/// `overlays` turns writable roots into [copy-on-write
+/// workspaces](OverlayWorkspace). They are emitted in the *same* sorted pass as
+/// every other mount, so the precedence rule is unchanged — a read-only path
+/// nested inside a copy-on-write root is still bound after it and still wins —
+/// and everything friring takes back (the `.git/hooks` bind, the secret masks,
+/// the database masks) is emitted after that pass, so an overlay can never widen
+/// what a mask denies.
+///
+/// # Errors
+///
+/// An overlay names a path this launch does not grant read-write, or two
+/// overlays stack. Plus everything the launch's own inputs refuse: a filtered
+/// mode with no proxy, a loopback endpoint this backend cannot reach, a missing
+/// relay.
+pub fn build_argv_with(
     program: &str,
     launch: &SandboxLaunch<'_>,
     relay: Option<&str>,
     exists: &dyn Fn(&str) -> bool,
+    overlays: &[OverlayWorkspace],
 ) -> SandboxResult<Argv> {
     let policy = launch.policy;
+    check_overlays(launch, overlays)?;
     let socket = proxy_socket(launch)?;
     let relay = match &socket {
         Some(_) => Some(relay_program(launch, relay, exists)?),
@@ -199,8 +350,25 @@ pub fn build_argv(
     // One sorted pass over both sets, so a read-only path nested in a writable
     // one is bound *after* its ancestor and wins.
     for (path, writable) in mount_plan(launch) {
-        let flag = if writable { "--bind" } else { "--ro-bind" };
-        push(&mut argv, &[flag, &path, &path]);
+        match overlays.iter().find(|ws| ws.root == path) {
+            // `--overlay-src` is consumed by the option that follows it, so the
+            // pair is emitted together and never separated by another mount.
+            Some(ws) => push(
+                &mut argv,
+                &[
+                    "--overlay-src",
+                    &ws.root,
+                    "--overlay",
+                    &ws.upper,
+                    &ws.work,
+                    &ws.root,
+                ],
+            ),
+            None => {
+                let flag = if writable { "--bind" } else { "--ro-bind" };
+                push(&mut argv, &[flag, &path, &path]);
+            }
+        }
     }
 
     for root in launch.writable_paths() {
@@ -312,6 +480,50 @@ pub fn build_argv(
 
 fn push(argv: &mut Vec<String>, tokens: &[&str]) {
     argv.extend(tokens.iter().map(|t| (*t).to_string()));
+}
+
+/// Refuse a set of copy-on-write workspaces that would mean more than the
+/// profile says.
+///
+/// Two shapes, both fail-closed:
+///
+/// - **An overlay narrows a grant; it never makes one.** A root the launch does
+///   not already grant read-write would otherwise become writable *and*
+///   invisible to every check that was made against the writable set — the
+///   database masks, the tmux-socket refusal, the engine-socket refusal all read
+///   [`SandboxLaunch::writable_paths`], and a path that is not in there has been
+///   judged by none of them.
+/// - **Overlays do not stack.** A copy-on-write root inside another one is an
+///   overlayfs whose lower layer is a directory that is itself an overlay by the
+///   time the sandbox looks at it; the merged view is defensible on paper and
+///   not something friring can state precisely, so it is refused rather than
+///   composed.
+fn check_overlays(launch: &SandboxLaunch<'_>, overlays: &[OverlayWorkspace]) -> SandboxResult<()> {
+    let refuse = |detail: String| SandboxError::Refused {
+        profile: launch.policy.profile.clone(),
+        detail,
+    };
+    let writable = launch.writable_paths();
+    for ws in overlays {
+        if !writable.contains(&ws.root) {
+            return Err(refuse(format!(
+                "'{}' is a copy-on-write workspace of a path this launch does not grant \
+                 read-write, and an overlay narrows a grant rather than making one",
+                ws.root
+            )));
+        }
+        if let Some(outer) = overlays
+            .iter()
+            .find(|other| other.root != ws.root && dirs::encloses(&other.root, &ws.root))
+        {
+            return Err(refuse(format!(
+                "'{}' and '{}' are both copy-on-write workspaces, one inside the other, and \
+                 friring will not stack one overlay's writes on another's",
+                outer.root, ws.root
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Every path to mount, sorted so an ancestor precedes its descendants.
@@ -467,7 +679,11 @@ impl BwrapBackend {
     }
 
     fn run_probe(&self) -> BwrapDetails {
-        let unavailable = |availability| BwrapDetails {
+        let unavailable = |availability: Availability| BwrapDetails {
+            overlay: Availability::unavailable(format!(
+                "bubblewrap is unavailable here: {}",
+                availability.message()
+            )),
             availability,
             version: None,
             program: None,
@@ -519,10 +735,95 @@ impl BwrapBackend {
             Ok(output) => self.diagnose(&output.stderr),
             Err(detail) => Availability::unavailable(detail),
         };
+        let overlay = if availability.is_available() {
+            self.probe_overlay(&program, version)
+        } else {
+            Availability::unavailable(format!(
+                "bubblewrap is unavailable here: {}",
+                availability.message()
+            ))
+        };
         BwrapDetails {
             program: availability.is_available().then_some(program),
             availability,
             version,
+            overlay,
+        }
+    }
+
+    /// Whether this bwrap can mount an unprivileged overlay, asked by mounting
+    /// one.
+    ///
+    /// The version is the cheap half and is checked first, because a bwrap that
+    /// has never heard of `--overlay-src` answers "unknown option" and the fix
+    /// is an upgrade rather than anything about this host. Past that bar the
+    /// only honest answer is an attempt: **a setuid bubblewrap cannot mount an
+    /// overlay at all**, and neither can a kernel that refuses overlayfs from a
+    /// user namespace, and nothing about either shows up in `--version`. The
+    /// attempt costs one fork of `true`, mounts nothing that outlives it and
+    /// writes nothing — the same shape as the user-namespace probe above it.
+    fn probe_overlay(&self, program: &str, version: Option<(u32, u32)>) -> Availability {
+        let (major, minor) = OVERLAY_SINCE;
+        match version {
+            Some(found) if found >= OVERLAY_SINCE => {}
+            Some((found_major, found_minor)) => {
+                return Availability::needs_fix(
+                    format!(
+                        "bubblewrap {found_major}.{found_minor} has no unprivileged overlays, \
+                         which a copy-on-write workspace is made of"
+                    ),
+                    format!("upgrade bubblewrap to {major}.{minor} or newer"),
+                )
+            }
+            None => {
+                return Availability::unavailable(
+                    "friring could not read this bubblewrap's version, so it will not assume the \
+                     unprivileged overlays a copy-on-write workspace is made of",
+                )
+            }
+        }
+        // `/usr` is the lower layer and the mount point: it is on every host
+        // this backend runs on, and an overlay over it is discarded with the
+        // namespace the moment `true` exits.
+        let attempt = self.host.run(
+            program,
+            &[
+                "--ro-bind",
+                "/",
+                "/",
+                "--overlay-src",
+                "/usr",
+                "--tmp-overlay",
+                "/usr",
+                "true",
+            ],
+        );
+        match attempt {
+            Ok(output) if output.ok() => Availability::available("unprivileged overlays"),
+            Ok(output) => {
+                let reason = output
+                    .stderr
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .unwrap_or("bubblewrap could not mount an unprivileged overlay");
+                // A setuid install is the one cause with a fix the user can act
+                // on, and bwrap says so itself ("Unable to create overlay
+                // filesystem in setuid mode"), so it is named rather than left
+                // as a quoted error nobody can place.
+                if reason.to_ascii_lowercase().contains("setuid") {
+                    return Availability::needs_fix(
+                        format!(
+                            "'{program}' is installed setuid, and an unprivileged overlay — which \
+                             a copy-on-write workspace is made of — cannot be mounted in that mode"
+                        ),
+                        "install a bubblewrap that relies on unprivileged user namespaces instead \
+                         of the setuid bit, or take the copy-on-write workspace off the profile",
+                    );
+                }
+                Availability::unavailable(reason.to_string())
+            }
+            Err(detail) => Availability::unavailable(detail),
         }
     }
 
@@ -611,6 +912,37 @@ impl SandboxBackend for BwrapBackend {
     }
 
     fn wrap(&self, argv: Argv, launch: &SandboxLaunch<'_>) -> SandboxResult<Argv> {
+        self.wrap_copy_on_write(argv, launch, &[])
+    }
+}
+
+impl BwrapBackend {
+    /// [`wrap`](SandboxBackend::wrap), with `cow_roots` served through
+    /// [copy-on-write workspaces](OverlayWorkspace) instead of written to
+    /// directly.
+    ///
+    /// The seam the profile's own capability plugs into: each root must be one
+    /// the profile already granted read-write, and the layers are minted under
+    /// friring's data directory rather than anywhere the sandbox can reach.
+    ///
+    /// **A host whose bubblewrap cannot mount an overlay refuses the launch**
+    /// rather than binding the root directly. Degrading silently would be the
+    /// one failure this mode exists to prevent: the user asked for writes that
+    /// do not touch the real directory, and a plain read-write bind writes
+    /// straight into it.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`wrap`](SandboxBackend::wrap) refuses, plus: this bwrap has
+    /// no unprivileged overlays (with [`BwrapDetails::overlay`]'s reason), a
+    /// root the launch does not grant read-write, stacked overlays, or a layer
+    /// directory friring could not mint.
+    pub fn wrap_copy_on_write(
+        &self,
+        argv: Argv,
+        launch: &SandboxLaunch<'_>,
+        cow_roots: &[String],
+    ) -> SandboxResult<Argv> {
         if launch.policy.backend != SandboxBackendKind::Bwrap {
             return Err(SandboxError::Unsupported {
                 backend: SandboxBackendKind::Bwrap,
@@ -644,10 +976,29 @@ impl SandboxBackend for BwrapBackend {
                 ),
             });
         }
+        // Asked before a directory is minted, and refused rather than degraded:
+        // a copy-on-write workspace that quietly became an ordinary read-write
+        // bind would write straight into the repository the user asked to keep
+        // untouched.
+        if !cow_roots.is_empty() && !details.supports_overlay() {
+            return Err(SandboxError::Unsupported {
+                backend: SandboxBackendKind::Bwrap,
+                detail: format!(
+                    "this profile asks for a copy-on-write workspace, which needs an unprivileged \
+                     overlay: {}",
+                    details.overlay.message()
+                ),
+            });
+        }
+        let overlays = overlay_workspaces(launch.session_key, cow_roots)?;
         let relay = local_relay_program().map(|p| p.display().to_string());
-        let mut out = build_argv(program, launch, relay.as_deref(), &|path| {
-            self.host.path_exists(path)
-        })?;
+        let mut out = build_argv_with(
+            program,
+            launch,
+            relay.as_deref(),
+            &|path| self.host.path_exists(path),
+            &overlays,
+        )?;
         out.extend(argv);
         Ok(out)
     }
@@ -691,6 +1042,16 @@ mod tests {
 
     /// What the probe would have resolved: a system-installed bubblewrap.
     const PROGRAM: &str = "/usr/bin/bwrap";
+
+    /// The command line [`BwrapBackend::probe_overlay`] asks the host, spelled
+    /// once so a test scripting an answer cannot drift from the probe.
+    const OVERLAY_PROBE: &str = "/usr/bin/bwrap --ro-bind / / --overlay-src /usr --tmp-overlay \
+                                 /usr true";
+
+    /// A host whose bubblewrap mounts an unprivileged overlay happily.
+    fn with_overlays(host: StubHost) -> StubHost {
+        host.with_command(OVERLAY_PROBE, ProbeOutput::success(""))
+    }
 
     /// The per-session scratch directory friring mints, as a launch sees it.
     /// Under the data directory — never the host temp root.
@@ -1236,7 +1597,9 @@ mod tests {
 
     #[test]
     fn probe_reports_the_version_and_overlay_support() {
-        let modern = BwrapBackend::new(Arc::new(StubHost::linux_with_bwrap("0.11.0")));
+        let modern = BwrapBackend::new(Arc::new(with_overlays(StubHost::linux_with_bwrap(
+            "0.11.0",
+        ))));
         assert_eq!(modern.probe().message(), "bubblewrap 0.11");
         assert!(modern.details().supports_overlay());
 
@@ -1246,6 +1609,72 @@ mod tests {
             !old.details().supports_overlay(),
             "copy-on-write workspaces need 0.11"
         );
+        // The version is the cheap half of the answer, so it is the one quoted:
+        // nothing about this host would change it.
+        let message = old.details().overlay.message();
+        assert!(message.contains("bubblewrap 0.8"), "{message}");
+        assert!(message.contains("upgrade bubblewrap to 0.11"), "{message}");
+    }
+
+    /// A setuid bubblewrap is a version check's blind spot: it reports 0.11 and
+    /// then refuses every overlay it is asked for. So the probe *mounts* one,
+    /// and the profile editor and the launch both get bwrap's own reason.
+    #[test]
+    fn a_setuid_bwrap_reports_overlays_as_unavailable_with_the_reason() {
+        let setuid = StubHost::linux_with_bwrap("0.11.0").with_command(
+            OVERLAY_PROBE,
+            ProbeOutput::failure(
+                1,
+                "bwrap: Unable to create overlay filesystem in setuid mode\n",
+            ),
+        );
+        let backend = BwrapBackend::new(Arc::new(setuid));
+        // The backend itself is fine — only the copy-on-write mode is not.
+        assert!(backend.probe().is_available());
+        assert!(!backend.details().supports_overlay());
+        let message = backend.details().overlay.message();
+        assert!(message.contains("installed setuid"), "{message}");
+        assert!(message.contains("/usr/bin/bwrap"), "{message}");
+
+        // A kernel that refuses an unprivileged overlay says so in its own
+        // words rather than being reported as a setuid install.
+        let old_kernel = StubHost::linux_with_bwrap("0.11.0").with_command(
+            OVERLAY_PROBE,
+            ProbeOutput::failure(1, "bwrap: Can't mount overlayfs: Operation not permitted\n"),
+        );
+        assert_eq!(
+            BwrapBackend::new(Arc::new(old_kernel))
+                .details()
+                .overlay
+                .message(),
+            "bwrap: Can't mount overlayfs: Operation not permitted"
+        );
+    }
+
+    /// The refusal that keeps the mode honest: a host that cannot overlay must
+    /// not quietly bind the root read-write instead, because the whole point of
+    /// the mode is that the real directory is not written to.
+    #[test]
+    fn a_host_without_overlays_refuses_a_copy_on_write_launch() {
+        let backend = BwrapBackend::new(Arc::new(StubHost::linux_with_bwrap("0.8.0")));
+        let policy = closed_policy(vec![SandboxPath::workspace("~/dev/app")]);
+        let launch = SandboxLaunch::new(&policy, "/home/u", "cow-refused");
+        let err = backend
+            .wrap_copy_on_write(
+                vec!["claude".into()],
+                &launch,
+                &["/home/u/dev/app".to_string()],
+            )
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::Unsupported { .. }), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("copy-on-write"), "{text}");
+        assert!(text.contains("upgrade bubblewrap"), "{text}");
+        // Nothing was minted for a launch that was never composed.
+        assert!(!overlay_root()
+            .expect("a data directory")
+            .join("cow-refused")
+            .exists());
     }
 
     #[test]
@@ -1381,6 +1810,215 @@ mod tests {
             backend.probe().message(),
             "bwrap: Can't mount proc on /newroot/proc"
         );
+    }
+
+    /// A copy-on-write root, as a launch that never touched the disk sees one.
+    fn workspace_at(root: &str) -> OverlayWorkspace {
+        OverlayWorkspace {
+            root: root.to_string(),
+            upper: format!("/data/sandbox/overlay/s1/{}/upper", dirs::digest(root)),
+            work: format!("/data/sandbox/overlay/s1/{}/work", dirs::digest(root)),
+        }
+    }
+
+    /// The overlay replaces the writable bind at exactly the same point in the
+    /// ordering, so the merged view lands at the root's own path — identical
+    /// absolute paths — and everything emitted after it still overrides it.
+    #[test]
+    fn a_copy_on_write_root_is_overlaid_at_its_own_path() {
+        let policy = closed_policy(vec![SandboxPath::workspace("~/dev/app")]);
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
+        let ws = workspace_at("/home/u/dev/app");
+        let argv =
+            build_argv_with(PROGRAM, &launch, None, &nothing, std::slice::from_ref(&ws)).unwrap();
+
+        // `--overlay-src` is consumed by the option that follows it, so the two
+        // are adjacent: a mount emitted between them would take the lower layer.
+        let at = index_of(&argv, "--overlay-src");
+        assert_eq!(
+            &argv[at..at + 6],
+            [
+                "--overlay-src",
+                &ws.root,
+                "--overlay",
+                &ws.upper,
+                &ws.work,
+                &ws.root,
+            ]
+        );
+        // And the root is not *also* bound read-write, which would put the
+        // agent's writes straight into the real directory.
+        assert!(!has_mount(&argv, "--bind", &ws.root, &ws.root));
+    }
+
+    /// The precedence rule is the mount order, and an overlay is emitted in the
+    /// same sorted pass as every other mount — so a read-only path nested in a
+    /// copy-on-write root still wins, and so does a read-write one.
+    #[test]
+    fn nesting_inside_a_copy_on_write_root_still_resolves_most_specific_first() {
+        let policy = closed_policy(vec![
+            SandboxPath::workspace("/repo"),
+            SandboxPath::read_only("/repo/vendor"),
+            SandboxPath::workspace("/repo/vendor/cache"),
+        ]);
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
+        let argv =
+            build_argv_with(PROGRAM, &launch, None, &nothing, &[workspace_at("/repo")]).unwrap();
+
+        let overlay = index_of(&argv, "--overlay");
+        let vendor = index_of(&argv, "/repo/vendor");
+        let cache = index_of(&argv, "/repo/vendor/cache");
+        assert!(overlay < vendor && vendor < cache, "{argv:?}");
+        // The nested pair are ordinary binds of the *real* directories, so a
+        // read-only descendant is still read-only and a read-write one still
+        // writes through to the host.
+        assert!(has_mount(
+            &argv,
+            "--ro-bind",
+            "/repo/vendor",
+            "/repo/vendor"
+        ));
+        assert!(has_mount(
+            &argv,
+            "--bind",
+            "/repo/vendor/cache",
+            "/repo/vendor/cache"
+        ));
+    }
+
+    /// ADR-29 and the secret masks are emitted after the mount pass, so they
+    /// still win over an overlay — a database sidecar written inside the
+    /// boundary would otherwise land in the upper layer and be replayed by the
+    /// host on next open.
+    #[test]
+    fn the_database_and_secret_masks_still_win_over_an_overlay() {
+        let db = "/home/u/.local/share/friring/friring.db";
+        let policy = policy(vec![SandboxPath::workspace("~/work")]);
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1")
+            .with_agent("claude")
+            .with_friring_db(db);
+        let present = |p: &str| p == "/home/u/.ssh" || p == db;
+        let argv = build_argv_with(
+            PROGRAM,
+            &launch,
+            None,
+            &present,
+            &[workspace_at("/home/u/work")],
+        )
+        .unwrap();
+
+        for file in [db, "/home/u/.ssh"] {
+            assert!(
+                index_of(&argv, file) > index_of(&argv, "--overlay"),
+                "{file} must be taken back after the overlay"
+            );
+        }
+        assert!(has_mount(&argv, "--ro-bind", "/dev/null", db));
+        assert!(has_flag(&argv, "--tmpfs", "/home/u/.ssh"));
+        // `.git/hooks` is the same rule: bound read-only over the merged view,
+        // because the *host's* git runs whatever is in the real directory.
+        let hooks = "/home/u/work/.git/hooks";
+        assert!(has_mount(&argv, "--ro-bind-try", hooks, hooks));
+        assert!(index_of(&argv, hooks) > index_of(&argv, "--overlay"));
+    }
+
+    /// An overlay narrows a grant the profile already made. One naming a path
+    /// the launch does not grant read-write would be a grant that no check ran
+    /// against — the database, tmux-socket and engine-socket refusals all read
+    /// the writable set.
+    #[test]
+    fn an_overlay_may_not_name_a_path_the_launch_does_not_grant() {
+        let policy = closed_policy(vec![SandboxPath::workspace("~/dev/app")]);
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
+        let err = build_argv_with(
+            PROGRAM,
+            &launch,
+            None,
+            &nothing,
+            &[workspace_at("/home/u/secrets")],
+        )
+        .unwrap_err();
+        assert!(matches!(err, SandboxError::Refused { .. }), "{err}");
+        assert!(err.to_string().contains("narrows a grant"), "{err}");
+
+        // Nor may two of them stack: the inner overlay's lower layer would be
+        // the outer overlay's merged view, which friring will not reason about.
+        let policy = closed_policy(vec![
+            SandboxPath::workspace("/repo"),
+            SandboxPath::workspace("/repo/sub"),
+        ]);
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
+        let err = build_argv_with(
+            PROGRAM,
+            &launch,
+            None,
+            &nothing,
+            &[workspace_at("/repo"), workspace_at("/repo/sub")],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("stack"), "{err}");
+    }
+
+    /// The layers are minted outside every sandbox's reach, adopted across a
+    /// relaunch, and dropped with the session.
+    ///
+    /// The escape this placement closes: the per-session scratch directory is
+    /// bind-mounted read-write into the sandbox, so a layer under it is a path
+    /// the agent can replace with a symlink — and an `upperdir` pointing at `/`
+    /// would put the next launch's every write on the host root.
+    #[test]
+    fn overlay_layers_live_outside_the_sandbox_and_survive_a_relaunch() {
+        let root = "/home/u/dev/app".to_string();
+        let first = overlay_workspaces("layers-test", std::slice::from_ref(&root)).unwrap();
+        assert_eq!(first.len(), 1);
+        let layers = &first[0];
+        assert!(std::path::Path::new(&layers.upper).is_dir());
+        assert!(std::path::Path::new(&layers.work).is_dir());
+
+        // Neither layer is under the directory the sandbox is handed, and both
+        // are inside the tree friring keeps for itself.
+        let scratch = dirs::session_scratch_dir("layers-test")
+            .unwrap()
+            .display()
+            .to_string();
+        let tree = dirs::sandbox_root().unwrap().display().to_string();
+        for path in [&layers.upper, &layers.work] {
+            assert!(
+                !dirs::encloses(&scratch, path),
+                "{path} is inside {scratch}"
+            );
+            assert!(dirs::encloses(&tree, path), "{path} is outside {tree}");
+        }
+        // And no profile could ever name them: they are under the sandbox tree
+        // that `check_declared_paths` refuses in either mode.
+        assert!(dirs::check_declared_paths(std::slice::from_ref(&layers.upper)).is_err());
+
+        // A relaunch adopts what is there rather than wiping the agent's work.
+        std::fs::write(std::path::Path::new(&layers.upper).join("kept"), "x").unwrap();
+        let again = overlay_workspaces("layers-test", std::slice::from_ref(&root)).unwrap();
+        assert_eq!(again, first);
+        assert!(std::path::Path::new(&layers.upper).join("kept").exists());
+
+        cleanup_overlays("layers-test");
+        assert!(!std::path::Path::new(&layers.upper).exists());
+    }
+
+    /// The layer directories are friring's own, and a link where one belongs is
+    /// interference rather than a profile a user should edit — so it refuses the
+    /// launch outright instead of routing through `allow_unsandboxed_fallback`.
+    #[cfg(unix)]
+    #[test]
+    fn a_layer_directory_replaced_by_a_link_refuses_the_launch_as_tampering() {
+        let base = overlay_root().expect("a data directory");
+        let key = "layers-tampered";
+        dirs::create_private_dir(&base.join(key).join(dirs::digest("/repo"))).unwrap();
+        let planted = base.join(key).join(dirs::digest("/repo")).join("upper");
+        let _ = std::fs::remove_dir_all(&planted);
+        std::os::unix::fs::symlink(dirs::host_temp_root(), &planted).unwrap();
+
+        let err = overlay_workspaces(key, &["/repo".to_string()]).unwrap_err();
+        assert!(err.is_tampering(), "{err}");
+        cleanup_overlays(key);
     }
 
     #[test]
