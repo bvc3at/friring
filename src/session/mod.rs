@@ -6,6 +6,7 @@ pub mod bridge;
 pub mod cc_activity;
 pub mod extension_def;
 pub mod host_def;
+pub mod hyperlink;
 pub mod keybindings;
 pub mod memory;
 pub mod message;
@@ -42,6 +43,7 @@ pub use host_def::{
     is_offhost_backend, is_remote_backend, is_ssh_backend, is_wsl_backend, HostDef, HostKind,
     HostRegistry, SSH_BACKEND_PREFIX, WSL_BACKEND_PREFIX,
 };
+pub use hyperlink::{HyperlinkRun, HyperlinkTable, VisibleRun};
 pub use keybindings::{
     compact_shortcut, prefix_sections, Action, KeyBindings, KeyChord, KeyContext, PrefixEntry,
     PrefixMode,

@@ -86,8 +86,22 @@ between it and the `app` coordinator.
   grouped by repo, never by status; `move_in_order` is the pure reorder
   behind `Shift+J/K`), `terminal_view`, `info_panel`, `status_bar`,
   `repo_picker_modal`, `agent_picker_modal`; `selection.rs` drives
-  mouse-drag text selection and `links.rs` detects clickable URLs. Colors
-  are centralized in `theme.rs` (ADR-14).
+  mouse-drag text selection and `links.rs` detects plain-text URLs in the
+  rendered rows for Ctrl+Click — while a **rich-text link** (OSC 8) prints
+  only its label, so its target is captured from the escape at parse time
+  (`agent::osc8` → `session::hyperlink`) and wins over a plain-text match at
+  the same cell (`App::url_at_click`). Because ratatui knows nothing about
+  hyperlinks, each painted frame is followed by
+  `App::paint_terminal_hyperlinks`, which re-prints the visible runs wrapped
+  in OSC 8 (same glyphs, same styles, read back out of the drawn frame) so
+  the **outer** terminal can open the user's own browser — the only route
+  to one when friring runs on a remote host. The click always toasts its
+  outcome, and on a host with no browser (headless / SSH — no `DISPLAY`, no
+  `BROWSER`) it **copies** the URL instead of spawning an opener that goes
+  nowhere, through the same clipboard fallbacks as `Ctrl+C` (tmux / OSC 52),
+  so the URL reaches the user's own clipboard. See the Clickable URLs
+  section of `docs/FEATURES.md`. Colors are centralized in `theme.rs`
+  (ADR-14).
 - **`cli/`** — `friring-cli` subcommand dispatch (headless session ops +
   scheduling + the editor command), sharing the SQLite DB with the TUI but
   never importing `app`/`ui` (ADR-15). Three subcommands run *inside* a

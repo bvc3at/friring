@@ -8,6 +8,7 @@ pub mod host_config;
 pub mod input;
 pub mod json_merge;
 pub mod osc52;
+mod osc8;
 pub mod provider;
 pub mod registry;
 pub mod sandboxing;
