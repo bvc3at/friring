@@ -40,6 +40,13 @@ change. Fork-visible divergences are also listed in [`FORK.md`](../FORK.md).
 - Native Windows process sandboxing (restricted tokens / AppContainer). Windows
   isolation is delivered through WSL2 and through containers. See
   [Backend catalogue](#backend-catalogue).
+- **Isolating the sessions that share a place from each other.** A place is one
+  container per profile, and the sessions in it run as one uid, in one pid
+  namespace, over one filesystem. Per-session isolation is what a *policy*
+  backend gives — one kernel policy per process tree — and what a place holding
+  one session gives; between siblings in a place there is none, and the boundary
+  that does hold is the place's. The lever is a profile per session, and the UI
+  says so rather than leaving it to be assumed.
 - **Detecting a pre-existing hardlink alias.** Both policy backends protect a
   file by *name*: seatbelt denies a pathname, bwrap covers one with a mask. A
   hard link made on the host *before* the launch — sitting inside a read-write
@@ -86,12 +93,22 @@ friring                               friring
 Consequences worth internalising:
 
 - A policy sandbox costs milliseconds and reuses the host toolchain. A place
-  sandbox costs a container start and needs an image containing the toolchain,
-  the agent, and tmux.
+  sandbox costs a container start and needs an image containing the toolchain
+  and tmux, with the agent either baked into that image or installed once into
+  the profile's home — friring's default image carries no agent CLI, and a
+  launch whose agent is not in the place is refused with the command that puts
+  one there rather than opening a pane that dies at once.
 - When a policy sandbox's process dies, one pane dies — the existing dead-pane
   UX. When a place dies, every session in it dies at once.
 - Only place backends can enforce memory/CPU limits, and only place backends
   give a filesystem the host cannot see.
+
+Sessions in one place are therefore **not isolated from each other**: one uid,
+one pid namespace, one filesystem, so each can read the others' files, processes
+and environment — the proxy credential and the first-use grants that go with it
+included. The trust domain is the place, not the session in it. A profile per
+session gives a place per session, and that lever is stated where a profile is
+chosen: the profile editor's footer and the profile list's `shared place` mark.
 
 Overlapping paths resolve **most-specific-first on both backends**: `repo`
 read-only with `repo/work` read-write leaves `repo/work` writable, and the
@@ -345,8 +362,52 @@ workload needs a toolchain the host does not have.
   so a missing source is refused rather than invented as a root-owned directory,
   and every refusal is friring's own sentence naming the profile's path. A path
   that cannot be spelled in a `--mount` value (a comma, a quote), one that would
-  carry the data directory or a tmux socket directory across, and two paths
-  landing on one target inside are all refused (ADR-29).
+  carry the data directory (ADR-29), a tmux socket directory or the engine's own
+  control socket across, and two paths landing on one target inside are all
+  refused. The tmux socket directory is refused from below as well as above: a
+  profile naming one server's `tmux-<uid>` directory encloses nothing, and a
+  read-only bind is no defence, because a read-only superblock does not take
+  write permission away from a socket inode — `connect(2)` still succeeds.
+- **A mount source is judged as the kernel resolves it, and is refused if it
+  travels through a symlink.** The string friring checks is the string the engine
+  hands over, and the kernel resolves it *again* when it sets the bind up, so a
+  source reached through a link means one thing to the check and another to the
+  mount. This needs no user error: a plan adds `<writable root>/.git/hooks` by
+  itself, and an agent inside a place can replace that path with a link to
+  friring's tmux socket directory for the next ensure to mount. A legitimately
+  symlinked path is refused too — friring cannot tell the two apart — with a
+  message naming the link and where it points. The check runs twice, once when
+  the plan is built and once immediately before the container is created; what is
+  left is the window between friring's last `realpath` and the engine's own
+  resolution of the same string, which nothing outside the engine can close.
+  friring's own place directories are judged from `<data dir>/sandbox/pl` down:
+  everything above it is unreachable from any sandbox (ADR-29 keeps the whole
+  data directory out), and a machine whose data directory sits behind a link —
+  `/var` → `/private/var` on macOS — would otherwise be refused its own egress
+  directory. Where the engine runs on another host, a source is not on friring's
+  filesystem to resolve and the launch's own existence check is the only
+  authority; the symlink rule does not apply there.
+  A refused source is never *rewritten* to its resolved spelling: rewriting one
+  would mount a directory the profile does not name, and identical absolute paths
+  are what keep a git linked worktree working (see below).
+- **The engine's control socket is never mounted**, wherever it lives:
+  `/var/run/docker.sock`, `/run/podman/podman.sock`, the per-user trees a
+  rootless engine or Docker Desktop keeps one in (`/run/user/<uid>`,
+  `$XDG_RUNTIME_DIR`, `~/.docker`, `~/.local/share/containers/podman/machine`),
+  and whatever `DOCKER_HOST` or `CONTAINER_HOST` names. This is deliberately not
+  the explicit-loopback escape hatch: that hatch shares one service the user
+  chose, and the engine socket is the ability to start a privileged container
+  with the host's filesystem in it — the whole host, which no profile can
+  coherently intend. The same refusal applies to a **policy** profile, where the
+  socket would otherwise be reachable: bubblewrap masks `/run` and `/var/run`
+  only under `host-minus-secrets`, and a path the profile lists explicitly wins
+  that mask.
+- **A profile that makes the engine binary writable is refused**, the rule and
+  the sentence bubblewrap already applies to itself: an engine at a user-writable
+  prefix (`/usr/local/bin`, `/opt/homebrew/bin`) plus a profile granting that
+  prefix read-write lets the sandbox replace the program the host runs next. Both
+  spellings are compared, so an engine reached through a symlink is judged by
+  where it lands — as it is at probe time.
 - Network is `--network none` for every mode but an unrestricted `full`, plus
   the bind-mounted proxy socket.
 - **The container runs as the host user** — `--user uid:gid` under a rootful
@@ -376,6 +437,27 @@ workload needs a toolchain the host does not have.
   or the default tag `friring/sandbox:1`. friring publishes no registry image,
   so a missing default is refused with the command that builds it from
   `packaging/sandbox/Containerfile`.
+- **The image carries no agent, by design.** Baking one in would put a vendor's
+  release train inside the image contract, and choosing which vendors to carry
+  is a decision friring's agent-neutrality does not make. An agent reaches a
+  place either through the profile's own `image`/`containerfile` or through a
+  one-time install into the profile's synthetic home, which lives outside the
+  image and survives every container the profile rebuilds — the same directory
+  `volume-login` keeps its credential in, so one install and one sign-in per
+  profile. friring composes that install as a *throwaway* container of the same
+  image: the place's own network is whatever the profile granted it, and an
+  install made in the image is built for the image's architecture rather than
+  the host's. Every launch asks the place for the agent it is about to run
+  (per launch, not per place — sessions of one profile may run different
+  agents) and refuses with that command when it is not there.
+- **`full` with no denies joins the engine's default network**, which is the one
+  mode with no `--network none` and no proxy — so the container can reach the
+  host at the bridge gateway (`172.17.0.1`) and anything the host binds on
+  `0.0.0.0`. ADR-27's refusal to let the proxy dial its own machine does not
+  apply, because under this mode there is no proxy in the path. That is the
+  honest reading of "unrestricted", and the reason every other mode gets
+  `--network none`; a profile that wants a way out but not the host's own
+  services should use `full` **with** denies, or `allowlist`.
 
 ### `wsl-distro` — Windows, place
 
@@ -1112,16 +1194,24 @@ lifecycle path keys off it:
   first — which is also the recovery: a container stopped by a host reboot is
   started again there — and the retry sweep keeps trying, so a place that comes
   back adopts its sessions without a restart.
-- **Delete.** The pane is killed inside the place, found by friring's own owner
-  and profile labels rather than by starting anything. Worktree removal stays
-  local: a place mounts every path at exactly its host path, so the checkout the
-  container sees *is* the host's.
+- **Delete.** The window is killed inside the place, found by friring's own
+  owner and profile labels rather than by starting anything. Addressed by its
+  `tb-<session>` **name**, and tried in *every* live place of the profile: a
+  profile can have several containers at once (an edit builds a new one while
+  the sessions already launched stay in the old), `sessions` records no
+  container, and a pane id is per tmux server — so `%1` in the container this
+  session is not in names a different session's agent. A name is unique to the
+  session wherever it lives, so missing costs a leaked window instead of a
+  stranger's agent. Worktree removal stays local: a place mounts every path at
+  exactly its host path, so the checkout the container sees *is* the host's.
 - **Headless.** `friring-cli session create --sandbox <profile>` spawns into the
   place and persists `sandbox:<profile>`; `session restart` refuses a
   place-backed session for the same reason it refuses a remote one — the local
   kill would find nothing and the local spawn would put an unsandboxed agent on
-  the host. Automation delivery resolves the running place and sends into it,
-  and skips (rather than errors) when the place is not running.
+  the host. Automation delivery asks every live place of the profile for the
+  session's window and sends into the one that has it, skipping (rather than
+  erroring) when no place holds it — picking the first labelled container
+  instead would report a running session as not running and never fire.
 
 ### Reclaiming places
 
@@ -1169,16 +1259,40 @@ Two details that silently break things if missed:
   seatbelt profile to `<data dir>/sandbox/profiles/`, both `0700`, both refusing
   a symlink. Neither may be the host temp root, and a profile is refused if its
   read-write roots enclose the data directory or reach a tmux socket directory.
+  A profile may not name anything under `<data dir>/sandbox` or
+  `<data dir>/signals` in **either** mode either: that tree holds the other
+  profiles' synthetic homes — and therefore the logins in them — the markers that
+  keep one credential to one boundary (ADR-28), the generated seatbelt policies,
+  and the other sessions' egress sockets and status files. All of those are taken
+  by being *readable*, so read-only is no defence, and the check is applied to
+  the paths the **profile** declares rather than to the launch's own grants: the
+  directories friring mints for a launch live in exactly that tree and are the
+  point of it. `host-minus-secrets` names no path and grants the whole host, so
+  it is taken back separately: both policy backends deny `<data>/sandbox/pl`,
+  `<data>/sandbox/profiles` and `<data>/sandbox/seeds` under that scope,
+  alongside the host credential list. Not `<data>/sandbox` whole — the launch's
+  own scratch is under `<data>/sandbox/tmp`, and an agent that cannot write a
+  temp file dies on startup.
   The scratch is keyed on the session and adopted, not recreated, so a crashed
   run's files survive into the next launch; session teardown drops both.
 
   A proxy instance is **per session, not per profile**: the policy is per
-  profile, but the bearer token and the socket are per boundary, and sharing them
-  would put every sibling session's way out behind one compromised agent and let
-  one first-use answer widen another session's boundary. A launch that cannot be
-  told apart — no friring session id and no agent conversation id — is refused
-  rather than filed under a shared fallback name, because two boundaries under
-  one key is exactly what that rule forbids.
+  profile, but the bearer token and the socket belong to one launch. That is what
+  makes a refusal name the session that provoked it, a first-use answer reach the
+  session that was asked, an instance die with its session, and a relaunch rotate
+  one session's credential without cutting off anybody else's. A launch that
+  cannot be told apart — no friring session id and no agent conversation id — is
+  refused rather than filed under a shared fallback name, because two launches
+  under one key would replace each other's instance mid-run.
+
+  It is **not** isolation between the sessions of a place. They share a uid, a
+  pid namespace and the place tree, so a sibling reads the proxy URL out of
+  `/proc/<pid>/environ`, connects to any socket under that tree, and dials any
+  relay port on the loopback they share; a grant one of them is given is
+  reachable by all of them, and is written back to the profile they all use. Per
+  session is the shape for what it buys above — attribution, lifetime, rotation —
+  and per place is the boundary. See
+  [The two sandbox shapes](#the-two-sandbox-shapes).
 
   It is bound before the agent — argv has to name the port or the socket — but
   it belongs to no session until that launch has a pane: the session keeps the
@@ -1259,9 +1373,12 @@ screens rather than patterns.
 
 **Profile list** (`Modal::SandboxList`, `Alt+S` or `<leader> S`) — the automations
 list: `n` new, `e`/`Enter` edit, `d` delete, empty-state hint. Each row shows the
-resolved backend (`auto → seatbelt`), the path count, the network mode, the state
-of its live place when it has one, and — when the backend it would run on is not
-available here — the probe's own reason. The resolution is as invisible-free here
+resolved backend (`auto → seatbelt`), the path count, the network mode,
+`shared place` when the backend it resolved to is a place — this row is where a
+profile is picked for a second session, and picking a shared one is the decision
+that puts two agents in one box — the state of its live place when it has one,
+and — when the backend it would run on is not available here — the probe's own
+reason. The resolution is as invisible-free here
 as at the creation step, and so is the availability: picking `docker` on a machine
 with no engine says so on the row rather than at launch. The stop / rebuild /
 prune actions are still P4; reclaiming happens on its own background pass.
@@ -1288,8 +1405,19 @@ Path entry is a plain text field. Reusing the repo picker's live completion
 needs a refactor first — that code is a private `App` method bound to
 `Modal::RepoPicker` — so it follows rather than ships with the screen.
 
+A profile that resolves to a place also says what sharing it costs, pinned in
+the footer under the shape line: `sessions sharing a place are not isolated from
+each other` / `a profile per session gives each session a place of its own`.
+This is the screen where that is decided, and the footer is pinned because the
+body scroll-windows — a caveat that can scroll out of sight is one that gets
+missed.
+
 Validation returns a message that surfaces through the existing error toast;
-there is no inline form-error widget today and adding one is deferred.
+there is no inline form-error widget today and adding one is deferred. It runs
+the launch's own path refusals at the *save*, so a profile that could never be
+launched is a form that will not store: a read-write root reaching the database
+or a tmux socket directory, and a path in either mode reaching Friring's own
+sandbox state or a container engine's control socket.
 
 **Session creation** — a dedicated step in the `Ctrl+N` sequence, after
 directory selection so it can rank profiles covering the chosen directories
@@ -1419,6 +1547,24 @@ complete and consistent with existing screens.
   command, and a line on `friring-cli session create`'s own output
   (`sandbox_login` in its JSON). One login serves every session of the profile,
   and it survives a container rebuild.
+- **A place whose image has no agent is refused, not launched.** A place runs
+  the agent inside itself, so a missing binary is a pane that dies the instant
+  it opens — taking the sign-in that happens *in that pane* with it. friring
+  asks the place for the program before it composes anything and refuses with
+  the install command filled in, through the profile's own
+  `allow_unsandboxed_fallback` switch like every other boundary it will not
+  grant. An `exec` that could not run at all (no `/bin/sh`, an image built for
+  another architecture) is reported as that instead, because "install the
+  agent" would be the wrong fix.
+- **Deleting a profile keeps its tree while sessions are still in it.** The
+  synthetic home is bind-mounted into a container the delete does not stop, so
+  removing it would take `$HOME` away from a live agent mid-turn, unlink the
+  egress sockets its siblings are talking through and destroy the login. The
+  confirmation says the tree and the login are kept; the reclaiming pass removes
+  the container once nothing is running in it, and collects the tree in the same
+  sweep. That pass only collects a tree when every engine it can drive answered
+  and every removal it attempted succeeded — "the engine would not say" has to
+  read as "something may still be running in there".
 - **A credential never rides a command line, so a launch that has only one is
   refused.** The local headless spawn passes a window's environment as
   `tmux -e KEY=VALUE` argv; a launch carrying an injected token there is
@@ -1432,10 +1578,27 @@ complete and consistent with existing screens.
   fixable, the second would run a policy nobody wrote.
 - **A boundary friring will not grant** fails the launch with the reason and
   the fix, whatever the profile asked for: read-write roots reaching the
-  database or a tmux socket directory, denies under a network mode that cannot
-  enforce them, a path that cannot be spelled exactly. Refusing is the whole
-  point — every one of these has a silent alternative that grants more than the
-  profile says.
+  database or a tmux socket directory, a path in either mode reaching friring's
+  own sandbox state or the container engine's control socket, denies under a
+  network mode that cannot enforce them, a path that cannot be spelled exactly.
+  Refusing is the whole point — every one of these has a silent alternative that
+  grants more than the profile says. A refusal routes through the profile's
+  `allow_unsandboxed_fallback` switch like any other, so a profile with it on
+  runs the agent on the host instead; the refusals below are the exception.
+- **A boundary whose own state has been interfered with is refused outright, and
+  the escape hatch does not apply.** That switch means "this host cannot apply
+  this profile" — a backend that is not installed, a policy this build cannot
+  express. It must not also mean "the state friring builds the next boundary out
+  of is wrong, so run outside it", because then an agent's way out of its
+  sandbox is to break it: the scratch directory and the place tree are writable
+  from inside by design, and a sandboxed agent can plant a symlink where friring
+  mints a directory, or bind its own listener at the socket path its next launch
+  needs. So a mount source that travels through a symlink, a directory friring
+  mints that has become a link, and an egress proxy that will not bind all fail
+  the launch whatever the profile says. The cost is stated rather than hidden: a
+  user whose profile legitimately names a symlinked path must name the resolved
+  one, and a filtered profile whose proxy cannot start refuses instead of
+  running unfiltered — which is the same trade ADR-27 already makes.
 
 ## Testing and privacy
 
@@ -1506,9 +1669,16 @@ fails closed.
 transport, instance lifecycle and garbage collection, identical-path mounts, the
 default image (`packaging/sandbox/Containerfile`, tag `friring/sandbox:1` —
 friring publishes no registry image, so a missing one is refused with the build
-command), resource limits, the per-profile synthetic home, and the signal-file
-channel for policy backends. Not in it: a place on a remote host is not wired —
-the backend probes and creates where friring runs.
+command), resource limits, the per-profile synthetic home, the default image
+deliberately carrying no agent CLI — a launch whose agent is not in the place is
+refused with the one-time install command — and the signal-file channel for
+policy backends. Not in it: a place on a remote host is not wired — the backend
+probes and creates where friring runs, and the mount-source symlink rule has no
+authority over another host's filesystem, so it does not apply there; nothing
+installs an agent for you — friring prints the command and the registry declares
+no install, so `<the package that provides 'x'>` stays a placeholder; and tmux
+and `/bin/sh` are assumed of an image rather than checked, so a tmux-less one
+surfaces as a control-mode stall.
 
 **P3b — A usable place.** Shipped: the credential strategies
 (`host-passthrough`, `env-token`, `volume-login`, `seed-file`) resolved against
@@ -1590,9 +1760,13 @@ distribution.
 token-authenticated and scoped to host loopback, to a `0o600` unix socket, or
 to both — a sandbox in its own network namespace can only reach the socket, and
 reaches it through a Friring-run relay inside the namespace. One instance per
-session, not per profile: the token and the socket are per boundary, and a
-launch with no identity of its own is refused rather than sharing one. Allow and
-deny decisions are taken on a canonicalised host, and a host with no single
+session, not per profile: the token and the socket belong to one launch, so a
+denial is attributable, a grant applies where it was asked for, and a relaunch
+rotates one session's credential alone; a launch with no identity of its own is
+refused rather than sharing a key. Inside a *place* that is bookkeeping and not
+separation — the sessions there share a uid and a pid namespace, so the place is
+the trust domain (see [The two sandbox shapes](#the-two-sandbox-shapes)). Allow
+and deny decisions are taken on a canonicalised host, and a host with no single
 canonical spelling is refused in every mode rather than compared. A bare rule
 names one host and the subtree is spelled `*.x`/`.x`, so the narrow reading is
 the default and the wide one is written down. Because the proxy dials with the
@@ -1646,3 +1820,11 @@ created after launch is replayed by the host on next open — and a profile whos
 read-write roots enclose the data directory is refused outright. The one
 residual is a hardlink alias planted on the host before the launch; see
 [Goals and non-goals](#goals-and-non-goals).
+
+A place is also never *told* where the database is. The `FRIRING_*` variables
+naming Friring's own config, data and metrics directories are withheld from
+every off-host launch — but that decision reads `sessions.backend_type`, which
+does not say `sandbox:<profile>` until a session has been launched into a place
+once, so the **first** launch of a place-backed session is composed as a local
+one. They are taken back out where the invocation learns it is place-bound
+(`agent::backend::window_env`), on both launch paths.

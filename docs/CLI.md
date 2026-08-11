@@ -355,6 +355,14 @@ headless restart drives the *local* tmux, so it would find no window to kill and
 would spawn an unsandboxed agent on the host. Restart it from the TUI, which
 reaches the place through its transport.
 
+The **first** launch of a place-backed session is composed before its row says
+`sandbox:<profile>`, so the variables naming friring's own config, data and
+metrics directories are injected as they would be for a local session — and then
+taken back out where the launch learns it is place-bound. An in-place
+`friring-cli` therefore sees none of them and resolves its own defaults, which
+is what ADR-29 requires: the database is never mounted into a place, and naming
+it would only point that CLI at a host path that does not exist in there.
+
 ## Delete and restore semantics
 
 `session delete <uuid>` **soft-deletes** by default — only the DB row is marked

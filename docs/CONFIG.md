@@ -1153,8 +1153,11 @@ The three *path* variables (`FRIRING_METRICS_DIR`, `FRIRING_CONFIG_DIR`,
 `FRIRING_DATA_DIR`) are set only for a session running on **this** machine's
 filesystem. An SSH/WSL session and a sandbox place both skip them: over there
 those paths name nothing, and for a place the data directory is precisely what
-the boundary exists to keep out (ADR-29). The identity variables are opaque and
-travel everywhere.
+the boundary exists to keep out (ADR-29). That decision reads the session's
+recorded backend, which does not say `sandbox:<profile>` until a session has
+been launched into a place once — so the **first** launch of a place-backed
+session is composed as a local one and has them removed again where it learns
+where it is going. The identity variables are opaque and travel everywhere.
 
 Set **at build time** (not runtime):
 

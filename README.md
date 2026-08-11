@@ -528,8 +528,10 @@ themes, switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
   [sandboxed agents](docs/SANDBOX.md) (a container instead of a host policy).
   friring publishes no image: the default tag is built locally with
   `docker build -t friring/sandbox:1 - < packaging/sandbox/Containerfile`, and
-  that file is self-contained, so a binary install only needs a copy of it. A
-  profile may name its own `image` or `containerfile` instead
+  that file is self-contained, so a binary install only needs a copy of it. That
+  image carries **no agent CLI** — friring prints the one-time command that
+  installs yours into the profile's own home, which outlives every container it
+  rebuilds. A profile may name its own `image` or `containerfile` instead
 - **Rust 1.75+** (only to build from source)
 
 ## Uninstall

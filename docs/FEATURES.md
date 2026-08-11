@@ -2997,11 +2997,22 @@ caps that a policy backend cannot enforce. Every network mode is enforced on
 both, including `allowlist` (see the egress firewall below). The VM and
 distro-clone backends are declared and probed — every surface that offers a
 profile says why a backend is unavailable rather than hiding it — but not built.
+friring's default image carries **no agent CLI**: baking one in would put a
+vendor's release train inside the image, so an agent gets into a place either
+through your own `image`/`containerfile` or through a one-time install into the
+profile's home, which outlives every container the profile rebuilds. A launch
+whose agent is not in the place is refused with that command rather than opening
+a pane that dies at once.
 
-**A place is shared, and that changes what its failure looks like.** One
-container per profile, started on first use and shared by every session using
-that profile, mounted at **identical absolute paths** so `git status` and an
-agent's own session transcripts keep working inside. Editing the profile builds a
+**A place is shared, and that changes what its failure looks like — and who it
+protects you from.** One container per profile, started on first use and shared
+by every session using that profile, mounted at **identical absolute paths** so
+`git status` and an agent's own session transcripts keep working inside. Shared
+means the sessions in it are **not isolated from each other**: one uid, one pid
+namespace, one filesystem, so each can read the others' files, processes and
+egress credential. The boundary is around the place, not around a session in it;
+a profile per session is what gives each session a place of its own, and the
+profile editor and the profile list both say so where you pick one. Editing the profile builds a
 new container rather than reusing mounts that no longer describe it, and a
 background pass reclaims the one it replaced. When a place goes — a reboot, a
 `docker system prune` — *every* session in it goes at once, so those panes say
@@ -3062,9 +3073,15 @@ the same headlessly.
 spawn rather than launching the agent on the host — unless the profile's own
 `allow_unsandboxed_fallback` switch is on, which makes the escape hatch visible
 and per-profile instead of ambient, and puts the reason in front of the user
-when it fires. Deleting a profile that sessions still reference leaves the
-reference dangling for the same reason: clearing it would silently unsandbox
-those sessions on their next launch.
+when it fires. That switch answers "this machine cannot apply this profile" and
+nothing else: a boundary whose own state has been interfered with — a mount
+source that has become a symlink, a scratch directory replaced by one, an egress
+proxy something else is holding the socket of — fails the launch whatever the
+profile says, because otherwise an agent's way out of its sandbox would be to
+break it. Deleting a profile that sessions still reference leaves the reference
+dangling for the same reason: clearing it would silently unsandbox those
+sessions on their next launch. Its sandbox home and login are kept too, until
+those sessions stop — that directory is the running container's `$HOME`.
 
 **Credentials, without copying any.** A rotating OAuth refresh token is
 single-use, so copying one into a container gives you two consumers that

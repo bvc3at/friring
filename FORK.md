@@ -123,7 +123,13 @@ actually needs and to an allowlist of domains.
   describe it. The image is the profile's, one built from its `containerfile`, or
   the default `friring/sandbox:1` built from
   [`packaging/sandbox/Containerfile`](packaging/sandbox/Containerfile) — friring
-  publishes no registry image, so a missing one is refused with the build command.
+  publishes no registry image, so a missing one is refused with the build command
+  — and it carries no agent CLI: an agent reaches a place through the profile's
+  own image or through a one-time install into the profile's home, and a launch
+  whose agent is not in the place is refused with that command rather than
+  opening a pane that dies. Sessions sharing a place are **not** isolated from
+  each other (one uid, one pid namespace, one filesystem); the trust domain is
+  the place, and a profile per session is what gives each session one of its own.
 - **friring touches only the places it created** — an owner label is set at
   creation, every lookup filters on it, every removal re-checks it, and a
   same-named container without it is neither adopted nor removed. A background
