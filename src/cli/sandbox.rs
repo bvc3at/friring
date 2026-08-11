@@ -1292,7 +1292,7 @@ fn set_token(
     // (macOS, where `security` takes a new item's value only on its command
     // line) would otherwise take a token off the user and then refuse it —
     // leaving them a secret they have to rotate for nothing.
-    store.can_store()?;
+    store.can_store(&entry.key)?;
     let secret = read_secret(&entry.key.account())?;
     store_token(&entry, store, &secret)
 }

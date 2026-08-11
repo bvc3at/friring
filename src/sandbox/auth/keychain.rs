@@ -172,21 +172,21 @@ pub trait SecretStore: Send + Sync {
     /// decides whether the user is told to sign in or told to unlock something.
     fn get(&self, key: &SecretKey) -> Result<Option<Secret>, String>;
 
-    /// Whether [`set`](Self::set) can write here at all, or `Err` with the
+    /// Whether [`set`](Self::set) can write `key` at all, or `Err` with the
     /// reason and the command that can.
     ///
     /// Asked **before** a value is read, and that is the whole point: on macOS
     /// `security` takes a new item's value only on its command line, so friring
     /// refuses to write — and a caller that discovered this *after* prompting
     /// would have taken a token the user then has to rotate, for nothing. The
-    /// answer is a property of the store rather than of the entry, so it costs
-    /// no keychain access to ask.
+    /// tool's own interface decides the answer, so asking costs no keychain
+    /// access; `key` is here only so the refusal can name the entry.
     ///
     /// # Errors
     ///
     /// This store cannot be written to; the message names the reason and the
     /// fix, as [`how_to_store`](Self::how_to_store) does for one entry.
-    fn can_store(&self) -> Result<(), String> {
+    fn can_store(&self, _key: &SecretKey) -> Result<(), String> {
         Ok(())
     }
 
@@ -346,12 +346,12 @@ impl SecretStore for SystemKeychain {
         Ok(Some(Secret::new(value)).filter(|s| !s.is_empty()))
     }
 
-    fn can_store(&self) -> Result<(), String> {
+    fn can_store(&self, key: &SecretKey) -> Result<(), String> {
         match self.kind {
-            // The same refusal `set` gives, raised where it costs nothing:
-            // `<placeholder>` rather than an account, because this answer is
-            // about the store and is reached before an entry is chosen.
-            KeychainKind::MacSecurity => Err(self.cannot_write_here("<account>")),
+            // Word for word the refusal `set` gives, raised where it costs
+            // nothing — including the entry's own command, so a user who asks
+            // early can run it as printed.
+            KeychainKind::MacSecurity => Err(self.cannot_write_here(&self.how_to_store(key))),
             KeychainKind::Libsecret => Ok(()),
         }
     }
@@ -440,7 +440,7 @@ impl SecretStore for Unavailable {
         &self.reason
     }
 
-    fn can_store(&self) -> Result<(), String> {
+    fn can_store(&self, _key: &SecretKey) -> Result<(), String> {
         Err(format!("{}: {}", self.reason, self.fix))
     }
 
@@ -638,7 +638,7 @@ impl SecretStore for StubStore {
         "a fabricated keychain"
     }
 
-    fn can_store(&self) -> Result<(), String> {
+    fn can_store(&self, _key: &SecretKey) -> Result<(), String> {
         match &self.write_refusal {
             Some(reason) => Err(reason.clone()),
             None => Ok(()),
@@ -776,6 +776,16 @@ mod tests {
         // The refusal reports the token nowhere — it is the whole reason the
         // write is refused.
         assert!(!err.contains(FAKE), "{err}");
+        // The preflight is the refusal a caller actually hits, so it has to
+        // carry the runnable command too — not a placeholder the user would
+        // have to fill in.
+        let preflight = store.can_store(&key).unwrap_err();
+        assert!(preflight.contains("add-generic-password"), "{preflight}");
+        assert!(
+            preflight.contains("claude/ANTHROPIC_API_KEY"),
+            "{preflight}"
+        );
+        assert!(!preflight.contains(FAKE), "{preflight}");
         assert!(!store.how_to_store(&key).contains(FAKE));
         assert!(store
             .how_to_store(&key)
