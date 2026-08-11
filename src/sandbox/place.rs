@@ -19,6 +19,13 @@
 //! through [`SandboxHost::wsl_distro`](crate::sandbox::SandboxHost::wsl_distro)
 //! instead, and the launch path refuses it with what is missing rather than
 //! composing half of one.
+//!
+//! Being outside this trait is a reason to name it explicitly everywhere the
+//! trait is what a caller walks, and **not** a reason to hold it to less: the
+//! shared conformance table (`sandbox::tests::place_conformance`) drives a WSL
+//! place through its own two seams — `ensure_distro`, then
+//! [`SandboxBackend::wrap`] — and asserts the same refusals as the three that
+//! ensure a container.
 
 use crate::sandbox::backend::{SandboxBackend, SandboxError, SandboxResult};
 use crate::sandbox::container::{EnsuredPlace, GcPlan, LiveContainer};

@@ -574,25 +574,35 @@ mod tests {
     /// Every one of these was found by a review of the container backend and
     /// closed there; the risk a second and a third backend introduce is not a
     /// new bug but an old one re-opened by an implementation that renders its
-    /// own command line and forgot a step. So each is asserted through
-    /// [`PlaceBackend::ensure_place`] — the seam the launch path actually uses —
-    /// on every backend friring can build a place with, and a fourth fails this
-    /// test until it does the same.
+    /// own command line and forgot a step. So each is asserted through the seam
+    /// the launch path actually drives — [`PlaceBackend::ensure_place`] for the
+    /// three engines, and `ensure_distro` then `wrap` for a
+    /// [`wsl-distro`](crate::sandbox::wsl) place, which has no `PlaceBackend` to
+    /// go through (see [`crate::sandbox::place`]) — and a fifth backend fails
+    /// this test until it does the same.
     ///
-    /// Nothing here starts, pulls or builds anything: every refusal happens
-    /// while the plan is built, before a single engine command is run, and the
-    /// stub host would fail an unscripted one anyway. That is also what makes
-    /// these assertions bite rather than pass vacuously — a backend that skipped
-    /// one of the checks would run on to the engine command the stub has no
-    /// answer for, and fail on the *sentence* rather than on the refusal.
+    /// **`wsl-distro` is in the table before it is in the launch path.** No
+    /// session launches into a distro yet, so every refusal here is latent —
+    /// which is exactly why it is pinned now: the moment that path is wired is
+    /// the moment nobody is looking at these.
+    ///
+    /// Nothing here starts, pulls or builds anything, and nothing registers,
+    /// imports or unregisters a distro: every refusal happens while the plan is
+    /// built or the argv is composed, before a single engine or `wsl.exe`
+    /// command that changes anything is run, and the stub host would fail an
+    /// unscripted one anyway. That is also what makes these assertions bite
+    /// rather than pass vacuously — a backend that skipped one of the checks
+    /// would run on to the command the stub has no answer for, and fail on the
+    /// *sentence* rather than on the refusal.
     mod place_conformance {
         use std::sync::Arc;
 
-        use crate::sandbox::backend::SandboxError;
+        use crate::sandbox::backend::{PlaceLaunch, SandboxError, SandboxLaunch, SandboxResult};
         use crate::sandbox::container::plan::{create_argv, plan_instance, MountCheck, PlanInput};
         use crate::sandbox::probe::{ProbeOutput, StubHost};
         use crate::sandbox::{
-            apple, dirs, AppleContainerBackend, ContainerBackend, ContainerEngine, PlaceBackend,
+            apple, dirs, wsl, AppleContainerBackend, ContainerBackend, ContainerEngine,
+            PlaceBackend, SandboxBackend, WslDistroBackend,
         };
         use crate::session::{
             NetworkMode, SandboxBackendKind, SandboxPath, SandboxPolicy, SandboxProfile,
@@ -606,6 +616,23 @@ mod tests {
         struct Subject {
             kind: SandboxBackendKind,
             backend: Box<dyn PlaceBackend>,
+        }
+
+        /// Everything one backend does with a profile before an agent could run
+        /// in its place, collapsed to its verdict.
+        type Ensure = Box<dyn Fn(&SandboxProfile) -> SandboxResult<()>>;
+
+        /// One backend's whole "make this profile's place and compose a launch
+        /// into it" path, as a single fallible call.
+        ///
+        /// A closure rather than a `&dyn PlaceBackend`, because the shapes
+        /// differ where it does not matter to a boundary: three engines answer
+        /// [`PlaceBackend::ensure_place`], and a WSL place is ensured as a
+        /// distro and then wrapped. What the caller needs from all four is the
+        /// same — the refusal, or the fact that there was not one.
+        struct PlacePath {
+            kind: SandboxBackendKind,
+            ensure: Ensure,
         }
 
         /// A profile with one workspace path, in the mode every backend here can
@@ -707,13 +734,120 @@ mod tests {
             home.display().to_string()
         }
 
+        /// Where `wsl.exe` sits on the stub Windows host, spelled with forward
+        /// slashes (Windows takes either) so the stub does not read it as a bare
+        /// program name.
+        const WSL_PROGRAM: &str = "C:/Windows/System32/wsl.exe";
+
+        /// The bubblewrap inside a stub distro, at the same system prefix the
+        /// stubs put every engine CLI at — so one read-write root (`/usr/bin`)
+        /// names the program that applies the boundary on all four backends.
+        const DISTRO_BWRAP: &str = "/usr/bin/bwrap";
+
+        /// A Windows host carrying friring's distro for `profile`: registered,
+        /// hardened, answering, and with bubblewrap at `bwrap` inside it.
+        ///
+        /// Scripted as a distro that already **exists**, so the whole path this
+        /// exercises is `adopt` — which runs nothing that changes anything.
+        /// Registering one is not scripted at all, so a refusal that stopped
+        /// being one could not quietly import a distro here; it would fail on
+        /// the unscripted `--export`.
+        fn wsl_host(profile: &str, home: &str, bwrap: &str) -> StubHost {
+            let distro = wsl::distro_name(profile);
+            let inside = |argv: &str| format!("{WSL_PROGRAM} -d {distro} --exec {argv}");
+            StubHost::new()
+                .with_home("C:/Users/me")
+                // No `uname` on a Windows host; `cmd.exe` is what settles it.
+                .with_binary("cmd.exe")
+                .with_binary_at(wsl::WSL, WSL_PROGRAM)
+                .with_command(
+                    &format!("{WSL_PROGRAM} --version"),
+                    ProbeOutput::success("WSL version: 2.3.26.0\nKernel version: 5.15.167.4\n"),
+                )
+                .with_command(
+                    &format!("{WSL_PROGRAM} --list --verbose"),
+                    ProbeOutput::success(format!(
+                        "  NAME             STATE           VERSION\n* Ubuntu-24.04     \
+                         Running         2\n  {distro}    Stopped         2\n"
+                    )),
+                )
+                .with_command(&inside("true"), ProbeOutput::success(""))
+                .with_command(
+                    &inside(&format!("cat {}", wsl::MARKER_FILE)),
+                    ProbeOutput::success(format!("{profile}\n")),
+                )
+                .with_command(
+                    &inside(&format!("cat {}", wsl::WSL_CONF)),
+                    ProbeOutput::success(wsl::plan::WSL_CONF_CONTENTS),
+                )
+                .with_command(
+                    &inside("sh -c printf %s \"$HOME\""),
+                    ProbeOutput::success(format!("{home}\n")),
+                )
+                .with_command(
+                    &inside("sh -c command -v bwrap"),
+                    ProbeOutput::success(format!("{bwrap}\n")),
+                )
+        }
+
+        /// A WSL place as the launch path drives it: ensure the distro, then
+        /// compose the command that runs inside it.
+        ///
+        /// Both halves, because a WSL place's refusals are split across them —
+        /// the profile's own paths are judged where the distro is ensured, and
+        /// the launch's minted directories only exist by the time the argv is
+        /// composed.
+        fn wsl_path(profile: &str, home: &str) -> PlacePath {
+            let backend = WslDistroBackend::new(Arc::new(wsl_host(profile, home, DISTRO_BWRAP)));
+            PlacePath {
+                kind: SandboxBackendKind::WslDistro,
+                ensure: Box::new(move |asked| {
+                    let ensured = backend.ensure_distro(asked)?;
+                    let policy = asked
+                        .resolve(SandboxBackendKind::WslDistro, &ensured.home)
+                        .expect("a profile that ensured a distro resolves against its home");
+                    backend
+                        .wrap(
+                            vec!["claude".to_string()],
+                            &SandboxLaunch::new(&policy, &ensured.home, "s1")
+                                .with_place(PlaceLaunch { relay: None }),
+                        )
+                        .map(|_| ())
+                }),
+            }
+        }
+
+        /// Every place friring can build, as the seam the launch path drives
+        /// each one through.
+        fn place_paths(profile: &str, home: &str, paths: &[String]) -> Vec<PlacePath> {
+            let mut out: Vec<PlacePath> = subjects(profile, home, paths)
+                .into_iter()
+                .map(|subject| PlacePath {
+                    kind: subject.kind,
+                    ensure: Box::new(move |asked| subject.backend.ensure_place(asked).map(|_| ())),
+                })
+                .collect();
+            out.push(wsl_path(profile, home));
+            out
+        }
+
         /// Every place backend refuses the same boundary, in its own words.
         ///
-        /// The cases are the escapes four adversarial reviews closed on the
-        /// first place backend: friring's own database (ADR-29), the tmux socket
-        /// directory that is a pane in every session, the container engine's
-        /// control socket (the whole host), and a read-write root containing the
-        /// program that applies the boundary.
+        /// The cases are the escapes five adversarial reviews closed on the
+        /// first place backend: friring's own data directory **and the database
+        /// file inside it** (ADR-29), the tmux socket directory that is a pane in
+        /// every session, the container engine's control socket (the whole
+        /// host), and a read-write root containing the program that applies the
+        /// boundary.
+        ///
+        /// The database file is its own case because every ADR-29 gate used to
+        /// test ancestry alone, and `encloses("<data>/friring.db", "<data>")` is
+        /// false: a profile naming the file passed the editor, passed
+        /// `sandbox import`, passed the mount check, and got
+        /// `--mount type=bind,src=<db>` — an automations row from inside is a
+        /// shell command the *host* runs. A policy backend survives that on a
+        /// mask it applies whatever the profile says; a place has no mask, so
+        /// the refusal below is the whole of the rule.
         #[test]
         fn every_place_backend_refuses_the_same_boundaries() {
             // Minted first: `data_dir` is only on disk once something has asked
@@ -723,6 +857,11 @@ mod tests {
                 .unwrap()
                 .display()
                 .to_string();
+            // Never created, only named: the point is that a path a profile can
+            // write down is refused, and the database of a friring that has
+            // never run is a path like any other.
+            let database = format!("{data}/friring.db");
+            let wal = format!("{database}-wal");
             let home = fake_home("place-conformance");
             let docker_dir = format!("{home}/.docker");
             std::fs::create_dir_all(&docker_dir).unwrap();
@@ -734,23 +873,34 @@ mod tests {
             let tmux_root = dirs::tmux_socket_root().display().to_string();
             let tmux_root = dirs::canonical(&tmux_root).unwrap_or(tmux_root);
 
+            // Another profile's place tree, which holds the login its
+            // `volume-login` made (ADR-28). Refused at the place's own seam and
+            // not only when the profile is stored: a place is ensured from a
+            // profile that is already in the database, and the editor is not
+            // the only thing that can put one there.
+            let other_place = format!("{data}/sandbox/pl/other/home");
+
             // (the path a profile names, the phrase its refusal must carry)
-            let cases: [(&str, &str); 4] = [
+            let cases: [(&str, &str); 7] = [
                 (data.as_str(), "ADR-29"),
+                (&database, "ADR-29"),
+                // The sidecar is the same escape by a slower route: a `-wal`
+                // written from inside is replayed by the host on next open.
+                (&wal, "ADR-29"),
+                (&other_place, "friring's own"),
                 (&tmux_root, "tmux socket directory"),
                 (&docker_dir, "control socket"),
                 // Both spellings of the Apple CLI's directory are the same one
-                // here, and it is where the stubs put every engine binary too.
+                // here, and it is where the stubs put every engine binary — and
+                // every distro's bubblewrap — too.
                 ("/usr/bin", "itself"),
             ];
 
             for (path, phrase) in cases {
                 let asked = profile("conform", vec![SandboxPath::workspace(path)]);
-                for subject in subjects("conform", &home, &[path.to_string()]) {
-                    let err = subject
-                        .backend
-                        .ensure_place(&asked)
-                        .expect_err(&format!("{} must refuse '{path}'", subject.kind));
+                for place in place_paths("conform", &home, &[path.to_string()]) {
+                    let err = (place.ensure)(&asked)
+                        .expect_err(&format!("{} must refuse '{path}'", place.kind));
                     let text = err.to_string();
                     assert!(
                         matches!(
@@ -758,15 +908,63 @@ mod tests {
                             SandboxError::Refused { .. } | SandboxError::Tampered { .. }
                         ),
                         "{}: {text}",
-                        subject.kind
+                        place.kind
                     );
                     assert!(
                         text.contains(phrase),
                         "{} refused '{path}' for the wrong reason: {text}",
-                        subject.kind
+                        place.kind
                     );
                 }
             }
+        }
+
+        /// A WSL place refuses the program that applies its boundary at **both**
+        /// of its seams, not only where the profile is read.
+        ///
+        /// `ensure_distro` sees the profile's own read-write paths; a launch
+        /// adds writable directories the profile never named — its workspace,
+        /// its signal directory, its scratch — and only `wrap` sees those. `wrap`
+        /// composes the bubblewrap argv itself rather than going through
+        /// [`crate::sandbox::bwrap::BwrapBackend::wrap`], so the check there is
+        /// not inherited from anywhere; it has to be its own.
+        #[test]
+        fn a_wsl_launch_refuses_a_minted_path_that_contains_bubblewrap() {
+            let home = fake_home("place-conformance-wsl");
+            // Installed from source, which is where a minimal distro's
+            // bubblewrap comes from — and the prefix a launch could hand over
+            // without the profile ever naming it.
+            let bwrap = "/usr/local/bin/bwrap";
+            let backend = WslDistroBackend::new(Arc::new(wsl_host("conform-wsl", &home, bwrap)));
+
+            let asked = profile("conform-wsl", vec![SandboxPath::workspace("/srv/work")]);
+            let ensured = backend
+                .ensure_distro(&asked)
+                .expect("the profile names nothing the distro refuses");
+            let policy = asked
+                .resolve(SandboxBackendKind::WslDistro, &ensured.home)
+                .unwrap();
+
+            let err = backend
+                .wrap(
+                    vec!["claude".to_string()],
+                    &SandboxLaunch::new(&policy, &ensured.home, "s1")
+                        .with_place(PlaceLaunch { relay: None })
+                        .with_workspace("/usr/local"),
+                )
+                .expect_err("a writable path containing bubblewrap must be refused");
+            let text = err.to_string();
+            assert!(text.contains("itself"), "{text}");
+            assert!(text.contains(bwrap), "{text}");
+
+            // And the other seam on its own: a profile naming the prefix is
+            // refused before a distro is handed to anything, which is what the
+            // headless `sandbox` commands and the manager view drive.
+            let named = profile("conform-wsl", vec![SandboxPath::workspace("/usr/local")]);
+            let err = WslDistroBackend::new(Arc::new(wsl_host("conform-wsl", &home, bwrap)))
+                .ensure_distro(&named)
+                .expect_err("a read-write path containing bubblewrap must be refused");
+            assert!(err.to_string().contains("itself"), "{err}");
         }
 
         /// A mount source reached through a symlink is refused rather than
