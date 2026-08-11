@@ -1468,11 +1468,7 @@ fn clean_token(raw: &str) -> Result<crate::sandbox::auth::keychain::Secret, Stri
     // whitespace, and trimming the front would silently accept a leading space.
     let value = raw.trim_end_matches(['\n', '\r']);
     if value.len() > MAX_TOKEN_BYTES {
-        return Err(format!(
-            "that is {} bytes, and a token may be at most {MAX_TOKEN_BYTES} — did a file reach \
-             stdin by accident?",
-            value.len()
-        ));
+        return Err(too_long(value.len()));
     }
     if value.trim().is_empty() {
         return Err(
@@ -1488,6 +1484,16 @@ fn clean_token(raw: &str) -> Result<crate::sandbox::auth::keychain::Secret, Stri
         ));
     }
     Ok(crate::sandbox::auth::keychain::Secret::new(value))
+}
+
+/// The one refusal for a value longer than a token can be, shared by the two
+/// ways one arrives: a redirected stdin and a line typed at the terminal. It
+/// quotes the length, never the value.
+fn too_long(len: usize) -> String {
+    format!(
+        "that is {len} bytes, and a token may be at most {MAX_TOKEN_BYTES} — did a file reach \
+         stdin by accident?"
+    )
 }
 
 /// Read one line from the terminal with echo off.
@@ -1511,11 +1517,19 @@ fn prompt_without_echo(prompt: &str) -> Result<String, String> {
 /// The raw-mode read itself: bytes until the line ends, with `Ctrl+C` and
 /// backspace honoured because raw mode means the terminal no longer is.
 fn read_raw_line() -> Result<String, String> {
-    let mut stdin = std::io::stdin();
+    read_raw_line_from(std::io::stdin())
+}
+
+/// [`read_raw_line`] over any reader, which is what makes the loop testable —
+/// the terminal it normally reads is not something a test may open.
+fn read_raw_line_from(mut reader: impl std::io::Read) -> Result<String, String> {
     let mut collected: Vec<u8> = Vec::new();
+    // Bytes typed past the cap: counted rather than kept, so the refusal can
+    // say how long the value really was without holding it.
+    let mut overflow = 0usize;
     let mut byte = [0u8; 1];
     loop {
-        match stdin.read(&mut byte) {
+        match reader.read(&mut byte) {
             Ok(0) => break,
             Ok(_) => {}
             Err(e) => return Err(format!("could not read the token: {e}")),
@@ -1527,16 +1541,24 @@ fn read_raw_line() -> Result<String, String> {
             // Backspace / delete. Pops a whole byte, which is enough: a token is
             // ASCII, and a mistyped multi-byte paste is refused as non-UTF-8
             // rather than half-deleted.
-            0x08 | 0x7f => {
-                collected.pop();
-            }
-            b if b < 0x20 => {}
-            b => {
-                if collected.len() < MAX_TOKEN_BYTES {
-                    collected.push(b);
+            0x08 | 0x7f => match overflow > 0 {
+                true => overflow -= 1,
+                false => {
+                    collected.pop();
                 }
-            }
+            },
+            b if b < 0x20 => {}
+            b => match collected.len() < MAX_TOKEN_BYTES {
+                true => collected.push(b),
+                // The line is still drained to its end, but what was typed is no
+                // longer what would be stored: keeping the prefix would put an
+                // invalid credential in the keychain under a success message.
+                false => overflow += 1,
+            },
         }
+    }
+    if overflow > 0 {
+        return Err(too_long(collected.len() + overflow));
     }
     String::from_utf8(collected).map_err(|_| "the token is not valid UTF-8".to_string())
 }
@@ -2648,5 +2670,25 @@ mod tests {
         assert!(!error.contains("half"), "the value must not be quoted back");
         let error = clean_token(&"x".repeat(MAX_TOKEN_BYTES + 1)).unwrap_err();
         assert!(error.contains("at most"), "{error}");
+    }
+
+    /// A pasted value longer than a token can be is refused rather than stored
+    /// as its own first bytes: a truncated credential is one the user believes
+    /// is in the keychain and every launch would then be rejected with.
+    #[test]
+    fn a_typed_value_past_the_cap_is_refused_rather_than_truncated() {
+        let typed = format!("{}\r", "x".repeat(MAX_TOKEN_BYTES + 1));
+        let error = read_raw_line_from(typed.as_bytes()).unwrap_err();
+        assert!(error.contains("at most"), "{error}");
+        assert!(
+            error.contains(&(MAX_TOKEN_BYTES + 1).to_string()),
+            "the refusal counts what was typed, not what was kept: {error}"
+        );
+
+        // Backspacing back under the cap is the value that fits, not a refusal.
+        let corrected = format!("{}\x7f\r", "x".repeat(MAX_TOKEN_BYTES + 1));
+        let value = read_raw_line_from(corrected.as_bytes()).unwrap();
+        assert_eq!(value.len(), MAX_TOKEN_BYTES);
+        assert_eq!(read_raw_line_from(&b"abc\r"[..]).unwrap(), "abc");
     }
 }
