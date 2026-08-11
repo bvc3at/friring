@@ -172,6 +172,24 @@ pub trait SecretStore: Send + Sync {
     /// decides whether the user is told to sign in or told to unlock something.
     fn get(&self, key: &SecretKey) -> Result<Option<Secret>, String>;
 
+    /// Whether [`set`](Self::set) can write here at all, or `Err` with the
+    /// reason and the command that can.
+    ///
+    /// Asked **before** a value is read, and that is the whole point: on macOS
+    /// `security` takes a new item's value only on its command line, so friring
+    /// refuses to write — and a caller that discovered this *after* prompting
+    /// would have taken a token the user then has to rotate, for nothing. The
+    /// answer is a property of the store rather than of the entry, so it costs
+    /// no keychain access to ask.
+    ///
+    /// # Errors
+    ///
+    /// This store cannot be written to; the message names the reason and the
+    /// fix, as [`how_to_store`](Self::how_to_store) does for one entry.
+    fn can_store(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Store `secret` under `key`, replacing whatever was there.
     ///
     /// # Errors
@@ -275,6 +293,23 @@ impl SystemKeychain {
     }
 }
 
+impl SystemKeychain {
+    /// Why friring will not write to this store, and what to run instead.
+    ///
+    /// One sentence for the two callers that need it — the capability query and
+    /// the write itself — so a user who asks early and a user who asks late are
+    /// told the same thing. `fix` is a command with a **placeholder** where the
+    /// value goes: this string reaches a terminal and a log.
+    fn cannot_write_here(&self, fix: &str) -> String {
+        format!(
+            "friring will not write to {} itself, because `security` takes a new item's value \
+             only on its command line, where every process on this machine can read it. Run this \
+             instead — it prompts for the value: {fix}",
+            self.label()
+        )
+    }
+}
+
 impl SecretStore for SystemKeychain {
     fn label(&self) -> &str {
         self.kind.label()
@@ -311,6 +346,16 @@ impl SecretStore for SystemKeychain {
         Ok(Some(Secret::new(value)).filter(|s| !s.is_empty()))
     }
 
+    fn can_store(&self) -> Result<(), String> {
+        match self.kind {
+            // The same refusal `set` gives, raised where it costs nothing:
+            // `<placeholder>` rather than an account, because this answer is
+            // about the store and is reached before an entry is chosen.
+            KeychainKind::MacSecurity => Err(self.cannot_write_here("<account>")),
+            KeychainKind::Libsecret => Ok(()),
+        }
+    }
+
     fn set(&self, key: &SecretKey, secret: &Secret) -> Result<(), String> {
         let account = key.account();
         match self.kind {
@@ -318,13 +363,7 @@ impl SecretStore for SystemKeychain {
             // would put a vendor token on the host's process table. friring
             // will not do that; the user's own run of the same command with
             // `-w` and no value prompts for it instead.
-            KeychainKind::MacSecurity => Err(format!(
-                "friring will not write to {} itself, because `security` takes a new item's value \
-                 only on its command line, where every process on this machine can read it. Run \
-                 this instead — it prompts for the value: {}",
-                self.label(),
-                self.how_to_store(key)
-            )),
+            KeychainKind::MacSecurity => Err(self.cannot_write_here(&self.how_to_store(key))),
             KeychainKind::Libsecret => self.run_with_secret(
                 &[
                     "store",
@@ -399,6 +438,10 @@ impl Unavailable {
 impl SecretStore for Unavailable {
     fn label(&self) -> &str {
         &self.reason
+    }
+
+    fn can_store(&self) -> Result<(), String> {
+        Err(format!("{}: {}", self.reason, self.fix))
     }
 
     fn get(&self, _key: &SecretKey) -> Result<Option<Secret>, String> {
@@ -548,12 +591,22 @@ pub struct StubStore {
     reads: std::sync::atomic::AtomicUsize,
     /// A store that is present but will not answer (a locked keychain).
     failure: Option<String>,
+    /// A store that can be read but not written — the macOS shape, where
+    /// `security` takes a new item's value only on its command line.
+    write_refusal: Option<String>,
 }
 
 #[cfg(test)]
 impl StubStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A store friring can read but will not write to, with the reason it
+    /// gives before a value is ever asked for.
+    pub fn that_cannot_store(mut self, reason: &str) -> Self {
+        self.write_refusal = Some(reason.to_string());
+        self
     }
 
     /// A store that holds `value` for `family`'s `variable`.
@@ -583,6 +636,13 @@ impl StubStore {
 impl SecretStore for StubStore {
     fn label(&self) -> &str {
         "a fabricated keychain"
+    }
+
+    fn can_store(&self) -> Result<(), String> {
+        match &self.write_refusal {
+            Some(reason) => Err(reason.clone()),
+            None => Ok(()),
+        }
     }
 
     fn get(&self, key: &SecretKey) -> Result<Option<Secret>, String> {

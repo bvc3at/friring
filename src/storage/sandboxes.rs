@@ -309,6 +309,57 @@ fn map_profile(row: &rusqlite::Row) -> rusqlite::Result<StoredSandboxProfile> {
     })
 }
 
+/// The profile upsert, against whatever connection the caller holds — the
+/// database's own, or a transaction wrapping several of these.
+///
+/// Storage owns the timestamps: `created_at` is stamped on insert and kept
+/// afterwards, `updated_at` on every save, and the profile's own timestamp
+/// fields are ignored on the way in.
+fn upsert_profile_on(
+    conn: &rusqlite::Connection,
+    profile: &SandboxProfile,
+) -> rusqlite::Result<()> {
+    let now = current_time_millis() as i64;
+    conn.execute(
+        "INSERT INTO sandbox_profiles
+            (name, backend, paths, network_mode, network_allow, network_deny,
+             prompt_new_domains, read_scope, memory_mb, cpus, image,
+             containerfile, allow_unsandboxed_fallback, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+         ON CONFLICT(name) DO UPDATE SET
+             backend = excluded.backend,
+             paths = excluded.paths,
+             network_mode = excluded.network_mode,
+             network_allow = excluded.network_allow,
+             network_deny = excluded.network_deny,
+             prompt_new_domains = excluded.prompt_new_domains,
+             read_scope = excluded.read_scope,
+             memory_mb = excluded.memory_mb,
+             cpus = excluded.cpus,
+             image = excluded.image,
+             containerfile = excluded.containerfile,
+             allow_unsandboxed_fallback = excluded.allow_unsandboxed_fallback,
+             updated_at = excluded.updated_at",
+        params![
+            profile.name.trim(),
+            profile.backend.as_str(),
+            list_to_json(&profile.paths),
+            profile.network_mode.as_str(),
+            list_to_json(&profile.network_allow),
+            list_to_json(&profile.network_deny),
+            profile.prompt_new_domains as i64,
+            profile.read_scope.as_str(),
+            profile.memory_mb.map(i64::from),
+            profile.cpus.map(i64::from),
+            profile.image,
+            profile.containerfile,
+            profile.allow_unsandboxed_fallback as i64,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
 fn map_instance(row: &rusqlite::Row) -> rusqlite::Result<SandboxInstance> {
     Ok(SandboxInstance {
         profile: row.get(0)?,
@@ -382,45 +433,25 @@ impl Database {
     /// for a renamed profile, since only that path rewrites the sessions and
     /// instances pointing at the old name.
     pub fn upsert_sandbox_profile(&self, profile: &SandboxProfile) -> rusqlite::Result<()> {
-        let now = current_time_millis() as i64;
-        self.conn.execute(
-            "INSERT INTO sandbox_profiles
-                (name, backend, paths, network_mode, network_allow, network_deny,
-                 prompt_new_domains, read_scope, memory_mb, cpus, image,
-                 containerfile, allow_unsandboxed_fallback, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
-             ON CONFLICT(name) DO UPDATE SET
-                 backend = excluded.backend,
-                 paths = excluded.paths,
-                 network_mode = excluded.network_mode,
-                 network_allow = excluded.network_allow,
-                 network_deny = excluded.network_deny,
-                 prompt_new_domains = excluded.prompt_new_domains,
-                 read_scope = excluded.read_scope,
-                 memory_mb = excluded.memory_mb,
-                 cpus = excluded.cpus,
-                 image = excluded.image,
-                 containerfile = excluded.containerfile,
-                 allow_unsandboxed_fallback = excluded.allow_unsandboxed_fallback,
-                 updated_at = excluded.updated_at",
-            params![
-                profile.name.trim(),
-                profile.backend.as_str(),
-                list_to_json(&profile.paths),
-                profile.network_mode.as_str(),
-                list_to_json(&profile.network_allow),
-                list_to_json(&profile.network_deny),
-                profile.prompt_new_domains as i64,
-                profile.read_scope.as_str(),
-                profile.memory_mb.map(i64::from),
-                profile.cpus.map(i64::from),
-                profile.image,
-                profile.containerfile,
-                profile.allow_unsandboxed_fallback as i64,
-                now,
-            ],
-        )?;
-        Ok(())
+        upsert_profile_on(&self.conn, profile)
+    }
+
+    /// Store several profiles **atomically** — the write half of
+    /// `friring-cli sandbox import`.
+    ///
+    /// One transaction, because an import validates every profile before it
+    /// writes any of them: a document whose third entry fails to store would
+    /// otherwise leave the first two behind, which is a boundary set nobody
+    /// authored. Same per-row semantics as
+    /// [`upsert_sandbox_profile`](Self::upsert_sandbox_profile), identity
+    /// included — a name that is not already stored inserts, and a rename is
+    /// still [`rename_sandbox_profile`](Self::rename_sandbox_profile)'s alone.
+    pub fn upsert_sandbox_profiles(&self, profiles: &[SandboxProfile]) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for profile in profiles {
+            upsert_profile_on(&tx, profile)?;
+        }
+        tx.commit()
     }
 
     /// Rename a profile and every reference to it: its instance records (by
@@ -788,6 +819,31 @@ mod tests {
         assert_eq!(got.network_mode, NetworkMode::None);
         assert_eq!(got.created_at, first.created_at);
         assert!(got.updated_at >= first.updated_at);
+    }
+
+    /// An import validates the whole document and then writes it, so the write
+    /// is all-or-nothing: a half-applied file is a set of boundaries nobody
+    /// authored.
+    #[test]
+    fn several_profiles_are_stored_or_none_are() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_sandbox_profiles(&[profile("dev"), profile("lib")])
+            .unwrap();
+        assert_eq!(db.list_sandbox_profile_names().unwrap(), ["dev", "lib"]);
+
+        // A row the table refuses. The schema has no constraint a valid profile
+        // can trip, so the test supplies one: what is under test is the
+        // transaction, not what might fail inside it.
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER refuse_later BEFORE INSERT ON sandbox_profiles \
+                 WHEN NEW.name = 'later' BEGIN SELECT RAISE(ABORT, 'refused'); END",
+            )
+            .unwrap();
+        let batch = [profile("added"), profile("later")];
+        assert!(db.upsert_sandbox_profiles(&batch).is_err());
+        // The entry *before* the failure did not survive either.
+        assert_eq!(db.list_sandbox_profile_names().unwrap(), ["dev", "lib"]);
     }
 
     #[test]

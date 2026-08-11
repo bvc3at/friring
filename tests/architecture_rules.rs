@@ -107,6 +107,12 @@ const MODULE_RULES: &[ModuleRules] = &[
     // `proxy` is the in-sandbox relay behind `friring-cli sandbox relay`: the
     // one command that runs *inside* a boundary, which is why it is dispatched
     // before the database is opened at all (ADR-29).
+    // `sandbox` is the rest of `friring-cli sandbox` — the host-side management
+    // commands. They ask the same layer the TUI asks: the credential store a
+    // token is written to, the path refusals an import must make before it
+    // stores a profile a launch would refuse, and the engine a prune reclaims
+    // places from. Path-only for the reason `agent` is: it is a side-effect
+    // layer, and every reach into it stays visible at the call site.
     ModuleRules {
         name: "cli",
         allowed: &[
@@ -121,7 +127,7 @@ const MODULE_RULES: &[ModuleRules] = &[
             "activity",
             "proxy",
         ],
-        allowed_path_only: &["agent"],
+        allowed_path_only: &["agent", "sandbox"],
     },
     // Agent-neutral activity: provider dispatch, on-disk source discovery, and
     // the incremental scan. Pure record→event parsers live in

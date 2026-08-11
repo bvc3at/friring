@@ -115,10 +115,13 @@ pub enum Command {
     /// Print the perf snapshot a running TUI publishes (FRIRING_PERF_LOG or
     /// the perf HUD must be active in that TUI).
     Perf,
-    /// Sandbox-internal commands, run inside a boundary friring built.
+    /// Manage sandbox profiles, places and tokens.
     ///
-    /// Dispatched before the database is opened, because ADR-29 keeps the
-    /// database out of every sandbox.
+    /// One subcommand — `relay` — runs inside a boundary friring built, and is
+    /// dispatched before the database is opened because ADR-29 keeps the
+    /// database out of every sandbox (`sandbox::run_before_database`).
+    /// Everything else is host-side management on the ordinary path.
+    #[command(alias = "sb")]
     Sandbox {
         #[command(subcommand)]
         action: sandbox::Action,
@@ -177,12 +180,11 @@ pub fn run(cli: Cli, db: &Database) -> Result<(), String> {
         Command::Notify(args) => Ok(notify::run(args)),
         Command::Usage(args) => metrics::run_usage(args, db),
         Command::Perf => perf::run(db),
-        // Long-running and database-free: it runs inside a sandbox, where
-        // ADR-29 keeps the database out. `main` dispatches it before opening
-        // one at all; reaching it here means that dispatch was removed, and
-        // returning early keeps the command correct rather than rendering an
-        // empty result for something that never finishes.
-        Command::Sandbox { action } => return sandbox::run(&action),
+        // Host-side sandbox management. The one subcommand that must not see a
+        // database — the in-sandbox relay (ADR-29) — never arrives here: `main`
+        // takes it through `sandbox::run_before_database` first, and `run`
+        // refuses it rather than serving it with one open.
+        Command::Sandbox { action } => sandbox::run(action, db),
     }?;
 
     println!("{}", format.render(&output));
