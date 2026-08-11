@@ -166,6 +166,28 @@ fn overlay_root() -> Option<PathBuf> {
     dirs::sandbox_root().map(|root| root.join("overlay"))
 }
 
+/// The directory one session's layers live under, inside [`overlay_root`].
+///
+/// Both halves earn their place. The sanitised key is what keeps the tree
+/// legible — being able to find and read what the agent wrote is the whole
+/// point of an inspectable upper layer — and the digest is what keeps two
+/// sessions apart: [`dirs::sanitize_component`] folds every character it does
+/// not accept onto `-`, and a session key is not always a UUID (an agent's own
+/// conversation id stands in when friring pinned no session id), so two keys
+/// differing only in folded characters would otherwise name one directory.
+/// Sharing it would put one session's discarded writes in another's workspace
+/// and let either session's teardown take the other's layers with it.
+///
+/// [`dirs::digest`] is not a collision-resistant hash and is not used as one:
+/// what is needed here is that keys which differ stay apart.
+fn session_layers(session_key: &str) -> String {
+    format!(
+        "{}-{}",
+        dirs::sanitize_component(session_key),
+        dirs::digest(session_key)
+    )
+}
+
 /// Mint (or adopt) the layer directories for one launch's copy-on-write roots.
 ///
 /// Adopted rather than recreated, like the per-session scratch: a relaunch of a
@@ -189,7 +211,7 @@ pub fn overlay_workspaces(
                  sandbox to keep a copy-on-write layer"
             .to_string(),
     })?;
-    let key = dirs::sanitize_component(session_key);
+    let key = session_layers(session_key);
     let mut out = Vec::with_capacity(roots.len());
     for root in roots {
         // Keyed on a digest of the path rather than on the path: a layer
@@ -212,10 +234,15 @@ pub fn overlay_workspaces(
 ///
 /// Session teardown's half of [`overlay_workspaces`], kept beside it rather than
 /// folded into [`dirs::cleanup_session`] because the layers deliberately do not
-/// live in the tree that function owns. Best effort: what will not go costs
-/// disk, and the next launch of the same session adopts it.
+/// live in the tree that function owns —
+/// [`crate::agent::sandboxing::cleanup`] calls both. Best effort: what will not
+/// go costs disk, and the next launch of the same session adopts it.
+///
+/// Named through `session_layers`, like the directories it removes: a
+/// teardown that keyed the tree any other way would either miss the layers it
+/// meant to drop or take a sibling session's with them.
 pub fn cleanup_overlays(session_key: &str) {
-    let key = dirs::sanitize_component(session_key);
+    let key = session_layers(session_key);
     if let Some(dir) = overlay_root().map(|root| root.join(&key)) {
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -268,14 +295,16 @@ pub fn build_argv(
 /// nested inside a copy-on-write root is still bound after it and still wins —
 /// and everything friring takes back (the `.git/hooks` bind, the secret masks,
 /// the database masks) is emitted after that pass, so an overlay can never widen
-/// what a mask denies.
+/// what a mask denies. The same ordering is why a *read-write* path nested
+/// inside a copy-on-write root is refused rather than emitted: see
+/// `check_overlays`.
 ///
 /// # Errors
 ///
-/// An overlay names a path this launch does not grant read-write, or two
-/// overlays stack. Plus everything the launch's own inputs refuse: a filtered
-/// mode with no proxy, a loopback endpoint this backend cannot reach, a missing
-/// relay.
+/// An overlay names a path this launch does not grant read-write, two overlays
+/// stack, or a copy-on-write root encloses another read-write grant. Plus
+/// everything the launch's own inputs refuse: a filtered mode with no proxy, a
+/// loopback endpoint this backend cannot reach, a missing relay.
 pub fn build_argv_with(
     program: &str,
     launch: &SandboxLaunch<'_>,
@@ -449,7 +478,9 @@ pub fn build_argv_with(
                     .iter()
                     .any(|root| dirs::encloses(root, &parent))
             });
-        for file in [db.to_string(), format!("{db}-wal"), format!("{db}-shm")] {
+        // One answer to "which files are the database", shared with seatbelt's
+        // deny and with the mount refusals in `dirs`.
+        for file in dirs::database_files(db) {
             if parent_is_writable || exists(&file) {
                 push(&mut argv, &["--ro-bind", "/dev/null", &file]);
             }
@@ -510,6 +541,20 @@ fn push(argv: &mut Vec<String>, tokens: &[&str]) {
 ///   time the sandbox looks at it; the merged view is defensible on paper and
 ///   not something friring can state precisely, so it is refused rather than
 ///   composed.
+/// - **Nothing else may be granted read-write *inside* a copy-on-write root.**
+///   The overlay is emitted in the same sorted pass as every other mount, so a
+///   nested grant lands after it as `--bind <path> <path>` — the *real* host
+///   directory put back over the merged view. Reads of it would show the
+///   sandbox what is on disk rather than what it wrote, and every write the
+///   profile calls discardable would land in the real directory. That is the
+///   one outcome this mode exists to prevent, so the profile is refused with
+///   the nested path named rather than composed into something that means the
+///   opposite of what it says.
+///
+///   Read-only nesting is a different thing and stays allowed: it is how a
+///   profile carves a protected path out of a writable root, nothing is written
+///   through it, and it is what `.git/hooks`, the secret masks and the ADR-29
+///   database masks all rely on.
 fn check_overlays(launch: &SandboxLaunch<'_>, overlays: &[OverlayWorkspace]) -> SandboxResult<()> {
     let refuse = |detail: String| SandboxError::Refused {
         profile: launch.policy.profile.clone(),
@@ -534,6 +579,23 @@ fn check_overlays(launch: &SandboxLaunch<'_>, overlays: &[OverlayWorkspace]) -> 
                 outer.root, ws.root
             )));
         }
+    }
+    // Checked after the two rules above, so a stacked pair — which is also a
+    // read-write grant inside a copy-on-write root — is reported as the
+    // stacking it is.
+    for path in &writable {
+        if overlays.iter().any(|ws| ws.root == *path) {
+            continue;
+        }
+        let Some(outer) = overlays.iter().find(|ws| dirs::encloses(&ws.root, path)) else {
+            continue;
+        };
+        return Err(refuse(format!(
+            "'{path}' is granted read-write inside the copy-on-write workspace '{}', and a nested \
+             grant is bound after the overlay — so it would put the real directory back over the \
+             merged view and every write this profile calls discardable would land in it",
+            outer.root
+        )));
     }
     Ok(())
 }
@@ -947,7 +1009,8 @@ impl BwrapBackend {
     ///
     /// Everything [`wrap`](SandboxBackend::wrap) refuses, plus: this bwrap has
     /// no unprivileged overlays (with [`BwrapDetails::overlay`]'s reason), a
-    /// root the launch does not grant read-write, stacked overlays, or a layer
+    /// root the launch does not grant read-write, stacked overlays, a
+    /// copy-on-write root enclosing another read-write grant, or a layer
     /// directory friring could not mint.
     pub fn wrap_copy_on_write(
         &self,
@@ -975,16 +1038,27 @@ impl BwrapBackend {
         // The probe vetted the binary against the *host*; this profile decides
         // what the agent can write, and a profile that hands it the directory
         // bubblewrap lives in hands it the boundary.
-        if let Some(root) = launch
-            .writable_paths()
-            .into_iter()
-            .find(|root| dirs::encloses(root, program))
+        //
+        // Through the shared rule, so **both** spellings are compared: a
+        // `/usr/bin/bwrap` that is a link into a prefix the profile makes
+        // writable redirects the host's next launch exactly as replacing the
+        // binary would, and a check that only read the name on `PATH` would
+        // miss it — as the three place backends' identical check does not.
+        let writable = launch.writable_paths();
+        let resolved = dirs::canonical(program);
+        if let Some((root, found)) =
+            dirs::program_in_writable_root(&writable, program, resolved.as_deref())
         {
+            let named = if found == program {
+                format!("'{program}'")
+            } else {
+                format!("'{program}', which resolves to '{found}'")
+            };
             return Err(SandboxError::Refused {
                 profile: launch.policy.profile.clone(),
                 detail: format!(
-                    "the read-write path '{root}' contains bubblewrap itself ('{program}'), so \
-                     the sandbox could replace the program that applies its own boundary"
+                    "the read-write path '{root}' contains bubblewrap itself ({named}), so the \
+                     sandbox could replace the program that applies its own boundary"
                 ),
             });
         }
@@ -1609,6 +1683,87 @@ mod tests {
         assert_eq!(&argv[end + 1..], ["claude", "--resume", "abc"]);
     }
 
+    /// The profile may not be handed the program that applies its own
+    /// boundary — **in either spelling**.
+    ///
+    /// The probe vetted bubblewrap against the host's fixed rewritable
+    /// prefixes; this is the other half, and it is the profile's own doing. A
+    /// literal `/usr/bin/bwrap` inside a granted root is the obvious case. The
+    /// case a name-only comparison misses is the one every place backend
+    /// already checks for its engine: a system-prefix `bwrap` that is a
+    /// *symlink* into a prefix this profile makes writable redirects the host's
+    /// next launch exactly as overwriting the binary would.
+    #[cfg(unix)]
+    #[test]
+    fn a_profile_that_hands_over_bubblewrap_is_refused_in_either_spelling() {
+        let policy = |granted: &str| {
+            let mut profile =
+                SandboxProfile::new("dev", vec![SandboxPath::workspace(granted.to_string())]);
+            profile.network_mode = NetworkMode::None;
+            profile
+                .resolve(SandboxBackendKind::Bwrap, "/home/u")
+                .unwrap()
+        };
+        let backend = BwrapBackend::new(Arc::new(StubHost::linux_with_bwrap("0.11.0")));
+
+        // The literal: the stub's bubblewrap is `/usr/bin/bwrap`.
+        let usr_bin = policy("/usr/bin");
+        let err = backend
+            .wrap(
+                vec!["claude".into()],
+                &SandboxLaunch::new(&usr_bin, "/home/u", "s1"),
+            )
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, SandboxError::Refused { .. }), "{text}");
+        assert!(text.contains("contains bubblewrap itself"), "{text}");
+
+        // And the link. A real tree, because what is compared is what the
+        // kernel resolves: `<base>/bin/bwrap` is on `PATH` and lands in
+        // `<base>/real`, which is the only path this profile grants.
+        let base = dirs::test_temp_base("bwrap-relink");
+        let (real, bin) = (base.join("real"), base.join("bin"));
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let binary = real.join("bwrap");
+        std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+        let link = bin.join("bwrap");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&binary, &link).unwrap();
+        let link = link.display().to_string();
+
+        // Built up rather than taken from `linux_with_bwrap`: a scripted bare
+        // command line puts its program on the stub's `PATH` at `/usr/bin/…`,
+        // and `which` answers with the first entry — so that helper's own
+        // `bwrap --version` would win over the link this test is about.
+        type Out = crate::sandbox::probe::ProbeOutput;
+        let linked = StubHost::new()
+            .with_home("/home/u")
+            .with_binary_at(BWRAP, &link)
+            .with_command("uname -s", Out::success("Linux\n"))
+            .with_file("/proc/sys/kernel/osrelease", "6.8.0-generic\n")
+            .with_command(
+                &format!("{link} --version"),
+                Out::success("bubblewrap 0.11.0\n"),
+            )
+            .with_command(&format!("{link} --ro-bind / / true"), Out::success(""));
+        let backend = BwrapBackend::new(Arc::new(linked));
+        assert_eq!(backend.details().program.as_deref(), Some(link.as_str()));
+
+        let granted = policy(&real.display().to_string());
+        let err = backend
+            .wrap(
+                vec!["claude".into()],
+                &SandboxLaunch::new(&granted, "/home/u", "s1"),
+            )
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, SandboxError::Refused { .. }), "{text}");
+        assert!(text.contains("which resolves to"), "{text}");
+        assert!(text.contains(&binary.display().to_string()), "{text}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn wrap_refuses_a_policy_resolved_for_another_backend() {
         let policy = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")])
@@ -1887,37 +2042,74 @@ mod tests {
 
     /// The precedence rule is the mount order, and an overlay is emitted in the
     /// same sorted pass as every other mount — so a read-only path nested in a
-    /// copy-on-write root still wins, and so does a read-write one.
+    /// copy-on-write root still wins, and is bound from the *real* directory.
     #[test]
-    fn nesting_inside_a_copy_on_write_root_still_resolves_most_specific_first() {
+    fn a_read_only_path_nested_in_a_copy_on_write_root_still_wins() {
         let policy = closed_policy(vec![
             SandboxPath::workspace("/repo"),
             SandboxPath::read_only("/repo/vendor"),
-            SandboxPath::workspace("/repo/vendor/cache"),
         ]);
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
         let argv =
             build_argv_with(PROGRAM, &launch, None, &nothing, &[workspace_at("/repo")]).unwrap();
 
-        let overlay = index_of(&argv, "--overlay");
-        let vendor = index_of(&argv, "/repo/vendor");
-        let cache = index_of(&argv, "/repo/vendor/cache");
-        assert!(overlay < vendor && vendor < cache, "{argv:?}");
-        // The nested pair are ordinary binds of the *real* directories, so a
-        // read-only descendant is still read-only and a read-write one still
-        // writes through to the host.
+        assert!(index_of(&argv, "/repo/vendor") > index_of(&argv, "--overlay"));
         assert!(has_mount(
             &argv,
             "--ro-bind",
             "/repo/vendor",
             "/repo/vendor"
         ));
-        assert!(has_mount(
-            &argv,
-            "--bind",
-            "/repo/vendor/cache",
-            "/repo/vendor/cache"
-        ));
+    }
+
+    /// The same ordering that lets a read-only nested path win is what makes a
+    /// read-*write* one a hole: `--bind /repo/sub /repo/sub` lands after the
+    /// overlay and puts the real host directory back over the merged view, so
+    /// every write the profile calls discardable goes into the real repository.
+    ///
+    /// Refused with the nested path named. A profile that quietly means the
+    /// opposite of what it says is worse than one that will not load.
+    #[test]
+    fn a_read_write_grant_nested_in_a_copy_on_write_root_is_refused() {
+        let policy = closed_policy(vec![
+            SandboxPath::workspace("/repo"),
+            SandboxPath::workspace("/repo/sub"),
+        ]);
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
+        let err = build_argv_with(PROGRAM, &launch, None, &nothing, &[workspace_at("/repo")])
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::Refused { .. }), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("/repo/sub"), "{text}");
+        assert!(text.contains("/repo"), "{text}");
+        assert!(text.contains("discardable"), "{text}");
+
+        // A per-session directory the launch mints counts the same way: a
+        // workspace inside the copy-on-write root (a linked worktree, say) would
+        // be bound over the merged view exactly as a profile path would.
+        let single = closed_policy(vec![SandboxPath::workspace("/repo")]);
+        let nested_workspace =
+            SandboxLaunch::new(&single, "/home/u", "s1").with_workspace("/repo/w");
+        let err = build_argv_with(
+            PROGRAM,
+            &nested_workspace,
+            None,
+            &nothing,
+            &[workspace_at("/repo")],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("/repo/w"), "{err}");
+
+        // And the root itself is not "nested inside itself": the ordinary
+        // single-root launch still composes.
+        assert!(build_argv_with(
+            PROGRAM,
+            &SandboxLaunch::new(&single, "/home/u", "s1"),
+            None,
+            &nothing,
+            &[workspace_at("/repo")],
+        )
+        .is_ok());
     }
 
     /// ADR-29 and the secret masks are emitted after the mount pass, so they
@@ -2037,6 +2229,40 @@ mod tests {
         assert!(!std::path::Path::new(&layers.upper).exists());
     }
 
+    /// Two sessions never share a layer, and neither one's teardown takes the
+    /// other's with it.
+    ///
+    /// The collision this closes: the layer tree used to be keyed on
+    /// [`dirs::sanitize_component`] alone, which folds every character it does
+    /// not accept onto `-` — so two session keys differing only in those
+    /// characters named one directory. A session key is not always a UUID (an
+    /// agent's own conversation id stands in when friring pinned no session id),
+    /// and sharing it would show one agent the writes another believes are
+    /// private and discardable.
+    #[test]
+    fn sessions_whose_keys_only_differ_in_folded_characters_keep_their_own_layers() {
+        let root = "/home/u/dev/app".to_string();
+        let roots = std::slice::from_ref(&root);
+        // The two keys `sanitize_component` cannot tell apart.
+        assert_eq!(
+            dirs::sanitize_component("sib/ling"),
+            dirs::sanitize_component("sib-ling")
+        );
+        let first = overlay_workspaces("sib/ling", roots).unwrap();
+        let second = overlay_workspaces("sib-ling", roots).unwrap();
+        assert_ne!(first[0].upper, second[0].upper);
+        assert_ne!(first[0].work, second[0].work);
+
+        // What one wrote is not in the other's layer…
+        std::fs::write(std::path::Path::new(&first[0].upper).join("mine"), "x").unwrap();
+        assert!(!std::path::Path::new(&second[0].upper).join("mine").exists());
+        // …and one session ending does not reclaim the other's.
+        cleanup_overlays("sib-ling");
+        assert!(std::path::Path::new(&first[0].upper).join("mine").exists());
+        cleanup_overlays("sib/ling");
+        assert!(!std::path::Path::new(&first[0].upper).exists());
+    }
+
     /// The layer directories are friring's own, and a link where one belongs is
     /// interference rather than a profile a user should edit — so it refuses the
     /// launch outright instead of routing through `allow_unsandboxed_fallback`.
@@ -2045,8 +2271,9 @@ mod tests {
     fn a_layer_directory_replaced_by_a_link_refuses_the_launch_as_tampering() {
         let base = overlay_root().expect("a data directory");
         let key = "layers-tampered";
-        dirs::create_private_dir(&base.join(key).join(dirs::digest("/repo"))).unwrap();
-        let planted = base.join(key).join(dirs::digest("/repo")).join("upper");
+        let leaf = base.join(session_layers(key)).join(dirs::digest("/repo"));
+        dirs::create_private_dir(&leaf).unwrap();
+        let planted = leaf.join("upper");
         let _ = std::fs::remove_dir_all(&planted);
         std::os::unix::fs::symlink(dirs::host_temp_root(), &planted).unwrap();
 
