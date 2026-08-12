@@ -700,6 +700,12 @@ mod tests {
         let err = reject_window_name_conflict(&db, "foo.bar").unwrap_err();
         assert!(err.contains("tb-foo_bar"), "got {err}");
         assert!(reject_window_name_conflict(&db, "foo-bar").is_ok());
+
+        // The guard runs inside the spawn itself, before anything is created:
+        // the request fails and no second row (nor tmux window) appears.
+        let err = spawn_session_headless(&db, req("foo.bar")).unwrap_err();
+        assert!(err.contains("tb-foo_bar"), "got {err}");
+        assert_eq!(db.list_active_sessions().unwrap().len(), 1);
     }
 
     #[test]
