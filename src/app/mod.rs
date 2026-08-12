@@ -17714,6 +17714,38 @@ mod tests {
         assert_eq!(bound.get("bar"), Some(&"%1"), "bar took foo's pane");
     }
 
+    /// A shell pane is re-adopted under the same identity rule as the agent
+    /// pane: the persisted `%N` must still be the `tbs-` window of *this*
+    /// session, or a recycled id would attach a stranger's pane as this
+    /// session's shell.
+    #[tokio::test]
+    async fn restore_readopts_only_its_own_shell_pane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+
+        let mut app = app_with_discovery(vec![
+            make_discovered("%1", "tb-foo", true),
+            make_discovered("%2", "tbs-foo", true),
+        ]);
+        let mut foo = make_shared_session("%1", "foo");
+        foo.shell_backend_id = Some("%2".to_string());
+        app.db.upsert_session(&foo).unwrap();
+        app.restore_sessions(vec![foo], 1);
+        assert_eq!(app.sessions[0].info.shell_backend_id.as_deref(), Some("%2"));
+
+        // Same persisted id, but after the server restart `%2` is *bar's* shell
+        // window — foo's shell is gone and must not be replaced by it.
+        let mut app = app_with_discovery(vec![
+            make_discovered("%1", "tb-foo", true),
+            make_discovered("%2", "tbs-bar", true),
+        ]);
+        let mut foo = make_shared_session("%1", "foo");
+        foo.shell_backend_id = Some("%2".to_string());
+        app.db.upsert_session(&foo).unwrap();
+        app.restore_sessions(vec![foo], 1);
+        assert_eq!(app.sessions[0].info.shell_backend_id, None);
+    }
+
     /// A pane id is unique only within its own tmux server, so a local session
     /// holding `%9` must not make a remote host's own `%9` look taken — the
     /// remote row would be starved of the window carrying its name and ghost.
