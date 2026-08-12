@@ -893,7 +893,10 @@ friring-cli session restore <uuid>       # undo a soft-delete
   `agents.toml` when omitted; `--worktree-branch` (off
   `--base-branch`, default `main`) creates a git worktree; `--host`
   (a name from `hosts.toml`) creates the worktree and tmux window on
-  that remote host over SSH instead of locally.
+  that remote host over SSH instead of locally. The name must
+  sanitize to a tmux window no active session already owns — `foo
+  bar`, `foo.bar` and `foo:bar` all become `tb-foo_bar`, so `create`
+  fails naming the session that holds it and you pick another name.
 - **`send`** types text into the session's terminal followed by
   Enter. It refuses while the target reports itself blocked on a
   permission prompt or its visible pane shows a dialog — that
