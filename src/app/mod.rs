@@ -2069,22 +2069,41 @@ impl App {
         }
     }
 
-    /// A prefilled session name: the working directory's basename, deduped
-    /// against existing session names with a numeric suffix — duplicate names
-    /// make the tmux window lookup ambiguous.
-    pub(crate) fn suggested_session_name(&self, cwd: Option<&std::path::Path>) -> String {
-        let base = cwd.map(crate::paths::display_path).unwrap_or_default();
-        if base.is_empty() {
-            return base;
-        }
-        let taken = |name: &str| self.sessions.iter().any(|s| s.info.name == name);
-        if !taken(&base) {
-            return base;
+    /// The open session whose tmux window `name` would collide with, if any.
+    ///
+    /// Compared on the **sanitized** window name, not the display name: that is
+    /// what every tmux lookup targets, and [`sanitize_window_name`] is
+    /// many-to-one, so `foo bar`, `foo.bar` and `foo:bar` are three sessions
+    /// sharing one window, `tb-foo_bar`. tmux happily creates duplicate window
+    /// names and then resolves `:=tb-foo_bar` to whichever came first — reads
+    /// silently return the wrong session's pane and `send-keys` fails outright
+    /// with "can't find window".
+    ///
+    /// [`sanitize_window_name`]: crate::agent::tmux::sanitize_window_name
+    pub(crate) fn window_name_conflict(&self, name: &str) -> Option<&str> {
+        let window = crate::agent::tmux::agent_window_name(name);
+        self.sessions
+            .iter()
+            .find(|s| crate::agent::tmux::agent_window_name(&s.info.name) == window)
+            .map(|s| s.info.name.as_str())
+    }
+
+    /// `base`, or the first `base-N` whose tmux window is free.
+    pub(crate) fn dedup_session_name(&self, base: &str) -> String {
+        if base.is_empty() || self.window_name_conflict(base).is_none() {
+            return base.to_string();
         }
         (2..100)
             .map(|i| format!("{base}-{i}"))
-            .find(|c| !taken(c))
-            .unwrap_or(base)
+            .find(|c| self.window_name_conflict(c).is_none())
+            .unwrap_or_else(|| base.to_string())
+    }
+
+    /// A prefilled session name: the working directory's basename, deduped
+    /// against existing sessions with a numeric suffix.
+    pub(crate) fn suggested_session_name(&self, cwd: Option<&std::path::Path>) -> String {
+        let base = cwd.map(crate::paths::display_path).unwrap_or_default();
+        self.dedup_session_name(&base)
     }
 
     /// Continue spawn after the user has chosen a session name: open the agent
@@ -2476,8 +2495,12 @@ impl App {
         self.new_session.fork = true;
         self.new_session.parent_session_id = Some(session.info.id);
 
+        // Deduped like any other prefill: forking the same session twice
+        // otherwise proposes `<name>-fork` both times, and accepting it builds
+        // a second tmux window with the first one's name.
+        let fork_name = self.dedup_session_name(&format!("{source_name}-fork"));
         let mut sn = modals::SessionNameModal::default();
-        sn.name.set(&format!("{source_name}-fork"));
+        sn.name.set(&fork_name);
         self.modal = modals::Modal::SessionName(sn);
     }
 
@@ -7170,6 +7193,16 @@ impl App {
                 continue;
             };
 
+            // Recomputed per iteration because a successful adopt below pushes
+            // onto `self.sessions`: a pane already backing an open session must
+            // never be handed to a second one.
+            let claimed: HashSet<String> = self
+                .sessions
+                .iter()
+                .map(|s| s.backend_id().to_string())
+                .filter(|id| !id.is_empty())
+                .collect();
+
             let matching_backend_id = {
                 let discovered = discovered_by_backend
                     .entry(shared_session.backend_type.clone())
@@ -7187,7 +7220,7 @@ impl App {
                             }
                         }
                     });
-                Self::find_matching_discovered(&shared_session, discovered)
+                Self::find_matching_discovered(&shared_session, discovered, &claimed)
                     .map(|disc| disc.backend_id.clone())
             };
 
@@ -7662,6 +7695,17 @@ impl App {
             .restore_seed_prefetches
             .wrapping_add(seeds.len() as u64);
 
+        // Panes already spoken for. One pane backs exactly one session: without
+        // this, two rows that resolve to the same window (a recycled pane id, or
+        // two names that sanitize alike) both adopt it and the user drives one
+        // agent from two panels. The loser falls through to ghost/respawn.
+        let mut claimed: HashSet<String> = self
+            .sessions
+            .iter()
+            .map(|s| s.backend_id().to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
+
         for shared in local {
             let discovered = discovered_by_backend
                 .get(&shared.backend_type)
@@ -7669,7 +7713,7 @@ impl App {
                 .unwrap_or_default();
             let adopt_start = perf_log.then(std::time::Instant::now);
             let name = perf_log.then(|| shared.name.clone());
-            self.restore_single_session(shared, &discovered, &seeds, &unloaded);
+            self.restore_single_session(shared, &discovered, &seeds, &unloaded, &mut claimed);
             if let (Some(start), Some(name)) = (adopt_start, name) {
                 tracing::info!(
                     session = %name,
@@ -8020,6 +8064,14 @@ impl App {
             .unwrap_or_default()
             .into_iter()
             .collect();
+        // Panes held by sessions this instance already has open, so a
+        // late-arriving host's adoption can't rebind one of them.
+        let mut claimed: HashSet<String> = self
+            .sessions
+            .iter()
+            .map(|s| s.backend_id().to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
 
         for (backend_type, reachable, discovered) in ready {
             if !reachable {
@@ -8070,7 +8122,13 @@ impl App {
                 let retry_copy = shared.clone();
                 // Remote adoption keeps the inline capture (`seed: None` path)
                 // — the SSH control-mode round-trips dominate there anyway.
-                self.restore_single_session(shared, &discovered, &HashMap::new(), &unloaded);
+                self.restore_single_session(
+                    shared,
+                    &discovered,
+                    &HashMap::new(),
+                    &unloaded,
+                    &mut claimed,
+                );
                 // A ghost counts as restored: the host is back but the pane is
                 // gone, and lazy restore (or the unloaded flag) chose a frozen
                 // frame over respawning on the host.
@@ -8221,11 +8279,15 @@ impl App {
         const MAX_CONCURRENT_CAPTURES: usize = 8;
 
         let mut jobs: Vec<(String, Arc<dyn SessionBackend>)> = Vec::new();
+        // No claims here: this only warms a cache keyed by pane id, so matching
+        // the superset of adoptable panes costs a spare capture at worst, while
+        // reserving one would starve the session that actually adopts it.
+        let unclaimed = HashSet::new();
         for shared in local {
             let Some(discovered) = discovered_by_backend.get(&shared.backend_type) else {
                 continue;
             };
-            let Some(disc) = Self::find_matching_discovered(shared, discovered) else {
+            let Some(disc) = Self::find_matching_discovered(shared, discovered, &unclaimed) else {
                 continue;
             };
             let Some(backend) = self.resolve_persisted_backend(&shared.backend_type) else {
@@ -8274,6 +8336,7 @@ impl App {
         discovered: &[crate::agent::backend::DiscoveredSession],
         seeds: &HashMap<String, Vec<u8>>,
         unloaded: &HashSet<SessionId>,
+        claimed: &mut HashSet<String>,
     ) {
         let name = shared.name.clone();
 
@@ -8290,7 +8353,7 @@ impl App {
             return;
         };
 
-        let matching_discovered = Self::find_matching_discovered(&shared, discovered);
+        let matching_discovered = Self::find_matching_discovered(&shared, discovered, claimed);
 
         // Select the correct backend based on the persisted backend_type.
         // Skip sessions on a backend this instance can't manage (unknown remote
@@ -8325,6 +8388,7 @@ impl App {
         });
 
         if let Some(session) = adopted {
+            claimed.insert(session.backend_id().to_string());
             // A live pane trumps the unloaded flag (e.g. a headless spawn
             // re-created the window after an unload): adopting it is free —
             // no process starts — so clear the flag rather than ghost a
@@ -8332,7 +8396,7 @@ impl App {
             if unloaded.contains(&shared.id) {
                 let _ = self.db.set_session_unloaded(shared.id, false);
             }
-            self.finish_adopted_session(session, &shared, agent, worktrees, discovered);
+            self.finish_adopted_session(session, &shared, agent, worktrees, discovered, claimed);
         } else if unloaded.contains(&shared.id)
             || crate::session::settings::global().lazy_session_restore
         {
@@ -8342,9 +8406,34 @@ impl App {
             let session = self.build_ghost_session(&shared);
             self.sessions.push(session);
             self.request_redraw();
+        } else if self.live_window_name_conflict(&name).is_some() {
+            // A session restored earlier in this sweep already runs the window
+            // this respawn would create. Rows that collide like that predate
+            // the spawn-time guard; respawning anyway would build the duplicate
+            // tmux window whose lookups resolve ambiguously, so ghost instead
+            // and leave the user a name they can change.
+            let session = self.build_ghost_session(&shared);
+            self.sessions.push(session);
+            self.set_error(format!(
+                "Session '{name}' shares tmux window {} with another session — \
+                 left unloaded; rename one of them",
+                crate::agent::tmux::agent_window_name(&name)
+            ));
+            self.request_redraw();
         } else {
             self.respawn_stale_session(name, shared, agent, agent_session_id, worktrees);
         }
+    }
+
+    /// Like [`Self::window_name_conflict`] but ignoring ghosts, which own no
+    /// tmux window until they are loaded.
+    fn live_window_name_conflict(&self, name: &str) -> Option<&str> {
+        let window = crate::agent::tmux::agent_window_name(name);
+        self.sessions
+            .iter()
+            .filter(|s| !s.is_ghost())
+            .find(|s| crate::agent::tmux::agent_window_name(&s.info.name) == window)
+            .map(|s| s.info.name.as_str())
     }
 
     /// Wire a freshly-adopted backend session into the app: copy persisted
@@ -8356,6 +8445,7 @@ impl App {
         agent: String,
         worktrees: Vec<WorktreeInfo>,
         discovered: &[crate::agent::backend::DiscoveredSession],
+        claimed: &mut HashSet<String>,
     ) {
         session.info.id = shared.id;
         session.info.agent_session_id = shared.agent_session_id.clone();
@@ -8371,7 +8461,9 @@ impl App {
         // Re-adopt shell pane if one was persisted
         if let Some(shell_bid) = &shared.shell_backend_id {
             let (rows, cols) = self.content_area_size();
-            Self::readopt_shell_pane(&mut session, shell_bid, discovered, rows, cols);
+            if Self::readopt_shell_pane(&mut session, shell_bid, discovered, rows, cols, claimed) {
+                claimed.insert(shell_bid.clone());
+            }
         }
 
         self.sessions.push(session);
@@ -8380,23 +8472,36 @@ impl App {
     }
 
     /// Re-adopt a persisted shell pane onto `session` if its backend window is
-    /// still alive. Failures are non-fatal (logged only).
+    /// still alive. Failures are non-fatal (logged only). Returns whether the
+    /// pane was claimed.
+    ///
+    /// The persisted id must still belong to a window named `tbs-<safe_name>`
+    /// for *this* session: a pane id alone is not proof of identity across a
+    /// tmux server restart (see [`Self::find_matching_discovered`]), and
+    /// without the name check a recycled `%N` attached another session's
+    /// window — including an agent pane — as this session's shell.
     fn readopt_shell_pane(
         session: &mut Session,
         shell_bid: &str,
         discovered: &[crate::agent::backend::DiscoveredSession],
         rows: u16,
         cols: u16,
-    ) {
-        if !discovered
-            .iter()
-            .any(|d| d.backend_id == *shell_bid && d.is_alive)
-        {
-            return;
+        claimed: &HashSet<String>,
+    ) -> bool {
+        let expected = crate::agent::tmux::shell_window_name(&session.info.name);
+        if !discovered.iter().any(|d| {
+            d.backend_id == *shell_bid
+                && d.is_alive
+                && d.name == expected
+                && !claimed.contains(&d.backend_id)
+        }) {
+            return false;
         }
         if let Err(e) = session.adopt_shell_pane(shell_bid, rows, cols) {
             tracing::warn!("Failed to re-adopt shell pane: {e}");
+            return false;
         }
+        true
     }
 
     /// No matching backend session or adopt failed — respawn resuming when the
@@ -8454,26 +8559,40 @@ impl App {
 
     /// Find a discovered backend session matching a shared session.
     ///
-    /// Tries to match by `backend_id` first; if that fails (e.g. the row
-    /// was created by the headless CLI/MCP path which doesn't know the
-    /// real tmux pane id yet), falls back to matching by the sanitized
-    /// window name (`tb-<safe_name>`).
+    /// The **window name** (`tb-<safe_name>`) is the identity: it is derived
+    /// from the session name and is reproduced verbatim every time the window
+    /// is re-created. The persisted `backend_id` is only a cache used to
+    /// disambiguate, never proof on its own — tmux allocates pane ids
+    /// (`%N`) per *server lifetime*, so a restarted server hands the same
+    /// `%N` back out to whichever window is created first. A persisted id
+    /// therefore routinely names a **different** session's pane after a tmux
+    /// restart, and trusting it wired a session to another agent's terminal.
+    ///
+    /// `claimed` holds the pane ids already owned by an open or
+    /// earlier-restored session. tmux permits two windows to share a name, so
+    /// without it a sanitized-name collision (`foo bar` and `foo.bar` both
+    /// sanitize to `tb-foo_bar`) let two sessions adopt one pane and drive a
+    /// single agent process from two panels.
     fn find_matching_discovered<'a>(
         shared: &sync::SharedSession,
         discovered: &'a [crate::agent::backend::DiscoveredSession],
+        claimed: &HashSet<String>,
     ) -> Option<&'a crate::agent::backend::DiscoveredSession> {
+        let expected_name = crate::agent::tmux::agent_window_name(&shared.name);
+        let available = |d: &&crate::agent::backend::DiscoveredSession| {
+            d.is_alive && d.name == expected_name && !claimed.contains(&d.backend_id)
+        };
+        // Among same-named windows, prefer the exact pane this session last
+        // used, so re-adopting an unchanged tmux server is stable.
         if !shared.backend_id.is_empty() {
             if let Some(d) = discovered
                 .iter()
-                .find(|d| d.backend_id == shared.backend_id && d.is_alive)
+                .find(|d| d.backend_id == shared.backend_id && available(d))
             {
                 return Some(d);
             }
         }
-        let expected_name = crate::agent::tmux::agent_window_name(&shared.name);
-        discovered
-            .iter()
-            .find(|d| d.name == expected_name && d.is_alive)
+        discovered.iter().find(available)
     }
 
     /// Paste `text` into a session as a bracketed paste, then queue an Enter.
@@ -12474,6 +12593,66 @@ mod tests {
             "other"
         );
         assert_eq!(app.suggested_session_name(None), "");
+    }
+
+    /// Sanitizing is many-to-one, so a name that merely *sanitizes* onto an
+    /// open session's window is taken even though the display names differ.
+    #[test]
+    fn window_name_conflict_detects_sanitized_collision() {
+        let mut app = app_with_sessions(1);
+        app.sessions[0].info.name = "foo bar".into();
+
+        assert_eq!(app.window_name_conflict("foo.bar"), Some("foo bar"));
+        assert_eq!(app.window_name_conflict("foo:bar"), Some("foo bar"));
+        assert_eq!(app.window_name_conflict("foo_bar"), Some("foo bar"));
+        assert_eq!(app.window_name_conflict("foo-bar"), None);
+    }
+
+    /// A ghost holds no tmux window, so it never blocks a respawn; a loaded
+    /// session with the same window name does.
+    #[tokio::test]
+    async fn live_window_name_conflict_ignores_ghosts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_discovery(vec![make_discovered("%1", "tb-foo_bar", true)]);
+
+        let live = make_shared_session("%1", "foo bar");
+        let gone = make_shared_session("", "gone away");
+        app.db.upsert_session(&live).unwrap();
+        app.db.upsert_session(&gone).unwrap();
+        app.restore_sessions(vec![live, gone], 2);
+
+        assert_eq!(app.live_window_name_conflict("foo.bar"), Some("foo bar"));
+        // `gone away` restored as a ghost — its window name is free.
+        assert!(app.sessions.iter().any(|s| s.is_ghost()));
+        assert_eq!(app.live_window_name_conflict("gone.away"), None);
+        assert_eq!(app.window_name_conflict("gone.away"), Some("gone away"));
+    }
+
+    #[test]
+    fn dedup_session_name_skips_sanitized_collision() {
+        let mut app = app_with_sessions(1);
+        app.sessions[0].info.name = "foo bar".into();
+
+        assert_eq!(app.dedup_session_name("foo.bar"), "foo.bar-2");
+        assert_eq!(app.dedup_session_name("other"), "other");
+    }
+
+    /// Forking twice proposed `<name>-fork` both times, so accepting the
+    /// prefill built a second window with the first fork's name.
+    #[test]
+    fn fork_prefill_dedupes_against_an_existing_fork() {
+        let mut app = app_with_sessions(2);
+        app.sessions[0].info.name = "friring".into();
+        app.sessions[1].info.name = "friring-fork".into();
+        app.active_index = 0;
+
+        app.fork_active_session();
+
+        let modals::Modal::SessionName(ref sn) = app.modal else {
+            panic!("expected the session-name modal");
+        };
+        assert_eq!(sn.name.value(), "friring-fork-2");
     }
 
     #[test]
@@ -17253,6 +17432,85 @@ mod tests {
         }
     }
 
+    /// No pane claimed yet — the common case.
+    fn unclaimed() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    /// tmux allocates pane ids per *server lifetime*: after a restart the same
+    /// `%N` is handed to whichever window is created first, so a persisted id
+    /// routinely names another session's pane. Matching on it alone wired a
+    /// session's panel to a different agent's terminal.
+    #[test]
+    fn find_matching_discovered_rejects_recycled_pane_id() {
+        // "foo" recorded pane %2 under a previous tmux server; after the
+        // restart %2 is *bar's* pane and foo's real window is %3.
+        let foo = make_shared_session("%2", "foo");
+        let discovered = vec![
+            make_discovered("%2", "tb-bar", true),
+            make_discovered("%3", "tb-foo", true),
+        ];
+        let result = App::find_matching_discovered(&foo, &discovered, &unclaimed()).unwrap();
+        assert_eq!(result.name, "tb-foo");
+        assert_eq!(result.backend_id, "%3");
+    }
+
+    /// A recycled id with no window of this session's own name left must not
+    /// fall back onto someone else's pane — nothing matches.
+    #[test]
+    fn find_matching_discovered_recycled_id_without_own_window_matches_nothing() {
+        let foo = make_shared_session("%2", "foo");
+        let discovered = vec![make_discovered("%2", "tb-bar", true)];
+        assert!(App::find_matching_discovered(&foo, &discovered, &unclaimed()).is_none());
+    }
+
+    /// One pane backs one session: a pane another session already adopted is
+    /// off-limits, so two panels can never drive a single agent process.
+    #[test]
+    fn find_matching_discovered_skips_claimed_pane() {
+        let shared = make_shared_session("", "1");
+        let discovered = vec![make_discovered("%5", "tb-1", true)];
+        let claimed: HashSet<String> = ["%5".to_string()].into_iter().collect();
+        assert!(App::find_matching_discovered(&shared, &discovered, &claimed).is_none());
+    }
+
+    /// tmux permits duplicate window names, so two sessions whose names
+    /// sanitize alike (`foo bar` / `foo.bar` → `tb-foo_bar`) both resolve to
+    /// `tb-foo_bar`. Claiming hands each a distinct pane.
+    #[test]
+    fn find_matching_discovered_sanitized_name_collision_splits_panes() {
+        let spaced = make_shared_session("", "foo bar");
+        let dotted = make_shared_session("", "foo.bar");
+        let discovered = vec![
+            make_discovered("%7", "tb-foo_bar", true),
+            make_discovered("%8", "tb-foo_bar", true),
+        ];
+        let mut claimed = unclaimed();
+        let first = App::find_matching_discovered(&spaced, &discovered, &claimed)
+            .unwrap()
+            .backend_id
+            .clone();
+        claimed.insert(first.clone());
+        let second = App::find_matching_discovered(&dotted, &discovered, &claimed)
+            .unwrap()
+            .backend_id
+            .clone();
+        assert_ne!(first, second);
+    }
+
+    /// Among same-named windows the remembered pane wins, so re-adopting an
+    /// unchanged tmux server is stable rather than order-dependent.
+    #[test]
+    fn find_matching_discovered_prefers_remembered_pane_among_duplicates() {
+        let shared = make_shared_session("%8", "foo bar");
+        let discovered = vec![
+            make_discovered("%7", "tb-foo_bar", true),
+            make_discovered("%8", "tb-foo_bar", true),
+        ];
+        let result = App::find_matching_discovered(&shared, &discovered, &unclaimed()).unwrap();
+        assert_eq!(result.backend_id, "%8");
+    }
+
     #[test]
     fn find_matching_discovered_by_backend_id() {
         let shared = make_shared_session("friring:@0", "1");
@@ -17260,7 +17518,7 @@ mod tests {
             make_discovered("friring:@0", "tb-1", true),
             make_discovered("friring:@1", "tb-2", true),
         ];
-        let result = App::find_matching_discovered(&shared, &discovered);
+        let result = App::find_matching_discovered(&shared, &discovered, &unclaimed());
         assert!(result.is_some());
         assert_eq!(result.unwrap().backend_id, "friring:@0");
     }
@@ -17272,7 +17530,7 @@ mod tests {
             make_discovered("friring:@5", "tb-1", true),
             make_discovered("friring:@6", "tb-2", true),
         ];
-        let result = App::find_matching_discovered(&shared, &discovered);
+        let result = App::find_matching_discovered(&shared, &discovered, &unclaimed());
         assert!(result.is_some());
         assert_eq!(result.unwrap().backend_id, "friring:@5");
     }
@@ -17281,7 +17539,7 @@ mod tests {
     fn find_matching_discovered_skips_dead() {
         let shared = make_shared_session("friring:@0", "1");
         let discovered = vec![make_discovered("friring:@0", "tb-1", false)];
-        let result = App::find_matching_discovered(&shared, &discovered);
+        let result = App::find_matching_discovered(&shared, &discovered, &unclaimed());
         assert!(result.is_none());
     }
 
@@ -17289,15 +17547,139 @@ mod tests {
     fn find_matching_discovered_no_match() {
         let shared = make_shared_session("friring:@99", "99");
         let discovered = vec![make_discovered("friring:@0", "tb-1", true)];
-        let result = App::find_matching_discovered(&shared, &discovered);
+        let result = App::find_matching_discovered(&shared, &discovered, &unclaimed());
         assert!(result.is_none());
     }
 
     #[test]
     fn find_matching_discovered_empty_list() {
         let shared = make_shared_session("friring:@0", "1");
-        let result = App::find_matching_discovered(&shared, &[]);
+        let result = App::find_matching_discovered(&shared, &[], &unclaimed());
         assert!(result.is_none());
+    }
+
+    /// Stub backend reporting a fixed window list and adopting any pane with
+    /// inert I/O, so a full `restore_sessions` sweep can be asserted on.
+    struct DiscoveryStubBackend(Vec<crate::agent::backend::DiscoveredSession>);
+    impl SessionBackend for DiscoveryStubBackend {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn check_available(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn ensure_ready(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn spawn(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[String],
+            _: Option<&Path>,
+            _: &HashMap<String, String>,
+            _: u16,
+            _: u16,
+        ) -> anyhow::Result<crate::agent::backend::SpawnedSession> {
+            anyhow::bail!("discovery stub does not spawn")
+        }
+        fn adopt(
+            &self,
+            _: &str,
+            _: u16,
+            _: u16,
+            _: Option<Vec<u8>>,
+        ) -> anyhow::Result<crate::agent::backend::AdoptedSession> {
+            Ok(crate::agent::backend::AdoptedSession {
+                output: Box::new(std::io::empty()),
+                input: Box::new(std::io::sink()),
+            })
+        }
+        fn discover(&self) -> anyhow::Result<Vec<crate::agent::backend::DiscoveredSession>> {
+            Ok(self.0.clone())
+        }
+        fn resize(&self, _: &str, _: u16, _: u16) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn is_dead(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn kill(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn detach(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn pane_pid(&self, _: &str) -> anyhow::Result<Option<u32>> {
+            Ok(None)
+        }
+    }
+
+    fn app_with_discovery(windows: Vec<crate::agent::backend::DiscoveredSession>) -> App {
+        let backend: Arc<dyn SessionBackend> = Arc::new(DiscoveryStubBackend(windows));
+        App::new(
+            24,
+            120,
+            BackendRegistry::new(backend),
+            stub_agents(),
+            test_db(),
+        )
+    }
+
+    /// The reported bug, end to end: a tmux server restart re-creates the
+    /// windows in a different order, so each session's persisted pane id now
+    /// names the *other* session's pane. Every panel must still land on the
+    /// window carrying its own name.
+    #[tokio::test]
+    async fn restore_does_not_swap_sessions_after_pane_ids_are_recycled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_discovery(vec![
+            make_discovered("%1", "tb-bar", true),
+            make_discovered("%2", "tb-foo", true),
+        ]);
+
+        // Recorded under the previous server, where the ids were the other way.
+        let foo = make_shared_session("%1", "foo");
+        let bar = make_shared_session("%2", "bar");
+        app.db.upsert_session(&foo).unwrap();
+        app.db.upsert_session(&bar).unwrap();
+
+        app.restore_sessions(vec![foo, bar], 2);
+
+        let bound: HashMap<&str, &str> = app
+            .sessions
+            .iter()
+            .map(|s| (s.info.name.as_str(), s.backend_id()))
+            .collect();
+        assert_eq!(bound.get("foo"), Some(&"%2"), "foo took bar's pane");
+        assert_eq!(bound.get("bar"), Some(&"%1"), "bar took foo's pane");
+    }
+
+    /// Two rows resolving to one window (names that sanitize alike, against a
+    /// single live pane) must not both adopt it: one agent process driven from
+    /// two panels is the "two sessions, same claude" report. The loser ghosts.
+    #[tokio::test]
+    async fn restore_never_binds_two_sessions_to_one_pane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_discovery(vec![make_discovered("%4", "tb-foo_bar", true)]);
+
+        let spaced = make_shared_session("", "foo bar");
+        let dotted = make_shared_session("", "foo.bar");
+        app.db.upsert_session(&spaced).unwrap();
+        app.db.upsert_session(&dotted).unwrap();
+
+        app.restore_sessions(vec![spaced, dotted], 2);
+
+        let live: Vec<&str> = app
+            .sessions
+            .iter()
+            .filter(|s| !s.is_ghost())
+            .map(|s| s.backend_id())
+            .collect();
+        assert_eq!(live, vec!["%4"], "pane %4 backs more than one session");
+        assert_eq!(app.sessions.len(), 2, "the loser should still be listed");
     }
 
     // --- Lazy restore / ghost tests ---

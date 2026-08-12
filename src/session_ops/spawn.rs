@@ -65,6 +65,7 @@ pub struct SpawnResult {
 /// shared SQLite database.
 pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnResult, String> {
     crate::paths::validate_safe_name(&req.name)?;
+    reject_window_name_conflict(db, &req.name)?;
     validate_parent_session(db, req.parent_session_id)?;
 
     // Resolve the agent definition once; `agent_name` is derived from it so the
@@ -224,6 +225,31 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         worktrees,
         parent_session_id: req.parent_session_id,
     })
+}
+
+/// Refuse a name that would resolve to the tmux window of an existing session.
+/// Runs before any side effects (worktree creation, tmux spawn).
+///
+/// The window name is the sanitized session name, and sanitizing is
+/// many-to-one (`foo bar` and `foo.bar` both become `tb-foo_bar`), so distinct
+/// names can still collide. tmux allows the duplicate and then resolves the
+/// window ambiguously: reads land on whichever window came first and
+/// `send-keys` fails, leaving two sessions cross-wired to one agent.
+fn reject_window_name_conflict(db: &Database, name: &str) -> Result<(), String> {
+    let window = crate::agent::tmux::agent_window_name(name);
+    let sessions = db
+        .list_active_sessions()
+        .map_err(|e| format!("list_active_sessions: {e}"))?;
+    match sessions
+        .iter()
+        .find(|s| crate::agent::tmux::agent_window_name(&s.name) == window)
+    {
+        Some(other) => Err(format!(
+            "Session '{}' already uses tmux window {window}; pick another name",
+            other.name
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Validate that the requested parent session, if any, exists and is active.
@@ -645,6 +671,35 @@ mod tests {
         };
         db.upsert_session(&parent).unwrap();
         assert!(validate_parent_session(&db, Some(parent.id)).is_ok());
+    }
+
+    /// `foo bar` and `foo.bar` are distinct session names that sanitize onto
+    /// one tmux window, which tmux then resolves ambiguously.
+    #[test]
+    fn window_name_conflict_is_rejected_before_spawn() {
+        let db = empty_db();
+        let existing = crate::sync::SharedSession {
+            id: SessionId::default(),
+            name: "foo bar".into(),
+            agent: DEFAULT_AGENT_NAME.into(),
+            backend_id: "%1".into(),
+            backend_type: "local-tmux".into(),
+            agent_session_id: None,
+            cwd: None,
+            additional_dirs: Vec::new(),
+            workspace_dir: None,
+            worktrees: Vec::new(),
+            shell_backend_id: None,
+            parent_session_id: None,
+            display_order: None,
+            tombstone: false,
+            tombstone_at: None,
+        };
+        db.upsert_session(&existing).unwrap();
+
+        let err = reject_window_name_conflict(&db, "foo.bar").unwrap_err();
+        assert!(err.contains("tb-foo_bar"), "got {err}");
+        assert!(reject_window_name_conflict(&db, "foo-bar").is_ok());
     }
 
     #[test]

@@ -1589,6 +1589,39 @@ real Claude turn and the stub's usage route.
   glyph that would straddle a truncation is dropped whole rather than
   half-painted.
 
+- **A session panel can't be wired to another session's agent.** Upstream
+  matches a persisted session to its tmux window by `backend_id` — the pane id
+  (`%N`) — and only falls back to the window name when that misses. But tmux
+  allocates pane ids per *server lifetime*: restart the server and `%1` is
+  handed to whichever window is created first. A stored `%1` therefore names a
+  **different** session's pane after any tmux restart or reboot, and matching it
+  first meant a panel labelled `foo` attached to `bar`'s agent — the two
+  swapping identity, or one Claude Code process showing up under two names.
+  Nothing removed a matched pane from the pool either, so a single sweep could
+  hand one pane to several rows (`["%4", "%4"]` in the regression test). The
+  fork inverts the precedence: the **window name is the identity** (it is
+  re-derived from the session name every time the window is created), the pane
+  id only disambiguates *between windows of that name*, and each sweep claims
+  panes exclusively so the loser ghosts instead of silently sharing an agent.
+  The same name check now guards shell-pane re-adoption, which matched on a
+  bare pane id and could bind another session's *agent* window as this
+  session's shell. Pinned by
+  `restore_does_not_swap_sessions_after_pane_ids_are_recycled` and
+  `restore_never_binds_two_sessions_to_one_pane` in `src/app/mod.rs`.
+
+- **Two sessions can't claim one tmux window.** Window names are the sanitized
+  session name, and sanitizing is many-to-one — `foo bar`, `foo.bar` and
+  `foo:bar` all become `tb-foo_bar`. Upstream dedupes only the *prefilled*
+  name, only on the raw string, and not at all when forking (which proposes
+  `<name>-fork` every time, so forking twice offers one name twice). tmux
+  accepts the duplicate and then resolves `:=tb-foo_bar` ambiguously: reads
+  land on whichever window came first and `send-keys` fails outright with
+  "can't find window", so a session's keystrokes vanish. The fork compares
+  *window* names when deduping, dedupes the fork prefill too, and refuses a
+  colliding name at both entry points — the name modal (which stays open and
+  editable) and `spawn_session_headless` — naming the session already holding
+  that window.
+
 ### Performance
 
 - **Shell-tab keystrokes echo immediately.** The demand-driven render loop's

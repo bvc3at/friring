@@ -1360,6 +1360,16 @@ impl App {
                     self.set_error("Session name cannot be empty");
                     return;
                 }
+                // Two sessions sharing a tmux window name cross-wire their
+                // panels (see `App::window_name_conflict`), so refuse the name
+                // while the modal is still open and editable.
+                if let Some(other) = self.window_name_conflict(&name).map(str::to_string) {
+                    let window = crate::agent::tmux::agent_window_name(&name);
+                    self.set_error(format!(
+                        "Session '{other}' already uses tmux window {window} — pick another name"
+                    ));
+                    return;
+                }
                 // Resolve + validate the workspace dir before committing, so a
                 // bad value keeps the modal open with everything editable.
                 if let Some(raw) = ws_raw {
