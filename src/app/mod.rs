@@ -10568,6 +10568,33 @@ mod tests {
         );
     }
 
+    /// Confirming a name that merely *sanitizes* onto an open session's tmux
+    /// window is refused: the modal stays open with the typed name intact,
+    /// nothing is spawned, and the error names the contested window.
+    #[test]
+    fn session_name_modal_rejects_a_colliding_window_name() {
+        let mut app = app_with_sessions(1);
+        app.sessions[0].info.name = "foo bar".into();
+        app.modal = modals::Modal::SessionName(modals::SessionNameModal::default());
+        if let modals::Modal::SessionName(ref mut sn) = app.modal {
+            sn.name.set("foo.bar");
+        }
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        let modals::Modal::SessionName(ref sn) = app.modal else {
+            panic!("modal must stay open");
+        };
+        assert_eq!(sn.name.value(), "foo.bar", "the name stays editable");
+        assert_eq!(app.sessions.len(), 1, "nothing was spawned");
+        let text = app
+            .status_message
+            .as_ref()
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        assert!(text.contains("tb-foo_bar"), "got: {text}");
+    }
+
     /// Cmd+C through the full key pipeline copies the active selection —
     /// the macOS alternate for Ctrl+C. Bound explicitly (not via defaults)
     /// so the test is platform-independent; the macOS default set carrying
