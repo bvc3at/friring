@@ -2868,6 +2868,19 @@ impl App {
         let was_force_deleted = deleted.force_deleted;
         let wanted_worktrees = deleted.worktrees.len();
 
+        // A soft-deleted row keeps its name but not its window, so a session
+        // created after the delete may now own it (`my project` deleted, then
+        // `my_project` created — both are `tb-my_project`). Restoring under the
+        // old name would spawn a duplicate window; deleting the row instead
+        // would make an unrelated create silently destroy a recoverable
+        // session. Come back under the next free name and say so.
+        let restored_name = self.dedup_session_name(&deleted.name);
+        let renamed_from = (restored_name != deleted.name).then(|| deleted.name.clone());
+        let deleted = DeletedSessionInfo {
+            name: restored_name,
+            ..deleted
+        };
+
         if let Err(e) = self.db.restore_session(deleted.id) {
             error!("Failed to restore session in DB: {e}");
             self.set_error("Failed to restore session");
@@ -2943,6 +2956,13 @@ impl App {
                     }
                     msg.push(')');
                     self.set_status(StatusLevel::Info, msg);
+                } else if let Some(old) = &renamed_from {
+                    // Silently coming back under a different name would look
+                    // like the restore picked the wrong session.
+                    self.set_status(
+                        StatusLevel::Info,
+                        format!("Restored '{old}' as '{session_name}' — its tmux window was taken"),
+                    );
                 } else {
                     self.set_status(StatusLevel::Success, format!("Restored '{session_name}'"));
                 }
@@ -8451,18 +8471,26 @@ impl App {
             self.request_redraw();
         } else if self.live_window_name_conflict(&name).is_some() {
             // A session restored earlier in this sweep already runs the window
-            // this respawn would create. Rows that collide like that predate
-            // the spawn-time guard; respawning anyway would build the duplicate
-            // tmux window whose lookups resolve ambiguously, so ghost instead
-            // and leave the user a name they can change.
-            let session = self.build_ghost_session(&shared);
-            self.sessions.push(session);
-            self.set_error(format!(
-                "Session '{name}' shares tmux window {} with another session — \
-                 left unloaded; rename one of them",
-                crate::agent::tmux::agent_window_name(&name)
-            ));
-            self.request_redraw();
+            // this respawn would create — rows that collide like that predate
+            // the spawn-time guard. Respawn under the next free name instead of
+            // building a second window of the same name: renaming only ever
+            // touches a session whose window is about to be *created* (never an
+            // adopted one, which would orphan its live pane), so the collision
+            // clears itself on the next launch rather than needing a rename the
+            // app has no command for.
+            let deduped = self.dedup_session_name(&name);
+            self.set_status(
+                StatusLevel::Info,
+                format!(
+                    "Session '{name}' shares tmux window {} — restored as '{deduped}'",
+                    crate::agent::tmux::agent_window_name(&name)
+                ),
+            );
+            let shared = sync::SharedSession {
+                name: deduped.clone(),
+                ..shared
+            };
+            self.respawn_stale_session(deduped, shared, agent, agent_session_id, worktrees);
         } else {
             self.respawn_stale_session(name, shared, agent, agent_session_id, worktrees);
         }
@@ -8720,6 +8748,19 @@ impl App {
             let id = existing.info.id;
             let _ = self.send_prompt_steps_to_session(id, steps, 0);
             return Ok(id);
+        }
+
+        // Same tmux window as a *differently* named session (the names sanitize
+        // alike), so the reuse above missed it. Spawning would build a second
+        // window of that name and every later lookup would resolve ambiguously.
+        // Rejected rather than renamed: the reuse above matches on the exact
+        // name, so a deduped session would never be found again and each run
+        // would spawn another one. The caller records this as an error run.
+        if let Some(other) = self.window_name_conflict(&name) {
+            return Err(format!(
+                "session '{name}' shares tmux window {} with '{other}' — rename one of them",
+                crate::agent::tmux::agent_window_name(&name)
+            ));
         }
 
         // Expand a leading `~` — the path may have been typed by hand in the
@@ -12678,6 +12719,70 @@ mod tests {
         assert_eq!(app.window_name_conflict("foo:bar"), Some("foo bar"));
         assert_eq!(app.window_name_conflict("foo_bar"), Some("foo bar"));
         assert_eq!(app.window_name_conflict("foo-bar"), None);
+    }
+
+    /// An automation/task fire whose name sanitizes onto another session's
+    /// window must fail, not spawn a duplicate. Renaming is wrong here: the
+    /// caller re-finds its session by exact name, so a deduped one would be
+    /// missed and every run would spawn another.
+    #[test]
+    fn spawn_and_prompt_refuses_a_colliding_window_name() {
+        let mut app = app_with_sessions(1);
+        app.sessions[0].info.name = "deploy bot".into();
+
+        let err = app
+            .spawn_and_prompt(SpawnPromptRequest {
+                name: "deploy.bot".into(),
+                repo_path: std::path::Path::new("/tmp"),
+                worktree_branch: None,
+                base_branch: None,
+                agent: None,
+                host: None,
+                extra_repos: &[],
+                steps: &[crate::session::PromptStep::new("go")],
+            })
+            .unwrap_err();
+
+        assert!(err.contains("tb-deploy_bot"), "got {err}");
+        assert!(err.contains("deploy bot"), "names the holder: {err}");
+        assert_eq!(app.sessions.len(), 1, "nothing was spawned");
+    }
+
+    /// Undelete must not resurrect a name whose tmux window a session created
+    /// since the delete now owns — and must not destroy the deleted row to
+    /// avoid it either. It comes back under the next free name.
+    #[tokio::test]
+    async fn undelete_dedupes_a_name_whose_window_was_taken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_discovery(Vec::new());
+        let backend = app.backends.default_backend().clone();
+        let provider = stub_provider();
+        app.sessions
+            .push(Session::stub("my_project", &backend, &provider));
+
+        // `my project` was deleted before `my_project` existed; both are
+        // `tb-my_project`.
+        let deleted = crate::storage::DeletedSessionInfo {
+            id: crate::session::SessionId::default(),
+            name: "my project".into(),
+            agent: DEFAULT_AGENT_NAME.into(),
+            agent_session_id: Some("agent-1".into()),
+            cwd: None,
+            parent_session_id: None,
+            backend_type: "stub".into(),
+            deleted_at: 0,
+            force_deleted: false,
+            worktrees: Vec::new(),
+        };
+        app.restore_deleted_session(deleted);
+
+        let names: Vec<&str> = app.sessions.iter().map(|s| s.info.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["my_project", "my project-2"],
+            "the restore must not reuse the taken window name"
+        );
     }
 
     /// A placeholder — a ghost, or a remote row whose host is unreachable —
@@ -17666,7 +17771,13 @@ mod tests {
             _: u16,
             _: u16,
         ) -> anyhow::Result<crate::agent::backend::SpawnedSession> {
-            anyhow::bail!("discovery stub does not spawn")
+            // Succeeds with inert I/O so respawn/undelete paths can be asserted
+            // on (the adopt path returns the same shape).
+            Ok(crate::agent::backend::SpawnedSession {
+                backend_id: "%spawned".to_string(),
+                output: Box::new(std::io::empty()),
+                input: Box::new(std::io::sink()),
+            })
         }
         fn adopt(
             &self,

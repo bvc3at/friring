@@ -1618,9 +1618,25 @@ real Claude turn and the stub's usage route.
   land on whichever window came first and `send-keys` fails outright with
   "can't find window", so a session's keystrokes vanish. The fork compares
   *window* names when deduping, dedupes the fork prefill too, and refuses a
-  colliding name at both entry points — the name modal (which stays open and
-  editable) and `spawn_session_headless` — naming the session already holding
-  that window.
+  colliding name at both creation entry points — the name modal (which stays
+  open and editable) and `spawn_session_headless` — naming the session already
+  holding that window.
+
+  Two paths can still reach a collision without creating a name, and each
+  resolves it where the conflict actually occurs rather than by refusing.
+  **Undelete**: a soft-deleted row keeps its name but not its window, so a
+  session created afterwards may now own it (`my project` deleted, then
+  `my_project` created). Restoring under the old name would spawn a duplicate;
+  dropping the deleted row instead would let an unrelated create silently
+  destroy a recoverable session. It comes back as `my project-2`, with a
+  status line saying so. **Startup restore**: two rows that predate the guards
+  can both want one window — the loser respawns deduped, which is safe because
+  renaming only ever touches a session whose window is about to be created
+  (never an adopted one, which would orphan its live pane), so a host that
+  already holds collisions heals itself on the next launch. Automation/task
+  fires (`spawn_and_prompt`) are the exception and *fail*: that caller re-finds
+  its session by exact name, so a deduped one would be missed and every run
+  would spawn another.
 
 ### Performance
 
