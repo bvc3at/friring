@@ -2985,13 +2985,18 @@ friring instances.
   is written to the SQLite database at
   `$XDG_DATA_HOME/friring/friring.db`. Friring detaches from each
   session without killing it.
-- On next startup, Friring discovers existing sessions from tmux,
-  matches them to persisted metadata by `backend_id`, and adopts
-  them — reconnecting to the live tmux panes with terminal content
-  intact. Unmatched persisted sessions become greyed **ghosts** of
-  their last saved frame (`lazy_session_restore`, default on; see
-  Lazy sessions & ghosts below), or — with the setting off — fall
-  back to `--resume <session-id>` to create new tmux panes.
+- On next startup, Friring discovers existing sessions from tmux and
+  matches each persisted session to the window carrying **its own
+  name** (`tb-<sanitized-name>`), then adopts it — reconnecting to the
+  live tmux pane with terminal content intact. The stored pane id
+  (`backend_id`) only picks between windows that share that name:
+  tmux re-allocates pane ids per server lifetime, so a stored id
+  routinely names a different session's pane after a tmux restart. A
+  session whose named pane is gone — or whose only candidate is
+  already taken by another session — becomes a greyed **ghost** of
+  its last saved frame (`lazy_session_restore`, default on; see
+  Lazy sessions & ghosts below), or — with the setting off — falls
+  back to `--resume <session-id>` to create a new tmux pane.
 - External recovery is always possible via `tmux -L friring attach`.
 
 ### Lazy sessions & ghosts
