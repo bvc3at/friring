@@ -65,7 +65,6 @@ pub struct SpawnResult {
 /// shared SQLite database.
 pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnResult, String> {
     crate::paths::validate_safe_name(&req.name)?;
-    reject_window_name_conflict(db, &req.name)?;
     validate_parent_session(db, req.parent_session_id)?;
 
     // Resolve the agent definition once; `agent_name` is derived from it so the
@@ -75,7 +74,9 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
 
     // Resolve the optional remote host. `backend_type` is `local-tmux` or
     // `ssh:<host>`; `host` is the matching HostDef for remote git/tmux ops.
+    // Resolved *before* the window-name check because that check is per-server.
     let (backend_type, host) = resolve_host(req.host.as_deref())?;
+    reject_window_name_conflict(db, &req.name, &backend_type)?;
 
     // The def's `args` may reference friring-managed config files by their
     // *local* absolute path (e.g. claude's hooks `--settings <config>/hooks/
@@ -227,25 +228,34 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
     })
 }
 
-/// Refuse a name that would resolve to the tmux window of an existing session.
-/// Runs before any side effects (worktree creation, tmux spawn).
+/// Refuse a name that would resolve to the tmux window of an existing session
+/// **on the same backend**. Runs before any side effects (worktree creation,
+/// tmux spawn).
 ///
 /// The window name is the sanitized session name, and sanitizing is
 /// many-to-one (`foo bar` and `foo.bar` both become `tb-foo_bar`), so distinct
 /// names can still collide. tmux allows the duplicate and then resolves the
 /// window ambiguously: reads land on whichever window came first and
 /// `send-keys` fails, leaving two sessions cross-wired to one agent.
-fn reject_window_name_conflict(db: &Database, name: &str) -> Result<(), String> {
+///
+/// Scoped to `backend_type` because a tmux window namespace is per *server*:
+/// the local server and every `ssh:<host>` have independent window names, so a
+/// local `tb-foo_bar` is no reason to refuse the same name on a remote host.
+fn reject_window_name_conflict(
+    db: &Database,
+    name: &str,
+    backend_type: &str,
+) -> Result<(), String> {
     let window = crate::agent::tmux::agent_window_name(name);
     let sessions = db
         .list_active_sessions()
         .map_err(|e| format!("list_active_sessions: {e}"))?;
-    match sessions
-        .iter()
-        .find(|s| crate::agent::tmux::agent_window_name(&s.name) == window)
-    {
+    match sessions.iter().find(|s| {
+        s.backend_type == backend_type && crate::agent::tmux::agent_window_name(&s.name) == window
+    }) {
         Some(other) => Err(format!(
-            "Session '{}' already uses tmux window {window}; pick another name",
+            "Session '{}' already uses tmux window {window} on {backend_type}; \
+             pick another name",
             other.name
         )),
         None => Ok(()),
@@ -697,9 +707,17 @@ mod tests {
         };
         db.upsert_session(&existing).unwrap();
 
-        let err = reject_window_name_conflict(&db, "foo.bar").unwrap_err();
+        let local = LOCAL_TMUX_BACKEND_TYPE;
+        let err = reject_window_name_conflict(&db, "foo.bar", local).unwrap_err();
         assert!(err.contains("tb-foo_bar"), "got {err}");
-        assert!(reject_window_name_conflict(&db, "foo-bar").is_ok());
+        assert!(reject_window_name_conflict(&db, "foo-bar", local).is_ok());
+
+        // A tmux window namespace is per server, so the same name on a *remote*
+        // host is not a conflict — rejecting it would block a legitimate spawn.
+        assert!(
+            reject_window_name_conflict(&db, "foo.bar", "ssh:builder").is_ok(),
+            "a local window must not reserve the name on another host"
+        );
 
         // The guard runs inside the spawn itself, before anything is created:
         // the request fails and no second row (nor tmux window) appears.

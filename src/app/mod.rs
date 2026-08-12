@@ -2022,9 +2022,10 @@ impl App {
     /// or clears it freely.
     pub(crate) fn prepare_spawn(&mut self, config: SessionConfig, worktrees: Vec<WorktreeInfo>) {
         let mut modal = modals::SessionNameModal::default();
+        let backend = self.spawn_backend_name(config.backend.as_deref());
         modal
             .name
-            .set(&self.suggested_session_name(config.cwd.as_deref()));
+            .set(&self.suggested_session_name(config.cwd.as_deref(), &backend));
         self.prefill_workspace_dir_field(&mut modal);
         self.new_session.spawn_config = Some(config);
         self.new_session.spawn_worktrees = worktrees;
@@ -2079,31 +2080,52 @@ impl App {
     /// silently return the wrong session's pane and `send-keys` fails outright
     /// with "can't find window".
     ///
+    /// Comparisons are scoped to `backend`: a tmux window namespace is per
+    /// *server*, so the local server and every `ssh:<host>` name windows
+    /// independently and a local `tb-foo_bar` is no reason to refuse or rename
+    /// the same name on a remote host. Pass a backend **name** as reported by
+    /// [`Self::spawn_backend_name`].
+    ///
     /// [`sanitize_window_name`]: crate::agent::tmux::sanitize_window_name
-    pub(crate) fn window_name_conflict(&self, name: &str) -> Option<&str> {
+    pub(crate) fn window_name_conflict(&self, name: &str, backend: &str) -> Option<&str> {
         let window = crate::agent::tmux::agent_window_name(name);
         self.sessions
             .iter()
+            .filter(|s| s.backend_name() == backend)
             .find(|s| crate::agent::tmux::agent_window_name(&s.info.name) == window)
             .map(|s| s.info.name.as_str())
     }
 
-    /// `base`, or the first `base-N` whose tmux window is free.
-    pub(crate) fn dedup_session_name(&self, base: &str) -> String {
-        if base.is_empty() || self.window_name_conflict(base).is_none() {
+    /// The backend **name** a persisted or pending `backend_type` resolves to
+    /// (`None` = local). The name, not the type, is what an open session
+    /// reports, so window-name scoping compares like with like.
+    pub(crate) fn spawn_backend_name(&self, backend_type: Option<&str>) -> String {
+        let bt = backend_type.unwrap_or_default();
+        self.resolve_persisted_backend(bt)
+            .map(|b| b.name().to_string())
+            .unwrap_or_else(|| bt.to_string())
+    }
+
+    /// `base`, or the first `base-N` whose tmux window is free on `backend`.
+    pub(crate) fn dedup_session_name(&self, base: &str, backend: &str) -> String {
+        if base.is_empty() || self.window_name_conflict(base, backend).is_none() {
             return base.to_string();
         }
         (2..100)
             .map(|i| format!("{base}-{i}"))
-            .find(|c| self.window_name_conflict(c).is_none())
+            .find(|c| self.window_name_conflict(c, backend).is_none())
             .unwrap_or_else(|| base.to_string())
     }
 
     /// A prefilled session name: the working directory's basename, deduped
-    /// against existing sessions with a numeric suffix.
-    pub(crate) fn suggested_session_name(&self, cwd: Option<&std::path::Path>) -> String {
+    /// against existing sessions on `backend` with a numeric suffix.
+    pub(crate) fn suggested_session_name(
+        &self,
+        cwd: Option<&std::path::Path>,
+        backend: &str,
+    ) -> String {
         let base = cwd.map(crate::paths::display_path).unwrap_or_default();
-        self.dedup_session_name(&base)
+        self.dedup_session_name(&base, backend)
     }
 
     /// Continue spawn after the user has chosen a session name: open the agent
@@ -2490,6 +2512,7 @@ impl App {
             ..SessionConfig::default()
         };
 
+        let fork_backend = self.spawn_backend_name(config.backend.as_deref());
         self.new_session.spawn_config = Some(config);
         self.new_session.spawn_worktrees = worktrees;
         self.new_session.fork = true;
@@ -2498,7 +2521,7 @@ impl App {
         // Deduped like any other prefill: forking the same session twice
         // otherwise proposes `<name>-fork` both times, and accepting it builds
         // a second tmux window with the first one's name.
-        let fork_name = self.dedup_session_name(&format!("{source_name}-fork"));
+        let fork_name = self.dedup_session_name(&format!("{source_name}-fork"), &fork_backend);
         let mut sn = modals::SessionNameModal::default();
         sn.name.set(&fork_name);
         self.modal = modals::Modal::SessionName(sn);
@@ -2874,7 +2897,8 @@ impl App {
         // old name would spawn a duplicate window; deleting the row instead
         // would make an unrelated create silently destroy a recoverable
         // session. Come back under the next free name and say so.
-        let restored_name = self.dedup_session_name(&deleted.name);
+        let restore_backend = self.spawn_backend_name(Some(&deleted.backend_type));
+        let restored_name = self.dedup_session_name(&deleted.name, &restore_backend);
         let renamed_from = (restored_name != deleted.name).then(|| deleted.name.clone());
         let deleted = DeletedSessionInfo {
             name: restored_name,
@@ -7274,7 +7298,7 @@ impl App {
                 // later lookup resolves ambiguously — so ghost the loser
                 // instead, like `restore_single_session` does.
                 if let Some(other) = self
-                    .live_window_name_conflict(&shared_session.name)
+                    .live_window_name_conflict(&shared_session.name, backend.name())
                     .map(str::to_string)
                 {
                     let session = self.build_ghost_session(&shared_session);
@@ -8469,7 +8493,10 @@ impl App {
             let session = self.build_ghost_session(&shared);
             self.sessions.push(session);
             self.request_redraw();
-        } else if self.live_window_name_conflict(&name).is_some() {
+        } else if self
+            .live_window_name_conflict(&name, backend.name())
+            .is_some()
+        {
             // A session restored earlier in this sweep already runs the window
             // this respawn would create — rows that collide like that predate
             // the spawn-time guard. Respawn under the next free name instead of
@@ -8478,7 +8505,7 @@ impl App {
             // adopted one, which would orphan its live pane), so the collision
             // clears itself on the next launch rather than needing a rename the
             // app has no command for.
-            let deduped = self.dedup_session_name(&name);
+            let deduped = self.dedup_session_name(&name, backend.name());
             self.set_status(
                 StatusLevel::Info,
                 format!(
@@ -8500,11 +8527,11 @@ impl App {
     /// and unreachable remote rows alike own no tmux window until they are
     /// loaded or adopted. Skipping them also keeps a row from matching *its
     /// own* placeholder: it is still listed while its restore runs.
-    fn live_window_name_conflict(&self, name: &str) -> Option<&str> {
+    fn live_window_name_conflict(&self, name: &str, backend: &str) -> Option<&str> {
         let window = crate::agent::tmux::agent_window_name(name);
         self.sessions
             .iter()
-            .filter(|s| !s.is_placeholder())
+            .filter(|s| !s.is_placeholder() && s.backend_name() == backend)
             .find(|s| crate::agent::tmux::agent_window_name(&s.info.name) == window)
             .map(|s| s.info.name.as_str())
     }
@@ -8756,7 +8783,11 @@ impl App {
         // Rejected rather than renamed: the reuse above matches on the exact
         // name, so a deduped session would never be found again and each run
         // would spawn another one. The caller records this as an error run.
-        if let Some(other) = self.window_name_conflict(&name) {
+        // Resolving the host here also fails a mistyped one before any worktree
+        // is created; the config below reuses the result.
+        let host_backend = self.backend_name_for_host(host)?;
+        let target_backend = self.spawn_backend_name(host_backend.as_deref());
+        if let Some(other) = self.window_name_conflict(&name, &target_backend) {
             return Err(format!(
                 "session '{name}' shares tmux window {} with '{other}' — rename one of them",
                 crate::agent::tmux::agent_window_name(&name)
@@ -8817,7 +8848,7 @@ impl App {
             // A remote spawn runs on the host's backend (`ssh:<host>` /
             // `wsl:<host>`), which is also what routes `send_input` — so the
             // prompt steps below reach the right machine.
-            backend: self.backend_name_for_host(host)?,
+            backend: host_backend,
             ..SessionConfig::default()
         };
         if let Some(a) = agent {
@@ -12698,14 +12729,14 @@ mod tests {
         app.sessions[1].info.name = "friring-2".into();
 
         assert_eq!(
-            app.suggested_session_name(Some(std::path::Path::new("/tmp/friring"))),
+            app.suggested_session_name(Some(std::path::Path::new("/tmp/friring")), "stub"),
             "friring-3"
         );
         assert_eq!(
-            app.suggested_session_name(Some(std::path::Path::new("/tmp/other"))),
+            app.suggested_session_name(Some(std::path::Path::new("/tmp/other")), "stub"),
             "other"
         );
-        assert_eq!(app.suggested_session_name(None), "");
+        assert_eq!(app.suggested_session_name(None, "stub"), "");
     }
 
     /// Sanitizing is many-to-one, so a name that merely *sanitizes* onto an
@@ -12715,10 +12746,15 @@ mod tests {
         let mut app = app_with_sessions(1);
         app.sessions[0].info.name = "foo bar".into();
 
-        assert_eq!(app.window_name_conflict("foo.bar"), Some("foo bar"));
-        assert_eq!(app.window_name_conflict("foo:bar"), Some("foo bar"));
-        assert_eq!(app.window_name_conflict("foo_bar"), Some("foo bar"));
-        assert_eq!(app.window_name_conflict("foo-bar"), None);
+        assert_eq!(app.window_name_conflict("foo.bar", "stub"), Some("foo bar"));
+        assert_eq!(app.window_name_conflict("foo:bar", "stub"), Some("foo bar"));
+        assert_eq!(app.window_name_conflict("foo_bar", "stub"), Some("foo bar"));
+        assert_eq!(app.window_name_conflict("foo-bar", "stub"), None);
+
+        // A tmux window namespace is per server: the local session's window
+        // reserves nothing on a remote host, so the same name is free there.
+        assert_eq!(app.window_name_conflict("foo.bar", "ssh:builder"), None);
+        assert_eq!(app.dedup_session_name("foo.bar", "ssh:builder"), "foo.bar");
     }
 
     /// An automation/task fire whose name sanitizes onto another session's
@@ -12804,19 +12840,34 @@ mod tests {
         app.db.upsert_session(&down).unwrap();
         app.restore_sessions(vec![live, gone, down], 3);
 
-        assert_eq!(app.live_window_name_conflict("foo.bar"), Some("foo bar"));
+        assert_eq!(
+            app.live_window_name_conflict("foo.bar", "stub"),
+            Some("foo bar")
+        );
         // `gone away` restored as a ghost — its window name is free.
         assert!(app.sessions.iter().any(|s| s.is_ghost()));
-        assert_eq!(app.live_window_name_conflict("gone.away"), None);
-        assert_eq!(app.window_name_conflict("gone.away"), Some("gone away"));
+        assert_eq!(app.live_window_name_conflict("gone.away", "stub"), None);
+        assert_eq!(
+            app.window_name_conflict("gone.away", "stub"),
+            Some("gone away")
+        );
         // `down away` is listed as an unreachable placeholder while its host is
         // probed: its own restore must not read that row as a rival window.
         assert!(app
             .sessions
             .iter()
             .any(|s| s.info.name == "down away" && s.is_placeholder() && !s.is_ghost()));
-        assert_eq!(app.live_window_name_conflict("down.away"), None);
-        assert_eq!(app.window_name_conflict("down.away"), Some("down away"));
+        assert_eq!(
+            app.live_window_name_conflict("down.away", "ssh:down-host"),
+            None
+        );
+        assert_eq!(
+            app.window_name_conflict("down.away", "ssh:down-host"),
+            Some("down away")
+        );
+        // …and it is invisible from the local server, whose window names are a
+        // separate namespace.
+        assert_eq!(app.window_name_conflict("down.away", "stub"), None);
     }
 
     #[test]
@@ -12824,8 +12875,8 @@ mod tests {
         let mut app = app_with_sessions(1);
         app.sessions[0].info.name = "foo bar".into();
 
-        assert_eq!(app.dedup_session_name("foo.bar"), "foo.bar-2");
-        assert_eq!(app.dedup_session_name("other"), "other");
+        assert_eq!(app.dedup_session_name("foo.bar", "stub"), "foo.bar-2");
+        assert_eq!(app.dedup_session_name("other", "stub"), "other");
     }
 
     /// Forking twice proposed `<name>-fork` both times, so accepting the

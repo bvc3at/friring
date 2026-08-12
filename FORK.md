@@ -1638,6 +1638,13 @@ real Claude turn and the stub's usage route.
   its session by exact name, so a deduped one would be missed and every run
   would spawn another.
 
+  Every one of these comparisons is scoped to a single backend, because a tmux
+  window namespace belongs to its *server*: the local server and each
+  `ssh:<host>` name windows independently. Unscoped, a local `tb-foo_bar` would
+  refuse a legitimate `foo bar` on a remote host, and the pane-claim sets would
+  read a local `%1` as taking the remote host's own `%1` — starving that
+  session of its correctly-named window.
+
 ### Performance
 
 - **Shell-tab keystrokes echo immediately.** The demand-driven render loop's

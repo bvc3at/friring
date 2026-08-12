@@ -1273,7 +1273,15 @@ impl App {
         self.new_session.base_branch = Some(base_branch);
         let mut modal = super::modals::SessionNameModal::default();
         let cwd = self.new_session.repo_path.clone();
-        modal.name.set(&self.suggested_session_name(cwd.as_deref()));
+        let backend = self.spawn_backend_name(
+            self.new_session
+                .spawn_config
+                .as_ref()
+                .and_then(|c| c.backend.as_deref()),
+        );
+        modal
+            .name
+            .set(&self.suggested_session_name(cwd.as_deref(), &backend));
         self.prefill_workspace_dir_field(&mut modal);
         self.modal = super::modals::Modal::SessionName(modal);
     }
@@ -1363,7 +1371,16 @@ impl App {
                 // Two sessions sharing a tmux window name cross-wire their
                 // panels (see `App::window_name_conflict`), so refuse the name
                 // while the modal is still open and editable.
-                if let Some(other) = self.window_name_conflict(&name).map(str::to_string) {
+                let backend = self.spawn_backend_name(
+                    self.new_session
+                        .spawn_config
+                        .as_ref()
+                        .and_then(|c| c.backend.as_deref()),
+                );
+                if let Some(other) = self
+                    .window_name_conflict(&name, &backend)
+                    .map(str::to_string)
+                {
                     let window = crate::agent::tmux::agent_window_name(&name);
                     self.set_error(format!(
                         "Session '{other}' already uses tmux window {window} — pick another name"
