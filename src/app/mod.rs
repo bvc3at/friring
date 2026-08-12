@@ -8448,13 +8448,15 @@ impl App {
         }
     }
 
-    /// Like [`Self::window_name_conflict`] but ignoring ghosts, which own no
-    /// tmux window until they are loaded.
+    /// Like [`Self::window_name_conflict`] but ignoring placeholders — ghosts
+    /// and unreachable remote rows alike own no tmux window until they are
+    /// loaded or adopted. Skipping them also keeps a row from matching *its
+    /// own* placeholder: it is still listed while its restore runs.
     fn live_window_name_conflict(&self, name: &str) -> Option<&str> {
         let window = crate::agent::tmux::agent_window_name(name);
         self.sessions
             .iter()
-            .filter(|s| !s.is_ghost())
+            .filter(|s| !s.is_placeholder())
             .find(|s| crate::agent::tmux::agent_window_name(&s.info.name) == window)
             .map(|s| s.info.name.as_str())
     }
@@ -12631,25 +12633,38 @@ mod tests {
         assert_eq!(app.window_name_conflict("foo-bar"), None);
     }
 
-    /// A ghost holds no tmux window, so it never blocks a respawn; a loaded
-    /// session with the same window name does.
+    /// A placeholder — a ghost, or a remote row whose host is unreachable —
+    /// holds no tmux window, so it never blocks a respawn; a loaded session
+    /// with the same window name does.
     #[tokio::test]
-    async fn live_window_name_conflict_ignores_ghosts() {
+    async fn live_window_name_conflict_ignores_placeholders() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = crate::paths::TestPathGuard::new(tmp.path());
         let mut app = app_with_discovery(vec![make_discovered("%1", "tb-foo_bar", true)]);
+        app.backends.register(Arc::new(DownRemoteStubBackend));
 
         let live = make_shared_session("%1", "foo bar");
         let gone = make_shared_session("", "gone away");
+        let mut down = make_shared_session("%9", "down away");
+        down.backend_type = "ssh:down-host".to_string();
         app.db.upsert_session(&live).unwrap();
         app.db.upsert_session(&gone).unwrap();
-        app.restore_sessions(vec![live, gone], 2);
+        app.db.upsert_session(&down).unwrap();
+        app.restore_sessions(vec![live, gone, down], 3);
 
         assert_eq!(app.live_window_name_conflict("foo.bar"), Some("foo bar"));
         // `gone away` restored as a ghost — its window name is free.
         assert!(app.sessions.iter().any(|s| s.is_ghost()));
         assert_eq!(app.live_window_name_conflict("gone.away"), None);
         assert_eq!(app.window_name_conflict("gone.away"), Some("gone away"));
+        // `down away` is listed as an unreachable placeholder while its host is
+        // probed: its own restore must not read that row as a rival window.
+        assert!(app
+            .sessions
+            .iter()
+            .any(|s| s.info.name == "down away" && s.is_placeholder() && !s.is_ghost()));
+        assert_eq!(app.live_window_name_conflict("down.away"), None);
+        assert_eq!(app.window_name_conflict("down.away"), Some("down away"));
     }
 
     #[test]
