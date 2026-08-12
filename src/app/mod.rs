@@ -7194,16 +7194,20 @@ impl App {
             };
 
             // Recomputed per iteration because a successful adopt below pushes
-            // onto `self.sessions`: a pane already backing an open session must
-            // never be handed to a second one. Restricted to this row's own
-            // backend because a tmux pane id is unique only within its own
-            // server — a local `%1` and a remote host's `%1` are different
-            // panes, and conflating them would starve the remote session.
+            // onto `self.sessions`: a pane already backing an open session (its
+            // agent pane or its shell pane) must never be handed to a second
+            // one. Restricted to this row's own backend because a tmux pane id
+            // is unique only within its own server — a local `%1` and a remote
+            // host's `%1` are different panes, and conflating them would starve
+            // the remote session.
             let claimed: HashSet<String> = self
                 .sessions
                 .iter()
                 .filter(|s| s.backend_name() == backend.name())
-                .map(|s| s.backend_id().to_string())
+                .flat_map(|s| {
+                    std::iter::once(s.backend_id().to_string())
+                        .chain(s.info.shell_backend_id.clone())
+                })
                 .filter(|id| !id.is_empty())
                 .collect();
 
@@ -7699,14 +7703,17 @@ impl App {
             .restore_seed_prefetches
             .wrapping_add(seeds.len() as u64);
 
-        // Panes already spoken for. One pane backs exactly one session: without
-        // this, two rows that resolve to the same window (a recycled pane id, or
-        // two names that sanitize alike) both adopt it and the user drives one
-        // agent from two panels. The loser falls through to ghost/respawn.
+        // Panes already spoken for — agent panes and re-adopted shell (`tbs-`)
+        // panes alike. One pane backs exactly one session: without this, two
+        // rows that resolve to the same window (a recycled pane id, or two names
+        // that sanitize alike) both adopt it and the user drives one agent from
+        // two panels. The loser falls through to ghost/respawn.
         let mut claimed: HashSet<String> = self
             .sessions
             .iter()
-            .map(|s| s.backend_id().to_string())
+            .flat_map(|s| {
+                std::iter::once(s.backend_id().to_string()).chain(s.info.shell_backend_id.clone())
+            })
             .filter(|id| !id.is_empty())
             .collect();
 
@@ -8092,12 +8099,13 @@ impl App {
             else {
                 continue;
             };
-            // Panes held by sessions this instance already has open **on this
-            // backend**, so a late-arriving host's adoption can't rebind one of
-            // them. Scoped per backend because a tmux pane id is unique only
-            // within its own server: a local session holding `%1` says nothing
-            // about this host's `%1`, and treating it as taken would starve the
-            // remote row of its own correctly-named window.
+            // Panes (agent and shell alike) held by sessions this instance
+            // already has open **on this backend**, so a late-arriving host's
+            // adoption can't rebind one of them. Scoped per backend because a
+            // tmux pane id is unique only within its own server: a local session
+            // holding `%1` says nothing about this host's `%1`, and treating it
+            // as taken would starve the remote row of its own correctly-named
+            // window.
             let backend_name = self
                 .resolve_persisted_backend(&backend_type)
                 .map(|b| b.name().to_string())
@@ -8106,7 +8114,10 @@ impl App {
                 .sessions
                 .iter()
                 .filter(|s| s.backend_name() == backend_name)
-                .map(|s| s.backend_id().to_string())
+                .flat_map(|s| {
+                    std::iter::once(s.backend_id().to_string())
+                        .chain(s.info.shell_backend_id.clone())
+                })
                 .filter(|id| !id.is_empty())
                 .collect();
             let mut still_pending: Vec<sync::SharedSession> = Vec::new();
