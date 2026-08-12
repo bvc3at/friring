@@ -74,7 +74,9 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
 
     // Resolve the optional remote host. `backend_type` is `local-tmux` or
     // `ssh:<host>`; `host` is the matching HostDef for remote git/tmux ops.
+    // Resolved *before* the window-name check because that check is per-server.
     let (backend_type, host) = resolve_host(req.host.as_deref())?;
+    reject_window_name_conflict(db, &req.name, &backend_type)?;
 
     // The def's `args` may reference friring-managed config files by their
     // *local* absolute path (e.g. claude's hooks `--settings <config>/hooks/
@@ -224,6 +226,40 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         worktrees,
         parent_session_id: req.parent_session_id,
     })
+}
+
+/// Refuse a name that would resolve to the tmux window of an existing session
+/// **on the same backend**. Runs before any side effects (worktree creation,
+/// tmux spawn).
+///
+/// The window name is the sanitized session name, and sanitizing is
+/// many-to-one (`foo bar` and `foo.bar` both become `tb-foo_bar`), so distinct
+/// names can still collide. tmux allows the duplicate and then resolves the
+/// window ambiguously: reads land on whichever window came first and
+/// `send-keys` fails, leaving two sessions cross-wired to one agent.
+///
+/// Scoped to `backend_type` because a tmux window namespace is per *server*:
+/// the local server and every `ssh:<host>` have independent window names, so a
+/// local `tb-foo_bar` is no reason to refuse the same name on a remote host.
+fn reject_window_name_conflict(
+    db: &Database,
+    name: &str,
+    backend_type: &str,
+) -> Result<(), String> {
+    let window = crate::agent::tmux::agent_window_name(name);
+    let sessions = db
+        .list_active_sessions()
+        .map_err(|e| format!("list_active_sessions: {e}"))?;
+    match sessions.iter().find(|s| {
+        s.backend_type == backend_type && crate::agent::tmux::agent_window_name(&s.name) == window
+    }) {
+        Some(other) => Err(format!(
+            "Session '{}' already uses tmux window {window} on {backend_type}; \
+             pick another name",
+            other.name
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Validate that the requested parent session, if any, exists and is active.
@@ -645,6 +681,49 @@ mod tests {
         };
         db.upsert_session(&parent).unwrap();
         assert!(validate_parent_session(&db, Some(parent.id)).is_ok());
+    }
+
+    /// `foo bar` and `foo.bar` are distinct session names that sanitize onto
+    /// one tmux window, which tmux then resolves ambiguously.
+    #[test]
+    fn window_name_conflict_is_rejected_before_spawn() {
+        let db = empty_db();
+        let existing = crate::sync::SharedSession {
+            id: SessionId::default(),
+            name: "foo bar".into(),
+            agent: DEFAULT_AGENT_NAME.into(),
+            backend_id: "%1".into(),
+            backend_type: "local-tmux".into(),
+            agent_session_id: None,
+            cwd: None,
+            additional_dirs: Vec::new(),
+            workspace_dir: None,
+            worktrees: Vec::new(),
+            shell_backend_id: None,
+            parent_session_id: None,
+            display_order: None,
+            tombstone: false,
+            tombstone_at: None,
+        };
+        db.upsert_session(&existing).unwrap();
+
+        let local = LOCAL_TMUX_BACKEND_TYPE;
+        let err = reject_window_name_conflict(&db, "foo.bar", local).unwrap_err();
+        assert!(err.contains("tb-foo_bar"), "got {err}");
+        assert!(reject_window_name_conflict(&db, "foo-bar", local).is_ok());
+
+        // A tmux window namespace is per server, so the same name on a *remote*
+        // host is not a conflict — rejecting it would block a legitimate spawn.
+        assert!(
+            reject_window_name_conflict(&db, "foo.bar", "ssh:builder").is_ok(),
+            "a local window must not reserve the name on another host"
+        );
+
+        // The guard runs inside the spawn itself, before anything is created:
+        // the request fails and no second row (nor tmux window) appears.
+        let err = spawn_session_headless(&db, req("foo.bar")).unwrap_err();
+        assert!(err.contains("tb-foo_bar"), "got {err}");
+        assert_eq!(db.list_active_sessions().unwrap().len(), 1);
     }
 
     #[test]

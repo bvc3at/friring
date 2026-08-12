@@ -527,7 +527,11 @@ bugs (#641, #2989), required 3 external deps in the data path
 - `window-size manual` — windows size independently
 - `pause-after 5` — flow control (auto-resumed by reader)
 
-**Window naming**: `tb-<session-name>` prefix for discovery.
+**Window naming**: `tb-<session-name>` prefix for discovery. The sanitized
+window name is the authoritative identity for re-adoption; a persisted pane id
+is a per-server cache used only to choose among windows sharing that name,
+because tmux re-allocates `%N` per server lifetime. One pane may be claimed by
+at most one session per restore sweep.
 
 **Output streaming**: `%output` notifications from control mode,
 demultiplexed by pane ID into per-pane broadcast channels. Multiple
