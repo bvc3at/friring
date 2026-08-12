@@ -7195,10 +7195,14 @@ impl App {
 
             // Recomputed per iteration because a successful adopt below pushes
             // onto `self.sessions`: a pane already backing an open session must
-            // never be handed to a second one.
+            // never be handed to a second one. Restricted to this row's own
+            // backend because a tmux pane id is unique only within its own
+            // server — a local `%1` and a remote host's `%1` are different
+            // panes, and conflating them would starve the remote session.
             let claimed: HashSet<String> = self
                 .sessions
                 .iter()
+                .filter(|s| s.backend_name() == backend.name())
                 .map(|s| s.backend_id().to_string())
                 .filter(|id| !id.is_empty())
                 .collect();
@@ -8064,15 +8068,6 @@ impl App {
             .unwrap_or_default()
             .into_iter()
             .collect();
-        // Panes held by sessions this instance already has open, so a
-        // late-arriving host's adoption can't rebind one of them.
-        let mut claimed: HashSet<String> = self
-            .sessions
-            .iter()
-            .map(|s| s.backend_id().to_string())
-            .filter(|id| !id.is_empty())
-            .collect();
-
         for (backend_type, reachable, discovered) in ready {
             if !reachable {
                 let first_time = self
@@ -8097,6 +8092,23 @@ impl App {
             else {
                 continue;
             };
+            // Panes held by sessions this instance already has open **on this
+            // backend**, so a late-arriving host's adoption can't rebind one of
+            // them. Scoped per backend because a tmux pane id is unique only
+            // within its own server: a local session holding `%1` says nothing
+            // about this host's `%1`, and treating it as taken would starve the
+            // remote row of its own correctly-named window.
+            let backend_name = self
+                .resolve_persisted_backend(&backend_type)
+                .map(|b| b.name().to_string())
+                .unwrap_or_else(|| backend_type.clone());
+            let mut claimed: HashSet<String> = self
+                .sessions
+                .iter()
+                .filter(|s| s.backend_name() == backend_name)
+                .map(|s| s.backend_id().to_string())
+                .filter(|id| !id.is_empty())
+                .collect();
             let mut still_pending: Vec<sync::SharedSession> = Vec::new();
             for shared in sessions {
                 let id = shared.id;
@@ -17654,6 +17666,39 @@ mod tests {
             .collect();
         assert_eq!(bound.get("foo"), Some(&"%2"), "foo took bar's pane");
         assert_eq!(bound.get("bar"), Some(&"%1"), "bar took foo's pane");
+    }
+
+    /// A pane id is unique only within its own tmux server, so a local session
+    /// holding `%9` must not make a remote host's own `%9` look taken — the
+    /// remote row would be starved of the window carrying its name and ghost.
+    #[tokio::test]
+    async fn remote_restore_ignores_a_local_session_holding_the_same_pane_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut app = app_with_discovery(vec![make_discovered("%9", "tb-local", true)]);
+        app.backends.register(Arc::new(RemoteStubBackend));
+
+        let local = make_shared_session("%9", "local");
+        // The remote stub serves `%9` as `tb-remote-sess` on its own server.
+        let mut remote = make_shared_session("%9", "remote-sess");
+        remote.backend_type = "ssh:test-host".to_string();
+        let remote_id = remote.id;
+        app.db.upsert_session(&local).unwrap();
+        app.db.upsert_session(&remote).unwrap();
+
+        app.restore_sessions(vec![local, remote], 2);
+        drain_remote_restore(&mut app);
+
+        let adopted = app
+            .sessions
+            .iter()
+            .find(|s| s.info.id == remote_id)
+            .expect("the remote session should still be listed");
+        assert!(
+            !adopted.is_ghost(),
+            "the remote row was starved of its pane"
+        );
+        assert_eq!(adopted.backend_id(), "%9");
     }
 
     /// Two rows resolving to one window (names that sanitize alike, against a
