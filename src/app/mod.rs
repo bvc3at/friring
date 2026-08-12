@@ -7248,6 +7248,26 @@ impl App {
             // CLI-created sessions whose claude process never persisted
             // a conversation before we first adopt them).
             if shared_session.agent_session_id.is_some() {
+                // "No match" also covers a window of this name whose only pane
+                // is already claimed (two rows whose names sanitize alike).
+                // Spawning then builds a *second* `tb-<name>` window, and every
+                // later lookup resolves ambiguously — so ghost the loser
+                // instead, like `restore_single_session` does.
+                if let Some(other) = self
+                    .live_window_name_conflict(&shared_session.name)
+                    .map(str::to_string)
+                {
+                    let session = self.build_ghost_session(&shared_session);
+                    self.sessions.push(session);
+                    self.set_error(format!(
+                        "Session '{}' shares tmux window {} with '{other}' — \
+                         left unloaded; rename one of them",
+                        shared_session.name,
+                        crate::agent::tmux::agent_window_name(&shared_session.name)
+                    ));
+                    self.request_redraw();
+                    continue;
+                }
                 self.spawn_restored_session(&shared_session, &backend, rows, cols);
             }
         }
