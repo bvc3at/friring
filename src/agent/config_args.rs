@@ -18,19 +18,31 @@
 //!   when it could not cross ([`crate::agent::sandboxing`],
 //!   [`crate::sandbox::projection`]).
 
+/// Whether the *local* config root is a POSIX absolute path. A root that isn't
+/// (a Windows `C:\…` one) separates components with `\` as well as `/`
+/// ([`path_under_root`], `session_ops::spawn::remote_config_path`) and has no
+/// absolute counterpart on a POSIX host (`session_ops::spawn::remote_config_root`).
+pub(crate) fn is_posix_root(root: &str) -> bool {
+    root.starts_with('/')
+}
+
 /// True when `path` is `root` itself or a descendant — a plain `starts_with`
 /// would also claim sibling directories sharing the prefix
-/// (`…/friring-backup` under root `…/friring`).
+/// (`…/friring-backup` under root `…/friring`). A Windows root also accepts `\`
+/// as the boundary (friring's own args mix them: `{home}/claude.json` appended
+/// to a `C:\…` home); on a POSIX root it can't, since `\` is a legal filename
+/// character there.
 ///
 /// An **empty** root is nothing rather than everything: read literally it is a
 /// prefix of every absolute path, which would put every argument the agent was
 /// given — a repository, a user's file — inside the narrow scope this rewrite is
 /// allowed. A caller with no config directory has nothing to recognise.
 pub(crate) fn path_under_root(path: &str, root: &str) -> bool {
+    let windows_root = !is_posix_root(root);
     !root.is_empty()
-        && path
-            .strip_prefix(root)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        && path.strip_prefix(root).is_some_and(|rest| {
+            rest.is_empty() || rest.starts_with('/') || (windows_root && rest.starts_with('\\'))
+        })
 }
 
 /// Every arg (or `--flag=value` value) under `config_root` is passed to `map`;
