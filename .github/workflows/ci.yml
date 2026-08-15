@@ -29,7 +29,7 @@ jobs:
   # `skipped`, which `all-checks` treats as success.
   changes:
     name: Detect changes
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     # Fork (Friring): a PRIVATE repo's default GITHUB_TOKEN lacks
     # pull-requests:read, which dorny/paths-filter needs (else "Resource not
     # accessible by integration"). Upstream is public, so it works without this.
@@ -110,17 +110,18 @@ jobs:
     name: Check
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo check --all
 
   fmt:
     name: Rustfmt
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -132,22 +133,24 @@ jobs:
     name: Clippy
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   nextest:
     name: Nextest
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           tool: cargo-nextest
@@ -208,20 +211,24 @@ jobs:
     name: Architecture Rules
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo test --test architecture_rules
 
   tui-smoke:
     name: TUI Smoke Test
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
       - name: Black-box TUI smoke test
         run: scripts/dev/smoke/tui-smoke.sh
 
@@ -229,10 +236,11 @@ jobs:
     name: Acceptance Tests
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           tool: cargo-nextest
@@ -243,7 +251,7 @@ jobs:
     name: Cargo Deny
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         checks:
@@ -260,17 +268,18 @@ jobs:
     name: Documentation
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
 
   conventional-commits:
     name: Conventional Commits
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -285,7 +294,7 @@ jobs:
     name: Markdown Lint
     needs: changes
     if: needs.changes.outputs.markdown == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Lint markdown files
@@ -301,7 +310,7 @@ jobs:
     name: Demo Pacing Budget
     needs: changes
     if: needs.changes.outputs.media == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       # Only the opening-hold metric shells out to ffmpeg; the rest is read
@@ -324,9 +333,11 @@ jobs:
     name: Install Script Tests
     needs: changes
     if: needs.changes.outputs.install_sh == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Install bats-core
+        run: sudo apt-get update && sudo apt-get install -y bats
       - name: Run install script tests
         run: bats scripts/install.bats
 
@@ -334,7 +345,7 @@ jobs:
     name: Install Script Tests (PowerShell)
     needs: changes
     if: needs.changes.outputs.install_ps == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       # pwsh is preinstalled on GitHub-hosted runners. The install.ps1 helpers
@@ -359,9 +370,11 @@ jobs:
     name: ShellCheck
     needs: changes
     if: needs.changes.outputs.shell == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Run shellcheck
         run: git ls-files -z '*.sh' | xargs -0 shellcheck
 
@@ -369,7 +382,7 @@ jobs:
     name: Website Lint
     needs: changes
     if: needs.changes.outputs.website == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
@@ -414,10 +427,11 @@ jobs:
     name: Binary Size
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Build release binaries
         run: cargo build --release --bins
       - name: Record binary sizes
@@ -453,10 +467,13 @@ jobs:
     name: Real-Agent E2E
     needs: changes
     if: needs.changes.outputs.agent_e2e == 'true'
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install tmux + bats
+        run: sudo apt-get update && sudo apt-get install -y tmux bats
       - name: Install pinned Claude Code
         # The pin is the binary version the fixtures were conformance-tested
         # against; bump it deliberately and re-run the suite locally first
@@ -512,7 +529,7 @@ jobs:
       - shellcheck
       - website-lint
       - sonarqube
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     steps:
       - name: Verify all checks passed
         run: |

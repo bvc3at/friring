@@ -1724,8 +1724,7 @@ real Claude turn and the stub's usage route.
     out of the artifact and would claim that hostname. The site is subpath-clean
     (every link resolves through the per-page `root` depth variable), so it
     needs no Eleventy `pathPrefix` to serve from `/friring/`.
-  - `pages.yml` lost its `github.repository == 'Thurbeen/thurbox'` guard and
-    moved to `runs-on: k3s-arc` like every other fork-active Linux job.
+  - `pages.yml` lost its `github.repository == 'Thurbeen/thurbox'` guard.
   - **Pages from a private repo needs GitHub Pro** (Free allows Pages only from
     public repos). The published site is public either way — access-controlled
     Pages is Enterprise Cloud-only.
@@ -1859,14 +1858,6 @@ test / lint jobs run normally on the fork.
   set up for the fork at the moment. The `changes` (paths-filter) job also grants
   `pull-requests: read`, which a **private** repo's default token lacks (public
   upstream doesn't need it).
-- **Linux CI/CD jobs run on the self-hosted `k3s-arc` runner.** Every
-  fork-active Linux job in `ci.yml`, `cd.yml` and `pages.yml` targets
-  `runs-on: k3s-arc` — an Actions Runner Controller scale set on k3s — instead
-  of GitHub-hosted `ubuntu-latest` — including `cd.yml`'s `publish-homebrew`,
-  whose formula bump needs `python3` on the runner. The upstream-only jobs stay
-  on plain `ubuntu-latest` — they never run on the fork and upstream has no
-  `k3s-arc` runner: `ci.yml`'s `sonarqube`. The Windows / macOS jobs and the
-  release build matrix are unchanged — a Linux ARC runner can't service them.
 - **`demo-pacing` job (fork-only).** Checks `docs/media/*.gif` against the
   pacing budget on any change under `docs/media/` or `scripts/demo/`. The media
   is recorded by hand on a workstation, so nothing else would catch a clip that
