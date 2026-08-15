@@ -2975,6 +2975,13 @@ complete. The TUI remains fully interactive during sync.
 whatever reach the user's shell has. Full design contract, per-backend detail
 and every ADR: [`docs/SANDBOX.md`](SANDBOX.md).
 
+**Experimental.** This is the newest and least-exercised feature in the fork.
+Its tests cover what friring generates — profile text, argv, mount plans,
+refusals — but none of them runs a real boundary and watches the kernel deny
+something, none starts a container, `apple-container` is unverified against
+real hardware, and `wsl-distro` has no caller. The screens say so where a
+profile is authored and where one is picked, both titled *experimental*.
+
 A **sandbox profile** scopes what an agent can touch — a set of paths with
 per-path read-only / read-write intent, a network mode, and a read scope — and a
 session runs its agent inside it. Profiles are a UI-edited collection, so they

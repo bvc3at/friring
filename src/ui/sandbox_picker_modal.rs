@@ -56,7 +56,7 @@ pub fn render_sandbox_picker_modal(
     let height = (visible.len().clamp(1, 15) as u16) + 3 + u16::from(filter_active);
     let area = centered_fixed_height_rect(64, height, frame.area());
 
-    let inner = render_modal_frame(frame, area, "New Session — Sandbox");
+    let inner = render_modal_frame(frame, area, "New Session — Sandbox (experimental)");
 
     let mut constraints = Vec::new();
     if filter_active {

@@ -342,6 +342,13 @@ fn editor_footer_lines<'a>(state: &SandboxEditorState<'a>) -> Vec<Line<'a>> {
         "  a sandbox reduces blast radius; it does not prove containment",
         Style::default().fg(Theme::text_muted()),
     )));
+    // Maturity, which is a different claim from the non-goal above: that one is
+    // permanent, this one is about how much mileage the feature has. Said here
+    // because this is where a boundary is authored and relied on.
+    lines.push(Line::from(Span::styled(
+        "  experimental — newer and less exercised than the rest of friring",
+        Style::default().fg(Theme::text_muted()),
+    )));
 
     lines.extend(lint_lines(state));
 
@@ -1217,17 +1224,21 @@ mod tests {
         s.effective_backend = SandboxBackendKind::Seatbelt;
         assert!(shape_summary(&s).starts_with("policy"));
         let footer = editor_footer_lines(&s);
-        assert_eq!(footer.len(), 3);
+        assert_eq!(footer.len(), 4);
         assert!(text(&footer[1]).contains("does not prove containment"));
-        assert!(text(&footer[2]).contains("adjust"));
+        // Maturity sits beside the non-goal: one says what a sandbox can never
+        // promise, the other how much mileage this one has.
+        assert!(text(&footer[2]).contains("experimental"));
+        assert!(text(&footer[3]).contains("adjust"));
 
         // A place carries the two extra lines below, between the two.
         s.effective_backend = SandboxBackendKind::Podman;
         assert!(shape_summary(&s).starts_with("place"));
         let footer = editor_footer_lines(&s);
-        assert_eq!(footer.len(), 5);
+        assert_eq!(footer.len(), 6);
         assert!(text(&footer[3]).contains("does not prove containment"));
-        assert!(text(&footer[4]).contains("adjust"));
+        assert!(text(&footer[4]).contains("experimental"));
+        assert!(text(&footer[5]).contains("adjust"));
     }
 
     /// The promise this editor is allowed to make. A place is created once per

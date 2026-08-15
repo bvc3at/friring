@@ -11,8 +11,20 @@ change. Fork-visible divergences are also listed in [`FORK.md`](../FORK.md).
 **Friring — fork-only.** Upstream has no sandboxing; see
 [`FORK.md`](../FORK.md).
 
-Deciding whether to rely on this? [**Not in it**](#not-in-it) is the complete
-list of what the feature does not do, in one place.
+> [!NOTE]
+> Sandboxed agents are **experimental** — the newest feature in the fork, and
+> the least exercised. It ships with a large test suite, but that suite checks
+> what friring *generates*: the seatbelt profile text, the bubblewrap argv, the
+> container spec, the mount plan and every refusal. **No test runs a real
+> boundary** and confirms that a read or a connection is actually denied by the
+> kernel, no test starts a container, `apple-container` has never been run
+> against real hardware, and `wsl-distro` has no caller at all. So the rules are
+> tested; the enforcement is argued from them.
+>
+> Use it, and treat it as defence in depth rather than as the only thing
+> standing between an agent and something that matters. Rough edges are
+> expected — please report them. [**Not in it**](#not-in-it) is the complete
+> list of what the feature does not do, in one place.
 
 ---
 

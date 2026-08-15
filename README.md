@@ -459,7 +459,7 @@ themes, switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
 
 **Also in the box:**
 
-- **[Sandboxed agents](docs/SANDBOX.md)** *(Friring — fork-only)* — run any
+- **[Sandboxed agents](docs/SANDBOX.md)** *(Friring — fork-only, experimental)* — run any
   agent from the registry inside an isolation boundary scoped to the directories
   you choose, each read-only or read-write, and to an allowlist of domains a
   Friring-owned proxy enforces while the kernel denies everything else: `Alt+S`
@@ -475,7 +475,9 @@ themes, switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
   signs in once per profile inside its own pane, because a rotating credential
   copied into two places invalidates itself. `friring-cli sandbox` manages the
   same profiles and places without a TUI, and exports them as TOML you can
-  commit.
+  commit. It is the newest thing here and the least exercised — its tests check
+  what friring generates rather than watching a kernel refuse something — so
+  treat it as defence in depth, expect rough edges, and please report them.
 - **[Leader key](#leader-key)** *(Friring — fork-only)* — `Ctrl+F` arms a
   tmux-style prefix and paints a which-key overlay naming everything reachable;
   the next key runs it. Every global command is on it, plus jump-to-session by

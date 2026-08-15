@@ -217,7 +217,7 @@ pub fn render_sandbox_list_modal(
     let Some([list_area, footer_area]) = render_list_modal_frame(
         frame,
         70,
-        "Sandbox Profiles",
+        "Sandbox Profiles (experimental)",
         state.entries.len(),
         Some("No sandbox profiles — press n to create one"),
         Some(empty_footer),

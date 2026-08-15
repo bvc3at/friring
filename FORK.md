@@ -85,7 +85,16 @@ merges carry rename conflicts on the renamed identifiers, and an existing
 
 #### Sandboxed agents
 
-Fork-only. Upstream runs every agent as the user, on the host, with the user's
+Fork-only, and **experimental**: the newest feature here and the least
+exercised. The tests cover what friring generates — the seatbelt profile, the
+bubblewrap argv, the container spec, the mount plan, every refusal — but none
+of them runs a real boundary and watches the kernel deny a read or a
+connection, none starts a container, `apple-container` was never run against
+real hardware, and `wsl-distro` has no caller. The rules are tested; the
+enforcement is argued from them. Both screens that author or pick a profile are
+titled *experimental*.
+
+Upstream runs every agent as the user, on the host, with the user's
 full filesystem and network. The fork can run any registry agent inside an
 isolation boundary chosen per session, scoped to the directories the session
 actually needs and to an allowlist of domains.
