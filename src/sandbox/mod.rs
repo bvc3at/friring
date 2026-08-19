@@ -850,6 +850,12 @@ mod tests {
         /// the refusal below is the whole of the rule.
         #[test]
         fn every_place_backend_refuses_the_same_boundaries() {
+            // A data directory of this test's own, outside the tmux socket root.
+            // A unit-test build hangs friring's data directory off the platform
+            // temp root, which on Linux *is* that socket root — so the tmux case
+            // below would name an ancestor of the data directory and be refused
+            // by ADR-29 instead, testing the fixture rather than the rule.
+            let _paths = crate::paths::TestPathGuard::new(dirs::test_temp_base("conformance-data"));
             // Minted first: `data_dir` is only on disk once something has asked
             // for a place tree, and the case below resolves it.
             dirs::create_place_dirs("conform").unwrap();

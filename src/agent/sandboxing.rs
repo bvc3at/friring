@@ -1263,6 +1263,19 @@ mod tests {
     /// resolved, never the bare [`crate::sandbox::bwrap::BWRAP`] name.
     const STUB_BWRAP: &str = "/usr/bin/bwrap";
 
+    /// Every bubblewrap flag whose next argument is a **host** path being handed
+    /// across the boundary. `--tmpfs`, `--proc` and `--dev` are deliberately not
+    /// here: their argument is a path *inside*, and what lands there is a fresh
+    /// filesystem rather than anything of the host's.
+    const BIND_FLAGS: [&str; 6] = [
+        "--bind",
+        "--bind-try",
+        "--ro-bind",
+        "--ro-bind-try",
+        "--dev-bind",
+        "--dev-bind-try",
+    ];
+
     #[test]
     fn the_wrapper_surrounds_the_agent_and_appends_its_bypass_flags() {
         let profile = closed_profile();
@@ -1438,9 +1451,21 @@ mod tests {
             "the sandbox was not given its scratch directory: {:?}",
             wrapped.args
         );
+        // What must never happen is that the host temp root is *bound* into the
+        // boundary — not that its spelling never appears. bubblewrap covers the
+        // sandbox's own `/tmp` with a `--tmpfs`, which is the opposite of
+        // granting the host's, and on a host whose temp root is `/tmp` (every
+        // Linux) the scratch directory above is legitimately a path under it.
+        // So the assertion reads the source of every bind instead.
         let host_temp = std::env::temp_dir().display().to_string();
+        let bound: Vec<&str> = wrapped
+            .args
+            .windows(2)
+            .filter(|pair| BIND_FLAGS.contains(&pair[0].as_str()))
+            .map(|pair| pair[1].as_str())
+            .collect();
         assert!(
-            !wrapped.args.contains(&host_temp),
+            !bound.contains(&host_temp.as_str()),
             "the host temp root must never be granted: {:?}",
             wrapped.args
         );
@@ -2312,8 +2337,13 @@ mod tests {
     /// A fabricated `$HOME` with one instruction file in it, standing in for the
     /// user's agent configuration. Never the machine owner's: every path here is
     /// under the test's own temporary directory.
-    fn fabricated_agent_home(root: &std::path::Path) -> String {
-        let home = root.join("home");
+    ///
+    /// Rooted at `dirs::test_temp_base` rather than at the platform temp root,
+    /// because the projection refuses an entry reaching a tmux socket directory
+    /// — and on Linux that root *is* the platform temp root, so a home built
+    /// there would be classified host-only for a reason no test here is about.
+    fn fabricated_agent_home(name: &str) -> String {
+        let home = crate::sandbox::dirs::test_temp_base(name).join("home");
         std::fs::create_dir_all(home.join(".claude")).unwrap();
         std::fs::write(
             home.join(".claude/CLAUDE.md"),
@@ -2502,9 +2532,8 @@ mod tests {
     /// home-relative path — which is the whole point of a synthetic `$HOME`.
     #[test]
     fn a_declared_config_entry_lands_in_the_places_home() {
-        let temp = tempfile::TempDir::new().unwrap();
         let _guard = fabricated_data_dir("place-copyin");
-        let home = fabricated_agent_home(temp.path());
+        let home = fabricated_agent_home("place-copyin");
         let mut config = config_with(Some(place_profile(|p| {
             p.network_mode = crate::session::NetworkMode::None;
         })));

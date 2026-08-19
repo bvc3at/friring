@@ -2066,41 +2066,57 @@ mod tests {
     /// Because the profile survives a fallback, the next launch tries the
     /// boundary again: on a host with a policy backend it is applied, on one
     /// with none it is refused. What it is never again is silently on the host.
+    ///
+    /// Both hosts are fabricated, and neither is the machine this runs on.
+    /// Asking the real one made the assertion depend on the runner: where
+    /// `auto` lands on a place backend the launch needs an engine and an image,
+    /// and a workspace that exists on the author's machine and nowhere else.
     #[test]
     fn the_launch_after_a_fallback_tries_the_boundary_again() {
         let provider = default_provider();
-        let mut profile = unappliable_profile(false);
-        // The same session, its profile now resolving down this host's ladder
-        // rather than naming a backend that will never exist.
-        profile.backend = crate::session::SandboxBackendKind::Auto;
-        let config = SessionConfig {
-            sandbox: Some(profile),
-            // As a real spawn always does. The default profile's `allowlist`
-            // needs the egress proxy, and a boundary with no session to be
-            // named by is refused rather than sharing the fallback key.
-            session_id: Some(crate::session::SessionId::default()),
-            ..SessionConfig::default()
+        let compose = || {
+            let mut profile = unappliable_profile(false);
+            // The same session, its profile now resolving down the host's
+            // ladder rather than naming a backend that will never exist.
+            profile.backend = crate::session::SandboxBackendKind::Auto;
+            // No egress: which of the two answers a launch gives is the whole
+            // subject here, and a filtered mode would bind a proxy for a
+            // session that never spawns.
+            profile.network_mode = crate::session::NetworkMode::None;
+            let config = SessionConfig {
+                sandbox: Some(profile),
+                // As a real spawn always does.
+                session_id: Some(crate::session::SessionId::default()),
+                ..SessionConfig::default()
+            };
+            sandboxed_invocation(&config, &provider)
         };
 
-        let host_has_a_backend = crate::sandbox::SandboxHost::local_shared()
-            .select(crate::session::SandboxBackendKind::Auto)
-            .chosen
-            .is_some();
-        match sandboxed_invocation(&config, &provider) {
-            Ok(out) => {
-                assert!(host_has_a_backend, "a host with no backend must not wrap");
-                assert_eq!(out.profile.as_deref(), Some("dev"));
-                assert!(
-                    out.state.as_ref().is_some_and(SandboxState::is_applied),
-                    "{:?}",
-                    out.state
-                );
-                assert_ne!(out.command, provider.command());
-            }
-            Err(e) => assert!(
-                !host_has_a_backend,
-                "this host offers a backend, so the wrap should have applied: {e:#}"
-            ),
+        // Whatever this machine is, the launch composes its policy backend's
+        // artefacts under a data directory of the test's own.
+        let dir = tempfile::TempDir::new().expect("a private test directory");
+        let _paths = crate::paths::TestPathGuard::new(dir.path());
+        {
+            let _host = crate::agent::sandboxing::TestSandboxHost::seatbelt();
+            let out = compose().expect("a host offering seatbelt applies the profile");
+            assert_eq!(out.profile.as_deref(), Some("dev"));
+            assert!(
+                out.state.as_ref().is_some_and(SandboxState::is_applied),
+                "{:?}",
+                out.state
+            );
+            assert_ne!(out.command, provider.command());
+        }
+        {
+            // And a host with nothing on its ladder refuses, rather than
+            // launching the agent outside the boundary it asked for.
+            let _host = crate::agent::sandboxing::TestSandboxHost::new(
+                crate::sandbox::SandboxHost::new(Arc::new(crate::sandbox::probe::StubHost::new())),
+            );
+            let Err(err) = compose() else {
+                panic!("a host with no backend must refuse, not wrap");
+            };
+            assert!(err.to_string().contains("no sandbox backend"), "{err:#}");
         }
     }
 

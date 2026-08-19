@@ -813,6 +813,12 @@ mod tests {
     /// permission away from a socket inode.
     #[test]
     fn no_mount_may_reach_a_tmux_socket_directory_from_either_side() {
+        // A data directory of this test's own, outside the socket root. A
+        // unit-test build hangs friring's data directory off the platform temp
+        // root, which on Linux *is* that socket root — so naming the root would
+        // be refused by ADR-29 for reaching the fixture, which is a different
+        // rule and a different test.
+        let _paths = crate::paths::TestPathGuard::new(dirs::test_temp_base("plan-socket-root"));
         let socket_root = dirs::tmux_socket_root().display().to_string();
         for path in [
             socket_root.clone(),

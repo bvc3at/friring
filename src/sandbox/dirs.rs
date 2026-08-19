@@ -498,15 +498,39 @@ pub fn host_temp_root() -> PathBuf {
     std::env::temp_dir()
 }
 
+/// Where a test's fixtures hang off: the platform temp root, unless that
+/// overlaps the tmux socket root.
+///
+/// On Linux the two are the same directory (`/tmp`), and every rule in this
+/// module refuses what reaches it — so a fixture built there is judged by the
+/// tmux rule, or by ADR-29 through the unit-test data directory beside it,
+/// before the rule the test is about is ever reached. `/var/tmp` is writable on
+/// every unix, is not where tmux keeps its sockets, and holds no friring state,
+/// so nothing under it is refused for a reason a test did not ask for. macOS
+/// (`/var/folders/…`) and Windows (under the user profile) never take that
+/// branch.
+#[cfg(test)]
+fn test_temp_root() -> PathBuf {
+    let temp = host_temp_root();
+    if !overlaps(
+        &temp.display().to_string(),
+        &tmux_socket_root().display().to_string(),
+    ) {
+        return temp;
+    }
+    PathBuf::from("/var/tmp")
+}
+
 /// A directory of a test's own, **resolved**.
 ///
 /// Shared by every test that plants a symlink, because they all need the same
 /// fixture: the platform temp root is itself symlinked on macOS (`/var` →
 /// `/private/var`), so a tree built on the unresolved spelling is refused by the
-/// very check the test is exercising, for a reason the test is not about.
+/// very check the test is exercising, for a reason the test is not about. It is
+/// rooted at [`test_temp_root`] for the second half of the same argument.
 #[cfg(test)]
 pub(crate) fn test_temp_base(name: &str) -> PathBuf {
-    let base = host_temp_root().join(format!("friring-{name}-{}", std::process::id()));
+    let base = test_temp_root().join(format!("friring-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).expect("a fabricated directory");
     std::fs::canonicalize(&base).expect("a resolvable directory")
