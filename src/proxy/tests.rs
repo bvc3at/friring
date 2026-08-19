@@ -252,6 +252,11 @@ async fn socks_greet(proxy: &Proxy, methods: &[u8]) -> (TcpStream, [u8; 2]) {
 
 /// The full SOCKS5 client sequence on an already-connected stream, for the
 /// transports that do not dial a TCP address.
+///
+/// Gated with its only callers, which live in the `unix_transport` module: the
+/// unix socket and the relay are the transports that hand over a stream rather
+/// than an address, so on Windows this helper has nothing to drive.
+#[cfg(unix)]
 async fn socks_tunnel_on<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     token: &str,
