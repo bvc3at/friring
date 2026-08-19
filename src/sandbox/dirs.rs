@@ -498,36 +498,62 @@ pub fn host_temp_root() -> PathBuf {
     std::env::temp_dir()
 }
 
-/// Where a test's fixtures hang off: the platform temp root, unless that
-/// overlaps the tmux socket root.
+/// Where a test's fixtures hang off: the crate's own build directory.
 ///
-/// On Linux the two are the same directory (`/tmp`), and every rule in this
-/// module refuses what reaches it — so a fixture built there is judged by the
-/// tmux rule, or by ADR-29 through the unit-test data directory beside it,
-/// before the rule the test is about is ever reached. `/var/tmp` is writable on
-/// every unix, is not where tmux keeps its sockets, and holds no friring state,
-/// so nothing under it is refused for a reason a test did not ask for. macOS
-/// (`/var/folders/…`) and Windows (under the user profile) never take that
-/// branch.
+/// **No temp directory can hold them**, because this module has an opinion
+/// about every one of them, and a fixture in a location one of these rules
+/// protects is judged by that rule rather than by the one the test is about:
+///
+/// - the platform temp root *is* [`tmux_socket_root`] on Linux, and the
+///   unit-test data directory hangs off it, so a fabricated home there is
+///   host-only and a mount source there is refused by ADR-29;
+/// - `/tmp`, `/var/tmp` and `/dev/shm` are all [`rewritable_root`]s, so a
+///   boundary program planted in one is refused for sitting somewhere a
+///   sandboxed agent could rewrite.
+///
+/// The build directory is none of those on any platform, is writable by
+/// construction — the build just wrote here — and goes with `cargo clean`. It
+/// belongs to this crate alone: the build script writes nothing into it.
+///
+/// It is a *compile-time* path, so a test binary that runs on a different
+/// machine from the one that built it does not have one. That is the
+/// cross-built nextest archive `scripts/dev/e2e/windows-vm.sh test-suite`
+/// ships into a Windows VM — the same baked-in-path problem that script remaps
+/// the sources for — and it falls back to the platform temp root there. Windows
+/// is the only host that runs it, and none of the rules above names a location
+/// a Windows temp root is under.
+///
+/// A build directory that is *itself* inside one of those locations —
+/// `CARGO_TARGET_DIR` under `/tmp` is the realistic way — cannot serve, and this
+/// says so instead of letting every fixture be judged by the wrong rule.
 #[cfg(test)]
 fn test_temp_root() -> PathBuf {
-    let temp = host_temp_root();
-    if !overlaps(
-        &temp.display().to_string(),
-        &tmux_socket_root().display().to_string(),
-    ) {
-        return temp;
+    let built = PathBuf::from(env!("OUT_DIR"));
+    if !built.is_dir() {
+        return host_temp_root();
     }
-    PathBuf::from("/var/tmp")
+    let path = built.display().to_string();
+    let socket_root = tmux_socket_root().display().to_string();
+    let protected = rewritable_root(&path, None)
+        .or_else(|| encloses(&socket_root, &path).then_some(socket_root));
+    assert!(
+        protected.is_none(),
+        "the build directory ('{path}') is inside '{}', which this module protects — a fixture \
+         there is judged by that rule rather than by the one a test is about. Point \
+         CARGO_TARGET_DIR outside it to run the sandbox tests",
+        protected.unwrap_or_default()
+    );
+    built
 }
 
 /// A directory of a test's own, **resolved**.
 ///
 /// Shared by every test that plants a symlink, because they all need the same
-/// fixture: the platform temp root is itself symlinked on macOS (`/var` →
-/// `/private/var`), so a tree built on the unresolved spelling is refused by the
-/// very check the test is exercising, for a reason the test is not about. It is
-/// rooted at [`test_temp_root`] for the second half of the same argument.
+/// fixture: a tree built on a spelling that is not its own canonical path is
+/// refused by the very check the test is exercising, for a reason the test is
+/// not about — and the platform temp root is itself symlinked on macOS (`/var`
+/// → `/private/var`). Where it hangs off, and why that is not a temp directory
+/// at all, is [`test_temp_root`].
 #[cfg(test)]
 pub(crate) fn test_temp_base(name: &str) -> PathBuf {
     let base = test_temp_root().join(format!("friring-{name}-{}", std::process::id()));
