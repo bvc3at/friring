@@ -322,12 +322,25 @@ mod tests {
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .expect("/bin/sh");
-            child
+            // Four of the five payloads never read their stdin — only
+            // `Notification` pipes it through `cat` — so the hook is entitled to
+            // have printed its line and exited before this write lands, which
+            // closes the pipe under it. `BrokenPipe` is that shell finishing
+            // early and nothing else: a `Notification` payload that stopped
+            // consuming stdin would fail the state assertion below, which is
+            // where that claim is actually made.
+            let write = child
                 .stdin
                 .take()
                 .expect("piped stdin")
-                .write_all(br#"{"message":"Claude needs your permission to use Bash"}"#)
-                .unwrap();
+                .write_all(br#"{"message":"Claude needs your permission to use Bash"}"#);
+            if let Err(e) = write {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe,
+                    "{event}: the hook's stdin refused the payload: {e}"
+                );
+            }
             assert!(child.wait().unwrap().success(), "{event} hook failed");
 
             // The assertion runs the whole way through: file → poll → database.
