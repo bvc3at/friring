@@ -27,7 +27,7 @@ jobs:
     # bvc3at.github.io/friring. The repo is private, so this needs the Pro plan
     # that allows Pages from a private repo; the published site is public
     # regardless. See FORK.md.
-    runs-on: k3s-arc
+    runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
