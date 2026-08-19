@@ -42,6 +42,8 @@ pub mod plan;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Mutex, OnceLock, PoisonError};
+/// Only the dial probe waits on anything here, and it is unix-only.
+#[cfg(unix)]
 use std::time::Duration;
 
 use std::sync::Arc;
@@ -110,13 +112,20 @@ const DIALER: &str = "tmux";
 /// is how the probe tells "the place tried and the kernel said no" from "the
 /// place never got to try", which are two different refusals with two different
 /// fixes.
+#[cfg(unix)]
 const DIAL_COMMAND: &str = "list-sessions";
 
 /// tmux's wording for a `connect(2)` that did not reach a listener.
+///
+/// Unix-only with the rest of the dial probe: friring binds the listener the
+/// place dials, and there is none to bind on a host without unix sockets — see
+/// [`probe_socket_reach`].
+#[cfg(unix)]
 const DIAL_REFUSED: &str = "no server running on";
 
 /// How often the probe's listener is polled while the place is being asked to
 /// dial it.
+#[cfg(unix)]
 const DIAL_POLL: Duration = Duration::from_millis(5);
 
 /// How long the probe keeps listening after the dial command has returned.
@@ -125,6 +134,7 @@ const DIAL_POLL: Duration = Duration::from_millis(5);
 /// completes, so a client that came and went while the loop was asleep is still
 /// there to accept — but only if the loop is still running. Paid solely on the
 /// failing path: a probe that has already seen its connection stops at once.
+#[cfg(unix)]
 const DIAL_GRACE: Duration = Duration::from_millis(250);
 
 /// The `state` a `sandbox_instances` row carries for a place this backend
@@ -592,9 +602,22 @@ impl ContainerBackend {
             )
         })?;
         let place_dir = representable(&place_dir, "the place directory", refuse)?;
+        self.probe_reach(container, &place_dir, policy, refuse)
+    }
 
+    /// Bind the listener, have the place dial it, and turn what happened into
+    /// the launch's answer — recording a place that crossed, so its next session
+    /// is not measured again.
+    #[cfg(unix)]
+    fn probe_reach(
+        &self,
+        container: &str,
+        place_dir: &str,
+        policy: &crate::session::SandboxPolicy,
+        refuse: &dyn Fn(String) -> SandboxError,
+    ) -> SandboxResult<()> {
         let dial = |socket: &str| self.dial_from_place(container, socket);
-        match probe_socket_reach(&place_dir, &dial) {
+        match probe_socket_reach(place_dir, &dial) {
             Ok((Reach::Crossed, _)) => {
                 self.reached
                     .lock()
@@ -616,6 +639,25 @@ impl ContainerBackend {
         }
     }
 
+    /// A host with no unix sockets has nothing for a place to dial, and nothing
+    /// for the proxy to listen on either (ADR-27) — so the question is answered
+    /// without asking it, and the filtered profile is refused rather than
+    /// started with a relay dialling nothing.
+    #[cfg(not(unix))]
+    fn probe_reach(
+        &self,
+        _container: &str,
+        _place_dir: &str,
+        policy: &crate::session::SandboxPolicy,
+        refuse: &dyn Fn(String) -> SandboxError,
+    ) -> SandboxResult<()> {
+        Err(refuse(reach_unprovable(
+            policy,
+            "this host has no unix sockets, and the egress proxy a filtered mode needs is reached \
+             over one",
+        )))
+    }
+
     /// Ask the place to connect to `socket`, which is at the same absolute path
     /// inside it as on the host.
     ///
@@ -624,6 +666,10 @@ impl ContainerBackend {
     /// the only question being asked. Its *output* is read for one thing:
     /// [`DIAL_REFUSED`], which separates a connect the kernel turned down from a
     /// dialer that never ran.
+    ///
+    /// Unix-only with the listener it dials, and with the socket path that would
+    /// be named to it.
+    #[cfg(unix)]
     fn dial_from_place(&self, container: &str, socket: &str) -> Result<ProbeOutput, String> {
         self.engine_run(&["exec", container, DIALER, "-S", socket, DIAL_COMMAND])
     }
@@ -1032,6 +1078,10 @@ fn assign_port(
 }
 
 /// What one reachability probe settled.
+///
+/// Unix-only, with the probe that decides it: a host without unix sockets never
+/// asks the question — see `ContainerBackend::probe_reach`.
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reach {
     /// The place dialled friring's listener: a unix socket carries a *listener*
@@ -1052,6 +1102,7 @@ enum Reach {
 /// friring's own accept on the host side, which is the measurement; the dialer's
 /// output only ever downgrades "friring saw nothing" into the more precise
 /// [`Reach::Refused`].
+#[cfg(unix)]
 fn dial_verdict(observed: bool, dialled: &Result<ProbeOutput, String>) -> Reach {
     if observed {
         return Reach::Crossed;
@@ -1163,21 +1214,6 @@ fn probe_socket_reach(
     ))
 }
 
-/// A host with no unix sockets has nothing for a place to dial, and nothing for
-/// the proxy to listen on either (ADR-27) — so the question is answered without
-/// asking it.
-#[cfg(not(unix))]
-fn probe_socket_reach(
-    _place_dir: &str,
-    _dial: &dyn Fn(&str) -> Result<ProbeOutput, String>,
-) -> Result<(Reach, String), String> {
-    Err(
-        "this host has no unix sockets, and the egress proxy a filtered mode needs is reached \
-         over one"
-            .to_string(),
-    )
-}
-
 /// The refusal for a place that dialled and was turned down.
 ///
 /// The container engines' [`crate::sandbox::apple::plan::egress_refusal`],
@@ -1185,6 +1221,10 @@ fn probe_socket_reach(
 /// difference is only that this one had to be measured, because docker and
 /// podman are on this kernel on a Linux host and in a Linux VM on a Mac or a
 /// Windows box, and the engine's own name says nothing about which.
+///
+/// Only a host that can bind a listener can be told its socket did not carry, so
+/// this goes with the probe.
+#[cfg(unix)]
 fn socket_does_not_carry(
     policy: &crate::session::SandboxPolicy,
     engine: ContainerEngine,
@@ -1691,6 +1731,9 @@ mod tests {
 
     /// A data directory short enough that a socket path under it fits in
     /// `sun_path`, which the macOS unit-test temp directory does not.
+    ///
+    /// Only the tests that bind one need it, and those are the unix ones.
+    #[cfg(unix)]
     fn short_data_dir(name: &str) -> crate::paths::TestPathGuard {
         crate::paths::TestPathGuard::new(
             std::path::Path::new("/tmp").join(format!("frc{}{name}", std::process::id())),

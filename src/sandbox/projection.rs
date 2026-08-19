@@ -1332,13 +1332,7 @@ fn write_into(root: &Path, rel: &str, contents: &[u8], executable: bool) -> Sand
     let mut at = root.to_path_buf();
     for component in components {
         at.push(component);
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-            builder.mode(0o700);
-        }
-        match builder.create(&at) {
+        match dirs::private_dir_builder().create(&at) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 match std::fs::symlink_metadata(&at) {

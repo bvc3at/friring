@@ -975,6 +975,11 @@ mod tests {
         /// is an agent inside a place planting a link where the next plan mounts
         /// from, and "the boundary's state is wrong, so run outside it" is a way
         /// out of the sandbox.
+        ///
+        /// Unix-only for the fixture rather than for the rule: planting the link
+        /// this is about takes `std::os::unix::fs::symlink`, and a Windows one
+        /// takes a privilege the test process does not have.
+        #[cfg(unix)]
         #[test]
         fn every_place_backend_refuses_a_symlinked_mount_source() {
             let base = dirs::test_temp_base("place-conformance-link");

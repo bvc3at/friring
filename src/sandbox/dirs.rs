@@ -1053,6 +1053,33 @@ pub fn sanitize_component(raw: &str) -> String {
     }
 }
 
+/// A `DirBuilder` that makes the directory **born** `0700` rather than chmodding
+/// it afterwards.
+///
+/// The mode belongs to `mkdir(2)` itself: `set_permissions` follows a symlink and
+/// resolves the whole path again, so a directory a walk had just checked and one
+/// it then chmodded were not necessarily the same directory — an agent that
+/// swapped a component in between got `0700` applied to whatever its link named.
+///
+/// Gated at the definition because a mode is a unix concept; on Windows a new
+/// directory inherits the parent's ACL, and there is nothing on `DirBuilder` to
+/// say otherwise.
+#[cfg(unix)]
+pub(crate) fn private_dir_builder() -> std::fs::DirBuilder {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+}
+
+/// The same builder on a host with no file mode to set: a Windows directory
+/// inherits its parent's ACL, so there is nothing to say at creation time.
+#[cfg(not(unix))]
+pub(crate) fn private_dir_builder() -> std::fs::DirBuilder {
+    std::fs::DirBuilder::new()
+}
+
 /// Create `path` and its parents `0700`, adopting an existing directory.
 ///
 /// Refuses a symlink outright: friring writes a policy file and an agent's
@@ -1091,13 +1118,8 @@ pub fn create_private_dir(path: &Path) -> SandboxResult<()> {
         _ => {}
     }
 
-    let mut builder = std::fs::DirBuilder::new();
+    let mut builder = private_dir_builder();
     builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
     builder.create(path).map_err(|e| io_err(e.to_string()))?;
 
     #[cfg(unix)]
@@ -1150,13 +1172,7 @@ pub fn create_private_dir_under(base: &Path, rel: &str) -> SandboxResult<PathBuf
             path: at.display().to_string(),
             detail,
         };
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-            builder.mode(0o700);
-        }
-        match builder.create(&at) {
+        match private_dir_builder().create(&at) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 match std::fs::symlink_metadata(&at) {
@@ -1359,10 +1375,10 @@ mod tests {
         create_private_dir(&base).unwrap();
         let target = base.join("victim.txt");
         std::fs::write(&target, "host data").unwrap();
-        let link = base.join("dev-s1.sb");
 
         #[cfg(unix)]
         {
+            let link = base.join("dev-s1.sb");
             std::os::unix::fs::symlink(&target, &link).unwrap();
             let err = write_private(&link, "(version 1)").unwrap_err();
             assert!(err.to_string().contains("is a symlink"), "{err}");
@@ -1532,6 +1548,9 @@ mod tests {
         assert!(err.contains("ADR-29"), "{resolved_db}: {err}");
     }
 
+    /// Every test that reaches for a fixture directory under this name plants a
+    /// symlink in it, which is a unix build.
+    #[cfg(unix)]
     use super::test_temp_base as temp_base;
 
     /// Sets an environment variable for one test and puts back what was there.
