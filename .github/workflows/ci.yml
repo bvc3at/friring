@@ -142,19 +142,37 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
+  # Sharded deliberately (fork): the unsplit `cargo nextest run --all` takes the
+  # runner VM down ~53 min in — the step stays `in_progress`, the job reports
+  # `failure`, and there is no log blob and no runner `system.txt`, so nothing
+  # from inside the job survives to say why. A `timeout` bound set well below
+  # that point does not survive either. Split four ways, every one of the 2701
+  # tests passes in seconds. See FORK.md.
   nextest:
-    name: Nextest
+    name: Nextest (${{ matrix.shard }}/4)
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      # One shard failing must not cancel the other three — which shards fail is
+      # the signal that separates a real test failure from the whole-suite death.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # The shards build identical artifacts and differ only in which tests
+          # they run, so they share one cache entry instead of storing four.
+          shared-key: nextest
       - uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           tool: cargo-nextest
-      - run: cargo nextest run --all --profile ci
+      # `count:` partitions by test count in listing order: the four shards are
+      # disjoint and together cover the suite exactly once.
+      - run: cargo nextest run --all --profile ci --partition count:${{ matrix.shard }}/4
 
   # Native-Windows gate (psmux backend selection, known-folder paths, toast
   # notifications, junction workspaces), split into two parallel jobs so the heavy

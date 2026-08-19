@@ -1858,6 +1858,19 @@ test / lint jobs run normally on the fork.
   set up for the fork at the moment. The `changes` (paths-filter) job also grants
   `pull-requests: read`, which a **private** repo's default token lacks (public
   upstream doesn't need it).
+- **`nextest` runs as a four-way shard.** Upstream runs `cargo nextest run
+  --all` in one job; here it is a `--partition count:N/4` matrix. The unsplit
+  run takes the runner VM down about 53 minutes in, and takes the evidence with
+  it: the test step stays `in_progress`, the job reports `failure`, and neither
+  a job log blob nor the runner's own `system.txt` is ever uploaded — a
+  `timeout` bound set well below the death point does not survive to fire
+  either. Reproduced on GitHub-hosted `ubuntu-latest` (2 cores, 7938 MB) and,
+  before that, on the retired self-hosted runner, so it is a property of the
+  whole suite rather than of any machine. Split four ways, all 2701 tests pass
+  with 3.6-8.9s of test time per shard. The four shards share one
+  `rust-cache` entry (`shared-key: nextest`) because they build identical
+  artifacts. `all-checks` still lists `nextest` in `needs` — that names the job
+  id, which a matrix does not change.
 - **`demo-pacing` job (fork-only).** Checks `docs/media/*.gif` against the
   pacing budget on any change under `docs/media/` or `scripts/demo/`. The media
   is recorded by hand on a workstation, so nothing else would catch a clip that
