@@ -896,6 +896,8 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            sandbox_profile: None,
+            sandbox_enforcement: crate::session::SandboxEnforcement::default(),
         };
         db.upsert_session(&existing).unwrap();
 

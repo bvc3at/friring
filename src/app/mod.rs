@@ -13357,6 +13357,7 @@ mod tests {
             deleted_at: 0,
             force_deleted: false,
             worktrees: Vec::new(),
+            sandbox_profile: None,
         };
         app.restore_deleted_session(deleted);
 
@@ -15747,7 +15748,14 @@ mod tests {
 
         // The startup-adoption path copies the same metadata.
         let fresh = Session::stub("boxed", &backend_arc, &provider);
-        app.finish_adopted_session(fresh, &shared, "claude".to_string(), Vec::new(), &[]);
+        app.finish_adopted_session(
+            fresh,
+            &shared,
+            "claude".to_string(),
+            Vec::new(),
+            &[],
+            &mut unclaimed(),
+        );
         assert_eq!(app.sessions[0].info.sandbox_profile.as_deref(), Some("dev"));
     }
 
