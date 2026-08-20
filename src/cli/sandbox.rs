@@ -1939,8 +1939,13 @@ mod tests {
         assert_eq!(db.list_sandbox_instances().unwrap().len(), 1);
     }
 
+    // The place cases below are unix-only for the same reason the TUI's are: a
+    // native Windows host has no place to prune or reclaim
+    // (`crate::sandbox::select::NATIVE_WINDOWS`).
+
     /// One container a scripted engine holds.
     #[derive(Clone)]
+    #[cfg(unix)]
     struct FakePlace {
         id: String,
         owned: bool,
@@ -1956,14 +1961,17 @@ mod tests {
     /// holds *after* the removals ran. This one drops a container on `rm` —
     /// except the ids it was told to keep — so "reclaimed" is observed rather
     /// than assumed.
+    #[cfg(unix)]
     struct FakeEngine {
         base: crate::sandbox::probe::StubHost,
         held: std::sync::Mutex<Vec<FakePlace>>,
         stubborn: Vec<String>,
     }
 
+    #[cfg(unix)]
     const PODMAN: &str = "/usr/bin/podman";
 
+    #[cfg(unix)]
     impl FakeEngine {
         fn new() -> Self {
             type ProbeOutput = crate::sandbox::probe::ProbeOutput;
@@ -2009,6 +2017,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl crate::sandbox::probe::ProbeHost for FakeEngine {
         fn which(&self, program: &str) -> Option<String> {
             crate::sandbox::probe::ProbeHost::which(&self.base, program)
@@ -2071,6 +2080,7 @@ mod tests {
 
     /// Everything a prune against a working engine needs: a data directory of
     /// its own, a real workspace to mount, the two profiles, and the engine.
+    #[cfg(unix)]
     struct PruneFixture {
         _temp: tempfile::TempDir,
         _paths: crate::paths::TestPathGuard,
@@ -2082,6 +2092,7 @@ mod tests {
         spec: String,
     }
 
+    #[cfg(unix)]
     fn prune_fixture(engine: FakeEngine) -> PruneFixture {
         let temp = tempfile::TempDir::new().unwrap();
         let paths = crate::paths::TestPathGuard::new(temp.path().join("data"));
@@ -2117,6 +2128,7 @@ mod tests {
     }
 
     /// The four kinds of container a prune has to tell apart, in one engine.
+    #[cfg(unix)]
     fn prune_places(spec: &str) -> Vec<FakePlace> {
         let place = |id: &str, owned: bool, profile: &str, spec: &str| FakePlace {
             id: id.to_string(),
@@ -2132,6 +2144,7 @@ mod tests {
         ]
     }
 
+    #[cfg(unix)]
     fn record(db: &Database, id: &str, profile: &str) {
         db.upsert_sandbox_instance(&crate::storage::sandboxes::SandboxInstance::new(
             profile,
@@ -2142,6 +2155,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
     fn recorded(db: &Database) -> Vec<String> {
         let mut ids: Vec<String> = db
             .list_sandbox_instances()
@@ -2153,6 +2167,7 @@ mod tests {
         ids
     }
 
+    #[cfg(unix)]
     fn ids_in(value: &Value) -> Vec<String> {
         let mut ids: Vec<String> = value
             .as_array()
@@ -2166,6 +2181,7 @@ mod tests {
 
     /// A dry run says what it would do and does none of it — neither to the
     /// engine nor to the record of what the engine holds.
+    #[cfg(unix)]
     #[test]
     fn a_dry_prune_names_the_superseded_place_and_touches_nothing() {
         let fixture = prune_fixture(FakeEngine::new());
@@ -2192,6 +2208,7 @@ mod tests {
     /// goes, the one that still matches the profile stays, a container friring
     /// does not own is invisible, and every place of a profile a live session
     /// names is protected by name.
+    #[cfg(unix)]
     #[test]
     fn a_prune_reclaims_the_superseded_place_and_leaves_every_other_one() {
         let fixture = prune_fixture(FakeEngine::new());
@@ -2217,6 +2234,7 @@ mod tests {
     /// A container the engine would not remove keeps its row: the row holds the
     /// only id anything has for it, and forgetting it turns a place that is
     /// still there into one nothing can find again.
+    #[cfg(unix)]
     #[test]
     fn a_place_the_engine_refuses_to_remove_keeps_its_record() {
         let fixture = prune_fixture(FakeEngine::new().refusing_to_remove("superseded"));
@@ -2247,6 +2265,7 @@ mod tests {
     /// one: matched on the label alone, the place an agent is working in reads
     /// as belonging to a profile that no longer exists, and is stopped and
     /// removed with its row forgotten.
+    #[cfg(unix)]
     #[test]
     fn a_renamed_profiles_live_place_is_not_reclaimed_out_from_under_it() {
         let fixture = prune_fixture(FakeEngine::new());

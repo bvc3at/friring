@@ -1182,8 +1182,13 @@ mod tests {
         }
     }
 
+    // A place's synthetic home is minted under this host's data directory and
+    // mounted at a path inside it, which a native Windows host has no place to
+    // do (`crate::sandbox::select::NATIVE_WINDOWS`).
+
     /// ADR-28 with teeth: one copy, in one place, ever. The second profile is
     /// refused with the reason and falls back to signing in.
+    #[cfg(unix)]
     #[test]
     fn a_second_place_may_not_copy_the_same_credential() {
         let fixture = Fixture::new("seed-twice");
@@ -1413,6 +1418,7 @@ mod tests {
     /// The state directory is friring's own, private, and inside the home the
     /// place already mounts — so nothing new has to be bound to make a login
     /// persist.
+    #[cfg(unix)]
     #[test]
     fn the_state_directory_is_created_private_inside_the_profiles_home() {
         let fixture = Fixture::new("statedir");

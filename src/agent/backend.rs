@@ -2350,6 +2350,10 @@ mod tests {
         crate::sandbox::egress::stop(&fixture.key());
     }
 
+    // A launch into a place, which only a unix host can have: a place mounts
+    // every path at exactly its host path, so a native Windows friring is
+    // offered no backend at all (`crate::sandbox::select::NATIVE_WINDOWS`).
+
     /// ADR-29 on the launch that composes a place for the *first* time.
     ///
     /// `inject_friring_env` withholds the host's own directories from a place —
@@ -2362,6 +2366,7 @@ mod tests {
     /// Composed against a fabricated [`Place`](crate::agent::transport::Place)
     /// rather than through [`sandboxed_invocation`]: resolving a real one runs a
     /// container engine, which no unit test may do.
+    #[cfg(unix)]
     #[test]
     fn a_place_launch_leaves_the_hosts_own_directories_out_of_the_window() {
         let env = || -> HashMap<String, String> {
@@ -2857,6 +2862,7 @@ mod tests {
     /// A place is created once per profile and shared, so one transport reaches
     /// it however many sessions are in it — and a rebuild retires the one that
     /// reached the container it replaced.
+    #[cfg(unix)]
     #[test]
     fn one_transport_per_place_and_a_rebuild_replaces_it() {
         let first =

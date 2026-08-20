@@ -315,6 +315,12 @@ impl TestSandboxHost {
         )))
     }
 
+    // The place cases below are unix-only, and not for a fixture's sake: a
+    // place mounts every path at exactly its host path, which is why a native
+    // Windows friring is offered no backend at all
+    // (`crate::sandbox::select::NATIVE_WINDOWS`). Inside WSL friring is a Linux
+    // binary and they all run.
+
     /// A host offering rootless podman, so a launch resolves to a **place**.
     ///
     /// The other shape a launch path has to be tested against, and named here
@@ -324,6 +330,7 @@ impl TestSandboxHost {
     /// Nothing is pulled, built or started — every engine command is answered by
     /// the injected probe host, and the place's own directories are friring's,
     /// under whatever data directory the test pinned.
+    #[cfg(unix)]
     pub(crate) fn place(profile: &str, workspace: &str) -> Self {
         use crate::sandbox::probe::ProbeOutput;
         const PODMAN: &str = "/usr/bin/podman";
@@ -1098,17 +1105,22 @@ mod tests {
         assert!(reason.contains("wsl-distro"), "{reason}");
     }
 
-    /// The refusal a host that *has* WSL gets, which is the intentional one: a
-    /// distro is a place friring registers and hardens but cannot yet run a
-    /// session in, so the launch says so and names what to pick instead rather
-    /// than opening a pane nothing reaches.
+    /// The refusal a *native Windows* host gets, all the way through the launch
+    /// path, whatever its profile asks for — and it names WSL2, because that is
+    /// where a Windows user's boundary actually comes from.
     ///
-    /// Not covered by the probe test above — off Windows that one never gets
-    /// past "the wsl-distro backend needs Windows", which is a different
-    /// sentence about a different thing. This one drives the ladder to the rung
-    /// where the transport is missing, on either kind of machine.
+    /// The host here has WSL installed and a distro to clone, which is what
+    /// makes the assertion mean something: this is not "nothing is installed",
+    /// it is friring declining to call anything here a boundary. A place mounts
+    /// every path at exactly its host path and no container engine can do that
+    /// with `C:\…`, so the ladder offers nothing and a pin is not even probed
+    /// ([`crate::sandbox::select::NATIVE_WINDOWS`]).
+    ///
+    /// Driven through [`apply`] rather than through the ladder alone, because
+    /// what a user meets is the launch: the sentence has to survive the whole
+    /// path, and the escape hatch has to answer it the same way.
     #[test]
-    fn a_windows_host_is_told_a_wsl_place_cannot_be_launched_into() {
+    fn a_windows_host_is_refused_and_pointed_at_wsl2() {
         // A Windows host with a Store WSL and one WSL2 distro to clone: enough
         // for the backend to probe as *available*, which is what puts the
         // launch on the rung this refusal belongs to.
@@ -1141,24 +1153,32 @@ mod tests {
         let _host = TestSandboxHost::new(SandboxHost::new(std::sync::Arc::new(windows)));
 
         let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
-        profile.backend = SandboxBackendKind::WslDistro;
         profile.read_scope = crate::session::ReadScope::Workspace;
 
-        let err = apply(
-            Some(&agent_def()),
-            &config_with(Some(profile.clone())),
-            "claude",
-            &[],
-        )
-        .expect_err("a launch into a WSL place must be refused");
-        assert!(err.contains("cannot yet run a session in"), "{err}");
-        assert!(err.contains("bwrap"), "{err}");
-        assert!(err.contains("docker"), "{err}");
+        // `auto` finds no rung, and every pin is refused without being probed —
+        // including the one backend that would have answered "available" here.
+        for backend in [
+            SandboxBackendKind::Auto,
+            SandboxBackendKind::WslDistro,
+            SandboxBackendKind::Docker,
+        ] {
+            profile.backend = backend;
+            let err = apply(
+                Some(&agent_def()),
+                &config_with(Some(profile.clone())),
+                "claude",
+                &[],
+            )
+            .expect_err("a native Windows host has no boundary to apply");
+            assert!(err.contains("WSL2"), "{backend}: {err}");
+            assert!(err.contains("exactly its host path"), "{backend}: {err}");
+        }
 
-        // A boundary friring cannot compose is not a host that lacks one, so the
-        // escape hatch does answer it — with the same sentence, and still
-        // without registering anything: every `wsl.exe` beyond the probe is
-        // unscripted, so an ensure would have failed the stub instead.
+        // A boundary this host cannot give is not the boundary's state being
+        // wrong, so the escape hatch does answer it — with the same sentence,
+        // and still without registering anything: every `wsl.exe` beyond the
+        // probe is unscripted, so an ensure would have failed the stub instead.
+        profile.backend = SandboxBackendKind::WslDistro;
         profile.allow_unsandboxed_fallback = true;
         let decision = apply(
             Some(&agent_def()),
@@ -1170,7 +1190,7 @@ mod tests {
         let SandboxDecision::Skipped { reason } = decision else {
             panic!("expected a skip, got {decision:?}");
         };
-        assert!(reason.contains("cannot yet run a session in"), "{reason}");
+        assert!(reason.contains("WSL2"), "{reason}");
     }
 
     /// The escape hatch answers "this host cannot apply this profile". It must
@@ -1216,6 +1236,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_remote_session_is_refused_rather_than_wrapped_locally() {
         let profile = closed_profile();
@@ -2003,6 +2024,7 @@ mod tests {
     /// Answering with one is how a caller acts on a stranger: a pane id is per
     /// tmux server and therefore per container, so `%1` in the container a
     /// session is *not* in names a different session's agent.
+    #[cfg(unix)]
     #[test]
     fn every_live_place_of_a_profile_is_answered_with_not_just_the_first() {
         use crate::sandbox::probe::ProbeOutput;
@@ -2091,6 +2113,7 @@ mod tests {
     /// The whole of a place launch in one composition: the place is ensured,
     /// the command composed for the *inside* of it, and the transport that
     /// reaches it handed back with the row to record.
+    #[cfg(unix)]
     #[test]
     fn a_place_profile_composes_a_transport_and_an_in_place_command() {
         let _guard = fabricated_data_dir("place-compose");
@@ -2177,6 +2200,7 @@ mod tests {
 
     /// …and a place-backed session's *own* backend is not a remote one, so the
     /// refusal above must not catch its every relaunch.
+    #[cfg(unix)]
     #[test]
     fn a_places_own_backend_is_not_mistaken_for_a_remote_host() {
         let _guard = fabricated_data_dir("place-relaunch");
@@ -2199,6 +2223,7 @@ mod tests {
     /// friring's own hook payload, written where a launch would find it: a
     /// fabricated config directory under the guard's root, never the machine
     /// owner's.
+    #[cfg(unix)]
     fn fabricated_hook_payload() -> String {
         let path = crate::paths::config_file()
             .and_then(|p| p.parent().map(|d| d.join("hooks").join("claude.json")))
@@ -2223,6 +2248,7 @@ mod tests {
     /// The regression this pins: "the indicator lies". A session whose hooks
     /// silently vanished never leaves `idle` and nothing on screen connects the
     /// two.
+    #[cfg(unix)]
     #[test]
     fn a_place_carries_frirings_hooks_and_reports_through_the_pane() {
         let _guard = fabricated_data_dir("place-config");
@@ -2342,6 +2368,7 @@ mod tests {
     /// because the projection refuses an entry reaching a tmux socket directory
     /// — and on Linux that root *is* the platform temp root, so a home built
     /// there would be classified host-only for a reason no test here is about.
+    #[cfg(unix)]
     fn fabricated_agent_home(name: &str) -> String {
         let home = crate::sandbox::dirs::test_temp_base(name).join("home");
         std::fs::create_dir_all(home.join(".claude")).unwrap();
@@ -2358,6 +2385,7 @@ mod tests {
     ///
     /// The store is a stub: no test may consult a real keychain, and this one
     /// holds a fabricated value in memory.
+    #[cfg(unix)]
     #[test]
     fn a_stored_token_is_injected_off_the_command_line_and_named_nowhere_else() {
         const FABRICATED: &str = "sk-fabricated-not-a-real-token";
@@ -2431,6 +2459,7 @@ mod tests {
     /// sandbox state silently dropped on a path that is not the first spawn. A
     /// session that logged in once must not be told to log in again, and a hook
     /// payload friring has since changed must not stay stale inside the place.
+    #[cfg(unix)]
     #[test]
     fn a_relaunch_reprojects_the_config_and_keeps_the_one_login() {
         let _guard = fabricated_data_dir("place-relaunch");
@@ -2530,6 +2559,7 @@ mod tests {
 
     /// The user's own configuration crosses into the place's home, at the same
     /// home-relative path — which is the whole point of a synthetic `$HOME`.
+    #[cfg(unix)]
     #[test]
     fn a_declared_config_entry_lands_in_the_places_home() {
         let _guard = fabricated_data_dir("place-copyin");

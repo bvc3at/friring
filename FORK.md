@@ -160,10 +160,18 @@ actually needs and to an allowlist of domains.
   container one, so the launch path was deliberately not wired — and with it
   unwired nothing else calls the backend either: registering, adopting and
   reclaiming are reached through `SandboxHost::wsl_distro` (no caller) or
-  `PLACE_KINDS` (the three container engines). What runs is the probe, the
-  capabilities the editor gates on, and a launch refusal naming the two ways to
-  get a boundary on Windows today. Its refusals are held to the shared
+  `PLACE_KINDS` (the three container engines). What runs is the probe and the
+  capabilities the editor gates on. Its refusals are held to the shared
   conformance table anyway, through its own two seams.
+- **No sandbox on a native Windows host.** `auto` offers no rung there and a
+  pinned backend is refused without being probed, both naming WSL2 as where a
+  Windows user's boundary comes from. The engines install and run on Windows,
+  but a place mounts every path at exactly its host path — the invariant that
+  keeps a git linked worktree and an agent's transcript resume working — and a
+  Linux container cannot mount `C:\Users\me\repo` at `C:\Users\me\repo`.
+  Upstream has no sandboxing at all, so this narrows only this fork's own
+  feature; the Windows *session* features (psmux backend, junction workspaces,
+  toast notifications) are untouched.
 - **Copy-on-write workspaces on `bwrap`** — the real directory as a read-only
   lower layer and the agent's writes in an inspectable upper layer outside the
   sandbox's own writable scratch. Availability is probed by *mounting* one, since

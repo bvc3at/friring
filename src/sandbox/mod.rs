@@ -216,7 +216,16 @@ impl SandboxHost {
     /// Whether `kind` can be used here, and if not, why. Never a silent skip:
     /// a backend this build does not implement says so in the same shape as one
     /// the host is missing.
+    ///
+    /// A native Windows host answers for every backend at once
+    /// ([`select::NATIVE_WINDOWS`]), before any of them is asked. The engines
+    /// install and answer there, so a per-backend probe would report docker
+    /// "available" while the launch refuses — and the picker, the profile list
+    /// and the launch all read this.
     pub fn probe(&self, kind: SandboxBackendKind) -> Availability {
+        if self.platform() == crate::sandbox::probe::HostPlatform::Windows {
+            return Availability::unavailable(select::NATIVE_WINDOWS);
+        }
         match self.backend(kind) {
             Some(backend) => backend.probe(),
             None if kind == SandboxBackendKind::Auto => {
@@ -298,6 +307,48 @@ mod tests {
 
         let selection = host.select(SandboxBackendKind::Auto);
         assert_eq!(selection.chosen, Some(SandboxBackendKind::Bwrap));
+    }
+
+    /// Every backend a native Windows host is asked about answers the same
+    /// thing, before any of them is probed — the picker, the profile list and
+    /// the launch all read [`SandboxHost::probe`], and an installed docker
+    /// answering "available" to one of them while the launch refuses is the
+    /// disagreement this closes.
+    #[test]
+    fn a_native_windows_host_offers_nothing_and_says_where_to_go() {
+        let windows = SandboxHost::new(Arc::new(
+            StubHost::new()
+                .with_home("C:/Users/me")
+                // No `uname` on a Windows host; `cmd.exe` is what settles it.
+                .with_binary("cmd.exe")
+                .with_binary("docker"),
+        ));
+        assert_eq!(windows.platform(), HostPlatform::Windows);
+        for kind in [
+            SandboxBackendKind::Docker,
+            SandboxBackendKind::Podman,
+            SandboxBackendKind::WslDistro,
+            SandboxBackendKind::Bwrap,
+        ] {
+            let availability = windows.probe(kind);
+            assert!(!availability.is_available(), "{kind}");
+            assert!(availability.message().contains("WSL2"), "{kind}");
+        }
+        assert_eq!(windows.select(SandboxBackendKind::Auto).chosen, None);
+    }
+
+    /// And on a machine that really is one. The stub above proves the rule; this
+    /// proves friring recognises the host it is running on as the host the rule
+    /// is about — the only assertion a fabricated platform cannot make.
+    #[cfg(windows)]
+    #[test]
+    fn this_windows_machine_is_offered_no_sandbox() {
+        let host = SandboxHost::local_shared();
+        assert_eq!(host.platform(), HostPlatform::Windows);
+        let selection = host.select(SandboxBackendKind::Auto);
+        assert_eq!(selection.chosen, None);
+        let refusal = selection.backend().unwrap_err().to_string();
+        assert!(refusal.contains("WSL2"), "{refusal}");
     }
 
     #[test]
@@ -594,6 +645,14 @@ mod tests {
     /// rather than pass vacuously — a backend that skipped one of the checks
     /// would run on to the command the stub has no answer for, and fail on the
     /// *sentence* rather than on the refusal.
+    ///
+    /// Unix-only, because a place is: the profile paths here are this host's
+    /// own, and a place mounts every one of them at exactly its own path — which
+    /// is why a native Windows host is offered no backend at all
+    /// ([`crate::sandbox::select::NATIVE_WINDOWS`]) and why there is nothing for
+    /// this table to say there. Inside WSL friring is a Linux binary and the
+    /// whole table runs.
+    #[cfg(unix)]
     mod place_conformance {
         use std::sync::Arc;
 
@@ -985,7 +1044,6 @@ mod tests {
         /// Unix-only for the fixture rather than for the rule: planting the link
         /// this is about takes `std::os::unix::fs::symlink`, and a Windows one
         /// takes a privilege the test process does not have.
-        #[cfg(unix)]
         #[test]
         fn every_place_backend_refuses_a_symlinked_mount_source() {
             let base = dirs::test_temp_base("place-conformance-link");

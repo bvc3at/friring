@@ -480,13 +480,18 @@ mod tests {
     // Nothing here starts a container: every assertion is about the command
     // line friring *would* run, which is the whole of what this seam decides.
 
+    // Unix-only with the place they address: a native Windows host is offered no
+    // sandbox at all (`crate::sandbox::select::NATIVE_WINDOWS`), so a `Place` is
+    // not a thing that exists there — and its engine path would not be absolute.
     /// A fabricated place. The engine path is a plausible install location and
     /// the container is a name friring's own `ensure` would mint; neither is
     /// touched by these tests.
+    #[cfg(unix)]
     fn place() -> Place {
         Place::new("/usr/local/bin/docker", "friring-dev-1a2b3c", "dev").unwrap()
     }
 
+    #[cfg(unix)]
     #[test]
     fn sandbox_builds_engine_exec_argv() {
         let t = TmuxTransport::sandbox(place());
@@ -509,6 +514,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn every_engine_takes_the_same_shape() {
         for engine in [
@@ -523,6 +529,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn sandbox_passes_tokens_through_verbatim() {
         // An engine `exec` takes an argv and never a shell, so the SSH arm's
@@ -559,6 +566,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn sandbox_never_carries_environment_in_argv() {
         // The engine's argv is on the *host* process table. Session environment
@@ -573,6 +581,7 @@ mod tests {
         assert!(!args.contains(&"-t".to_string()), "{args:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_place_is_addressed_by_values_that_were_vetted() {
         // The engine runs on the host with a root-equivalent socket: a bare
@@ -594,6 +603,7 @@ mod tests {
         assert!(Place::new("/usr/bin/docker", "ctr", "my profile").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_place_names_its_backend_like_a_host_does() {
         assert_eq!(place().backend_name(), "sandbox:dev");
@@ -602,6 +612,7 @@ mod tests {
         assert_eq!(place().profile(), "dev");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_place_runs_tmux_whatever_the_host_runs() {
         // `DEFAULT_MUX` follows the *host* OS, so a native-Windows friring
@@ -614,6 +625,7 @@ mod tests {
         assert!(TmuxTransport::Local.place().is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_place_is_reached_like_a_host_but_needs_no_login_shell() {
         let sandbox = TmuxTransport::sandbox(place());
@@ -645,6 +657,7 @@ mod tests {
         assert!(!TmuxTransport::Local.needs_login_shell());
     }
 
+    #[cfg(unix)]
     #[test]
     fn only_the_bare_local_mux_keeps_frirings_stdin() {
         // Every launcher forwards stdin, and `Command::status()` inherits it —
@@ -667,6 +680,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn nesting_env_is_stripped_on_every_transport() {
         // A no-op for a place (`exec` gives the process the image's
@@ -717,6 +731,7 @@ mod tests {
         assert!(!wsl.uses_psmux());
     }
 
+    #[cfg(unix)]
     #[test]
     fn is_remote_reflects_variant() {
         assert!(!TmuxTransport::Local.is_remote());

@@ -158,7 +158,13 @@ pub fn network_is_open(plan: &InstancePlan) -> bool {
     matches!(plan.network, NetworkSetting::Default)
 }
 
+/// A plan mounts this host's own paths at themselves, which a native Windows
+/// host cannot offer and is therefore offered no sandbox for
+/// ([`crate::sandbox::select::NATIVE_WINDOWS`]) — the same reason the container
+/// plan's tests are unix-only. Apple's tool is macOS-only anyway; this keeps the
+/// two plan modules stated the same way.
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use crate::sandbox::container::plan::{plan_instance, MountCheck, PlanInput, CONTAINER_HOME};
@@ -207,7 +213,6 @@ mod tests {
     fn has_flag(argv: &[String], flag: &str, value: &str) -> bool {
         argv.windows(2).any(|w| w[0] == flag && w[1] == value)
     }
-
     #[test]
     fn a_place_is_named_networked_and_mounted_at_identical_paths() {
         let plan = plan_for(&resolved(|_| {}));
@@ -251,7 +256,6 @@ mod tests {
             assert!(!argv.iter().any(|token| token == absent), "{absent}");
         }
     }
-
     #[test]
     fn the_limits_a_profile_asked_for_reach_the_command_line() {
         let plan = plan_for(&resolved(|profile| {

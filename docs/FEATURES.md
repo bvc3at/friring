@@ -3007,16 +3007,21 @@ honour only an unrestricted `full`, because a place there is a VM with its own
 kernel and the proxy socket carries no reachable listener across it — so a
 filtered profile is **refused** rather than started unfiltered. `docker`/`podman`
 enforce every mode *where their daemon is on this machine's kernel*, which is not
-something the engine's name says: on a Mac or a Windows box it is usually a Linux
-VM's, and the same socket problem applies. friring settles that per place by
+something the engine's name says: on a Mac it is usually a Linux VM's, and the
+same socket problem applies. friring settles that per place by
 having it dial a listener friring binds outside it, and refuses a filtered
 profile it cannot get an answer from rather than starting a place with no egress
 while claiming an allowlist.
-The `wsl-distro` backend's code clones, hardens and reclaims a distro per
-profile — and **nothing in this build calls any of it**. What runs is its probe,
-its capabilities and a launch refusal naming the two ways to get a boundary on
-Windows today; no distro is registered and no session runs in one. Every surface
-that offers a profile says why a backend is unavailable rather than hiding it.
+**A native Windows friring has no sandbox at all** — `auto` finds no backend and
+a pinned one is refused, both saying to run friring inside WSL2 instead. A place
+mounts your repositories at exactly their host paths, which is what keeps git
+and agent resume working inside it, and no Linux container can mount `C:\…` at
+`C:\…`. Inside a distro friring is a Linux binary and the whole Linux ladder
+applies. The `wsl-distro` backend's code clones, hardens and reclaims a distro
+per profile — and **nothing in this build calls any of it**: what runs is its
+probe and the capabilities the editor gates on, no distro is registered, and no
+session runs in one. Every surface that offers a profile says why a backend is
+unavailable rather than hiding it.
 friring's default image carries **no agent CLI**: baking one in would put a
 vendor's release train inside the image, so an agent gets into a place either
 through your own `image`/`containerfile` or through a one-time install into the

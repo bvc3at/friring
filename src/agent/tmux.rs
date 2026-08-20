@@ -3220,6 +3220,11 @@ mod tests {
         }
     }
 
+    // Unix-only with the place they address — see the note on
+    // `crate::sandbox::select::NATIVE_WINDOWS`: a native Windows host is
+    // offered no sandbox, so no window is ever opened inside one there.
+
+    #[cfg(unix)]
     #[test]
     fn a_redacted_failure_is_still_worth_reading() {
         let backend = TmuxBackend::local();
@@ -3268,11 +3273,13 @@ mod tests {
 
     /// A fabricated place: an engine path that is merely plausible, and a
     /// container name shaped like the ones friring's own `ensure` mints.
+    #[cfg(unix)]
     fn test_place() -> Place {
         Place::new("/usr/local/bin/docker", "friring-dev-1a2b3c", "dev").unwrap()
     }
 
     /// The program and argv a built [`Command`] would run.
+    #[cfg(unix)]
     fn program_and_args(cmd: &Command) -> (String, Vec<String>) {
         (
             cmd.get_program().to_string_lossy().into_owned(),
@@ -3282,6 +3289,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     #[test]
     fn for_place_names_the_backend_and_pins_the_flavour() {
         let backend = TmuxBackend::for_place(&test_place());
@@ -3307,6 +3315,7 @@ mod tests {
         std::env::remove_var(SESSION_OVERRIDE_ENV);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_place_reuses_the_ssh_paths_argv_verbatim() {
         // Discovery, adoption and scrollback are not re-implemented for a
@@ -3344,6 +3353,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_place_window_carries_the_session_identity_env() {
         // The window lives *inside* the place and `<engine> exec` inherits
@@ -3368,6 +3378,7 @@ mod tests {
         assert!(cmd.ends_with(" claude --resume x"), "{cmd}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_place_gets_no_login_shell() {
         let backend = TmuxBackend::for_place(&test_place());
@@ -3407,6 +3418,7 @@ mod tests {
             .contains("exec \"$SHELL\" -l"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_place_launch_failure_withholds_the_proxy_credential() {
         // Same guarantee as the local path, on the transport that carries a

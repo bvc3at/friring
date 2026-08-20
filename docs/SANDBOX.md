@@ -52,9 +52,10 @@ change. Fork-visible divergences are also listed in [`FORK.md`](../FORK.md).
   "reduce blast radius", not "prove containment". The UI says so.
 - A general container-management product. Friring manages the instances it
   creates and nothing else.
-- Native Windows process sandboxing (restricted tokens / AppContainer). Windows
-  isolation is delivered through WSL2 and through containers. See
-  [Backend catalogue](#backend-catalogue).
+- Any sandbox at all for a **native Windows** friring — neither process
+  sandboxing (restricted tokens / AppContainer) nor a container place. A
+  Windows user's boundary comes from running friring inside WSL2. See
+  [Backend catalogue](#backend-catalogue) and [Not in it](#not-in-it).
 - **Isolating the sessions that share a place from each other.** A place is one
   container per profile, and the sessions in it run as one uid, in one pid
   namespace, over one filesystem. Per-session isolation is what a *policy*
@@ -305,8 +306,7 @@ that is unit-tested against a stub `wsl.exe` — but **nothing in the running
 application calls any of it.** What is reachable in this build is the backend's
 *probe* and its *capabilities* (so the editor, the list and the session step say
 what a WSL place could and could not do, and a profile asking for something it
-cannot enforce is refused at the save) and the launch refusal that names the two
-ways to get a boundary on Windows today. No session launches into a distro, no
+cannot enforce is refused at the save). No session launches into a distro, no
 distro is ever registered or hardened by the application, and the reclaiming pass
 does not walk distros at all — `PLACE_KINDS` lists the three container engines
 and nothing else. See [its entry](#wsl-distro--windows-place) and
@@ -482,11 +482,18 @@ made bwrap its primary Linux backend and Claude Code's sandbox uses it too.
   applies the policy — the same rule `/usr/bin/sandbox-exec` follows by being
   absolute.
 
-### `docker` / `podman` — everywhere, place
+### `docker` / `podman` — every unix host, place
 
-The universal fallback and the only isolation available to a **native Windows
-binary** user who is not going through WSL. Also the backend to pick when the
+The universal fallback on macOS and Linux, and the backend to pick when the
 workload needs a toolchain the host does not have.
+
+**Not on a native Windows host.** The engines install and run there, but a place
+mounts every path at exactly its host path (see [Identical absolute
+paths](#identical-absolute-paths)) and the kernel honouring that mount is a
+Linux one, which cannot mount `C:\Users\me\repo` at `C:\Users\me\repo`. friring
+offers no backend at all on that host rather than a boundary whose paths mean
+something else inside; run it inside WSL2, where its paths are the distro's own
+and the whole Linux ladder applies.
 
 - Podman rootless is preferred on shared and remote hosts (no daemon, no root
   socket). It is CLI-compatible enough that one backend implementation covers
@@ -531,7 +538,8 @@ workload needs a toolchain the host does not have.
 - **A filtered mode is measured, not assumed.** These are the only backends
   whose boundary may or may not carry the egress proxy's socket depending on
   the *host*: an `AF_UNIX` listener lives in the kernel that called `bind(2)`,
-  and on a Mac or a Windows box the daemon's kernel is a VM's, not friring's.
+  and on a Mac — or under a Docker Desktop reached from inside WSL — the
+  daemon's kernel is a VM's, not friring's.
   Rather than keep a list of which engines are VM-backed where — a list that
   goes stale — friring asks: when a filtered profile's place is ensured it
   binds a listener in the place's own directory (mounted at the same absolute
@@ -627,11 +635,13 @@ accessor that hands the backend out as a place — has no caller, and
 the three container engines only. So on a real machine **no distro is
 registered, hardened, adopted, reclaimed or unregistered by friring**, and no
 session runs inside one. What the running application does with this backend is
-exactly two things: it *probes* it (so the UI can say whether a WSL place is
-possible here and why not), and it *refuses a launch* pinned to it, naming the
-two ways to get a boundary on Windows today. Read the rest as the design and
-the tested implementation of a rung that is not yet plugged in — not as a
-boundary anything is relying on.
+exactly one thing: it *probes* it, so the UI can say whether a WSL place is
+possible here and why not — and the answer is always no. Inside a distro the
+probe points at `bwrap`, and on the Windows side, where registering a distro
+would have been possible, friring now offers no backend at all
+([Not in it](#not-in-it)). Read the rest as the design and the tested
+implementation of a rung that is not plugged in — not as a boundary anything is
+relying on.
 
 One cloned distro per profile, addressed by the existing `wsl.exe -d <distro>`
 transport with no new plumbing. Templates come from `wsl --export --format vhd`
@@ -773,7 +783,7 @@ attributable.
 | macOS (other) | `seatbelt` → `docker`/`podman` |
 | Linux | `bwrap` → `podman` → `docker` |
 | Windows via WSL transport | `bwrap` (inside the distro) → `wsl-distro` → `docker` |
-| Windows native binary | `docker`/`podman` |
+| Windows native binary | *nothing* — the profile is refused, pinned or not |
 
 The default is the first *available* rung, which favours startup latency,
 credential passthrough and zero image maintenance. The user overrides per
@@ -840,13 +850,11 @@ pane. `--new-session` is deliberately **not** used.
 The `wsl-distro` rung sits below `bwrap` for a Windows host reached through the
 WSL transport, as the table says — but the platform detected *inside* a distro
 is the distro itself, and cloning a new one is a Windows-side operation a
-sandbox running in one cannot perform. The rung is reachable only from the
-Windows side. And it does not resolve to a usable boundary even there: an `auto`
-ladder that reached it produces a launch refusal naming what to use instead,
-because nothing in this build launches into a distro (see
-[its entry](#wsl-distro--windows-place)). It stays on the ladder rather than
-being removed so that the reason is a sentence rather than a silently missing
-rung.
+sandbox running in one cannot perform, so the rung's own probe declines and
+names `bwrap`, which is the rung above it. The Windows side, which is where it
+could have been performed from, is offered no ladder at all now. So nothing
+resolves to this rung; it stays on the WSL ladder rather than being removed so
+that a user who pins it gets a sentence rather than a silently missing rung.
 
 ## Egress firewall
 
@@ -2161,12 +2169,21 @@ report: each is a deliberate stopping point with the reason it stopped there.
   across a VM boundary; closing it needs an ADR-27 endpoint change, not a backend
   change. `full` with no denies is the one mode that backend offers, and one
   network per profile.
-- **A filtered place on a Mac or a Windows host is refused, not filtered.** The
-  probe settles it per place instead of guessing, but where the engine's daemon
-  is in a VM the answer is always no — and it needs the same ADR-27 endpoint
-  change `apple-container` needs.
-- **No native Windows process sandboxing.** Restricted tokens and AppContainer
-  are not built; Windows isolation is `docker`/`podman`.
+- **A filtered place whose engine runs in a VM is refused, not filtered.** A Mac
+  is the everyday case. The probe settles it per place instead of guessing, but
+  where the daemon's kernel is not friring's the answer is always no — and it
+  needs the same ADR-27 endpoint change `apple-container` needs.
+- **No sandbox of any kind on a native Windows host.** Not the process
+  boundaries Windows has (restricted tokens, AppContainer), and not a container
+  place either — even though docker and podman install and run there. A place
+  mounts every path at exactly its host path, and the kernel that honours the
+  mount is a Linux one: it cannot mount `C:\Users\me\repo` at
+  `C:\Users\me\repo`, and a translated path silently breaks the two things that
+  invariant exists for — a git linked worktree's absolute reference to its main
+  repository, and an agent's transcript keyed by project path. So `auto` finds
+  no rung and a pinned backend is refused without being probed, both saying to
+  run friring inside WSL2 instead. Inside a distro friring is a Linux binary,
+  its paths are the distro's own, and the whole Linux ladder applies.
 - **No place on a remote host.** A backend probes and creates where friring runs,
   and an `ssh:`/`wsl:` session carrying a profile is refused rather than composed
   around the wrong filesystem. The mount-source symlink rule has no authority
@@ -2230,8 +2247,10 @@ report: each is a deliberate stopping point with the reason it stopped there.
   private `App` method that needs a refactor first.
 - **No inline form errors** in the profile editor; validation surfaces through
   the error toast.
-- **`auto` never picks `wsl-distro` on a native-Windows host** — it is chosen by
-  pinning, which then refuses.
+- **`wsl-distro` is on no ladder any host reaches.** A native-Windows host is
+  refused before any rung is probed, and inside a distro the rung's own probe
+  says registering another distro is a Windows-side operation and points at
+  `bwrap`.
 - **The per-command escape `allow_unsandboxed_fallback`'s name suggests is not
   built.** It decides what happens when the profile cannot be applied at launch,
   and nothing finer.

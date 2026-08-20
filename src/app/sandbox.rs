@@ -1901,6 +1901,11 @@ mod tests {
         }
     }
 
+    // The place cases below are unix-only: a native Windows host is offered no
+    // sandbox (`crate::sandbox::select::NATIVE_WINDOWS`), so it has no place to
+    // list, stop or lint a projection into. The profile editor and the list
+    // around them are platform-independent and stay so.
+
     /// The profile editor's config lint, over a **fabricated** home: an agent
     /// that declares a directory friring can carry, one it cannot, and one that
     /// only crosses if the profile mounts it.
@@ -1908,6 +1913,7 @@ mod tests {
     /// The verdicts are the projection's; what this pins is that the editor asks
     /// it the right question — the profile's own granted paths, the agent's own
     /// declaration, one report per agent that has one.
+    #[cfg(unix)]
     #[test]
     fn the_editor_lints_a_places_config_against_the_form_in_front_of_it() {
         use crate::session::{AgentRegistry, AgentSandboxDef};
@@ -2419,6 +2425,7 @@ mod tests {
     /// Stopping a place takes it away from whatever is running in it, so it is
     /// confirmed first — and the question names both counts, because those are
     /// what the answer costs.
+    #[cfg(unix)]
     #[test]
     fn stopping_a_place_asks_first_and_names_what_it_costs() {
         let (mut app, _g, _t, _h) = manager(2);
@@ -2454,6 +2461,7 @@ mod tests {
     /// acts on the engines either way — so a count taken from the rows can
     /// promise to remove places that are already gone, or refuse to offer a
     /// container that is right there.
+    #[cfg(unix)]
     #[test]
     fn the_confirmation_counts_the_places_that_are_actually_running() {
         // Three rows, one container: two rebuilds nothing has reconciled away.
@@ -2481,6 +2489,7 @@ mod tests {
     /// The other direction: a container friring adopted after a crash has no row
     /// at all, and it is still a place the stop would remove — so the question
     /// is asked rather than answered with "there is nothing to stop".
+    #[cfg(unix)]
     #[test]
     fn a_running_place_with_no_row_is_still_offered_for_stopping() {
         let (mut app, _g, _t, _h) = manager_with(0, 1);
@@ -2502,6 +2511,7 @@ mod tests {
     /// `y` is the only answer that carries it out. `Enter` and `d` already mean
     /// edit and delete on this list, so neither may double as "yes" — and while
     /// a question is armed they do not do their own job either.
+    #[cfg(unix)]
     #[test]
     fn only_y_confirms_and_every_other_key_cancels() {
         for code in [
@@ -2538,6 +2548,7 @@ mod tests {
     /// A click moves the selection without going through the key handler, so a
     /// question the cursor has left behind is dropped rather than left armed on
     /// a row whose footer nobody can see.
+    #[cfg(unix)]
     #[test]
     fn a_question_the_selection_moved_away_from_is_dropped() {
         let (mut app, _g, _t, _h) = manager(1);
@@ -2601,6 +2612,7 @@ mod tests {
     /// One background slot, because every one of these drives a container
     /// engine: two workers reconciling one engine's containers would be two
     /// opinions about what to remove.
+    #[cfg(unix)]
     #[test]
     fn a_second_place_job_waits_for_the_first() {
         let (mut app, _g, _t, _h) = manager(1);

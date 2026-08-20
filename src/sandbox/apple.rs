@@ -970,6 +970,9 @@ mod tests {
     use crate::session::SandboxPath;
 
     const PROGRAM: &str = "/usr/bin/container";
+    // Apple's tool only runs on macOS, and the cases that build one of its places
+    // name this host's own paths — unix-only in both directions.
+    #[cfg(unix)]
     const IMAGE: &str = "friring/sandbox:1";
 
     fn profile(name: &str) -> SandboxProfile {
@@ -1047,6 +1050,7 @@ mod tests {
     /// Those two are minted here rather than left to `plan_for`, because the
     /// stub answers "does this exist?" from a list and a place's own mounts are
     /// checked like every other source.
+    #[cfg(unix)]
     fn host_for(profile: &str) -> StubHost {
         let (place, home) = dirs::create_place_dirs(profile).unwrap();
         host()
@@ -1129,6 +1133,7 @@ mod tests {
 
     /// Every mode but an unrestricted `full` is turned down before a place is
     /// created — so no proxy is ever bound for a boundary that cannot use one.
+    #[cfg(unix)]
     #[test]
     fn a_profile_this_backend_cannot_enforce_is_refused_before_anything_is_built() {
         dirs::cleanup_place("unenforceable");
@@ -1191,6 +1196,7 @@ mod tests {
     ///
     /// Nothing scripts a `run` here, so a create would fail the test: reuse has
     /// to be reuse.
+    #[cfg(unix)]
     #[test]
     fn an_ensure_creates_frirings_network_and_reuses_a_running_place() {
         let profile = profile("lifecycle");
@@ -1249,6 +1255,7 @@ mod tests {
     /// cannot express a lifecycle: whether a stopped place was started or
     /// replaced is a question about the *sequence* of commands and about which
     /// container exists afterwards, not about any one answer.
+    #[cfg(unix)]
     struct Recording {
         base: StubHost,
         log: std::sync::Mutex<Vec<String>>,
@@ -1258,6 +1265,7 @@ mod tests {
         created: std::sync::Mutex<bool>,
     }
 
+    #[cfg(unix)]
     impl Recording {
         fn new(base: StubHost, replacement: Option<String>) -> Arc<Self> {
             Arc::new(Self {
@@ -1290,6 +1298,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl ProbeHost for Recording {
         fn which(&self, program: &str) -> Option<String> {
             self.base.which(program)
@@ -1328,6 +1337,7 @@ mod tests {
     /// An owned place that is not running, with everything an ensure needs
     /// around it. `id` is deliberately not the container's name: the name is
     /// friring's handle, the id is what the tool answers with.
+    #[cfg(unix)]
     fn stopped_place(name: &str, id: &str) -> (InstancePlan, StubHost) {
         let planned = backend(host_for(name)).plan_for(&profile(name)).unwrap().0;
         let host = host_for(name)
@@ -1352,6 +1362,7 @@ mod tests {
 
     /// A stopped place friring owns is started again, and the session lands in
     /// the same one: a restart must not throw away the work in it.
+    #[cfg(unix)]
     #[test]
     fn a_stopped_place_is_started_rather_than_rebuilt() {
         let (_planned, host) = stopped_place("restarted", "stoppedplace1");
@@ -1375,6 +1386,7 @@ mod tests {
     /// It is taken away by name and built again — `stop` first, because a
     /// delete of a running container is refused — and the session lands in the
     /// replacement rather than on a dead handle.
+    #[cfg(unix)]
     #[test]
     fn a_place_that_will_not_start_is_replaced_and_the_new_id_is_the_one_recorded() {
         let (planned, host) = stopped_place("wedged", "wedgedplace1");
@@ -1418,6 +1430,7 @@ mod tests {
 
     /// And when the replacement will not build either, the ensure refuses with
     /// the tool's own reason rather than handing back the id it just deleted.
+    #[cfg(unix)]
     #[test]
     fn a_replacement_that_will_not_build_refuses_the_ensure() {
         let (_planned, host) = stopped_place("doomed", "doomedplace1");
@@ -1453,6 +1466,7 @@ mod tests {
 
     /// friring only ever reuses or removes what it can prove it created, and the
     /// proof is its own label.
+    #[cfg(unix)]
     #[test]
     fn a_container_that_is_not_frirings_is_neither_reused_nor_removed() {
         let profile = profile("squatted");
@@ -1480,6 +1494,7 @@ mod tests {
     /// The tool is asked what it made rather than believed about what it
     /// printed, which is what catches a label that did not land — and every
     /// later lookup and removal depends on that label being there.
+    #[cfg(unix)]
     #[test]
     fn a_created_container_without_frirings_label_is_refused() {
         let planned = backend(host_for("unlabelled"))
@@ -1532,6 +1547,7 @@ mod tests {
     /// ADR-29 is absolute, and a place makes the read-only half matter: a
     /// read-only bind of the data directory would still carry the automation
     /// commands the *host* executes.
+    #[cfg(unix)]
     #[test]
     fn no_mount_may_reach_the_data_directory() {
         // `host_for` mints this profile's place tree first, so the data

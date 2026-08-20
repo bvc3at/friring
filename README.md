@@ -469,7 +469,9 @@ themes, switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
   agent on the host, and the **place** backends — `docker`/`podman` and, on
   Apple Silicon running macOS 26, Apple's own `container` — which run it in a
   container reached exactly the way an SSH host is, with your repositories
-  mounted at their real paths so git keeps working inside. A container gets the
+  mounted at their real paths so git keeps working inside — which is also why a
+  *native Windows* friring is offered no boundary at all and asks you to run it
+  inside WSL2 instead: no Linux container can mount `C:\…` at `C:\…`. A container gets the
   safe subset of your agent configuration projected in — instructions, skills,
   commands, minus anything naming a path that isn't in there — and the agent
   signs in once per profile inside its own pane, because a rotating credential
@@ -528,7 +530,8 @@ themes, switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
 - **git** (required for worktree features)
 - **[bubblewrap](https://github.com/containers/bubblewrap)** (`bwrap`) — only
   for [sandboxed agents](docs/SANDBOX.md) on Linux; macOS uses the system
-  `sandbox-exec`
+  `sandbox-exec`. A native Windows friring gets no sandbox at all — run it
+  inside WSL2, where `bwrap` applies the boundary
 - **Docker or Podman** — one way to run a *place*-backed
   [sandboxed agent](docs/SANDBOX.md) (a container instead of a host policy).
   friring publishes no image: the default tag is built locally with

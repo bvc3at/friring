@@ -7,10 +7,13 @@
 use std::path::{Path, PathBuf};
 
 use super::*;
-use crate::session::{
-    AgentSandboxDef, EnforcedSettings, SandboxAuth, SettingsFormat, REMOTE_HOOK_STATE_OPTION,
-    STATUS_SIGNAL_MARKER,
-};
+use crate::session::{AgentSandboxDef, EnforcedSettings, SandboxAuth, SettingsFormat};
+/// Read only by the cases below that project a place's hooks. Those — and every
+/// case that classifies this fabricated *unix* home — are unix-only, because
+/// what they feed is a place's synthetic home and a native Windows host has no
+/// place at all (`crate::sandbox::select::NATIVE_WINDOWS`).
+#[cfg(unix)]
+use crate::session::{REMOTE_HOOK_STATE_OPTION, STATUS_SIGNAL_MARKER};
 
 /// `$HOME` inside the place, matching what the container backend mounts the
 /// synthetic home at.
@@ -68,6 +71,7 @@ impl Host {
         path
     }
 
+    #[cfg(unix)]
     fn dir(&self, home_relative: &str) -> PathBuf {
         let path = self.path(home_relative);
         std::fs::create_dir_all(&path).expect("a fabricated directory");
@@ -251,6 +255,7 @@ fn a_credential_file_never_crosses() {
 
 /// A settings document carrying every shape that names the host, with `HOME` and
 /// `REPO` standing in for the fabricated paths.
+#[cfg(unix)]
 const SETTINGS: &str = r#"{
   "statusLine": { "type": "command", "command": "HOME/bin/status.sh" },
   "mcpServers": {
@@ -272,6 +277,7 @@ const SETTINGS: &str = r#"{
 /// The three awkward shapes, in one document: a hook naming a host script, an
 /// MCP server naming a host binary, and a plugin directory outside the config
 /// directory.
+#[cfg(unix)]
 #[test]
 fn every_host_reference_is_classified_with_a_reason() {
     let host = Host::new();
@@ -356,6 +362,7 @@ fn every_host_reference_is_classified_with_a_reason() {
 
 /// A reference to something that *is* projected is rewritten rather than
 /// dropped: it exists inside the boundary, just at the synthetic home's path.
+#[cfg(unix)]
 #[test]
 fn a_reference_to_projected_content_is_rewritten_to_where_it_lands() {
     let host = Host::new();
@@ -426,6 +433,7 @@ fn instructions_are_copied_verbatim_rather_than_linted() {
 
 // ---- Enforced settings --------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn enforced_settings_are_frirings_last_word_over_what_was_projected() {
     let host = Host::new();
@@ -516,6 +524,7 @@ fn an_enforced_template_that_will_not_render_is_reported_not_written() {
 /// friring's own layer is held to the rule it applies to everybody else's: a
 /// host path in it would be friring writing the very reference the lint pass
 /// strips out of the user's file.
+#[cfg(unix)]
 #[test]
 fn an_enforced_template_naming_a_host_path_is_refused() {
     let host = Host::new();
@@ -540,6 +549,7 @@ fn an_enforced_template_naming_a_host_path_is_refused() {
 
 /// The reason a place-backed session reported no status at all: friring's own
 /// hook configuration was dropped from the launch rather than carried in.
+#[cfg(unix)]
 #[test]
 fn frirings_hooks_cross_and_report_through_a_tmux_pane_option() {
     let host = Host::new();
@@ -625,6 +635,7 @@ fn a_managed_path_is_followed_only_inside_frirings_own_config_root() {
 /// The database never enters a sandbox, and projection is a shape that could
 /// carry it in three different ways: as a declared entry, through a symlink, and
 /// as a reference inside a document friring copies.
+#[cfg(unix)]
 #[test]
 fn no_projection_shape_reaches_the_data_directory() {
     let host = Host::new();
@@ -979,6 +990,7 @@ fn a_path_is_found_inside_a_command_line_but_a_colon_never_splits_one() {
 /// `~/.claude` is projected and `~/.claude-backup` is not, and the two differ by
 /// a suffix — which is also why a rewrite splices the byte range it classified
 /// instead of replacing every occurrence of the text.
+#[cfg(unix)]
 #[test]
 fn a_prefix_neighbour_is_classified_on_its_own() {
     let host = Host::new();

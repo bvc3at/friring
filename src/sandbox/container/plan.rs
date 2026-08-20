@@ -318,10 +318,18 @@ impl MountCheck<'_> {
 
         for mount in mounts {
             let source = mount.source.as_str();
+            // A unix path, not merely an absolute one. A place mounts every
+            // path at exactly its host path, and the kernel that honours the
+            // mount is the container's — so `C:\repo` is not a source a place
+            // could carry under any spelling. That is why a native Windows host
+            // is offered no backend at all
+            // ([`crate::sandbox::select::NATIVE_WINDOWS`]) and why this stays a
+            // POSIX test rather than growing a Windows case.
             if !source.starts_with('/') {
                 return Err(refuse(format!(
-                    "'{source}' is not an absolute path, and a place mounts every path at \
-                     exactly its host path"
+                    "'{source}' is not an absolute unix path, and a place mounts every path at \
+                     exactly its host path — inside a Linux kernel, which is the whole reason \
+                     friring does not offer a sandbox on a native Windows host"
                 )));
             }
             if let Some(bad) = source
@@ -568,7 +576,14 @@ pub fn create_argv(program: &str, plan: &InstancePlan) -> Vec<String> {
     argv
 }
 
+/// Every case here plans a place out of **this host's** own paths — the data
+/// directory friring minted, the place tree under it — and a plan's first rule
+/// is that every source is an absolute unix path mounted at itself. A native
+/// Windows host is offered no sandbox at all for exactly that reason
+/// ([`crate::sandbox::select::NATIVE_WINDOWS`]), so there is no such thing as a
+/// plan to assert there. Inside WSL friring is a Linux binary and these all run.
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use crate::session::{ReadScope, SandboxBackendKind, SandboxPath, SandboxProfile};
@@ -641,7 +656,6 @@ mod tests {
     fn has_flag(argv: &[String], flag: &str, value: &str) -> bool {
         argv.windows(2).any(|w| w[0] == flag && w[1] == value)
     }
-
     #[test]
     fn every_profile_path_is_mounted_at_its_own_path() {
         let policy = workspace_policy();
@@ -671,7 +685,6 @@ mod tests {
         assert_eq!(home.source, home_dir());
         assert!(home.writable);
     }
-
     #[test]
     fn a_nested_read_only_path_is_mounted_after_the_root_it_narrows() {
         let policy = resolved(SandboxProfile::new(
@@ -774,7 +787,6 @@ mod tests {
             }
         }
     }
-
     #[test]
     fn a_mount_that_cannot_be_honoured_is_refused_rather_than_dropped() {
         let policy = workspace_policy();
@@ -889,7 +901,6 @@ mod tests {
     /// not already its own resolved spelling is *refused*, never silently
     /// swapped, and the check's answer is used only to compare against the
     /// directories no mount may carry.
-    #[cfg(unix)]
     #[test]
     fn resolving_a_source_never_rewrites_it_so_a_linked_worktree_still_works() {
         let base = dirs::test_temp_base("worktree-identity");
@@ -961,7 +972,6 @@ mod tests {
     /// anywhere. friring's own two mounts are no different: the place directory
     /// is mounted read-write, so the synthetic home underneath it is a path the
     /// sandbox can replace with a link of its own.
-    #[cfg(unix)]
     #[test]
     fn a_planted_symlink_never_becomes_a_mount() {
         let base = dirs::test_temp_base("planted-mount");
@@ -1053,7 +1063,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         dirs::cleanup_place("planted");
     }
-
     #[test]
     fn the_command_line_carries_the_limits_the_profile_asked_for() {
         let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
@@ -1079,7 +1088,6 @@ mod tests {
         let image = argv.iter().position(|a| a == IMAGE).unwrap();
         assert_eq!(&argv[image + 1..], KEEPALIVE);
     }
-
     #[test]
     fn git_can_act_on_a_bind_mounted_repository_and_says_who_committed() {
         let policy = workspace_policy();

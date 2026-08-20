@@ -143,13 +143,17 @@ impl ImageSource {
 pub fn resolve(policy: &SandboxPolicy) -> SandboxResult<ImageSource> {
     if let Some(containerfile) = policy.containerfile.as_deref().map(str::trim) {
         if !containerfile.is_empty() {
+            // A unix path for the same reason the mount sources are: the build
+            // context is read by the engine on the host a place can exist on,
+            // and that host is never native Windows
+            // ([`crate::sandbox::select::NATIVE_WINDOWS`]).
             if !containerfile.starts_with('/') {
                 return Err(SandboxError::Refused {
                     profile: policy.profile.clone(),
                     detail: format!(
-                        "the containerfile '{containerfile}' is not an absolute path, and its \
-                         directory is the build context — a relative one would resolve against \
-                         whichever directory friring was started in"
+                        "the containerfile '{containerfile}' is not an absolute unix path, and \
+                         its directory is the build context — a relative one would resolve \
+                         against whichever directory friring was started in"
                     ),
                 });
             }
@@ -476,7 +480,10 @@ mod tests {
             p.containerfile = Some("images/Containerfile".into())
         }))
         .unwrap_err();
-        assert!(err.to_string().contains("not an absolute path"), "{err}");
+        assert!(
+            err.to_string().contains("not an absolute unix path"),
+            "{err}"
+        );
     }
 
     /// The failure this refusal prevents: a place whose image has no agent runs

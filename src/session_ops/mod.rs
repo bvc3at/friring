@@ -990,6 +990,9 @@ mod tests {
         assert!(!config.env.contains_key(crate::paths::DATA_DIR_OVERRIDE_ENV));
     }
 
+    // A place-backed launch, which a native Windows host cannot have
+    // (`crate::sandbox::select::NATIVE_WINDOWS`).
+
     /// The **first** launch of a place-backed session is composed as a local
     /// one, so the guard above has not fired for it — and the window env it
     /// carries is the one set inside the container.
@@ -1000,6 +1003,7 @@ mod tests {
     /// `backend: None`, is treated as local, and picks up the host's own
     /// directories. They come back out where the invocation learns it is
     /// place-bound (ADR-29).
+    #[cfg(unix)]
     #[test]
     fn a_first_headless_place_launch_leaves_the_hosts_directories_out_of_the_window() {
         // Short, private and fabricated: a place's socket path is one level

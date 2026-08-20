@@ -725,9 +725,13 @@ mod tests {
         }
     }
 
+    // A place-backed spawn, which a native Windows host cannot have
+    // (`crate::sandbox::select::NATIVE_WINDOWS`).
+
     /// A credential goes over a control connection or not at all. The local
     /// one-shot spawner puts its whole environment in a `tmux` client's argv,
     /// so a launch carrying one is refused there and injected everywhere else.
+    #[cfg(unix)]
     #[test]
     fn a_credential_never_rides_a_tmux_clients_command_line() {
         let secret = vec![("ANTHROPIC_API_KEY".to_string(), "sk-fabricated".to_string())];
