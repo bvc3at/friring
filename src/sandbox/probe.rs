@@ -189,6 +189,19 @@ pub fn detect_platform(host: &dyn ProbeHost) -> HostPlatform {
                 HostPlatform::Linux
             }
         }
+        // A POSIX shim on Windows still answers `uname`, so the fallback above
+        // never runs there: Git for Windows ships one, and its kernel string is
+        // `MINGW64_NT-10.0-…` (MSYS2 and Cygwin spell it their own way). The
+        // host underneath is Windows whichever shim is in front of it, and
+        // reading it as `Unknown` would offer a sandbox friring cannot build —
+        // see `select::NATIVE_WINDOWS`.
+        other
+            if other.starts_with("MINGW")
+                || other.starts_with("MSYS")
+                || other.starts_with("CYGWIN") =>
+        {
+            HostPlatform::Windows
+        }
         _ => HostPlatform::Unknown,
     }
 }
@@ -548,6 +561,23 @@ mod tests {
         assert_eq!(detect_platform(&windows), HostPlatform::Windows);
         // Nothing answered at all: not guessed at.
         assert_eq!(detect_platform(&StubHost::new()), HostPlatform::Unknown);
+    }
+
+    /// The shim answers `uname`, so the no-`uname` path above never runs on a
+    /// Windows host that has one — which is every Windows machine with Git for
+    /// Windows on its `PATH`, including GitHub's runner image.
+    #[test]
+    fn a_posix_shim_on_windows_is_still_a_windows_host() {
+        for kernel in [
+            "MINGW64_NT-10.0-20348",
+            "MINGW32_NT-6.2",
+            "MSYS_NT-10.0-19045",
+            "CYGWIN_NT-10.0",
+        ] {
+            let shim = StubHost::new()
+                .with_command("uname -s", ProbeOutput::success(format!("{kernel}\n")));
+            assert_eq!(detect_platform(&shim), HostPlatform::Windows, "{kernel}");
+        }
     }
 
     #[test]
