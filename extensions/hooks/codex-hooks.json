@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "friring-cli session signal --state idle >/dev/null 2>&1 || true",
+            "command": "if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'idle\\n' >> \"$FRIRING_SIGNAL_FILE\" 2>/dev/null || true; else friring-cli session signal --state idle >/dev/null 2>&1 || true; fi",
             "timeout": 10
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "friring-cli session signal --state working >/dev/null 2>&1 || true",
+            "command": "if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'working\\n' >> \"$FRIRING_SIGNAL_FILE\" 2>/dev/null || true; else friring-cli session signal --state working >/dev/null 2>&1 || true; fi",
             "timeout": 10
           }
         ]
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "friring-cli session signal --state working >/dev/null 2>&1 || true",
+            "command": "if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'working\\n' >> \"$FRIRING_SIGNAL_FILE\" 2>/dev/null || true; else friring-cli session signal --state working >/dev/null 2>&1 || true; fi",
             "timeout": 10
           }
         ]
@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "friring-cli session signal --state done >/dev/null 2>&1 || true",
+            "command": "if [ -n \"$FRIRING_SIGNAL_FILE\" ]; then printf 'done\\n' >> \"$FRIRING_SIGNAL_FILE\" 2>/dev/null || true; else friring-cli session signal --state done >/dev/null 2>&1 || true; fi",
             "timeout": 10
           }
         ]

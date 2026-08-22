@@ -120,6 +120,39 @@ resume_latest = false       # true = id-less "resume last session in cwd"
 # hook_schema = "claude"    # optional: name the hook FAMILY this CLI speaks so
                             #   the built-in hooks extension wires its status
                             #   hooks under this custom agent's name too
+
+[agents.sandbox]            # optional: what this CLI needs inside a sandbox
+auth = "auto"               # auto | host-passthrough | env-token | volume-login
+                            #   | seed-file. A request, not a verdict: a policy
+                            #   sandbox is always host-passthrough, and a
+                            #   container never can be
+config_dir_env = "CLAUDE_CONFIG_DIR"  # env var relocating its state (place backends)
+state_dir = "~/.claude"     # the directory that variable names, `~`-anchored
+state_rw = ["~/.claude", "~/.claude.json"]  # dirs it writes and must keep
+bypass = ["--dangerously-skip-permissions"]  # flags turning its OWN sandbox off
+copy_in = ["~/.claude/skills"]   # config safe to project into a container,
+                            #   `~`-anchored: it lands at the same home-relative
+                            #   path inside. Linted first — a hook or MCP server
+                            #   naming a host path is dropped, and a credential
+                            #   never crosses (ADR-28)
+# env = { DISABLE_AUTOUPDATER = "1" }  # static env while a sandbox is active
+# secret_env = ["ANTHROPIC_API_KEY"]   # token variable NAMES only; the value
+                            #   lives in your OS keychain under the service
+                            #   "dev.friring.sandbox", never here — put one
+                            #   there with `friring-cli sandbox token set`
+# credential_file = "~/.claude/.credentials.json"  # the vendor credential file
+# seed_file_supported = false  # true ONLY where the vendor documents copying it
+# writeback = true          # a refreshed credential must survive the sandbox
+# login_fallback = "/login" # what to type in the pane when the state is empty
+
+[[agents.sandbox.enforced]]  # friring's highest-precedence layer inside a container
+path = "~/.codex/config.toml"  # `~`-anchored: a container's only writable
+                               #   surface is its own synthetic home
+format = "toml"                # json | toml
+per_path = "[projects.\"{path}\"]\ntrust_level = \"trusted\""
+# `content` is written once ({workspaces} → the granted paths as a list);
+# `per_path` is repeated once per granted path ({path} → that path). JSON takes
+# `content` only, because two JSON documents cannot be concatenated.
 ```
 
 `{id}` is substituted with the friring-generated session UUID. Groups
@@ -187,6 +220,20 @@ host. It names the *family* to imitate, not a boolean; today the useful value is
 `"claude"` (the only family wired via a per-agent arg patch — codex/opencode/
 antigravity/vibe/copilot are wired through their own config dir, so a rebrand
 sharing that dir already reports status).
+
+`[agents.<name>.sandbox]` is optional and every field inside it is too. It is
+how friring stays agent-neutral about sandboxing: the flags that turn an agent's
+*own* sandbox off (nesting is denied outright under seatbelt), the state
+directories it must keep writable, how it authenticates inside a boundary and
+which of your configuration is safe to carry into a container are **your**
+declaration, never code. It is applied only while a sandbox profile is active,
+so an agent that declares nothing still launches — it just gets no help, which
+the profile editor says rather than papering over. An `agents.toml` written
+before sandboxing existed loads unchanged. Full semantics:
+[`docs/SANDBOX.md`](SANDBOX.md) §Credentials, §Config projection and §Inner
+agent sandboxes. Sandbox *profiles* themselves are UI-edited and live in SQLite,
+not here — `friring-cli sandbox export|import` is how one moves between machines
+([`docs/CLI.md`](CLI.md#sandboxes)).
 
 The seeded file also ships two commented, copy-pasteable templates
 below the built-ins — **Add your own agent** (every field annotated)
@@ -1102,6 +1149,17 @@ these to prove its own identity without scraping panes or names:
 | `FRIRING_TASK` | the originating task id; task-spawned sessions only (headless `task run`) |
 | `FRIRING_METRICS_DIR` | metrics output dir |
 | `FRIRING_CONFIG_DIR` / `FRIRING_DATA_DIR` | the resolved config/data dirs, so the agent's `friring-cli` (its status hook) targets the same DB the TUI reads — independent of XDG, which `friring-cli` is on PATH, or a stale tmux-server env. Also honored if you set them yourself to relocate friring's state. |
+| `FRIRING_SIGNAL_FILE` | **sandboxed sessions only.** The one file a policy boundary may write status into: the bundled hooks append a state word here instead of calling `friring-cli session signal`, because the database is denied inside every sandbox (see [`docs/SANDBOX.md`](SANDBOX.md) §Status signals). Unset for every unsandboxed session, which is what makes those hooks byte-identical to before. |
+
+The three *path* variables (`FRIRING_METRICS_DIR`, `FRIRING_CONFIG_DIR`,
+`FRIRING_DATA_DIR`) are set only for a session running on **this** machine's
+filesystem. An SSH/WSL session and a sandbox place both skip them: over there
+those paths name nothing, and for a place the data directory is precisely what
+the boundary exists to keep out (ADR-29). That decision reads the session's
+recorded backend, which does not say `sandbox:<profile>` until a session has
+been launched into a place once — so the **first** launch of a place-backed
+session is composed as a local one and has them removed again where it learns
+where it is going. The identity variables are opaque and travel everywhere.
 
 Set **at build time** (not runtime):
 

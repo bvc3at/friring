@@ -9,6 +9,8 @@ pub mod git;
 pub mod notifications;
 pub mod paths;
 pub mod proctable;
+pub mod proxy;
+pub mod sandbox;
 pub mod session;
 pub mod session_ops;
 pub mod shell;

@@ -83,6 +83,265 @@ merges carry rename conflicts on the renamed identifiers, and an existing
 
 ### Features
 
+#### Sandboxed agents
+
+Fork-only, and **experimental**: the newest feature here and the least
+exercised. The tests cover what friring generates — the seatbelt profile, the
+bubblewrap argv, the container spec, the mount plan, every refusal — but none
+of them runs a real boundary and watches the kernel deny a read or a
+connection, none starts a container, `apple-container` was never run against
+real hardware, and `wsl-distro` has no caller. The rules are tested; the
+enforcement is argued from them. Both screens that author or pick a profile are
+titled *experimental*.
+
+Upstream runs every agent as the user, on the host, with the user's
+full filesystem and network. The fork can run any registry agent inside an
+isolation boundary chosen per session, scoped to the directories the session
+actually needs and to an allowlist of domains.
+
+- **Sandbox profiles** — a UI-edited collection in SQLite (the automations
+  pattern): per-path read-only/read-write scope, network mode, domain
+  allowlist, resource limits, backend choice. New tables (schema v47)
+  **supersede** the dormant upstream `containers` / `project_container_config` /
+  `vms` / `project_vm_config` tables (created by upstream schema v8/v10/v11 and
+  referenced nowhere in live code), which this feature's migration drops.
+  Merges touching those tables resolve toward the Friring tables. `sessions`
+  also gains a `sandbox_profile` column, carried end to end like
+  `backend_type`, and (schema v48) a `sandbox_unenforced` column recording why
+  the last launch could *not* apply that profile, so a restart or a
+  cross-instance adopt inherits the warning instead of rendering the sandboxed
+  mark over an agent on the host.
+- **Two sandbox shapes** — *policy* backends (`seatbelt`, `bwrap`) wrap the
+  agent's argv with tmux outside; *place* backends (`docker`/`podman`,
+  `apple-container`, `wsl-distro`) run tmux inside and are reached through a new
+  sandbox transport that mirrors the fork's SSH/WSL transports. The place
+  backends share one `PlaceBackend` seam and one set of refusals as *code* — one
+  mount plan, one owner-label set, one spec digest, one collection decision — and
+  a conformance test holds all of them to it.
+- **Place backends: `docker`/`podman`** — one container per profile, shared by
+  that profile's sessions and reached with `<engine> exec -i <ctr> tmux …`.
+  `backend_type` carries `sandbox:<profile>` the way `ssh:<host>` does, so
+  restore, adoption, restart and delete all re-derive the transport from it, and
+  a place that is down turns its sessions into unreachable placeholders that
+  reattach when friring starts it again. Mounts are **identical absolute paths**
+  (a git worktree references its main repository by absolute path, and agents key
+  transcripts and trust by project path), `--mount type=bind` so a missing source
+  is refused rather than invented, and the container is given the host user's
+  identity — `--user uid:gid`, or `--userns=keep-id` under rootless Podman —
+  rather than widening the `0o600` proxy socket. `--cap-drop ALL`,
+  `--security-opt no-new-privileges` and `--init` are not configurable. The
+  container's name carries a digest of everything a profile edit could change, so
+  an edited profile builds a new place instead of reusing mounts that no longer
+  describe it. The image is the profile's, one built from its `containerfile`, or
+  the default `friring/sandbox:1` built from
+  [`packaging/sandbox/Containerfile`](packaging/sandbox/Containerfile) — friring
+  publishes no registry image, so a missing one is refused with the build command
+  — and it carries no agent CLI: an agent reaches a place through the profile's
+  own image or through a one-time install into the profile's home, and a launch
+  whose agent is not in the place is refused with that command rather than
+  opening a pane that dies. Sessions sharing a place are **not** isolated from
+  each other (one uid, one pid namespace, one filesystem); the trust domain is
+  the place, and a profile per session is what gives each session one of its own.
+- **Place backend: `apple-container`** — Apple's `container` CLI on Apple
+  Silicon and macOS 26 or newer, one lightweight VM per place, on friring's own
+  `friring-sandbox` network rather than the one every container on the Mac
+  shares. It reuses the container engines' mount plan, labels, digest and
+  collection decision unchanged, and reads its option surface out of
+  `container run --help` at probe time because the CLI is young. Its one real
+  limit is stated rather than papered over: **the egress proxy cannot be reached
+  across a VM boundary**, so every filtered network mode — and `none`, whose
+  promise friring cannot keep there — is refused, leaving an unrestricted `full`
+  as the only mode it can honour.
+- **Place backend: `wsl-distro`** — one hardened clone per profile
+  (`friring-sbx-<profile>`, `automount` and `interop` off, an ownership marker, a
+  *checked* `wsl --terminate` before the hardening is verified, bubblewrap
+  required inside it), with VHD export/import and reclaiming. **None of that runs
+  in this build.** Reaching a distro needs the `wsl:` transport rather than the
+  container one, so the launch path was deliberately not wired — and with it
+  unwired nothing else calls the backend either: registering, adopting and
+  reclaiming are reached through `SandboxHost::wsl_distro` (no caller) or
+  `PLACE_KINDS` (the three container engines). What runs is the probe and the
+  capabilities the editor gates on. Its refusals are held to the shared
+  conformance table anyway, through its own two seams.
+- **No sandbox on a native Windows host.** `auto` offers no rung there and a
+  pinned backend is refused without being probed, both naming WSL2 as where a
+  Windows user's boundary comes from. The engines install and run on Windows,
+  but a place mounts every path at exactly its host path — the invariant that
+  keeps a git linked worktree and an agent's transcript resume working — and a
+  Linux container cannot mount `C:\Users\me\repo` at `C:\Users\me\repo`.
+  Upstream has no sandboxing at all, so this narrows only this fork's own
+  feature; the Windows *session* features (psmux backend, junction workspaces,
+  toast notifications) are untouched.
+- **Copy-on-write workspaces on `bwrap`** — the real directory as a read-only
+  lower layer and the agent's writes in an inspectable upper layer outside the
+  sandbox's own writable scratch. Availability is probed by *mounting* one, since
+  a setuid bubblewrap and a kernel that refuses unprivileged overlays are both
+  invisible to a version check, and a host that cannot refuses the profile rather
+  than binding the root read-write.
+- **friring touches only the places it created** — an owner label is set at
+  creation, every lookup filters on it, every removal re-checks it, and a
+  same-named container without it is neither adopted nor removed. A background
+  pass reclaims superseded and orphaned places and reconciles the
+  `sandbox_instances` table; idleness never reclaims one, and a profile whose
+  live sessions this instance is not driving protects every container of that
+  profile by name.
+- **Egress firewall** — a Friring-owned Rust filtering proxy enforces a domain
+  allowlist while the kernel denies direct egress, so ignoring the proxy means
+  no network rather than a bypass. Chosen over resolved-IP `iptables`
+  allowlists, which break on CDN address rotation and cannot work under
+  seatbelt or in WSL's shared network namespace. A bare `x` is that host alone
+  and `*.x`/`.x` are one spelling of its subtree, apex included, in both the
+  profile validator and the proxy — two matchers held to one table by
+  `tests/egress_matcher_conformance.rs`, both canonicalising a host before they
+  compare it (`127.1` and `2130706433` are `127.0.0.1`) and both refusing a
+  non-ASCII host outright rather than guessing at a U-label. The proxy dials on
+  the *host's* network stack, so it refuses destinations local to the host —
+  loopback, unspecified, link-local, the cloud metadata address — in every mode
+  including `full`, re-checking after a name resolves, unless an allow rule
+  names the literal address; and it replaces a plaintext request's `Host` header
+  with the authority it authorised. Both policy backends are wired to it:
+  `allowlist` is enforced for real, and `full` with denies is proxied too,
+  because a deny list is enforceable nowhere else. An instance is **per session**
+  (the bearer token and the unix socket are per boundary, not per profile), and
+  a launch with no session identity is refused rather than sharing one; it is
+  bound before the agent but belongs to the session only once that launch has a
+  pane, so a failed launch never costs a running agent its egress. Seatbelt
+  reaches it on host loopback — on both loopback families, because SBPL's
+  `localhost` cannot be told which one it means — and a `--unshare-net` sandbox
+  through a bind-mounted socket fronted by `friring-cli sandbox relay` running
+  inside the namespace.
+- **First-use domain prompts** — a refused host raises a status line and, under
+  `prompt_new_domains`, a confirm modal; allowing applies to the running proxy
+  immediately (no restart) *and* writes a port-scoped rule for that host alone
+  back to the profile. It is the only confirmation in friring that grants on `y`
+  rather than `Enter` and ignores keys until it has been on screen, because it
+  is the only one an agent can raise while the user is typing into a pane. A
+  relaunch withdraws a question still on screen, since its answer would land on
+  the boundary that replaced the one it was about. The same host is asked about
+  once per session however hard the agent retries.
+- **Credential handling** — never copies rotating OAuth credentials per
+  sandbox (copies invalidate each other on first refresh); prefers host
+  passthrough under policy backends (the macOS Keychain keeps working), then a
+  long-lived token friring holds in its **own** OS keychain entry (service
+  `dev.friring.sandbox`; the registry declares variable *names* only), then one
+  login per profile inside the session pane, shared by every session of that
+  profile and surviving a container rebuild. `seed-file` copies a credential
+  file exactly once per credential family per host, only where the declaration
+  asserts the vendor documents it, and never writes a refreshed one back to the
+  host. The token's value never reaches a command line in either direction:
+  reads use the platform tool's stdout, the write uses its stdin where one
+  exists and is refused (with the prompting command printed) where none does,
+  and injection is the control-mode window environment — so the headless launch
+  path, which passes window environment as `tmux -e` argv, refuses instead. No
+  credential problem ever fails a launch: the agent starts signed out and the
+  session says so and says what to type.
+- **The safe subset of the user's agent configuration is projected into a
+  place** — instructions, skills and commands land in the synthetic home at
+  the same `~`-relative path, through a lint pass that parses every JSON/TOML
+  document and classifies each host reference as projectable, rewritten,
+  needs-a-read-only-mount or host-only, dropping the smallest whole entry around
+  anything that cannot cross. No credential ever crosses (not even the launching
+  agent's own), nothing reaching the data directory or a tmux socket does, and
+  every write refuses a symlink at every component. friring's own hook payload
+  crosses too, with each `friring-cli session signal` rewritten to
+  `tmux set-option -p @friring_state` — the same rewrite the SSH path uses — so
+  a place-backed session reports working/blocked/done through the control-mode
+  subscription instead of reporting nothing. Enforced settings are a declared
+  template friring fills with the paths the profile granted, merged over the
+  user's own file, which pre-seeds the workspace trust an agent would otherwise
+  prompt for in a fresh home.
+- **The database never enters a sandbox** — a policy-sandboxed session reports
+  status through a narrow file channel instead, because automations make database
+  write access equivalent to arbitrary host command execution: the launch mints
+  `<data dir>/signals/<session>/`, exposes that one directory read-write, and the
+  bundled hooks append a state word there when `FRIRING_SIGNAL_FILE` is set
+  (unsandboxed sessions run the CLI exactly as before). The host **takes** the
+  file with a `rename(2)` into a directory no sandbox is granted before reading
+  it, refuses anything that is not a regular file under 4 KiB of UTF-8, and
+  writes only a matched constant from a closed vocabulary — never the file's own
+  bytes. The database and its `-wal`/`-shm` siblings are masked wherever a
+  writable root could create the mount point, whether or not they exist yet, and
+  no place is ever given the data directory or the metrics/config/data
+  environment variables that point at it.
+- **A launch is refused rather than quietly narrowed** — friring will not start
+  a session whose profile hands over more than the boundary can hold: read-write
+  roots reaching the data directory (ADR-29 — the directory judged from above,
+  the database file and its `-wal`/`-shm` siblings from either side, because a
+  path naming a file encloses no directory), reaching a tmux server socket
+  directory, or reaching friring's own `agents.toml`/`hosts.toml`/`config.toml`,
+  which write down the command lines the host launches every agent with; a
+  filtered network mode with no proxy running to enforce it; a `docker`/`podman`
+  place that cannot be *shown* to reach the proxy's socket, measured by having
+  the place dial a listener friring binds outside it rather than guessed from the
+  engine's name; and a security-relevant path that is not valid UTF-8 (a rule
+  built from a lossy spelling names a different file). The profile editor applies
+  the path refusals at save, so such a profile never becomes a stored row, and
+  `sandbox import` applies them before it writes any of a document.
+- **A per-session scratch directory** — the agent's writable temp space is
+  `<data dir>/sandbox/tmp/<session id>`, minted `0700`, adopted after a crash
+  and dropped with the session; generated seatbelt profiles sit beside it under
+  `<data dir>/sandbox/profiles/`. The host temp root is never granted: friring's
+  own tmux server socket lives there, and a network namespace does not stop
+  `connect(2)` on a pathname unix socket.
+- **Desired vs applied boundary** — a session records the profile it asked for
+  *and* what the launch did with it. A launch that falls back to the host keeps
+  the profile (so the next relaunch is sandboxed again) and is marked `⚠`
+  rather than `⛨`, with the reason in the info panel, in an error toast, and on
+  `friring-cli session create|restart` output. A profile whose stored row
+  friring cannot decode is still listed and repairable but is refused at
+  launch, naming each column that failed.
+- **Agent requirements are declared data** — an optional
+  `[agents.<name>.sandbox]` block in `agents.toml` carries the state
+  directories an agent must keep writable, the flags that turn its *own*
+  sandbox off (mandatory under `seatbelt`, where nesting is denied by the
+  kernel), the credential strategy and the names of the token variables it
+  accepts, the configuration safe to project into a container, and the
+  highest-precedence settings friring writes in there. Upstream's `agents.toml`
+  has no such key and loads unchanged; the fork bakes in no agent knowledge.
+- **A new module in the architecture allowlist** — `sandbox` may reference
+  `session`, `paths` and `shell`, and `agent` may reference `sandbox` (the wrap
+  is a decorator on the launch `agent` composes). Enforced in
+  `tests/architecture_rules.rs`.
+- **`friring-cli sandbox`** (fork-only, as the whole sandbox feature is) —
+  profile and place management (`list`, `show`, `rm`, `prune`), TOML
+  `export`/`import` that refuses at the *import* anything a launch would refuse,
+  and `token set|rm|list` for the `env-token` keychain entry, with the token
+  never on a command line in either direction and a store friring cannot write
+  to saying so before the value is asked for. The internal `sandbox relay` stays
+  the one subcommand dispatched before the database is opened (ADR-29).
+- **The profile list is a manager view** — places per profile, with `s` stop,
+  `r` rebuild and `p` prune. The two that take a container away from whatever is
+  running in it are confirmed in the footer, and `y` alone answers, because
+  `Enter` and `d` already mean edit and delete there.
+
+What ships and runs is both policy backends and the two *container* place
+backends (`docker`/`podman` and `apple-container`), with every
+network mode enforced where the backend can enforce it, host-passthrough
+credentials under a policy backend, and status reporting out of either kind of
+boundary — a place gets the safe subset of the user's agent configuration
+projected into its synthetic home, including friring's own hook payload rewritten
+to report through tmux, so a place-backed session says working/blocked/done like
+any other. All three place credential strategies are built: `env-token`,
+`volume-login` and `seed-file`.
+
+What does not: a place on a *remote* host is refused rather than supported
+(friring creates the container locally, with this machine's paths); **nothing
+drives the `wsl-distro` backend** — it is built and stub-tested with no
+production caller, so no distro is registered, hardened or reclaimed and no
+session runs in one, and pinning it refuses with the alternatives;
+**`apple-container` honours no filtered network mode**, because the egress proxy
+is not reachable across a VM boundary — and a `docker`/`podman` place whose
+daemon is in a VM (Docker Desktop, `podman machine`, colima) is refused a
+filtered mode for the same reason, now that friring measures it rather than
+assuming; and no profile column selects a copy-on-write workspace yet. An egress
+proxy dies with the friring process that started it, so a session created by the
+short-lived `friring-cli` starts with no way out (kernel-closed, which fails
+closed) until a running friring relaunches it. Renaming a profile that has a
+place means signing in again: the place tree is named by profile name and the
+rename is a database transaction. Design, delivery phases, the full "not in it"
+list and ADR-25 through ADR-29 live in
+[`docs/SANDBOX.md`](docs/SANDBOX.md).
+
 #### Lazy sessions & ghosts (July 2026)
 
 Upstream restores every persisted session eagerly at startup: sessions whose

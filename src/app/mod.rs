@@ -8,6 +8,7 @@ mod clipboard;
 pub(crate) mod clock;
 pub(crate) mod code_review;
 mod config_reload;
+pub(crate) mod egress_prompts;
 mod helpers;
 mod key_handlers;
 mod memory;
@@ -15,8 +16,10 @@ pub(crate) mod metrics_state;
 pub(crate) mod modals;
 mod new_session_state;
 mod notify_state;
+mod sandbox;
 pub(crate) mod search;
 mod state;
+mod status_signals;
 mod sync_state;
 mod task_state;
 mod tasks;
@@ -206,7 +209,25 @@ struct PendingSessionSpawn {
 /// was **reachable** (its `ensure_ready` succeeded — distinguishes "host down"
 /// from "host up but no windows"), plus the windows it reported. Sent once per
 /// discovery attempt by the restore threads.
-type RemoteDiscovery = (String, bool, Vec<crate::agent::backend::DiscoveredSession>);
+/// What a restore's discovery thread has to reach: a backend the registry
+/// already holds (an SSH host, a WSL distro), or a sandbox **place** it has to
+/// open first. Opening one runs a container engine, which is why it happens on
+/// that thread rather than where the restore is planned.
+enum DiscoveryTarget {
+    Ready(Arc<dyn SessionBackend>),
+    Place(crate::session::SandboxProfile),
+}
+
+struct RemoteDiscovery {
+    backend_type: String,
+    reachable: bool,
+    windows: Vec<crate::agent::backend::DiscoveredSession>,
+    /// The transport a **place** discovery opened on its way in, for the
+    /// registry to adopt. `None` for an SSH/WSL host, whose backend was already
+    /// registered from `hosts.toml`, and for a place that could not be opened —
+    /// which is what `reachable = false` says.
+    opened: Option<(Arc<dyn SessionBackend>, crate::sandbox::SandboxInstance)>,
+}
 
 /// How long to wait between retry sweeps for a still-unreachable remote backend.
 const REMOTE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
@@ -993,6 +1014,21 @@ pub struct App {
     /// [`Self::poll_remote_restore`]. `None` once every remote backend has
     /// reported (or when there was nothing remote to restore).
     remote_restore: Option<RemoteRestore>,
+    /// The place-reclaiming pass ([`sandbox::App::tick_sandbox_gc`]) while it
+    /// runs: every step is a container-engine command, so none of it is on the
+    /// render path.
+    sandbox_gc: background::BackgroundTask<sandbox::GcOutcome>,
+    /// Which containers this instance has opened for each place, keyed by its
+    /// `sandbox:<profile>` backend name. What tells the reclaiming pass which
+    /// places this instance's sessions are in — the session row records the
+    /// profile, and only the launch that opened the place knows the id.
+    ///
+    /// Every id ever opened for a profile is kept, not just the newest: editing
+    /// a profile builds a *new* container for the next session while the
+    /// sessions already attached to the old one keep running in it, and a
+    /// session row names only the profile, so forgetting the superseded id
+    /// would let the pass reclaim a place out from under a live agent.
+    place_containers: HashMap<String, HashSet<String>>,
     /// Deferred inputs: `(session_id, data, tick_at_which_to_send)`.
     /// Used to introduce a small delay between pasting text and pressing Enter.
     deferred_inputs: Vec<(SessionId, Vec<u8>, u64)>,
@@ -1089,6 +1125,11 @@ pub struct App {
     /// starts. The wrapper tracks per-session prior status + last-fired-at so
     /// dedup and "only on transition" logic live next to the sender.
     notification_state: Option<NotificationState>,
+    /// Which egress refusals the user has already been told about, and the
+    /// first-use questions waiting for the modal slot
+    /// ([`egress_prompts`]). Empty unless a sandboxed session
+    /// under a filtered network mode is running.
+    egress_prompts: egress_prompts::EgressPromptState,
     /// Redraw-throttling dirty flag. The render loop paints only when this is
     /// set (or `FORCE_REDRAW_INTERVAL` elapsed). Starts `true` so the first
     /// frame always paints. Set by [`Self::request_redraw`] from `update`,
@@ -1478,11 +1519,14 @@ impl App {
                 settings_mtime: config_reload::settings_mtime(),
             },
             notification_state: build_notification_state(),
+            egress_prompts: egress_prompts::EgressPromptState::default(),
             needs_redraw: true,
             spinner_frame: 0,
             last_active_session_id: None,
             cached_hook_states: HashMap::new(),
             pending_remote_hook_events: Vec::new(),
+            sandbox_gc: background::BackgroundTask::default(),
+            place_containers: HashMap::new(),
             hook_states_version: None,
             last_draw_at: clock::now(),
             last_output_gen: 0,
@@ -1808,6 +1852,8 @@ impl App {
         // Clear any choice left over from a previously cancelled flow.
         self.new_session.backend = None;
         self.new_session.workspace_dir = None;
+        self.new_session.sandbox_profile = None;
+        self.new_session.sandbox_step_shown = false;
         self.new_session.saved_repo_picker = None;
         self.new_session.saved_conversation_picker = None;
 
@@ -2015,20 +2061,67 @@ impl App {
         self.prepare_spawn(config, Vec::new());
     }
 
-    /// Route session creation through the name modal, then agent selection.
+    /// Route session creation through the sandbox step and the name modal,
+    /// then agent selection.
     ///
     /// The name modal opens prefilled with a suggestion derived from the
     /// working directory, so the common case is Enter-through; the user edits
     /// or clears it freely.
     pub(crate) fn prepare_spawn(&mut self, config: SessionConfig, worktrees: Vec<WorktreeInfo>) {
-        let mut modal = modals::SessionNameModal::default();
-        let backend = self.spawn_backend_name(config.backend.as_deref());
-        modal
-            .name
-            .set(&self.suggested_session_name(config.cwd.as_deref(), &backend));
-        self.prefill_workspace_dir_field(&mut modal);
         self.new_session.spawn_config = Some(config);
         self.new_session.spawn_worktrees = worktrees;
+        self.new_session.sandbox_step_shown = false;
+        // The sandbox step comes first because it is the one that can be
+        // answered from the directories alone; skipped entirely when no profile
+        // exists, so a user who never opens the profile list never sees it.
+        let dirs = self.pending_spawn_dirs();
+        if self.open_sandbox_picker(&dirs) {
+            return;
+        }
+        self.new_session.sandbox_profile = None;
+        self.open_pending_session_name_modal();
+    }
+
+    /// [`pending_spawn_dirs`](Self::pending_spawn_dirs), reachable from the
+    /// key-handler cluster when Esc re-opens the sandbox step.
+    pub(super) fn pending_spawn_dirs_for_back(&self) -> Vec<PathBuf> {
+        self.pending_spawn_dirs()
+    }
+
+    /// Every directory the pending spawn will span — the launch cwd plus the
+    /// extra member dirs a multi-repo session gathers. What the sandbox step
+    /// checks a profile's paths against.
+    fn pending_spawn_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self
+            .new_session
+            .spawn_config
+            .as_ref()
+            .and_then(|c| c.cwd.clone())
+            .into_iter()
+            .collect();
+        dirs.extend(self.new_session.additional_dirs.iter().cloned());
+        dirs
+    }
+
+    /// Open the name modal for the spawn already parked on the wizard state.
+    /// Shared by [`prepare_spawn`](Self::prepare_spawn) and the sandbox step,
+    /// which is the step before it.
+    pub(crate) fn open_pending_session_name_modal(&mut self) {
+        let (cwd, backend_type) = self
+            .new_session
+            .spawn_config
+            .as_ref()
+            .map(|c| (c.cwd.clone(), c.backend.clone()))
+            .unwrap_or_default();
+        // Scoped to the backend the spawn will land on: a tmux window namespace
+        // belongs to its server, so a local `tb-foo` is no reason to suggest
+        // `foo-2` for a session being created on a remote host.
+        let backend = self.spawn_backend_name(backend_type.as_deref());
+        let mut modal = modals::SessionNameModal::default();
+        modal
+            .name
+            .set(&self.suggested_session_name(cwd.as_deref(), &backend));
+        self.prefill_workspace_dir_field(&mut modal);
         self.modal = modals::Modal::SessionName(modal);
     }
 
@@ -2186,6 +2279,17 @@ impl App {
         // Rebuild the process cwd: the primary repo for a single-repo session,
         // or the (idempotently rebuilt) symlink workspace for a multi-repo one.
         let cwd = self.session_process_cwd(&session.info);
+        // Re-read the profile rather than caching it on the session: a restart
+        // is when an edited profile takes effect, and a *deleted* one must fail
+        // loudly instead of relaunching the agent on the host.
+        let sandbox_profile = session.info.sandbox_profile.clone();
+        let sandbox = match self.load_session_sandbox(sandbox_profile.as_deref()) {
+            Ok(profile) => profile,
+            Err(message) => {
+                self.set_status(StatusLevel::Error, &message);
+                return;
+            }
+        };
 
         let mut config = SessionConfig {
             resume_session_id: None,
@@ -2194,10 +2298,15 @@ impl App {
             cwd,
             agent,
             fork_session_id: None,
-            backend: crate::session::is_remote_backend(&backend_type).then_some(backend_type),
+            // Preserved for every off-host backend, and a **place** counts:
+            // env injection below skips the local-path dir variables for one,
+            // and a forwarded `FRIRING_DATA_DIR` would point the in-place
+            // `friring-cli` at the host's database (ADR-29).
+            backend: crate::session::is_offhost_backend(&backend_type).then_some(backend_type),
             // Only reaches the args when the restart falls back to a fresh
             // conversation (new_session_args); a resume never renames.
             session_name: Some(session_name),
+            sandbox,
             ..SessionConfig::default()
         };
         // `Session::restart` replaces the session env wholesale, so re-inject the
@@ -2237,10 +2346,31 @@ impl App {
         let session_id = session.info.id;
         match session.restart(&config, rows, cols) {
             Ok(()) => {
+                // A restart re-derives the boundary, so it is also where one
+                // that could not be applied last time comes back — and where
+                // one that used to hold stops holding.
+                let sandbox_notice = crate::app::sandbox::sandbox_launch_notice(&session.info);
                 // The measured tree belonged to the pane just replaced — on a
                 // load it was the ghost's `—`. Back to unknown until the next
                 // scan prices the new pane.
                 session.info.memory = None;
+                // An edited profile builds a new container, so a relaunch can
+                // move the session into a different place: the registry has to
+                // learn the one it is in *now*, or restore would later reach for
+                // the container it left.
+                let place = crate::session::is_sandbox_backend(session.backend_name()).then(|| {
+                    (
+                        Arc::clone(session.backend_arc()),
+                        session.place_instance().cloned(),
+                    )
+                });
+                if let Some((backend, instance)) = place {
+                    self.adopt_place_backend(backend, instance.as_ref());
+                }
+                // A relaunch mints a fresh proxy from a re-read profile, so the
+                // answers given about the previous boundary — a refusal above
+                // all — are not the user's standing position on this one.
+                self.forget_egress_prompts(&session_id.to_string());
                 // Re-spawned fresh: clear stale hook-driven status so it doesn't
                 // linger as Blocked/Working/Done until the agent re-reports (a
                 // resumed agent may not re-fire its boot hook). Mirrors the
@@ -2256,7 +2386,10 @@ impl App {
                 // so force the status cache to reload and pick up the cleared row.
                 self.invalidate_hook_state_cache();
                 self.save_state();
-                self.set_status(StatusLevel::Info, success_msg.to_string());
+                match sandbox_notice {
+                    Some((level, message)) => self.set_status(level, message),
+                    None => self.set_status(StatusLevel::Info, success_msg.to_string()),
+                }
             }
             Err(e) => {
                 error!("Failed to restart session: {e}");
@@ -2314,6 +2447,13 @@ impl App {
             self.set_error(format!("Failed to unload '{name}': {e:#}"));
             return;
         }
+        // The agent is gone, so its boundary's way out goes with it: a listener,
+        // a bearer token and a unix socket outliving the process they were
+        // minted for are a tunnel nothing is using and anything local could.
+        // A reload re-establishes one from the profile as it reads then. The
+        // scratch directory is deliberately left alone — the next launch adopts
+        // it — so this is not the full `sandboxing::cleanup_by_session_id`.
+        crate::sandbox::egress::stop(&id.to_string());
         if let Err(e) = self.db.set_session_unloaded(id, true) {
             error!("Failed to flag session '{name}' unloaded: {e}");
         }
@@ -2502,6 +2642,10 @@ impl App {
         let worktrees = session.info.worktrees.clone();
         let source_name = session.info.name.clone();
         let fork_session_id = session.info.agent_session_id.clone();
+        // A fork continues the parent's conversation, so it inherits the
+        // parent's boundary; `build_spawn_inputs` reloads the profile by name,
+        // and a deleted one fails the spawn instead of landing on the host.
+        let sandbox_profile = session.info.sandbox_profile.clone();
 
         let config = SessionConfig {
             resume_session_id: None,
@@ -2517,6 +2661,7 @@ impl App {
         self.new_session.spawn_worktrees = worktrees;
         self.new_session.fork = true;
         self.new_session.parent_session_id = Some(session.info.id);
+        self.new_session.sandbox_profile = sandbox_profile;
 
         // Deduped like any other prefill: forking the same session twice
         // otherwise proposes `<name>-fork` both times, and accepting it builds
@@ -2698,9 +2843,18 @@ impl App {
         removed_session.kill();
 
         if let Some(shared) = shared {
+            // Read here, on the thread that holds the database: the teardown
+            // itself touches no SQLite, and these ids are what find a
+            // place-backed session's container after its profile was renamed.
+            let recorded =
+                crate::session_ops::delete::recorded_places(&self.db, &shared.backend_type);
             tokio::task::spawn_blocking(move || {
                 let mut report = crate::session_ops::delete::ForceDeleteReport::default();
-                crate::session_ops::delete::teardown_runtime_resources(&shared, &mut report);
+                crate::session_ops::delete::teardown_runtime_resources(
+                    &shared,
+                    &recorded,
+                    &mut report,
+                );
             });
         }
 
@@ -2930,6 +3084,16 @@ impl App {
             return;
         };
 
+        // An undelete must come back inside the session's boundary; a profile
+        // deleted meanwhile fails the restore instead of landing on the host.
+        let sandbox = match self.load_session_sandbox(deleted.sandbox_profile.as_deref()) {
+            Ok(profile) => profile,
+            Err(message) => {
+                self.set_error(message);
+                return;
+            }
+        };
+
         // Reuse the existing SessionId + inject identity/dir env so the restored
         // session's status hooks can attribute their `session signal` (otherwise
         // it renders Idle forever).
@@ -2940,6 +3104,7 @@ impl App {
             deleted.name.clone(),
             cwd,
             &deleted.backend_type,
+            sandbox,
         );
         config.resume_session_id = deleted.agent_session_id;
 
@@ -2956,19 +3121,30 @@ impl App {
             &provider,
         ) {
             Ok(mut session) => {
+                self.learn_launched_place(&session);
                 session.info.id = deleted.id;
                 session.info.worktrees = worktree_infos;
                 session.info.parent_session_id = deleted.parent_session_id;
                 // `DeletedSessionInfo` doesn't carry display_order: a restored
                 // session simply re-appends at the end of its repo group.
                 resolve_repo_display_names(&mut session.info);
+                let sandbox_notice = crate::app::sandbox::sandbox_launch_notice(&session.info);
+                // The restore reuses the deleted session's id, which is also the
+                // proxy's key: start its egress history clean rather than
+                // inheriting what the previous incarnation was asked.
+                self.forget_egress_prompts(&deleted.id.to_string());
                 self.sessions.push(session);
                 self.set_active_index(self.sessions.len() - 1);
                 self.focus = InputFocus::Terminal;
 
                 self.save_state();
 
-                if was_force_deleted {
+                // An undelete is meant to come back *inside* the session's
+                // boundary; one that could not says so instead of reporting a
+                // clean restore.
+                if let Some((level, message)) = sandbox_notice {
+                    self.set_status(level, message);
+                } else if was_force_deleted {
                     // Recovery is lossy: note it, and flag any worktree whose
                     // branch was gone (so couldn't be reattached).
                     let mut msg =
@@ -3010,6 +3186,18 @@ impl App {
         session.info.worktrees = shared.worktrees.iter().cloned().map(Into::into).collect();
         session.info.parent_session_id = shared.parent_session_id;
         session.info.display_order = shared.display_order;
+        // Adopting reattaches to a pane whose wrapper is already running, so
+        // there is no launch to re-derive `sandbox_state` from — but the
+        // persisted profile must come across, or the next full-row write-back
+        // would clear the column and the session would relaunch unsandboxed.
+        session.info.sandbox_profile = shared.sandbox_profile.clone();
+        // Merged, not assigned: `Unrecorded` on the row cannot tell "the
+        // boundary held" from "nobody looked", so an absent verdict must leave
+        // this instance's own launch composition alone. A recorded warning
+        // always wins — another instance saw a launch this one did not.
+        if let Some(state) = shared.sandbox_enforcement.launch_state() {
+            session.info.sandbox_state = Some(state);
+        }
         resolve_repo_display_names(&mut session.info);
     }
 
@@ -3511,6 +3699,11 @@ impl App {
             modals::Modal::AutomationEditor(a) => {
                 if let Some(&field) = a.visible_fields().get(index) {
                     a.field = field;
+                }
+            }
+            modals::Modal::SandboxEditor(s) => {
+                if let Some(&field) = s.visible_fields().get(index) {
+                    s.field = field;
                 }
             }
             _ => {}
@@ -4622,10 +4815,65 @@ impl App {
         if let Some(b) = self.backends.get(backend_type) {
             return Some(b.clone());
         }
-        if crate::session::is_remote_backend(backend_type) {
+        if crate::session::is_offhost_backend(backend_type) {
+            // A `sandbox:<profile>` this instance has not opened a place for
+            // yet is skipped exactly like an unconfigured host: falling back to
+            // the local backend would adopt a pane that lives inside a
+            // container onto the host's tmux. [`Self::open_place_backend`] is
+            // what puts one in the registry, and it runs off the UI thread.
             return None;
         }
         Some(self.backends.default_backend().clone())
+    }
+
+    /// Ensure the place a `sandbox:<profile>` backend names and answer with its
+    /// transport, without touching `self` — this runs on a restore worker,
+    /// because ensuring a place starts a container engine command and a cold one
+    /// can take seconds.
+    ///
+    /// The caller registers the result ([`Self::adopt_place_backend`]); until
+    /// then [`Self::resolve_persisted_backend`] answers `None` for it and the
+    /// session keeps its placeholder.
+    fn open_place_backend(
+        profile: crate::session::SandboxProfile,
+    ) -> Result<(Arc<dyn SessionBackend>, crate::sandbox::SandboxInstance), String> {
+        crate::agent::sandboxing::open_place(&profile)
+    }
+
+    /// Register the transport for a place a launch or a restore opened, and
+    /// record the instance so garbage collection can find the container.
+    ///
+    /// Registering by the backend's own name (`sandbox:<profile>`) is what makes
+    /// every later lookup — restore, adoption, teardown, the session list —
+    /// resolve, and re-registering replaces the transport when an edited profile
+    /// built a new container. The container *id* is added rather than replaced:
+    /// the sessions already running in the superseded container still need it
+    /// protected from the reclaiming pass.
+    fn adopt_place_backend(
+        &mut self,
+        backend: Arc<dyn SessionBackend>,
+        instance: Option<&crate::sandbox::SandboxInstance>,
+    ) {
+        if !crate::session::is_sandbox_backend(backend.name()) {
+            return;
+        }
+        if let Some(instance) = instance {
+            self.place_containers
+                .entry(backend.name().to_string())
+                .or_default()
+                .insert(instance.external_id.clone());
+            crate::session_ops::record_sandbox_instance(&self.db, instance);
+        }
+        self.backends.register(backend);
+    }
+
+    /// The place half of finishing a launch: a place-backed session spawns
+    /// through a transport it built itself, so this is where the registry and
+    /// the instance table learn about it.
+    fn learn_launched_place(&mut self, session: &Session) {
+        let backend = Arc::clone(session.backend_arc());
+        let instance = session.place_instance().cloned();
+        self.adopt_place_backend(backend, instance.as_ref());
     }
 
     /// Resolve the backend a session should spawn on, ensuring it is ready —
@@ -4653,6 +4901,17 @@ impl App {
                 .backends
                 .get(name)
                 .cloned()
+                // A place this instance has not opened yet is not an unknown
+                // backend: the launch is about to ensure it and spawn through
+                // the transport it hands back
+                // ([`crate::agent::backend::Session::spawn`]), so what is
+                // resolved here is only what a launch that turns out *not* to
+                // be place-backed would fall back to. Refusing would make a
+                // first spawn after a restart impossible.
+                .or_else(|| {
+                    crate::session::is_sandbox_backend(name)
+                        .then(|| self.backends.default_backend().clone())
+                })
                 .ok_or_else(|| format!("Unknown backend '{name}'")),
             _ => Ok(self.backends.default_backend().clone()),
         }
@@ -4695,6 +4954,20 @@ impl App {
         // task spawns track the task↔session link in-memory (`task_session_links`),
         // so only the headless `task run` path auto-tags messages with it.
         crate::session_ops::inject_friring_env(&mut config, &agent_session_id, None);
+
+        // The wizard's sandbox step (`None` = skipped, or it never ran). Loaded
+        // here rather than carried as a profile so a spawn always applies what
+        // storage holds *now* — the editor may have been open in between.
+        if config.sandbox.is_none() {
+            let chosen = self.new_session.sandbox_profile.take();
+            match self.load_session_sandbox(chosen.as_deref()) {
+                Ok(profile) => config.sandbox = profile,
+                Err(message) => {
+                    self.set_error(message);
+                    return None;
+                }
+            }
+        }
 
         // For a multi-repo session, launch the agent in a symlink workspace that
         // gathers every member dir; `info.cwd` keeps the primary repo (restored
@@ -4768,12 +5041,21 @@ impl App {
             resolve_repo_display_names(&mut session.info);
         }
         let session_id = session.info.id;
+        // Composed before the session moves into the list, raised after
+        // `status_message = None` — a launch that landed outside its boundary
+        // is what the status bar must be left showing.
+        let sandbox_notice = crate::app::sandbox::sandbox_launch_notice(&session.info);
+        self.learn_launched_place(&session);
         self.sessions.push(session);
         self.set_active_index(self.sessions.len() - 1);
         self.focus = InputFocus::Terminal;
         self.status_message = None;
 
         self.save_state();
+
+        if let Some((level, message)) = sandbox_notice {
+            self.set_status(level, message);
+        }
 
         // Persist the worktree's fork point (write-once, like the hook columns)
         // so the code-review view can scope its diff to `<base>..HEAD`. Runs
@@ -5887,6 +6169,14 @@ impl App {
         // Send deferred inputs whose delay has elapsed
         self.drain_deferred_inputs();
 
+        // Surface what the egress firewall refused, and ask about a host a
+        // profile wants to be asked about.
+        self.tick_sandbox_egress();
+
+        // Reclaim superseded and orphaned places on their own slow cadence.
+        self.tick_sandbox_gc();
+        self.poll_sandbox_gc();
+
         self.tick_expire_timers();
 
         self.poll_external_changes();
@@ -6254,17 +6544,22 @@ impl App {
     /// Recompute each session's status/activity/notification for this tick.
     ///
     /// Status is **hooks-driven**: agents report `working`/`blocked`/`done` via
-    /// `friring-cli session signal` (local sessions) or a tmux pane user option
-    /// pushed over the control-mode subscription (remote sessions — drained
-    /// below into the same hook columns), persisted in `sessions` and read here
-    /// in one batch (see [`derive_session_status`]). A `done` session stays
-    /// `Done` until the user moves focus *off* it (acknowledged → `Idle`). The
-    /// OSC terminal title is still captured for the live activity line, but no
-    /// longer drives status.
+    /// `friring-cli session signal` (local sessions), a tmux pane user option
+    /// pushed over the control-mode subscription (remote sessions), or a status
+    /// file under the data directory (sandboxed sessions, whose agents are kept
+    /// out of the database by ADR-29) — the last two drained below into the same
+    /// hook columns, persisted in `sessions` and read here in one batch (see
+    /// [`derive_session_status`]). A `done` session stays `Done` until the user
+    /// moves focus *off* it (acknowledged → `Idle`). The OSC terminal title is
+    /// still captured for the live activity line, but no longer drives status.
     fn refresh_session_statuses(&mut self) {
         // Before the data_version gate, so a persisted remote event reloads the
-        // cache in this same tick.
+        // cache in this same tick. The sandbox file channel is drained on the
+        // same terms: a boundary keeps its agent out of the database, so a
+        // status word in a file is the only report a sandboxed session makes
+        // (see [`Self::drain_sandbox_status_signals`] and ADR-29).
         self.drain_remote_hook_events();
+        self.drain_sandbox_status_signals();
         self.metrics.bump(|p| &mut p.status_refreshes);
         let active_index = self.active_index;
         // Reload the persisted hook columns only when the DB actually changed —
@@ -7386,16 +7681,24 @@ impl App {
         name: String,
         cwd: Option<PathBuf>,
         backend_type: &str,
+        sandbox: Option<crate::session::SandboxProfile>,
     ) -> SessionConfig {
         let mut config = SessionConfig {
             agent_session_id: agent_session_id.clone(),
             session_id: Some(id),
             cwd,
             agent,
-            // Preserve a persisted off-local (`ssh:<host>` / `wsl:<distro>`)
-            // backend — set *before* env injection, which skips the local-path
-            // dir vars for remote sessions. Local stays `None`.
-            backend: crate::session::is_remote_backend(backend_type)
+            // A relaunch rebuilds the same boundary: without this the restored
+            // agent would come back on the host, outside the profile the
+            // session was created under.
+            sandbox,
+            // Preserve a persisted off-host (`ssh:<host>` / `wsl:<distro>` /
+            // `sandbox:<profile>`) backend — set *before* env injection, which
+            // skips the local-path dir vars for one. A place skips them for a
+            // stronger reason than a host: a forwarded `FRIRING_DATA_DIR` would
+            // name the one thing the boundary exists to keep out (ADR-29).
+            // Local stays `None`.
+            backend: crate::session::is_offhost_backend(backend_type)
                 .then(|| backend_type.to_string()),
             // Only reaches the args when the relaunch starts a fresh
             // conversation (new_session_args); a resume never renames.
@@ -7431,6 +7734,16 @@ impl App {
             .map(|wt| wt.worktree_path.clone())
             .or(shared_session.cwd.clone());
 
+        // A dangling profile fails the restore loudly rather than relaunching
+        // the agent on the host (mirrors the restart path).
+        let sandbox = match self.load_session_sandbox(shared_session.sandbox_profile.as_deref()) {
+            Ok(profile) => profile,
+            Err(message) => {
+                self.set_error(message);
+                return;
+            }
+        };
+
         // Build the relaunch config reusing the existing SessionId and injecting
         // identity/dir env, so the agent's status hooks can attribute their
         // `session signal` (otherwise the row stays Idle). The injector runs
@@ -7442,6 +7755,7 @@ impl App {
             shared_session.name.clone(),
             cwd,
             &shared_session.backend_type,
+            sandbox,
         );
         let def = self.agent_def_for(&config.agent);
         config.resume_session_id =
@@ -7456,18 +7770,26 @@ impl App {
             backend,
             &provider,
         ) {
+            self.learn_launched_place(&spawned);
             spawned.info.id = shared_session.id;
             spawned.info.worktrees = worktree_infos;
             spawned.info.additional_dirs = shared_session.additional_dirs.clone();
             spawned.info.workspace_dir = shared_session.workspace_dir.clone();
             spawned.info.parent_session_id = shared_session.parent_session_id;
             spawned.info.display_order = shared_session.display_order;
+            let sandbox_notice = crate::app::sandbox::sandbox_launch_notice(&spawned.info);
             self.sessions.push(spawned);
             self.save_state();
             tracing::debug!(
                 "Spawned restored session {} with --resume",
                 shared_session.name
             );
+            // Relaunching a session friring found in the database is still a
+            // launch: if its boundary could not be applied, that is not
+            // something to leave in the log.
+            if let Some((level, message)) = sandbox_notice {
+                self.set_status(level, message);
+            }
         }
     }
 
@@ -7495,6 +7817,10 @@ impl App {
         self.finalize_pending_delete();
         self.save_state();
         self.persist_shutdown_frames();
+        // Every egress proxy dies with this process anyway; stopping them first
+        // unlinks their sockets, so a sandbox that outlives friring under tmux
+        // finds nothing to connect to rather than a path with no listener.
+        crate::sandbox::egress::shutdown_all();
         // Do NOT remove worktrees — they persist for resume.
         // Detach from backend sessions without killing them — they persist in tmux.
         // `take` rather than consuming `self.sessions`: that would partially move
@@ -7566,7 +7892,10 @@ impl App {
             if session.is_placeholder() {
                 continue;
             }
-            let frame = if crate::session::is_remote_backend(session.backend_name()) {
+            // A place counts as off-host here for the same reason a host does:
+            // the capture would be an `<engine> exec` round trip on the way out,
+            // and a container that is already going down would hang the exit.
+            let frame = if crate::session::is_offhost_backend(session.backend_name()) {
                 session.serialize_visible_frame()
             } else {
                 session.capture_unload_frame()
@@ -7686,6 +8015,14 @@ impl App {
                 .map(Into::into)
                 .collect(),
             shell_backend_id: session.info.shell_backend_id.clone(),
+            sandbox_profile: session.info.sandbox_profile.clone(),
+            // What the last launch actually *applied*. Deriving it here rather
+            // than at each launch site is what makes every path — spawn,
+            // restart, restore, reload-from-ghost — persist its verdict through
+            // the one `save_state()` they all already go through.
+            sandbox_enforcement: crate::session::SandboxEnforcement::from_launch(
+                session.info.sandbox_state.as_ref(),
+            ),
             parent_session_id: session.info.parent_session_id,
             display_order: session.info.display_order,
             tombstone: false,
@@ -7741,9 +8078,12 @@ impl App {
             .filter(|s| s.agent_session_id.is_some())
             .collect();
 
+        // A sandbox **place** restores exactly like a remote host: its tmux is
+        // reached through a transport, and opening the place (a container
+        // engine command on a cold one) must not block the first frame.
         let (remote, local): (Vec<_>, Vec<_>) = resumable
             .into_iter()
-            .partition(|s| crate::session::is_remote_backend(&s.backend_type));
+            .partition(|s| crate::session::is_offhost_backend(&s.backend_type));
 
         // Sessions to ghost instead of respawn: everything explicitly unloaded,
         // plus — with lazy restore on — every session whose pane is gone. Read
@@ -7843,12 +8183,13 @@ impl App {
             for shared in &sessions {
                 self.insert_remote_placeholder(shared);
             }
-            // A backend we can resolve gets a discovery thread + retry tracking.
-            // An unknown host (no config) keeps its placeholder but can't be
-            // adopted, so it isn't queued for retries.
-            if let Some(backend) = self.resolve_persisted_backend(&backend_type) {
+            // A backend we can reach gets a discovery thread + retry tracking.
+            // An unknown host (no config) or a place whose profile is gone keeps
+            // its placeholder but can't be adopted, so it isn't queued for
+            // retries.
+            if let Some(target) = self.discovery_target(&backend_type) {
                 Self::spawn_remote_discovery(
-                    backend,
+                    target,
                     backend_type.clone(),
                     perf_log,
                     restore.tx.clone(),
@@ -7862,28 +8203,80 @@ impl App {
         }
     }
 
-    /// Ready + discover one remote backend on its own thread, reporting the
+    /// Ready + discover one off-host backend on its own thread, reporting the
     /// result over `tx` (a dropped receiver — app shut down — is fine).
+    ///
+    /// For a place this is also where the place is *opened*: ensuring a
+    /// container is a subprocess and, on a cold one, seconds — the same reason
+    /// an SSH connect is not done on the UI thread.
     fn spawn_remote_discovery(
-        backend: Arc<dyn SessionBackend>,
+        target: DiscoveryTarget,
         backend_type: String,
         perf_log: bool,
         tx: mpsc::Sender<RemoteDiscovery>,
     ) {
         std::thread::spawn(move || {
             let start = std::time::Instant::now();
-            let (reachable, discovered) = Self::ready_and_discover(&backend);
+            let (backend, opened) = match target {
+                DiscoveryTarget::Ready(backend) => (Some(backend), None),
+                DiscoveryTarget::Place(profile) => match Self::open_place_backend(profile) {
+                    Ok((backend, instance)) => {
+                        (Some(Arc::clone(&backend)), Some((backend, instance)))
+                    }
+                    Err(e) => {
+                        // Not fatal and not silent: the sessions in this place
+                        // keep their placeholders, and the retry sweep tries
+                        // again — a place is exactly as recoverable as a host
+                        // that came back.
+                        tracing::warn!(backend = %backend_type, "Could not open sandbox place: {e}");
+                        (None, None)
+                    }
+                },
+            };
+            let (reachable, windows) = match &backend {
+                Some(backend) => Self::ready_and_discover(backend),
+                None => (false, Vec::new()),
+            };
             if perf_log {
                 tracing::info!(
                     backend = %backend_type,
                     reachable,
-                    windows = discovered.len() as u64,
+                    windows = windows.len() as u64,
                     discover_ms = start.elapsed().as_millis() as u64,
                     "restore_discover"
                 );
             }
-            let _ = tx.send((backend_type, reachable, discovered));
+            let _ = tx.send(RemoteDiscovery {
+                backend_type,
+                reachable,
+                windows,
+                opened,
+            });
         });
+    }
+
+    /// How to reach `backend_type` for a restore, or `None` when this instance
+    /// cannot manage it at all.
+    ///
+    /// A **place** is always re-opened rather than taken from the registry, and
+    /// that is the recovery path: a container stopped by a host reboot or an
+    /// engine restart is started again here, which is what makes a place-backed
+    /// session come back the way a returning SSH host's does. Ensuring is
+    /// idempotent, so a place that is already up costs one `inspect`.
+    fn discovery_target(&self, backend_type: &str) -> Option<DiscoveryTarget> {
+        if let Some(name) = crate::session::sandbox_backend_profile(backend_type) {
+            return match self.load_session_sandbox(Some(name)) {
+                Ok(Some(profile)) => Some(DiscoveryTarget::Place(profile)),
+                // A profile that was deleted, or will not decode, has no place
+                // to open — the same refusal a launch gets, and for the same
+                // reason: friring will not guess at a boundary nobody wrote.
+                _ => None,
+            };
+        }
+        self.backends
+            .get(backend_type)
+            .cloned()
+            .map(DiscoveryTarget::Ready)
     }
 
     /// Rebuild the `(info, backend, provider)` triple for a persisted session
@@ -7919,6 +8312,11 @@ impl App {
         info.parent_session_id = shared.parent_session_id;
         info.display_order = shared.display_order;
         info.remote_host = host_label_from_backend_type(&shared.backend_type);
+        info.sandbox_profile = shared.sandbox_profile.clone();
+        // A ghost or a placeholder has no launch of its own, so the row's
+        // recorded warning is the only verdict there is. Only the negative half
+        // is stored, so this can surface `⚠` but never invent `⛨`.
+        info.sandbox_state = shared.sandbox_enforcement.launch_state();
         resolve_repo_display_names(&mut info);
         (info, backend, provider)
     }
@@ -7929,7 +8327,15 @@ impl App {
     fn build_placeholder_session(&self, shared: &sync::SharedSession) -> Session {
         let (info, backend, provider) = self.persisted_session_parts(shared);
         let (rows, cols) = self.content_area_size();
-        Session::placeholder(info, rows, cols, &backend, &provider, HashMap::new())
+        Session::placeholder(
+            info,
+            rows,
+            cols,
+            &backend,
+            &shared.backend_type,
+            &provider,
+            HashMap::new(),
+        )
     }
 
     /// Build (but don't insert) a **ghost** [`Session`] for a persisted row:
@@ -7981,22 +8387,31 @@ impl App {
             .filter(|(_, s)| {
                 !s.is_placeholder()
                     && s.has_exited()
-                    && crate::session::is_remote_backend(s.backend_name())
+                    && crate::session::is_offhost_backend(s.backend_name())
             })
             .map(|(i, _)| i)
             .collect();
         if lost.is_empty() {
             return;
         }
+        let mut lost_labels: Vec<String> = Vec::new();
         for i in lost {
             // Capture the persisted shape before swapping in the placeholder, so
             // the reconnect keeps the real `backend_id` / worktrees / identity.
             let shared = self.session_to_shared(&self.sessions[i]);
+            if let Some(label) = offhost_label(&shared.backend_type) {
+                if !lost_labels.contains(&label) {
+                    lost_labels.push(label);
+                }
+            }
             // Replace in place (same index) so the active selection is undisturbed.
             self.sessions[i] = self.build_placeholder_session(&shared);
             self.enqueue_remote_reconnect(shared);
         }
-        self.set_error("Remote host connection lost — reconnecting…");
+        // Named, because the two shapes lose sessions differently: a host takes
+        // the sessions it was running, a place takes every session of its
+        // profile at once. One message per thing that went, not one per pane.
+        self.set_error(format!("{} lost — reconnecting…", lost_labels.join(", ")));
         self.request_redraw();
     }
 
@@ -8051,8 +8466,8 @@ impl App {
 
         // Each reported backend's discovery thread has finished.
         if let Some(state) = &mut self.remote_restore {
-            for (backend_type, _, _) in &ready {
-                state.inflight.remove(backend_type);
+            for discovery in &ready {
+                state.inflight.remove(&discovery.backend_type);
             }
         }
 
@@ -8094,12 +8509,12 @@ impl App {
             None => return,
         };
         for backend_type in to_retry {
-            if let Some(backend) = self.resolve_persisted_backend(&backend_type) {
+            if let Some(target) = self.discovery_target(&backend_type) {
                 let (tx, perf_log) = match &self.remote_restore {
                     Some(s) => (s.tx.clone(), s.perf_log),
                     None => return,
                 };
-                Self::spawn_remote_discovery(backend, backend_type.clone(), perf_log, tx);
+                Self::spawn_remote_discovery(target, backend_type.clone(), perf_log, tx);
                 if let Some(s) = self.remote_restore.as_mut() {
                     s.inflight.insert(backend_type);
                 }
@@ -8139,15 +8554,28 @@ impl App {
             .unwrap_or_default()
             .into_iter()
             .collect();
-        for (backend_type, reachable, discovered) in ready {
+        for RemoteDiscovery {
+            backend_type,
+            reachable,
+            windows: discovered,
+            opened,
+        } in ready
+        {
+            // Registered before anything resolves a backend from it: the
+            // adoption below looks the transport up by `backend_type`, and a
+            // place that has just been opened is only in the registry because
+            // of this.
+            if let Some((backend, instance)) = opened {
+                self.adopt_place_backend(backend, Some(&instance));
+            }
             if !reachable {
                 let first_time = self
                     .remote_restore
                     .as_mut()
                     .is_some_and(|s| s.notified_unreachable.insert(backend_type.clone()));
                 if first_time {
-                    if let Some(h) = host_label_from_backend_type(&backend_type) {
-                        unreachable_hosts.push(h);
+                    if let Some(label) = offhost_label(&backend_type) {
+                        unreachable_hosts.push(label);
                     }
                 }
                 continue;
@@ -8247,8 +8675,8 @@ impl App {
             }
         }
 
-        for host in &unreachable_hosts {
-            self.set_error(format!("Remote host '{host}' unavailable"));
+        for label in &unreachable_hosts {
+            self.set_error(format!("{label} unavailable"));
         }
         if restored > 0 {
             self.save_state();
@@ -8556,6 +8984,13 @@ impl App {
         session.info.worktrees = worktrees;
         session.info.parent_session_id = shared.parent_session_id;
         session.info.display_order = shared.display_order;
+        // Without this the adopted session has no profile, and the full-row
+        // write-back that follows clears the column — the next restart would
+        // relaunch the agent on the host. The recorded verdict comes with it:
+        // friring did not make this launch, so the row is the only evidence of
+        // whether the boundary it is adopting ever held.
+        session.info.sandbox_profile = shared.sandbox_profile.clone();
+        session.info.sandbox_state = shared.sandbox_enforcement.launch_state();
         resolve_repo_display_names(&mut session.info);
 
         // Re-adopt shell pane if one was persisted
@@ -8621,11 +9056,23 @@ impl App {
         // restarts: `do_spawn_session` upserts in place (no soft-delete + new-row
         // churn), and `FRIRING_SESSION` is re-injected with the same id. Any
         // cached id / queued message addressed to this session stays valid.
-        // Preserving a remote `backend` keeps the respawn on its own host —
-        // without it `do_spawn_session` would silently relaunch the session on
-        // the local tmux, pointed at worktree paths that only exist remotely.
-        let backend = crate::session::is_remote_backend(&shared.backend_type)
+        // Preserving an off-host `backend` keeps the respawn where the session
+        // lives — without it `do_spawn_session` would silently relaunch on the
+        // local tmux, pointed at worktree paths that only exist remotely, and
+        // would forward the local-path environment variables into a place
+        // (ADR-29).
+        let backend = crate::session::is_offhost_backend(&shared.backend_type)
             .then(|| shared.backend_type.clone());
+        // After a reboot every sandboxed session comes back through here, so
+        // the profile has to be re-applied or the agent silently resumes on the
+        // host. A profile deleted meanwhile fails loudly, as at restart.
+        let sandbox = match self.load_session_sandbox(shared.sandbox_profile.as_deref()) {
+            Ok(profile) => profile,
+            Err(message) => {
+                self.set_error(message);
+                return;
+            }
+        };
         let mut config = SessionConfig {
             session_id: Some(shared.id),
             resume_session_id: None,
@@ -8634,6 +9081,7 @@ impl App {
             agent,
             fork_session_id: None,
             backend,
+            sandbox,
             ..SessionConfig::default()
         };
         let def = self.agent_def_for(&config.agent);
@@ -9045,12 +9493,26 @@ fn resolve_repo_display_names(info: &mut SessionInfo) {
 
 /// The bare host name behind a remote `backend_type` (`ssh:<name>` /
 /// `wsl:<name>`), used to label a placeholder/unreachable session. `None` for a
-/// local backend.
+/// local backend — and for a sandbox place, which is not a *host*: it runs on
+/// this machine and mounts its paths, so the remote mark would say something
+/// untrue. [`offhost_label`] is what names one in a message.
 fn host_label_from_backend_type(backend_type: &str) -> Option<String> {
     backend_type
         .strip_prefix(crate::session::SSH_BACKEND_PREFIX)
         .or_else(|| backend_type.strip_prefix(crate::session::WSL_BACKEND_PREFIX))
         .map(str::to_string)
+}
+
+/// How a message names the thing an off-host `backend_type` could not reach.
+///
+/// The two shapes are worth telling apart in front of the user: a host is
+/// somewhere else and comes back on its own, a place is here and friring is the
+/// one that starts it. `None` for a local backend, which is never unreachable.
+fn offhost_label(backend_type: &str) -> Option<String> {
+    if let Some(profile) = crate::session::sandbox_backend_profile(backend_type) {
+        return Some(format!("Sandbox place '{profile}'"));
+    }
+    host_label_from_backend_type(backend_type).map(|host| format!("Remote host '{host}'"))
 }
 
 /// The `(display_name, directory)` pairs a session spans, in display order:
@@ -9564,7 +10026,7 @@ mod tests {
         }
     }
 
-    fn app_with_sessions(count: usize) -> App {
+    pub(crate) fn app_with_sessions(count: usize) -> App {
         let backend_arc = stub_backend_arc();
         let provider = stub_provider();
         let mut app = App::new(
@@ -9616,6 +10078,7 @@ mod tests {
             "restored".into(),
             None,
             "local-tmux",
+            None,
         );
         assert_eq!(config.session_id, Some(id));
         assert_eq!(config.backend, None, "local backend stays None");
@@ -9649,32 +10112,48 @@ mod tests {
             "restored".into(),
             None,
             "local-tmux",
+            None,
         );
         assert_eq!(config.env.get("FRIRING_SESSION"), Some(&id.to_string()));
     }
 
     #[test]
-    fn restored_session_config_remote_backend_carries_and_skips_local_dirs() {
+    fn restored_session_config_offhost_backend_carries_and_skips_local_dirs() {
         // A restored off-local session must set `backend` *before* env injection
         // so the local-path dir vars are skipped (they don't exist on the host)
         // — and so the relaunch provider adapts the def's args for the host.
+        // A place is the same shape with a sharper reason: a forwarded
+        // `FRIRING_DATA_DIR` would name what the boundary exists to keep out
+        // (ADR-29), and the profile must survive the rebuild or the agent comes
+        // back on the host.
         let tmp = tempfile::tempdir().unwrap();
         let _guard = crate::paths::TestPathGuard::new(tmp.path());
-        let id = crate::session::SessionId::default();
-        let config = App::restored_session_config(
-            id,
-            Some("agent-conv-uuid".into()),
-            "claude".into(),
-            "restored".into(),
-            None,
-            "ssh:devbox",
-        );
-        assert_eq!(config.backend.as_deref(), Some("ssh:devbox"));
-        assert!(config.env.contains_key("FRIRING_SESSION"));
-        assert!(!config
-            .env
-            .contains_key(crate::paths::CONFIG_DIR_OVERRIDE_ENV));
-        assert!(!config.env.contains_key(crate::paths::DATA_DIR_OVERRIDE_ENV));
+        for backend_type in ["ssh:devbox", "sandbox:dev"] {
+            let id = crate::session::SessionId::default();
+            let config = App::restored_session_config(
+                id,
+                Some("agent-conv-uuid".into()),
+                "claude".into(),
+                "restored".into(),
+                None,
+                backend_type,
+                Some(crate::session::SandboxProfile::new(
+                    "dev",
+                    vec![crate::session::SandboxPath::workspace("~/dev/app")],
+                )),
+            );
+            assert_eq!(config.backend.as_deref(), Some(backend_type));
+            assert_eq!(
+                config.sandbox.as_ref().map(|p| p.name.as_str()),
+                Some("dev"),
+                "{backend_type} must relaunch under the profile it was created with"
+            );
+            assert!(config.env.contains_key("FRIRING_SESSION"));
+            assert!(!config
+                .env
+                .contains_key(crate::paths::CONFIG_DIR_OVERRIDE_ENV));
+            assert!(!config.env.contains_key(crate::paths::DATA_DIR_OVERRIDE_ENV));
+        }
     }
 
     #[test]
@@ -10119,6 +10598,7 @@ mod tests {
             24,
             80,
             &backend_arc,
+            "ssh:devbox",
             &provider,
             HashMap::new(),
         ));
@@ -10154,8 +10634,15 @@ mod tests {
         let mut info = crate::session::SessionInfo::new("remote".into());
         info.agent = "claude".into();
         info.remote_host = Some("devbox".into());
-        let placeholder =
-            Session::placeholder(info, 24, 80, &backend_arc, &provider, HashMap::new());
+        let placeholder = Session::placeholder(
+            info,
+            24,
+            80,
+            &backend_arc,
+            "ssh:devbox",
+            &provider,
+            HashMap::new(),
+        );
         app.sessions.insert(0, placeholder);
         app.sessions[1].info.agent = "claude".into();
         app.sessions[1].info.remote_host = Some("devbox".into());
@@ -10185,6 +10672,66 @@ mod tests {
         }
         // Unknown remote backend → skipped (None), never misadopted on local.
         assert!(app.resolve_persisted_backend("ssh:nope").is_none());
+        // …and so is a place this instance has not opened: adopting a pane that
+        // lives inside a container onto the host's tmux would corrupt its
+        // `backend_type` and could collide with an unrelated local `%N`.
+        assert!(app.resolve_persisted_backend("sandbox:dev").is_none());
+    }
+
+    /// ADR-29 in the relaunch config: a place-backed session must keep its
+    /// `sandbox:<profile>` backend through a restart and a restore, because that
+    /// is what makes `inject_friring_env` skip the variables pointing at the
+    /// host's data directory.
+    #[test]
+    fn a_relaunch_keeps_the_backend_that_decides_what_env_travels() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        for backend_type in ["sandbox:dev", "ssh:devbox", "wsl:Ubuntu"] {
+            let mut config = SessionConfig {
+                session_id: Some(SessionId::default()),
+                backend: crate::session::is_offhost_backend(backend_type)
+                    .then(|| backend_type.to_string()),
+                ..SessionConfig::default()
+            };
+            crate::session_ops::inject_friring_env(&mut config, "conv", None);
+            assert!(
+                !config.env.contains_key(crate::paths::DATA_DIR_OVERRIDE_ENV),
+                "{backend_type} was handed the host's data directory"
+            );
+        }
+    }
+
+    /// A place and a host both go down, and a message has to say which: a host
+    /// takes the sessions it was running, a place takes every session of its
+    /// profile at once (ADR-26). A place is deliberately *not* given the remote
+    /// mark — it runs on this machine and mounts its paths.
+    #[test]
+    fn an_offhost_backend_is_labelled_by_its_shape() {
+        assert_eq!(
+            offhost_label("sandbox:dev").as_deref(),
+            Some("Sandbox place 'dev'")
+        );
+        assert_eq!(
+            offhost_label("ssh:devbox").as_deref(),
+            Some("Remote host 'devbox'")
+        );
+        assert_eq!(offhost_label("local-tmux"), None);
+        assert_eq!(host_label_from_backend_type("sandbox:dev"), None);
+    }
+
+    /// Restore partitions on where the multiplexer is, not on whether the
+    /// machine is somebody else's: a place-backed session must take the
+    /// background path, because opening its container is a subprocess that
+    /// cannot run before the first frame.
+    #[test]
+    fn a_place_backed_session_restores_through_the_background_path() {
+        for backend_type in ["sandbox:dev", "ssh:devbox", "wsl:Ubuntu"] {
+            assert!(
+                crate::session::is_offhost_backend(backend_type),
+                "{backend_type} must not restore synchronously"
+            );
+        }
+        assert!(!crate::session::is_offhost_backend("local-tmux"));
     }
 
     #[test]
@@ -12810,6 +13357,7 @@ mod tests {
             deleted_at: 0,
             force_deleted: false,
             worktrees: Vec::new(),
+            sandbox_profile: None,
         };
         app.restore_deleted_session(deleted);
 
@@ -15172,6 +15720,73 @@ mod tests {
         let mut adopted = Session::stub("worker", &backend_arc, &provider);
         App::apply_shared_session_metadata(&mut adopted, &shared);
         assert_eq!(adopted.info.parent_session_id, Some(parent_id));
+    }
+
+    /// A round trip through the shared row is what an adopt does, and the
+    /// full-row write-back that follows it would clear the column if the copy
+    /// dropped the profile — silently relaunching that agent on the host.
+    #[test]
+    fn session_to_shared_round_trips_the_sandbox_profile() {
+        let backend_arc = stub_backend_arc();
+        let provider = stub_provider();
+        let mut app = App::new(
+            24,
+            120,
+            BackendRegistry::new(backend_arc.clone()),
+            stub_agents(),
+            test_db(),
+        );
+
+        let mut session = Session::stub("boxed", &backend_arc, &provider);
+        session.info.sandbox_profile = Some("dev".into());
+        let shared = app.session_to_shared(&session);
+        assert_eq!(shared.sandbox_profile.as_deref(), Some("dev"));
+
+        let mut adopted = Session::stub("boxed", &backend_arc, &provider);
+        App::apply_shared_session_metadata(&mut adopted, &shared);
+        assert_eq!(adopted.info.sandbox_profile.as_deref(), Some("dev"));
+
+        // The startup-adoption path copies the same metadata.
+        let fresh = Session::stub("boxed", &backend_arc, &provider);
+        app.finish_adopted_session(
+            fresh,
+            &shared,
+            "claude".to_string(),
+            Vec::new(),
+            &[],
+            &mut unclaimed(),
+        );
+        assert_eq!(app.sessions[0].info.sandbox_profile.as_deref(), Some("dev"));
+    }
+
+    /// After a reboot every persisted session comes back through
+    /// `respawn_stale_session`. A profile deleted in the meantime must stop the
+    /// respawn, not relaunch the agent on the host without its boundary.
+    #[test]
+    fn respawn_of_a_session_naming_a_deleted_profile_is_refused() {
+        let backend_arc = stub_backend_arc();
+        let mut app = App::new(
+            24,
+            120,
+            BackendRegistry::new(backend_arc.clone()),
+            stub_agents(),
+            test_db(),
+        );
+
+        let mut shared = make_shared_session("friring:@0", "boxed");
+        shared.sandbox_profile = Some("gone".into());
+        app.respawn_stale_session(
+            "boxed".to_string(),
+            shared,
+            "claude".to_string(),
+            "agent-123".to_string(),
+            Vec::new(),
+        );
+
+        assert!(app.sessions.is_empty(), "no unsandboxed session may spawn");
+        let msg = app.status_message.as_ref().expect("an error is surfaced");
+        assert_eq!(msg.level, StatusLevel::Error);
+        assert!(msg.text.contains("gone"), "{}", msg.text);
     }
 
     #[test]
@@ -17654,6 +18269,8 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
+            sandbox_enforcement: Default::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -19203,6 +19820,19 @@ mod tests {
         }
         assert!(!app.new_session.import);
         assert!(app.new_session.spawn_config.is_none());
+    }
+
+    #[test]
+    fn fork_inherits_the_parent_sandbox_profile() {
+        // The fork skips the wizard's sandbox step, so the parent's profile is
+        // the only thing that can put the child back inside a boundary.
+        let mut app = app_with_sessions(1);
+        app.sessions[0].info.sandbox_profile = Some("dev".into());
+
+        app.fork_active_session();
+
+        assert!(app.new_session.fork);
+        assert_eq!(app.new_session.sandbox_profile.as_deref(), Some("dev"));
     }
 
     #[test]

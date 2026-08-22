@@ -82,15 +82,19 @@ what it may reference):
 
 ```text
 session  ← pure data types, no crate-internal references
-agent    ← session (+ paths/shell utils; NEVER ui, git, app)
+agent    ← session + sandbox (+ paths/shell utils; NEVER ui, git, app)
+sandbox  ← session + proxy + paths + shell (NEVER ui, git, app)
+proxy    ← leaf: no crate-internal references
 ui       ← session + app model/view state (+ fuzzy/paths; NEVER agent or git)
 app      ← coordinator, imports all modules
 ```
 
 `ui → app` is the TEA `view(model)` coupling (ui renders app-owned state, never
-triggers side effects); `session_ops` and `cli` may reach `crate::agent::…` via
-fully-qualified paths only (never `use`). Module responsibilities, the event
-loop, and every ADR are in **`docs/ARCHITECTURE.md`**.
+triggers side effects); `session_ops` may reach `crate::agent::…` via
+fully-qualified paths only (never `use`), and `cli` may reach both
+`crate::agent::…` and `crate::sandbox::…` the same way. Module
+responsibilities, the event loop, and every ADR are in
+**`docs/ARCHITECTURE.md`**.
 
 Key facts:
 
@@ -139,6 +143,7 @@ Detail is read on demand — jump to the doc for what you're touching:
 | Any config file (agents / hosts / settings / themes / keybindings), env var, or DB setting | `docs/CONFIG.md` |
 | A user-facing feature — sessions, code review, automations, tasks, global search, notifications, status, remote/WSL, extensions, keybindings | `docs/FEATURES.md` |
 | Render-loop performance, perf counters, redraw throttling | `docs/PERFORMANCE.md` |
+| Sandboxed agents — profiles, backends (seatbelt/bwrap/docker/…), egress proxy, credentials | `docs/SANDBOX.md` |
 | The headless CLI (`friring-cli`) | `docs/CLI.md` |
 | Real-agent e2e tests, the model stub, scenario-driven demos | `docs/E2E.md` |
 | Cutting a release, versioning, installers, packaging | `docs/RELEASING.md` |

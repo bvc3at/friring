@@ -38,6 +38,8 @@ pub enum Action {
     DeleteSession,
     OpenInEditor,
     OpenAutomations,
+    /// Open the sandbox-profile list (`docs/SANDBOX.md`).
+    OpenSandboxProfiles,
     StartSync,
     ToggleShell,
     /// Toggle the native code-review view for the active session.
@@ -194,6 +196,7 @@ impl Action {
             Action::DeleteSession,
             Action::OpenInEditor,
             Action::OpenAutomations,
+            Action::OpenSandboxProfiles,
             Action::StartSync,
             Action::ToggleShell,
             Action::ToggleReview,
@@ -279,6 +282,7 @@ impl Action {
             Action::DeleteSession => "Delete session",
             Action::OpenInEditor => "Open in editor",
             Action::OpenAutomations => "Automations",
+            Action::OpenSandboxProfiles => "Sandbox profiles",
             Action::StartSync => "Sync worktrees",
             Action::ToggleShell => "Toggle shell view",
             Action::ToggleReview => "Toggle code review",
@@ -539,6 +543,9 @@ impl Action {
             // deleted sessions to bring back, `U` puts the current one to sleep.
             UnloadSession => KeyChord::normalized(KeyModifiers::SHIFT, KeyCode::Char('u')),
             OpenAutomations => KeyChord::plain('p'),
+            // `S` for **S**andbox. No lowercase twin to widen from — `s` is
+            // StartSync — so it stands on the mnemonic, like `G` for ghosts.
+            OpenSandboxProfiles => KeyChord::normalized(KeyModifiers::SHIFT, KeyCode::Char('S')),
             FocusTasks => KeyChord::plain('w'),
             // ── Project ─────────────────────────────────────────────────
             OpenInEditor => KeyChord::plain('o'),
@@ -603,6 +610,12 @@ impl Action {
             Action::DeleteSession => vec![KeyChord::ctrl('d')],
             Action::OpenInEditor => vec![KeyChord::ctrl('o')],
             Action::OpenAutomations => vec![KeyChord::ctrl('p')],
+            // Alt+S (mnemonic: **S**andbox), mirroring `<leader> S`. Every bare
+            // `Ctrl+<letter>` is bound or reserved, `F1`–`F10` and `F12` are
+            // spent, and `F11` belongs to the OS/terminal (Mission Control,
+            // fullscreen) — so this joins the Alt tier with `Alt+U`/`Alt+A`/
+            // `Alt+G`. `Ctrl+S` stays worktree sync. Fully rebindable.
+            Action::OpenSandboxProfiles => vec![KeyChord::alt(KeyCode::Char('s'))],
             Action::StartSync => vec![KeyChord::ctrl('s')],
             // Ctrl+T primary, F8 alternate (the only panel toggle that lacked
             // one; F1–F7 are taken). Stays a shell toggle in the terminal — see
@@ -894,7 +907,10 @@ pub fn help_sections() -> Vec<(&'static str, Vec<Action>)> {
                 OpenRestoreSessions,
             ],
         ),
-        ("Project", vec![OpenInEditor, StartSync]),
+        (
+            "Project",
+            vec![OpenInEditor, StartSync, OpenSandboxProfiles],
+        ),
         (
             "UI",
             vec![
@@ -1042,6 +1058,7 @@ pub fn prefix_sections() -> Vec<(&'static str, Vec<PrefixEntry>)> {
             vec![
                 A(OpenInEditor),
                 A(StartSync),
+                A(OpenSandboxProfiles),
                 A(ToggleReview),
                 A(ToggleCcActivity),
             ],
@@ -2015,6 +2032,7 @@ mod tests {
                 Action::DeleteSession => 0,
                 Action::OpenInEditor => 0,
                 Action::OpenAutomations => 0,
+                Action::OpenSandboxProfiles => 0,
                 Action::StartSync => 0,
                 Action::ToggleShell => 0,
                 Action::ToggleCcActivity => 0,
@@ -2092,7 +2110,7 @@ mod tests {
         }
         // The listed variants must equal Action::all().len(). If you add
         // a variant, update both `Action::all()` and the match above.
-        const EXPECTED: usize = 79;
+        const EXPECTED: usize = 80;
         assert_eq!(Action::all().len(), EXPECTED);
         for a in Action::all() {
             classify(*a);

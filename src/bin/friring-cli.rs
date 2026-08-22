@@ -14,6 +14,20 @@ fn main() {
 
     let cli = friring::cli::Cli::parse();
 
+    // Dispatched here, before anything opens the database: `sandbox relay` runs
+    // *inside* a sandbox, where ADR-29 keeps the database out on purpose.
+    // Opening one from in there would either create a stray database inside the
+    // boundary or fail and leave the sandbox with no egress at all. Every other
+    // `sandbox` subcommand is host-side management and answers `None`, so it
+    // takes the ordinary path below with the database open.
+    if let Some(result) = friring::cli::sandbox::run_before_database(&cli.command) {
+        if let Err(e) = result {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Publish settings before Database::open (audit pruning reads retention).
     // Warnings go to the WARN-level stderr logger; `config validate` is the
     // loud path.

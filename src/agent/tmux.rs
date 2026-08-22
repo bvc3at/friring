@@ -11,10 +11,10 @@ use tracing::{debug, warn};
 
 use crate::agent::backend::{AdoptedSession, DiscoveredSession, SessionBackend, SpawnedSession};
 use crate::agent::control_mode::{
-    self, shell_escape, CommandResponse, ControlModeReader, ControlModeWriter, Notification,
-    PaneSendersMapShared, PANE_CHANNEL_CAPACITY,
+    self, redact_secrets, shell_escape, CommandResponse, ControlModeReader, ControlModeWriter,
+    Notification, PaneSendersMapShared, PANE_CHANNEL_CAPACITY,
 };
-use crate::agent::transport::{TmuxTransport, DEFAULT_MUX};
+use crate::agent::transport::{Place, TmuxTransport, DEFAULT_MUX};
 
 /// Dedicated tmux socket name — isolates friring sessions from the user's tmux.
 /// Dev builds use "friring-dev" to avoid interfering with an installed release binary.
@@ -553,12 +553,14 @@ impl ControlMode {
             stdin.flush()?;
         }
 
+        // Lazy `with_context`: the redaction (and the whole message) is built
+        // only when the command actually stalls, not on every command sent.
         let response = rx
             .recv_timeout(COMMAND_TIMEOUT)
-            .context(format!("Timeout waiting for response to: {cmd}"))?;
+            .with_context(|| timeout_context(cmd))?;
 
         if response.is_error {
-            bail!("tmux command failed: {cmd}: {}", response.lines.join("\n"));
+            bail!("{}", command_failed(cmd, &response.lines.join("\n")));
         }
 
         Ok(response.lines.join("\n"))
@@ -620,6 +622,41 @@ impl Drop for ControlMode {
             }
         }
     }
+}
+
+/// The two ways a control-mode command reports itself when it goes wrong: a
+/// stall and a `%error` reply. Both quote the command, and for a sandboxed
+/// launch the command carries the egress boundary's bearer token, so both go
+/// through [`redact_secrets`] on their way to the log file and the error toast.
+///
+/// They are separate named functions rather than inline `format!`s so the
+/// redaction cannot be forgotten by a third failure path added later, and so
+/// the guarantee is testable without a live tmux server.
+fn timeout_context(cmd: &str) -> String {
+    format!("Timeout waiting for response to: {}", redact_secrets(cmd))
+}
+
+/// See [`timeout_context`]. tmux's own reply is redacted too: an error is free
+/// to quote the argument it objected to, which for a rejected `-e` is the
+/// credential itself.
+fn command_failed(cmd: &str, response: &str) -> String {
+    format!(
+        "tmux command failed: {}: {}",
+        redact_secrets(cmd),
+        redact_secrets(response)
+    )
+}
+
+/// The third report that quotes something friring did not write: the
+/// launcher's own words when `tmux -V` fails
+/// ([`check_available`](SessionBackend::check_available)).
+///
+/// Redacted like the other two. What a launcher prints back is not friring's to
+/// predict — `ssh` and a container engine both quote the command they were
+/// given, and the diagnostic is just as useful with a value withheld as
+/// without.
+fn version_probe_failed(stderr: &str) -> String {
+    format!("tmux -V failed: {}", redact_secrets(stderr.trim()))
 }
 
 /// Check if an error is caused by a broken pipe (control mode stdin closed).
@@ -701,6 +738,36 @@ impl TmuxBackend {
         Self::with_transport(transport, socket, session, host.backend_name())
     }
 
+    /// Build a tmux backend that reaches the multiplexer **inside a sandbox
+    /// place** — `<engine> exec -i <container> tmux …` (ADR-26). Named
+    /// `sandbox:<profile>`, which is what a place-backed session persists in
+    /// `backend_type`, exactly as `ssh:<host>` does for a remote one.
+    ///
+    /// Everything downstream of the launcher is the SSH path's: one
+    /// [`TmuxBackend`], one [`SessionBackend`] implementation, one control-mode
+    /// connection. Discovery, adoption, `remain-on-exit`, scrollback capture and
+    /// the `tb-`/`tbs-` window names are not re-implemented here and must not be
+    /// — a place differs from a remote host only in its launch prefix.
+    ///
+    /// Socket and group session are the compile-time flavour
+    /// (`friring`/`friring-dev`), never the [`SOCKET_OVERRIDE_ENV`] /
+    /// [`SESSION_OVERRIDE_ENV`] overrides: those name a server on *this*
+    /// machine, and a dev binary attached to the release server locally must not
+    /// rename the server inside the place. Same rule as
+    /// [`from_host`](Self::from_host).
+    ///
+    /// Every path the window command carries — the launch cwd, a worktree — is a
+    /// **host** path, and reaches the place mounted at exactly that path; see
+    /// "Identical absolute paths" in `docs/SANDBOX.md`.
+    pub fn for_place(place: &Place) -> Self {
+        Self::with_transport(
+            TmuxTransport::sandbox(place.clone()),
+            TMUX_SOCKET,
+            TMUX_SESSION,
+            place.backend_name(),
+        )
+    }
+
     /// Run a tmux command and return its stdout (used before control mode is available).
     fn tmux_output(&self, args: &[&str]) -> Result<String> {
         let output = self.run_tmux(args)?;
@@ -725,7 +792,16 @@ impl TmuxBackend {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("tmux {} failed: {}", args.join(" "), stderr.trim());
+            // Redacted for the same reason the control-mode failures are: this
+            // reports an argv, and an argv is where a `-e` value would be. No
+            // caller passes one today, which is exactly why the guarantee
+            // belongs here rather than in each caller's head — the shapes that
+            // *are* passed come through untouched (see the tests).
+            bail!(
+                "tmux {} failed: {}",
+                redact_secrets(&args.join(" ")),
+                redact_secrets(stderr.trim())
+            );
         }
 
         Ok(output)
@@ -852,7 +928,7 @@ impl TmuxBackend {
     /// The login-shell `PATH` fix for remote agents (e.g. `claude` under
     /// `~/.local/bin`) is applied at the *window command* instead — see
     /// [`build_shell_command`](Self::build_shell_command) /
-    /// [`login_wrap_for_remote`](Self::login_wrap_for_remote).
+    /// [`login_shell_wrap`](Self::login_shell_wrap).
     #[cfg(not(windows))]
     fn config_shell(&self) -> String {
         if self.transport.is_remote() {
@@ -885,15 +961,18 @@ impl TmuxBackend {
     /// window command exits 1, and the pane dies instantly — the remote session
     /// appears to "not launch". `exec` replaces the wrapper so no extra process
     /// lingers. Local backends already inherit the user's interactive `PATH`, so
-    /// they pass through unchanged — and so does a **psmux** remote (a Windows
-    /// SSH host), which has no `/bin/sh` to wrap with (psmux windows are built by
-    /// [`psmux_window_command`] instead).
+    /// they pass through unchanged — and so do a **psmux** remote (a Windows SSH
+    /// host), which has no `/bin/sh` to wrap with (psmux windows are built by
+    /// [`psmux_window_command`] instead), and a **sandbox place**, whose `PATH`
+    /// comes from its image rather than from a login profile. Which of the three
+    /// applies is [`TmuxTransport::needs_login_shell`]'s answer, not this
+    /// function's.
     ///
     /// Done here — not via tmux `default-command` — because that value round-trips
     /// through the remote transport's per-arg shell-quoting, where a `-l` flag's
     /// space would be re-split into a stray `set-option` argument.
-    fn login_wrap_for_remote(&self, shell_cmd: &str) -> String {
-        if self.transport.is_remote() && !self.transport.uses_psmux() {
+    fn login_shell_wrap(&self, shell_cmd: &str) -> String {
+        if self.transport.needs_login_shell() {
             let inner = control_mode::shell_escape(&format!("exec {shell_cmd}"));
             format!("/bin/sh -lc {inner}")
         } else {
@@ -907,7 +986,8 @@ impl TmuxBackend {
     ///
     /// [`default_shell`](Self::default_shell) returns `/bin/sh` for a remote
     /// Unix host (guaranteed to exist), and the generic
-    /// [`login_wrap_for_remote`] would run it as `/bin/sh -lc 'exec /bin/sh'` —
+    /// [`login_shell_wrap`](Self::login_shell_wrap) would run it as
+    /// `/bin/sh -lc 'exec /bin/sh'` —
     /// a login-sourced but then bare POSIX shell. That drops everything a real
     /// SSH login loads from the account's shell: its rc files (`~/.bashrc` /
     /// `~/.zshrc`), prompt, aliases, functions, and `PATH` additions. SSH runs
@@ -989,6 +1069,70 @@ impl TmuxBackend {
         env: &HashMap<String, String>,
     ) -> String {
         format!("\"{}\"", Self::psmux_window_powershell(command, args, env))
+    }
+
+    /// The control-mode `new-window` line that launches an agent.
+    ///
+    /// Split out of [`spawn`](SessionBackend::spawn) because this is the one
+    /// command friring sends that carries an environment, and therefore the one
+    /// that can carry a credential (a sandboxed launch's proxy URL). Building it
+    /// separately lets a test assert what the line contains *and* what its
+    /// failure reports do not — see [`timeout_context`] / [`command_failed`].
+    fn new_window_command(
+        &self,
+        window_name: &str,
+        command: &str,
+        args: &[String],
+        cwd: Option<&Path>,
+        env: &HashMap<String, String>,
+    ) -> String {
+        // psmux can't take the command as joined trailing tokens nor env via
+        // `-e` (see `psmux_window_command`); everything is folded into one
+        // token there. tmux keeps the byte-identical multi-token + `-e` path.
+        let psmux = self.transport.uses_psmux();
+        // A remote/WSL companion shell pane (`tbs-` window) opens the user's own
+        // interactive login shell — the SSH-login environment — instead of the
+        // bare `/bin/sh` the generic login-wrap would produce (see
+        // `remote_shell_pane_command`). Agent windows (`tb-`) and psmux hosts
+        // keep the standard path, and so does a sandbox place: there is no
+        // account profile in a container, and `-l` there would trade the image's
+        // `PATH` for `/etc/profile`'s (see `TmuxTransport::needs_login_shell`).
+        let is_remote_shell_pane =
+            self.transport.needs_login_shell() && window_name.starts_with(SHELL_WINDOW_PREFIX);
+        let shell_cmd = if psmux {
+            Self::psmux_window_command(command, args, env)
+        } else if is_remote_shell_pane {
+            self.remote_shell_pane_command()
+        } else {
+            self.login_shell_wrap(&Self::build_shell_command(command, args))
+        };
+
+        // psmux's tokenizer can't read POSIX `'\''` escapes (see
+        // `psmux_quote`), so its `-c`/`-n` values get the double-quote framing
+        // it does parse; tmux keeps the byte-identical single-quote path.
+        let quote_arg = |s: &str| {
+            if psmux {
+                control_mode::psmux_quote(s)
+            } else {
+                control_mode::shell_escape(s)
+            }
+        };
+        let cwd_part = match cwd {
+            Some(dir) => format!(" -c {}", quote_arg(&dir.to_string_lossy())),
+            None => String::new(),
+        };
+        let env_part: String = if psmux {
+            String::new()
+        } else {
+            env.iter()
+                .map(|(k, v)| format!(" -e {}", shell_escape(&format!("{k}={v}"))))
+                .collect()
+        };
+        let escaped_window_name = quote_arg(window_name);
+        let session = &self.session;
+        format!(
+            "new-window -t {session} -n {escaped_window_name} -P -F '#{{pane_id}}'{cwd_part}{env_part} {shell_cmd}"
+        )
     }
 
     /// Run a closure with a reference to the active control mode, or bail if
@@ -1190,9 +1334,16 @@ impl SessionBackend for TmuxBackend {
         &self.name
     }
 
+    fn place_container(&self) -> Option<&str> {
+        self.transport.place().map(Place::container)
+    }
+
     fn check_available(&self) -> Result<()> {
-        // `tmux -L <socket> -V` prints the version without connecting, and over
-        // the SSH transport this verifies remote connectivity at the same time.
+        // `tmux -L <socket> -V` prints the version without connecting. Over the
+        // SSH transport this verifies remote connectivity at the same time, and
+        // over the sandbox transport it verifies that the place is running and
+        // that its image actually ships tmux — both in one command that changes
+        // nothing.
         let output = self
             .transport
             .tmux_command(&self.socket, &["-V"])
@@ -1203,7 +1354,7 @@ impl SessionBackend for TmuxBackend {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("tmux -V failed: {}", stderr.trim());
+            bail!("{}", version_probe_failed(&stderr));
         }
 
         let version_str = String::from_utf8_lossy(&output.stdout);
@@ -1242,51 +1393,7 @@ impl SessionBackend for TmuxBackend {
         rows: u16,
         cols: u16,
     ) -> Result<SpawnedSession> {
-        // psmux can't take the command as joined trailing tokens nor env via
-        // `-e` (see `psmux_window_command`); everything is folded into one
-        // token there. tmux keeps the byte-identical multi-token + `-e` path.
-        let psmux = self.transport.uses_psmux();
-        // A remote/WSL companion shell pane (`tbs-` window) opens the user's own
-        // interactive login shell — the SSH-login environment — instead of the
-        // bare `/bin/sh` the generic login-wrap would produce (see
-        // `remote_shell_pane_command`). Agent windows (`tb-`) and psmux hosts
-        // keep the standard path.
-        let is_remote_shell_pane =
-            self.transport.is_remote() && !psmux && window_name.starts_with(SHELL_WINDOW_PREFIX);
-        let shell_cmd = if psmux {
-            Self::psmux_window_command(command, args, env)
-        } else if is_remote_shell_pane {
-            self.remote_shell_pane_command()
-        } else {
-            self.login_wrap_for_remote(&Self::build_shell_command(command, args))
-        };
-
-        // psmux's tokenizer can't read POSIX `'\''` escapes (see
-        // `psmux_quote`), so its `-c`/`-n` values get the double-quote framing
-        // it does parse; tmux keeps the byte-identical single-quote path.
-        let quote_arg = |s: &str| {
-            if psmux {
-                control_mode::psmux_quote(s)
-            } else {
-                control_mode::shell_escape(s)
-            }
-        };
-        let cwd_part = match cwd {
-            Some(dir) => format!(" -c {}", quote_arg(&dir.to_string_lossy())),
-            None => String::new(),
-        };
-        let env_part: String = if psmux {
-            String::new()
-        } else {
-            env.iter()
-                .map(|(k, v)| format!(" -e {}", shell_escape(&format!("{k}={v}"))))
-                .collect()
-        };
-        let escaped_window_name = quote_arg(window_name);
-        let session = &self.session;
-        let cmd = format!(
-            "new-window -t {session} -n {escaped_window_name} -P -F '#{{pane_id}}'{cwd_part}{env_part} {shell_cmd}"
-        );
+        let cmd = self.new_window_command(window_name, command, args, cwd, env);
         let result = self.ctrl_command(&cmd)?;
         let pane_id = result.trim().to_string();
         if !control_mode::is_valid_pane_id(&pane_id) {
@@ -1513,16 +1620,19 @@ impl SessionBackend for TmuxBackend {
     /// The shell-pane command must match the **host's** OS, not the local
     /// binary's — the trait default reads the local `$SHELL`/`%COMSPEC%`,
     /// which shipped e.g. `/bin/zsh` to a remote Windows pane
-    /// ("CommandNotFoundException"). Remote hosts get a shell that exists
+    /// ("CommandNotFoundException"). Off-local backends get a shell that exists
     /// there by construction: `powershell` on a psmux (Windows) host — the
     /// same interpreter psmux wraps every window command in — and `/bin/sh`
-    /// on a Unix/WSL host (the local `$SHELL` may not be installed there).
-    /// Local backends keep the trait default's behavior.
+    /// on a Unix/WSL host or in a sandbox place (the local `$SHELL` may not be
+    /// installed there, and in a place it certainly is not). Local backends keep
+    /// the trait default's behavior.
     ///
     /// This is only the *bootstrap* for a remote Unix pane: `spawn` upgrades
     /// it to the user's own interactive login shell via
     /// `remote_shell_pane_command` so the pane matches an `ssh <host>` login
-    /// (rc files, prompt, aliases, `PATH`).
+    /// (rc files, prompt, aliases, `PATH`). A place keeps the plain shell: it
+    /// inherits the image's environment, which is the one that names the
+    /// toolchain (see [`TmuxTransport::needs_login_shell`]).
     fn default_shell(&self) -> String {
         if !self.transport.is_remote() {
             #[cfg(windows)]
@@ -1595,6 +1705,24 @@ impl MuxTarget {
         }
     }
 
+    /// The server **inside a sandbox place**, reached the same way
+    /// [`TmuxBackend::for_place`] reaches it.
+    ///
+    /// A `run-shell` script scheduled through this target is executed by the
+    /// tmux server in the place, so `mux` is that server's binary (`tmux`) and
+    /// the script is the POSIX one — a place runs Linux, whatever friring runs
+    /// on.
+    pub fn for_place(place: &Place) -> Self {
+        let backend = TmuxBackend::for_place(place);
+        let mux = backend.transport.mux().to_string();
+        Self {
+            transport: backend.transport,
+            socket: backend.socket,
+            session: backend.session,
+            mux,
+        }
+    }
+
     /// Resolve a `hosts.toml` host name; `None` or empty = [`local`](Self::local).
     /// Errors when the name isn't configured, so a remote automation fails
     /// loudly instead of silently firing at the local server.
@@ -1624,8 +1752,18 @@ impl MuxTarget {
     ///
     /// A backend naming a host that is no longer in `hosts.toml` is an error,
     /// not a fallback to local — delivering someone's prompt to the wrong
-    /// machine is worse than a failed run.
+    /// machine is worse than a failed run. A `sandbox:<profile>` backend is an
+    /// error for the same reason and needs [`for_place`](Self::for_place): its
+    /// window lives in a container, which is found through the profile's running
+    /// instance rather than through this name.
     pub fn for_backend(backend_type: &str) -> Result<Self> {
+        if let Some(profile) = crate::session::sandbox_backend_profile(backend_type) {
+            bail!(
+                "Session backend '{backend_type}' runs its tmux inside a sandbox place; reaching \
+                 it needs the running instance of profile '{profile}', which this path does not \
+                 resolve."
+            );
+        }
         if !crate::session::is_remote_backend(backend_type) {
             return Ok(Self::local());
         }
@@ -2332,11 +2470,15 @@ pub fn spawn_window(
         .context("Failed to run tmux new-window for headless spawn")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // This path reports the window and tmux's own words, never the argv —
+        // but tmux is free to quote the argument it objected to, and on this
+        // path that includes every `-e` value. Redact for the same reason the
+        // control-mode failures do.
         bail!(
             "tmux new-window exited {} for window {}: {}",
             output.status,
             window_name,
-            stderr.trim()
+            redact_secrets(stderr.trim())
         );
     }
     Ok(())
@@ -2357,10 +2499,59 @@ pub fn spawn_window_remote(
     cwd: Option<&Path>,
     env: &HashMap<String, String>,
 ) -> Result<String> {
-    let backend = TmuxBackend::from_host(host);
+    spawn_window_over(
+        &TmuxBackend::from_host(host),
+        session_name,
+        command,
+        args,
+        cwd,
+        env,
+    )
+}
+
+/// Headless spawn of an agent window **inside a sandbox place**.
+///
+/// The place twin of [`spawn_window_remote`], and deliberately built on the same
+/// control-mode path rather than on [`spawn_window`]'s one-shot `tmux -e KEY=…`
+/// argv: a place-backed launch carries the egress proxy's bearer token in its
+/// environment, and a control-mode `new-window` puts that in a command sent over
+/// the connection instead of in a process table anyone on the host can read.
+///
+/// Returns the pane id (`%N`) of the window *inside* the place, which is what
+/// `backend_id` persists and what the TUI adopts later.
+pub fn spawn_window_place(
+    place: &Place,
+    session_name: &str,
+    command: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    env: &HashMap<String, String>,
+) -> Result<String> {
+    spawn_window_over(
+        &TmuxBackend::for_place(place),
+        session_name,
+        command,
+        args,
+        cwd,
+        env,
+    )
+}
+
+/// The shared body of [`spawn_window_remote`] and [`spawn_window_place`]: reach
+/// the multiplexer wherever it is, then spawn the agent window through control
+/// mode. The connection is dropped when this returns; the tmux over there keeps
+/// the window alive for the TUI to adopt.
+fn spawn_window_over(
+    backend: &TmuxBackend,
+    session_name: &str,
+    command: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    env: &HashMap<String, String>,
+) -> Result<String> {
     backend
         .check_available()
-        .context("remote host is unreachable or tmux is missing")?;
+        .with_context(|| format!("backend '{}' is unreachable or has no tmux", backend.name()))?;
     backend.ensure_ready()?;
     let window_name = agent_window_name(session_name);
     // Headless: no live terminal, so use a sane default geometry. The TUI
@@ -2378,6 +2569,54 @@ pub fn kill_pane_remote(host: &crate::session::HostDef, backend_id: &str) -> Res
     let backend = TmuxBackend::from_host(host);
     backend.ensure_ready()?;
     backend.kill(backend_id)
+}
+
+/// Kill a pane **inside a sandbox place** by its pane id (`%N`), best-effort.
+///
+/// The place twin of [`kill_pane_remote`], for the same failure: a window that
+/// was spawned but could not be tracked would otherwise stay alive in a place
+/// that outlives the launch.
+///
+/// Only ever for a place this launch itself just created a window in. A pane id
+/// is per tmux server and therefore per *container*, and a profile can have
+/// several live containers at once, so a teardown that knows only the profile
+/// must use [`kill_window_on`] instead — see
+/// [`crate::agent::sandboxing::running_places`].
+pub fn kill_pane_place(place: &Place, backend_id: &str) -> Result<()> {
+    let backend = TmuxBackend::for_place(place);
+    backend.ensure_ready()?;
+    backend.kill(backend_id)
+}
+
+/// Kill the window `tb-<session_name>` on `target`'s server, answering whether
+/// there was one to kill.
+///
+/// The name is friring's own and unique to the session, so this is the
+/// addressing to use wherever the *server* is a guess: a place-backed session's
+/// profile may have several live containers, and the pane id friring recorded
+/// names an entirely different session's pane in each of the others. Missing the
+/// right one then costs a leaked window instead of a stranger's agent.
+pub fn kill_window_on(target: &MuxTarget, session_name: &str) -> Result<bool> {
+    let window = target.window_target(session_name);
+    let output = target
+        .command(&["kill-window", "-t", &window])
+        .output()
+        .with_context(|| format!("Failed to run tmux kill-window on {}", target.mux))?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Not this server's window — the outcome every caller wanted, and for a
+    // place the ordinary answer from the containers the session is not in.
+    if stderr.contains("can't find window") || stderr.contains("window not found") {
+        return Ok(false);
+    }
+    bail!(
+        "tmux kill-window exited {} for {window} on {}: {}",
+        output.status,
+        target.mux,
+        stderr.trim()
+    );
 }
 
 /// Kill the tmux window `tb-<session_name>` if it exists.
@@ -2937,6 +3176,311 @@ mod tests {
         assert_eq!(cmd, "'/opt/My Agents/codex' --foo");
     }
 
+    // --- credential redaction in failure reports ---
+    //
+    // A sandboxed launch hands the agent the egress boundary's proxy URL, whose
+    // userinfo is a live bearer token. It travels in the `new-window` line, and
+    // both failure paths of a control-mode command quote that line — into the
+    // log file and into an error toast. Neither may carry the credential.
+
+    /// A fabricated proxy grant, shaped exactly like the one
+    /// `sandbox::egress` mints (`http://friring:<token>@127.0.0.1:<port>`) but
+    /// authorising nothing. Nothing here touches a real credential.
+    fn sandboxed_launch_env() -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "HTTP_PROXY".to_string(),
+                "http://friring:fake-token-abc@127.0.0.1:54321".to_string(),
+            ),
+            (
+                "ALL_PROXY".to_string(),
+                "socks5h://friring:fake-token-abc@127.0.0.1:54321".to_string(),
+            ),
+            ("FRIRING_SESSION_ID".to_string(), "sess-1".to_string()),
+        ])
+    }
+
+    #[test]
+    fn control_mode_failures_withhold_the_proxy_credential() {
+        let backend = TmuxBackend::local();
+        let env = sandboxed_launch_env();
+        let cmd = backend.new_window_command("tb-work", "claude", &[], Some(Path::new("/w")), &env);
+        // The command friring actually sends must carry the credential — the
+        // redaction is on the report, not on the launch.
+        assert!(cmd.contains("fake-token-abc"), "{cmd}");
+
+        for message in [
+            timeout_context(&cmd),
+            command_failed(&cmd, "can't establish current session"),
+        ] {
+            assert!(!message.contains("fake-token-abc"), "{message}");
+            // The port is the other half of a usable endpoint.
+            assert!(!message.contains("54321"), "{message}");
+            assert!(!message.contains("socks5h://friring"), "{message}");
+        }
+    }
+
+    // Unix-only with the place they address — see the note on
+    // `crate::sandbox::select::NATIVE_WINDOWS`: a native Windows host is
+    // offered no sandbox, so no window is ever opened inside one there.
+
+    #[cfg(unix)]
+    #[test]
+    fn a_redacted_failure_is_still_worth_reading() {
+        let backend = TmuxBackend::local();
+        let env = sandboxed_launch_env();
+        let cmd = backend.new_window_command("tb-work", "claude", &[], Some(Path::new("/w")), &env);
+
+        for message in [
+            timeout_context(&cmd),
+            command_failed(&cmd, "can't establish current session"),
+        ] {
+            // The verb, the window, the directory and the agent: what a stalled
+            // spawn is diagnosed from.
+            assert!(message.contains("new-window"), "{message}");
+            assert!(message.contains("tb-work"), "{message}");
+            assert!(message.contains("-c /w"), "{message}");
+            assert!(message.contains("claude"), "{message}");
+            // Which keys were set, even for the ones whose values went.
+            assert!(message.contains("HTTP_PROXY=<redacted>"), "{message}");
+            // A non-secret entry is shown in full.
+            assert!(message.contains("FRIRING_SESSION_ID=sess-1"), "{message}");
+        }
+        // tmux's own words survive; only the command around them is rewritten.
+        assert!(command_failed("kill-pane -t %1", "no such pane")
+            .ends_with("tmux command failed: kill-pane -t %1: no such pane"));
+    }
+
+    #[test]
+    fn tmux_error_text_is_redacted_as_well_as_the_command() {
+        // A tmux error is free to quote the argument it rejected, which on the
+        // one command that carries an environment is the credential itself.
+        let message = command_failed(
+            "new-window -t friring -n tb-work",
+            "bad value: HTTP_PROXY=http://friring:fake-token-abc@127.0.0.1:54321",
+        );
+        assert!(!message.contains("fake-token-abc"), "{message}");
+        assert!(message.contains("HTTP_PROXY=<redacted>"), "{message}");
+        assert!(message.contains("tb-work"), "{message}");
+    }
+
+    // --- sandbox places (ADR-26) ---
+    //
+    // A place is reached like an SSH host, so these tests are about the two
+    // things that differ (the launch prefix, and the login shell a container
+    // must *not* get) and about the much larger set that must not differ.
+    // Nothing here starts a container.
+
+    /// A fabricated place: an engine path that is merely plausible, and a
+    /// container name shaped like the ones friring's own `ensure` mints.
+    #[cfg(unix)]
+    fn test_place() -> Place {
+        Place::new("/usr/local/bin/docker", "friring-dev-1a2b3c", "dev").unwrap()
+    }
+
+    /// The program and argv a built [`Command`] would run.
+    #[cfg(unix)]
+    fn program_and_args(cmd: &Command) -> (String, Vec<String>) {
+        (
+            cmd.get_program().to_string_lossy().into_owned(),
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn for_place_names_the_backend_and_pins_the_flavour() {
+        let backend = TmuxBackend::for_place(&test_place());
+        // `sandbox:<profile>`, the same shape `ssh:<host>` persists.
+        assert_eq!(backend.name(), "sandbox:dev");
+        assert!(backend.transport.is_remote());
+        assert_eq!(
+            backend.transport.place().map(Place::container),
+            Some("friring-dev-1a2b3c")
+        );
+
+        // The socket and group session inside the place are the compile-time
+        // flavour, never the local overrides: those name a server on *this*
+        // machine (`scripts/dev/live.sh` points a dev binary at the release
+        // one), and renaming the server inside the container from them would
+        // strand every window the previous launch created.
+        std::env::set_var(SOCKET_OVERRIDE_ENV, "friring-live");
+        std::env::set_var(SESSION_OVERRIDE_ENV, "friring-live");
+        let backend = TmuxBackend::for_place(&test_place());
+        assert_eq!(backend.socket, TMUX_SOCKET);
+        assert_eq!(backend.session, TMUX_SESSION);
+        std::env::remove_var(SOCKET_OVERRIDE_ENV);
+        std::env::remove_var(SESSION_OVERRIDE_ENV);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_place_reuses_the_ssh_paths_argv_verbatim() {
+        // Discovery, adoption and scrollback are not re-implemented for a
+        // place: the same `TmuxBackend` issues the same tmux argv, and only the
+        // launch prefix in front of it changes. If any of them ever forked, the
+        // tails would stop matching.
+        let local = TmuxBackend::local();
+        let place = TmuxBackend::for_place(&test_place());
+        let operations: [&[&str]; 3] = [
+            &["list-windows", "-t", "friring", "-F", "#{pane_id}"],
+            &["capture-pane", "-e", "-p", "-J", "-S", "-500", "-t", "%3"],
+            &["-C", "attach-session", "-t", "friring"],
+        ];
+        for args in operations {
+            let (_, local_args) = program_and_args(&local.transport.tmux_command("friring", args));
+            let (prog, place_args) =
+                program_and_args(&place.transport.tmux_command("friring", args));
+            assert_eq!(prog, "/usr/local/bin/docker");
+            // `<engine> exec -i <container> tmux` and then, byte for byte, the
+            // command the local backend would have run.
+            assert_eq!(
+                &place_args[..4],
+                ["exec", "-i", "friring-dev-1a2b3c", "tmux"],
+                "{args:?}"
+            );
+            assert_eq!(&place_args[4..], &local_args[..], "{args:?}");
+        }
+
+        // The `tb-` naming is the same function, so a place's windows are
+        // discovered and targeted by the same names.
+        assert_eq!(agent_window_name("my session"), "tb-my_session");
+        assert_eq!(
+            MuxTarget::for_place(&test_place()).window_target("my session"),
+            format!("{TMUX_SESSION}:=tb-my_session")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_place_window_carries_the_session_identity_env() {
+        // The window lives *inside* the place and `<engine> exec` inherits
+        // nothing from friring, so `-e` on the window is the only channel
+        // inward. It travels in the control-mode command, not in an argv.
+        let backend = TmuxBackend::for_place(&test_place());
+        let env = sandboxed_launch_env();
+        let cmd = backend.new_window_command(
+            "tb-work",
+            "claude",
+            &["--resume".to_string(), "x".to_string()],
+            Some(Path::new("/Users/me/dev/app")),
+            &env,
+        );
+        assert!(cmd.contains(" -e FRIRING_SESSION_ID=sess-1"), "{cmd}");
+        assert!(cmd.contains("HTTP_PROXY="), "{cmd}");
+        // The launch cwd is a *host* path, mounted at exactly that path inside
+        // the place — it is passed through untranslated on purpose.
+        assert!(cmd.contains(" -c /Users/me/dev/app"), "{cmd}");
+        // No login wrap: the image's PATH is the one that names the agent.
+        assert!(!cmd.contains("/bin/sh -lc"), "{cmd}");
+        assert!(cmd.ends_with(" claude --resume x"), "{cmd}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_place_gets_no_login_shell() {
+        let backend = TmuxBackend::for_place(&test_place());
+        // An agent window: the command runs as written, under the image's env.
+        assert_eq!(
+            backend.login_shell_wrap("claude --resume x"),
+            "claude --resume x"
+        );
+        // A companion shell pane: the plain shell, not the SSH-login bootstrap
+        // (`$SHELL` is usually unset in a container, and `-l` would trade the
+        // image's PATH for /etc/profile's).
+        assert_eq!(backend.default_shell(), "/bin/sh");
+        let shell_pane = backend.new_window_command(
+            &shell_window_name("work"),
+            &backend.default_shell(),
+            &[],
+            None,
+            &HashMap::new(),
+        );
+        assert!(!shell_pane.contains("-lc"), "{shell_pane}");
+        assert!(shell_pane.ends_with(" /bin/sh"), "{shell_pane}");
+        // The SSH host still gets both, unchanged.
+        let ssh = TmuxBackend::from_host(&crate::session::HostDef {
+            name: "devbox".into(),
+            destination: "me@devbox".into(),
+            ..Default::default()
+        });
+        assert_eq!(ssh.login_shell_wrap("claude"), "/bin/sh -lc 'exec claude'");
+        assert!(ssh
+            .new_window_command(
+                &shell_window_name("work"),
+                &ssh.default_shell(),
+                &[],
+                None,
+                &HashMap::new()
+            )
+            .contains("exec \"$SHELL\" -l"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_place_launch_failure_withholds_the_proxy_credential() {
+        // Same guarantee as the local path, on the transport that carries a
+        // credential the most: a place is the shape that needs the proxy.
+        let backend = TmuxBackend::for_place(&test_place());
+        let env = sandboxed_launch_env();
+        let cmd = backend.new_window_command("tb-work", "claude", &[], Some(Path::new("/w")), &env);
+        assert!(cmd.contains("fake-token-abc"), "{cmd}");
+        for message in [
+            timeout_context(&cmd),
+            command_failed(
+                &cmd,
+                "bad value: HTTP_PROXY=http://friring:fake-token-abc@127.0.0.1:54321",
+            ),
+        ] {
+            assert!(!message.contains("fake-token-abc"), "{message}");
+            assert!(!message.contains("54321"), "{message}");
+            // Still diagnosable: the verb, the window, the keys.
+            assert!(message.contains("new-window"), "{message}");
+            assert!(message.contains("tb-work"), "{message}");
+            assert!(message.contains("HTTP_PROXY=<redacted>"), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_failed_version_probe_is_redacted_too() {
+        // `tmux -V` is how a place is checked for being up, and the launcher's
+        // own words come back through it. An engine quotes the command it was
+        // given, so this is the third path that can echo an argv friring did
+        // not write.
+        let message = version_probe_failed(
+            "Error response from daemon: exec: \"tmux\": HTTP_PROXY=http://friring:tok@127.0.0.1:1",
+        );
+        assert!(!message.contains("tok@"), "{message}");
+        assert!(message.contains("HTTP_PROXY=<redacted>"), "{message}");
+        // An ordinary failure is untouched, which is the whole point of it
+        // still being readable.
+        assert_eq!(
+            version_probe_failed("Error: No such container: friring-dev-1a2b3c\n"),
+            "tmux -V failed: Error: No such container: friring-dev-1a2b3c"
+        );
+    }
+
+    #[test]
+    fn for_backend_refuses_a_place_instead_of_answering_local() {
+        // `sandbox:<profile>` is not a remote backend, so the host branch would
+        // have fallen through to the *local* server — and typed a headless
+        // prompt into whatever window on this machine happened to share the
+        // session's name.
+        let err = MuxTarget::for_backend("sandbox:dev")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sandbox place"), "{err}");
+        assert!(err.contains("'dev'"), "{err}");
+        // The other backends are unaffected.
+        assert!(!MuxTarget::for_backend("local-tmux")
+            .unwrap()
+            .transport
+            .is_remote());
+        assert!(!MuxTarget::for_backend("").unwrap().transport.is_remote());
+    }
+
     #[test]
     fn backend_default_has_no_control_mode() {
         let backend = LocalTmuxBackend::new();
@@ -3134,7 +3678,7 @@ mod tests {
         // profile PATH (e.g. `~/.local/bin/claude`) is present, or the agent
         // binary isn't found and the pane dies instantly.
         let backend = TmuxBackend::from_host(&crate::session::HostDef::wsl("Ubuntu"));
-        let wrapped = backend.login_wrap_for_remote("claude --resume x");
+        let wrapped = backend.login_shell_wrap("claude --resume x");
         assert_eq!(wrapped, "/bin/sh -lc 'exec claude --resume x'");
     }
 
@@ -3142,7 +3686,7 @@ mod tests {
     fn login_wrap_is_noop_for_local() {
         // Local backends inherit the user's interactive PATH — no wrap needed.
         let backend = TmuxBackend::local();
-        assert_eq!(backend.login_wrap_for_remote("claude"), "claude");
+        assert_eq!(backend.login_shell_wrap("claude"), "claude");
     }
 
     // --- psmux_window_command tests ---
@@ -3194,7 +3738,7 @@ mod tests {
             ..Default::default()
         };
         let backend = TmuxBackend::from_host(&host);
-        assert_eq!(backend.login_wrap_for_remote("claude"), "claude");
+        assert_eq!(backend.login_shell_wrap("claude"), "claude");
     }
 
     #[test]

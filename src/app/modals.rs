@@ -2455,6 +2455,760 @@ fn step_clamp(current: i64, delta: i32, step: i64, min: i64, max: i64) -> i64 {
     (current + i64::from(delta) * step).clamp(min, max)
 }
 
+// ── Sandbox profiles ────────────────────────────────────────────────────
+
+/// Modal state for the sandbox-profile list (`docs/SANDBOX.md` §UI).
+///
+/// The rows are the renderer's own view type: the list owns nothing but the
+/// cursor, so a second app-side copy of every column would only be a way for
+/// the two to disagree.
+#[derive(Debug, Clone, Default)]
+pub struct SandboxListModal {
+    pub index: usize,
+    pub entries: Vec<crate::ui::sandbox_list_modal::SandboxProfileRow>,
+}
+
+impl SandboxListModal {
+    /// The selected row, or `None` while the list is empty.
+    pub fn selected(&self) -> Option<&crate::ui::sandbox_list_modal::SandboxProfileRow> {
+        self.entries.get(self.index)
+    }
+
+    /// The selected profile's name — what edit and delete key on, the name
+    /// being the storage identity.
+    pub fn selected_name(&self) -> Option<&str> {
+        self.selected().map(|e| e.name.as_str())
+    }
+}
+
+/// Focusable field in the sandbox-profile editor.
+///
+/// The set shown depends only on whether the two sub-lists have entries (see
+/// [`SandboxEditorModal::visible_fields`]). A field the chosen backend cannot
+/// honour stays *visible but inert* — see [`sandbox_field_available`] — so an
+/// unavailable capability is shown as unavailable rather than silently missing
+/// (`docs/SANDBOX.md` §Failure modes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxField {
+    #[default]
+    Name,
+    /// Isolation technology (cycled with ←/→); `auto` also shows what it
+    /// resolved to on this host.
+    Backend,
+    /// Path sub-list anchor: ←/→ walk it, `n`/`d` add/remove, `[`/`]` reorder.
+    Paths,
+    /// The selected path, as typed.
+    PathText,
+    /// The selected path's `‹ ro | rw ›`.
+    PathMode,
+    Network,
+    /// Allowed-domain sub-list anchor: ←/→ walk it, `n`/`d` add/remove.
+    Domains,
+    /// The selected allowed domain, as typed.
+    DomainText,
+    /// Ask on first use of an unlisted domain (Space toggles).
+    PromptDomains,
+    ReadScope,
+    /// Place backends only: memory cap in MB.
+    Memory,
+    /// Place backends only: CPU cap.
+    Cpus,
+    /// Place backends only: image reference.
+    Image,
+    /// Place backends only: build source, an alternative to the image.
+    Containerfile,
+    /// Whether the agent may run a command outside the boundary (Space toggles).
+    Fallback,
+}
+
+/// Whether `field` can be edited against a backend of `shape` (`None` = an
+/// unresolved `auto`, whose shape is only known after a host probe) with
+/// `network` selected.
+///
+/// The single rule behind both halves of the unavailable-capability treatment:
+/// the editor drops input to an unavailable field, and
+/// [`crate::ui::sandbox_editor_modal`] renders the reason in place of its
+/// value. An unresolved `auto` blocks nothing, mirroring
+/// [`SandboxProfile::validate`](crate::session::SandboxProfile::validate),
+/// which exempts it for the same reason.
+pub fn sandbox_field_available(
+    field: SandboxField,
+    backend: crate::session::SandboxBackendKind,
+    network: crate::session::NetworkMode,
+) -> bool {
+    let shape = backend.shape();
+    match field {
+        SandboxField::Memory | SandboxField::Cpus => backend_enforces_limits(backend),
+        SandboxField::Image | SandboxField::Containerfile => {
+            shape.map_or(true, crate::session::SandboxShape::supports_image)
+        }
+        SandboxField::ReadScope => {
+            shape.map_or(true, crate::session::SandboxShape::supports_read_scope)
+        }
+        // Nothing is unlisted under `full`, and nothing leaves at all under
+        // `none`, so there is no first use to ask about either way.
+        SandboxField::PromptDomains => {
+            matches!(network, crate::session::NetworkMode::Allowlist)
+        }
+        _ => true,
+    }
+}
+
+/// Whether `backend` can enforce a memory or CPU cap, asked of the backend
+/// itself rather than of its shape.
+///
+/// Shape stopped being enough when a third place backend landed: every *place*
+/// can carry a cap in principle, and a WSL distro cannot — all of a host's
+/// distros share one utility VM, and a cap on it is set machine-wide in
+/// `.wslconfig`. Reading the backend's own
+/// [`Caps::limits`](crate::sandbox::Caps) is what keeps this editor from storing
+/// a value the launch would then refuse; a profile that carries one anyway
+/// (imported, or written by an older friring) is still refused there.
+///
+/// Costs no probe: capabilities are constants per backend, and an unresolved
+/// `auto` rules nothing out.
+fn backend_enforces_limits(backend: crate::session::SandboxBackendKind) -> bool {
+    if backend.shape().is_none() {
+        return true;
+    }
+    crate::sandbox::SandboxHost::local_shared()
+        .backend(backend)
+        .map_or(true, |backend| backend.capabilities().limits)
+}
+
+/// The network modes `backend` can actually enforce, in selector order.
+///
+/// The same question [`backend_enforces_limits`] asks about a resource cap, put
+/// to the same place — the backend's own
+/// [`Caps::network_modes`](crate::sandbox::Caps) — because the answer differs
+/// per backend rather than per shape: an `apple-container` place can enforce
+/// only `full`, and a `wsl-distro` cannot enforce `allowlist`, since the
+/// filtered modes are enforced by friring's proxy over a socket neither can be
+/// handed. A launch refuses a profile asking for one of them, so the editor
+/// offers only these — and says which are missing rather than shortening the
+/// selector in silence.
+///
+/// Costs no probe: capabilities are constants per backend, and an unresolved
+/// `auto` rules nothing out.
+pub fn backend_network_modes(
+    backend: crate::session::SandboxBackendKind,
+) -> &'static [crate::session::NetworkMode] {
+    if backend.shape().is_none() {
+        return crate::session::NetworkMode::ALL;
+    }
+    crate::sandbox::SandboxHost::local_shared()
+        .backend(backend)
+        .map_or(crate::session::NetworkMode::ALL, |backend| {
+            backend.capabilities().network_modes
+        })
+}
+
+/// What the config-projection lint said about the profile in the form, in the
+/// words the editor renders.
+///
+/// Pre-rendered strings rather than [`crate::sandbox::Finding`]s: `ui` may not
+/// reference `sandbox` (see `tests/architecture_rules.rs`), and the verdicts are
+/// text by the time anything paints them anyway.
+///
+/// One report per agent that declares configuration, because the answer is the
+/// agent's: a profile is not tied to one, and "does this cross?" is decided by
+/// what that agent declares and where it keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxLintReport {
+    /// Whose configuration this is about.
+    pub agent: String,
+    /// The composition line — what crossed and what did not.
+    pub summary: String,
+    /// The entries the user still has a decision to make about: `(entry,
+    /// reason)`, already phrased to stand alone.
+    pub actionable: Vec<(String, String)>,
+}
+
+/// One path row being edited: the text exactly as typed (`~` kept, expanded
+/// only at launch) plus its read/write intent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxPathDraft {
+    pub text: TextInput,
+    pub mode: crate::session::PathMode,
+}
+
+/// Editor form for creating or editing a sandbox profile.
+///
+/// Mirrors [`AutomationEditorModal`]: one `visible_fields` projection drives
+/// both render order and Tab navigation, selector fields are adjusted with
+/// ←/→, and `Enter`/`Ctrl+S` hand a validated value back to the caller.
+#[derive(Debug, Clone)]
+pub struct SandboxEditorModal {
+    /// The name the profile was loaded under; `None` for a new profile.
+    ///
+    /// The name is the storage key, so renaming is a delete-plus-insert that
+    /// also rewrites the sessions referencing it — this is what tells the
+    /// caller the name moved.
+    pub editing: Option<String>,
+    pub name: TextInput,
+    pub backend: crate::session::SandboxBackendKind,
+    /// What `auto` resolves to on this host, from the sandbox module's probe.
+    /// `None` until probed, which keeps every capability editable — the same
+    /// exemption the profile validator makes for `auto`.
+    pub resolved: Option<crate::session::SandboxBackendKind>,
+    /// Why the backend this profile would run on is not usable here, from the
+    /// probe — the actionable half of the same question `resolved` answers.
+    /// `None` when it is usable, and while an `auto` ladder is unresolved.
+    pub backend_unavailable: Option<String>,
+    pub paths: Vec<SandboxPathDraft>,
+    /// Index into `paths` of the row `PathText`/`PathMode` edit.
+    pub path_index: usize,
+    pub network_mode: crate::session::NetworkMode,
+    /// Allowed `host[:port]` entries, as typed.
+    pub domains: Vec<TextInput>,
+    /// Index into `domains` of the row `DomainText` edits.
+    pub domain_index: usize,
+    /// Deny entries, carried through untouched: they beat allows in every mode
+    /// but have no editor of their own yet, and dropping them on save would
+    /// silently widen the profile.
+    pub deny: Vec<String>,
+    pub prompt_new_domains: bool,
+    pub read_scope: crate::session::ReadScope,
+    /// Memory cap in MB, as typed. Empty = uncapped.
+    pub memory: TextInput,
+    /// CPU cap, as typed. Empty = uncapped.
+    pub cpus: TextInput,
+    pub image: TextInput,
+    pub containerfile: TextInput,
+    pub allow_unsandboxed_fallback: bool,
+    pub field: SandboxField,
+    /// Carried from the stored profile so saving an edit doesn't reset it.
+    pub created_at: u64,
+    /// `column = 'value'` for every column of the stored row friring could not
+    /// decode (`crate::storage::sandboxes::UndecodedColumn`). Empty for a
+    /// healthy profile and for a new one.
+    ///
+    /// The form already holds the narrow values storage substituted, so saving
+    /// **is** the repair — this is what tells the user there is something to
+    /// repair, and which of the values in front of them are friring's rather
+    /// than theirs. Filled in by the caller that loaded the row; a form has no
+    /// database.
+    pub undecoded: Vec<String>,
+    /// What the config-projection lint last said, per agent, or `None` until
+    /// the user asks for it with `Ctrl+L`.
+    ///
+    /// A **snapshot of the form as it read when it was asked for**, not live
+    /// state: the pass reads the user's configuration off disk, so recomputing
+    /// it on every keystroke would make the editor stat and parse a dozen files
+    /// per character. Asking again is one keystroke, and the panel says which
+    /// question it answered.
+    pub lint: Option<Vec<SandboxLintReport>>,
+}
+
+impl Default for SandboxEditorModal {
+    /// The blank new-profile form, seeded from
+    /// [`SandboxProfile::default`](crate::session::SandboxProfile::default) so
+    /// the editor's starting knobs are the profile's own defaults rather than a
+    /// second copy of them that could drift.
+    fn default() -> Self {
+        Self::from_profile(&crate::session::SandboxProfile::default())
+    }
+}
+
+impl SandboxEditorModal {
+    /// A form pre-filled from `profile`. A profile with a name is treated as an
+    /// existing one (see [`editing`](Self::editing)); the blank default
+    /// profile, whose name is empty, opens as a new one.
+    pub fn from_profile(profile: &crate::session::SandboxProfile) -> Self {
+        let mut name = TextInput::default();
+        name.set(&profile.name);
+        let mut memory = TextInput::default();
+        if let Some(mb) = profile.memory_mb {
+            memory.set(&mb.to_string());
+        }
+        let mut cpus = TextInput::default();
+        if let Some(c) = profile.cpus {
+            cpus.set(&c.to_string());
+        }
+        let mut image = TextInput::default();
+        image.set(profile.image.as_deref().unwrap_or_default());
+        let mut containerfile = TextInput::default();
+        containerfile.set(profile.containerfile.as_deref().unwrap_or_default());
+        Self {
+            editing: (!profile.name.trim().is_empty()).then(|| profile.name.clone()),
+            name,
+            backend: profile.backend,
+            resolved: None,
+            backend_unavailable: None,
+            paths: profile
+                .paths
+                .iter()
+                .map(|p| {
+                    let mut text = TextInput::default();
+                    text.set(&p.path);
+                    SandboxPathDraft { text, mode: p.mode }
+                })
+                .collect(),
+            path_index: 0,
+            network_mode: profile.network_mode,
+            domains: profile
+                .network_allow
+                .iter()
+                .map(|d| {
+                    let mut text = TextInput::default();
+                    text.set(d);
+                    text
+                })
+                .collect(),
+            domain_index: 0,
+            deny: profile.network_deny.clone(),
+            prompt_new_domains: profile.prompt_new_domains,
+            read_scope: profile.read_scope,
+            memory,
+            cpus,
+            image,
+            containerfile,
+            allow_unsandboxed_fallback: profile.allow_unsandboxed_fallback,
+            field: SandboxField::default(),
+            created_at: profile.created_at,
+            undecoded: Vec::new(),
+            lint: None,
+        }
+    }
+
+    /// The fields shown, in display and navigation order. Only the two
+    /// sub-lists change the set: with nothing in a list there is no entry to
+    /// edit, so its text (and mode) rows would point at nothing.
+    pub fn visible_fields(&self) -> Vec<SandboxField> {
+        use SandboxField::*;
+        let mut fields = vec![Name, Backend, Paths];
+        if !self.paths.is_empty() {
+            fields.extend([PathText, PathMode]);
+        }
+        fields.extend([Network, Domains]);
+        if !self.domains.is_empty() {
+            fields.push(DomainText);
+        }
+        fields.extend([
+            PromptDomains,
+            ReadScope,
+            Memory,
+            Cpus,
+            Image,
+            Containerfile,
+            Fallback,
+        ]);
+        fields
+    }
+
+    /// The backend that will actually run: the chosen one, or what `auto`
+    /// resolved to once a host has been probed.
+    pub fn effective_backend(&self) -> crate::session::SandboxBackendKind {
+        match self.backend {
+            crate::session::SandboxBackendKind::Auto => self.resolved.unwrap_or(self.backend),
+            explicit => explicit,
+        }
+    }
+
+    /// [`effective_backend`](Self::effective_backend)'s shape, or `None` while
+    /// an `auto` backend is still unresolved.
+    pub fn effective_shape(&self) -> Option<crate::session::SandboxShape> {
+        self.effective_backend().shape()
+    }
+
+    /// Whether `field` accepts input right now (see
+    /// [`sandbox_field_available`]).
+    pub fn field_available(&self, field: SandboxField) -> bool {
+        sandbox_field_available(field, self.effective_backend(), self.network_mode)
+    }
+
+    /// The path row `PathText`/`PathMode` edit.
+    pub fn selected_path(&self) -> Option<&SandboxPathDraft> {
+        self.paths.get(self.path_index)
+    }
+
+    fn selected_path_mut(&mut self) -> Option<&mut SandboxPathDraft> {
+        self.paths.get_mut(self.path_index)
+    }
+
+    /// The domain row `DomainText` edits.
+    pub fn selected_domain(&self) -> Option<&TextInput> {
+        self.domains.get(self.domain_index)
+    }
+
+    /// Insert a blank read-only path after the selected row and select it.
+    /// Read-only because widening a boundary should be a deliberate keystroke —
+    /// the same reason [`PathMode`](crate::session::PathMode) defaults that way.
+    pub fn add_path(&mut self) {
+        let at = sublist_insert_index(self.path_index, self.paths.len());
+        self.paths.insert(at, SandboxPathDraft::default());
+        self.path_index = at;
+    }
+
+    /// Remove the selected path. Unlike the automation editor's steps, an empty
+    /// list is representable here: the blank editor starts with none, and
+    /// saving without one is what the profile validator rejects.
+    pub fn remove_path(&mut self) {
+        if self.path_index >= self.paths.len() {
+            return;
+        }
+        self.paths.remove(self.path_index);
+        self.path_index = self.path_index.min(self.paths.len().saturating_sub(1));
+    }
+
+    /// Move the selected path one row earlier (`-1`) or later (`+1`), keeping
+    /// the selection on it. A no-op at the ends.
+    pub fn move_path(&mut self, delta: i32) {
+        let Some(target) = sublist_swap_target(self.path_index, delta, self.paths.len()) else {
+            return;
+        };
+        self.paths.swap(self.path_index, target);
+        self.path_index = target;
+    }
+
+    /// Insert a blank allowed domain after the selected row and select it.
+    pub fn add_domain(&mut self) {
+        let at = sublist_insert_index(self.domain_index, self.domains.len());
+        self.domains.insert(at, TextInput::default());
+        self.domain_index = at;
+    }
+
+    /// Remove the selected allowed domain.
+    pub fn remove_domain(&mut self) {
+        if self.domain_index >= self.domains.len() {
+            return;
+        }
+        self.domains.remove(self.domain_index);
+        self.domain_index = self.domain_index.min(self.domains.len().saturating_sub(1));
+    }
+
+    /// Move focus to the next visible field (wraps).
+    pub fn next_field(&mut self) {
+        self.field = cycle_field(&self.visible_fields(), self.field, 1);
+    }
+
+    /// Move focus to the previous visible field (wraps).
+    pub fn prev_field(&mut self) {
+        self.field = cycle_field(&self.visible_fields(), self.field, -1);
+    }
+
+    /// Whether the focused field is adjusted with ←/→/Space rather than typed
+    /// into. The sub-list anchors count: their arrows walk the list.
+    pub fn is_adjustable(&self) -> bool {
+        use SandboxField::*;
+        matches!(
+            self.field,
+            Backend | Paths | PathMode | Network | Domains | PromptDomains | ReadScope | Fallback
+        )
+    }
+
+    /// Adjust the focused selector/toggle by `delta` (−1 for ←, +1 for →/Space).
+    /// Input to an unavailable field is dropped, so a capability the backend
+    /// cannot honour cannot be edited into a meaningless state.
+    pub fn adjust(&mut self, delta: i32) {
+        use crate::session::{PathMode, ReadScope, SandboxBackendKind};
+        use SandboxField::*;
+        if !self.field_available(self.field) {
+            return;
+        }
+        match self.field {
+            Backend => self.backend = cycle_value(SandboxBackendKind::ALL, self.backend, delta),
+            Paths => self.path_index = wrap_index(self.path_index, delta, self.paths.len()),
+            PathMode => {
+                if let Some(p) = self.selected_path_mut() {
+                    p.mode = cycle_value(PathMode::ALL, p.mode, delta);
+                }
+            }
+            // Only the modes the backend can enforce, so a mode its launch
+            // would refuse cannot be selected into a saved profile. A form
+            // already carrying one — imported, or left behind by a change of
+            // backend — steps out of it onto the first mode that is offered.
+            Network => {
+                self.network_mode = cycle_value(
+                    backend_network_modes(self.effective_backend()),
+                    self.network_mode,
+                    delta,
+                );
+            }
+            Domains => self.domain_index = wrap_index(self.domain_index, delta, self.domains.len()),
+            PromptDomains => self.prompt_new_domains = !self.prompt_new_domains,
+            ReadScope => self.read_scope = cycle_value(ReadScope::ALL, self.read_scope, delta),
+            Fallback => self.allow_unsandboxed_fallback = !self.allow_unsandboxed_fallback,
+            _ => {}
+        }
+    }
+
+    /// The focused text field, or `None` for a selector, a toggle, an empty
+    /// sub-list, or a field the backend cannot honour (whose row renders the
+    /// reason instead of a value).
+    pub fn active_field_mut(&mut self) -> Option<&mut TextInput> {
+        use SandboxField::*;
+        if !self.field_available(self.field) {
+            return None;
+        }
+        Some(match self.field {
+            Name => &mut self.name,
+            PathText => return self.selected_path_mut().map(|p| &mut p.text),
+            DomainText => return self.domains.get_mut(self.domain_index),
+            Memory => &mut self.memory,
+            Cpus => &mut self.cpus,
+            Image => &mut self.image,
+            Containerfile => &mut self.containerfile,
+            Backend | Paths | PathMode | Network | Domains | PromptDomains | ReadScope
+            | Fallback => return None,
+        })
+    }
+
+    /// The caret within the focused text field — where the renderer draws the
+    /// block cursor. `0` for a selector, a toggle or an inert field, none of
+    /// which draw one.
+    pub fn active_cursor(&self) -> usize {
+        use SandboxField::*;
+        match self.field {
+            Name => self.name.cursor_pos(),
+            PathText => self.selected_path().map_or(0, |p| p.text.cursor_pos()),
+            DomainText => self.selected_domain().map_or(0, TextInput::cursor_pos),
+            Memory => self.memory.cursor_pos(),
+            Cpus => self.cpus.cursor_pos(),
+            Image => self.image.cursor_pos(),
+            Containerfile => self.containerfile.cursor_pos(),
+            Backend | Paths | PathMode | Network | Domains | PromptDomains | ReadScope
+            | Fallback => 0,
+        }
+    }
+
+    /// Sub-list chords on the `Paths`/`Domains` anchors: `n` adds a row after
+    /// the current one, `d` deletes it, `[`/`]` reorder (paths only — the allow
+    /// list's order carries no meaning). Returns whether the key was consumed.
+    /// Safe to bind letters here: both anchors are selectors, so nothing types
+    /// into them.
+    fn handle_sublist_key(&mut self, code: KeyCode) -> bool {
+        match (self.field, code) {
+            (SandboxField::Paths, KeyCode::Char('n')) => self.add_path(),
+            (SandboxField::Paths, KeyCode::Char('d')) => self.remove_path(),
+            (SandboxField::Paths, KeyCode::Char('[')) => self.move_path(-1),
+            (SandboxField::Paths, KeyCode::Char(']')) => self.move_path(1),
+            (SandboxField::Domains, KeyCode::Char('n')) => self.add_domain(),
+            (SandboxField::Domains, KeyCode::Char('d')) => self.remove_domain(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Feed a key to the editor, mutating field state. Returns whether the
+    /// caller should save (`Enter` or `Ctrl+S`), cancel (`Esc`), or keep
+    /// editing. Every field is single-line, so `Enter` saves from anywhere.
+    pub fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> EditorOutcome {
+        if mods.contains(KeyModifiers::CONTROL)
+            && matches!(code, KeyCode::Char('s') | KeyCode::Char('S'))
+        {
+            return EditorOutcome::Save;
+        }
+        let adjustable = self.is_adjustable();
+        match code {
+            KeyCode::Esc => return EditorOutcome::Cancel,
+            KeyCode::Enter => return EditorOutcome::Save,
+            KeyCode::Tab | KeyCode::Down => self.next_field(),
+            KeyCode::BackTab | KeyCode::Up => self.prev_field(),
+            KeyCode::Left if adjustable => self.adjust(-1),
+            KeyCode::Right | KeyCode::Char(' ') if adjustable => self.adjust(1),
+            other if self.handle_sublist_key(other) => {}
+            other => {
+                apply_text_input_key(self.active_field_mut(), other, mods);
+            }
+        }
+        EditorOutcome::Continue
+    }
+
+    /// The profile these fields describe, without the uniqueness check —
+    /// [`validated_profile`](Self::validated_profile) is what a save calls.
+    ///
+    /// Blank rows are dropped (an added-then-abandoned row is not a path), and
+    /// a capability the backend cannot honour is left out rather than saved
+    /// into a profile the validator would reject: the row renders as
+    /// unavailable, so a value the user cannot see must not decide the save.
+    /// The typed text stays in the form, so choosing a backend that supports it
+    /// again brings it back.
+    pub fn build_profile(&self) -> Result<crate::session::SandboxProfile, String> {
+        use crate::session::{SandboxPath, SandboxProfile};
+        let limits = self.field_available(SandboxField::Memory);
+        let image = self.field_available(SandboxField::Image);
+        Ok(SandboxProfile {
+            name: self.name.value().trim().to_string(),
+            backend: self.backend,
+            paths: self
+                .paths
+                .iter()
+                .filter(|p| !p.text.value().trim().is_empty())
+                .map(|p| SandboxPath {
+                    path: p.text.value().trim().to_string(),
+                    mode: p.mode,
+                })
+                .collect(),
+            network_mode: self.network_mode,
+            network_allow: non_empty_values(&self.domains),
+            network_deny: self.deny.clone(),
+            prompt_new_domains: self.prompt_new_domains,
+            read_scope: self.read_scope,
+            memory_mb: limits
+                .then(|| parse_limit(self.memory.value(), "Memory limit", "megabytes"))
+                .transpose()?
+                .flatten(),
+            cpus: limits
+                .then(|| parse_limit(self.cpus.value(), "CPU limit", "CPUs"))
+                .transpose()?
+                .flatten(),
+            image: image.then(|| trimmed_option(self.image.value())).flatten(),
+            containerfile: image
+                .then(|| trimmed_option(self.containerfile.value()))
+                .flatten(),
+            allow_unsandboxed_fallback: self.allow_unsandboxed_fallback,
+            created_at: self.created_at,
+            // Storage stamps the save; a form has no clock.
+            updated_at: 0,
+        })
+    }
+
+    /// The profile these fields describe, validated against `existing_names`
+    /// (every stored profile's name, the edited one included — it is filtered
+    /// out here so re-saving under its own name is not a collision), against the
+    /// host locations no sandbox may be handed, and against what the chosen
+    /// backend can enforce.
+    ///
+    /// The error is one sentence for the footer toast: the editor has no inline
+    /// form-error widget.
+    pub fn validated_profile(
+        &self,
+        existing_names: &[String],
+    ) -> Result<crate::session::SandboxProfile, String> {
+        let profile = self.build_profile()?;
+        let editing = self.editing.as_deref();
+        let others: Vec<String> = existing_names
+            .iter()
+            .filter(|n| !matches!(editing, Some(e) if n.trim().eq_ignore_ascii_case(e.trim())))
+            .cloned()
+            .collect();
+        profile.validate_unique(&others)?;
+        if let Some(refusal) = self.network_mode_refusal(profile.network_mode) {
+            return Err(refusal);
+        }
+        writable_roots_refusal(&profile).map_or(Ok(profile), Err)
+    }
+
+    /// Why this form's network mode may not be stored against its backend, or
+    /// `None` when the backend can enforce it.
+    ///
+    /// A refusal rather than a substitution, unlike the capability rows
+    /// [`build_profile`](Self::build_profile) drops: which mode to fall back to
+    /// is not friring's to choose. Down from `allowlist` to `none` would take
+    /// the network away from an agent that needs it, and up to `full` would open
+    /// egress the profile's author never granted — so the form stays open with
+    /// the sentence, and the two ways out (a mode this backend enforces, or a
+    /// backend that enforces this mode) are the user's.
+    ///
+    /// Never fires for an unresolved `auto`, which rules nothing out for the
+    /// same reason every other capability gate here exempts it.
+    fn network_mode_refusal(&self, mode: crate::session::NetworkMode) -> Option<String> {
+        let backend = self.effective_backend();
+        let offered = backend_network_modes(backend);
+        if offered.contains(&mode) {
+            return None;
+        }
+        let list: Vec<String> = offered.iter().map(ToString::to_string).collect();
+        Some(format!(
+            "Sandbox backend '{backend}' cannot enforce network '{mode}' — it can enforce only \
+             {}. Pick one of those, or a backend that enforces '{mode}'",
+            list.join(", ")
+        ))
+    }
+}
+
+/// Why this profile's paths may not be stored, or `None` when they are
+/// grantable.
+///
+/// The same refusals
+/// [`SandboxLaunch::validate`](crate::sandbox::SandboxLaunch::validate) makes,
+/// moved forward to the save: a *read-write* path enclosing friring's data
+/// directory reaches the database (ADR-29) or drives the host's own multiplexer
+/// through a tmux socket directory, and a path in **either** mode may reach
+/// neither friring's own sandbox state — the other profiles' logins, the
+/// generated policies, the other sessions' sockets — nor a container engine's
+/// control socket, both of which are taken by being *readable*. Catching it here
+/// turns "a stored profile that refuses every session picking it" into "a form
+/// that will not save", with the same sentence.
+///
+/// It cannot live in
+/// [`SandboxProfile::validate`](crate::session::SandboxProfile::validate): the
+/// check needs the data directory and the database path, and `session` may not
+/// reference [`crate::paths`]. A home or database path that is not valid UTF-8
+/// simply narrows what there is to compare — the launch refuses that outright,
+/// and that is where the user gets the whole sentence.
+fn writable_roots_refusal(profile: &crate::session::SandboxProfile) -> Option<String> {
+    let home = crate::paths::home_dir()
+        .as_deref()
+        .and_then(std::path::Path::to_str)
+        .unwrap_or_default()
+        .to_string();
+    let declared: Vec<String> = profile.paths.iter().map(|p| p.expanded(&home)).collect();
+    let writable: Vec<String> = profile
+        .paths
+        .iter()
+        .filter(|p| p.mode.is_writable())
+        .map(|p| p.expanded(&home))
+        .collect();
+    let db = crate::paths::database_file();
+    crate::sandbox::check_writable_roots(&writable, db.as_deref().and_then(std::path::Path::to_str))
+        .err()
+        .or_else(|| crate::sandbox::check_declared_paths(&declared).err())
+        .or_else(|| crate::sandbox::check_engine_socket_paths(&declared, Some(&home)).err())
+}
+
+/// Where an `n`-added sub-list row lands: after the selection, or at the end of
+/// an empty list.
+fn sublist_insert_index(selected: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        (selected + 1).min(len)
+    }
+}
+
+/// The sub-list row `selected` would swap with for a `delta` reorder, or `None`
+/// at the ends of the list.
+fn sublist_swap_target(selected: usize, delta: i32, len: usize) -> Option<usize> {
+    let target = selected as i32 + delta;
+    (target >= 0 && (target as usize) < len && selected < len).then_some(target as usize)
+}
+
+/// Step a `Copy` value through `values` by `delta`, wrapping at both ends.
+/// The selector counterpart of [`cycle_field`], for the editor's enum rows.
+fn cycle_value<T: PartialEq + Copy>(values: &[T], current: T, delta: i32) -> T {
+    cycle_field(values, current, delta as isize)
+}
+
+/// The non-blank, trimmed values of a list of text rows.
+fn non_empty_values(inputs: &[TextInput]) -> Vec<String> {
+    inputs
+        .iter()
+        .map(|t| t.value().trim().to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+/// `raw` trimmed, or `None` when it is blank.
+fn trimmed_option(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Parse an optional whole-number resource cap. A typed value that doesn't
+/// parse is an error rather than a silent "uncapped" — the same reason a
+/// mistyped automation step delay refuses to become the default.
+fn parse_limit(raw: &str, what: &str, unit: &str) -> Result<Option<u32>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse::<u32>()
+        .map(Some)
+        .map_err(|_| format!("{what} must be a whole number of {unit}"))
+}
+
 /// Single, discriminated union replacing boolean flags for modal state.
 /// Only one modal can be active at a time, making invalid states unrepresentable.
 #[derive(Debug, Clone, Default)]
@@ -2474,6 +3228,16 @@ pub enum Modal {
     AutomationsList(AutomationsListModal),
     /// Read-only preview of what an automation would do on its next fire.
     AutomationDryRun(AutomationDryRunModal),
+    SandboxList(SandboxListModal),
+    /// The new-session wizard's sandbox step.
+    SandboxPicker(crate::ui::sandbox_picker_modal::SandboxPickerState),
+    /// Boxed for the same reason as [`Modal::AutomationEditor`]: an editor form
+    /// is a large payload and `Modal` is moved around per frame.
+    SandboxEditor(Box<SandboxEditorModal>),
+    /// The egress firewall's first-use question: a sandboxed agent reached for
+    /// a host its profile does not allow. Raised from the tick rather than by a
+    /// keypress — see [`super::egress_prompts`].
+    SandboxDomainPrompt(super::egress_prompts::DomainPrompt),
     RepoPicker(RepoPickerModal),
     ConversationPicker(super::cc_import::ConversationPickerModal),
     SessionName(SessionNameModal),
@@ -2513,6 +3277,8 @@ impl Modal {
             Modal::SyncBasePicker(sb) => Some((&mut sb.index, KeyCode::Enter, enter)),
             Modal::TaskActionPicker(p) => Some((&mut p.selected, KeyCode::Enter, enter)),
             Modal::AutomationsList(al) => Some((&mut al.index, KeyCode::Enter, enter)),
+            Modal::SandboxList(sl) => Some((&mut sl.index, KeyCode::Enter, enter)),
+            Modal::SandboxPicker(sp) => Some((&mut sp.selected_index, KeyCode::Enter, enter)),
             Modal::RestoreSessions(rs) => Some((&mut rs.index, KeyCode::Enter, enter)),
             Modal::RepoPicker(rp) => Some((
                 &mut rp.list_index,
@@ -4251,5 +5017,511 @@ mod tests {
         assert_eq!(modal.matches.len(), entries.len());
         assert!(modal.selected_entry().is_some());
         assert!(modal.filter.is_none());
+    }
+
+    // ── Sandbox profiles ────────────────────────────────────────────────
+
+    /// A minimal valid form: one named profile over one writable path.
+    fn sandbox_editor() -> SandboxEditorModal {
+        let mut m = SandboxEditorModal::default();
+        m.name.set("dev");
+        m.add_path();
+        m.paths[0].text.set("~/dev/app");
+        m.paths[0].mode = crate::session::PathMode::ReadWrite;
+        m
+    }
+
+    fn sandbox_row(name: &str) -> crate::ui::sandbox_list_modal::SandboxProfileRow {
+        crate::ui::sandbox_list_modal::SandboxProfileRow {
+            name: name.to_string(),
+            paths: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sandbox_list_selection_follows_the_cursor() {
+        let mut list = SandboxListModal {
+            index: 1,
+            entries: vec![sandbox_row("a"), sandbox_row("b")],
+        };
+        assert_eq!(list.selected_name(), Some("b"));
+        // A stale cursor names nothing rather than panicking.
+        list.index = 9;
+        assert_eq!(list.selected_name(), None);
+
+        let mut modal = Modal::SandboxList(list);
+        let (cursor, code, mods) = modal.list_selection().expect("the list is selectable");
+        *cursor = 0;
+        assert_eq!((code, mods), (KeyCode::Enter, KeyModifiers::NONE));
+        let Modal::SandboxList(ref list) = modal else {
+            unreachable!()
+        };
+        assert_eq!(list.selected_name(), Some("a"));
+        modal.close();
+        assert!(!modal.is_open());
+    }
+
+    #[test]
+    fn sandbox_visible_fields_gate_on_the_sub_lists() {
+        use SandboxField::*;
+        // Nothing in either list: no row to point the per-entry fields at.
+        let blank = SandboxEditorModal::default().visible_fields();
+        assert_eq!(&blank[..3], &[Name, Backend, Paths]);
+        for hidden in [PathText, PathMode, DomainText] {
+            assert!(!blank.contains(&hidden), "{hidden:?}");
+        }
+        // Capabilities a backend may not honour stay listed — they render as
+        // unavailable rather than vanishing.
+        for shown in [
+            PromptDomains,
+            ReadScope,
+            Memory,
+            Cpus,
+            Image,
+            Containerfile,
+            Fallback,
+        ] {
+            assert!(blank.contains(&shown), "{shown:?}");
+        }
+
+        let mut m = sandbox_editor();
+        assert_eq!(
+            &m.visible_fields()[..5],
+            &[Name, Backend, Paths, PathText, PathMode]
+        );
+        assert!(!m.visible_fields().contains(&DomainText));
+        m.add_domain();
+        assert!(m.visible_fields().contains(&DomainText));
+    }
+
+    #[test]
+    fn sandbox_tab_walks_the_visible_fields_and_wraps() {
+        let mut m = sandbox_editor();
+        let fields = m.visible_fields();
+        for expected in fields.iter().skip(1) {
+            m.next_field();
+            assert_eq!(m.field, *expected);
+        }
+        m.next_field();
+        assert_eq!(m.field, fields[0], "forward wrap");
+        m.prev_field();
+        assert_eq!(m.field, *fields.last().unwrap(), "backward wrap");
+    }
+
+    #[test]
+    fn sandbox_path_sublist_adds_removes_and_reorders() {
+        let mut m = sandbox_editor();
+        m.field = SandboxField::Paths;
+        m.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(m.paths.len(), 2);
+        assert_eq!(m.path_index, 1, "the added row is selected");
+        m.paths[1].text.set("/srv/shared");
+
+        m.handle_key(KeyCode::Char('['), KeyModifiers::NONE);
+        assert_eq!(m.paths[0].text.value(), "/srv/shared");
+        assert_eq!(m.path_index, 0, "the selection rides the moved row");
+        m.handle_key(KeyCode::Char('['), KeyModifiers::NONE);
+        assert_eq!(m.path_index, 0, "a no-op at the top of the list");
+        m.handle_key(KeyCode::Char(']'), KeyModifiers::NONE);
+        assert_eq!(m.path_index, 1);
+
+        m.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(m.paths.len(), 1);
+        assert_eq!(m.path_index, 0);
+        m.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(m.paths.is_empty(), "an empty list is representable here");
+        assert!(!m.visible_fields().contains(&SandboxField::PathText));
+        m.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(m.paths.is_empty(), "removing from an empty list is a no-op");
+        // ← / → walk the list from the anchor.
+        m.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        m.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        m.handle_key(KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(m.path_index, 0);
+    }
+
+    #[test]
+    fn sandbox_domain_sublist_adds_and_removes_without_reordering() {
+        let mut m = sandbox_editor();
+        m.field = SandboxField::Domains;
+        m.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        m.domains[0].set("github.com");
+        m.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        m.domains[1].set("api.anthropic.com");
+        assert_eq!(m.domain_index, 1);
+
+        // The allow list's order carries no meaning, so `[` is unbound and
+        // falls through without touching the list.
+        m.handle_key(KeyCode::Char('['), KeyModifiers::NONE);
+        assert_eq!(m.domains[0].value(), "github.com");
+
+        m.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(m.domains.len(), 1);
+        assert_eq!(m.domains[0].value(), "github.com");
+    }
+
+    #[test]
+    fn sandbox_selectors_cycle_and_wrap() {
+        use crate::session::{NetworkMode, PathMode, ReadScope, SandboxBackendKind};
+        let mut m = sandbox_editor();
+
+        m.field = SandboxField::Backend;
+        m.adjust(1);
+        assert_eq!(m.backend, SandboxBackendKind::Seatbelt);
+        m.adjust(-1);
+        assert_eq!(m.backend, SandboxBackendKind::Auto);
+        m.adjust(-1);
+        assert_eq!(m.backend, *SandboxBackendKind::ALL.last().unwrap());
+        m.backend = SandboxBackendKind::Auto;
+
+        m.field = SandboxField::Network;
+        m.adjust(1);
+        assert_eq!(m.network_mode, NetworkMode::Full);
+        m.adjust(1);
+        assert_eq!(m.network_mode, NetworkMode::None);
+
+        m.field = SandboxField::ReadScope;
+        m.adjust(1);
+        assert_eq!(m.read_scope, ReadScope::Workspace);
+
+        m.field = SandboxField::PathMode;
+        assert_eq!(m.paths[0].mode, PathMode::ReadWrite);
+        m.adjust(1);
+        assert_eq!(m.paths[0].mode, PathMode::ReadOnly);
+    }
+
+    #[test]
+    fn sandbox_space_toggles_the_booleans() {
+        let mut m = sandbox_editor();
+        m.field = SandboxField::PromptDomains;
+        assert!(m.prompt_new_domains);
+        m.handle_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(!m.prompt_new_domains);
+        m.field = SandboxField::Fallback;
+        m.handle_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(m.allow_unsandboxed_fallback);
+    }
+
+    #[test]
+    fn sandbox_typing_reaches_the_selected_sub_list_row() {
+        let mut m = sandbox_editor();
+        m.add_path();
+        m.field = SandboxField::PathText;
+        for c in "/srv".chars() {
+            m.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(m.paths[1].text.value(), "/srv");
+        assert_eq!(
+            m.paths[0].text.value(),
+            "~/dev/app",
+            "the other row is untouched"
+        );
+        assert_eq!(m.active_cursor(), 4);
+        // A selector draws no caret.
+        m.field = SandboxField::PathMode;
+        assert_eq!(m.active_cursor(), 0);
+    }
+
+    #[test]
+    fn sandbox_unavailable_fields_refuse_input() {
+        use crate::session::SandboxBackendKind;
+        let mut m = sandbox_editor();
+
+        m.backend = SandboxBackendKind::Seatbelt;
+        m.field = SandboxField::Memory;
+        assert!(!m.field_available(SandboxField::Memory));
+        m.handle_key(KeyCode::Char('4'), KeyModifiers::NONE);
+        assert_eq!(m.memory.value(), "");
+
+        // The mirror case: a place backend has no host read scope to widen.
+        m.backend = SandboxBackendKind::Docker;
+        m.field = SandboxField::ReadScope;
+        let before = m.read_scope;
+        m.handle_key(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(m.read_scope, before);
+
+        // An unresolved `auto` rules nothing out; a probe narrows it.
+        m.backend = SandboxBackendKind::Auto;
+        assert!(m.field_available(SandboxField::Memory));
+        m.resolved = Some(SandboxBackendKind::Bwrap);
+        assert!(!m.field_available(SandboxField::Memory));
+        assert_eq!(m.effective_backend(), SandboxBackendKind::Bwrap);
+    }
+
+    /// A backend that can enforce only some of the modes offers only those.
+    ///
+    /// The same gate the resource caps get, on the same authority
+    /// ([`crate::sandbox::Caps`]): the selector cannot step onto a mode the
+    /// launch would refuse, and a form already carrying one steps *out* of it
+    /// rather than being stuck.
+    #[test]
+    fn sandbox_network_selector_offers_only_what_the_backend_enforces() {
+        use crate::session::{NetworkMode, SandboxBackendKind};
+        let mut m = sandbox_editor();
+        m.field = SandboxField::Network;
+
+        // An unresolved `auto` rules nothing out, so every mode is on the wheel.
+        assert_eq!(
+            backend_network_modes(SandboxBackendKind::Auto),
+            NetworkMode::ALL
+        );
+
+        // Apple's `container` can only run `full`: the filtered modes need a
+        // proxy socket a place there cannot be handed.
+        m.backend = SandboxBackendKind::AppleContainer;
+        assert_eq!(
+            backend_network_modes(SandboxBackendKind::AppleContainer),
+            &[NetworkMode::Full]
+        );
+        m.network_mode = NetworkMode::Allowlist;
+        m.adjust(1);
+        assert_eq!(m.network_mode, NetworkMode::Full);
+        // …and there is nowhere else to go, in either direction.
+        m.adjust(1);
+        m.adjust(-1);
+        assert_eq!(m.network_mode, NetworkMode::Full);
+
+        // A WSL distro enforces two of the three, so the wheel is two long and
+        // never stops on `allowlist`.
+        m.backend = SandboxBackendKind::WslDistro;
+        m.network_mode = NetworkMode::Allowlist;
+        for _ in 0..4 {
+            m.adjust(1);
+            assert_ne!(m.network_mode, NetworkMode::Allowlist);
+        }
+
+        // A backend that enforces all three still walks all three.
+        m.backend = SandboxBackendKind::Seatbelt;
+        m.network_mode = NetworkMode::None;
+        m.adjust(1);
+        assert_eq!(m.network_mode, NetworkMode::Allowlist);
+    }
+
+    /// A mode the backend cannot enforce is refused at the **save**, rather than
+    /// swapped for one friring picked.
+    ///
+    /// Unlike a memory cap, which is dropped from the saved profile, neither
+    /// substitution is friring's to make: down takes the network away from an
+    /// agent that needs it and up grants egress nobody authorised. Without this
+    /// the form stores a profile whose own launch refuses it.
+    #[test]
+    fn sandbox_save_refuses_a_network_mode_the_backend_cannot_enforce() {
+        use crate::session::{NetworkMode, SandboxBackendKind};
+        let mut m = sandbox_editor();
+        m.backend = SandboxBackendKind::AppleContainer;
+        m.network_mode = NetworkMode::Allowlist;
+
+        let error = m.validated_profile(&[]).unwrap_err();
+        assert!(error.contains("apple-container"), "{error}");
+        assert!(error.contains("allowlist"), "{error}");
+        assert!(error.contains("full"), "{error}");
+
+        // The two ways out, both the user's.
+        m.network_mode = NetworkMode::Full;
+        assert!(m.validated_profile(&[]).is_ok());
+        m.network_mode = NetworkMode::Allowlist;
+        m.backend = SandboxBackendKind::Podman;
+        assert!(m.validated_profile(&[]).is_ok());
+
+        // An unresolved `auto` refuses nothing, exactly as it rules no
+        // capability out.
+        m.backend = SandboxBackendKind::Auto;
+        assert!(m.validated_profile(&[]).is_ok());
+    }
+
+    #[test]
+    fn sandbox_prompt_toggle_needs_the_allowlist() {
+        use crate::session::NetworkMode;
+        let mut m = sandbox_editor();
+        assert!(m.field_available(SandboxField::PromptDomains));
+        for mode in [NetworkMode::None, NetworkMode::Full] {
+            m.network_mode = mode;
+            assert!(!m.field_available(SandboxField::PromptDomains), "{mode}");
+        }
+    }
+
+    #[test]
+    fn sandbox_build_profile_drops_blank_rows_and_trims() {
+        let mut m = sandbox_editor();
+        m.add_path(); // added, then abandoned
+        m.add_domain();
+        m.domains[0].set("  github.com:443  ");
+        m.add_domain();
+        let p = m.build_profile().unwrap();
+        assert_eq!(p.paths.len(), 1);
+        assert_eq!(p.paths[0].path, "~/dev/app");
+        assert_eq!(p.network_allow, ["github.com:443"]);
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn sandbox_build_profile_omits_what_the_backend_cannot_honour() {
+        use crate::session::SandboxBackendKind;
+        let mut m = sandbox_editor();
+        m.backend = SandboxBackendKind::Docker;
+        m.memory.set("2048");
+        m.cpus.set("2");
+        m.image.set("ghcr.io/example/dev:latest");
+        let place = m.build_profile().unwrap();
+        assert_eq!(place.memory_mb, Some(2048));
+        assert_eq!(place.cpus, Some(2));
+        assert_eq!(place.image.as_deref(), Some("ghcr.io/example/dev:latest"));
+        place.validate().unwrap();
+
+        // The same form on a policy backend saves a profile the validator
+        // accepts, and keeps the typed values for a switch back.
+        m.backend = SandboxBackendKind::Seatbelt;
+        let policy = m.build_profile().unwrap();
+        assert_eq!(policy.memory_mb, None);
+        assert_eq!(policy.cpus, None);
+        assert_eq!(policy.image, None);
+        policy.validate().unwrap();
+        assert_eq!(m.memory.value(), "2048");
+    }
+
+    #[test]
+    fn sandbox_build_profile_rejects_a_mistyped_limit() {
+        use crate::session::SandboxBackendKind;
+        let mut m = sandbox_editor();
+        m.backend = SandboxBackendKind::Docker;
+        m.memory.set("2 gigs");
+        assert_eq!(
+            m.build_profile().unwrap_err(),
+            "Memory limit must be a whole number of megabytes"
+        );
+        m.memory.clear();
+        m.cpus.set("half");
+        assert_eq!(
+            m.build_profile().unwrap_err(),
+            "CPU limit must be a whole number of CPUs"
+        );
+    }
+
+    #[test]
+    fn sandbox_build_profile_keeps_deny_entries_it_cannot_edit() {
+        let mut m = sandbox_editor();
+        m.deny = vec!["gist.github.com".to_string()];
+        assert_eq!(m.build_profile().unwrap().network_deny, ["gist.github.com"]);
+    }
+
+    #[test]
+    fn sandbox_validation_surfaces_one_sentence_for_the_toast() {
+        let mut m = SandboxEditorModal::default();
+        assert_eq!(
+            m.validated_profile(&[]).unwrap_err(),
+            "Name cannot be empty"
+        );
+        m.name.set("dev");
+        assert_eq!(
+            m.validated_profile(&[]).unwrap_err(),
+            "Add at least one path the sandbox can see"
+        );
+        m.add_path();
+        m.paths[0].text.set("~/dev/app");
+        m.validated_profile(&[]).unwrap();
+        assert!(m
+            .validated_profile(&["DEV".to_string()])
+            .unwrap_err()
+            .contains("already exists"));
+    }
+
+    /// A read-write path reaching friring's data directory is refused at
+    /// launch; the editor refuses to store it in the first place, so the
+    /// profile never becomes a row that lists fine and fails every session
+    /// picking it.
+    #[test]
+    fn a_profile_reaching_the_database_is_refused_by_the_save_not_only_the_launch() {
+        let data_dir = crate::paths::log_directory().expect("a test build pins the data directory");
+        let ancestor = data_dir
+            .parent()
+            .expect("the data directory has a parent")
+            .to_string_lossy()
+            .into_owned();
+
+        let mut m = sandbox_editor();
+        m.paths[0].text.set(&ancestor);
+        m.paths[0].mode = crate::session::PathMode::ReadWrite;
+        let err = m
+            .validated_profile(&[])
+            .expect_err("a read-write path above the data directory cannot be saved");
+        assert!(err.contains("ADR-29"), "{err}");
+        assert!(
+            err.contains(&data_dir.to_string_lossy().into_owned()),
+            "{err}"
+        );
+
+        // A path *inside* the data directory encloses nothing above it, so the
+        // ADR-29 rule passes it — and it is refused anyway, in **either** mode:
+        // `<data>/sandbox` holds the other profiles' sandbox logins, the markers
+        // that keep one credential to one boundary, the generated policies and
+        // the other sessions' egress sockets, every one of which is taken by
+        // being read.
+        for path in [
+            ancestor.clone(),
+            data_dir.join("sandbox").to_string_lossy().into_owned(),
+            data_dir
+                .join("sandbox/pl/other/home")
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            for mode in [
+                crate::session::PathMode::ReadOnly,
+                crate::session::PathMode::ReadWrite,
+            ] {
+                m.paths[0].text.set(&path);
+                m.paths[0].mode = mode;
+                assert!(
+                    m.validated_profile(&[]).is_err(),
+                    "'{path}' must not be storable as {mode:?}"
+                );
+            }
+        }
+
+        // A path that is none of friring's own still saves in either mode.
+        m.paths[0].text.set("/fabricated/home/dev/app");
+        m.paths[0].mode = crate::session::PathMode::ReadWrite;
+        m.validated_profile(&[]).unwrap();
+    }
+
+    #[test]
+    fn sandbox_editor_round_trips_an_existing_profile() {
+        let mut p = crate::session::SandboxProfile::new(
+            "dev",
+            vec![crate::session::SandboxPath::workspace("~/dev/app")],
+        );
+        p.network_allow = vec!["github.com:443".to_string()];
+        p.created_at = 17;
+        let m = SandboxEditorModal::from_profile(&p);
+        assert_eq!(m.editing.as_deref(), Some("dev"));
+        // Re-saving under its own name is not a collision, and the creation
+        // stamp survives.
+        let saved = m
+            .validated_profile(&["dev".to_string(), "other".to_string()])
+            .unwrap();
+        assert_eq!(saved, p);
+        // The blank form is a *new* profile, not an edit of an unnamed one.
+        assert!(SandboxEditorModal::default().editing.is_none());
+    }
+
+    #[test]
+    fn sandbox_editor_outcomes_match_the_footer_buttons() {
+        let mut m = sandbox_editor();
+        assert_eq!(
+            m.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            EditorOutcome::Save
+        );
+        assert_eq!(
+            m.handle_key(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            EditorOutcome::Save
+        );
+        assert_eq!(
+            m.handle_key(KeyCode::Esc, KeyModifiers::NONE),
+            EditorOutcome::Cancel
+        );
+        assert_eq!(
+            m.handle_key(KeyCode::Tab, KeyModifiers::NONE),
+            EditorOutcome::Continue
+        );
     }
 }

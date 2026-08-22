@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod agent_def;
+pub mod agent_projection;
 pub mod automation;
 pub mod cc_activity;
 pub mod extension_def;
@@ -8,11 +9,16 @@ pub mod keybindings;
 pub mod memory;
 pub mod message;
 pub mod review;
+pub mod sandbox_profile;
 pub mod settings;
+pub mod status_signal;
 pub mod task;
 pub mod theme_config;
 
-pub use agent_def::{AgentDef, AgentRegistry};
+pub use agent_def::{AgentDef, AgentRegistry, AgentSandboxDef, SandboxAuth};
+pub use agent_projection::{
+    rewrite_status_signals_for_tmux, EnforcedSettings, SettingsFormat, STATUS_SIGNAL_MARKER,
+};
 pub use automation::{
     parse_hhmm, preset_to_cron, Automation, AutomationAction, AutomationRun, AutomationRunStatus,
     AutomationSchedule, ExtraRepo, PromptStep, SchedulePreset, SendTarget, SpawnSessionMode,
@@ -26,8 +32,8 @@ pub use extension_def::{
     ExtensionSymlink, ExternalFile, PromptStepDecl,
 };
 pub use host_def::{
-    is_remote_backend, is_ssh_backend, is_wsl_backend, HostDef, HostKind, HostRegistry,
-    SSH_BACKEND_PREFIX, WSL_BACKEND_PREFIX,
+    is_offhost_backend, is_remote_backend, is_ssh_backend, is_wsl_backend, HostDef, HostKind,
+    HostRegistry, SSH_BACKEND_PREFIX, WSL_BACKEND_PREFIX,
 };
 pub use keybindings::{
     compact_shortcut, prefix_sections, Action, KeyBindings, KeyChord, KeyContext, PrefixEntry,
@@ -39,6 +45,12 @@ pub use review::{
     parse_unified_diff, Classification, CommentAnchor, DiffFile, DiffHunk, DiffLine, DiffLineKind,
     FileStatus, ReviewComment, Side,
 };
+pub use sandbox_profile::{
+    expand_tilde, is_sandbox_backend, sandbox_backend_profile, DomainRule, EgressDecision,
+    NetworkMode, PathMode, ReadScope, SandboxBackendKind, SandboxInstance, SandboxPath,
+    SandboxPolicy, SandboxProfile, SandboxShape, SANDBOX_BACKEND_PREFIX,
+};
+pub use status_signal::{parse_status_signal, SignalState};
 pub use task::{Task, TaskStatus, SOURCE_LOCAL};
 pub use theme_config::{ThemePalette, ThemePreset};
 
@@ -302,6 +314,116 @@ impl AgentUsage {
     }
 }
 
+/// What a launch actually did with the boundary a session's
+/// [`sandbox_profile`](SessionInfo::sandbox_profile) asks for.
+///
+/// The profile is the **desired** state — the user's choice, persisted, and
+/// never cleared by a launch that could not honour it. This is the **applied**
+/// state, which only the launch knows. Keeping the two apart is what stops the
+/// session-list mark and the info panel claiming a boundary that a fallback
+/// launch never put in place (`docs/SANDBOX.md` §Indicators).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxState {
+    /// The boundary is in effect. Carries the composition the launch applied:
+    /// the resolved backend and what became of the agent's own sandbox, e.g.
+    /// `seatbelt · inner agent sandbox: off — Friring is the boundary`.
+    Applied(String),
+    /// The profile could **not** be applied and its
+    /// `allow_unsandboxed_fallback` switch permitted launching anyway, so the
+    /// agent is running on the host. Carries the reason, which the UI shows in
+    /// place of the composition — a session the user believes is sandboxed and
+    /// is not is the worst outcome this feature has.
+    Unenforced(String),
+}
+
+impl SandboxState {
+    /// Whether the boundary is really in effect. Every "is this sandboxed"
+    /// question goes through this rather than through the profile name, which
+    /// only says what was asked for.
+    pub fn is_applied(&self) -> bool {
+        matches!(self, Self::Applied(_))
+    }
+}
+
+/// What the **persisted row** records about a session's boundary — the half of
+/// [`SandboxState`] that outlives the friring that launched it.
+///
+/// A sandboxed agent runs in tmux, so the wrapped process survives a friring
+/// restart and is adopted by any instance that opens the same database. Both
+/// paths rebuild the session from SQLite, which knows the *desired* profile;
+/// without this the applied state would be evidence-free after every restart,
+/// and the mark rendered from no evidence is the **protected** one
+/// (`docs/SANDBOX.md` §Indicators).
+///
+/// Only the **negative** verdict is stored, as `sessions.sandbox_unenforced`:
+/// a reason string, or `NULL`. The composition an applied boundary produced
+/// (`seatbelt · inner agent sandbox: off …`) is deliberately not persisted —
+/// the next launch re-derives it, and a stale *positive* claim is the exact
+/// failure this feature exists to prevent, where a stale warning is at worst
+/// noise. Reading a row therefore only ever yields [`Unrecorded`](Self::Unrecorded)
+/// or [`Unenforced`](Self::Unenforced); [`Enforced`](Self::Enforced) is the
+/// write direction's way of saying "clear the warning".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SandboxEnforcement {
+    /// Nothing to report: this writer did not launch the agent (a session it
+    /// only adopted, a row rebuilt from storage, a session with no profile).
+    /// A write of it **leaves the stored verdict exactly as it found it**.
+    ///
+    /// The default on purpose: a construction site that has no launch to report
+    /// cannot erase one that did — the full-row write-back hazard that has
+    /// already cost this feature a lying indicator once.
+    #[default]
+    Unrecorded,
+    /// A launch put the boundary in force. Stored as the *absence* of a reason,
+    /// so nothing about the composition can go stale.
+    Enforced,
+    /// A launch could not apply the profile and `allow_unsandboxed_fallback`
+    /// let the agent start on the host anyway. Carries the reason, which the
+    /// indicators show in place of the composition.
+    Unenforced(String),
+}
+
+impl SandboxEnforcement {
+    /// What a launch learned, read off the live
+    /// [`SessionInfo::sandbox_state`]. `None` — a session friring did not
+    /// launch, or one that asked for no boundary — records nothing rather than
+    /// claiming anything.
+    pub fn from_launch(state: Option<&SandboxState>) -> Self {
+        match state {
+            None => Self::Unrecorded,
+            Some(SandboxState::Applied(_)) => Self::Enforced,
+            Some(SandboxState::Unenforced(reason)) => Self::Unenforced(reason.clone()),
+        }
+    }
+
+    /// Decode the `sessions.sandbox_unenforced` column. Any text is a reason —
+    /// the column has no encoding that could fail to parse, and therefore none
+    /// that could be corrupted into a claim of protection.
+    pub fn from_column(reason: Option<String>) -> Self {
+        match reason {
+            Some(reason) => Self::Unenforced(reason),
+            None => Self::Unrecorded,
+        }
+    }
+
+    /// The recorded reason the boundary is not in force, if there is one.
+    pub fn unenforced_reason(&self) -> Option<&str> {
+        match self {
+            Self::Unenforced(reason) => Some(reason),
+            Self::Unrecorded | Self::Enforced => None,
+        }
+    }
+
+    /// The live [`SandboxState`] a **restored or adopted** session inherits
+    /// from the row. Only a recorded warning crosses: an applied boundary's
+    /// composition is not persisted, so the alternative to `None` would be a
+    /// composition friring never applied.
+    pub fn launch_state(&self) -> Option<SandboxState> {
+        self.unenforced_reason()
+            .map(|reason| SandboxState::Unenforced(reason.to_string()))
+    }
+}
+
 pub struct SessionInfo {
     pub id: SessionId,
     pub name: String,
@@ -323,6 +445,43 @@ pub struct SessionInfo {
     /// `ssh:<host>` backend; `None` for local sessions. Drives the remote
     /// indicator in the session list. Set by the agent layer at spawn/adopt.
     pub remote_host: Option<String>,
+    /// Name of the [`SandboxProfile`] this session's agent was launched to run
+    /// under — the **desired** boundary, not necessarily the applied one; ask
+    /// [`sandbox_state`](Self::sandbox_state) for that. `None` for a session
+    /// that asked for no boundary.
+    ///
+    /// Persisted (`sessions.sandbox_profile`) so a restart re-derives the same
+    /// boundary. Two things deliberately never clear it: a **dangling** name
+    /// (the profile was deleted), which must fail the next launch loudly rather
+    /// than quietly run on the host, and a launch that **fell back** to the
+    /// host, which must be sandboxed again the moment its backend returns.
+    pub sandbox_profile: Option<String>,
+    /// What the last launch did with that profile — whether the boundary is
+    /// actually in effect, and why it is not when it is not.
+    ///
+    /// Half-persisted, as [`SandboxEnforcement`]: an `Unenforced` reason is
+    /// stored (`sessions.sandbox_unenforced`) so a restore or a cross-instance
+    /// adopt inherits the warning instead of rendering the shield over an agent
+    /// on the host; an `Applied` composition is not, because the next launch
+    /// re-derives it and a stale one would claim a boundary nobody checked.
+    /// `None` therefore means friring has no launch verdict for this process —
+    /// it only adopted it, and no warning was ever recorded — so the persisted
+    /// profile is the only evidence there is.
+    pub sandbox_state: Option<SandboxState>,
+    /// What the user has to type **in this pane** to sign the agent in, when
+    /// the last launch left it signed out inside its boundary.
+    ///
+    /// `None` is "nothing to do": every policy-backed session (the host's own
+    /// credential store is right where it was, ADR-28), every place friring
+    /// injected a token into or that already holds a login, and every session
+    /// with no profile at all.
+    ///
+    /// Never persisted, for [`sandbox_state`](Self::sandbox_state)'s reason
+    /// turned around: the answer is only true of the launch that computed it,
+    /// and a stale "sign in" against an agent that has since signed itself in
+    /// is a prompt for work nobody needs to do. An adopted session shows
+    /// nothing rather than guessing.
+    pub sandbox_login: Option<String>,
     /// Agent metrics from the agent's statusline (Claude only).
     pub agent_metrics: Option<AgentMetrics>,
     /// Latest OSC window title the agent emitted (live activity text),
@@ -372,6 +531,9 @@ impl SessionInfo {
             backend_id: None,
             shell_backend_id: None,
             remote_host: None,
+            sandbox_profile: None,
+            sandbox_state: None,
+            sandbox_login: None,
             agent_metrics: None,
             agent_activity: None,
             cc_activity: None,
@@ -422,6 +584,12 @@ pub struct SessionConfig {
     /// Environment variables injected into the spawned session process
     /// (friring-internal: session id, metrics dir, etc.).
     pub env: HashMap<String, String>,
+    /// Sandbox profile the agent runs under, loaded from storage by whoever
+    /// built this config. Carried as the whole profile rather than its name so
+    /// the launch path — which has no database — can resolve a policy from it;
+    /// `SessionInfo::sandbox_profile` is the persisted half. `None` = the agent
+    /// runs on the host with no boundary.
+    pub sandbox: Option<SandboxProfile>,
 }
 
 #[cfg(test)]
@@ -553,6 +721,73 @@ mod tests {
         assert!(config.cwd.is_none());
         assert_eq!(config.agent, "");
         assert!(config.env.is_empty());
+    }
+
+    /// The write direction: a launch's verdict maps onto the row, and a session
+    /// friring did not launch records *nothing* — the default that keeps a
+    /// full-row write-back from erasing a verdict it never had.
+    #[test]
+    fn sandbox_enforcement_from_a_launch() {
+        assert_eq!(
+            SandboxEnforcement::from_launch(None),
+            SandboxEnforcement::Unrecorded
+        );
+        assert_eq!(
+            SandboxEnforcement::default(),
+            SandboxEnforcement::Unrecorded
+        );
+        assert_eq!(
+            SandboxEnforcement::from_launch(Some(&SandboxState::Applied(
+                "seatbelt · inner agent sandbox: off".to_string()
+            ))),
+            SandboxEnforcement::Enforced,
+        );
+        assert_eq!(
+            SandboxEnforcement::from_launch(Some(&SandboxState::Unenforced(
+                "bwrap is not installed".to_string()
+            ))),
+            SandboxEnforcement::Unenforced("bwrap is not installed".to_string()),
+        );
+    }
+
+    /// The read direction: the column is a reason or nothing, and only a reason
+    /// crosses back into a live session. An applied boundary's composition is
+    /// deliberately not persisted, so a restored session inherits no claim.
+    #[test]
+    fn sandbox_enforcement_column_round_trip() {
+        assert_eq!(
+            SandboxEnforcement::from_column(None),
+            SandboxEnforcement::Unrecorded
+        );
+        assert_eq!(SandboxEnforcement::Unrecorded.unenforced_reason(), None);
+        assert_eq!(SandboxEnforcement::Unrecorded.launch_state(), None);
+
+        // An applied launch stores the absence of a reason, so it reads back as
+        // "nothing recorded" — never as a composition friring cannot re-verify.
+        assert_eq!(SandboxEnforcement::Enforced.unenforced_reason(), None);
+        assert_eq!(SandboxEnforcement::Enforced.launch_state(), None);
+        assert_eq!(
+            SandboxEnforcement::from_column(
+                SandboxEnforcement::Enforced
+                    .unenforced_reason()
+                    .map(str::to_string)
+            ),
+            SandboxEnforcement::Unrecorded,
+        );
+
+        let stored = SandboxEnforcement::Unenforced("bwrap is not installed".to_string());
+        assert_eq!(stored.unenforced_reason(), Some("bwrap is not installed"));
+        assert_eq!(
+            SandboxEnforcement::from_column(stored.unenforced_reason().map(str::to_string)),
+            stored,
+        );
+        assert_eq!(
+            stored.launch_state(),
+            Some(SandboxState::Unenforced(
+                "bwrap is not installed".to_string()
+            )),
+        );
+        assert!(!stored.launch_state().unwrap().is_applied());
     }
 
     #[test]

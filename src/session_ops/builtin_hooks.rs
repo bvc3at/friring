@@ -32,10 +32,6 @@ const CODEX_HOOKS: &str = include_str!("../../extensions/hooks/codex-hooks.json"
 const VIBE_HOOKS: &str = include_str!("../../extensions/hooks/vibe-hooks.toml");
 const COPILOT_HOOKS: &str = include_str!("../../extensions/hooks/copilot-hooks.json");
 
-/// Marker prefix of every friring-managed hook command; the state word
-/// (`working`/`blocked`/`done`/`idle`) follows it directly.
-const SIGNAL_MARKER: &str = "friring-cli session signal --state ";
-
 /// Rewrite friring-managed hook commands for a **remote (real-tmux) host**:
 /// `friring-cli session signal --state <s>` →
 /// `tmux set-option -p @friring_state <s>`.
@@ -47,18 +43,15 @@ const SIGNAL_MARKER: &str = "friring-cli session signal --state ";
 /// and the local TUI's control-mode connection receives changes through its
 /// [`crate::session::REMOTE_HOOK_SUBSCRIPTION`] format subscription. Applied
 /// by the spawn-time materialization (`adapt_agent_args_for_remote`) to every
-/// config file it ships. Prefix-replace keeps the state word and whatever
-/// trails it (`|| true`, `;; esac; true`) intact; the replacement contains no
-/// `"`/`\`, so a byte-level replace on JSON text is safe. Idempotent, and a
-/// no-op for marker-free content.
+/// config file it ships.
+///
+/// One line, because a sandbox **place** is the same problem and reaches
+/// [`crate::session::rewrite_status_signals_for_tmux`] from the other side of
+/// the crate (`crate::sandbox::projection` may not reference `session_ops`).
+/// Two copies of one marker is exactly the drift that would silently kill
+/// status reporting on one path and not the other.
 pub(crate) fn rewrite_hook_signals_for_remote(contents: &str) -> String {
-    contents.replace(
-        SIGNAL_MARKER,
-        &format!(
-            "tmux set-option -p {} ",
-            crate::session::REMOTE_HOOK_STATE_OPTION
-        ),
-    )
+    crate::session::rewrite_status_signals_for_tmux(contents)
 }
 
 /// The hooks extension's home, under this build's resolved config dir
@@ -282,11 +275,15 @@ mod tests {
                 "missing rewritten {state} command"
             );
         }
-        // The surrounding hook shape (`|| true`, the blocked `case`) survives
-        // the prefix replace, and the result is still valid JSON with all five
-        // hook events.
+        // The surrounding hook shape survives the prefix replace — `|| true`,
+        // the `if`/`else` the sandbox file channel added around the CLI call,
+        // and the blocked `case` arm that closes it — and the result is still
+        // valid JSON with all five hook events.
         assert!(rewritten.contains("tmux set-option -p @friring_state idle || true"));
-        assert!(rewritten.contains("tmux set-option -p @friring_state blocked ;;"));
+        assert!(
+            rewritten.contains("tmux set-option -p @friring_state blocked || true; fi ;; esac"),
+            "the rewritten blocked command lost its shell shape"
+        );
         let json: serde_json::Value = serde_json::from_str(&rewritten).expect("still valid JSON");
         let hooks = json.get("hooks").and_then(|h| h.as_object()).unwrap();
         for event in [
@@ -316,9 +313,11 @@ mod tests {
         // exact marker prefix.
         let occurrences = CLAUDE_SETTINGS.matches("session signal").count();
         assert_eq!(
-            CLAUDE_SETTINGS.matches(SIGNAL_MARKER).count(),
+            CLAUDE_SETTINGS
+                .matches(crate::session::STATUS_SIGNAL_MARKER)
+                .count(),
             occurrences,
-            "a `session signal` command in claude.json doesn't match SIGNAL_MARKER"
+            "a `session signal` command in claude.json doesn't match STATUS_SIGNAL_MARKER"
         );
         assert_eq!(
             occurrences, 5,

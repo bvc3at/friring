@@ -11,6 +11,8 @@
 //! beyond serde/std) to satisfy the `session/` architecture rule. The TOML
 //! loading and the `AgentProvider` bridge live in `crate::agent`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Placeholder substituted with a session id in resume/fork/new-session groups.
@@ -66,6 +68,139 @@ pub struct AgentDef {
     /// (`apply_agent_patches`) and `extensions/hooks/`.
     #[serde(default)]
     pub hook_schema: Option<String>,
+    /// What this CLI needs in order to survive being sandboxed
+    /// (`[agents.<name>.sandbox]`). Absent for an agent nobody has sandboxed
+    /// yet: it still launches, it just gets no help — which the editor says
+    /// rather than papering over. friring bakes in no agent knowledge; the
+    /// *user* declares the flags and directories here.
+    #[serde(default)]
+    pub sandbox: Option<AgentSandboxDef>,
+}
+
+/// How an agent gets its credentials inside a sandbox (`docs/SANDBOX.md`
+/// §Credentials, in resolution order).
+///
+/// A *request*, not a verdict: what a launch actually does is
+/// [`crate::sandbox::auth::CredentialStrategy`], which resolves this
+/// against the boundary's shape. A policy backend is always host passthrough,
+/// and a place cannot be one — so a declaration naming a strategy its boundary
+/// cannot give it degrades to one it can, with the reason in front of the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxAuth {
+    /// Let friring pick: host passthrough under a policy backend, and the
+    /// strongest strategy the agent declares elsewhere in a place.
+    #[default]
+    Auto,
+    /// The agent sees the real credential store, subject to path policy. Policy
+    /// backends only, and the reason they are the default.
+    HostPassthrough,
+    /// A long-lived token friring holds in its own keychain entry and injects.
+    EnvToken,
+    /// A per-profile volume holding the agent's state, with one login per
+    /// profile.
+    VolumeLogin,
+    /// Copy a credential file in once and honour write-back. Opt-in, and only
+    /// for agents whose vendor documents it.
+    SeedFile,
+}
+
+/// The `[agents.<name>.sandbox]` block.
+///
+/// Every field is optional: an agent that declares nothing still runs, it just
+/// gets no help. Lives here rather than in `crate::sandbox` because `session` is
+/// the dependency sink — [`AgentDef`] can only embed a type defined alongside
+/// it. `crate::sandbox::agent` is what turns a declaration plus the chosen
+/// backend into the extra argv and extra writable paths a launch applies.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AgentSandboxDef {
+    /// Environment variable that relocates the agent's state into the sandbox.
+    /// Meaningful for a place, whose home is synthetic; a policy backend leaves
+    /// it alone, because the real state directory is already visible and
+    /// relocating it would strand the agent's existing login.
+    #[serde(default)]
+    pub config_dir_env: Option<String>,
+    #[serde(default)]
+    pub auth: SandboxAuth,
+    /// The one directory [`config_dir_env`](Self::config_dir_env) names — the
+    /// agent's own state, where its login lands. Written home-relative (`~/.x`),
+    /// because a place relocates it under that place's synthetic home and the
+    /// host's home path does not exist in there.
+    ///
+    /// Distinct from [`state_rw`](Self::state_rw), which is a *policy* input
+    /// (paths to keep writable on the host): this is the single directory a
+    /// place persists per profile, and the one an agent signs into once.
+    #[serde(default)]
+    pub state_dir: Option<String>,
+    /// The vendor's credential file, home-relative — the file `seed-file`
+    /// copies and the file whose presence says the sandbox has a login already.
+    ///
+    /// friring never reads its contents to inspect them (ADR-28); it is named
+    /// here so a strategy can copy it whole and so "is this sandbox signed in?"
+    /// can be answered without opening anything.
+    #[serde(default)]
+    pub credential_file: Option<String>,
+    /// Whether the vendor documents copying
+    /// [`credential_file`](Self::credential_file) into another environment.
+    ///
+    /// The gate on `seed-file`, and deliberately a separate assertion from
+    /// asking for that strategy: a **rotating single-use refresh token can
+    /// never be declared here**, because the copy and the original invalidate
+    /// each other on the first refresh (ADR-28). Left `false`, `seed-file` is
+    /// refused and the launch falls back to signing in inside the pane.
+    #[serde(default)]
+    pub seed_file_supported: bool,
+    /// Directories the agent writes and must keep. Added to the policy's
+    /// writable set: an agent that cannot write its own state directory dies on
+    /// first launch under an otherwise correct profile.
+    #[serde(default)]
+    pub state_rw: Vec<String>,
+    /// Configuration safe to project into a place, subject to the lint pass.
+    ///
+    /// Written `~`-anchored (`"~/.claude/skills"`) and projected to the
+    /// *identical* home-relative path inside the boundary, because a place gives
+    /// the agent a synthetic `$HOME` and nothing else about the layout has to
+    /// change. Each entry is a file or a directory tree;
+    /// [`crate::sandbox::projection`] classifies every member before any of it
+    /// crosses, and a credential file never does (ADR-28).
+    #[serde(default)]
+    pub copy_in: Vec<String>,
+    /// The highest-precedence configuration layer friring writes inside the
+    /// boundary — what must hold there whatever a repository-level file says,
+    /// including the workspace trust several agents otherwise prompt for on
+    /// first run in a fresh home. See
+    /// [`EnforcedSettings`](super::agent_projection::EnforcedSettings).
+    #[serde(default)]
+    pub enforced: Vec<super::agent_projection::EnforcedSettings>,
+    /// Static environment applied whenever a sandbox is active.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Names of the environment variables that carry a long-lived token this
+    /// agent accepts (`ANTHROPIC_API_KEY`, …) — **names only**. The values live
+    /// in friring's own OS keychain entry and never in the registry, the
+    /// database or a config file, and they are what `env-token` injects.
+    #[serde(default)]
+    pub secret_env: Vec<String>,
+    /// Flags that mean "the outer boundary is the sandbox" — the agent's own
+    /// sandbox off. Applied only when a profile is active.
+    #[serde(default)]
+    pub bypass: Vec<String>,
+    /// Whether a credential the agent refreshes has to survive the sandbox it
+    /// was refreshed in.
+    ///
+    /// It does so by living in the profile's own persistent state directory
+    /// rather than by being written back to the host: two writers of one
+    /// rotating token is the failure ADR-28 exists to prevent, and the host is
+    /// one of them.
+    #[serde(default)]
+    pub writeback: bool,
+    /// What the user has to do inside the pane when this agent has no
+    /// credential in the sandbox — the agent's own words for it (`/login`,
+    /// `codex login`). friring composes the sentence around it, so a place with
+    /// no credential reads as "sign in here, like this" rather than as a broken
+    /// session.
+    #[serde(default)]
+    pub login_fallback: Option<String>,
 }
 
 impl AgentDef {
@@ -229,6 +364,7 @@ mod tests {
             ],
             resume_latest: false,
             hook_schema: None,
+            sandbox: None,
         }
     }
 
@@ -369,6 +505,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: None,
+            sandbox: None,
         };
         let args = d.build_args(None, None, Some("ignored"), None);
         assert_eq!(args, vec!["--quiet"]);
@@ -387,6 +524,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: true,
             hook_schema: None,
+            sandbox: None,
         };
         // resume id present, but no {id} token -> tokens unchanged.
         assert_eq!(
@@ -423,6 +561,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: true,
             hook_schema: None,
+            sandbox: None,
         };
         // Flag set but no resume_args -> nothing to emit, so not "resumes latest".
         assert!(!d.resumes_latest());
@@ -448,12 +587,74 @@ mod tests {
                     new_session_args: vec![],
                     resume_latest: false,
                     hook_schema: None,
+                    sandbox: None,
                 },
             ],
         };
         assert_eq!(reg.get("claude").unwrap().command, "claude");
         assert_eq!(reg.default_agent().unwrap().name, "codex");
         assert_eq!(reg.names(), vec!["claude", "codex"]);
+    }
+
+    #[test]
+    fn sandbox_block_round_trips_and_is_optional() {
+        let toml = r#"
+name = "claude"
+command = "claude"
+
+[sandbox]
+config_dir_env = "CLAUDE_CONFIG_DIR"
+auth = "host-passthrough"
+state_dir = "~/.claude"
+credential_file = "~/.claude/.credentials.json"
+seed_file_supported = false
+secret_env = ["ANTHROPIC_API_KEY"]
+login_fallback = "/login"
+state_rw = ["~/.claude"]
+bypass = ["--dangerously-skip-permissions"]
+writeback = true
+[sandbox.env]
+DISABLE_AUTOUPDATER = "1"
+"#;
+        let def: AgentDef = toml::from_str(toml).unwrap();
+        let sandbox = def.sandbox.expect("declared block parses");
+        assert_eq!(sandbox.auth, SandboxAuth::HostPassthrough);
+        assert_eq!(sandbox.config_dir_env.as_deref(), Some("CLAUDE_CONFIG_DIR"));
+        assert_eq!(sandbox.state_dir.as_deref(), Some("~/.claude"));
+        assert_eq!(
+            sandbox.credential_file.as_deref(),
+            Some("~/.claude/.credentials.json")
+        );
+        assert!(!sandbox.seed_file_supported);
+        assert_eq!(sandbox.secret_env, ["ANTHROPIC_API_KEY"]);
+        assert_eq!(sandbox.login_fallback.as_deref(), Some("/login"));
+        assert_eq!(sandbox.state_rw, ["~/.claude"]);
+        assert_eq!(sandbox.bypass, ["--dangerously-skip-permissions"]);
+        assert_eq!(sandbox.env.get("DISABLE_AUTOUPDATER").unwrap(), "1");
+        assert!(sandbox.writeback);
+        assert!(sandbox.copy_in.is_empty());
+
+        // An agents.toml written before sandboxing existed must load unchanged.
+        let legacy: AgentDef = toml::from_str("name = \"x\"\ncommand = \"x\"\n").unwrap();
+        assert_eq!(legacy.sandbox, None);
+
+        // An empty block is valid and means "declare nothing".
+        let bare: AgentDef = toml::from_str("name = \"x\"\ncommand = \"x\"\n[sandbox]\n").unwrap();
+        assert_eq!(bare.sandbox, Some(AgentSandboxDef::default()));
+
+        // …and so is one written before the credential fields existed: every
+        // addition here is `#[serde(default)]`, so a registry that predates
+        // this slice keeps loading and simply declares nothing about
+        // credentials.
+        let p3: AgentDef = toml::from_str(
+            "name = \"x\"\ncommand = \"x\"\n[sandbox]\nauth = \"auto\"\nstate_rw = [\"~/.x\"]\n",
+        )
+        .unwrap();
+        let p3 = p3.sandbox.expect("the older block still parses");
+        assert_eq!(p3.state_dir, None);
+        assert_eq!(p3.credential_file, None);
+        assert!(!p3.seed_file_supported);
+        assert!(p3.secret_env.is_empty());
     }
 
     #[test]

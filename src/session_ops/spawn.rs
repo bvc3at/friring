@@ -47,6 +47,10 @@ pub struct SpawnRequest {
     /// as-is as an additional directory. When any extra is non-empty the agent
     /// launches in a per-session symlink workspace gathering every member.
     pub extra_repos: Vec<ExtraRepo>,
+    /// Name of the sandbox profile to run the agent under (`docs/SANDBOX.md`).
+    /// `None` = unsandboxed, the default. An unknown name fails the spawn
+    /// rather than quietly running on the host.
+    pub sandbox_profile: Option<String>,
 }
 
 /// Result returned on successful headless spawn.
@@ -59,11 +63,121 @@ pub struct SpawnResult {
     pub cwd: PathBuf,
     pub worktrees: Vec<SharedWorktree>,
     pub parent_session_id: Option<SessionId>,
+    /// What the launch did with [`SpawnRequest::sandbox_profile`]. `None` = the
+    /// session asked for no boundary. A
+    /// [`SandboxState::Unenforced`](crate::session::SandboxState::Unenforced)
+    /// here means the agent is running **on the host**: the caller reports it,
+    /// because a session the user believes is sandboxed and is not is the worst
+    /// outcome this feature has.
+    pub sandbox: Option<crate::session::SandboxState>,
+    /// What the user has to type in the session's pane to sign the agent in,
+    /// when the boundary started it signed out. `None` when there is nothing to
+    /// do — every policy-backed launch, and every place that already holds a
+    /// credential. Reported for the reason the fallback is: an agent parked at
+    /// a sign-in prompt with nothing said about it reads as a broken session.
+    pub sandbox_login: Option<String>,
+}
+
+/// How a headless spawn creates the session's window, and what it learns: the
+/// remote pane id, or an empty string for a local spawn (whose pane the TUI
+/// resolves by name).
+///
+/// Injected so the failure path — the one that must leave behind no egress
+/// proxy, no scratch directory and no generated policy file — is exercised
+/// without a tmux server. Driving the real one in a test would either talk to
+/// the user's own friring socket or launch an agent.
+type WindowSpawner<'a> = &'a dyn Fn(
+    LaunchTarget<'_>,
+    &str,
+    &str,
+    &[String],
+    &std::path::Path,
+    &std::collections::HashMap<String, String>,
+) -> Result<String, String>;
+
+/// Where a headless launch puts its window: this machine's tmux, a host's over
+/// SSH/WSL, or the tmux **inside a sandbox place**. The three multiplexers are
+/// reached differently and nothing else about the launch changes, which is
+/// exactly the transport seam ADR-26 leans on.
+#[derive(Clone, Copy)]
+pub(crate) enum LaunchTarget<'a> {
+    Local,
+    Host(&'a HostDef),
+    Place(&'a crate::agent::transport::Place),
+}
+
+/// The real one: a window on the local tmux server, on the host's over SSH, or
+/// on the one running inside a place.
+fn spawn_launch_window(
+    target: LaunchTarget<'_>,
+    name: &str,
+    command: &str,
+    args: &[String],
+    cwd: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<String, String> {
+    // Off-host spawns drive control mode to learn the real pane id; local spawns
+    // leave `backend_id` empty for the TUI to resolve by name.
+    match target {
+        LaunchTarget::Host(h) => {
+            crate::agent::tmux::spawn_window_remote(h, name, command, args, Some(cwd), env)
+                .map_err(|e| format!("Failed to spawn remote tmux window: {e:#}"))
+        }
+        LaunchTarget::Place(place) => {
+            crate::agent::tmux::spawn_window_place(place, name, command, args, Some(cwd), env)
+                .map_err(|e| format!("Failed to spawn tmux window in the sandbox place: {e:#}"))
+        }
+        LaunchTarget::Local => {
+            crate::agent::tmux::spawn_window(name, command, args, Some(cwd), env)
+                .map(|()| String::new())
+                .map_err(|e| format!("Failed to spawn tmux window: {e}"))
+        }
+    }
+}
+
+/// Refuse a launch that would put a credential on a command line.
+///
+/// A window's environment reaches an off-host target — an SSH host, a sandbox
+/// place — inside a control-mode command sent over the tmux socket, which never
+/// touches a process table. The **local** one-shot spawn has no control
+/// connection and passes each variable as a `tmux -e KEY=VALUE` argument
+/// instead, readable by any local user through `/proc/<pid>/cmdline`
+/// (`docs/SANDBOX.md` §Failure modes). Refusing is the point: the alternative is
+/// exposing the token in order to satisfy the launch, and the quieter
+/// alternative — dropping it — starts an agent that will fail to authenticate
+/// with nothing on screen saying why.
+///
+/// Unreachable today by construction (only a place injects a credential, and a
+/// place is never the local target), which is exactly why it is a check rather
+/// than a comment: the next credential strategy must not be able to make it
+/// reachable silently.
+fn credential_channel(
+    target: LaunchTarget<'_>,
+    secret_env: &[(String, String)],
+) -> Result<(), String> {
+    if secret_env.is_empty() || !matches!(target, LaunchTarget::Local) {
+        return Ok(());
+    }
+    Err(
+        "This sandbox profile injects a credential, which friring will not pass on a tmux \
+         client's command line where another local user could read it; start the session from \
+         the TUI instead"
+            .to_string(),
+    )
 }
 
 /// Spawn a new session inside `tmux -L friring`, persisting its state to the
 /// shared SQLite database.
 pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnResult, String> {
+    spawn_session_with(db, req, &spawn_launch_window)
+}
+
+/// [`spawn_session_headless`] against `spawn_window`. See [`WindowSpawner`].
+fn spawn_session_with(
+    db: &Database,
+    req: SpawnRequest,
+    spawn_window: WindowSpawner<'_>,
+) -> Result<SpawnResult, String> {
     crate::paths::validate_safe_name(&req.name)?;
     validate_parent_session(db, req.parent_session_id)?;
 
@@ -129,36 +243,45 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         agent: agent_name.clone(),
         backend: (backend_type != LOCAL_TMUX_BACKEND_TYPE).then(|| backend_type.clone()),
         session_name: Some(req.name.clone()),
+        sandbox: super::load_sandbox_profile(db, req.sandbox_profile.as_deref())?,
         ..SessionConfig::default()
     };
     super::inject_friring_env(&mut config, &agent_session_id, req.task_id);
 
-    let (command, args) = super::build_agent_invocation(&agent_def, &config);
-
-    // Remote spawns drive the SSH backend's control mode to learn the real pane
-    // id; local spawns leave `backend_id` empty for the TUI to resolve by name.
-    let backend_id = match host.as_ref() {
-        Some(h) => crate::agent::tmux::spawn_window_remote(
-            h,
-            &req.name,
-            &command,
-            &args,
-            Some(&launch_cwd),
-            &config.env,
-        )
-        .map_err(|e| format!("Failed to spawn remote tmux window: {e:#}"))?,
-        None => {
-            crate::agent::tmux::spawn_window(
-                &req.name,
-                &command,
-                &args,
-                Some(&launch_cwd),
-                &config.env,
-            )
-            .map_err(|e| format!("Failed to spawn tmux window: {e}"))?;
-            String::new()
-        }
+    let invocation = super::build_agent_invocation(&agent_def, &mut config)?;
+    let (command, args) = (invocation.command, invocation.args);
+    // A place is where this session lives from now on, so it is what
+    // `backend_type` records — mirroring `ssh:<host>`, and for the same reason:
+    // restore and reattach re-derive the transport from it.
+    let backend_type = match &invocation.place {
+        Some(place) => place.backend_name(),
+        None => backend_type,
     };
+    let target = match (&invocation.place, host.as_ref()) {
+        (Some(place), _) => LaunchTarget::Place(place),
+        (None, Some(h)) => LaunchTarget::Host(h),
+        (None, None) => LaunchTarget::Local,
+    };
+    // A filtered profile bound an egress proxy to compose that invocation
+    // against, and it is nobody's until this session exists. Held from here to
+    // the upsert so every failure in between releases it, rather than leaving a
+    // live credential for a session that never happened — which is why it is
+    // claimed *before* the refusal below rather than after it.
+    let egress = crate::agent::sandboxing::pending_egress(&config);
+    credential_channel(target, &invocation.secret_env)?;
+    config.env.extend(invocation.secret_env.iter().cloned());
+
+    let backend_id =
+        match spawn_window(target, &req.name, &command, &args, &launch_cwd, &config.env) {
+            Ok(backend_id) => backend_id,
+            Err(e) => {
+                // Nothing will adopt what this launch minted. The proxy goes with
+                // `egress`; the scratch directory the agent would have written and
+                // the policy file generated for it have to be said out loud.
+                crate::agent::sandboxing::cleanup_by_session_id(session_id);
+                return Err(e);
+            }
+        };
 
     let shared = SharedSession {
         id: session_id,
@@ -174,6 +297,17 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         workspace_dir: None,
         worktrees: worktrees.clone(),
         shell_backend_id: None,
+        // The profile the session **asked for**, recorded even when the launch
+        // fell back to the host: clearing it would strand the session outside
+        // its boundary for good, where keeping it makes the next relaunch
+        // sandboxed again as soon as the backend is available.
+        sandbox_profile: config.sandbox.as_ref().map(|p| p.name.clone()),
+        // …and what this launch managed to apply. A headless spawn writes the
+        // row once and never comes back to it, so a fallback that went
+        // unrecorded here would render as a boundary that holds.
+        sandbox_enforcement: crate::session::SandboxEnforcement::from_launch(
+            invocation.sandbox.as_ref(),
+        ),
         parent_session_id: req.parent_session_id,
         display_order: None,
         tombstone: false,
@@ -189,9 +323,10 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
              tearing down the orphaned window: {e}",
             req.name
         );
-        let cleanup = match host.as_ref() {
-            Some(h) => crate::agent::tmux::kill_pane_remote(h, &backend_id),
-            None => crate::agent::tmux::kill_window(&req.name),
+        let cleanup = match target {
+            LaunchTarget::Host(h) => crate::agent::tmux::kill_pane_remote(h, &backend_id),
+            LaunchTarget::Place(place) => crate::agent::tmux::kill_pane_place(place, &backend_id),
+            LaunchTarget::Local => crate::agent::tmux::kill_window(&req.name),
         };
         if let Err(kill_err) = cleanup {
             tracing::error!(
@@ -199,7 +334,17 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
                 req.name
             );
         }
+        // The window is gone with the row that would have tracked it, so the
+        // boundary minted for it goes too: `egress` releases the proxy as this
+        // returns, and the id-keyed cleanup takes the rest.
+        crate::agent::sandboxing::cleanup_by_session_id(session_id);
         return Err(format!("Failed to persist session: {e}"));
+    }
+    // The window is live and the row that owns it is committed: this session
+    // exists, so its boundary is the session's now.
+    egress.commit();
+    if let Some(instance) = &invocation.instance {
+        super::record_sandbox_instance(db, instance);
     }
 
     // Record the worktree's fork point so the code-review view can scope its
@@ -225,6 +370,8 @@ pub fn spawn_session_headless(db: &Database, req: SpawnRequest) -> Result<SpawnR
         cwd: primary_cwd,
         worktrees,
         parent_session_id: req.parent_session_id,
+        sandbox: invocation.sandbox,
+        sandbox_login: invocation.login,
     })
 }
 
@@ -459,7 +606,7 @@ pub(crate) fn adapt_agent_args_for_remote(host: &HostDef, args: Vec<String>) -> 
     // Resolve the translation target lazily (one ssh round-trip) and at most
     // once; `None` = strip mode.
     let mut remote_root: Option<Option<String>> = None;
-    rewrite_config_path_args(args, &config_root, |local_path| {
+    crate::agent::config_args::rewrite_config_path_args(args, &config_root, |local_path| {
         let root = remote_root
             .get_or_insert_with(|| remote_config_root(host, &config_root))
             .clone()?;
@@ -522,59 +669,6 @@ fn remote_config_root(host: &HostDef, config_root: &str) -> Option<String> {
     }
 }
 
-/// True when `path` is `root` itself or a descendant — a plain
-/// `starts_with` would also claim sibling dirs sharing the prefix
-/// (`…/friring-backup` under root `…/friring`).
-fn path_under_root(path: &str, root: &str) -> bool {
-    path.strip_prefix(root)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-}
-
-/// Pure arg-rewriting core of [`adapt_agent_args_for_remote`]: every arg (or
-/// `--flag=value` value) under `config_root` is passed to `map`; `Some(new)`
-/// substitutes the path, `None` drops the arg **and** its preceding token when
-/// that token is a flag (so a `--settings <path>` pair vanishes together).
-fn rewrite_config_path_args(
-    args: Vec<String>,
-    config_root: &str,
-    mut map: impl FnMut(&str) -> Option<String>,
-) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(args.len());
-    for arg in args {
-        if path_under_root(&arg, config_root) {
-            match map(&arg) {
-                Some(new) => out.push(new),
-                None => {
-                    tracing::warn!("dropping agent arg for remote spawn: {arg}");
-                    // A `--flag=value` token is self-contained — never a
-                    // dangling flag for the dropped path — so popping it would
-                    // eat an unrelated (possibly already-rewritten) arg.
-                    if out
-                        .last()
-                        .is_some_and(|prev| prev.starts_with('-') && !prev.contains('='))
-                    {
-                        out.pop();
-                    }
-                }
-            }
-            continue;
-        }
-        // `--flag=<path>` form: rewrite the value in place, or drop the whole
-        // token (it is self-contained — nothing precedes it to pop).
-        if let Some((flag, value)) = arg.split_once('=') {
-            if flag.starts_with('-') && path_under_root(value, config_root) {
-                match map(value) {
-                    Some(new) => out.push(format!("{flag}={new}")),
-                    None => tracing::warn!("dropping agent arg for remote spawn: {arg}"),
-                }
-                continue;
-            }
-        }
-        out.push(arg);
-    }
-    out
-}
-
 /// A human-friendly label for a member directory in the symlink workspace:
 /// the git repo display name, falling back to the final path component.
 fn dir_label(path: &std::path::Path) -> String {
@@ -627,7 +721,36 @@ mod tests {
             parent_session_id: None,
             task_id: None,
             extra_repos: Vec::new(),
+            sandbox_profile: None,
         }
+    }
+
+    // A place-backed spawn, which a native Windows host cannot have
+    // (`crate::sandbox::select::NATIVE_WINDOWS`).
+
+    /// A credential goes over a control connection or not at all. The local
+    /// one-shot spawner puts its whole environment in a `tmux` client's argv,
+    /// so a launch carrying one is refused there and injected everywhere else.
+    #[cfg(unix)]
+    #[test]
+    fn a_credential_never_rides_a_tmux_clients_command_line() {
+        let secret = vec![("ANTHROPIC_API_KEY".to_string(), "sk-fabricated".to_string())];
+        let host = HostDef {
+            name: "devbox".into(),
+            destination: "devbox".into(),
+            ..HostDef::default()
+        };
+        let place = crate::agent::transport::Place::new("/usr/bin/podman", "abc123", "dev")
+            .expect("a spellable place");
+
+        let err = credential_channel(LaunchTarget::Local, &secret).unwrap_err();
+        assert!(err.contains("command line"), "{err}");
+        assert!(err.contains("from the TUI"), "{err}");
+
+        assert!(credential_channel(LaunchTarget::Place(&place), &secret).is_ok());
+        assert!(credential_channel(LaunchTarget::Host(&host), &secret).is_ok());
+        // Nothing to protect, nothing to refuse.
+        assert!(credential_channel(LaunchTarget::Local, &[]).is_ok());
     }
 
     #[test]
@@ -645,6 +768,77 @@ mod tests {
                 spawn_session_headless(&db, req(bad)).is_err(),
                 "should reject {bad}"
             );
+        }
+    }
+
+    /// A headless spawn binds its egress proxy while composing — argv has to
+    /// name the port — so a window that never spawns must leave nothing at all
+    /// behind: no listener, no writable scratch directory, and no generated
+    /// policy file, for a session that does not exist.
+    #[test]
+    fn a_spawn_that_fails_leaves_no_boundary_behind() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _paths = crate::paths::TestPathGuard::new(temp.path());
+        let _host = crate::agent::sandboxing::TestSandboxHost::seatbelt();
+        let db = empty_db();
+
+        let mut profile = crate::session::SandboxProfile::new(
+            "dev",
+            vec![crate::session::SandboxPath::workspace(
+                "/fabricated/dev/app",
+            )],
+        );
+        profile.network_allow = vec!["api.anthropic.com".into()];
+        db.upsert_sandbox_profile(&profile).unwrap();
+
+        let mut request = req("boxed");
+        // Not the host temp root the default carries: a read-write grant over
+        // it reaches friring's own tmux socket, which the launch refuses.
+        request.repo_path = PathBuf::from("/fabricated/repo");
+        request.sandbox_profile = Some("dev".into());
+
+        let composed = std::sync::Mutex::new(std::collections::HashMap::new());
+        let err = spawn_session_with(&db, request, &|_, _, _, _, _, env| {
+            composed.lock().unwrap().clone_from(env);
+            Err("Failed to spawn tmux window: no server".to_string())
+        })
+        .expect_err("the window cannot be spawned");
+        assert!(err.contains("tmux window"), "{err}");
+
+        // The listener is closed on the egress supervisor's own thread, so the
+        // assertion is that it happens, not that it already has.
+        let url = composed
+            .lock()
+            .unwrap()
+            .get("HTTP_PROXY")
+            .cloned()
+            .expect("the launch was composed against a proxy");
+        let port: u16 = url
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or_else(|| panic!("no port in {url}"));
+        let closed = (0..200).any(|_| {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        });
+        assert!(
+            closed,
+            "the proxy for a session that never existed is still listening"
+        );
+
+        let data = crate::paths::log_directory().expect("the fabricated data directory");
+        for (what, dir) in [
+            ("scratch directory", data.join("sandbox").join("tmp")),
+            ("policy file", data.join("sandbox").join("profiles")),
+        ] {
+            let left: Vec<_> = std::fs::read_dir(&dir)
+                .map(|entries| entries.flatten().map(|e| e.path()).collect())
+                .unwrap_or_default();
+            assert!(left.is_empty(), "a failed spawn left a {what}: {left:?}");
         }
     }
 
@@ -674,6 +868,8 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
+            sandbox_enforcement: Default::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -704,6 +900,8 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            sandbox_profile: None,
+            sandbox_enforcement: crate::session::SandboxEnforcement::default(),
         };
         db.upsert_session(&existing).unwrap();
 
@@ -749,9 +947,11 @@ mod tests {
         let args: Vec<String> = ["--settings", "/home/a/.config/friring/hooks/claude.json"]
             .map(String::from)
             .into();
-        let out = rewrite_config_path_args(args, "/home/a/.config/friring", |p| {
-            Some(p.replace("/home/a/", "/home/b/"))
-        });
+        let out = crate::agent::config_args::rewrite_config_path_args(
+            args,
+            "/home/a/.config/friring",
+            |p| Some(p.replace("/home/a/", "/home/b/")),
+        );
         assert_eq!(
             out,
             ["--settings", "/home/b/.config/friring/hooks/claude.json"].map(String::from)
@@ -771,7 +971,11 @@ mod tests {
         ]
         .map(String::from)
         .into();
-        let out = rewrite_config_path_args(args, "/home/a/.config/friring", |_| None);
+        let out = crate::agent::config_args::rewrite_config_path_args(
+            args,
+            "/home/a/.config/friring",
+            |_| None,
+        );
         assert_eq!(out, ["--verbose", "--session-id", "x"].map(String::from));
     }
 
@@ -783,12 +987,14 @@ mod tests {
             .map(String::from)
             .into();
         let rewritten =
-            rewrite_config_path_args(args.clone(), "/cfg", |p| Some(format!("/rem{p}")));
+            crate::agent::config_args::rewrite_config_path_args(args.clone(), "/cfg", |p| {
+                Some(format!("/rem{p}"))
+            });
         assert_eq!(
             rewritten,
             ["--settings=/rem/cfg/hooks/x.json", "/rem/cfg/seed.toml"].map(String::from)
         );
-        let stripped = rewrite_config_path_args(args, "/cfg", |_| None);
+        let stripped = crate::agent::config_args::rewrite_config_path_args(args, "/cfg", |_| None);
         assert!(stripped.is_empty());
     }
 
@@ -800,7 +1006,7 @@ mod tests {
         let args: Vec<String> = ["--settings=/cfg/a.json", "/cfg/b.json"]
             .map(String::from)
             .into();
-        let out = rewrite_config_path_args(args, "/cfg", |p| {
+        let out = crate::agent::config_args::rewrite_config_path_args(args, "/cfg", |p| {
             (p == "/cfg/a.json").then(|| format!("/rem{p}"))
         });
         assert_eq!(out, ["--settings=/rem/cfg/a.json"].map(String::from));
@@ -813,7 +1019,7 @@ mod tests {
         let args: Vec<String> = ["--settings", "/cfg-backup/notes.md"]
             .map(String::from)
             .into();
-        let out = rewrite_config_path_args(args.clone(), "/cfg", |_| {
+        let out = crate::agent::config_args::rewrite_config_path_args(args.clone(), "/cfg", |_| {
             panic!("map must not be called for a sibling-prefixed path")
         });
         assert_eq!(out, args);
@@ -824,9 +1030,11 @@ mod tests {
         let args: Vec<String> = ["--model", "opus", "--add-dir", "/home/a/repo"]
             .map(String::from)
             .into();
-        let out = rewrite_config_path_args(args.clone(), "/home/a/.config/friring", |_| {
-            panic!("map must not be called for non-config args")
-        });
+        let out = crate::agent::config_args::rewrite_config_path_args(
+            args.clone(),
+            "/home/a/.config/friring",
+            |_| panic!("map must not be called for non-config args"),
+        );
         assert_eq!(out, args);
     }
 

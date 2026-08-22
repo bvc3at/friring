@@ -1,5 +1,6 @@
 pub mod agent_config;
 pub mod backend;
+pub mod config_args;
 pub mod control_mode;
 pub mod extension_config;
 pub mod generic;
@@ -9,6 +10,7 @@ pub mod json_merge;
 pub mod osc52;
 pub mod provider;
 pub mod registry;
+pub mod sandboxing;
 pub mod self_update;
 pub mod settings_config;
 pub mod themes_config;

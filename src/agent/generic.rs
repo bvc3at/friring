@@ -38,6 +38,10 @@ impl AgentProvider for GenericProvider {
             config.session_name.as_deref(),
         )
     }
+
+    fn agent_def(&self) -> Option<&AgentDef> {
+        Some(&self.def)
+    }
 }
 
 #[cfg(test)]

@@ -42,7 +42,8 @@ pub fn delete_session_headless(
     let mut report = ForceDeleteReport::default();
 
     if force {
-        teardown_runtime_resources(&session, &mut report);
+        let recorded = recorded_places(db, &session.backend_type);
+        teardown_runtime_resources(&session, &recorded, &mut report);
         report.disabled_automations = db
             .disable_send_automations_for_session(session_id)
             .map_err(|e| format!("disable_send_automations_for_session: {e}"))?;
@@ -61,12 +62,34 @@ pub fn delete_session_headless(
     Ok(report)
 }
 
+/// The places friring has **recorded** for the profile a session is sandboxed
+/// under, or nothing when it is not sandboxed into one.
+///
+/// Read where a `Database` is in hand and handed to
+/// [`teardown_runtime_resources`], which deliberately touches no SQLite of its
+/// own. It is what keeps a place findable across a profile rename: the running
+/// container still carries the label it was created with, and only these rows
+/// were rewritten — see
+/// [`running_places`](crate::agent::sandboxing::running_places).
+pub fn recorded_places(db: &Database, backend_type: &str) -> Vec<String> {
+    let Some(profile) = crate::session::sandbox_backend_profile(backend_type) else {
+        return Vec::new();
+    };
+    db.list_sandbox_instances_for_profile(profile)
+        .map(|rows| rows.into_iter().map(|row| row.external_id).collect())
+        .unwrap_or_default()
+}
+
 /// Tear down a session's slow runtime resources: kill the tmux window, remove
 /// worktrees + the symlink workspace. Touches no SQLite — safe to call from a
 /// background thread after the row has been soft-deleted on the UI thread, so
 /// the TUI's hard-delete confirmation can close without blocking on a remote
 /// `kill-window` or a `git worktree remove`. Best-effort: failures are logged
 /// into `report` (or `tracing::warn`), never abort.
+///
+/// `recorded` is [`recorded_places`]' answer, read by the caller for exactly
+/// that reason: a place-backed session's container is found by profile name,
+/// and after a rename the rows are the only half that still says the new one.
 ///
 /// **Backend-aware.** The window kill and each worktree removal run on the
 /// server the session actually lives on, resolved from `session.backend_type`:
@@ -76,9 +99,29 @@ pub fn delete_session_headless(
 /// the local data dir), so it is torn down regardless of backend.
 pub fn teardown_runtime_resources(
     session: &crate::sync::SharedSession,
+    recorded: &[String],
     report: &mut ForceDeleteReport,
 ) {
-    if crate::session::is_remote_backend(&session.backend_type) {
+    if let Some(profile) = crate::session::sandbox_backend_profile(&session.backend_type) {
+        // A **place**-backed session: its pane is inside the container, so the
+        // local kill would find nothing and leave the agent running. Worktree
+        // removal stays local — a place mounts every path at exactly its host
+        // path, so the checkout the container sees *is* the host's.
+        let places = crate::agent::sandboxing::running_places(profile, recorded);
+        if places.is_empty() {
+            // Not an error: a place that is not running took every pane in it
+            // with it, which is the outcome this call wanted.
+            tracing::info!(
+                "sandbox place '{profile}' is not running; session '{}' had no pane to kill",
+                session.name
+            );
+        } else {
+            kill_place_window(&places, session, report);
+        }
+        for wt in &session.worktrees {
+            remove_worktree_into(None, wt, report);
+        }
+    } else if crate::session::is_remote_backend(&session.backend_type) {
         // Off-local session: kill the pane + remove worktrees on the host. An
         // unresolvable/unreachable host is expected — record it, never abort.
         let registry = crate::agent::host_config::load_all();
@@ -121,6 +164,16 @@ pub fn teardown_runtime_resources(
             tracing::warn!("remove_workspace_at({}) failed: {e}", ws.display());
         }
     }
+    // The scratch directory a sandboxed launch minted, and the policy file
+    // generated for it, both under the data directory (`docs/SANDBOX.md`
+    // §Launch integration). Keyed on the session id, so it is the *desired*
+    // profile that says whether there is anything to drop — a launch that fell
+    // back to the host keeps its profile and may have minted the scratch before
+    // failing. Always local: friring writes them beside its own database, on
+    // whichever machine composed the launch.
+    if session.sandbox_profile.is_some() {
+        crate::agent::sandboxing::cleanup_by_session_id(session.id);
+    }
 }
 
 /// Kill the session's window on the local tmux server, reaping the pane's child
@@ -151,6 +204,47 @@ fn kill_local_window(session: &crate::sync::SharedSession, report: &mut ForceDel
     #[cfg(windows)]
     if let Some(pid) = pane_pid {
         reap_pane_process(pid);
+    }
+}
+
+/// Kill the session's window **inside a sandbox place**, by name, in every place
+/// the profile currently has.
+///
+/// The place twin of [`kill_remote_window`] and best-effort like it, but
+/// addressed by `tb-<session>` rather than by the persisted pane id — because
+/// unlike a remote host, a profile can have **several live containers at once**
+/// (an edited profile builds a new one while the sessions already launched stay
+/// in the old), the session row records no container, and a pane id is per tmux
+/// server. Killing `%1` in the wrong container of the right profile kills a
+/// different session's agent; killing `tb-<session>` there kills nothing,
+/// because the name is unique to the session wherever it lives.
+///
+/// So every place is asked, and a window found in none of them is not a failure:
+/// a place that has gone away since the row was written took its panes with it,
+/// which is the outcome this call wanted.
+fn kill_place_window(
+    places: &[crate::agent::transport::Place],
+    session: &crate::sync::SharedSession,
+    report: &mut ForceDeleteReport,
+) {
+    let mut failures: Vec<String> = Vec::new();
+    for place in places {
+        let target = crate::agent::tmux::MuxTarget::for_place(place);
+        match crate::agent::tmux::kill_window_on(&target, &session.name) {
+            Ok(true) => report.killed_window = true,
+            Ok(false) => {}
+            Err(e) => failures.push(format!("{}: {e}", place.container())),
+        }
+    }
+    if !report.killed_window && !failures.is_empty() {
+        let msg = format!(
+            "could not kill session '{}' in sandbox place '{}': {}",
+            session.name,
+            places[0].profile(),
+            failures.join("; ")
+        );
+        tracing::warn!("{msg}");
+        report.remote_teardown_error = Some(msg);
     }
 }
 
@@ -266,6 +360,8 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
+            sandbox_enforcement: Default::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -412,6 +508,8 @@ mod tests {
                 branch: "feat/x".into(),
             }],
             shell_backend_id: None,
+            sandbox_profile: None,
+            sandbox_enforcement: Default::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -419,7 +517,7 @@ mod tests {
         };
 
         let mut report = ForceDeleteReport::default();
-        teardown_runtime_resources(&session, &mut report);
+        teardown_runtime_resources(&session, &[], &mut report);
 
         assert!(
             report.remote_teardown_error.is_some(),
@@ -430,6 +528,62 @@ mod tests {
             "no local git worktree removal attempted for a remote session"
         );
         assert!(!report.killed_window);
+    }
+
+    /// A sandboxed session's scratch directory is the agent's own writable
+    /// space; it must not outlive the session. The layout is
+    /// `<data>/sandbox/tmp/<session id>` (`crate::sandbox::dirs`), spelled out
+    /// here because `session_ops` reaches the sandbox layer only through
+    /// `agent::sandboxing`.
+    #[test]
+    fn tearing_down_a_sandboxed_session_drops_the_scratch_it_minted() {
+        let scratch_root = crate::paths::log_directory()
+            .expect("a test build pins the data directory under a temp dir")
+            .join("sandbox")
+            .join("tmp");
+
+        let sandboxed = SessionId::default();
+        let plain = SessionId::default();
+        for id in [sandboxed, plain] {
+            let dir = scratch_root.join(id.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("agent-scratch"), "x").unwrap();
+        }
+
+        let session = |id, profile: Option<&str>| SharedSession {
+            id,
+            name: "remote".into(),
+            agent: "dev".into(),
+            backend_id: "%3".into(),
+            // An unresolvable remote host: teardown records the failure and
+            // performs no tmux or git work, leaving the sandbox half isolated.
+            backend_type: "wsl:Ubuntu".into(),
+            agent_session_id: None,
+            cwd: None,
+            additional_dirs: Vec::new(),
+            workspace_dir: None,
+            worktrees: Vec::new(),
+            shell_backend_id: None,
+            sandbox_profile: profile.map(str::to_string),
+            sandbox_enforcement: Default::default(),
+            parent_session_id: None,
+            display_order: None,
+            tombstone: false,
+            tombstone_at: None,
+        };
+
+        let mut report = ForceDeleteReport::default();
+        teardown_runtime_resources(&session(sandboxed, Some("dev")), &[], &mut report);
+        teardown_runtime_resources(&session(plain, None), &[], &mut report);
+
+        assert!(
+            !scratch_root.join(sandboxed.to_string()).exists(),
+            "the sandboxed session's scratch directory outlived it"
+        );
+        // The desired profile is what says there is anything to drop, so a
+        // session that never asked for a boundary is not touched.
+        assert!(scratch_root.join(plain.to_string()).exists());
+        let _ = std::fs::remove_dir_all(scratch_root.join(plain.to_string()));
     }
 
     #[test]

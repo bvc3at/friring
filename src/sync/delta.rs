@@ -94,6 +94,11 @@ fn session_changed(old: &SharedSession, new: &SharedSession) -> bool {
         || old.workspace_dir != new.workspace_dir
         || old.worktrees != new.worktrees
         || old.shell_backend_id != new.shell_backend_id
+        || old.sandbox_profile != new.sandbox_profile
+        // The applied half changes without the desired half moving — a relaunch
+        // that lost (or regained) the boundary rewrites only this — so an
+        // instance that misses it keeps rendering the previous verdict.
+        || old.sandbox_enforcement != new.sandbox_enforcement
         || old.parent_session_id != new.parent_session_id
         || old.display_order != new.display_order
 }
@@ -116,6 +121,8 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
+            sandbox_enforcement: crate::session::SandboxEnforcement::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -295,6 +302,69 @@ mod tests {
         assert_eq!(
             delta.updated_sessions[0].shell_backend_id,
             Some("friring:@1".to_string())
+        );
+    }
+
+    #[test]
+    fn session_changed_detects_sandbox_profile_change() {
+        let session_id = SessionId::default();
+
+        let mut old_state = SharedState::new();
+        old_state.sessions.push(make_session(session_id, "Session"));
+
+        let mut new_state = SharedState::new();
+        let mut s = make_session(session_id, "Session");
+        s.sandbox_profile = Some("dev".to_string());
+        new_state.sessions.push(s);
+
+        let delta = StateDelta::compute(&old_state, &new_state);
+
+        assert_eq!(delta.updated_sessions.len(), 1);
+        assert_eq!(
+            delta.updated_sessions[0].sandbox_profile,
+            Some("dev".to_string())
+        );
+    }
+
+    /// A relaunch that lost the boundary changes only the *applied* half — the
+    /// profile it asked for is untouched — so an instance whose delta ignored
+    /// this field would go on showing a shield over an agent on the host.
+    #[test]
+    fn session_changed_detects_sandbox_enforcement_change() {
+        let session_id = SessionId::default();
+
+        let mut old_state = SharedState::new();
+        let mut before = make_session(session_id, "Session");
+        before.sandbox_profile = Some("dev".to_string());
+        before.sandbox_enforcement = crate::session::SandboxEnforcement::Unrecorded;
+        old_state.sessions.push(before);
+
+        let mut new_state = SharedState::new();
+        let mut after = make_session(session_id, "Session");
+        after.sandbox_profile = Some("dev".to_string());
+        after.sandbox_enforcement =
+            crate::session::SandboxEnforcement::Unenforced("bwrap is not installed".to_string());
+        new_state.sessions.push(after);
+
+        let delta = StateDelta::compute(&old_state, &new_state);
+
+        assert_eq!(delta.updated_sessions.len(), 1);
+        assert_eq!(
+            delta.updated_sessions[0]
+                .sandbox_enforcement
+                .unenforced_reason(),
+            Some("bwrap is not installed"),
+        );
+
+        // …and the way back: a relaunch that regains the boundary clears the
+        // warning, which is just as much a change to notice.
+        let delta = StateDelta::compute(&new_state, &old_state);
+        assert_eq!(delta.updated_sessions.len(), 1);
+        assert_eq!(
+            delta.updated_sessions[0]
+                .sandbox_enforcement
+                .unenforced_reason(),
+            None
         );
     }
 

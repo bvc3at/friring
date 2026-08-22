@@ -653,6 +653,9 @@ impl App {
             Modal::SessionName(_) => self.handle_session_name_key(code, mods),
             Modal::AutomationEditor(_) => self.handle_automation_editor_key(code, mods),
             Modal::AutomationsList(_) => self.handle_automations_list_key(code),
+            Modal::SandboxList(_) => self.handle_sandbox_list_key(code),
+            Modal::SandboxEditor(_) => self.handle_sandbox_editor_key(code, mods),
+            Modal::SandboxDomainPrompt(_) => self.handle_sandbox_domain_prompt_key(code),
             // Read-only, so only the usual dismissal keys close it. Closing on
             // *any* key would contradict the overlay's own `Esc` hint and would
             // fight a future scrolling pass, where j/k have to reach the plan.
@@ -663,6 +666,7 @@ impl App {
             }
             Modal::AgentPicker(_) => self.handle_agent_picker_key(code, mods),
             Modal::HostPicker(_) => self.handle_host_picker_key(code, mods),
+            Modal::SandboxPicker(_) => self.handle_sandbox_picker_key(code, mods),
             Modal::ThemePicker(_) => self.handle_theme_picker_key(code, mods),
             Modal::RepoPicker(_) => self.handle_repo_picker_key(code, mods),
             Modal::ConversationPicker(_) => self.handle_conversation_picker_key(code, mods),
@@ -1449,9 +1453,25 @@ impl App {
         sn.workspace_focused = true;
     }
 
-    /// `Esc` on the name modal: step back to wherever this flow came from —
-    /// or cancel when there is no prior step to return to.
+    /// `Esc` on the name modal: back to the sandbox step when this flow had
+    /// one (with the previous answer preselected), otherwise straight to
+    /// whatever came before it.
     fn session_name_back(&mut self) {
+        if self.new_session.sandbox_step_shown {
+            let dirs = self.pending_spawn_dirs_for_back();
+            if self.open_sandbox_picker(&dirs) {
+                return;
+            }
+            // The last profile was deleted while the wizard was open: there is
+            // nothing left to ask, so fall through to the step before it.
+            self.new_session.sandbox_step_shown = false;
+        }
+        self.new_session_step_back();
+    }
+
+    /// `Esc` past the sandbox step: step back to wherever this flow came from —
+    /// or cancel when there is no prior step to return to.
+    pub(super) fn new_session_step_back(&mut self) {
         // Fork has no prior step — Esc cancels as before. Checked first: a
         // fork of a worktree session pre-seeds `spawn_worktrees` with the
         // *source's* worktrees, which must not read as "created" below.
@@ -1858,6 +1878,10 @@ impl App {
                 "Automations",
                 Self::open_automations_list,
             ),
+            Action::OpenSandboxProfiles => {
+                self.open_sandbox_list();
+                true
+            }
             Action::ToggleInfoPanel => self.gated(self.features.info_panel, "Info panel", |s| {
                 // With the list collapsed and no room for the dedicated column
                 // the pane cannot render at all, so flipping the flag would

@@ -46,6 +46,37 @@ resume_args = ["--resume", "{id}"]
 fork_args = ["--resume", "{id}", "--fork-session", "-n", "{name}"]
 new_session_args = ["--session-id", "{id}", "-n", "{name}"]
 
+# What this CLI needs to survive a sandbox profile (docs/SANDBOX.md). Applied
+# only while a profile is active; edit it if your CLI's flags differ.
+#
+# `auth = "auto"` is host-passthrough under a policy sandbox (the real login,
+# Keychain included, is right where it was) and, inside a container, a token
+# from friring's own keychain entry if you stored one — otherwise one login per
+# profile, done in the pane. `seed_file_supported` is deliberately absent: this
+# vendor's refresh token is single-use, so a copy and the original invalidate
+# each other (ADR-28).
+[agents.sandbox]
+auth = "auto"
+config_dir_env = "CLAUDE_CONFIG_DIR"
+state_dir = "~/.claude"
+credential_file = "~/.claude/.credentials.json"
+secret_env = ["ANTHROPIC_API_KEY"]
+login_fallback = "/login"
+writeback = true
+state_rw = ["~/.claude", "~/.claude.json"]
+bypass = ["--dangerously-skip-permissions"]
+# Projected into a container's synthetic home at the same `~`-relative path,
+# after a lint pass that drops anything naming the host filesystem. Instructions,
+# skills and commands are prose and cross whole; a hook or MCP server pointing at
+# a host binary does not, and no credential ever does (ADR-28).
+copy_in = [
+  "~/.claude/CLAUDE.md",
+  "~/.claude/skills",
+  "~/.claude/commands",
+  "~/.claude/agents",
+  "~/.claude/settings.json",
+]
+
 # codex can't pin or report its session id, so resume/fork target the most
 # recent session in the launch directory. friring keeps that directory stable
 # across restart (same cwd) and single-repo fork (child reuses the parent cwd).
@@ -55,6 +86,30 @@ command = "codex"
 resume_args = ["resume", "--last"]
 fork_args = ["fork", "--last"]
 resume_latest = true
+
+[agents.sandbox]
+auth = "auto"
+config_dir_env = "CODEX_HOME"
+state_dir = "~/.codex"
+credential_file = "~/.codex/auth.json"
+secret_env = ["OPENAI_API_KEY"]
+login_fallback = "codex login"
+writeback = true
+state_rw = ["~/.codex"]
+bypass = ["--dangerously-bypass-approvals-and-sandbox"]
+copy_in = ["~/.codex/AGENTS.md", "~/.codex/prompts"]
+
+# friring's highest-precedence layer inside the boundary, merged over whatever
+# projected to the same path. A place is always a fresh home, so the workspace
+# trust this agent would otherwise prompt for on first run is pre-seeded here —
+# once per path the profile granted.
+[[agents.sandbox.enforced]]
+path = "~/.codex/config.toml"
+format = "toml"
+per_path = """
+[projects."{path}"]
+trust_level = "trusted"
+"""
 
 # antigravity (the `agy` CLI, the Gemini CLI successor) resumes the latest
 # session in the launch directory via `--continue`; it has no fork (Ctrl+F falls
@@ -117,6 +172,56 @@ command = "vibe"
 #                               #   A rebranded-claude CLI sets "claude" to get
 #                               #   claude's --settings hook wiring under its own
 #                               #   name. Omit if the agent has no known family.
+#
+# [agents.sandbox]              # OPTIONAL: what this CLI needs inside a sandbox
+# auth = "auto"                 #   auto | host-passthrough | env-token
+#                               #   | volume-login | seed-file
+#                               #   (see docs/SANDBOX.md §Credentials)
+# state_rw = ["~/.my-agent"]    #   directories it writes and must keep — an
+#                               #   agent that can't write its state dies at launch
+# bypass = ["--no-sandbox"]     #   flags turning its OWN sandbox off, applied
+#                               #   only while a friring profile is active
+# env = { X = "1" }             #   static env applied whenever a sandbox is active
+#
+# --- credentials in a container (nothing below applies to a policy sandbox,
+#     which just uses your real login) -------------------------------------
+# config_dir_env = "MY_AGENT_HOME"          # env var naming its state directory
+# state_dir = "~/.my-agent"                 # the directory that var points at;
+#                                           #   kept per profile inside the
+#                                           #   sandbox and signed into ONCE
+# secret_env = ["MY_AGENT_TOKEN"]           # variable NAMES only — the value
+#                                           #   lives in your OS keychain, under
+#                                           #   service "dev.friring.sandbox"
+# login_fallback = "/login"                 # what to type in the pane when the
+#                                           #   sandbox has no credential yet
+# writeback = true                          # a refreshed credential must survive
+# credential_file = "~/.my-agent/auth.json" # the vendor's credential file
+# seed_file_supported = false               # true ONLY if the vendor documents
+#                                           #   copying that file elsewhere. A
+#                                           #   rotating OAuth token never can:
+#                                           #   the copy and the original
+#                                           #   invalidate each other (ADR-28),
+#                                           #   and friring refuses a second copy
+#
+# --- configuration in a container (a policy sandbox already sees the real
+#     home, so none of this applies to one) -------------------------------
+# copy_in = ["~/.my-agent/skills"]          # config safe to project, `~`-anchored:
+#                                           #   it lands at the same home-relative
+#                                           #   path inside. Linted first — a hook
+#                                           #   or MCP server naming a host path is
+#                                           #   dropped, a credential never crosses
+#
+# [[agents.<name>.sandbox.enforced]]        # friring's highest-precedence layer
+# path = "~/.my-agent/config.toml"          #   `~`-anchored: a place's only
+# format = "toml"                           #   writable surface is its own home
+# per_path = "[projects.\"{path}\"]\ntrust_level = \"trusted\""
+#                                           # `content` is written once
+#                                           #   ({workspaces} → the granted paths
+#                                           #   as a list); `per_path` repeats once
+#                                           #   per granted path ({path} → that
+#                                           #   path). JSON takes `content` only —
+#                                           #   two JSON documents cannot be
+#                                           #   concatenated
 #
 # {id} is a friring-generated UUID. Only agents that accept it at creation
 # (like claude's `--session-id {id}`) can resume/fork by that exact id; for
@@ -417,6 +522,117 @@ mod tests {
                 "{name} must use id-less resume/fork flags"
             );
         }
+    }
+
+    /// The seeded declarations are what the credential strategies read
+    /// (`docs/SANDBOX.md` §Credentials): friring bakes in no agent knowledge, so
+    /// everything a sandboxed launch needs about an agent has to be *here*, as
+    /// data, and be internally consistent.
+    #[test]
+    fn the_seeded_sandbox_declarations_describe_their_credentials() {
+        use crate::session::SandboxAuth;
+
+        let reg = builtin_registry();
+        for (name, config_dir_env, state_dir, credential_file, token) in [
+            (
+                "claude",
+                "CLAUDE_CONFIG_DIR",
+                "~/.claude",
+                "~/.claude/.credentials.json",
+                "ANTHROPIC_API_KEY",
+            ),
+            (
+                "codex",
+                "CODEX_HOME",
+                "~/.codex",
+                "~/.codex/auth.json",
+                "OPENAI_API_KEY",
+            ),
+        ] {
+            let sandbox = reg
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} is a built-in"))
+                .sandbox
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} declares a sandbox block"));
+            // `auto`, not a strategy: the boundary decides, and a place cannot
+            // give an agent the host's credential store however it is declared.
+            assert_eq!(sandbox.auth, SandboxAuth::Auto, "{name}");
+            assert_eq!(sandbox.config_dir_env.as_deref(), Some(config_dir_env));
+            assert_eq!(sandbox.state_dir.as_deref(), Some(state_dir));
+            assert_eq!(sandbox.credential_file.as_deref(), Some(credential_file));
+            assert_eq!(sandbox.secret_env, [token], "{name}");
+            // The state directory has to be the one the credential file lives
+            // in, or a relocated agent would sign in somewhere friring does not
+            // look for the login.
+            assert!(credential_file.starts_with(state_dir), "{name}");
+            // A place with no credential has to be able to say what to type.
+            assert!(
+                sandbox
+                    .login_fallback
+                    .as_deref()
+                    .is_some_and(|text| !text.trim().is_empty()),
+                "{name} needs a login fallback"
+            );
+            assert!(sandbox.writeback, "{name} refreshes its own credential");
+        }
+
+        // Nothing shipped may assert that its credential file is safe to copy:
+        // both vendors here issue rotating single-use refresh tokens, and a copy
+        // logs one of the two holders out on the first refresh (ADR-28). Turning
+        // this on is a decision a user makes for an agent they know.
+        for agent in &reg.agents {
+            if let Some(sandbox) = &agent.sandbox {
+                assert!(
+                    !sandbox.seed_file_supported,
+                    "{} must not ship claiming its credential is copyable",
+                    agent.name
+                );
+            }
+        }
+    }
+
+    /// What the seeded registry offers a *container*: the configuration to
+    /// carry in, and the settings friring writes over it.
+    ///
+    /// Every entry has to be `~`-anchored (a place's only writable surface is
+    /// its own synthetic home), none of them may be a credential (ADR-28 — a
+    /// copy and the original invalidate each other), and an enforced template
+    /// that will not render is a registry typo that writes nothing, which is
+    /// worth catching here rather than in a container.
+    #[test]
+    fn the_seeded_projection_declarations_are_projectable() {
+        let reg = builtin_registry();
+        let mut projecting = 0;
+        for agent in &reg.agents {
+            let Some(sandbox) = &agent.sandbox else {
+                continue;
+            };
+            for entry in &sandbox.copy_in {
+                projecting += 1;
+                assert!(entry.starts_with("~/"), "{}: '{entry}'", agent.name);
+                assert!(!entry.contains(".."), "{}: '{entry}'", agent.name);
+                // The one file that must never be listed is the one this agent
+                // declares as its own credential.
+                assert_ne!(
+                    Some(entry.as_str()),
+                    sandbox.credential_file.as_deref(),
+                    "{} lists its own credential file for projection",
+                    agent.name
+                );
+            }
+            for enforced in &sandbox.enforced {
+                assert_eq!(enforced.invalid(), None, "{}", agent.name);
+                let rendered = enforced
+                    .render(&["/fabricated/repo".to_string()])
+                    .unwrap_or_else(|e| panic!("{} enforced template: {e}", agent.name));
+                assert!(!rendered.trim().is_empty(), "{}", agent.name);
+            }
+        }
+        assert!(
+            projecting > 0,
+            "no built-in declares anything to project, so a container would start empty"
+        );
     }
 
     /// The seed must carry copy-pasteable examples (add-your-own-agent +

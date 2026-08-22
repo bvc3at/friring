@@ -485,6 +485,8 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
+            sandbox_enforcement: Default::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,

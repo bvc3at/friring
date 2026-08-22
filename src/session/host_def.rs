@@ -13,6 +13,11 @@
 //! `ssh <dest>`). tmux, git, the agent, and the worktrees all run *inside* the
 //! distro at native Linux paths, so everything downstream of the launcher is
 //! identical to the SSH path.
+//!
+//! A sandbox place (`sandbox:<profile>`, ADR-26) is a third launch prefix, but
+//! it is not a host and has no definition here. What it shares with one is
+//! [`is_offhost_backend`], which lives beside [`is_remote_backend`] because it
+//! is defined in terms of it.
 
 use serde::{Deserialize, Serialize};
 
@@ -37,8 +42,27 @@ pub fn is_wsl_backend(backend_name: &str) -> bool {
 /// Whether a backend name refers to any off-local host (SSH or WSL) — i.e. one
 /// that needs a launch prefix and runs git/worktrees somewhere other than the
 /// local filesystem. Local backends (`""`, `tmux`, `local-tmux`) are not.
+///
+/// A sandbox place (`sandbox:<profile>`) is deliberately **not** one: it needs a
+/// launch prefix, but every path it mounts is mounted at exactly its host path,
+/// so git and the worktrees are still the local filesystem's. What it does share
+/// with a remote host is [`is_offhost_backend`].
 pub fn is_remote_backend(backend_name: &str) -> bool {
     is_ssh_backend(backend_name) || is_wsl_backend(backend_name)
+}
+
+/// Whether the agent this backend launches can reach **this friring's own state
+/// directories** at the paths friring resolved them to — the question the
+/// host-only `FRIRING_*` path variables are forwarded on.
+///
+/// False for an SSH host and a WSL distro (another machine's filesystem), and
+/// false for a sandbox place: the data directory is never mounted into one
+/// (ADR-29), so a forwarded `FRIRING_DATA_DIR` would either name nothing or name
+/// the one thing a boundary exists to keep out. It stays **true** for a *policy*
+/// sandbox, whose backend name is unchanged and whose paths are the host's real
+/// ones — the boundary denies the database there instead of hiding the path.
+pub fn is_offhost_backend(backend_name: &str) -> bool {
+    is_remote_backend(backend_name) || super::sandbox_profile::is_sandbox_backend(backend_name)
 }
 
 /// How friring reaches a host: over SSH, or into a local WSL distro.
@@ -237,6 +261,21 @@ mod tests {
         assert!(is_remote_backend("wsl:Ubuntu"));
         assert!(!is_remote_backend("local-tmux"));
         assert!(!is_remote_backend(""));
+    }
+
+    #[test]
+    fn a_sandbox_place_is_offhost_but_not_remote() {
+        // A place mounts every path at its host path, so git and the worktrees
+        // are still local — it is not a *remote* backend.
+        assert!(!is_remote_backend("sandbox:dev"));
+        // But friring's own state directories are not in there (ADR-29), so it
+        // is off-host for everything that forwards a `FRIRING_*` path.
+        assert!(is_offhost_backend("sandbox:dev"));
+        assert!(is_offhost_backend("ssh:devbox"));
+        assert!(is_offhost_backend("wsl:Ubuntu"));
+        // A *policy* sandbox keeps its backend name, and its paths are real.
+        assert!(!is_offhost_backend("local-tmux"));
+        assert!(!is_offhost_backend(""));
     }
 
     #[test]

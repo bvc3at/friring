@@ -459,6 +459,27 @@ themes, switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
 
 **Also in the box:**
 
+- **[Sandboxed agents](docs/SANDBOX.md)** *(Friring — fork-only, experimental)* — run any
+  agent from the registry inside an isolation boundary scoped to the directories
+  you choose, each read-only or read-write, and to an allowlist of domains a
+  Friring-owned proxy enforces while the kernel denies everything else: `Alt+S`
+  authors the profiles, and `Ctrl+N` picks one per session. Reach for a host
+  that isn't listed and friring asks once, then remembers. Two shapes ship: the
+  policy backends — macOS `seatbelt` and Linux `bubblewrap` — which wrap the
+  agent on the host, and the **place** backends — `docker`/`podman` and, on
+  Apple Silicon running macOS 26, Apple's own `container` — which run it in a
+  container reached exactly the way an SSH host is, with your repositories
+  mounted at their real paths so git keeps working inside — which is also why a
+  *native Windows* friring is offered no boundary at all and asks you to run it
+  inside WSL2 instead: no Linux container can mount `C:\…` at `C:\…`. A container gets the
+  safe subset of your agent configuration projected in — instructions, skills,
+  commands, minus anything naming a path that isn't in there — and the agent
+  signs in once per profile inside its own pane, because a rotating credential
+  copied into two places invalidates itself. `friring-cli sandbox` manages the
+  same profiles and places without a TUI, and exports them as TOML you can
+  commit. It is the newest thing here and the least exercised — its tests check
+  what friring generates rather than watching a kernel refuse something — so
+  treat it as defence in depth, expect rough edges, and please report them.
 - **[Leader key](#leader-key)** *(Friring — fork-only)* — `Ctrl+F` arms a
   tmux-style prefix and paints a which-key overlay naming everything reachable;
   the next key runs it. Every global command is on it, plus jump-to-session by
@@ -507,6 +528,29 @@ themes, switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
   [claude](https://github.com/anthropics/claude-code), codex,
   antigravity, opencode, or aider (whichever agents you plan to run)
 - **git** (required for worktree features)
+- **[bubblewrap](https://github.com/containers/bubblewrap)** (`bwrap`) — only
+  for [sandboxed agents](docs/SANDBOX.md) on Linux; macOS uses the system
+  `sandbox-exec`. A native Windows friring gets no sandbox at all — run it
+  inside WSL2, where `bwrap` applies the boundary
+- **Docker or Podman** — one way to run a *place*-backed
+  [sandboxed agent](docs/SANDBOX.md) (a container instead of a host policy).
+  friring publishes no image: the default tag is built locally with
+  `docker build -t friring/sandbox:1 - < packaging/sandbox/Containerfile`, and
+  that file is self-contained, so a binary install only needs a copy of it. That
+  image carries **no agent CLI** — friring prints the one-time command that
+  installs yours into the profile's own home, which outlives every container it
+  rebuilds. A profile may name its own `image` or `containerfile` instead.
+  A filtered network mode needs the engine's daemon on *this machine's* kernel:
+  friring's egress proxy is reached over a unix socket, and where the daemon runs
+  in a Linux VM (Docker Desktop, `podman machine`, colima) the mount carries the
+  socket file and nothing behind it. friring measures that per place and refuses
+  the profile rather than running it with no egress
+- **[Apple's `container` CLI](https://github.com/apple/container)** — the other
+  way to run a *place*-backed sandboxed agent, and macOS-only in the narrow
+  sense: Apple Silicon, macOS 26 or newer, the CLI on `PATH`, and its service
+  running (`container system start`). Only network `full` is enforceable in one
+  — friring's egress proxy is reached over a socket that does not cross the VM
+  boundary, so a filtered profile is refused rather than run unfiltered
 - **Rust 1.75+** (only to build from source)
 
 ## Uninstall
@@ -770,6 +814,7 @@ overlay delay are configurable — see [docs/CONFIG.md](docs/CONFIG.md)
 | `Ctrl+C` / `Cmd+C` | Copy selection / SIGINT (terminal; `Cmd+C` never SIGINTs) | **C**opy |
 | `Ctrl+V` / `Cmd+V` | Paste from clipboard | Paste |
 | `Ctrl+P` | Automations (list/new/edit/toggle/run/delete) | **P**rogram |
+| `Alt+S` / `<leader> S` | Sandbox profiles (list/new/edit/delete) | **S**andbox |
 | `Ctrl+/` / `Shift Shift` | Session switcher (ranked, most-recent first); `Tab` widens it to every scope (tasks/automations/files/buffer content) and back | **/** = search; JetBrains double-shift |
 | `Ctrl+W` / `F5` | Toggle tasks panel (todo list) | **W**ork items |
 | `Ctrl+T` / `F8` | Toggle shell pane | **T**erminal |
@@ -881,6 +926,7 @@ friring-cli session create \
   --worktree-branch feat/x \
   --base-branch main \
   --host devbox          # optional — run on a remote host from hosts.toml
+friring-cli session create --name demo --repo-path /path --sandbox dev
 friring-cli session send <uuid> "run the test suite"
 friring-cli session capture <uuid> --lines 500
 friring-cli session restart <uuid>       # kill + re-spawn with --resume
@@ -946,8 +992,10 @@ friring-cli usage [--agent <name>] [--host <name>] [--timeout <secs>]
 
 Each reads the same source the TUI reads, so they work with **no TUI
 running** and write nothing to SQLite (and therefore keep no history).
-The three per-session readers are local-only — a remote session reports
-`null` plus a `note` — and `session metrics` needs an agent-side
+The three per-session readers are local-only — an off-host session (an
+ssh/wsl host, or a sandbox place, which is never given the data directory
+the metrics dir lives under) reports `null` plus a `note` — and
+`session metrics` needs an agent-side
 statusLine writing `$FRIRING_METRICS_DIR/$FRIRING_SESSION_ID.json`. See
 [`docs/CLI.md`](docs/CLI.md#agent-metrics).
 

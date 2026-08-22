@@ -63,6 +63,16 @@ between it and the `app` coordinator.
   `Arc<Mutex<vt100::Parser>>` on a `spawn_blocking` reader; input is
   written over an mpsc channel (ADR-3), translated from crossterm
   `KeyCode` to xterm ANSI by `input.rs` (ADR-4).
+- **`sandbox/`** — isolation boundaries: host probing, policy generation
+  (SBPL / bwrap argv) and the wrap of a composed launch. Same tier as
+  `agent`, which depends on it and never the reverse (ADR-25/ADR-26 in
+  [`SANDBOX.md`](SANDBOX.md)). It also owns the per-session egress-proxy
+  lifecycle — `sandbox::egress` starts, replaces and stops one instance per
+  sandboxed session — which is why it depends on the leaf `proxy` module,
+  one way only.
+- **`proxy/`** — the egress filtering proxy (HTTP CONNECT + SOCKS5, TCP and
+  unix transports), a self-contained leaf that enforces the policy it is
+  handed (ADR-27 in [`SANDBOX.md`](SANDBOX.md)).
 - **`session/`** — plain data types, the dependency sink (no
   crate-internal references): `SessionId`, `SessionStatus`, `SessionInfo`
   (carries the `agent` name), `SessionConfig` (agent/backend names, ids,
@@ -80,7 +90,13 @@ between it and the `app` coordinator.
   are centralized in `theme.rs` (ADR-14).
 - **`cli/`** — `friring-cli` subcommand dispatch (headless session ops +
   scheduling + the editor command), sharing the SQLite DB with the TUI but
-  never importing `app`/`ui` (ADR-15).
+  never importing `app`/`ui` (ADR-15). `friring-cli sandbox relay` is the
+  one subcommand that runs *inside* a boundary, and is dispatched before
+  the database is opened (ADR-29 in [`SANDBOX.md`](SANDBOX.md)) — which is
+  why `cli` may reference `proxy`. The rest of `friring-cli sandbox` is
+  host-side management — profiles, places, prune, export/import, keychain
+  tokens — and asks the same layer the TUI asks, reaching `crate::sandbox::…`
+  by fully-qualified path only, never `use`.
 - **`activity/`** — agent-neutral activity: which provider reads a
   session's records, where each agent CLI keeps them, and the incremental
   stat-gated scan that turns them into the `session::activity` event

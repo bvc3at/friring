@@ -65,6 +65,8 @@ mod tests {
             workspace_dir: None,
             worktrees: Vec::new(),
             shell_backend_id: None,
+            sandbox_profile: None,
+            sandbox_enforcement: Default::default(),
             parent_session_id: None,
             display_order: None,
             tombstone: false,
@@ -113,6 +115,46 @@ mod tests {
 
         let delta = db.compute_delta(&local).unwrap();
         assert_eq!(delta.removed_sessions.len(), 1);
+    }
+
+    /// The cross-instance path, end to end: another instance relaunches a
+    /// session and the boundary does not go on. The row is the only channel,
+    /// so an instance that reloads from it has to see the verdict move — a
+    /// delta that missed it would leave the other instance rendering the
+    /// sandboxed mark over an agent on the host.
+    #[test]
+    fn compute_delta_detects_a_boundary_that_stopped_holding() {
+        use crate::session::SandboxEnforcement;
+
+        let db = Database::open_in_memory().unwrap();
+        let mut session = make_session("boxed");
+        session.sandbox_profile = Some("dev".to_string());
+        db.upsert_session(&session).unwrap();
+
+        // The snapshot this instance already has: sandboxed, nothing wrong.
+        let local = db.load_shared_state().unwrap();
+        assert!(db.compute_delta(&local).unwrap().is_empty());
+
+        // The other instance's relaunch falls back to the host.
+        db.set_session_sandbox_enforcement(
+            session.id,
+            &SandboxEnforcement::Unenforced("bwrap is not installed".to_string()),
+        )
+        .unwrap();
+
+        let delta = db.compute_delta(&local).unwrap();
+        assert_eq!(delta.updated_sessions.len(), 1);
+        assert_eq!(
+            delta.updated_sessions[0]
+                .sandbox_enforcement
+                .unenforced_reason(),
+            Some("bwrap is not installed"),
+        );
+        assert_eq!(
+            delta.updated_sessions[0].sandbox_profile.as_deref(),
+            Some("dev"),
+            "the desired boundary is untouched — only the applied half moved"
+        );
     }
 
     #[test]

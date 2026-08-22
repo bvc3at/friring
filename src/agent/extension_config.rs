@@ -934,6 +934,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: None,
+            sandbox: None,
         };
         // claude already exists in the seeded built-ins → not re-added.
         let claude = AgentDef {
@@ -967,6 +968,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: None,
+            sandbox: None,
         };
         ensure_agents_registered(&[flow]).unwrap();
         // Sanity: flow + the seeded built-ins are present.
@@ -1052,6 +1054,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: Some("claude".into()),
+            sandbox: None,
         };
         ensure_agents_registered(&[fleet]).unwrap();
 

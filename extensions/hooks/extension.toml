@@ -14,11 +14,31 @@
 # through a POSIX shell, which is what they all do (Windows runs agents inside
 # WSL; the one payload with a native Windows path, copilot's, ships an explicit
 # `powershell` command variant because its schema has the field for it).
+#
+# Every payload branches on $FRIRING_SIGNAL_FILE, because neither half of
+# `friring-cli session signal` survives a sandbox: the binary need not exist
+# inside one, and the database it writes is what ADR-29 keeps outside every
+# boundary — automations stored there are shell commands the *host* runs, so an
+# agent that can write it can schedule them (docs/SANDBOX.md §Status signals).
+# A sandboxed launch exports that variable and polls the file it names, so the
+# hook appends a state word to it instead:
+#
+#     if [ -n "$FRIRING_SIGNAL_FILE" ]; then printf 'done\n' >> "$FRIRING_SIGNAL_FILE" || true
+#     else friring-cli session signal --state done || true; fi
+#
+# The variable is set only by a launch that actually applied a boundary, so an
+# unsandboxed session — the overwhelming majority — runs the same command it
+# always did. The append is a single `>>` write of one short line, which is
+# atomic on every local filesystem, so two hook processes never tear each
+# other's line; friring takes the whole file each poll and reads the last line.
+# Keeping the CLI spelling verbatim in the `else` branch is load-bearing:
+# `session_ops::builtin_hooks` finds friring-managed commands by that exact
+# prefix, to rewrite them for a remote host and to prune them on uninstall.
 
 name = "hooks"
 description = "Report each agent's lifecycle state (working/blocked/done) to friring via agent hooks."
 config_version = 1
-version = "1.4.0"
+version = "1.5.0"
 # Default home; the auto-activation path overrides this with *this build's*
 # resolved config dir (`~/.config/friring` or `~/.config/friring-dev`) so dev and
 # release installs stay isolated. See `session_ops::builtin_hooks::hooks_home`.
@@ -37,6 +57,12 @@ append_args = ["--settings", "{home}/claude.json"]
 # aider has no lifecycle hook system — only a "waiting for input" callback, which
 # maps to blocked. (working/done aren't expressible; the dot stays accurate for
 # the block edge.)
+#
+# The one payload with no sandbox branch: this string is an argv value aider
+# passes to its own notification machinery, not a hook command friring can be
+# sure reaches a shell, and a `if …; fi` that is exec'd rather than interpreted
+# would break the callback outright. A sandboxed aider therefore reports no
+# state — the pre-sandbox behaviour — rather than risking the unsandboxed one.
 [[agent_patches]]
 name = "aider"
 append_args = [

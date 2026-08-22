@@ -943,11 +943,43 @@ fn fire_send(
     // here made the TUI and this path disagree about the same automation: the
     // TUI routes through the session's backend and succeeds, while this found
     // no local window and skipped.
-    let mux = match crate::agent::tmux::MuxTarget::for_backend(&session.backend_type) {
-        Ok(m) => m,
-        // A host that vanished from hosts.toml is a loud failure, never a
-        // silent skip or a delivery to the wrong machine.
-        Err(e) => return (AutomationRunStatus::Error, e.to_string(), None),
+    let mux = match crate::session::sandbox_backend_profile(&session.backend_type) {
+        // A place-backed session's tmux is inside the container, which is found
+        // by friring's own label rather than from a config file — and a place
+        // that is not running has no window to deliver to, which is a skip
+        // rather than an error, exactly like a session that is not running.
+        //
+        // Every place of the profile is asked for the session's window rather
+        // than the first one being assumed to hold it: a profile can have
+        // several live containers at once (an edited profile builds a new one
+        // while the already-launched sessions stay in the old), and picking the
+        // wrong one would report a running session as not running and never
+        // fire.
+        Some(profile) => {
+            // Both names a container could answer to: the label it was created
+            // with, and the rows a profile rename rewrote.
+            let recorded = crate::session_ops::delete::recorded_places(db, &session.backend_type);
+            let found = crate::agent::sandboxing::running_places(profile, &recorded)
+                .iter()
+                .map(crate::agent::tmux::MuxTarget::for_place)
+                .find(|target| crate::agent::tmux::window_exists_on(target, &name));
+            match found {
+                Some(target) => target,
+                None => {
+                    return (
+                        AutomationRunStatus::Skipped,
+                        format!("no window for this session in sandbox place '{profile}'"),
+                        None,
+                    )
+                }
+            }
+        }
+        None => match crate::agent::tmux::MuxTarget::for_backend(&session.backend_type) {
+            Ok(m) => m,
+            // A host that vanished from hosts.toml is a loud failure, never a
+            // silent skip or a delivery to the wrong machine.
+            Err(e) => return (AutomationRunStatus::Error, e.to_string(), None),
+        },
     };
     if !crate::agent::tmux::window_exists_on(&mux, &name) {
         return (
@@ -1073,6 +1105,7 @@ fn fire_spawn(
         parent_session_id: None,
         task_id: None,
         extra_repos: extra_repos.to_vec(),
+        sandbox_profile: None,
     };
     match action::spawn_and_deliver_steps(db, &name, req, &steps) {
         Ok(session_id) => (
@@ -2156,6 +2189,8 @@ mod tests {
                 workspace_dir: None,
                 worktrees: Vec::new(),
                 shell_backend_id: None,
+                sandbox_profile: None,
+                sandbox_enforcement: Default::default(),
                 parent_session_id: None,
                 display_order: None,
                 tombstone: false,

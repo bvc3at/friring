@@ -25,6 +25,7 @@ pub mod notify;
 pub mod output;
 pub mod pane_guard;
 pub mod perf;
+pub mod sandbox;
 pub mod sessions;
 pub mod tasks;
 pub mod update;
@@ -114,6 +115,17 @@ pub enum Command {
     /// Print the perf snapshot a running TUI publishes (FRIRING_PERF_LOG or
     /// the perf HUD must be active in that TUI).
     Perf,
+    /// Manage sandbox profiles, places and tokens.
+    ///
+    /// One subcommand — `relay` — runs inside a boundary friring built, and is
+    /// dispatched before the database is opened because ADR-29 keeps the
+    /// database out of every sandbox (`sandbox::run_before_database`).
+    /// Everything else is host-side management on the ordinary path.
+    #[command(alias = "sb")]
+    Sandbox {
+        #[command(subcommand)]
+        action: sandbox::Action,
+    },
 }
 
 /// Build the additional-repo list for a multi-repo `Spawn` from the repeatable
@@ -168,6 +180,11 @@ pub fn run(cli: Cli, db: &Database) -> Result<(), String> {
         Command::Notify(args) => Ok(notify::run(args)),
         Command::Usage(args) => metrics::run_usage(args, db),
         Command::Perf => perf::run(db),
+        // Host-side sandbox management. The one subcommand that must not see a
+        // database — the in-sandbox relay (ADR-29) — never arrives here: `main`
+        // takes it through `sandbox::run_before_database` first, and `run`
+        // refuses it rather than serving it with one open.
+        Command::Sandbox { action } => sandbox::run(action, db),
     }?;
 
     println!("{}", format.render(&output));
@@ -280,6 +297,29 @@ mod tests {
         assert_eq!(repo_path.to_string_lossy(), "/tmp/repo");
         assert_eq!(worktree_branch.as_deref(), Some("feat/x"));
         assert_eq!(agent.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn parse_session_create_accepts_a_sandbox_profile() {
+        let cli = Cli::try_parse_from([
+            "friring-cli",
+            "session",
+            "create",
+            "--name",
+            "boxed",
+            "--repo-path",
+            "/tmp/repo",
+            "--sandbox",
+            "dev",
+        ])
+        .unwrap();
+        let Command::Session {
+            action: sessions::Action::Create { sandbox, .. },
+        } = cli.command
+        else {
+            panic!("expected Session::Create");
+        };
+        assert_eq!(sandbox.as_deref(), Some("dev"));
     }
 
     #[test]

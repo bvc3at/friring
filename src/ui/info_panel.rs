@@ -170,6 +170,43 @@ fn append_session_section<'a>(
             ),
         ]));
     }
+    // Sandbox; omitted entirely for a session that asked for no boundary. The
+    // profile name is only what was *asked for* — whether the boundary went on
+    // is the launch's answer, so it arrives as `sandbox_state` rather than
+    // being re-derived here (the view probes nothing), and a launch that fell
+    // back to the host says so instead of wearing the shield.
+    if let Some(profile) = info.sandbox_profile.as_deref() {
+        let (detail, color) = match info.sandbox_state.as_ref() {
+            Some(crate::session::SandboxState::Applied(state)) => (
+                format!("\u{26e8} {profile} \u{b7} {state}"),
+                Theme::tool_disallowed(),
+            ),
+            Some(crate::session::SandboxState::Unenforced(reason)) => (
+                format!("\u{26a0} {profile} \u{b7} NOT APPLIED, running on the host: {reason}"),
+                Theme::danger(),
+            ),
+            // Adopted, not launched by this friring: the persisted profile is
+            // all the evidence there is.
+            None => (format!("\u{26e8} {profile}"), Theme::tool_disallowed()),
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Sandbox: ", Theme::label()),
+            Span::styled(detail, Style::default().fg(color)),
+        ]));
+        // A boundary the agent has no credential in is a session that looks
+        // broken until you know it is only signed out. Its own row, because it
+        // is the one thing on this panel the user has to *act* on, and the
+        // action is a command typed in this pane.
+        if let Some(how) = info.sandbox_login.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("Login:   ", Theme::label()),
+                Span::styled(
+                    how.to_string(),
+                    Style::default().fg(Theme::status_blocked()),
+                ),
+            ]));
+        }
+    }
     // Live activity from the agent-emitted OSC terminal title.
     if let Some(activity) = info.agent_activity.as_deref() {
         lines.push(Line::from(vec![
@@ -698,6 +735,108 @@ fn format_tokens(count: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── sandbox row tests ──
+
+    fn sandbox_row(profile: Option<&str>, state: Option<crate::session::SandboxState>) -> String {
+        let mut info = SessionInfo::new("api".to_string());
+        info.sandbox_profile = profile.map(str::to_string);
+        info.sandbox_state = state;
+        let mut lines = Vec::new();
+        append_session_section(&mut lines, &info, None);
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .find(|text| text.starts_with("Sandbox:"))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_sandbox_row_is_omitted_for_a_session_that_asked_for_no_boundary() {
+        assert!(sandbox_row(None, None).is_empty());
+    }
+
+    /// The row reports the **applied** boundary, not the desired one. A launch
+    /// that fell back to the host wearing the same shield as a wrapped one is
+    /// the lie this pair of assertions exists to prevent.
+    #[test]
+    fn the_sandbox_row_distinguishes_an_applied_boundary_from_a_fallback() {
+        let applied = sandbox_row(
+            Some("dev"),
+            Some(crate::session::SandboxState::Applied(
+                "seatbelt · inner agent sandbox: off".to_string(),
+            )),
+        );
+        assert!(applied.contains('\u{26e8}'), "{applied}");
+        assert!(applied.contains("dev · seatbelt"), "{applied}");
+        assert!(!applied.contains("NOT APPLIED"), "{applied}");
+
+        let fell_back = sandbox_row(
+            Some("dev"),
+            Some(crate::session::SandboxState::Unenforced(
+                "bwrap is not installed".to_string(),
+            )),
+        );
+        assert!(!fell_back.contains('\u{26e8}'), "{fell_back}");
+        assert!(fell_back.contains('\u{26a0}'), "{fell_back}");
+        assert!(fell_back.contains("NOT APPLIED"), "{fell_back}");
+        assert!(fell_back.contains("running on the host"), "{fell_back}");
+        assert!(fell_back.contains("bwrap is not installed"), "{fell_back}");
+    }
+
+    /// A boundary the agent has no credential in gets a row of its own, saying
+    /// what to type. Without it a place-backed session reads as broken, because
+    /// the agent is sitting at a sign-in prompt with nothing to explain it.
+    #[test]
+    fn a_boundary_with_no_login_says_what_to_type_in_the_pane() {
+        let mut info = SessionInfo::new("api".to_string());
+        info.sandbox_profile = Some("dev".to_string());
+        info.sandbox_state = Some(crate::session::SandboxState::Applied(
+            "podman · credentials (volume-login): none in this sandbox yet".to_string(),
+        ));
+        info.sandbox_login = Some("sign in inside this pane: /login".to_string());
+        let mut lines = Vec::new();
+        append_session_section(&mut lines, &info, None);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let login = text
+            .iter()
+            .find(|t| t.starts_with("Login:"))
+            .unwrap_or_else(|| panic!("no login row in {text:?}"));
+        assert!(login.contains("/login"), "{login}");
+
+        // Nothing to do, no row: an agent that is signed in must not be told to
+        // sign in, and neither must one friring never launched.
+        info.sandbox_login = None;
+        let mut lines = Vec::new();
+        append_session_section(&mut lines, &info, None);
+        assert!(!lines.iter().any(|l| l
+            .spans
+            .first()
+            .is_some_and(|s| s.content.starts_with("Login:"))));
+    }
+
+    /// An adopted session: friring did not launch this process, so all it can
+    /// honestly show is the profile the row names.
+    #[test]
+    fn the_sandbox_row_of_an_adopted_session_shows_only_its_profile() {
+        let row = sandbox_row(Some("dev"), None);
+        assert!(row.contains('\u{26e8}'), "{row}");
+        assert!(row.contains("dev"), "{row}");
+        assert!(!row.contains('·'), "{row}");
+    }
 
     // ── human_bytes tests ──
 

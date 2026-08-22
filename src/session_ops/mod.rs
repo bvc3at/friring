@@ -448,15 +448,94 @@ pub(crate) fn resolve_agent_def(requested: Option<&str>) -> crate::session::Agen
         })
 }
 
-/// Build the `(command, args)` invocation for an already-resolved [`AgentDef`].
+/// Load the [`SandboxProfile`](crate::session::SandboxProfile) a session row
+/// names, for a launch that has to rebuild the boundary from persisted state.
+///
+/// # Errors
+///
+/// Two ways a stored name refuses to become a launchable profile, both of them
+/// preferring a refusal to a boundary-free launch:
+///
+/// - **No such profile.** It was deleted while a session still referenced it.
+///   Deleting deliberately leaves the reference dangling (see
+///   [`crate::storage::sandboxes`]) precisely so this fails here.
+/// - **The row did not decode.** A hand-edited or imported value friring
+///   cannot read leaves part of the policy unknown, and the parts it
+///   substitutes are guesses; a corrupt profile is repairable in the editor,
+///   never runnable
+///   ([`StoredSandboxProfile`](crate::storage::sandboxes::StoredSandboxProfile)).
+pub(crate) fn load_sandbox_profile(
+    db: &crate::storage::Database,
+    name: Option<&str>,
+) -> Result<Option<crate::session::SandboxProfile>, String> {
+    let Some(name) = name.filter(|n| !n.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let stored = db
+        .get_sandbox_profile(name)
+        .map_err(|e| format!("Failed to load sandbox profile '{name}': {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "Sandbox profile '{name}' no longer exists; refusing to launch this session \
+                 outside the boundary it was created with"
+            )
+        })?;
+    match stored.launch_refusal() {
+        Some(refusal) => Err(refusal),
+        None => Ok(Some(stored.profile)),
+    }
+}
+
+/// An agent launch composed and ready to hand to tmux, with the session's
+/// sandbox profile applied. Built by [`build_agent_invocation`].
+pub(crate) struct AgentInvocation {
+    /// The program to run: the agent, or the sandbox wrapper around it.
+    pub command: String,
+    pub args: Vec<String>,
+    /// The credential a sandboxed launch injects, kept **out** of `config.env`
+    /// so the caller has to place it deliberately. It may only reach the window
+    /// over a control-mode connection, never as a `tmux -e KEY=VALUE` argument
+    /// on a client's command line (`docs/SANDBOX.md` §Failure modes) — so a
+    /// caller holding only the argv channel refuses the launch instead.
+    pub secret_env: Vec<(String, String)>,
+    /// What the launch did with `config.sandbox`. `None` = the session carries
+    /// no profile; [`SandboxState::Unenforced`] = it carries one that could not
+    /// be applied and whose escape hatch let the agent run on the host anyway.
+    pub sandbox: Option<crate::session::SandboxState>,
+    /// The **place** this invocation runs in, when the profile resolved to a
+    /// place backend (ADR-26). A place is a transport, so the caller spawns
+    /// through it and persists `sandbox:<profile>` as the session's
+    /// `backend_type`, exactly as an SSH host persists `ssh:<host>`.
+    pub place: Option<crate::agent::transport::Place>,
+    /// The row to record in `sandbox_instances` once the launch has a window,
+    /// so garbage collection can find the container it created.
+    pub instance: Option<crate::session::SandboxInstance>,
+    /// What the user types in the session's pane to sign the agent in, when the
+    /// boundary starts it signed out. `None` when there is nothing to do.
+    pub login: Option<String>,
+}
+
+/// Build the invocation for an already-resolved [`AgentDef`], with the
+/// session's sandbox profile applied.
 ///
 /// Centralised here so headless spawn and restart agree on the args, and so the
 /// `AgentDef` is resolved exactly once per operation (callers pass the def they
 /// already resolved rather than re-running [`resolve_agent_def`]).
+///
+/// `config` is taken by `&mut` because a sandbox contributes environment as well
+/// as argv: a policy backend applies nothing in argv, so `config.env` — which
+/// becomes the tmux window's environment, *outside* the boundary and inherited
+/// through it — is the only channel inward. Callers must therefore finish
+/// composing `config` (including [`inject_friring_env`]) before calling.
+///
+/// # Errors
+///
+/// The session's sandbox profile could not be applied and does not permit
+/// launching without it. See [`crate::agent::sandboxing::apply`].
 fn build_agent_invocation(
     def: &crate::session::AgentDef,
-    config: &SessionConfig,
-) -> (String, Vec<String>) {
+    config: &mut SessionConfig,
+) -> Result<AgentInvocation, String> {
     let provider = crate::agent::GenericProvider::new(def.clone());
     // Reach the provider trait methods via fully-qualified call syntax so this
     // module imports nothing from the agent module (architecture rule:
@@ -467,7 +546,91 @@ fn build_agent_invocation(
     let args = <crate::agent::GenericProvider as crate::agent::AgentProvider>::build_args(
         &provider, config,
     );
-    (command, args)
+
+    match crate::agent::sandboxing::apply(Some(def), config, &command, &args)? {
+        crate::agent::sandboxing::SandboxDecision::Unsandboxed => Ok(AgentInvocation {
+            command,
+            args,
+            secret_env: Vec::new(),
+            sandbox: None,
+            place: None,
+            instance: None,
+            login: None,
+        }),
+        // The escape hatch fired: this agent runs on the host. The session's
+        // link to its profile is left alone by the caller — a relaunch once the
+        // backend is back must be sandboxed again — and the reason travels out
+        // so the caller can put it in front of whoever asked for the launch.
+        crate::agent::sandboxing::SandboxDecision::Skipped { reason } => {
+            tracing::warn!(agent = %def.name, "{reason}");
+            Ok(AgentInvocation {
+                command,
+                args,
+                secret_env: Vec::new(),
+                sandbox: Some(crate::session::SandboxState::Unenforced(reason)),
+                place: None,
+                instance: None,
+                login: None,
+            })
+        }
+        crate::agent::sandboxing::SandboxDecision::Wrapped(wrapped) => {
+            config.env.extend(wrapped.env);
+            // The headless twin of the TUI's own seam. `inject_friring_env`
+            // withholds the variables naming friring's config, data and metrics
+            // directories from every off-host launch, but it decides from
+            // `SessionConfig::backend`, which does not say `sandbox:<profile>`
+            // until a session has been launched into a place once — so the
+            // *first* spawn of a place-backed session is composed as a local one
+            // and carries them. This is where the launch learns it is
+            // place-bound, so this is where they come back out (ADR-29).
+            config.env = crate::agent::backend::window_env(
+                std::mem::take(&mut config.env),
+                wrapped.place.as_ref(),
+            );
+            Ok(AgentInvocation {
+                command: wrapped.command,
+                args: wrapped.args,
+                secret_env: wrapped.secret_env,
+                sandbox: Some(crate::session::SandboxState::Applied(wrapped.state)),
+                place: wrapped.place,
+                instance: wrapped.instance,
+                login: wrapped.login,
+            })
+        }
+    }
+}
+
+/// Record the place a launch created or adopted, so garbage collection can find
+/// the container later.
+///
+/// Deliberately **not** an upsert on a reuse: a launch that adopted a place must
+/// not re-insert a row a collection pass has just deleted, so the refresh is a
+/// targeted `UPDATE` that touches nothing when the row is gone
+/// (`docs/SANDBOX.md` §`sandbox_instances`). Best-effort — a place that is
+/// running and unrecorded is a leak the next pass can still find by its owner
+/// label, and failing a live session's launch over a bookkeeping row would be
+/// the worse trade.
+pub(crate) fn record_sandbox_instance(
+    db: &crate::storage::Database,
+    instance: &crate::session::SandboxInstance,
+) {
+    let touched = db
+        .touch_sandbox_instance(instance.engine, &instance.external_id, &instance.state)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to refresh sandbox instance row: {e}");
+            false
+        });
+    if !touched {
+        let row = crate::storage::sandboxes::SandboxInstance::new(
+            &instance.profile,
+            instance.engine,
+            &instance.external_id,
+            &instance.state,
+        );
+        if let Err(e) = db.upsert_sandbox_instance(&row) {
+            tracing::warn!("Failed to record sandbox instance: {e}");
+        }
+    }
 }
 
 /// Inject the standard friring env hints into a session config so a
@@ -487,9 +650,12 @@ fn build_agent_invocation(
 ///   so the agent's `friring-cli` (its status hook) targets the same DB the TUI
 ///   reads regardless of XDG / PATH / a stale tmux-server env.
 ///
-/// The three *path* vars are **local-only**: a remote (SSH/WSL) session skips
-/// them — the local dirs don't exist on the host, and a remote `friring-cli`
-/// pinned to them would resolve garbage instead of its own defaults. The
+/// The three *path* vars are **off-host-only**: a remote (SSH/WSL) session and a
+/// sandbox place both skip them — the local dirs don't exist over there, and a
+/// `friring-cli` pinned to them would resolve garbage instead of its own
+/// defaults. For a place it is stronger than that: the data directory is the one
+/// thing no sandbox may reach (ADR-29), so a forwarded `FRIRING_DATA_DIR` would
+/// name either nothing or exactly what the boundary exists to keep out. The
 /// identity vars (`FRIRING_SESSION`/`FRIRING_SESSION_ID`/`FRIRING_TASK`) are
 /// opaque and travel everywhere.
 ///
@@ -518,14 +684,15 @@ pub(crate) fn inject_friring_env(
     if config
         .backend
         .as_deref()
-        .is_some_and(crate::session::is_remote_backend)
+        .is_some_and(crate::session::is_offhost_backend)
     {
         return;
     }
     if let Some(dir) = crate::paths::metrics_directory() {
-        config
-            .env
-            .insert("FRIRING_METRICS_DIR".into(), dir.to_string_lossy().into());
+        config.env.insert(
+            crate::paths::METRICS_DIR_ENV.into(),
+            dir.to_string_lossy().into(),
+        );
     }
     // Pin the agent's `friring-cli` (its status hook) to the *same* config/data
     // dirs this friring resolved, so a status `signal` always lands in the DB
@@ -553,6 +720,39 @@ mod tests {
     use super::*;
     use crate::session::AutomationAction;
     use crate::session::SessionId;
+
+    /// A profile whose stored policy friring cannot read is repairable, never
+    /// runnable: half its columns are friring's own substitutions, and the two
+    /// the decoder used to substitute silently (`read_scope`, `network_deny`)
+    /// were the *wider* option each time.
+    #[test]
+    fn a_profile_whose_row_did_not_decode_is_refused_at_launch() {
+        let db = crate::storage::Database::open_in_memory().unwrap();
+        db.insert_undecodable_sandbox_profile("broken").unwrap();
+
+        let err = load_sandbox_profile(&db, Some("broken")).unwrap_err();
+        // The message names what failed, because repairing it means knowing
+        // which values in the editor are friring's rather than the user's.
+        assert!(err.contains("'broken'"), "{err}");
+        assert!(err.contains("read_scope = 'everything'"), "{err}");
+        assert!(err.contains("network_deny = '[oops'"), "{err}");
+    }
+
+    /// The same path must not become paranoid: a profile that decoded
+    /// completely still loads.
+    #[test]
+    fn a_profile_that_decoded_completely_still_loads() {
+        let db = crate::storage::Database::open_in_memory().unwrap();
+        let profile = crate::session::SandboxProfile::new(
+            "dev",
+            vec![crate::session::SandboxPath::workspace("~/dev/app")],
+        );
+        db.upsert_sandbox_profile(&profile).unwrap();
+
+        let loaded = load_sandbox_profile(&db, Some("dev")).unwrap();
+        assert_eq!(loaded.map(|p| p.name).as_deref(), Some("dev"));
+        assert!(load_sandbox_profile(&db, None).unwrap().is_none());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -766,6 +966,141 @@ mod tests {
             .env
             .contains_key(crate::paths::CONFIG_DIR_OVERRIDE_ENV));
         assert!(!config.env.contains_key(crate::paths::DATA_DIR_OVERRIDE_ENV));
+    }
+
+    /// ADR-29 in the launch environment: the data directory is the one thing a
+    /// sandbox may never reach, so a place-backed session must not be handed a
+    /// variable pointing its in-place `friring-cli` at the host's database.
+    #[test]
+    fn inject_env_skips_local_path_dirs_for_a_sandbox_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(tmp.path());
+        let mut config = SessionConfig {
+            session_id: Some(SessionId::default()),
+            backend: Some("sandbox:dev".into()),
+            ..SessionConfig::default()
+        };
+        inject_friring_env(&mut config, "agent-conv-uuid", None);
+        assert!(config.env.contains_key("FRIRING_SESSION"));
+        assert!(config.env.contains_key("FRIRING_SESSION_ID"));
+        assert!(!config.env.contains_key("FRIRING_METRICS_DIR"));
+        assert!(!config
+            .env
+            .contains_key(crate::paths::CONFIG_DIR_OVERRIDE_ENV));
+        assert!(!config.env.contains_key(crate::paths::DATA_DIR_OVERRIDE_ENV));
+    }
+
+    // A place-backed launch, which a native Windows host cannot have
+    // (`crate::sandbox::select::NATIVE_WINDOWS`).
+
+    /// The **first** launch of a place-backed session is composed as a local
+    /// one, so the guard above has not fired for it — and the window env it
+    /// carries is the one set inside the container.
+    ///
+    /// `sessions.backend_type` does not say `sandbox:<profile>` until a session
+    /// has been launched into a place once, so `friring-cli session create
+    /// --sandbox <place profile>` reaches [`build_agent_invocation`] with
+    /// `backend: None`, is treated as local, and picks up the host's own
+    /// directories. They come back out where the invocation learns it is
+    /// place-bound (ADR-29).
+    #[cfg(unix)]
+    #[test]
+    fn a_first_headless_place_launch_leaves_the_hosts_directories_out_of_the_window() {
+        // Short, private and fabricated: a place's socket path is one level
+        // deeper than a policy sandbox's and has to fit `sun_path`.
+        //
+        // Resolved, because a mount source that travels through a symlink is
+        // refused — and on macOS the platform temp root is behind `/var` →
+        // `/private/var`, which is the profile's problem to spell, not this
+        // test's subject.
+        let base = std::env::temp_dir().join(format!("frso{}-place", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let _guard = crate::paths::TestPathGuard::new(&base);
+        let workspace = base.join("app");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let _host = crate::agent::sandboxing::TestSandboxHost::place(
+            "dev",
+            &workspace.display().to_string(),
+        );
+
+        let mut profile = crate::session::SandboxProfile::new(
+            "dev",
+            vec![crate::session::SandboxPath::workspace(
+                workspace.display().to_string(),
+            )],
+        );
+        profile.backend = crate::session::SandboxBackendKind::Podman;
+        profile.network_mode = crate::session::NetworkMode::None;
+        let mut config = SessionConfig {
+            session_id: Some(SessionId::default()),
+            // What a create path composes: a place-backed session's row does not
+            // say so yet.
+            backend: None,
+            sandbox: Some(profile),
+            cwd: Some(workspace.clone()),
+            ..SessionConfig::default()
+        };
+        inject_friring_env(&mut config, "agent-conv-uuid", None);
+        assert!(
+            config.env.contains_key(crate::paths::DATA_DIR_OVERRIDE_ENV),
+            "the injector treats a first place launch as local, which is the defect's setup"
+        );
+
+        let def = crate::agent::agent_config::builtin_registry()
+            .default_agent()
+            .expect("a built-in agent")
+            .clone();
+        let invocation = build_agent_invocation(&def, &mut config).expect("a place composes");
+        assert!(invocation.place.is_some(), "this launch is place-backed");
+        for var in [
+            crate::paths::METRICS_DIR_ENV,
+            crate::paths::CONFIG_DIR_OVERRIDE_ENV,
+            crate::paths::DATA_DIR_OVERRIDE_ENV,
+        ] {
+            assert!(
+                !config.env.contains_key(var),
+                "{var} names a host path inside the place: {:?}",
+                config.env.get(var)
+            );
+        }
+        // The identity variables are not host paths and still travel.
+        assert!(config.env.contains_key("FRIRING_SESSION"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A place is recorded on first sight and only *refreshed* afterwards: a
+    /// launch reusing a place must not re-insert a row a collection pass has
+    /// just deleted, which would resurrect a record of a container on its way
+    /// out.
+    #[test]
+    fn a_reused_place_refreshes_its_row_rather_than_resurrecting_it() {
+        let db = crate::storage::Database::open_in_memory().unwrap();
+        let profile = crate::session::SandboxProfile::new(
+            "dev",
+            vec![crate::session::SandboxPath::workspace("~/dev/app")],
+        );
+        db.upsert_sandbox_profile(&profile).unwrap();
+        let instance = crate::session::SandboxInstance {
+            profile: "dev".into(),
+            engine: crate::session::SandboxBackendKind::Podman,
+            external_id: "ctr1".into(),
+            state: "running".into(),
+        };
+
+        record_sandbox_instance(&db, &instance);
+        assert_eq!(db.list_sandbox_instances().unwrap().len(), 1);
+
+        // A pass reclaimed it between two launches of the same place.
+        db.delete_sandbox_instance(crate::session::SandboxBackendKind::Podman, "ctr1")
+            .unwrap();
+        record_sandbox_instance(&db, &instance);
+        assert_eq!(
+            db.list_sandbox_instances().unwrap().len(),
+            1,
+            "a re-ensured place is recorded again, not left unrecorded"
+        );
     }
 
     #[test]

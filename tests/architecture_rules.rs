@@ -38,10 +38,26 @@ const MODULE_RULES: &[ModuleRules] = &[
         allowed: &[],
         allowed_path_only: &[],
     },
-    // Side-effect layer (PTY/tmux). Never ui, git, or app.
+    // Side-effect layer (PTY/tmux). Never ui, git, or app. `sandbox` is a
+    // decorator on the launch it composes (ADR-26) — the dependency runs one
+    // way, so an isolation boundary never learns about panes or transports.
     ModuleRules {
         name: "agent",
-        allowed: &["session", "paths", "shell"],
+        allowed: &["session", "paths", "shell", "sandbox"],
+        allowed_path_only: &[],
+    },
+    // Isolation boundaries (ADR-25). Same tier as `agent`: a side-effect layer
+    // over pure `session` data — it probes hosts, generates sandbox profiles
+    // and wraps argv. `shell` for the ssh/wsl launchers a remote host is probed
+    // through, `paths` for the PATH lookup. `proxy` is the egress half of the
+    // boundary (ADR-27): the filtering proxy is a leaf that enforces a policy
+    // it is handed, and this is the layer that hands it one, keeps it alive for
+    // a session and tells each backend which transport to open — the dependency
+    // runs one way, so the proxy still knows nothing about sessions or
+    // backends. Never ui, git, or app.
+    ModuleRules {
+        name: "sandbox",
+        allowed: &["session", "paths", "shell", "proxy"],
         allowed_path_only: &[],
     },
     // Rendering. `app` is allowed read-only model/view state (TEA
@@ -88,6 +104,15 @@ const MODULE_RULES: &[ModuleRules] = &[
     // `friring-cli usage` and `session resources`/`activity`: each reads the
     // same source the TUI reads, so the commands work with no TUI running and
     // nothing has to be cached into SQLite for them.
+    // `proxy` is the in-sandbox relay behind `friring-cli sandbox relay`: the
+    // one command that runs *inside* a boundary, which is why it is dispatched
+    // before the database is opened at all (ADR-29).
+    // `sandbox` is the rest of `friring-cli sandbox` — the host-side management
+    // commands. They ask the same layer the TUI asks: the credential store a
+    // token is written to, the path refusals an import must make before it
+    // stores a profile a launch would refuse, and the engine a prune reclaims
+    // places from. Path-only for the reason `agent` is: it is a side-effect
+    // layer, and every reach into it stays visible at the call site.
     ModuleRules {
         name: "cli",
         allowed: &[
@@ -100,8 +125,9 @@ const MODULE_RULES: &[ModuleRules] = &[
             "usage",
             "proctable",
             "activity",
+            "proxy",
         ],
-        allowed_path_only: &["agent"],
+        allowed_path_only: &["agent", "sandbox"],
     },
     // Agent-neutral activity: provider dispatch, on-disk source discovery, and
     // the incremental scan. Pure record→event parsers live in
@@ -119,6 +145,16 @@ const MODULE_RULES: &[ModuleRules] = &[
     ModuleRules {
         name: "proctable",
         allowed: &["session"],
+        allowed_path_only: &[],
+    },
+    // The sandbox egress proxy: a self-contained network service (ADR-27).
+    // It owns its policy vocabulary rather than borrowing one, so a sandbox
+    // profile is translated into a `proxy::Policy` by its caller and the proxy
+    // itself stays a leaf — testable, and reusable by anything that needs a
+    // filtered egress path.
+    ModuleRules {
+        name: "proxy",
+        allowed: &[],
         allowed_path_only: &[],
     },
     // Leaf utilities.
@@ -524,6 +560,15 @@ fn agent_module_isolation() {
     assert_module_clean("agent");
 }
 
+/// The sandbox layer sits beside `agent`: both wrap the launch with a side
+/// effect. A reference into `app` or `ui` would make an isolation decision
+/// depend on TUI state, and a reference into `agent` would fuse the boundary to
+/// one backend instead of leaving it a decorator the launch path applies.
+#[test]
+fn sandbox_module_isolation() {
+    assert_module_clean("sandbox");
+}
+
 #[test]
 fn ui_layer_isolation() {
     assert_module_clean("ui");
@@ -578,6 +623,14 @@ fn metrics_source_modules_stay_app_free() {
 #[test]
 fn notifications_module_isolation() {
     assert_module_clean("notifications");
+}
+
+/// The egress proxy enforces a policy it is handed, so it needs nothing from
+/// the rest of the crate. Keeping it a leaf is what lets it be tested on its
+/// own, without a session, a database or a sandbox backend.
+#[test]
+fn proxy_module_is_self_contained() {
+    assert_module_clean("proxy");
 }
 
 /// Every module under `src/` must be governed: either a MODULE_RULES entry
