@@ -1921,6 +1921,22 @@ real Claude turn and the stub's usage route.
   scenario, which creates three sessions through the CLI and asserts where they
   land.
 
+- **Owning a worktree doesn't cost a session its place in the list.**
+  `query_sessions` ends its `ORDER BY` on `w.created_at`, which the `LEFT JOIN`
+  leaves NULL for a session with no worktrees — and SQLite sorts NULLs first.
+  Upstream therefore returns worktree-bearing sessions *last* among any that
+  share a `created_at` millisecond, whichever was created first: three
+  same-millisecond sessions of which only the earliest has worktrees come back
+  exactly reversed. The same missing tiebreak lets one session's worktree rows
+  interleave with another's, which the row-merge loop right below the query
+  assumes cannot happen — it would emit that session twice. The fork breaks the
+  tie on `s.rowid`, since insertion order is creation order and that is the
+  order `compute_session_order` promises for never-moved sessions. Reaching any
+  of this needs two sessions first *inserted* inside one millisecond
+  (`ON CONFLICT` leaves `created_at` alone on update), which no create path here
+  manages — every one of them spawns a process or a tmux window in between — so
+  this is the ordering contract made airtight rather than an observed bug.
+
 ### Performance
 
 - **Shell-tab keystrokes echo immediately.** The demand-driven render loop's

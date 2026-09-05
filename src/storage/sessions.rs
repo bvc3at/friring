@@ -314,6 +314,17 @@ impl Database {
         condition: &str,
         params: impl rusqlite::Params,
     ) -> rusqlite::Result<Vec<SharedSession>> {
+        // `s.rowid` breaks `created_at` ties, and is load-bearing rather than
+        // cosmetic. `w.created_at` is NULL for a session with no worktrees (LEFT
+        // JOIN) and SQLite sorts NULLs first, so two sessions sharing a
+        // `created_at` millisecond would otherwise come back with the
+        // worktree-bearing one last, whichever was created first — and one
+        // session's worktree rows would not be guaranteed adjacent, which the
+        // merge loop below assumes. Insertion order is creation order, so this
+        // is the order `crate::ui::project_list::compute_session_order` promises
+        // for never-moved sessions. `rowid` is available because `sessions` is a
+        // rowid table (`id` is a TEXT primary key); a `WITHOUT ROWID` rewrite
+        // would have to replace this term.
         let sql = format!(
             "SELECT s.id, s.name, s.agent, s.backend_id, s.backend_type, \
              s.agent_session_id, s.cwd, s.additional_dirs, s.workspace_dir, \
@@ -323,7 +334,8 @@ impl Database {
              FROM sessions s \
              LEFT JOIN worktrees w ON s.id = w.session_id AND w.deleted_at IS NULL \
              WHERE {condition} \
-             ORDER BY s.display_order IS NULL, s.display_order, s.created_at, w.created_at"
+             ORDER BY s.display_order IS NULL, s.display_order, s.created_at, \
+             s.rowid, w.created_at"
         );
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -890,6 +902,53 @@ mod tests {
             .map(|s| s.name)
             .collect();
         assert_eq!(names, ["ordered-early", "ordered-late", "unordered"]);
+    }
+
+    /// Sessions sharing a `created_at` millisecond still list in creation
+    /// order, and one that owns worktrees does not sort behind ones that own
+    /// none — `w.created_at` is NULL for those and SQLite sorts NULLs first, so
+    /// only the `s.rowid` tiebreak keeps `first` at the top. The same tiebreak
+    /// is what guarantees a session's worktree rows arrive adjacent, which
+    /// `query_sessions`'s merge loop assumes.
+    #[test]
+    fn list_breaks_created_at_ties_by_creation_order() {
+        let db = Database::open_in_memory().unwrap();
+        let first = make_session("first");
+        let second = make_session("second");
+        let third = make_session("third");
+
+        db.upsert_session(&first).unwrap();
+        db.upsert_session(&second).unwrap();
+        db.upsert_session(&third).unwrap();
+
+        // Only the earliest session owns worktrees — the rows the NULLs-first
+        // rule would otherwise push behind the other two.
+        db.upsert_worktrees(
+            first.id,
+            &[
+                SharedWorktree {
+                    repo_path: PathBuf::from("/repo-a"),
+                    worktree_path: PathBuf::from("/repo-a/.git/wt/feat"),
+                    branch: "feat".to_string(),
+                },
+                SharedWorktree {
+                    repo_path: PathBuf::from("/repo-b"),
+                    worktree_path: PathBuf::from("/repo-b/.git/wt/feat"),
+                    branch: "feat".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+
+        // Force the tie rather than racing the millisecond clock.
+        db.conn
+            .execute("UPDATE sessions SET created_at = 1000", [])
+            .unwrap();
+
+        let sessions = db.list_active_sessions().unwrap();
+        let names: Vec<&str> = sessions.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["first", "second", "third"]);
+        assert_eq!(sessions[0].worktrees.len(), 2);
     }
 
     #[test]
