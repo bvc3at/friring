@@ -2350,8 +2350,16 @@ impl App {
                 .map(str::to_string)
             {
                 let window = crate::agent::tmux::agent_window_name(&session_name);
+                // Name the host only when the window is on another machine —
+                // that is the case where the user has to go and look somewhere
+                // else. A local or place-backed collision is between two rows
+                // the session list already shows side by side.
+                let on_host = host_label_from_backend_type(&backend_type)
+                    .map(|host| format!(" on {host}"))
+                    .unwrap_or_default();
                 self.set_error(format!(
-                    "Cannot load '{session_name}': tmux window {window} is already used by '{other}'"
+                    "Cannot load '{session_name}': tmux window {window}{on_host} \
+                     is already used by '{other}'"
                 ));
                 return;
             }
