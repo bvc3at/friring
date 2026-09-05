@@ -1904,6 +1904,39 @@ real Claude turn and the stub's usage route.
   read a local `%1` as taking the remote host's own `%1` — starving that
   session of its correctly-named window.
 
+- **A burst of externally-created sessions keeps its order.** Upstream's
+  `StateDelta::compute` builds `added_sessions` by iterating a `HashMap`, which
+  throws away the order the DB was sorted into (`list_active_sessions`:
+  `display_order`, then `created_at`) and replaces it with `RandomState`'s
+  per-process hash order. `App::apply_added_sessions` adopts in delta order and
+  pushes onto `self.sessions`, and `compute_session_order` renders never-moved
+  sessions (`display_order == None`) by that push index — so every session
+  another instance, a `friring-cli session create` or an automation created
+  between two 250 ms sync polls arrived in the session list shuffled, and
+  shuffled differently on each run. `removed_sessions` and `updated_sessions`
+  were scrambled the same way, harmlessly: both are applied by id. The fork
+  walks `new.sessions` / `old.sessions` and only *probes* the maps, which also
+  folds the added and updated passes into one. Pinned by three ordering tests
+  in `src/sync/delta.rs` and end-to-end by the `scripted-sidebar-order` e2e
+  scenario, which creates three sessions through the CLI and asserts where they
+  land.
+
+- **Owning a worktree doesn't cost a session its place in the list.**
+  `query_sessions` ends its `ORDER BY` on `w.created_at`, which the `LEFT JOIN`
+  leaves NULL for a session with no worktrees — and SQLite sorts NULLs first.
+  Upstream therefore returns worktree-bearing sessions *last* among any that
+  share a `created_at` millisecond, whichever was created first: three
+  same-millisecond sessions of which only the earliest has worktrees come back
+  exactly reversed. The same missing tiebreak lets one session's worktree rows
+  interleave with another's, which the row-merge loop right below the query
+  assumes cannot happen — it would emit that session twice. The fork breaks the
+  tie on `s.rowid`, since insertion order is creation order and that is the
+  order `compute_session_order` promises for never-moved sessions. Reaching any
+  of this needs two sessions first *inserted* inside one millisecond
+  (`ON CONFLICT` leaves `created_at` alone on update), which no create path here
+  manages — every one of them spawns a process or a tmux window in between — so
+  this is the ordering contract made airtight rather than an observed bug.
+
 ### Performance
 
 - **Shell-tab keystrokes echo immediately.** The demand-driven render loop's
