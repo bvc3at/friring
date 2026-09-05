@@ -203,6 +203,14 @@ struct PendingSessionSpawn {
     /// persisted once the session is live so the code-review view can scope its
     /// diff to `<base>..HEAD`. `None` for bare-repo / fork spawns.
     base_branch: Option<String>,
+    /// The name and backend this spawn will claim once it lands. The worker
+    /// creates the tmux window off-thread, so between kickoff and
+    /// [`App::poll_session_spawn`] the roster does not yet show it — without
+    /// these, a second spawn started in that gap validates its name against a
+    /// list that is missing the first one and both end up on one window.
+    /// See [`App::window_name_conflict`].
+    name: String,
+    backend: String,
 }
 
 /// One remote backend's discovery result: its `backend_type`, whether the host
@@ -2235,6 +2243,18 @@ impl App {
             .filter(|s| s.backend_name() == backend)
             .find(|s| crate::agent::tmux::agent_window_name(&s.info.name) == window)
             .map(|s| s.info.name.as_str())
+            .or_else(|| self.pending_spawn_window_conflict(&window, backend))
+    }
+
+    /// The in-flight background spawn, when it will claim `window` on `backend`.
+    /// A spawn owns its window from kickoff, not from the moment it lands in
+    /// `sessions` — see [`PendingSessionSpawn::name`].
+    fn pending_spawn_window_conflict(&self, window: &str, backend: &str) -> Option<&str> {
+        self.pending_session_spawn
+            .as_ref()
+            .filter(|p| p.backend == backend)
+            .filter(|p| crate::agent::tmux::agent_window_name(&p.name) == window)
+            .map(|p| p.name.as_str())
     }
 
     /// The backend **name** a persisted or pending `backend_type` resolves to
@@ -5311,6 +5331,8 @@ impl App {
             task_prompt,
             agent,
             base_branch,
+            name: name.clone(),
+            backend: backend.name().to_string(),
         });
         self.set_status(StatusLevel::Info, format!("Spawning {name}…"));
 
@@ -9070,6 +9092,8 @@ impl App {
             .filter(|s| !s.is_placeholder() && s.backend_name() == backend)
             .find(|s| crate::agent::tmux::agent_window_name(&s.info.name) == window)
             .map(|s| s.info.name.as_str())
+            // An in-flight spawn lands *live*, so it rivals these callers too.
+            .or_else(|| self.pending_spawn_window_conflict(&window, backend))
     }
 
     /// Wire a freshly-adopted backend session into the app: copy persisted
@@ -18016,6 +18040,8 @@ mod tests {
             task_prompt: None,
             agent: "codex".into(),
             base_branch: None,
+            name: "spawning".into(),
+            backend: "stub".into(),
         });
 
         app.poll_session_spawn();
@@ -18043,12 +18069,59 @@ mod tests {
             task_prompt: None,
             agent: "claude".into(),
             base_branch: None,
+            name: "spawning".into(),
+            backend: "stub".into(),
         });
 
         app.poll_session_spawn();
 
         assert!(!app.session_spawn.in_progress());
         assert!(app.pending_session_spawn.is_none());
+    }
+
+    /// A background spawn owns its tmux window from kickoff. Until it lands in
+    /// `sessions` the roster cannot show it, so a second spawn started in that
+    /// gap must still be refused a sanitize-colliding name — otherwise both
+    /// come up on one window (the async-fork race the model fuzzer found).
+    #[test]
+    fn in_flight_spawn_reserves_its_window_name() {
+        let mut app = app_with_sessions(0);
+        let _tx = app.session_spawn.start();
+        app.pending_session_spawn = Some(PendingSessionSpawn {
+            primary_cwd: None,
+            worktrees: vec![],
+            additional_dirs: vec![],
+            workspace_dir: None,
+            parent_session_id: None,
+            task_prompt: None,
+            agent: "claude".into(),
+            base_branch: None,
+            name: "home-fork:beta".into(),
+            backend: "stub".into(),
+        });
+
+        // Sanitizing is many-to-one, so `:` and `.` name one window.
+        assert_eq!(
+            app.window_name_conflict("home-fork.beta", "stub"),
+            Some("home-fork:beta")
+        );
+        assert_eq!(
+            app.live_window_name_conflict("home-fork.beta", "stub"),
+            Some("home-fork:beta")
+        );
+        // …and the prefill must not propose it either.
+        assert_eq!(
+            app.dedup_session_name("home-fork.beta", "stub"),
+            "home-fork.beta-2"
+        );
+
+        // A tmux window namespace is per server, so a remote host is untouched.
+        assert_eq!(app.window_name_conflict("home-fork.beta", "ssh:box"), None);
+        assert_eq!(app.window_name_conflict("other", "stub"), None);
+
+        // Once it lands the reservation is gone.
+        app.pending_session_spawn = None;
+        assert_eq!(app.window_name_conflict("home-fork.beta", "stub"), None);
     }
 
     #[tokio::test]

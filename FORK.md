@@ -393,7 +393,12 @@ boundaries:
   restore/undo races converge on the session already present; and
 - loading a ghost checks the backend-scoped, sanitized tmux window name before
   spawning. A collision leaves the ghost unloaded with an error instead of
-  creating an ambiguous second window.
+  creating an ambiguous second window; and
+- a backgrounded spawn reserves its window name from kickoff, not from the
+  moment it joins the session list. The worker builds the tmux window
+  off-thread, so a second spawn started in that gap used to validate its name
+  against a roster still missing the first — two forks accepted in quick
+  succession then came up on one window.
 
 #### Per-session memory (August 2026)
 
