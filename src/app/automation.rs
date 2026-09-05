@@ -787,8 +787,8 @@ impl App {
 
     /// The in-pane automation/task editor + run-history capture input like the
     /// overlay modal — so editor chords (e.g. `e`, `d`, Ctrl+E) reach the form
-    /// instead of firing a global binding. Focus navigation (Ctrl+L/H) and quit
-    /// still pass through to the global handler so you can move between panes.
+    /// instead of firing a global binding. Focus navigation (Ctrl+L/H), quit,
+    /// and the task panel's non-text F-key toggle still pass through.
     /// Returns `true` if consumed.
     pub(crate) fn handle_automation_pane_capture(
         &mut self,
@@ -803,8 +803,9 @@ impl App {
         ) {
             return false;
         }
+        let action = self.keybindings.lookup(code, mods);
         let passthrough = matches!(
-            self.keybindings.lookup(code, mods),
+            action,
             Some(
                 crate::session::Action::FocusForward
                     | crate::session::Action::FocusBackward
@@ -812,7 +813,9 @@ impl App {
                     // `ReloadApp` (quit + re-exec) escapes like `QuitApp`.
                     | crate::session::Action::ReloadApp
             )
-        );
+        ) || (self.focus == InputFocus::TaskEditor
+            && matches!(code, KeyCode::F(_))
+            && action == Some(crate::session::Action::FocusTasks));
         if passthrough {
             return false;
         }

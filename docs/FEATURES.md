@@ -2466,12 +2466,13 @@ live; they only open the file viewer on `Enter`, since rebuilding the tree
 per keystroke is heavy.)
 
 The state the search touches is **snapshotted on open**, so `Esc` cancels
-back to exactly where you were — selections, focus, and which optional
-panels were visible all restore. `Enter` commits the jump and focuses the
+back to where you were — selections, focus, and which optional panels were
+visible all restore while those surfaces still exist. A feature disabled or a
+panel made unavailable by a resize while the popup is open stays hidden, with
+focus moved to a visible fallback. `Enter` commits the jump and focuses the
 result's pane: a session result switches the active session and focuses its
-terminal; a task focuses the tasks panel with that row selected; an
-automation focuses the automations pane; a file opens the file viewer and
-reveals the path.
+terminal; a task focuses the tasks panel with that row selected; an automation
+focuses the automations pane; a file opens the file viewer and reveals the path.
 
 ### Live in-place highlighting
 
@@ -2533,7 +2534,8 @@ the owning panel's cursor (`preview_global_search_result` →
 `global_search_preview_kind()` tells the view which panel owns it);
 `open_global_search` captures a `SearchSnapshot` (focus + those three indices +
 `show_tasks_panel`/`show_file_viewer`) that `Esc` restores and `Enter`
-drops. `InputFocus::GlobalSearch` captures all input before the global
+drops; restored/stale focus is normalized through
+`App::visible_focus_or_fallback`. `InputFocus::GlobalSearch` captures all input before the global
 keybinding lookup; `compute_layout`'s `show_global_search` floats the
 centered `PanelAreas::global_search` popup (`global_search_popup` in
 `src/ui/layout.rs`, rendered by `src/ui/global_search.rs`) over the
@@ -3247,8 +3249,11 @@ agent": `Enter` (in the session list or the focused pane) or restart
 (`Ctrl+R` / `<leader> r`) respawns via the normal resume path
 (`--resume <id>` where a transcript exists, the agent's cwd-scoped
 resume otherwise), in place — order, id, and injected identity all
-survive. `Alt+N` / `Alt+P` (`<leader> c` / `<leader> C`) cycle among
-loaded sessions only, skipping ghosts.
+survive. Before spawning, the load checks the backend-scoped **sanitized** tmux
+window name; if a loaded session already owns it, the load is refused and the
+row remains a ghost instead of creating an ambiguous duplicate window.
+`Alt+N` / `Alt+P` (`<leader> c` / `<leader> C`) cycle among loaded sessions
+only, skipping ghosts.
 
 **Frames.** The saved frame is the pane's **visible screen** as SGR-styled
 lines (the same byte shape as the adopt seed), captured at unload and
@@ -3302,16 +3307,17 @@ branch name) is saved in the database and reconstructed on restore.
 - **`Ctrl+Q` (Quit)**: Detaches from all sessions (tmux panes keep
   running), saves metadata. Sessions resume on next launch with
   terminal content preserved.
-- **`Ctrl+D` (Delete)**: Soft-deletes the session — its tmux pane
-  is killed and its worktree (if any) is removed. The database
-  row is retained with `deleted_at` set so the deletion can be
-  undone with `Ctrl+Z` (most recent) or restored from the
-  `Ctrl+U` list. This is governed by `[features] soft_delete`
-  (default `true`): set it `false` and `Ctrl+D` becomes a **hard
-  delete** — the full teardown with no `Ctrl+Z` undo, so it is gated
-  behind a confirmation modal (`Modal::ConfirmDeleteSession`) instead.
-  The flag never affects `friring-cli session delete`, which stays soft
-  unless `--force`.
+- **`Ctrl+D` (Delete)**: Soft-deletes the session and immediately hides its
+  row. During the short undo window its pane is held alive, so `Ctrl+Z` — or
+  selecting that same row from `Ctrl+U` — restores the exact in-memory session
+  without a respawn. When the window expires, the pane is stopped but its
+  worktrees remain; the database row keeps `deleted_at` so `Ctrl+U` can respawn
+  it later. Concurrent/stale restores converge on the already-live `SessionId`
+  rather than adding a duplicate. This is governed by `[features] soft_delete`
+  (default `true`): set it `false` and `Ctrl+D` becomes a **hard delete** — the
+  full teardown with no `Ctrl+Z` undo, gated behind a confirmation modal. The
+  flag never affects `friring-cli session delete`, which stays soft unless
+  `--force`.
 
 ### Multi-instance support
 

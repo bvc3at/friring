@@ -203,6 +203,14 @@ struct PendingSessionSpawn {
     /// persisted once the session is live so the code-review view can scope its
     /// diff to `<base>..HEAD`. `None` for bare-repo / fork spawns.
     base_branch: Option<String>,
+    /// The name and backend this spawn will claim once it lands. The worker
+    /// creates the tmux window off-thread, so between kickoff and
+    /// [`App::poll_session_spawn`] the roster does not yet show it — without
+    /// these, a second spawn started in that gap validates its name against a
+    /// list that is missing the first one and both end up on one window.
+    /// See [`App::window_name_conflict`].
+    name: String,
+    backend: String,
 }
 
 /// One remote backend's discovery result: its `backend_type`, whether the host
@@ -1672,6 +1680,45 @@ impl App {
         }
     }
 
+    /// Keep a requested/restored focus only when its owning surface still
+    /// exists. Snapshots and external changes can outlive the pane they name.
+    pub(crate) fn visible_focus_or_fallback(&self, focus: InputFocus) -> InputFocus {
+        match focus {
+            InputFocus::TaskList | InputFocus::TaskEditor
+                if !(self.features.tasks && self.show_tasks_panel) =>
+            {
+                self.focus_fallback()
+            }
+            InputFocus::FileViewer if !(self.features.file_viewer && self.show_file_viewer) => {
+                self.focus_fallback()
+            }
+            InputFocus::GlobalSearch
+                if !(self.features.global_search && self.global_search.active) =>
+            {
+                self.focus_fallback()
+            }
+            InputFocus::CodeReview | InputFocus::ReviewFiles
+                if !(self.features.code_review && self.active_review().is_some()) =>
+            {
+                InputFocus::Terminal
+            }
+            InputFocus::Automations
+            | InputFocus::AutomationEditor
+            | InputFocus::AutomationRunHistory
+                if !(self.features.automations && self.show_session_list) =>
+            {
+                self.focus_fallback()
+            }
+            InputFocus::CcActivity | InputFocus::CcActivityTree
+                if !(self.features.cc_activity && self.active_cc_activity().is_some()) =>
+            {
+                InputFocus::Terminal
+            }
+            InputFocus::SessionList if !self.show_session_list => InputFocus::Terminal,
+            _ => focus,
+        }
+    }
+
     /// Tear down any panel/view/focus that a now-disabled live feature flag
     /// leaves stranded. The open-state booleans (`show_*`), the per-session
     /// shell views, and the open code reviews are all opt-in toggles that
@@ -1720,6 +1767,15 @@ impl App {
         if !self.features.code_review && !self.code_reviews.is_empty() {
             self.code_reviews.clear();
             if matches!(self.focus, InputFocus::CodeReview | InputFocus::ReviewFiles) {
+                self.focus = InputFocus::Terminal;
+            }
+        }
+        if !self.features.cc_activity {
+            self.cc_activities.clear();
+            if matches!(
+                self.focus,
+                InputFocus::CcActivity | InputFocus::CcActivityTree
+            ) {
                 self.focus = InputFocus::Terminal;
             }
         }
@@ -2187,6 +2243,18 @@ impl App {
             .filter(|s| s.backend_name() == backend)
             .find(|s| crate::agent::tmux::agent_window_name(&s.info.name) == window)
             .map(|s| s.info.name.as_str())
+            .or_else(|| self.pending_spawn_window_conflict(&window, backend))
+    }
+
+    /// The in-flight background spawn, when it will claim `window` on `backend`.
+    /// A spawn owns its window from kickoff, not from the moment it lands in
+    /// `sessions` — see [`PendingSessionSpawn::name`].
+    fn pending_spawn_window_conflict(&self, window: &str, backend: &str) -> Option<&str> {
+        self.pending_session_spawn
+            .as_ref()
+            .filter(|p| p.backend == backend)
+            .filter(|p| crate::agent::tmux::agent_window_name(&p.name) == window)
+            .map(|p| p.name.as_str())
     }
 
     /// The backend **name** a persisted or pending `backend_type` resolves to
@@ -2276,6 +2344,26 @@ impl App {
         // (which skips the local-path dir vars for remote sessions) and used to
         // adapt the relaunch args for the host.
         let backend_type = session.backend_name().to_string();
+        if is_ghost_load {
+            if let Some(other) = self
+                .live_window_name_conflict(&session_name, &backend_type)
+                .map(str::to_string)
+            {
+                let window = crate::agent::tmux::agent_window_name(&session_name);
+                // Name the host only when the window is on another machine —
+                // that is the case where the user has to go and look somewhere
+                // else. A local or place-backed collision is between two rows
+                // the session list already shows side by side.
+                let on_host = host_label_from_backend_type(&backend_type)
+                    .map(|host| format!(" on {host}"))
+                    .unwrap_or_default();
+                self.set_error(format!(
+                    "Cannot load '{session_name}': tmux window {window}{on_host} \
+                     is already used by '{other}'"
+                ));
+                return;
+            }
+        }
         // Rebuild the process cwd: the primary repo for a single-repo session,
         // or the (idempotently rebuilt) symlink workspace for a multi-repo one.
         let cwd = self.session_process_cwd(&session.info);
@@ -2951,6 +3039,20 @@ impl App {
         }
 
         let session_name = pending.session.info.name.clone();
+        if let Some(existing) = self
+            .sessions
+            .iter()
+            .position(|s| s.info.id == pending.session_id)
+        {
+            // Another instance restored the row while this app still held its
+            // undo object. Release only our I/O registration; the shared pane
+            // and the already-visible session remain authoritative.
+            pending.session.detach();
+            self.set_active_index(existing);
+            self.save_state();
+            self.set_status(StatusLevel::Success, format!("Restored '{session_name}'"));
+            return;
+        }
         self.sessions.push(pending.session);
         self.set_active_index(self.sessions.len() - 1);
         self.save_state();
@@ -3042,6 +3144,37 @@ impl App {
     /// (uncommitted work was lost on delete). `restore_session` also clears the
     /// `force_deleted` flag. The TUI gates this behind a confirm modal.
     fn restore_deleted_session(&mut self, deleted: DeletedSessionInfo) {
+        // Ctrl+U during the undo window names the exact live object held by
+        // Ctrl+Z. Reuse it and consume the undo slot instead of spawning a
+        // second Session with the same id and tmux window.
+        if self
+            .pending_delete
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == deleted.id)
+        {
+            self.undo_delete();
+            return;
+        }
+
+        // The restore modal is a snapshot. Another instance can restore the
+        // row before its selection is confirmed and sync that same identity
+        // into this app; converge on it instead of spawning a duplicate.
+        if let Some(existing) = self.sessions.iter().position(|s| s.info.id == deleted.id) {
+            if let Err(e) = self.db.restore_session(deleted.id) {
+                error!("Failed to restore session in DB: {e}");
+                self.set_error("Failed to restore session");
+                return;
+            }
+            let session_name = self.sessions[existing].info.name.clone();
+            self.set_active_index(existing);
+            self.focus = InputFocus::Terminal;
+            self.set_status(
+                StatusLevel::Info,
+                format!("'{session_name}' was already restored"),
+            );
+            return;
+        }
+
         let was_force_deleted = deleted.force_deleted;
         let wanted_worktrees = deleted.worktrees.len();
 
@@ -5206,6 +5339,8 @@ impl App {
             task_prompt,
             agent,
             base_branch,
+            name: name.clone(),
+            backend: backend.name().to_string(),
         });
         self.set_status(StatusLevel::Info, format!("Spawning {name}…"));
 
@@ -6033,16 +6168,13 @@ impl App {
         self.set_active_index(order[prev]);
     }
 
-    fn handle_resize(&mut self, cols: u16, rows: u16) {
-        self.terminal_cols = cols;
-        self.terminal_rows = rows;
-
+    fn enforce_responsive_visibility(&mut self) {
         // Collapse the optional right-side panels if the terminal gets too
         // narrow (they only render at width >= 120 anyway). The info panel is
         // exempt unless pinned to its column: with `auto`/`inline` it docks in
         // the left column, which narrow terminals still show — but not while
         // that column is collapsed, which leaves every position column-only.
-        if cols < 120 {
+        if self.terminal_cols < 120 {
             if self.info_panel_position == crate::session::settings::InfoPanelPosition::Column
                 || !self.show_session_list
             {
@@ -6055,6 +6187,12 @@ impl App {
                 self.focus = self.focus_fallback();
             }
         }
+    }
+
+    fn handle_resize(&mut self, cols: u16, rows: u16) {
+        self.terminal_cols = cols;
+        self.terminal_rows = rows;
+        self.enforce_responsive_visibility();
 
         self.resize_sessions_to_content_area();
     }
@@ -8962,6 +9100,8 @@ impl App {
             .filter(|s| !s.is_placeholder() && s.backend_name() == backend)
             .find(|s| crate::agent::tmux::agent_window_name(&s.info.name) == window)
             .map(|s| s.info.name.as_str())
+            // An in-flight spawn lands *live*, so it rivals these callers too.
+            .or_else(|| self.pending_spawn_window_conflict(&window, backend))
     }
 
     /// Wire a freshly-adopted backend session into the app: copy persisted
@@ -9463,7 +9603,7 @@ impl App {
     pub(crate) fn content_area_size(&self) -> (u16, u16) {
         let terminal = self.screen_layout().terminal;
         let inner = Block::default().borders(Borders::ALL).inner(terminal);
-        (inner.height, inner.width)
+        (inner.height.max(1), inner.width.max(1))
     }
 }
 
@@ -17908,6 +18048,8 @@ mod tests {
             task_prompt: None,
             agent: "codex".into(),
             base_branch: None,
+            name: "spawning".into(),
+            backend: "stub".into(),
         });
 
         app.poll_session_spawn();
@@ -17935,12 +18077,59 @@ mod tests {
             task_prompt: None,
             agent: "claude".into(),
             base_branch: None,
+            name: "spawning".into(),
+            backend: "stub".into(),
         });
 
         app.poll_session_spawn();
 
         assert!(!app.session_spawn.in_progress());
         assert!(app.pending_session_spawn.is_none());
+    }
+
+    /// A background spawn owns its tmux window from kickoff. Until it lands in
+    /// `sessions` the roster cannot show it, so a second spawn started in that
+    /// gap must still be refused a sanitize-colliding name — otherwise both
+    /// come up on one window (the async-fork race the model fuzzer found).
+    #[test]
+    fn in_flight_spawn_reserves_its_window_name() {
+        let mut app = app_with_sessions(0);
+        let _tx = app.session_spawn.start();
+        app.pending_session_spawn = Some(PendingSessionSpawn {
+            primary_cwd: None,
+            worktrees: vec![],
+            additional_dirs: vec![],
+            workspace_dir: None,
+            parent_session_id: None,
+            task_prompt: None,
+            agent: "claude".into(),
+            base_branch: None,
+            name: "home-fork:beta".into(),
+            backend: "stub".into(),
+        });
+
+        // Sanitizing is many-to-one, so `:` and `.` name one window.
+        assert_eq!(
+            app.window_name_conflict("home-fork.beta", "stub"),
+            Some("home-fork:beta")
+        );
+        assert_eq!(
+            app.live_window_name_conflict("home-fork.beta", "stub"),
+            Some("home-fork:beta")
+        );
+        // …and the prefill must not propose it either.
+        assert_eq!(
+            app.dedup_session_name("home-fork.beta", "stub"),
+            "home-fork.beta-2"
+        );
+
+        // A tmux window namespace is per server, so a remote host is untouched.
+        assert_eq!(app.window_name_conflict("home-fork.beta", "ssh:box"), None);
+        assert_eq!(app.window_name_conflict("other", "stub"), None);
+
+        // Once it lands the reservation is gone.
+        app.pending_session_spawn = None;
+        assert_eq!(app.window_name_conflict("home-fork.beta", "stub"), None);
     }
 
     #[tokio::test]

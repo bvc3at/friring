@@ -2130,7 +2130,7 @@ impl App {
             // Populate the central-pane preview for the selected task (without
             // this the workspace shows the empty hint).
             self.sync_task_editor();
-        } else if self.focus == InputFocus::TaskList {
+        } else if matches!(self.focus, InputFocus::TaskList | InputFocus::TaskEditor) {
             self.focus = self.focus_fallback();
         }
         self.resize_sessions_to_content_area();
