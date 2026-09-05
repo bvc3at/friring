@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::session::SessionId;
 
@@ -8,15 +8,18 @@ use super::state::{SharedSession, SharedState};
 ///
 /// Used to communicate to an instance what changed externally
 /// so it can update its local view accordingly.
+///
+/// Every vector below preserves the order of the [`SharedState`] it was derived
+/// from — see [`StateDelta::compute`] for why that matters.
 #[derive(Debug, Default, Clone)]
 pub struct StateDelta {
-    /// Sessions that were created by other instances.
+    /// Sessions that were created by other instances, in `new` state order.
     pub added_sessions: Vec<SharedSession>,
 
-    /// Session IDs that were deleted by other instances.
+    /// Session IDs that were deleted by other instances, in `old` state order.
     pub removed_sessions: Vec<SessionId>,
 
-    /// Sessions that were updated (metadata changed).
+    /// Sessions that were updated (metadata changed), in `new` state order.
     pub updated_sessions: Vec<SharedSession>,
 
     /// Latest session counter from external state.
@@ -30,8 +33,19 @@ impl StateDelta {
     /// Determines which sessions were added, removed, or updated
     /// by comparing the old state (what we knew) with the new state
     /// (what other instances know).
+    ///
+    /// The two collections below are only ever *probed*; the delta's vectors
+    /// are built by walking `new.sessions` / `old.sessions` so each keeps that
+    /// state's order. That order is load-bearing, not cosmetic: `SharedState`
+    /// comes from `list_active_sessions`, which sorts by `display_order` then
+    /// `created_at`, and `App::apply_added_sessions` adopts in delta order
+    /// while [`crate::ui::project_list::compute_session_order`] renders
+    /// never-moved sessions (`display_order == None`) in adoption order.
+    /// Iterating a `HashMap` here instead would re-randomize that order per
+    /// process, so several sessions created between two 250 ms polls — a
+    /// scripted burst of `friring-cli session create`, or another instance
+    /// spawning a fleet — would land in the session list shuffled.
     pub fn compute(old: &SharedState, new: &SharedState) -> Self {
-        // Build lookup maps, excluding tombstoned sessions
         let old_session_map: HashMap<SessionId, &SharedSession> = old
             .sessions
             .iter()
@@ -39,32 +53,29 @@ impl StateDelta {
             .map(|s| (s.id, s))
             .collect();
 
-        let new_session_map: HashMap<SessionId, &SharedSession> = new
+        let new_session_ids: HashSet<SessionId> = new
             .sessions
             .iter()
             .filter(|s| !s.tombstone)
-            .map(|s| (s.id, s))
+            .map(|s| s.id)
             .collect();
 
         let mut delta = StateDelta::default();
 
-        for (id, session) in &new_session_map {
-            if !old_session_map.contains_key(id) {
-                delta.added_sessions.push((*session).clone());
-            }
-        }
-
-        for id in old_session_map.keys() {
-            if !new_session_map.contains_key(id) {
-                delta.removed_sessions.push(*id);
-            }
-        }
-
-        for (id, new_session) in &new_session_map {
-            if let Some(old_session) = old_session_map.get(id) {
-                if session_changed(old_session, new_session) {
-                    delta.updated_sessions.push((*new_session).clone());
+        for session in new.sessions.iter().filter(|s| !s.tombstone) {
+            match old_session_map.get(&session.id) {
+                None => delta.added_sessions.push(session.clone()),
+                Some(old_session) => {
+                    if session_changed(old_session, session) {
+                        delta.updated_sessions.push(session.clone());
+                    }
                 }
+            }
+        }
+
+        for session in old.sessions.iter().filter(|s| !s.tombstone) {
+            if !new_session_ids.contains(&session.id) {
+                delta.removed_sessions.push(session.id);
             }
         }
 
@@ -409,6 +420,62 @@ mod tests {
 
         assert!(!delta.is_empty());
         assert_eq!(delta.updated_sessions.len(), 1);
+    }
+
+    /// Twelve sessions make a false pass (a `HashMap` that happens to iterate
+    /// in insertion order) a 1-in-479-million accident rather than a flake.
+    fn ordered_state(names: &[&str]) -> SharedState {
+        let mut state = SharedState::new();
+        for name in names {
+            state
+                .sessions
+                .push(make_session(SessionId::default(), name));
+        }
+        state
+    }
+
+    const TWELVE: [&str; 12] = [
+        "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
+    ];
+
+    /// `added_sessions` must come out in `new.sessions` order — that is the
+    /// order `list_active_sessions` sorted the DB into, and the session list
+    /// renders never-moved sessions (`display_order == None`) in the order the
+    /// app adopted them (see `crate::ui::project_list::compute_session_order`).
+    #[test]
+    fn added_sessions_preserve_new_state_order() {
+        let new_state = ordered_state(&TWELVE);
+
+        let delta = StateDelta::compute(&SharedState::new(), &new_state);
+
+        let expected: Vec<SessionId> = new_state.sessions.iter().map(|s| s.id).collect();
+        let actual: Vec<SessionId> = delta.added_sessions.iter().map(|s| s.id).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn removed_sessions_preserve_old_state_order() {
+        let old_state = ordered_state(&TWELVE);
+
+        let delta = StateDelta::compute(&old_state, &SharedState::new());
+
+        let expected: Vec<SessionId> = old_state.sessions.iter().map(|s| s.id).collect();
+        assert_eq!(delta.removed_sessions, expected);
+    }
+
+    #[test]
+    fn updated_sessions_preserve_new_state_order() {
+        let old_state = ordered_state(&TWELVE);
+        let mut new_state = old_state.clone();
+        for session in &mut new_state.sessions {
+            session.agent = "codex".to_string();
+        }
+
+        let delta = StateDelta::compute(&old_state, &new_state);
+
+        let expected: Vec<SessionId> = new_state.sessions.iter().map(|s| s.id).collect();
+        let actual: Vec<SessionId> = delta.updated_sessions.iter().map(|s| s.id).collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]
