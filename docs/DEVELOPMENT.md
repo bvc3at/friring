@@ -193,7 +193,9 @@ The TUI has three layers of end-to-end coverage:
   through), and agent output is injected per session via `Harness::feed_output`
   (same vt100 + `TermSignals` path as the PTY reader), so redraw detection, OSC
   title/bell signals, buffer-content search, and terminal rendering are all
-  testable. Stable screens (welcome state, F1 help, theme picker) are pinned with
+  testable. Clipboard writes are captured in memory too, so acceptance keys and
+  mouse gestures can never reach the developer's host clipboard. Stable screens
+  (welcome state, F1 help, theme picker) are pinned with
   **`insta`** snapshots (`src/app/snapshots/`); dynamic flows (navigation,
   modals, panel toggles, quit) assert on `App` state instead, so live
   metrics/clock never make them flaky. Runs in the normal `cargo nextest --all` —
@@ -203,10 +205,10 @@ The TUI has three layers of end-to-end coverage:
   `src/app/acceptance.rs`). Seeded pseudo-random event streams (keys, chords,
   mouse, ticks, clock jumps, resizes, injected agent output) against the harness,
   rendering after **every** step and checking `assert_invariants` (selection
-  indices in bounds, focus never on a hidden surface, panels never outlive their
-  feature flag). A failure prints the seed + step for exact replay. When a "weird
-  TUI behavior" reduces to a rule, add it to `assert_invariants` and let the
-  monkey hunt for a violating sequence.
+  indices in bounds, live session IDs unique, focus never on a hidden surface,
+  panels never outlive their feature flag). A failure prints the seed + step for
+  exact replay. When a "weird TUI behavior" reduces to a rule, add it to
+  `assert_invariants` and let the monkey hunt for a violating sequence.
 - **Black-box smoke test** (`scripts/dev/smoke/tui-smoke.sh`, `just smoke`).
   Launches the real `friring` binary inside a throwaway tmux pane (isolated
   `HOME`/XDG/`TMUX_TMPDIR`, mirroring `scripts/demo/record.sh`), drives it with

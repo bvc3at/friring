@@ -1056,6 +1056,41 @@ fn render_focused_field_line(
     width: usize,
     suggestion_text: &str,
 ) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+
+    let cursor = cursor.min(chars.len());
+    // Overflow markers need one cell each. At one or two cells they can leave
+    // no content window at all, so show the caret's immediate window instead.
+    if width <= 2 {
+        let cursor_symbol = chars
+            .get(cursor)
+            .filter(|ch| ch.width().is_some_and(|cells| cells > 0 && cells <= width))
+            .map(char::to_string)
+            .unwrap_or_else(|| " ".to_string());
+        let mut remaining = width.saturating_sub(cursor_symbol.width());
+        let mut start = cursor;
+        while start > 0 {
+            let cells = chars[start - 1].width().unwrap_or(0);
+            if cells > remaining {
+                break;
+            }
+            remaining -= cells;
+            start -= 1;
+        }
+        let mut spans = Vec::new();
+        if start < cursor {
+            let before: String = chars[start..cursor].iter().collect();
+            spans.push(Span::styled(
+                before,
+                Style::default().fg(Theme::text_primary()),
+            ));
+        }
+        spans.push(Span::styled(cursor_symbol, Theme::cursor()));
+        return Line::from(spans);
+    }
+
     let vp = compute_viewport(chars.len(), width, cursor);
 
     let content_start = if vp.has_left_overflow {
@@ -1149,6 +1184,9 @@ fn push_cursor_spans(
 /// Build the rendered line for an unfocused text field (plain text, truncated
 /// with an ellipsis when it exceeds the visible width).
 fn render_unfocused_field_line(value: &str, chars: &[char], width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
     if chars.len() > width {
         let truncated: String = chars[..width - 1].iter().collect();
         return Line::from(vec![
@@ -1398,6 +1436,23 @@ mod tests {
 
     fn line_text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn focused_text_field_tolerates_tiny_viewports() {
+        for value in ["repo", "日a"] {
+            let chars: Vec<char> = value.chars().collect();
+            for width in 0..=2 {
+                for cursor in 0..=chars.len() {
+                    let line = render_focused_field_line(&chars, cursor, width, "suggestion");
+                    assert!(
+                        line_text(&line).width() <= width,
+                        "value {value:?}, width {width}, cursor {cursor}: {:?}",
+                        line_text(&line)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -351,6 +351,10 @@ impl App {
         // resurrect a panel/focus whose feature was just disabled. Runs after
         // `active = false`, so its own close-search branch is a no-op.
         self.enforce_feature_visibility();
+        // A resize can happen while search owns focus. Its snapshot predates
+        // the new layout and must not resurrect a panel that no longer fits.
+        self.enforce_responsive_visibility();
+        self.focus = self.visible_focus_or_fallback(self.focus);
         self.resize_sessions_to_content_area();
     }
 
@@ -752,6 +756,7 @@ impl App {
             .as_ref()
             .map(|s| s.focus)
             .unwrap_or_else(|| self.focus_fallback());
+        let fallback_focus = self.visible_focus_or_fallback(fallback_focus);
         // For the LastSession toggle the meaningful "previous" is the session
         // active before the search *opened* — live previews already moved
         // `active_index` while browsing results, so recording via

@@ -238,6 +238,9 @@ impl Harness {
             crate::agent::agent_config::builtin_registry(),
             Database::open_in_memory().unwrap(),
         );
+        // Acceptance tests must never hand copied pane/status text to the host
+        // clipboard. Capturing here keeps every key and mouse flow hermetic.
+        app.captured_clipboard = Some(Vec::new());
         for i in 0..session_count {
             app.sessions
                 .push(Session::stub(&format!("session-{i}"), &backend, &provider));
@@ -1283,6 +1286,104 @@ fn ctrl_d_soft_deletes_and_ctrl_z_undoes() {
     );
 }
 
+#[tokio::test]
+async fn restore_picker_consumes_the_matching_pending_delete() {
+    let mut h = Harness::spawnable(1);
+    h.app.save_state();
+    let id = h.app.sessions[0].info.id;
+
+    h.alt('u'); // keep the deleted session as a ghost in the undo slot
+    h.ctrl('d');
+    assert!(h.app.pending_delete.is_some());
+    assert!(h.app.sessions.is_empty());
+
+    h.ctrl('u');
+    assert!(matches!(h.app.modal, modals::Modal::RestoreSessions(_)));
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+
+    assert!(
+        h.app.pending_delete.is_none(),
+        "restoring the same row must consume its in-memory undo entry"
+    );
+    assert_eq!(
+        h.app.sessions.iter().filter(|s| s.info.id == id).count(),
+        1,
+        "restore keeps exactly one instance of the session identity"
+    );
+    assert!(h.app.sessions[0].is_ghost(), "the pending ghost is reused");
+
+    h.ctrl('z');
+    assert_eq!(h.app.sessions.len(), 1, "undo is now a no-op");
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        !h.app.sessions[0].is_ghost(),
+        "the restored ghost still loads"
+    );
+    assert_eq!(h.app.sessions.len(), 1);
+}
+
+#[test]
+fn undo_does_not_duplicate_a_session_restored_by_another_instance() {
+    let mut h = Harness::standard(1);
+    h.app.save_state();
+    let id = h.app.sessions[0].info.id;
+    h.ctrl('d');
+
+    let backend: Arc<dyn SessionBackend> = Arc::new(FakeBackend::stub());
+    let provider: Arc<dyn AgentProvider> = Arc::new(GenericProvider::new(
+        crate::agent::agent_config::builtin_registry()
+            .default_agent()
+            .unwrap()
+            .clone(),
+    ));
+    let mut externally_restored = Session::stub("restored-elsewhere", &backend, &provider);
+    externally_restored.info.id = id;
+    h.app.sessions.push(externally_restored);
+
+    h.ctrl('z');
+
+    assert!(h.app.pending_delete.is_none());
+    assert_eq!(
+        h.app.sessions.iter().filter(|s| s.info.id == id).count(),
+        1,
+        "an external restore wins without duplicating SessionId"
+    );
+}
+
+#[tokio::test]
+async fn stale_restore_picker_does_not_duplicate_an_external_restore() {
+    let mut h = Harness::spawnable(1);
+    h.app.save_state();
+    let id = h.app.sessions[0].info.id;
+    h.ctrl('d');
+    h.app.finalize_pending_delete();
+
+    h.ctrl('u');
+    assert!(matches!(h.app.modal, modals::Modal::RestoreSessions(_)));
+
+    // Another instance restores the row after this modal captured its list,
+    // and the normal state sync makes that session visible here.
+    h.app.db.restore_session(id).unwrap();
+    let backend: Arc<dyn SessionBackend> = Arc::new(FakeBackend::spawnable());
+    let provider: Arc<dyn AgentProvider> = Arc::new(GenericProvider::new(
+        crate::agent::agent_config::builtin_registry()
+            .default_agent()
+            .unwrap()
+            .clone(),
+    ));
+    let mut externally_restored = Session::stub("restored-elsewhere", &backend, &provider);
+    externally_restored.info.id = id;
+    h.app.sessions.push(externally_restored);
+
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+
+    assert_eq!(
+        h.app.sessions.iter().filter(|s| s.info.id == id).count(),
+        1,
+        "a stale restore selection must converge on the existing identity"
+    );
+}
+
 #[test]
 fn ctrl_d_hard_delete_confirms_when_soft_delete_disabled() {
     let mut h = Harness::standard(2);
@@ -1626,6 +1727,21 @@ fn cc_activity_view_opens_navigates_folds_and_closes() {
 }
 
 #[test]
+fn disabling_activity_live_closes_the_view_and_rescues_focus() {
+    let mut h = Harness::standard(1);
+    h.func(9);
+    assert!(h.app.active_cc_activity().is_some());
+    assert!(matches!(h.app.focus, InputFocus::CcActivityTree));
+
+    let mut settings = crate::session::settings::Settings::default();
+    settings.features.cc_activity = false;
+    h.app.apply_live_settings(&settings);
+
+    assert!(h.app.cc_activities.is_empty());
+    assert_eq!(h.app.focus, InputFocus::Terminal);
+}
+
+#[test]
 fn activity_sections_render_seeded_events() {
     use super::activity::{ProviderKind, Section, SessionActivity};
     use crate::session::activity::{ActionKind, ActivityEvent};
@@ -1882,6 +1998,22 @@ fn tasks_panel_new_task_opens_editor() {
     assert!(
         h.app.task_ui.task_editor.is_some(),
         "a fresh task editor is in flight"
+    );
+}
+
+#[test]
+fn hiding_tasks_while_editing_rescues_focus() {
+    let mut h = Harness::standard(1);
+    h.ctrl('w');
+    h.key(KeyCode::Char('n'), KeyModifiers::NONE);
+    assert!(matches!(h.app.focus, InputFocus::TaskEditor));
+
+    h.func(5);
+
+    assert!(!h.app.show_tasks_panel);
+    assert!(
+        matches!(h.app.focus, InputFocus::SessionList),
+        "focus must leave the editor when its panel is hidden"
     );
 }
 
@@ -2145,6 +2277,55 @@ async fn switcher_enter_loads_an_unloaded_session() {
         "choosing a ghost loads it"
     );
     assert!(!h.app.global_search.active, "and the popup is gone");
+}
+
+#[tokio::test]
+async fn loading_a_ghost_in_a_tiny_terminal_clamps_parser_size() {
+    let mut h = Harness::spawnable(1);
+    h.alt('u');
+    assert!(h.app.sessions[0].is_ghost());
+
+    h.resize(31, 4);
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+
+    assert!(!h.app.sessions[0].is_ghost());
+    let mut size = None;
+    h.app.with_active_parser(|p| size = Some(p.screen().size()));
+    let (rows, cols) = size.expect("the loaded session has a parser");
+    assert!(rows >= 1 && cols >= 1, "parser size was {rows}x{cols}");
+}
+
+#[tokio::test]
+async fn ghost_load_refuses_a_sanitized_live_window_collision() {
+    let mut h = Harness::spawnable(2);
+    h.app.sessions[0].info.name = "alpha:beta".into();
+    h.app.set_active_index(1);
+    h.alt('u');
+    h.app.sessions[1].info.name = "alpha.beta".into();
+
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+
+    assert!(
+        h.app.sessions[1].is_ghost(),
+        "the ghost stays unloaded when its tmux window is already owned"
+    );
+    assert_eq!(
+        h.app
+            .sessions
+            .iter()
+            .filter(|s| !s.is_placeholder())
+            .count(),
+        1,
+        "no second live pane is spawned"
+    );
+    let msg = h
+        .app
+        .status_message
+        .as_ref()
+        .expect("collision is reported");
+    assert_eq!(msg.level, StatusLevel::Error);
+    assert!(msg.text.contains("tb-alpha_beta"), "got: {}", msg.text);
+    assert!(msg.text.contains("alpha:beta"), "got: {}", msg.text);
 }
 
 #[tokio::test]
@@ -4310,6 +4491,40 @@ fn narrow_resize_rescues_task_editor_focus() {
     h.render();
 }
 
+#[test]
+fn stale_search_result_cannot_restore_focus_to_hidden_tasks() {
+    let mut h = Harness::new(160, 40, 2);
+    h.ctrl('w');
+    h.ctrl('/');
+    assert_eq!(h.app.global_search.results[0].label, "session-1");
+
+    let stale_id = h.app.sessions[1].info.id;
+    h.app.apply_removed_sessions(vec![stale_id]);
+    h.resize(50, 40);
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+
+    assert!(!h.app.show_tasks_panel);
+    assert!(
+        !matches!(h.app.focus, InputFocus::TaskList | InputFocus::TaskEditor),
+        "a stale result must fall back to a visible surface"
+    );
+}
+
+#[test]
+fn cancelling_search_after_a_narrow_resize_keeps_tasks_hidden() {
+    let mut h = Harness::new(160, 40, 1);
+    h.ctrl('w');
+    h.ctrl('/');
+    h.resize(50, 40);
+    h.key(KeyCode::Esc, KeyModifiers::NONE);
+
+    assert!(!h.app.show_tasks_panel);
+    assert!(
+        !matches!(h.app.focus, InputFocus::TaskList | InputFocus::TaskEditor),
+        "cancel must not resurrect focus on a panel the new layout cannot show"
+    );
+}
+
 // ── Injected agent output: the PTY seam ──────────────────────────────────────
 
 #[test]
@@ -4468,6 +4683,12 @@ fn assert_invariants(app: &App, ctx: &str) {
         "[{ctx}] active_index {} out of bounds ({} sessions)",
         app.active_index,
         app.sessions.len()
+    );
+    let unique_ids: std::collections::HashSet<_> = app.sessions.iter().map(|s| s.info.id).collect();
+    assert_eq!(
+        unique_ids.len(),
+        app.sessions.len(),
+        "[{ctx}] live sessions contain a duplicate SessionId"
     );
     assert!(
         app.task_ui.filtered_task_indices.is_empty()

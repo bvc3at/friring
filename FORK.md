@@ -376,6 +376,25 @@ fork makes "not running" a first-class state:
   parse ≈ 50 µs; grey pass ≈ 7 µs; idle claude CLI ≈ 333 MB RSS) were taken
   with the e2e stub harness on real agent frames.
 
+#### Model-fuzz stability guards (August 2026)
+
+Long-running state-machine fuzzing of the fork-only panels, ghosts, global
+search, and soft-delete lifecycle turned implicit assumptions into enforced
+boundaries:
+
+- terminal/parser dimensions are clamped to at least 1×1 at the app, backend,
+  and vt100 wiring boundaries, and focused text fields render safely even when
+  only zero, one, or two display columns remain;
+- restored focus is accepted only while its pane still exists, so responsive
+  resizes, live feature changes, task-editor toggles, and stale search
+  snapshots cannot leave input captured by a hidden surface;
+- a live `SessionId` is unique across Ctrl+Z, Ctrl+U, and multi-instance
+  restores: the pending in-memory object is reused when possible and stale
+  restore/undo races converge on the session already present; and
+- loading a ghost checks the backend-scoped, sanitized tmux window name before
+  spawning. A collision leaves the ghost unloaded with an error instead of
+  creating an ambiguous second window.
+
 #### Per-session memory (August 2026)
 
 The ~333 MB above was the argument *for* ghosts, but nothing in either
@@ -1881,21 +1900,24 @@ real Claude turn and the stub's usage route.
   open and editable) and `spawn_session_headless` — naming the session already
   holding that window.
 
-  Two paths can still reach a collision without creating a name, and each
-  resolves it where the conflict actually occurs rather than by refusing.
-  **Undelete**: a soft-deleted row keeps its name but not its window, so a
-  session created afterwards may now own it (`my project` deleted, then
+  Three paths can still reach a collision without creating a name, and each
+  resolves it where the conflict actually occurs. **Undelete**: once its undo
+  window is finalized, a soft-deleted row keeps its name but not its window, so
+  a session created afterwards may now own it (`my project` deleted, then
   `my_project` created). Restoring under the old name would spawn a duplicate;
   dropping the deleted row instead would let an unrelated create silently
-  destroy a recoverable session. It comes back as `my project-2`, with a
-  status line saying so. **Startup restore**: two rows that predate the guards
-  can both want one window — the loser respawns deduped, which is safe because
-  renaming only ever touches a session whose window is about to be created
-  (never an adopted one, which would orphan its live pane), so a host that
-  already holds collisions heals itself on the next launch. Automation/task
-  fires (`spawn_and_prompt`) are the exception and *fail*: that caller re-finds
-  its session by exact name, so a deduped one would be missed and every run
-  would spawn another.
+  destroy a recoverable session. It comes back as `my project-2`, with a status
+  line saying so. During the undo window, Ctrl+U reuses the same pending object
+  as Ctrl+Z instead of spawning at all. **Startup restore**: two rows that
+  predate the guards can both want one window — the loser respawns deduped,
+  which is safe because renaming only ever touches a session whose window is
+  about to be created (never an adopted one, which would orphan its live pane),
+  so a host that already holds collisions heals itself on the next launch.
+  **Ghost load**: two colliding rows may both begin as pane-less ghosts; after
+  one is loaded, loading the other is refused and it stays a ghost. Automation/
+  task fires (`spawn_and_prompt`) likewise *fail*: that caller re-finds its
+  session by exact name, so a deduped one would be missed and every run would
+  spawn another.
 
   Every one of these comparisons is scoped to a single backend, because a tmux
   window namespace belongs to its *server*: the local server and each

@@ -815,6 +815,7 @@ impl Session {
         backend: &Arc<dyn SessionBackend>,
         provider: &Arc<dyn AgentProvider>,
     ) -> Result<Self> {
+        let (rows, cols) = (rows.max(1), cols.max(1));
         let window_name = crate::agent::tmux::agent_window_name(&name);
         let Sandboxed {
             command,
@@ -906,6 +907,7 @@ impl Session {
         env: HashMap<String, String>,
         seed: Option<Vec<u8>>,
     ) -> Result<Self> {
+        let (rows, cols) = (rows.max(1), cols.max(1));
         let adopted = backend.adopt(backend_id, rows, cols, seed)?;
 
         debug!(
@@ -938,6 +940,7 @@ impl Session {
 
     /// Create parser, spawn reader/writer loops for the given I/O handles.
     fn wire_up(rows: u16, cols: u16, io: SessionIo) -> (WiredState, String) {
+        let (rows, cols) = (rows.max(1), cols.max(1));
         let last_title = Arc::new(Mutex::new(None));
         let attention_at = Arc::new(AtomicU64::new(0));
         let notification = Arc::new(Mutex::new(None));
@@ -1482,6 +1485,7 @@ impl Session {
     /// placeholder/ghost flags — the frozen frame is simply replaced by the
     /// live stream, in place.
     pub fn restart(&mut self, config: &SessionConfig, rows: u16, cols: u16) -> Result<()> {
+        let (rows, cols) = (rows.max(1), cols.max(1));
         // Resolve the wrapped invocation *before* tearing the old pane down:
         // applying a sandbox profile can fail (backend unavailable with
         // fallback off, a policy this build can't express, an I/O error writing
