@@ -452,6 +452,10 @@ pub(crate) fn scan_once(
 /// The whole scan pass, run on a blocking thread.
 pub(crate) fn collect_activity(roots: ScanRoots, inputs: Vec<ActivityInput>) -> ActivityRefresh {
     let mut updates = Vec::with_capacity(inputs.len());
+    // Codex discovery is a question about the tree, not about the asking
+    // session, so every codex input in this pass shares one answer (ADR-P15).
+    // Built here and dropped with the pass — see [`codex::CodexDiscovery`].
+    let mut codex_disc = codex::CodexDiscovery::default();
     for input in inputs {
         let mut state = input.state;
         let changed = match &mut state.scan {
@@ -529,6 +533,7 @@ pub(crate) fn collect_activity(roots: ScanRoots, inputs: Vec<ActivityInput>) -> 
                 roots.codex_sessions.as_deref(),
                 &input.dirs,
                 input.own_id.as_deref(),
+                &mut codex_disc,
             ),
             ProviderScan::Cline(src) => cline::scan_cline(
                 src,

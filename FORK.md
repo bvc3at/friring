@@ -419,6 +419,19 @@ all rather than claiming a saving nobody observed.
 - Gated by `[features] session_memory` (default `true`); off means the process
   table is never read and none of the three surfaces render.
 
+#### A shelved session costs nothing
+
+The fork's answer to a large fleet is the ghost: unload a session and it stops
+costing anything. Two of the ~1 s background scans broke that promise — the F9
+activity scan and the cc-activity tree scan both ran every local session,
+shelved or not, so a fleet's worth of ghosts each paid their provider's
+discovery walk once a second forever. Both now skip ghosts, matching what the
+per-session memory scan already did. The codex provider additionally shared its
+discovery across one pass instead of repeating it per session, and the
+notification bookkeeping's per-tick prune stopped being quadratic in the session
+count. Measured on a 526-session fleet with 50 loaded; ADR-P15 in
+`docs/PERFORMANCE.md`.
+
 #### Headless sends can't answer a dialog (July 2026)
 
 Upstream's headless senders type their text and press Enter as two separate

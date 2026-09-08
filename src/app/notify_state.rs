@@ -3,7 +3,7 @@
 //! direct dependence on `App` state — so the transition rule is unit-testable
 //! without spinning up an `App`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::notifications::{Notification, NotificationSender};
@@ -51,9 +51,28 @@ impl NotificationState {
         }
     }
 
+    /// Whether [`Self::prune_to`] has anything to do, from the session count
+    /// alone — so the per-tick caller never builds an id vector for nothing.
+    ///
+    /// Exact, not a heuristic: by the time the dispatcher prunes,
+    /// [`Self::observe`] has recorded every live session, so `prev_status`
+    /// holds a superset of them and an equal size means nothing is stale.
+    /// `last_fired_at` needs no check of its own — it only ever gains an id
+    /// `observe` has already put in `prev_status`, and only `prune_to` removes
+    /// from either, so it is always a subset.
+    pub fn needs_prune(&self, live_count: usize) -> bool {
+        self.prev_status.len() > live_count
+    }
+
     /// Drop bookkeeping for sessions that no longer exist so the maps stay
     /// bounded across long sessions.
+    ///
+    /// Gate the per-tick call on [`Self::needs_prune`]: this builds a set
+    /// rather than scanning `live` per entry, because the linear scan cost
+    /// O(sessions²) comparisons on every tick — ~550k of them at 526 sessions,
+    /// which profiled as 2.4% of the render thread.
     pub fn prune_to(&mut self, live: &[SessionId]) {
+        let live: HashSet<SessionId> = live.iter().copied().collect();
         self.prev_status.retain(|id, _| live.contains(id));
         self.last_fired_at.retain(|id, _| live.contains(id));
     }
@@ -347,6 +366,22 @@ mod tests {
             s.observe(keep, SessionStatus::Blocked, false, now),
             TransitionDecision::Fire
         );
+    }
+
+    #[test]
+    fn perf_prune_is_a_no_op_until_a_session_actually_goes_away() {
+        // The dispatcher prunes every tick. `needs_prune` is what keeps that
+        // from costing an id vector plus O(sessions²) comparisons per tick.
+        let mut s = test_state(false, true, 0);
+        let a = SessionId::default();
+        let b = SessionId::default();
+        let now = Instant::now();
+        assert!(!s.needs_prune(0), "nothing observed yet, nothing to drop");
+
+        let _ = s.observe(a, SessionStatus::Working, false, now);
+        let _ = s.observe(b, SessionStatus::Working, false, now);
+        assert!(!s.needs_prune(2), "both sessions are still live");
+        assert!(s.needs_prune(1), "one went away — the maps hold a stale id");
     }
 
     #[test]

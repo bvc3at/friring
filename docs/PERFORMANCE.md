@@ -690,6 +690,72 @@ CPU and carries every process's name/cmdline/user; a per-session `ps -o rss= -p
 
 ---
 
+## ADR-P15: A shelved session costs nothing, and a pass asks the tree once
+
+**Choice**: three fixes to work that scaled with the *stored* session count
+rather than the *loaded* one. Measured on a real fleet of **526 sessions, 50 of
+them loaded**, by sampling the running process:
+
+- **Ghosts are not scanned.** `start_activity_refresh`
+  (`src/app/activity/mod.rs`) and `start_cc_refresh` (`src/app/cc_activity.rs`)
+  ran every local session through their ~1 s pass, ghosts included. An unloaded
+  session has no agent process and no daemon worker of its own, so its
+  transcript and its `subagents/` tree cannot have grown since it was shelved:
+  the pass can only re-derive what the accumulator already holds, while still
+  paying that provider's discovery walk. Both now skip `is_ghost()`, matching
+  what ADR-P14's memory scan already did. A ghost stays **eligible**, so the
+  accumulator it was shelved with survives the eviction sweep, is still shown,
+  and is picked back up on load.
+- **Codex discovery is answered once per pass, not once per session.**
+  `scan_codex` (`src/activity/codex.rs`) asked the same two questions of
+  `$CODEX_HOME/sessions` per session: the recent-rollout listing (a
+  `MAX_DAY_DIRS`-shard walk, run on *every* scan because it is also the rebind
+  trigger) and each rollout's head `session_meta`. Neither depends on who is
+  asking. `CodexDiscovery` now memoizes both for the length of one
+  `collect_activity` pass, so a pass costs one walk and at most one head-parse
+  per file however many codex sessions it carries. Being pass-scoped it has
+  nothing to invalidate — the next pass builds a fresh one.
+- **The notification prune is gated.** `dispatch_status_notifications`
+  (`src/app/mod.rs`) built a vector of every session id every tick and handed it
+  to `NotificationState::prune_to`, which scanned it *per map entry* —
+  O(sessions²), ~550k comparisons per tick at 526 sessions. `observe` has
+  already recorded every live session by then, so `prev_status` holds a superset
+  of them and an equal size means nothing is stale: `needs_prune` answers that
+  in O(1), and neither the vector nor the (now set-based) retains are built on
+  the common tick.
+
+**Why**: ghosts are the fork's answer to a large fleet — the point of unloading
+is that a session stops costing anything. Two of the three ~1 s scans quietly
+broke that, and the third made every tick quadratic in a number the user is
+encouraged to let grow. On the measured fleet the codex walk alone held a
+background thread at ~40% of a core, re-listing 455 rollouts across 36 date
+shards once per codex session per second.
+
+Gate: `perf_ghosts_are_never_scanned_but_keep_their_accumulator`,
+`perf_an_all_ghost_fleet_starts_no_cc_pass`, `cc_refresh_scans_a_loaded_session`
+(`src/app/activity/mod.rs` tests),
+`perf_one_pass_answers_every_session_from_one_walk`
+(`src/activity/codex.rs` tests),
+`perf_prune_is_a_no_op_until_a_session_actually_goes_away`
+(`src/app/notify_state.rs` tests). All count or observe the *mechanism* — which
+accumulators moved, whether a pass started, whether a removed tree is still
+answered — never a clock, per ADR-P2.
+
+**Rejected**:
+
+- *Dropping a ghost's accumulator when it is skipped* — the F9 view renders a
+  shelved session's history from it, and re-deriving on load means re-ingesting
+  a whole transcript in the foreground.
+- *A cross-pass head-`session_meta` cache keyed on path* — a rollout's head is
+  immutable, so it would be sound, but it needs an eviction policy for a
+  directory that grows without bound. Pass scope gets the same win against the
+  cost that was actually measured, and expires by construction.
+- *Skipping the prune entirely and letting the maps grow* — they are keyed by
+  session id and would leak across a long run of deletions; the O(1) gate keeps
+  the bound without the per-tick cost.
+
+---
+
 ## Quick reference
 
 | I want to… | Do this |
@@ -706,3 +772,5 @@ CPU and carries every process's name/cmdline/user; a per-session `ps -o rss= -p
 | Verify no perf regression | `cargo nextest run -E 'test(perf_)'` |
 | Confirm idle CPU is low | Launch, leave it idle — `redraws_skipped` climbs while `frames_rendered` stays flat |
 | See what a session costs in RAM | Read its list-row badge / the `Σ` fleet total / the info panel's RAM line; turn the scan off with `[features] session_memory = false` (ADR-P14) |
+| Check that shelved sessions still cost nothing (ADR-P15) | `cargo nextest run -E 'test(perf_ghosts) + test(perf_an_all_ghost) + test(perf_one_pass) + test(perf_prune)'` |
+| Attribute a CPU burn in a running TUI | Sample it — `sample $(pgrep -x friring) 10 -file /tmp/friring.txt` on macOS, `perf record -p $(pgrep -x friring)` on Linux. Reads stack symbols only, writes nothing, and needs no restart or feature flag |

@@ -62,13 +62,18 @@ struct CcSessionInput {
 }
 
 impl App {
-    /// Kick off a background scan of every local session's `subagents/` tree —
-    /// its own, plus any owned by background/daemon workers it launched (see
-    /// [`CcSessionInput`]). Skips remote sessions (their `~/.claude` lives on the
-    /// host) and sessions without an agent conversation id. Non-claude local
-    /// sessions simply resolve to no directory (empty activity) — cheap, and it
-    /// means claude-based agents under custom names (flow/shepherd workers) are
-    /// covered without a name allowlist.
+    /// Kick off a background scan of every loaded local session's `subagents/`
+    /// tree — its own, plus any owned by background/daemon workers it launched
+    /// (see [`CcSessionInput`]). Skips remote sessions (their `~/.claude` lives
+    /// on the host) and sessions without an agent conversation id. Non-claude
+    /// local sessions simply resolve to no directory (empty activity) — cheap,
+    /// and it means claude-based agents under custom names (flow/shepherd
+    /// workers) are covered without a name allowlist.
+    ///
+    /// Ghosts are skipped (ADR-P15): an unloaded session has no agent process
+    /// and no daemon worker of its own still writing, so its tree cannot have
+    /// grown since it was shelved. The index it was shelved with stays on the
+    /// session and is refreshed again on load.
     pub(super) fn start_cc_refresh(&mut self) {
         if self.cc_refresh.in_progress() {
             return;
@@ -80,7 +85,7 @@ impl App {
             .sessions
             .iter()
             .filter_map(|s| {
-                if s.info.remote_host.is_some() {
+                if s.info.remote_host.is_some() || s.is_ghost() {
                     return None;
                 }
                 let own_id = s.info.agent_session_id.clone()?;

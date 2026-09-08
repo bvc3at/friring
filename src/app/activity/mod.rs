@@ -77,9 +77,16 @@ impl App {
         ProviderKind::for_command(&self.session_command(info))
     }
 
-    /// Kick off a background event scan for every local session with a
-    /// provider. Accumulators are moved into the pass and returned by
+    /// Kick off a background event scan for every **loaded** local session with
+    /// a provider. Accumulators are moved into the pass and returned by
     /// [`Self::poll_activity_refresh`].
+    ///
+    /// Ghosts are eligible but never scanned (ADR-P15). An unloaded session has
+    /// no agent process, so its transcript cannot have grown since it was
+    /// shelved and a pass over it can only re-derive what the accumulator
+    /// already holds — while still paying that provider's discovery walk. They
+    /// stay in the eligible set so the accumulator they were shelved with
+    /// survives to be shown, and is picked back up the moment they load.
     pub(super) fn start_activity_refresh(&mut self) {
         if self.activity_refresh.in_progress() {
             return;
@@ -91,33 +98,39 @@ impl App {
             Vec<String>,
             Vec<(PathBuf, String)>,
         );
-        let pre: Vec<PreInput> = self
+        let mut eligible: std::collections::HashSet<SessionId> = std::collections::HashSet::new();
+        let mut pre: Vec<PreInput> = Vec::new();
+        for s in self
             .sessions
             .iter()
             .filter(|s| s.info.remote_host.is_none())
-            .filter_map(|s| {
-                let provider = self.session_provider(&s.info)?;
-                let sub_sources = if provider == ProviderKind::Claude {
-                    claude_sub_sources(&s.info)
-                } else {
-                    Vec::new()
-                };
-                Some((
-                    s.info.id,
-                    provider,
-                    s.info.agent_session_id.clone(),
-                    self.session_candidate_dirs(&s.info),
-                    sub_sources,
-                ))
-            })
-            .collect();
+        {
+            let Some(provider) = self.session_provider(&s.info) else {
+                continue;
+            };
+            eligible.insert(s.info.id);
+            if s.is_ghost() {
+                continue;
+            }
+            let sub_sources = if provider == ProviderKind::Claude {
+                claude_sub_sources(&s.info)
+            } else {
+                Vec::new()
+            };
+            pre.push((
+                s.info.id,
+                provider,
+                s.info.agent_session_id.clone(),
+                self.session_candidate_dirs(&s.info),
+                sub_sources,
+            ));
+        }
         // Evict accumulators for sessions no longer eligible (deleted, gone
         // remote, or repointed to an unsupported command) so their event
         // vectors don't leak across session churn. Safe here: the in_progress
         // guard means no accumulator is checked out, and it must run even when
         // `pre` is empty so every stale entry clears.
-        let ids: std::collections::HashSet<SessionId> = pre.iter().map(|(id, ..)| *id).collect();
-        self.activity.retain(|id, _| ids.contains(id));
+        self.activity.retain(|id, _| eligible.contains(id));
         if pre.is_empty() {
             return;
         }
@@ -574,6 +587,66 @@ fn fmt_span_ms(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn perf_ghosts_are_never_scanned_but_keep_their_accumulator() {
+        // ADR-P15. A shelved session has no agent process, so a pass over it can
+        // only re-derive what its accumulator already holds — while still paying
+        // its provider's discovery walk, once per shelved session per second.
+        //
+        // Asserted on where the accumulators end up, which is exact: the pass
+        // *moves* the accumulator of every session it scans out of `activity`
+        // and gives it back on poll. So a key still present right after dispatch
+        // is a session the pass did not take.
+        let (mut app, _guard, _tmp) = crate::app::state::tests::app_with_sessions(2);
+        let ghost = app.sessions[0].info.id;
+        let loaded = app.sessions[1].info.id;
+        app.active_index = 0;
+        app.unload_active_session();
+        assert!(app.sessions[0].is_ghost());
+        assert!(!app.sessions[1].is_ghost());
+        app.activity
+            .insert(ghost, SessionActivity::new(ProviderKind::Claude));
+        app.activity
+            .insert(loaded, SessionActivity::new(ProviderKind::Claude));
+
+        app.start_activity_refresh();
+
+        assert!(
+            !app.activity.contains_key(&loaded),
+            "the loaded session is scanned: its accumulator moved into the pass"
+        );
+        assert!(
+            app.activity.contains_key(&ghost),
+            "the ghost is skipped, and stays eligible — so the accumulator it \
+             was shelved with survives to be shown and picked back up on load"
+        );
+    }
+
+    #[tokio::test]
+    async fn perf_an_all_ghost_fleet_starts_no_cc_pass() {
+        // Same reason as the tree scan: no live agent and no daemon worker of
+        // its own, so the `subagents/` tree cannot have grown since the unload.
+        let (mut app, _guard, _tmp) = crate::app::state::tests::app_with_sessions(1);
+        app.sessions[0].info.agent_session_id = Some("conversation-id".to_string());
+        app.unload_active_session();
+
+        app.start_cc_refresh();
+
+        assert!(!app.cc_refresh.in_progress());
+    }
+
+    #[tokio::test]
+    async fn cc_refresh_scans_a_loaded_session() {
+        // The control for the test above: without it, an unrelated early return
+        // in `start_cc_refresh` would make that one pass for the wrong reason.
+        let (mut app, _guard, _tmp) = crate::app::state::tests::app_with_sessions(1);
+        app.sessions[0].info.agent_session_id = Some("conversation-id".to_string());
+
+        app.start_cc_refresh();
+
+        assert!(app.cc_refresh.in_progress());
+    }
 
     fn ev(kind: ActionKind, detail: &str) -> ActivityEvent {
         ActivityEvent {
