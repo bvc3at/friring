@@ -7022,9 +7022,12 @@ impl App {
             );
             state.send(n);
         }
-        // Cheap: bounds the bookkeeping after deletions / restarts.
-        let live: Vec<SessionId> = self.sessions.iter().map(|s| s.info.id).collect();
-        state.prune_to(&live);
+        // Bounds the bookkeeping after deletions / restarts. Gated so the
+        // common tick — nothing deleted — builds no id vector at all.
+        if state.needs_prune(self.sessions.len()) {
+            let live: Vec<SessionId> = self.sessions.iter().map(|s| s.info.id).collect();
+            state.prune_to(&live);
+        }
     }
 
     /// Poll for external state changes from other friring instances (DB-based)
