@@ -158,12 +158,17 @@ fn discover_codex_file(
     disc: &mut CodexDiscovery,
 ) -> Option<PathBuf> {
     if let Some(id) = own_id.filter(|s| !s.is_empty()) {
-        // The first name match settles it either way: a second file carrying
-        // the same thread id would be the same thread.
-        if let Some(p) = files.iter().find(|p| file_name_contains(p, id)) {
-            if disc.head(p).is_some_and(|m| m.parent_thread_id.is_none()) {
-                return Some(p.clone());
-            }
+        // Every filename match is weighed, not just the newest. The id is an
+        // unanchored substring test against a name friring does not mint, so
+        // more than one rollout can match it and the newest match is not
+        // necessarily the top-level thread; stopping at it gave up on a
+        // top-level file sitting further down the listing. `file_name_contains`
+        // short-circuits, so a name that does not match still costs no head
+        // parse.
+        if let Some(p) = files.iter().find(|p| {
+            file_name_contains(p, id) && disc.head(p).is_some_and(|m| m.parent_thread_id.is_none())
+        }) {
+            return Some(p.clone());
         }
     }
     files
@@ -425,6 +430,45 @@ mod tests {
         assert_eq!(src.scan.events.len(), 1);
         assert_eq!(src.scan.events[0].detail, "cargo build");
         assert_eq!(src.scan.events[0].kind, ActionKind::Command);
+    }
+
+    #[test]
+    fn thread_id_binding_looks_past_a_subagent_carrying_the_same_id() {
+        // The id is matched as a raw substring of a filename friring does not
+        // mint, so more than one rollout can match it. Binding must find the
+        // top-level thread wherever it sits in the listing rather than give up
+        // at the newest match — and neither cwd here is a launch dir, so a
+        // wrong choice has no cwd fallback to rescue it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("sessions");
+        let day = root.join("2026/07/12");
+        write_rollout(
+            &day,
+            "rollout-2026-07-12T10-00-00-target.jsonl",
+            &[meta_line("/other/cwd", "target", None), command_line("id")],
+        );
+        // Newer, so it is listed first, and its name contains "target" too.
+        write_rollout(
+            &day,
+            "rollout-2026-07-12T11-00-00-target-sub.jsonl",
+            &[
+                meta_line("/other/cwd", "target-sub", Some("target")),
+                command_line("grep x"),
+            ],
+        );
+
+        let mut src = CodexSource::default();
+        let mut sig = 0u64;
+        assert!(scan_codex(
+            &mut src,
+            &mut sig,
+            Some(&root),
+            &["/repo/a".to_string()],
+            Some("target"),
+            &mut CodexDiscovery::default(),
+        ));
+        assert_eq!(src.scan.session.thread_id.as_deref(), Some("target"));
+        assert_eq!(src.scan.events[0].detail, "id");
     }
 
     #[test]
