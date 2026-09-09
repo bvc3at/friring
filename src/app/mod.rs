@@ -2,6 +2,9 @@ pub(crate) mod activity;
 mod automation;
 mod automation_state;
 mod background;
+pub(crate) mod bridge;
+pub(crate) mod bridge_saga;
+pub(crate) mod bridge_spawn;
 pub(crate) mod cc_activity;
 pub(crate) mod cc_import;
 mod clipboard;
@@ -223,7 +226,10 @@ struct PendingSessionSpawn {
 /// that thread rather than where the restore is planned.
 enum DiscoveryTarget {
     Ready(Arc<dyn SessionBackend>),
-    Place(crate::session::SandboxProfile),
+    /// Boxed because a profile is much larger than an `Arc`, and this enum is
+    /// built once per discovery attempt: an unboxed variant would make every
+    /// `Ready` carry the profile's footprint too.
+    Place(Box<crate::session::SandboxProfile>),
 }
 
 struct RemoteDiscovery {
@@ -861,6 +867,10 @@ pub struct App {
     /// `HostDef` for a session's `ssh:<host>` backend when running git over SSH.
     pub(crate) hosts: crate::session::HostRegistry,
     pub(crate) db: Database,
+    /// What the orchestration broker remembers between ticks (ADR-30).
+    pub(crate) bridge: bridge::BridgeState,
+    /// The child lifecycles this instance is driving (ADR-32).
+    pub(crate) child_lifecycle: bridge_spawn::ChildLifecycle,
     pub(crate) focus: InputFocus,
     pub(crate) should_quit: bool,
     /// Quit-and-re-exec (`Action::ReloadApp`): read by `main` after
@@ -1425,6 +1435,8 @@ impl App {
         let (usage_tx, usage_rx) = mpsc::channel();
 
         let mut app = Self {
+            bridge: bridge::BridgeState::default(),
+            child_lifecycle: bridge_spawn::ChildLifecycle::default(),
             sessions: Vec::new(),
             active_index: 0,
             last_active_session: None,
@@ -2335,6 +2347,21 @@ impl App {
             return;
         };
 
+        // A bridge child's boundary is its owner's, narrowed, with a gate and a
+        // private state directory that only the spawn saga builds — none of
+        // which this path reconstructs. Restarting one here would relaunch its
+        // agent in its worktree under the owner's un-narrowed profile, so it is
+        // refused and pointed at the verb that does rebuild them.
+        if self.is_bridge_child(session.info.id) {
+            self.set_error(
+                "This session is a bridge child, so friring will not restart it here: its \
+                 boundary is its owner's narrowed, and only its owner's 'resume' rebuilds that. \
+                 Ask the owner to resume it."
+                    .to_string(),
+            );
+            return;
+        }
+
         let agent = session.info.agent.clone();
         let session_name = session.info.name.clone();
         // Keep the same friring identity across a restart so injected env stays
@@ -2892,6 +2919,16 @@ impl App {
         let Some(idx) = self.sessions.iter().position(|s| s.info.id == session_id) else {
             return;
         };
+        // The owner's bridge children first, and the owner's own owner told if
+        // this session is itself a child (ADR-32). Before anything is torn down,
+        // because a stop reads the pane friring recorded and the row it is about
+        // to soft-delete — and before any mutation, so a cascade that could not
+        // read the bridge refuses the delete rather than stranding children with
+        // no session left to stop them.
+        if let Err(detail) = self.cascade_bridge_delete(session_id) {
+            self.set_error(detail);
+            return;
+        }
 
         // Snapshot the shared row before the soft-delete so the background
         // teardown still has the window name + worktrees + agent_session_id.
@@ -3331,7 +3368,98 @@ impl App {
         if let Some(state) = shared.sandbox_enforcement.launch_state() {
             session.info.sandbox_state = Some(state);
         }
+        // The exact pane the launch recorded, and where its way out listened.
+        // Both come across whole: an adopting instance did not make this launch
+        // and has nothing of its own to prefer, and dropping them would leave
+        // the next full-row write-back clearing the identity every destructive
+        // action revalidates against.
+        session.info.mux = shared.mux.clone();
+        session.info.egress_endpoint = shared.egress.endpoint.clone();
+        session.info.egress_state = shared.egress.state.clone();
+        session.info.sandbox_overlay = shared.sandbox_overlay.clone();
         resolve_repo_display_names(&mut session.info);
+    }
+
+    /// Bring an adopted session's egress proxy back at the endpoint and token
+    /// it was launched with (ADR-27).
+    ///
+    /// The listener lives in the friring **process**, so a restart leaves an
+    /// agent that is still running holding proxy URLs naming a port and a
+    /// credential nothing answers on. This is what puts them back, and it is
+    /// deliberately fail-closed in both directions:
+    ///
+    /// - Nothing is rebound for a session whose profile no longer needs a proxy,
+    ///   or one that recorded no endpoint.
+    /// - A rebind that fails records
+    ///   [`EgressState::Unrestorable`](crate::session::EgressState::Unrestorable)
+    ///   with the reason and **leaves the token exactly as it was**. Rotating it
+    ///   would invalidate the URLs the running agent already holds, taking its
+    ///   network away for a reason nothing would explain. The agent stays
+    ///   kernel-closed instead, and `sandbox_unenforced` is never written: an
+    ///   enforced boundary with a dead proxy is still enforced.
+    #[cfg(test)]
+    pub(crate) fn restore_session_egress_for_test(
+        &mut self,
+        session_id: crate::session::SessionId,
+    ) {
+        self.restore_session_egress(session_id);
+    }
+
+    fn restore_session_egress(&mut self, session_id: crate::session::SessionId) {
+        let Ok(Some(record)) = self.db.session_egress(session_id) else {
+            return;
+        };
+        let (Some(endpoint), Some(token)) = (record.endpoint.as_deref(), record.token.as_deref())
+        else {
+            return;
+        };
+        let Some(session) = self.sessions.iter().find(|s| s.info.id == session_id) else {
+            return;
+        };
+        let Some(profile_name) = session.info.sandbox_profile.clone() else {
+            return;
+        };
+        let Ok(Some(stored)) = self.db.get_sandbox_profile(&profile_name) else {
+            return;
+        };
+        if !stored.is_intact() {
+            self.mark_egress_unrestorable(
+                session_id,
+                format!("sandbox profile '{profile_name}' has columns friring cannot decode"),
+            );
+            return;
+        }
+        match crate::app::sandbox::restore_egress(&stored.profile, session_id, endpoint, token) {
+            Ok(()) => {
+                self.set_session_egress_state(session_id, crate::session::EgressState::Active);
+            }
+            Err(reason) => self.mark_egress_unrestorable(session_id, reason),
+        }
+    }
+
+    /// Record that a session's way out could not be rebuilt, in both the model
+    /// and the row, without touching its token.
+    fn mark_egress_unrestorable(&mut self, session_id: crate::session::SessionId, reason: String) {
+        tracing::warn!(session = %session_id, "Could not restore the session's egress: {reason}");
+        self.set_session_egress_state(
+            session_id,
+            crate::session::EgressState::Unrestorable(reason),
+        );
+    }
+
+    /// Write one session's egress state to the model and to the row.
+    fn set_session_egress_state(
+        &mut self,
+        session_id: crate::session::SessionId,
+        state: crate::session::EgressState,
+    ) {
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.info.id == session_id) {
+            session.info.egress_state = state.clone();
+        }
+        if let Err(e) = self.db.set_session_egress_state(session_id, &state) {
+            tracing::warn!("Failed to record the session's egress state: {e}");
+        }
+        self.request_redraw();
     }
 
     pub fn update(&mut self, msg: AppMessage) {
@@ -6311,6 +6439,10 @@ impl App {
         // profile wants to be asked about.
         self.tick_sandbox_egress();
 
+        // Serve the orchestration bridge: bounded work per tick, and nothing
+        // that blocks (ADR-30).
+        self.tick_bridge();
+
         // Reclaim superseded and orphaned places on their own slow cadence.
         self.tick_sandbox_gc();
         self.poll_sandbox_gc();
@@ -6345,6 +6477,11 @@ impl App {
     /// network, the filesystem outside the harness tempdir, or a runtime.
     fn tick_background(&mut self) {
         self.tick_background_refreshes();
+
+        // Advance the child lifecycles (ADR-32). Here rather than in
+        // `tick_core` because three of its steps put work on a blocking task,
+        // which that half is documented never to do.
+        self.tick_child_sagas();
 
         self.tick_version_check();
 
@@ -7748,6 +7885,19 @@ impl App {
                     self.request_redraw();
                     continue;
                 }
+                // A bridge child is never relaunched by a generic path. The
+                // narrowing, the gate and the private state that make it a child
+                // live on its `sandbox_overlay`, which this path does not read —
+                // so respawning here would put its agent back in its worktree
+                // under its *owner's* un-narrowed profile, with its family's
+                // shared state and no gate. Its owner's `resume` verb is the one
+                // relaunch, because it is the one that rebuilds the overlay.
+                if self.is_bridge_child(shared_session.id) {
+                    let session = self.build_ghost_session(&shared_session);
+                    self.sessions.push(session);
+                    self.request_redraw();
+                    continue;
+                }
                 self.spawn_restored_session(&shared_session, &backend, rows, cols);
             }
         }
@@ -7785,7 +7935,12 @@ impl App {
                 // consistent ID).
                 adopted_session.info.id = shared_session.id;
                 Self::apply_shared_session_metadata(&mut adopted_session, shared_session);
+                let adopted_id = adopted_session.info.id;
                 self.sessions.push(adopted_session);
+                // The agent in this pane is still running and still holds proxy
+                // URLs naming the endpoint its launch was given; nothing else
+                // will put a listener back there.
+                self.restore_session_egress(adopted_id);
                 // Persist the real pane_id (`%N`) back to the DB so future
                 // lookups short-circuit on the backend_id match instead of
                 // always falling back to name matching.
@@ -8133,6 +8288,36 @@ impl App {
             if let Err(e) = self.db.upsert_session(&shared_session) {
                 error!("Failed to upsert session to DB: {e}");
             }
+            self.record_session_repos(session);
+        }
+    }
+
+    /// Record the repositories a session works in (`session_repos`).
+    ///
+    /// The authority a bridge `create`'s `repo_root` is checked against, and a
+    /// **row** rather than a derivation from the session's sandbox grants:
+    /// deriving it would make editing a profile into an authority change, and a
+    /// leader could then create children in any repository its boundary happened
+    /// to reach. Written from the two sources a session acquires them from, in
+    /// the same order the v49 backfill uses.
+    fn record_session_repos(&self, session: &Session) {
+        let id = session.info.id.to_string();
+        for worktree in &session.info.worktrees {
+            let _ = self.db.upsert_session_repo(
+                &id,
+                &worktree.repo_path.display().to_string(),
+                "worktree",
+                Some(&worktree.worktree_path.display().to_string()),
+                Some(&worktree.branch),
+            );
+        }
+        if session.info.worktrees.is_empty() {
+            if let Some(cwd) = session.info.cwd.as_deref() {
+                let cwd = cwd.display().to_string();
+                let _ = self
+                    .db
+                    .upsert_session_repo(&id, &cwd, "cwd", Some(&cwd), None);
+            }
         }
     }
 
@@ -8168,6 +8353,32 @@ impl App {
             display_order: session.info.display_order,
             tombstone: false,
             tombstone_at: None,
+            // Carried through the one `save_state()` every launch path already
+            // goes through, exactly as the sandbox verdict is. A session that
+            // recorded nothing writes nothing:
+            // `upsert_session` leaves the stored values alone rather than
+            // clearing the pane every destructive action revalidates against.
+            mux: session.info.mux.clone(),
+            egress: crate::session::EgressRecord {
+                endpoint: session.info.egress_endpoint.clone(),
+                // Held on the `Session` rather than on its `SessionInfo`: the
+                // token is a credential, and `SessionInfo` is rendered,
+                // serialized, logged and snapshotted all over the app. This is
+                // the one place that reads it.
+                //
+                // A session friring only *adopted* has none in memory, so the
+                // stored one is read back — otherwise a write-back would erase
+                // the credential a restart rebinds with.
+                token: session.egress_token().map(str::to_string).or_else(|| {
+                    self.db
+                        .session_egress(session.info.id)
+                        .ok()
+                        .flatten()
+                        .and_then(|record| record.token)
+                }),
+                state: session.info.egress_state.clone(),
+            },
+            sandbox_overlay: session.info.sandbox_overlay.clone(),
         }
     }
 
@@ -8360,7 +8571,7 @@ impl App {
             let start = std::time::Instant::now();
             let (backend, opened) = match target {
                 DiscoveryTarget::Ready(backend) => (Some(backend), None),
-                DiscoveryTarget::Place(profile) => match Self::open_place_backend(profile) {
+                DiscoveryTarget::Place(profile) => match Self::open_place_backend(*profile) {
                     Ok((backend, instance)) => {
                         (Some(Arc::clone(&backend)), Some((backend, instance)))
                     }
@@ -8407,7 +8618,7 @@ impl App {
     fn discovery_target(&self, backend_type: &str) -> Option<DiscoveryTarget> {
         if let Some(name) = crate::session::sandbox_backend_profile(backend_type) {
             return match self.load_session_sandbox(Some(name)) {
-                Ok(Some(profile)) => Some(DiscoveryTarget::Place(profile)),
+                Ok(Some(profile)) => Some(DiscoveryTarget::Place(Box::new(profile))),
                 // A profile that was deleted, or will not decode, has no place
                 // to open — the same refusal a launch gets, and for the same
                 // reason: friring will not guess at a boundary nobody wrote.
@@ -9134,6 +9345,16 @@ impl App {
         // whether the boundary it is adopting ever held.
         session.info.sandbox_profile = shared.sandbox_profile.clone();
         session.info.sandbox_state = shared.sandbox_enforcement.launch_state();
+        // The exact pane the launch recorded and where its way out listened —
+        // see [`Self::apply_shared_session_metadata`] for why all three come
+        // across whole. Dropping them here would leave `revalidate_identity`
+        // refusing every kill, gate release and identity-checked stop for an
+        // adopted bridge child, and the next full-row write-back clearing the
+        // columns.
+        session.info.mux = shared.mux.clone();
+        session.info.egress_endpoint = shared.egress.endpoint.clone();
+        session.info.egress_state = shared.egress.state.clone();
+        session.info.sandbox_overlay = shared.sandbox_overlay.clone();
         resolve_repo_display_names(&mut session.info);
 
         // Re-adopt shell pane if one was persisted
@@ -9144,7 +9365,12 @@ impl App {
             }
         }
 
+        let adopted_id = session.info.id;
         self.sessions.push(session);
+        // The agent in this pane is still running and still holds proxy URLs
+        // naming the endpoint its launch was given; nothing else will put a
+        // listener back there.
+        self.restore_session_egress(adopted_id);
         self.active_index = self.sessions.len() - 1;
         self.focus = InputFocus::Terminal;
     }
@@ -18467,6 +18693,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         }
     }
 
@@ -18634,6 +18863,7 @@ mod tests {
             // Succeeds with inert I/O so respawn/undelete paths can be asserted
             // on (the adopt path returns the same shape).
             Ok(crate::agent::backend::SpawnedSession {
+                identity: crate::session::MuxIdentity::default(),
                 backend_id: "%spawned".to_string(),
                 output: Box::new(std::io::empty()),
                 input: Box::new(std::io::sink()),

@@ -449,6 +449,245 @@ impl FromStr for ReadScope {
     }
 }
 
+/// What a profile may grant a sandboxed agent over the orchestration bridge
+/// (ADR-31).
+///
+/// Deliberately **generic**: three capabilities named for what they do, not for
+/// any workflow that consumes them. An agent declares what it needs
+/// (`bridge_requires`), a profile grants a subset (`bridge_grants`), and a
+/// launch is refused when the two do not meet — no capability is ever inferred
+/// from an agent's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BridgeCapability {
+    /// Create, stop, resume and inspect children of the caller's own session.
+    ///
+    /// The only capability that creates anything. A child never receives it —
+    /// orchestration is one level deep by construction, not by a depth counter
+    /// that could be miscounted.
+    ChildLifecycle,
+    /// Claim the caller's own mail, send to its owner or to a child it owns,
+    /// and read its own status.
+    Mailbox,
+    /// File a bounded progress report against the caller's own session.
+    Report,
+}
+
+impl BridgeCapability {
+    /// Every capability, in the order the editor lists them.
+    pub const ALL: &'static [Self] = &[Self::ChildLifecycle, Self::Mailbox, Self::Report];
+
+    /// What a **child** may ever hold, before intersecting with its owner's
+    /// grants: never [`ChildLifecycle`](Self::ChildLifecycle), which is what
+    /// keeps the tree one level deep.
+    pub const CHILD_MAX: &'static [Self] = &[Self::Mailbox, Self::Report];
+
+    /// Storage value, wire value and UI label — one spelling for all three.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ChildLifecycle => "child-lifecycle",
+            Self::Mailbox => "mailbox",
+            Self::Report => "report",
+        }
+    }
+}
+
+impl fmt::Display for BridgeCapability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for BridgeCapability {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let key = s.trim().to_ascii_lowercase();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|c| c.as_str() == key)
+            .ok_or_else(|| {
+                format!(
+                    "Unknown bridge capability '{s}' (expected {})",
+                    Self::ALL
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
+/// How one entry of an agent's state directory reaches a child's **private**
+/// state directory (ADR-31).
+///
+/// A bridge child never runs from its family's shared state: it gets a private
+/// directory of its own, seeded from the entries the agent declares and the
+/// profile authorizes. The mode is the whole of what a seed may do, and the
+/// closed set is the point — a mode friring does not recognise is not a weaker
+/// seed, it is a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SeedMode {
+    /// Link to the parent's file or directory, and grant the child **read** on
+    /// that exact target and nothing else. Read-only skill or prompt material.
+    Symlink,
+    /// Copy it. The child's copy diverges and nothing it writes reaches the
+    /// parent.
+    Copy,
+    /// Copy a UTF-8 text file (≤ 1 MiB) and replace every occurrence of the
+    /// parent's resolved state directory with the private one.
+    ///
+    /// How a path-keyed hook configuration keeps working from a new location. A
+    /// source that is not text is a refusal, never a plain copy: a binary file
+    /// carrying the old path would leave the child's hooks pointing at the
+    /// family's directory.
+    CopyRewrite,
+    /// Link to the parent's file and grant the child **read and write** on that
+    /// exact target.
+    ///
+    /// The credential mode, and the only one that writes anything outside the
+    /// child's own tree. A long-lived credential the agent refreshes is
+    /// refreshed in the one file the owner also uses — the same sharing the
+    /// vendor's own concurrent sessions already do on a host — so no second copy
+    /// of a rotating token ever exists, which is ADR-28's condition. Legal only
+    /// under the conditions in
+    /// [`ChildSeedAllow`], and refused rather than degraded when any of them
+    /// fails.
+    LinkRw,
+}
+
+impl SeedMode {
+    /// Every mode, in the order the editor lists them.
+    pub const ALL: &'static [Self] = &[Self::Symlink, Self::Copy, Self::CopyRewrite, Self::LinkRw];
+
+    /// Storage value, manifest value and UI label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Symlink => "symlink",
+            Self::Copy => "copy",
+            Self::CopyRewrite => "copy-rewrite",
+            Self::LinkRw => "link-rw",
+        }
+    }
+
+    /// Whether this mode gives the child write access to a path outside its own
+    /// private tree.
+    pub fn writes_outside_child(self) -> bool {
+        matches!(self, Self::LinkRw)
+    }
+}
+
+impl fmt::Display for SeedMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SeedMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let key = s.trim().to_ascii_lowercase();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|m| m.as_str() == key)
+            .ok_or_else(|| {
+                format!(
+                    "Unknown child state seed mode '{s}' (expected {})",
+                    Self::ALL
+                        .iter()
+                        .map(|m| m.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
+/// One state-directory entry a profile authorizes a child to receive, and the
+/// single mode it authorizes for it.
+///
+/// The **profile** decides which credential and configuration surfaces a child
+/// gets, not the agent: an agent declares what it would like
+/// (`child_state_seed`), and a seed reaches a child only when a profile entry
+/// names that exact path with that exact mode. An agent asking for `auth.json`
+/// as `link-rw` under a profile that authorizes it as `copy` is a refusal, not a
+/// downgrade — the two mean different things about where a refreshed token
+/// lands.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ChildSeedAllow {
+    /// A **normalized relative** path under the agent's state directory: no
+    /// leading `/`, no `..` component. Anything else is refused at save and at
+    /// import, because a seed path is joined onto a directory friring minted.
+    pub path: String,
+    /// The one mode this path is authorized in.
+    pub mode: SeedMode,
+}
+
+impl ChildSeedAllow {
+    /// Refuse a path that could not safely be joined onto a child's private
+    /// state directory.
+    ///
+    /// # Errors
+    ///
+    /// The path is empty, absolute, carries a `..` component, or is a bare `.`.
+    pub fn validate(&self) -> Result<(), String> {
+        let path = self.path.trim();
+        if path.is_empty() {
+            return Err(
+                "A child state seed needs a path relative to the agent's state \
+                        directory"
+                    .to_string(),
+            );
+        }
+        if path.starts_with('/') || path.starts_with('\\') {
+            return Err(format!(
+                "The child state seed '{path}' is absolute. A seed names a path *inside* the \
+                 agent's state directory, so it must be relative"
+            ));
+        }
+        if path
+            .split(['/', '\\'])
+            .any(|part| part == ".." || part == "." || part.is_empty())
+        {
+            return Err(format!(
+                "The child state seed '{path}' is not a normalized relative path. It is joined \
+                 onto a directory friring minted, so '.', '..' and empty components are refused"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Whether `parent` is `child` or an ancestor of it, on normalized separators.
+///
+/// The session layer's own containment rule, kept here because `narrow` is pure
+/// data and may not reach the sandbox layer's path helpers. Case-sensitive even
+/// on Windows: over-matching silently widens a boundary, under-matching only
+/// costs a refusal an operator can read.
+fn encloses_path(parent: &str, child: &str) -> bool {
+    let parent = parent.trim_end_matches('/');
+    if parent == child {
+        return true;
+    }
+    child.starts_with(parent) && child.as_bytes().get(parent.len()) == Some(&b'/')
+}
+
+/// Whether any subtract entry covers `path`, in either direction.
+///
+/// Both directions, because the subtract set holds *trees*: naming
+/// `<data>/sandbox` must take away `<data>/sandbox/tmp/other`, and naming an
+/// exact transcript file must take it away from a grant that encloses it.
+fn subtracted(subtract: &[SubtractPath], path: &str) -> bool {
+    subtract
+        .iter()
+        .any(|entry| encloses_path(&entry.path, path) || encloses_path(path, &entry.path))
+}
+
 /// One `host[:port]` entry of an allow or deny list.
 ///
 /// **A bare host is exactly that host; `*.host` is that host and its
@@ -985,6 +1224,118 @@ pub struct SandboxInstance {
     pub state: String,
 }
 
+/// The narrowing a **bridge child** launches under (ADR-31).
+///
+/// A child's boundary is its owner's, made smaller. Nothing here can widen
+/// anything: [`SandboxPolicy::narrow`] intersects every dimension against the
+/// parent's, so an overlay naming a path the parent does not have grants
+/// nothing, and one naming a domain the parent does not allow allows nothing.
+///
+/// Persisted on `sessions.sandbox_overlay` and **re-applied at every launch**
+/// against the parent's profile *as it stands then*, so an owner whose profile
+/// was narrowed after its child was created gets a child narrowed to match — or
+/// a refused relaunch, never a child wider than its owner.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxOverlay {
+    /// The child's own worktree, read-write. The only path it is given
+    /// unconditionally.
+    #[serde(default)]
+    pub worktree: Option<String>,
+    /// The per-child directories this launch minted, read-write: scratch,
+    /// signal and bridge, plus the child's own git metadata directory when its
+    /// worktree is a linked one. Named here so the narrowed policy can carry
+    /// them — each belongs to this child alone and to no sibling.
+    #[serde(default)]
+    pub own_dirs: Vec<String>,
+    /// The child's launch gate, **read-only** (ADR-33). Never in
+    /// [`own_dirs`](Self::own_dirs): a writable gate is a gate the child
+    /// releases itself.
+    #[serde(default)]
+    pub gate_dir: Option<String>,
+    /// The child's private agent state directory, read-write.
+    #[serde(default)]
+    pub state_dir: Option<String>,
+    /// Paths the profile lets a child share with its owner, intersected with
+    /// the parent's own read-write set — the build caches a real project needs.
+    #[serde(default)]
+    pub shared_rw: Vec<String>,
+    /// Extra read-only paths, which must already be inside the parent's grant.
+    #[serde(default)]
+    pub ro_extra: Vec<String>,
+    /// The exact seed targets to re-grant *after* the subtract set, and in which
+    /// mode — see [`SeedGrant`].
+    #[serde(default)]
+    pub seed: Vec<SeedGrant>,
+    /// Everything denied after every grant, whatever encloses it — see
+    /// [`SandboxPolicy::narrow`].
+    #[serde(default)]
+    pub subtract: Vec<SubtractPath>,
+}
+
+/// One path a child is denied after every grant, and what it is.
+///
+/// The kind is carried rather than looked up because the renderers are **pure
+/// functions of the launch**: bubblewrap masks a directory with a `--tmpfs` and
+/// a file with `/dev/null`, and a renderer that stat'd the path to decide would
+/// be consulting the developer's filesystem in a test and a racing agent's in
+/// production. The host computes the set and knows which is which.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubtractPath {
+    pub path: String,
+    /// A directory tree rather than a single file.
+    #[serde(default)]
+    pub is_dir: bool,
+}
+
+/// One exact path a child keeps reaching after the subtract set, and how.
+///
+/// The subtract set denies the whole family state directory, so a seed that is a
+/// *link* into it would be dead without this: the target has to be re-granted as
+/// the **last** rule for that one path. Read-only for a `symlink`, read and
+/// write for `link-rw` — so write reaches exactly the credential file and never
+/// the state directory, the transcripts, the history or the sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeedGrant {
+    /// The resolved host path the child reaches.
+    pub target: String,
+    /// The mode it is reached in. Only `symlink` and `link-rw` produce a grant;
+    /// a `copy` or a `copy-rewrite` leaves a file of the child's own and needs
+    /// none.
+    pub mode: SeedMode,
+}
+
+impl SeedGrant {
+    /// Whether this grant is writable.
+    pub fn is_writable(&self) -> bool {
+        self.mode.writes_outside_child()
+    }
+}
+
+/// Why a narrowing was refused.
+///
+/// One variant per dimension, because "the child would have been wider" is not
+/// a useful thing to tell an operator: which path, which domain, which mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayViolation {
+    /// The dimension: `read-write path`, `allowed domain`, `network mode`, …
+    pub dimension: &'static str,
+    /// What the overlay asked for that the parent does not have.
+    pub detail: String,
+}
+
+impl fmt::Display for OverlayViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "a bridge child's {} would be wider than its owner's: {}",
+            self.dimension, self.detail
+        )
+    }
+}
+
 /// A named, user-edited isolation recipe.
 ///
 /// Identity is [`name`](Self::name): it is the storage primary key, the label
@@ -1023,6 +1374,29 @@ pub struct SandboxProfile {
     /// Whether the agent may run a specific command outside the boundary. Off
     /// by default: the escape hatch exists, but visibly and per profile.
     pub allow_unsandboxed_fallback: bool,
+    /// What this profile grants over the orchestration bridge (ADR-31). Empty
+    /// by default: no profile carries the bridge unless someone wrote it down.
+    pub bridge_grants: Vec<BridgeCapability>,
+    /// How many **live** children one session under this profile may have.
+    ///
+    /// Counted over the live states, so a child that reached a terminal state
+    /// releases its slot and one that is merely dirty or unstoppable does not.
+    pub max_children: u32,
+    /// Which agents a child may be, by registry name. Empty means none: a
+    /// profile that grants `child-lifecycle` and names no agent creates nothing,
+    /// which is the closed default.
+    pub child_agents: Vec<String>,
+    /// Which of this profile's read-write paths a child shares with its owner.
+    ///
+    /// The shared build caches a real project needs (`~/.gradle`, `~/.m2`,
+    /// `~/.npm`, `~/.cache/pip`, `~/.cargo/registry`) live here. Intersected
+    /// with the parent's own read-write set at every launch, so listing one the
+    /// parent does not have grants nothing.
+    pub child_shared_rw: Vec<String>,
+    /// Which entries of the agent's state directory a child may be seeded with,
+    /// and in which mode — see [`ChildSeedAllow`]. Empty means a bridge-required
+    /// agent whose declaration needs a seed cannot launch at all.
+    pub child_seed_allow: Vec<ChildSeedAllow>,
     /// Unix millis, set by storage on insert.
     pub created_at: u64,
     /// Unix millis, set by storage on every save.
@@ -1050,11 +1424,24 @@ impl Default for SandboxProfile {
             image: None,
             containerfile: None,
             allow_unsandboxed_fallback: false,
+            bridge_grants: Vec::new(),
+            max_children: DEFAULT_MAX_CHILDREN,
+            child_agents: Vec::new(),
+            child_shared_rw: Vec::new(),
+            child_seed_allow: Vec::new(),
             created_at: 0,
             updated_at: 0,
         }
     }
 }
+
+/// How many live children a profile allows before it says so, unless the
+/// operator changes it.
+///
+/// Three is a fan-out a laptop can host — three agents, three worktrees, three
+/// proxies — and it is a number rather than "unbounded" because the cap is the
+/// only thing standing between one runaway leader and every core on the machine.
+pub const DEFAULT_MAX_CHILDREN: u32 = 3;
 
 impl SandboxProfile {
     /// A named profile over `paths`, everything else defaulted.
@@ -1324,6 +1711,199 @@ pub struct SandboxPolicy {
 }
 
 impl SandboxPolicy {
+    /// The policy a **bridge child** runs under: this one, made smaller
+    /// (ADR-31).
+    ///
+    /// Pure and **monotone**: every dimension of the result is a subset of this
+    /// policy's, and there is no input that makes any of them larger. That is
+    /// the whole property, and it is what lets a child's boundary be described
+    /// by a small overlay rather than by a second profile nobody wrote.
+    ///
+    /// Dimension by dimension:
+    ///
+    /// - **rw** = the child's own worktree, its own friring directories, its
+    ///   private state directory, `shared_rw ∩ parent rw`, and the exact
+    ///   `link-rw` credential target. Deliberately *not* shrunk to the worktree
+    ///   alone: a real build needs `~/.gradle`, `~/.m2`, `~/.npm`,
+    ///   `~/.cache/pip`, `~/.cargo/registry`, and a child that cannot reach them
+    ///   is a child that cannot build. The profile decides which of them, and
+    ///   the intersection means listing one the parent lacks grants nothing.
+    /// - **ro** = `(parent ro ∪ (parent rw − child rw) ∪ ro_extra ⊆ parent) −
+    ///   subtract`. A path the parent could *write* and the child cannot becomes
+    ///   readable rather than vanishing: a worker needs to read the repository
+    ///   its owner is writing.
+    /// - **subtract** is applied after everything, so a parent grant enclosing
+    ///   one of these does not re-open it — the family's state directory, the
+    ///   owner's and every sibling's control directories, and friring's own
+    ///   trees. Then the exact seed targets are re-granted as the last word for
+    ///   those paths alone.
+    /// - **network** is the parent's mode, `allow ⊆ parent allow`, `deny ⊇
+    ///   parent deny`, `prompt_new_domains = false` (a child has no operator at
+    ///   its pane to ask) and `allow_unsandboxed_fallback = false` (a child that
+    ///   could fall back to the host is a child that can leave its boundary).
+    /// - **backend** is the parent's resolved backend, because the child runs on
+    ///   the same host under the same technology.
+    ///
+    /// # Errors
+    ///
+    /// The overlay asks for anything the parent does not have — a read-write
+    /// path outside the parent's grant, a read-only path outside it, a `link-rw`
+    /// target the parent cannot write. Each names its dimension, because "the
+    /// child would have been wider" is not a useful thing to tell an operator.
+    pub fn narrow(&self, overlay: &SandboxOverlay) -> Result<Self, OverlayViolation> {
+        let parent_rw = &self.rw_paths;
+        let parent_all: Vec<&String> = parent_rw.iter().chain(self.ro_paths.iter()).collect();
+
+        // The child's own directories are friring's, minted for this child, and
+        // are not required to be inside the parent's grant: the parent never had
+        // them, because they did not exist until this launch.
+        //
+        // Held separately because the subtract set denies friring's trees
+        // wholesale — `<data>/worktrees`, `<data>/signals`, `<data>/sandbox`,
+        // `<data>/gates` — which is how it covers every sibling *including ones
+        // created after this launch. The child's own paths are inside those
+        // trees, so they are exempted from the subtraction below rather than
+        // filtered by it; without the exemption a child cannot read its own
+        // gate, write its own workspace, or reach its own bridge queue.
+        let mut own_rw: Vec<String> = Vec::new();
+        own_rw.extend(overlay.worktree.clone());
+        own_rw.extend(overlay.own_dirs.iter().cloned());
+        own_rw.extend(overlay.state_dir.clone());
+
+        let mut rw: Vec<String> = own_rw.clone();
+        // What the child *shares* with its owner has to be the owner's already.
+        for path in &overlay.shared_rw {
+            if !parent_rw.iter().any(|parent| encloses_path(parent, path)) {
+                return Err(OverlayViolation {
+                    dimension: "read-write path",
+                    detail: format!("'{path}' is not read-write for its owner"),
+                });
+            }
+            rw.push(path.clone());
+        }
+        // The credential target, and only in the one mode that writes.
+        for grant in overlay.seed.iter().filter(|g| g.is_writable()) {
+            if !parent_rw
+                .iter()
+                .any(|parent| encloses_path(parent, &grant.target))
+            {
+                return Err(OverlayViolation {
+                    dimension: "credential target",
+                    detail: format!("'{}' is not read-write for its owner", grant.target),
+                });
+            }
+            rw.push(grant.target.clone());
+        }
+
+        // Everything the parent has that the child does not write stays
+        // readable, plus whatever the overlay asks for inside the parent's
+        // grant.
+        let mut ro: Vec<String> = self
+            .ro_paths
+            .iter()
+            .chain(parent_rw.iter())
+            .filter(|path| !rw.contains(path))
+            .cloned()
+            .collect();
+        for path in &overlay.ro_extra {
+            if !parent_all.iter().any(|parent| encloses_path(parent, path)) {
+                return Err(OverlayViolation {
+                    dimension: "read-only path",
+                    detail: format!("'{path}' is outside its owner's grant"),
+                });
+            }
+            ro.push(path.clone());
+        }
+        // The gate is read-only and is friring's own, so it needs no parent
+        // grant — and must never reach the writable set.
+        ro.extend(overlay.gate_dir.clone());
+        // A read-only seed target: re-granted after the subtract set by the
+        // backends, and listed here so the ordinary path rules carry it too.
+        ro.extend(
+            overlay
+                .seed
+                .iter()
+                .filter(|g| !g.is_writable())
+                .map(|g| g.target.clone()),
+        );
+
+        // Applied to both sets. A subtract entry beats a grant that encloses it,
+        // which is the point: the family's state directory is inside the home
+        // the parent may grant whole, and a child inherits none of that home.
+        //
+        // Two exemptions, and they are different in kind. The child's own
+        // directories are friring's, minted for this child — see `own_rw`
+        // above; the gate is the read-only half. And a path the operator named
+        // in `child_shared_rw` keeps its grant when a subtract entry is
+        // *inside* it, because the deny is emitted after the allow in every
+        // backend: the subtracted tree stays denied and the rest of the share
+        // survives. Without that second exemption, sharing `<repo>/.git` grants
+        // **nothing at all** the moment `<repo>/.git/worktrees` is subtracted —
+        // which is every bridge child, and leaves one with a worktree whose
+        // object store, ref store and config it cannot even read. Observed
+        // exactly that way by `just omx-team-e2e`: `fatal: unable to access
+        // '<repo>/.git/config': Operation not permitted`, after every unit test
+        // passed.
+        let inside_a_denied_tree = |path: &String| {
+            overlay
+                .subtract
+                .iter()
+                .any(|entry| encloses_path(&entry.path, path))
+        };
+        rw.retain(|path| {
+            if own_rw.contains(path) {
+                return true;
+            }
+            if overlay.shared_rw.contains(path) {
+                return !inside_a_denied_tree(path);
+            }
+            !subtracted(&overlay.subtract, path)
+        });
+        ro.retain(|path| {
+            overlay.gate_dir.as_ref() == Some(path) || !subtracted(&overlay.subtract, path)
+        });
+        // …except the exact seed targets, which the backends re-grant as the
+        // last rule for that one path. Kept in the sets so a reader of the
+        // policy sees what the child really reaches.
+        for grant in &overlay.seed {
+            if grant.is_writable() {
+                rw.push(grant.target.clone());
+            } else {
+                ro.push(grant.target.clone());
+            }
+        }
+
+        rw.sort();
+        rw.dedup();
+        ro.sort();
+        ro.dedup();
+        ro.retain(|path| !rw.contains(path));
+
+        Ok(Self {
+            profile: self.profile.clone(),
+            backend: self.backend,
+            shape: self.shape,
+            ro_paths: ro,
+            rw_paths: rw,
+            read_scope: self.read_scope,
+            network: self.network,
+            allow: self.allow.clone(),
+            deny: self.deny.clone(),
+            // A child has no operator at its pane to answer a first-use prompt,
+            // so an unlisted domain is a refusal rather than a question nobody
+            // sees.
+            prompt_new_domains: false,
+            memory_mb: self.memory_mb,
+            cpus: self.cpus,
+            image: self.image.clone(),
+            containerfile: self.containerfile.clone(),
+            // A child that could fall back to the host is a child that can leave
+            // its boundary by making the boundary fail.
+            allow_unsandboxed_fallback: false,
+            env: self.env.clone(),
+        })
+    }
+
     /// Add or replace one environment entry, returning the value it displaced.
     pub fn insert_env(
         &mut self,
@@ -1384,6 +1964,282 @@ impl SandboxPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── A bridge child's narrowing (ADR-31) ──────────────────────────────
+
+    fn parent_policy() -> SandboxPolicy {
+        let mut profile = SandboxProfile::new(
+            "orchestrator",
+            vec![
+                SandboxPath::workspace("/home/u"),
+                SandboxPath::read_only("/opt/toolchain"),
+            ],
+        );
+        profile.network_mode = NetworkMode::Allowlist;
+        profile.network_allow = vec!["api.openai.com".into(), "github.com".into()];
+        profile.network_deny = vec!["gist.github.com".into()];
+        profile.prompt_new_domains = true;
+        profile.allow_unsandboxed_fallback = true;
+        profile
+            .resolve(SandboxBackendKind::Seatbelt, "/home/u")
+            .unwrap()
+    }
+
+    fn child_overlay() -> SandboxOverlay {
+        SandboxOverlay {
+            worktree: Some("/data/worktrees/child".into()),
+            own_dirs: vec![
+                "/data/sandbox/tmp/child".into(),
+                "/data/signals/child".into(),
+            ],
+            gate_dir: Some("/data/gates/child".into()),
+            state_dir: Some("/data/sandbox/tmp/child/state".into()),
+            shared_rw: vec!["/home/u/.cargo/registry".into()],
+            ro_extra: Vec::new(),
+            seed: vec![SeedGrant {
+                target: "/home/u/.codex/auth.json".into(),
+                mode: SeedMode::LinkRw,
+            }],
+            // All four of friring's trees, as `crate::sandbox::child_state::
+            // subtract_set` really produces them. The child's own directories
+            // are inside them by construction, which is the case the fixture
+            // exists to cover.
+            subtract: [
+                "/home/u/.codex",
+                "/data/sandbox",
+                "/data/signals",
+                "/data/gates",
+                "/data/worktrees",
+            ]
+            .into_iter()
+            .map(|path| SubtractPath {
+                path: path.into(),
+                is_dir: true,
+            })
+            .collect(),
+        }
+    }
+
+    /// A path the operator **shared** survives a subtract entry inside it.
+    ///
+    /// The shape every bridge child has: a profile shares `<repo>/.git` so a
+    /// linked worktree can reach the object and ref stores it makes siblings
+    /// share, and `<repo>/.git/worktrees` is subtracted so no child reaches a
+    /// sibling's index. The subtract entry is *inside* the share, and the
+    /// wholesale rule — a grant enclosing a denied path is dropped — took the
+    /// whole share away with it: a child with a worktree whose repository it
+    /// could not read, could not commit to, and whose `config` git dies on.
+    /// Every unit test passed; `just omx-team-e2e` is what saw it.
+    ///
+    /// Keeping the share is safe because the deny is emitted **after** the allow
+    /// in all three backends, so the subtracted tree stays denied. The
+    /// wholesale rule still holds for everything the operator did not name — a
+    /// parent granting the whole home still gives its children none of it.
+    #[test]
+    fn an_explicitly_shared_path_survives_a_subtraction_inside_it() {
+        let parent = parent_policy();
+        let mut overlay = child_overlay();
+        overlay.shared_rw = vec!["/home/u/repo/.git".into()];
+        overlay.subtract.push(SubtractPath {
+            path: "/home/u/repo/.git/worktrees".into(),
+            is_dir: true,
+        });
+        let child = parent.narrow(&overlay).expect("the overlay narrows");
+
+        assert!(
+            child.rw_paths.iter().any(|p| p == "/home/u/repo/.git"),
+            "the shared git directory was dropped, so no child can commit: {:?}",
+            child.rw_paths
+        );
+        // The tree inside it stays denied by the overlay the backends render
+        // after these allows — `sandbox::seatbelt` and `sandbox::bwrap` assert
+        // that ordering, because it is the whole reason the share is safe to
+        // keep.
+        assert!(overlay
+            .subtract
+            .iter()
+            .any(|entry| entry.path == "/home/u/repo/.git/worktrees"));
+        // The wholesale rule is untouched for everything else: the parent grants
+        // the whole home and the child inherits none of it, because its family's
+        // state directory is inside.
+        assert!(!child.rw_paths.iter().any(|p| p == "/home/u"));
+        assert!(!child.ro_paths.iter().any(|p| p == "/home/u"));
+    }
+
+    /// The subtract set denies friring's trees **wholesale**, because that is
+    /// what covers a sibling created after this child launched — and the child's
+    /// own directories are inside those trees. Subtracting them too would leave
+    /// a child that cannot read its own gate, write its own workspace, report
+    /// its own status or reach its own bridge queue.
+    #[test]
+    fn a_childs_own_directories_survive_the_subtract_set() {
+        let overlay = child_overlay();
+        let child = parent_policy().narrow(&overlay).unwrap();
+
+        for own in overlay
+            .worktree
+            .iter()
+            .chain(overlay.own_dirs.iter())
+            .chain(overlay.state_dir.iter())
+        {
+            assert!(
+                child.rw_paths.contains(own),
+                "the child cannot write its own '{own}': {:?}",
+                child.rw_paths
+            );
+        }
+        let gate = overlay.gate_dir.as_ref().unwrap();
+        assert!(
+            child.ro_paths.contains(gate),
+            "the child cannot read its own gate '{gate}': {:?}",
+            child.ro_paths
+        );
+        // …and the exemption is exactly those paths. A sibling's directory under
+        // the same trees is still denied, which is what the wholesale entries
+        // are for.
+        for sibling in [
+            "/data/worktrees/sibling",
+            "/data/sandbox/tmp/sibling",
+            "/data/signals/sibling",
+            "/data/gates/sibling",
+        ] {
+            assert!(
+                !child.rw_paths.iter().any(|p| p == sibling)
+                    && !child.ro_paths.iter().any(|p| p == sibling),
+                "the child reaches a sibling's '{sibling}'"
+            );
+        }
+        // The gate is never writable: a writable gate is one the child opens for
+        // itself (ADR-33).
+        assert!(!child.rw_paths.contains(gate));
+    }
+
+    /// The property the whole design rests on: a child's boundary is its
+    /// owner's, made smaller, in **every** dimension.
+    #[test]
+    fn narrowing_never_widens_any_dimension() {
+        let parent = parent_policy();
+        let child = parent
+            .narrow(&child_overlay())
+            .expect("the overlay narrows");
+
+        // A child never prompts (no operator at its pane) and never falls back
+        // to the host (that would be leaving its boundary by breaking it).
+        assert!(!child.prompt_new_domains);
+        assert!(!child.allow_unsandboxed_fallback);
+        // Network: the parent's mode, its allows and at least its denies.
+        assert_eq!(child.network, parent.network);
+        assert!(child.allow.iter().all(|rule| parent.allow.contains(rule)));
+        assert!(parent.deny.iter().all(|rule| child.deny.contains(rule)));
+        assert_eq!(child.backend, parent.backend);
+
+        // Nothing the child may write is outside what the parent had — except
+        // the directories friring minted for this child, which the parent never
+        // had because they did not exist.
+        let minted = |path: &String| {
+            path.starts_with("/data/worktrees/child")
+                || path.starts_with("/data/sandbox/tmp/child")
+                || path.starts_with("/data/signals/child")
+        };
+        for path in &child.rw_paths {
+            assert!(
+                minted(path) || parent.rw_paths.iter().any(|p| encloses_path(p, path)),
+                "the child may write '{path}', which its owner may not"
+            );
+        }
+    }
+
+    /// The subtract set beats a grant that encloses it. A parent that grants the
+    /// whole home directory encloses the family's state; the child must still
+    /// not have it.
+    #[test]
+    fn the_subtract_set_beats_an_enclosing_grant() {
+        let parent = parent_policy();
+        assert!(parent.rw_paths.contains(&"/home/u".to_string()));
+        let child = parent.narrow(&child_overlay()).unwrap();
+
+        // The family's state directory is gone from both sets, even though the
+        // parent grants everything above it.
+        assert!(!child.rw_paths.contains(&"/home/u/.codex".to_string()));
+        assert!(!child.ro_paths.contains(&"/home/u/.codex".to_string()));
+        // …and so is friring's own tree.
+        assert!(!child.rw_paths.iter().any(|p| p == "/data/sandbox"));
+    }
+
+    /// The one credential file comes back after the subtract set, writable — and
+    /// it is the *only* writable thing under the family's state.
+    #[test]
+    fn only_the_credential_target_is_writable_under_the_family_state() {
+        let child = parent_policy().narrow(&child_overlay()).unwrap();
+        let under_family: Vec<&String> = child
+            .rw_paths
+            .iter()
+            .filter(|p| p.starts_with("/home/u/.codex"))
+            .collect();
+        assert_eq!(
+            under_family,
+            [&"/home/u/.codex/auth.json".to_string()],
+            "exactly one writable path under the family's state"
+        );
+    }
+
+    /// The gate is read-only, always: a writable gate is a gate the child
+    /// releases itself (ADR-33).
+    #[test]
+    fn the_gate_is_never_writable_for_a_child() {
+        let child = parent_policy().narrow(&child_overlay()).unwrap();
+        assert!(child.ro_paths.contains(&"/data/gates/child".to_string()));
+        assert!(!child.rw_paths.contains(&"/data/gates/child".to_string()));
+    }
+
+    /// An overlay asking for something the parent does not have is refused, with
+    /// the dimension named — "the child would have been wider" is not a useful
+    /// thing to tell an operator.
+    #[test]
+    fn an_overlay_that_would_widen_is_refused_by_dimension() {
+        let parent = parent_policy();
+
+        let shared_elsewhere = SandboxOverlay {
+            shared_rw: vec!["/etc".into()],
+            ..child_overlay()
+        };
+        let violation = parent.narrow(&shared_elsewhere).unwrap_err();
+        assert_eq!(violation.dimension, "read-write path");
+        assert!(violation.detail.contains("/etc"), "{violation}");
+
+        let read_elsewhere = SandboxOverlay {
+            ro_extra: vec!["/var/secrets".into()],
+            ..child_overlay()
+        };
+        let violation = parent.narrow(&read_elsewhere).unwrap_err();
+        assert_eq!(violation.dimension, "read-only path");
+
+        let credential_elsewhere = SandboxOverlay {
+            seed: vec![SeedGrant {
+                target: "/opt/toolchain/token".into(),
+                mode: SeedMode::LinkRw,
+            }],
+            ..child_overlay()
+        };
+        let violation = parent.narrow(&credential_elsewhere).unwrap_err();
+        assert_eq!(violation.dimension, "credential target");
+    }
+
+    /// Narrowing a **narrowed** policy narrows further and never recovers
+    /// anything: the operation composes, which is what makes re-applying an
+    /// overlay at every launch safe.
+    #[test]
+    fn narrowing_is_idempotent_and_composes() {
+        let parent = parent_policy();
+        let once = parent.narrow(&child_overlay()).unwrap();
+        let twice = once.narrow(&child_overlay()).unwrap();
+        assert!(twice
+            .rw_paths
+            .iter()
+            .all(|path| once.rw_paths.contains(path)));
+        assert!(!twice.prompt_new_domains);
+        assert!(!twice.allow_unsandboxed_fallback);
+    }
 
     fn profile() -> SandboxProfile {
         SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")])

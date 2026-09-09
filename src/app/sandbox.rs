@@ -1694,6 +1694,71 @@ fn narrow_to_profile(
 /// §Failure modes). A free function rather than a method so a caller that has
 /// already moved the session into `self.sessions` can compose the message first
 /// and set it afterwards.
+/// Rebind one session's egress proxy at the **exact** endpoint and token its
+/// launch recorded (ADR-27).
+///
+/// The whole of the restart story, and every step of it fails closed:
+///
+/// - The profile is resolved against **this** host, because a profile whose
+///   backend is not available here has no transport to restore onto.
+/// - The policy is re-read from the profile as it stands now, so an edit between
+///   the two runs takes effect. That is the one thing that deliberately changes.
+/// - The endpoint and the token are the persisted ones, because the agent that
+///   is still running holds proxy URLs naming both.
+///
+/// # Errors
+///
+/// The profile's backend is unavailable here, its policy will not resolve, or
+/// the endpoint could not be rebound — the port or the socket is taken, or the
+/// stored value is not one friring wrote. The caller records
+/// [`EgressState::Unrestorable`](crate::session::EgressState::Unrestorable) and
+/// leaves the token alone.
+pub(crate) fn restore_egress(
+    profile: &SandboxProfile,
+    session_id: crate::session::SessionId,
+    endpoint: &str,
+    token: &str,
+) -> Result<(), String> {
+    let host = SandboxHost::local_shared();
+    let backend = host
+        .select(profile.backend)
+        .backend()
+        .map_err(|e| e.to_string())?;
+    let home = crate::paths::home_dir()
+        .map(|home| home.display().to_string())
+        .ok_or_else(|| "friring cannot resolve a home directory".to_string())?;
+    let policy = profile.resolve(backend, &home).map_err(|e| e.to_string())?;
+    if !crate::sandbox::egress::proxy_required(&policy) {
+        // The profile was edited to a mode the kernel enforces on its own, so
+        // there is no proxy to bind. That is **not** a restored session: the
+        // agent that is running was launched against the old profile and its
+        // environment still names the old endpoint, so its traffic goes to a
+        // port nothing listens on. Reported as unrestorable, which is what the
+        // panel already renders as "enforced boundary, dead proxy — relaunch",
+        // rather than as `Active` over a listener that does not exist.
+        return Err(format!(
+            "sandbox profile '{}' no longer filters egress, so there is no proxy to restore at \
+             the endpoint this session was launched against. Its boundary is still enforced; \
+             relaunch it to pick up the profile as it stands now",
+            profile.name
+        ));
+    }
+    let transport = host
+        .backend(backend)
+        .ok_or_else(|| format!("sandbox backend '{backend}' is not built into this friring"))?
+        .capabilities()
+        .proxy_transport;
+    crate::sandbox::egress::establish_at(
+        &session_id.to_string(),
+        &policy,
+        transport,
+        endpoint,
+        token,
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
 pub(crate) fn unenforced_sandbox_message(info: &crate::session::SessionInfo) -> Option<String> {
     // Both halves, in the same order the indicators read them: a state with no
     // profile beside it would be claiming something about a session that never
@@ -1897,6 +1962,7 @@ mod tests {
             new_session_args: Vec::new(),
             resume_latest: false,
             hook_schema: None,
+            transcript: None,
             sandbox,
         }
     }
@@ -2086,6 +2152,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         }
     }
 

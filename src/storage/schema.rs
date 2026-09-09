@@ -40,7 +40,7 @@ use rusqlite::{Connection, OptionalExtension};
 /// the warning instead of rendering the sandboxed mark over an agent that is
 /// running on the host.
 /// Gaps in the step table are fine (there is no v18 step either).
-pub const SCHEMA_VERSION: u32 = 48;
+pub const SCHEMA_VERSION: u32 = 49;
 
 /// A single migration step: applied when the stored version is below `target`.
 type MigrationStep = (u32, fn(&Connection) -> rusqlite::Result<()>);
@@ -112,6 +112,15 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             unloaded          INTEGER NOT NULL DEFAULT 0,
             sandbox_profile   TEXT,
             sandbox_unenforced TEXT,
+            mux_server        TEXT,
+            mux_window_id     TEXT,
+            mux_pane_id       TEXT,
+            mux_pane_pid      INTEGER,
+            mux_launch_key    TEXT,
+            egress_endpoint   TEXT,
+            egress_token      TEXT,
+            egress_state      TEXT,
+            sandbox_overlay   TEXT,
             created_at        INTEGER NOT NULL,
             updated_at        INTEGER NOT NULL,
             deleted_at        INTEGER
@@ -289,6 +298,11 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             image                      TEXT,
             containerfile              TEXT,
             allow_unsandboxed_fallback INTEGER NOT NULL DEFAULT 0,
+            bridge_grants              TEXT NOT NULL DEFAULT '[]',
+            max_children               INTEGER NOT NULL DEFAULT 3,
+            child_agents               TEXT NOT NULL DEFAULT '[]',
+            child_shared_rw            TEXT NOT NULL DEFAULT '[]',
+            child_seed_allow           TEXT NOT NULL DEFAULT '[]',
             created_at                 INTEGER NOT NULL,
             updated_at                 INTEGER NOT NULL
         );
@@ -308,6 +322,19 @@ pub fn initialize(conn: &Connection) -> rusqlite::Result<()> {
             ON sandbox_instances(profile);
         ",
     )?;
+    // The bridge's own tables, from the same constant the v49 migration runs,
+    // so a fresh database and an upgraded one cannot end up different shapes.
+    conn.execute_batch(BRIDGE_SCHEMA)?;
+    // …and the columns a database created by an **earlier revision of v49**
+    // lacks. `CREATE TABLE IF NOT EXISTS` leaves an existing table exactly as it
+    // was, and the version-gated migration above will not re-run for a file
+    // already stamped 49 — so this runs unconditionally. Idempotent and cheap:
+    // `add_column_if_absent` reads `PRAGMA table_info` and usually does nothing.
+    // v49 has never been released, so this is the whole population that can be
+    // in that state.
+    for column in CHILD_SAGA_COLUMNS {
+        add_column_if_absent(conn, "child_sagas", column.0, column.1)?;
+    }
 
     conn.execute(
         "INSERT OR IGNORE INTO metadata (key, value) VALUES ('schema_version', ?1)",
@@ -427,6 +454,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         (46, migrate_v46_message_threading),
         (47, migrate_v47_sandbox_profiles),
         (48, migrate_v48_sandbox_unenforced),
+        (49, migrate_v49_bridge),
     ];
 
     for &(target, step) in steps {
@@ -1481,6 +1509,257 @@ fn migrate_v48_sandbox_unenforced(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_absent(conn, "sessions", "sandbox_unenforced", "TEXT")
 }
 
+/// v48 → v49: the orchestration bridge (ADR-30 … ADR-32).
+///
+/// Additive: seven new tables, one backfilled index of a session's
+/// repositories, and columns on `sessions` and `sandbox_profiles`. Nothing
+/// existing is rewritten, so an existing database keeps working with the bridge
+/// simply unused.
+///
+/// **Downgrade is unsupported.** [`reject_newer_schema`] refuses to open this
+/// file with an older binary, and the only way back is the pre-upgrade copy the
+/// operator backed up — which is why `docs/SANDBOX.md` says to make one.
+fn migrate_v49_bridge(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(BRIDGE_SCHEMA)?;
+    // `CREATE TABLE IF NOT EXISTS` leaves a `child_sagas` that already exists
+    // exactly as it was, so a column added to the definition later would be
+    // missing from any database that ran an earlier v49. Added the same way the
+    // `sessions` columns are, which costs nothing on a fresh file.
+    for column in CHILD_SAGA_COLUMNS {
+        add_column_if_absent(conn, "child_sagas", column.0, column.1)?;
+    }
+    for column in SESSION_BRIDGE_COLUMNS {
+        add_column_if_absent(conn, "sessions", column.0, column.1)?;
+    }
+    for column in SANDBOX_PROFILE_BRIDGE_COLUMNS {
+        add_column_if_absent(conn, "sandbox_profiles", column.0, column.1)?;
+    }
+    backfill_session_repos(conn)
+}
+
+/// Every session's repositories, from the rows that already record them.
+///
+/// `session_repos` is the authority for `create.repo_root`: a bridge child may
+/// only be created in a repository its owner already has. Deriving that from
+/// grants would make a profile edit into an authority change, so it is a row —
+/// and an existing session needs one before it can own a child at all.
+///
+/// Two sources, in the order a session acquires them: the worktree rows a
+/// worktree-backed session has, and the working directory of one that has none.
+/// `INSERT OR IGNORE` because the primary key is `(session_id, repo_root)` and a
+/// re-run must add nothing.
+fn backfill_session_repos(conn: &Connection) -> rusqlite::Result<()> {
+    if !table_exists(conn, "worktrees")? {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO session_repos
+             (session_id, repo_root, role, worktree_path, branch)
+         SELECT session_id, repo_path, 'worktree', worktree_path, branch
+         FROM worktrees
+         WHERE deleted_at IS NULL",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO session_repos
+             (session_id, repo_root, role, worktree_path, branch)
+         SELECT id, cwd, 'cwd', cwd, NULL
+         FROM sessions
+         WHERE cwd IS NOT NULL AND cwd <> '' AND deleted_at IS NULL",
+        [],
+    )?;
+    Ok(())
+}
+
+/// The bridge's own tables, shared by [`initialize`] and [`migrate_v49_bridge`]
+/// so a fresh database and an upgraded one cannot end up with different shapes.
+///
+/// `bridge_children` is **insert-only, enforced in SQL**. It is the ownership
+/// record every verb's authority is derived from, and a row that could be
+/// updated could be re-pointed at another owner by anything holding a write
+/// handle to the file. Archival is a stamp on `bridge_child_state`, never a
+/// delete here: ownership outlives the child, the worktree and the branch.
+const BRIDGE_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS bridge_children (
+        child_id    TEXT PRIMARY KEY NOT NULL,
+        owner_id    TEXT NOT NULL,
+        request_key TEXT NOT NULL,
+        created_at  INTEGER NOT NULL,
+        UNIQUE (owner_id, request_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_bridge_children_owner
+        ON bridge_children(owner_id);
+    CREATE TRIGGER IF NOT EXISTS bridge_children_no_update
+        BEFORE UPDATE ON bridge_children
+        BEGIN SELECT RAISE(ABORT, 'bridge_children is insert-only'); END;
+    CREATE TRIGGER IF NOT EXISTS bridge_children_no_delete
+        BEFORE DELETE ON bridge_children
+        BEGIN SELECT RAISE(ABORT, 'bridge_children is insert-only'); END;
+
+    CREATE TABLE IF NOT EXISTS bridge_child_state (
+        child_id         TEXT PRIMARY KEY NOT NULL,
+        state            TEXT NOT NULL,
+        acked_at         INTEGER,
+        claimed_at       INTEGER,
+        finishing_at     INTEGER,
+        last_report_at   INTEGER,
+        tombstoned_at    INTEGER,
+        force_deleted_at INTEGER,
+        archived_at      INTEGER,
+        updated_at       INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS bridge_requests (
+        owner_id   TEXT NOT NULL,
+        key        TEXT NOT NULL,
+        verb       TEXT NOT NULL,
+        body_hash  TEXT NOT NULL,
+        state      TEXT NOT NULL,
+        response   TEXT,
+        deadline   INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (owner_id, key)
+    );
+
+    CREATE TABLE IF NOT EXISTS child_sagas (
+        owner_id        TEXT NOT NULL,
+        key             TEXT NOT NULL,
+        child_id        TEXT,
+        step            TEXT NOT NULL,
+        task_kind       TEXT,
+        task_body       TEXT,
+        worktree_path   TEXT,
+        branch          TEXT,
+        base_head       TEXT,
+        -- Whether this saga's own `git branch` created `branch`. The unwind's
+        -- and recovery's licence to touch `worktree_path` at all: the path is
+        -- recorded before git runs, so the loser of a cross-instance race holds
+        -- the winner's directory against its own failed saga (ADR-32).
+        branch_claimed  INTEGER NOT NULL DEFAULT 0,
+        -- The child's own finish intent, when it arrived **during** this launch
+        -- and had to be held (ADR-32 gives a child one, and the `send` that
+        -- carried it was already answered `ok`). Persisted because the launch
+        -- has not written `finishing` yet, so nothing else on record would carry
+        -- it across a crash between S8 and S9.
+        finish_outcome  TEXT,
+        finish_message_id INTEGER,
+        scratch_minted  INTEGER NOT NULL DEFAULT 0,
+        gate_dir        TEXT,
+        egress_endpoint TEXT,
+        egress_token    TEXT,
+        mux_server      TEXT,
+        mux_window_id   TEXT,
+        mux_pane_id     TEXT,
+        mux_pane_pid    INTEGER,
+        -- The `@friring_pane` marker, without which `MuxIdentity::is_recorded`
+        -- is false and recovery can kill nothing it recorded (ADR-32).
+        mux_launch_key  TEXT,
+        instance_id     TEXT,
+        lease_until     INTEGER,
+        created_at      INTEGER NOT NULL,
+        updated_at      INTEGER NOT NULL,
+        PRIMARY KEY (owner_id, key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_child_sagas_step ON child_sagas(step);
+
+    CREATE TABLE IF NOT EXISTS bridge_results (
+        child_id      TEXT PRIMARY KEY NOT NULL,
+        message_id    INTEGER,
+        outcome       TEXT NOT NULL,
+        branch        TEXT,
+        head          TEXT,
+        dirty         INTEGER NOT NULL DEFAULT 0,
+        ahead_of_base INTEGER NOT NULL DEFAULT 0,
+        verified_at   INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS bridge_reports (
+        child_id       TEXT NOT NULL,
+        seq            INTEGER NOT NULL,
+        phase          TEXT NOT NULL,
+        progress       INTEGER NOT NULL DEFAULT 0,
+        summary        TEXT NOT NULL DEFAULT '',
+        needs_operator INTEGER NOT NULL DEFAULT 0,
+        artifact_paths TEXT NOT NULL DEFAULT '[]',
+        created_at     INTEGER NOT NULL,
+        PRIMARY KEY (child_id, seq)
+    );
+
+    CREATE TABLE IF NOT EXISTS bridge_brokers (
+        session_id  TEXT PRIMARY KEY NOT NULL,
+        instance_id TEXT NOT NULL,
+        lease_until INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS session_repos (
+        session_id    TEXT NOT NULL,
+        repo_root     TEXT NOT NULL,
+        role          TEXT NOT NULL DEFAULT 'worktree',
+        worktree_path TEXT,
+        branch        TEXT,
+        PRIMARY KEY (session_id, repo_root)
+    );
+";
+
+/// The bridge columns on `sessions`, as `(name, declaration)`.
+///
+/// The multiplexer half is the **exact** identity of the window a session's
+/// agent runs in — server, window, pane, pane pid, and the launch key friring
+/// stamped on the pane — so every destructive action can prove it is acting on
+/// the pane it recorded rather than on whatever now answers to that name. The
+/// egress half is what a filtered session needs to come back at the *same*
+/// endpoint after a restart, plus the honest state of that attempt.
+/// Columns on `child_sagas` that a database created by an earlier revision of
+/// schema v49 may not have.
+///
+/// `mux_launch_key` is the `@friring_pane` marker. Without it
+/// [`crate::session::MuxIdentity::is_recorded`] is false for every recovered
+/// saga, so the exact-pane kill recovery depends on would return early every
+/// time — the guarantee ADR-32 makes about acting only on recorded identities
+/// would hold vacuously.
+/// `branch_claimed` is what tells a reclaim whose the worktree at the recorded
+/// path is. Absent, every recovered saga reads as "not proven mine", which is the
+/// fail-closed answer: friring leaves the directory and tells the operator.
+///
+/// `finish_outcome`/`finish_message_id` carry a child's own finish intent when it
+/// arrived during its launch. Absent, a recovered child that had already reported
+/// is adopted with no verdict and holds its owner's fan-out slot until someone
+/// stops it by hand.
+const CHILD_SAGA_COLUMNS: &[(&str, &str)] = &[
+    ("mux_launch_key", "TEXT"),
+    ("branch_claimed", "INTEGER NOT NULL DEFAULT 0"),
+    ("finish_outcome", "TEXT"),
+    ("finish_message_id", "INTEGER"),
+];
+
+const SESSION_BRIDGE_COLUMNS: &[(&str, &str)] = &[
+    ("mux_server", "TEXT"),
+    ("mux_window_id", "TEXT"),
+    ("mux_pane_id", "TEXT"),
+    ("mux_pane_pid", "INTEGER"),
+    ("mux_launch_key", "TEXT"),
+    ("egress_endpoint", "TEXT"),
+    ("egress_token", "TEXT"),
+    ("egress_state", "TEXT"),
+    ("sandbox_overlay", "TEXT"),
+];
+
+/// The bridge columns on `sandbox_profiles`, as `(name, declaration)`.
+///
+/// The profile, not the agent, decides what a child receives: which capabilities
+/// are granted at all, how many children may be live, which agents they may be,
+/// which of the parent's read-write paths they share, and which of the agent's
+/// state-seed entries are authorized in which mode. Defaults are the closed
+/// ones — no grants, no shared paths, no authorized seeds.
+const SANDBOX_PROFILE_BRIDGE_COLUMNS: &[(&str, &str)] = &[
+    ("bridge_grants", "TEXT NOT NULL DEFAULT '[]'"),
+    ("max_children", "INTEGER NOT NULL DEFAULT 3"),
+    ("child_agents", "TEXT NOT NULL DEFAULT '[]'"),
+    ("child_shared_rw", "TEXT NOT NULL DEFAULT '[]'"),
+    ("child_seed_allow", "TEXT NOT NULL DEFAULT '[]'"),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1549,6 +1828,214 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap()
+    }
+
+    /// A database that stopped at v48, so the v49 migration is exercised
+    /// against real pre-existing rows rather than against a fresh schema where
+    /// every `add_column_if_absent` is a no-op.
+    fn v48_fixture(conn: &Connection) {
+        initialize(conn).unwrap();
+        // Wind the recorded version back and drop what v49 added, so the next
+        // `initialize` has genuine work to do.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS bridge_children;
+             DROP TABLE IF EXISTS bridge_child_state;
+             DROP TABLE IF EXISTS bridge_requests;
+             DROP TABLE IF EXISTS child_sagas;
+             DROP TABLE IF EXISTS bridge_results;
+             DROP TABLE IF EXISTS bridge_reports;
+             DROP TABLE IF EXISTS bridge_brokers;
+             DROP TABLE IF EXISTS session_repos;",
+        )
+        .unwrap();
+        for column in SESSION_BRIDGE_COLUMNS {
+            conn.execute(
+                &format!("ALTER TABLE sessions DROP COLUMN {}", column.0),
+                [],
+            )
+            .unwrap();
+        }
+        for column in SANDBOX_PROFILE_BRIDGE_COLUMNS {
+            conn.execute(
+                &format!("ALTER TABLE sandbox_profiles DROP COLUMN {}", column.0),
+                [],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE metadata SET value = '48' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// Everything v49 adds, from a database that really was at v48: the tables,
+    /// the insert-only triggers, the backfilled repository index, and the
+    /// columns on both existing tables.
+    #[test]
+    fn v49_adds_the_bridge_to_an_existing_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        v48_fixture(&conn);
+
+        // Two sessions the backfill has to see: one with a worktree row, one
+        // with only a working directory.
+        conn.execute(
+            "INSERT INTO sessions (id, name, created_at, updated_at, cwd)
+             VALUES ('s-wt', 'worktree session', 1, 1, '/repo/a/wt')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, name, created_at, updated_at, cwd)
+             VALUES ('s-cwd', 'plain session', 1, 1, '/repo/b')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO worktrees (session_id, repo_path, worktree_path, branch, created_at)
+             VALUES ('s-wt', '/repo/a', '/repo/a/wt', 'feat/x', 1)",
+            [],
+        )
+        .unwrap();
+
+        initialize(&conn).unwrap();
+
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+
+        for table in [
+            "bridge_children",
+            "bridge_child_state",
+            "bridge_requests",
+            "child_sagas",
+            "bridge_results",
+            "bridge_reports",
+            "bridge_brokers",
+            "session_repos",
+        ] {
+            assert!(table_exists(&conn, table).unwrap(), "{table} is missing");
+        }
+        for column in SESSION_BRIDGE_COLUMNS {
+            assert!(
+                column_exists(&conn, "sessions", column.0).unwrap(),
+                "sessions.{} is missing",
+                column.0
+            );
+        }
+        for column in SANDBOX_PROFILE_BRIDGE_COLUMNS {
+            assert!(
+                column_exists(&conn, "sandbox_profiles", column.0).unwrap(),
+                "sandbox_profiles.{} is missing",
+                column.0
+            );
+        }
+
+        // The repository index equals what the session rows already recorded:
+        // the worktree row for one, the working directory for the other.
+        let mut stmt = conn
+            .prepare("SELECT session_id, repo_root, role FROM session_repos ORDER BY session_id, repo_root")
+            .unwrap();
+        let rows: Vec<(String, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "s-cwd".to_string(),
+                    "/repo/b".to_string(),
+                    "cwd".to_string()
+                ),
+                (
+                    "s-wt".to_string(),
+                    "/repo/a".to_string(),
+                    "worktree".to_string()
+                ),
+                (
+                    "s-wt".to_string(),
+                    "/repo/a/wt".to_string(),
+                    "cwd".to_string()
+                ),
+            ]
+        );
+
+        // Ownership is insert-only in SQL, not merely by convention.
+        conn.execute(
+            "INSERT INTO bridge_children (child_id, owner_id, request_key, created_at)
+             VALUES ('c1', 's-wt', 'k-1', 1)",
+            [],
+        )
+        .unwrap();
+        for statement in [
+            "UPDATE bridge_children SET owner_id = 'x' WHERE child_id = 'c1'",
+            "DELETE FROM bridge_children WHERE child_id = 'c1'",
+        ] {
+            let refused = conn.execute(statement, []).unwrap_err().to_string();
+            assert!(refused.contains("insert-only"), "{statement}: {refused}");
+        }
+
+        // Re-running is a no-op rather than an error: `initialize` runs the DDL
+        // batch on every open.
+        initialize(&conn).unwrap();
+    }
+
+    /// The population [`CHILD_SAGA_COLUMNS`] exists for: a database **already**
+    /// at the current version whose `child_sagas` was created by an earlier
+    /// revision of v49 and predates a column.
+    ///
+    /// The version-gated migration will not re-run for it and
+    /// `CREATE TABLE IF NOT EXISTS` leaves the old shape alone, so the
+    /// unconditional repair in `initialize` is the only thing that can add the
+    /// column — and the only fixture that covers v49 drops `child_sagas`
+    /// outright, which recreates it from `BRIDGE_SCHEMA` and never reaches the
+    /// repair.
+    #[test]
+    fn a_child_sagas_missing_branch_claimed_is_repaired_at_the_same_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+
+        // Exactly the shape an earlier v49 wrote: the table, at the current
+        // version, without the column.
+        conn.execute("ALTER TABLE child_sagas DROP COLUMN branch_claimed", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO child_sagas (owner_id, key, step, created_at, updated_at)
+             VALUES ('s-1', 'create-0001', 'worktree', 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        initialize(&conn).unwrap();
+
+        assert!(
+            conn.prepare(
+                "SELECT 1 FROM pragma_table_info('child_sagas') WHERE name='branch_claimed'"
+            )
+            .unwrap()
+            .exists([])
+            .unwrap(),
+            "the repair did not add the column back"
+        );
+        // The fail-closed default, and the row that predates it still reads:
+        // a saga recovered here is "not proven mine", which is what leaves an
+        // unowned worktree alone.
+        let (claimed, step): (i64, String) = conn
+            .query_row(
+                "SELECT branch_claimed, step FROM child_sagas WHERE key = 'create-0001'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(claimed, 0);
+        assert_eq!(step, "worktree");
     }
 
     #[test]

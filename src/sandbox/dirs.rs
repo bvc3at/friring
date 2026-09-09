@@ -78,6 +78,79 @@ pub fn scratch_root() -> Option<PathBuf> {
     sandbox_root().map(|root| root.join("tmp"))
 }
 
+/// One bridge child's **private** agent state directory (ADR-31).
+///
+/// `<data>/sandbox/tmp/<child>/state`, inside the scratch directory the child
+/// already owns. A bridge child never runs from its family's shared state: its
+/// transcripts, its history and its session list are its own, and the subtract
+/// set denies the family's.
+pub fn child_state_dir(session_key: &str) -> Option<PathBuf> {
+    session_scratch_dir(session_key).map(|dir| dir.join("state"))
+}
+
+/// Create (or adopt) one child's private state directory, `0700`.
+pub fn create_child_state_dir(session_key: &str) -> SandboxResult<PathBuf> {
+    let dir = child_state_dir(session_key).ok_or_else(no_data_dir)?;
+    create_private_dir(&dir)?;
+    Ok(dir)
+}
+
+/// Parent of every child session's launch gate (ADR-33).
+///
+/// A separate tree from [`scratch_root`] because it is the one directory a
+/// sandbox is given **read-only**: the release primitive is the existence of a
+/// regular file the host renames into place, and the whole proof rests on the
+/// sandbox being unable to create, rename or unlink anything under here. A
+/// profile naming any of it is refused by [`check_declared_paths`], for the same
+/// reason it may not name `<data>/sandbox`.
+pub fn gate_root() -> Option<PathBuf> {
+    data_dir().map(|data| data.join("gates"))
+}
+
+/// One session's gate directory, whether or not it exists yet.
+pub fn gate_dir(session_key: &str) -> Option<PathBuf> {
+    gate_root().map(|root| root.join(sanitize_component(session_key)))
+}
+
+/// Where a release file is written before it is renamed into a gate.
+///
+/// Never granted to anything: a gate directory is read-only inside the boundary,
+/// so the file has to arrive by `rename(2)` — which needs a source the sandbox
+/// cannot see, or the agent could write the key into the source and release its
+/// own gate.
+pub fn gate_staging_dir() -> Option<PathBuf> {
+    gate_root().map(|root| root.join(".staging"))
+}
+
+/// The file whose *existence* releases a gated launch.
+pub fn gate_release_file(session_key: &str) -> Option<PathBuf> {
+    gate_dir(session_key).map(|dir| dir.join(GATE_RELEASE_NAME))
+}
+
+/// Name of the release file inside a gate directory. One constant, because the
+/// host writes it and the launch helper polls for it from inside the boundary.
+pub const GATE_RELEASE_NAME: &str = "release";
+
+/// Create (or adopt) one session's gate directory, `0700`.
+///
+/// Idempotent like [`create_session_scratch`], and for the same reason: a
+/// relaunch of the same child reuses its gate. A stale release file left by an
+/// earlier launch is removed here, so a gate never opens on the previous run's
+/// key.
+pub fn create_session_gate_dir(session_key: &str) -> SandboxResult<PathBuf> {
+    let dir = gate_dir(session_key).ok_or_else(no_data_dir)?;
+    create_private_dir(&dir)?;
+    let _ = std::fs::remove_file(dir.join(GATE_RELEASE_NAME));
+    Ok(dir)
+}
+
+/// Create (or adopt) the staging directory release files are renamed out of.
+pub fn create_gate_staging_dir() -> SandboxResult<PathBuf> {
+    let dir = gate_staging_dir().ok_or_else(no_data_dir)?;
+    create_private_dir(&dir)?;
+    Ok(dir)
+}
+
 /// Where the one-copy-per-credential-family markers live (ADR-28).
 ///
 /// Inside the data directory rather than in a place's own tree, because the
@@ -290,8 +363,8 @@ pub fn create_session_scratch(session_key: &str) -> SandboxResult<PathBuf> {
     Ok(dir)
 }
 
-/// Drop everything one session left behind: its scratch directory and the
-/// seatbelt profile generated for it.
+/// Drop everything one session left behind: its scratch directory, its launch
+/// gate and the seatbelt profile generated for it.
 ///
 /// Best effort — this runs when a session ends, and a failure to clean up must
 /// never be the thing that reports an error. Nothing here follows a symlink:
@@ -299,7 +372,11 @@ pub fn create_session_scratch(session_key: &str) -> SandboxResult<PathBuf> {
 /// component.
 pub fn cleanup_session(session_key: &str) {
     let key = sanitize_component(session_key);
-    if let Some(dir) = scratch_root().map(|root| root.join(&key)) {
+    for dir in [scratch_root(), gate_root()]
+        .into_iter()
+        .flatten()
+        .map(|root| root.join(&key))
+    {
         let _ = std::fs::remove_dir_all(dir);
     }
     let Some(profiles) = profile_dir() else {
@@ -576,6 +653,101 @@ pub fn tmux_socket_root() -> PathBuf {
         Some(dir) => PathBuf::from(dir),
         None => PathBuf::from("/tmp"),
     }
+}
+
+/// One entry of the multiplexer deny set: a path, and whether it is a directory
+/// (a whole tree to refuse) or a single socket file.
+///
+/// Both spellings of every path are separate entries — see
+/// [`multiplexer_socket_denies`] — so a backend renders what it is given and
+/// never has to decide which spelling the kernel will see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketDeny {
+    /// The path to refuse, absolute.
+    pub path: String,
+    /// A `tmux-<uid>` directory rather than a socket file.
+    pub is_dir: bool,
+}
+
+/// The **closed** set of multiplexer sockets every policy launch denies, in each
+/// entry's written and resolved spelling (ADR-33).
+///
+/// Three things are in it and nothing else:
+///
+/// 1. friring's own server socket file. A sandbox that reaches it asks friring's
+///    tmux to run a command in any pane on the host — outside the boundary, with
+///    the user's own privileges. No network namespace stops that: `connect(2)`
+///    on a pathname unix socket is a filesystem operation.
+/// 2. The socket of the server friring is itself running inside, when it is. A
+///    different server, the same escape.
+/// 3. The `tmux-<uid>` directory under every root a tmux — the system one, or a
+///    distribution build with a different compiled-in default — can put sockets
+///    in: `$TMUX_TMPDIR`, `$TMPDIR`, `/tmp`, and `/private/tmp` on macOS where
+///    `/tmp` actually lives. The exact `tmux-<uid>` child, never the root.
+///
+/// **Nothing broader, on purpose.** `/tmp`, `/run`, `/var/run`,
+/// `$XDG_RUNTIME_DIR` and `$TMPDIR` as wholes are not denied here: the profile
+/// already decides what a sandbox reaches in those trees, and a blanket
+/// unix-socket denial would break the IPC a real agent needs — its own language
+/// server, a test harness's socket, a package-manager daemon. The set is
+/// therefore closed and discoverable rather than exhaustive: a tmux server an
+/// operator starts at an arbitrary `-S` path inside a directory the profile
+/// grants is outside it and reachable. [`grants_tmux_socket_tree`] keeps
+/// refusing a profile path that names a `tmux-` directory, and
+/// `docs/SANDBOX.md` records the residual.
+///
+/// psmux is absent because there is no boundary to add it to: native Windows has
+/// no sandbox backend, and a remote psmux host cannot host one.
+pub fn multiplexer_socket_denies(host: &crate::session::HostMuxSockets) -> Vec<SocketDeny> {
+    let mut out: Vec<SocketDeny> = Vec::new();
+    let mut push = |path: String, is_dir: bool| {
+        for spelling in [canonical(&path), Some(path)].into_iter().flatten() {
+            let entry = SocketDeny {
+                path: spelling,
+                is_dir,
+            };
+            if !out.contains(&entry) {
+                out.push(entry);
+            }
+        }
+    };
+    for socket in [Some(&host.own_socket), host.outer_socket.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        push(socket.display().to_string(), false);
+    }
+    for root in socket_directory_roots() {
+        push(
+            root.join(format!("tmux-{}", host.uid))
+                .display()
+                .to_string(),
+            true,
+        );
+    }
+    out
+}
+
+/// Every root a tmux build on this host could derive its socket directory from.
+///
+/// `$TMUX_TMPDIR` is what tmux reads first and what [`tmux_socket_root`]
+/// returns. The rest are the fallbacks a build can be compiled with or a
+/// distribution can patch in, plus the resolved spelling of `/tmp` on macOS —
+/// listing them costs a few denies and missing one costs the boundary.
+fn socket_directory_roots() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = vec![tmux_socket_root()];
+    let candidates = [
+        std::env::var_os("TMPDIR").map(PathBuf::from),
+        Some(PathBuf::from("/tmp")),
+        cfg!(target_os = "macos").then(|| PathBuf::from("/private/tmp")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        let candidate = PathBuf::from(normalize(&candidate.display().to_string()));
+        if candidate.is_absolute() && !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
 }
 
 /// Whether a read-write root would hand a sandbox a tmux server socket
@@ -909,6 +1081,7 @@ pub fn check_declared_paths(declared: &[String]) -> Result<(), String> {
     let protected: Vec<(&str, PathBuf)> = [
         ("sandbox state", sandbox_root()),
         ("status-signal", crate::paths::signals_directory()),
+        ("launch gate", gate_root()),
     ]
     .into_iter()
     .filter_map(|(what, dir)| dir.map(|dir| (what, dir)))
@@ -921,9 +1094,10 @@ pub fn check_declared_paths(declared: &[String]) -> Result<(), String> {
                     "the path '{path}' reaches friring's own {what} directory '{dir}'. That tree \
                      holds the other profiles' sandbox logins, the markers that keep one \
                      credential to one boundary, the generated sandbox policies and the other \
-                     sessions' egress sockets — reading it is enough to take any of them, so no \
-                     profile may name it in either mode. List the directories the agent needs \
-                     instead"
+                     sessions' egress sockets, and the launch gates whose whole guarantee is \
+                     that only the host can write one — reading or writing it is enough to take \
+                     any of them, so no profile may name it in either mode. List the \
+                     directories the agent needs instead"
                 ));
             }
         }

@@ -74,6 +74,22 @@ pub(crate) struct PerfCounters {
     /// ticks (~100 ms) unless the cache was explicitly invalidated
     /// (ADR-P10), so it climbs ~10×/s, not ~100×/s.
     pub(crate) data_version_checks: u64,
+    /// Bridge requests taken off a session's queue and answered (ADR-30).
+    /// Bounded per tick, which is what a flood test asserts on: 100 queued
+    /// requests must move this by the budget, not by 100.
+    pub(crate) bridge_requests_served: u64,
+    /// Nudges typed into a recipient's pane to tell it mail arrived. Rate
+    /// limited per recipient, so this is what a flood test proves stayed flat.
+    pub(crate) bridge_nudges_sent: u64,
+    /// Session queues the broker actually read. One per **live** bridge session
+    /// per poll: a placeholder has no client writing to its queue, so it is not
+    /// polled at all (ADR-P16), and this is what proves the population is the
+    /// loaded subset rather than every stored session.
+    pub(crate) bridge_queue_polls: u64,
+    /// Response-GC passes. One per housekeeping tick, each sweeping a bounded
+    /// rotating slice of the fleet rather than all of it, so the work per pass
+    /// no longer scales with the number of stored sessions (ADR-P16).
+    pub(crate) bridge_response_sweeps: u64,
 }
 
 impl PerfCounters {
@@ -121,6 +137,18 @@ impl PerfCounters {
             data_version_checks: self
                 .data_version_checks
                 .wrapping_sub(prev.data_version_checks),
+            bridge_requests_served: self
+                .bridge_requests_served
+                .wrapping_sub(prev.bridge_requests_served),
+            bridge_nudges_sent: self
+                .bridge_nudges_sent
+                .wrapping_sub(prev.bridge_nudges_sent),
+            bridge_queue_polls: self
+                .bridge_queue_polls
+                .wrapping_sub(prev.bridge_queue_polls),
+            bridge_response_sweeps: self
+                .bridge_response_sweeps
+                .wrapping_sub(prev.bridge_response_sweeps),
         }
     }
 }

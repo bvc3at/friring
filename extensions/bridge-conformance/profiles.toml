@@ -1,0 +1,38 @@
+# The minimal profile that carries the orchestration bridge.
+#
+# Import with `friring-cli sandbox import`, then edit the one path.
+#
+# Deliberately minimal. Everything in it is there because the bridge needs it,
+# so it doubles as the answer to "what is the least a profile has to grant for a
+# leader to work?" — and to "what does a bridge child get?", which is: its own
+# worktree, its own control directories, and nothing else of the host.
+
+[[profile]]
+name = "bridge-conformance"
+backend = "auto"
+paths = [
+    # EDIT: any git repository. The conformance run creates a branch and a
+    # worktree in it and commits nothing.
+    { path = "~/dev/scratch", mode = "rw" },
+    # This extension's own home, read-only. Not optional and not a convenience:
+    # `read_scope = "workspace"` grants the profile's paths plus the system
+    # directories a binary needs, and these agents are **scripts** that source a
+    # shared library beside them. friring reads the agent's own program into
+    # every narrow scope — a policy that cannot exec its agent is never right —
+    # but what that program then opens is the profile's to grant. Without this
+    # the pane opens and the script dies on its first `.` line.
+    { path = "~/.config/friring/extensions/bridge-conformance", mode = "ro" },
+]
+# Nothing leaves. A conformance agent is a shell script: it has no model to
+# call, so the run also proves the bridge works with the network closed.
+network_mode = "none"
+network_allow = []
+network_deny = []
+prompt_new_domains = false
+read_scope = "workspace"
+allow_unsandboxed_fallback = false
+bridge_grants = ["child-lifecycle", "mailbox", "report"]
+max_children = 2
+child_agents = ["conformance-worker"]
+child_shared_rw = []
+child_seed_allow = [{ path = "settings.json", mode = "copy" }]

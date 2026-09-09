@@ -31,6 +31,7 @@
 //! checked after every step — the regression net for "weird TUI behavior"
 //! that no directed test anticipated.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -94,6 +95,24 @@ struct FakeBackend {
     /// [`SessionBackend::take_hook_state_events`] — lets a test drive the
     /// remote-session status path without a control-mode connection.
     hook_events: std::sync::Mutex<Vec<(String, String)>>,
+    /// What each spawned pane reports as its identity, keyed by pane id, plus
+    /// the marker friring stamped on it.
+    ///
+    /// The seam every ADR-32 identity rule needs: `revalidate_identity` refuses
+    /// to act on a pane whose recorded fields do not match, and a test can only
+    /// exercise that against a backend that has fields to report.
+    panes: std::sync::Mutex<HashMap<String, crate::session::MuxIdentity>>,
+    /// How many panes have been spawned, so each gets its own ids.
+    spawned: std::sync::atomic::AtomicU32,
+    /// Refuse every `kill` — the `stop_failed` path.
+    kill_refuses: bool,
+    /// What this backend's multiplexer server says about itself (ADR-33).
+    ///
+    /// `None` by default, which is what every backend that is not a real
+    /// multiplexer reports and what makes the socket check a no-op — so a test
+    /// that does not care is unaffected, and the one that does can drive both
+    /// sides of the comparison from the identity's own `host`.
+    server: Option<crate::session::MuxServerIdentity>,
 }
 
 impl FakeBackend {
@@ -103,6 +122,10 @@ impl FakeBackend {
             spawnable: false,
             spawn_output: Vec::new(),
             hook_events: std::sync::Mutex::new(Vec::new()),
+            panes: std::sync::Mutex::new(HashMap::new()),
+            spawned: std::sync::atomic::AtomicU32::new(0),
+            kill_refuses: false,
+            server: None,
         }
     }
 
@@ -110,8 +133,15 @@ impl FakeBackend {
     fn spawnable() -> Self {
         Self {
             spawnable: true,
-            spawn_output: Vec::new(),
-            hook_events: std::sync::Mutex::new(Vec::new()),
+            ..Self::stub()
+        }
+    }
+
+    /// Spawnable, but every `kill` is refused — the pane friring cannot stop.
+    fn unstoppable() -> Self {
+        Self {
+            kill_refuses: true,
+            ..Self::spawnable()
         }
     }
 
@@ -119,6 +149,26 @@ impl FakeBackend {
     fn spawnable_with_output(output: &[u8]) -> Self {
         Self {
             spawn_output: output.to_vec(),
+            ..Self::spawnable()
+        }
+    }
+
+    /// Spawnable, but reporting a server whose socket is **not** the one the
+    /// generated policy denies — the multiplexer a policy launch must refuse to
+    /// land on (ADR-33).
+    fn on_a_socket_the_policy_does_not_name() -> Self {
+        Self {
+            server: Some(crate::session::MuxServerIdentity {
+                host: crate::session::HostMuxSockets {
+                    own_socket: std::path::PathBuf::from("/tmp/tmux-501/friring"),
+                    outer_socket: None,
+                    uid: 501,
+                },
+                socket_path: Some("/tmp/tmux-501/somebody-else".to_string()),
+                pid: Some(9),
+                start_time: None,
+                marker: Some("uuid".to_string()),
+            }),
             ..Self::spawnable()
         }
     }
@@ -153,11 +203,50 @@ impl SessionBackend for FakeBackend {
         _: u16,
     ) -> anyhow::Result<crate::agent::backend::SpawnedSession> {
         anyhow::ensure!(self.spawnable, "inert fake backend does not spawn");
+        let n = self
+            .spawned
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let pane = format!("%{n}");
+        let identity = crate::session::MuxIdentity {
+            server: Some("fake".into()),
+            window_id: Some(format!("@{n}")),
+            pane_id: Some(pane.clone()),
+            pane_pid: Some(40000 + n),
+            launch_key: None,
+        };
+        self.panes
+            .lock()
+            .unwrap()
+            .insert(pane.clone(), identity.clone());
         Ok(crate::agent::backend::SpawnedSession {
-            backend_id: "fake:0".into(),
+            identity,
+            backend_id: pane,
             output: Box::new(std::io::Cursor::new(self.spawn_output.clone())),
             input: Box::new(std::io::sink()),
         })
+    }
+
+    fn pane_identity(&self, backend_id: &str) -> anyhow::Result<crate::session::MuxIdentity> {
+        self.panes
+            .lock()
+            .unwrap()
+            .get(backend_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no such pane: {backend_id}"))
+    }
+
+    fn server_identity(&self) -> Option<crate::session::MuxServerIdentity> {
+        self.server.clone()
+    }
+
+    fn set_pane_marker(&self, backend_id: &str, value: &str) -> anyhow::Result<()> {
+        let mut panes = self.panes.lock().unwrap();
+        let pane = panes
+            .get_mut(backend_id)
+            .ok_or_else(|| anyhow::anyhow!("no such pane: {backend_id}"))?;
+        pane.launch_key = Some(value.to_string());
+        Ok(())
     }
     fn adopt(
         &self,
@@ -181,7 +270,9 @@ impl SessionBackend for FakeBackend {
     fn is_dead(&self, _: &str) -> anyhow::Result<bool> {
         Ok(false)
     }
-    fn kill(&self, _: &str) -> anyhow::Result<()> {
+    fn kill(&self, backend_id: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.kill_refuses, "fake backend refuses to kill a pane");
+        self.panes.lock().unwrap().remove(backend_id);
         Ok(())
     }
     fn detach(&self, _: &str) -> anyhow::Result<()> {
@@ -403,6 +494,21 @@ impl Harness {
     fn tick(&mut self) -> &mut Self {
         self.app.tick_core();
         self
+    }
+
+    /// Tick until the bridge's housekeeping pass has run once more.
+    ///
+    /// Driven off the pass's own counter rather than off the tick arithmetic,
+    /// so the two cadence constants stay free to change.
+    fn tick_until_bridge_housekeeping(&mut self) -> &mut Self {
+        let before = self.app.perf_counters().bridge_response_sweeps;
+        for _ in 0..200 {
+            self.tick();
+            if self.app.perf_counters().bridge_response_sweeps != before {
+                return self;
+            }
+        }
+        panic!("no bridge housekeeping pass inside 200 ticks");
     }
 
     /// Fast-forward the app's clock by `d` (see [`clock`]). Timers, debounces
@@ -5177,4 +5283,5477 @@ fn theme_picker_slash_is_not_query_text() {
         panic!("expected the theme picker");
     };
     assert_eq!(tp.filter_query(), "nord", "a second / must not type");
+}
+
+// ── The orchestration bridge's broker (ADR-30) ───────────────────────────
+
+/// Give session `idx` a sandbox profile granting `grants`, so the broker serves
+/// its queue.
+///
+/// A grant is a **profile** decision, so it is written as a stored profile
+/// rather than poked onto the session: the broker asks the profile, and a test
+/// that shortcut that would be testing something else.
+fn grant_bridge(h: &mut Harness, idx: usize, grants: &[crate::session::BridgeCapability]) {
+    let mut profile = crate::session::SandboxProfile::new(
+        "orchestrator",
+        vec![crate::session::SandboxPath::workspace("~/dev/app")],
+    );
+    profile.network_mode = crate::session::NetworkMode::None;
+    profile.bridge_grants = grants.to_vec();
+    h.app.db.upsert_sandbox_profile(&profile).unwrap();
+    h.app.sessions[idx].info.sandbox_profile = Some(profile.name.clone());
+    let key = h.app.sessions[idx].info.id.to_string();
+    crate::paths::create_session_signal_dir(&key).unwrap();
+    crate::paths::create_session_bridge_dirs(&key).unwrap();
+}
+
+/// Push a file's timestamps `age` into the past, so an age-based GC sees it as
+/// old without the test waiting for a real clock.
+fn backdate(path: &std::path::Path, age: std::time::Duration) {
+    let when = std::time::SystemTime::now() - age;
+    let file = std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("the file to backdate");
+    file.set_times(
+        std::fs::FileTimes::new()
+            .set_accessed(when)
+            .set_modified(when),
+    )
+    .expect("backdating the file");
+}
+
+/// Write one request into session `idx`'s queue, as its agent's client would.
+fn queue_request(h: &Harness, idx: usize, key: &str, request: &serde_json::Value) {
+    let session = h.app.sessions[idx].info.id.to_string();
+    let dir = crate::paths::bridge_request_dir(&session).unwrap();
+    std::fs::write(
+        dir.join(format!("{key}.req")),
+        serde_json::to_string(request).unwrap(),
+    )
+    .unwrap();
+}
+
+/// The answer to `key`, once one exists.
+fn bridge_answer(h: &Harness, idx: usize, key: &str) -> Option<serde_json::Value> {
+    let session = h.app.sessions[idx].info.id.to_string();
+    let path = crate::paths::bridge_response_dir(&session)
+        .unwrap()
+        .join(format!("{key}.res"));
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+}
+
+/// A well-formed request envelope.
+fn envelope(key: &str, verb: &str, body: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "protocol": crate::session::bridge::BRIDGE_PROTOCOL,
+        "key": key,
+        "verb": verb,
+        "body": body,
+    })
+}
+
+/// A queued request is served within two ticks — the broker polls on its own
+/// cadence, so "next tick" is not the promise; "promptly, without the client
+/// doing anything else" is.
+#[test]
+fn a_queued_bridge_request_is_served_within_two_ticks() {
+    let mut h = Harness::standard(1);
+    grant_bridge(&mut h, 0, &[crate::session::BridgeCapability::Mailbox]);
+    queue_request(
+        &h,
+        0,
+        "abc-1234",
+        &envelope("abc-1234", "status", serde_json::json!({})),
+    );
+
+    for _ in 0..2 * 3 {
+        h.tick();
+        if bridge_answer(&h, 0, "abc-1234").is_some() {
+            break;
+        }
+    }
+    let answer = bridge_answer(&h, 0, "abc-1234").expect("the broker answered");
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert!(answer["data"]["children"].is_array(), "{answer}");
+}
+
+/// The per-tick budget holds under a flood: a client writing faster than friring
+/// answers costs latency, never frames. Asserted on the counter, because that is
+/// the only thing a wall-clock-free test can prove about a budget.
+#[test]
+fn the_bridge_tick_budget_holds_under_a_flood() {
+    let mut h = Harness::standard(1);
+    grant_bridge(&mut h, 0, &[crate::session::BridgeCapability::Mailbox]);
+    for n in 0..100 {
+        queue_request(
+            &h,
+            0,
+            &format!("flood-{n:04}"),
+            &envelope(&format!("flood-{n:04}"), "status", serde_json::json!({})),
+        );
+    }
+
+    let before = h.app.perf_counters().bridge_requests_served;
+    // Enough ticks for exactly one polling pass.
+    for _ in 0..3 {
+        h.tick();
+    }
+    let served = h.app.perf_counters().bridge_requests_served - before;
+    assert!(
+        served <= crate::app::bridge::REQUESTS_PER_TICK as u64,
+        "one pass served {served}, past the per-tick budget"
+    );
+    assert!(served > 0, "the pass must make progress");
+}
+
+/// ADR-P16. A **placeholder** bridge session's queue is never polled. It has no
+/// agent process on this host, so by construction nothing is filling its `req/`
+/// and a poll could only ever find the directory empty.
+///
+/// Asserted on the counter, because from the outside a pass over an empty queue
+/// and a pass that never happened look identical — which is exactly what let
+/// this cost 24% of a render thread unnoticed. The second half is the other
+/// side of the same rule: nothing is remembered about the skip, so loading the
+/// session serves the request that was waiting all along.
+#[tokio::test]
+async fn perf_a_ghost_bridge_session_is_never_polled_and_serving_resumes_on_load() {
+    let mut h = Harness::spawnable(2);
+    // Unloaded *before* the profile is attached: this test is about the poll,
+    // and a sandboxed relaunch is a different path with its own tests.
+    h.app.set_active_index(1);
+    h.alt('u'); // UnloadSession
+    assert!(
+        h.app.sessions[1].is_ghost(),
+        "the row is a ghost to begin with"
+    );
+    grant_bridge(&mut h, 0, &[crate::session::BridgeCapability::Mailbox]);
+    grant_bridge(&mut h, 1, &[crate::session::BridgeCapability::Mailbox]);
+    queue_request(
+        &h,
+        1,
+        "ghost-001",
+        &envelope("ghost-001", "status", serde_json::json!({})),
+    );
+
+    let before = h.app.perf_counters().bridge_queue_polls;
+    // Three ticks is exactly one polling pass, whatever the tick count is at.
+    for _ in 0..3 {
+        h.tick();
+    }
+    assert_eq!(
+        h.app.perf_counters().bridge_queue_polls - before,
+        1,
+        "a pass over two bridge sessions polled the unloaded one's queue too"
+    );
+    assert!(
+        bridge_answer(&h, 1, "ghost-001").is_none(),
+        "a ghost's queue was served"
+    );
+
+    h.app.set_active_index(1);
+    h.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(!h.app.sessions[1].is_ghost(), "the ghost did not load");
+    for _ in 0..6 {
+        h.tick();
+        if bridge_answer(&h, 1, "ghost-001").is_some() {
+            break;
+        }
+    }
+    let answer = bridge_answer(&h, 1, "ghost-001")
+        .expect("the request waiting since before the unload was never served");
+    assert_eq!(answer["ok"], true, "{answer}");
+}
+
+/// ADR-P16. The shared `.taking` directory is minted **once per broker pass**,
+/// not once per session that pass serves.
+///
+/// Counted at [`crate::paths::mint_bridge_taking_dir`] itself rather than at the
+/// broker's call to it: a gate on the caller would still pass if the mint moved
+/// back inside the per-session take, which is the shape of the bug.
+#[test]
+fn perf_a_bridge_pass_mints_the_taking_directory_once() {
+    const SESSIONS: usize = 4;
+    const PASSES: u64 = 3;
+    let mut h = Harness::standard(SESSIONS);
+    for idx in 0..SESSIONS {
+        grant_bridge(&mut h, idx, &[crate::session::BridgeCapability::Mailbox]);
+    }
+
+    let polls_before = h.app.perf_counters().bridge_queue_polls;
+    crate::paths::BRIDGE_TAKING_MINTS.with(|mints| mints.set(0));
+    for _ in 0..(PASSES * crate::app::bridge::POLL_TICKS) {
+        h.tick();
+    }
+    let mints = crate::paths::BRIDGE_TAKING_MINTS.with(|mints| mints.get()) as u64;
+    let polls = h.app.perf_counters().bridge_queue_polls - polls_before;
+
+    assert_eq!(
+        polls,
+        PASSES * SESSIONS as u64,
+        "every session is still polled"
+    );
+    assert_eq!(
+        mints, PASSES,
+        "the staging directory was minted {mints} times for {polls} queue polls"
+    );
+}
+
+/// ADR-P16. The response GC reaches every bridge channel's `res/` directory —
+/// nothing else removes an answer a client never acknowledged — while sweeping
+/// only a bounded slice of them per pass.
+///
+/// The roster is the **disk**, and the two cases that shows are the ones a
+/// session list cannot: a ghost, which is a session with no process, and a
+/// channel with no session row in memory at all — which is what a cleanly
+/// stopped child leaves behind, since the quiesce retires its runtime and keeps
+/// everything else.
+#[tokio::test]
+async fn perf_the_response_gc_sweeps_every_channel_a_slice_at_a_time() {
+    use crate::app::bridge::RESPONSE_GC_BATCH;
+    // More channels than one slice, so "swept everything" and "swept a slice"
+    // are distinguishable.
+    let sessions = RESPONSE_GC_BATCH + 2;
+    let mut h = Harness::spawnable(sessions);
+    h.app.set_active_index(sessions - 1);
+    h.alt('u'); // one of them is a ghost, and its directory must still shrink
+    assert!(h.app.sessions[sessions - 1].is_ghost());
+    for idx in 0..sessions {
+        grant_bridge(&mut h, idx, &[crate::session::BridgeCapability::Mailbox]);
+    }
+    // The parked child: a channel friring minted whose session is no longer in
+    // the list. Never swept while the roster was the session list.
+    let retired = SessionId::default().to_string();
+    crate::paths::create_session_signal_dir(&retired).unwrap();
+    crate::paths::create_session_bridge_dirs(&retired).unwrap();
+
+    let mut keys: Vec<String> = (0..sessions)
+        .map(|idx| h.app.sessions[idx].info.id.to_string())
+        .collect();
+    keys.push(retired.clone());
+    let stale: Vec<std::path::PathBuf> = keys
+        .iter()
+        .map(|key| {
+            let path = crate::paths::bridge_response_dir(key)
+                .unwrap()
+                .join("aged-0001.res");
+            std::fs::write(&path, "{}").unwrap();
+            backdate(&path, crate::app::bridge::RESPONSE_MAX_AGE * 2);
+            path
+        })
+        .collect();
+    // A fresh answer in the same directory proves this is an age GC and not a
+    // sweep of everything it finds.
+    let fresh = crate::paths::bridge_response_dir(&keys[0])
+        .unwrap()
+        .join("fresh-0001.res");
+    std::fs::write(&fresh, "{}").unwrap();
+
+    // One housekeeping pass: a slice, not the fleet. At most the batch can have
+    // gone, and the slice may also have landed on channels this test did not
+    // put a stale file in — so the bound is what is asserted.
+    h.tick_until_bridge_housekeeping();
+    let survivors = stale.iter().filter(|p| p.exists()).count();
+    assert!(
+        survivors >= stale.len() - RESPONSE_GC_BATCH,
+        "one pass swept {} of {} channels, past a slice of {RESPONSE_GC_BATCH}",
+        stale.len() - survivors,
+        stale.len()
+    );
+
+    // Keep going: the cursor moves on, so the whole roster comes round.
+    for _ in 0..(2 * stale.len()) {
+        h.tick_until_bridge_housekeeping();
+    }
+    let left: Vec<&std::path::PathBuf> = stale.iter().filter(|p| p.exists()).collect();
+    assert!(
+        left.is_empty(),
+        "the sweep never reached these channels: {left:?}"
+    );
+    assert!(fresh.exists(), "the GC removed an answer that is not stale");
+}
+
+/// A session whose profile grants nothing has no bridge, whatever its agent
+/// asks for. The refusal is a code the caller can act on, not prose.
+#[test]
+fn a_verb_without_its_grant_is_refused() {
+    let mut h = Harness::standard(1);
+    grant_bridge(&mut h, 0, &[]);
+    queue_request(
+        &h,
+        0,
+        "abc-1234",
+        &envelope("abc-1234", "status", serde_json::json!({})),
+    );
+    for _ in 0..6 {
+        h.tick();
+    }
+    let answer = bridge_answer(&h, 0, "abc-1234").expect("the broker answered");
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"], "grant_missing", "{answer}");
+}
+
+/// `inbox` reads the caller's own mail and there is no way to ask for another
+/// session's: the recipient comes from the queue the request landed in.
+#[test]
+fn an_inbox_never_returns_another_sessions_mail() {
+    let mut h = Harness::standard(2);
+    grant_bridge(&mut h, 0, &[crate::session::BridgeCapability::Mailbox]);
+    let caller = h.app.sessions[0].info.id;
+    let other = h.app.sessions[1].info.id;
+    for (to, body) in [(caller, "for the caller"), (other, "for somebody else")] {
+        h.app
+            .db
+            .enqueue_message(&crate::storage::messages::NewMessage {
+                to_session_id: to,
+                from_session_id: None,
+                from_task_id: None,
+                kind: "task".to_string(),
+                body: body.to_string(),
+                in_reply_to: None,
+            })
+            .unwrap();
+    }
+
+    queue_request(
+        &h,
+        0,
+        "abc-1234",
+        &envelope("abc-1234", "inbox", serde_json::json!({ "claim": true })),
+    );
+    for _ in 0..6 {
+        h.tick();
+    }
+    let answer = bridge_answer(&h, 0, "abc-1234").expect("the broker answered");
+    assert_eq!(answer["ok"], true, "{answer}");
+    let bodies: Vec<String> = answer["data"]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(bodies, ["for the caller"], "{answer}");
+    // And the other session's mail is untouched.
+    assert_eq!(h.app.db.count_unread_messages(other).unwrap(), 1);
+}
+
+/// A `send` to a session the caller does not own is refused by the ownership
+/// row, not by a name check: `to` is a name the broker resolves.
+#[test]
+fn a_send_to_a_session_the_caller_does_not_own_is_refused() {
+    let mut h = Harness::standard(2);
+    grant_bridge(&mut h, 0, &[crate::session::BridgeCapability::Mailbox]);
+    let stranger = h.app.sessions[1].info.id.to_string();
+    // The stranger is somebody *else's* child, so it exists as a child and is
+    // still not this caller's.
+    h.app
+        .db
+        .insert_bridge_child(&stranger, "some-other-owner", "k-1")
+        .unwrap();
+
+    queue_request(
+        &h,
+        0,
+        "abc-1234",
+        &envelope(
+            "abc-1234",
+            "send",
+            serde_json::json!({ "to": stranger, "kind": "task", "body": "do this" }),
+        ),
+    );
+    for _ in 0..6 {
+        h.tick();
+    }
+    let answer = bridge_answer(&h, 0, "abc-1234").expect("the broker answered");
+    assert_eq!(answer["error"], "not_owner", "{answer}");
+    assert_eq!(
+        h.app
+            .db
+            .count_unread_messages(h.app.sessions[1].info.id)
+            .unwrap(),
+        0,
+        "nothing was delivered"
+    );
+}
+
+/// A kind sent in the wrong direction is refused: a child that could send
+/// `task` would be assigning work to its owner, and one that could send
+/// `child.done` would be reporting a verdict only the host may reach.
+#[test]
+fn a_mail_kind_in_the_wrong_direction_is_refused() {
+    let mut h = Harness::standard(2);
+    grant_bridge(&mut h, 0, &[crate::session::BridgeCapability::Mailbox]);
+    let child = h.app.sessions[1].info.id.to_string();
+    let owner = h.app.sessions[0].info.id.to_string();
+    h.app.db.insert_bridge_child(&child, &owner, "k-1").unwrap();
+    h.app
+        .db
+        .set_bridge_child_state(&child, crate::session::ChildState::Ready)
+        .unwrap();
+
+    for (n, kind) in ["result", "child.done"].iter().enumerate() {
+        let key = format!("dir-{n:05}");
+        queue_request(
+            &h,
+            0,
+            &key,
+            &envelope(
+                &key,
+                "send",
+                serde_json::json!({ "to": child, "kind": kind, "body": "{}" }),
+            ),
+        );
+        for _ in 0..6 {
+            h.tick();
+        }
+        let answer = bridge_answer(&h, 0, &key).expect("the broker answered");
+        assert_eq!(answer["ok"], false, "{kind} must be refused: {answer}");
+    }
+    // …while the kind this direction *does* allow goes through.
+    queue_request(
+        &h,
+        0,
+        "task-0001",
+        &envelope(
+            "task-0001",
+            "send",
+            serde_json::json!({ "to": child, "kind": "task", "body": "do this" }),
+        ),
+    );
+    for _ in 0..6 {
+        h.tick();
+    }
+    assert_eq!(bridge_answer(&h, 0, "task-0001").unwrap()["ok"], true);
+}
+
+/// A `result` whose body is not a `ResultBody` is refused and starts no
+/// quiesce: "the child asked to finish" is the one message that must not be
+/// inferred from free text.
+#[test]
+fn a_result_that_is_not_a_result_body_is_refused() {
+    let mut h = Harness::standard(2);
+    grant_bridge(&mut h, 1, &[crate::session::BridgeCapability::Mailbox]);
+    let child = h.app.sessions[1].info.id.to_string();
+    let owner = h.app.sessions[0].info.id.to_string();
+    h.app.db.insert_bridge_child(&child, &owner, "k-1").unwrap();
+    h.app
+        .db
+        .set_bridge_child_state(&child, crate::session::ChildState::Working)
+        .unwrap();
+
+    queue_request(
+        &h,
+        1,
+        "abc-1234",
+        &envelope(
+            "abc-1234",
+            "send",
+            serde_json::json!({ "to": "owner", "kind": "result", "body": "all done!" }),
+        ),
+    );
+    for _ in 0..6 {
+        h.tick();
+    }
+    let answer = bridge_answer(&h, 1, "abc-1234").expect("the broker answered");
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert!(
+        answer["message"].as_str().unwrap().contains("outcome"),
+        "{answer}"
+    );
+    // The child is still working: nothing about its state moved.
+    assert_eq!(
+        h.app.db.bridge_child_state(&child).unwrap().unwrap().state,
+        crate::session::ChildState::Working
+    );
+}
+
+/// A child may not create children: orchestration is one level deep by
+/// construction, so the refusal comes from the ownership row rather than from a
+/// depth counter that could be miscounted.
+#[test]
+fn a_child_may_not_create_children() {
+    let mut h = Harness::standard(2);
+    grant_bridge(
+        &mut h,
+        1,
+        &[
+            crate::session::BridgeCapability::ChildLifecycle,
+            crate::session::BridgeCapability::Mailbox,
+        ],
+    );
+    let child = h.app.sessions[1].info.id.to_string();
+    h.app
+        .db
+        .insert_bridge_child(&child, "some-owner", "k-1")
+        .unwrap();
+
+    queue_request(
+        &h,
+        1,
+        "abc-1234",
+        &envelope(
+            "abc-1234",
+            "create",
+            serde_json::json!({
+                "repo_root": "/repo",
+                "branch": "feat/x",
+                "agent": "worker",
+                "task_kind": "task",
+                "task_body": "go",
+            }),
+        ),
+    );
+    for _ in 0..6 {
+        h.tick();
+    }
+    let answer = bridge_answer(&h, 1, "abc-1234").expect("the broker answered");
+    assert_eq!(answer["error"], "depth_exceeded", "{answer}");
+}
+
+/// A replay returns the first answer's exact bytes; a key reused for a different
+/// request is refused and does nothing.
+#[test]
+fn a_replayed_request_is_answered_from_the_journal() {
+    let mut h = Harness::standard(1);
+    grant_bridge(&mut h, 0, &[crate::session::BridgeCapability::Report]);
+    let report = |summary: &str| {
+        envelope(
+            "abc-1234",
+            "report",
+            serde_json::json!({ "phase": "implementing", "summary": summary }),
+        )
+    };
+
+    queue_request(&h, 0, "abc-1234", &report("first"));
+    for _ in 0..6 {
+        h.tick();
+    }
+    let first = bridge_answer(&h, 0, "abc-1234").expect("the broker answered");
+    assert_eq!(first["ok"], true, "{first}");
+
+    // The same key and the same body: the first answer, verbatim.
+    queue_request(&h, 0, "abc-1234", &report("first"));
+    for _ in 0..6 {
+        h.tick();
+    }
+    assert_eq!(bridge_answer(&h, 0, "abc-1234").unwrap(), first);
+
+    // The same key, different work: refused, and nothing recorded.
+    let session = h.app.sessions[0].info.id.to_string();
+    let before = h.app.db.bridge_reports(&session, 50).unwrap().len();
+    queue_request(&h, 0, "abc-1234", &report("second"));
+    for _ in 0..6 {
+        h.tick();
+    }
+    let answer = bridge_answer(&h, 0, "abc-1234").unwrap();
+    assert_eq!(answer["error"], "key_reused", "{answer}");
+    assert_eq!(h.app.db.bridge_reports(&session, 50).unwrap().len(), before);
+}
+
+/// A request from a friring speaking another protocol version is refused rather
+/// than interpreted.
+#[test]
+fn a_request_from_another_protocol_version_is_refused() {
+    let mut h = Harness::standard(1);
+    grant_bridge(&mut h, 0, &[crate::session::BridgeCapability::Mailbox]);
+    let mut request = envelope("abc-1234", "status", serde_json::json!({}));
+    request["protocol"] = serde_json::json!(999);
+    queue_request(&h, 0, "abc-1234", &request);
+    for _ in 0..6 {
+        h.tick();
+    }
+    let answer = bridge_answer(&h, 0, "abc-1234").expect("the broker answered");
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert!(
+        answer["message"].as_str().unwrap().contains("protocol"),
+        "{answer}"
+    );
+}
+
+/// A field friring does not recognise is a request that does not mean here what
+/// it meant where it was written, so it is refused rather than answered as
+/// though it said something else.
+#[test]
+fn a_request_with_an_unknown_field_is_refused() {
+    let mut h = Harness::standard(1);
+    grant_bridge(&mut h, 0, &[crate::session::BridgeCapability::Report]);
+    let request = envelope(
+        "abc-1234",
+        "report",
+        serde_json::json!({ "phase": "implementing", "escalate_to_root": true }),
+    );
+    queue_request(&h, 0, "abc-1234", &request);
+    for _ in 0..6 {
+        h.tick();
+    }
+    let answer = bridge_answer(&h, 0, "abc-1234").expect("the broker answered");
+    assert_eq!(answer["ok"], false, "{answer}");
+}
+
+// ── Stage F: the child lifecycle (ADR-32) ────────────────────────────────
+
+/// A [`ChildEffects`](crate::app::bridge_spawn::ChildEffects) a test scripts.
+///
+/// The saga's whole contract is about what survives a failure at each step, so
+/// every step it does outside SQLite has to be one a test can *make* fail. Real
+/// `git` cannot be persuaded to refuse a checkout on demand, and a real egress
+/// supervisor cannot be persuaded to go silent, so both are scripted here and
+/// every call is recorded.
+#[derive(Default)]
+struct ScriptedEffects {
+    calls: std::sync::Mutex<Vec<String>>,
+    /// What `create_worktree` answers. `None` succeeds with a fabricated path.
+    /// What S2 fails with, and whether that failure claimed the branch first —
+    /// the two cases the unwind must tell apart.
+    worktree_error: std::sync::Mutex<Option<crate::git::ClaimFailure>>,
+    /// The directory a successful checkout reports.
+    worktree_path: std::sync::Mutex<Option<std::path::PathBuf>>,
+    base_head: std::sync::Mutex<Option<String>>,
+    /// What the post-stop inspection finds.
+    verdict: std::sync::Mutex<crate::git::WorktreeVerdict>,
+    /// What the seeding answers.
+    seed_error: std::sync::Mutex<Option<String>>,
+    /// Whether the egress supervisor acknowledges the commit.
+    acknowledges: std::sync::atomic::AtomicBool,
+    /// How many commits a branch carries, for the reclaim rule.
+    ahead: std::sync::Mutex<Option<u32>>,
+    removed_worktrees: std::sync::Mutex<Vec<String>>,
+    deleted_branches: std::sync::Mutex<Vec<String>>,
+    /// What `worktree_is_on` answers. `Some(true)` — the default — is what a
+    /// real successful claim leaves; `Some(false)` is the sanitized-name
+    /// collision, where the recorded path is another launch's worktree, and
+    /// `None` is a git that would not say.
+    worktree_is_on: std::sync::Mutex<Option<bool>>,
+    /// The multiplexer this harness's children were spawned on, so
+    /// `verify_worktree` can record whether any pane was still alive **at the
+    /// moment it looked**.
+    ///
+    /// The quiesce's whole promise is that the host reads the worktree only
+    /// after the child's pane is dead. Asserting that the two both *happened*
+    /// proves nothing about their order — the kill goes through the backend and
+    /// the verification through this seam, two separate pieces of state — so the
+    /// ordering has to be observed from inside one of them.
+    panes: std::sync::Mutex<Option<Arc<FakeBackend>>>,
+    /// How many panes were alive each time `verify_worktree` ran.
+    panes_alive_at_verify: std::sync::Mutex<Vec<usize>>,
+}
+
+impl ScriptedEffects {
+    fn new() -> Arc<Self> {
+        let effects = Self::default();
+        effects
+            .acknowledges
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // `Default` is `None`, which means "git would not say" and would make
+        // every unwind decline. The ordinary case is a directory this launch
+        // really made.
+        *effects.worktree_is_on.lock().unwrap() = Some(true);
+        Arc::new(effects)
+    }
+
+    fn note(&self, what: &str) {
+        self.calls.lock().unwrap().push(what.to_string());
+    }
+
+    fn called(&self, what: &str) -> bool {
+        self.calls.lock().unwrap().iter().any(|c| c == what)
+    }
+
+    /// Watch `backend` so every verification records the live pane count.
+    fn watching(&self, backend: &Arc<FakeBackend>) {
+        *self.panes.lock().unwrap() = Some(Arc::clone(backend));
+    }
+}
+
+impl crate::app::bridge_spawn::ChildEffects for ScriptedEffects {
+    fn create_worktree(
+        &self,
+        _repo: &Path,
+        _branch: &str,
+        _base: &str,
+    ) -> Result<std::path::PathBuf, crate::git::ClaimFailure> {
+        self.note("create_worktree");
+        if let Some(error) = self.worktree_error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        Ok(self
+            .worktree_path
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("/fabricated/worktree")))
+    }
+
+    fn head_commit(&self, _cwd: &Path) -> Option<String> {
+        self.base_head.lock().unwrap().clone()
+    }
+
+    fn verify_worktree(
+        &self,
+        _worktree: &Path,
+        _base_head: Option<&str>,
+    ) -> crate::git::WorktreeVerdict {
+        self.note("verify_worktree");
+        // Read *now*, not afterwards: this is the instant the host looks at the
+        // worktree, and the quiesce's promise is that nothing can be writing it.
+        let alive = self
+            .panes
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|b| b.panes.lock().unwrap().len())
+            .unwrap_or(0);
+        self.panes_alive_at_verify.lock().unwrap().push(alive);
+        self.verdict.lock().unwrap().clone()
+    }
+
+    fn worktree_is_on(&self, _repo: &Path, _worktree: &Path, _branch: &str) -> Option<bool> {
+        self.note("worktree_is_on");
+        // Defaults to yes, which is what a real successful claim leaves behind;
+        // a test that wants the sanitized-name collision (or a git that will not
+        // answer) sets it.
+        *self.worktree_is_on.lock().unwrap()
+    }
+
+    fn remove_worktree(&self, _repo: &Path, worktree: &Path) -> Result<(), String> {
+        self.note("remove_worktree");
+        self.removed_worktrees
+            .lock()
+            .unwrap()
+            .push(worktree.display().to_string());
+        Ok(())
+    }
+
+    fn delete_branch(&self, _repo: &Path, branch: &str) -> Result<(), String> {
+        self.note("delete_branch");
+        self.deleted_branches
+            .lock()
+            .unwrap()
+            .push(branch.to_string());
+        Ok(())
+    }
+
+    fn commits_ahead(&self, _repo: &Path, _base: &str, _tip: &str) -> Option<u32> {
+        *self.ahead.lock().unwrap()
+    }
+
+    fn egress_acknowledged(&self, _session_key: &str) -> bool {
+        self.acknowledges.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn seed_child_state(
+        &self,
+        _plan: &crate::sandbox::child_state::SeedPlan,
+    ) -> Result<(), String> {
+        self.note("seed_child_state");
+        match self.seed_error.lock().unwrap().clone() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A harness whose one session can create bridge children.
+///
+/// Everything a `create` needs and nothing more: a spawnable backend that
+/// reports pane identities (so every ADR-32 identity rule is exercised rather
+/// than skipped), a profile granting `child-lifecycle`, a recorded repository,
+/// a child agent friring can give private state to, and a fabricated sandbox
+/// host so the composition resolves the same backend on every machine.
+struct ChildHarness {
+    h: Harness,
+    effects: Arc<ScriptedEffects>,
+    // Held for its `Drop`: the host override is thread-local.
+    _sandbox: crate::agent::sandboxing::TestSandboxHost,
+}
+
+/// The agent a child runs, declaring exactly what private state needs.
+fn worker_agent() -> crate::session::AgentDef {
+    crate::session::AgentDef {
+        name: "worker".into(),
+        command: "worker".into(),
+        args: vec![],
+        resume_args: vec![],
+        fork_args: vec![],
+        new_session_args: vec![],
+        resume_latest: false,
+        hook_schema: None,
+        transcript: None,
+        sandbox: Some(crate::session::AgentSandboxDef {
+            config_dir_env: Some("WORKER_HOME".into()),
+            state_dir: Some("~/.worker".into()),
+            ..Default::default()
+        }),
+    }
+}
+
+impl ChildHarness {
+    fn new() -> Self {
+        Self::with_watched_backend(Arc::new(FakeBackend::spawnable()))
+    }
+
+    /// A harness whose effects seam can see the multiplexer, so the quiesce's
+    /// *ordering* is observable and not merely its two halves.
+    fn with_watched_backend(backend: Arc<FakeBackend>) -> Self {
+        let watched = Arc::clone(&backend);
+        let harness = Self::with_backend(backend);
+        harness.effects.watching(&watched);
+        harness
+    }
+
+    fn with_backend(backend: Arc<dyn SessionBackend>) -> Self {
+        let mut h = Harness::with_backend(STD_COLS, STD_ROWS, 1, backend);
+        // Installed *after* the harness pinned its paths: the fabricated place
+        // tree and the profile file both land under the tempdir.
+        let sandbox = crate::agent::sandboxing::TestSandboxHost::seatbelt();
+
+        let mut profile = crate::session::SandboxProfile::new(
+            "orchestrator",
+            vec![crate::session::SandboxPath::workspace("~/dev/app")],
+        );
+        profile.network_mode = crate::session::NetworkMode::None;
+        profile.bridge_grants = vec![
+            crate::session::BridgeCapability::ChildLifecycle,
+            crate::session::BridgeCapability::Mailbox,
+            crate::session::BridgeCapability::Report,
+        ];
+        profile.child_agents = vec!["worker".into()];
+        profile.max_children = 2;
+        h.app.db.upsert_sandbox_profile(&profile).unwrap();
+        h.app.sessions[0].info.sandbox_profile = Some(profile.name.clone());
+        h.app.agents.agents.push(worker_agent());
+
+        let owner = h.app.sessions[0].info.id.to_string();
+        crate::paths::create_session_signal_dir(&owner).unwrap();
+        crate::paths::create_session_bridge_dirs(&owner).unwrap();
+        h.app
+            .db
+            .upsert_session_repo(&owner, "/repo/app", "cwd", Some("/repo/app"), None)
+            .unwrap();
+
+        let effects = ScriptedEffects::new();
+        h.app.child_lifecycle =
+            crate::app::bridge_spawn::ChildLifecycle::with_effects(Arc::clone(&effects) as Arc<_>);
+        Self {
+            h,
+            effects,
+            _sandbox: sandbox,
+        }
+    }
+
+    fn owner(&self) -> SessionId {
+        self.h.app.sessions[0].info.id
+    }
+
+    /// Queue a `create` as the owner's own agent would.
+    fn create(&mut self, key: &str) {
+        self.create_on(key, "feat/one");
+    }
+
+    /// [`Self::create`] on a named branch, for a test that needs two children at
+    /// once: two creates resolving to one worktree directory are refused, so a
+    /// second live child needs a branch of its own.
+    fn create_on(&mut self, key: &str, branch: &str) {
+        queue_request(
+            &self.h,
+            0,
+            key,
+            &envelope(
+                key,
+                "create",
+                serde_json::json!({
+                    "repo_root": "/repo/app",
+                    "branch": branch,
+                    "agent": "worker",
+                    "task_kind": "task",
+                    "task_body": "do the thing",
+                }),
+            ),
+        );
+    }
+
+    /// Run the tick pipeline and the saga driver `passes` times.
+    ///
+    /// Every wait in the saga is a state check or a pass counter rather than a
+    /// wall-clock sleep, so this converges in a handful of passes. The short
+    /// sleep is only to let a blocking task's worker thread finish.
+    async fn drive(&mut self, passes: usize) {
+        for _ in 0..passes {
+            self.h.tick();
+            self.h.app.tick_child_sagas();
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Drive until `stop` says so, or the budget runs out.
+    async fn drive_until(&mut self, passes: usize, stop: impl Fn(&Self) -> bool) {
+        for _ in 0..passes {
+            self.h.tick();
+            self.h.app.tick_child_sagas();
+            if stop(self) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// [`Self::drive_until`] with the child's hook reporting on every pass.
+    ///
+    /// S9 accepts nothing but a hook report stamped at or after the gate opened,
+    /// so a test that lets a launch run to `ready` has to keep reporting rather
+    /// than report once — the pane may not exist yet on the pass it chose.
+    async fn drive_reporting(&mut self, passes: usize, stop: impl Fn(&Self) -> bool) {
+        for _ in 0..passes {
+            self.h.tick();
+            self.h.app.tick_child_sagas();
+            self.child_hook_reports();
+            if stop(self) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Drive until `key` has an answer, and return it.
+    async fn answer(&mut self, key: &str) -> serde_json::Value {
+        self.drive_until(60, |h| bridge_answer(&h.h, 0, key).is_some())
+            .await;
+        bridge_answer(&self.h, 0, key)
+            .unwrap_or_else(|| panic!("no answer to '{key}' after 60 passes"))
+    }
+
+    /// Create one child and drive it all the way to `ready`.
+    ///
+    /// The hook is reported on every pass, because S9 accepts nothing else and a
+    /// test that reported it once could report it before the pane existed.
+    async fn ready_child(&mut self, key: &str) -> crate::session::BridgeChild {
+        self.create(key);
+        for _ in 0..60 {
+            self.h.tick();
+            self.h.app.tick_child_sagas();
+            self.child_hook_reports();
+            if self.child_state() == Some(crate::session::ChildState::Ready) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            self.child_state(),
+            Some(crate::session::ChildState::Ready),
+            "the saga did not reach a ready child"
+        );
+        self.child().expect("a ready child")
+    }
+
+    /// Accept a finish intent from the child and drive the quiesce to a
+    /// terminal or held state.
+    async fn quiesce(&mut self, child: &str, outcome: crate::session::Outcome) {
+        let id: SessionId = child.parse().unwrap();
+        self.h.app.accept_finish_intent(id, outcome, None);
+        self.drive_until(60, |h| h.h.app.child_lifecycle.in_flight() == 0)
+            .await;
+    }
+
+    /// The one child this harness's owner has, if it has one.
+    fn child(&self) -> Option<crate::session::BridgeChild> {
+        self.h
+            .app
+            .db
+            .bridge_children_of(&self.owner().to_string())
+            .unwrap()
+            .into_iter()
+            .next()
+    }
+
+    fn child_state(&self) -> Option<crate::session::ChildState> {
+        let child = self.child()?;
+        self.h
+            .app
+            .db
+            .bridge_child_state(&child.child_id)
+            .unwrap()
+            .map(|row| row.state)
+    }
+
+    /// Report the child's hook state, which is S9's only accepted proof.
+    ///
+    /// Through the **hook row**, which is what the sandboxed status channel
+    /// writes and what S9 reads. Setting `SessionInfo::status` would prove
+    /// nothing: it is `Working` from the moment a session is constructed.
+    fn child_hook_reports(&mut self) {
+        let Some(child) = self.child() else { return };
+        let Ok(id) = child.child_id.parse::<SessionId>() else {
+            return;
+        };
+        let _ = self.h.app.db.set_hook_state(id, "idle");
+        self.h.app.cached_hook_states = self.h.app.db.load_hook_states().unwrap_or_default();
+    }
+
+    /// Report the child's hook state through the **file channel** a sandboxed
+    /// agent actually writes, rather than straight into the row.
+    ///
+    /// The difference is the dedupe: `apply_status_signals` drops a file that
+    /// repeats the recorded state, so it does not re-stamp `state_at` — and
+    /// `state_at` is the whole of S9's proof. A test that wrote the row directly
+    /// would never take that path, which is exactly the path a relaunched
+    /// agent's first report takes when it says the same word the previous one
+    /// ended on.
+    fn child_signals(&mut self, word: &str) {
+        let Some(child) = self.child() else { return };
+        let Ok(id) = child.child_id.parse::<SessionId>() else {
+            return;
+        };
+        let Ok(channel) = crate::paths::create_session_signal_dir(&child.child_id) else {
+            return;
+        };
+        std::fs::write(&channel.file, format!("{word}\n")).unwrap();
+        super::status_signals::apply_status_signals(&self.h.app.db, &[id]);
+        self.h.app.cached_hook_states = self.h.app.db.load_hook_states().unwrap_or_default();
+    }
+}
+
+/// The whole of `create`: a request in the queue becomes a committed child, a
+/// released gate and a `ready` state — and the request is answered only then.
+#[tokio::test]
+async fn a_create_runs_the_saga_to_a_ready_child() {
+    let mut h = ChildHarness::new();
+    h.create("create-0001");
+
+    // Up to the point the gate is released, nothing is answered: the client is
+    // still waiting, which is what a deferred verb means.
+    h.drive_until(60, |h| {
+        h.child()
+            .and_then(|c| h.h.app.db.child_saga_of_child(&c.child_id).ok().flatten())
+            .and_then(|saga| saga.step)
+            == Some(crate::session::SagaStep::Released)
+    })
+    .await;
+
+    let child = h.child().expect("the saga committed a child");
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Starting),
+        "a released gate is not yet a ready child"
+    );
+    assert!(
+        bridge_answer(&h.h, 0, "create-0001").is_none(),
+        "a create is answered when the child is ready, not before"
+    );
+    // The gate really was opened, by the host and by nothing else.
+    let gate = crate::sandbox::dirs::gate_release_file(&child.child_id).unwrap();
+    assert!(gate.exists(), "S8 renames a release file into the gate");
+
+    // The child's own hook reports — the only proof S9 accepts.
+    h.child_hook_reports();
+    h.drive_until(60, |h| {
+        h.child_state() == Some(crate::session::ChildState::Ready)
+    })
+    .await;
+
+    assert_eq!(h.child_state(), Some(crate::session::ChildState::Ready));
+    let answer = bridge_answer(&h.h, 0, "create-0001").expect("the saga answered");
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["data"]["child_id"], child.child_id, "{answer}");
+    assert_eq!(answer["data"]["state"], "ready", "{answer}");
+
+    // The child's first mail is the task, inserted in the same transaction as
+    // its row.
+    let id: SessionId = child.child_id.parse().unwrap();
+    let mail = h.h.app.db.list_messages(id, true, None).unwrap();
+    assert!(
+        mail.iter().any(|m| m.kind == "task"),
+        "the child's first mail is its task: {mail:?}"
+    );
+    // And the owner was told, in friring's own words.
+    let owner_mail = h.h.app.db.list_messages(h.owner(), true, None).unwrap();
+    assert!(
+        owner_mail.iter().any(|m| m.kind == "child.ready"),
+        "{owner_mail:?}"
+    );
+}
+
+/// The gate is what makes every step before S8 able to fail without the agent
+/// ever having run — so a silent supervisor never opens it.
+#[tokio::test]
+async fn a_silent_egress_supervisor_never_releases_the_gate() {
+    let mut h = ChildHarness::new();
+    // A supervisor that never says it holds the committed instance.
+    h.effects
+        .acknowledges
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    // The profile has to want a proxy for there to be anything to acknowledge.
+    let mut profile =
+        h.h.app
+            .db
+            .get_sandbox_profile("orchestrator")
+            .unwrap()
+            .unwrap()
+            .profile;
+    profile.network_mode = crate::session::NetworkMode::Allowlist;
+    profile.network_allow = vec!["api.example.com".into()];
+    h.h.app.db.upsert_sandbox_profile(&profile).unwrap();
+
+    h.create("create-0002");
+    h.drive(30).await;
+
+    // Unconditional: the saga must reach S6 and stop there. Wrapped in an
+    // `if let`, a launch that failed before the commit would assert nothing at
+    // all and the test would still be green.
+    let child = h
+        .child()
+        .expect("a child was committed before the egress gate");
+    let gate = crate::sandbox::dirs::gate_release_file(&child.child_id).unwrap();
+    let state =
+        h.h.app
+            .db
+            .bridge_child_state(&child.child_id)
+            .unwrap()
+            .map(|row| row.state);
+    assert_ne!(
+        state,
+        Some(crate::session::ChildState::Ready),
+        "a child whose proxy never acknowledged is never ready"
+    );
+    assert!(
+        !gate.exists(),
+        "the gate must stay shut while the boundary is unproven"
+    );
+    // Stopped *at* the acknowledgement, not before it and not past it.
+    let saga =
+        h.h.app
+            .db
+            .child_saga(&h.owner().to_string(), "create-0002")
+            .unwrap()
+            .expect("the saga row survives an unacknowledged commit");
+    assert_eq!(
+        saga.step,
+        Some(crate::session::SagaStep::Committed),
+        "the saga did not stop where the acknowledgement is waited on"
+    );
+    // …and the caller is still waiting, rather than being told it succeeded.
+    assert!(
+        bridge_answer(&h.h, 0, "create-0002").is_none(),
+        "a create was answered while its boundary was unproven: {:?}",
+        bridge_answer(&h.h, 0, "create-0002")
+    );
+}
+
+/// A `create` whose repository the owner does not work in is refused before
+/// anything is minted, and the refusal names which rule it broke.
+#[tokio::test]
+async fn a_create_outside_the_owners_repositories_is_refused() {
+    let mut h = ChildHarness::new();
+    queue_request(
+        &h.h,
+        0,
+        "create-0003",
+        &envelope(
+            "create-0003",
+            "create",
+            serde_json::json!({
+                "repo_root": "/somebody/elses/repo",
+                "branch": "feat/one",
+                "agent": "worker",
+                "task_kind": "task",
+                "task_body": "do the thing",
+            }),
+        ),
+    );
+    let answer = h.answer("create-0003").await;
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"], "repo_not_owned", "{answer}");
+    assert!(h.child().is_none(), "nothing was created");
+    assert!(!h.effects.called("create_worktree"), "and nothing was made");
+}
+
+/// ADR-33's socket check has exactly one production caller — the policy launch
+/// in `spawn_inner` — and every other test here runs against a backend that
+/// reports no server identity, so removing that call site would fail nothing.
+/// This is the launch that must not happen: a server whose `#{socket_path}` is
+/// not the one the generated policy denies is a server the policy says nothing
+/// about, and a child spawned onto it would be unconstrained in exactly the
+/// dimension the deny set exists for.
+#[tokio::test]
+async fn a_child_is_never_spawned_onto_a_server_the_policy_does_not_deny() {
+    let backend = Arc::new(FakeBackend::on_a_socket_the_policy_does_not_name());
+    let mut h = ChildHarness::with_watched_backend(Arc::clone(&backend));
+
+    h.create("create-0081");
+    let answer = h.answer("create-0081").await;
+
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert!(
+        answer["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("identity_mismatch"),
+        "the refusal must name the check that made it: {answer}"
+    );
+    // Refused *before* the window was opened, which is the whole point: a pane
+    // on the wrong server is one friring would then have to find and kill.
+    assert!(
+        backend.panes.lock().unwrap().is_empty(),
+        "a pane was opened on a server the policy does not constrain"
+    );
+}
+
+/// An agent the profile does not list is refused, whatever the request says.
+#[tokio::test]
+async fn a_create_naming_an_unlisted_agent_is_refused() {
+    let mut h = ChildHarness::new();
+    queue_request(
+        &h.h,
+        0,
+        "create-0004",
+        &envelope(
+            "create-0004",
+            "create",
+            serde_json::json!({
+                "repo_root": "/repo/app",
+                "branch": "feat/one",
+                "agent": "something-else",
+                "task_kind": "task",
+                "task_body": "do the thing",
+            }),
+        ),
+    );
+    let answer = h.answer("create-0004").await;
+    assert_eq!(answer["error"], "agent_not_allowed", "{answer}");
+}
+
+/// A `git` that refuses the checkout fails the saga, and the failure is the
+/// answer a replay of the same key returns.
+#[tokio::test]
+async fn a_worktree_that_cannot_be_created_fails_the_saga() {
+    let mut h = ChildHarness::new();
+    *h.effects.worktree_error.lock().unwrap() = Some(crate::git::ClaimFailure {
+        detail: "fatal: branch already checked out".into(),
+        owns_branch: false,
+    });
+    h.create("create-0005");
+    let answer = h.answer("create-0005").await;
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert!(
+        answer["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already checked out"),
+        "{answer}"
+    );
+    assert!(h.child().is_none(), "nothing was committed");
+
+    // The journal is what makes a retry safe: the same key returns this answer
+    // rather than starting a second saga.
+    let journaled =
+        h.h.app
+            .db
+            .bridge_request(&h.owner().to_string(), "create-0005")
+            .unwrap()
+            .expect("the request is journaled");
+    assert_eq!(
+        journaled.state,
+        crate::storage::bridge::RequestState::Failed,
+        "{journaled:?}"
+    );
+}
+
+/// A seeding that cannot be carried out is `state_unrelocatable`, and the child
+/// is never started: there is no shared-state mode and no fallback to one.
+#[tokio::test]
+async fn a_child_whose_private_state_cannot_be_seeded_is_refused() {
+    let mut h = ChildHarness::new();
+    *h.effects.seed_error.lock().unwrap() = Some("the hook file is not UTF-8".into());
+    h.create("create-0006");
+    let answer = h.answer("create-0006").await;
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"], "state_unrelocatable", "{answer}");
+    assert!(h.child().is_none());
+}
+
+/// A child whose pane runs but whose hook never reports is never `ready`: a
+/// live process does not show the agent is running from the private state
+/// friring seeded.
+#[tokio::test]
+async fn a_child_whose_hook_never_reports_is_never_ready() {
+    let mut h = ChildHarness::new();
+    h.create("create-0007");
+    h.drive_until(60, |h| {
+        h.child()
+            .and_then(|c| h.h.app.db.child_saga_of_child(&c.child_id).ok().flatten())
+            .and_then(|saga| saga.step)
+            == Some(crate::session::SagaStep::Released)
+    })
+    .await;
+    let child = h.child().expect("the saga committed a child");
+
+    // Driven well past the release, because the vacuous version of this rule
+    // reads `SessionInfo::status` — which is `Working` from the moment a session
+    // is constructed, so it says "ready" on the very first pass after S8.
+    h.drive(20).await;
+    assert_ne!(
+        h.child_state(),
+        Some(crate::session::ChildState::Ready),
+        "a pane is not proof the agent runs from its private state"
+    );
+    assert!(bridge_answer(&h.h, 0, "create-0007").is_none());
+
+    // Nor is a report from **before** the gate opened. A resume reuses the
+    // child's session id, so a row left by its previous life is exactly the
+    // stale proof S9 must not accept.
+    let id = child.child_id.parse::<SessionId>().unwrap();
+    h.h.app.db.set_hook_state_at(id, "idle", 1).unwrap();
+    h.h.app.cached_hook_states = h.h.app.db.load_hook_states().unwrap_or_default();
+    assert!(
+        h.h.app.cached_hook_states.contains_key(&id),
+        "the fixture wrote no hook row"
+    );
+    h.drive(10).await;
+    assert_ne!(
+        h.child_state(),
+        Some(crate::session::ChildState::Ready),
+        "a hook report older than the gate was accepted as this launch's"
+    );
+}
+
+/// A `result` is a finish **intent**, not a verdict: over a dirty worktree the
+/// child lands in `dirty` whatever the outcome claimed, and is never `done`.
+#[tokio::test]
+async fn a_dirty_worktree_is_never_integrated_whatever_the_child_claimed() {
+    for outcome in [
+        crate::session::Outcome::Completed,
+        crate::session::Outcome::Failed,
+    ] {
+        let mut h = ChildHarness::new();
+        *h.effects.verdict.lock().unwrap() = crate::git::WorktreeVerdict {
+            branch: Some("feat/one".into()),
+            head: Some("abc1234".into()),
+            dirty: true,
+            ahead_of_base: 1,
+            unreadable: false,
+        };
+        let child = h.ready_child("create-0008").await;
+        h.quiesce(&child.child_id, outcome).await;
+
+        assert_eq!(
+            h.child_state(),
+            Some(crate::session::ChildState::Dirty),
+            "'{outcome}' over a dirty worktree must not be integrated"
+        );
+        let verdict = h.h.app.db.bridge_result(&child.child_id).unwrap();
+        assert!(verdict.is_some_and(|v| v.dirty), "the host recorded dirty");
+        // And the slot is still held: the owner has to deal with the worktree.
+        assert_eq!(
+            h.h.app
+                .db
+                .live_bridge_children(&h.owner().to_string())
+                .unwrap(),
+            1
+        );
+        let owner_mail = h.h.app.db.list_messages(h.owner(), true, None).unwrap();
+        assert!(
+            owner_mail.iter().any(|m| m.kind == "child.dirty"),
+            "{owner_mail:?}"
+        );
+    }
+}
+
+/// A clean worktree takes the intent's own verdict — `failed` stays `failed`.
+#[tokio::test]
+async fn a_clean_worktree_takes_the_intents_own_verdict() {
+    let mut h = ChildHarness::new();
+    *h.effects.verdict.lock().unwrap() = crate::git::WorktreeVerdict {
+        branch: Some("feat/one".into()),
+        head: Some("abc1234".into()),
+        dirty: false,
+        ahead_of_base: 2,
+        unreadable: false,
+    };
+    let child = h.ready_child("create-0009").await;
+    h.quiesce(&child.child_id, crate::session::Outcome::Failed)
+        .await;
+
+    assert_eq!(h.child_state(), Some(crate::session::ChildState::Failed));
+    let verdict = h.h.app.db.bridge_result(&child.child_id).unwrap().unwrap();
+    assert_eq!(verdict.outcome, crate::session::Outcome::Failed);
+    assert_eq!(verdict.ahead_of_base, 2);
+    assert!(!verdict.dirty);
+    // The slot is released.
+    assert_eq!(
+        h.h.app
+            .db
+            .live_bridge_children(&h.owner().to_string())
+            .unwrap(),
+        0
+    );
+}
+
+/// A completed intent over a clean worktree is the one path to `done`.
+#[tokio::test]
+async fn a_completed_intent_over_a_clean_worktree_is_done() {
+    let mut h = ChildHarness::new();
+    *h.effects.verdict.lock().unwrap() = crate::git::WorktreeVerdict {
+        branch: Some("feat/one".into()),
+        head: Some("abc1234".into()),
+        dirty: false,
+        ahead_of_base: 1,
+        unreadable: false,
+    };
+    let child = h.ready_child("create-0021").await;
+    h.quiesce(&child.child_id, crate::session::Outcome::Completed)
+        .await;
+    assert_eq!(h.child_state(), Some(crate::session::ChildState::Done));
+    let owner_mail = h.h.app.db.list_messages(h.owner(), true, None).unwrap();
+    assert!(
+        owner_mail.iter().any(|m| m.kind == "child.done"),
+        "{owner_mail:?}"
+    );
+}
+
+/// A worktree git could not read is **dirty**, never verified-complete.
+#[tokio::test]
+async fn an_unreadable_worktree_is_never_reported_complete() {
+    let mut h = ChildHarness::new();
+    *h.effects.verdict.lock().unwrap() = crate::git::WorktreeVerdict {
+        dirty: true,
+        unreadable: true,
+        ..Default::default()
+    };
+    let child = h.ready_child("create-0022").await;
+    h.quiesce(&child.child_id, crate::session::Outcome::Completed)
+        .await;
+    assert_eq!(h.child_state(), Some(crate::session::ChildState::Dirty));
+}
+
+/// A pane friring cannot stop lands the child in `stop_failed` — never
+/// integrated, never reused, and surfaced for an operator.
+#[tokio::test]
+async fn a_pane_that_will_not_die_lands_in_stop_failed() {
+    let mut h = ChildHarness::with_backend(Arc::new(FakeBackend::unstoppable()));
+    let child = h.ready_child("create-0010").await;
+    h.quiesce(&child.child_id, crate::session::Outcome::Completed)
+        .await;
+
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::StopFailed)
+    );
+    assert!(
+        !h.effects.called("verify_worktree"),
+        "nothing is verified in a worktree whose agent may still be writing"
+    );
+    let owner_mail = h.h.app.db.list_messages(h.owner(), true, None).unwrap();
+    assert!(
+        owner_mail.iter().any(|m| m.kind == "child.stop_failed"),
+        "{owner_mail:?}"
+    );
+}
+
+/// A `result` whose body is not a `ResultBody` is refused and starts no
+/// quiesce: "the child asked to finish" is the one message that must never be
+/// inferred from free text.
+#[tokio::test]
+async fn a_malformed_result_starts_no_quiesce() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0011").await;
+
+    // The child's own queue, which the launch minted.
+    let dir = crate::paths::bridge_request_dir(&child.child_id).unwrap();
+    std::fs::write(
+        dir.join("bad-result-1.req"),
+        serde_json::to_string(&envelope(
+            "bad-result-1",
+            "send",
+            serde_json::json!({ "to": "owner", "kind": "result", "body": "I am done!" }),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let response = crate::paths::bridge_response_dir(&child.child_id)
+        .unwrap()
+        .join("bad-result-1.res");
+    h.drive_until(60, |_| response.exists()).await;
+
+    let answer: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&response).expect("the broker answered"))
+            .unwrap();
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_ne!(
+        h.child_state(),
+        Some(crate::session::ChildState::Finishing),
+        "a free-text result must not be read as a finish intent"
+    );
+    assert_eq!(h.h.app.child_lifecycle.in_flight(), 0);
+}
+
+/// One `create` key makes one child however often it is replayed, and the
+/// replay returns the first attempt's exact bytes.
+#[tokio::test]
+async fn a_replayed_create_returns_the_first_answer_and_makes_no_second_child() {
+    let mut h = ChildHarness::new();
+    h.ready_child("create-0012").await;
+    let first = bridge_answer(&h.h, 0, "create-0012").expect("the saga answered");
+
+    // The same key and the same body again.
+    h.create("create-0012");
+    h.drive(12).await;
+    let second = bridge_answer(&h.h, 0, "create-0012").expect("a replay is answered");
+    assert_eq!(first, second, "a replay returns the first attempt's answer");
+    assert_eq!(
+        h.h.app
+            .db
+            .bridge_children_of(&h.owner().to_string())
+            .unwrap()
+            .len(),
+        1,
+        "one key, one child"
+    );
+}
+
+/// A recipient nudged repeatedly with no bridge call in return is marked
+/// `stalled` **once** and told about once, rather than typed at forever.
+///
+/// What this cannot cover is the *delivery*: `send_prompt_now` talks to a real
+/// tmux, and this harness's backend is not one — a nudge here never leaves. So
+/// the give-up rule is asserted from the counter it actually runs on, and
+/// delivery into a live pane is left to the harnesses that have a multiplexer
+/// (`docs/E2E.md`).
+#[tokio::test]
+async fn a_recipient_that_never_answers_is_marked_once_and_not_nudged_forever() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0080").await;
+    let id: SessionId = child.child_id.parse().unwrap();
+
+    h.h.app.owe_bridge_nudge_for_test(id);
+    for _ in 0..12 {
+        h.h.app.force_bridge_nudge_unanswered_for_test(id);
+        h.drive(1).await;
+    }
+
+    assert_eq!(
+        h.h.app
+            .db
+            .bridge_child_state(&child.child_id)
+            .unwrap()
+            .map(|row| row.state),
+        Some(crate::session::ChildState::Stalled),
+        "a recipient that never answers was nudged forever"
+    );
+    // Said once, not every tick: `stalled` is attention, and repeating it would
+    // bury the owner's mailbox under one child.
+    let owner_mail =
+        h.h.app
+            .db
+            .list_messages(h.owner(), false, Some(50))
+            .unwrap();
+    assert_eq!(
+        owner_mail
+            .iter()
+            .filter(|m| m.kind == crate::session::bridge::MailKind::ChildStalled.as_str())
+            .count(),
+        1,
+        "the owner was told more than once: {owner_mail:?}"
+    );
+}
+
+/// **Any** bridge call resets the unanswered-nudge count — not only an
+/// `inbox --claim`.
+///
+/// The rule the stall watch enforces is that the agent is still talking to
+/// friring, so a `status` answers a nudge exactly as reading the mail does. A
+/// child one nudge below the give-up threshold that calls `status` and is then
+/// nudged again must not be marked `stalled`: `stalled` is sticky (nothing
+/// moves it back but an operator), so a count that only mail could spend would
+/// retire a child that was answering all along.
+#[tokio::test]
+async fn any_bridge_call_from_a_nudged_child_resets_its_unanswered_count() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0081").await;
+    let id: SessionId = child.child_id.parse().unwrap();
+
+    // One nudge below the threshold, with nothing back yet.
+    h.h.app.owe_bridge_nudge_for_test(id);
+    for _ in 0..(crate::app::bridge::MAX_UNANSWERED_NUDGES - 1) {
+        h.h.app.force_bridge_nudge_unanswered_for_test(id);
+        h.drive(1).await;
+    }
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Ready),
+        "the child was retired before the threshold"
+    );
+
+    // A `status` from the child — not an `inbox --claim`.
+    let dir = crate::paths::bridge_request_dir(&child.child_id).unwrap();
+    std::fs::write(
+        dir.join("status-0081.req"),
+        serde_json::to_string(&envelope("status-0081", "status", serde_json::json!({}))).unwrap(),
+    )
+    .unwrap();
+    let response = crate::paths::bridge_response_dir(&child.child_id)
+        .unwrap()
+        .join("status-0081.res");
+    h.drive_until(60, |_| response.exists()).await;
+    assert!(response.exists(), "the child's status was never answered");
+
+    // The count is spent, so the next nudge is the first of a new run.
+    h.h.app.force_bridge_nudge_unanswered_for_test(id);
+    h.drive(2).await;
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Ready),
+        "a child that answered friring with 'status' was still marked stalled"
+    );
+}
+
+/// A bridge call resets the unanswered **count** and does not discard the nudge
+/// the recipient is still owed.
+///
+/// The record is the only trace that mail is waiting, and `owe_bridge_nudge`
+/// recreates it only when *new* mail arrives. Dropped on any call, a recipient
+/// that answers `status` promptly and never opens its inbox is never reminded
+/// again — and the mail it was owed a reminder about sits unread for ever, with
+/// the stall watch that would have surfaced it spent.
+#[tokio::test]
+async fn a_bridge_call_spends_the_nudge_count_and_not_the_nudge() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0092").await;
+    let id: SessionId = child.child_id.parse().unwrap();
+
+    // Mail the child something and leave it unread — the state the reminder
+    // exists for.
+    h.h.app.host_mail(
+        id,
+        crate::session::bridge::MailKind::Cancel,
+        &child.child_id,
+    );
+    assert!(h.h.app.db.count_unread_messages(id).unwrap() > 0);
+    h.h.app.force_bridge_nudge_unanswered_for_test(id);
+    assert_eq!(h.h.app.bridge_nudge_owed_for_test(id), Some(1));
+
+    // A `status` from the child. Not a claim: it never reads its mail.
+    let dir = crate::paths::bridge_request_dir(&child.child_id).unwrap();
+    std::fs::write(
+        dir.join("status-0092.req"),
+        serde_json::to_string(&envelope("status-0092", "status", serde_json::json!({}))).unwrap(),
+    )
+    .unwrap();
+    let response = crate::paths::bridge_response_dir(&child.child_id)
+        .unwrap()
+        .join("status-0092.res");
+    h.drive_until(60, |_| response.exists()).await;
+    assert!(response.exists(), "the child's status was never answered");
+
+    assert_eq!(
+        h.h.app.bridge_nudge_owed_for_test(id),
+        Some(0),
+        "a bridge call must spend the count and keep the reminder"
+    );
+
+    // And when the mail is actually taken, the reminder is discharged — the
+    // record means "this recipient has mail it has not taken delivery of", and
+    // every drain path settles it rather than only `inbox --claim`.
+    h.h.app.db.claim_messages(id, Some(20)).unwrap();
+    h.drive(3).await;
+    assert_eq!(
+        h.h.app.bridge_nudge_owed_for_test(id),
+        None,
+        "a drained mailbox is still owed a nudge"
+    );
+}
+
+/// One stalled child must not starve every other nudge in the process.
+///
+/// `tick_bridge_nudges` types at most one nudge per pass and picks the
+/// longest-waiting recipient. The exhausted branch used to return *without*
+/// restarting that recipient's interval, so its `at` never moved again: it won
+/// `max_by_key(elapsed)` on every later pass and returned, and no other
+/// recipient was ever reached. A stalled child is exactly the case that
+/// persists — `stalled` is sticky and only an operator clears it — so one
+/// unanswering worker silenced the nudge for its own **owner**, which is the
+/// session that has to notice it.
+#[tokio::test]
+async fn a_stalled_child_does_not_starve_its_owners_nudge() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0140").await;
+    let child_id: SessionId = child.child_id.parse().unwrap();
+    let owner = h.owner();
+
+    // Both records are built here rather than left to whatever the launch
+    // happened to leave behind, so which one a pass picks is decided by this
+    // test and not by an accident of ordering. `owe_bridge_nudge` back-dates a
+    // new record a whole interval, so both are due at once — and the child's is
+    // aged *first*, which makes it the longest-waiting and therefore the one
+    // every pass selects while it holds its place.
+    h.h.app.forget_bridge_nudges_for_test();
+    h.h.app.owe_bridge_nudge_for_test(child_id);
+    for _ in 0..crate::app::bridge::MAX_UNANSWERED_NUDGES {
+        h.h.app.force_bridge_nudge_unanswered_for_test(child_id);
+    }
+    h.h.app.owe_bridge_nudge_for_test(owner);
+    assert_eq!(h.h.app.bridge_nudge_due_for_test(owner), Some(true));
+    assert!(
+        h.h.app.db.count_unread_messages(child_id).unwrap() > 0
+            && h.h.app.db.count_unread_messages(owner).unwrap() > 0,
+        "both recipients need unread mail, or their records are discharged \
+         rather than contended"
+    );
+
+    h.drive_until(30, |h| {
+        h.child_state() == Some(crate::session::ChildState::Stalled)
+    })
+    .await;
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Stalled),
+        "the child never reached the give-up threshold"
+    );
+    h.drive(6 * crate::app::bridge::POLL_TICKS as usize).await;
+
+    // The give-up branch restarted the child's interval, so it stopped being
+    // the longest-waiting…
+    assert_eq!(
+        h.h.app.bridge_nudge_due_for_test(child_id),
+        Some(false),
+        "a recipient past its allowance kept its place at the front of the queue"
+    );
+    // …and the owner, which had been waiting behind it, was reached. A record
+    // is minted *due*, so one that is no longer due is one a pass got to —
+    // which is the only thing this can observe, since the harness has no
+    // multiplexer and no nudge ever actually leaves.
+    assert_eq!(
+        h.h.app.bridge_nudge_due_for_test(owner),
+        Some(false),
+        "a stalled child held the nudge slot and its owner was never reached"
+    );
+    // And the stalled child is still owed one — it is quietened, not forgotten,
+    // so a resume finds the reminder for the mail it never read.
+    assert!(
+        h.h.app.bridge_nudge_owed_for_test(child_id).is_some(),
+        "the stalled child's owed nudge was discarded"
+    );
+}
+
+/// A recipient this instance cannot type into keeps its owed nudge.
+///
+/// The debt was dropped whenever the recipient was absent from `sessions`, and
+/// `owe_bridge_nudge` recreates one only when **new** mail arrives — so mail
+/// already queued for a parked child, for a session another friring on the same
+/// database has loaded, or for one this instance has unloaded was never
+/// announced by anybody, however long the recipient ran afterwards.
+///
+/// A parked child is the exact case: `stop` mails it `cancel` and *then* retires
+/// its runtime, so the mail lands and the recipient leaves the session list in
+/// one operation.
+#[tokio::test]
+async fn a_parked_recipient_keeps_the_nudge_it_is_owed() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0141").await;
+    let child_id: SessionId = child.child_id.parse().unwrap();
+
+    queue_request(
+        &h.h,
+        0,
+        "stop-0141",
+        &envelope(
+            "stop-0141",
+            "stop",
+            serde_json::json!({ "child": child.child_id, "grace_secs": 0 }),
+        ),
+    );
+    let stopped = h.answer("stop-0141").await;
+    assert_eq!(stopped["data"]["state"], "stopped", "{stopped}");
+    assert!(
+        !h.h.app
+            .sessions
+            .iter()
+            .any(|session| session.info.id == child_id),
+        "the parked child is still in the session list, so this proves nothing"
+    );
+    assert!(
+        h.h.app.db.count_unread_messages(child_id).unwrap() > 0,
+        "the parked child has no unread mail to be owed a nudge about"
+    );
+
+    // The parked child is made the only candidate, so a pass has to select it
+    // — otherwise "the record survived" would also be true of a record no pass
+    // ever looked at.
+    h.h.app.forget_bridge_nudges_for_test();
+    h.h.app.owe_bridge_nudge_for_test(child_id);
+    h.drive(3 * crate::app::bridge::POLL_TICKS as usize).await;
+
+    assert_eq!(
+        h.h.app.bridge_nudge_due_for_test(child_id),
+        Some(false),
+        "no pass reached the parked child, so nothing here is about what a pass does with one"
+    );
+    assert!(
+        h.h.app.bridge_nudge_owed_for_test(child_id).is_some(),
+        "the reminder for mail a parked child has never read was thrown away"
+    );
+}
+
+/// The owed-nudge set is re-derived from the mailbox, so it survives the things
+/// that lose it.
+///
+/// `BridgeState` is per process: a restart, or a handover between two friring
+/// instances on one database, starts with no record at all — and the mail those
+/// records were about is still sitting unread. Nothing announced it, because
+/// `owe_bridge_nudge` fires on arrival and the arrival already happened.
+#[tokio::test]
+async fn a_restart_re_derives_the_owed_nudges_from_the_mailbox() {
+    let mut h = ChildHarness::new();
+    let owner = h.owner();
+    h.h.app.host_mail(
+        owner,
+        crate::session::bridge::MailKind::ChildStalled,
+        "some-child",
+    );
+    assert!(h.h.app.db.count_unread_messages(owner).unwrap() > 0);
+
+    // What a fresh process starts with.
+    h.h.app.forget_bridge_nudges_for_test();
+    assert_eq!(h.h.app.bridge_nudge_owed_for_test(owner), None);
+
+    h.drive_until(400, |h| h.h.app.bridge_nudge_owed_for_test(owner).is_some())
+        .await;
+
+    assert!(
+        h.h.app.bridge_nudge_owed_for_test(owner).is_some(),
+        "unread mail that predates this instance is never announced to its recipient"
+    );
+}
+
+/// A child's inbox is held to the plan's 50, not the generic 500.
+///
+/// Both sides of a child's mailbox are agent-chosen — its owner decides how much
+/// to send and the child decides when to drain — and at the bridge's 64 KiB body
+/// cap the generic ceiling is ~32 MiB of undrained mail per recipient.
+#[tokio::test]
+async fn a_childs_inbox_is_capped_tighter_than_an_ordinary_one() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0093").await;
+    let id: SessionId = child.child_id.parse().unwrap();
+    let cap = crate::session::bridge::MAX_UNREAD_PER_CHILD;
+
+    // Fill it to the cap through the same path the owner's `send` takes.
+    for _ in 0..cap {
+        h.h.app.host_mail(
+            id,
+            crate::session::bridge::MailKind::Cancel,
+            &child.child_id,
+        );
+    }
+    assert_eq!(
+        h.h.app.db.count_unread_messages(id).unwrap(),
+        cap,
+        "the child's mailbox did not fill to the bridge cap"
+    );
+
+    // The owner's own `send` is refused, and told why — backpressure it can act
+    // on rather than a message quietly lost.
+    queue_request(
+        &h.h,
+        0,
+        "send-0093",
+        &envelope(
+            "send-0093",
+            "send",
+            serde_json::json!({ "to": child.child_id, "kind": "answer", "body": "one more" }),
+        ),
+    );
+    let answer = h.answer("send-0093").await;
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"], "quota", "{answer}");
+    assert!(
+        answer["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&cap.to_string()),
+        "the refusal did not name the cap it hit: {answer}"
+    );
+    // Well under the generic ceiling, which is the point.
+    assert!(cap < crate::storage::messages::MAX_UNREAD_PER_RECIPIENT);
+}
+
+/// The other half of the pair: an **owner** is held to 200, not to the child's
+/// 50 and not to the generic 500.
+///
+/// An owner is the recipient of every one of its children plus friring's own
+/// host mail, so it legitimately accumulates a deeper backlog — but a child that
+/// can fill its owner's inbox is a child that can starve a fan-out leader, so
+/// the deeper cap is still a cap.
+#[tokio::test]
+async fn an_owners_inbox_is_capped_wider_than_a_childs_but_still_capped() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0094").await;
+    let owner = h.owner();
+    let cap = crate::session::bridge::MAX_UNREAD_PER_OWNER;
+    assert!(cap > crate::session::bridge::MAX_UNREAD_PER_CHILD);
+
+    // Fill it through friring's own host mail, which takes the same cap. Had
+    // the owner been charged the child's cap, this would settle at 50.
+    for _ in 0..cap {
+        h.h.app.host_mail(
+            owner,
+            crate::session::bridge::MailKind::ChildDone,
+            &child.child_id,
+        );
+    }
+    assert_eq!(
+        h.h.app.db.count_unread_messages(owner).unwrap(),
+        cap,
+        "the owner's mailbox did not fill to the owner cap"
+    );
+
+    // The child's own `send` upward is then refused, with the owner's cap named.
+    let dir = crate::paths::bridge_request_dir(&child.child_id).unwrap();
+    std::fs::write(
+        dir.join("blocked-0094.req"),
+        serde_json::to_string(&envelope(
+            "blocked-0094",
+            "send",
+            serde_json::json!({ "to": "owner", "kind": "blocked", "body": "which branch?" }),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let response = crate::paths::bridge_response_dir(&child.child_id)
+        .unwrap()
+        .join("blocked-0094.res");
+    h.drive_until(60, |_| response.exists()).await;
+
+    let answer: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&response).expect("the broker answered"))
+            .unwrap();
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"], "quota", "{answer}");
+    let message = answer["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&format!("({cap} unread)")),
+        "the refusal named a cap that is not the owner's: {answer}"
+    );
+    assert!(cap < crate::storage::messages::MAX_UNREAD_PER_RECIPIENT);
+}
+
+/// The constraint two racing instances rest on: `(owner, request_key)` is
+/// unique, so a second commit under one `create` key is refused by the table
+/// rather than making a second child.
+///
+/// Deliberately named for the **constraint** and not for the race. Two real
+/// brokers are two processes against one file, which this harness has no way to
+/// arrange — the broker lease that keeps them off each other's queues is a
+/// courtesy, and this row is the guard. A test claiming to exercise two
+/// instances while inserting twice in sequence would be claiming the harder
+/// thing and asserting the easier one.
+#[test]
+fn one_create_key_admits_exactly_one_ownership_row() {
+    let db = crate::storage::Database::open_in_memory().unwrap();
+    db.insert_bridge_child("child-a", "owner", "create-0013")
+        .unwrap();
+    assert!(
+        db.insert_bridge_child("child-b", "owner", "create-0013")
+            .is_err(),
+        "a second child under one create key must be refused by the table"
+    );
+    assert_eq!(db.bridge_children_of("owner").unwrap().len(), 1);
+}
+
+/// A `resume` relaunches the **same** `child_id` and keeps its ownership row.
+#[tokio::test]
+async fn a_resume_relaunches_the_same_child_and_keeps_its_ownership() {
+    let mut h = ChildHarness::new();
+    *h.effects.verdict.lock().unwrap() = crate::git::WorktreeVerdict {
+        dirty: true,
+        ..Default::default()
+    };
+    let child = h.ready_child("create-0014").await;
+    h.quiesce(&child.child_id, crate::session::Outcome::Completed)
+        .await;
+    assert_eq!(h.child_state(), Some(crate::session::ChildState::Dirty));
+
+    let creates_before = h
+        .effects
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.as_str() == "create_worktree")
+        .count();
+
+    queue_request(
+        &h.h,
+        0,
+        "resume-0001",
+        &envelope(
+            "resume-0001",
+            "resume",
+            serde_json::json!({ "child": child.child_id }),
+        ),
+    );
+    // Driven to the **relaunched pane**, not to `starting`: `begin_resume`
+    // writes that column before its job runs, so an implementation that only
+    // flipped it and relaunched nothing would satisfy a `Starting` stop
+    // condition.
+    h.drive_until(60, |h| {
+        h.h.app
+            .db
+            .child_saga_of_child(&child.child_id)
+            .ok()
+            .flatten()
+            .and_then(|saga| saga.step)
+            == Some(crate::session::SagaStep::Released)
+    })
+    .await;
+    assert!(
+        h.h.app
+            .sessions
+            .iter()
+            .any(|s| s.info.id == child.child_id.parse().unwrap()),
+        "a resume left no running session for the child"
+    );
+    assert_eq!(
+        h.effects
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.as_str() == "create_worktree")
+            .count(),
+        creates_before,
+        "a resume relaunches in the child's existing worktree and must never re-run S2: the real \
+         effect cuts a new branch, so it would fail on the one the child already has"
+    );
+
+    // The same child, the same ownership row.
+    let children =
+        h.h.app
+            .db
+            .bridge_children_of(&h.owner().to_string())
+            .unwrap();
+    assert_eq!(children.len(), 1, "a resume makes no second child");
+    assert_eq!(children[0].child_id, child.child_id);
+    assert_eq!(children[0].request_key, "create-0014");
+    assert_ne!(
+        h.child_state(),
+        Some(crate::session::ChildState::Dirty),
+        "a resume moves the child out of dirty"
+    );
+
+    // The relaunched agent reports the **same word** its previous life ended on,
+    // through the file channel it really uses. `apply_status_signals` drops a
+    // file repeating the recorded state, so unless the gate release cleared the
+    // child's hook row this report never re-stamps `state_at` and S9 waits out
+    // its readiness timeout on a child that is running perfectly well.
+    for _ in 0..60 {
+        h.h.tick();
+        h.h.app.tick_child_sagas();
+        h.child_signals("idle");
+        if h.child_state() == Some(crate::session::ChildState::Ready) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Ready),
+        "a resumed child that reports the same state as before must still prove ready"
+    );
+    let answer = h.answer("resume-0001").await;
+    assert_eq!(answer["ok"], true, "{answer}");
+}
+
+/// A clean owner stop is the bridge's slot-releasing parking operation: the
+/// process goes away, while the same child, ownership and worktree can be
+/// relaunched explicitly later.
+#[tokio::test]
+async fn a_stopped_child_releases_its_slot_and_resumes_as_the_same_child() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0104").await;
+    let child_id: SessionId = child.child_id.parse().unwrap();
+    let creates_before = h
+        .effects
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| call.as_str() == "create_worktree")
+        .count();
+
+    queue_request(
+        &h.h,
+        0,
+        "stop-0104",
+        &envelope(
+            "stop-0104",
+            "stop",
+            serde_json::json!({ "child": child.child_id, "grace_secs": 0 }),
+        ),
+    );
+    let stopped = h.answer("stop-0104").await;
+    assert_eq!(stopped["data"]["state"], "stopped", "{stopped}");
+    assert_eq!(
+        h.h.app
+            .db
+            .bridge_child_state(&child.child_id)
+            .unwrap()
+            .map(|row| row.state),
+        Some(crate::session::ChildState::Stopped)
+    );
+    assert_eq!(
+        h.h.app
+            .db
+            .live_bridge_children(&h.owner().to_string())
+            .unwrap(),
+        0,
+        "a clean stop kept its fan-out slot"
+    );
+    assert!(
+        !h.h.app
+            .sessions
+            .iter()
+            .any(|session| session.info.id == child_id),
+        "a stopped child kept a live session runtime"
+    );
+
+    queue_request(
+        &h.h,
+        0,
+        "resume-0104",
+        &envelope(
+            "resume-0104",
+            "resume",
+            serde_json::json!({ "child": child.child_id }),
+        ),
+    );
+    h.drive_reporting(60, |h| {
+        h.child_state() == Some(crate::session::ChildState::Ready)
+    })
+    .await;
+    let resumed = h.answer("resume-0104").await;
+    assert_eq!(resumed["ok"], true, "{resumed}");
+    assert_eq!(h.child_state(), Some(crate::session::ChildState::Ready));
+    assert_eq!(
+        h.h.app
+            .db
+            .bridge_children_of(&h.owner().to_string())
+            .unwrap()
+            .into_iter()
+            .map(|row| row.child_id)
+            .collect::<Vec<_>>(),
+        vec![child.child_id.clone()],
+        "resume replaced the stopped child instead of relaunching it"
+    );
+    assert_eq!(
+        h.effects
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call.as_str() == "create_worktree")
+            .count(),
+        creates_before,
+        "resume recreated a stopped child's preserved worktree"
+    );
+}
+
+/// A `resume` comes back to the child's **conversation**, not merely to its
+/// files.
+///
+/// The worktree, the branch, the mailbox and the private state directory are
+/// half of what an owner parked; the thread is the other half, and for an agent
+/// that has one it is the half that decides whether the worker still knows what
+/// it was doing. friring keeps the child's `agent_session_id` across the
+/// relaunch and emits the agent's own resume group, so the launch reopens that
+/// conversation rather than minting one.
+///
+/// Reverting `child_resume_identity` to the fresh `Uuid::new_v4()` every launch
+/// used to get fails this at the id assertion: the resumed child comes back
+/// under a conversation nothing has ever written to.
+#[tokio::test]
+async fn a_resume_keeps_the_childs_conversation_identity() {
+    let mut h = ChildHarness::new();
+    // A worker that can resume the way codex and opencode do: id-less flags,
+    // resolved against the launch directory — which for a child is the worktree
+    // friring kept for it.
+    let resuming =
+        h.h.app
+            .agents
+            .agents
+            .iter_mut()
+            .find(|def| def.name == "worker")
+            .expect("the harness worker");
+    resuming.resume_args = vec!["resume".into(), "--last".into()];
+    resuming.resume_latest = true;
+    // And where that agent's conversations live, which is what makes the resume
+    // *provable* rather than hopeful — `resume --last` in an empty directory is
+    // not a resume, and friring refuses one it cannot prove.
+    resuming.transcript = Some(crate::session::TranscriptDef {
+        dir: "sessions".into(),
+        suffix: ".jsonl".into(),
+        name_has_id: false,
+    });
+
+    let child = h.ready_child("create-0160").await;
+    let child_id: SessionId = child.child_id.parse().unwrap();
+    let created_conversation =
+        h.h.app
+            .db
+            .get_session_by_id(child_id)
+            .unwrap()
+            .and_then(|row| row.agent_session_id.clone())
+            .expect("a created child records the conversation it started");
+    // What the agent wrote in its own private state directory (ADR-31) while it
+    // was running. Nothing seeds this; it is the evidence the thread exists.
+    let thread = crate::sandbox::dirs::child_state_dir(&child.child_id)
+        .expect("the child's private state directory")
+        .join("sessions/2026/09/rollout-0160.jsonl");
+    std::fs::create_dir_all(thread.parent().unwrap()).unwrap();
+    std::fs::write(&thread, "{\"thread\":\"0160\"}\n").unwrap();
+
+    queue_request(
+        &h.h,
+        0,
+        "stop-0160",
+        &envelope(
+            "stop-0160",
+            "stop",
+            serde_json::json!({ "child": child.child_id, "grace_secs": 0 }),
+        ),
+    );
+    assert_eq!(h.answer("stop-0160").await["data"]["state"], "stopped");
+
+    queue_request(
+        &h.h,
+        0,
+        "resume-0160",
+        &envelope(
+            "resume-0160",
+            "resume",
+            serde_json::json!({ "child": child.child_id }),
+        ),
+    );
+    h.drive_reporting(60, |h| {
+        h.child_state() == Some(crate::session::ChildState::Ready)
+    })
+    .await;
+    let resumed = h.answer("resume-0160").await;
+    assert_eq!(resumed["ok"], true, "{resumed}");
+
+    assert_eq!(
+        h.h.app
+            .db
+            .get_session_by_id(child_id)
+            .unwrap()
+            .and_then(|row| row.agent_session_id.clone())
+            .as_deref(),
+        Some(created_conversation.as_str()),
+        "the resumed child came back under a different conversation"
+    );
+}
+
+/// The **by-id** half of the same contract, against a transcript in the child's
+/// own private state directory.
+///
+/// An agent that resumes by id (claude's shape) puts the id friring minted on
+/// the command line, so the question is not "is there a conversation here" but
+/// "is *this* one here". Both answers are exercised, in the order they happen to
+/// a parked worker: the transcript is absent first — the state a child has
+/// before its agent has written anything, and the state
+/// `a_resume_reads_the_childs_own_state_directory` used to launch blank into —
+/// and present second.
+///
+/// The directory searched is the child's, never the operator's: it comes from
+/// `child_env`, which points the agent's own `config_dir_env` at the private
+/// state directory ADR-31 gives the child. Pointing it at the default location
+/// would ask about the operator's conversations, and answer `true` for a child
+/// whose own thread does not exist.
+#[tokio::test]
+async fn a_by_id_resume_is_decided_by_the_transcript_in_the_childs_private_state() {
+    let mut h = ChildHarness::new();
+    let by_id =
+        h.h.app
+            .agents
+            .agents
+            .iter_mut()
+            .find(|def| def.name == "worker")
+            .expect("the harness worker");
+    by_id.resume_args = vec!["--resume".into(), "{id}".into()];
+    by_id.resume_latest = false;
+    by_id.transcript = Some(crate::session::TranscriptDef {
+        dir: "projects".into(),
+        suffix: ".jsonl".into(),
+        name_has_id: true,
+    });
+
+    let child = h.ready_child("create-0170").await;
+    let child_id: SessionId = child.child_id.parse().unwrap();
+    let conversation =
+        h.h.app
+            .db
+            .get_session_by_id(child_id)
+            .unwrap()
+            .and_then(|row| row.agent_session_id.clone())
+            .expect("a created child records the conversation it started");
+
+    queue_request(
+        &h.h,
+        0,
+        "stop-0170",
+        &envelope(
+            "stop-0170",
+            "stop",
+            serde_json::json!({ "child": child.child_id, "grace_secs": 0 }),
+        ),
+    );
+    assert_eq!(h.answer("stop-0170").await["data"]["state"], "stopped");
+
+    // Nothing written yet: refused, and the child is left where it was.
+    queue_request(
+        &h.h,
+        0,
+        "resume-0170a",
+        &envelope(
+            "resume-0170a",
+            "resume",
+            serde_json::json!({ "child": child.child_id }),
+        ),
+    );
+    let refused = h.answer("resume-0170a").await;
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(h.child_state(), Some(crate::session::ChildState::Stopped));
+
+    // The transcript the agent wrote for *this* conversation, under the private
+    // state directory friring gave it.
+    let state_dir = crate::sandbox::dirs::child_state_dir(&child.child_id)
+        .expect("the child's private state directory");
+    let transcript = state_dir
+        .join("projects/-repo")
+        .join(format!("{conversation}.jsonl"));
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(&transcript, "{\"role\":\"user\"}\n").unwrap();
+
+    // A neighbouring conversation must not answer for this one.
+    std::fs::write(
+        transcript.with_file_name("11111111-2222-3333-4444-555555555555.jsonl"),
+        "{\"role\":\"user\"}\n",
+    )
+    .unwrap();
+
+    let identity =
+        h.h.app
+            .child_resume_identity(child_id, "worker", &h.h.app.child_env(child_id))
+            .expect("the conversation is on disk");
+    assert_eq!(identity.agent_session_id, conversation);
+    assert_eq!(
+        identity.resume_trigger.as_deref(),
+        Some(conversation.as_str()),
+        "a by-id resume must put the child's own id on the command line"
+    );
+
+    queue_request(
+        &h.h,
+        0,
+        "resume-0170b",
+        &envelope(
+            "resume-0170b",
+            "resume",
+            serde_json::json!({ "child": child.child_id }),
+        ),
+    );
+    h.drive_reporting(60, |h| {
+        h.child_state() == Some(crate::session::ChildState::Ready)
+    })
+    .await;
+    let resumed = h.answer("resume-0170b").await;
+    assert_eq!(resumed["ok"], true, "{resumed}");
+    assert_eq!(
+        h.h.app
+            .db
+            .get_session_by_id(child_id)
+            .unwrap()
+            .and_then(|row| row.agent_session_id.clone())
+            .as_deref(),
+        Some(conversation.as_str()),
+        "the resumed child came back under a different conversation"
+    );
+}
+
+/// An agent that **can** resume but never said where its conversations live is
+/// refused, rather than resumed on the assumption that one is there.
+///
+/// The hole a directory-existence check leaves: `resume --last` resolves to
+/// whatever the agent finds, and an agent nobody has declared a transcript for
+/// gives friring nothing to check — so a "resume" that starts a brand-new
+/// conversation under the parked child's id is indistinguishable from one that
+/// came back. friring will not guess, and the refusal names the block to add.
+///
+/// Generic by construction: the check asks the registry what this agent
+/// declared, never what it is. No agent name appears in the decision.
+#[tokio::test]
+async fn a_resume_is_refused_when_the_agent_declares_no_transcript() {
+    let mut h = ChildHarness::new();
+    let resuming =
+        h.h.app
+            .agents
+            .agents
+            .iter_mut()
+            .find(|def| def.name == "worker")
+            .expect("the harness worker");
+    resuming.resume_args = vec!["resume".into(), "--last".into()];
+    resuming.resume_latest = true;
+    resuming.transcript = None;
+
+    let child = h.ready_child("create-0171").await;
+    queue_request(
+        &h.h,
+        0,
+        "stop-0171",
+        &envelope(
+            "stop-0171",
+            "stop",
+            serde_json::json!({ "child": child.child_id, "grace_secs": 0 }),
+        ),
+    );
+    assert_eq!(h.answer("stop-0171").await["data"]["state"], "stopped");
+
+    queue_request(
+        &h.h,
+        0,
+        "resume-0171",
+        &envelope(
+            "resume-0171",
+            "resume",
+            serde_json::json!({ "child": child.child_id }),
+        ),
+    );
+    let refused = h.answer("resume-0171").await;
+    assert_eq!(refused["ok"], false, "{refused}");
+    let message = refused["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("transcript"),
+        "the refusal must name what is missing: {refused}"
+    );
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Stopped),
+        "a refused resume moved the child"
+    );
+
+    // And the same for an agent that resumes **by id**, which is the branch that
+    // used to be waved through: `resume_trigger_for` would fall back to one
+    // vendor's on-disk layout, so a stale file of *that* vendor's could
+    // authorize a resume for an agent whose own conversation store friring never
+    // looked at. The child here has a recorded id and no declaration.
+    let by_id =
+        h.h.app
+            .agents
+            .agents
+            .iter_mut()
+            .find(|def| def.name == "worker")
+            .expect("the harness worker");
+    by_id.resume_args = vec!["--resume".into(), "{id}".into()];
+    by_id.resume_latest = false;
+    by_id.transcript = None;
+
+    queue_request(
+        &h.h,
+        0,
+        "resume-0171b",
+        &envelope(
+            "resume-0171b",
+            "resume",
+            serde_json::json!({ "child": child.child_id }),
+        ),
+    );
+    let refused = h.answer("resume-0171b").await;
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("transcript"),
+        "a by-id agent with no declaration must be refused too: {refused}"
+    );
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Stopped),
+        "a refused resume moved the child"
+    );
+}
+
+/// A refused resume must leave a **live** child's pane running.
+///
+/// `stalled` is set from the nudge counter alone, with the child's agent still
+/// running, and `begin_resume` stops that pane before relaunching. So the order
+/// matters: a refusal decided *after* the stop leaves a child whose agent has
+/// been killed and whose resume did not happen — the worst of both, and
+/// unrecoverable without a second resume that would then be refused for the
+/// same reason. Starting from `stopped`, as the other refusal tests do, cannot
+/// see it: there is no pane left to kill.
+#[tokio::test]
+async fn a_refused_resume_leaves_a_stalled_childs_pane_running() {
+    let backend = Arc::new(FakeBackend::spawnable());
+    let mut h = ChildHarness::with_watched_backend(Arc::clone(&backend));
+    let resuming =
+        h.h.app
+            .agents
+            .agents
+            .iter_mut()
+            .find(|def| def.name == "worker")
+            .expect("the harness worker");
+    resuming.resume_args = vec!["resume".into(), "--last".into()];
+    resuming.resume_latest = true;
+    // Declared, and its directory deliberately left empty: the conversation
+    // cannot be reached, so the resume must be refused.
+    resuming.transcript = Some(crate::session::TranscriptDef {
+        dir: "sessions".into(),
+        suffix: ".jsonl".into(),
+        name_has_id: false,
+    });
+
+    let child = h.ready_child("create-0172").await;
+    let running_pane = {
+        let panes = backend.panes.lock().unwrap();
+        assert_eq!(panes.len(), 1, "a ready child is one pane: {panes:?}");
+        panes.keys().next().cloned().unwrap()
+    };
+    h.h.app
+        .db
+        .set_bridge_child_state(&child.child_id, crate::session::ChildState::Stalled)
+        .unwrap();
+
+    queue_request(
+        &h.h,
+        0,
+        "resume-0172",
+        &envelope(
+            "resume-0172",
+            "resume",
+            serde_json::json!({ "child": child.child_id }),
+        ),
+    );
+    let refused = h.answer("resume-0172").await;
+    assert_eq!(refused["ok"], false, "{refused}");
+
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Stalled),
+        "a refused resume moved a live child"
+    );
+    let panes = backend.panes.lock().unwrap();
+    assert_eq!(
+        panes.len(),
+        1,
+        "a refused resume spawned or lost a pane: {panes:?}"
+    );
+    assert!(
+        panes.contains_key(&running_pane),
+        "a refused resume killed the running agent it refused to relaunch"
+    );
+}
+
+/// A `resume` that cannot reach the conversation is **refused**.
+///
+/// Never launched blank, because a blank one is indistinguishable from the
+/// outside: the child comes up, answers its mail, has forgotten the task, and
+/// nothing anywhere says so. An agent that resumes by id has a transcript
+/// friring can look for, and its absence is the case this covers.
+///
+/// An agent that declares no resume contract at all is deliberately *not* one of
+/// these — a `/bin/sh` worker has no thread to lose — which is what
+/// `a_stopped_child_releases_its_slot_and_resumes_as_the_same_child` still
+/// exercises on the default harness agent.
+#[tokio::test]
+async fn a_resume_is_refused_when_the_conversation_cannot_be_reached() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0161").await;
+
+    queue_request(
+        &h.h,
+        0,
+        "stop-0161",
+        &envelope(
+            "stop-0161",
+            "stop",
+            serde_json::json!({ "child": child.child_id, "grace_secs": 0 }),
+        ),
+    );
+    assert_eq!(h.answer("stop-0161").await["data"]["state"], "stopped");
+
+    // Declared *after* the child was created, so the transcript this contract
+    // implies was never written — the shape a claude worker has when its
+    // transcript has been cleaned up under it.
+    let by_id =
+        h.h.app
+            .agents
+            .agents
+            .iter_mut()
+            .find(|def| def.name == "worker")
+            .expect("the harness worker");
+    by_id.resume_args = vec!["--resume".into(), "{id}".into()];
+    by_id.resume_latest = false;
+    by_id.transcript = Some(crate::session::TranscriptDef {
+        dir: "projects".into(),
+        suffix: ".jsonl".into(),
+        name_has_id: true,
+    });
+
+    queue_request(
+        &h.h,
+        0,
+        "resume-0161",
+        &envelope(
+            "resume-0161",
+            "resume",
+            serde_json::json!({ "child": child.child_id }),
+        ),
+    );
+    let refused = h.answer("resume-0161").await;
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot reach this child's"),
+        "the refusal must name the conversation it could not reach: {refused}"
+    );
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Stopped),
+        "a refused resume moved the child"
+    );
+}
+
+/// Parking is only worth having if the parked worker is still there afterwards.
+///
+/// A clean stop retires the child's **runtime** and nothing else: its private
+/// agent state (ADR-31) — where an interactive Codex worker's own thread lives —
+/// its bridge channel and its ownership row all survive, and a resume re-seeds
+/// the family files it is declared to seed without touching what the agent
+/// wrote. Without that, "resume the same child" would relaunch an agent with no
+/// memory of what it was doing, which is a replacement worker under an old id.
+#[tokio::test]
+async fn parking_a_child_preserves_its_private_agent_state() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0132").await;
+    let state_dir = crate::sandbox::dirs::child_state_dir(&child.child_id)
+        .expect("the child's private state directory");
+    // What the agent itself writes there, which nothing seeds and nothing may
+    // remove: a Codex rollout is exactly this shape.
+    let thread = state_dir.join("sessions/2026/rollout-parked.jsonl");
+    std::fs::create_dir_all(thread.parent().unwrap()).unwrap();
+    std::fs::write(&thread, "{\"thread\":\"parked\"}\n").unwrap();
+    let channel = crate::paths::bridge_request_dir(&child.child_id).unwrap();
+    assert!(channel.is_dir(), "the child has no bridge channel to keep");
+
+    queue_request(
+        &h.h,
+        0,
+        "stop-0132",
+        &envelope(
+            "stop-0132",
+            "stop",
+            serde_json::json!({ "child": child.child_id, "grace_secs": 0 }),
+        ),
+    );
+    let stopped = h.answer("stop-0132").await;
+    assert_eq!(stopped["data"]["state"], "stopped", "{stopped}");
+    assert!(
+        thread.exists(),
+        "a clean stop destroyed the parked worker's own thread"
+    );
+    assert!(channel.is_dir(), "a clean stop removed the child's channel");
+    assert!(
+        h.h.app.db.bridge_child(&child.child_id).unwrap().is_some(),
+        "a clean stop dropped the ownership row"
+    );
+
+    queue_request(
+        &h.h,
+        0,
+        "resume-0132",
+        &envelope(
+            "resume-0132",
+            "resume",
+            serde_json::json!({ "child": child.child_id }),
+        ),
+    );
+    h.drive_reporting(60, |h| {
+        h.child_state() == Some(crate::session::ChildState::Ready)
+    })
+    .await;
+    let resumed = h.answer("resume-0132").await;
+    assert_eq!(resumed["ok"], true, "{resumed}");
+    assert_eq!(
+        std::fs::read_to_string(&thread).ok().as_deref(),
+        Some("{\"thread\":\"parked\"}\n"),
+        "the resume re-seeded over the worker's own thread"
+    );
+}
+
+/// A stopped or unusable child no longer owns a slot. Resuming one must claim
+/// capacity before changing its state or starting a pane, just like a create.
+#[tokio::test]
+async fn a_released_child_resume_refuses_when_the_fanout_is_full() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0105").await;
+    queue_request(
+        &h.h,
+        0,
+        "stop-0105",
+        &envelope(
+            "stop-0105",
+            "stop",
+            serde_json::json!({ "child": child.child_id, "grace_secs": 0 }),
+        ),
+    );
+    let stopped = h.answer("stop-0105").await;
+    assert_eq!(stopped["data"]["state"], "stopped", "{stopped}");
+    assert_eq!(h.child_state(), Some(crate::session::ChildState::Stopped));
+
+    let owner = h.owner().to_string();
+    for n in 1..=2 {
+        let id = format!("resume-cap-filler-{n}");
+        h.h.app
+            .db
+            .insert_bridge_child(&id, &owner, &format!("resume-cap-key-{n}"))
+            .unwrap();
+        h.h.app
+            .db
+            .set_bridge_child_state(&id, crate::session::ChildState::Ready)
+            .unwrap();
+    }
+
+    queue_request(
+        &h.h,
+        0,
+        "resume-0105",
+        &envelope(
+            "resume-0105",
+            "resume",
+            serde_json::json!({ "child": child.child_id }),
+        ),
+    );
+    let answer = h.answer("resume-0105").await;
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"], "fanout_exhausted", "{answer}");
+    assert_eq!(
+        h.h.app
+            .db
+            .bridge_child_state(&child.child_id)
+            .unwrap()
+            .map(|row| row.state),
+        Some(crate::session::ChildState::Stopped),
+        "a refused resume consumed the parked state"
+    );
+    assert_eq!(
+        h.h.app.child_lifecycle.in_flight(),
+        0,
+        "a refused resume still started a relaunch"
+    );
+    assert!(
+        h.h.app
+            .db
+            .child_saga(&owner, "resume-0105")
+            .unwrap()
+            .is_none(),
+        "a capacity refusal recorded a relaunch saga"
+    );
+}
+
+/// Make the owner's **aggregate** child-state read fail while every single-row
+/// read still works.
+///
+/// `bridge_child_states_of` maps `updated_at` as an integer and SQLite is
+/// dynamically typed, so one sibling row holding text is a genuine
+/// deserialization failure over the set — and over nothing else. Dropping the
+/// table would fail the ownership and state reads a request makes first, and
+/// the refusal would then prove nothing about the capacity check.
+fn break_the_live_child_count(h: &ChildHarness, owner: &str) {
+    h.h.app
+        .db
+        .insert_bridge_child("unreadable-sibling", owner, "unreadable-sibling-key")
+        .unwrap();
+    h.h.app
+        .db
+        .set_bridge_child_state("unreadable-sibling", crate::session::ChildState::Ready)
+        .unwrap();
+    h.h.app
+        .db
+        .conn_ref()
+        .execute(
+            "UPDATE bridge_child_state SET updated_at = 'not-a-number' \
+             WHERE child_id = 'unreadable-sibling'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        h.h.app.db.live_bridge_children(owner).is_err(),
+        "the injection did not actually break the count"
+    );
+}
+
+/// A launch another broker is still running counts against the cap here.
+///
+/// The bridge lease moves: it is renewed on a cadence and taken over when it
+/// lapses, so an instance can pick up an owner's queue while a peer is part-way
+/// through a `create` for the same owner. Capacity used to be the durable
+/// children **plus this process's own in-flight jobs**, and the second half is
+/// invisible across a handover — the new broker would see only the committed
+/// children and admit its peer's launches all over again, one extra child per
+/// launch in flight.
+///
+/// The claim is durable the whole time: `begin_create` writes the saga row
+/// before it pushes the job, and S6 writes the child's state row and the
+/// `committed` step together — so a pre-commit saga with no state row is
+/// exactly "a slot claimed, no child yet", from any process.
+///
+/// Written as the row a peer would have left, because two real brokers are two
+/// processes against one file and this harness is one.
+#[tokio::test]
+async fn a_peers_uncommitted_launch_still_holds_a_slot() {
+    let mut h = ChildHarness::new();
+    let owner = h.owner().to_string();
+    // The profile allows two. One committed child, plus one launch a peer has
+    // accepted and not committed, is the cap.
+    let child = h.ready_child("create-0150").await;
+    assert_eq!(h.h.app.db.live_bridge_children(&owner).unwrap(), 1);
+
+    let peer_child = SessionId::default().to_string();
+    h.h.app
+        .db
+        .upsert_child_saga(&crate::session::ChildSaga {
+            owner_id: owner.clone(),
+            key: "peer-create-0150".to_string(),
+            child_id: Some(peer_child.clone()),
+            step: Some(crate::session::SagaStep::Pane),
+            ..crate::session::ChildSaga::default()
+        })
+        .unwrap();
+    assert_eq!(
+        h.h.app.db.pending_child_slot_claims(&owner).unwrap(),
+        1,
+        "a pre-commit saga with no child state is a slot claimed"
+    );
+    // The number the cap is actually read from, and it comes out of **one**
+    // statement. The two halves are disjoint at any single instant, which is
+    // exactly why reading them at two instants loses a child: a peer that
+    // commits in between moves its child from the pending side to the live
+    // side, and a count taken before that on one side and after it on the other
+    // sees it on neither.
+    assert_eq!(
+        h.h.app.db.reserved_child_slots(&owner).unwrap(),
+        2,
+        "a live child and a peer's uncommitted launch are two slots"
+    );
+
+    // A branch of its own, so a refusal can only be about capacity: two creates
+    // resolving to one worktree directory are refused for that instead.
+    h.create_on("create-0151", "feat/two");
+    let answer = h.answer("create-0151").await;
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"], "fanout_exhausted", "{answer}");
+    assert!(
+        h.h.app
+            .db
+            .bridge_children_of(&owner)
+            .unwrap()
+            .iter()
+            .all(|row| row.child_id == child.child_id),
+        "a create past the cap still made a child"
+    );
+
+    // And the claim is released the way a real one is — the peer's launch
+    // reaching a final step — rather than by anything this instance does.
+    h.h.app
+        .db
+        .upsert_child_saga(&crate::session::ChildSaga {
+            owner_id: owner.clone(),
+            key: "peer-create-0150".to_string(),
+            child_id: Some(peer_child),
+            step: Some(crate::session::SagaStep::Failed),
+            ..crate::session::ChildSaga::default()
+        })
+        .unwrap();
+    assert_eq!(h.h.app.db.pending_child_slot_claims(&owner).unwrap(), 0);
+    assert_eq!(
+        h.h.app.db.reserved_child_slots(&owner).unwrap(),
+        1,
+        "the released claim leaves only the live child"
+    );
+    h.create_on("create-0152", "feat/three");
+    h.drive_until(60, |h| {
+        h.h.app
+            .db
+            .bridge_children_of(&owner)
+            .map(|rows| rows.len() >= 2)
+            .unwrap_or(false)
+    })
+    .await;
+    assert_eq!(
+        h.h.app.db.bridge_children_of(&owner).unwrap().len(),
+        2,
+        "the slot the peer's launch held was never usable again: {:?}",
+        bridge_answer(&h.h, 0, "create-0152")
+    );
+}
+
+/// Capacity fails **closed** on a `create`.
+///
+/// `reserved_child_slots` read an unreadable child count as zero, so the one
+/// moment friring could not see the children an owner already has was the moment
+/// it would authorize a whole `max_children` worth more of them. The refusal is
+/// `failed` and not `fanout_exhausted`: the cap was not reached, it could not be
+/// evaluated, and a leader retrying on "not now" would retry forever.
+#[tokio::test]
+async fn a_create_is_refused_when_the_live_child_count_cannot_be_read() {
+    let mut h = ChildHarness::new();
+    let owner = h.owner().to_string();
+    break_the_live_child_count(&h, &owner);
+
+    h.create("create-0130");
+    let answer = h.answer("create-0130").await;
+
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"], "failed", "{answer}");
+    assert!(
+        answer["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("how many children")),
+        "{answer}"
+    );
+    assert_eq!(
+        h.h.app.child_lifecycle.in_flight(),
+        0,
+        "a create friring could not authorize still started a saga"
+    );
+    assert!(
+        h.h.app
+            .db
+            .bridge_children_of(&owner)
+            .unwrap()
+            .iter()
+            .all(|row| row.child_id == "unreadable-sibling"),
+        "a create friring could not authorize still made a child"
+    );
+}
+
+/// The same rule on the other side of the parking cycle, and the parked child is
+/// left exactly as it was.
+///
+/// A `resume` of a released child is a fresh capacity claim, so it has the same
+/// uncertainty to fail closed on — and the refusal must not spend the thing it
+/// refuses: the child stays `stopped`, with no relaunch saga and no runtime.
+#[tokio::test]
+async fn a_released_child_resume_is_refused_when_the_live_child_count_cannot_be_read() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0131").await;
+    let owner = h.owner().to_string();
+    queue_request(
+        &h.h,
+        0,
+        "stop-0131",
+        &envelope(
+            "stop-0131",
+            "stop",
+            serde_json::json!({ "child": child.child_id, "grace_secs": 0 }),
+        ),
+    );
+    let stopped = h.answer("stop-0131").await;
+    assert_eq!(stopped["data"]["state"], "stopped", "{stopped}");
+
+    break_the_live_child_count(&h, &owner);
+    queue_request(
+        &h.h,
+        0,
+        "resume-0131",
+        &envelope(
+            "resume-0131",
+            "resume",
+            serde_json::json!({ "child": child.child_id }),
+        ),
+    );
+    let answer = h.answer("resume-0131").await;
+
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"], "failed", "{answer}");
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Stopped),
+        "a refused resume consumed the parked state"
+    );
+    assert_eq!(
+        h.h.app.child_lifecycle.in_flight(),
+        0,
+        "a refused resume still started a relaunch"
+    );
+    assert!(
+        h.h.app
+            .db
+            .child_saga(&owner, "resume-0131")
+            .unwrap()
+            .is_none(),
+        "a refusal friring could not authorize recorded a relaunch saga"
+    );
+    assert!(
+        !h.h.app
+            .sessions
+            .iter()
+            .any(|session| session.info.id.to_string() == child.child_id),
+        "a refused resume started the child's runtime"
+    );
+}
+
+/// Two creates that resolve to one worktree directory make one child, and the
+/// second is refused.
+///
+/// `worktree_segments` maps `/` to `-`, so `feat/one` and `feat-one` are two
+/// git-legal branch names for one directory. The broker takes both in a single
+/// pass and S2 cuts the directory off the tick, so at the moment the second is
+/// validated the path still does not exist — only in-flight accounting can tell
+/// them apart, and without it both children would share one writable workspace.
+#[tokio::test]
+async fn two_creates_resolving_to_one_worktree_make_one_child() {
+    let mut h = ChildHarness::new();
+    let keys = ["create-0031", "create-0032"];
+    for (key, branch) in keys.iter().zip(["feat/one", "feat-one"]) {
+        queue_request(
+            &h.h,
+            0,
+            key,
+            &envelope(
+                key,
+                "create",
+                serde_json::json!({
+                    "repo_root": "/repo/app",
+                    "branch": branch,
+                    "agent": "worker",
+                    "task_kind": "task",
+                    "task_body": "do the thing",
+                }),
+            ),
+        );
+    }
+    // `read_dir` order is unspecified, so which of the two wins is not asserted
+    // — only that exactly one does. The other is answered immediately, because a
+    // refusal is not deferred the way an accepted create is.
+    h.drive_until(60, |h| {
+        keys.iter().any(|key| bridge_answer(&h.h, 0, key).is_some())
+    })
+    .await;
+    let refusals: Vec<serde_json::Value> = keys
+        .iter()
+        .filter_map(|key| bridge_answer(&h.h, 0, key))
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "exactly one create is answered: {refusals:?}"
+    );
+    assert_eq!(refusals[0]["ok"], false, "{}", refusals[0]);
+    // Named specifically: the profile allows two children, so a fan-out refusal
+    // or the pre-existing-worktree refusal would be a different bug passing this
+    // test.
+    assert!(
+        refusals[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already in flight"),
+        "{}",
+        refusals[0]
+    );
+
+    // The survivor really becomes a child, and it is the only one.
+    for _ in 0..60 {
+        h.h.tick();
+        h.h.app.tick_child_sagas();
+        h.child_hook_reports();
+        if h.child_state() == Some(crate::session::ChildState::Ready) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Ready),
+        "the accepted create did not reach a ready child"
+    );
+    assert_eq!(
+        h.h.app
+            .db
+            .bridge_children_of(&h.owner().to_string())
+            .unwrap()
+            .len(),
+        1,
+        "two creates on one worktree made two children"
+    );
+}
+
+/// A child that is running is never resumable: relaunching one would kill work
+/// in progress.
+#[tokio::test]
+async fn a_running_child_may_not_be_resumed() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0023").await;
+    queue_request(
+        &h.h,
+        0,
+        "resume-0002",
+        &envelope(
+            "resume-0002",
+            "resume",
+            serde_json::json!({ "child": child.child_id }),
+        ),
+    );
+    let answer = h.answer("resume-0002").await;
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert!(
+        answer["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not resumable"),
+        "{answer}"
+    );
+}
+
+/// A claimed branch is not a claimed path, and the reclaim asks git which it is.
+///
+/// `worktree_segments` maps `/` to `-`, so `feat/one` and `feat-one` resolve to
+/// one directory. Two creates issued in the same tick both pass validation (the
+/// path does not exist yet), both win their own distinct ref, and only one wins
+/// `git worktree add` — but the loser's failure reports `owns_branch: true`,
+/// which is honest about the ref and says nothing about the directory. Trusting
+/// it alone, the loser's unwind force-removes the winner's freshly created —
+/// therefore clean — worktree. So the directory's ownership is asked of git, and
+/// an answer of anything but "this launch's branch" leaves it alone.
+///
+/// The branch is still reclaimed: it really was this attempt's, and leaking one
+/// ref per collision is the thing the unwind is for.
+#[tokio::test]
+async fn a_reclaim_leaves_a_worktree_that_git_says_is_another_launchs() {
+    for (n, is_on, why) in [
+        (0u8, Some(false), "another launch's worktree"),
+        (1, None, "a directory git would not name"),
+    ] {
+        let mut h = ChildHarness::new();
+        let owner = h.owner().to_string();
+        let worktree = tempfile::tempdir().unwrap();
+        let key = format!("create-005{n}");
+        *h.effects.worktree_is_on.lock().unwrap() = is_on;
+        *h.effects.ahead.lock().unwrap() = Some(0);
+        h.h.app
+            .db
+            .take_bridge_request(&owner, &key, "create", "hash", None)
+            .unwrap();
+        h.h.app
+            .db
+            .upsert_child_saga(&crate::session::ChildSaga {
+                owner_id: owner.clone(),
+                key: key.clone(),
+                child_id: Some(SessionId::default().to_string()),
+                step: Some(crate::session::SagaStep::Worktree),
+                worktree_path: Some(worktree.path().display().to_string()),
+                // The ref really was this attempt's — that is exactly the case
+                // that used to be treated as licence over the directory.
+                branch_claimed: true,
+                branch: Some("feat-one".into()),
+                base_head: None,
+                instance_id: Some("a-dead-instance".into()),
+                lease_until: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+
+        h.h.app.tick_child_sagas();
+
+        assert!(
+            !h.effects.called("remove_worktree"),
+            "{why} was removed by a saga that only owned the branch"
+        );
+        assert!(
+            worktree.path().exists(),
+            "{why} was destroyed on disk by another launch's unwind"
+        );
+        assert!(
+            h.effects.called("delete_branch"),
+            "the branch this attempt really did cut must still be reclaimed ({why})"
+        );
+        let banner = h.h.app.status_message.as_ref().expect("an operator banner");
+        assert!(
+            banner.text.contains(&worktree.path().display().to_string()),
+            "the operator must be told which directory was left alone ({why}): {}",
+            banner.text
+        );
+    }
+}
+
+/// Recovery reconciles a saga a previous run left below the committed line: the
+/// worktree it recorded is reclaimed and the request is failed.
+#[tokio::test]
+async fn recovery_reclaims_an_interrupted_launch_by_its_recorded_identity() {
+    let mut h = ChildHarness::new();
+    let owner = h.owner().to_string();
+    let worktree = tempfile::tempdir().unwrap();
+    // What a previous run would have left: a saga past S2, with a lease that
+    // has expired and an instance nobody is.
+    h.h.app
+        .db
+        .take_bridge_request(&owner, "create-0015", "create", "hash", None)
+        .unwrap();
+    h.h.app
+        .db
+        .upsert_child_saga(&crate::session::ChildSaga {
+            owner_id: owner.clone(),
+            key: "create-0015".into(),
+            child_id: Some(SessionId::default().to_string()),
+            step: Some(crate::session::SagaStep::Worktree),
+            worktree_path: Some(worktree.path().display().to_string()),
+            // A saga past S2 recorded that its own `git branch` created the
+            // branch; a reclaim acts on nothing it cannot prove it made.
+            branch_claimed: true,
+            branch: Some("feat/interrupted".into()),
+            base_head: Some("abc1234".into()),
+            instance_id: Some("a-dead-instance".into()),
+            lease_until: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+    *h.effects.ahead.lock().unwrap() = Some(0);
+
+    h.h.app.tick_child_sagas();
+
+    assert!(
+        h.effects.called("remove_worktree"),
+        "the recorded worktree is reclaimed"
+    );
+    assert!(
+        h.effects.called("delete_branch"),
+        "an empty branch is deleted"
+    );
+    let saga =
+        h.h.app
+            .db
+            .child_saga(&owner, "create-0015")
+            .unwrap()
+            .unwrap();
+    assert_eq!(saga.step, Some(crate::session::SagaStep::Failed));
+    let answer = bridge_answer(&h.h, 0, "create-0015").expect("the request is answered");
+    assert_eq!(answer["ok"], false, "{answer}");
+}
+
+/// A finish intent held behind a launch survives the process that held it.
+///
+/// The agent starts at S8, so a small worker can report `completed` before S9
+/// proves the child ready. The broker answers that `send` `ok` and journals the
+/// answer, which a replay returns verbatim — so the intent reaches
+/// `accept_finish_intent` exactly once, and the launch it lands in has not
+/// written `finishing` yet. Kept only in the job, a crash between S8 and S9
+/// loses it: recovery's `Finishing` sweep does not see this child, and the saga
+/// sweep adopts it with no verdict, holding its owner's fan-out slot until
+/// somebody stops it by hand. So it is written to the saga row instead, and
+/// recovery carries it out.
+#[tokio::test]
+async fn a_held_finish_intent_is_carried_out_after_a_restart() {
+    let mut h = ChildHarness::new();
+    let owner = h.owner().to_string();
+    h.create("create-0092");
+    h.drive_until(30, |h| h.child().is_some()).await;
+    let child = h.child().expect("the launch committed a child");
+    let id: SessionId = child.child_id.parse().unwrap();
+
+    // What the broker does the moment the `result` mail is durable, while the
+    // launch is still running.
+    h.h.app
+        .accept_finish_intent(id, crate::session::Outcome::Completed, Some(13));
+
+    let saga =
+        h.h.app
+            .db
+            .child_saga(&owner, "create-0092")
+            .unwrap()
+            .expect("the launch has a saga row");
+    assert_eq!(
+        saga.finish_outcome.as_deref(),
+        Some("completed"),
+        "the held intent was never written down, so a crash here loses it"
+    );
+    assert_eq!(saga.finish_message_id, Some(13), "the mail row was lost");
+
+    // The crash: every job this process was carrying is gone, and the saga row
+    // is what a new instance starts from. Left at the committed line, so
+    // recovery adopts rather than reconciles.
+    h.h.app.child_lifecycle.jobs.clear();
+    h.h.app
+        .db
+        .upsert_child_saga(&crate::session::ChildSaga {
+            step: Some(crate::session::SagaStep::Released),
+            instance_id: Some("a-dead-instance".into()),
+            lease_until: Some(1),
+            ..saga
+        })
+        .unwrap();
+
+    h.h.app.recover_child_sagas();
+    h.drive_reporting(120, |h| {
+        h.h.app.child_lifecycle.in_flight() == 0
+            && h.child_state()
+                .is_some_and(crate::session::ChildState::is_terminal)
+    })
+    .await;
+
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Done),
+        "a child that had already reported was adopted with no verdict"
+    );
+    let verdict =
+        h.h.app
+            .db
+            .bridge_result(&child.child_id)
+            .unwrap()
+            .expect("the recovered intent must still produce a host verdict");
+    assert_eq!(verdict.outcome, crate::session::Outcome::Completed);
+    assert_eq!(
+        verdict.message_id,
+        Some(13),
+        "the recovered verdict lost the mail row the intent arrived on"
+    );
+}
+
+/// Recovery is a rule about **every** step below the committed line, not only
+/// the one a fixture happened to pick. At `Pane` a gated pane was recorded and
+/// has to be killed by its exact identity; at `Committed` and `Released` the
+/// child is a real session and nothing may be removed at all.
+#[tokio::test]
+async fn recovery_reconciles_each_step_by_what_it_positively_names() {
+    for (n, step, removes) in [
+        (0, crate::session::SagaStep::Dirs, true),
+        (1, crate::session::SagaStep::Pane, true),
+        (2, crate::session::SagaStep::Committed, false),
+        (3, crate::session::SagaStep::Released, false),
+    ] {
+        let backend = Arc::new(FakeBackend::spawnable());
+        let mut h = ChildHarness::with_watched_backend(Arc::clone(&backend));
+        let owner = h.owner().to_string();
+        let worktree = tempfile::tempdir().unwrap();
+        let key = format!("create-006{n}");
+        let child = SessionId::default().to_string();
+        h.h.app
+            .db
+            .take_bridge_request(&owner, &key, "create", "hash", None)
+            .unwrap();
+        h.h.app
+            .db
+            .upsert_child_saga(&crate::session::ChildSaga {
+                owner_id: owner.clone(),
+                key: key.clone(),
+                child_id: Some(child.clone()),
+                step: Some(step),
+                worktree_path: Some(worktree.path().display().to_string()),
+                // A saga past S2 recorded that its own `git branch` created the
+                // branch; a reclaim acts on nothing it cannot prove it made.
+                branch_claimed: true,
+                branch: Some("feat/interrupted".into()),
+                base_head: Some("abc1234".into()),
+                // A recorded pane, marker included — without which
+                // `MuxIdentity::is_recorded` is false and the kill is skipped.
+                mux_server: Some("server-1".into()),
+                mux_window_id: Some("@7".into()),
+                mux_pane_id: Some("%12".into()),
+                mux_pane_pid: Some(4242),
+                mux_launch_key: Some(crate::session::MuxIdentity::launch_marker(&child, "k")),
+                instance_id: Some("a-dead-instance".into()),
+                lease_until: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        // A live pane matching the recorded identity exactly, plus a decoy that
+        // matches nothing: the kill has to be aimed by identity, not by "the
+        // pane that happens to be there". Without a pane to find,
+        // `kill_recorded_pane` takes its already-gone branch and a kill that
+        // never happened would look exactly like a kill that did.
+        if step == crate::session::SagaStep::Pane {
+            let mut panes = backend.panes.lock().unwrap();
+            panes.insert(
+                "%12".into(),
+                crate::session::MuxIdentity {
+                    server: Some("server-1".into()),
+                    window_id: Some("@7".into()),
+                    pane_id: Some("%12".into()),
+                    pane_pid: Some(4242),
+                    launch_key: Some(crate::session::MuxIdentity::launch_marker(&child, "k")),
+                },
+            );
+            panes.insert(
+                "%99".into(),
+                crate::session::MuxIdentity {
+                    server: Some("server-1".into()),
+                    window_id: Some("@9".into()),
+                    pane_id: Some("%99".into()),
+                    pane_pid: Some(9999),
+                    launch_key: Some(crate::session::MuxIdentity::launch_marker(
+                        &SessionId::default().to_string(),
+                        "other",
+                    )),
+                },
+            );
+        }
+        // Past the committed line the child is a real session, so its rows exist.
+        if !removes {
+            h.h.app
+                .db
+                .insert_bridge_child(&child, &owner, &key)
+                .unwrap();
+            h.h.app
+                .db
+                .set_bridge_child_state(&child, crate::session::ChildState::Starting)
+                .unwrap();
+        }
+        *h.effects.ahead.lock().unwrap() = Some(0);
+
+        h.h.app.tick_child_sagas();
+
+        assert_eq!(
+            h.effects.called("remove_worktree"),
+            removes,
+            "{step:?}: reconciliation removed the wrong thing"
+        );
+        if step == crate::session::SagaStep::Pane {
+            let panes = backend.panes.lock().unwrap();
+            assert!(
+                !panes.contains_key("%12"),
+                "the pane the saga recorded survived reconciliation"
+            );
+            assert!(
+                panes.contains_key("%99"),
+                "reconciliation killed a pane the saga never named"
+            );
+        }
+        if removes {
+            let answer = bridge_answer(&h.h, 0, &key)
+                .unwrap_or_else(|| panic!("{step:?}: the request was never answered"));
+            assert_eq!(answer["ok"], false, "{step:?}: {answer}");
+        } else {
+            // A committed child is adopted, not unwound: its ownership row, its
+            // worktree and its mailbox are all real.
+            assert!(
+                h.h.app.db.bridge_child(&child).unwrap().is_some(),
+                "{step:?}: a committed child lost its ownership row"
+            );
+            // …and adoption *ran*, rather than leaving the seeded row alone.
+            // This child is not in the session list, so it is not running: the
+            // one resumable outcome, said in all three places it is said.
+            assert_eq!(
+                h.h.app
+                    .db
+                    .bridge_child_state(&child)
+                    .unwrap()
+                    .map(|row| row.state),
+                Some(crate::session::ChildState::Stalled),
+                "{step:?}: an unrunnable adopted child was not marked resumable"
+            );
+            let saga =
+                h.h.app
+                    .db
+                    .child_saga(&owner, &key)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{step:?}: the saga row is gone"));
+            assert_eq!(
+                saga.step,
+                Some(crate::session::SagaStep::Failed),
+                "{step:?}: the interrupted saga was left open"
+            );
+            let owner_mail =
+                h.h.app
+                    .db
+                    .list_messages(h.owner(), false, Some(50))
+                    .unwrap();
+            assert_eq!(
+                owner_mail
+                    .iter()
+                    .filter(|m| m.kind == crate::session::bridge::MailKind::ChildStalled.as_str())
+                    .count(),
+                1,
+                "{step:?}: the owner was never told its child stalled: {owner_mail:?}"
+            );
+        }
+    }
+}
+
+/// `stop` is a public verb with a grace period, a cancel, a deferred answer and
+/// terminal-state idempotency, and none of it was covered: the only route to
+/// `Stopped` any test took was the delete cascade, which enters the quiesce
+/// already acknowledged.
+#[tokio::test]
+async fn the_stop_verb_cancels_waits_and_answers_once() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0070").await;
+
+    queue_request(
+        &h.h,
+        0,
+        "stop-0070",
+        &envelope(
+            "stop-0070",
+            "stop",
+            // A real grace, so the wait is the thing being observed: friring
+            // asks the child to finish and gives it this long to answer before
+            // stopping it anyway.
+            serde_json::json!({ "child": child.child_id, "grace_secs": 120 }),
+        ),
+    );
+    h.drive(3).await;
+
+    // Accepted, not answered: a stop takes as long as the child's own finish
+    // intent, so the journal row waits.
+    assert!(
+        bridge_answer(&h.h, 0, "stop-0070").is_none(),
+        "a stop was answered before the child stopped: {:?}",
+        bridge_answer(&h.h, 0, "stop-0070")
+    );
+    // Still running during the grace, and deliberately: the point of the window
+    // is that the child may finish on its own terms. What is durable meanwhile
+    // is the journal row, which recovery reads if this instance dies holding it.
+    assert_eq!(h.child_state(), Some(crate::session::ChildState::Ready));
+    assert_eq!(
+        h.h.app
+            .db
+            .bridge_request(&h.owner().to_string(), "stop-0070")
+            .unwrap()
+            .map(|row| row.state),
+        Some(crate::storage::bridge::RequestState::Accepted)
+    );
+    // The child was told, in friring's own words, before anything was killed.
+    let mail =
+        h.h.app
+            .db
+            .list_messages(child.child_id.parse().unwrap(), false, Some(20))
+            .unwrap();
+    assert!(
+        mail.iter().any(|m| m.kind == "cancel"),
+        "the child was stopped without being asked to finish: {mail:?}"
+    );
+
+    // The child answers, and the quiesce runs to a verdict.
+    h.h.app.accept_finish_intent(
+        child.child_id.parse().unwrap(),
+        crate::session::Outcome::Completed,
+        None,
+    );
+    h.drive_until(60, |h| h.h.app.child_lifecycle.in_flight() == 0)
+        .await;
+
+    let answer = bridge_answer(&h.h, 0, "stop-0070").expect("the stop is answered when it is done");
+    assert_eq!(answer["ok"], true, "{answer}");
+    // `stopped`, not `done`, even though the child reported `completed`: an
+    // owner-initiated stop is a stop. `done` is reachable only from a finish the
+    // child started.
+    assert_eq!(h.child_state(), Some(crate::session::ChildState::Stopped));
+
+    // A replay of the same key returns the same answer and stops nothing twice.
+    queue_request(
+        &h.h,
+        0,
+        "stop-0070",
+        &envelope(
+            "stop-0070",
+            "stop",
+            serde_json::json!({ "child": child.child_id, "grace_secs": 120 }),
+        ),
+    );
+    h.drive(3).await;
+    let replay = bridge_answer(&h.h, 0, "stop-0070").expect("a replay is answered");
+    assert_eq!(replay, answer, "a replay did not return the first answer");
+}
+
+/// A **pre-effect** saga write that fails stops the launch before the effect.
+///
+/// The module header's promise is that every external effect is written down
+/// first, so recovery has an exact identity to reconcile. A step that recorded
+/// nothing and made the effect anyway would leave a worktree or a gated pane
+/// that recovery cannot name and will not touch — the one failure the whole
+/// design is arranged around, and the one nothing injected until now.
+///
+/// Injected for real rather than through a seam: a `BEFORE INSERT` trigger makes
+/// `upsert_child_saga` fail exactly the way a broken database does, and S2's
+/// pre-effect record is the first write after the job starts.
+#[tokio::test]
+async fn a_step_that_cannot_be_recorded_is_never_carried_out() {
+    let mut h = ChildHarness::new();
+    h.h.app
+        .db
+        .conn_ref()
+        .execute(
+            // BEFORE **UPDATE**, so S1's insert lands and S2's pre-effect
+            // record — the first write of an existing row — is the one that
+            // fails. An insert trigger would refuse at S1 and never reach the
+            // step whose ordering is the property under test.
+            "CREATE TRIGGER no_saga_step BEFORE UPDATE ON child_sagas \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+            [],
+        )
+        .unwrap();
+
+    h.create("create-0085");
+    let answer = h.answer("create-0085").await;
+
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert!(
+        answer["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("will not carry out what it cannot recover"),
+        "{answer}"
+    );
+    // The effect never ran, which is the property: a worktree friring could not
+    // write down is a worktree it must not make.
+    assert!(
+        !h.effects.called("create_worktree"),
+        "the launch cut a worktree it had failed to record"
+    );
+    assert!(h.child().is_none(), "nothing was committed");
+}
+
+/// A launch that lost the branch reclaims **nothing**, and one that won it
+/// reclaims what it made.
+///
+/// The planned worktree path is recorded before `git` runs, so a saga that lost
+/// the ref to another instance is holding the *winner's* directory against its
+/// own failure. Removing it is the one mistake here that destroys work nobody
+/// can recover, and telling the two apart is not something the planned path can
+/// do — it is what the two-phase claim reports.
+#[tokio::test]
+async fn only_a_launch_that_claimed_the_branch_reclaims_anything() {
+    for (owns, expect_reclaim) in [(false, false), (true, true)] {
+        let mut h = ChildHarness::new();
+        *h.effects.worktree_error.lock().unwrap() = Some(crate::git::ClaimFailure {
+            detail: "fatal: a branch named 'feat/one' already exists".into(),
+            owns_branch: owns,
+        });
+        h.create("create-0083");
+        let answer = h.answer("create-0083").await;
+        assert_eq!(answer["ok"], false, "{answer}");
+
+        let reclaimed = !h.effects.deleted_branches.lock().unwrap().is_empty();
+        assert_eq!(
+            reclaimed,
+            expect_reclaim,
+            "a launch that {} the branch {} reclaim",
+            if owns { "won" } else { "lost" },
+            if reclaimed { "did" } else { "did not" }
+        );
+        // The saga records which it was, because a *later* process's recovery
+        // has only the row to decide from.
+        let saga =
+            h.h.app
+                .db
+                .child_saga(&h.owner().to_string(), "create-0083")
+                .unwrap()
+                .expect("the failed launch left its saga row");
+        assert_eq!(saga.branch_claimed, owns);
+    }
+}
+
+/// Recovery declines a worktree it cannot prove the interrupted saga made.
+///
+/// The narrow window the flag cannot cover is a crash *during* `git worktree
+/// add`, after the branch was claimed and before the tick recorded it. A leaked
+/// directory can be removed by hand; a wrongly deleted one cannot be brought
+/// back, so recovery leaves it and says where it is.
+#[tokio::test]
+async fn recovery_leaves_a_worktree_it_cannot_prove_belongs_to_the_saga() {
+    let mut h = ChildHarness::new();
+    let dir = tempfile::tempdir().unwrap();
+    let worktree = dir.path().join("someone-elses");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let child = SessionId::default();
+    h.h.app
+        .db
+        .upsert_child_saga(&crate::session::ChildSaga {
+            owner_id: h.owner().to_string(),
+            key: "create-0084".to_string(),
+            child_id: Some(child.to_string()),
+            step: Some(crate::session::SagaStep::Worktree),
+            worktree_path: Some(worktree.display().to_string()),
+            branch: Some("feat/interrupted".to_string()),
+            // The whole point: unproven, so unreclaimable.
+            branch_claimed: false,
+            ..crate::session::ChildSaga::default()
+        })
+        .unwrap();
+
+    h.h.app.recover_child_sagas();
+
+    assert!(
+        worktree.exists(),
+        "recovery removed a worktree it could not prove was the saga's"
+    );
+    assert!(
+        h.effects.deleted_branches.lock().unwrap().is_empty(),
+        "recovery deleted a branch it could not prove was the saga's"
+    );
+    assert!(
+        h.effects.removed_worktrees.lock().unwrap().is_empty(),
+        "recovery removed a worktree it could not prove was the saga's"
+    );
+}
+
+/// A `stop` that lands on a running launch is answered by the **stop**, not by
+/// the create it was coalesced onto.
+///
+/// The waiter list attaches a key to whatever job holds the child, and every
+/// waiter is answered from that job's own response. For a `stop` on a launch
+/// that is `ok` with `state: "ready"` — the caller is told quiescence completed
+/// while nothing was stopped, nothing was verified, and no verdict was written.
+#[tokio::test]
+async fn a_stop_during_a_create_stops_the_child_rather_than_reporting_it_ready() {
+    let mut h = ChildHarness::new();
+    h.create("create-0080");
+    // Far enough in that the child exists and S9 has not been satisfied: no hook
+    // has reported, so the launch is still waiting for its readiness proof.
+    h.drive_until(30, |h| h.child().is_some()).await;
+    let child = h.child().expect("the launch committed a child");
+    assert_ne!(
+        h.child_state(),
+        Some(crate::session::ChildState::Ready),
+        "this test needs a launch that has not finished"
+    );
+
+    queue_request(
+        &h.h,
+        0,
+        "stop-0080",
+        &envelope(
+            "stop-0080",
+            "stop",
+            // No grace: this test is about which answer the caller gets, not
+            // about the window, and waiting one out would be a wall-clock sleep.
+            serde_json::json!({ "child": child.child_id, "grace_secs": 0 }),
+        ),
+    );
+    h.drive(2).await;
+    // Nothing yet: the launch is still running and the stop is held behind it.
+    assert!(bridge_answer(&h.h, 0, "stop-0080").is_none());
+
+    // The launch finishes normally, and the held stop then runs as a real
+    // quiesce of its own.
+    h.drive_reporting(90, |h| bridge_answer(&h.h, 0, "stop-0080").is_some())
+        .await;
+
+    let create = bridge_answer(&h.h, 0, "create-0080").expect("the create is answered");
+    let stop = bridge_answer(&h.h, 0, "stop-0080").expect("the stop is answered");
+    assert_eq!(create["data"]["state"], "ready", "{create}");
+    // The two answers are about different things, and the stop's is about
+    // stopping. Sharing the create's `ok` is the exact defect — but so is a
+    // refusal, whose `data` is absent and would satisfy "not the create's".
+    assert_eq!(stop["ok"], true, "the stop was refused: {stop}");
+    assert_eq!(stop["data"]["child"], child.child_id, "{stop}");
+    assert_eq!(
+        stop["data"]["state"], "stopped",
+        "the stop was answered with the create's own result: {stop}"
+    );
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Stopped),
+        "the child was reported stopped without being stopped"
+    );
+    // And friring really did look at the worktree afterwards, which is what the
+    // create's answer would have claimed without doing.
+    assert!(
+        h.effects.called("verify_worktree"),
+        "nothing verified the worktree of a child a caller was told was stopped"
+    );
+}
+
+/// A `result` that arrives **before** the readiness proof is kept, and quiesced
+/// once the launch ends.
+///
+/// The agent starts when the gate opens at S8, one step before S9, so a worker
+/// small enough to finish inside that window is ordinary rather than exotic. Its
+/// `send` is already answered `ok` with a `message_id`, so dropping the intent
+/// strands the child `ready` for good: no ack, no quiesce, no verdict, and a
+/// fan-out slot held for ever.
+#[tokio::test]
+async fn a_result_that_beats_the_readiness_proof_is_quiesced_and_not_dropped() {
+    let mut h = ChildHarness::new();
+    h.create("create-0091");
+    h.drive_until(30, |h| h.child().is_some()).await;
+    let child = h.child().expect("the launch committed a child");
+    let id: SessionId = child.child_id.parse().unwrap();
+    assert_ne!(
+        h.child_state(),
+        Some(crate::session::ChildState::Ready),
+        "this test needs a child that has not yet proved ready"
+    );
+
+    // What the broker does the moment the `result` mail is durable.
+    h.h.app
+        .accept_finish_intent(id, crate::session::Outcome::Completed, Some(7));
+
+    // The launch runs to its own end, and the held intent becomes the quiesce.
+    h.drive_reporting(120, |h| {
+        h.h.app.child_lifecycle.in_flight() == 0
+            && h.child_state()
+                .is_some_and(crate::session::ChildState::is_terminal)
+    })
+    .await;
+
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Done),
+        "a child that finished early never reached a terminal state"
+    );
+    let verdict =
+        h.h.app
+            .db
+            .bridge_result(&child.child_id)
+            .unwrap()
+            .expect("a child that reported a result has a host verdict");
+    assert_eq!(verdict.outcome, crate::session::Outcome::Completed);
+    assert_eq!(
+        verdict.message_id,
+        Some(7),
+        "the verdict lost the mail row the intent arrived on"
+    );
+    // And the child was told its intent was taken, which is the whole reason the
+    // host sends an `ack` at all.
+    let mail = h.h.app.db.list_messages(id, false, Some(20)).unwrap();
+    assert!(
+        mail.iter().any(|m| m.kind == "ack"),
+        "the child was never acknowledged: {mail:?}"
+    );
+}
+
+/// When both a `result` and a `stop` are held behind one launch, the one that
+/// arrived first decides — as it would have on the live path.
+///
+/// Live, the pair resolves by arrival order: a `result` creates the quiesce and
+/// a later `stop` joins it as a waiter, so the child's own `completed` is what
+/// both callers are answered from; a `stop` first wins over a later result,
+/// deliberately. A held pair carries no order unless it is recorded, and without
+/// it the deferred path always behaved as if the stop came first — turning a
+/// child that really did finish its work into `failed`/`stopped`, and losing the
+/// verdict an integration step reads.
+///
+/// Both orders are exercised, because a rule that only ever produces one answer
+/// is not a rule about order.
+#[tokio::test]
+async fn a_held_result_and_a_held_stop_are_resolved_by_which_arrived_first() {
+    for (n, result_first, want_state, want_outcome) in [
+        (
+            0u8,
+            true,
+            crate::session::ChildState::Done,
+            crate::session::Outcome::Completed,
+        ),
+        (
+            1,
+            false,
+            crate::session::ChildState::Stopped,
+            crate::session::Outcome::Failed,
+        ),
+    ] {
+        let mut h = ChildHarness::new();
+        let create = format!("create-009{n}");
+        let stop = format!("stop-009{n}");
+        h.create(&create);
+        h.drive_until(30, |h| h.child().is_some()).await;
+        let child = h.child().expect("the launch committed a child");
+        let id: SessionId = child.child_id.parse().unwrap();
+        assert_ne!(
+            h.child_state(),
+            Some(crate::session::ChildState::Ready),
+            "this case needs a launch that has not finished"
+        );
+
+        // No grace: this is about which answer wins, not about the window.
+        let queue_stop = |h: &ChildHarness| {
+            queue_request(
+                &h.h,
+                0,
+                &stop,
+                &envelope(
+                    &stop,
+                    "stop",
+                    serde_json::json!({ "child": child.child_id, "grace_secs": 0 }),
+                ),
+            );
+        };
+        if result_first {
+            // Nothing is holding a stop yet, so this intent is unambiguously
+            // first — no waiting needed to establish it.
+            h.h.app
+                .accept_finish_intent(id, crate::session::Outcome::Completed, Some(11));
+            queue_stop(&h);
+        } else {
+            queue_stop(&h);
+            // Driven until the broker has actually **taken** the stop, not for a
+            // fixed number of passes: under load a fixed count leaves the stop
+            // still in the queue, the intent lands first, and the case silently
+            // becomes the other one.
+            h.drive_until(60, |h| h.h.app.held_stop_keys_for_test(id) == 1)
+                .await;
+            assert_eq!(
+                h.h.app.held_stop_keys_for_test(id),
+                1,
+                "case {n} needs the stop held before the result arrives"
+            );
+            h.h.app
+                .accept_finish_intent(id, crate::session::Outcome::Completed, Some(11));
+        }
+
+        h.drive_reporting(120, |h| {
+            h.h.app.child_lifecycle.in_flight() == 0
+                && h.child_state()
+                    .is_some_and(crate::session::ChildState::is_terminal)
+        })
+        .await;
+
+        assert_eq!(
+            h.child_state(),
+            Some(want_state),
+            "case {n}: the wrong arrival decided the child's state"
+        );
+        let verdict =
+            h.h.app
+                .db
+                .bridge_result(&child.child_id)
+                .unwrap()
+                .expect("a quiesce that ran leaves a verdict");
+        assert_eq!(
+            verdict.outcome, want_outcome,
+            "case {n}: the wrong arrival decided the verdict"
+        );
+        // Whichever won, the `stop` is still answered — it was journaled
+        // `accepted`, and a replay of an accepted key waits rather than acting.
+        let answer = bridge_answer(&h.h, 0, &stop).expect("the held stop is answered");
+        assert_eq!(answer["ok"], true, "case {n}: {answer}");
+        assert_eq!(
+            answer["data"]["state"],
+            want_state.as_str(),
+            "case {n}: the stop's answer disagrees with the child's state: {answer}"
+        );
+    }
+}
+
+/// A quiesce that cannot record what it found refuses, and leaves the child
+/// where a retry can pick it up.
+///
+/// The pane is already dead by then, so the alternative is a caller told `done`
+/// over an empty `bridge_results` row — which an integration step reads as a
+/// branch friring verified. `finishing` is live, so the slot is held, an
+/// operator sees it, and `recover_child_sagas` runs the quiesce again next start.
+#[tokio::test]
+async fn a_quiesce_that_cannot_be_recorded_refuses_and_stays_recoverable() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0082").await;
+
+    // Real failure injection rather than a seam: the verdict write is a plain
+    // INSERT, and a BEFORE INSERT trigger makes it fail the way a broken
+    // database does.
+    h.h.app
+        .db
+        .conn_ref()
+        .execute(
+            "CREATE TRIGGER no_verdict BEFORE INSERT ON bridge_results \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+            [],
+        )
+        .unwrap();
+
+    queue_request(
+        &h.h,
+        0,
+        "stop-0082",
+        &envelope(
+            "stop-0082",
+            "stop",
+            serde_json::json!({ "child": child.child_id, "grace_secs": 1 }),
+        ),
+    );
+    h.h.app.accept_finish_intent(
+        child.child_id.parse().unwrap(),
+        crate::session::Outcome::Completed,
+        None,
+    );
+    let answer = h.answer("stop-0082").await;
+
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"], "quiesce_failed", "{answer}");
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Finishing),
+        "a quiesce that recorded nothing left a terminal state behind"
+    );
+    assert!(
+        h.h.app.db.bridge_result(&child.child_id).unwrap().is_none(),
+        "a verdict was reported that was never written"
+    );
+    // Still live, so the fan-out slot is held rather than released for a child
+    // nothing has a verdict for.
+    assert!(h
+        .child_state()
+        .is_some_and(crate::session::ChildState::is_live));
+}
+
+/// The other half of that write: the verdict lands and the **state** write is
+/// the one that fails.
+///
+/// The two are chained, not transactional, so this is a real partial write —
+/// a `bridge_results` row for a child still marked `finishing`. It must refuse
+/// exactly as the verdict failure does: nothing may be reported complete, and
+/// the child stays live so its slot is held and the next start re-runs the
+/// quiesce over the verdict it already wrote.
+#[tokio::test]
+async fn a_quiesce_whose_state_write_fails_refuses_and_keeps_the_verdict() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0083").await;
+
+    queue_request(
+        &h.h,
+        0,
+        "stop-0083",
+        &envelope(
+            "stop-0083",
+            "stop",
+            serde_json::json!({ "child": child.child_id, "grace_secs": 1 }),
+        ),
+    );
+    h.h.app.accept_finish_intent(
+        child.child_id.parse().unwrap(),
+        crate::session::Outcome::Completed,
+        None,
+    );
+
+    // Installed *after* the intent moved the child to `finishing`: the state
+    // write is an upsert, so a trigger on the conflict branch would otherwise
+    // fail that transition too and the quiesce would never get as far as the
+    // verdict.
+    h.h.app
+        .db
+        .conn_ref()
+        .execute(
+            "CREATE TRIGGER no_state BEFORE UPDATE ON bridge_child_state \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+            [],
+        )
+        .unwrap();
+
+    let answer = h.answer("stop-0083").await;
+
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"], "quiesce_failed", "{answer}");
+    assert!(
+        answer["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("the child's state"),
+        "the refusal did not name the write that failed: {answer}"
+    );
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Finishing),
+        "a quiesce whose state write failed reported a state it never wrote"
+    );
+    assert!(
+        h.child_state()
+            .is_some_and(crate::session::ChildState::is_live),
+        "the fan-out slot was released for a child with no recorded outcome"
+    );
+    assert!(
+        h.h.app.db.bridge_result(&child.child_id).unwrap().is_some(),
+        "the verdict that was written was lost with the state write that was not"
+    );
+}
+
+/// A branch that carries commits is never deleted: a saga that failed is not
+/// evidence that the work in it is worthless.
+#[tokio::test]
+async fn recovery_keeps_a_branch_that_carries_work() {
+    let mut h = ChildHarness::new();
+    let owner = h.owner().to_string();
+    let worktree = tempfile::tempdir().unwrap();
+    h.h.app
+        .db
+        .take_bridge_request(&owner, "create-0016", "create", "hash", None)
+        .unwrap();
+    h.h.app
+        .db
+        .upsert_child_saga(&crate::session::ChildSaga {
+            owner_id: owner.clone(),
+            key: "create-0016".into(),
+            child_id: Some(SessionId::default().to_string()),
+            step: Some(crate::session::SagaStep::Worktree),
+            worktree_path: Some(worktree.path().display().to_string()),
+            // A saga past S2 recorded that its own `git branch` created the
+            // branch; a reclaim acts on nothing it cannot prove it made.
+            branch_claimed: true,
+            branch: Some("feat/has-work".into()),
+            base_head: Some("abc1234".into()),
+            instance_id: Some("a-dead-instance".into()),
+            lease_until: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+    // Three commits nobody else has.
+    *h.effects.ahead.lock().unwrap() = Some(3);
+
+    h.h.app.tick_child_sagas();
+
+    assert!(h.effects.called("remove_worktree"), "a clean worktree goes");
+    assert!(
+        !h.effects.called("delete_branch"),
+        "a branch with commits stays"
+    );
+}
+
+/// A dirty worktree an interrupted launch left is never removed, and the
+/// operator is told rather than left to find out.
+#[tokio::test]
+async fn recovery_keeps_a_worktree_with_uncommitted_work() {
+    let mut h = ChildHarness::new();
+    let owner = h.owner().to_string();
+    let worktree = tempfile::tempdir().unwrap();
+    *h.effects.verdict.lock().unwrap() = crate::git::WorktreeVerdict {
+        dirty: true,
+        ..Default::default()
+    };
+    h.h.app
+        .db
+        .upsert_child_saga(&crate::session::ChildSaga {
+            owner_id: owner.clone(),
+            key: "create-0024".into(),
+            child_id: Some(SessionId::default().to_string()),
+            step: Some(crate::session::SagaStep::Worktree),
+            worktree_path: Some(worktree.path().display().to_string()),
+            // A saga past S2 recorded that its own `git branch` created the
+            // branch; a reclaim acts on nothing it cannot prove it made.
+            branch_claimed: true,
+            branch: Some("feat/unfinished".into()),
+            instance_id: Some("a-dead-instance".into()),
+            lease_until: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+
+    h.h.app.tick_child_sagas();
+
+    assert!(
+        !h.effects.called("remove_worktree"),
+        "uncommitted work is never removed by a reconciliation"
+    );
+    assert!(
+        h.h.app
+            .status_message
+            .as_ref()
+            .is_some_and(|m| m.text.contains("uncommitted work")),
+        "the operator is told: {:?}",
+        h.h.app.status_message
+    );
+}
+
+/// A saga another instance is driving is left alone: two friring processes
+/// reconciling one child would be two processes killing one pane.
+#[tokio::test]
+async fn recovery_leaves_a_live_lease_to_its_holder() {
+    let mut h = ChildHarness::new();
+    let owner = h.owner().to_string();
+    h.h.app
+        .db
+        .upsert_child_saga(&crate::session::ChildSaga {
+            owner_id: owner.clone(),
+            key: "create-0017".into(),
+            child_id: Some(SessionId::default().to_string()),
+            step: Some(crate::session::SagaStep::Worktree),
+            worktree_path: Some("/somewhere".into()),
+            branch: Some("feat/theirs".into()),
+            instance_id: Some("another-running-friring".into()),
+            lease_until: Some(crate::sync::state::current_time_millis() + 600_000),
+            ..Default::default()
+        })
+        .unwrap();
+
+    h.h.app.tick_child_sagas();
+
+    assert!(
+        !h.effects.called("remove_worktree"),
+        "another instance's saga is not this one's to reconcile"
+    );
+    let saga =
+        h.h.app
+            .db
+            .child_saga(&owner, "create-0017")
+            .unwrap()
+            .unwrap();
+    assert_eq!(saga.step, Some(crate::session::SagaStep::Worktree));
+}
+
+/// A hard delete of an owner stops its children first, and never deletes them:
+/// removing a leader is not an instruction to throw away what its workers
+/// wrote.
+#[tokio::test]
+async fn deleting_an_owner_stops_its_children_and_keeps_their_work() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0018").await;
+
+    let owner = h.owner();
+    h.h.app
+        .cascade_bridge_delete(owner)
+        .expect("the bridge is readable");
+    assert_eq!(
+        h.h.app.child_lifecycle.in_flight(),
+        1,
+        "the owner's live child is stopped first"
+    );
+    h.drive_until(60, |h| h.h.app.child_lifecycle.in_flight() == 0)
+        .await;
+
+    assert_eq!(h.child_state(), Some(crate::session::ChildState::Stopped));
+    // The ownership row outlives everything.
+    assert!(h.h.app.db.bridge_child(&child.child_id).unwrap().is_some());
+}
+
+/// A hard delete whose cascade cannot read the bridge is **refused**, not
+/// carried out — the same fail-closed rule the headless force-delete follows.
+///
+/// An unreadable ownership table is not evidence that this session owns
+/// nothing. Deleting it anyway would remove the one session that could stop
+/// whatever it does own, and leave those agents running for an owner that is
+/// gone.
+#[tokio::test]
+async fn a_hard_delete_is_refused_when_the_bridge_cannot_be_read() {
+    let mut h = ChildHarness::new();
+    h.ready_child("create-0095").await;
+    let owner = h.owner();
+
+    // Persisted so the force-delete stamp has a row it could land on.
+    let shared = h.h.app.session_to_shared(&h.h.app.sessions[0]);
+    h.h.app.db.upsert_session(&shared).unwrap();
+
+    h.h.app
+        .db
+        .conn_ref()
+        .execute("DROP TABLE bridge_children", [])
+        .unwrap();
+
+    h.h.app.confirm_hard_delete_session(owner);
+
+    assert!(
+        h.h.app.sessions.iter().any(|s| s.info.id == owner),
+        "the owner left the session list on a delete that could not read its children"
+    );
+    assert!(
+        h.h.app.db.get_session_by_id(owner).unwrap().is_some(),
+        "a refused delete neither soft-deletes the row nor removes it"
+    );
+    let stamped: i64 =
+        h.h.app
+            .db
+            .conn_ref()
+            .query_row(
+                "SELECT force_deleted FROM sessions WHERE id = ?1",
+                [owner.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(
+        stamped, 0,
+        "the owner was stamped force-deleted by a delete that was refused"
+    );
+    assert_eq!(
+        h.h.app.child_lifecycle.in_flight(),
+        0,
+        "a stop was started for children the cascade could not enumerate"
+    );
+    assert!(
+        matches!(
+            h.h.app.status_message.as_ref().map(|m| m.level),
+            Some(StatusLevel::Error)
+        ),
+        "the operator was not told the delete was refused"
+    );
+}
+
+/// Deleting a **child** tells its owner, so a leader polling `status` does not
+/// see a child that simply stopped existing.
+#[tokio::test]
+async fn deleting_a_child_tells_its_owner() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0019").await;
+    let id: SessionId = child.child_id.parse().unwrap();
+
+    h.h.app
+        .cascade_bridge_delete(id)
+        .expect("the bridge is readable");
+
+    let owner_mail = h.h.app.db.list_messages(h.owner(), true, None).unwrap();
+    assert!(
+        owner_mail
+            .iter()
+            .any(|m| m.kind == "child.removed_by_operator"),
+        "{owner_mail:?}"
+    );
+    assert!(h
+        .h
+        .app
+        .db
+        .bridge_child_state(&child.child_id)
+        .unwrap()
+        .unwrap()
+        .force_deleted_at
+        .is_some());
+}
+
+/// The fan-out cap counts **live** children, and a dirty one still holds its
+/// slot.
+#[tokio::test]
+async fn the_fanout_cap_counts_live_children() {
+    let mut h = ChildHarness::new();
+    let owner = h.owner().to_string();
+    for (n, state) in [
+        (1, crate::session::ChildState::Ready),
+        (2, crate::session::ChildState::Dirty),
+    ] {
+        let id = format!("filler-{n}");
+        h.h.app
+            .db
+            .insert_bridge_child(&id, &owner, &format!("filler-key-{n}"))
+            .unwrap();
+        h.h.app.db.set_bridge_child_state(&id, state).unwrap();
+    }
+    h.create("create-0020");
+    let answer = h.answer("create-0020").await;
+    assert_eq!(answer["error"], "fanout_exhausted", "{answer}");
+}
+
+/// The cap counts committed rows **and** in-flight creates, because a tick takes
+/// several requests at once and the rows only exist after S6. The window between
+/// those two is where it can go wrong in the other direction: from `Committed`
+/// until the child's own hook reports, a create has a row *and* a job, and
+/// counting both charges one child two slots — halving the cap whenever anything
+/// is starting up.
+#[tokio::test]
+async fn a_committed_child_is_charged_one_slot_not_two() {
+    let mut h = ChildHarness::new();
+    // `max_children = 2`, so a single child mid-startup must still leave room.
+    h.create("create-0021");
+    h.drive_until(60, |h| {
+        h.child()
+            .and_then(|c| h.h.app.db.child_saga_of_child(&c.child_id).ok().flatten())
+            .and_then(|saga| saga.step)
+            == Some(crate::session::SagaStep::Released)
+    })
+    .await;
+    let first = h.child().expect("the first child committed");
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Starting),
+        "the window this test is about is committed-but-not-ready"
+    );
+
+    // A successful `create` is deferred until its child is ready, so the second
+    // one is judged by what it commits rather than by an answer. A refusal is
+    // what would arrive immediately, which is why its absence is the assertion.
+    // Its own branch, because two live children never share a worktree — that is
+    // a different refusal, and it would satisfy this assertion for the wrong
+    // reason.
+    h.create_on("create-0022", "feat/two");
+    h.drive_until(60, |h| {
+        h.h.app
+            .db
+            .bridge_children_of(&h.owner().to_string())
+            .map(|c| c.len())
+            .unwrap_or(0)
+            == 2
+    })
+    .await;
+
+    let refusal = bridge_answer(&h.h, 0, "create-0022");
+    assert!(
+        refusal.is_none(),
+        "the second create was refused while one child was merely starting: {refusal:?}"
+    );
+    let children =
+        h.h.app
+            .db
+            .bridge_children_of(&h.owner().to_string())
+            .unwrap();
+    assert_eq!(
+        children.len(),
+        2,
+        "one starting child consumed both fan-out slots"
+    );
+    assert!(children.iter().any(|c| c.child_id == first.child_id));
+}
+
+/// The branch is chosen by the requesting agent and it decides a **path**:
+/// `worktree_segments` maps only `/` to `-`, so `..` survives and resolves to
+/// the parent of every friring worktree for that repository — which a create
+/// would then hand the child as its workspace.
+#[tokio::test]
+async fn a_child_branch_that_would_escape_the_worktree_root_is_refused() {
+    for branch in ["..", "../..", "-x", "a..b", "with space", "tail.lock", ""] {
+        let mut h = ChildHarness::new();
+        let key = "create-0050";
+        queue_request(
+            &h.h,
+            0,
+            key,
+            &envelope(
+                key,
+                "create",
+                serde_json::json!({
+                    "repo_root": "/repo/app",
+                    "branch": branch,
+                    "agent": "worker",
+                    "task_kind": "task",
+                    "task_body": "do the thing",
+                }),
+            ),
+        );
+        let answer = h.answer(key).await;
+        assert_eq!(answer["ok"], false, "branch '{branch}' was accepted");
+        assert!(h.child().is_none(), "branch '{branch}' made a child anyway");
+    }
+}
+
+/// `create_or_attach_worktree` returns an existing deterministic path unchecked,
+/// so a create naming a branch the operator already has a worktree for would run
+/// the child **in the operator's worktree** — and two children on one branch
+/// would share one.
+#[tokio::test]
+async fn a_create_refuses_a_branch_whose_worktree_already_exists() {
+    let mut h = ChildHarness::new();
+    let planned =
+        crate::git::planned_worktree_path(std::path::Path::new("/repo/app"), "feat/one").unwrap();
+    std::fs::create_dir_all(&planned).unwrap();
+
+    h.create("create-0051");
+    let answer = h.answer("create-0051").await;
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert!(
+        answer["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("already a worktree")),
+        "{answer}"
+    );
+    assert!(
+        h.child().is_none(),
+        "a child was made in an existing worktree"
+    );
+}
+
+/// A child's boundary — the narrowing, the gate, the private state — is built
+/// by the spawn saga and by nothing else, so every **generic** relaunch path has
+/// to decline. `Ctrl+R` would otherwise put the agent back in the child's
+/// worktree under its owner's un-narrowed profile.
+#[tokio::test]
+async fn a_bridge_child_is_never_relaunched_by_a_generic_path() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0040").await;
+    let id: SessionId = child.child_id.parse().unwrap();
+
+    assert!(
+        h.h.app.is_bridge_child(id),
+        "the ownership row is what marks a child"
+    );
+    let index =
+        h.h.app
+            .sessions
+            .iter()
+            .position(|s| s.info.id == id)
+            .expect("the child is a session");
+    h.h.app.active_index = index;
+    h.h.app.restart_active_session();
+
+    let refusal = h.h.app.status_message.as_ref().map(|m| m.text.clone());
+    assert!(
+        refusal
+            .as_deref()
+            .is_some_and(|m| m.contains("bridge child")),
+        "the restart was not refused: {refusal:?}"
+    );
+    // Refused, not half-done: the child is still the session it was.
+    assert!(h.h.app.sessions.iter().any(|s| s.info.id == id));
+
+    // And the read fails **closed**: a row friring cannot read is a child, not
+    // a non-child. An unreadable ownership table is exactly the state in which
+    // relaunching would put the agent back under its owner's un-narrowed
+    // profile, so the refusal has to survive it.
+    h.h.app
+        .db
+        .conn_ref()
+        .execute("DROP TABLE bridge_children", [])
+        .unwrap();
+    assert!(
+        h.h.app.is_bridge_child(id),
+        "an ownership row friring cannot read was read as 'not a child'"
+    );
+    h.h.app.status_message = None;
+    h.h.app.restart_active_session();
+    let refusal = h.h.app.status_message.as_ref().map(|m| m.text.clone());
+    assert!(
+        refusal
+            .as_deref()
+            .is_some_and(|m| m.contains("bridge child")),
+        "the restart was not refused once ownership became unreadable: {refusal:?}"
+    );
+    assert!(h.h.app.sessions.iter().any(|s| s.info.id == id));
+}
+
+/// A child the quiesce has stopped must not stay an active session row with an
+/// `agent_session_id` and no pane — that is precisely what startup restore
+/// relaunches, restarting an agent inside a worktree friring already verified.
+#[tokio::test]
+async fn a_terminal_child_is_retired_from_the_session_list() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0041").await;
+    let id: SessionId = child.child_id.parse().unwrap();
+    assert!(h.h.app.sessions.iter().any(|s| s.info.id == id));
+
+    h.quiesce(&child.child_id, crate::session::Outcome::Completed)
+        .await;
+    assert_eq!(h.child_state(), Some(crate::session::ChildState::Done));
+
+    assert!(
+        !h.h.app.sessions.iter().any(|s| s.info.id == id),
+        "a done child is still in the session list"
+    );
+    assert!(
+        h.h.app.db.unloaded_session_ids().unwrap().contains(&id),
+        "a done child's row is still loaded, so a restore would respawn it"
+    );
+    // The rows a later decision reads are untouched: ownership, the worktree and
+    // the verdict are not runtime.
+    assert!(h.h.app.db.bridge_child(&child.child_id).unwrap().is_some());
+    assert!(h.h.app.db.bridge_result(&child.child_id).unwrap().is_some());
+}
+
+/// `stalled` is set from the nudge counter alone, with the child's agent still
+/// running. A resume that simply relaunched would leave two panes under one
+/// session id — and S8's identity check would find the *old* one, pass, and open
+/// the *new* one's gate.
+#[tokio::test]
+async fn a_resume_stops_the_running_pane_and_leaves_one_session() {
+    let backend = Arc::new(FakeBackend::spawnable());
+    let mut h = ChildHarness::with_watched_backend(Arc::clone(&backend));
+    let child = h.ready_child("create-0042").await;
+    let id: SessionId = child.child_id.parse().unwrap();
+    // The pane the child is running in *now*. Counting sessions cannot see the
+    // regression this test is named for: S6 replaces the in-memory session
+    // either way, so a resume that stopped nothing leaves the old pane alive
+    // beside the new one and the session list still says one.
+    let running_pane = {
+        let panes = backend.panes.lock().unwrap();
+        assert_eq!(panes.len(), 1, "a ready child is one pane: {panes:?}");
+        panes.keys().next().cloned().unwrap()
+    };
+    h.h.app
+        .db
+        .set_bridge_child_state(&child.child_id, crate::session::ChildState::Stalled)
+        .unwrap();
+
+    queue_request(
+        &h.h,
+        0,
+        "resume-0042",
+        &envelope(
+            "resume-0042",
+            "resume",
+            serde_json::json!({ "child": child.child_id }),
+        ),
+    );
+    // Driven to the *relaunched* pane, not merely to `starting`: `begin_resume`
+    // writes that column before the job runs, so stopping there would assert
+    // nothing about what the saga did.
+    h.drive_until(60, |h| {
+        h.h.app
+            .db
+            .child_saga_of_child(&child.child_id)
+            .ok()
+            .flatten()
+            .and_then(|saga| saga.step)
+            == Some(crate::session::SagaStep::Released)
+    })
+    .await;
+
+    assert_eq!(
+        h.h.app.sessions.iter().filter(|s| s.info.id == id).count(),
+        1,
+        "one id must have exactly one session: S8 revalidates the first match"
+    );
+    assert_eq!(
+        h.h.app
+            .db
+            .bridge_children_of(&h.owner().to_string())
+            .unwrap()
+            .len(),
+        1,
+        "a resume made a second child"
+    );
+    // One pane, and not the one that was already there: the old agent was
+    // stopped and a new one relaunched, rather than two agents sharing one
+    // worktree.
+    let panes = backend.panes.lock().unwrap();
+    assert_eq!(
+        panes.len(),
+        1,
+        "the resumed child's old pane is still running beside its new one: {panes:?}"
+    );
+    assert!(
+        !panes.contains_key(&running_pane),
+        "the resume left the original pane in place, so nothing was relaunched"
+    );
+}
+
+/// A request accepted against a job already carrying its child is journaled
+/// `accepted` and answered by nothing of its own — and a replay of an accepted
+/// key waits rather than acting. Without a waiter list that caller never hears
+/// back.
+#[tokio::test]
+async fn a_second_request_against_a_running_job_is_answered_too() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0043").await;
+
+    // Two stops for one child. The first starts the quiesce; the second finds a
+    // job already carrying it.
+    for key in ["stop-0043a", "stop-0043b"] {
+        queue_request(
+            &h.h,
+            0,
+            key,
+            &envelope(key, "stop", serde_json::json!({ "child": child.child_id })),
+        );
+        h.drive(2).await;
+    }
+    h.h.app.accept_finish_intent(
+        child.child_id.parse().unwrap(),
+        crate::session::Outcome::Completed,
+        None,
+    );
+    h.drive_until(60, |h| h.h.app.child_lifecycle.in_flight() == 0)
+        .await;
+
+    for key in ["stop-0043a", "stop-0043b"] {
+        let answer = bridge_answer(&h.h, 0, key)
+            .unwrap_or_else(|| panic!("'{key}' was accepted and never answered"));
+        assert_eq!(answer["key"], key, "an answer carries the key it answers");
+    }
+}
+
+/// A `stop` writes no saga row (the durable record of a quiesce is
+/// `ChildState::Finishing` itself), so a crash mid-stop leaves its journal row
+/// `accepted` for ever — and a replay of an accepted key waits by design.
+/// Recovery closes those out with a typed refusal the caller can act on.
+#[tokio::test]
+async fn recovery_answers_a_request_its_predecessor_died_holding() {
+    let mut h = ChildHarness::new();
+    let owner = h.owner().to_string();
+    // A row from *before* this instance came up: what a crash leaves behind.
+    h.h.app
+        .db
+        .take_bridge_request(&owner, "stop-0044", "stop", "hash", None)
+        .unwrap();
+    h.h.app.child_lifecycle.started_at = u64::MAX;
+    h.h.app.child_lifecycle.recovered = false;
+
+    h.h.app.tick_child_sagas();
+
+    let answer =
+        bridge_answer(&h.h, 0, "stop-0044").expect("recovery left an accepted request unanswered");
+    assert_eq!(answer["ok"], false);
+    assert_eq!(answer["error"], "broker_absent", "{answer}");
+    assert!(
+        answer["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("restarted")),
+        "{answer}"
+    );
+
+    // And a request this instance accepted itself is left alone: the broker runs
+    // in `tick_core` and this driver in `tick_background`, so on the first tick
+    // a fresh row is already in the journal.
+    h.h.app.child_lifecycle.started_at = 0;
+    h.h.app.child_lifecycle.recovered = false;
+    h.h.app
+        .db
+        .take_bridge_request(&owner, "stop-0045", "stop", "hash", None)
+        .unwrap();
+    h.h.app.tick_child_sagas();
+    assert!(
+        bridge_answer(&h.h, 0, "stop-0045").is_none(),
+        "recovery refused a request this instance had just accepted"
+    );
+}
+
+// ── Stage H: host-verified results and escalation ────────────────────────
+
+/// The verdict is the **host's**, read after the pane stopped. The child's
+/// `result` carries an outcome and a summary and nothing else — there is no
+/// field in it for a branch or a head, so a worker cannot report a commit it did
+/// not make.
+#[tokio::test]
+async fn a_verdict_carries_only_what_the_host_read_after_the_stop() {
+    let mut h = ChildHarness::new();
+    *h.effects.verdict.lock().unwrap() = crate::git::WorktreeVerdict {
+        branch: Some("feat/one".into()),
+        head: Some("deadbeef".into()),
+        dirty: false,
+        ahead_of_base: 3,
+        unreadable: false,
+    };
+    let child = h.ready_child("create-0030").await;
+    h.quiesce(&child.child_id, crate::session::Outcome::Completed)
+        .await;
+
+    let verdict = h.h.app.db.bridge_result(&child.child_id).unwrap().unwrap();
+    assert_eq!(verdict.head.as_deref(), Some("deadbeef"));
+    assert_eq!(verdict.branch.as_deref(), Some("feat/one"));
+    assert_eq!(verdict.ahead_of_base, 3);
+    assert!(verdict.verified_at > 0, "the host stamped when it looked");
+    // The verification happened **after** the kill, which is the property that
+    // makes the verdict mean anything: friring read a worktree nothing could
+    // still be writing. Observed from inside the verification rather than
+    // inferred from both having happened.
+    assert!(h.effects.called("verify_worktree"));
+    let alive = h.effects.panes_alive_at_verify.lock().unwrap().clone();
+    assert_eq!(
+        alive,
+        vec![0],
+        "the host inspected the worktree while a pane was still alive"
+    );
+
+    // And `status` reports it, so an integration step reads the host's fields.
+    queue_request(
+        &h.h,
+        0,
+        "status-0030",
+        &envelope("status-0030", "status", serde_json::json!({})),
+    );
+    let answer = h.answer("status-0030").await;
+    let child_view = &answer["data"]["children"][0];
+    assert_eq!(child_view["result"]["head"], "deadbeef", "{answer}");
+    assert_eq!(child_view["result"]["dirty"], false, "{answer}");
+    assert_eq!(child_view["result"]["ahead_of_base"], 3, "{answer}");
+    assert_eq!(child_view["state"], "done", "{answer}");
+}
+
+/// A report that asks for an operator moves the child to `blocked` and mirrors
+/// itself to the owner, labelled as the child's own words.
+#[tokio::test]
+async fn a_report_needing_an_operator_escalates_to_the_owner() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0031").await;
+
+    let dir = crate::paths::bridge_request_dir(&child.child_id).unwrap();
+    std::fs::write(
+        dir.join("report-0031.req"),
+        serde_json::to_string(&envelope(
+            "report-0031",
+            "report",
+            serde_json::json!({
+                "phase": "blocked",
+                "progress": 40,
+                "summary": "the migration needs a decision",
+                "needs_operator": true,
+            }),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let response = crate::paths::bridge_response_dir(&child.child_id)
+        .unwrap()
+        .join("report-0031.res");
+    h.drive_until(60, |_| response.exists()).await;
+
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Blocked),
+        "a child that says it is stuck is stuck in the owner's view too"
+    );
+    let owner_mail = h.h.app.db.list_messages(h.owner(), true, None).unwrap();
+    let mirrored = owner_mail
+        .iter()
+        .find(|m| m.kind == "report")
+        .expect("the report is mirrored to the owner");
+    let body: serde_json::Value = serde_json::from_str(&mirrored.body).unwrap();
+    assert_eq!(body["child_authored"], true, "{body}");
+    assert_eq!(body["needs_operator"], true, "{body}");
+    assert_eq!(body["summary"], "the migration needs a decision", "{body}");
+    // The mail is attributed to the child, because it is the child's words.
+    assert_eq!(
+        mirrored.from_session_id.map(|id| id.to_string()),
+        Some(child.child_id.clone())
+    );
+}
+
+/// An escalation never puts a child that has already been judged back into the
+/// fan-out.
+#[tokio::test]
+async fn an_escalation_never_revives_a_finished_child() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0032").await;
+    h.quiesce(&child.child_id, crate::session::Outcome::Completed)
+        .await;
+    assert_eq!(h.child_state(), Some(crate::session::ChildState::Done));
+
+    let dir = crate::paths::bridge_request_dir(&child.child_id).unwrap();
+    std::fs::write(
+        dir.join("report-0032.req"),
+        serde_json::to_string(&envelope(
+            "report-0032",
+            "report",
+            serde_json::json!({ "phase": "blocked", "needs_operator": true }),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    h.drive(15).await;
+
+    assert_eq!(
+        h.child_state(),
+        Some(crate::session::ChildState::Done),
+        "a verdict is not something a late report can undo"
+    );
+}
+
+// ── Stage I: UI and CLI surfaces ─────────────────────────────────────────
+
+/// The `Bridge:` row says what a session *is* in an orchestration, from either
+/// side, and the owner's row marks a child that needs a person.
+#[tokio::test]
+async fn the_info_panel_says_where_a_session_sits_in_an_orchestration() {
+    let mut h = ChildHarness::new();
+    let child = h.ready_child("create-0040").await;
+
+    let owner_row =
+        h.h.app
+            .bridge_row_for_test(h.owner())
+            .expect("the owner has a bridge row");
+    assert_eq!(owner_row.children, Some((1, 2)));
+    assert!(!owner_row.needs_operator);
+    assert!(
+        owner_row.detail().contains("1/2 children"),
+        "{}",
+        owner_row.detail()
+    );
+
+    let id: SessionId = child.child_id.parse().unwrap();
+    let child_row =
+        h.h.app
+            .bridge_row_for_test(id)
+            .expect("the child has a bridge row");
+    assert_eq!(child_row.child_state.as_deref(), Some("ready"));
+    assert_eq!(child_row.owner.as_deref(), Some("session-0"));
+    assert!(
+        child_row.detail().starts_with("child of session-0"),
+        "{}",
+        child_row.detail()
+    );
+
+    // A dirty child is one an operator has to deal with, and the owner's row
+    // has to say so — the whole point of the row.
+    h.h.app
+        .db
+        .set_bridge_child_state(&child.child_id, crate::session::ChildState::Dirty)
+        .unwrap();
+    let owner_row = h.h.app.bridge_row_for_test(h.owner()).unwrap();
+    assert!(owner_row.needs_operator);
+    assert!(
+        owner_row.detail().contains("needs you"),
+        "{}",
+        owner_row.detail()
+    );
+}
+
+/// A session in no orchestration gets no row at all: the overwhelming majority
+/// of sessions must pay nothing for a feature they do not use.
+#[test]
+fn an_ordinary_session_has_no_bridge_row() {
+    let h = Harness::standard(1);
+    let id = h.app.sessions[0].info.id;
+    assert!(h.app.bridge_row_for_test(id).is_none());
+}
+
+/// `session get` carries the host's verdict and never the child's own words:
+/// an integration step reads this document, and text a worker wrote must not be
+/// part of what decides whether its branch is merged.
+#[tokio::test]
+async fn session_get_reports_the_bridge_and_never_a_childs_summary() {
+    let mut h = ChildHarness::new();
+    *h.effects.verdict.lock().unwrap() = crate::git::WorktreeVerdict {
+        branch: Some("feat/one".into()),
+        head: Some("cafebabe".into()),
+        dirty: false,
+        ahead_of_base: 4,
+        unreadable: false,
+    };
+    let child = h.ready_child("create-0041").await;
+    h.quiesce(&child.child_id, crate::session::Outcome::Completed)
+        .await;
+
+    // The owner is a harness stub, so it reaches the rows the way every
+    // session does — through `save_state`, which is also what writes the
+    // `session_repos` row a `create` is checked against.
+    h.h.app.save_state();
+    let owner = h.owner().to_string();
+    let out = crate::cli::sessions::run(
+        crate::cli::sessions::Action::Get {
+            uuid: owner.clone(),
+        },
+        &h.h.app.db,
+    )
+    .expect("session get");
+    let bridge = &out["bridge"];
+    assert!(
+        bridge["owner"].is_null(),
+        "the owner has no owner: {bridge}"
+    );
+    assert_eq!(bridge["children"][0]["id"], child.child_id, "{bridge}");
+    assert_eq!(bridge["children"][0]["state"], "done", "{bridge}");
+    assert_eq!(
+        bridge["children"][0]["result"]["head"], "cafebabe",
+        "{bridge}"
+    );
+    assert_eq!(
+        bridge["children"][0]["result"]["ahead_of_base"], 4,
+        "{bridge}"
+    );
+    // No summary field anywhere: the document an integration step reads carries
+    // host-known fields only.
+    assert!(
+        !out.to_string().contains("summary"),
+        "a session document must not carry child-authored text: {out}"
+    );
+    // And the egress token is nowhere in it, as nothing that renders a session
+    // may carry one.
+    assert!(!out.to_string().contains("token"), "{out}");
+
+    // The child's own document names its owner.
+    let child_out = crate::cli::sessions::run(
+        crate::cli::sessions::Action::Get {
+            uuid: child.child_id.clone(),
+        },
+        &h.h.app.db,
+    )
+    .expect("session get for the child");
+    assert_eq!(child_out["bridge"]["owner"], owner, "{child_out}");
+    assert_eq!(child_out["bridge"]["state"], "done", "{child_out}");
+}
+
+/// An ordinary session's document carries `"bridge": null` — present, so a
+/// consumer can key on it, and empty, so it says what it means.
+#[test]
+fn an_ordinary_session_document_carries_a_null_bridge() {
+    let db = Database::open_in_memory().unwrap();
+    let shared = sync::SharedSession {
+        id: SessionId::default(),
+        name: "plain".into(),
+        agent: "claude".into(),
+        backend_id: String::new(),
+        backend_type: "local-tmux".into(),
+        agent_session_id: None,
+        cwd: None,
+        additional_dirs: Vec::new(),
+        workspace_dir: None,
+        worktrees: Vec::new(),
+        shell_backend_id: None,
+        sandbox_profile: None,
+        sandbox_enforcement: Default::default(),
+        parent_session_id: None,
+        display_order: None,
+        tombstone: false,
+        tombstone_at: None,
+        mux: crate::session::MuxIdentity::default(),
+        egress: crate::session::EgressRecord::default(),
+        sandbox_overlay: None,
+    };
+    db.upsert_session(&shared).unwrap();
+    let out = crate::cli::sessions::run(
+        crate::cli::sessions::Action::Get {
+            uuid: shared.id.to_string(),
+        },
+        &db,
+    )
+    .unwrap();
+    assert!(out["bridge"].is_null(), "{out}");
+}
+
+/// The five bridge fields round-trip through the profile editor, and the four
+/// that only mean anything once something is granted appear with the grant.
+#[test]
+fn the_profile_editor_round_trips_the_bridge_fields() {
+    use crate::app::modals::{BridgePreset, SandboxField};
+
+    let mut profile = crate::session::SandboxProfile::new(
+        "orchestrator",
+        vec![crate::session::SandboxPath::workspace("~/dev/app")],
+    );
+    profile.backend = crate::session::SandboxBackendKind::Seatbelt;
+    profile.bridge_grants = vec![
+        crate::session::BridgeCapability::ChildLifecycle,
+        crate::session::BridgeCapability::Mailbox,
+        crate::session::BridgeCapability::Report,
+    ];
+    profile.max_children = 5;
+    profile.child_agents = vec!["codex".into(), "claude".into()];
+    profile.child_shared_rw = vec!["~/.cargo/registry".into()];
+    profile.child_seed_allow = vec![crate::session::ChildSeedAllow {
+        path: "auth.json".into(),
+        mode: crate::session::SeedMode::LinkRw,
+    }];
+
+    let editor = crate::app::modals::SandboxEditorModal::from_profile(&profile);
+    assert_eq!(editor.bridge.preset, BridgePreset::Leader);
+    let fields = editor.visible_fields();
+    for field in [
+        SandboxField::BridgeGrants,
+        SandboxField::MaxChildren,
+        SandboxField::ChildAgents,
+        SandboxField::ChildSharedRw,
+        SandboxField::ChildSeedAllow,
+    ] {
+        assert!(fields.contains(&field), "{field:?} is missing");
+    }
+    let rebuilt = editor.build_profile().expect("the form round-trips");
+    assert_eq!(rebuilt.bridge_grants, profile.bridge_grants);
+    assert_eq!(rebuilt.max_children, 5);
+    assert_eq!(rebuilt.child_agents, profile.child_agents);
+    assert_eq!(rebuilt.child_shared_rw, profile.child_shared_rw);
+    assert_eq!(rebuilt.child_seed_allow, profile.child_seed_allow);
+}
+
+/// A profile that grants nothing shows only the grant row: a fan-out cap on a
+/// profile with no bridge is a number nothing reads.
+#[test]
+fn the_dependent_bridge_rows_appear_with_the_grant() {
+    use crate::app::modals::SandboxField;
+
+    let mut profile = crate::session::SandboxProfile::new(
+        "plain",
+        vec![crate::session::SandboxPath::workspace("~/dev/app")],
+    );
+    profile.backend = crate::session::SandboxBackendKind::Seatbelt;
+    let mut editor = crate::app::modals::SandboxEditorModal::from_profile(&profile);
+    let fields = editor.visible_fields();
+    assert!(fields.contains(&SandboxField::BridgeGrants));
+    assert!(!fields.contains(&SandboxField::MaxChildren));
+
+    editor.field = SandboxField::BridgeGrants;
+    editor.adjust(1);
+    assert!(editor.visible_fields().contains(&SandboxField::MaxChildren));
+    assert!(!editor.build_profile().unwrap().bridge_grants.is_empty());
+}
+
+/// A seed authorization friring could not join onto a child's private state
+/// directory is refused at save, not at launch.
+#[test]
+fn a_seed_authorization_that_would_escape_is_refused_at_save() {
+    use crate::app::modals::{BridgePreset, SandboxField};
+
+    let mut profile = crate::session::SandboxProfile::new(
+        "orchestrator",
+        vec![crate::session::SandboxPath::workspace("~/dev/app")],
+    );
+    profile.backend = crate::session::SandboxBackendKind::Seatbelt;
+    let mut editor = crate::app::modals::SandboxEditorModal::from_profile(&profile);
+    editor.bridge.preset = BridgePreset::Leader;
+    editor.field = SandboxField::ChildSeedAllow;
+
+    for hostile in [
+        "../../etc/passwd:copy",
+        "/etc/passwd:copy",
+        "auth.json:teleport",
+    ] {
+        editor.bridge.child_seed_allow.set(hostile);
+        assert!(
+            editor.build_profile().is_err(),
+            "'{hostile}' must be refused at save"
+        );
+    }
+    editor.bridge.child_seed_allow.set("auth.json:link-rw");
+    assert!(editor.build_profile().is_ok());
+}
+
+/// A profile that resolves to a **place** cannot grant the bridge: the bridge
+/// is a directory friring mints on the host, and a place has no such path.
+#[test]
+fn a_place_backed_profile_cannot_grant_the_bridge() {
+    use crate::app::modals::{sandbox_field_available, BridgePreset, SandboxField};
+
+    for field in [
+        SandboxField::BridgeGrants,
+        SandboxField::MaxChildren,
+        SandboxField::ChildAgents,
+        SandboxField::ChildSharedRw,
+        SandboxField::ChildSeedAllow,
+    ] {
+        assert!(
+            !sandbox_field_available(
+                field,
+                crate::session::SandboxBackendKind::Docker,
+                crate::session::NetworkMode::Allowlist
+            ),
+            "{field:?} must be unavailable for a place"
+        );
+        assert!(sandbox_field_available(
+            field,
+            crate::session::SandboxBackendKind::Seatbelt,
+            crate::session::NetworkMode::Allowlist
+        ));
+    }
+    // And a grant typed against a policy backend is dropped rather than saved
+    // when the backend is changed to a place.
+    let mut profile = crate::session::SandboxProfile::new(
+        "moved",
+        vec![crate::session::SandboxPath::workspace("~/dev/app")],
+    );
+    profile.backend = crate::session::SandboxBackendKind::Seatbelt;
+    let mut editor = crate::app::modals::SandboxEditorModal::from_profile(&profile);
+    editor.bridge.preset = BridgePreset::Leader;
+    assert!(!editor.build_profile().unwrap().bridge_grants.is_empty());
+    editor.backend = crate::session::SandboxBackendKind::Docker;
+    assert!(
+        editor.build_profile().unwrap().bridge_grants.is_empty(),
+        "a grant the launch would refuse must not be saved"
+    );
+}
+
+// ── Stage L: egress restoration across a restart ─────────────────────────
+
+/// A filtered session's proxy listener lives in the **friring process**, so a
+/// restart has to rebind one at the *same* endpoint with the *same* token — an
+/// agent that is still running holds proxy URLs naming both.
+///
+/// This drops the `App` and rebuilds from the same database, which is what a
+/// restart is from the row's point of view.
+#[tokio::test]
+async fn a_restart_rebinds_a_filtered_session_at_its_persisted_endpoint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = crate::paths::TestPathGuard::new(tmp.path());
+    let _host = crate::agent::sandboxing::TestSandboxHost::seatbelt();
+    let db_path = tmp.path().join("restore.db");
+
+    let mut profile = crate::session::SandboxProfile::new(
+        "filtered",
+        vec![crate::session::SandboxPath::workspace("~/dev/app")],
+    );
+    profile.network_mode = crate::session::NetworkMode::Allowlist;
+    profile.network_allow = vec!["api.example.com:443".into()];
+
+    // What a launch persisted: the endpoint the agent's environment names, and
+    // the credential it demands.
+    let session_id = SessionId::default();
+    let endpoint = {
+        let db = Database::open(&db_path).unwrap();
+        db.upsert_sandbox_profile(&profile).unwrap();
+        let shared = sync::SharedSession {
+            id: session_id,
+            name: "filtered".into(),
+            agent: "claude".into(),
+            backend_id: "fake:0".into(),
+            backend_type: "local-tmux".into(),
+            agent_session_id: None,
+            cwd: None,
+            additional_dirs: Vec::new(),
+            workspace_dir: None,
+            worktrees: Vec::new(),
+            shell_backend_id: None,
+            sandbox_profile: Some("filtered".into()),
+            sandbox_enforcement: Default::default(),
+            parent_session_id: None,
+            display_order: None,
+            tombstone: false,
+            tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord {
+                endpoint: Some("tcp:0".into()),
+                token: Some("a-persisted-token".into()),
+                state: crate::session::EgressState::Active,
+            },
+            sandbox_overlay: None,
+        };
+        db.upsert_session(&shared).unwrap();
+        // Bind once so the port is a real one, then record what it became: the
+        // row has to name an endpoint a restart can actually rebind.
+        let home = crate::paths::home_dir().unwrap().display().to_string();
+        let backend = crate::sandbox::SandboxHost::local_shared()
+            .select(profile.backend)
+            .backend()
+            .unwrap();
+        let policy = profile.resolve(backend, &home).unwrap();
+        let bound = crate::sandbox::egress::establish_at(
+            &session_id.to_string(),
+            &policy,
+            crate::sandbox::ProxyTransport::Loopback,
+            "tcp:0",
+            "a-persisted-token",
+        )
+        .expect("the first bind");
+        let endpoint = crate::sandbox::egress::PersistedEndpoint::of(&bound.endpoint).to_string();
+        crate::sandbox::egress::stop(&session_id.to_string());
+        db.set_session_egress(
+            session_id,
+            &crate::session::EgressRecord {
+                endpoint: Some(endpoint.clone()),
+                token: Some("a-persisted-token".into()),
+                state: crate::session::EgressState::Active,
+            },
+        )
+        .unwrap();
+        endpoint
+    };
+
+    // The restart: a fresh App over the same rows.
+    let backend: Arc<dyn SessionBackend> = Arc::new(FakeBackend::stub());
+    let provider: Arc<dyn AgentProvider> = Arc::new(GenericProvider::new(
+        crate::agent::agent_config::builtin_registry()
+            .default_agent()
+            .unwrap()
+            .clone(),
+    ));
+    let mut app = App::new(
+        STD_ROWS,
+        STD_COLS,
+        BackendRegistry::new(Arc::clone(&backend)),
+        crate::agent::agent_config::builtin_registry(),
+        Database::open(&db_path).unwrap(),
+    );
+    let mut session = Session::stub("filtered", &backend, &provider);
+    session.info.id = session_id;
+    session.info.sandbox_profile = Some("filtered".into());
+    app.sessions.push(session);
+
+    app.restore_session_egress_for_test(session_id);
+
+    let state = app.sessions[0].info.egress_state.clone();
+    assert_eq!(
+        state,
+        crate::session::EgressState::Active,
+        "the proxy was rebound at the persisted endpoint: {endpoint}"
+    );
+    // And the row says so too, so a second restart reads the same thing.
+    let persisted = app.db.session_egress(session_id).unwrap().unwrap();
+    assert_eq!(persisted.state, crate::session::EgressState::Active);
+    assert_eq!(persisted.endpoint.as_deref(), Some(endpoint.as_str()));
+    // The token is untouched: rotating it would invalidate the URLs a running
+    // agent already holds.
+    assert_eq!(persisted.token.as_deref(), Some("a-persisted-token"));
+    crate::sandbox::egress::stop(&session_id.to_string());
+}
+
+/// A port the persisted endpoint names that is no longer available leaves the
+/// session `Unrestorable` — never `sandbox_unenforced`.
+///
+/// The distinction is the whole reason `EgressState` exists: an enforced
+/// boundary with a dead proxy is still enforced. The agent has *no* network
+/// rather than an unfiltered one, and painting `⚠ NOT APPLIED` over it would
+/// say the agent is running on the host.
+#[tokio::test]
+async fn a_port_that_cannot_be_rebound_is_unrestorable_and_never_unenforced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = crate::paths::TestPathGuard::new(tmp.path());
+    let _host = crate::agent::sandboxing::TestSandboxHost::seatbelt();
+
+    let mut profile = crate::session::SandboxProfile::new(
+        "filtered",
+        vec![crate::session::SandboxPath::workspace("~/dev/app")],
+    );
+    profile.network_mode = crate::session::NetworkMode::Allowlist;
+    profile.network_allow = vec!["api.example.com:443".into()];
+
+    let backend: Arc<dyn SessionBackend> = Arc::new(FakeBackend::stub());
+    let provider: Arc<dyn AgentProvider> = Arc::new(GenericProvider::new(
+        crate::agent::agent_config::builtin_registry()
+            .default_agent()
+            .unwrap()
+            .clone(),
+    ));
+    let mut app = App::new(
+        STD_ROWS,
+        STD_COLS,
+        BackendRegistry::new(Arc::clone(&backend)),
+        crate::agent::agent_config::builtin_registry(),
+        Database::open_in_memory().unwrap(),
+    );
+    app.db.upsert_sandbox_profile(&profile).unwrap();
+    let session_id = SessionId::default();
+    let mut session = Session::stub("filtered", &backend, &provider);
+    session.info.id = session_id;
+    session.info.sandbox_profile = Some("filtered".into());
+    app.sessions.push(session);
+    app.save_state();
+
+    // Somebody else is holding the port the row names.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    app.db
+        .set_session_egress(
+            session_id,
+            &crate::session::EgressRecord {
+                endpoint: Some(format!("tcp:{port}")),
+                token: Some("t".into()),
+                state: crate::session::EgressState::Active,
+            },
+        )
+        .unwrap();
+
+    app.restore_session_egress_for_test(session_id);
+
+    let state = app.sessions[0].info.egress_state.clone();
+    assert!(
+        matches!(state, crate::session::EgressState::Unrestorable(_)),
+        "a port friring cannot take back is unrestorable, got {state:?}"
+    );
+    // The boundary is still enforced: nothing wrote the fallback marker.
+    assert!(
+        !matches!(
+            app.sessions[0].info.sandbox_state,
+            Some(crate::session::SandboxState::Unenforced(_))
+        ),
+        "an enforced boundary with a dead proxy is still enforced"
+    );
+    // And the token is exactly as it was.
+    assert_eq!(
+        app.db
+            .session_egress(session_id)
+            .unwrap()
+            .unwrap()
+            .token
+            .as_deref(),
+        Some("t")
+    );
+    drop(taken);
+}
+
+// ── Stage L: the refusals, in every shape ────────────────────────────────
+
+/// Every way a bridge-required agent must **not** start, asserted through the
+/// launch path rather than against the refusal function alone.
+///
+/// The failure this closes is subtle: a bridge-required agent that starts
+/// without a bridge has no boundary *and* a channel nobody is serving, which is
+/// strictly worse than not starting. So every one of these is an integrity
+/// refusal that `allow_unsandboxed_fallback` may not answer.
+#[test]
+fn a_bridge_required_agent_never_starts_where_it_cannot_be_served() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = crate::paths::TestPathGuard::new(tmp.path());
+    let _host = crate::agent::sandboxing::TestSandboxHost::seatbelt();
+
+    let mut def = worker_agent();
+    def.sandbox.as_mut().unwrap().bridge_requires = vec![crate::session::BridgeCapability::Mailbox];
+
+    let mut granting = crate::session::SandboxProfile::new(
+        "granting",
+        vec![crate::session::SandboxPath::workspace("~/dev/app")],
+    );
+    granting.network_mode = crate::session::NetworkMode::None;
+    granting.bridge_grants = vec![crate::session::BridgeCapability::Mailbox];
+    // Even with the escape hatch on, none of these may fall back to the host.
+    granting.allow_unsandboxed_fallback = true;
+
+    let config = |profile: Option<crate::session::SandboxProfile>| crate::session::SessionConfig {
+        session_id: Some(SessionId::default()),
+        agent: "worker".into(),
+        sandbox: profile,
+        ..Default::default()
+    };
+
+    // No profile at all: the bridge is granted by a profile.
+    let err = crate::agent::sandboxing::apply(Some(&def), &config(None), "worker", &[])
+        .expect_err("a bridge agent with no profile is refused");
+    assert!(err.contains("never started as a plain session"), "{err}");
+
+    // A profile that grants nothing of what the agent needs.
+    let mut ungranting = granting.clone();
+    ungranting.bridge_grants = Vec::new();
+    let err = crate::agent::sandboxing::apply(Some(&def), &config(Some(ungranting)), "worker", &[])
+        .expect_err("a profile that grants nothing is refused");
+    assert!(err.contains("grant_missing"), "{err}");
+
+    // A remote session: friring mints the bridge directory on the machine it
+    // runs on.
+    let mut remote = config(Some(granting.clone()));
+    remote.backend = Some("ssh:devbox".into());
+    let err = crate::agent::sandboxing::apply(Some(&def), &remote, "worker", &[])
+        .expect_err("a remote session cannot carry the bridge");
+    assert!(err.contains("runs on a remote host"), "{err}");
+
+    // The headless path, which exits after spawning: nothing would own the
+    // session's proxy or answer its requests.
+    let err = crate::agent::sandboxing::apply_for(
+        Some(&def),
+        &config(Some(granting.clone())),
+        "worker",
+        &[],
+        None,
+        false,
+    )
+    .expect_err("a headless create cannot serve the bridge");
+    assert!(err.contains("bridge_requires_tui"), "{err}");
+
+    // And the one that must work, so the four above are refusals rather than a
+    // feature that never starts anything.
+    assert!(crate::agent::sandboxing::apply(
+        Some(&def),
+        &config(Some(granting.clone())),
+        "worker",
+        &[]
+    )
+    .is_ok());
+
+    // Last, because installing another host clears the one above: a machine
+    // offering no backend at all. `bridge_refusal` cannot see this — the probe
+    // fails, so there are no capabilities to inspect — and composition refuses
+    // with an ordinary, non-integrity `Refusal` that `allow_unsandboxed_fallback`
+    // would otherwise turn into an unsandboxed launch of a bridge agent.
+    let _bare = crate::agent::sandboxing::TestSandboxHost::new(crate::sandbox::SandboxHost::new(
+        std::sync::Arc::new(
+            crate::sandbox::probe::StubHost::new()
+                .with_home("/fabricated/home")
+                .with_command(
+                    "uname -s",
+                    crate::sandbox::probe::ProbeOutput::success("Linux\n"),
+                )
+                .with_file("/proc/sys/kernel/osrelease", "6.8.0-generic\n"),
+        ),
+    ));
+    let refused =
+        crate::agent::sandboxing::apply(Some(&def), &config(Some(granting)), "worker", &[]);
+    assert!(
+        refused.is_err(),
+        "a bridge agent must not fall back onto the host: {refused:?}"
+    );
+}
+
+/// A child whose profile authorizes no seed the agent requires never launches
+/// — and never launches sharing its family's state instead.
+#[tokio::test]
+async fn a_child_whose_seed_is_unauthorized_is_refused_and_never_shared() {
+    let mut h = ChildHarness::new();
+    // The agent now requires a seed the profile does not authorize.
+    let agent =
+        h.h.app
+            .agents
+            .agents
+            .iter_mut()
+            .find(|a| a.name == "worker")
+            .unwrap();
+    agent.sandbox.as_mut().unwrap().child_state_seed = vec![crate::session::ChildStateSeed {
+        src: "auth.json".into(),
+        mode: crate::session::SeedMode::LinkRw,
+        required: true,
+    }];
+
+    h.create("create-0050");
+    let answer = h.answer("create-0050").await;
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"], "state_unrelocatable", "{answer}");
+    assert!(h.child().is_none(), "nothing was launched");
+    // There is no shared-state mode and no fallback to one, so nothing was
+    // seeded either.
+    assert!(!h.effects.called("seed_child_state"), "the plan never ran");
 }

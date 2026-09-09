@@ -15,7 +15,9 @@ use crate::storage::Database;
 
 pub mod action;
 pub mod automations;
+pub mod bridge;
 pub mod config;
+pub mod early;
 pub mod editor;
 pub mod extensions;
 pub mod identity;
@@ -32,6 +34,17 @@ pub mod update;
 pub mod version;
 
 use output::{CommandOutput, Format};
+
+/// Refusal shown if a bridge command ever reaches the database-bearing path.
+///
+/// Unreachable while `main` calls `cli::early::run_before_database` first, and a
+/// refusal rather than a served request if that call is ever removed: a bridge
+/// command served from here has a database open in the process a *sandbox* is
+/// talking to, which is the one thing ADR-29 forbids.
+const BRIDGE_OFF_THE_EARLY_PATH: &str =
+    "`friring-cli bridge` runs inside a sandbox and must be dispatched before the database is \
+     opened (ADR-29); friring-cli's main no longer does that, so the request was refused rather \
+     than served with a database open";
 
 /// Friring CLI — manage sessions, scheduled commands, and more.
 #[derive(Parser, Debug)]
@@ -117,15 +130,37 @@ pub enum Command {
     Perf,
     /// Manage sandbox profiles, places and tokens.
     ///
-    /// One subcommand — `relay` — runs inside a boundary friring built, and is
-    /// dispatched before the database is opened because ADR-29 keeps the
-    /// database out of every sandbox (`sandbox::run_before_database`).
-    /// Everything else is host-side management on the ordinary path.
+    /// Two subcommands — `relay` and `launch` — run inside a boundary friring
+    /// built, and are dispatched before the database is opened because ADR-29
+    /// keeps the database out of every sandbox (`cli::early`). Everything else
+    /// is host-side management on the ordinary path.
     #[command(alias = "sb")]
     Sandbox {
         #[command(subcommand)]
         action: sandbox::Action,
     },
+    /// Ask friring for something from **inside** a sandbox (ADR-30).
+    ///
+    /// The orchestration bridge's client: it writes a request into this
+    /// session's own queue and prints the answer. Every one of these runs
+    /// before the database opens, for the reason `sandbox relay` does — a
+    /// sandboxed process must never hold a handle to friring's database.
+    ///
+    /// Authority comes from *which* queue the request lands in, never from
+    /// anything the request says: friring exposed exactly one bridge directory
+    /// inside this boundary, so a request in it is by construction a request
+    /// from this session.
+    Bridge {
+        #[command(subcommand)]
+        action: bridge::Action,
+    },
+    /// What this friring's bridge offers: protocol version, capabilities,
+    /// verbs and error codes.
+    ///
+    /// Printed from the constants the broker itself uses, so a version this
+    /// reports is one it speaks. An extension's `binary-capability` requirement
+    /// is checked against it.
+    Capabilities,
 }
 
 /// Build the additional-repo list for a multi-repo `Spawn` from the repeatable
@@ -185,6 +220,14 @@ pub fn run(cli: Cli, db: &Database) -> Result<(), String> {
         // takes it through `sandbox::run_before_database` first, and `run`
         // refuses it rather than serving it with one open.
         Command::Sandbox { action } => sandbox::run(action, db),
+        // Never reached: `main` dispatches these before the database opens, and
+        // this refuses rather than serving one with a handle in hand.
+        Command::Bridge { .. } => Err(BRIDGE_OFF_THE_EARLY_PATH.to_string()),
+        Command::Capabilities => {
+            let json = bridge::capabilities_json();
+            let human = serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string());
+            Ok(CommandOutput::new(json, human))
+        }
     }?;
 
     println!("{}", format.render(&output));

@@ -173,6 +173,28 @@ impl RowDecoder {
         }
     }
 
+    /// Decode an INTEGER count column whose absence means **zero**, not
+    /// "unlimited".
+    ///
+    /// The mirror of [`limit_col`](Self::limit_col), and the difference is which
+    /// direction is safe: an unreadable resource *limit* is narrowest as
+    /// uncapped-but-recorded, while an unreadable child *cap* is narrowest as no
+    /// children at all. A profile whose `max_children` friring cannot read is
+    /// refused at launch like any other undecoded column, so this only decides
+    /// what the row reads as while it is being repaired.
+    fn count_col(&mut self, column: &'static str, raw: Option<i64>) -> u32 {
+        let Some(raw) = raw else {
+            return 0;
+        };
+        match u32::try_from(raw) {
+            Ok(value) => value,
+            Err(_) => {
+                self.record(column, &raw.to_string());
+                0
+            }
+        }
+    }
+
     /// Decode an INTEGER limit column. `NULL` is "uncapped"; a value that is
     /// not a `u32` is recorded, because "uncapped" is the wider reading of a
     /// number friring could not use.
@@ -263,7 +285,8 @@ impl StoredSandboxProfile {
 /// Column list for profile SELECTs (keep in sync with [`map_profile`]).
 const COLS: &str = "name, backend, paths, network_mode, network_allow, network_deny, \
     prompt_new_domains, read_scope, memory_mb, cpus, image, containerfile, \
-    allow_unsandboxed_fallback, created_at, updated_at";
+    allow_unsandboxed_fallback, bridge_grants, max_children, child_agents, \
+    child_shared_rw, child_seed_allow, created_at, updated_at";
 
 /// Column list for instance SELECTs (keep in sync with [`map_instance`]).
 const INSTANCE_COLS: &str = "profile, engine, external_id, state, created_at, last_used_at";
@@ -300,8 +323,19 @@ fn map_profile(row: &rusqlite::Row) -> rusqlite::Result<StoredSandboxProfile> {
         image: row.get(10)?,
         containerfile: row.get(11)?,
         allow_unsandboxed_fallback: row.get::<_, i64>(12)? != 0,
-        created_at: row.get::<_, i64>(13)? as u64,
-        updated_at: row.get::<_, i64>(14)? as u64,
+        // The bridge columns decode like every other policy column: a value
+        // friring cannot read is recorded and falls back to the **narrowest**
+        // reading, so an unreadable grant list is no grants and an unreadable
+        // seed allowance authorizes nothing. `max_children` is the one where
+        // narrow means a number rather than an absence, so a value that is not
+        // a `u32` reads as zero children rather than as the default three.
+        bridge_grants: decoder.list_col("bridge_grants", row.get(13)?),
+        max_children: decoder.count_col("max_children", row.get(14)?),
+        child_agents: decoder.list_col("child_agents", row.get(15)?),
+        child_shared_rw: decoder.list_col("child_shared_rw", row.get(16)?),
+        child_seed_allow: decoder.list_col("child_seed_allow", row.get(17)?),
+        created_at: row.get::<_, i64>(18)? as u64,
+        updated_at: row.get::<_, i64>(19)? as u64,
     };
     Ok(StoredSandboxProfile {
         profile,
@@ -324,8 +358,11 @@ fn upsert_profile_on(
         "INSERT INTO sandbox_profiles
             (name, backend, paths, network_mode, network_allow, network_deny,
              prompt_new_domains, read_scope, memory_mb, cpus, image,
-             containerfile, allow_unsandboxed_fallback, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+             containerfile, allow_unsandboxed_fallback, bridge_grants,
+             max_children, child_agents, child_shared_rw, child_seed_allow,
+             created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 ?15, ?16, ?17, ?18, ?19, ?19)
          ON CONFLICT(name) DO UPDATE SET
              backend = excluded.backend,
              paths = excluded.paths,
@@ -339,6 +376,11 @@ fn upsert_profile_on(
              image = excluded.image,
              containerfile = excluded.containerfile,
              allow_unsandboxed_fallback = excluded.allow_unsandboxed_fallback,
+             bridge_grants = excluded.bridge_grants,
+             max_children = excluded.max_children,
+             child_agents = excluded.child_agents,
+             child_shared_rw = excluded.child_shared_rw,
+             child_seed_allow = excluded.child_seed_allow,
              updated_at = excluded.updated_at",
         params![
             profile.name.trim(),
@@ -354,6 +396,11 @@ fn upsert_profile_on(
             profile.image,
             profile.containerfile,
             profile.allow_unsandboxed_fallback as i64,
+            list_to_json(&profile.bridge_grants),
+            i64::from(profile.max_children),
+            list_to_json(&profile.child_agents),
+            list_to_json(&profile.child_shared_rw),
+            list_to_json(&profile.child_seed_allow),
             now,
         ],
     )?;

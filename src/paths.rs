@@ -89,9 +89,16 @@ fn app_dir_name() -> &'static str {
 }
 
 /// The user's home directory: `$HOME` on Unix, `%USERPROFILE%` on Windows.
+///
+/// Set-but-empty counts as unset. An empty value would otherwise produce a
+/// *relative* path — `PathBuf::from("").join(".local")` is `.local` — so
+/// everything downstream would resolve against the current directory instead of
+/// failing, which is the worst of the three outcomes.
 pub fn home_dir() -> Option<PathBuf> {
     let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    std::env::var_os(var).map(PathBuf::from)
+    std::env::var_os(var)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Whether `exe` resolves on `PATH`. A minimal lookup that avoids pulling in a
@@ -107,14 +114,20 @@ pub fn which_on_path(exe: &str) -> bool {
 /// Base directory for config files. `$XDG_CONFIG_HOME` wins on every platform
 /// (some users set it on Windows too); otherwise `%APPDATA%` on Windows,
 /// `$HOME/.config` on Unix.
+///
+/// Set-but-empty counts as unset, which is what the XDG specification says and
+/// what [`home_dir`] does for the same reason: an empty value would resolve
+/// every path below it relative to the current directory.
 #[cfg_attr(test, allow(dead_code))] // only used by the non-test XDG fallback
 fn config_base() -> Option<PathBuf> {
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
+    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(x));
     }
     #[cfg(windows)]
     {
-        std::env::var_os("APPDATA").map(PathBuf::from)
+        std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
     }
     #[cfg(not(windows))]
     {
@@ -124,14 +137,18 @@ fn config_base() -> Option<PathBuf> {
 
 /// Base directory for data files. `$XDG_DATA_HOME` wins on every platform;
 /// otherwise `%LOCALAPPDATA%` on Windows, `$HOME/.local/share` on Unix.
+///
+/// Set-but-empty counts as unset; see [`config_base`].
 #[cfg_attr(test, allow(dead_code))] // only used by the non-test XDG fallback
 fn data_base() -> Option<PathBuf> {
-    if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
+    if let Some(x) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(x));
     }
     #[cfg(windows)]
     {
-        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
     }
     #[cfg(not(windows))]
     {
@@ -290,6 +307,113 @@ fn resolve_override(base: &Path, kind: PathKind) -> PathBuf {
         PathKind::WorkspacesDir => base.join("workspaces"),
         PathKind::SignalsDir => base.join("signals"),
         PathKind::KeybindingsFile => base.join("keybindings.json"),
+    }
+}
+
+/// What decided a resolved directory, named as the operator can check it.
+///
+/// A plain string rather than an enum because every value that matters *is* an
+/// environment variable name: a preflight that wants "the data directory came
+/// from `FRIRING_DATA_DIR`" can compare against the variable it set.
+mod source {
+    /// A `TestPathGuard` base, or the unit-test temp sandbox — never production.
+    pub const TEST: &str = "test-override";
+    /// Nothing resolved: no override, no XDG root and no home directory.
+    pub const NONE: &str = "unresolved";
+}
+
+/// The directories this process will actually use, and what decided each.
+///
+/// Built without opening anything. It exists so a harness can prove, *before* a
+/// binary touches storage, that the environment it composed is the environment
+/// the binary resolved — the isolation a dev harness assumes is otherwise only
+/// assumed. See `friring-cli config paths`.
+#[derive(Debug, Clone)]
+pub struct ResolvedPaths {
+    /// The resolved config app dir, `friring`/`friring-dev` segment included.
+    pub config_dir: Option<PathBuf>,
+    /// The environment variable that decided `config_dir`, or `test-override` /
+    /// `unresolved` where no variable did.
+    pub config_source: &'static str,
+    /// The resolved data app dir.
+    pub data_dir: Option<PathBuf>,
+    /// The environment variable that decided `data_dir`, or `test-override` /
+    /// `unresolved` where no variable did.
+    pub data_source: &'static str,
+    /// Where a database would be opened. Resolving it opens nothing.
+    pub database: Option<PathBuf>,
+    /// `friring` for a release build, `friring-dev` for a dev build.
+    pub app_dir_name: &'static str,
+}
+
+/// Which environment variable decides one of the two app dirs, under the
+/// resolution [`resolve_xdg`] actually performs.
+///
+/// The order mirrors `config_app_dir`/`data_app_dir` exactly, and both
+/// `cfg(test)` cases report `test-override` rather than a variable, because in
+/// a test build neither the override nor the XDG root is consulted at all.
+fn dir_source(override_env: &str, xdg_env: &'static str) -> &'static str {
+    let overridden = PATH_STRATEGY.with(|s| matches!(*s.borrow(), PathStrategy::Override(_)));
+    if overridden || cfg!(test) {
+        return source::TEST;
+    }
+    if std::env::var_os(override_env).is_some_and(|v| !v.is_empty()) {
+        // Returned as a `&'static str` the caller can compare: the two override
+        // variables are consts in this module, so this is their own name.
+        return if override_env == CONFIG_DIR_OVERRIDE_ENV {
+            CONFIG_DIR_OVERRIDE_ENV
+        } else {
+            DATA_DIR_OVERRIDE_ENV
+        };
+    }
+    if std::env::var_os(xdg_env).is_some_and(|v| !v.is_empty()) {
+        return xdg_env;
+    }
+    // The platform fallback, which is not the same variable on both. Reporting
+    // `USERPROFILE` on Windows would name a variable that decided nothing:
+    // `config_base` falls back to `%APPDATA%` and `data_base` to
+    // `%LOCALAPPDATA%`, and neither consults the home directory.
+    #[cfg(windows)]
+    {
+        let platform_env = if override_env == CONFIG_DIR_OVERRIDE_ENV {
+            "APPDATA"
+        } else {
+            "LOCALAPPDATA"
+        };
+        if std::env::var_os(platform_env).is_some_and(|v| !v.is_empty()) {
+            return platform_env;
+        }
+        source::NONE
+    }
+    #[cfg(not(windows))]
+    {
+        if home_dir().is_some() {
+            "HOME"
+        } else {
+            source::NONE
+        }
+    }
+}
+
+/// Everything [`ResolvedPaths`] reports, read from the live environment.
+///
+/// Deliberately total: an unresolvable directory is `None` with a source of
+/// `unresolved`, never a panic, because the caller is a diagnostic that has to
+/// be able to report a broken environment rather than die in it.
+pub fn resolved_paths() -> ResolvedPaths {
+    // Under the `Override` strategy every path shares one base, so reporting
+    // `config_app_dir()` there would name a directory nothing resolves against.
+    let overridden = PATH_STRATEGY.with(|s| match *s.borrow() {
+        PathStrategy::Override(ref base) => Some(base.clone()),
+        PathStrategy::Xdg => None,
+    });
+    ResolvedPaths {
+        config_dir: overridden.clone().or_else(config_app_dir),
+        config_source: dir_source(CONFIG_DIR_OVERRIDE_ENV, "XDG_CONFIG_HOME"),
+        data_dir: overridden.or_else(data_app_dir),
+        data_source: dir_source(DATA_DIR_OVERRIDE_ENV, "XDG_DATA_HOME"),
+        database: resolve(PathKind::Database),
+        app_dir_name: app_dir_name(),
     }
 }
 
@@ -625,6 +749,699 @@ fn read_taken_signal(staged: &Path) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+// ── The bridge's file queue (ADR-30) ─────────────────────────────────────
+
+/// One session's bridge directory: `<data>/signals/<key>/bridge`.
+///
+/// Under the session's own signal directory, which a sandboxed launch already
+/// grants read-write, so a bridge child needs no second grant and no second
+/// path in its policy. The two subdirectories are `req` (the client writes) and
+/// `res` (friring writes).
+pub fn session_bridge_dir(session_key: &str) -> Option<PathBuf> {
+    Some(session_signal_dir(session_key)?.join(BRIDGE_DIR_NAME))
+}
+
+/// The subdirectory a client writes requests into.
+pub fn bridge_request_dir(session_key: &str) -> Option<PathBuf> {
+    Some(session_bridge_dir(session_key)?.join(BRIDGE_REQUEST_DIR))
+}
+
+/// The subdirectory friring writes responses into.
+pub fn bridge_response_dir(session_key: &str) -> Option<PathBuf> {
+    Some(session_bridge_dir(session_key)?.join(BRIDGE_RESPONSE_DIR))
+}
+
+/// Where a taken request waits while friring works on it:
+/// `<data>/signals/.taking/`.
+///
+/// A sibling of every session's directory rather than a child of one, for the
+/// reason the status file's own staging path is: the whole point is to land
+/// somewhere no
+/// sandbox was granted. A launch grants one session directory, never this
+/// root.
+pub fn bridge_taking_dir() -> Option<PathBuf> {
+    Some(signals_directory()?.join(BRIDGE_TAKING_DIR))
+}
+
+/// Mint the shared staging directory, `0700`, and hand it back.
+///
+/// [`bridge_taking_dir`] takes no session key — it is one directory for every
+/// caller — so a broker pass mints it **once** and passes it to
+/// [`take_bridge_requests_in`] for each session it serves. Minting it per
+/// session cost a `symlink_metadata` + `mkdir` + `chmod` per session per poll,
+/// which profiled as the single largest leaf under the bridge tick.
+///
+/// The call is kept rather than replaced by an existence check because the
+/// `mkdir` is not what it is for: [`create_private_dir`] refuses a symlink at
+/// the final component and re-asserts `0700` on a directory it adopted, and
+/// both properties have to hold on every pass, not only on the first.
+pub fn mint_bridge_taking_dir() -> Option<PathBuf> {
+    let taking = bridge_taking_dir()?;
+    #[cfg(test)]
+    BRIDGE_TAKING_MINTS.with(|mints| mints.set(mints.get() + 1));
+    create_private_dir(&taking).ok()?;
+    Some(taking)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`mint_bridge_taking_dir`] has run on this thread.
+    ///
+    /// Counted at the syscall site rather than at the broker's call to it, so a
+    /// gate on "once per pass" cannot be satisfied by a caller that counts once
+    /// while the mint quietly moves back inside the per-session take. Its
+    /// thread-local scope is [`BRIDGE_ENTRIES_SCANNED`]'s, for the same reason.
+    pub(crate) static BRIDGE_TAKING_MINTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Every session key that has a signal directory on disk.
+///
+/// The response GC's population, and deliberately **not** the app's session
+/// list. A child that was cleanly stopped is retired from `App::sessions` while
+/// its rows, its worktree and its `res/` directory all stay (ADR-32), so a
+/// roster of loaded sessions never reaches the one case where an
+/// unacknowledged answer can sit past its bound for good — and a session
+/// deleted while friring was not running leaves a directory no list mentions at
+/// all. The disk is the only thing that knows about both.
+///
+/// Cheap enough to be a per-cycle question rather than a per-pass one: one
+/// `read_dir` of a directory with one entry per session that has ever had a
+/// signal channel. A name is returned unchanged, which is sound because the
+/// key sanitizing a signal directory is named after is the identity on a
+/// session id.
+pub fn bridge_session_keys() -> Vec<String> {
+    let Some(root) = signals_directory() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name != BRIDGE_TAKING_DIR)
+        .collect()
+}
+
+const BRIDGE_DIR_NAME: &str = "bridge";
+const BRIDGE_REQUEST_DIR: &str = "req";
+const BRIDGE_RESPONSE_DIR: &str = "res";
+const BRIDGE_TAKING_DIR: &str = ".taking";
+
+/// Extension of a request a client has finished writing.
+const BRIDGE_REQUEST_EXT: &str = "req";
+/// Extension of a response friring has finished writing.
+const BRIDGE_RESPONSE_EXT: &str = "res";
+
+/// Mint one session's bridge directories, `0700`.
+///
+/// Both halves, because a client that can write a request and cannot read a
+/// response has no way to learn what happened. Idempotent: a relaunch of the
+/// same session adopts what is there, and a request left by the previous run is
+/// deliberately **not** cleared — it is journaled work, and dropping it would
+/// turn a friring restart into a silently lost request.
+///
+/// # Errors
+///
+/// No data directory resolves, or something that is not a directory friring owns
+/// sits where one belongs.
+pub fn create_session_bridge_dirs(session_key: &str) -> Result<PathBuf, String> {
+    let dir = session_bridge_dir(session_key).ok_or(NO_SIGNAL_ROOT)?;
+    create_private_dir(&dir)?;
+    for child in [BRIDGE_REQUEST_DIR, BRIDGE_RESPONSE_DIR] {
+        create_private_dir(&dir.join(child))?;
+    }
+    let taking = bridge_taking_dir().ok_or(NO_SIGNAL_ROOT)?;
+    create_private_dir(&taking)?;
+    Ok(dir)
+}
+
+/// One request file, taken out of the agent's reach and read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakenRequest {
+    /// The session whose directory it came out of.
+    pub session_key: String,
+    /// The key its filename carried, already validated as one path segment.
+    pub key: String,
+    /// The file's text, still hostile — it is the agent's own bytes. Only the
+    /// protocol parser decides what it means.
+    pub text: String,
+    /// Where it waits while friring works on it.
+    pub staged: PathBuf,
+}
+
+/// Why a request file was not taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakeRefusal {
+    /// The filename is not `<key>.req` with a key friring will accept.
+    BadName(String),
+    /// The staged file is not a regular file, is too large, or is not UTF-8.
+    /// Already removed.
+    Unreadable(String),
+    /// The directory holds more unanswered requests than friring will read.
+    /// More requests are waiting than the protocol holds unanswered.
+    ///
+    /// The excess is **not** taken and **not** answered: friring has read no
+    /// request, and writing a refusal for a key it has not validated would be
+    /// inventing one. What the caller does with this is report it — the client
+    /// learns by its own request going unanswered until the queue drains, which
+    /// is the same thing a slow broker looks like.
+    Quota,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many directory entries [`take_bridge_requests`] has looked at on this
+    /// thread.
+    ///
+    /// The bound is on the *enumeration*, and a test that only inspects the
+    /// returned requests cannot see it: the unbounded `filter(..).take(n)` this
+    /// replaced also returned the one real request and dropped the junk. So the
+    /// count is exported, test-only.
+    ///
+    /// Thread-local rather than a global counter, for the same reason
+    /// `PATH_STRATEGY` is: these tests run in parallel threads of one process,
+    /// and a shared counter would be bumped by whichever other test happened to
+    /// be taking requests at the same moment.
+    pub(crate) static BRIDGE_ENTRIES_SCANNED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Take every request waiting in one session's queue, up to `limit`.
+///
+/// The take is a `rename(2)` into [`bridge_taking_dir`], and that single syscall
+/// is what makes everything after it a decision about a fixed inode rather than
+/// a race — the same primitive [`take_session_signal`] rests on, and for the same
+/// reasons. Once it returns, the object friring is about to read sits in a
+/// directory no sandbox was granted, and the agent cannot swap it for something
+/// else between the check and the read.
+///
+/// Everything that could be hostile is decided **before** any content is
+/// trusted:
+///
+/// - The **filename** is validated as a bridge request key before it is joined
+///   onto anything, so a name carrying a separator or a `..` never becomes a
+///   path.
+/// - A file that is **not a regular file** is dropped unread. The FIFO is the
+///   one that matters: opening one blocks until a writer appears, and this runs
+///   on the render loop.
+/// - **Too large** is checked before the open *and* enforced during the read: a
+///   descriptor the agent still holds keeps writing to the same inode after the
+///   rename.
+/// - **Not UTF-8** is dropped rather than lossily converted, so no byte sequence
+///   is reshaped into something that might parse.
+///
+/// `limit` is the per-tick budget: the broker takes a bounded number so a client
+/// writing faster than friring answers cannot starve the render loop.
+pub fn take_bridge_requests(
+    session_key: &str,
+    limit: usize,
+) -> (Vec<TakenRequest>, Vec<TakeRefusal>) {
+    let Some(taking) = mint_bridge_taking_dir() else {
+        return (Vec::new(), Vec::new());
+    };
+    take_bridge_requests_in(&taking, session_key, limit)
+}
+
+/// [`take_bridge_requests`] against a staging directory the caller already
+/// minted.
+///
+/// The broker's own form: `taking` comes from one [`mint_bridge_taking_dir`]
+/// per pass rather than one per session. `taking` must be that directory —
+/// [`recover_taken_requests`] answers what is left in it, and a take that
+/// staged elsewhere would be a request nothing ever recovers.
+pub fn take_bridge_requests_in(
+    taking: &Path,
+    session_key: &str,
+    limit: usize,
+) -> (Vec<TakenRequest>, Vec<TakeRefusal>) {
+    let mut taken = Vec::new();
+    let mut refused = Vec::new();
+    let Some(req_dir) = bridge_request_dir(session_key) else {
+        return (taken, refused);
+    };
+    // The session holds read-write on its own request directory, so it can
+    // unlink what friring minted and leave a symlink there. Opened once, without
+    // following, and never named by path again: every take and every unlink
+    // below is relative to this descriptor, so replacing the *directory* after
+    // this point reaches nothing. See [`QueueDir`].
+    let Some(queue) = QueueDir::open(&req_dir) else {
+        return (taken, refused);
+    };
+    // **Bounded enumeration.** The directory is agent-writable, so a client
+    // writing faster than friring answers would otherwise impose an unbounded
+    // listing plus sort on the render loop every poll — the exact starvation
+    // `limit` exists to prevent, arriving one step earlier than `limit` acts.
+    // Two bounds, because a hostile client controls both how many requests it
+    // writes and how many *other* files it leaves beside them: the request count
+    // stops at the quota, and the raw entry count at `MAX_QUEUE_SCAN`. The raw
+    // count is charged per directory entry read, errors and skipped names
+    // included, so a client that fills its own queue with junk starves itself
+    // and not the render loop.
+    //
+    // Sorted within what was read, so a queue is served in a stable order rather
+    // than in whatever order the filesystem enumerates. The promise is
+    // "stable among the entries read", not "the globally first": past the quota
+    // there is no answer to give in any case.
+    let quota = crate::session::bridge::MAX_UNANSWERED_REQUESTS;
+    let suffix = format!(".{BRIDGE_REQUEST_EXT}");
+    let mut scanned = 0usize;
+    let mut names = queue.names(quota, &mut scanned, |name| name.ends_with(&suffix));
+    names.sort();
+    // Over quota. The excess is not taken and not answered here: friring has
+    // read no request to answer, and writing a refusal for a key it has not
+    // validated would be inventing one. The caller surfaces the refusal.
+    if names.len() > crate::session::bridge::MAX_UNANSWERED_REQUESTS {
+        names.truncate(crate::session::bridge::MAX_UNANSWERED_REQUESTS);
+        refused.push(TakeRefusal::Quota);
+    }
+    for name in names.into_iter().take(limit) {
+        let raw = name.trim_end_matches(&format!(".{BRIDGE_REQUEST_EXT}"));
+        // Validated before the join: the key names the file, and a value
+        // carrying a separator would be a path rather than a name.
+        let Ok(key) = crate::session::bridge::RequestKey::new(raw) else {
+            queue.unlink(&name);
+            refused.push(TakeRefusal::BadName(raw.to_string()));
+            continue;
+        };
+        let staged = taking.join(staged_name(session_key, key.as_str()));
+        remove_anything_at(&staged);
+        if !queue.take(&name, &staged) {
+            continue;
+        }
+        match read_taken_bridge_file(&staged, crate::session::bridge::MAX_BRIDGE_REQUEST_BYTES) {
+            Some(text) => taken.push(TakenRequest {
+                session_key: session_key.to_string(),
+                key: key.as_str().to_string(),
+                text,
+                staged,
+            }),
+            None => {
+                remove_anything_at(&staged);
+                refused.push(TakeRefusal::Unreadable(key.as_str().to_string()));
+            }
+        }
+    }
+    (taken, refused)
+}
+
+/// The name a taken request waits under: `<session>__<key>.req`.
+///
+/// Both halves, because [`recover_taken_requests`] has to know which session a
+/// file belongs to in order to answer it, and the taking directory is shared by
+/// every session.
+fn staged_name(session_key: &str, key: &str) -> String {
+    format!(
+        "{}__{key}.{BRIDGE_REQUEST_EXT}",
+        sanitize_signal_key(session_key)
+    )
+}
+
+/// Read a file that has already been taken out of the agent's reach.
+///
+/// The bounded, type-checked, UTF-8-only read [`read_taken_signal`] makes, with
+/// the cap as a parameter: a request and a response have different ones.
+fn read_taken_bridge_file(staged: &Path, cap: u64) -> Option<String> {
+    use std::io::Read as _;
+
+    let meta = std::fs::symlink_metadata(staged).ok()?;
+    if !meta.file_type().is_file() || meta.len() > cap {
+        return None;
+    }
+    let file = std::fs::File::open(staged).ok()?;
+    let mut bytes = Vec::new();
+    // One byte past the cap, so a file that grew under an open descriptor is
+    // detected rather than silently truncated into something that parses.
+    file.take(cap + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > cap {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Write one response and drop the request it answers.
+///
+/// Staged in the response directory and `rename`d into place, so a client
+/// polling for `<key>.res` never reads a half-written answer. The staged name
+/// carries the same key, so two answers for two requests cannot collide.
+///
+/// # Errors
+///
+/// The response directory does not resolve or cannot be written.
+pub fn write_bridge_response(session_key: &str, key: &str, body: &str) -> Result<PathBuf, String> {
+    let dir = bridge_response_dir(session_key).ok_or(NO_SIGNAL_ROOT)?;
+    create_private_dir(&dir)?;
+    if body.len() as u64 > crate::session::bridge::MAX_BRIDGE_RESPONSE_BYTES {
+        return Err(format!(
+            "the response to '{key}' is {} bytes, past the {} friring will write",
+            body.len(),
+            crate::session::bridge::MAX_BRIDGE_RESPONSE_BYTES
+        ));
+    }
+    let staged = dir.join(format!("{key}.tmp"));
+    let final_path = dir.join(format!("{key}.{BRIDGE_RESPONSE_EXT}"));
+    remove_anything_at(&staged);
+    std::fs::write(&staged, body).map_err(|e| format!("{}: {e}", staged.display()))?;
+    std::fs::rename(&staged, &final_path).map_err(|e| format!("{}: {e}", final_path.display()))?;
+    Ok(final_path)
+}
+
+/// Drop a taken request now that it has been answered.
+pub fn finish_taken_request(taken: &TakenRequest) {
+    remove_anything_at(&taken.staged);
+}
+
+/// Every request left in the taking directory by a friring that died mid-work.
+///
+/// **Nothing in `.taking` is ever silently dropped.** A file there was taken out
+/// of a client's directory, so the client is still polling for an answer that
+/// will never come unless something produces one. The caller answers each from
+/// the journal when there is a row, and processes it as a fresh take when there
+/// is not — which is safe precisely because the journal is what makes a replay
+/// idempotent.
+///
+/// Files whose name friring cannot parse, and files older than `max_age`, are
+/// removed: the first names no session to answer, and the second belongs to a
+/// client that is long gone.
+pub fn recover_taken_requests(max_age: std::time::Duration) -> Vec<TakenRequest> {
+    let mut out = Vec::new();
+    let Some(taking) = bridge_taking_dir() else {
+        return out;
+    };
+    let Ok(entries) = std::fs::read_dir(&taking) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            remove_anything_at(&path);
+            continue;
+        };
+        let Some((session_key, key)) = parse_staged_name(name) else {
+            remove_anything_at(&path);
+            continue;
+        };
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if stale {
+            remove_anything_at(&path);
+            continue;
+        }
+        match read_taken_bridge_file(&path, crate::session::bridge::MAX_BRIDGE_REQUEST_BYTES) {
+            Some(text) => out.push(TakenRequest {
+                session_key,
+                key,
+                text,
+                staged: path,
+            }),
+            None => remove_anything_at(&path),
+        }
+    }
+    out
+}
+
+/// Split `<session>__<key>.req` back into its two halves.
+///
+/// `None` for anything friring did not write, which the caller removes: a file
+/// in the taking directory whose name names no session cannot be answered, and
+/// leaving it there would mean walking it forever.
+fn parse_staged_name(name: &str) -> Option<(String, String)> {
+    let stem = name.strip_suffix(&format!(".{BRIDGE_REQUEST_EXT}"))?;
+    let (session, key) = stem.split_once("__")?;
+    if session.is_empty() {
+        return None;
+    }
+    let key = crate::session::bridge::RequestKey::new(key).ok()?;
+    Some((session.to_string(), key.as_str().to_string()))
+}
+
+/// Drop responses a client never acknowledged.
+///
+/// A client that exits without reading its answer leaves a `.res` behind, and a
+/// leader that runs for weeks would accumulate one per request. Removed on age
+/// rather than on read, because friring cannot tell "read" from "not yet".
+pub fn prune_bridge_responses(session_key: &str, max_age: std::time::Duration) -> usize {
+    let Some(dir) = bridge_response_dir(session_key) else {
+        return 0;
+    };
+    // Refused rather than followed, as in `create_private_dir`: the session
+    // holds read-write on this channel, so a symlink planted where friring's
+    // response directory was would aim the removals below at host files.
+    if !is_real_dir(&dir) {
+        return 0;
+    }
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Only a response friring itself wrote is pruned: a name it minted, and
+        // a regular file rather than a directory or a symlink pointing out of
+        // here. Anything else is left alone rather than deleted.
+        let named_response = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(&format!(".{BRIDGE_RESPONSE_EXT}")))
+            .is_some_and(|stem| crate::session::bridge::RequestKey::new(stem).is_ok());
+        if !named_response
+            || !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file())
+        {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if stale && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Whether `path` is a directory friring will enumerate.
+///
+/// `symlink_metadata` never follows, so this is false for a symlink even when it
+/// points at a directory — the read-side half of [`create_private_dir`]'s
+/// refusal, for the same reason: a sandboxed session can replace a channel
+/// friring minted, and walking the replacement would enumerate, rename out of
+/// and delete whatever it aims at.
+///
+/// **A check, not a guarantee.** Between it and the next syscall on the same
+/// *path* the agent can swap the directory. Where that matters — the
+/// agent-writable request queue — the answer is not a better check but
+/// [`queue_dir`], which stops using the path at all.
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
+/// The agent-writable request queue, held open as a descriptor.
+///
+/// A path is a name, and a name a sandboxed session can rewrite is not a thing
+/// friring can act on twice. It holds read-write on its own request directory,
+/// so between `symlink_metadata(req_dir)` saying "a real directory" and the
+/// `rename(req_dir.join(name), …)` that follows, it can `rmdir` the directory
+/// and put a symlink to somewhere else under the same name — after which the
+/// rename moves a *host* file out and the bad-name unlink deletes one.
+///
+/// So the queue is opened **once**, with `O_DIRECTORY | O_NOFOLLOW`, and every
+/// operation after that is relative to the descriptor: `fdopendir` to list it,
+/// `renameat` to take a request out, `unlinkat` to drop one friring will not
+/// read. A descriptor names an inode. Renaming or replacing the *directory*
+/// afterwards changes what the path means and changes nothing about what these
+/// calls reach — which is the property the check could never have.
+///
+/// The destination of the take is deliberately still a path:
+/// [`bridge_taking_dir`] is minted by [`create_private_dir`] under friring's own
+/// data directory and is granted to no sandbox, so there is no writer to race.
+///
+/// Unix only, and that is the whole surface: [`crate::sandbox::Caps::bridge`] is
+/// true for `seatbelt` and `bwrap` alone, so a bridge queue exists nowhere else.
+#[cfg(unix)]
+struct QueueDir(std::fs::File);
+
+#[cfg(unix)]
+impl QueueDir {
+    /// Open `path` as a directory, refusing a symlink.
+    fn open(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .ok()
+            .map(Self)
+    }
+
+    /// Every name in the directory, in filesystem order, bounded.
+    ///
+    /// Through `fdopendir` on a **duplicate** of the descriptor, because
+    /// `closedir` closes what it was given and this type outlives the listing.
+    ///
+    /// `scanned` is bumped once per `readdir` — errors and skipped names
+    /// included — so the caller's bound is on what the directory was asked for
+    /// rather than on what it answered.
+    fn names(
+        &self,
+        max: usize,
+        scanned: &mut usize,
+        mut keep: impl FnMut(&str) -> bool,
+    ) -> Vec<String> {
+        use std::os::unix::io::AsRawFd as _;
+
+        let mut names = Vec::new();
+        // SAFETY: `self.0` is an open directory descriptor for the whole of this
+        // call. `fdopendir` takes ownership of the duplicate, and `closedir`
+        // below is the only close of it.
+        let dir = unsafe {
+            let dup = libc::dup(self.0.as_raw_fd());
+            if dup < 0 {
+                return names;
+            }
+            let dir = libc::fdopendir(dup);
+            if dir.is_null() {
+                libc::close(dup);
+                return names;
+            }
+            dir
+        };
+        loop {
+            // SAFETY: `dir` is a live `DIR*` from `fdopendir` above. `readdir`
+            // returns a pointer into storage owned by `dir`, valid until the
+            // next call on it — the name is copied out before that happens.
+            let entry = unsafe { libc::readdir(dir) };
+            if entry.is_null() {
+                break;
+            }
+            *scanned += 1;
+            #[cfg(test)]
+            BRIDGE_ENTRIES_SCANNED.with(|seen| seen.set(seen.get() + 1));
+            // SAFETY: `d_name` is a NUL-terminated array inside the entry.
+            let raw = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if let Ok(name) = std::str::from_utf8(raw.to_bytes()) {
+                if name != "." && name != ".." && keep(name) {
+                    names.push(name.to_string());
+                }
+            }
+            if names.len() > max || *scanned >= crate::session::bridge::MAX_QUEUE_SCAN {
+                break;
+            }
+        }
+        // SAFETY: `dir` came from `fdopendir` and has not been closed.
+        unsafe { libc::closedir(dir) };
+        names
+    }
+
+    /// Move `name` out of this directory to the absolute path `to`.
+    ///
+    /// `renameat` never follows the final component, so a symlink the agent left
+    /// under `name` is moved as the symlink it is — and the staged read refuses
+    /// it for not being a regular file.
+    fn take(&self, name: &str, to: &Path) -> bool {
+        use std::os::unix::io::AsRawFd as _;
+        let (Some(from), Some(to)) = (c_name(name), c_path(to)) else {
+            return false;
+        };
+        // SAFETY: both strings are NUL-terminated and live across the call, and
+        // `self.0` is an open directory descriptor.
+        unsafe {
+            libc::renameat(
+                self.0.as_raw_fd(),
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+            ) == 0
+        }
+    }
+
+    /// Unlink `name` from this directory. Never follows.
+    fn unlink(&self, name: &str) -> bool {
+        use std::os::unix::io::AsRawFd as _;
+        let Some(name) = c_name(name) else {
+            return false;
+        };
+        // SAFETY: as `take`.
+        unsafe { libc::unlinkat(self.0.as_raw_fd(), name.as_ptr(), 0) == 0 }
+    }
+}
+
+/// A single path component as a C string, refusing anything with a separator.
+#[cfg(unix)]
+fn c_name(name: &str) -> Option<std::ffi::CString> {
+    if name.contains('/') || name.is_empty() {
+        return None;
+    }
+    std::ffi::CString::new(name).ok()
+}
+
+#[cfg(unix)]
+fn c_path(path: &Path) -> Option<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt as _;
+    std::ffi::CString::new(path.as_os_str().as_bytes()).ok()
+}
+
+/// [`QueueDir`] where there are no `*at` calls to pin a directory with.
+///
+/// The same interface over ordinary path operations, with the
+/// check-then-act window the descriptor closes. That is honest rather than
+/// tidy, and it costs nothing real: `Caps::bridge` is false on every backend
+/// that is not `seatbelt` or `bwrap`, so no sandboxed session on this platform
+/// has a queue for anything to race over.
+#[cfg(not(unix))]
+struct QueueDir(PathBuf);
+
+#[cfg(not(unix))]
+impl QueueDir {
+    fn open(path: &Path) -> Option<Self> {
+        is_real_dir(path).then(|| Self(path.to_path_buf()))
+    }
+
+    fn names(
+        &self,
+        max: usize,
+        scanned: &mut usize,
+        mut keep: impl FnMut(&str) -> bool,
+    ) -> Vec<String> {
+        let mut names = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.0) else {
+            return names;
+        };
+        for entry in entries {
+            *scanned += 1;
+            #[cfg(test)]
+            BRIDGE_ENTRIES_SCANNED.with(|seen| seen.set(seen.get() + 1));
+            if let Ok(entry) = entry {
+                if let Some(name) = entry.file_name().to_str() {
+                    if keep(name) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+            if names.len() > max || *scanned >= crate::session::bridge::MAX_QUEUE_SCAN {
+                break;
+            }
+        }
+        names
+    }
+
+    fn take(&self, name: &str, to: &Path) -> bool {
+        std::fs::rename(self.0.join(name), to).is_ok()
+    }
+
+    fn unlink(&self, name: &str) -> bool {
+        std::fs::remove_file(self.0.join(name)).is_ok()
+    }
+}
+
 /// Unlink whatever is at `path`, whichever kind of thing it turned out to be.
 ///
 /// `remove_file` covers every non-directory — a regular file, a FIFO, a socket,
@@ -777,6 +1594,22 @@ pub fn reset_to_xdg() {
     PATH_STRATEGY.with(|strategy| {
         *strategy.borrow_mut() = PathStrategy::Xdg;
     });
+}
+
+/// The base directory a test pinned on **this** thread, if any.
+///
+/// The override is thread-local, which is what keeps two tests running in
+/// parallel out of each other's directories — and which means a worker thread a
+/// test's code hands work to does not inherit it. Anything that spawns a
+/// blocking task and then resolves a friring path on it must carry the override
+/// across, or the test would write into the developer's real data directory.
+/// See `App::inherit_test_context`.
+#[cfg(test)]
+pub fn test_dir_override() -> Option<PathBuf> {
+    PATH_STRATEGY.with(|strategy| match &*strategy.borrow() {
+        PathStrategy::Override(base) => Some(base.clone()),
+        PathStrategy::Xdg => None,
+    })
 }
 
 /// RAII guard for test path overrides.
@@ -1035,6 +1868,43 @@ mod tests {
     /// Windows, `HOME` elsewhere. Tests that exercise tilde expansion source the
     /// home directory from the same var so they pass on every target.
     const HOME_VAR: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+
+    /// A test build resolves under its own sandbox and must say so, whatever the
+    /// environment holds. Reporting `FRIRING_DATA_DIR` from a `cargo test`
+    /// process would be a lie that a harness could not tell from the truth —
+    /// exactly the confusion `config paths` exists to remove.
+    #[test]
+    fn a_test_build_never_claims_a_production_source() {
+        std::env::set_var(DATA_DIR_OVERRIDE_ENV, "/nowhere/data");
+        std::env::set_var("XDG_DATA_HOME", "/nowhere/xdg");
+        let resolved = resolved_paths();
+        std::env::remove_var(DATA_DIR_OVERRIDE_ENV);
+
+        assert_eq!(resolved.data_source, source::TEST);
+        assert_eq!(resolved.config_source, source::TEST);
+        let data = resolved.data_dir.expect("a test sandbox data dir");
+        assert!(
+            !data.starts_with("/nowhere"),
+            "a test build resolved against the environment: {}",
+            data.display()
+        );
+    }
+
+    /// Under a `TestPathGuard` every path shares one base, and the report has to
+    /// name that base rather than the sandbox nothing is resolving against.
+    #[test]
+    fn an_overridden_base_is_what_the_report_names() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = TestPathGuard::new(tmp.path());
+        let resolved = resolved_paths();
+
+        assert_eq!(resolved.config_dir.as_deref(), Some(tmp.path()));
+        assert_eq!(resolved.data_dir.as_deref(), Some(tmp.path()));
+        assert_eq!(
+            resolved.database.as_deref(),
+            Some(tmp.path().join("friring.db").as_path())
+        );
+    }
 
     #[test]
     fn display_path_uses_basename() {
@@ -1317,6 +2187,403 @@ mod tests {
         let base = tmp.path().join(name);
         let guard = TestPathGuard::new(&base);
         (tmp, base, guard)
+    }
+
+    // ── The bridge's file queue (ADR-30) ─────────────────────────────────
+
+    /// Write a request into a session's queue the way the client does.
+    fn submit(session_key: &str, key: &str, body: &str) {
+        let dir = bridge_request_dir(session_key).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{key}.req")), body).unwrap();
+    }
+
+    #[test]
+    fn a_bridge_queue_is_private_and_under_the_sessions_own_directory() {
+        let (_tmp, _base, _guard) = signal_sandbox("bridge-mint");
+        create_session_signal_dir("s1").unwrap();
+        let dir = create_session_bridge_dirs("s1").unwrap();
+
+        // Under the directory a launch already grants read-write, so a bridge
+        // child needs no second grant and no second path in its policy.
+        assert_eq!(dir, session_signal_dir("s1").unwrap().join("bridge"));
+        assert!(bridge_request_dir("s1").unwrap().is_dir());
+        assert!(bridge_response_dir("s1").unwrap().is_dir());
+        // The taking directory is a sibling of every session's, never a child
+        // of one: the whole point is to land where no sandbox was granted.
+        let taking = bridge_taking_dir().unwrap();
+        assert_eq!(taking, signals_directory().unwrap().join(".taking"));
+        assert!(!dir.starts_with(&taking));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for probe in [dir.clone(), bridge_request_dir("s1").unwrap(), taking] {
+                let mode = std::fs::metadata(&probe).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o700, "{} must be private", probe.display());
+            }
+        }
+    }
+
+    /// A well-formed request is taken out of the agent's reach and read whole.
+    #[test]
+    fn a_request_is_taken_by_rename_and_answered_in_place() {
+        let (_tmp, _base, _guard) = signal_sandbox("bridge-take");
+        create_session_signal_dir("s1").unwrap();
+        create_session_bridge_dirs("s1").unwrap();
+        submit("s1", "abc-1234", r#"{"verb":"status"}"#);
+
+        let (taken, refused) = take_bridge_requests("s1", 4);
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].key, "abc-1234");
+        assert_eq!(taken[0].session_key, "s1");
+        assert_eq!(taken[0].text, r#"{"verb":"status"}"#);
+        // Out of the client's directory, into one no sandbox was granted.
+        assert!(taken[0].staged.starts_with(bridge_taking_dir().unwrap()));
+        assert!(std::fs::read_dir(bridge_request_dir("s1").unwrap())
+            .unwrap()
+            .next()
+            .is_none());
+
+        write_bridge_response("s1", "abc-1234", r#"{"ok":true}"#).unwrap();
+        finish_taken_request(&taken[0]);
+        let answer =
+            std::fs::read_to_string(bridge_response_dir("s1").unwrap().join("abc-1234.res"))
+                .unwrap();
+        assert_eq!(answer, r#"{"ok":true}"#);
+        // Nothing is left staged once it has been answered.
+        assert!(!taken[0].staged.exists());
+    }
+
+    /// Every hostile shape a request file can take has **no effect**: the
+    /// filename never becomes a path, the content is never trusted, and nothing
+    /// blocks the thread this runs on.
+    #[test]
+    fn a_hostile_request_file_is_refused_without_effect() {
+        let (_tmp, _base, _guard) = signal_sandbox("bridge-hostile");
+        create_session_signal_dir("s1").unwrap();
+        create_session_bridge_dirs("s1").unwrap();
+        let req = bridge_request_dir("s1").unwrap();
+
+        // A name that would be a path, or one no key format accepts. Neither
+        // reaches a `join` that could walk out of the directory: the key is
+        // validated first.
+        for bad in ["UPPER", "short", "with.dot"] {
+            std::fs::write(req.join(format!("{bad}.req")), "{}").unwrap();
+        }
+        // Oversized: bounded before the open and again during the read.
+        std::fs::write(
+            req.join("toolarge-01.req"),
+            "x".repeat(crate::session::bridge::MAX_BRIDGE_REQUEST_BYTES as usize + 1),
+        )
+        .unwrap();
+        // Not UTF-8: dropped rather than lossily converted into something that
+        // might parse.
+        std::fs::write(req.join("notutf8-01.req"), [0xff, 0xfe, 0x00]).unwrap();
+        // A directory where a file belongs.
+        std::fs::create_dir(req.join("adirect-01.req")).unwrap();
+
+        let (taken, refused) = take_bridge_requests("s1", 32);
+        assert!(taken.is_empty(), "nothing hostile is taken: {taken:?}");
+        assert!(refused.len() >= 6, "{refused:?}");
+        // Every one is gone: a file left behind would be walked forever.
+        let left: Vec<_> = std::fs::read_dir(&req)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A symlink with a **valid** key: the shape that gets past the name check
+    /// and would, if the take followed it, read a file outside the boundary and
+    /// then delete it when the request was finished. The request directory is
+    /// agent-writable, so this is a link the agent plants itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_request_is_refused_and_its_target_untouched() {
+        let (_tmp, _base, _guard) = signal_sandbox("bridge-symlink");
+        create_session_signal_dir("s1").unwrap();
+        create_session_bridge_dirs("s1").unwrap();
+        let outside = signals_directory().unwrap().join("host-secret");
+        std::fs::write(&outside, r#"{"verb":"create"}"#).unwrap();
+
+        let link = bridge_request_dir("s1").unwrap().join("symlink1-01.req");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let (taken, refused) = take_bridge_requests("s1", 4);
+        assert!(taken.is_empty(), "a symlink was taken: {taken:?}");
+        assert!(
+            refused
+                .iter()
+                .any(|r| matches!(r, TakeRefusal::Unreadable(_))),
+            "{refused:?}"
+        );
+        // What it pointed at is intact: the rename moves the link, and the
+        // cleanup unlinks the link rather than descending through it.
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            r#"{"verb":"create"}"#
+        );
+        // …and the link itself is gone from both directories, so it is not
+        // walked again on every pass.
+        assert!(std::fs::symlink_metadata(&link).is_err(), "the link stayed");
+        let staged: Vec<_> = std::fs::read_dir(bridge_taking_dir().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(staged.is_empty(), "the link was left staged: {staged:?}");
+    }
+
+    /// A FIFO is the shape that matters most: opening one for reading blocks
+    /// until a writer appears, and this runs on the render loop, so a request
+    /// that read it in place would let an agent freeze the whole TUI.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_request_does_not_block_the_take() {
+        let (_tmp, _base, _guard) = signal_sandbox("bridge-fifo");
+        create_session_signal_dir("s1").unwrap();
+        create_session_bridge_dirs("s1").unwrap();
+        let path = bridge_request_dir("s1").unwrap().join("fifo-0001.req");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path this test owns, and a mode with no bits
+        // outside the permission mask.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let (taken, refused) = take_bridge_requests("s1", 4);
+        assert!(taken.is_empty());
+        assert!(matches!(refused.first(), Some(TakeRefusal::Unreadable(_))));
+        assert!(!path.exists());
+    }
+
+    /// A client writing faster than friring answers is refused rather than
+    /// absorbed: the queue is not the place to buffer a flood, and a directory
+    /// that grew without bound would be a disk-filling channel out of a
+    /// boundary.
+    #[test]
+    fn an_overfull_queue_is_reported_and_read_in_a_bounded_batch() {
+        let (_tmp, _base, _guard) = signal_sandbox("bridge-flood");
+        create_session_signal_dir("s1").unwrap();
+        create_session_bridge_dirs("s1").unwrap();
+        for n in 0..(crate::session::bridge::MAX_UNANSWERED_REQUESTS + 5) {
+            submit("s1", &format!("flood-{n:04}"), "{}");
+        }
+
+        let (taken, refused) = take_bridge_requests("s1", 4);
+        assert_eq!(taken.len(), 4, "the per-tick budget holds");
+        assert!(refused.contains(&TakeRefusal::Quota));
+        // Sorted **among what was read**. The enumeration itself is bounded at
+        // the quota, because an unbounded `read_dir` plus sort on the render
+        // loop is the starvation `limit` exists to prevent arriving one step
+        // earlier — so the promise is a stable order within the batch, not the
+        // globally first keys. Past the quota there is no answer to give in any
+        // case.
+        let mut sorted = taken.iter().map(|t| t.key.clone()).collect::<Vec<_>>();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            taken.iter().map(|t| t.key.clone()).collect::<Vec<_>>(),
+            "the batch is not in a stable order"
+        );
+        assert!(
+            taken.iter().all(|t| t.key.starts_with("flood-")),
+            "the batch took something it was not offered"
+        );
+    }
+
+    /// The bound is on the **entries**, not on the matches. `filter(..).take(n)`
+    /// pulls the underlying `read_dir` until it finds `n` matches or the
+    /// directory is exhausted — so a queue an agent has filled with names that
+    /// are *not* requests would be enumerated whole, on the render loop, which is
+    /// the unbounded scan the quota exists to prevent.
+    #[test]
+    fn a_queue_full_of_names_that_are_not_requests_is_still_a_bounded_scan() {
+        let (_tmp, _base, _guard) = signal_sandbox("bridge-junk");
+        create_session_signal_dir("s1").unwrap();
+        let dir = create_session_bridge_dirs("s1").unwrap();
+        let requests = bridge_request_dir("s1").unwrap();
+        let _ = dir;
+        // Far more junk than the scan cap, and one real request behind it.
+        for n in 0..(crate::session::bridge::MAX_QUEUE_SCAN * 3) {
+            std::fs::write(requests.join(format!("junk-{n:05}.txt")), "x").unwrap();
+        }
+        submit("s1", "real-0001", r#"{"verb":"status"}"#);
+
+        BRIDGE_ENTRIES_SCANNED.with(|seen| seen.set(0));
+        let (taken, _) = take_bridge_requests("s1", 4);
+        // The property, observed where it lives: how many entries the
+        // enumeration looked at. Asserting only on `taken` would pass against the
+        // unbounded `filter(..).take(n)` this replaced, which enumerated the
+        // whole directory and returned the same one request.
+        let scanned = BRIDGE_ENTRIES_SCANNED.with(std::cell::Cell::get);
+        assert!(
+            scanned <= crate::session::bridge::MAX_QUEUE_SCAN,
+            "the enumeration read {scanned} entries, past the {} cap",
+            crate::session::bridge::MAX_QUEUE_SCAN
+        );
+        // …and it really did enumerate, so the bound is not satisfied by an
+        // early return that read nothing.
+        assert!(scanned > 0, "nothing was enumerated at all");
+        // Whatever it found, it stopped looking: the assertion is that this
+        // returns rather than listing the directory. A client that fills its own
+        // queue with junk starves itself, not the render loop.
+        assert!(taken.len() <= 1);
+        // The junk is left exactly where it is — friring removes only a file
+        // whose name is a well-formed request key.
+        assert!(requests.join("junk-00000.txt").exists());
+    }
+
+    /// A queue directory swapped **after** friring opened it reaches nothing.
+    ///
+    /// This is the check-then-act window a `symlink_metadata` guard leaves open,
+    /// and it is the one an agent can actually drive: it holds read-write on its
+    /// own request directory, so it can `rmdir` and re-point the name between
+    /// the check and the rename that follows — after which the rename moves a
+    /// *host* file out and the bad-name unlink deletes one.
+    ///
+    /// Asserted on the mechanism rather than by racing it: the swap here happens
+    /// while friring holds the descriptor, which is exactly the state a
+    /// mid-call swap produces, and the take must still act on the original
+    /// inode.
+    #[cfg(unix)]
+    #[test]
+    fn a_queue_swapped_under_an_open_descriptor_still_names_the_original() {
+        let (tmp, _base, _guard) = signal_sandbox("bridge-swap");
+        create_session_signal_dir("s1").unwrap();
+        create_session_bridge_dirs("s1").unwrap();
+        let requests = bridge_request_dir("s1").unwrap();
+        std::fs::write(requests.join("swap-0001.req"), "mine").unwrap();
+
+        // friring opens the queue…
+        let queue = QueueDir::open(&requests).expect("the queue opens");
+
+        // …and the agent replaces it with a symlink to somewhere it wants
+        // friring's next syscall aimed at.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("swap-0001.req"), "theirs").unwrap();
+        // Moved aside rather than deleted: the real queue keeps its contents,
+        // which is what a rename-and-relink actually does and what makes the
+        // two candidate answers distinguishable.
+        std::fs::rename(&requests, tmp.path().join("moved-aside")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &requests).unwrap();
+
+        let staged = tmp.path().join("staged.req");
+        assert!(queue.take("swap-0001.req", &staged));
+        // The original inode's file, not the one the name now points at — and
+        // the host file the agent aimed at is untouched.
+        assert_eq!(std::fs::read_to_string(&staged).unwrap(), "mine");
+        assert!(elsewhere.join("swap-0001.req").exists());
+
+        // The same for the unlink a bad name takes.
+        std::fs::write(elsewhere.join("victim"), "theirs").unwrap();
+        assert!(!queue.unlink("victim"));
+        assert!(elsewhere.join("victim").exists());
+    }
+
+    /// A request directory that **is** a symlink is refused, unfollowed.
+    ///
+    /// The other half of the same rule, at open time rather than after it:
+    /// `O_NOFOLLOW` on the directory is what stops friring enumerating, renaming
+    /// out of and deleting inside whatever an agent pointed the name at.
+    #[test]
+    fn a_symlinked_queue_directory_is_never_enumerated() {
+        let (tmp, _base, _guard) = signal_sandbox("bridge-symlink-dir");
+        create_session_signal_dir("s1").unwrap();
+        create_session_bridge_dirs("s1").unwrap();
+        let requests = bridge_request_dir("s1").unwrap();
+        let elsewhere = tmp.path().join("host-files");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("theirs-001.req"), r#"{"verb":"status"}"#).unwrap();
+
+        std::fs::remove_dir_all(&requests).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&elsewhere, &requests).unwrap();
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(&requests).unwrap();
+
+        let (taken, refused) = take_bridge_requests("s1", 4);
+        assert!(taken.is_empty(), "a symlinked queue was read: {taken:?}");
+        assert!(refused.is_empty(), "{refused:?}");
+        assert!(
+            elsewhere.join("theirs-001.req").exists(),
+            "a host file was taken out through a symlinked queue directory"
+        );
+    }
+
+    /// Nothing in the taking directory is ever silently dropped: a file there
+    /// was taken out of a client's queue, so the client is still waiting for an
+    /// answer that will never come unless something produces one.
+    #[test]
+    fn taken_requests_are_recovered_and_never_dropped() {
+        let (_tmp, _base, _guard) = signal_sandbox("bridge-recover");
+        create_session_signal_dir("s1").unwrap();
+        create_session_bridge_dirs("s1").unwrap();
+        submit("s1", "recov-001", r#"{"verb":"status"}"#);
+        let (taken, _) = take_bridge_requests("s1", 4);
+        assert_eq!(taken.len(), 1);
+        // …and friring dies here, leaving the file staged.
+
+        let recovered = recover_taken_requests(std::time::Duration::from_secs(60 * 60));
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].session_key, "s1");
+        assert_eq!(recovered[0].key, "recov-001");
+        assert_eq!(recovered[0].text, r#"{"verb":"status"}"#);
+
+        // A file whose name names no session cannot be answered, so it is
+        // removed rather than walked forever.
+        let taking = bridge_taking_dir().unwrap();
+        std::fs::write(taking.join("garbage"), "{}").unwrap();
+        std::fs::write(taking.join("__nokey.req"), "{}").unwrap();
+        let again = recover_taken_requests(std::time::Duration::from_secs(60 * 60));
+        assert_eq!(again.len(), 1, "only the real one: {again:?}");
+        assert!(!taking.join("garbage").exists());
+        assert!(!taking.join("__nokey.req").exists());
+
+        // And one older than the horizon belongs to a client long gone.
+        let stale = recover_taken_requests(std::time::Duration::from_secs(0));
+        assert!(stale.is_empty());
+        assert!(!recovered[0].staged.exists());
+    }
+
+    /// A response larger than friring will write is refused rather than
+    /// truncated: a client reading a half-answer would act on it.
+    #[test]
+    fn an_oversized_response_is_refused_rather_than_truncated() {
+        let (_tmp, _base, _guard) = signal_sandbox("bridge-bigres");
+        create_session_signal_dir("s1").unwrap();
+        create_session_bridge_dirs("s1").unwrap();
+        let huge = "x".repeat(crate::session::bridge::MAX_BRIDGE_RESPONSE_BYTES as usize + 1);
+        let error = write_bridge_response("s1", "abc-1234", &huge).unwrap_err();
+        assert!(error.contains("past the"), "{error}");
+        assert!(!bridge_response_dir("s1")
+            .unwrap()
+            .join("abc-1234.res")
+            .exists());
+    }
+
+    /// A client that exits without reading its answer leaves a `.res` behind,
+    /// and a leader that runs for weeks would accumulate one per request.
+    #[test]
+    fn unacknowledged_responses_age_out() {
+        let (_tmp, _base, _guard) = signal_sandbox("bridge-prune");
+        create_session_signal_dir("s1").unwrap();
+        create_session_bridge_dirs("s1").unwrap();
+        write_bridge_response("s1", "abc-1234", "{}").unwrap();
+        assert_eq!(
+            prune_bridge_responses("s1", std::time::Duration::from_secs(3600)),
+            0
+        );
+        assert_eq!(
+            prune_bridge_responses("s1", std::time::Duration::from_secs(0)),
+            1
+        );
+        assert!(!bridge_response_dir("s1")
+            .unwrap()
+            .join("abc-1234.res")
+            .exists());
     }
 
     #[test]

@@ -45,6 +45,8 @@ jobs:
       install_ps: ${{ steps.filter.outputs.install_ps || steps.all.outputs.all }}
       media: ${{ steps.filter.outputs.media || steps.all.outputs.all }}
       agent_e2e: ${{ steps.filter.outputs.agent_e2e || steps.all.outputs.all }}
+      sandbox_probe: ${{ steps.filter.outputs.sandbox_probe || steps.all.outputs.all }}
+      omx: ${{ steps.filter.outputs.omx || steps.all.outputs.all }}
     steps:
       # A merge queue entry already contains exactly the PR's changes; validate
       # the whole suite against it rather than diffing (paths-filter has no PR
@@ -104,6 +106,21 @@ jobs:
               - 'extensions/hooks/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+            sandbox_probe:
+              - 'scripts/dev/sandbox-probes/**'
+              - 'scripts/dev/bridge-e2e.sh'
+              - 'scripts/dev/lib/**'
+              - 'src/sandbox/**'
+              - 'src/agent/sandboxing.rs'
+              - 'src/app/bridge*.rs'
+              - 'src/cli/sandbox.rs'
+              - 'extensions/bridge-conformance/**'
+              - '.github/workflows/ci.yml'
+            omx:
+              - 'extensions/omx/**'
+              - 'extensions/bridge-conformance/**'
+              - 'tests/omx_manifest_invocation.rs'
               - '.github/workflows/ci.yml'
 
   check:
@@ -249,6 +266,84 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y tmux
       - name: Black-box TUI smoke test
         run: scripts/dev/smoke/tui-smoke.sh
+
+  # Observe the deny set against a real kernel rather than against generated
+  # policy text. Non-blocking like agent-e2e: a hosted runner's namespace and
+  # socket capabilities are the runner's, not friring's, and the probes skip
+  # rather than fail where one is absent — but a *failure* here is a real hole
+  # and shows up in the run.
+  seatbelt-probe:
+    name: Seatbelt Boundary Probe (macOS)
+    needs: changes
+    if: needs.changes.outputs.sandbox_probe == 'true'
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install tmux
+        run: brew install tmux
+      - name: Observe the seatbelt boundary
+        run: scripts/dev/sacrificial-env.sh scripts/dev/sandbox-probes/seatbelt.sh
+
+  bwrap-probe:
+    name: Bubblewrap Boundary Probe (Linux)
+    needs: changes
+    if: needs.changes.outputs.sandbox_probe == 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install tmux and bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y tmux bubblewrap
+      - name: Observe the bubblewrap boundary
+        run: scripts/dev/sacrificial-env.sh scripts/dev/sandbox-probes/bwrap.sh
+
+  # The orchestration bridge, end to end against a real TUI: a leader created
+  # through the wizard, a child through the saga, a verdict friring reached by
+  # reading a worktree. Non-blocking for the same reason the probes are — it
+  # needs bubblewrap and a usable user namespace, and skips where either is
+  # absent — but a *failure* here is a bridge that does not work.
+  # Run through `sacrificial-env.sh`, which mints a throwaway outer HOME whose
+  # friring fallback paths are canaries, and fails the job if anything writes to
+  # one. A runner's HOME is disposable, so this buys little here; it is the same
+  # command a developer runs locally, where it buys a great deal.
+  bridge-e2e:
+    name: Bridge Conformance E2E (Linux)
+    needs: changes
+    if: needs.changes.outputs.sandbox_probe == 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install tmux, bubblewrap and jq
+        run: sudo apt-get update && sudo apt-get install -y tmux bubblewrap jq
+      - name: Run the conformance extension end to end
+        run: scripts/dev/sacrificial-env.sh scripts/dev/bridge-e2e.sh
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bridge-e2e
+          path: target/bridge-e2e/
+          if-no-files-found: ignore
+
+  # The omx extension's own program tests. Node is on every hosted runner, so
+  # this is an ordinary blocking job rather than a skip-if-absent one.
+  omx-tests:
+    name: OMX Extension Tests
+    needs: changes
+    if: needs.changes.outputs.omx == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Run the extension's program tests
+        run: node --test "extensions/omx/lib/*.test.mjs"
 
   acceptance:
     name: Acceptance Tests

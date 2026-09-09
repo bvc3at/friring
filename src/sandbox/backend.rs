@@ -25,11 +25,109 @@ pub type Argv = Vec<String>;
 /// when the root is not a repository: denying writes to a path that does not
 /// exist is a no-op.
 ///
-/// `.git/config` is deliberately *not* protected despite being a comparable
-/// channel (`core.pager`, `core.fsmonitor` and aliases all name commands):
-/// ordinary work inside a sandbox writes it — `git config`, `git remote add` —
-/// and a profile that breaks `git` gets turned off, which protects nothing.
+/// `<root>/.git/config` is deliberately *not* protected in an ordinary
+/// **checkout**, despite being a comparable channel (`core.pager`,
+/// `core.fsmonitor` and aliases all name commands): ordinary work inside a
+/// sandbox writes it — `git config`, `git remote add` — and a profile that
+/// breaks `git` gets turned off, which protects nothing. It *is* protected when
+/// the writable root is a bare git directory; see [`PROTECTED_IN_GIT_DIR`].
 pub const PROTECTED_IN_WRITABLE_ROOT: &str = ".git/hooks";
+
+/// What is taken back inside a writable root that **is a git directory** —
+/// `<repo>/.git`, the shape a profile shares with bridge children so they can
+/// reach the object and ref stores a linked worktree makes them share
+/// (`docs/SANDBOX.md` §What a shared git directory does and does not give away).
+///
+/// Every entry is a way to run a command on the **host**, or the state of a
+/// worktree that is not the writer's:
+///
+/// - `hooks` — run by whichever git touches the repository next, including the
+///   operator's, outside the boundary. The real hooks of a git directory are at
+///   `<root>/hooks`, one level up from where a checkout keeps them.
+/// - `config` and `config.worktree` — `core.fsmonitor` and `core.pager` name
+///   programs git executes, `core.hooksPath` moves the hooks somewhere writable,
+///   and aliases run anything. Unlike a checkout's own config this one is the
+///   *shared* repository's, so writing it reaches every sibling and the
+///   operator. Nothing a child legitimately does writes it.
+/// - `commondir` — git honours one in **any** git directory, including a main
+///   checkout's, and it decides which directory `config` is then read from. A
+///   writable one is the config protection above with an extra step.
+/// - `HEAD` and `index` — the **main** worktree's, i.e. the leader's staging
+///   area and checked-out branch. A child works in a linked worktree, whose
+///   `HEAD` and `index` are per-worktree and stay writable.
+///
+/// A profile that grants a bare `.git` as a writable root to a session that
+/// commits in the *main* worktree therefore breaks that session's commits. That
+/// shape has no reason to exist — grant the checkout, which encloses its git
+/// directory — and the alternative is a shared grant that silently lets one
+/// child rewrite what another is committing.
+pub const PROTECTED_IN_GIT_DIR: [&str; 6] = [
+    "hooks",
+    "config",
+    "config.worktree",
+    "commondir",
+    "HEAD",
+    "index",
+];
+
+/// What is taken back inside a writable root that is **one worktree's
+/// metadata** — `<repo>/.git/worktrees/<id>`, which ADR-31 grants a bridge child
+/// so it can commit at all.
+///
+/// All three are redirects, and a redirect is how a writable metadata directory
+/// becomes host command execution: `commondir` decides which directory git
+/// reads `config` (and so `core.fsmonitor`) from, `gitdir` decides which
+/// worktree the entry belongs to, and `config.worktree` is read directly when
+/// the shared config enables it. friring itself runs `git` in a child's worktree
+/// to reach a verdict, so a child that could point any of them at a file it
+/// wrote would be running commands as the host.
+///
+/// The rest of the directory — `HEAD`, `index`, `logs`, `refs` — is the child's
+/// own and stays writable, because a child that cannot write them cannot commit.
+pub const PROTECTED_IN_WORKTREE_METADATA: [&str; 3] = ["gitdir", "commondir", "config.worktree"];
+
+/// Protected names that git does not always create — so friring creates them
+/// **empty** before a launch, and every backend has something to take back.
+///
+/// Only seatbelt denies by pathname, which covers a path that does not exist
+/// yet. bwrap binds and a container mounts, and neither can protect a name with
+/// nothing behind it: `--ro-bind-try` skips a missing source, and a place mounts
+/// only what exists, because an engine asked to bind a missing one invents a
+/// root-owned file inside somebody's repository. Left absent,
+/// `config.worktree` is therefore a name a child can *create* — and a repository
+/// with `extensions.worktreeConfig` already enabled (`git sparse-checkout` turns
+/// it on) reads `core.fsmonitor` out of what the child wrote, the next time the
+/// host runs git in that worktree.
+///
+/// Every name here has to be inert when empty, which is why it is one name and
+/// not three: an empty `commondir` would tell git the common directory is `""`.
+pub const PROTECTED_CREATED_IF_ABSENT: [&str; 1] = ["config.worktree"];
+
+/// Every path that has to be taken back inside one writable root.
+///
+/// Three shapes, because a writable root is not always a checkout: an ordinary
+/// checkout ([`PROTECTED_IN_WRITABLE_ROOT`]), a git directory
+/// ([`PROTECTED_IN_GIT_DIR`]) and one worktree's metadata directory
+/// ([`PROTECTED_IN_WORKTREE_METADATA`]). Decided on the path's **shape** rather
+/// than by looking at the filesystem, so a profile reads the same wherever it is
+/// generated; costs nothing when a root is none of them, because denying writes
+/// to a path that does not exist is a no-op.
+pub fn protected_paths_in(root: &str) -> Vec<String> {
+    let mut out = vec![format!("{root}/{PROTECTED_IN_WRITABLE_ROOT}")];
+    let mut components = root.trim_end_matches('/').rsplit('/');
+    let last = components.next();
+    let parent = components.next();
+    let grandparent = components.next();
+    let extra: &[&str] = if last == Some(".git") {
+        &PROTECTED_IN_GIT_DIR
+    } else if parent == Some("worktrees") && grandparent == Some(".git") {
+        &PROTECTED_IN_WORKTREE_METADATA
+    } else {
+        &[]
+    };
+    out.extend(extra.iter().map(|name| format!("{root}/{name}")));
+    out
+}
 
 /// Result of any sandbox operation.
 pub type SandboxResult<T> = std::result::Result<T, SandboxError>;
@@ -275,6 +373,18 @@ pub struct Caps {
     /// proxy, declared where the primitive is rather than in a lookup beside
     /// it.
     pub proxy_transport: ProxyTransport,
+    /// Whether this backend can carry the orchestration bridge (ADR-30).
+    ///
+    /// The bridge is a directory friring mints on the host and exposes inside
+    /// the boundary, and its **authority** is that friring exposed exactly one
+    /// per session. A backend that cannot give a session a private directory
+    /// friring writes — every place backend, every remote host — cannot carry
+    /// that, so a bridge-required agent is refused there rather than launched
+    /// with a channel nobody is serving.
+    ///
+    /// Declared per backend rather than inferred from the shape, so a backend
+    /// that grows the capability says so where its other primitives are.
+    pub bridge: bool,
 }
 
 /// How a sandbox reaches the friring egress proxy, which is decided by what its
@@ -395,6 +505,14 @@ pub struct SandboxLaunch<'a> {
     pub workspace: Option<&'a str>,
     /// Per-session status-file directory (ADR-29's file channel). Writable.
     pub signal_dir: Option<&'a str>,
+    /// Per-session bridge queue (ADR-30's file channel). Writable, and present
+    /// exactly when the session's profile grants a bridge capability.
+    ///
+    /// Writable because the whole channel is the agent writing a request file
+    /// and reading an answer; which directory a request arrives in *is* the
+    /// caller's identity, so exposing one session's is exposing its authority
+    /// and no other's.
+    pub bridge_dir: Option<&'a str>,
     /// The per-session scratch directory friring minted for this launch
     /// ([`crate::sandbox::dirs::create_session_scratch`]). Writable, because a
     /// CLI that cannot write a temp file dies on startup.
@@ -409,6 +527,69 @@ pub struct SandboxLaunch<'a> {
     /// the friring that owns the session is not necessarily the one on the host
     /// where the agent runs.
     pub friring_db: Option<&'a str>,
+    /// The launch gate this session waits on, exposed **read-only** (ADR-33).
+    ///
+    /// `None` for an ordinary launch, which starts its agent immediately. A
+    /// gated launch runs `friring-cli sandbox launch` in the pane instead, and
+    /// that helper polls this directory for the release file the host renames
+    /// in. Read-only is the whole proof: the helper only has to *see* a regular
+    /// file, and a policy that grants reads and nothing else means no process
+    /// inside the boundary can create, rename or unlink one.
+    pub gate_dir: Option<&'a str>,
+    /// The content the release file must hold for this launch to proceed.
+    ///
+    /// Not a credential — the gate directory is unwritable from inside, so
+    /// nothing in the boundary could forge one anyway. What it buys is that a
+    /// release file left behind by an earlier launch of the same child cannot
+    /// open this one: the host mints a fresh key per launch, so a stale file is
+    /// a mismatch rather than a gate that is already open.
+    pub gate_key: Option<&'a str>,
+    /// The **child narrowing** this launch runs under, when it is a bridge
+    /// child's (ADR-31).
+    ///
+    /// Two halves the backends need beyond the policy itself: the paths to deny
+    /// after **every** allow, whatever encloses them, and the exact seed targets
+    /// to re-grant as the last word for those paths alone. A parent profile that
+    /// grants the whole home directory encloses the family's state directory, so
+    /// the subtraction cannot be expressed as an absent grant — it has to be a
+    /// deny that comes after.
+    ///
+    /// `None` for every launch that is not a bridge child's, which is every
+    /// ordinary session.
+    pub narrowing: Option<&'a crate::session::SandboxOverlay>,
+    /// friring's own CLI, which every policy launch runs inside the boundary as
+    /// its launch helper (ADR-33).
+    ///
+    /// Set by the backend from its own resolution, so [`render_profile`] and
+    /// [`build_argv`] stay pure functions of the launch. It has to be *readable*
+    /// inside the boundary or the helper cannot start at all, which is why it is
+    /// a launch fact rather than something either renderer looks up.
+    ///
+    /// [`render_profile`]: crate::sandbox::seatbelt::render_profile
+    /// [`build_argv`]: crate::sandbox::bwrap::build_argv
+    pub helper_program: Option<&'a str>,
+    /// The **agent's** own program, when it is an absolute path.
+    ///
+    /// Read into the narrow scope for exactly the reason
+    /// [`helper_program`](Self::helper_program) is: `workspace` grants "the
+    /// profile's own paths, plus the system directories a binary needs in order
+    /// to load and run", and an agent whose program lives outside both is a pane
+    /// that dies before the agent starts. An extension that ships its agent as a
+    /// script under its own home is the ordinary case — both of this fork's
+    /// bridge-backed extensions do — and no operator should have to add it to
+    /// every profile by hand.
+    ///
+    /// `None` for a bare command name, which resolves on `PATH` under the system
+    /// directories the scope already allows, and for a place backend, whose
+    /// filesystem is the place's own.
+    pub agent_program: Option<&'a str>,
+    /// The multiplexer sockets on this host, for the closed deny set every
+    /// policy launch renders
+    /// ([`crate::sandbox::dirs::multiplexer_socket_denies`]).
+    ///
+    /// `None` only where friring could not work them out, which leaves the deny
+    /// set empty rather than guessed — the launch paths always supply them.
+    pub host_mux: Option<&'a crate::session::HostMuxSockets>,
     /// The egress proxy, once P2 runs one.
     pub proxy: Option<ProxyEndpoint>,
     /// The place this launch runs in, for a place backend. `None` for a policy
@@ -426,8 +607,15 @@ impl<'a> SandboxLaunch<'a> {
             agent: None,
             workspace: None,
             signal_dir: None,
+            bridge_dir: None,
             tmp_dir: None,
             friring_db: None,
+            gate_dir: None,
+            gate_key: None,
+            narrowing: None,
+            helper_program: None,
+            agent_program: None,
+            host_mux: None,
             proxy: None,
             place: None,
         }
@@ -451,6 +639,12 @@ impl<'a> SandboxLaunch<'a> {
         self
     }
 
+    /// The per-session bridge queue — see [`bridge_dir`](Self::bridge_dir).
+    pub fn with_bridge_dir(mut self, dir: &'a str) -> Self {
+        self.bridge_dir = Some(dir);
+        self
+    }
+
     /// The per-session scratch directory — see [`tmp_dir`](Self::tmp_dir).
     pub fn with_tmp_dir(mut self, dir: &'a str) -> Self {
         self.tmp_dir = Some(dir);
@@ -461,6 +655,109 @@ impl<'a> SandboxLaunch<'a> {
     pub fn with_friring_db(mut self, db: &'a str) -> Self {
         self.friring_db = Some(db);
         self
+    }
+
+    /// The read-only launch gate and the key that opens it — see
+    /// [`gate_dir`](Self::gate_dir).
+    pub fn with_gate(mut self, dir: &'a str, key: &'a str) -> Self {
+        self.gate_dir = Some(dir);
+        self.gate_key = Some(key);
+        self
+    }
+
+    /// The gate as the launch helper wants it, or `None` for an ungated launch.
+    ///
+    /// Both halves or neither: a directory with no key would let a stale release
+    /// file from a previous launch open this one, and a key with no directory
+    /// names nothing to poll.
+    pub fn gate(&self) -> Option<(&'a str, &'a str)> {
+        self.gate_dir.zip(self.gate_key)
+    }
+
+    /// The child narrowing — see [`narrowing`](Self::narrowing).
+    pub fn with_narrowing(mut self, overlay: &'a crate::session::SandboxOverlay) -> Self {
+        self.narrowing = Some(overlay);
+        self
+    }
+
+    /// The paths this launch denies after every allow, and the seed targets it
+    /// re-grants after those.
+    ///
+    /// `(subtract, seeds)`. Empty for every launch that is not a bridge child's.
+    pub fn subtract(
+        &self,
+    ) -> (
+        Vec<crate::session::SubtractPath>,
+        Vec<crate::session::SeedGrant>,
+    ) {
+        match self.narrowing {
+            Some(overlay) => (overlay.subtract.clone(), overlay.seed.clone()),
+            None => (Vec::new(), Vec::new()),
+        }
+    }
+
+    /// A bridge child's **own** directories, which the subtract set denies
+    /// wholesale and every backend must therefore re-grant after it.
+    ///
+    /// Returns `(read-write, read-only)`. The subtract set denies friring's
+    /// trees — `<data>/worktrees`, `<data>/signals`, `<data>/sandbox`,
+    /// `<data>/gates` — because that is what covers every sibling, including one
+    /// created after this child launched. The child's own worktree, scratch,
+    /// signal directory, bridge queue and private state live inside those trees,
+    /// so a renderer that emitted the denies and stopped would have built a
+    /// boundary in which the child cannot read its own gate, write its own
+    /// workspace, report its own status or reach its own queue.
+    ///
+    /// The gate is the read-only half and must stay there: a writable gate is a
+    /// gate the child can open for itself (ADR-33).
+    ///
+    /// Empty for a launch that is not a child, which is what makes calling this
+    /// unconditionally safe.
+    pub fn child_own_paths(&self) -> (Vec<String>, Vec<String>) {
+        let Some(overlay) = self.narrowing else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut rw: Vec<String> = Vec::new();
+        rw.extend(overlay.worktree.clone());
+        rw.extend(overlay.own_dirs.iter().cloned());
+        rw.extend(overlay.state_dir.clone());
+        rw.sort();
+        rw.dedup();
+        let ro: Vec<String> = overlay.gate_dir.clone().into_iter().collect();
+        (rw, ro)
+    }
+
+    /// friring's own CLI — see [`helper_program`](Self::helper_program).
+    pub fn with_helper_program(mut self, program: &'a str) -> Self {
+        self.helper_program = Some(program);
+        self
+    }
+
+    /// The agent's own program — see [`agent_program`](Self::agent_program).
+    ///
+    /// A relative or bare command is ignored: it resolves on `PATH`, under the
+    /// system directories every scope already allows, and turning it into a
+    /// policy literal would grant a path relative to whatever the launch's cwd
+    /// happens to be.
+    pub fn with_agent_program(mut self, program: &'a str) -> Self {
+        if program.starts_with('/') {
+            self.agent_program = Some(program);
+        }
+        self
+    }
+
+    /// The host's multiplexer sockets — see [`host_mux`](Self::host_mux).
+    pub fn with_host_mux(mut self, host: &'a crate::session::HostMuxSockets) -> Self {
+        self.host_mux = Some(host);
+        self
+    }
+
+    /// The closed multiplexer deny set for this launch, empty when friring could
+    /// not work the host's sockets out.
+    pub fn multiplexer_denies(&self) -> Vec<crate::sandbox::dirs::SocketDeny> {
+        self.host_mux
+            .map(crate::sandbox::dirs::multiplexer_socket_denies)
+            .unwrap_or_default()
     }
 
     /// The egress proxy friring started alongside the session.
@@ -501,9 +798,14 @@ impl<'a> SandboxLaunch<'a> {
     /// order bind-mount backends need.
     pub fn writable_paths(&self) -> Vec<String> {
         let mut out: Vec<String> = self.policy.rw_paths.clone();
-        for extra in [self.workspace, self.signal_dir, self.tmp_dir]
-            .into_iter()
-            .flatten()
+        for extra in [
+            self.workspace,
+            self.signal_dir,
+            self.bridge_dir,
+            self.tmp_dir,
+        ]
+        .into_iter()
+        .flatten()
         {
             out.push(extra.to_string());
         }
@@ -531,7 +833,13 @@ impl<'a> SandboxLaunch<'a> {
     ///   [`crate::sandbox::dirs::check_declared_paths`], which is given the
     ///   profile's own paths rather than [`Self::writable_paths`] — this
     ///   launch's minted directories live in exactly that tree and are the point
-    ///   of it.
+    ///   of it. A **bridge child** is the one launch whose minted directories
+    ///   are also policy paths, because [`crate::session::SandboxPolicy::narrow`]
+    ///   has to put them there for the boundary to grant them; those exact paths
+    ///   are taken back out here, since friring minted them for this child and
+    ///   no profile declared them. Only the exact paths — anything else under
+    ///   those trees is still refused, which is what keeps a child out of its
+    ///   siblings'.
     /// - **The container engine's control socket is off limits in either
     ///   mode**, and not only to the place backends. bwrap masks `/run` and
     ///   `/var/run` under `host-minus-secrets` alone, and a path the profile
@@ -555,11 +863,13 @@ impl<'a> SandboxLaunch<'a> {
         };
         crate::sandbox::dirs::check_writable_roots(&self.writable_paths(), self.friring_db)
             .map_err(&refuse)?;
+        let (own_rw, own_ro) = self.child_own_paths();
         let declared: Vec<String> = self
             .policy
             .rw_paths
             .iter()
             .chain(self.policy.ro_paths.iter())
+            .filter(|path| !own_rw.contains(*path) && !own_ro.contains(*path))
             .cloned()
             .collect();
         crate::sandbox::dirs::check_declared_paths(&declared).map_err(&refuse)?;
@@ -587,17 +897,23 @@ impl<'a> SandboxLaunch<'a> {
         Ok(())
     }
 
-    /// The profile's read-only paths, minus any the launch made writable.
+    /// The profile's read-only paths, minus any the launch made writable, plus
+    /// the launch gate.
+    ///
     /// Mirrors [`SandboxPolicy`]'s own rule that the two sets stay disjoint and
-    /// the wider grant wins.
+    /// the wider grant wins. The gate is folded in here and **never** into
+    /// [`writable_paths`](Self::writable_paths): a writable gate is a gate the
+    /// agent releases itself.
     pub fn readable_paths(&self) -> Vec<String> {
         let writable = self.writable_paths();
         let mut out: Vec<String> = self
             .policy
             .ro_paths
             .iter()
-            .filter(|p| !writable.contains(p))
-            .cloned()
+            .map(String::as_str)
+            .chain(self.gate_dir)
+            .filter(|p| !writable.iter().any(|w| w == p))
+            .map(str::to_string)
             .collect();
         out.sort();
         out.dedup();
@@ -685,6 +1001,76 @@ mod tests {
         .unwrap()
     }
 
+    /// The protected sets, spelled out here rather than read from the constants
+    /// the renderers use.
+    ///
+    /// Every backend test iterates those constants, which is what keeps three
+    /// renderers agreeing — and means a name **removed** from one would delete
+    /// the assertions about it everywhere at once, silently. This is the one
+    /// place the required names are stated independently, so a removal has to
+    /// be argued for here.
+    #[test]
+    fn the_protected_sets_are_what_they_say_they_are() {
+        assert_eq!(PROTECTED_IN_WRITABLE_ROOT, ".git/hooks");
+        for name in [
+            "hooks",
+            "config",
+            "config.worktree",
+            "commondir",
+            "HEAD",
+            "index",
+        ] {
+            assert!(
+                PROTECTED_IN_GIT_DIR.contains(&name),
+                "a shared git directory no longer protects '{name}'"
+            );
+        }
+        for name in ["gitdir", "commondir", "config.worktree"] {
+            assert!(
+                PROTECTED_IN_WORKTREE_METADATA.contains(&name),
+                "a child's own git metadata no longer protects '{name}'"
+            );
+        }
+        // And what a commit writes is in neither: a child that cannot write its
+        // own `HEAD`, `index` or refs cannot commit, which friring then reads as
+        // a dirty worktree and never merges.
+        for name in ["objects", "refs", "logs", "packed-refs"] {
+            assert!(!PROTECTED_IN_GIT_DIR.contains(&name));
+        }
+        for name in ["HEAD", "index", "logs", "refs"] {
+            assert!(!PROTECTED_IN_WORKTREE_METADATA.contains(&name));
+        }
+    }
+
+    /// Which shape a writable root is read as, on its path alone.
+    #[test]
+    fn a_roots_shape_decides_what_is_taken_back_inside_it() {
+        let git_dir = protected_paths_in("/repo/.git");
+        assert!(git_dir.contains(&"/repo/.git/config".to_string()));
+        assert!(git_dir.contains(&"/repo/.git/hooks".to_string()));
+
+        let metadata = protected_paths_in("/repo/.git/worktrees/child");
+        assert!(metadata.contains(&"/repo/.git/worktrees/child/gitdir".to_string()));
+        assert!(!metadata.contains(&"/repo/.git/worktrees/child/HEAD".to_string()));
+
+        // An ordinary checkout keeps the narrow rule, so `git config` inside a
+        // sandboxed session still works.
+        let checkout = protected_paths_in("/repo");
+        assert_eq!(checkout, vec!["/repo/.git/hooks".to_string()]);
+
+        // The metadata *root* is neither: it is subtracted wholesale instead.
+        assert_eq!(
+            protected_paths_in("/repo/.git/worktrees"),
+            vec!["/repo/.git/worktrees/.git/hooks".to_string()]
+        );
+
+        // A trailing slash must not change the reading.
+        assert_eq!(
+            protected_paths_in("/repo/.git/").len(),
+            PROTECTED_IN_GIT_DIR.len() + 1
+        );
+    }
+
     /// A place backend that implements neither half, to exercise the defaults.
     struct FakePlace;
 
@@ -705,6 +1091,7 @@ mod tests {
                 host_credentials: false,
                 inner_agent_sandbox: InnerSandboxVerdict::Redundant,
                 proxy_transport: ProxyTransport::UnixSocket,
+                bridge: true,
             }
         }
     }
@@ -898,6 +1285,73 @@ mod tests {
             .with_proxy(endpoint())
             .validate()
             .unwrap();
+    }
+
+    /// The one carve-out in `check_declared_paths`, from both sides.
+    ///
+    /// A bridge child is the single launch whose minted directories are also
+    /// *policy* paths — `narrow` has to put them there for the boundary to grant
+    /// them — so `validate` takes exactly those back out. Exactly: a sibling's
+    /// directory under the same roots is what the protection is for, and a
+    /// carve-out that widened to the trees rather than to the paths would hand a
+    /// child every other child's gate and private state.
+    #[test]
+    fn a_childs_own_minted_directories_pass_validate_and_a_siblings_do_not() {
+        let overlay = crate::session::SandboxOverlay {
+            worktree: Some("/home/u/dev/app/child".into()),
+            own_dirs: vec![
+                crate::sandbox::dirs::session_scratch_dir("child")
+                    .unwrap()
+                    .display()
+                    .to_string(),
+                crate::paths::signals_directory()
+                    .unwrap()
+                    .join("child")
+                    .display()
+                    .to_string(),
+            ],
+            gate_dir: Some(
+                crate::sandbox::dirs::gate_root()
+                    .unwrap()
+                    .join("child")
+                    .display()
+                    .to_string(),
+            ),
+            state_dir: Some(
+                crate::sandbox::dirs::sandbox_root()
+                    .unwrap()
+                    .join("state")
+                    .join("child")
+                    .display()
+                    .to_string(),
+            ),
+            ..crate::session::SandboxOverlay::default()
+        };
+        let narrowed = policy().narrow(&overlay).unwrap();
+        SandboxLaunch::new(&narrowed, "/home/u", "child")
+            .with_narrowing(&overlay)
+            .with_proxy(endpoint())
+            .validate()
+            .expect("a child may reach the directories friring minted for it");
+
+        // The same launch, plus one path under those roots that friring did not
+        // mint for *this* child. It is not in `child_own_paths`, so nothing
+        // exempts it and the refusal names it.
+        let sibling = crate::sandbox::dirs::gate_root()
+            .unwrap()
+            .join("some-other-child")
+            .display()
+            .to_string();
+        let mut with_sibling = narrowed.clone();
+        with_sibling.ro_paths.push(sibling.clone());
+        let err = SandboxLaunch::new(&with_sibling, "/home/u", "child")
+            .with_narrowing(&overlay)
+            .with_proxy(endpoint())
+            .validate()
+            .expect_err("a sibling's gate is not this child's own");
+        let text = err.to_string();
+        assert!(text.contains(&sibling), "{text}");
+        assert!(text.contains("launch gate"), "{text}");
     }
 
     /// A mode the kernel cannot express on its own is refused unless the proxy

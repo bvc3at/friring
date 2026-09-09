@@ -2,6 +2,7 @@ pub mod activity;
 pub mod agent_def;
 pub mod agent_projection;
 pub mod automation;
+pub mod bridge;
 pub mod cc_activity;
 pub mod extension_def;
 pub mod host_def;
@@ -15,7 +16,9 @@ pub mod status_signal;
 pub mod task;
 pub mod theme_config;
 
-pub use agent_def::{AgentDef, AgentRegistry, AgentSandboxDef, SandboxAuth};
+pub use agent_def::{
+    AgentDef, AgentRegistry, AgentSandboxDef, ChildStateSeed, SandboxAuth, TranscriptDef,
+};
 pub use agent_projection::{
     rewrite_status_signals_for_tmux, EnforcedSettings, SettingsFormat, STATUS_SIGNAL_MARKER,
 };
@@ -23,13 +26,17 @@ pub use automation::{
     parse_hhmm, preset_to_cron, Automation, AutomationAction, AutomationRun, AutomationRunStatus,
     AutomationSchedule, ExtraRepo, PromptStep, SchedulePreset, SendTarget, SpawnSessionMode,
 };
+pub use bridge::{
+    BridgeChild, BridgeChildState, BridgeReport, BridgeResult, ChildSaga, ChildState, Outcome,
+    SagaStep, MAX_REPORTS_PER_CHILD,
+};
 pub use cc_activity::{
     CcActivity, CcAgent, CcAgentState, CcPhase, CcRunStatus, CcWorkflow, CcWorkflowSummary,
     TranscriptBlock,
 };
 pub use extension_def::{
     AgentPatch, ConfigMerge, ExtensionAutomation, ExtensionDef, ExtensionFile, ExtensionSession,
-    ExtensionSymlink, ExternalFile, PromptStepDecl,
+    ExtensionSymlink, ExternalFile, OnConflict, PromptStepDecl, Requirement,
 };
 pub use host_def::{
     is_offhost_backend, is_remote_backend, is_ssh_backend, is_wsl_backend, HostDef, HostKind,
@@ -46,9 +53,11 @@ pub use review::{
     FileStatus, ReviewComment, Side,
 };
 pub use sandbox_profile::{
-    expand_tilde, is_sandbox_backend, sandbox_backend_profile, DomainRule, EgressDecision,
-    NetworkMode, PathMode, ReadScope, SandboxBackendKind, SandboxInstance, SandboxPath,
-    SandboxPolicy, SandboxProfile, SandboxShape, SANDBOX_BACKEND_PREFIX,
+    expand_tilde, is_sandbox_backend, sandbox_backend_profile, BridgeCapability, ChildSeedAllow,
+    DomainRule, EgressDecision, NetworkMode, OverlayViolation, PathMode, ReadScope,
+    SandboxBackendKind, SandboxInstance, SandboxOverlay, SandboxPath, SandboxPolicy,
+    SandboxProfile, SandboxShape, SeedGrant, SeedMode, SubtractPath, DEFAULT_MAX_CHILDREN,
+    SANDBOX_BACKEND_PREFIX,
 };
 pub use status_signal::{parse_status_signal, SignalState};
 pub use task::{Task, TaskStatus, SOURCE_LOCAL};
@@ -89,6 +98,260 @@ pub const REMOTE_HOOK_STATE_OPTION: &str = "@friring_state";
 /// [`REMOTE_HOOK_STATE_OPTION`] changes as `%subscription-changed`
 /// notifications for every pane of the attached session.
 pub const REMOTE_HOOK_SUBSCRIPTION: &str = "friring-status";
+
+/// Environment variables a tmux/psmux server reads to resolve a *nested*
+/// client's default target.
+///
+/// Two consumers, which is why the list is here in the pure-data layer rather
+/// than beside either of them: `agent::transport` strips them from every
+/// multiplexer subcommand friring runs, so an explicit `-L <socket> -t
+/// <session>` always targets friring's own server even when friring itself was
+/// launched inside a pane; and `sandbox` strips them from a sandboxed agent's
+/// environment, so a boundary the kernel closes is not also handed the address
+/// of the server outside it. The second is defence in depth — the deny set in
+/// [`crate::sandbox::dirs::multiplexer_socket_denies`] is the enforcement — but
+/// an inherited `$TMUX` is a working address, and leaving it there invites a
+/// tool to find one path out of the boundary and report a confusing failure
+/// when it is refused.
+pub const MUX_NESTING_ENV: &[&str] = &[
+    "TMUX",
+    "TMUX_PANE",
+    "PSMUX",
+    "PSMUX_PANE",
+    "PSMUX_SESSION",
+    "PSMUX_TARGET_SESSION",
+];
+
+/// The multiplexer sockets that exist on the host friring runs on, as facts a
+/// sandbox policy can be written against.
+///
+/// Built once at startup, from what the transport already knows: the socket name
+/// friring passes to `tmux -L`, the root tmux derives socket directories under,
+/// this process's uid, and — when friring is itself running inside a pane — the
+/// server that pane belongs to, read from `$TMUX` **before** anything strips it
+/// (see [`MUX_NESTING_ENV`]).
+///
+/// Deliberately minimal and deliberately in `session`: the deny set every policy
+/// launch renders is computed from this, and the launch path must not have to
+/// reach into `agent` to get it. Stage B's `MuxServerIdentity` extends it with
+/// what the *server* reports about itself, which is what proves the socket
+/// friring talks to is the socket the policy denied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostMuxSockets {
+    /// friring's own server socket file — the path tmux derives from `-L
+    /// <name>`, which is `<root>/tmux-<uid>/<name>`.
+    pub own_socket: PathBuf,
+    /// The socket of the server friring is itself running inside, when it is.
+    /// The first `,`-separated field of `$TMUX`.
+    pub outer_socket: Option<PathBuf>,
+    /// The uid whose `tmux-<uid>` directories are this user's.
+    pub uid: u32,
+}
+
+/// What became of a filtered session's way out (ADR-27, ADR-30).
+///
+/// A session whose profile needs the egress proxy has a listener that lives in
+/// the *friring process*, and a restart therefore has to bind a new one at the
+/// **same** endpoint with the **same** token — an agent that is still running
+/// holds proxy URLs naming both. This records how that went, honestly, because
+/// the three failure shapes are different things to a user: a boundary that is
+/// still filtered, one that is being rebuilt, and one that cannot be.
+///
+/// **Never `sandbox_unenforced`.** That column means "the profile could not be
+/// applied, so the agent is on the host". An enforced boundary whose proxy is
+/// dead is still enforced: the kernel policy holds, and the agent has no network
+/// rather than an unfiltered one. Conflating the two would paint `⚠` over a
+/// session that is sandboxed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EgressState {
+    /// This session needs no proxy: no profile, or a mode the kernel enforces
+    /// on its own.
+    #[default]
+    None,
+    /// A launch has bound a provisional listener and has not committed it. The
+    /// agent may not be running yet.
+    Preparing,
+    /// The supervisor has acknowledged the commit: this session's proxy is the
+    /// one enforcing its rules.
+    Active,
+    /// A restart is rebinding the persisted endpoint.
+    Restoring,
+    /// The persisted endpoint could not be rebound, and the reason. The agent
+    /// stays kernel-closed and the token is **never** rotated: rotating it would
+    /// silently invalidate the URLs the running agent already holds.
+    Unrestorable(String),
+}
+
+impl EgressState {
+    /// The stored spelling. `Unrestorable` carries its reason after a `:`, which
+    /// is why this returns an owned string rather than a `&'static str`.
+    pub fn to_storage(&self) -> String {
+        match self {
+            Self::None => "none".to_string(),
+            Self::Preparing => "preparing".to_string(),
+            Self::Active => "active".to_string(),
+            Self::Restoring => "restoring".to_string(),
+            Self::Unrestorable(reason) => format!("unrestorable:{reason}"),
+        }
+    }
+
+    /// The label a UI row shows, without the reason.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Preparing => "preparing",
+            Self::Active => "active",
+            Self::Restoring => "restoring",
+            Self::Unrestorable(_) => "unrestorable",
+        }
+    }
+
+    /// Why the endpoint could not be rebound, when that is what happened.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Unrestorable(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// Whether this session's way out is presently working.
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    /// Whether this needs an operator's attention: the boundary holds, but the
+    /// agent inside it can reach nothing.
+    pub fn needs_attention(&self) -> bool {
+        matches!(self, Self::Unrestorable(_))
+    }
+
+    /// Read a stored value back. Anything unrecognised is
+    /// [`None`](Self::None) — the reading that claims nothing.
+    pub fn from_storage(raw: &str) -> Self {
+        match raw.split_once(':') {
+            Some(("unrestorable", reason)) => Self::Unrestorable(reason.to_string()),
+            _ => match raw {
+                "preparing" => Self::Preparing,
+                "active" => Self::Active,
+                "restoring" => Self::Restoring,
+                "unrestorable" => Self::Unrestorable(String::new()),
+                _ => Self::None,
+            },
+        }
+    }
+}
+
+impl fmt::Display for EgressState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.reason() {
+            Some(reason) if !reason.is_empty() => write!(f, "{} ({reason})", self.label()),
+            _ => f.write_str(self.label()),
+        }
+    }
+}
+
+/// Where a session's egress proxy listened, what it demanded, and what became
+/// of it across a restart.
+///
+/// Grouped rather than three loose fields because they are one fact and are
+/// always written together — and because grouping is what lets the `Debug` that
+/// withholds the token live in one place.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct EgressRecord {
+    /// `tcp:<port>` or `unix:<path>`. `None` for a session that needs no proxy.
+    pub endpoint: Option<String>,
+    /// The credential the sandbox presents. Never rendered, never logged, and
+    /// **never rotated on a failed restore**: the agent that is still running
+    /// holds proxy URLs carrying this value, and minting a new one would take
+    /// its network away without saying so.
+    pub token: Option<String>,
+    /// What became of the restore — see
+    /// [`EgressState`].
+    pub state: EgressState,
+}
+
+impl std::fmt::Debug for EgressRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EgressRecord")
+            .field("endpoint", &self.endpoint)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
+/// A session's multiplexer window, exactly as friring recorded it (ADR-32).
+///
+/// The window name is the adoption key and always will be; this is what every
+/// **destructive** action revalidates against first. A kill, a nudge or a gate
+/// release that matched only on a name would act on whatever now answers to that
+/// name — a decoy window an agent created, or a pane that was recycled after a
+/// crash. Matching on server marker, window id, pane id, pane pid *and*
+/// friring's own pane marker together means a mismatch in any one of them is a
+/// refusal rather than an action on the wrong process.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MuxIdentity {
+    /// The `@friring_server` uuid friring set on the server it talks to.
+    pub server: Option<String>,
+    /// `#{window_id}` — `@7`.
+    pub window_id: Option<String>,
+    /// `#{pane_id}` — `%12`.
+    pub pane_id: Option<String>,
+    /// `#{pane_pid}` — the process the pane started.
+    pub pane_pid: Option<u32>,
+    /// The `@friring_pane` marker friring stamped on the pane:
+    /// `<session id>:<launch key>`.
+    pub launch_key: Option<String>,
+}
+
+impl MuxIdentity {
+    /// Whether friring recorded enough to revalidate anything at all.
+    ///
+    /// A session spawned before schema v49, or one whose row was written by a
+    /// path that does not record identity, has nothing to compare — and a
+    /// comparison against nothing must not read as a match.
+    pub fn is_recorded(&self) -> bool {
+        self.pane_id.is_some() && self.launch_key.is_some()
+    }
+
+    /// The marker friring stamps on a pane, from a session id and launch key.
+    pub fn launch_marker(session_id: &str, launch_key: &str) -> String {
+        format!("{session_id}:{launch_key}")
+    }
+}
+
+/// What a multiplexer server says about itself, checked against what friring
+/// wrote down.
+///
+/// [`marker`](Self::marker) is the authority: friring sets `@friring_server` to
+/// a uuid of its own on first connection, and a server carrying that uuid is
+/// the server friring has been talking to. `pid` and `start_time` are
+/// cross-checks — a server that was restarted keeps neither — and a variable the
+/// running tmux does not support degrades to the marker rather than failing the
+/// launch.
+///
+/// `socket_path` is the one that must match [`HostMuxSockets::own_socket`]: it
+/// proves the deny set a policy launch renders and the server friring drives are
+/// the same one. A difference refuses every launch on that server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxServerIdentity {
+    pub host: HostMuxSockets,
+    /// `#{socket_path}` as the server reports it.
+    pub socket_path: Option<String>,
+    /// `#{pid}` — the server process.
+    pub pid: Option<u32>,
+    /// `#{start_time}`, where the running tmux reports one.
+    pub start_time: Option<String>,
+    /// `@friring_server` — friring's own uuid for this server.
+    pub marker: Option<String>,
+}
+
+/// The server option friring stamps its own identity into.
+pub const MUX_SERVER_MARKER_OPTION: &str = "@friring_server";
+
+/// The pane option friring stamps a launch's identity into:
+/// `<session id>:<launch key>`.
+pub const MUX_PANE_MARKER_OPTION: &str = "@friring_pane";
 
 #[derive(Debug, Clone)]
 pub struct WorktreeInfo {
@@ -509,11 +772,33 @@ pub struct SessionInfo {
     /// Populated by the app layer at spawn/restore time.
     pub repo_display_names: Vec<String>,
     /// Parent session (lead/worker relationship for orchestration).
-    /// `None` for top-level sessions. Purely informational.
+    ///
+    /// **Display only.** A bridge child's authority comes from its immutable
+    /// `bridge_children` row and the caller's directory identity, never from
+    /// this: it is what the UI shows and what a user can change, and a verb that
+    /// asked it would be a verb a user could redirect.
     pub parent_session_id: Option<SessionId>,
     /// Manual position in the session list. `None` = never moved: renders
     /// after all ordered sessions, in creation order.
     pub display_order: Option<i64>,
+    /// The exact multiplexer window this session's agent runs in, as friring
+    /// recorded it at spawn — see [`MuxIdentity`].
+    ///
+    /// Persisted, because the actions it guards (a kill, a nudge, a gate
+    /// release) happen after restarts and from other instances. Empty for a
+    /// session spawned before schema v49, which is why
+    /// [`is_recorded`](MuxIdentity::is_recorded) exists: nothing recorded must
+    /// not read as a match.
+    pub mux: MuxIdentity,
+    /// Where this session's egress proxy listened, as `tcp:<port>` or
+    /// `unix:<path>`, so a restart can rebind the **same** endpoint. `None` for
+    /// a session that needs no proxy.
+    pub egress_endpoint: Option<String>,
+    /// What became of it — see [`EgressState`].
+    pub egress_state: EgressState,
+    /// The narrowed effective policy a bridge child was launched under, as JSON.
+    /// `None` for every session that is not one.
+    pub sandbox_overlay: Option<String>,
 }
 
 impl SessionInfo {
@@ -543,6 +828,10 @@ impl SessionInfo {
             repo_display_names: Vec::new(),
             parent_session_id: None,
             display_order: None,
+            mux: MuxIdentity::default(),
+            egress_endpoint: None,
+            egress_state: EgressState::None,
+            sandbox_overlay: None,
         }
     }
 }

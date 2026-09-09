@@ -1,8 +1,14 @@
-//! Config introspection subcommands: `validate` and `show`.
+//! Config introspection subcommands: `paths`, `validate` and `show`.
 //!
 //! `validate` strictly parses every config file and fails (exit 1) when any
 //! is invalid — usable as a dotfiles CI check. `show` prints the *effective*
-//! resolved configuration and where each value came from.
+//! resolved configuration and where each value came from. Both need a database.
+//!
+//! `paths` does not, and is dispatched before one is opened ([`crate::cli::early`]):
+//! it answers "which config dir, data dir and database file will this binary
+//! use, and what decided each", which is exactly the question a harness has to
+//! settle *before* letting a binary touch storage. It resolves paths and opens
+//! nothing.
 //!
 //! The agent module's loaders are reached via fully-qualified paths (no
 //! `use crate::agent`) to keep the cli module free of an `agent` import —
@@ -16,14 +22,60 @@ use crate::storage::Database;
 
 #[derive(Subcommand, Debug)]
 pub enum Action {
+    /// Print the resolved config/data/database paths without opening anything.
+    Paths,
     /// Parse every config file strictly; non-zero exit when any is invalid.
     Validate,
     /// Print the effective configuration and where each value came from.
     Show,
 }
 
+/// What [`run`] says when `config paths` reaches it with a database in hand.
+///
+/// `main` dispatches it early, so this means the early routing was broken; the
+/// answer would still be correct, but it would no longer be evidence that the
+/// binary resolved those paths without opening anything.
+pub const PATHS_OFF_THE_EARLY_PATH: &str =
+    "`config paths` must be answered before the database is opened; this build routed it \
+     afterwards, so its report is no longer proof of what it says";
+
+/// The `paths` report, built without a database handle.
+///
+/// Separate from [`run`] because `main` calls it *before* `Database::open`, so
+/// it can never take one. A harness compares `config_source` / `data_source`
+/// against the variables it set, and every path against the root it minted.
+pub fn paths_output() -> CommandOutput {
+    let resolved = crate::paths::resolved_paths();
+    let show = |p: &Option<std::path::PathBuf>| p.as_ref().map(|p| p.display().to_string());
+    let json = json!({
+        "config_dir": show(&resolved.config_dir),
+        "config_source": resolved.config_source,
+        "data_dir": show(&resolved.data_dir),
+        "data_source": resolved.data_source,
+        "database": show(&resolved.database),
+        "app_dir_name": resolved.app_dir_name,
+        // Stated rather than implied: this report is the one command that runs
+        // with no database open, and a harness asserting isolation wants that
+        // in the artifact it keeps, not only in the docs.
+        "database_opened": false,
+    });
+    let human = output::kv(&[
+        ("config_dir", output::dash(json["config_dir"].as_str())),
+        ("config_source", resolved.config_source.to_string()),
+        ("data_dir", output::dash(json["data_dir"].as_str())),
+        ("data_source", resolved.data_source.to_string()),
+        ("database", output::dash(json["database"].as_str())),
+        ("app_dir_name", resolved.app_dir_name.to_string()),
+    ]);
+    CommandOutput::new(json, human)
+}
+
 pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
     match action {
+        // Never reached: `main` dispatches this before the database opens.
+        // Refused rather than served, because a `paths` answer printed *after*
+        // an open has already lost the property its caller is asking about.
+        Action::Paths => Err(PATHS_OFF_THE_EARLY_PATH.to_string()),
         Action::Validate => {
             let (report, failed) = validate();
             let human = render_validate(&report, &failed);

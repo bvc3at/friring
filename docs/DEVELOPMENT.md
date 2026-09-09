@@ -44,13 +44,20 @@ dev build's migrations run; ships with macOS, one package away elsewhere.
 | Task | What it does |
 |------|--------------|
 | `just build` | build the dev binaries (`friring` + `friring-cli`) |
-| `just test` | `cargo nextest run --all` |
+| `just test` | `cargo nextest run --all`, under a throwaway outer HOME (§ 2.1) |
+| `just test-unprotected` | the same suite with your real environment |
 | `just lint` | fmt-check + clippy + cargo-deny + rumdl + shellcheck |
 | `just fmt` | format Rust + website |
 | `just arch` | architecture-rule + rustdoc checks |
 | `just hooks-install` | `prek install` |
 | `just smoke` | black-box TUI smoke test |
 | `just sandbox*` | dev runtime sandbox (below) |
+| `just seatbelt-probe` | observe the seatbelt boundary against a real kernel (macOS; § 4) |
+| `just bwrap-probe` | the same, against bubblewrap (Linux with user namespaces; § 4) |
+| `just bridge-e2e` | the orchestration bridge end to end against a real TUI (§ 4) |
+| `just codex-park-e2e` | park and resume a real interactive Codex child (§ 4) |
+| `just omx-team-e2e` | the omx Team fan-out, real vendor leader and workers (§ 4) |
+| `just omx-test` | the `omx` extension's own `node --test` suite (Node 20+) |
 | `just dev-live` | dev build against your **real** sessions (§ 3, Live mode) |
 
 Bare `cargo` still works for everything `just` wraps:
@@ -59,6 +66,43 @@ Bare `cargo` still works for everything `just` wraps:
 cargo build --bin friring --bin friring-cli   # what `just build` runs
 cargo check --all                             # type check
 cargo build --release                         # release build (LTO, stripped)
+```
+
+### 2.1 Anything that starts a friring binary runs in a throwaway environment
+
+A dev build reads `~/.config/friring-dev` and writes
+`~/.local/share/friring-dev/friring.db` — **your own** development config and
+database, shared with every other dev binary on the machine, including the TUI
+you may have running. A test or harness that starts one and resolves its paths
+wrongly writes there. A schema migration is one-way, so a single such write can
+leave an installed binary unable to open its own database.
+
+Two rings stop that, and both are cheap enough to be on by default:
+
+- **Each harness proves its own isolation.** `friring-cli config paths` reports
+  the config dir, data dir and database file a process resolved, and the
+  environment variable that decided each, *before* any database is opened
+  (`cli::early`). `tbx_sandbox_init_full` now sets `FRIRING_CONFIG_DIR` and
+  `FRIRING_DATA_DIR` explicitly rather than relying on the `XDG_*` fallback,
+  whose last link is `$HOME`; a harness runs `config paths` and refuses to
+  continue unless every path is inside its own root and both sources are those
+  overrides.
+- **`scripts/dev/sacrificial-env.sh` bounds a wrong proof.** It mints one
+  throwaway root, points HOME, all four `XDG_*` roots and both `FRIRING_*_DIR`
+  overrides at it, and plants canaries at `$HOME/.local/share/friring[-dev]` and
+  `$HOME/.config/friring[-dev]` — where a fallback lands. It runs the command,
+  then fails the run if a canary changed. `just test`, `just test-one`,
+  `just bridge-e2e`, `just seatbelt-probe` and `just bwrap-probe` all go through
+  it.
+
+`CARGO_HOME`/`RUSTUP_HOME` keep pointing at the real ones, so a build under the
+wrapper does not re-download the registry. Use `just test-unprotected` when you
+are debugging a test that genuinely needs your environment.
+
+Run anything else that starts a friring binary the same way:
+
+```bash
+scripts/dev/sacrificial-env.sh cargo nextest run -E 'test(sandbox)'
 ```
 
 ## 3. Runtime sandbox — run friring isolated
@@ -229,6 +273,201 @@ The TUI has three layers of end-to-end coverage:
   without flaky timing: e.g. idle iterations skip the paint, the session order is
   rebuilt only when its inputs change. Run with `cargo nextest run -E
   'test(perf_)'`. See `docs/PERFORMANCE.md`.
+
+### Boundary probes (`scripts/dev/sandbox-probes/`)
+
+Everything a unit test can say about a sandbox is a statement about *generated
+policy text*. The probes are the other half: they ask a real kernel.
+
+- **`just seatbelt-probe`** (macOS) starts five tmux servers — friring's own,
+  one under each directory tmux derives a socket path from, and an **outer**
+  server whose socket the probe process inherits through `$TMUX` — then dials
+  every one of them from inside a boundary friring composed, in each of the
+  three network modes. It also asserts the two **positive controls**, because a
+  boundary that refused everything would pass every deny assertion and be
+  useless: the session's own workspace is readable and writable, and a tmux
+  server started at a `-S` path *under that workspace* is reachable. That last
+  one is the documented residual — friring denies the host's sockets, not the
+  concept of a socket.
+- **`just bwrap-probe`** (Linux) is the twin, with the same assertions plus the
+  two only a namespace can be asked: the wrapped process is **pid 1** inside its
+  namespace, and **no relay survives** a launch.
+- Both go through **`friring-cli sandbox exec --profile <name> -- <cmd>`**, which
+  composes the boundary the same way a session launch does and never falls back
+  to the host. Building the boundary inside the probe would have proved
+  something about the probe.
+- Both **skip rather than fail** where the platform cannot answer — a probe that
+  failed on a kernel without user namespaces would be reporting the machine
+  rather than friring. They run as non-blocking CI jobs; the conformance status
+  each one establishes is recorded in
+  [`docs/SANDBOX.md`](SANDBOX.md#conformance-what-has-been-observed).
+
+### The bridge, end to end (`just bridge-e2e`)
+
+`scripts/dev/bridge-e2e.sh` is the operator-path proof for the orchestration
+bridge, and the only harness that stands up a **whole friring**. In one
+throwaway sandbox root it makes a git repository, installs
+`extensions/bridge-conformance` from this working tree, imports its profile with
+the repository path substituted in, boots the real TUI in a driver tmux and
+drives the new-session wizard by keystrokes — because a bridge-requiring agent is
+refused a headless create, which it also asserts. Then it reads what the host
+recorded: an ownership row, a terminal state friring reached by stopping the pane
+and inspecting the worktree, and a `bridge_results` verdict.
+
+Both agents are `/bin/sh` scripts with no vendor, no login, no model and no
+network, so a green run is a statement about friring rather than about an
+integration. Three things it observes that `sandbox exec` cannot — because a
+one-shot composes no gate and no proxy — are asserted by the leader from **inside
+its own launched boundary**: friring's gate root is neither readable nor
+writable, and the database is unreadable. It also captures the leader's pane off
+friring's own tmux server, which is where a **nudge's delivery into a live pane**
+is observed rather than inferred.
+
+Before it installs anything or starts a TUI it runs the § 2.1 preflight: a
+`friring-cli config paths` whose every reported path must canonicalize inside
+this run's own root and must have come from the explicit override, never a
+fallback. Every binary after that point is started through `env` with those
+variables as arguments, so a tmux server that captured an older environment
+cannot hand a pane a different one. `just bridge-e2e` wraps the whole thing in
+`sacrificial-env.sh` as well.
+
+Skips on any platform that is not macOS-with-seatbelt or Linux-with-bwrap, since
+`Caps::bridge` is false everywhere else and there is no queue to exercise.
+Artifacts land in `target/bridge-e2e/` — the TUI pane, the leader's pane, the
+session row and friring's log.
+
+### Parking a real agent (`just codex-park-e2e`)
+
+`scripts/dev/codex-park-e2e.sh` answers the one question `bridge-e2e` cannot.
+Parking exists so an agent with a **conversation** can stop and come back to it,
+and a `/bin/sh` worker has no conversation — so there, "the same child resumed"
+is only ever a statement about friring's bookkeeping. This harness keeps
+friring's side identical (the leader is still a shell script driving the ordinary
+verbs) and makes the child `extensions/codex-park`: a **real interactive Codex
+CLI**, in the pane friring opened for it.
+
+It reuses the § 2.1 preflight and the same throwaway-root discipline, and adds a
+local model stub (`scripts/dev/agent-e2e/stub/openai-stub.mjs`) on loopback. The
+child's seeded `config.toml` names that stub as a provider with **no `env_key`**,
+which is the shape Codex accepts with no login and sends no authorization header
+for; the worker wrapper also points every proxy variable at a dead port with
+loopback excluded, so nothing but the stub is reachable. No credential, no
+account, no billing, and the developer's own `~/.codex` is never read.
+
+What it asserts beyond `bridge-e2e`:
+
+- a nudge typed into a live **vendor** pane produces a turn — the child acts only
+  because friring typed into it, and the pane is captured while it is alive,
+  since a stopped child's window is closed;
+- the process that took the pre-stop turn never runs again, so the park ended a
+  process rather than only a row;
+- the marker the child wrote into its private `CODEX_HOME` survives a clean stop
+  and is quoted back by the relaunched process after it claims new mail;
+- and, read from outside the boundary in Codex's own rollout files, the
+  relaunched process comes back to the **same thread** — it carries the pre-stop
+  turn as well as the new work. Turn ids make that checkable; the marker cannot,
+  because it survives the stop on purpose and a blank conversation reports it
+  too. Running this is what found that a bridge `resume` had been minting a new
+  conversation every time, which is fixed in
+  `app::bridge_saga::child_resume_identity` (`docs/SANDBOX.md`).
+
+Two fixture-only trades, both recorded in the extension's profile: the child runs
+`network_mode = "full"`, because a dynamically-numbered loopback port is not a
+shape friring's egress proxy can name, and Codex's own sandbox is off, because
+nesting a second seatbelt inside friring's proves nothing and fails for unrelated
+reasons. What the boundary allows is proven by `bridge-e2e` (the whole bridge
+with `network_mode = "none"`) and by `just seatbelt-probe`.
+
+Skips when `codex` or `node` is absent, and on any platform without seatbelt or
+bwrap. Artifacts land in `target/codex-park-e2e/`, including every child pane and
+the stub's request journal.
+
+### The omx Team fan-out (`just omx-team-e2e`)
+
+`scripts/dev/omx-team-e2e.sh` is the scenario `docs/E2E.md` recorded for a long
+time as not built. It runs the `omx` extension end to end with the **real vendor
+package** as the leader: `oh-my-codex@0.21.0` into the run's own npm prefix,
+`omx setup --scope user --install-mode legacy` into a throwaway `~/.codex`,
+friring's own `extension install` against what that installer produced, `omx` as
+a sandboxed leader with Codex behind it, `friring-omx run` fanning out one bridge
+child per DAG node, and `integrate` merging what friring verified.
+
+Everything talks to the same loopback stub the rest of the e2e family uses, with
+a provider carrying no `env_key` — so there is no login, no account and no
+credential. `auth.json` is a synthetic placeholder, present only because the
+worker's `link-rw` seed is `required = true`.
+
+The reason it took a harness to find anything is that it seeds **vendor**
+first-run state, and each seed stands for a question a sandboxed agent cannot be
+asked: OMX's one-time GitHub star prompt (answered in advance and declined, so
+no `gh api` call as the operator is possible), Codex's hook trust (which the
+extension install itself invalidates — see the extension README's step order),
+and a stale OMX session pointer. Each is then asserted absent rather than assumed
+away.
+
+Two of its assertions are about the **boundary and the history** rather than the
+outcome, and both exist because a weaker version passed while the thing they
+check was broken. It reads the generated seatbelt profile of the leader and of
+each child, and requires OMX's state roots in the first and in neither of the
+others. And it traces each DAG node's `result.head` — the commit friring itself
+verified — into `main` with `git merge-base --is-ancestor`, rather than counting
+commit subjects, which cannot tell two nodes from one node that committed twice.
+
+Skips when `codex`, `node`, `npm` or the registry is unreachable. Artifacts land
+in `target/omx-team-e2e/`.
+
+### The `omx` extension's program (`just omx-test`)
+
+`extensions/omx/lib/friring-omx.mjs` is a dependency-free Node 20 module, so it
+is tested by `node --test` rather than by cargo: `just omx-test` runs it and
+skips cleanly when node is absent or older than 20. Its *manifest* contract —
+that friring's argv reaches the wrappers in the order OMX accepts — is a Rust
+test instead (`tests/omx_manifest_invocation.rs`), which runs each wrapper for
+real against a `node` shim on `PATH`.
+
+Three more checks need something this repository does not carry, and each skips
+cleanly when what it needs is absent.
+
+`OMX_SOURCE_DIR`, pointed at an unpacked oh-my-codex 0.21.0 tree, makes
+`just omx-test` verify every **role prompt** digest in `pins.json` against the
+release's own files. `OMX_CODEX_HOME`, pointed at a `CODEX_HOME` that a real
+`omx setup` produced, verifies every **skill** digest — which is a different
+question, because `omx setup` rewrites a skill card's frontmatter description as
+it installs it and the gate is on what the operator actually has. A drifted pin
+in either direction makes its `file-digest` gate in the manifest unsatisfiable,
+and the operator sees a refused install with nothing to tell them whether their
+tree or friring's pins are wrong.
+
+Both come from one disposable fixture, and nothing here may run against your own
+`~/.codex`:
+
+```bash
+FIX=$(mktemp -d); mkdir -p "$FIX/home" "$FIX/cache" "$FIX/npm"
+(cd "$FIX" && HOME=$FIX/home npm_config_cache=$FIX/cache \
+  npm pack oh-my-codex@0.21.0 && tar -xzf oh-my-codex-0.21.0.tgz)
+HOME=$FIX/home npm_config_cache=$FIX/cache \
+  npm install --prefix "$FIX/npm" oh-my-codex@0.21.0
+(cd "$FIX" && HOME=$FIX/home CODEX_HOME=$FIX/home/.codex \
+  XDG_CONFIG_HOME=$FIX/home/.config XDG_DATA_HOME=$FIX/home/.local/share \
+  "$FIX/npm/node_modules/.bin/omx" setup --scope user --install-mode legacy)
+OMX_SOURCE_DIR=$FIX/package OMX_CODEX_HOME=$FIX/home/.codex just omx-test
+```
+
+`tests/codex_private_state.rs` is the third: it runs the extension's two ship
+gates against an installed Codex CLI — that a `copy-rewrite`d `hooks.json` fires
+from the child's private `CODEX_HOME`, and that `auth.json` is written in place
+through the `link-rw` link.
+
+The same fixture answers the question the `omx-friring-team` scenario used to be
+recorded as blocked on — whether the vendor leader path needs an authenticated
+endpoint. It does not. Point the fixture's `~/.codex/config.toml` at the local
+stub (a `[model_providers.stub]` on loopback with **no `env_key`**, as
+`scripts/dev/codex-park-e2e.sh` writes) and both `omx exec "<prompt>"` and
+`omx --direct` launch codex against it with no login, no account and no billing.
+`friring-cli extension install extensions/omx` also exits 0 against that fixture,
+which is the only check that exercises all 26 requirement gates at once. What is
+still not built, and the three pieces of vendor first-run state that would have
+to be seeded for it, are recorded in [`docs/E2E.md`](E2E.md).
 
 ### Dev harness layout (`scripts/dev/`)
 

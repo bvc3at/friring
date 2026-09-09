@@ -51,6 +51,7 @@ pub mod apple;
 pub mod auth;
 pub mod backend;
 pub mod bwrap;
+pub mod child_state;
 pub mod container;
 pub mod dirs;
 pub mod egress;
@@ -362,6 +363,7 @@ mod tests {
         // The default profile is `allowlist`, which only means anything with
         // the proxy that enforces it.
         let launch = SandboxLaunch::new(&policy, "/Users/u", "host-test")
+            .with_helper_program("/usr/local/bin/friring-cli")
             .with_proxy(ProxyEndpoint::Loopback { port: 8123 });
         let argv = host
             .wrap(chosen, vec!["claude".to_string()], &launch)
@@ -547,7 +549,7 @@ mod tests {
                 let argv = bwrap::build_argv(
                     "/usr/bin/bwrap",
                     &SandboxLaunch::new(&linux, "/home/u", "s1"),
-                    None,
+                    Some("/usr/local/bin/friring-cli"),
                     &|_| false,
                 )
                 .unwrap();

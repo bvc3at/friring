@@ -17,10 +17,13 @@ fn main() {
     // Dispatched here, before anything opens the database: `sandbox relay` runs
     // *inside* a sandbox, where ADR-29 keeps the database out on purpose.
     // Opening one from in there would either create a stray database inside the
-    // boundary or fail and leave the sandbox with no egress at all. Every other
-    // `sandbox` subcommand is host-side management and answers `None`, so it
-    // takes the ordinary path below with the database open.
-    if let Some(result) = friring::cli::sandbox::run_before_database(&cli.command) {
+    // boundary or fail and leave the sandbox with no egress at all. `config
+    // paths` is here for the opposite reason — it reports which database file
+    // this process resolved, and an answer printed after the open would describe
+    // a file the process had already created. Every other `sandbox` subcommand
+    // is host-side management and answers `None`, so it takes the ordinary path
+    // below with the database open.
+    if let Some(result) = friring::cli::early::run_before_database(&cli) {
         if let Err(e) = result {
             eprintln!("error: {e}");
             std::process::exit(1);

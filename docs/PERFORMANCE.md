@@ -756,6 +756,118 @@ answered — never a clock, per ADR-P2.
 
 ---
 
+## ADR-P16: The bridge tick costs what is loaded, not what is stored
+
+**Choice**: four fixes to `App::tick_bridge`, which sampling a real fleet found
+holding the render thread at **44% of its wall clock** — more than
+`terminal.draw`. The same shape as ADR-P15: the cost scaled with the number of
+**stored** sandboxed sessions rather than the loaded ones, so it survived a
+restart and grew with every session ever created. Fleet at the time: 526
+sessions, **386 with a `sandbox_profile`**, 50 with a live tmux window, and
+**zero pending requests** — every poll below found nothing to do.
+
+| Frame | Share of the main thread |
+| --- | --- |
+| `App::tick_bridge` | 44% |
+| ├ `serve_bridge_queue` → `paths::take_bridge_requests` | 24% |
+| ├ `serve_bridge_queue` → `Database::broker_lease_holder` | 12% |
+| ├ `bridge_housekeeping` | 6% |
+| `terminal.draw` | 23% |
+
+- **A placeholder's queue is not polled.** `tick_bridge` now builds two lists:
+  every bridge session, and the subset that is not a placeholder. A placeholder
+  has no agent process on this host — a ghost is deliberately unloaded, an
+  unreachable remote never started here — so by construction nothing is writing
+  into its `req/` and the poll can only ever find the directory empty. This is
+  the dominant win, 386 sessions down to the loaded subset. `is_placeholder()`
+  rather than `is_ghost()`, matching what `start_metrics_refresh` already gates
+  on. Nothing is remembered about the skip, so it is self-healing: loading a
+  session serves its queue on the very next pass, without waiting for a lease or
+  a housekeeping tick, because an absent or lapsed lease reads as "nobody holds
+  it".
+- **The broker lease follows the poll.** `claim_broker_lease` runs only for the
+  sessions this instance actually serves. A lease over a session nobody polls
+  buys nothing and denies it to an instance that has the session loaded, so
+  letting it lapse is the correct outcome — and the `rename(2)` a take makes is
+  the real cross-instance guard either way.
+- **The two lease statements are `prepare_cached`.** `Connection::query_row` and
+  `Connection::execute` re-parse their SQL on every call, and the profile put
+  SQLite's *parser* (`yy_reduce`, `yy_find_shift_action`) at 386 samples,
+  re-parsing the same two statements ~12,700 times a second. Same treatment as
+  `load_hook_states` under ADR-P6.
+- **The response GC sweeps a rotating slice.** `prune_bridge_responses` is the
+  one piece of per-session bridge work a ghost still needs — nothing else
+  removes an answer a client never acknowledged, so skipping unloaded sessions
+  here would mean their `res/` directories only ever grow. What it does not need
+  is the housekeeping cadence: the bound it enforces is 24 hours. It now sweeps
+  `RESPONSE_GC_BATCH` sessions per housekeeping pass from a rotating cursor, so
+  the pruning per pass is constant in the fleet size and a 400-session fleet
+  still comes round in about half a minute.
+
+  The roster is a `readdir` of `signals/`, not the session list, because a
+  parked child's channel outlives its row in `App::sessions` and nothing else
+  would ever sweep it. That one enumeration is the exception to "constant per
+  pass": it happens **once per cycle**, when the cursor wraps — so on a
+  400-session fleet, one directory listing every hundred passes and a bounded
+  slice on each of them. Refreshing it per pass would have put the listing back
+  on the tick, which is the cost ADR-P16 exists to remove.
+- **The shared `.taking` directory is minted once per pass.**
+  `paths::bridge_taking_dir` takes no session key — it is `signals/.taking` for
+  every caller — and `take_bridge_requests` re-minted it per session, costing a
+  `symlink_metadata` + `mkdir` + `chmod` each time. `mint_bridge_taking_dir` is
+  hoisted to once per broker pass and the directory is handed to
+  `take_bridge_requests_in`. The call is kept rather than replaced by an
+  existence check, because the `mkdir` is not what it is for: `create_private_dir`
+  refuses a symlink at the final component and re-asserts `0700` on a directory
+  it adopted, and both have to hold on every pass.
+
+**Why**: the bridge's bounded-work contract (ADR-3) bounds what one pass does
+*per session*, and that is the wrong bound when the session count is the thing
+growing. Nothing above changes the protocol, the authority model or the
+per-queue budget; each is a scope fix or a constant factor.
+
+Gate: `perf_a_ghost_bridge_session_is_never_polled_and_serving_resumes_on_load`,
+`perf_a_bridge_pass_mints_the_taking_directory_once`,
+`perf_the_response_gc_sweeps_the_whole_fleet_a_slice_at_a_time`
+(`src/app/acceptance.rs`). Each was checked to fail without its fix: including
+placeholders makes the first count two polls where it allows one; moving the
+mint back inside the take makes the second count 15 mints for 12 polls; sweeping
+the whole fleet, and restricting the sweep to loaded sessions, each break one
+half of the third. The mint is counted at `mint_bridge_taking_dir` itself rather
+than at the broker's call to it, so a gate on the caller cannot pass while the
+mint quietly moves back inside the per-session take.
+
+**Rejected: caching the held-lease set in `App::bridge`.** Measured rather than
+argued — `storage::bridge::tests::measure_broker_lease_read_cost`, 100k reads
+over 400 lease rows:
+
+| Form | Per call |
+| --- | --- |
+| `prepare` on every call | 5341 ns |
+| `prepare_cached` | 1511 ns |
+
+At the pre-fix population that read was 386 × 33 Hz × 5.34 µs ≈ **69 ms of
+every second**, which is the 12% the profile attributed to it. After the
+placeholder gate and `prepare_cached` the same arithmetic over an upper bound of
+50 loaded sessions is ≈ **2.5 ms of every second**, and a cache can only remove
+that. Against it: the in-memory copy would be free to diverge from the row for a
+whole housekeeping interval, during which this instance would take requests from
+a session another instance legitimately holds — correct, because the `rename(2)`
+is the real guard, but exactly the duplicate-take churn the lease exists to
+prevent — and it adds broker state that recovery has to reason about. The
+measurement is against an in-memory database, so it understates a cold page
+read and overstates nothing; the lease table is one small primary-key lookup
+that lives in the page cache in either case.
+
+Also rejected:
+
+- *Skipping the response GC for placeholders*, the way the queue poll does —
+  their `res/` directories would then never shrink at all.
+- *Replacing the per-pass `create_private_dir` with an existence check* — the
+  symlink refusal and the `0700` re-assert are the reason the call is there.
+
+---
+
 ## Quick reference
 
 | I want to… | Do this |
@@ -773,4 +885,6 @@ answered — never a clock, per ADR-P2.
 | Confirm idle CPU is low | Launch, leave it idle — `redraws_skipped` climbs while `frames_rendered` stays flat |
 | See what a session costs in RAM | Read its list-row badge / the `Σ` fleet total / the info panel's RAM line; turn the scan off with `[features] session_memory = false` (ADR-P14) |
 | Check that shelved sessions still cost nothing (ADR-P15) | `cargo nextest run -E 'test(perf_ghosts) + test(perf_an_all_ghost) + test(perf_one_pass) + test(perf_prune)'` |
+| Check the bridge tick still scales with loaded sessions (ADR-P16) | `just test-one perf_a_ghost_bridge_session`, `perf_a_bridge_pass_mints`, `perf_the_response_gc_sweeps` |
+| Re-measure the broker lease read (ADR-P16) | `cargo nextest run --run-ignored only -E 'test(measure_broker_lease_read)' --no-capture` |
 | Attribute a CPU burn in a running TUI | Sample it — `sample $(pgrep -x friring) 10 -file /tmp/friring.txt` on macOS, `perf record -p $(pgrep -x friring)` on Linux. Reads stack symbols only, writes nothing, and needs no restart or feature flag |

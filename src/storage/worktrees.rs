@@ -137,6 +137,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         };
         let sid = session.id;
         db.upsert_session(&session).unwrap();

@@ -1,0 +1,382 @@
+name = "omx"
+description = "Bridge-backed Team execution for oh-my-codex 0.21.0"
+config_version = 1
+version = "1.0.0"
+# The soft compatibility gate, and deliberately not the real one: the bridge
+# this extension needs is gated hard by `[[requires]] binary-capability bridge`
+# below, which refuses rather than warns. A floor above the fork's newest
+# release would warn on every install for a check the hard gate already makes.
+min_thurbox_version = "0.20.0"
+home = "~/.config/friring/extensions/omx"
+
+# ── What must hold before this installs ──────────────────────────────────
+#
+# Every one is a hard gate. An extension whose routing, argv contract and skill
+# text were all read from one oh-my-codex release does not work against another,
+# and installing it anyway would produce a leader that fails in a way nobody can
+# attribute.
+
+# The bridge itself: this extension is nothing without it.
+[[requires]]
+kind = "binary-capability"
+name = "bridge"
+version = 1
+
+# oh-my-codex declares `engines.node >= 20`, so this adds no new dependency —
+# it states the one the operator already has. The manifest gate proves only that
+# `node` is installed and prints a `v`-prefixed version; the exact major bound
+# (>= 20) is enforced by the program's `checkNodeVersion`, which compares the
+# major numerically and refuses with a message naming the version it found. A
+# `tool-version` pattern is a literal boundary match, not a comparison, so it
+# cannot express "20 or newer".
+[[requires]]
+kind = "tool-version"
+command = "node"
+args = ["--version"]
+pattern = "v"
+
+[[requires]]
+kind = "tool-version"
+command = "omx"
+args = ["--version"]
+pattern = "0.21.0"
+
+# Evidence the operator ran `omx setup --scope user`. Without it the skills and
+# prompts below are not there, and a worker's `copy-rewrite`d hooks file would
+# point at nothing.
+[[requires]]
+kind = "file-contains"
+path = "~/.codex/hooks.json"
+needle = "codex-native-hook"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/skills/autopilot/SKILL.md"
+sha256 = "c26fc9f4742f6e9656df9f939d71d1cba20b2c26e3dc3057663403d41e47c583"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/skills/code-review/SKILL.md"
+sha256 = "688d260974ddd1c5a238d773d586fd0e3af429a53e4deef375d9d1ec555e07a9"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/skills/deep-interview/SKILL.md"
+sha256 = "075127bd760e8b412202f02b8f0c88ef5f1793ada25d794fcb8a3b40a9542df7"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/skills/ralplan/SKILL.md"
+sha256 = "fdea8a842c352dd10a466287429df403c90dfc44c62d5fbb1abb44ffa9150994"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/skills/team/SKILL.md"
+sha256 = "70f7dc629fe41ea543ac3d557b4e6268870513a7237eb2b525e1462a04fb9200"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/skills/ultragoal/SKILL.md"
+sha256 = "1778555ec9831e6d51f8e9adb0ef0f03f59e3c905d78ba8950d00090cc3fc6d4"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/skills/ultraqa/SKILL.md"
+sha256 = "77ac2225df4418dee21988433a3199323edcae6445957e160eaf78ac42b9270e"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/skills/worker/SKILL.md"
+sha256 = "88fcc9a6cc80da64ce9126268d63e9213a29ab935225c9887aee411de9a6e771"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/analyst.md"
+sha256 = "c4f74fb651155bb39281ea97fb582d22b6d5e8b33b45073633ec11baf1baa7f9"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/architect.md"
+sha256 = "66ff411f4b4965819e076fe1e060874e95f74e63f526b1f03dec97038ac725da"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/build-fixer.md"
+sha256 = "0a7f080af951632f77326cf0b1c83ea8c21d2cc62edb3f4c7cf73d9110e5012c"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/code-reviewer.md"
+sha256 = "50106e0fbc2875785da8377626f3fcc13e8bc0b6fa04bbfc191bdcaf04dbe38c"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/critic.md"
+sha256 = "2fec72f4d448e37a4fe1ab71e20d2b40582052627009677aeda50eec787d0aaf"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/debugger.md"
+sha256 = "9760e4089f99616c8963975ba4b7d75347c132cbcb62241e2b1927acba981dad"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/designer.md"
+sha256 = "70580763add7fbe729572f98a5471dc0926762dbd85e4c1b637d0cb199c028da"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/executor.md"
+sha256 = "abd5be0de98713fb4ab072315b42f9e1f2adb6ce7c08ebbec642f38a3b59e44f"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/explore.md"
+sha256 = "38101af5220cc3f8ea01f9637bb3ef92092882dc9a2084193e26b84dc5883910"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/planner.md"
+sha256 = "3b3ced06acf55d2255414fde4ba1c2ceab71759ace20edf60bccf2b7c72af959"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/qa-tester.md"
+sha256 = "cfff374f8a3406ffe01e4ecb01ede99e6ad3b2a9ad37926126ebee4af8d68b46"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/quality-reviewer.md"
+sha256 = "f730b8a7cad4a9c1216b992eb0bc614a680115500c0d280df147e31f27a8c524"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/researcher.md"
+sha256 = "d2d2aa142eea5390d2d4cb617e0d1388280eff65d80f53024256fbea3e52719f"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/security-reviewer.md"
+sha256 = "a6ab30fd26370e835f3d044c2ac0ad9ac97a8976b820eb455d0d2c0506204016"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/test-engineer.md"
+sha256 = "496f34a08398a9510317dd6a9076cda896cc0f20d105e6a59217611f5e1e86f8"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/verifier.md"
+sha256 = "fbcd52e789aa580b9f3b75cb46a6d4a48b3c79581551e5f6298bd92f57291bc0"
+
+[[requires]]
+kind = "file-digest"
+path = "~/.codex/prompts/writer.md"
+sha256 = "20a40dd88fc1d8dbe3f088c50919598340336339ce9975dd9956eb604c3b4cac"
+
+# ── The two agents ───────────────────────────────────────────────────────
+#
+# Both run a one-line wrapper under `bin/`, never `node` directly, so the
+# program always receives its subcommand first and friring's argv after it.
+# friring emits the session-selection group before the static `args`
+# (`AgentDef::build_args`), so a leader restart arrives as
+# `resume --last --direct` — which is the order the pinned `omx` accepts.
+
+[[agents]]
+name = "omx-leader"
+command = "{home}/bin/omx-leader"
+args = ["--direct"]
+resume_args = ["resume", "--last"]
+resume_latest = true
+hook_schema = "codex"
+
+# Where a leader's conversation lands, so `resume --last` is checked rather than
+# assumed. See the worker's block below for why the id is not in the name.
+[agents.transcript]
+dir = "sessions"
+suffix = ".jsonl"
+
+[agents.sandbox]
+auth = "auto"
+config_dir_env = "CODEX_HOME"
+state_dir = "~/.codex"
+credential_file = "~/.codex/auth.json"
+writeback = true
+secret_env = ["OPENAI_API_KEY"]
+# The exact files codex and OMX write under `~/.codex` — never `~/.codex`
+# whole. A leader that could write the whole directory could rewrite the skill
+# cards this extension pins.
+#
+# `~/.omx` and `~/.omx-runs` are here rather than in the profile's `paths`, and
+# that placement is the security boundary: a profile path is inherited by every
+# bridge child (read-only, after narrowing), and these two hold the leader's
+# session identity, its launch lineage, its logs and its codebase map. Declared
+# on the *leader agent* they reach the leader — which is the only session that
+# needs them — and no worker, because a worker's own agent block does not
+# declare them. `omx` creates `~/.omx-runs` before it launches anything, so a
+# leader without them dies on EPERM with no pane to say so.
+state_rw = [
+  "~/.codex/config.toml",
+  "~/.codex/auth.json",
+  "~/.codex/sessions",
+  "~/.codex/log",
+  "~/.codex/history.jsonl",
+  "~/.codex/.omx-config.json",
+  "~/.omx",
+  "~/.omx-runs",
+]
+bypass = ["--madmax"]
+bridge_requires = ["child-lifecycle", "mailbox"]
+
+[agents.sandbox.env]
+# OMX must not replace itself under a boundary that pinned its version.
+OMX_AUTO_UPDATE = "0"
+# The routing overlay. `readLaunchAppendInstructions` throws when the file is
+# missing, so this fails closed rather than silently launching native Team.
+OMX_RALPH_APPEND_INSTRUCTIONS_FILE = "{home}/leader/APPENDIX.md"
+
+[[agents]]
+name = "omx-worker-codex"
+command = "{home}/bin/omx-worker-codex"
+args = []
+resume_args = ["resume", "--last"]
+# `resume --last` is unambiguous for a worker because its `CODEX_HOME` is
+# private: the last conversation in it is its own, and there is no other. A
+# bridge `resume` emits this group through
+# `app::bridge_saga::child_resume_identity`, so a parked worker comes back to
+# the conversation it was having.
+resume_latest = true
+hook_schema = "codex"
+
+# And what makes that provable: friring refuses a bridge child's resume it
+# cannot prove will reach a conversation, rather than starting a blank one under
+# the same id. A rollout is `sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl`; the id
+# in that filename is Codex's own and not friring's, so the check is "is there a
+# conversation in this directory at all?" — exact here, because the directory is
+# this worker's private CODEX_HOME.
+[agents.transcript]
+dir = "sessions"
+suffix = ".jsonl"
+
+[agents.sandbox]
+auth = "auto"
+config_dir_env = "CODEX_HOME"
+state_dir = "~/.codex"
+credential_file = "~/.codex/auth.json"
+writeback = true
+secret_env = ["OPENAI_API_KEY"]
+state_rw = [
+  "~/.codex/config.toml",
+  "~/.codex/auth.json",
+  "~/.codex/sessions",
+  "~/.codex/log",
+  "~/.codex/history.jsonl",
+  "~/.codex/.omx-config.json",
+]
+bypass = ["--dangerously-bypass-approvals-and-sandbox"]
+bridge_requires = ["mailbox", "report"]
+
+# What a worker needs in its **private** state directory. `sessions`,
+# `history.jsonl` and `log` are in the leader's `state_rw` and therefore in
+# every worker's subtract set: a worker's transcripts live only under its own
+# `CODEX_HOME`, and no other session's history is readable.
+#
+# `auth.json` is the one shared file, through a `link-rw` — legal because this
+# block declares it as the `credential_file` under `state_dir` with
+# `writeback = true`, so a refresh updates the one credential in place rather
+# than leaving a worker a private copy (ADR-28).
+[[agents.sandbox.child_state_seed]]
+src = "auth.json"
+mode = "link-rw"
+required = true
+
+[[agents.sandbox.child_state_seed]]
+src = "config.toml"
+mode = "copy"
+required = true
+
+# The one seed that has to be rewritten: a hooks file naming `~/.codex/hooks/…`
+# would, copied verbatim, point a worker's hooks back at its family's directory
+# — the one place its subtract set denies.
+[[agents.sandbox.child_state_seed]]
+src = "hooks.json"
+mode = "copy-rewrite"
+required = true
+
+[[agents.sandbox.child_state_seed]]
+src = "skills"
+mode = "symlink"
+required = true
+
+[[agents.sandbox.child_state_seed]]
+src = "prompts"
+mode = "symlink"
+required = true
+
+[[agents.sandbox.child_state_seed]]
+src = "AGENTS.md"
+mode = "symlink"
+required = false
+
+[agents.sandbox.env]
+OMX_AUTO_UPDATE = "0"
+
+# ── The two skill cards ──────────────────────────────────────────────────
+#
+# `refuse` rather than the default `skip`: these are the routing, and an
+# install that skipped them would leave a leader running somebody else's card
+# under this extension's name.
+
+[[external_files]]
+path = "~/.codex/skills/friring-team/SKILL.md"
+source = "skills/friring-team/SKILL.md"
+requires_dir = "~/.codex/skills"
+substitute = true
+on_conflict = "refuse"
+
+[[external_files]]
+path = "~/.codex/skills/friring-autopilot/SKILL.md"
+source = "skills/friring-autopilot/SKILL.md"
+requires_dir = "~/.codex/skills"
+substitute = true
+on_conflict = "refuse"
+
+# ── Everything else, under the extension's own home ──────────────────────
+
+[[files]]
+path = "lib/friring-omx.mjs"
+
+[[files]]
+path = "lib/friring-omx.test.mjs"
+
+[[files]]
+path = "bin/omx-leader"
+executable = true
+
+[[files]]
+path = "bin/omx-worker-codex"
+executable = true
+
+[[files]]
+path = "leader/APPENDIX.md"
+
+[[files]]
+path = "worker/AGENTS.md"
+
+[[files]]
+path = "skills/friring-team/SKILL.md"
+
+[[files]]
+path = "skills/friring-autopilot/SKILL.md"
+
+[[files]]
+path = "pins.json"
+
+[[files]]
+path = "profiles.toml"
+
+[[files]]
+path = "README.md"
+
+[[files]]
+path = "OMX.md"

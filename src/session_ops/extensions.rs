@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 
 use crate::session::automation::parse_trigger;
 use crate::session::extension_def::HOME_TOKEN;
-use crate::session::{Automation, AutomationAction, ExtensionAutomation, ExtensionDef, SessionId};
+use crate::session::{
+    Automation, AutomationAction, ExtensionAutomation, ExtensionDef, Requirement, SessionId,
+};
 use crate::storage::automations::NewAutomation;
 use crate::storage::Database;
 use crate::sync::current_time_millis;
@@ -132,6 +134,307 @@ pub struct InstallReport {
     pub compat_warning: Option<String>,
 }
 
+// ── Requirements ─────────────────────────────────────────────────────────
+
+/// How long a `tool-version` probe may run before friring gives up on it.
+///
+/// A version flag answers in milliseconds. Anything that does not is a tool that
+/// is not going to, and a hung probe would hang the install rather than fail it.
+const TOOL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How much of a probe's output friring will read.
+const TOOL_PROBE_MAX_OUTPUT: usize = 64 * 1024;
+
+/// How long a `tool-version` result is reused before the tool is probed again.
+///
+/// Deliberately **not** a cross-invocation cache: it is `thread_local!`, and
+/// self-heal runs once at TUI startup and once per `friring-cli automation tick`
+/// process, so nothing in it outlives the process that filled it. What it spans
+/// is a single process's install/activate/heal pass, where one requirement is
+/// evaluated more than once — a process spawn per evaluation is a real cost for
+/// a check whose answer only changes when somebody installs a new toolchain. The
+/// cache is keyed on the **resolved binary path and its mtime** as well as the
+/// argv, so a tool that is replaced is re-probed at once rather than an hour
+/// later — the hour is a backstop for a tool replaced in place with the same
+/// mtime, not the invalidation.
+///
+/// File checks are **not** cached at all: they are a read, and a file the
+/// extension depends on can be edited between one tick and the next.
+const TOOL_PROBE_CACHE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+thread_local! {
+    /// `(argv, resolved path, mtime) -> (checked_at, output)`.
+    static TOOL_PROBE_RESULTS: std::cell::RefCell<
+        HashMap<String, (std::time::Instant, String)>,
+    > = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Where `PATH` resolves `command`, and when that file was last written.
+///
+/// The cache key's real content: a `node` replaced by a version manager is a
+/// different file, and a check that kept answering from the old one would say a
+/// requirement holds because it held an hour ago. `None` — `command` is not on
+/// `PATH`, or carries a separator, or cannot be stat'd — means **no caching**,
+/// so the probe runs and fails honestly every time.
+///
+/// This resolves `PATH` itself rather than shelling out to `which`, for the
+/// reason the probe does not use a shell: introducing an interpreter is the one
+/// thing this must not do.
+fn resolved_tool(command: &str) -> Option<(PathBuf, std::time::SystemTime)> {
+    if command.contains(std::path::MAIN_SEPARATOR) || command.contains('/') {
+        return None;
+    }
+    let path = std::env::var_os("PATH")?;
+    let found = std::env::split_paths(&path)
+        .map(|dir| dir.join(command))
+        .find(|candidate| candidate.is_file())?;
+    let mtime = std::fs::metadata(&found).ok()?.modified().ok()?;
+    Some((found, mtime))
+}
+
+/// Check every requirement an extension declares, or say which one failed.
+///
+/// A **hard gate** on install, activate and heal: an extension whose declared
+/// preconditions do not hold is one whose behaviour nobody has reasoned about,
+/// and "installed but not working" costs an operator more than a refusal does.
+/// The failing entry is named, because "requirements not met" is not something
+/// anybody can act on.
+///
+/// # Errors
+///
+/// The first requirement that does not hold, labelled by
+/// [`Requirement::label`] — which carries a path or a command and never a
+/// file's contents.
+pub fn evaluate_requirements(def: &ExtensionDef) -> Result<(), String> {
+    for requirement in &def.requires {
+        if let Err(detail) = check_requirement(requirement) {
+            return Err(format!(
+                "extension '{}' requires {}: {detail}",
+                def.name,
+                requirement.label()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One requirement, evaluated.
+fn check_requirement(requirement: &Requirement) -> Result<(), String> {
+    match requirement {
+        Requirement::BinaryCapability { name, version } => {
+            let have = crate::session::bridge::binary_capability(name)
+                .ok_or_else(|| format!("this friring reports no capability called '{name}'"))?;
+            if have < *version {
+                return Err(format!("this friring reports {have}"));
+            }
+            Ok(())
+        }
+        Requirement::ToolVersion {
+            command,
+            args,
+            pattern,
+        } => {
+            let output = probe_tool(command, args)?;
+            if version_pattern_matches(&output, pattern) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "'{command}' answered something else (first line: {})",
+                    output.lines().next().unwrap_or("").trim()
+                ))
+            }
+        }
+        Requirement::FileDigest { path, sha256 } => {
+            let resolved = crate::agent::extension_config::expand_tilde(path);
+            let bytes =
+                std::fs::read(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))?;
+            let actual = sha256_hex(&bytes);
+            if actual.eq_ignore_ascii_case(sha256) {
+                Ok(())
+            } else {
+                Err(format!("its digest is {actual}"))
+            }
+        }
+        Requirement::FileExists { path } => {
+            let resolved = crate::agent::extension_config::expand_tilde(path);
+            if resolved.exists() {
+                Ok(())
+            } else {
+                Err(format!("{} is not there", resolved.display()))
+            }
+        }
+        Requirement::FileContains { path, needle } => {
+            let resolved = crate::agent::extension_config::expand_tilde(path);
+            let content = std::fs::read_to_string(&resolved)
+                .map_err(|e| format!("{}: {e}", resolved.display()))?;
+            if content.contains(needle) {
+                Ok(())
+            } else {
+                // The needle is not echoed: it can be a credential fragment, and
+                // a refusal is printed to a terminal and pasted into bug reports.
+                Err(format!("{} does not contain it", resolved.display()))
+            }
+        }
+    }
+}
+
+/// Whether a `tool-version` pattern occurs in a tool's output **as a version**
+/// rather than as any old substring.
+///
+/// A plain `contains` reads the wrong thing in both directions: `0.21.0` occurs
+/// in `10.21.0` and in `0.21.0-beta`, and `v2` occurs in `v20.11.0`. The first
+/// two are the dangerous ones — a pin satisfied by a different release, or by a
+/// prerelease of it — so the match has to sit on a boundary:
+///
+/// - **Left**: the character before the match may not continue a version token
+///   (`0-9`, `.`, `-`, `_`, or a letter). That is what stops `10.21.0` and
+///   `foo0.21.0` from satisfying `0.21.0`. The **one** exception is a
+///   conventional `v` prefix, because real tools print one and a manifest pins
+///   the number: a single `v`/`V` is stepped over, and the boundary is then
+///   required before *that*, so `10v0.21.0` is still refused.
+/// - **Right**, and only when the pattern *ends in a digit*: the character after
+///   may not be `0-9`, `.` or `-`. That stops `0.21.0-beta` and `0.21.05` from
+///   satisfying `0.21.0`, while leaving a deliberate prefix pattern like `v20.`
+///   — which ends in `.` — to mean what it says.
+///
+/// Still a **substring** rule, not a semver comparison: a manifest asks for a
+/// spelling, and friring does not parse a vendor's version grammar for it.
+fn version_pattern_matches(output: &str, pattern: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    let bounded_right = pattern.ends_with(|c: char| c.is_ascii_digit());
+    // What continues a version *token*, and so may not abut a match: the
+    // strictness is the whole point of the boundary, and relaxing it to "not a
+    // digit" would let `foo0.21.0` satisfy `0.21.0`.
+    let continues = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_';
+    // The exception, and only this one: oh-my-codex 0.21.0 prints
+    // `oh-my-codex v0.21.0` while its manifest pins the number, and a rule that
+    // read the `v` as part of the version refused the release the pattern
+    // names. Stepping over it is safe only when the `v` is itself at a
+    // boundary, or `10v0.21.0` would satisfy `0.21.0` through the exception.
+    let left_ok = |before: &str| match before.chars().next_back() {
+        None => true,
+        Some(c) if !continues(c) => true,
+        Some(c @ ('v' | 'V')) => {
+            let head = &before[..before.len() - c.len_utf8()];
+            head.chars().next_back().map_or(true, |p| !continues(p))
+        }
+        Some(_) => false,
+    };
+    let mut from = 0usize;
+    while let Some(offset) = output[from..].find(pattern) {
+        let start = from + offset;
+        let end = start + pattern.len();
+        let left_ok = left_ok(&output[..start]);
+        let right_ok = !bounded_right
+            || output[end..]
+                .chars()
+                .next()
+                .map_or(true, |c| !(c.is_ascii_digit() || c == '.' || c == '-'));
+        if left_ok && right_ok {
+            return true;
+        }
+        // Advance by one character, not one byte: `pattern` may start mid-UTF-8.
+        from = start + output[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+/// Run a `tool-version` probe, argv-only, and return what it printed.
+///
+/// **No shell.** `Command::new(command).args(args)` resolves `command` through
+/// `PATH` exactly as the operator's shell would, and a `command` containing a
+/// space is one argv element that simply fails to resolve — which is the point:
+/// friring runs the operator's installed tool and trusts it exactly as much as
+/// the operator does, but it must never *introduce* an interpreter that would
+/// turn a manifest string into a command line.
+///
+/// The environment is the process's own, because `PATH` is the whole question,
+/// and the output is bounded and the wait is bounded.
+fn probe_tool(command: &str, args: &[String]) -> Result<String, String> {
+    // A tool this cannot resolve is not cached: the probe then runs — and fails
+    // — every time, which is the honest answer for something not on `PATH`.
+    let key = resolved_tool(command).map(|(path, mtime)| {
+        format!(
+            "{}\u{0}{:?}\u{0}{}",
+            path.display(),
+            mtime,
+            args.join("\u{0}")
+        )
+    });
+    let cached = key.as_ref().and_then(|key| {
+        TOOL_PROBE_RESULTS.with(|cache| {
+            cache
+                .borrow()
+                .get(key)
+                .filter(|(at, _)| at.elapsed() < TOOL_PROBE_CACHE)
+                .map(|(_, out)| out.clone())
+        })
+    });
+    if let Some(output) = cached {
+        return Ok(output);
+    }
+    let mut child = std::process::Command::new(command)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run '{command}': {e}"))?;
+    let deadline = std::time::Instant::now() + TOOL_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                return Err(format!(
+                    "'{command}' did not answer within {}s",
+                    TOOL_PROBE_TIMEOUT.as_secs()
+                ));
+            }
+            Err(e) => return Err(format!("could not wait for '{command}': {e}")),
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("could not read '{command}': {e}"))?;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    if text.trim().is_empty() {
+        // Several tools print their version on stderr.
+        text = String::from_utf8_lossy(&out.stderr).into_owned();
+    }
+    text.truncate(
+        text.char_indices()
+            .take(TOOL_PROBE_MAX_OUTPUT)
+            .last()
+            .map_or(0, |(i, c)| i + c.len_utf8()),
+    );
+    if let Some(key) = key {
+        TOOL_PROBE_RESULTS.with(|cache| {
+            cache
+                .borrow_mut()
+                .insert(key, (std::time::Instant::now(), text.clone()));
+        });
+    }
+    Ok(text)
+}
+
+/// SHA-256 of `bytes`, lowercase hex.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Install an extension end-to-end from a `target` (a bare name resolved against
 /// the official source, a `http(s)://` base, or a local directory): fetch the
 /// manifest, lay down its payload files + symlinks under the home dir, register
@@ -154,6 +457,12 @@ pub fn install_extension(
     for w in &warnings {
         tracing::warn!("{w}");
     }
+    // Before anything is fetched, written or registered: a requirement that
+    // does not hold refuses the install rather than leaving half an extension
+    // on disk. Checked against the **source** manifest, whose `{home}` tokens
+    // are not resolved yet, so a file requirement under the extension's own home
+    // is re-checked at activate.
+    evaluate_requirements(&def)?;
 
     // Record the previously-installed version (if any) before we overwrite the
     // discovery manifest, so an install-over-existing / update can report a move.
@@ -203,8 +512,18 @@ pub fn install_extension(
         install_symlink(s, &home, &mut report)?;
     }
 
-    // 3. Agents → agents.toml (idempotent).
-    report.agents_added = crate::agent::extension_config::ensure_agents_registered(&def.agents)?;
+    // 3. Agents → agents.toml (idempotent), from the **home-resolved** manifest.
+    //
+    // Resolved here rather than only at step 4: an agent's `command` may be
+    // `{home}/bin/x`, and `agents.toml` is read by the launcher, which expands
+    // no tokens. Registered unresolved, every launch of that agent dies with
+    // `cannot run '{home}/bin/x'` — which is what both of this fork's
+    // bridge-backed extensions declare, so neither could start at all.
+    let resolved = def
+        .resolved_for_home(&home_str, crate::paths::home_dir().as_deref())
+        .with_provenance(current, target);
+    report.agents_added =
+        crate::agent::extension_config::ensure_agents_registered(&resolved.agents)?;
 
     // 3b. External files (hook plugins) into agents' own config dirs. These take
     //     absolute / `~` paths, so `{home}` is resolved first.
@@ -259,9 +578,8 @@ pub fn install_extension(
     //    which binary installed it + where from) to the discovery dir, then
     //    activate. `target` is recorded verbatim so `update` re-fetches the same
     //    source (a bare name re-resolves against the *current* binary's tag).
-    let resolved = def
-        .resolved_for_home(&home_str, crate::paths::home_dir().as_deref())
-        .with_provenance(current, target);
+    //    The same `resolved` the agents above were registered from, so what
+    //    `agents.toml` says and what the discovery dir says cannot drift.
     crate::agent::extension_config::write_manifest(&resolved)?;
     report.ensure = activate_extension(db, &resolved)?;
 
@@ -359,8 +677,20 @@ fn install_external_file(
         report.external_files_skipped.push(f.path.clone());
         return Ok(());
     }
-    // Never clobber a file a user has edited (one lacking our managed marker).
+    // Never clobber a file a user has edited (one lacking our managed marker)…
     if !force && dest.exists() && is_user_modified(&dest) {
+        // …unless the extension declared it cannot work around one, in which
+        // case the install is **refused** rather than silently completed. An
+        // extension whose hook file is somebody else's is one whose behaviour
+        // nobody has reasoned about; installing it anyway is the outcome this
+        // exists to prevent.
+        if f.on_conflict == crate::session::OnConflict::Refuse {
+            return Err(format!(
+                "{} already exists and friring did not write it, and this extension declares \
+                 on_conflict = \"refuse\" for it. Move or remove that file, then install again",
+                dest.display()
+            ));
+        }
         report.external_files_skipped.push(f.path.clone());
         return Ok(());
     }
@@ -687,11 +1017,21 @@ pub fn uninstall_extension(
     report.agents_unpatched =
         crate::agent::extension_config::remove_agent_patches(&def.agent_patches)?;
 
-    // Remove external hook files we still own (those carrying our managed marker).
+    // Remove external hook files we still own — **marker-managed only**. A file
+    // the user has since taken over (its marker gone) is theirs, and an
+    // uninstall that removed it would delete somebody's work because friring
+    // once wrote to that path. The directory around it is left alone unless it
+    // is now empty, for the same reason.
     for f in &def.external_files {
         let dest = crate::agent::extension_config::expand_tilde(&f.path);
         if dest.is_file() && !is_user_modified(&dest) && std::fs::remove_file(&dest).is_ok() {
             report.external_files_removed.push(f.path.clone());
+            if let Some(parent) = dest.parent() {
+                // `remove_dir` refuses a non-empty directory, which is exactly
+                // the guard wanted: friring never created the directory's other
+                // contents and must not take them with it.
+                let _ = std::fs::remove_dir(parent);
+            }
         }
     }
 
@@ -1037,6 +1377,10 @@ fn ensure_automation(
 /// that (it owns the `agent::tmux` dependency). A `Send` automation only fires
 /// while something ticks it (TUI tick loop, or the heartbeat keeper window).
 pub fn activate_extension(db: &Database, def: &ExtensionDef) -> Result<EnsureReport, String> {
+    // A hard gate here too, not only at install: a toolchain can be uninstalled
+    // and a file edited between one and the other, and an extension whose
+    // preconditions stopped holding must not quietly keep running.
+    evaluate_requirements(def)?;
     let report = ensure_extension(db, def)?;
     db.add_active_extension(&def.name)
         .map_err(|e| format!("add_active_extension: {e}"))?;
@@ -1126,6 +1470,16 @@ fn heal_one_extension(db: &Database, name: &str, messages: &mut Vec<String>) {
     let current = crate::agent::extension_config::binary_version();
     let auto_update = crate::session::settings::global().features.auto_update;
     if heal_version_drift(db, &def, name, current, auto_update, messages) {
+        return;
+    }
+    // The same hard gate `install_extension` and `activate_extension` apply, and
+    // for the stronger reason: self-heal is what re-creates resources over time,
+    // so a toolchain uninstalled or a pinned file edited since activation must
+    // stop the heal rather than be re-ensured around.
+    if let Err(e) = evaluate_requirements(&def) {
+        messages.push(format!(
+            "extension '{name}' is active but its requirements no longer hold: {e}"
+        ));
         return;
     }
     match ensure_extension(db, &def) {
@@ -1292,6 +1646,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         };
         db.upsert_session(&shared).unwrap();
         id
@@ -1320,6 +1677,7 @@ mod tests {
                 agent: "flow".into(),
                 repo_path: "/tmp/flow".into(),
             }],
+            requires: Vec::new(),
             automations: vec![ExtensionAutomation {
                 name: "flow-tick".into(),
                 trigger: "cron:*/5 * * * *".into(),
@@ -1631,6 +1989,138 @@ prompt = "tick"
             "if_absent file must not be clobbered on reinstall"
         );
         assert!(again.agents_added.is_empty());
+    }
+
+    /// `on_conflict = "refuse"` fails the install when the destination is
+    /// somebody else's file, and restores one that is friring's own.
+    ///
+    /// The alternative — skipping, which is the default — would install an
+    /// extension that then behaves as an unrelated file says, and an extension
+    /// declaring this has said that is worse than not installing.
+    #[test]
+    fn refuse_on_conflict_fails_an_install_over_an_unmanaged_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let db = Database::open_in_memory().unwrap();
+
+        let plugin_dir = temp.path().join("codexhome");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let dest = plugin_dir.join("hooks/status.mjs");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        let home = temp.path().join("refusehome");
+
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            src.path().join("extension.toml"),
+            format!(
+                r#"name = "refuser"
+home = '{home}'
+
+[[external_files]]
+path = '{dest}'
+source = "status.mjs"
+on_conflict = "refuse"
+"#,
+                home = home.display(),
+                dest = dest.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            src.path().join("status.mjs"),
+            "// friring `extension install` managed\nexport const v = 2;\n",
+        )
+        .unwrap();
+        let target = src.path().to_string_lossy().to_string();
+
+        // Somebody else's file at the destination: the install is refused, and
+        // the refusal names the path so it can be acted on.
+        std::fs::write(&dest, "// mine, thanks\n").unwrap();
+        let refusal = install_extension(&db, &target, None, false)
+            .expect_err("an unmanaged destination refuses the install");
+        assert!(refusal.contains(&dest.display().to_string()), "{refusal}");
+        assert!(refusal.contains("on_conflict"), "{refusal}");
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "// mine, thanks\n",
+            "the user's file is untouched"
+        );
+
+        // friring's own file that has drifted is restored byte-exact.
+        std::fs::write(
+            &dest,
+            "// friring `extension install` managed\nexport const v = 1;\n",
+        )
+        .unwrap();
+        install_extension(&db, &target, None, false).expect("a managed destination is restored");
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "// friring `extension install` managed\nexport const v = 2;\n"
+        );
+
+        // Uninstall removes friring's own file and nothing around it.
+        std::fs::write(plugin_dir.join("hooks/theirs.mjs"), "// theirs\n").unwrap();
+        uninstall_extension(&db, "refuser", false).unwrap();
+        assert!(!dest.exists(), "friring's own file is removed");
+        assert!(
+            plugin_dir.join("hooks/theirs.mjs").is_file(),
+            "a user's file in the same directory survives"
+        );
+    }
+
+    /// An agent whose `command` is `{home}/…` reaches `agents.toml` **resolved**.
+    ///
+    /// `agents.toml` is read by the launcher, which expands no tokens: an entry
+    /// carrying the literal makes every launch of that agent die with `cannot
+    /// run '{home}/bin/x'`. Both of this fork's bridge-backed extensions declare
+    /// their agents that way, so registering before resolving meant neither
+    /// could start — which manifest-linting them could not have shown.
+    #[test]
+    fn an_agent_command_under_the_extension_home_is_registered_resolved() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let db = Database::open_in_memory().unwrap();
+
+        let home = temp.path().join("tokenhome");
+        let src = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            src.path().join("extension.toml"),
+            format!(
+                r#"name = "tokened"
+home = '{home}'
+
+[[files]]
+path = "bin/run.sh"
+executable = true
+
+[[agents]]
+name = "tokened-agent"
+command = "{{home}}/bin/run.sh"
+args = ["{{home}}/lib/thing"]
+"#,
+                home = home.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(src.path().join("bin")).unwrap();
+        std::fs::write(src.path().join("bin/run.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+
+        install_extension(&db, &src.path().to_string_lossy(), None, false)
+            .expect("the install succeeds");
+
+        let agents = crate::agent::agent_config::agents_config_path().unwrap();
+        let text = std::fs::read_to_string(&agents).unwrap();
+        assert!(
+            !text.contains("{home}"),
+            "agents.toml carries an unresolved token:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("{}/bin/run.sh", home.display())),
+            "the agent's command was not resolved to the extension's home:\n{text}"
+        );
+        // The command the launcher would run is really there, which is the
+        // property the token exists to produce.
+        assert!(home.join("bin/run.sh").is_file());
     }
 
     #[test]
@@ -2520,6 +3010,59 @@ prompt = "tick"
         );
     }
 
+    /// Self-heal is the pass that re-creates an extension's resources over
+    /// time, so it applies the same requirement gate install and activate do: a
+    /// pinned file edited since activation stops the heal rather than having its
+    /// resources quietly re-ensured around a gate that no longer holds.
+    #[test]
+    fn heal_refuses_an_extension_whose_requirements_stopped_holding() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let src = tempfile::TempDir::new().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        insert_session(&db, "flow");
+
+        let pinned = temp.path().join("pinned.json");
+        std::fs::write(&pinned, "{\"pin\":1}\n").unwrap();
+        let digest = sha256_hex(&std::fs::read(&pinned).unwrap());
+        let home = temp.path().join("flowhome");
+        std::fs::write(
+            src.path().join("extension.toml"),
+            format!(
+                "name = \"flow\"\nhome = '{home}'\n\n[[requires]]\nkind = \"file-digest\"\n\
+                 path = '{pin}'\nsha256 = \"{digest}\"\n\n[[sessions]]\nname = \"flow\"\n\
+                 agent = \"flow\"\nrepo_path = \"{{home}}\"\n\n[[automations]]\n\
+                 name = \"flow-tick\"\ntrigger = \"cron:*/5 * * * *\"\nsession_ref = \"flow\"\n\
+                 prompt = \"tick\"\n",
+                home = home.display(),
+                pin = pinned.display(),
+            ),
+        )
+        .unwrap();
+        install_extension(&db, &src.path().to_string_lossy(), None, false).unwrap();
+        let def = crate::agent::extension_config::load_manifest("flow").unwrap();
+        activate_extension(&db, &def).unwrap();
+        let automation = db.list_automations().unwrap();
+        assert_eq!(automation.len(), 1, "activation created the automation");
+
+        // The pinned file changed under the operator, and the managed resource
+        // is gone — exactly the state self-heal exists to repair.
+        std::fs::write(&pinned, "{\"pin\":2}\n").unwrap();
+        db.delete_automation(automation[0].id).unwrap();
+
+        let messages = heal_active_extensions(&db);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("requirements no longer hold") && m.contains("file-digest")),
+            "got: {messages:?}"
+        );
+        assert!(
+            db.list_automations().unwrap().is_empty(),
+            "a broken gate must stop the heal, not be re-ensured around"
+        );
+    }
+
     #[test]
     fn update_errors_when_no_recorded_source() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -2666,5 +3209,296 @@ prompt = "tick"
         let after = extension_health(&db, &def).unwrap();
         assert!(after.active);
         assert!(after.is_healthy());
+    }
+}
+
+#[cfg(test)]
+mod requirement_tests {
+    use super::*;
+    use crate::session::Requirement;
+
+    /// A manifest with the given requirements and nothing else.
+    fn def(requires: Vec<Requirement>) -> ExtensionDef {
+        ExtensionDef {
+            name: "probe".into(),
+            requires,
+            ..blank_def()
+        }
+    }
+
+    fn blank_def() -> ExtensionDef {
+        ExtensionDef {
+            name: "probe".into(),
+            description: None,
+            config_version: None,
+            version: None,
+            min_thurbox_version: None,
+            installed_with: None,
+            source: None,
+            home: None,
+            agents: Vec::new(),
+            files: Vec::new(),
+            external_files: Vec::new(),
+            agent_patches: Vec::new(),
+            config_merges: Vec::new(),
+            symlinks: Vec::new(),
+            sessions: Vec::new(),
+            automations: Vec::new(),
+            requires: Vec::new(),
+        }
+    }
+
+    /// A capability check is answered from the document this binary prints, so a
+    /// version it is checked against is one it actually speaks.
+    #[test]
+    fn a_binary_capability_is_checked_against_what_this_binary_reports() {
+        let current = crate::session::bridge::BRIDGE_PROTOCOL;
+        assert!(
+            evaluate_requirements(&def(vec![Requirement::BinaryCapability {
+                name: "bridge".into(),
+                version: current,
+            }]))
+            .is_ok()
+        );
+
+        let too_new = evaluate_requirements(&def(vec![Requirement::BinaryCapability {
+            name: "bridge".into(),
+            version: current + 1,
+        }]))
+        .expect_err("a version this binary does not speak is refused");
+        assert!(too_new.contains("binary-capability bridge"), "{too_new}");
+
+        // A name this friring does not know is a refusal, not an ignored line:
+        // an extension that declared it meant something by it.
+        let unknown = evaluate_requirements(&def(vec![Requirement::BinaryCapability {
+            name: "time-travel".into(),
+            version: 1,
+        }]))
+        .expect_err("an unknown capability is refused");
+        assert!(unknown.contains("no capability called"), "{unknown}");
+    }
+
+    /// Every file requirement passes on a fixture and fails on its absence, its
+    /// contents or its digest — and a refusal never echoes what it was looking
+    /// for.
+    #[test]
+    fn the_file_requirements_pass_and_fail_on_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hook.mjs");
+        std::fs::write(&file, "export const secret = 'sk-not-a-real-key';\n").unwrap();
+        let path = file.display().to_string();
+        let digest = sha256_hex(&std::fs::read(&file).unwrap());
+
+        for ok in [
+            Requirement::FileExists { path: path.clone() },
+            Requirement::FileContains {
+                path: path.clone(),
+                needle: "sk-not-a-real-key".into(),
+            },
+            Requirement::FileDigest {
+                path: path.clone(),
+                sha256: digest.clone(),
+            },
+        ] {
+            assert!(
+                evaluate_requirements(&def(vec![ok.clone()])).is_ok(),
+                "{ok:?}"
+            );
+        }
+
+        let missing = dir.path().join("gone.mjs").display().to_string();
+        assert!(evaluate_requirements(&def(vec![Requirement::FileExists {
+            path: missing.clone()
+        }]))
+        .is_err());
+        assert!(evaluate_requirements(&def(vec![Requirement::FileDigest {
+            path: path.clone(),
+            sha256: "0".repeat(64),
+        }]))
+        .is_err());
+
+        // A needle can be a credential fragment, and a refusal is pasted into
+        // bug reports.
+        let refusal = evaluate_requirements(&def(vec![Requirement::FileContains {
+            path,
+            needle: "sk-another-real-looking-secret".into(),
+        }]))
+        .expect_err("a missing needle is refused");
+        assert!(
+            !refusal.contains("sk-another-real-looking-secret"),
+            "a refusal must not echo what it was looking for: {refusal}"
+        );
+    }
+
+    /// A pin must not be satisfied by a *different* release that happens to
+    /// contain its digits, nor by a prerelease of it. This extension's whole
+    /// premise is that it is bound to one oh-my-codex.
+    #[test]
+    fn a_version_pattern_matches_a_version_and_not_any_substring() {
+        // The two that matter: a longer major, and a prerelease suffix.
+        assert!(!version_pattern_matches("omx 10.21.0", "0.21.0"));
+        assert!(!version_pattern_matches("omx 0.21.0-beta.1", "0.21.0"));
+        assert!(!version_pattern_matches("omx 0.21.01", "0.21.0"));
+        // …and the ones that must still pass.
+        assert!(version_pattern_matches("omx 0.21.0", "0.21.0"));
+        assert!(version_pattern_matches("0.21.0", "0.21.0"));
+        assert!(version_pattern_matches("omx 0.21.0 (build 7)", "0.21.0"));
+        // The `v` prefix, which is what oh-my-codex 0.21.0 actually prints. A
+        // left boundary that treated any letter as part of the version refused
+        // it — and refused the install with it, which is not a stricter gate
+        // but an extension nobody can install.
+        assert!(version_pattern_matches("oh-my-codex v0.21.0", "0.21.0"));
+        assert!(version_pattern_matches("v0.21.0", "0.21.0"));
+        assert!(version_pattern_matches("tool V0.21.0", "0.21.0"));
+        // …and the exception is a `v` **at a boundary**, not a licence for any
+        // letter. Both of these would satisfy a rule that merely stopped at
+        // digits, and neither is the release the pattern names.
+        assert!(!version_pattern_matches("foo0.21.0", "0.21.0"));
+        assert!(!version_pattern_matches("10v0.21.0", "0.21.0"));
+        assert!(!version_pattern_matches("rev0.21.0", "0.21.0"));
+        assert!(!version_pattern_matches("_0.21.0", "0.21.0"));
+
+        // A pattern ending in `.` is a deliberate prefix and keeps meaning that.
+        assert!(version_pattern_matches("v20.11.0", "v20."));
+        assert!(!version_pattern_matches("v120.11.0", "v20."));
+
+        assert!(!version_pattern_matches("anything", ""));
+    }
+
+    /// The matcher and the manifests that ship in this repo have to agree. A
+    /// pattern the matcher rejects is not a stricter gate — it is an extension
+    /// nobody can install, and the refusal happens at install, activate *and*
+    /// self-heal. This pins the two `tool-version` patterns in the omx manifest
+    /// against the output their tools actually print.
+    #[test]
+    fn the_shipped_omx_manifest_declares_patterns_this_matcher_accepts() {
+        let manifest =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("extensions/omx/extension.toml");
+        let text = std::fs::read_to_string(&manifest)
+            .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+        let (def, _) = crate::agent::extension_config::parse_manifest_text(&text, "extension.toml")
+            .expect("the shipped manifest parses");
+
+        let pattern_for = |tool: &str| -> String {
+            def.requires
+                .iter()
+                .find_map(|r| match r {
+                    Requirement::ToolVersion {
+                        command, pattern, ..
+                    } if command == tool => Some(pattern.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the manifest requires a {tool} version"))
+        };
+
+        // `node --version` on every supported major, and `omx --version`.
+        let node = pattern_for("node");
+        for output in ["v20.11.0", "v22.14.0", "v24.0.0"] {
+            assert!(
+                version_pattern_matches(output, &node),
+                "node pattern '{node}' rejects {output}"
+            );
+        }
+        // The exact first line `omx --version` prints, taken from the release
+        // rather than assumed: the assumed form had no `v`, and the shipped
+        // pattern was refused by the shipped matcher against the real one.
+        let omx = pattern_for("omx");
+        assert!(
+            version_pattern_matches("oh-my-codex v0.21.0", &omx),
+            "omx pattern '{omx}' rejects the release it pins"
+        );
+    }
+
+    /// The tool check runs **argv-only**. A `command` containing a space is one
+    /// argv element and fails to resolve, rather than being split by a shell.
+    #[test]
+    fn the_tool_check_never_introduces_a_shell() {
+        let refusal = evaluate_requirements(&def(vec![Requirement::ToolVersion {
+            command: "echo hello".into(),
+            args: vec![],
+            pattern: "hello".into(),
+        }]))
+        .expect_err("a command with a space is not a program");
+        assert!(refusal.contains("could not run"), "{refusal}");
+
+        // And a program that does exist is run with its arguments as arguments.
+        let ok = evaluate_requirements(&def(vec![Requirement::ToolVersion {
+            command: "echo".into(),
+            args: vec!["v20.11.0".into()],
+            pattern: "v20.".into(),
+        }]));
+        assert!(ok.is_ok(), "{ok:?}");
+
+        // A tool that answers something else is refused, and the refusal says
+        // what it answered.
+        let mismatch = evaluate_requirements(&def(vec![Requirement::ToolVersion {
+            command: "echo".into(),
+            args: vec!["v18.0.0".into()],
+            pattern: "v20.".into(),
+        }]))
+        .expect_err("a version that does not match is refused");
+        assert!(mismatch.contains("v18.0.0"), "{mismatch}");
+    }
+
+    /// A tool this cannot resolve on `PATH` is never cached, so a check that
+    /// fails keeps failing rather than being answered from a stale pass.
+    #[test]
+    fn an_unresolvable_tool_is_never_cached() {
+        assert!(resolved_tool("this-program-does-not-exist-anywhere").is_none());
+        assert!(
+            resolved_tool("/usr/bin/env").is_none(),
+            "a path is not a PATH lookup"
+        );
+        // Something every unix has.
+        #[cfg(unix)]
+        assert!(resolved_tool("sh").is_some());
+    }
+
+    /// An extension declaring no requirements passes, which is what keeps the
+    /// vocabulary additive for every manifest that predates it.
+    #[test]
+    fn an_extension_with_no_requirements_passes() {
+        assert!(evaluate_requirements(&def(Vec::new())).is_ok());
+    }
+
+    /// `{home}` is resolved in a requirement's path, in an agent's command and
+    /// arguments, and in its sandbox environment — everywhere the extension's
+    /// own tree is named.
+    #[test]
+    fn the_home_token_is_resolved_in_agents_and_requirements() {
+        let mut def = blank_def();
+        def.agents = vec![crate::session::AgentDef {
+            name: "omx".into(),
+            command: "{home}/lib/run.mjs".into(),
+            args: vec!["--root".into(), "{home}".into()],
+            resume_args: vec!["--resume".into(), "{home}/state".into()],
+            fork_args: vec![],
+            new_session_args: vec![],
+            resume_latest: false,
+            hook_schema: None,
+            transcript: None,
+            sandbox: Some(crate::session::AgentSandboxDef {
+                env: [("OMX_ROOT".to_string(), "{home}/lib".to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            }),
+        }];
+        def.requires = vec![Requirement::FileExists {
+            path: "{home}/lib/run.mjs".into(),
+        }];
+
+        let resolved = def.resolved_for_home("/opt/omx", None);
+        assert_eq!(resolved.agents[0].command, "/opt/omx/lib/run.mjs");
+        assert_eq!(resolved.agents[0].args[1], "/opt/omx");
+        assert_eq!(resolved.agents[0].resume_args[1], "/opt/omx/state");
+        assert_eq!(
+            resolved.agents[0].sandbox.as_ref().unwrap().env["OMX_ROOT"],
+            "/opt/omx/lib"
+        );
+        match &resolved.requires[0] {
+            Requirement::FileExists { path } => assert_eq!(path, "/opt/omx/lib/run.mjs"),
+            other => panic!("{other:?}"),
+        }
     }
 }

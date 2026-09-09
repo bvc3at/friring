@@ -54,7 +54,7 @@ use crate::sandbox::backend::{
 };
 use crate::sandbox::dirs;
 use crate::sandbox::egress::{proxy_required, RELAY_PORT};
-use crate::sandbox::launcher::relay_launcher_argv;
+use crate::sandbox::launcher::{launch_argv, mux_env_to_unset, LaunchHelper};
 use crate::sandbox::place::{valid_container_ref, PlaceBackend};
 use crate::sandbox::probe::{ProbeHost, ProbeOutput};
 use crate::session::{
@@ -923,6 +923,12 @@ impl SandboxBackend for ContainerBackend {
             // *could* cross. Whether it does on this host is the question
             // `check_proxy_reachable` settles.
             proxy_transport: ProxyTransport::UnixSocket,
+            // A place runs the agent *inside* a container or a VM, so a
+            // directory friring mints on the host is not at that path in there
+            // — and the bridge's authority is that friring exposed exactly one
+            // per session. Refused rather than approximated (ADR-30's deferred
+            // list).
+            bridge: false,
         }
     }
 
@@ -982,7 +988,14 @@ impl SandboxBackend for ContainerBackend {
             ),
         })?;
         let listen = format!("127.0.0.1:{}", relay.port);
-        let mut out = relay_launcher_argv(relay.program, &listen, &socket);
+        let mut out = launch_argv(
+            relay.program,
+            &LaunchHelper {
+                relay: Some((&listen, &socket)),
+                unset: mux_env_to_unset(),
+                ..LaunchHelper::default()
+            },
+        );
         out.extend(argv);
         Ok(out)
     }
@@ -1387,12 +1400,20 @@ mod tests {
         let argv = backend
             .wrap(vec!["claude".into(), "--resume".into()], &launch)
             .unwrap();
-        // The launcher's three positionals, then the agent's own argv.
-        assert_eq!(argv[0], "/bin/sh");
-        assert_eq!(argv[4], "/usr/local/bin/friring-cli");
-        assert_eq!(argv[5], "127.0.0.1:8119");
-        assert_eq!(argv[6], "/data/pl/dev/abc/proxy.sock");
-        assert_eq!(&argv[7..], ["claude", "--resume"]);
+        // friring's own launch helper — the place's copy of the CLI — starts
+        // the relay and then becomes the agent, every value its own argv
+        // element (ADR-33).
+        assert_eq!(argv[0], "/usr/local/bin/friring-cli");
+        assert_eq!(&argv[1..3], ["sandbox", "launch"]);
+        assert_eq!(&argv[3..5], ["--relay-listen", "127.0.0.1:8119"]);
+        assert_eq!(
+            &argv[5..7],
+            ["--relay-socket", "/data/pl/dev/abc/proxy.sock"]
+        );
+        let handover = argv.iter().position(|a| a == "--").expect("a handover");
+        assert_eq!(&argv[handover + 1..], ["claude", "--resume"]);
+        // Nothing is composed into a command string for a shell to re-split.
+        assert!(!argv.iter().any(|a| a == "/bin/sh" || a == "-c"));
         // Nothing here names the engine: reaching the place is the transport's
         // job, and this command runs inside it.
         assert!(!argv.iter().any(|token| token.contains("podman")));

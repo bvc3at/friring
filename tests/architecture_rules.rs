@@ -163,9 +163,16 @@ const MODULE_RULES: &[ModuleRules] = &[
         allowed: &[],
         allowed_path_only: &[],
     },
+    // Where friring's own directories are, and the two file channels a
+    // sandboxed agent reaches friring through: the status signal (ADR-29) and
+    // the bridge queue (ADR-30). `session` for the bridge's pure-data protocol
+    // — the key format a filename is validated against, and the byte caps a
+    // read is bounded by — so the queue and the wire cannot disagree about what
+    // a request is. The dependency runs one way: `session` is the sink and
+    // references nothing, least of all this.
     ModuleRules {
         name: "paths",
-        allowed: &[],
+        allowed: &["session"],
         allowed_path_only: &[],
     },
     ModuleRules {
@@ -609,6 +616,20 @@ fn util_modules_are_leaves() {
     for name in ["fuzzy", "paths", "shell", "workspace"] {
         assert_module_clean(name);
     }
+}
+
+/// `paths` may read the bridge protocol's pure data and nothing else: the
+/// request-key format its filenames are validated against, and the caps its
+/// reads are bounded by. A reference into any side-effect layer would make
+/// resolving a directory depend on a running backend.
+#[test]
+fn paths_reaches_only_the_pure_data_layer() {
+    let rules = MODULE_RULES
+        .iter()
+        .find(|r| r.name == "paths")
+        .expect("paths is governed");
+    assert_eq!(rules.allowed, ["session"]);
+    assert!(rules.allowed_path_only.is_empty());
 }
 
 /// The metrics sources `cli` reads directly. Both were split out of `app` so

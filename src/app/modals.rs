@@ -91,6 +91,13 @@ impl TextInput {
         self.cursor = value.chars().count();
     }
 
+    /// An input already carrying `value`, with the cursor at its end.
+    pub fn with_value(value: &str) -> Self {
+        let mut input = Self::new();
+        input.set(value);
+        input
+    }
+
     pub fn value(&self) -> &str {
         &self.buffer
     }
@@ -2519,6 +2526,81 @@ pub enum SandboxField {
     Containerfile,
     /// Whether the agent may run a command outside the boundary (Space toggles).
     Fallback,
+    /// What this profile grants over the orchestration bridge (cycled with
+    /// ←/→ over the three presets — see [`BridgePreset`]).
+    BridgeGrants,
+    /// How many live children one session under this profile may have.
+    MaxChildren,
+    /// Which agents a child may be, comma-separated.
+    ChildAgents,
+    /// Which of this profile's read-write paths a child shares, comma-separated.
+    ChildSharedRw,
+    /// Which entries of the agent's state directory a child may be seeded with,
+    /// as comma-separated `path:mode` pairs.
+    ChildSeedAllow,
+}
+
+/// The three grant sets the editor offers, rather than eight combinations.
+///
+/// A profile granting `child-lifecycle` without `mailbox` could create a child
+/// and then never speak to it, and one granting `report` alone could file
+/// progress nobody asked for. Neither is a thing an operator means, so the
+/// editor offers the three that are: none, a worker, a leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BridgePreset {
+    /// No bridge at all — the default, and what every profile has until
+    /// somebody writes otherwise.
+    #[default]
+    None,
+    /// `mailbox` + `report`: a session that can be a child.
+    Worker,
+    /// `child-lifecycle` + `mailbox` + `report`: a session that can create them.
+    Leader,
+}
+
+impl BridgePreset {
+    pub const ALL: &'static [Self] = &[Self::None, Self::Worker, Self::Leader];
+
+    /// The capabilities this preset grants.
+    pub fn grants(self) -> Vec<crate::session::BridgeCapability> {
+        use crate::session::BridgeCapability as Cap;
+        match self {
+            Self::None => Vec::new(),
+            Self::Worker => vec![Cap::Mailbox, Cap::Report],
+            Self::Leader => vec![Cap::ChildLifecycle, Cap::Mailbox, Cap::Report],
+        }
+    }
+
+    /// The preset a stored grant set reads as.
+    ///
+    /// A set that is none of the three — hand-edited, or written by a later
+    /// friring — reads as the **narrowest** preset that covers it, so opening
+    /// and saving a profile never widens what it grants by accident.
+    pub fn of(grants: &[crate::session::BridgeCapability]) -> Self {
+        use crate::session::BridgeCapability as Cap;
+        if grants.contains(&Cap::ChildLifecycle) {
+            Self::Leader
+        } else if grants.is_empty() {
+            Self::None
+        } else {
+            Self::Worker
+        }
+    }
+
+    /// The row's label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Worker => "worker (mailbox, report)",
+            Self::Leader => "leader (child-lifecycle, mailbox, report)",
+        }
+    }
+}
+
+impl std::fmt::Display for BridgePreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
 }
 
 /// Whether `field` can be edited against a backend of `shape` (`None` = an
@@ -2549,6 +2631,19 @@ pub fn sandbox_field_available(
         // `none`, so there is no first use to ask about either way.
         SandboxField::PromptDomains => {
             matches!(network, crate::session::NetworkMode::Allowlist)
+        }
+        // The bridge is a directory friring mints on the host and exposes
+        // inside the boundary, so only a **policy** backend can carry it: a
+        // place has no such path, and a remote host is not the machine friring
+        // mints on. Granting it on a profile that resolves to a place would
+        // store a grant every launch then refuses — see
+        // `crate::agent::sandboxing::bridge_refusal`.
+        SandboxField::BridgeGrants
+        | SandboxField::MaxChildren
+        | SandboxField::ChildAgents
+        | SandboxField::ChildSharedRw
+        | SandboxField::ChildSeedAllow => {
+            shape.map_or(true, |shape| shape == crate::session::SandboxShape::Policy)
         }
         _ => true,
     }
@@ -2632,6 +2727,101 @@ pub struct SandboxPathDraft {
     pub mode: crate::session::PathMode,
 }
 
+/// The orchestration-bridge half of a sandbox profile, as the editor holds it.
+///
+/// Grouped rather than spread across the form's other fields because they are
+/// one decision — what a session under this profile may do to *other* sessions —
+/// and because the editor rows that render them arrive with the bridge's UI
+/// surface. Until then the form carries the stored values unchanged, so editing
+/// any other field cannot silently clear a grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeProfileFields {
+    /// The grant set, as one of three presets.
+    pub preset: BridgePreset,
+    /// The fan-out cap, typed.
+    pub max_children: TextInput,
+    /// Comma-separated registry names.
+    pub child_agents: TextInput,
+    /// Comma-separated paths a child shares with its owner.
+    pub child_shared_rw: TextInput,
+    /// Comma-separated `path:mode` pairs.
+    pub child_seed_allow: TextInput,
+}
+
+impl Default for BridgeProfileFields {
+    fn default() -> Self {
+        Self {
+            preset: BridgePreset::None,
+            max_children: TextInput::with_value(&crate::session::DEFAULT_MAX_CHILDREN.to_string()),
+            child_agents: TextInput::default(),
+            child_shared_rw: TextInput::default(),
+            child_seed_allow: TextInput::default(),
+        }
+    }
+}
+
+impl BridgeProfileFields {
+    fn from_profile(profile: &crate::session::SandboxProfile) -> Self {
+        Self {
+            preset: BridgePreset::of(&profile.bridge_grants),
+            max_children: TextInput::with_value(&profile.max_children.to_string()),
+            child_agents: TextInput::with_value(&profile.child_agents.join(", ")),
+            child_shared_rw: TextInput::with_value(&profile.child_shared_rw.join(", ")),
+            child_seed_allow: TextInput::with_value(
+                &profile
+                    .child_seed_allow
+                    .iter()
+                    .map(|entry| format!("{}:{}", entry.path, entry.mode))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        }
+    }
+
+    /// The seed authorizations this field describes, or why it cannot be read.
+    ///
+    /// Each entry is `path:mode`, and both halves are validated here rather
+    /// than at launch: an authorization that cannot be joined onto a child's
+    /// private state directory, or that names a mode friring does not have, is
+    /// a profile that would refuse every bridge launch under it.
+    ///
+    /// # Errors
+    ///
+    /// An entry with no `:`, an unknown mode, or a path
+    /// [`ChildSeedAllow::validate`](crate::session::ChildSeedAllow::validate)
+    /// rejects.
+    fn seed_allow(&self) -> Result<Vec<crate::session::ChildSeedAllow>, String> {
+        let mut out = Vec::new();
+        for raw in self.child_seed_allow.value().split(',') {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let (path, mode) = raw.rsplit_once(':').ok_or_else(|| {
+                format!("Child state seed '{raw}' needs a mode: write it as 'path:mode'")
+            })?;
+            let entry = crate::session::ChildSeedAllow {
+                path: path.trim().to_string(),
+                mode: mode.trim().parse()?,
+            };
+            entry.validate()?;
+            out.push(entry);
+        }
+        Ok(out)
+    }
+}
+
+/// Split a comma-separated editor field into trimmed, non-empty values.
+fn comma_values(input: &TextInput) -> Vec<String> {
+    input
+        .value()
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Editor form for creating or editing a sandbox profile.
 ///
 /// Mirrors [`AutomationEditorModal`]: one `visible_fields` projection drives
@@ -2676,6 +2866,10 @@ pub struct SandboxEditorModal {
     pub image: TextInput,
     pub containerfile: TextInput,
     pub allow_unsandboxed_fallback: bool,
+    /// The orchestration-bridge fields (ADR-31), carried through the form so a
+    /// save cannot silently clear a grant the editor does not yet render. The
+    /// rows that edit them land with the bridge's UI surface.
+    pub bridge: BridgeProfileFields,
     pub field: SandboxField,
     /// Carried from the stored profile so saving an edit doesn't reset it.
     pub created_at: u64,
@@ -2764,6 +2958,7 @@ impl SandboxEditorModal {
             image,
             containerfile,
             allow_unsandboxed_fallback: profile.allow_unsandboxed_fallback,
+            bridge: BridgeProfileFields::from_profile(profile),
             field: SandboxField::default(),
             created_at: profile.created_at,
             undecoded: Vec::new(),
@@ -2792,7 +2987,15 @@ impl SandboxEditorModal {
             Image,
             Containerfile,
             Fallback,
+            BridgeGrants,
         ]);
+        // The four fields that only mean anything once something is granted.
+        // Hidden rather than greyed: a fan-out cap on a profile that grants no
+        // bridge is a number nothing reads, and offering it would suggest
+        // otherwise.
+        if self.bridge.preset != BridgePreset::None {
+            fields.extend([MaxChildren, ChildAgents, ChildSharedRw, ChildSeedAllow]);
+        }
         fields
     }
 
@@ -2893,7 +3096,15 @@ impl SandboxEditorModal {
         use SandboxField::*;
         matches!(
             self.field,
-            Backend | Paths | PathMode | Network | Domains | PromptDomains | ReadScope | Fallback
+            Backend
+                | Paths
+                | PathMode
+                | Network
+                | Domains
+                | PromptDomains
+                | ReadScope
+                | Fallback
+                | BridgeGrants
         )
     }
 
@@ -2929,6 +3140,14 @@ impl SandboxEditorModal {
             PromptDomains => self.prompt_new_domains = !self.prompt_new_domains,
             ReadScope => self.read_scope = cycle_value(ReadScope::ALL, self.read_scope, delta),
             Fallback => self.allow_unsandboxed_fallback = !self.allow_unsandboxed_fallback,
+            BridgeGrants => {
+                self.bridge.preset = cycle_value(BridgePreset::ALL, self.bridge.preset, delta);
+                // The four dependent rows appear and disappear with the grant,
+                // so focus has to stay on a row that still exists.
+                if !self.visible_fields().contains(&self.field) {
+                    self.field = BridgeGrants;
+                }
+            }
             _ => {}
         }
     }
@@ -2949,8 +3168,12 @@ impl SandboxEditorModal {
             Cpus => &mut self.cpus,
             Image => &mut self.image,
             Containerfile => &mut self.containerfile,
+            MaxChildren => &mut self.bridge.max_children,
+            ChildAgents => &mut self.bridge.child_agents,
+            ChildSharedRw => &mut self.bridge.child_shared_rw,
+            ChildSeedAllow => &mut self.bridge.child_seed_allow,
             Backend | Paths | PathMode | Network | Domains | PromptDomains | ReadScope
-            | Fallback => return None,
+            | Fallback | BridgeGrants => return None,
         })
     }
 
@@ -2967,8 +3190,12 @@ impl SandboxEditorModal {
             Cpus => self.cpus.cursor_pos(),
             Image => self.image.cursor_pos(),
             Containerfile => self.containerfile.cursor_pos(),
+            MaxChildren => self.bridge.max_children.cursor_pos(),
+            ChildAgents => self.bridge.child_agents.cursor_pos(),
+            ChildSharedRw => self.bridge.child_shared_rw.cursor_pos(),
+            ChildSeedAllow => self.bridge.child_seed_allow.cursor_pos(),
             Backend | Paths | PathMode | Network | Domains | PromptDomains | ReadScope
-            | Fallback => 0,
+            | Fallback | BridgeGrants => 0,
         }
     }
 
@@ -3028,6 +3255,7 @@ impl SandboxEditorModal {
         use crate::session::{SandboxPath, SandboxProfile};
         let limits = self.field_available(SandboxField::Memory);
         let image = self.field_available(SandboxField::Image);
+        let bridge = self.field_available(SandboxField::BridgeGrants);
         Ok(SandboxProfile {
             name: self.name.value().trim().to_string(),
             backend: self.backend,
@@ -3058,6 +3286,34 @@ impl SandboxEditorModal {
                 .then(|| trimmed_option(self.containerfile.value()))
                 .flatten(),
             allow_unsandboxed_fallback: self.allow_unsandboxed_fallback,
+            // Left out entirely when the backend cannot carry the bridge, for
+            // the reason every other unavailable capability is: the row renders
+            // as unavailable, so a value the user cannot see must not decide
+            // the save. The typed text stays in the form.
+            bridge_grants: if bridge {
+                self.bridge.preset.grants()
+            } else {
+                Vec::new()
+            },
+            max_children: bridge
+                .then(|| parse_limit(self.bridge.max_children.value(), "Child limit", "children"))
+                .transpose()?
+                .flatten()
+                .unwrap_or(crate::session::DEFAULT_MAX_CHILDREN),
+            child_agents: if bridge {
+                comma_values(&self.bridge.child_agents)
+            } else {
+                Vec::new()
+            },
+            child_shared_rw: if bridge {
+                comma_values(&self.bridge.child_shared_rw)
+            } else {
+                Vec::new()
+            },
+            child_seed_allow: bridge
+                .then(|| self.bridge.seed_allow())
+                .transpose()?
+                .unwrap_or_default(),
             created_at: self.created_at,
             // Storage stamps the save; a form has no clock.
             updated_at: 0,

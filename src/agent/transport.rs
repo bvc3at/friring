@@ -201,14 +201,11 @@ pub enum TmuxTransport {
 /// `PSMUX_TARGET_SESSION = <socket>__<session>`). Stripping them makes friring's
 /// explicit `-L <socket> -t <session>` always target its own server, whether the
 /// host OS is Windows (psmux) or Unix (friring launched from inside tmux).
-const MUX_NESTING_ENV: &[&str] = &[
-    "TMUX",
-    "TMUX_PANE",
-    "PSMUX",
-    "PSMUX_PANE",
-    "PSMUX_SESSION",
-    "PSMUX_TARGET_SESSION",
-];
+///
+/// The list itself lives in the pure-data layer because a sandbox launch strips
+/// the same variables for a different reason — see
+/// [`crate::session::MUX_NESTING_ENV`].
+const MUX_NESTING_ENV: &[&str] = crate::session::MUX_NESTING_ENV;
 
 /// Remove the multiplexer-nesting env vars (see [`MUX_NESTING_ENV`]) from `cmd`
 /// so a multiplexer subcommand never inherits an outer pane's target context.

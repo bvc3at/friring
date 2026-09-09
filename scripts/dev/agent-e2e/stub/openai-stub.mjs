@@ -9,12 +9,29 @@
 //   POST {base}/chat/completions   opencode (@ai-sdk/openai-compatible)
 //
 // Same CLI surface, fixture schema and journal shape as anthropic-stub.mjs
-// (shared via stub-core.mjs); only the wire encoding differs. Replies are
-// TEXT-ONLY on this dialect: `reply.toolUse` is an anthropic-stub feature —
-// the tool-use loop is conformance-tested against Claude Code, while this
-// dialect exists to render stubbed conversations (demos, text turns).
+// (shared via stub-core.mjs); only the wire encoding differs.
 //
-// Conformance notes (probed against codex-cli 0.144.4):
+// `reply.toolUse` works here too, and it is what lets a stubbed codex leader
+// actually *run* something rather than only narrate: the scenario names the
+// tool and the arguments, the CLI executes them, and its output comes back as
+// the next request's `function_call_output`. That is how the bridge is exercised
+// end to end from a real agent binary with no model behind it.
+//
+//   "reply": {
+//     "text": "…",                              // optional, emitted first
+//     "toolUse": {
+//       "id": "call_e2e_1",                     // becomes call_id
+//       "name": "shell",                        // the tool the CLI declared
+//       "input": {"command": ["bash","-lc","…"]}
+//     }
+//   }
+//
+// A fixture matches the *next* turn on `hasToolResult` / `toolResultIds`, so a
+// loop is written as: call fixture, then a fixture with `"hasToolResult": true`.
+// Both are scoped to the turn being answered (the trailing tool outputs), which
+// is what lets the same pair fire again on a later turn of the same thread.
+//
+// Conformance notes (probed against codex-cli 0.144.4 and 0.149.0):
 // - codex sends the full transcript in `input`; the LAST input item with
 //   role "user" is the prompt (an earlier user item carries
 //   <environment_context> — never match on position, only on role order).
@@ -22,6 +39,11 @@
 //   response.output_item.added → response.output_text.delta* →
 //   response.output_item.done → response.completed (usage drives the
 //   "tokens used" line, so it is fixed for run-to-run stability).
+// - A function call is the same envelope with a `function_call` item:
+//   output_item.added → function_call_arguments.delta →
+//   function_call_arguments.done → output_item.done, and the item repeated in
+//   `response.completed.output`. `arguments` is a JSON **string**, not an
+//   object, on every one of those events.
 import { createStub, serveStub, effectiveText, chunkText, sleep } from './stub-core.mjs';
 
 const stub = createStub('openai-stub');
@@ -46,7 +68,18 @@ function summarizeResponses(body) {
   const userTexts = items
     .filter((i) => i && i.role === 'user')
     .map((i) => textOfContent(i.content));
-  const toolOutputs = items.filter((i) => i && i.type === 'function_call_output');
+  // The **trailing** run of outputs, not every one the transcript ever carried.
+  // codex sends the whole thread on each turn and `codex resume` replays it, so
+  // an "anywhere in `input`" reading makes `hasToolResult` true for every turn
+  // after the first: the terminator fixture of a two-fixture loop then shadows
+  // the call fixture and the agent never runs anything again. This is also what
+  // `hasToolResult` has always meant in the anthropic dialect, which scopes it
+  // to the last user message — one vocabulary, one meaning.
+  const toolOutputs = [];
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    if (items[i] && items[i].type === 'function_call_output') toolOutputs.unshift(items[i]);
+    else break;
+  }
   return {
     model: body.model || '',
     stream: body.stream !== false,
@@ -69,7 +102,14 @@ function summarizeChat(body) {
   const userTexts = msgs
     .filter((m) => m && m.role === 'user')
     .map((m) => textOfContent(m.content));
-  const toolMsgs = msgs.filter((m) => m && m.role === 'tool');
+  // The trailing run, for the reason `summarizeResponses` takes one: both keys
+  // describe the turn being answered, so `toolResultFor` must not still match on
+  // a call the agent made several turns ago.
+  const toolMsgs = [];
+  for (let i = msgs.length - 1; i >= 0; i -= 1) {
+    if (msgs[i] && msgs[i].role === 'tool') toolMsgs.unshift(msgs[i]);
+    else break;
+  }
   return {
     model: body.model || '',
     stream: body.stream !== false,
@@ -80,7 +120,7 @@ function summarizeChat(body) {
       .filter((m) => m && (m.role === 'system' || m.role === 'developer'))
       .map((m) => textOfContent(m.content))
       .join('\n'),
-    hasToolResult: msgs.length > 0 && msgs[msgs.length - 1].role === 'tool',
+    hasToolResult: toolMsgs.length > 0,
     toolResultIds: toolMsgs.map((m) => m.tool_call_id).filter(Boolean),
     nTools: Array.isArray(body.tools) ? body.tools.length : 0,
   };
@@ -92,6 +132,12 @@ function sseWrite(res, event, data) {
   else res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
+/** The `arguments` string a `function_call` carries, from a fixture's input. */
+function argumentsOf(toolUse) {
+  if (typeof toolUse.arguments === 'string') return toolUse.arguments;
+  return JSON.stringify(toolUse.input || {});
+}
+
 async function respondResponses(res, model, picked) {
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
@@ -101,44 +147,95 @@ async function respondResponses(res, model, picked) {
   const { reply, delayMs } = picked;
   const text = effectiveText(reply);
   const respId = stub.nextMessageId('resp_e2e_');
-  const itemId = stub.nextMessageId('msg_e2e_');
+  const output = [];
+  let index = 0;
   sseWrite(res, 'response.created', {
     type: 'response.created',
     response: { id: respId, status: 'in_progress' },
   });
-  sseWrite(res, 'response.output_item.added', {
-    type: 'response.output_item.added',
-    output_index: 0,
-    item: { type: 'message', id: itemId, status: 'in_progress', role: 'assistant', content: [] },
-  });
-  for (const piece of chunkText(text)) {
-    sseWrite(res, 'response.output_text.delta', {
-      type: 'response.output_text.delta',
-      item_id: itemId,
-      output_index: 0,
-      content_index: 0,
-      delta: piece,
+
+  // Text first, so a turn that both narrates and acts reads in that order. A
+  // reply with neither still emits an (empty) message item: a `response.completed`
+  // with no output at all is not something the CLIs are known to accept, and
+  // this keeps the no-fixture marker reply on the path it has always taken.
+  if (text || !reply.toolUse) {
+    const itemId = stub.nextMessageId('msg_e2e_');
+    sseWrite(res, 'response.output_item.added', {
+      type: 'response.output_item.added',
+      output_index: index,
+      item: { type: 'message', id: itemId, status: 'in_progress', role: 'assistant', content: [] },
     });
-    if (delayMs) await sleep(delayMs);
+    for (const piece of chunkText(text)) {
+      sseWrite(res, 'response.output_text.delta', {
+        type: 'response.output_text.delta',
+        item_id: itemId,
+        output_index: index,
+        content_index: 0,
+        delta: piece,
+      });
+      if (delayMs) await sleep(delayMs);
+    }
+    const doneItem = {
+      type: 'message',
+      id: itemId,
+      status: 'completed',
+      role: 'assistant',
+      content: [{ type: 'output_text', text, annotations: [] }],
+    };
+    sseWrite(res, 'response.output_item.done', {
+      type: 'response.output_item.done',
+      output_index: index,
+      item: doneItem,
+    });
+    output.push(doneItem);
+    index += 1;
   }
-  const doneItem = {
-    type: 'message',
-    id: itemId,
-    status: 'completed',
-    role: 'assistant',
-    content: [{ type: 'output_text', text, annotations: [] }],
-  };
-  sseWrite(res, 'response.output_item.done', {
-    type: 'response.output_item.done',
-    output_index: 0,
-    item: doneItem,
-  });
+
+  if (reply.toolUse) {
+    const callId = reply.toolUse.id || stub.nextMessageId('call_e2e_');
+    const itemId = stub.nextMessageId('fc_e2e_');
+    const args = argumentsOf(reply.toolUse);
+    const item = {
+      type: 'function_call',
+      id: itemId,
+      call_id: callId,
+      name: reply.toolUse.name,
+      arguments: '',
+      status: 'in_progress',
+    };
+    sseWrite(res, 'response.output_item.added', {
+      type: 'response.output_item.added',
+      output_index: index,
+      item,
+    });
+    sseWrite(res, 'response.function_call_arguments.delta', {
+      type: 'response.function_call_arguments.delta',
+      item_id: itemId,
+      output_index: index,
+      delta: args,
+    });
+    sseWrite(res, 'response.function_call_arguments.done', {
+      type: 'response.function_call_arguments.done',
+      item_id: itemId,
+      output_index: index,
+      arguments: args,
+    });
+    const doneItem = { ...item, arguments: args, status: 'completed' };
+    sseWrite(res, 'response.output_item.done', {
+      type: 'response.output_item.done',
+      output_index: index,
+      item: doneItem,
+    });
+    output.push(doneItem);
+    index += 1;
+  }
+
   sseWrite(res, 'response.completed', {
     type: 'response.completed',
     response: {
       id: respId,
       status: 'completed',
-      output: [doneItem],
+      output,
       usage: {
         input_tokens: USAGE.input_tokens,
         input_tokens_details: { cached_tokens: 0 },
@@ -155,7 +252,21 @@ async function respondChat(res, model, picked, stream) {
   const { reply, delayMs } = picked;
   const text = effectiveText(reply);
   const id = stub.nextMessageId('chatcmpl_e2e_');
+  // The Chat-Completions spelling of the same call.
+  const toolCalls = reply.toolUse
+    ? [
+        {
+          index: 0,
+          id: reply.toolUse.id || stub.nextMessageId('call_e2e_'),
+          type: 'function',
+          function: { name: reply.toolUse.name, arguments: argumentsOf(reply.toolUse) },
+        },
+      ]
+    : null;
+  const finish = toolCalls ? 'tool_calls' : 'stop';
   if (!stream) {
+    const message = { role: 'assistant', content: text || null };
+    if (toolCalls) message.tool_calls = toolCalls.map(({ index: _index, ...rest }) => rest);
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(
       JSON.stringify({
@@ -163,13 +274,7 @@ async function respondChat(res, model, picked, stream) {
         object: 'chat.completion',
         created: 0,
         model,
-        choices: [
-          {
-            index: 0,
-            message: { role: 'assistant', content: text },
-            finish_reason: 'stop',
-          },
-        ],
+        choices: [{ index: 0, message, finish_reason: finish }],
         usage: {
           prompt_tokens: USAGE.input_tokens,
           completion_tokens: USAGE.output_tokens,
@@ -196,7 +301,8 @@ async function respondChat(res, model, picked, stream) {
     sseWrite(res, null, chunk({ content: piece }));
     if (delayMs) await sleep(delayMs);
   }
-  const last = chunk({}, 'stop');
+  if (toolCalls) sseWrite(res, null, chunk({ tool_calls: toolCalls }));
+  const last = chunk({}, finish);
   last.usage = {
     prompt_tokens: USAGE.input_tokens,
     completion_tokens: USAGE.output_tokens,

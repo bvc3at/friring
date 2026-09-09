@@ -70,6 +70,9 @@ fn central_tabs_width(area: Rect, chevron: Option<Rect>, cells: &[CentralTabCell
 struct InfoPanelData {
     automations: Vec<info_panel::AutomationEntry>,
     parent_name: Option<String>,
+    /// Where this session sits in an orchestration, resolved from the rows
+    /// (ADR-32). `None` for the overwhelming majority, which are in none.
+    bridge: Option<info_panel::BridgeRow>,
 }
 
 /// `area` with the session list's columns carved off its left edge, so an
@@ -579,7 +582,10 @@ impl App {
             Some(&self.metrics.system_metrics),
             &data.automations,
             self.agent_usage(info),
-            data.parent_name.as_deref(),
+            &info_panel::Resolved {
+                parent_name: data.parent_name.as_deref(),
+                bridge: data.bridge.as_ref(),
+            },
         );
     }
 
@@ -631,7 +637,71 @@ impl App {
         InfoPanelData {
             automations,
             parent_name,
+            bridge: self.bridge_row(info.id),
         }
+    }
+
+    /// What the info panel's `Bridge:` row says about one session.
+    ///
+    /// Read from the rows here rather than in the view, for the reason every
+    /// other resolved field on that panel is: the view probes nothing.
+    /// Ownership is authority, and a view that read it could be wrong about who
+    /// may act on what.
+    #[cfg(test)]
+    pub(crate) fn bridge_row_for_test(
+        &self,
+        id: crate::session::SessionId,
+    ) -> Option<info_panel::BridgeRow> {
+        self.bridge_row(id)
+    }
+
+    fn bridge_row(&self, id: crate::session::SessionId) -> Option<info_panel::BridgeRow> {
+        let key = id.to_string();
+        let owner_row = self.db.bridge_child(&key).ok().flatten();
+        let children = self.db.bridge_child_states_of(&key).unwrap_or_default();
+        if owner_row.is_none() && children.is_empty() {
+            return None;
+        }
+        let child_state = self
+            .db
+            .bridge_child_state(&key)
+            .ok()
+            .flatten()
+            .map(|row| row.state.to_string());
+        let owner = owner_row.as_ref().and_then(|row| {
+            row.owner_id
+                .parse::<crate::session::SessionId>()
+                .ok()
+                .and_then(|id| self.sessions.iter().find(|s| s.info.id == id))
+                .map(|s| s.info.name.clone())
+        });
+        let live = children.iter().filter(|row| row.state.is_live()).count();
+        let cap = self
+            .sessions
+            .iter()
+            .find(|s| s.info.id == id)
+            .and_then(|s| s.info.sandbox_profile.clone())
+            .and_then(|name| self.db.get_sandbox_profile(&name).ok().flatten())
+            .map(|stored| stored.profile.max_children)
+            .unwrap_or(0);
+        // The states an operator has to do something about. A `blocked` child is
+        // waiting on its owner; a `dirty` or unstoppable one is waiting on a
+        // person.
+        let needs_operator = children.iter().any(|row| {
+            matches!(
+                row.state,
+                crate::session::ChildState::Dirty
+                    | crate::session::ChildState::StopFailed
+                    | crate::session::ChildState::Blocked
+                    | crate::session::ChildState::Stalled
+            )
+        });
+        Some(info_panel::BridgeRow {
+            child_state,
+            owner,
+            children: (!children.is_empty()).then_some((live, cap)),
+            needs_operator,
+        })
     }
 
     /// Rows (incl. borders) the active session's info panel needs for its full
@@ -647,7 +717,10 @@ impl App {
             Some(&self.metrics.system_metrics),
             &data.automations,
             self.agent_usage(info),
-            data.parent_name.as_deref(),
+            &info_panel::Resolved {
+                parent_name: data.parent_name.as_deref(),
+                bridge: data.bridge.as_ref(),
+            },
         )
     }
 

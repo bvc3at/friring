@@ -112,6 +112,177 @@ fn local_mux_command(args: &[&str]) -> Command {
     cmd
 }
 
+/// The multiplexer sockets on this host, as the sandbox layer needs them.
+///
+/// Computed once and cached, and the caching is the point: `outer_socket` comes
+/// from friring's **own** `$TMUX`, which is read here before any launch path
+/// strips it from a child (see [`crate::session::MUX_NESTING_ENV`]). A later
+/// reader would still see it — `strip_mux_nesting_env` edits a `Command`, not
+/// this process's environment — but the value is a fact about how friring was
+/// started and pinning it makes that explicit.
+///
+/// `own_socket` is `<root>/tmux-<uid>/<name>`, which is the path tmux itself
+/// derives from `-L <name>`: `$TMUX_TMPDIR` (or `/tmp`) as the root, one
+/// directory per user, the socket named by the `-L` argument. Stage B compares
+/// the running server's reported `#{socket_path}` against it and refuses a
+/// launch when the two differ, so the deny set and the server friring drives are
+/// provably the same one.
+pub fn host_mux_sockets() -> &'static crate::session::HostMuxSockets {
+    static SOCKETS: std::sync::OnceLock<crate::session::HostMuxSockets> =
+        std::sync::OnceLock::new();
+    SOCKETS.get_or_init(|| {
+        let uid = current_uid();
+        let root = crate::sandbox::dirs::tmux_socket_root();
+        crate::session::HostMuxSockets {
+            own_socket: root.join(format!("tmux-{uid}")).join(local_socket()),
+            outer_socket: outer_mux_socket(),
+            uid,
+        }
+    })
+}
+
+/// This process's uid, or `0` where the platform has no such concept.
+///
+/// Windows is the `0`: psmux resolves `-L <name>` machine-wide with no
+/// `tmux-<uid>` directory at all, and there is no sandbox on a native Windows
+/// host for the value to feed (`docs/SANDBOX.md`), so the number is never used
+/// there.
+fn current_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: `getuid` takes no arguments, cannot fail and touches no
+        // memory friring owns.
+        unsafe { libc::getuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// The socket of the server friring is running inside, from the first
+/// `,`-separated field of `$TMUX`.
+///
+/// `$TMUX` is `<socket path>,<server pid>,<session index>`. Only the path is
+/// wanted, and only when it is absolute: a relative or empty first field is not
+/// a socket this can deny, and guessing one would put an arbitrary string into a
+/// generated policy.
+fn outer_mux_socket() -> Option<std::path::PathBuf> {
+    let value = std::env::var("TMUX").ok()?;
+    let path = value.split(',').next()?.trim();
+    let path = std::path::PathBuf::from(path);
+    path.is_absolute().then_some(path)
+}
+
+/// Whether the server friring is talking to is the server whose socket the
+/// policy denied (ADR-33).
+///
+/// The deny set is computed from `HostMuxSockets::own_socket` — the path tmux
+/// *derives* from `-L <name>` — and this is what proves the derivation was
+/// right. A server reporting a different `#{socket_path}` is one the generated
+/// policy says nothing about, so a sandbox launched against it would be
+/// unconstrained in exactly the dimension the deny set exists for. Both
+/// spellings are compared, because `/tmp` is `/private/tmp` on macOS.
+///
+/// A server that does not report the variable at all degrades to the marker:
+/// `Ok(())`, because refusing would take the feature away on an older tmux for
+/// a cross-check friring never had.
+pub fn socket_matches_policy(identity: &crate::session::MuxServerIdentity) -> Result<()> {
+    let Some(reported) = identity.socket_path.as_deref() else {
+        return Ok(());
+    };
+    let expected = identity.host.own_socket.display().to_string();
+    if same_socket(reported, &expected) {
+        return Ok(());
+    }
+    bail!(
+        "identity_mismatch: the multiplexer server friring is connected to reports its socket as \
+         '{reported}', but the sandbox policy denies '{expected}'. A launch on this server would \
+         be unconstrained in exactly the way that deny set exists to prevent"
+    )
+}
+
+/// Whether two socket paths name one file, comparing each in its written and
+/// its resolved spelling.
+fn same_socket(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let resolve = |path: &str| crate::sandbox::dirs::canonical(path);
+    match (resolve(left), resolve(right)) {
+        // Both resolve: the kernel's answer is the comparison.
+        (Some(left), Some(right)) => left == right,
+        // One resolves and the other does not — a socket that is not there
+        // (yet) has no resolved spelling, so the resolved one is compared
+        // against the written one.
+        (Some(left), None) => left == right,
+        (None, Some(right)) => left == right,
+        (None, None) => false,
+    }
+}
+
+/// Read what `new-window -P -F` reported, tolerating a server that answered
+/// with less than was asked for.
+///
+/// A format variable a running tmux does not know expands to the empty string
+/// rather than failing the command, so a short or blank field is "this server
+/// does not report that" — recorded as `None`, which
+/// [`MuxIdentity::is_recorded`](crate::session::MuxIdentity::is_recorded) reads
+/// as a weaker identity rather than as a match. Degrading is right here: the
+/// authority is friring's own marker, and refusing the launch over a missing
+/// cross-check would take the feature away on an older tmux for no gain.
+fn parse_spawn_identity(reported: &str) -> crate::session::MuxIdentity {
+    let mut fields = reported.split('|');
+    crate::session::MuxIdentity {
+        server: None,
+        window_id: non_empty(fields.next()),
+        pane_id: non_empty(fields.next()),
+        pane_pid: non_empty(fields.next()).and_then(|pid| pid.parse().ok()),
+        launch_key: None,
+    }
+}
+
+/// Read what `display-message -p -t <pane>` reported for a live pane: the three
+/// spawn fields plus friring's own marker.
+fn parse_pane_identity(reported: &str) -> crate::session::MuxIdentity {
+    let mut fields = reported.split('|');
+    crate::session::MuxIdentity {
+        server: None,
+        window_id: non_empty(fields.next()),
+        pane_id: non_empty(fields.next()),
+        pane_pid: non_empty(fields.next()).and_then(|pid| pid.parse().ok()),
+        launch_key: non_empty(fields.next()),
+    }
+}
+
+/// A reported field, or `None` when the server had nothing to say.
+fn non_empty(field: Option<&str>) -> Option<String> {
+    field
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// What `new-window -P -F` reports about the pane it created (ADR-32).
+///
+/// Three variables, `|`-separated. The pane id alone was enough while the only
+/// question was "which pane do I read"; it is not enough for "may I kill this",
+/// because a pane id is reused after a server restart and a window can be
+/// created by anything with the socket. The window id anchors the window, and
+/// the pane pid is what makes a *recycled* pane id detectable.
+///
+/// Every variable here is in the tmux 3.2 man page — the floor `docs/SANDBOX.md`
+/// states — so a server old enough for friring at all reports all three.
+const SPAWN_FORMAT: &str = "#{window_id}|#{pane_id}|#{pane_pid}";
+
+/// What a live pane reports when friring revalidates it: the same three, plus
+/// friring's own marker.
+const PANE_IDENTITY_FORMAT: &str = "#{window_id}|#{pane_id}|#{pane_pid}|#{@friring_pane}";
+
+/// What the **server** reports about itself, for
+/// [`crate::session::MuxServerIdentity`].
+const SERVER_IDENTITY_FORMAT: &str = "#{socket_path}|#{pid}|#{start_time}|#{@friring_server}";
+
 /// Window-name prefix for friring-managed tmux windows. Combined with the
 /// sanitized session name (`{prefix}{sanitized_name}`) to form the tmux
 /// window target.
@@ -872,13 +1043,24 @@ impl TmuxBackend {
     /// mode) and the headless spawn paths ([`spawn_window`],
     /// [`ensure_automation_heartbeat`]) that drive tmux via one-shot commands and
     /// must not open a control-mode connection.
+    ///
+    /// # Losing the create race is success, not failure
+    ///
+    /// The probe and the create are two commands, and ADR-7b puts several
+    /// friring instances on one machine. Two that start at the same moment can
+    /// both find the session absent and both run `new-session -s <name>`; tmux
+    /// fails the loser with "duplicate session", and the loser would otherwise
+    /// report a failed spawn for a session that is, in fact, there. So a failed
+    /// create is re-probed, and an existing session makes it a success — which
+    /// masks nothing, because a create that failed for any other reason still
+    /// leaves no session and still propagates.
     fn ensure_session_configured(&self) -> Result<()> {
         if !self.session_exists() {
             debug!(
                 "Creating tmux session '{}' on socket '{}'",
                 self.session, self.socket
             );
-            self.run_tmux(&[
+            if let Err(e) = self.run_tmux(&[
                 "new-session",
                 "-d",
                 "-s",
@@ -887,8 +1069,15 @@ impl TmuxBackend {
                 "80",
                 "-y",
                 "24",
-            ])
-            .context("Failed to create tmux session")?;
+            ]) {
+                if !self.session_exists() {
+                    return Err(e).context("Failed to create tmux session");
+                }
+                debug!(
+                    "tmux session '{}' was created concurrently; continuing",
+                    self.session
+                );
+            }
             // Cheap defensiveness on Windows: poll until the freshly-created
             // session answers `has-session` before applying options. (The
             // `no server running on 'friring__friring'` failure that originally
@@ -1131,7 +1320,7 @@ impl TmuxBackend {
         let escaped_window_name = quote_arg(window_name);
         let session = &self.session;
         format!(
-            "new-window -t {session} -n {escaped_window_name} -P -F '#{{pane_id}}'{cwd_part}{env_part} {shell_cmd}"
+            "new-window -t {session} -n {escaped_window_name} -P -F '{SPAWN_FORMAT}'{cwd_part}{env_part} {shell_cmd}"
         )
     }
 
@@ -1204,6 +1393,41 @@ impl TmuxBackend {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Ask the server who it is, stamping friring's own marker on it first if it
+    /// carries none (ADR-32).
+    ///
+    /// The marker is the authority. `@friring_server` is a uuid friring sets
+    /// once, so a server carrying it is a server friring has been talking to —
+    /// which `#{pid}` alone cannot show, because a pid is reused. `pid` and
+    /// `start_time` are cross-checks that both change across a restart.
+    ///
+    /// `socket_path` is the field that matters most: it is compared against the
+    /// socket the *policy* denied, so a launch on a server friring did not
+    /// expect is refused rather than sandboxed against the wrong deny set.
+    fn read_server_identity(&self) -> Result<crate::session::MuxServerIdentity> {
+        let marker_option = crate::session::MUX_SERVER_MARKER_OPTION;
+        // Set only when absent, so a reconnect keeps the uuid this server was
+        // first seen with. `-s` is a server option: one value per server, which
+        // is exactly the scope of the identity.
+        let existing = self
+            .ctrl_command(&format!("display-message -p '#{{{marker_option}}}'"))
+            .unwrap_or_default();
+        if existing.trim().is_empty() {
+            let minted = uuid::Uuid::new_v4().to_string();
+            self.ctrl_command_nowait(&format!("set-option -s {marker_option} {minted}"))?;
+        }
+        let reported =
+            self.ctrl_command(&format!("display-message -p '{SERVER_IDENTITY_FORMAT}'"))?;
+        let mut fields = reported.trim().split('|');
+        Ok(crate::session::MuxServerIdentity {
+            host: host_mux_sockets().clone(),
+            socket_path: non_empty(fields.next()),
+            pid: non_empty(fields.next()).and_then(|pid| pid.parse().ok()),
+            start_time: non_empty(fields.next()),
+            marker: non_empty(fields.next()),
+        })
     }
 
     /// Register a pane sender and return the corresponding reader.
@@ -1395,10 +1619,21 @@ impl SessionBackend for TmuxBackend {
     ) -> Result<SpawnedSession> {
         let cmd = self.new_window_command(window_name, command, args, cwd, env);
         let result = self.ctrl_command(&cmd)?;
-        let pane_id = result.trim().to_string();
-        if !control_mode::is_valid_pane_id(&pane_id) {
-            bail!("tmux new-window returned an invalid pane id: {pane_id:?}");
-        }
+        // `#{window_id}|#{pane_id}|#{pane_pid}` — the identity every later
+        // destructive action revalidates against (ADR-32). The pane id is
+        // required; the other two are recorded when the server reports them and
+        // are cross-checks rather than the authority.
+        let identity = parse_spawn_identity(result.trim());
+        let pane_id = identity
+            .pane_id
+            .clone()
+            .filter(|id| control_mode::is_valid_pane_id(id))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "tmux new-window reported no usable pane id: {:?}",
+                    result.trim()
+                )
+            })?;
 
         debug!(pane_id = %pane_id, "tmux window created via control mode");
 
@@ -1406,9 +1641,35 @@ impl SessionBackend for TmuxBackend {
 
         Ok(SpawnedSession {
             backend_id: pane_id,
+            identity,
             output: connected.output,
             input: connected.input,
         })
+    }
+
+    fn server_identity(&self) -> Option<crate::session::MuxServerIdentity> {
+        self.read_server_identity().ok()
+    }
+
+    fn pane_identity(&self, backend_id: &str) -> Result<crate::session::MuxIdentity> {
+        if !control_mode::is_valid_pane_id(backend_id) {
+            bail!("refusing to read the identity of an invalid pane id: {backend_id:?}");
+        }
+        let reported = self.ctrl_command(&format!(
+            "display-message -p -t {backend_id} '{PANE_IDENTITY_FORMAT}'"
+        ))?;
+        Ok(parse_pane_identity(reported.trim()))
+    }
+
+    fn set_pane_marker(&self, backend_id: &str, value: &str) -> Result<()> {
+        if !control_mode::is_valid_pane_id(backend_id) {
+            bail!("refusing to mark an invalid pane id: {backend_id:?}");
+        }
+        self.ctrl_command_nowait(&format!(
+            "set-option -p -t {backend_id} {} {}",
+            crate::session::MUX_PANE_MARKER_OPTION,
+            shell_escape(value)
+        ))
     }
 
     fn adopt(
@@ -2725,6 +2986,68 @@ fn parse_window_pane_pids(stdout: &str) -> std::collections::HashMap<String, u32
 
 #[cfg(test)]
 mod tests {
+    /// A server report parses into the identity every destructive action is
+    /// checked against — and a server that answered with less than was asked
+    /// for leaves the missing fields unrecorded rather than guessed.
+    #[test]
+    fn a_spawn_report_parses_into_the_recorded_identity() {
+        let full = super::parse_spawn_identity("@7|%12|4242");
+        assert_eq!(full.window_id.as_deref(), Some("@7"));
+        assert_eq!(full.pane_id.as_deref(), Some("%12"));
+        assert_eq!(full.pane_pid, Some(4242));
+        // The marker is stamped after the spawn, never reported by it.
+        assert_eq!(full.launch_key, None);
+
+        // A tmux that does not know a variable expands it to nothing rather
+        // than failing the command, so a blank field is "not reported".
+        let partial = super::parse_spawn_identity("|%12|");
+        assert_eq!(partial.window_id, None);
+        assert_eq!(partial.pane_id.as_deref(), Some("%12"));
+        assert_eq!(partial.pane_pid, None);
+
+        let live = super::parse_pane_identity("@7|%12|4242|sess-1:launch-1");
+        assert_eq!(live.launch_key.as_deref(), Some("sess-1:launch-1"));
+        assert!(live.is_recorded());
+    }
+
+    /// The deny set names the socket friring *derived* from `-L <name>`; this is
+    /// what proves the derivation was right. A server reporting anything else is
+    /// one the generated policy says nothing about.
+    #[test]
+    fn a_server_on_another_socket_refuses_every_launch() {
+        let host = crate::session::HostMuxSockets {
+            own_socket: std::path::PathBuf::from("/tmp/tmux-501/friring"),
+            outer_socket: None,
+            uid: 501,
+        };
+        let matching = crate::session::MuxServerIdentity {
+            host: host.clone(),
+            socket_path: Some("/tmp/tmux-501/friring".to_string()),
+            pid: Some(9),
+            start_time: None,
+            marker: Some("uuid".to_string()),
+        };
+        assert!(super::socket_matches_policy(&matching).is_ok());
+
+        let elsewhere = crate::session::MuxServerIdentity {
+            socket_path: Some("/tmp/tmux-501/other".to_string()),
+            ..matching.clone()
+        };
+        let refusal = super::socket_matches_policy(&elsewhere)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("identity_mismatch"), "{refusal}");
+        assert!(refusal.contains("/tmp/tmux-501/other"), "{refusal}");
+
+        // A server that does not report the variable degrades to the marker
+        // rather than failing a launch over a cross-check friring never had.
+        let silent = crate::session::MuxServerIdentity {
+            socket_path: None,
+            ..matching
+        };
+        assert!(super::socket_matches_policy(&silent).is_ok());
+    }
+
     use super::*;
     use crate::agent::control_mode::{
         decode_octal, format_send_keys, parse_notification, shell_escape,
@@ -3313,6 +3636,60 @@ mod tests {
         assert_eq!(backend.session, TMUX_SESSION);
         std::env::remove_var(SOCKET_OVERRIDE_ENV);
         std::env::remove_var(SESSION_OVERRIDE_ENV);
+    }
+
+    /// ADR-7b puts several friring instances on one machine, and the session
+    /// create is check-then-create: two that start together can both find the
+    /// session absent, and tmux fails the loser with "duplicate session". The
+    /// loser must still be ready, because the session it needs exists.
+    ///
+    /// Against a real tmux on a private socket, because that race lives entirely
+    /// in tmux: nothing friring holds can produce it, and a stub would only
+    /// re-assert the branch this test is here to justify. Every override is
+    /// process-global, which nextest's process-per-test makes safe (and which
+    /// the tests above already rely on).
+    #[cfg(unix)]
+    #[test]
+    fn losing_the_session_create_race_still_leaves_the_backend_ready() {
+        if !crate::paths::which_on_path("tmux") {
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        // A private socket directory *and* a name of this test's own: either
+        // alone would be enough, both together make it impossible for this to
+        // reach a server anyone else is using.
+        std::env::set_var("TMUX_TMPDIR", dir.path());
+        std::env::set_var(SOCKET_OVERRIDE_ENV, "friring-race-test");
+        std::env::set_var(SESSION_OVERRIDE_ENV, "friring-race-test");
+
+        // Spawning alone does not race: the first thread can finish the create
+        // before the last one probes, and then nobody takes the losing branch.
+        // The barrier holds every thread until all eight are ready to issue.
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let outcomes: Vec<_> = (0..8)
+            .map(|_| {
+                let gate = std::sync::Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    gate.wait();
+                    TmuxBackend::local().ensure_session_configured()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("the thread ran"))
+            .collect();
+
+        let backend = TmuxBackend::local();
+        let _ = backend.run_tmux(&["kill-server"]);
+        std::env::remove_var(SOCKET_OVERRIDE_ENV);
+        std::env::remove_var(SESSION_OVERRIDE_ENV);
+
+        for outcome in &outcomes {
+            assert!(
+                outcome.is_ok(),
+                "a concurrent starter reported failure for a session that exists: {outcome:?}"
+            );
+        }
     }
 
     #[cfg(unix)]

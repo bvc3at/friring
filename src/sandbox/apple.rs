@@ -801,6 +801,12 @@ impl SandboxBackend for AppleContainerBackend {
             // proxy at all. Nothing here ever gets one: a launch whose mode
             // needs a proxy is refused before one is bound.
             proxy_transport: ProxyTransport::UnixSocket,
+            // A place runs the agent *inside* a container or a VM, so a
+            // directory friring mints on the host is not at that path in there
+            // — and the bridge's authority is that friring exposed exactly one
+            // per session. Refused rather than approximated (ADR-30's deferred
+            // list).
+            bridge: false,
         }
     }
 

@@ -75,6 +75,58 @@ pub struct AgentDef {
     /// *user* declares the flags and directories here.
     #[serde(default)]
     pub sandbox: Option<AgentSandboxDef>,
+    /// Where this CLI stores the conversations it can resume
+    /// (`[agents.<name>.transcript]`), so friring can tell a resume that will
+    /// reach one from a resume that would silently start a new one.
+    ///
+    /// Declared rather than known: friring bakes in no agent knowledge, and
+    /// "does this conversation still exist?" is the one question a resume
+    /// contract cannot answer from argv alone. An agent that declares nothing
+    /// resumes in the TUI exactly as before — but a **bridge child** of that
+    /// agent is refused rather than relaunched blank, because a blank
+    /// conversation is indistinguishable from a resumed one from the outside
+    /// (ADR-32).
+    #[serde(default)]
+    pub transcript: Option<TranscriptDef>,
+}
+
+/// The `[agents.<name>.transcript]` block: how friring checks that a
+/// conversation is still there before resuming it.
+///
+/// Pure data, evaluated by `session_ops::conversation_exists`. Paths are
+/// relative to the agent's [`state_dir`](AgentSandboxDef::state_dir) — which is
+/// where a bridge child's *private* conversation lives (ADR-31), and what
+/// [`config_dir_env`](AgentSandboxDef::config_dir_env) relocates — so the same
+/// declaration answers the question for a family session and for a child.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptDef {
+    /// The directory conversations are stored in, relative to the agent's
+    /// `state_dir` (`"sessions"`, `"projects"`). Searched recursively: agents
+    /// shard by date (`sessions/2026/09/08/`) or by project.
+    pub dir: String,
+    /// The file-name suffix one stored conversation carries (`".jsonl"`). Empty
+    /// matches any file.
+    #[serde(default)]
+    pub suffix: String,
+    /// Whether a conversation's **file name** is the id friring resumes by, so
+    /// the check is about *this* conversation rather than about any
+    /// conversation.
+    ///
+    /// True for an agent that resumes by id (claude writes
+    /// `projects/<project>/<id>.jsonl`). False for an agent that resumes "the
+    /// latest in this directory", whose stored id is its own and not friring's.
+    ///
+    /// What `false` proves is weaker, and deliberately stated rather than
+    /// implied: that the directory the agent resolves *from* holds a
+    /// conversation, not that it holds **this** one. friring cannot say more
+    /// without parsing a vendor's transcript format, which is exactly the agent
+    /// knowledge the core does not hold. It is exact for a bridge child, whose
+    /// state directory is private and holds only its own conversations; for a
+    /// family session sharing one state directory with the operator's own work,
+    /// it is the same guarantee the agent's `--last` flag itself gives.
+    #[serde(default)]
+    pub name_has_id: bool,
 }
 
 /// How an agent gets its credentials inside a sandbox (`docs/SANDBOX.md`
@@ -201,6 +253,50 @@ pub struct AgentSandboxDef {
     /// session.
     #[serde(default)]
     pub login_fallback: Option<String>,
+    /// Which orchestration-bridge capabilities this agent **needs** (ADR-31).
+    ///
+    /// A declaration of what the agent will not work without, not a grant: the
+    /// profile grants, and a launch whose profile does not cover this list is
+    /// refused with `grant_missing` rather than started to fail later in a way
+    /// nobody can attribute. Generic names — no agent's identity ever decides a
+    /// capability.
+    #[serde(default)]
+    pub bridge_requires: Vec<super::sandbox_profile::BridgeCapability>,
+    /// What a **bridge child** running this agent needs seeded into its private
+    /// state directory (ADR-31).
+    ///
+    /// A child never runs from its family's shared state: it gets a private
+    /// directory of its own, and this says what has to be in it for the agent to
+    /// work at all. Each entry is a path relative to
+    /// [`state_dir`](Self::state_dir) plus the mode it needs.
+    ///
+    /// The agent declares; the **profile authorizes**. A seed reaches a child
+    /// only when the profile's `child_seed_allow` names that exact path with
+    /// that exact mode, so an operator decides which credential and
+    /// configuration surfaces a child receives and an agent registry cannot
+    /// widen them.
+    #[serde(default)]
+    pub child_state_seed: Vec<ChildStateSeed>,
+}
+
+/// One entry of an agent's private-state seed declaration (ADR-31).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildStateSeed {
+    /// A path relative to the agent's `state_dir`, normalized: no leading `/`,
+    /// no `..`. Validated where the profile's own authorization is.
+    pub src: String,
+    /// How it reaches the child's private directory.
+    pub mode: super::sandbox_profile::SeedMode,
+    /// Whether the agent cannot work without it.
+    ///
+    /// A **required** entry that is missing on disk, is not of the declared
+    /// kind, or is not authorized by the profile refuses the launch with
+    /// `state_unrelocatable` — never degrades it. A child that started without
+    /// the configuration its agent needs would fail in a way nobody can
+    /// attribute to a seed.
+    #[serde(default)]
+    pub required: bool,
 }
 
 impl AgentDef {
@@ -364,6 +460,7 @@ mod tests {
             ],
             resume_latest: false,
             hook_schema: None,
+            transcript: None,
             sandbox: None,
         }
     }
@@ -505,6 +602,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: None,
+            transcript: None,
             sandbox: None,
         };
         let args = d.build_args(None, None, Some("ignored"), None);
@@ -524,6 +622,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: true,
             hook_schema: None,
+            transcript: None,
             sandbox: None,
         };
         // resume id present, but no {id} token -> tokens unchanged.
@@ -561,6 +660,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: true,
             hook_schema: None,
+            transcript: None,
             sandbox: None,
         };
         // Flag set but no resume_args -> nothing to emit, so not "resumes latest".
@@ -587,6 +687,7 @@ mod tests {
                     new_session_args: vec![],
                     resume_latest: false,
                     hook_schema: None,
+                    transcript: None,
                     sandbox: None,
                 },
             ],

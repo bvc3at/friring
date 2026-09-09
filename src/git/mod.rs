@@ -685,6 +685,145 @@ pub fn create_worktree_on(
     Ok(wt_path)
 }
 
+/// What a [`claim_child_worktree`] that did not finish left behind.
+///
+/// The distinction is the whole point of the two-phase claim: `owns_branch`
+/// answers "is anything at the planned path this attempt's to remove?", and
+/// nothing else can. See [`claim_child_worktree`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimFailure {
+    /// What git said, for the caller's message.
+    pub detail: String,
+    /// Whether **this attempt** created the branch.
+    ///
+    /// `true` means the planned path and the branch belong to this caller: no
+    /// other process could have checked out a ref that did not exist before this
+    /// one atomically created it. `false` means the branch was already somebody
+    /// else's, so nothing at the planned path may be removed on this attempt's
+    /// behalf.
+    pub owns_branch: bool,
+}
+
+impl std::fmt::Display for ClaimFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for ClaimFailure {}
+
+/// Claim a branch and put a worktree on it, in two phases, so a failure says
+/// **whose** the leftovers are.
+///
+/// `git worktree add -b <branch> <path> <base>` is one command with two
+/// outcomes that are indistinguishable afterwards. Both of these leave a
+/// registered worktree at `<path>` on `<branch>`:
+///
+/// - another friring instance won the race and created it (ADR-7b: several
+///   instances share one database), and
+/// - *this* process created it and a repository hook — `post-checkout` is the
+///   usual one — then exited non-zero, so git reported failure over a worktree
+///   it had already made and registered.
+///
+/// The child-spawn saga has to tell them apart, because it reclaims what its
+/// failed launch made: getting it backwards either deletes the winner's clean
+/// worktree or leaks a directory and a branch with nothing left to name them.
+///
+/// So the claim is split. `git branch <branch> <base>` creates a ref or refuses
+/// — an atomic ref transaction, so exactly one caller can win it — and only
+/// after winning does this add the worktree. From then on ownership is not
+/// inferred, it is known: whatever sits at the planned path is on a branch this
+/// process holds, and no other process could have got there.
+///
+/// # Errors
+///
+/// Which branch git says the worktree registered at `worktree` is on.
+///
+/// The question a reclaim has to answer before it removes a directory, and one
+/// only git can: the *planned* path is not evidence of ownership, because
+/// the worktree layout maps `/` to `-` and two agent-chosen branch names —
+/// `feat/one` and `feat-one` — resolve to a single directory. The loser of that
+/// collision has the winner's directory recorded against its own failed saga.
+///
+/// `None` is "git would not say": the path is not a registered worktree, it is
+/// detached, or the command failed. Every one of those is a reason to leave the
+/// directory alone rather than a reason to remove it.
+pub fn worktree_branch_at(repo_path: &Path, worktree: &Path) -> Option<String> {
+    let output = git_command(None, repo_path, &["worktree", "list", "--porcelain"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // Compared canonically: git prints the resolved path, and a caller's is
+    // composed from a data directory that is a symlink on macOS.
+    let want = std::fs::canonicalize(worktree).ok()?;
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let mut at: Option<PathBuf> = None;
+    for line in listing.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            at = std::fs::canonicalize(path).ok();
+        } else if let Some(branch) = line.strip_prefix("branch ") {
+            if at.as_deref() == Some(want.as_path()) {
+                return Some(branch.trim_start_matches("refs/heads/").to_string());
+            }
+        }
+    }
+    None
+}
+
+/// A [`ClaimFailure`] carrying git's message and whether the branch was claimed.
+pub fn claim_child_worktree(
+    repo_path: &Path,
+    new_branch: &str,
+    base_branch: &str,
+) -> std::result::Result<PathBuf, ClaimFailure> {
+    let unclaimed = |detail: String| ClaimFailure {
+        detail,
+        owns_branch: false,
+    };
+    let wt_path = worktree_path_for(None, repo_path, new_branch)
+        .map_err(|e| unclaimed(format!("failed to resolve a worktree directory: {e:#}")))?;
+
+    let claim = git_command(None, repo_path, &["branch", new_branch, base_branch])
+        .output()
+        .map_err(|e| unclaimed(format!("failed to run git branch: {e}")))?;
+    if !claim.status.success() {
+        return Err(unclaimed(format!(
+            "git branch failed: {}",
+            String::from_utf8_lossy(&claim.stderr)
+        )));
+    }
+
+    // Past here the branch is this caller's, so every failure reports
+    // `owns_branch: true` — including one where git created nothing. The unwind
+    // is conservative in both directions: it removes a worktree only when it is
+    // clean and deletes a branch only when git agrees it carries nothing.
+    let owned = |detail: String| ClaimFailure {
+        detail,
+        owns_branch: true,
+    };
+    let output = git_command(
+        None,
+        repo_path,
+        &[
+            "worktree",
+            "add",
+            &wt_path.display().to_string(),
+            new_branch,
+        ],
+    )
+    .output()
+    .map_err(|e| owned(format!("failed to run git worktree add: {e}")))?;
+    if !output.status.success() {
+        return Err(owned(format!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(wt_path)
+}
+
 /// Idempotently provision a worktree on `branch`, returning its directory.
 ///
 /// Unlike [`create_worktree`] (which always passes `-b` and fails if the branch
@@ -741,6 +880,175 @@ pub fn remove_worktree_on(
     }
 
     Ok(())
+}
+
+/// Where [`create_or_attach_worktree`] would put a worktree, without making one.
+///
+/// The child-spawn saga records the path **before** it creates anything (ADR-32),
+/// so recovery has an exact directory to reconcile rather than a prefix to scan.
+/// The layout is deterministic, which is what makes recording it up front
+/// possible at all.
+pub fn planned_worktree_path(repo_path: &Path, branch: &str) -> Option<PathBuf> {
+    worktree_path(repo_path, branch)
+}
+
+/// Refuse a branch name a **bridge child** may not be created on.
+///
+/// A child's branch is chosen by the requesting agent and it decides a *path*:
+/// `worktree_segments` maps only `/` to `-`, so `..` survives intact and
+/// resolves to `<worktrees>/<repo-hash>` — the parent of every friring worktree
+/// for that repository, which `create_or_attach_worktree` would then hand the
+/// child as its workspace and cwd. So this asks two questions, and neither is
+/// trusted to imply the other:
+///
+/// 1. **Is it a ref name at all?** `git check-ref-format --branch`, git's own
+///    answer, which rejects `..`, a leading `-`, control characters, `~^:?*[`,
+///    `@{`, a trailing `.lock` and the rest. Asked of git rather than
+///    reimplemented, because a hand-written approximation of that grammar is
+///    exactly the kind of thing that is subtly wrong.
+/// 2. **Does the name it sanitizes to stay one path segment?** A ref name git
+///    accepts still becomes a directory name here, so a `/`-free reading of the
+///    result is checked directly: no separator, no `.`/`..`, nothing empty.
+///
+/// # Errors
+///
+/// The name is empty, git will not parse it as a branch, or it sanitizes to
+/// something that is not a single ordinary directory name. Each says which.
+pub fn check_child_branch_name(branch: &str) -> Result<(), String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("a child needs a branch to cut its worktree on".to_string());
+    }
+    // Bounded: a branch name is a path segment on some filesystem eventually.
+    if branch.len() > 200 {
+        return Err("that branch name is too long for a worktree directory".to_string());
+    }
+    let ok = std::process::Command::new("git")
+        .args(["check-ref-format", "--branch", branch])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !ok {
+        return Err(format!(
+            "'{branch}' is not a valid git branch name, so friring will not cut a child's \
+             worktree on it"
+        ));
+    }
+    let segment = branch.replace('/', "-");
+    if segment.is_empty()
+        || segment == "."
+        || segment == ".."
+        || segment.contains(std::path::MAIN_SEPARATOR)
+        || segment.contains('/')
+        || segment.contains('\\')
+        || segment.contains('\0')
+    {
+        return Err(format!(
+            "'{branch}' would not name a single directory under friring's worktree root"
+        ));
+    }
+    Ok(())
+}
+
+/// `git rev-parse HEAD` in `cwd`, or `None` when there is no commit to name.
+pub fn head_commit(cwd: &Path) -> Option<String> {
+    let out = run_git_capture(&["rev-parse", "HEAD"], cwd)?;
+    let sha = out.trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// Delete a local branch, refusing when it carries commits nothing else has.
+///
+/// `-d` rather than `-D` on purpose: the saga's recovery deletes a branch only
+/// when it is sure the branch carries no work, and git's own merged-check is a
+/// second opinion on that. A branch git will not delete stays, and the caller
+/// surfaces it.
+///
+/// # Errors
+///
+/// git refused — usually because the branch is not merged, which is exactly the
+/// case that must not be forced.
+pub fn delete_branch(repo_path: &Path, branch: &str) -> Result<()> {
+    let output = git_command(None, repo_path, &["branch", "-d", branch])
+        .output()
+        .context("failed to run git branch -d")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git branch -d failed: {stderr}");
+    }
+    Ok(())
+}
+
+/// How many commits `<base>..<tip>` carries, or `None` when git would not say.
+///
+/// `None` is **not** zero: recovery deletes a branch only on a positive answer
+/// of zero, so a repository git could not read leaves the branch alone.
+pub fn commits_ahead(repo_path: &Path, base: &str, tip: &str) -> Option<u32> {
+    let range = format!("{base}..{tip}");
+    let out = run_git_capture(&["rev-list", "--count", &range], repo_path)?;
+    out.trim().parse().ok()
+}
+
+/// What the **host** found in a child's worktree after it stopped the pane
+/// (ADR-32).
+///
+/// Every field is read by friring from git, after the agent could no longer
+/// write. This is what an integration step reads; the child's own summary is
+/// never part of it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorktreeVerdict {
+    /// `git symbolic-ref --short HEAD`. `None` on a detached head.
+    pub branch: Option<String>,
+    /// `git rev-parse HEAD`.
+    pub head: Option<String>,
+    /// `git status --porcelain` was non-empty.
+    pub dirty: bool,
+    /// `git rev-list --count <base_head>..HEAD`.
+    pub ahead_of_base: u32,
+    /// Set when git would not answer at all — a worktree that is gone, or one
+    /// that is no longer a repository. Read as **dirty**: friring will not
+    /// declare work integrated on a directory it could not inspect.
+    pub unreadable: bool,
+}
+
+/// Inspect a stopped child's worktree — the quiesce protocol's step 4.
+///
+/// Deliberately narrow: four read-only git commands, no fetch, no write, no
+/// `--force` anything. It runs after the pane is dead, so what it reads is
+/// final.
+///
+/// A worktree git cannot read comes back `unreadable` **and** `dirty`. The
+/// alternative — reporting a clean tree friring never saw — would let a
+/// deleted worktree read as verified-complete.
+pub fn verify_worktree(worktree: &Path, base_head: Option<&str>) -> WorktreeVerdict {
+    let Some(status) = run_git_capture(&["status", "--porcelain"], worktree) else {
+        return WorktreeVerdict {
+            dirty: true,
+            unreadable: true,
+            ..WorktreeVerdict::default()
+        };
+    };
+    let branch = run_git_capture(&["symbolic-ref", "--short", "HEAD"], worktree)
+        .map(|out| out.trim().to_string())
+        .filter(|b| !b.is_empty());
+    let head = head_commit(worktree);
+    let ahead_of_base = match (base_head, head.as_deref()) {
+        (Some(base), Some(_)) => {
+            run_git_capture(&["rev-list", "--count", &format!("{base}..HEAD")], worktree)
+                .and_then(|out| out.trim().parse().ok())
+                .unwrap_or(0)
+        }
+        _ => 0,
+    };
+    WorktreeVerdict {
+        branch,
+        head,
+        dirty: !status.trim().is_empty(),
+        ahead_of_base,
+        unreadable: false,
+    }
 }
 
 /// Detect the repository's default branch name.
@@ -1510,6 +1818,104 @@ mod tests {
         let p3 = create_or_attach_worktree(&repo, "feat/x", &base).expect("third reattaches");
         assert_eq!(p1, p3);
         assert!(p3.exists());
+    }
+
+    /// A repository with one commit, and the name of its default branch.
+    fn one_commit_repo(root: &Path) -> (PathBuf, String) {
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let ok = git_program()
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("run git")
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("file.txt"), "hi").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        let base = String::from_utf8(
+            git_program()
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        (repo, base)
+    }
+
+    /// A `git worktree add` that fails **after** creating the worktree still
+    /// says the branch is this caller's.
+    ///
+    /// This is the case the one-command form cannot express, observed against a
+    /// real git: a `post-checkout` hook that exits non-zero makes
+    /// `git worktree add` exit non-zero over a worktree it has already created
+    /// and registered. Read as "created nothing", the saga drops the path it
+    /// recorded and leaks the directory and its branch with nothing left to
+    /// reclaim them.
+    #[test]
+    fn a_hook_that_fails_after_the_checkout_still_leaves_the_branch_claimed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, base) = one_commit_repo(tmp.path());
+        let hooks = repo.join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("post-checkout");
+        std::fs::write(&hook, "#!/bin/sh\nexit 3\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _guard = TestPathGuard::new(tmp.path().join("data"));
+
+        let failure = claim_child_worktree(&repo, "feat/hooked", &base)
+            .expect_err("a failing post-checkout hook fails the add");
+        assert!(
+            failure.owns_branch,
+            "a failure past the branch claim reported the branch as somebody else's: {failure:?}"
+        );
+        // The reason it matters: git really did leave both behind.
+        assert!(
+            branch_exists(&repo, "feat/hooked"),
+            "the branch this claim created is gone"
+        );
+        assert!(
+            planned_worktree_path(&repo, "feat/hooked")
+                .unwrap()
+                .exists(),
+            "git reported failure and created no worktree, so this test proves nothing"
+        );
+    }
+
+    /// The other half: a caller that did **not** win the branch owns nothing at
+    /// the planned path, whatever is sitting there.
+    #[test]
+    fn a_branch_already_taken_leaves_the_loser_owning_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, base) = one_commit_repo(tmp.path());
+        let _guard = TestPathGuard::new(tmp.path().join("data"));
+
+        let won = claim_child_worktree(&repo, "feat/raced", &base).expect("the first claim wins");
+        assert!(won.exists());
+
+        let failure = claim_child_worktree(&repo, "feat/raced", &base)
+            .expect_err("a second claim on one branch is refused");
+        assert!(
+            !failure.owns_branch,
+            "the loser of the ref claimed the winner's worktree: {failure:?}"
+        );
+        // Untouched by the loser, which is the property the flag protects.
+        assert!(won.exists());
     }
 
     /// Compute the 16-char hex repo hash used in worktree paths.

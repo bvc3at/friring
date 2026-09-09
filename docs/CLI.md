@@ -46,8 +46,13 @@ friring-cli session list --parent <lead-uuid> --json | jq  # direct children onl
   <auto|terminal|gui>` chooses how `Ctrl+O` launches it: terminal editors get a
   real TTY via a tmux popup or a TUI suspend, GUI editors spawn detached. See
   the Editor Integration section of `docs/FEATURES.md`.
-- **`config`** — validate / show: strict-parses every config file, or prints the
-  effective resolved config. See `docs/CONFIG.md`.
+- **`config`** — paths / validate / show: strict-parses every config file, or
+  prints the effective resolved config. `paths` reports the resolved config dir,
+  data dir and database file together with the environment variable that decided
+  each, and answers *before* any database is opened — which is what makes it
+  usable as a preflight (`--json` fields: `config_dir`, `config_source`,
+  `data_dir`, `data_source`, `database`, `app_dir_name`, `database_opened`). See
+  `docs/CONFIG.md`.
 - **`extension`** (alias `ext`) — install / uninstall / reinstall / list /
   available / update / activate / deactivate / status: manage opt-in extensions.
   See the Extensions section of `docs/FEATURES.md`.
@@ -84,11 +89,26 @@ the same places its manager view drives, and the same refusals a launch makes.
 | `sandbox prune [--profile <name>] [--dry-run]` | Reclaim superseded and orphaned places, through the same decision the TUI's background pass makes. |
 | `sandbox export [<name>] [--output <file>]` | One profile, or every profile, as a `[[profile]]` TOML document — the *human* rendering, so a redirected stdout follows the CLI-wide JSON default. `--output` refuses to overwrite. |
 | `sandbox import <file> [--replace]` | Validate the **whole** document, then write it in one transaction. |
+| `sandbox exec --profile <name> [--cwd <dir>] -- <command…>` | Run one command inside a profile's boundary and report what applied. |
 | `sandbox token set <agent> [VAR]` / `token rm <agent> [VAR]` / `token list` | The `env-token` value in friring's own OS keychain entry. `VAR` may be omitted when the agent declares exactly one. |
 | `sandbox relay` | **Internal** — see below. |
+| `sandbox launch` | **Internal** — see below. |
 
-Six things about it are deliberate:
+Eight things about it are deliberate:
 
+- **`sandbox exec` never falls back to the host.** It is the way to ask "does
+  this profile actually let that through?" without spawning a session, and it is
+  what the boundary probes (`scripts/dev/sandbox-probes/`) use to observe the
+  deny set against a real kernel rather than against generated policy text. A
+  profile that cannot be applied here refuses, whatever its
+  `allow_unsandboxed_fallback` says: that switch means "start the session
+  anyway", there is no session, and "it ran outside the boundary" is not an
+  answer to the question that was asked. It refuses a **place** too (an
+  environment rather than a wrapper — running one command in one would create or
+  adopt a container as a side effect of a question) and an **egress-filtered**
+  profile (whose proxy lives in a running friring; a one-shot process would bind
+  a listener, exec, and take it away). The command's own exit status becomes
+  friring-cli's, so a probe asserting "this was refused" gets the refusal.
 - **A token is never an argument.** `token set` takes no value: it reads stdin
   when one is piped, otherwise it prompts with echo off, and the value is never
   rendered, logged or quoted back in a refusal. Every refusal about *which*
@@ -130,9 +150,158 @@ Six things about it are deliberate:
   runs *inside* a boundary, offering a TCP endpoint on the sandbox's own loopback
   and forwarding each connection to the bind-mounted proxy socket, because no
   HTTP or SOCKS client can dial a unix socket. Friring composes the command
-  itself; there is nothing to run by hand. It is the one subcommand dispatched
-  **before the database is opened** — ADR-29 keeps the database out of every
-  sandbox — and it holds no credential and makes no policy decision.
+  itself; there is nothing to run by hand. It holds no credential and makes no
+  policy decision.
+- **`sandbox launch` is internal too**, and is the process a policy boundary
+  runs *instead of* the agent (ADR-33):
+
+  ```text
+  friring-cli sandbox launch [--gate <dir> --key <key> --timeout <secs>]
+      [--relay-listen <addr> --relay-socket <path>] [--unset <VAR>]... -- <agent argv…>
+  ```
+
+  It starts the relay when there is one, removes each `--unset` variable, waits
+  for `<gate>/release` to hold `<key>` when there is a gate, and then `execvp`s
+  the agent argv verbatim, in place. A gate that never opens exits `75`. Every
+  value is its own argv element and nothing is parsed by a shell. Friring
+  composes it; there is nothing to run by hand.
+
+  Both it and `sandbox relay` are dispatched **before the database is opened** —
+  ADR-29 keeps the database out of every sandbox — which is what `cli/early.rs`
+  is for.
+
+## The bridge (inside a sandbox)
+
+`friring-cli bridge` is the orchestration bridge's client (ADR-30): the one
+command a **sandboxed** agent runs to ask friring for something. Like `sandbox
+relay` and `sandbox launch` it is dispatched before the database opens, because
+ADR-29 keeps friring's SQLite file out of every boundary and this runs inside
+one.
+
+| Command | Does |
+|---|---|
+| `bridge create --repo-root <p> --branch <b> --agent <a> --task-body <t> [--task-kind k] [--role-hint r] [--depends-on <child>]…` | Create one child session on a **new** worktree cut on `--branch` (see the branch rules below). `--depends-on` is repeatable and each named child must be `done` first, or the create is refused `dependency_unfinished` |
+| `bridge stop <child> [--grace-secs N]` | Ask a child to finish, then stop and verify it. A clean `stopped` child releases its slot but keeps its ownership, worktree and agent state for an explicit resume |
+| `bridge resume <child>` | Relaunch a dirty, stalled, stopped or unusable child. Resuming a released `stopped`/`unusable` child first reacquires fan-out capacity |
+| `bridge status` | This session's own state, and its children's |
+| `bridge inbox [--claim] [--limit N]` | Read this session's own mail |
+| `bridge send --to <child\|owner> --kind <k> --body <b>` | Mail its owner, or a child it owns |
+| `bridge report --phase <p> [--progress N] [--summary s] [--needs-operator] [--artifact <path>]…` | A bounded progress note about itself. `--needs-operator` raises the attention badge and mails the owner; `--artifact` is repeatable and each path must be inside this session's own worktree |
+
+Every verb takes the same five flags:
+
+- `--key` — the idempotency key. Minted when omitted; supplying it is what makes
+  a retry safe.
+- `--timeout` — how many seconds the **client** waits for a response file,
+  default `120`. It ends the wait, never friring's work: a `create` that outlives
+  it is still building a child, so a retry must reuse the same `--key` to be
+  handed that child rather than to start a second one.
+- `--ack` — delete the response file once it has been read.
+- `--deadline` — absolute Unix **milliseconds** after which friring must not
+  *start* this work; a request that arrives late is refused `expired`. A key that
+  already has a journal row replays its recorded answer instead of expiring,
+  because refusing it would destroy the only record a caller that timed out has
+  of the child it already created.
+- `--human` — print a readable summary. JSON is the default, because the caller
+  is almost always an agent parsing the answer.
+
+`--task-body`, `--body` and `--summary` accept `-` to read the value from stdin,
+which is how a long task avoids a command line.
+
+Four things about it are deliberate:
+
+- **The channel is the identity.** Nothing in the protocol says who the caller
+  is, and there is no field for it. Authority comes from *which* directory the
+  request was written into: friring minted one bridge directory per session and
+  exposed exactly that one inside that session's boundary, so a request in it is
+  by construction a request from that session. A caller-supplied session id would
+  be a claim, and a claim is not evidence. `FRIRING_BRIDGE_DIR` names it, inserted
+  on the sandbox *policy* so an agent that declares the variable in `agents.toml`
+  cannot point the channel elsewhere.
+- **The verbs are a closed set.** There is no `exec`, no arbitrary
+  `friring-cli`, no SQL, no pane capture and no way to name another session's
+  anything. Every verb acts on the caller's own session or on a child it provably
+  owns, and a verb friring does not know is refused rather than passed through.
+- **Nothing is a fallback.** A queue that cannot be found, a friring that never
+  answers, a response that will not parse: each is an error and none is a
+  degraded mode. A client that quietly did nothing and exited zero would let a
+  leader believe it had created a child that does not exist. A refusal *is* a
+  well-formed answer — it is printed, and the exit status is non-zero so a shell
+  chain stops.
+- **The key makes a retry safe.** The same key with the same body returns the
+  first attempt's exact bytes rather than doing the work twice; the same key with
+  a *different* body is refused `key_reused` and has no effect at all. A client
+  that timed out should retry with the same `--key`.
+
+**What `create --branch` accepts.** The name decides a path — a child's worktree
+is cut under friring's worktree root — so it is checked twice and neither answer
+is trusted to imply the other:
+
+- **git's own answer.** `git check-ref-format --branch` must accept it, which
+  rules out `..`, a leading `-`, control characters, `~ ^ : ? * [`, `@{`, a
+  trailing `.lock`, and the rest of that grammar. Asked of git rather than
+  reimplemented.
+- **it must still name one directory.** The sanitized form — every `/` replaced
+  by `-` — has to be a single ordinary directory name: nothing empty, no `.` or
+  `..`, no separator left. Slash-separated names are therefore fine (which is why
+  the omx extension's `omx/<slug>/<node>` branches work); what is refused is a
+  name that would still be a path afterwards.
+- **at most 200 bytes** (not characters — a multi-byte name reaches the cap
+  sooner), since it becomes a path segment on some filesystem eventually.
+
+A create is also refused when a worktree **already exists** at the path that name
+resolves to, and when another create resolving to that same path is **still in
+flight** — the directory is cut off the tick, so two creates sent together would
+otherwise both see it missing and end up sharing one workspace. Note that this is
+about the *directory*, not the spelling: `feat/one` and `feat-one` are two branch
+names for one worktree. friring cuts a child's workspace; it never attaches one
+to a directory it did not just make.
+
+It is refused for the **branch** on the same grounds: `create` always cuts a new
+one (`git worktree add -b`), so a branch that already exists in the repository is
+refused even when nothing has a worktree on it. Only `resume` reuses a child's
+existing branch and worktree — it relaunches the child friring already made
+rather than making a second one.
+
+The protocol is a JSON file renamed into `<dir>/req/<key>.req` and an answer
+renamed into `<dir>/res/<key>.res`, so any program with `rename(2)` and a JSON
+parser can drive it without this client.
+
+## `friring-cli capabilities`
+
+What this friring's bridge offers — protocol version, capability names, verbs
+and error codes — printed from the constants the broker itself uses, so a version
+it reports is one it speaks. An extension's `binary-capability` requirement is
+checked against it.
+
+```json
+{
+  "bridge": {
+    "protocol": 1,
+    "capabilities": ["child-lifecycle", "mailbox", "report"],
+    "verbs": ["create", "stop", "resume", "status", "inbox", "send", "report"],
+    "errors": ["expired", "key_reused", "..."]
+  },
+  "extension_requires": 1
+}
+```
+
+## Session egress fields
+
+`session get` and `session list` carry three fields about a sandboxed session's
+way out, and they answer different questions from `sandbox_unenforced`:
+
+| Field | Means |
+|---|---|
+| `egress_state` | `none` \| `preparing` \| `active` \| `restoring` \| `unrestorable` |
+| `egress_unrestorable_reason` | Why a restart could not rebind it, or `null` |
+| `egress_endpoint` | `tcp:<port>` or `unix:<path>` — where it listened |
+
+A session whose proxy could not be rebound after a restart is still **sandboxed**:
+its kernel policy holds and its agent has no network rather than an unfiltered
+one. Reporting that as `sandbox_unenforced` would say the agent is running on the
+host, so it is a separate field. The credential the proxy demands is never
+reported: nothing that renders a session may carry it.
 
 ## Agent metrics
 
@@ -429,6 +598,23 @@ deleted (the TUI tears down the tmux window/worktree on its next sync), and
 worktrees + the symlink workspace, and disable `send` automations targeting the
 session — for headless cleanup when no TUI is running. Teardown is best-effort
 (failures land in the JSON report); the row is always soft-deleted last.
+
+**Bridge children are the exception, in both directions.** A *non-forced* delete
+of a **live** bridge child is **refused**: without `--force` there is no runtime
+teardown, so the row would be marked deleted and its owner told the child was
+gone while its agent kept writing the worktree a later verdict reads. The path
+that stops one is the owner's `friring-cli bridge stop <child>`, which has
+friring verify the pane died first; `--force` is the operator's override and does
+tear the runtime down. In the other direction, `--force` on an **owner** first
+stops every live child it has (`stop_owned_children`) — the owner is the only
+session that could ever answer a child's `blocked`, read its `result` or
+integrate its branch. Each child's recorded state is what the teardown
+*achieved*: a pane that would not die is `stop_failed` and keeps its slot, and so
+is a child whose own session row friring could not read — nothing was torn down,
+so nothing was verified dead. The
+children's own rows, branches and worktrees are **preserved** — only the owner is
+deleted — and the report carries `stopped_children` (also a `stopped children`
+line in the human summary).
 
 A `--force` delete also stamps the `sessions.force_deleted` column (schema v37):
 the row still appears in the restore list **tagged `force-deleted`** and is

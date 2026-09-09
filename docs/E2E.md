@@ -79,8 +79,28 @@ opencode's title call replays the user's prompt verbatim, so it would otherwise 
 deliberately no catch-all default — it would answer surprise calls `200` and silently disable the
 strictness the `UNMATCHED` marker enforces.
 
-`reply.toolUse` is an `anthropic`-dialect feature: the tool-use loop is conformance-tested against
-Claude Code, while the `openai` dialect exists to render text turns (scenarios and demo panes).
+`reply.toolUse` works on **both** dialects. On `anthropic` it is a `tool_use` content block; on
+`openai` it is a Responses `function_call` item (`output_item.added` →
+`function_call_arguments.delta` → `function_call_arguments.done` → `output_item.done`, with the
+item repeated in `response.completed.output` and `arguments` a JSON *string* on every event), or
+a Chat-Completions `tool_calls` delta. The CLI's own output comes back as the next request's
+`function_call_output`, which `hasToolResult` / `toolResultFor` match on — so a two-fixture loop
+(call, then `"hasToolResult": true`) is how a stubbed agent is made to actually *run* something
+rather than only narrate it. Probed against codex-cli 0.149.0, whose shell tool is
+`exec_command` taking `{"cmd": "…"}` (still true at 0.153.4; add `"shell": "/bin/sh"` and
+`"login": false` to keep a fixture off the developer's own login shell).
+
+Both keys describe **the turn being answered**, never the whole thread, in every dialect: on
+`anthropic` that is the last user message, and on `openai` the trailing run of tool outputs
+(`function_call_output` items on the Responses route, `role: "tool"` messages on Chat
+Completions). The
+distinction only shows up once a thread outlives a single turn — codex resends the entire
+transcript, and `codex resume` replays it — where an "anywhere in the transcript" reading would
+make `hasToolResult` permanently true, let the terminator fixture shadow the call fixture, and
+leave a stubbed agent narrating every turn after its first. A two-fixture loop is therefore
+reusable: the same pair fires again on the next prompt, which is what
+`scripts/dev/codex-park-e2e.sh` needs of a child that takes one turn before it is parked and
+another after it comes back.
 The `anthropic` stub also serves an account-usage route (`GET /api/oauth/usage`) when the fixture
 file carries a top-level `usage` key (reset times are minutes-from-now, converted at request
 time); friring's info panel reaches it via `FRIRING_CLAUDE_USAGE_URL` — the demo recorder uses
@@ -435,6 +455,217 @@ telemetry or config probe) is harmless (a custom `ANTHROPIC_BASE_URL` proxy igno
 it doesn't fail the run but is surfaced to `target/agent-e2e/unexpected-endpoints.log` and a CI
 `::warning::` annotation — review it, and extend the allowlist in
 `e2e_surface_unexpected_endpoints` if it's expected.
+
+## Sandboxed orchestration: what covers it, and what does not
+
+The orchestration bridge (`docs/FEATURES.md` § Sandboxed orchestration) is covered by six
+things that are **not** this harness. The split is recorded rather than smoothed over, because
+what each one can and cannot say differs.
+
+Each entry names the layer it belongs to, and the layer is what decides what it is worth.
+**In-process** (`src/app/acceptance.rs`) is a real `App`, database and filesystem with the
+multiplexer and git behind a seam: deterministic, hermetic, and unable to say anything about a
+process that stops existing. **Real TUI** is the real binary, a real tmux server and the real
+broker, with `/bin/sh` agents — so a green run is a statement about friring rather than about an
+integration. **Real vendor** replaces those agents with the published CLI and only its model with
+a local stub, which stands in for everything except the model's *judgement*. Nothing here is
+reported at a layer above the one that produced it.
+
+**What is asserted today.**
+
+- **The bridge contract, with no vendor agent involved** — `extensions/bridge-conformance`, run
+  end to end by `just bridge-e2e` (`scripts/dev/bridge-e2e.sh`). Both its agents are `/bin/sh`
+  scripts with no login, no model and no network, so a green run is a statement about friring:
+  the verbs, the authority rules, the child boundary and the quiesce protocol. Its worker
+  deliberately *tries* to create a child of its own and fails the run if it is allowed, which
+  turns the one-level-deep rule into an assertion rather than a claim.
+
+  The harness stands up a throwaway sandbox, installs the extension from this working tree,
+  imports its profile with the repository path substituted in, boots the **real TUI** in a driver
+  tmux and drives the new-session wizard by keystrokes — because a bridge-requiring agent is
+  refused a headless create, which it also asserts. Then it reads what the host recorded: an
+  ownership row, a terminal state friring reached itself, and a `bridge_results` verdict.
+
+  Three things only a **launched** session can be asked, which `friring-cli sandbox exec` cannot
+  (it composes a one-shot with no gate and no proxy), are asserted from inside the leader:
+  friring's gate root is neither readable nor writable and its database is unreadable. A fourth
+  is structural — the leader is running at all only because the launch helper could read *this*
+  launch's own gate through the read-only re-grant. And the leader's pane is captured off
+  friring's own tmux server, so a **nudge's delivery into a live pane** is observed rather than
+  inferred from the counter it runs on.
+
+  The run then drives the whole **parking lifecycle**, which is the one part of the child
+  contract that is about what survives a process going away and therefore cannot be reached
+  in-process: a child is created and stopped cleanly, its fan-out slot is observed to be
+  released, the fan-out is filled by two more children so a `resume` is refused
+  `fanout_exhausted` and the parked child is checked to be untouched by that refusal, a slot is
+  freed, the **same** child resumes, and it is mailed new work which the relaunched process
+  claims and answers by quoting a marker its previous life wrote into its own private state
+  directory (ADR-31). What that does *not* prove is an interactive vendor agent's own thread
+  surviving the same cycle: the conformance worker is a `/bin/sh` script, so the state it
+  preserves is a file it wrote, not a Codex rollout. That is what the next entry is for.
+- **The same lifecycle with a real agent as the child** — `extensions/codex-park`, run by
+  `just codex-park-e2e` (`scripts/dev/codex-park-e2e.sh`). friring's side is unchanged — the
+  leader is still a `/bin/sh` script driving the ordinary verbs — and the **child** is an
+  interactive Codex CLI against the local model stub, with no `env_key`, no login, no account and
+  every proxy variable pointed at a dead port so only loopback resolves.
+
+  It adds the claims that need a real agent: a nudge typed into a live **vendor** pane produces a
+  turn (the child acts only because friring typed into it); the process that took the pre-stop
+  turn never runs again, so the park really ended it; the marker the child wrote into its private
+  `CODEX_HOME` survives the stop and is quoted back by the relaunched process after it claims new
+  mail; and — read from outside the boundary, in Codex's own rollout files — the relaunched
+  process comes back to the **same thread**, which carries the pre-stop turn as well as the new
+  work.
+
+  Turn ids, not the marker, are what make that checkable, and running this is what showed why: the
+  marker file survives the stop on purpose, so a child that came back to a blank conversation
+  reports the same marker on its first turn, and a marker-only check passes on exactly the case it
+  exists to catch. It did, in the first draft — and the first draft was what revealed that a
+  bridge `resume` was minting a new conversation every time. That is fixed
+  (`app::bridge_saga::child_resume_identity`), and a resume that cannot reach the conversation is
+  now refused rather than launched blank.
+
+  The file layout is the vendor's, not friring's: 0.153.4 was observed extending the rollout it
+  had and, at other times, writing a new one seeded with the replayed conversation. Both are the
+  same thread, so the assertion is on what the resumed process's thread contains.
+
+  Two deliberate fixture-only trades, both recorded in the extension's profile: the child runs
+  `network_mode = "full"`, because a dynamically-numbered loopback port is not a shape friring's
+  egress proxy can name, and Codex's own sandbox is off, because nesting a second seatbelt inside
+  friring's would fail for reasons that say nothing about parking. Egress is what
+  `bridge-conformance` proves with `network_mode = "none"`.
+- **The saga, the quiesce and the recovery** — in-process acceptance tests
+  (`src/app/acceptance.rs`) against a real `App` with the effects behind a seam, with failure
+  injected at each step. Deterministic and hermetic, so they run in `cargo nextest`.
+- **The boundary itself** — the kernel probes in `scripts/dev/sandbox-probes/`
+  (`docs/DEVELOPMENT.md` § Boundary probes).
+- **The `omx` extension's argv contract and its program** — `tests/omx_manifest_invocation.rs`
+  (each wrapper run for real against a `node` shim) and `just omx-test`.
+
+**The `omx-friring-team` scenario, which used to be the thing that was not built.** An end-to-end
+run in which a real oh-my-codex leader plans a Team DAG and friring spawns each node as a
+sandboxed bridge child. It is `just omx-team-e2e` (`scripts/dev/omx-team-e2e.sh`) and it is green:
+`oh-my-codex@0.21.0` from the registry into the run's own npm prefix, a real
+`omx setup --scope user --install-mode legacy`, friring's own `extension install` with all 26
+requirement gates satisfied at once, `omx` as a **sandboxed leader** with Codex behind it,
+`friring-omx run` fanning out one bridge child per node, each child a real interactive Codex that
+commits its work, each verified into `done` by friring itself, and `integrate` merging both
+branches into `main`. Everything against the local stub, with no login, no account and no
+credential — `auth.json` is a synthetic placeholder, present only because the worker's `link-rw`
+seed is `required = true`.
+
+Its three recorded blockers were closed first; the fourth, "`omx` is not installed on the
+operator's machine, so this needs an authenticated endpoint", was simply wrong, and the rest of
+this section is the record of finding that out.
+
+- ~~The openai stub cannot emit a tool call.~~ **Closed.** `reply.toolUse` works on the openai
+  dialect: a Responses `function_call` item, or a Chat-Completions `tool_calls` delta, with the
+  CLI's own output arriving back as `function_call_output` for the next fixture to match on.
+  Probed against codex-cli 0.149.0, whose shell tool is `exec_command` taking `{"cmd": "…"}` —
+  a stubbed codex really does run what a fixture names.
+- ~~Two ship gates are unobserved.~~ **Closed**, in `tests/codex_private_state.rs`, against the
+  installed CLI: codex fires a hook from a `copy-rewrite`d private `CODEX_HOME` (and does **not**
+  fire the family's copy), and it writes `auth.json` in place through a `link-rw` hard link — same
+  inode, link count still two, and the family's path reads back what the child wrote. What is
+  *not* observed is an OAuth **refresh** specifically: inducing one needs a real credential and an
+  expired token. Both writes go through codex's own auth-file writer, but that remains the exact
+  residual gap rather than a pass.
+- ~~`omx` is not installed on the operator's machine, so the leader path needs an operator and an
+  authenticated endpoint.~~ **Closed, and the endpoint half was simply wrong.** In a disposable
+  fixture (the recipe is in `docs/DEVELOPMENT.md`), `omx exec "<prompt>"` and `omx --direct` both
+  launch codex 0.153.4 against the **local model stub** — the stub's fixture answers, and there is
+  no login, no account, no authorization header and no billing, for the same reason a bare codex
+  needs none: a custom `[model_providers.*]` with no `env_key`. Nothing about the vendor leader
+  path requires a production endpoint.
+
+  Also proven against the real vendor package: `oh-my-codex@0.21.0` fetched from the registry,
+  `omx --version` satisfying the manifest's `tool-version` gate, all 25 `file-digest` gates and the
+  `hooks.json` `file-contains` gate satisfied by what a real
+  `omx setup --scope user --install-mode legacy` installs, and then
+  `friring-cli extension install extensions/omx` **exiting 0** against that fixture with
+  `extension activate` writing both `friring-*` skill cards into `~/.codex/skills`.
+
+  Running that is what showed the pins had been wrong in a way no lint could see. `omx setup`
+  **rewrites** a skill card's frontmatter description as it installs it (`description: X` becomes
+  `description: "[OMX] X"`), so pinning the release tarball's copy made 7 of the 8 skill gates
+  unsatisfiable and the extension uninstallable after the exact steps its own README gave. The
+  skill pins are now the installed digests, checked by `just omx-test` with `OMX_CODEX_HOME` set;
+  the 17 role prompts do install verbatim and are still checked against the release with
+  `OMX_SOURCE_DIR`. The rewrite is deterministic — two setups into two fresh homes produce
+  identical files — and idempotent, which is why `autopilot`, already prefixed upstream, was the
+  one skill that passed. Running the operator's own `friring-cli extension install` against that
+  fixture then found a second defect: the manifest pins `omx --version` on `0.21.0` and the
+  release prints `oh-my-codex v0.21.0`, which friring's `version_pattern_matches` refused because
+  it read a leading letter as part of the version. Both fixed, and the install now exits 0 with
+  every requirement gate satisfied — which is the only check that exercises all of them at once.
+
+**What building it found.** Nothing in this list could have been found by reading: the extension
+had been manifest-linted, digest-checked and argv-tested, and never launched.
+
+- **Three first-run gates on the *vendor* side**, each rendering a string in
+  [`MODAL_MARKERS`](../src/agent/tmux.rs) — so friring correctly refuses to type into that pane and
+  an unattended leader waits for a person with nothing in any log to say why. The harness seeds
+  each the way an operator would and then asserts it is gone. They are listed below.
+- **The leader could not start at all.** `omx` creates `~/.omx-runs` before it launches anything
+  and the profile granted no read-write path, so it died on `EPERM: mkdir`. And Codex 0.153.4 keeps
+  its state in SQLite — several databases with `-wal`/`-shm` siblings, a lock directory, two temp
+  directories — which the agent's hand-written per-file `state_rw` list could not express, so the
+  next layer down was "Codex couldn't start because its local database appears to be damaged". The
+  profile now grants `~/.codex` read-write with the pinned material taken back read-only after it.
+- **Neither agent could ever be pre-trusted.** Codex keys a hook's trust hash on the `hooks.json`
+  *path*, and neither agent has a stable one: the leader runs under `--madmax`, which mints a state
+  directory per launch, and a worker's private `CODEX_HOME` is seeded fresh every launch. So "Hooks
+  need review" is not a first-run question — it is every launch. Both wrappers now pass Codex's own
+  escape hatch for hooks already vetted.
+- **A bridge child could not commit.** A linked worktree keeps its index and `HEAD` in
+  `<repo>/.git/worktrees/<id>` and shares the object and ref stores; a child was granted only the
+  worktree, so `git commit` failed on `index.lock`, then on a loose object. friring now grants the
+  child's *own* git metadata directory with its own directories (`app::bridge_spawn::child_git_dir`,
+  regression `a_child_is_granted_the_git_directory_of_its_own_worktree`), and the profile shares
+  the repository's `.git`, which is what a git worktree makes siblings share. Until this, no
+  harness had ever had a child that committed — `bridge-conformance`'s worker writes nothing — so a
+  worker doing real work would have ended every run dirty and unmerged. Which directory that grant
+  names is decided by the repository's own `gitdir` record rather than by the `.git` marker inside
+  the child's writable worktree, and what a shared `.git` does and does not give away is written
+  down in `docs/SANDBOX.md`.
+- **The harness asserts the boundary, not only the outcome.** The generated seatbelt profile *is*
+  the policy, so the run reads it: the leader's grants OMX's two state roots and neither worker's
+  mentions them — the check behind moving `~/.omx`/`~/.omx-runs` out of the profile's `paths` and
+  onto the leader agent's `state_rw`, since a profile path is inherited read-only by every child.
+  The merge assertion is per node and against `result.head`, the commit friring actually verified,
+  traced with `git merge-base --is-ancestor` into `main`. Counting commit subjects could not tell
+  two nodes from one node that committed twice, which the worker's turn script does on every turn.
+- **And an ordering an operator cannot guess.** Installing the extension **merges friring's four
+  status hooks into the `hooks.json` `omx setup` just hashed**, so the "launch `omx` once outside
+  friring" step has to come *after* the install. Before it, the trust it grants is invalidated by
+  the next step. The extension README now says so in the right place.
+
+The three vendor gates, in the order they appear:
+
+- **OMX's one-time GitHub star prompt.** `[omx] Enjoying oh-my-codex? Star it on GitHub? [Y/n]`,
+  shown when `gh` is installed and `~/.omx/state/star-prompt.json` is absent. It is worth an
+  operator's attention beyond the hang: answering yes makes OMX run
+  `gh api -X PUT /user/starred/…`, a write to GitHub authenticated as whoever owns the `gh`
+  credential, from inside the boundary. The `omx` profile's allowlist does not carry
+  `api.github.com`, so friring's proxy refuses the call — but with `prompt_new_domains = true` the
+  operator is asked about a new domain in the middle of a run. Launch `omx` once outside friring,
+  or seed that state file, before the first sandboxed leader.
+- **Codex's "Hooks need review" prompt.** `omx setup` records `[hooks.state."<path>:…"]` trusted
+  hashes in `config.toml` keyed on the `hooks.json` path *as it resolved it*, and installing this
+  extension then merges friring's four status hooks into that same file — so four hashes stop
+  matching and the next launch offers them for review. Answered once, after the install, the way an
+  operator answers it. Both agents also pass `--dangerously-bypass-hook-trust` now, because under
+  `--madmax` and inside a freshly seeded private `CODEX_HOME` no answer ever carries to the next
+  launch.
+- **A stale OMX session pointer.** `[omx] session pointer launch aborted: session_pointer_unusable`
+  after an earlier launch died without clearing its pointer; OMX exits 1 rather than starting.
+  `omx session` has the recovery surface for it.
+
+None of these is a credential problem, and none of them is friring's to fix — but each has to be
+*handled*, and the harness handles them the way an operator has to: seeded or answered, then
+asserted absent rather than assumed away. Each is free to move in the next OMX release, which is
+why the run asserts on their absence and would say so loudly if one came back.
 
 ## Conformance status
 

@@ -74,6 +74,16 @@ pub struct SandboxEditorState<'a> {
     pub image: &'a str,
     pub containerfile: &'a str,
     pub allow_unsandboxed_fallback: bool,
+    /// What this profile grants over the orchestration bridge (ADR-31).
+    pub bridge_preset: crate::app::modals::BridgePreset,
+    /// The fan-out cap, as typed.
+    pub max_children: &'a str,
+    /// Comma-separated registry names a child may be, as typed.
+    pub child_agents: &'a str,
+    /// Comma-separated paths a child shares with its owner, as typed.
+    pub child_shared_rw: &'a str,
+    /// Comma-separated `path:mode` seed authorizations, as typed.
+    pub child_seed_allow: &'a str,
     /// Columns of the stored row friring could not decode, as
     /// `column = 'value'`. Empty for a healthy profile.
     pub undecoded: &'a [String],
@@ -110,6 +120,11 @@ impl<'a> SandboxEditorState<'a> {
             image: m.image.value(),
             containerfile: m.containerfile.value(),
             allow_unsandboxed_fallback: m.allow_unsandboxed_fallback,
+            bridge_preset: m.bridge.preset,
+            max_children: m.bridge.max_children.value(),
+            child_agents: m.bridge.child_agents.value(),
+            child_shared_rw: m.bridge.child_shared_rw.value(),
+            child_seed_allow: m.bridge.child_seed_allow.value(),
             undecoded: &m.undecoded,
             lint: m.lint.as_deref(),
         }
@@ -160,6 +175,16 @@ pub fn unavailable_reason(
             NetworkMode::None => "unavailable — network 'none' lets nothing out".to_string(),
             _ => "unavailable — network 'full' leaves no domain unlisted".to_string(),
         },
+        SandboxField::BridgeGrants
+        | SandboxField::MaxChildren
+        | SandboxField::ChildAgents
+        | SandboxField::ChildSharedRw
+        | SandboxField::ChildSeedAllow => {
+            format!(
+                "unavailable — the bridge is a directory friring mints on the host, and \
+                 {backend} has no such path inside it"
+            )
+        }
         _ => format!("unavailable with {backend}"),
     })
 }
@@ -480,6 +505,11 @@ fn field_label(field: SandboxField) -> &'static str {
         SandboxField::Image => "image",
         SandboxField::Containerfile => "build",
         SandboxField::Fallback => "escape",
+        SandboxField::BridgeGrants => "bridge",
+        SandboxField::MaxChildren => "children",
+        SandboxField::ChildAgents => "child agents",
+        SandboxField::ChildSharedRw => "child shares",
+        SandboxField::ChildSeedAllow => "child seeds",
     }
 }
 
@@ -518,6 +548,28 @@ fn field_value(
             false,
         ),
         SandboxField::Containerfile => (placeholder(state.containerfile, "(none)", active), false),
+        SandboxField::BridgeGrants => (state.bridge_preset.to_string(), true),
+        SandboxField::MaxChildren => (placeholder(state.max_children, "(3)", active), false),
+        SandboxField::ChildAgents => (
+            placeholder(
+                state.child_agents,
+                "(none — a leader that creates nothing)",
+                active,
+            ),
+            false,
+        ),
+        SandboxField::ChildSharedRw => (
+            placeholder(
+                state.child_shared_rw,
+                "(e.g. ~/.cargo/registry, ~/.npm)",
+                active,
+            ),
+            false,
+        ),
+        SandboxField::ChildSeedAllow => (
+            placeholder(state.child_seed_allow, "(e.g. auth.json:link-rw)", active),
+            false,
+        ),
         // Rendered by their own builders; `field_line` never routes them here.
         SandboxField::Backend
         | SandboxField::Network
@@ -860,6 +912,11 @@ mod tests {
             image: "",
             containerfile: "",
             allow_unsandboxed_fallback: false,
+            bridge_preset: crate::app::modals::BridgePreset::None,
+            max_children: "",
+            child_agents: "",
+            child_shared_rw: "",
+            child_seed_allow: "",
             undecoded: &[],
             lint: None,
         }

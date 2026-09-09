@@ -188,6 +188,11 @@ and resolve toward the Friring tables.
 | `image` | TEXT | Place backends: image reference |
 | `containerfile` | TEXT | Place backends: build source, alternative to `image` |
 | `allow_unsandboxed_fallback` | INTEGER | Whether the agent may escape for a specific command |
+| `bridge_grants` | TEXT (JSON) | `["child-lifecycle", "mailbox", "report"]` — what this profile grants over the orchestration bridge. `[]` by default |
+| `max_children` | INTEGER | How many **live** children one session under this profile may have. `3` by default |
+| `child_agents` | TEXT (JSON) | Registry names a child may be. `[]` means none |
+| `child_shared_rw` | TEXT (JSON) | Which of this profile's read-write paths a child shares, intersected with the parent's own set at every launch |
+| `child_seed_allow` | TEXT (JSON) | `[{path, mode}]` — which entries of the agent's state directory a child may be seeded with, and in which mode (`symlink` \| `copy` \| `copy-rewrite` \| `link-rw`) |
 | `created_at`, `updated_at` | INTEGER | Unix millis, the convention every other table uses |
 
 Paths are stored as written (`~` preserved) and expanded at launch, so a
@@ -291,6 +296,54 @@ launch verdict leaves it untouched, the same protection the hook columns get —
 and a relaunch that does not rewrite the row (`restart_session_headless`)
 records it with a targeted update.
 
+Schema v49 adds two groups more. The **multiplexer identity** —
+`mux_server`, `mux_window_id`, `mux_pane_id`, `mux_pane_pid`, `mux_launch_key` —
+is the exact window a session's agent runs in, so every destructive action can
+revalidate that it is acting on the pane friring recorded rather than on whatever
+now answers to that name. The **egress** group — `egress_endpoint`,
+`egress_token`, `egress_state` — is what a filtered session needs to come back at
+the *same* endpoint after a restart, plus the honest state of that attempt.
+`sandbox_overlay` holds a bridge child's narrowed effective policy. The token is
+redacted from every rendering: it is the live credential for a running boundary.
+
+### The bridge's own tables
+
+Schema v49 adds eight, and one of them is the authority.
+
+| Table | Holds |
+|---|---|
+| `bridge_children` | `(child_id, owner_id, request_key)` — **insert-only in SQL**, for the life of the database |
+| `bridge_child_state` | The mutable half: state, and the timestamps a state implies |
+| `bridge_requests` | The request journal: key, body hash, state, and the exact response bytes a replay returns |
+| `child_sagas` | A running child-spawn saga, with every external effect recorded before it is made |
+| `bridge_results` | What the **host** found in a child's worktree after it stopped the pane |
+| `bridge_reports` | Bounded child-authored progress notes, capped per child by the writer |
+| `bridge_brokers` | Which TUI instance is serving a session's bridge directory |
+| `session_repos` | The repositories a session works in — the authority a `create` request's `repo_root` is checked against |
+
+`bridge_children` carries `BEFORE UPDATE` and `BEFORE DELETE` triggers that
+`RAISE(ABORT, 'bridge_children is insert-only')`. Every verb's authority is the
+caller's directory identity plus this row, so a row that could be updated could
+be re-pointed at another owner by anything holding a write handle to the file —
+including a bug in friring itself. Archival is a stamp on
+`bridge_child_state.archived_at`, never a delete here: ownership outlives the
+child, the worktree and the branch. `sessions.parent_session_id` is **display
+only** and is never asked whether a verb is allowed.
+
+`session_repos` is a row rather than a derivation from the profile's grants,
+which is what keeps editing a profile from becoming an authority change. The
+migration backfills it from the worktree rows a session already has and from the
+working directory of one that has none.
+
+What churns is pruned: the journal, the results and the reports at 14 days,
+sagas 14 days after they stop moving, and a child is hidden from `status` and the
+UI 90 days after it reached a terminal state — the horizon the audit log already
+uses.
+
+**Downgrade is unsupported.** v49 is additive, so an existing database keeps
+working with the bridge simply unused; going back is the pre-upgrade file the
+operator backed up, which is why the setup steps say to make one.
+
 ## Backend catalogue
 
 **Four of the five backends below are wired end to end**: the two policy
@@ -347,7 +400,11 @@ by the backend being pluggable.
   `securityd`, so Claude Code's Keychain-stored OAuth keeps working with no
   credential handling at all. A default-deny profile must explicitly allow
   `mach-lookup` for `com.apple.SecurityServer`, `com.apple.securityd`,
-  `com.apple.trustd`, `com.apple.ocspd` and `com.apple.cfprefsd.daemon`.
+  `com.apple.trustd`, `com.apple.trustd.agent`, `com.apple.ocspd` and
+  `com.apple.cfprefsd.daemon`. `trustd.agent` is the per-user trust service
+  native TLS uses for certificate-chain validation; without it, HTTPS can fail
+  inside seatbelt while a WebSocket client using a different TLS stack succeeds
+  against the same host.
 - **Network granularity is all-or-localhost.** SBPL host filters accept only
   `*` or `localhost` (with ports); there is no domain predicate. Domain
   allowlists therefore mean: deny all outbound except the loopback proxy port.
@@ -1432,10 +1489,46 @@ writable root — a shared constant both policy backends apply, and a no-op when
 the root is not a repository. Hook scripts are run by whichever git touches the
 repository next, including the *host's*, outside the boundary.
 
-`.git/config` is deliberately **not** protected despite naming commands
-(`core.pager`, `core.fsmonitor`, aliases): `git config` and `git remote add` are
-ordinary sandboxed work, and a profile that breaks git gets turned off, which
-protects nothing.
+In an ordinary **checkout** that is the only rule, and `.git/config` is
+deliberately **not** protected despite naming commands (`core.pager`,
+`core.fsmonitor`, aliases): `git config` and `git remote add` are ordinary
+sandboxed work, and a profile that breaks git gets turned off, which protects
+nothing.
+
+Two writable roots are not checkouts, and both are shapes a **bridge child**
+gets. They take back more, on the path's shape alone
+(`sandbox::backend::protected_paths_in`) — see [What a shared git directory does
+and does not give away](#what-a-shared-git-directory-does-and-does-not-give-away):
+
+| Writable root | Also read-only inside it | Why |
+|---|---|---|
+| `<repo>/.git` (a git directory) | `hooks`, `config`, `config.worktree`, `commondir`, `HEAD`, `index` | `hooks` is one level up from where a checkout keeps it. `config` here is the *shared* repository's, so `core.fsmonitor` / `core.hooksPath` / an alias runs a command for the operator and every sibling — and `commondir` decides which directory that config is read from, in **any** git directory. `HEAD` and `index` are the **main** worktree's: the leader's checked-out branch and staging area. |
+| `<repo>/.git/worktrees/<id>` (one worktree's metadata) | `gitdir`, `commondir`, `config.worktree` | All three are redirects, and friring itself runs `git` in a child's worktree to reach a verdict: a child that could point `commondir` at a directory it wrote would be naming the `core.fsmonitor` program the host then executes. |
+
+A profile that grants a bare `.git` as a writable root to a session that commits
+in the *main* worktree therefore breaks that session's commits. That shape has
+no reason to exist — grant the checkout, which encloses its git directory.
+
+**A protected name only counts where it exists**, in two of the three backends.
+Seatbelt denies by pathname, which covers a path that is not there yet; bwrap's
+`--ro-bind-try` skips a missing source and a place mounts only what exists,
+because an engine asked to bind a missing one invents a root-owned file inside
+somebody's repository. So an absent `config.worktree` is not a protected name at
+all under those two — it is a name a child can *create*, and a repository with
+`extensions.worktreeConfig` already enabled (`git sparse-checkout` turns it on)
+then reads `core.fsmonitor` out of what the child wrote, the next time the host
+runs `git` in that worktree. That is host command execution, not a documentation
+matter.
+
+friring therefore **creates the file, empty, before the grant**
+(`PROTECTED_CREATED_IF_ABSENT`, applied at S3 to every writable git root a child
+is about to get: its own metadata directory *and* each `child_shared_rw` entry),
+and **refuses the launch** when it cannot — a read-only filesystem, a permission,
+a path that is not a directory. An empty config is inert whether or not the
+extension is on, and no protected name is left to a backend that cannot express
+it. It does mean friring adds one empty file to a repository an operator has
+already shared read-write with that owner's children, which is written down here
+rather than left to be discovered.
 
 The agent's own configuration is likewise not blanket-protected, because
 `state_rw` exists: an agent that cannot write its state directory dies on first
@@ -1466,6 +1559,929 @@ rather than composed. Sandboxing a remote session needs a place created *on*
 that host, which is not wired. A place-backed session's own
 `sandbox:<profile>` backend is not a remote one and never trips this: it says
 where the boundary is, not where the session's machine is.
+
+### The launch helper
+
+Every policy launch runs one extra process before the agent:
+`friring-cli sandbox launch`, dispatched before the database opens (ADR-29) and
+composed by `sandbox::launcher`. It is the wrapper's last argv element, and the
+agent's own argv follows its `--`:
+
+```text
+sandbox-exec -f <profile> -D … --  friring-cli sandbox launch [--gate …] [--relay-…] --unset TMUX … --  <agent argv>
+bwrap …                        --  friring-cli sandbox launch [--gate …] [--relay-…] --unset TMUX … --  <agent argv>
+```
+
+It does three things and then disappears:
+
+1. **Starts the egress relay**, when the launch has one — the job the two-line
+   `/bin/sh` launcher used to do. Nothing composes a shell string any more, so
+   no path from a profile to a running agent quotes, re-splits or re-parses a
+   value. A socket path or an agent argument containing a space, a quote or a
+   `;` arrives as one element.
+2. **Removes the multiplexer variables** (`TMUX`, `TMUX_PANE`, `PSMUX*`). tmux
+   sets them in the pane itself and they point at Friring's **own** server, so
+   an agent that inherited them would hold a working address for the
+   multiplexer outside its boundary. This is defence in depth — the kernel deny
+   set below is the enforcement — and it is applied on every policy launch, not
+   only gated ones, because a guarantee that holds on some launches is not one.
+3. **Waits for the gate**, for a bridge child (ADR-33). See
+   [The launch gate](#the-launch-gate).
+
+Then it `execvp`s the agent **in place**. That is the whole reason it is an exec
+rather than a spawn: under `bwrap --unshare-pid` the program after `--` is pid 1
+of the namespace, so the agent replaces the helper *as pid 1*, the pane's
+process is the agent, and when it exits the namespace teardown takes the relay
+with it. The relay is a direct child of pid 1 — never double-forked,
+re-parented or `setsid`'d — so every helper exit (a gate timeout, `75`; an
+`execvp` failure; a relay that would not start) tears it down the same way.
+Outside a pid namespace there is no teardown to rely on, so on Linux the relay
+child also sets `PR_SET_PDEATHSIG(SIGTERM)` before it execs. A seatbelt sandbox
+never starts a relay at all — it reaches the proxy socket directly. No policy
+backend can therefore orphan a relay.
+
+The binary is *this* Friring's own CLI, resolved from the running executable
+(`local_relay_program`) rather than from `PATH`, and handed down as a launch
+input so a backend never looks it up itself. A host with no `friring-cli` beside
+`friring` is **refused**, with the fix named; it is an ordinary refusal, so a
+profile's `allow_unsandboxed_fallback` still answers it. Under the `workspace`
+read scope the binary is bound in (bwrap) or read-allowed by literal path
+(seatbelt), because that scope builds a root out of the system directories and
+Friring's CLI is as often as not somewhere else.
+
+### The launch gate
+
+A bridge child must not run before its session row, its ownership row, its
+starting state, its first task mail and its egress commit all exist. The gate is
+how the host holds it at the door.
+
+`<data>/gates/<session-key>/` is minted `0700` by the host and exposed to the
+boundary **read-only**. The helper polls `<gate>/release` every 100 ms and
+proceeds only when it is a regular file whose content equals this launch's key.
+
+**Why only the host can release one.** The release primitive is deliberately the
+*existence of a regular file* in a directory the policy grants read-only:
+
+- Seatbelt's `(deny default)` plus a `file-read*` allow means `open` for
+  writing, `rename`, `link` and `unlink` in that directory are all denied.
+- A bubblewrap read-only bind returns `EROFS` for creating, renaming or
+  unlinking a regular file or a directory.
+
+A FIFO or a socket would not do, which is why anything but a regular file at
+that path is ignored: a read-only bind stops neither `connect(2)` nor a FIFO
+opened for writing, so a process inside the boundary could release its own gate.
+The open uses `O_NOFOLLOW` (a symlink planted there points at something the
+agent may be able to write) and `O_NONBLOCK` (opening a FIFO for reading blocks
+until a writer appears, so without it a FIFO would hang the launch rather than
+be ignored). The host writes the file under `<data>/gates/.staging/`, which is
+granted to nothing, and `rename`s it into place, so a reader never sees a
+half-written key. No profile may name any of `<data>/gates`:
+`check_declared_paths` refuses it in either mode, as it does `<data>/sandbox`
+and `<data>/signals`. Processes outside every boundary are the host trust
+domain. Therefore only the host Friring can release a gate.
+
+The key is per launch, not a credential — the directory is unwritable from
+inside, so nothing in the boundary could forge one anyway. What it buys is that
+a release file left behind by an earlier launch of the same child cannot open
+this one.
+
+A gate that never opens exits `75` (`EX_TEMPFAIL`) after five minutes. The pane
+dies under `remain-on-exit` and recovery finds a window with no live agent —
+never an agent running from a session row that was never committed.
+
+### The bridge's file queue
+
+The orchestration bridge (ADR-30) is a request/response queue of files, and it
+sits **inside** the status-signal channel a sandboxed launch already grants:
+
+```text
+<data>/signals/<session>/            the one directory a launch grants read-write
+<data>/signals/<session>/status      the status signal (ADR-29)
+<data>/signals/<session>/bridge/req/ the client writes  <key>.req
+<data>/signals/<session>/bridge/res/ friring writes     <key>.res
+<data>/signals/.taking/              <session>__<key>.req while friring works
+```
+
+No second grant and no second path in any policy: the bridge is a subdirectory
+of the one a launch already exposes. `FRIRING_BRIDGE_DIR` names it, inserted on
+the **policy** — the launch's last word — so an agent that declares the variable
+in `agents.toml` cannot point the channel somewhere friring does not read.
+
+**The channel is the identity.** Nothing in the protocol says who the caller is,
+and there is no field for it: friring exposed exactly one bridge directory inside
+one boundary, so a request in it is by construction a request from that session.
+A caller-supplied session id would be a claim, and a claim is not evidence.
+
+**A take is a `rename(2)`.** That single syscall is what makes everything after
+it a decision about a fixed inode rather than a race — the same primitive the
+status signal rests on. Once it returns, the file friring is about to read sits
+in `.taking`, a directory no sandbox was granted, and the agent cannot swap it
+for something else between the check and the read. Then:
+
+- The **filename** is validated as a request key (`[a-z0-9-]{8,64}`) *before* it
+  is joined onto anything, so a name carrying a separator or a `..` never becomes
+  a path.
+- A file that is **not a regular file** is dropped unread. The FIFO is the one
+  that matters: opening one for reading blocks until a writer appears, and the
+  broker runs on the render loop.
+- **Too large** (64 KiB) is checked before the open *and* enforced during the
+  read: a descriptor the agent still holds keeps writing to the same inode after
+  the rename.
+- **Not UTF-8** is dropped rather than lossily converted, so no byte sequence is
+  reshaped into something that might parse.
+- Every struct is `deny_unknown_fields`, so a field friring does not recognise is
+  a refusal rather than a request answered as though it said something else.
+
+**A narrow read scope reads the agent's own program.** `workspace` grants the
+profile's own paths plus the system directories a binary needs to load and run,
+and friring adds two literals to that: its own `friring-cli`, which every policy
+launch execs as its launch helper (ADR-33), and the **agent's** program, which
+that helper then execs. Both for one reason — a scope that cannot read them
+opens a pane that dies before the agent starts. A bare command name is left
+alone: it resolves on `PATH` under directories the scope already allows, and
+turning it into a policy literal would name a path relative to whatever cwd the
+launch happened to have.
+
+What the program then *opens* is still the profile's to grant. An extension that
+ships its agent as a shell script sourcing a library beside it needs its own
+home listed read-only, and both bridge-backed extensions ship exactly that in
+their `profiles.toml`.
+
+**The queue is opened once and never named by path again.** A path is a name,
+and a name the session can rewrite is not something friring can act on twice: it
+holds read-write on its own request directory, so between a
+`symlink_metadata` check and the rename that follows it can `rmdir` the
+directory and point the name somewhere else — after which the rename moves a
+*host* file out and a bad-name unlink deletes one. So the directory is opened
+with `O_DIRECTORY | O_NOFOLLOW` and every operation afterwards is relative to
+that descriptor: `fdopendir` to list it, `renameat` to take a request out,
+`unlinkat` to drop one friring will not read. A descriptor names an inode, so
+replacing the directory afterwards changes what the path means and nothing about
+what those calls reach. The destination of the take is still a path, and safely:
+`.taking` sits under friring's own data directory and is granted to no sandbox.
+
+At most 16 unanswered requests are read from one directory, and the
+**enumeration** is bounded twice — a directory the agent can write is not
+something the render loop will list without bound. Twice, because a hostile
+client controls two counts: how many requests it writes, and how many *other*
+files it leaves beside them. So the request count stops at the quota and the raw
+entry count at 256, and a client that fills its own queue with names that are not
+requests starves itself rather than the render loop.
+
+Past the quota the excess stays queued, **unread and unanswered**: friring has
+read no request to answer, and writing a refusal for a key it has not validated
+would be inventing one. The operator is warned (rate-limited), and the excess is
+taken later, as capacity frees up. Ordering is stable only *among the entries in
+each bounded batch*, never globally: a flood past the quota is served in whatever
+order the filesystem enumerated the batch that read it.
+
+**Nothing in `.taking` is ever silently dropped.** A file there was taken out of
+a client's queue, so the client is still polling for an answer that will never
+come unless something produces one. Recovery answers each from the request
+journal when there is a row and processes it as a fresh take when there is not —
+which is safe precisely because the journal is what makes a replay idempotent.
+Files older than 24 hours, and files whose name names no session, are removed.
+
+**The journal is the exactly-once guarantee.** A key taken and answered replays
+to the first answer's *exact bytes* — not an equivalent answer, because a
+re-rendered response could differ in field order and read as two. A key reused
+for a **different** body is `key_reused` and has no effect at all.
+
+### A bridge child's boundary
+
+A child's boundary is its owner's, **made smaller** (ADR-31), described by a
+small overlay rather than by a second profile nobody wrote.
+`SandboxPolicy::narrow` is pure and monotone: every dimension of the result is a
+subset of the parent's, and there is no input that makes any of them larger. It
+is re-applied at **every** launch against the parent's profile as it stands then,
+so a child whose owner was narrowed in between is narrowed to match — or its
+relaunch is refused `overlay_violation`, never widened.
+
+- **rw** = the child's worktree, its own friring directories, its private state
+  directory, `child_shared_rw ∩ parent rw`, and the exact `link-rw` credential
+  target. Deliberately *not* the worktree alone: a real build needs `~/.gradle`,
+  `~/.m2`, `~/.npm`, `~/.cache/pip`, `~/.cargo/registry`, and a child that
+  cannot reach them cannot build. The profile lists which; the intersection means
+  listing one the parent lacks grants nothing.
+- **ro** = `(parent ro ∪ (parent rw − child rw) ∪ ro_extra ⊆ parent) − subtract`.
+  A path the parent could write and the child cannot becomes *readable*: a worker
+  needs to read the repository its owner is writing — **unless** something inside
+  it is subtracted, and then the whole path goes. That is the wholesale rule
+  below, and it is why a child of a profile that shares `<repo>/.git` no longer
+  inherits `<repo>` itself: the sibling metadata tree inside it is subtracted. A
+  child works in its own worktree and reaches the repository through the share,
+  so nothing needs it; an operator who wants it back names it in
+  `child_shared_rw`.
+- **network** = the parent's mode and allows, at least its denies,
+  `prompt_new_domains = false` (no operator sits at a child's pane to answer a
+  first-use prompt) and `allow_unsandboxed_fallback = false` (a child that could
+  fall back to the host could leave its boundary by breaking it).
+- **backend** = the parent's resolved backend.
+
+#### The subtract set
+
+A parent profile may grant the whole home directory, and the family's state
+directory is inside it — so what a child must not reach **cannot** be expressed
+as an absent grant. It is a deny that comes after every allow: seatbelt's
+last-match-wins gives it directly, and bubblewrap gets it by mounting *over* what
+the profile bound (a `--tmpfs` for a directory, `/dev/null` for a file). The set
+is computed by the host at each launch and holds:
+
+1. the family's `state_dir` and every `state_rw` entry as the *parent* has them —
+   transcripts, history, logs, session state;
+2. the owner's scratch, signal, bridge and gate directories;
+3. `<data>/sandbox`, `<data>/signals`, `<data>/gates` and `<data>/worktrees`
+   wholesale, minus the child's own — which is what covers every sibling,
+   including one created after this child launched.
+
+Then the exact **seed targets** are re-granted after that, as the last rule for
+those paths alone. A test enumerates every write allow in the generated seatbelt
+text and every writable bind in the bwrap argv, and asserts the only one under the
+family's state is the `link-rw` target.
+
+**A grant that encloses a denied path is dropped wholesale** — that is what makes
+a parent's whole-home grant reach none of its children — with two exemptions. The
+child's own directories are one, because friring minted them. A path the operator
+named in `child_shared_rw` is the other: the deny is emitted *after* the allow in
+every backend, so the subtracted tree stays denied while the rest of the share
+survives. Without that second exemption, sharing `<repo>/.git` grants nothing at
+all the moment `<repo>/.git/worktrees` is subtracted — a child with a worktree
+whose object store, ref store and `config` it cannot even read, which is a `git`
+that dies rather than one that cannot commit. Every unit test passed over that;
+`just omx-team-e2e` is what saw it.
+
+**Where an operator declares a path decides who inherits it.** A path in a
+profile's `paths` is inherited by every bridge child — read-only, after
+narrowing, but inherited. A path in the *agent's* `state_rw` reaches only
+sessions running that agent, and a child running a different agent never sees it.
+So a tool's own runtime state belongs on the agent that runs it: the `omx`
+extension declares `~/.omx` and `~/.omx-runs` on its **leader** agent, and its
+workers — a different agent — cannot read the leader's session identity, launch
+lineage, logs or codebase map. Listing them in the profile instead would hand all
+of it to every worker.
+
+#### What a shared git directory does and does not give away
+
+A bridge child works in a **linked worktree**, and a linked worktree is not a
+self-contained repository: its `.git` is a *file* naming
+`<repo>/.git/worktrees/<id>`, its index and `HEAD` live there, and its object and
+ref stores are the main repository's. So a child granted only its worktree edits
+files it can never commit — `git commit` fails on `index.lock` with `Operation
+not permitted` — and friring reads a worktree it could not commit in as **dirty**,
+which is the one verdict that is never merged. Every child doing real work would
+end its run needing a person.
+
+Two grants make a commit possible, and they are deliberately different in kind:
+
+- **The child's own metadata directory**, granted with its own directories. Which
+  one that is comes from the **host's record**, never from the child: git writes
+  `<repo>/.git/worktrees/<id>/gitdir` naming that worktree's `.git` file, and
+  friring grants the single entry whose record names *this* worktree, requiring
+  the child's own marker to agree. Zero matching entries, two matching entries,
+  or a marker that names a different entry all grant nothing. A child can
+  therefore cost a sibling the ability to commit — friring reports that as a
+  dirty worktree and a person resolves it — and cannot gain a byte of anyone
+  else's state.
+- **`<repo>/.git` itself**, only when the profile's `child_shared_rw` lists it.
+  That is the operator's decision, and it is the one that shares something.
+
+Against that, three things are taken back. `<repo>/.git/worktrees` is subtracted
+wholesale and the child's own directory re-granted after, so no child reaches a
+sibling's index, `HEAD` or refs. The redirects inside its own metadata directory
+(`gitdir`, `commondir`, `config.worktree`) are read-only — **after** that
+re-grant, which is what makes them stick: both policy backends allow a child's
+own directories last, so a protection emitted earlier is undone by the allow that
+follows it. And inside the shared git directory, `hooks`, `config`,
+`config.worktree`, `commondir`, `HEAD` and `index` are read-only — see the table
+under [Inner agent sandboxes](#inner-agent-sandboxes).
+
+**What stays shared and writable is git's own design, and it is not small.** With
+`<repo>/.git` in `child_shared_rw`, every child of that owner can:
+
+- **add and delete objects** under `<repo>/.git/objects`. Adding is the commit.
+  Deleting is not portably preventable: loose objects are read-only files in a
+  writable directory, so unlinking them needs a deny that only seatbelt can
+  express, and a guarantee friring could keep on macOS and not on Linux would be
+  worse than a stated boundary.
+- **write any branch ref** under `<repo>/.git/refs`, `packed-refs` and
+  `logs/refs`, including the leader's and a sibling's — so a child can replace
+  what a sibling is about to have verified and merged. Narrowing this to the
+  child's own ref was considered and rejected: git writes `<ref>.lock` beside the
+  ref, so the grant has to reach the ref's *parent directory*, and friring names
+  every child's branch under one prefix — `refs/heads/<prefix>/` would expose
+  exactly the siblings the narrowing was for.
+
+**There is no mitigation, and the verdict is not one.** A child's verdict is
+reached by the host over the branch and head friring recorded for that child, and
+it establishes what that branch pointed at when friring looked and whether the
+worktree was clean. It establishes **nothing about who wrote it**: a child that
+moves a sibling's ref has friring verify, and an integration step merge, whatever
+that branch now points at, as that sibling's work. The same goes for the object
+store — content is shared, and deletable.
+
+So a profile that puts `<repo>/.git` in `child_shared_rw` declares **one trust
+domain**: every child of that owner, plus the owner, mutually trusting for refs,
+objects and history. Inside it, isolation is the worktree, the private agent
+state and each child's own metadata — never the commits. friring does not claim
+more, because it cannot enforce more, and a guarantee that holds only while every
+child behaves is not one.
+
+The lever is the grant itself: leave `<repo>/.git` out of `child_shared_rw` and
+children cannot commit at all, which is the right answer whenever one child's
+work must not be forgeable by another. Nothing about the two grants changes what
+a child may *read* of a sibling's worktree, transcripts or private state — those
+stay separate either way.
+
+#### Private agent state, always
+
+A bridge child never runs from its family's shared state. It gets
+`<data>/sandbox/tmp/<child>/state`, exposed through the agent's own
+`config_dir_env`, seeded from the entries the agent declares
+(`child_state_seed`) **and** the profile authorizes (`child_seed_allow`) — the
+exact path in the exact mode. The agent declares; the operator decides.
+
+| Mode | Does | For |
+|---|---|---|
+| `symlink` | Links to the parent's file or tree, plus **read** on that exact target | Read-only skill or prompt material |
+| `copy` | Copies it; the child's diverges | Configuration the child may edit |
+| `copy-rewrite` | Copies a UTF-8 text file ≤ 1 MiB, replacing the parent's state-directory path with the private one | A path-keyed hook configuration |
+| `link-rw` | Links, plus **read and write** on that exact target | The one credential the agent refreshes |
+
+`link-rw` is the only mode that writes outside the child's own tree, so it is the
+only one with conditions — and all three must hold: `src` resolves to the agent's
+declared `credential_file`, the agent declares `writeback = true` (its own
+assertion that it refreshes this credential in place), and the profile authorizes
+that exact path in that exact mode. It exists because ADR-28's condition is that
+**no second copy of a rotating token ever exists**: one shared file, refreshed in
+place, is the same sharing the vendor's own concurrent sessions already do on a
+host.
+
+**There is no shared-state mode and no fallback to one.** Every failure —
+no `config_dir_env`, no `state_dir`, a missing required seed, a seed the profile
+does not authorize, one authorized in a *different* mode, a non-text
+`copy-rewrite` source, a failed seeding step — refuses the launch with
+`state_unrelocatable`. A fallback would make "a leader and its workers cannot
+read each other's conversations" conditional on nothing having gone wrong.
+
+#### When a bridge-required agent is refused
+
+`bridge_requires` on an agent and `bridge_grants` on a profile must meet. Every
+one of these is an **integrity** refusal, so `allow_unsandboxed_fallback` cannot
+answer it — a bridge-required agent on the host would have no boundary *and* a
+channel nobody is serving, which is worse than not starting:
+
+- the session carries no profile at all;
+- the profile grants less than the agent requires (`grant_missing`);
+- the resolved backend cannot carry the bridge (`Caps::bridge` — every place
+  backend and every remote host);
+- the session is on a remote host;
+- the launch is **headless** (`bridge_requires_tui`): a `friring-cli session
+  create` exits after spawning, so nothing would own the session's egress proxy
+  or answer its bridge requests.
+
+### The broker
+
+The running friring process is what reads a request, decides whether the caller
+may, does the work and writes the answer. It is the only thing in the system with
+that authority, and it runs on the TEA tick — which means every pass is
+**bounded** rather than drained (ADR-3): at most four requests taken from each
+session's queue, at most one
+nudge typed, and anything that blocks running off the tick. A client flooding its
+queue costs latency, never frames.
+
+**Authority is the row and the directory.** Every verb resolves its caller from
+which queue the request came out of; every verb naming a child checks the
+immutable `bridge_children` row. `sessions.parent_session_id` is display only and
+is never asked. `send`'s `to` is a name the broker resolves through those rows,
+never one it trusts, and the *sender* is forced to the caller whatever the body
+says.
+
+**Mail kinds are directional, and the broker enforces it:**
+
+| Direction | Kinds |
+|---|---|
+| owner → child | `task`, `answer`, `cancel` |
+| child → owner | `result` (a typed `ResultBody`), `blocked`, `report` |
+| host → child | `ack`, `cancel` |
+| host → owner | `child.ready`, `child.stalled`, `child.dirty`, `child.done`, `child.failed`, `child.stop_failed`, `child.relaunched`, `child.removed_by_operator` |
+
+A child that could send `task` would be assigning work to its owner; one that
+could send `child.done` would be reporting a verdict only the host may reach. A
+`result` whose body is not a `ResultBody` is refused and starts no quiesce,
+because "the child asked to finish" is the one message that must not be inferred
+from free text.
+
+**The nudge is one exact literal.** When mail arrives, friring types
+`BRIDGE_NUDGE` into the recipient's pane — nothing is formatted into it, and a
+test asserts both the constant and that no code path builds it. A nudge lands in
+a live agent's *prompt*, so any part of it drawn from a message would let one
+sandboxed session put chosen words in front of another agent. The mail itself is
+read through `friring-cli bridge inbox`, where it arrives as data the agent
+parses rather than as words it was told. Rate limits: one nudge per recipient per
+60 s, new mail coalescing into the next; five unanswered nudges then `stalled`
+(attention, never a verdict — a long turn looks exactly like this); any bridge
+call resets the count. The **count**, not the reminder: the owed nudge is the
+only trace that mail is waiting, and it is discharged when the mailbox is
+actually drained — by any path, not only `inbox --claim` — so a recipient that
+answers every other verb and never reads its inbox is still reminded. The pane
+guard and the hook state both keep their veto, so friring never types into a
+pane that is asking the operator a question.
+
+**One nudge is typed per pass, and every pass gives up its place.** The
+recipient is the longest-waiting one, and *every* outcome restarts that
+recipient's interval — a nudge typed, a pane guard's veto, an identity that no
+longer matches, a recipient this instance cannot reach, and a recipient past its
+allowance alike. The last two are the ones that matter, because both persist:
+`stalled` is sticky until an operator clears it, and a parked or remotely-loaded
+recipient can be away indefinitely. A record whose interval never restarted
+would win the selection on every later pass and return without typing, so one
+unanswering child silenced the nudge for every other recipient in the process —
+its own owner included, which is the session that has to notice it.
+
+**An owed nudge is not lost with the process.** The record is per instance, but
+the mail it is about is a row, so the owed set is re-derived from the mailbox on
+a slow pass over the sessions this instance serves. Without it a restart, a
+handover between two friring instances on one database, or a recipient that was
+simply not loaded here when its mail arrived would leave that mail unannounced
+for ever: the reminder is created on arrival, and the arrival already happened.
+Strictly additive — a recipient already being nudged keeps its interval, its
+unanswered count and its stall report. A recipient this instance cannot type
+into keeps its reminder rather than losing it, so the mail is announced when it
+comes back.
+
+**A mailbox is bounded per recipient**: 50 unread for a child, 200 for an owner,
+tighter than the 500 an ordinary session's mailbox allows because both sides of a
+child's are agent-chosen — its owner decides how much to send and the child
+decides when to drain. At the 64 KiB body cap that is ~3 MiB of undrained mail
+per child rather than ~32. Past it a `send` is refused `quota`, which is
+backpressure the sender can act on rather than a message quietly lost.
+
+**Child-authored text is data.** A summary or a report is bounded, has its
+control characters stripped (an escape sequence would let a sandboxed agent paint
+the operator's screen), is labelled `child_authored` wherever it is shown, and
+never reaches a command, a query, a path, a nudge or an OS notification.
+
+### The child lifecycle
+
+`create`, `stop` and `resume` are the three verbs that change what is running,
+and all three are **deferred**: a `create` is a worktree checkout, a window spawn
+and a wait for the child's own hook, so it cannot be answered on the tick that
+accepted it. The journal entry stays `accepted`, no response file is written, and
+the saga writes both when it reaches a final step — so the client, which is
+already polling the response directory, simply waits. A retry with the same key
+finds the journal entry and waits too, rather than starting a second child.
+
+A verb that arrives for a child something else is already carrying attaches to
+that work **only when its outcome is an answer to it**. A second `stop` of a
+child already quiescing gets that quiesce's verdict, and a second `resume` of a
+child already relaunching gets that relaunch's. A `stop` that lands on a
+*launch* does not: the launch's success says the child is `ready`, which is the
+opposite of what the caller asked for. It is held and run as a real quiesce once
+the launch ends — against a child that exists, with a pane to stop and a
+worktree to read.
+
+**The spawn saga (ADR-32).** Every external effect is recorded in `child_sagas`
+*before* it is made, so recovery reconciles by exact identity:
+
+| Step | What happens | What is recorded first |
+|---|---|---|
+| S0 | the request is journaled | `bridge_requests` row, `accepted` |
+| S1 | the child is named `<owner>-<key8>` | saga row, task payload, lease |
+| S2 | `git branch`, then `git worktree add` | the worktree path (deterministic) and the branch; the ref claim afterwards |
+| S3 | scratch, signal, bridge, gate and private state dirs; the state is seeded | `scratch_minted`, `gate_dir` |
+| S4 | the egress proxy is prepared, not committed | the endpoint |
+| S5 | a **gated** pane opens, running the launch helper | the window, pane and pane pid |
+| S6 | **one transaction**: session row, ownership row, `starting` state, `session_repos`, first task mail | `committed` |
+| S7 | the proxy claim is committed and the supervisor's acknowledgement waited for | `egress_live` |
+| S8 | `revalidate_identity`, then the gate is opened by `rename(2)` | `released` |
+| S9 | the child's own hook reports | `done`, and the request is answered |
+
+The pane exists at S5 and the agent does not start until S8. That window is what
+makes every step between them able to fail *without the agent ever having run*.
+A silent egress supervisor therefore fails the saga rather than releasing the
+gate: an agent that believes it is filtered and is not is worse than a failed
+`create`.
+
+**S2 is two commands so a failure says whose the leftovers are.** friring
+supports several instances on one database (ADR-7b), so two `create`s naming one
+branch is a real race — and `git worktree add -b` has two outcomes that look
+identical afterwards: another instance won and made the worktree, or *this* one
+made it and a repository hook (`post-checkout` is the usual one) then exited
+non-zero. The recorded worktree path cannot tell them apart, and getting it
+backwards either deletes the winner's clean worktree or leaks a directory and a
+branch with nothing left to reclaim them. So the claim is split: `git branch`
+creates the ref or refuses — one atomic transaction, exactly one winner — and
+only the winner adds the worktree. From then on ownership is known rather than
+inferred, and it is recorded as `branch_claimed`. An unwind or a recovery that
+cannot read that flag removes **nothing** and tells the operator where the
+directory is: a leaked worktree can be deleted by hand, and a wrongly deleted one
+cannot be brought back.
+
+That claim is about the **ref**, and the reclaim needs one about the **path** too.
+The worktree layout sanitizes `/` to `-`, so `feat/one` and `feat-one` name one
+directory; two creates in a tick each win their own ref and both report the branch
+claimed, while only one wins `git worktree add`. So the reclaim asks
+`git worktree list` which branch the directory is on and removes it only on its
+own — any other answer, "somebody else's" or "git would not say", leaves it and
+says so. The branch is reclaimed either way, because it really was this attempt's.
+
+**Readiness is the hook report and nothing else.** A live pane proves a process
+is running; it does not prove the process is running from the private state
+directory friring seeded. The hook fires from inside the boundary, from that
+directory, so it is the only proof S9 accepts — the pane-pid fallback ordinary
+sessions use is refused for a bridge child.
+
+**Recovery** runs once, before the broker serves anything, over every saga that
+did not finish and whose lease has expired. A saga another instance still holds a
+live lease on is left to it. Below the committed line the saga's effects are
+removed — the recorded pane (only if its whole identity still matches), the
+recorded directories, and the recorded worktree and branch (only if
+`branch_claimed` proves this saga made them, only if the worktree is clean, and
+only on a positive answer of zero commits ahead) — and the request is failed. At
+or above it the child is a real session: its egress is restored and, if it is not
+running, it is relaunched **once**; a second failure is `unusable`.
+
+**The quiesce protocol** is the only way a child reaches a quiesced state:
+
+1. A `result` mail is accepted as the finish **intent** → `finishing`. One that
+   arrives while the child's own launch is still running is **held**, not
+   dropped: the agent starts when the gate opens at S8, one step before S9, so a
+   worker small enough to finish inside that window is ordinary. It is carried
+   out as a quiesce the moment the launch ends, and it is written to
+   `child_sagas.finish_outcome` so a crash in that window does not lose it. When
+   a `stop` is held on the same launch, whichever arrived first decides — the
+   order the live path would have produced.
+2. The host sends its fixed `ack` (or `cancel`, for a `stop`).
+3. The exact pane is stopped: `revalidate_identity`, then kill. After this the
+   agent cannot write, so what is read next is final.
+4. Four read-only `git` commands in the child's worktree: `status --porcelain`,
+   `symbolic-ref --short HEAD`, `rev-parse HEAD`, and `rev-list --count` over
+   `base..HEAD`. The answers go in `bridge_results`.
+5. The verdict and the terminal state are written **before** anything is
+   answered or retired. Neither landing refuses the request with
+   `quiesce_failed` and leaves the child `finishing` — live, so its slot is held
+   and an operator sees it, and re-run by recovery on the next start. A caller
+   told `done` over an empty `bridge_results` row is a branch an integration step
+   would merge as one friring verified.
+6. Clean and stopped → the intent's own verdict (`done` or `failed`). **Dirty →
+   `dirty`, whatever the intent said** — never integrated, slot still held, the
+   owner's to `resume` or `stop`. A worktree git could not read is dirty too:
+   friring will not report a directory it could not inspect as complete. A kill
+   that fails or an identity mismatch → `stop_failed`, never integrated, never
+   reused, surfaced for an operator.
+
+**Slots.** `starting`, `ready`, `working`, `blocked`, `stalled`, `finishing`,
+`dirty` and `stop_failed` are **live** and hold one of the owner's
+`max_children`. `done`, `failed`, `stopped` and `unusable` have released it.
+`dirty` and `stop_failed` are live precisely because they still need somebody to
+do something, and a child that quietly released its slot in either state would
+let a leader create a replacement while the first one still holds a worktree.
+`stopped` is the deliberate parking path: a clean owner `stop` retires the
+runtime but preserves the ownership row, worktree, branch and private agent
+state. `resume` may relaunch that same child later. Because `stopped` and
+`unusable` no longer hold a slot, resuming either first claims capacity and
+refuses `fanout_exhausted` without changing the child when the profile is full;
+the `starting` claim and relaunch saga are one transaction. Resuming `dirty` or
+`stalled` consumes no additional slot because each already holds one.
+
+**A resume comes back to the child's own conversation.** The worktree, the
+branch, the mailbox and the private state directory are half of what an owner
+parked; for an agent that has a thread, the thread is the half that decides
+whether the worker still knows what it was doing.
+`app::bridge_saga::child_resume_identity` keeps the `agent_session_id` friring
+minted when it created the child and emits that agent's own resume group
+(`resume_args` / `resume_latest`, resolved by the same
+`session_ops::resume_trigger_for` an ordinary restart uses), so the relaunched
+agent reopens the conversation rather than starting one. A `create` is
+unchanged: it mints a conversation, as it always did.
+
+**A resume that cannot be proved to reach the conversation is refused.** Never
+launched into a blank one — a blank one is indistinguishable from the outside,
+because the child comes up, answers its mail, has forgotten the task, and nothing
+says so. The refusal happens in `begin_resume`, beside the capacity check and
+**before anything is mutated**, so it leaves the child exactly as it found it —
+including a `stalled` child's still-running pane, which the relaunch would
+otherwise have killed on its way to a refusal. The saga checks again at S5 as a
+backstop. Three cases reach it:
+
+- a child with no recorded conversation at all;
+- an agent that declares where its conversations live
+  (`[agents.<name>.transcript]`, see `docs/CONFIG.md`) and this child's is not
+  there — a claude transcript deleted, a codex state directory never written;
+- an agent that declares a resume contract but **no** transcript block. `resume
+  --last` in an empty directory is not a resume, so friring has no way to tell
+  the two apart and will not guess; the refusal names the block to add.
+
+The check is generic: it asks the registry what the agent *declared*, never what
+the agent is. friring holds no agent-specific knowledge about transcripts — the
+agent's own entry says `dir`, `suffix` and whether the file name carries the id
+friring resumes by, and the same declaration answers the question for a family
+session and for a child, because it is evaluated against the state directory
+*that launch* uses.
+
+An agent that declares **no** resume contract at all is not one of these — a
+`/bin/sh` worker has no thread to lose, so its relaunch is a fresh process by
+definition.
+
+The refusal is the fail-closed direction, and it is a behaviour change for an
+`agents.toml` written before the key existed: a codex-shaped bridge child of a
+registry entry with no `[agents.<name>.transcript]` block is refused rather than
+resumed. Adding the three lines the message names restores it.
+
+This is also when ADR-32's drop-a-repeat readiness rule earns its keep: a
+resumed agent replays its own transcript, so its first report can repeat the
+state its previous life left recorded. The hook row is cleared as the gate opens
+for exactly that. `just codex-park-e2e` observes the whole of it against a real
+interactive Codex — the pre-stop process never runs again, and the thread the
+relaunched one writes carries the pre-stop turn as well as the new work.
+
+**Capacity fails closed, and it is durable on both halves.** The count a
+`create` and a released `resume` are checked against is `live_bridge_children`
+plus `pending_child_slot_claims` — the launches that have claimed a slot without
+having a child row yet. Both come from the database rather than from the
+broker's own in-flight jobs, because the bridge lease **moves**: an instance
+that takes an owner's queue over mid-launch has none of its peer's jobs and
+would admit those launches all over again, one extra child each. The claim is
+durable throughout — `begin_create` writes the saga row before it pushes the
+job, and S6 writes the child's state row and the `committed` step in one
+transaction, so a pre-commit saga with no state row is exactly "a slot claimed,
+no child yet" from any process, and the two counts cannot overlap. A saga whose
+lease has expired still counts: an expired lease means a friring went away
+mid-launch, which is when what it made is unaccounted for. When either count
+cannot be read the request is refused `failed` — not counted as zero, and not
+reported `fanout_exhausted`. The cap is the only thing bounding how many agents run
+inside one owner's boundary, so the moment friring cannot see the children an
+owner already has is precisely the moment it must not authorize more; and a
+leader that retries a transient "not now" would retry a broken read forever.
+
+**Cascades.** Hard-deleting an owner stops every live child first and deletes
+none of them: removing a leader is not an instruction to throw away what its
+workers wrote. Deleting a child mails its owner `child.removed_by_operator`, so a
+leader polling `status` does not see a child that simply stopped existing.
+
+### What the UI and the CLI say
+
+**The info panel** gains two rows beside `Sandbox:`. `Egress:` says whether the
+*filter* is live, which the shield does not answer: a profile can be applied —
+its path and process policy enforced by the kernel — while its allowlist is
+down, because the allowlist lives in a listener inside the friring process and a
+restart has to rebind it. `NOT FILTERED` is the loud case, and the session list
+carries a mark for it beside the shield.
+
+`Bridge:` says where a session sits in an orchestration, and is omitted entirely
+for the overwhelming majority, which are in none. As a child it reads `child of
+<owner>` and the child's state; as an owner, `<live>/<cap> children`, plus
+`needs you` when one of them is `dirty`, `stop_failed`, `blocked` or `stalled`.
+Every field is host-known — a name friring resolved and a count it made — so
+nothing a sandboxed agent wrote reaches the panel through this row.
+
+**The profile editor** gains five fields, and they appear only for a backend
+that can carry the bridge: `bridge` (one of three presets — none, worker,
+leader — rather than eight combinations nobody means), then `children`, `child
+agents`, `child shares` and `child seeds`, which appear once something is
+granted. A seed authorization is written `path:mode` and is validated at **save**
+rather than at launch, so a profile that would refuse every bridge child cannot
+be stored.
+
+**The CLI.** `friring-cli session get|list` carry a `bridge` object: the owner,
+this session's own state, and for each child its state and the host's verdict
+(`outcome`, `branch`, `head`, `dirty`, `ahead_of_base`, `verified_at`). Nothing
+a child wrote is in it — an integration step reads this document, and text a
+worker wrote must not be part of what decides whether its branch is merged. The
+egress token is not in it either, here or anywhere else that renders a session.
+`friring-cli bridge --human` prints a readable summary instead of the JSON an
+agent parses; the JSON stays the default.
+
+### Proving it works
+
+Two extensions ship with the bridge, and the first is the one to reach for when
+something is wrong.
+
+**`bridge-conformance`** proves the bridge with **no vendor agent involved**.
+Both its agents are `/bin/sh` scripts — no login, no model, no network, no
+dependencies — so a green run demonstrates the verbs, the authority rules and
+the quiesce protocol rather than an integration with anything. Its worker
+deliberately *tries* to create a child and fails the run if it is allowed, which
+is the depth rule asserted rather than assumed. Its `profiles.toml` is also the
+answer to "what is the least a profile has to grant?".
+
+**`omx`** is the real one: oh-my-codex 0.21.0 as a leader, with every Team node
+as a sandboxed bridge child. It replaces exactly one lane — native `omx team`,
+which needs a tmux pane layout inside the leader's own terminal, and which
+therefore refuses correctly under a boundary that strips `TMUX` and denies the
+host's sockets. Everything else in OMX is untouched. See
+`extensions/omx/README.md` for the operator path and `extensions/omx/OMX.md` for
+which facts of that release the extension is bound to.
+
+### Conformance: what has been observed
+
+The deny set is stated above. This is what has been **observed** against a real
+kernel, and what has not.
+
+`just seatbelt-probe` runs `scripts/dev/sandbox-probes/seatbelt.sh` inside a
+disposable full-isolation sandbox. It starts friring's own tmux server, one at
+`/tmp/tmux-<uid>/`, one under `$TMUX_TMPDIR`, one under `$TMPDIR`, and an outer
+server whose socket the probe process inherits through `$TMUX` — then dials each
+from inside a boundary friring composed, under `full`, `allowlist` and `none`.
+The deny set is about paths and processes rather than about the network, so it
+must hold identically in all three, and a mode-dependent hole is the interesting
+kind. **Observed on macOS: 24 assertions, all passing** — every socket refused
+in every mode, the inherited `$TMUX` address gone from the environment, and
+friring's own trees out of reach.
+
+The last group is what a probe is *for*. It asserts that another session's gate
+directory is neither readable nor writable and that the database is unreadable —
+and the first of those **failed on its first run**. `host-minus-secrets` makes
+the host filesystem readable and takes back a named list of credential paths,
+which never covered friring's own trees, so a gate's release file — which
+carries the key its launch helper compares against — was readable from any other
+boundary. `check_declared_paths` had refused a *profile* naming that tree in
+either mode all along; the generated scope did not agree. Both backends now deny
+the gate tree wholesale and re-grant only this launch's own gate, read-only,
+after the deny.
+
+The **positive controls** matter as much. A boundary that refused everything
+would pass every deny assertion and be useless, so the probe also proves the
+session's own workspace is readable and writable, and that a tmux server started
+at a `-S` path *under that workspace* is reachable. That last one is the
+documented residual, asserted rather than glossed: friring denies the **host's**
+sockets, not the concept of a socket.
+
+`just bwrap-probe` is the Linux twin, with the same assertions plus the two only
+a namespace can be asked: the wrapped process is **pid 1** inside it (which is
+what makes a relay's lifetime the launch's), and no `friring-cli sandbox relay`
+survives a launch. Both probes **skip** rather than fail where the capability is
+absent — user namespaces are off on some distributions and in most containers,
+and a probe that failed there would be reporting the machine rather than friring.
+Both run as non-blocking CI jobs.
+
+The probes use `friring-cli sandbox exec --profile <name> -- <argv>`, which
+composes the **same** boundary a session launch composes — the same `apply`, the
+same generated policy, the same deny set — because a probe that built its own
+would be proving something about itself. That command never falls back to the
+host, whatever a profile's `allow_unsandboxed_fallback` says: there is no
+session, and "it ran outside the boundary" is not an answer to "what does the
+boundary allow?".
+
+`just bridge-e2e` asks the three questions a one-shot cannot. `sandbox exec`
+composes no gate and no proxy, so it observes the deny set a *question* gets;
+that harness boots the real TUI, creates a leader through the wizard, and has the
+leader assert from **inside its own launched boundary** that friring's gate root
+is neither readable nor writable and that the database is unreadable. A fourth is
+structural rather than asserted: the leader runs at all only because the launch
+helper, inside that boundary, could read *this* launch's own gate through the
+read-only re-grant — the gate root being denied is what says the re-grant reaches
+nothing else.
+
+The **omx ship gates** are observed by `tests/codex_private_state.rs` against the
+installed Codex CLI (skipped where it is absent, which is every CI runner). Both
+hold on codex-cli 0.149.0:
+
+- **Relocated hooks.** A `hooks.json` seeded by friring's own `SeedPlan` in
+  `copy-rewrite` mode fires from the child's private `CODEX_HOME`, from the
+  rewritten path — and the family's copy of the same script does **not** run.
+- **Credential writeback.** `codex login --with-api-key` writes `auth.json`
+  **in place** through a `link-rw` hard link: same inode, link count still two,
+  and the family's path reads back what the child wrote. That is ADR-28's
+  condition — one credential file, no private copy of a rotating token.
+
+**Not yet observed**, and recorded rather than argued away:
+
+- The bwrap probe has not been run on a Linux host by this work; it runs in CI.
+- **A filtered session's proxy being reachable from inside** is asserted at unit
+  level and not by a probe. `sandbox exec` refuses a filtered profile — a
+  one-shot process cannot own a proxy — and the `bridge-conformance` profile is
+  `network_mode = "none"` on purpose, so its run proves the bridge works with the
+  network closed rather than proving anything about the proxy.
+- **An OAuth refresh specifically.** The credential gate above observes codex's
+  auth-file *write path*, through a real write it can be made to perform.
+  Inducing an actual token refresh needs a real credential and an expired token,
+  neither of which this work holds. Both writes go through the same writer, and
+  that is an argument rather than an observation, so the refresh stays listed
+  here.
+
+### Restoring a filtered session's egress
+
+A filtered session's proxy listener lives in the **friring process**, so a
+restart leaves an agent that is still running holding proxy URLs naming a port
+and a credential nothing answers on. Adoption therefore rebinds, and every part
+of that is pinned:
+
+- **The endpoint is the persisted one** (`sessions.egress_endpoint`, as
+  `tcp:<port>` or `unix:<path>`), on both loopback families — a client resolving
+  `localhost` may pick either, and a seatbelt rule cannot tell them apart.
+- **The token is the persisted one** (`sessions.egress_token`). Minting a fresh
+  one would leave the running agent presenting a credential the new listener
+  refuses: a sandbox that looks filtered and reaches nothing.
+- **The policy is re-read** from the profile as it stands now, so an edit between
+  the two runs takes effect. That is the one thing that deliberately changes.
+
+`sessions.egress_state` records how it went, and the states are different things
+to a user rather than degrees of the same one:
+
+| State | Means |
+|---|---|
+| `none` | This session needs no proxy |
+| `preparing` | A launch bound a listener the supervisor has not acknowledged |
+| `active` | The supervisor holds this session's committed instance |
+| `restoring` | A restart is rebinding the persisted endpoint |
+| `unrestorable` | It could not be rebound, with the reason |
+
+`preparing` becomes `active` only once the supervisor **answers** — a commit is a
+message to its thread, so inferring "active" from a successful send would record
+that a boundary is filtering before anything agreed to. A silent supervisor
+leaves it `preparing`, and the bridge's spawn saga refuses to release a child's
+gate on that.
+
+**`sandbox_unenforced` is never written for any of this.** That column means "the
+profile could not be applied, so the agent is on the host". An enforced boundary
+with a dead proxy is still enforced: the kernel policy holds and the agent has no
+network rather than an unfiltered one. Conflating the two would paint `⚠` over a
+session that is sandboxed. A failed restore also leaves the token exactly as it
+was, because rotating it would take the running agent's network away for a reason
+nothing would explain.
+
+The token is written to the row and read back by one caller. It is deliberately
+**not** on `SessionInfo`: that type is rendered, serialized, logged and
+snapshotted all over the app, and the safest redaction is the value never being
+in it. `EgressRecord`, `ProxyGrant`, `SharedSession` and `SandboxedInvocation`
+all carry hand-written `Debug`s that withhold it.
+
+### Multiplexer identity
+
+The window name is the adoption key and always will be. It is not evidence: a
+window can be created by anything holding the socket, and a pane id is reused
+after a server restart. So every launch records the **exact** window its agent
+went into, and every destructive multiplexer action revalidates against it before
+acting.
+
+Per session (`sessions.mux_*`): `#{window_id}`, `#{pane_id}`, `#{pane_pid}`, and
+`@friring_pane` — a per-**launch** marker friring stamps on the pane as
+`<session id>:<launch key>`. A relaunch mints a fresh key, so a marker left by a
+previous launch never matches the current row: the marker is evidence rather
+than a label, because only this launch could have put it there.
+
+Per server: `@friring_server`, a uuid friring sets once on first connection, plus
+`#{socket_path}`, `#{pid}` and `#{start_time}` as cross-checks. The marker is the
+authority — a pid is reused, a uuid is not — and `socket_path` is what proves the
+deny set above and the server friring drives are the same one: a server reporting
+a different socket refuses every launch with `identity_mismatch`, because a
+sandbox built against a deny set for some *other* socket is unconstrained in
+exactly the dimension that set exists for.
+
+Every format variable used is in the tmux 3.2 man page, the floor this feature
+states. A variable a running tmux does not know expands to the empty string
+rather than failing the command, so a missing field is recorded as *not reported*
+and is simply not compared — degrading to the marker rather than refusing every
+action on an older server. What **is** recorded must match exactly, and nothing
+recorded is never a match: a session from before the identity existed is refused,
+not waved through.
+
+### The host multiplexer deny set
+
+`connect(2)` on a pathname unix socket is a filesystem operation, and no
+network namespace stops it. A sandbox that can reach Friring's own tmux socket
+asks that server to run a command in a pane — outside the boundary, with the
+user's privileges. Seatbelt makes this worse than it sounds: SBPL models a unix
+socket as a *network* operation, so `(allow network*)` under an unrestricted
+`full` profile grants it.
+
+So every policy launch renders a **closed** deny set
+(`dirs::multiplexer_socket_denies`), each entry in both its written and its
+resolved spelling, after every allow:
+
+1. Friring's own server socket file, `<root>/tmux-<uid>/<socket name>` — the
+   path tmux derives from `-L <name>`.
+2. The socket of the server Friring is itself running inside, when it is: the
+   first `,`-separated field of Friring's own `$TMUX`, read at startup.
+3. The exact `tmux-<uid>` directory under every root a tmux build on this host
+   could use — `$TMUX_TMPDIR`, `$TMPDIR`, `/tmp`, and `/private/tmp` on macOS
+   where `/tmp` actually lives. The directory, never the root.
+
+Seatbelt emits `(deny network-outbound …)` and `(deny network-bind …)` per
+entry — `subpath` for a directory, `literal` for a socket file. bwrap's existing
+masks are unchanged product behaviour (`--tmpfs /tmp` always; `/run`,
+`/var/run`, `$XDG_RUNTIME_DIR` and the tmux socket root under
+`host-minus-secrets`) and it adds only the entries those do not already cover: a
+`tmux-<uid>` under a `$TMPDIR` somewhere else, an inherited outer socket outside
+every masked tree, masked as a file with `/dev/null`. Under `workspace` scope
+nothing outside the profile is bound at all, so the set is unreachable by
+construction rather than by a mask.
+
+**Nothing broader, on purpose.** `/tmp`, `/run`, `/var/run`, `$XDG_RUNTIME_DIR`
+and `$TMPDIR` are *not* denied as wholes. The profile already decides what a
+sandbox reaches in those trees, and a blanket unix-socket denial would break the
+IPC a real agent needs — its own language server, a test harness's socket, a
+package-manager daemon.
+
+**The residual.** The set is closed and discoverable, which means a tmux server
+an operator starts at an arbitrary `-S <path>` inside a directory the profile
+grants read-write is outside it and reachable from the sandbox. That is the same
+class of grant as handing over any other socket the profile names, and
+`grants_tmux_socket_tree` still refuses a profile path that names a `tmux-`
+directory. psmux is absent from the set because there is no boundary to add it
+to: native Windows has no sandbox backend, and a remote psmux host cannot host
+one.
 
 **Place backends** add an ensure-instance step before spawn and then reach the
 place through `TmuxTransport::Sandbox`, a launch prefix in front of the tmux argv
@@ -1599,9 +2615,11 @@ Two details that silently break things if missed:
 - **Scratch and policy files.** friring mints a per-session directory under
   `<data dir>/sandbox/tmp/` for the agent's scratch and writes the generated
   seatbelt profile to `<data dir>/sandbox/profiles/`, both `0700`, both refusing
-  a symlink. Neither may be the host temp root, and a profile is refused if its
-  read-write roots reach the data directory, the database file, a tmux socket
-  directory or friring's own configuration files.
+  a symlink. `TMPDIR`, `TMP` and `TEMP` all name that private session directory,
+  overriding inherited host values so language runtimes and build tools do not
+  fall back to an unreadable host temp tree. Neither may be the host temp root.
+  A profile is refused if its read-write roots reach the data directory, the
+  database file, a tmux socket directory or friring's own configuration files.
   A profile may not name anything under `<data dir>/sandbox` or
   `<data dir>/signals` in **either** mode either: that tree holds the other
   profiles' synthetic homes — and therefore the logins in them — the markers that

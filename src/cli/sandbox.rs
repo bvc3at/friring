@@ -2,14 +2,15 @@
 //!
 //! Two kinds of command live here, and the difference is the database.
 //!
-//! **Inside the boundary.** [`Action::Relay`] runs *in* a sandbox, where
-//! ADR-29 keeps the database out on purpose. A sandbox in its own network
-//! namespace has no route to the host's loopback, so it reaches the egress
-//! proxy through a bind-mounted unix socket — and no mainstream HTTP or SOCKS
-//! client can dial one, because `HTTP_PROXY` and `ALL_PROXY` take a host and a
-//! port. The relay closes that gap by offering a TCP endpoint inside the
-//! namespace and forwarding each connection to the socket (`docs/SANDBOX.md`
-//! §Reaching the proxy).
+//! **Inside the boundary.** [`Action::Relay`] and [`Action::Launch`] run *in* a
+//! sandbox, where ADR-29 keeps the database out on purpose.
+//!
+//! A sandbox in its own network namespace has no route to the host's loopback,
+//! so it reaches the egress proxy through a bind-mounted unix socket — and no
+//! mainstream HTTP or SOCKS client can dial one, because `HTTP_PROXY` and
+//! `ALL_PROXY` take a host and a port. The relay closes that gap by offering a
+//! TCP endpoint inside the namespace and forwarding each connection to the
+//! socket (`docs/SANDBOX.md` §Reaching the proxy).
 //!
 //! ```text
 //! agent  →  127.0.0.1:PORT   (the sandbox's own loopback)
@@ -24,6 +25,11 @@
 //! allowlist is still applied outside the boundary — and it never parses a
 //! byte, so `CONNECT` and SOCKS5 both cross unchanged.
 //!
+//! `sandbox launch` is the process the boundary runs *instead of* the agent: it
+//! starts that relay when there is one, drops the host multiplexer's environment
+//! and — for a bridge child — waits for the host to release its gate, then
+//! `execvp`s the agent in place (ADR-33).
+//!
 //! **Outside the boundary.** Everything else — listing and inspecting
 //! profiles, removing one, reclaiming places, moving profiles between machines
 //! as TOML, and storing the `env-token` value — is host-side management that
@@ -31,13 +37,14 @@
 //!
 //! # Dispatched before the database
 //!
-//! `friring-cli`'s `main` calls [`run_before_database`] immediately after
-//! parsing: it answers `Some` for the relay and `None` for every host-side
-//! command, so the relay never opens a database (which would either create a
-//! stray one inside the boundary or fail and leave the sandbox with no egress)
-//! and the management commands take the ordinary [`crate::cli::run`] path with
-//! the database already open. [`run`] refuses the relay for the same reason
-//! rather than serving it with a database in hand.
+//! `friring-cli`'s `main` calls
+//! [`early::run_before_database`](crate::cli::early::run_before_database)
+//! immediately after parsing: it answers `Some` for the two in-boundary commands
+//! and `None` for every host-side one, so neither ever opens a database (which
+//! would either create a stray one inside the boundary or fail and leave the
+//! sandbox with no egress) and the management commands take the ordinary
+//! [`crate::cli::run`] path with the database already open. [`run`] refuses both
+//! for the same reason rather than serving one with a database in hand.
 //!
 //! # Nothing here prints a secret
 //!
@@ -67,6 +74,43 @@ use crate::storage::Database;
 /// a boundary it built.
 #[derive(Subcommand, Debug)]
 pub enum Action {
+    /// Wait for this launch's gate, then become the agent.
+    ///
+    /// Not for interactive use: friring composes this itself, inside a boundary
+    /// it built, as the process the sandbox runs *instead of* the agent — it
+    /// starts the egress relay when there is one, drops the multiplexer
+    /// variables, waits for the host to release the gate when there is one, and
+    /// then `execvp`s the agent argv after `--` **in place**, so the pane's
+    /// process is the agent and nothing forked stays behind (ADR-33).
+    ///
+    /// Dispatched before the database opens, like [`Action::Relay`] and for the
+    /// same reason.
+    Launch {
+        /// The gate directory to poll, read-only inside the boundary. Omit for
+        /// an ungated launch.
+        #[arg(long, requires = "key")]
+        gate: Option<PathBuf>,
+        /// The content the release file must hold.
+        #[arg(long, requires = "gate")]
+        key: Option<String>,
+        /// How long to wait for the release file, in seconds.
+        #[arg(long, default_value_t = crate::sandbox::launcher::GATE_TIMEOUT_SECS)]
+        timeout: u64,
+        /// Address the egress relay should offer inside the boundary. Omit when
+        /// this launch reaches the proxy directly or has no egress at all.
+        #[arg(long, requires = "relay_socket")]
+        relay_listen: Option<SocketAddr>,
+        /// The proxy's unix socket, at its path inside the boundary.
+        #[arg(long, requires = "relay_listen")]
+        relay_socket: Option<PathBuf>,
+        /// Remove this variable from the environment before exec'ing the agent.
+        /// Repeatable.
+        #[arg(long = "unset")]
+        unset: Vec<String>,
+        /// The agent's own command line, taken verbatim.
+        #[arg(last = true, required = true)]
+        agent: Vec<String>,
+    },
     /// Forward a TCP port inside the sandbox to the egress proxy's unix socket.
     ///
     /// Not for interactive use: friring composes this itself, inside a boundary
@@ -137,6 +181,32 @@ pub enum Action {
         #[arg(long)]
         replace: bool,
     },
+    /// Run one command inside a profile's boundary and report what applied.
+    ///
+    /// The operator's way to ask "does this profile actually let that through?"
+    /// without spawning a session, and the tool the sandbox probes
+    /// (`scripts/dev/sandbox-probes/`) use to observe the deny set against a
+    /// real kernel rather than against generated text.
+    ///
+    /// **Never falls back to the host.** A profile that cannot be applied here
+    /// refuses, whatever its `allow_unsandboxed_fallback` says: a session that
+    /// falls back is still a session doing useful work with its state on the
+    /// row, and this is a question — an answer of "it ran, outside the
+    /// boundary" would be the wrong answer to it.
+    ///
+    /// Policy backends only. A place is an environment, not a wrapper, and
+    /// running one command in it would create or adopt a container.
+    Exec {
+        /// Profile name (case-insensitive).
+        #[arg(long)]
+        profile: String,
+        /// Working directory for the command. Defaults to the current one.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// The command line, taken verbatim after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     /// Manage the long-lived tokens `env-token` injects into a place.
     Token {
         #[command(subcommand)]
@@ -169,40 +239,18 @@ pub enum TokenAction {
     List,
 }
 
-/// Refusal shown if the relay ever reaches the database-bearing path.
+/// Refusal shown if an in-boundary command ever reaches the database-bearing
+/// path.
 ///
-/// Unreachable while `main` calls [`run_before_database`] first, and a refusal
-/// rather than a working relay if that call is ever removed: a relay served
-/// from here has a database open in a process the sandbox talks to, which is
-/// the one thing ADR-29 forbids. Failing closed costs the sandbox its egress
-/// and says exactly why.
-const RELAY_OFF_THE_EARLY_PATH: &str =
-    "`sandbox relay` runs inside a sandbox and must be dispatched before the database is \
-     opened (ADR-29); friring-cli's main no longer does that, so the relay was refused \
+/// Unreachable while `main` calls [`crate::cli::early::run_before_database`]
+/// first, and a refusal rather than a working relay if that call is ever
+/// removed: a command served from here has a database open in a process the
+/// sandbox talks to, which is the one thing ADR-29 forbids. Failing closed costs
+/// the sandbox its egress and says exactly why.
+const IN_BOUNDARY_OFF_THE_EARLY_PATH: &str =
+    "this command runs inside a sandbox and must be dispatched before the database is \
+     opened (ADR-29); friring-cli's main no longer does that, so it was refused \
      rather than served with a database open";
-
-/// Run the one sandbox command that must not open the database, or answer
-/// `None` for a command that needs one.
-///
-/// Called by `friring-cli`'s `main` immediately after parsing and before the
-/// settings/database block. `None` means "this is host-side management, take
-/// the normal path" — which is where the output format, the JSON rendering and
-/// the exit code come from.
-pub fn run_before_database(command: &crate::cli::Command) -> Option<Result<(), String>> {
-    database_free(command).map(|(listen, socket)| relay(listen, socket))
-}
-
-/// The decision behind [`run_before_database`], separated from carrying it out
-/// so it can be asserted on: the relay serves until its sandbox is torn down,
-/// and a test that called the runner would never come back.
-fn database_free(command: &crate::cli::Command) -> Option<(SocketAddr, &Path)> {
-    match command {
-        crate::cli::Command::Sandbox {
-            action: Action::Relay { listen, socket },
-        } => Some((*listen, socket.as_path())),
-        _ => None,
-    }
-}
 
 /// Run a host-side sandbox command against `db`.
 ///
@@ -213,7 +261,9 @@ fn database_free(command: &crate::cli::Command) -> Option<(SocketAddr, &Path)> {
 /// answer. Never carries a token: see the module docs.
 pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
     match action {
-        Action::Relay { .. } => Err(RELAY_OFF_THE_EARLY_PATH.to_string()),
+        Action::Relay { .. } | Action::Launch { .. } => {
+            Err(IN_BOUNDARY_OFF_THE_EARLY_PATH.to_string())
+        }
         Action::List { instances } => {
             list(db, crate::sandbox::SandboxHost::local_shared(), instances)
         }
@@ -227,6 +277,11 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
         ),
         Action::Export { name, output } => export(db, name.as_deref(), output.as_deref()),
         Action::Import { path, replace } => import(db, &path, replace),
+        Action::Exec {
+            profile,
+            cwd,
+            command,
+        } => exec(db, &profile, cwd.as_deref(), &command),
         Action::Token { action } => token(
             action,
             crate::agent::agent_config::load_or_seed().agents,
@@ -236,7 +291,7 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
 }
 
 #[cfg(unix)]
-fn relay(listen: SocketAddr, socket: &std::path::Path) -> Result<(), String> {
+pub(crate) fn relay(listen: SocketAddr, socket: &std::path::Path) -> Result<(), String> {
     // A runtime of its own, and the smallest one: this process exists to move
     // bytes between two sockets, and it is started by a sandbox launch that has
     // no runtime to inherit.
@@ -404,6 +459,27 @@ fn show(
         (
             "unsandboxed fallback",
             p.allow_unsandboxed_fallback.to_string(),
+        ),
+        (
+            "bridge grants",
+            join_or_dash(
+                &p.bridge_grants
+                    .iter()
+                    .map(|g| g.as_str().to_string())
+                    .collect::<Vec<_>>(),
+            ),
+        ),
+        ("max children", p.max_children.to_string()),
+        ("child agents", join_or_dash(&p.child_agents)),
+        ("child shared rw", join_or_dash(&p.child_shared_rw)),
+        (
+            "child seed allow",
+            join_or_dash(
+                &p.child_seed_allow
+                    .iter()
+                    .map(|seed| format!("{} ({})", seed.path, seed.mode))
+                    .collect::<Vec<_>>(),
+            ),
         ),
         (
             "places",
@@ -855,6 +931,14 @@ fn profile_json(
         "image": p.image,
         "containerfile": p.containerfile,
         "allow_unsandboxed_fallback": p.allow_unsandboxed_fallback,
+        "bridge_grants": p.bridge_grants.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
+        "max_children": p.max_children,
+        "child_agents": p.child_agents,
+        "child_shared_rw": p.child_shared_rw,
+        "child_seed_allow": p.child_seed_allow.iter().map(|seed| json!({
+            "path": seed.path,
+            "mode": seed.mode.as_str(),
+        })).collect::<Vec<_>>(),
         "undecoded": stored.undecoded_columns(),
         "unavailable": unavailable_reason(host, p.backend),
         "places": places.iter().map(|place| place_json(&p.name, place)).collect::<Vec<_>>(),
@@ -1020,6 +1104,36 @@ fn profile_table(profile: &SandboxProfile) -> toml_edit::Table {
         "allow_unsandboxed_fallback",
         value(profile.allow_unsandboxed_fallback),
     );
+    // The orchestration-bridge half (ADR-31). Written whenever the profile
+    // grants anything, and omitted entirely when it grants nothing: a document
+    // for a profile with no bridge should read like the ones that came before
+    // it, and an absent key imports as the closed default.
+    if !profile.bridge_grants.is_empty() {
+        let grants: Vec<String> = profile
+            .bridge_grants
+            .iter()
+            .map(|g| g.as_str().to_string())
+            .collect();
+        table.insert("bridge_grants", string_array(&grants));
+        table.insert("max_children", value(i64::from(profile.max_children)));
+        table.insert("child_agents", string_array(&profile.child_agents));
+        table.insert("child_shared_rw", string_array(&profile.child_shared_rw));
+        let mut seeds = Array::new();
+        for seed in &profile.child_seed_allow {
+            let mut entry = InlineTable::new();
+            entry.insert("path", TomlValue::from(seed.path.clone()));
+            entry.insert("mode", TomlValue::from(seed.mode.as_str()));
+            seeds.push(TomlValue::InlineTable(entry));
+        }
+        if profile.child_seed_allow.len() > 1 {
+            for entry in seeds.iter_mut() {
+                entry.decor_mut().set_prefix("\n    ");
+            }
+            seeds.set_trailing_comma(true);
+            seeds.set_trailing("\n");
+        }
+        table.insert("child_seed_allow", Item::Value(TomlValue::Array(seeds)));
+    }
     table
 }
 
@@ -1039,6 +1153,125 @@ fn string_array(items: &[String]) -> toml_edit::Item {
 /// engine's control socket — is refused *here*, in the same words, rather than
 /// stored and discovered at the first launch that picks it. So is a name
 /// collision, unless `--replace` says otherwise, and so is a key friring does
+/// Run one command inside a profile's boundary.
+///
+/// The composition is the **same one a session launch makes** — the same
+/// `apply`, the same generated policy, the same deny set — because a probe that
+/// composed its own boundary would be proving something about itself.
+///
+/// Three refusals, and each is the honest answer to a different wrong shape:
+///
+/// - a profile that cannot be applied here, whatever `allow_unsandboxed_fallback`
+///   says. That switch means "run the session anyway"; there is no session here,
+///   and "it ran outside the boundary" is not an answer to "what does the
+///   boundary allow?";
+/// - a **place**, which is an environment rather than a wrapper: running one
+///   command in one would create or adopt a container as a side effect of a
+///   question;
+/// - an egress-filtered profile, whose proxy lives in a running friring. A
+///   one-shot process would bind a listener, exec, and take it away.
+///
+/// # Errors
+///
+/// The profile is unknown or unusable, its backend is not a policy backend, the
+/// composition refused, or the command could not be started.
+fn exec(
+    db: &Database,
+    profile: &str,
+    cwd: Option<&Path>,
+    command: &[String],
+) -> Result<CommandOutput, String> {
+    let stored = db
+        .get_sandbox_profile(profile)
+        .map_err(|e| format!("get_sandbox_profile: {e}"))?
+        .ok_or_else(|| format!("No sandbox profile named '{profile}'"))?;
+    if let Some(refusal) = stored.launch_refusal() {
+        return Err(refusal);
+    }
+    let mut profile = stored.profile;
+    // The switch answers "start the session anyway". There is no session here.
+    profile.allow_unsandboxed_fallback = false;
+
+    let (program, argv) = command
+        .split_first()
+        .ok_or_else(|| "a command is required after `--`".to_string())?;
+    let cwd = cwd
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
+
+    let config = crate::session::SessionConfig {
+        // A real id: the composition mints this session's scratch, signal and
+        // gate directories under it, and two probes running at once must not
+        // share them.
+        session_id: Some(crate::session::SessionId::default()),
+        agent: String::new(),
+        cwd,
+        sandbox: Some(profile),
+        ..Default::default()
+    };
+    let decision = crate::agent::sandboxing::apply(None, &config, program, argv)
+        .map_err(|reason| format!("This profile could not be applied here: {reason}"))?;
+    let wrapped = match decision {
+        crate::agent::sandboxing::SandboxDecision::Wrapped(wrapped) => wrapped,
+        // Unreachable: the profile is `Some` above, and the fallback is off.
+        _ => return Err("This profile applied no boundary, so nothing was run".to_string()),
+    };
+    if wrapped.place.is_some() {
+        return Err(format!(
+            "Sandbox profile '{}' resolves to a place. A place is an environment rather than a \
+             wrapper, so running one command in it would create or adopt a container; start a \
+             session in it instead",
+            config.sandbox.as_ref().map_or("", |p| p.name.as_str())
+        ));
+    }
+    if !wrapped.secret_env.is_empty() {
+        return Err(
+            "This profile's launch would inject a credential, which a one-shot process must not \
+             put in an environment it cannot take back. Start a session instead"
+                .to_string(),
+        );
+    }
+
+    // The proxy this composition may have bound belongs to the launch that
+    // composed it, and this process is about to exec away from it.
+    let pending = crate::agent::sandboxing::pending_egress(&config);
+    if pending.is_pending() {
+        return Err(
+            "This profile filters egress, and its proxy lives in a running friring: a one-shot \
+             command would bind a listener and take it away again. Start a session under this \
+             profile instead"
+                .to_string(),
+        );
+    }
+
+    let mut child = std::process::Command::new(&wrapped.command);
+    child.args(&wrapped.args);
+    for (key, value) in &wrapped.env {
+        child.env(key, value);
+    }
+    if let Some(cwd) = config.cwd.as_deref() {
+        child.current_dir(cwd);
+    }
+    let status = child
+        .status()
+        .map_err(|e| format!("could not run {}: {e}", wrapped.command))?;
+    let code = status.code().unwrap_or(-1);
+    let mut output = CommandOutput::new(
+        json!({
+            "applied": wrapped.state,
+            "command": command,
+            "exit_code": code,
+        }),
+        format!("{} · exit {code}", wrapped.label),
+    );
+    // The command's own status is the answer a probe reads, so it becomes this
+    // process's — a probe asserting "this was refused" needs the refusal.
+    if code != 0 {
+        output.failure = Some(String::new());
+    }
+    Ok(output)
+}
+
 /// not know: an ignored `network_alow` would be a boundary quietly wider than
 /// the document says.
 fn import(db: &Database, path: &Path, replace: bool) -> Result<CommandOutput, String> {
@@ -1593,6 +1826,7 @@ mod tests {
             new_session_args: Vec::new(),
             resume_latest: false,
             hook_schema: None,
+            transcript: None,
             sandbox: Some(AgentSandboxDef {
                 secret_env: secret_env.iter().map(|s| (*s).to_string()).collect(),
                 ..Default::default()
@@ -1635,6 +1869,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         })
         .unwrap();
     }
@@ -1665,16 +1902,21 @@ mod tests {
         assert!(Cli::try_parse_from(["friring-cli", "sandbox", "relay"]).is_err());
     }
 
-    /// The relay is the one subcommand that must never open a database
-    /// (ADR-29), and every host-side command must. This is the split
+    /// The relay and the launch helper are the subcommands that must never open
+    /// a database (ADR-29), and every host-side command must. This is the split
     /// `friring-cli`'s `main` dispatches on.
     #[test]
-    fn only_the_relay_runs_before_the_database_is_opened() {
-        let relay = Cli::parse_from(["friring-cli", "sandbox", "relay", "--socket", "/s/p.sock"]);
-        let (listen, socket) =
-            database_free(&relay.command).expect("the relay is dispatched before the database");
-        assert!(listen.ip().is_loopback());
-        assert_eq!(socket, Path::new("/s/p.sock"));
+    fn only_the_in_boundary_commands_run_before_the_database_is_opened() {
+        for argv in [
+            vec!["friring-cli", "sandbox", "relay", "--socket", "/s/p.sock"],
+            vec!["friring-cli", "sandbox", "launch", "--", "/usr/bin/true"],
+        ] {
+            let cli = Cli::parse_from(argv.clone());
+            assert!(
+                crate::cli::early::is_database_free(&cli.command),
+                "{argv:?} runs inside a boundary and must be dispatched early"
+            );
+        }
 
         for argv in [
             vec!["friring-cli", "sandbox", "list"],
@@ -1688,8 +1930,86 @@ mod tests {
         ] {
             let cli = Cli::parse_from(argv.clone());
             assert!(
-                database_free(&cli.command).is_none(),
+                !crate::cli::early::is_database_free(&cli.command),
                 "{argv:?} needs the database and must take the normal path"
+            );
+            assert!(crate::cli::early::run_before_database(&cli).is_none());
+        }
+    }
+
+    /// The helper's whole input is argv, and every value is its own element:
+    /// nothing on the path from a profile to a running agent is quoted,
+    /// re-split or parsed by a shell (ADR-33).
+    #[test]
+    fn the_launch_helper_takes_every_value_as_its_own_argument() {
+        let cli = Cli::parse_from([
+            "friring-cli",
+            "sandbox",
+            "launch",
+            "--gate",
+            "/data/gates/c1",
+            "--key",
+            "k-1",
+            "--timeout",
+            "30",
+            "--unset",
+            "TMUX",
+            "--unset",
+            "TMUX_PANE",
+            "--",
+            "codex",
+            "--flag with a space",
+            "; echo pwned",
+        ]);
+        let Command::Sandbox {
+            action:
+                Action::Launch {
+                    gate,
+                    key,
+                    timeout,
+                    unset,
+                    agent,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("a launch");
+        };
+        assert_eq!(gate, Some(PathBuf::from("/data/gates/c1")));
+        assert_eq!(key.as_deref(), Some("k-1"));
+        assert_eq!(timeout, 30);
+        assert_eq!(unset, ["TMUX", "TMUX_PANE"]);
+        assert_eq!(agent, ["codex", "--flag with a space", "; echo pwned"]);
+    }
+
+    /// A gate without its key, or a key without its gate, is a launch that
+    /// would either wait on nothing or accept any file: refused at parse.
+    #[test]
+    fn a_half_specified_gate_is_refused() {
+        for argv in [
+            vec![
+                "friring-cli",
+                "sandbox",
+                "launch",
+                "--gate",
+                "/g",
+                "--",
+                "true",
+            ],
+            vec![
+                "friring-cli",
+                "sandbox",
+                "launch",
+                "--key",
+                "k",
+                "--",
+                "true",
+            ],
+            vec!["friring-cli", "sandbox", "launch"],
+        ] {
+            assert!(
+                Cli::try_parse_from(argv.clone()).is_err(),
+                "{argv:?} must not parse"
             );
         }
     }
@@ -2341,6 +2661,48 @@ mod tests {
         // carrying per-path read/write.
         assert_eq!(back.paths[0].mode, PathMode::ReadWrite);
         assert_eq!(back.paths[1].path, "/srv/shared");
+    }
+
+    /// The orchestration half survives a round trip too — including which mode
+    /// each seed is authorized in, which is what decides whether a child's
+    /// refreshed credential lands in the family's one file or in a copy.
+    #[test]
+    fn the_bridge_fields_survive_an_export_and_an_import() {
+        use crate::session::{BridgeCapability, ChildSeedAllow, SeedMode};
+
+        let mut p = profile("orchestrator", vec![SandboxPath::workspace("~/dev/app")]);
+        p.bridge_grants = vec![BridgeCapability::ChildLifecycle, BridgeCapability::Mailbox];
+        p.max_children = 5;
+        p.child_agents = vec!["worker".into()];
+        p.child_shared_rw = vec!["~/.cargo/registry".into()];
+        p.child_seed_allow = vec![
+            ChildSeedAllow {
+                path: "auth.json".into(),
+                mode: SeedMode::LinkRw,
+            },
+            ChildSeedAllow {
+                path: "skills".into(),
+                mode: SeedMode::Symlink,
+            },
+        ];
+
+        assert_eq!(round_trip(&p), p);
+    }
+
+    /// A profile that grants nothing writes a document that reads like the ones
+    /// written before the bridge existed, and importing one of those gives the
+    /// closed defaults rather than a decode failure.
+    #[test]
+    fn a_profile_without_the_bridge_writes_and_reads_the_closed_defaults() {
+        let p = profile("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        let document = render_bundle(std::slice::from_ref(&p));
+        assert!(!document.contains("bridge_grants"), "{document}");
+        assert!(!document.contains("child_seed_allow"), "{document}");
+
+        let back = round_trip(&p);
+        assert!(back.bridge_grants.is_empty());
+        assert!(back.child_seed_allow.is_empty());
+        assert_eq!(back.max_children, crate::session::DEFAULT_MAX_CHILDREN);
     }
 
     /// Storage owns the timestamps: exporting them would carry one machine's

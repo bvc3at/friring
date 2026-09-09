@@ -18,12 +18,120 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// The version of the `[[requires]]` vocabulary this friring understands.
+///
+/// Printed by `friring-cli capabilities` so an extension can state which one it
+/// needs. Bumped only for a change that is not backwards compatible; a new
+/// requirement kind is not one, because an extension that names a kind this
+/// friring does not know is refused rather than ignored.
+pub const REQUIREMENTS_VERSION: u32 = 1;
+
 use super::AgentDef;
 
 /// Token replaced with the resolved (absolute) extension home directory wherever
 /// it appears in a manifest (session `repo_path`, file contents marked
 /// `substitute`). The only template token the installer understands.
 pub const HOME_TOKEN: &str = "{home}";
+
+/// One thing an extension needs before it can be installed or activated.
+///
+/// A **hard gate**: install, activate and self-heal refuse on a failed
+/// requirement and print the entry that failed. Never a warning — an extension
+/// whose declared preconditions do not hold is one whose behaviour nobody has
+/// reasoned about, and "installed but not working" is the state that costs an
+/// operator an afternoon.
+///
+/// The vocabulary is closed and its version is
+/// [`REQUIREMENTS_VERSION`]: a kind this friring does not recognise is a
+/// **refusal**, not an ignored line, because an extension that declared it meant
+/// something by it.
+///
+/// `min_thurbox_version` stays what it was — a soft compatibility warning — so
+/// this is additive for every extension that predates it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum Requirement {
+    /// A capability of the friring binary itself, from the same constants
+    /// `friring-cli capabilities` prints — so a version friring reports is one
+    /// it actually speaks. `name` is `bridge` or `extension_requires`.
+    BinaryCapability {
+        name: String,
+        /// The lowest version that will do.
+        version: u32,
+    },
+    /// A tool on the operator's `PATH`, whose `--version` output must match.
+    ///
+    /// The command is run **argv-only** — no shell — resolved through `PATH` as
+    /// the operator's shell would. friring runs the operator's installed tool
+    /// and trusts it exactly as much as the operator does; a hostile binary on
+    /// `PATH` already owns the account, so this adds no exposure. What it must
+    /// not do is *introduce* a shell, which is why `command` is one argv
+    /// element and a value containing a space simply fails to resolve.
+    ToolVersion {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        /// A substring the output must contain. Not a regular expression: a
+        /// pattern language here would be a second thing to get wrong, and every
+        /// real check is "does it say 20".
+        pattern: String,
+    },
+    /// A file whose exact contents matter, by SHA-256.
+    FileDigest {
+        /// Absolute, `~`-relative, or containing [`HOME_TOKEN`].
+        path: String,
+        sha256: String,
+    },
+    /// A file (or directory) that must be there.
+    FileExists { path: String },
+    /// A file that must contain `needle`.
+    FileContains { path: String, needle: String },
+}
+
+impl Requirement {
+    /// A one-line label naming this requirement in a refusal.
+    ///
+    /// Carries the path or the command but never a file's *contents*: a
+    /// `file-contains` needle can be a credential fragment, and a refusal is
+    /// printed to a terminal and pasted into bug reports.
+    pub fn label(&self) -> String {
+        match self {
+            Self::BinaryCapability { name, version } => {
+                format!("binary-capability {name} >= {version}")
+            }
+            Self::ToolVersion {
+                command, pattern, ..
+            } => format!("tool-version {command} matching '{pattern}'"),
+            Self::FileDigest { path, .. } => format!("file-digest {path}"),
+            Self::FileExists { path } => format!("file-exists {path}"),
+            Self::FileContains { path, .. } => format!("file-contains {path}"),
+        }
+    }
+}
+
+/// What an [`ExternalFile`] does when its destination already exists.
+///
+/// The default is what friring has always done and stays the safe one: leave a
+/// file somebody else wrote alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OnConflict {
+    /// Leave the destination as it is. The default.
+    #[default]
+    Skip,
+    /// Refuse the install when the destination exists **without** friring's
+    /// managed marker.
+    ///
+    /// For a file whose exact content the extension depends on — a hook script a
+    /// worker's private state is rewritten to point at, say. Skipping there
+    /// would install an extension that then behaves as somebody else's file
+    /// says, which is worse than not installing.
+    ///
+    /// A destination that *does* carry the marker is friring's own and is
+    /// restored to the manifest's content, because a managed file that drifted
+    /// is a managed file that needs putting back.
+    Refuse,
+}
 
 /// A file the installer lays down under the extension home directory. The
 /// content comes from the install source (`<source>/<source_path>`); only
@@ -74,6 +182,9 @@ pub struct ExternalFile {
     /// Only write when the destination is absent (don't clobber a user file).
     #[serde(default)]
     pub if_absent: bool,
+    /// What to do when the destination exists — see [`OnConflict`].
+    #[serde(default)]
+    pub on_conflict: OnConflict,
     /// Replace [`HOME_TOKEN`] in the content before writing.
     #[serde(default)]
     pub substitute: bool,
@@ -501,6 +612,11 @@ pub struct ExtensionDef {
     /// Automations to ensure exist while the extension is active.
     #[serde(default)]
     pub automations: Vec<ExtensionAutomation>,
+    /// What must hold before this extension may be installed, activated or
+    /// healed — see [`Requirement`]. Empty for every extension that predates
+    /// the vocabulary, which is what keeps it additive.
+    #[serde(default)]
+    pub requires: Vec<Requirement>,
 }
 
 impl ExtensionDef {
@@ -542,6 +658,40 @@ impl ExtensionDef {
         for p in &mut out.agent_patches {
             for arg in &mut p.append_args {
                 *arg = arg.replace(HOME_TOKEN, home);
+            }
+        }
+        // An extension's own agent runs *its* program: `{home}/lib/run.mjs`,
+        // with `{home}` in an argument and in the sandbox environment that
+        // points the agent at the extension's tree. Resolved here for the same
+        // reason a session's `repo_path` is — the discovery copy holds absolute
+        // paths, and nothing downstream expands tokens.
+        for agent in &mut out.agents {
+            agent.command = agent.command.replace(HOME_TOKEN, home);
+            for arg in agent
+                .args
+                .iter_mut()
+                .chain(agent.resume_args.iter_mut())
+                .chain(agent.fork_args.iter_mut())
+                .chain(agent.new_session_args.iter_mut())
+            {
+                *arg = arg.replace(HOME_TOKEN, home);
+            }
+            if let Some(sandbox) = agent.sandbox.as_mut() {
+                for value in sandbox.env.values_mut() {
+                    *value = value.replace(HOME_TOKEN, home);
+                }
+            }
+        }
+        // A requirement names a file, and an extension's own files live under
+        // its home.
+        for requirement in &mut out.requires {
+            match requirement {
+                Requirement::FileDigest { path, .. }
+                | Requirement::FileExists { path }
+                | Requirement::FileContains { path, .. } => {
+                    *path = path.replace(HOME_TOKEN, home);
+                }
+                Requirement::BinaryCapability { .. } | Requirement::ToolVersion { .. } => {}
             }
         }
         for m in &mut out.config_merges {
@@ -754,6 +904,7 @@ prompt = "tick"
                 new_session_args: vec![],
                 resume_latest: false,
                 hook_schema: None,
+                transcript: None,
                 sandbox: None,
             }],
             files: vec![ExtensionFile {
@@ -775,6 +926,7 @@ prompt = "tick"
                 agent: "flow".into(),
                 repo_path: PathBuf::from("{home}"),
             }],
+            requires: Vec::new(),
             automations: vec![ExtensionAutomation {
                 name: "flow-tick".into(),
                 trigger: "cron:*/5 * * * *".into(),

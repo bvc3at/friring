@@ -175,7 +175,7 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
             let json = Value::Array(
                 sessions
                     .iter()
-                    .map(|s| shared_session_to_json(s, hooks.get(&s.id)))
+                    .map(|s| shared_session_to_json(s, hooks.get(&s.id), bridge_json(db, s)))
                     .collect(),
             );
             Ok(CommandOutput::new(json, render_session_list(&sessions)))
@@ -186,7 +186,7 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
                 .load_hook_states()
                 .map_err(|e| format!("load_hook_states: {e}"))?;
             Ok(CommandOutput::new(
-                shared_session_to_json(&session, hooks.get(&session.id)),
+                shared_session_to_json(&session, hooks.get(&session.id), bridge_json(db, &session)),
                 render_session_detail(&session),
             ))
         }
@@ -262,6 +262,12 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
                         "removed worktrees",
                         report.removed_worktrees.len().to_string(),
                     ),
+                    // An operator who force-deleted an orchestrator stopped N
+                    // other agents by doing so, and nothing else says which.
+                    (
+                        "stopped children",
+                        report.stopped_children.len().to_string(),
+                    ),
                     (
                         "disabled automations",
                         report.disabled_automations.to_string(),
@@ -286,6 +292,7 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
                     "killed_window": report.killed_window,
                     "removed_worktrees": report.removed_worktrees,
                     "worktree_errors": report.worktree_errors,
+                    "stopped_children": report.stopped_children,
                     "disabled_automations": report.disabled_automations,
                     "remote_teardown_error": report.remote_teardown_error,
                 }),
@@ -593,7 +600,18 @@ fn refuse_send(db: &Database, session: &SharedSession) -> Option<String> {
 // is why the last launch did not deliver it. `null` there means no launch
 // recorded a complaint — `create`/`restart` report their own launch's verdict
 // under the same key.
-fn shared_session_to_json(s: &SharedSession, hook: Option<&HookRow>) -> Value {
+//
+// `egress_state` is a third question and deliberately not folded into either:
+// a session whose proxy could not be rebound after a restart is still
+// *sandboxed*, and reporting that as `sandbox_unenforced` would say the agent
+// is running on the host. The endpoint is reported for the same reason a port
+// number is ever reported — it is what an operator checks — and the token it
+// demands is not, because nothing that renders a session may carry it.
+fn shared_session_to_json(
+    s: &SharedSession,
+    hook: Option<&HookRow>,
+    bridge: Option<Value>,
+) -> Value {
     json!({
         "id": s.id.to_string(),
         "name": s.name,
@@ -606,6 +624,9 @@ fn shared_session_to_json(s: &SharedSession, hook: Option<&HookRow>) -> Value {
         "parent_session_id": s.parent_session_id.map(|id| id.to_string()),
         "sandbox_profile": s.sandbox_profile,
         "sandbox_unenforced": s.sandbox_enforcement.unenforced_reason(),
+        "egress_state": s.egress.state.label(),
+        "egress_unrestorable_reason": s.egress.state.reason(),
+        "egress_endpoint": s.egress.endpoint,
         "display_order": s.display_order,
         "hook_state": hook.and_then(|h| h.state.as_deref()),
         "hook_state_at": hook.and_then(|h| h.state_at),
@@ -614,7 +635,63 @@ fn shared_session_to_json(s: &SharedSession, hook: Option<&HookRow>) -> Value {
             "worktree_path": w.worktree_path.display().to_string(),
             "branch": w.branch,
         })).collect::<Vec<_>>(),
+        "bridge": bridge,
     })
+}
+
+/// Where a session sits in an orchestration, for `session get` and `list`
+/// (ADR-32).
+///
+/// `null` for the overwhelming majority of sessions, which are in none. What is
+/// reported is **host-known** throughout: the ownership row, the states friring
+/// itself set, and the verdict it read from git after the pane stopped. A
+/// child's own summary is not here — an integration step reads this document,
+/// and text a worker wrote must not be part of what decides whether its branch
+/// is merged.
+///
+/// The egress token is never reported, here or anywhere else that renders a
+/// session.
+fn bridge_json(db: &Database, s: &SharedSession) -> Option<Value> {
+    let key = s.id.to_string();
+    let owner = db.bridge_child(&key).ok().flatten();
+    let children = db.bridge_children_of(&key).unwrap_or_default();
+    if owner.is_none() && children.is_empty() {
+        return None;
+    }
+    let own_state = db
+        .bridge_child_state(&key)
+        .ok()
+        .flatten()
+        .map(|row| row.state.to_string());
+    let children: Vec<Value> = children
+        .into_iter()
+        .map(|child| {
+            let state = db
+                .bridge_child_state(&child.child_id)
+                .ok()
+                .flatten()
+                .map(|row| row.state.to_string());
+            let result = db.bridge_result(&child.child_id).ok().flatten();
+            json!({
+                "id": child.child_id,
+                "created_at": child.created_at,
+                "state": state,
+                "result": result.map(|r| json!({
+                    "outcome": r.outcome.as_str(),
+                    "branch": r.branch,
+                    "head": r.head,
+                    "dirty": r.dirty,
+                    "ahead_of_base": r.ahead_of_base,
+                    "verified_at": r.verified_at,
+                })),
+            })
+        })
+        .collect();
+    Some(json!({
+        "owner": owner.map(|row| row.owner_id),
+        "state": own_state,
+        "children": children,
+    }))
 }
 
 #[cfg(test)]
@@ -823,6 +900,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         }
     }
 
@@ -846,6 +926,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         };
         let rendered = render_session_list(std::slice::from_ref(&s));
         assert!(rendered.contains("NAME"));
@@ -877,6 +960,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         };
         db.upsert_session(&shared).unwrap();
 
@@ -917,6 +1003,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         };
         db.upsert_session(&parent).unwrap();
         let mut child = parent.clone();
@@ -993,6 +1082,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         };
         db.upsert_session(&shared).unwrap();
         // Both empty and whitespace-only text are rejected (trimmed check).
@@ -1034,6 +1126,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         };
         db.upsert_session(&shared).unwrap();
         let auto = db
