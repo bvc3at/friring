@@ -114,19 +114,44 @@ pub const PROTECTED_CREATED_IF_ABSENT: [&str; 1] = ["config.worktree"];
 /// to a path that does not exist is a no-op.
 pub fn protected_paths_in(root: &str) -> Vec<String> {
     let mut out = vec![format!("{root}/{PROTECTED_IN_WRITABLE_ROOT}")];
-    let mut components = root.trim_end_matches('/').rsplit('/');
-    let last = components.next();
-    let parent = components.next();
-    let grandparent = components.next();
-    let extra: &[&str] = if last == Some(".git") {
+    out.extend(
+        protected_names_in(root)
+            .iter()
+            .map(|name| format!("{root}/{name}")),
+    );
+    out
+}
+
+/// The names a root's shape takes back inside it, beyond
+/// [`PROTECTED_IN_WRITABLE_ROOT`] — and the answer
+/// [`app::bridge_spawn::ensure_protected_placeholders`] acts on directly.
+///
+/// Read as **path components** rather than by splitting on `'/'`. A root
+/// arrives spelled the way its host writes it, and where that is `\` a
+/// `/`-split found no component it recognised and answered "no shape" — so
+/// every git directory looked like an ordinary one and nothing was taken back.
+/// Native Windows is offered no sandbox backend at all
+/// ([`crate::sandbox::select::NATIVE_WINDOWS`]), so nothing reached that
+/// answer; it is fixed rather than documented because the next backend would
+/// inherit it silently.
+///
+/// [`app::bridge_spawn::ensure_protected_placeholders`]: crate::app
+pub fn protected_names_in(root: &str) -> &'static [&'static str] {
+    fn named(path: Option<&std::path::Path>) -> Option<&str> {
+        path.and_then(std::path::Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+    }
+    let path = std::path::Path::new(root);
+    let parent = path.parent();
+    if named(Some(path)) == Some(".git") {
         &PROTECTED_IN_GIT_DIR
-    } else if parent == Some("worktrees") && grandparent == Some(".git") {
+    } else if named(parent) == Some("worktrees")
+        && named(parent.and_then(std::path::Path::parent)) == Some(".git")
+    {
         &PROTECTED_IN_WORKTREE_METADATA
     } else {
         &[]
-    };
-    out.extend(extra.iter().map(|name| format!("{root}/{name}")));
-    out
+    }
 }
 
 /// Result of any sandbox operation.

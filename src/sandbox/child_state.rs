@@ -590,6 +590,12 @@ mod tests {
         )
     }
 
+    /// Unix-only for its fixture rather than its subject: it feeds a POSIX
+    /// `/home/u` and reads back paths friring joined, and a host that joins
+    /// with `\` answers correctly in a spelling this fixture cannot state.
+    /// Native Windows is offered no sandbox backend, so there is no seed to
+    /// plan there.
+    #[cfg(unix)]
     #[test]
     fn a_fully_authorized_declaration_plans_every_seed() {
         let plan = plan(&agent(), &authorized()).expect("the plan builds");
@@ -744,6 +750,10 @@ mod tests {
     /// The subtract set covers the family's state, the owner's control
     /// directories, and friring's own trees wholesale — which is what covers
     /// every sibling, including one created later.
+    ///
+    /// `cfg(unix)` for the same fixture reason as
+    /// [`a_fully_authorized_declaration_plans_every_seed`].
+    #[cfg(unix)]
     #[test]
     fn the_subtract_set_covers_the_family_and_every_sibling() {
         let agent = agent();

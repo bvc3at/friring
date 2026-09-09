@@ -1737,12 +1737,16 @@ pub(super) fn child_git_dir(worktree: &std::path::Path, repo: &std::path::Path) 
 /// A root that is neither a git directory nor one worktree's metadata has no
 /// protected names of this kind, so this is a no-op for it.
 pub(super) fn ensure_protected_placeholders(root: &str) -> Result<(), String> {
-    let protected = crate::sandbox::backend::protected_paths_in(root);
+    // The shape's names, not the rendered paths: those are `/`-joined for the
+    // policy backends that consume them, and comparing them against a
+    // `Path::join` is a comparison that only holds where the two separators
+    // agree.
+    let protected = crate::sandbox::backend::protected_names_in(root);
     for name in crate::sandbox::backend::PROTECTED_CREATED_IF_ABSENT {
-        let path = std::path::Path::new(root).join(name);
-        if !protected.contains(&path.display().to_string()) {
+        if !protected.contains(&name) {
             continue;
         }
+        let path = std::path::Path::new(root).join(name);
         if path.exists() {
             continue;
         }
@@ -2201,7 +2205,9 @@ mod tests {
         };
         let overlay = super::child_overlay(&profile, "owner", &dirs, None, "/home/u", &seed, &repo);
 
-        let siblings = repo.join(".git/worktrees").display().to_string();
+        // Joined component by component: a `".git/worktrees"` literal keeps its
+        // `/` on a host that writes `\`, and then matches nothing.
+        let siblings = repo.join(".git").join("worktrees").display().to_string();
         assert!(
             overlay
                 .subtract
