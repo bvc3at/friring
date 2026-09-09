@@ -5420,6 +5420,12 @@ fn the_bridge_tick_budget_holds_under_a_flood() {
 /// session serves the request that was waiting all along.
 #[tokio::test]
 async fn perf_a_ghost_bridge_session_is_never_polled_and_serving_resumes_on_load() {
+    // `grant_bridge` gives both sessions a profile, so loading one composes a
+    // *sandboxed* launch — which resolves the machine's backend unless a host
+    // is installed. Without this the load simply fails wherever the runner has
+    // no usable backend, and the session stays a ghost for a reason that has
+    // nothing to do with what this test is about.
+    let _host = crate::agent::sandboxing::TestSandboxHost::seatbelt();
     let mut h = Harness::spawnable(2);
     // Unloaded *before* the profile is attached: this test is about the poll,
     // and a sandboxed relaunch is a different path with its own tests.
@@ -5455,16 +5461,6 @@ async fn perf_a_ghost_bridge_session_is_never_polled_and_serving_resumes_on_load
 
     h.app.set_active_index(1);
     h.key(KeyCode::Enter, KeyModifiers::NONE);
-    // The load spawns a real window, so it completes on a tick rather than
-    // inside the keypress. Waited for rather than assumed: how many passes it
-    // takes is a property of the machine, and asserting straight after the key
-    // made this test pass on the developer's and fail on a slower runner.
-    for _ in 0..30 {
-        if !h.app.sessions[1].is_ghost() {
-            break;
-        }
-        h.tick();
-    }
     assert!(!h.app.sessions[1].is_ghost(), "the ghost did not load");
     for _ in 0..6 {
         h.tick();
