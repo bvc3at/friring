@@ -463,7 +463,13 @@ pub(crate) const TEST_HELPER_PROGRAM: &str = "/usr/local/bin/friring-cli";
 
 /// Run `wrap` against the host friring itself runs on — or, in a test, the one
 /// it installed.
-fn with_host<R>(wrap: impl FnOnce(&SandboxHost) -> R) -> R {
+///
+/// Every path that resolves a backend goes through here rather than reaching
+/// for [`SandboxHost::local_shared`] itself, and the reason is the one
+/// [`TestSandboxHost`] gives: a path that does not asserts something different
+/// depending on whether the machine running the test happens to have seatbelt
+/// or bubblewrap. Egress restoration is such a path, in `app::sandbox`.
+pub(crate) fn with_host<R>(wrap: impl FnOnce(&SandboxHost) -> R) -> R {
     #[cfg(test)]
     if let Some(host) = TEST_HOST.with(|installed| installed.borrow().clone()) {
         return wrap(&host);

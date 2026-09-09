@@ -5455,6 +5455,16 @@ async fn perf_a_ghost_bridge_session_is_never_polled_and_serving_resumes_on_load
 
     h.app.set_active_index(1);
     h.key(KeyCode::Enter, KeyModifiers::NONE);
+    // The load spawns a real window, so it completes on a tick rather than
+    // inside the keypress. Waited for rather than assumed: how many passes it
+    // takes is a property of the machine, and asserting straight after the key
+    // made this test pass on the developer's and fail on a slower runner.
+    for _ in 0..30 {
+        if !h.app.sessions[1].is_ghost() {
+            break;
+        }
+        h.tick();
+    }
     assert!(!h.app.sessions[1].is_ghost(), "the ghost did not load");
     for _ in 0..6 {
         h.tick();
@@ -6217,11 +6227,17 @@ impl ChildHarness {
     }
 
     /// Drive until `key` has an answer, and return it.
+    ///
+    /// The budget is generous on purpose. It bounds how long a *genuinely*
+    /// unanswered request takes to fail and nothing else — the loop returns on
+    /// the pass the answer lands — so the only thing a tight number buys is a
+    /// flake on a slower machine, which is what 60 passes bought on CI.
     async fn answer(&mut self, key: &str) -> serde_json::Value {
-        self.drive_until(60, |h| bridge_answer(&h.h, 0, key).is_some())
+        const PASSES: usize = 240;
+        self.drive_until(PASSES, |h| bridge_answer(&h.h, 0, key).is_some())
             .await;
         bridge_answer(&self.h, 0, key)
-            .unwrap_or_else(|| panic!("no answer to '{key}' after 60 passes"))
+            .unwrap_or_else(|| panic!("no answer to '{key}' after {PASSES} passes"))
     }
 
     /// Create one child and drive it all the way to `ready`.
@@ -10479,10 +10495,12 @@ async fn a_restart_rebinds_a_filtered_session_at_its_persisted_endpoint() {
         // Bind once so the port is a real one, then record what it became: the
         // row has to name an endpoint a restart can actually rebind.
         let home = crate::paths::home_dir().unwrap().display().to_string();
-        let backend = crate::sandbox::SandboxHost::local_shared()
-            .select(profile.backend)
-            .backend()
-            .unwrap();
+        // The host this test installed, which is the one the restore resolves
+        // too — so the transport both sides bind in is seatbelt's loopback
+        // whatever the machine underneath offers.
+        let backend = crate::agent::sandboxing::with_host(|host| {
+            host.select(profile.backend).backend().unwrap()
+        });
         let policy = profile.resolve(backend, &home).unwrap();
         let bound = crate::sandbox::egress::establish_at(
             &session_id.to_string(),

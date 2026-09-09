@@ -1719,7 +1719,23 @@ pub(crate) fn restore_egress(
     endpoint: &str,
     token: &str,
 ) -> Result<(), String> {
-    let host = SandboxHost::local_shared();
+    // `with_host` rather than `local_shared`: this resolves a backend, so it has
+    // to resolve the same one the launch path would — including a host a test
+    // installed. Without it, what this asserts depends on whether the machine
+    // running it happens to have seatbelt or bubblewrap, and the two disagree
+    // about the transport an endpoint is spelled in.
+    crate::agent::sandboxing::with_host(|host| {
+        restore_egress_on(host, profile, session_id, endpoint, token)
+    })
+}
+
+fn restore_egress_on(
+    host: &SandboxHost,
+    profile: &SandboxProfile,
+    session_id: crate::session::SessionId,
+    endpoint: &str,
+    token: &str,
+) -> Result<(), String> {
     let backend = host
         .select(profile.backend)
         .backend()

@@ -1183,9 +1183,24 @@ mod tests {
     fn every_mode_denies_the_whole_multiplexer_set() {
         let host = host_mux();
         let expected = dirs::multiplexer_socket_denies(&host);
+        // Stated as content rather than as a count. How many *spellings* a
+        // socket root has is a property of the machine — `/private/tmp` is a
+        // macOS root, and `canonical` resolves `/tmp` into it only there — so a
+        // count makes this test assert something different per platform. What
+        // it is actually about is that both sockets and a directory are in the
+        // set the rules below are then checked against.
+        for socket in [&host.own_socket, host.outer_socket.as_ref().unwrap()] {
+            let named = socket.display().to_string();
+            assert!(
+                expected
+                    .iter()
+                    .any(|deny| !deny.is_dir && deny.path == named),
+                "the fixture should deny the socket itself: {named} not in {expected:?}"
+            );
+        }
         assert!(
-            expected.len() >= 4,
-            "the fixture should produce both sockets and the socket directories: {expected:?}"
+            expected.iter().any(|deny| deny.is_dir),
+            "the fixture should deny at least one socket directory: {expected:?}"
         );
         for mode in [NetworkMode::Full, NetworkMode::None] {
             for scope in [ReadScope::HostMinusSecrets, ReadScope::Workspace] {
