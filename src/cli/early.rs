@@ -311,6 +311,12 @@ fn read_release(path: &Path) -> Option<String> {
     if !metadata.is_file() {
         return None;
     }
+    // The size bound is a property of a gate key rather than of a platform, so
+    // it holds here too — taken from the `stat` already done rather than from a
+    // second read.
+    if metadata.len() > MAX_GATE_KEY_BYTES as u64 {
+        return None;
+    }
     std::fs::read_to_string(path)
         .ok()
         .map(|held| held.trim().to_string())
