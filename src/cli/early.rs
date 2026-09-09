@@ -34,7 +34,6 @@
 //! still holds: nothing here names the storage layer — a rule that covers the
 //! prose as well as the code, so the check needs no exception for a comment.
 
-use std::io::Read as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -283,6 +282,10 @@ fn wait_for_gate(dir: &Path, key: &str, timeout: Duration) -> bool {
 /// is not one.
 #[cfg(unix)]
 fn read_release(path: &Path) -> Option<String> {
+    // Both traits are used only here — the non-unix arm below is a plain read —
+    // so importing them at module scope would be an unused import on Windows,
+    // which `-D warnings` fails.
+    use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let file = std::fs::OpenOptions::new()

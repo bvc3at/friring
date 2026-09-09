@@ -2080,6 +2080,12 @@ mod tests {
     /// to a sibling's `.git` makes the host resolve this worktree to the
     /// sibling's, match the sibling's record, and grant the sibling's metadata,
     /// with no record ever being written.
+    ///
+    /// Unix-only because the escape needs a symlink to exist, and creating one
+    /// on Windows takes a privilege a test runner does not have. The refusal
+    /// itself is not: `child_git_dir` reads the marker's own file type on every
+    /// platform.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_git_marker_grants_nothing() {
         let tmp = tempfile::tempdir().unwrap();

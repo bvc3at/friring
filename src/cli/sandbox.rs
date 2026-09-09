@@ -326,7 +326,7 @@ pub(crate) fn relay(listen: SocketAddr, socket: &std::path::Path) -> Result<(), 
 /// bridge on a platform without them: a Windows host reaches a sandbox through
 /// WSL or a container, and the relay runs *inside* that, where sockets exist.
 #[cfg(not(unix))]
-fn relay(_listen: SocketAddr, socket: &std::path::Path) -> Result<(), String> {
+pub(crate) fn relay(_listen: SocketAddr, socket: &std::path::Path) -> Result<(), String> {
     Err(format!(
         "the sandbox relay needs unix sockets (asked for `{}`); on Windows a sandbox is reached \
          through WSL or a container, and the relay runs inside it",
