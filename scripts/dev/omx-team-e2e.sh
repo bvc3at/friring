@@ -50,29 +50,14 @@ E2E_NAME="omx-team-e2e"
 OMX_VERSION="0.21.0"
 PLAN_SLUG="demo"
 
-case "$(uname -s)" in
-    Darwin)
-        [ -x /usr/bin/sandbox-exec ] || {
-            echo "$E2E_NAME: /usr/bin/sandbox-exec is not present; skipping" >&2
-            exit 0
-        }
-        ;;
-    Linux)
-        command -v bwrap >/dev/null || {
-            echo "$E2E_NAME: bubblewrap is not installed; skipping" >&2
-            exit 0
-        }
-        ;;
-    *)
-        echo "$E2E_NAME: the bridge is carried by seatbelt and bwrap only; skipping on $(uname -s)" >&2
-        exit 0
-        ;;
-esac
+# shellcheck source=scripts/dev/lib/bridge-backend.sh
+# shellcheck disable=SC1091
+. "$REPO_ROOT/scripts/dev/lib/bridge-backend.sh"
+bridge_backend_or_skip "$E2E_NAME"
 
 for tool in codex node npm git jq; do
     command -v "$tool" >/dev/null || {
-        echo "$E2E_NAME: no $tool on PATH; skipping" >&2
-        exit 0
+        bridge_require_or_skip "$E2E_NAME" "no $tool on PATH"
     }
 done
 
@@ -161,9 +146,8 @@ mkdir -p "$OMX_PREFIX" "$E2E_ROOT/npm-cache"
 if ! npm_config_cache="$E2E_ROOT/npm-cache" npm install --prefix "$OMX_PREFIX" \
     "oh-my-codex@$OMX_VERSION" > "$E2E_ARTIFACTS/npm-install.log" 2>&1
 then
-    echo "$E2E_NAME: could not fetch oh-my-codex@$OMX_VERSION; skipping" >&2
-    tail -5 "$E2E_ARTIFACTS/npm-install.log" >&2
-    exit 0
+    bridge_require_or_skip "$E2E_NAME" "could not fetch oh-my-codex@$OMX_VERSION" \
+        "$(tail -5 "$E2E_ARTIFACTS/npm-install.log")"
 fi
 OMX_BIN_DIR="$OMX_PREFIX/node_modules/.bin"
 PATH="$OMX_BIN_DIR:$PATH"

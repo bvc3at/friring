@@ -60,26 +60,10 @@ REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 export REPO_ROOT
 E2E_NAME="bridge-e2e"
 
-case "$(uname -s)" in
-    Darwin)
-        [ -x /usr/bin/sandbox-exec ] || {
-            echo "$E2E_NAME: /usr/bin/sandbox-exec is not present; skipping" >&2
-            exit 0
-        }
-        ;;
-    Linux)
-        command -v bwrap >/dev/null || {
-            echo "$E2E_NAME: bubblewrap is not installed; skipping" >&2
-            exit 0
-        }
-        ;;
-    *)
-        # `Caps::bridge` is true for seatbelt and bwrap only, so there is no
-        # queue to exercise anywhere else. A skip, not a pass.
-        echo "$E2E_NAME: the bridge is carried by seatbelt and bwrap only; skipping on $(uname -s)" >&2
-        exit 0
-        ;;
-esac
+# shellcheck source=scripts/dev/lib/bridge-backend.sh
+# shellcheck disable=SC1091
+. "$REPO_ROOT/scripts/dev/lib/bridge-backend.sh"
+bridge_backend_or_skip "$E2E_NAME"
 
 # shellcheck source=scripts/dev/lib/sandbox-env.sh
 # shellcheck disable=SC1091
@@ -362,10 +346,26 @@ leader_dead() {
 # Observed exactly once that way — every later assertion in this run passed, and
 # the dump printed a completed transcript a moment after the loop gave up on it.
 # So a dead pane buys one more look rather than a verdict.
+#
+# And a third outcome: the launch is *refused*, so no `tb-conformance` window is
+# ever created and `leader_dead` has nothing to find. Left to the budget, that
+# spends the whole wait and then reports every later assertion as a conformance
+# failure — which reads as "the bridge is broken" and means "the leader never
+# started". friring writes the refusal the moment the wizard is answered, so it
+# is read rather than waited out, and reported as itself.
+# shellcheck source=scripts/dev/lib/harness-log.sh
+# shellcheck disable=SC1091
+. "$REPO_ROOT/scripts/dev/lib/harness-log.sh"
+launch_refused() { harness_spawn_refusal "$FRIRING_DATA_DIR" "$E2E_NAME"; }
 run_ok=0
+refused=""
 for _ in $(seq 1 900); do
     if pane | grep -qE "conformance: the bridge answered every verb"; then
         run_ok=1
+        break
+    fi
+    refused=$(launch_refused)
+    if [ -n "$refused" ]; then
         break
     fi
     if leader_dead; then
@@ -375,6 +375,17 @@ for _ in $(seq 1 900); do
     fi
     sleep 1
 done
+if [ -n "$refused" ] && [ "$run_ok" != 1 ]; then
+    bad "the leader was never launched, so nothing below was exercised: $refused"
+    printf -- '--- pane ---\n%s\n------------\n' "$(pane)"
+    mkdir -p "$E2E_ARTIFACTS"
+    pane > "$E2E_ARTIFACTS/pane.txt" || true
+    find "$FRIRING_DATA_DIR" -maxdepth 1 -name 'friring.log.*' -exec cat {} + \
+        > "$E2E_ARTIFACTS/friring.log" 2>/dev/null || true
+    printf '\n%s: %d failed\n' "$E2E_NAME" "$FAILURES"
+    printf 'artifacts: %s\n' "$E2E_ARTIFACTS"
+    exit 1
+fi
 if [ "$run_ok" = 1 ]; then
     ok "the leader completed its conformance run"
 else

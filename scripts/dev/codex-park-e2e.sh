@@ -45,34 +45,18 @@ REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 export REPO_ROOT
 E2E_NAME="codex-park-e2e"
 
-case "$(uname -s)" in
-    Darwin)
-        [ -x /usr/bin/sandbox-exec ] || {
-            echo "$E2E_NAME: /usr/bin/sandbox-exec is not present; skipping" >&2
-            exit 0
-        }
-        ;;
-    Linux)
-        command -v bwrap >/dev/null || {
-            echo "$E2E_NAME: bubblewrap is not installed; skipping" >&2
-            exit 0
-        }
-        ;;
-    *)
-        echo "$E2E_NAME: the bridge is carried by seatbelt and bwrap only; skipping on $(uname -s)" >&2
-        exit 0
-        ;;
-esac
+# shellcheck source=scripts/dev/lib/bridge-backend.sh
+# shellcheck disable=SC1091
+. "$REPO_ROOT/scripts/dev/lib/bridge-backend.sh"
+bridge_backend_or_skip "$E2E_NAME"
 
 # A skip, not a failure: this harness is about a vendor CLI, and a machine
 # without it has nothing to say about one. `bridge-e2e` still covers the bridge.
 command -v codex >/dev/null || {
-    echo "$E2E_NAME: no codex on PATH; skipping" >&2
-    exit 0
+    bridge_require_or_skip "$E2E_NAME" "no codex on PATH"
 }
 command -v node >/dev/null || {
-    echo "$E2E_NAME: no node on PATH, so the model stub cannot run; skipping" >&2
-    exit 0
+    bridge_require_or_skip "$E2E_NAME" "no node on PATH, so the model stub cannot run"
 }
 
 # shellcheck source=scripts/dev/lib/sandbox-env.sh

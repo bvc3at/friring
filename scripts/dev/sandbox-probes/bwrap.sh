@@ -28,16 +28,14 @@ if [ "$(uname -s)" != "Linux" ]; then
     echo "$PROBE_NAME: bubblewrap is Linux only; skipping on $(uname -s)" >&2
     exit 0
 fi
-if ! command -v bwrap >/dev/null 2>&1; then
-    echo "$PROBE_NAME: bwrap is not installed; skipping" >&2
-    exit 0
-fi
-# The capability check, not a version check: `bwrap --dev-bind` needs user
-# namespaces, and whether this kernel grants them is what decides.
-if ! bwrap --ro-bind / / --unshare-all true >/dev/null 2>&1; then
-    echo "$PROBE_NAME: this kernel does not grant unprivileged user namespaces; skipping" >&2
-    exit 0
-fi
+# The capability check this file already made, moved into the gate the bridge
+# harnesses now share — the drift between the two is what let a job report
+# success for assertions it never reached. Its `FRIRING_E2E_REQUIRE_BRIDGE`
+# contract comes with it, which is what a dedicated CI job sets.
+# shellcheck source=scripts/dev/lib/bridge-backend.sh
+# shellcheck disable=SC1091
+. "$REPO_ROOT/scripts/dev/lib/bridge-backend.sh"
+bridge_backend_or_skip "$PROBE_NAME"
 
 # shellcheck source=scripts/dev/lib/sandbox-env.sh
 # shellcheck disable=SC1091
@@ -51,8 +49,7 @@ cargo build --bin friring --bin friring-cli >/dev/null
 OUTER_DIR=$(mktemp -d /tmp/friring-probe-outer.XXXXXX)
 OUTER_SOCKET="$OUTER_DIR/outer"
 if ! probe_tmux_server "$OUTER_SOCKET"; then
-    echo "$PROBE_NAME: could not start the outer tmux server; skipping" >&2
-    exit 0
+    bridge_require_or_skip "$PROBE_NAME" "could not start the outer tmux server"
 fi
 export TMUX="$OUTER_SOCKET,1,0"
 

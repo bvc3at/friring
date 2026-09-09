@@ -24,10 +24,13 @@ if [ "$(uname -s)" != "Darwin" ]; then
     echo "$PROBE_NAME: seatbelt is macOS only; skipping on $(uname -s)" >&2
     exit 0
 fi
-if [ ! -x /usr/bin/sandbox-exec ]; then
-    echo "$PROBE_NAME: /usr/bin/sandbox-exec is not present; skipping" >&2
-    exit 0
-fi
+# The same capability gate the bridge harnesses share, for its
+# `FRIRING_E2E_REQUIRE_BRIDGE` contract: this probe's whole output is
+# assertions, so a dedicated job must not report success for making none.
+# shellcheck source=scripts/dev/lib/bridge-backend.sh
+# shellcheck disable=SC1091
+. "$REPO_ROOT/scripts/dev/lib/bridge-backend.sh"
+bridge_backend_or_skip "$PROBE_NAME"
 
 # shellcheck source=scripts/dev/lib/sandbox-env.sh
 # shellcheck disable=SC1091
@@ -44,8 +47,7 @@ cargo build --bin friring --bin friring-cli >/dev/null
 OUTER_DIR=$(mktemp -d /tmp/friring-probe-outer.XXXXXX)
 OUTER_SOCKET="$OUTER_DIR/outer"
 if ! probe_tmux_server "$OUTER_SOCKET"; then
-    echo "$PROBE_NAME: could not start the outer tmux server; skipping" >&2
-    exit 0
+    bridge_require_or_skip "$PROBE_NAME" "could not start the outer tmux server"
 fi
 # What friring reads to learn it is inside a pane: the socket is the first
 # `,`-separated field.

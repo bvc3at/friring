@@ -807,6 +807,36 @@ all of it. No change to the protocol, the grants or the per-queue budget.
 ADR-P16 in `docs/PERFORMANCE.md`, including the measurement behind declining an
 in-memory lease cache on top.
 
+#### A boundary gate that cannot pass by skipping
+
+Upstream has no sandbox, so none of this exists there. The fork's probes and
+bridge harnesses skip where a platform cannot answer, which is right on a
+developer's machine and wrong in a CI job whose entire output is those
+assertions: a green meaning "asserted nothing" is indistinguishable from one
+meaning "asserted everything", and the Linux boundary went unexercised behind
+exactly that.
+
+One gate now serves both readings (`scripts/dev/lib/bridge-backend.sh`). It asks
+whether a namespace can be **created** rather than whether bwrap is
+**installed** — the two differ wherever an LSM restricts unprivileged user
+namespaces, and the harnesses had been asking the second while the probe asked
+the first, so they ran on a host where `auto` could only resolve to a backend
+`Caps::bridge` refuses. It carries the failure's own stderr, because one exit
+code covers a refused namespace, an unmakeable mount and an inaccessible
+directory. `FRIRING_E2E_REQUIRE_BRIDGE=1` makes every skip in these scripts a
+failure; the three dedicated jobs set it, and they are blocking now.
+
+Where a hosted runner withholds the capability,
+`scripts/ci/allow-user-namespaces.sh` grants it — probing first and changing
+nothing if a namespace is already available, preferring the bwrap-specific
+AppArmor profile over the global restriction, and refusing any runner that is
+not GitHub-hosted. It changes what the kernel grants and never what a profile
+asks for: no product check is relaxed to fit a runner.
+
+`bridge-e2e` also reports a refused launch as itself. Waiting for a pane that
+was never created spent the whole budget and then read as a broken bridge; the
+refusal is in friring's log the moment the wizard is answered.
+
 #### Headless sends can't answer a dialog (July 2026)
 
 Upstream's headless senders type their text and press Enter as two separate

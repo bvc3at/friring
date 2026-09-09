@@ -298,9 +298,37 @@ policy text*. The probes are the other half: they ask a real kernel.
   something about the probe.
 - Both **skip rather than fail** where the platform cannot answer — a probe that
   failed on a kernel without user namespaces would be reporting the machine
-  rather than friring. They run as non-blocking CI jobs; the conformance status
-  each one establishes is recorded in
-  [`docs/SANDBOX.md`](SANDBOX.md#conformance-what-has-been-observed).
+  rather than friring. The conformance status each one establishes is recorded
+  in [`docs/SANDBOX.md`](SANDBOX.md#conformance-what-has-been-observed).
+
+#### A skip is not a pass, and a dedicated job may not accept one
+
+That skip is right on a developer's machine and wrong in a job whose whole
+output is these assertions. Both are served by one gate,
+`scripts/dev/lib/bridge-backend.sh`, which every probe and every bridge harness
+calls:
+
+- it asks the **capability**, not the packaging — `bwrap --ro-bind / /
+  --unshare-all true` — because bubblewrap installs everywhere and is then
+  refused a namespace by a kernel or an LSM, which `command -v bwrap` cannot
+  see;
+- it carries the failure's **own stderr**, bounded, since one non-zero exit
+  covers a refused namespace, a mount that could not be made and an
+  inaccessible directory;
+- and `FRIRING_E2E_REQUIRE_BRIDGE=1` turns every skip in these scripts — an
+  absent backend, an absent tmux, a missing vendor tool — into a failure.
+
+The three dedicated CI jobs set it and are **blocking**. Where a hosted runner
+withholds user namespaces, `scripts/ci/allow-user-namespaces.sh` grants them
+first: it probes and changes nothing if a namespace is already available,
+prefers the AppArmor profile Ubuntu ships for bwrap alone, and only then clears
+the global restriction, saying which was needed. It refuses to run anywhere but
+a GitHub-hosted runner — a self-hosted one is somebody's real machine, and `CI`
+and `GITHUB_ACTIONS` are equally true there. None of it touches friring's own
+boundary: it changes what the kernel grants, never what a profile asks for.
+
+`tests/harness_capability_gate.rs` is what keeps the two halves from drifting
+apart again.
 
 ### The bridge, end to end (`just bridge-e2e`)
 
