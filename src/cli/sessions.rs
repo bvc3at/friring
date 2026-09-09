@@ -1,11 +1,13 @@
 //! Session CRUD and orchestration subcommands.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::cli::output::{self, CommandOutput};
+use crate::session::bridge::BridgeChild;
 use crate::session::{SandboxEnforcement, SessionId};
 use crate::storage::{Database, HookRow};
 use crate::sync::SharedSession;
@@ -172,21 +174,39 @@ pub fn run(action: Action, db: &Database) -> Result<CommandOutput, String> {
             let hooks = db
                 .load_hook_states()
                 .map_err(|e| format!("load_hook_states: {e}"))?;
-            let json = Value::Array(
-                sessions
-                    .iter()
-                    .map(|s| shared_session_to_json(s, hooks.get(&s.id), bridge_json(db, s)))
-                    .collect(),
+            let index = BridgeIndex::from_rows(
+                db.all_bridge_children()
+                    .map_err(|e| format!("all_bridge_children: {e}"))?,
             );
-            Ok(CommandOutput::new(json, render_session_list(&sessions)))
+            let mut rendered = Vec::with_capacity(sessions.len());
+            for s in &sessions {
+                let bridge = bridge_json(db, &index, s)?;
+                rendered.push(shared_session_to_json(s, hooks.get(&s.id), bridge));
+            }
+            Ok(CommandOutput::new(
+                Value::Array(rendered),
+                render_session_list(&sessions),
+            ))
         }
         Action::Get { uuid } => {
             let session = resolve(db, &uuid)?;
             let hooks = db
                 .load_hook_states()
                 .map_err(|e| format!("load_hook_states: {e}"))?;
+            // One session, so the index is built from the two statements this
+            // path always ran rather than from a whole-table read.
+            let key = session.id.to_string();
+            let mut rows = db
+                .bridge_children_of(&key)
+                .map_err(|e| format!("bridge_children_of({key}): {e}"))?;
+            rows.extend(
+                db.bridge_child(&key)
+                    .map_err(|e| format!("bridge_child({key}): {e}"))?,
+            );
+            let index = BridgeIndex::from_rows(rows);
+            let bridge = bridge_json(db, &index, &session)?;
             Ok(CommandOutput::new(
-                shared_session_to_json(&session, hooks.get(&session.id), bridge_json(db, &session)),
+                shared_session_to_json(&session, hooks.get(&session.id), bridge),
                 render_session_detail(&session),
             ))
         }
@@ -639,6 +659,35 @@ fn shared_session_to_json(
     })
 }
 
+/// Every ownership row, indexed both ways, so `list` asks for them once.
+///
+/// `session list` renders one document per session and the bridge block is
+/// `None` for nearly all of them; discovering that per session cost two
+/// statements each. `session get` builds this for the one session it was asked
+/// about, which is the same two statements it always did.
+struct BridgeIndex {
+    owner_of: HashMap<String, String>,
+    children_of: HashMap<String, Vec<BridgeChild>>,
+}
+
+impl BridgeIndex {
+    fn from_rows(rows: Vec<BridgeChild>) -> Self {
+        let mut owner_of = HashMap::new();
+        let mut children_of: HashMap<String, Vec<BridgeChild>> = HashMap::new();
+        for row in rows {
+            owner_of.insert(row.child_id.clone(), row.owner_id.clone());
+            children_of
+                .entry(row.owner_id.clone())
+                .or_default()
+                .push(row);
+        }
+        Self {
+            owner_of,
+            children_of,
+        }
+    }
+}
+
 /// Where a session sits in an orchestration, for `session get` and `list`
 /// (ADR-32).
 ///
@@ -649,49 +698,65 @@ fn shared_session_to_json(
 /// and text a worker wrote must not be part of what decides whether its branch
 /// is merged.
 ///
+/// Every read is propagated rather than defaulted. A database error and "this
+/// session is in no orchestration" are the same JSON — `null` — and the
+/// consumers are scripts, so answering the second when the first is true would
+/// tell an integration step that a verified child has no verdict. The sibling
+/// `load_hook_states` read in the same command already fails the command; this
+/// one now does too.
+///
 /// The egress token is never reported, here or anywhere else that renders a
 /// session.
-fn bridge_json(db: &Database, s: &SharedSession) -> Option<Value> {
+fn bridge_json(
+    db: &Database,
+    index: &BridgeIndex,
+    s: &SharedSession,
+) -> Result<Option<Value>, String> {
     let key = s.id.to_string();
-    let owner = db.bridge_child(&key).ok().flatten();
-    let children = db.bridge_children_of(&key).unwrap_or_default();
+    let owner = index.owner_of.get(&key);
+    let empty = Vec::new();
+    let children = index.children_of.get(&key).unwrap_or(&empty);
     if owner.is_none() && children.is_empty() {
-        return None;
+        return Ok(None);
     }
     let own_state = db
         .bridge_child_state(&key)
-        .ok()
-        .flatten()
+        .map_err(|e| format!("bridge_child_state({key}): {e}"))?
         .map(|row| row.state.to_string());
-    let children: Vec<Value> = children
-        .into_iter()
-        .map(|child| {
-            let state = db
-                .bridge_child_state(&child.child_id)
-                .ok()
-                .flatten()
-                .map(|row| row.state.to_string());
-            let result = db.bridge_result(&child.child_id).ok().flatten();
-            json!({
-                "id": child.child_id,
-                "created_at": child.created_at,
-                "state": state,
-                "result": result.map(|r| json!({
-                    "outcome": r.outcome.as_str(),
-                    "branch": r.branch,
-                    "head": r.head,
-                    "dirty": r.dirty,
-                    "ahead_of_base": r.ahead_of_base,
-                    "verified_at": r.verified_at,
-                })),
-            })
-        })
-        .collect();
-    Some(json!({
-        "owner": owner.map(|row| row.owner_id),
+    // One statement for the owner's whole set, rather than one per child.
+    let states: HashMap<String, String> = if children.is_empty() {
+        HashMap::new()
+    } else {
+        db.bridge_child_states_of(&key)
+            .map_err(|e| format!("bridge_child_states_of({key}): {e}"))?
+            .into_iter()
+            .map(|row| (row.child_id, row.state.to_string()))
+            .collect()
+    };
+    let mut rendered = Vec::with_capacity(children.len());
+    for child in children {
+        let result = db
+            .bridge_result(&child.child_id)
+            .map_err(|e| format!("bridge_result({}): {e}", child.child_id))?;
+        rendered.push(json!({
+            "id": child.child_id,
+            "created_at": child.created_at,
+            "state": states.get(&child.child_id),
+            "result": result.map(|r| json!({
+                "outcome": r.outcome.as_str(),
+                "branch": r.branch,
+                "head": r.head,
+                "dirty": r.dirty,
+                "ahead_of_base": r.ahead_of_base,
+                "verified_at": r.verified_at,
+            })),
+        }));
+    }
+    Ok(Some(json!({
+        "owner": owner,
         "state": own_state,
-        "children": children,
-    }))
+        "children": rendered,
+    })))
 }
 
 #[cfg(test)]
@@ -709,6 +774,71 @@ mod tests {
         assert!(v.is_array(), "got {v}");
         assert_eq!(v.as_array().unwrap().len(), 0);
         assert_eq!(v.human, "No active sessions.");
+    }
+
+    /// A leader's own children, and the verdict friring reached for each.
+    #[test]
+    fn list_and_get_report_the_orchestration_a_session_is_in() {
+        let db = db();
+        let leader = make_test_session("leader");
+        let child = make_test_session("child");
+        db.upsert_session(&leader).unwrap();
+        db.upsert_session(&child).unwrap();
+        let (owner_id, child_id) = (leader.id.to_string(), child.id.to_string());
+        db.insert_bridge_child(&child_id, &owner_id, "k1").unwrap();
+        db.set_bridge_child_state(&child_id, crate::session::bridge::ChildState::Ready)
+            .unwrap();
+
+        let listed = run(Action::List { parent: None }, &db).unwrap();
+        let rows = listed.as_array().unwrap();
+        let of = |name: &str| {
+            rows.iter()
+                .find(|r| r["name"] == name)
+                .unwrap_or_else(|| panic!("no row for {name}"))
+                .clone()
+        };
+        assert_eq!(of("leader")["bridge"]["children"][0]["id"], child_id);
+        assert_eq!(of("leader")["bridge"]["children"][0]["state"], "ready");
+        assert_eq!(of("child")["bridge"]["owner"], owner_id);
+
+        // `get` composes the same block from the one session's own rows.
+        let got = run(
+            Action::Get {
+                uuid: child_id.clone(),
+            },
+            &db,
+        )
+        .unwrap();
+        assert_eq!(got["bridge"]["owner"], owner_id);
+    }
+
+    /// A database that cannot be read must not render as "in no orchestration".
+    ///
+    /// The two are the same JSON — `null` — and the consumers are scripts, so a
+    /// swallowed error would tell an integration step that a verified child has
+    /// no verdict. Fails without the propagation: the reads were
+    /// `.ok().flatten()` and `unwrap_or_default()`.
+    #[test]
+    fn a_bridge_read_that_fails_fails_the_command() {
+        let db = db();
+        let shared = make_test_session("leader");
+        let id = shared.id;
+        db.upsert_session(&shared).unwrap();
+        // A read that genuinely fails, rather than a seam: there is no table.
+        db.conn_ref()
+            .execute("DROP TABLE bridge_children", [])
+            .unwrap();
+
+        let err = run(Action::List { parent: None }, &db).unwrap_err();
+        assert!(err.contains("all_bridge_children"), "got {err}");
+        let err = run(
+            Action::Get {
+                uuid: id.to_string(),
+            },
+            &db,
+        )
+        .unwrap_err();
+        assert!(err.contains("bridge_children_of"), "got {err}");
     }
 
     #[test]

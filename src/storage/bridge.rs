@@ -195,6 +195,23 @@ impl Database {
         rows
     }
 
+    /// Every ownership row there is, oldest first.
+    ///
+    /// For a caller that has to answer "is this session in an orchestration?"
+    /// about a whole fleet — `friring-cli session list` renders one JSON
+    /// document per session, and the answer is `None` for nearly all of them.
+    /// Asking per session costs two statements each; the table holds one row
+    /// per child that has ever been created, which is bounded by the fan-out
+    /// caps rather than by the session count.
+    pub fn all_bridge_children(&self) -> rusqlite::Result<Vec<BridgeChild>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT child_id, owner_id, request_key, created_at
+             FROM bridge_children ORDER BY created_at, child_id",
+        )?;
+        let rows = stmt.query_map([], map_child)?.collect();
+        rows
+    }
+
     /// Whether `owner_id` owns `child_id` — the authority question, asked of the
     /// immutable row and of nothing else.
     pub fn owns_bridge_child(&self, owner_id: &str, child_id: &str) -> rusqlite::Result<bool> {
