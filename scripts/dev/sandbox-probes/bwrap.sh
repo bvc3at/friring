@@ -100,12 +100,19 @@ for mode in full allowlist none; do
     probe_denied 'the inherited TMUX address is gone' -- sh -c '[ -n "${TMUX:-}" ]'
 done
 
-# One per network mode, not only under `full`. Every `probe_denied` above
-# passes when the launch does not run at all, so a mode that cannot start is
-# invisible in the deny set — and the modes differ in exactly the way that
-# matters here: `none` and `allowlist` add `--unshare-net`, whose loopback setup
-# is the part a restricted kernel refuses. `bridge-conformance` runs `none`.
-for mode in full allowlist none; do
+# One per network mode this can be asked in, not only under `full`. Every
+# `probe_denied` above passes when the launch does not run at all, so a mode
+# that cannot start is invisible in the deny set — and the modes differ in the
+# way that matters on a restricted kernel: `--unshare-net` is added for
+# everything but `full`, and its loopback setup is what such a kernel refuses.
+# `bridge-conformance` runs `none`, so `none` is the one that had to be covered.
+#
+# `allowlist` is absent because `sandbox exec` refuses a **filtered** profile
+# outright — its proxy lives in a running friring, and a one-shot would bind a
+# listener and take it away again. That refusal is the product's, it is correct,
+# and it means this harness cannot positive-control that mode at all;
+# `bridge-e2e` is where a filtered profile gets a real session.
+for mode in full none; do
     probe_note "positive controls (network_mode = $mode)"
     PROBE_PROFILE="probe-$mode"
     probe_allowed "the workspace is writable" \
@@ -138,24 +145,27 @@ probe_note "the namespace"
 # the namespace — two processes in one namespace read the same inode — and the
 # boundary mounts a fresh `/proc`, so the comparison is like for like.
 #
-# Both readings must **succeed** and both must be exactly one `pid:[<digits>]`
-# before they are compared. Filtering arbitrary output and comparing whatever
-# is left is how a failed launch passes this: `sandbox exec --json` wraps the
-# command's output, so a refusal is still a non-empty document, and a non-empty
-# document that differs from the host's reads as isolation.
-ns_of() { grep -oE '^pid:\[[0-9]+\]$' | head -1; }
+# Both readings must **succeed**, and each whole answer must be exactly one
+# `pid:[<digits>]`, before they are compared. Searching instead of validating is
+# how a failed launch passes this: a refusal is still output, one good line
+# among junk still matches, and any non-empty string that differs from the
+# host's then reads as isolation. `x=$(grep …)` would also exit the script under
+# `set -e` on no match, before anything could report why.
+HOST_RAW=""
+SANDBOX_RAW=""
 HOST_PIDNS=""
 SANDBOX_PIDNS=""
-readlink /proc/self/ns/pid > "$PROBE_ROOT/host-ns" 2>/dev/null &&
-    HOST_PIDNS=$(ns_of < "$PROBE_ROOT/host-ns")
+if ! HOST_RAW=$(readlink /proc/self/ns/pid 2>/dev/null); then HOST_RAW=""; fi
 # The raw form: `--json` wraps the answer, and this assertion reads the answer.
-if probe_run_raw readlink /proc/self/ns/pid > "$PROBE_ROOT/sandbox-ns" 2>/dev/null; then
-    SANDBOX_PIDNS=$(ns_of < "$PROBE_ROOT/sandbox-ns")
+if ! SANDBOX_RAW=$(probe_run_raw readlink /proc/self/ns/pid 2>/dev/null); then
+    SANDBOX_RAW=""
 fi
+if [[ "$HOST_RAW" =~ ^pid:\[[0-9]+\]$ ]]; then HOST_PIDNS="$HOST_RAW"; fi
+if [[ "$SANDBOX_RAW" =~ ^pid:\[[0-9]+\]$ ]]; then SANDBOX_PIDNS="$SANDBOX_RAW"; fi
 if [ -z "$HOST_PIDNS" ] || [ -z "$SANDBOX_PIDNS" ]; then
-    probe_bad "could not read a pid namespace to compare \
-(host '${HOST_PIDNS:-none}', sandbox '${SANDBOX_PIDNS:-none}')"
-    head -3 "$PROBE_ROOT/sandbox-ns" 2>/dev/null | sed 's/^/          /'
+    probe_bad "could not read one pid namespace from each side to compare"
+    printf '          host:    %s\n' "${HOST_RAW:-(nothing)}" | head -3
+    printf '          sandbox: %s\n' "${SANDBOX_RAW:-(nothing)}" | head -3
 elif [ "$SANDBOX_PIDNS" = "$HOST_PIDNS" ]; then
     probe_bad "the launch shares the host's pid namespace ($HOST_PIDNS): its \
 teardown would leave anything it started, a relay included"
