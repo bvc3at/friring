@@ -293,6 +293,14 @@ tmux -L "$DRIVER_SOCKET" new-session -d -s "$DRIVER_SESSION" -x 200 -y 50 \
 need_pane "friring" 60 || exit 1
 need_pane "No sessions yet" 30 || exit 1
 
+# Fixture-only, and set before the first launch on purpose: a pane whose command
+# dies immediately is *gone* by the time friring resizes it, and its stderr —
+# which is the launch's own reason for exiting — goes with it. `remain-on-exit`
+# keeps the dead pane and its last screen, so a launch that fails leaves the
+# evidence rather than only the shape of its absence. friring never sets this
+# itself for a whole server; this is the harness arranging to be able to see.
+tmux -L "$TBX_DEV_SOCKET" set-option -g remain-on-exit on 2>/dev/null || true
+
 key C-n
 need_pane "New Session — Repo" 30 || exit 1
 type_text "$E2E_WS"
@@ -378,6 +386,17 @@ done
 if [ -n "$refused" ] && [ "$run_ok" != 1 ]; then
     bad "the leader was never launched, so nothing below was exercised: $refused"
     printf -- '--- pane ---\n%s\n------------\n' "$(pane)"
+    # What the launch itself said before it exited. `remain-on-exit` above is
+    # what keeps this readable: the message friring reports is the *host* side
+    # of the failure, and the pane holds the other side.
+    printf -- '--- friring panes ---\n'
+    tmux -L "$TBX_DEV_SOCKET" list-panes -a \
+        -F '#{pane_id} #{window_name} dead=#{pane_dead} status=#{pane_dead_status}' \
+        2>&1 || true
+    for dead in $(tmux -L "$TBX_DEV_SOCKET" list-panes -a -F '#{pane_id}' 2>/dev/null); do
+        printf -- '--- %s ---\n' "$dead"
+        tmux -L "$TBX_DEV_SOCKET" capture-pane -p -S -200 -t "$dead" 2>&1 || true
+    done
     mkdir -p "$E2E_ARTIFACTS"
     pane > "$E2E_ARTIFACTS/pane.txt" || true
     find "$FRIRING_DATA_DIR" -maxdepth 1 -name 'friring.log.*' -exec cat {} + \

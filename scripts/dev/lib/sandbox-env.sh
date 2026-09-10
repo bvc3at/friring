@@ -73,7 +73,13 @@ _tbx_resolve_root() {
             # folder-trust entry seeded under the symlinked path silently misses
             # and the agent boots into a "trust this folder?" dialog instead of
             # a usable UI.
-            TBX_SANDBOX_ROOT="$(cd "$(mktemp -d /tmp/friring-sandbox.XXXXXX)" && pwd -P)"
+            # The name is short for the same reason the tmux dir below is: the
+            # **egress proxy's** socket lives at
+            # `<root>/data/friring-dev/sandbox/tmp/<uuid>/proxy.sock`, whose
+            # fixed part is 77 bytes, so a root longer than 26 overflows the
+            # 103-byte AF_UNIX limit and friring correctly refuses every
+            # filtered profile. `friring-sandbox.XXXXXX` was 27.
+            TBX_SANDBOX_ROOT="$(cd "$(mktemp -d /tmp/friring-e2e.XXXXXX)" && pwd -P)"
             TBX_SANDBOX_FRESH=1
             # NOT under the root: AF_UNIX socket paths are ~104-byte limited,
             # and <root>/tmux/tmux-<uid>/friring-dev would overflow it under any

@@ -129,8 +129,6 @@ probe_other_gate
 
 probe_note "the namespace"
 
-# The agent is pid 1 inside it, which is what makes a relay's lifetime the
-# launch's: everything in the namespace goes when pid 1 does.
 # The property is that the launch is in a pid namespace **of its own**, so its
 # teardown takes everything in it — a relay included. Asserted on the
 # namespace's identity rather than on a pid number: without `--as-pid-1` bwrap
@@ -139,15 +137,25 @@ probe_note "the namespace"
 # flag friring does not pass. `/proc/self/ns/pid` is the kernel's own name for
 # the namespace — two processes in one namespace read the same inode — and the
 # boundary mounts a fresh `/proc`, so the comparison is like for like.
-ns_of() { grep -oE 'pid:\[[0-9]+\]' | head -1; }
-HOST_PIDNS=$(readlink /proc/self/ns/pid 2>/dev/null | ns_of || true)
-# Matched, not filtered: `sandbox exec --json` wraps the command's output, and
-# deleting every other character from the document leaves fragments of the
-# wrapper interleaved with the answer.
-SANDBOX_PIDNS=$(probe_run readlink /proc/self/ns/pid 2>/dev/null | ns_of || true)
+#
+# Both readings must **succeed** and both must be exactly one `pid:[<digits>]`
+# before they are compared. Filtering arbitrary output and comparing whatever
+# is left is how a failed launch passes this: `sandbox exec --json` wraps the
+# command's output, so a refusal is still a non-empty document, and a non-empty
+# document that differs from the host's reads as isolation.
+ns_of() { grep -oE '^pid:\[[0-9]+\]$' | head -1; }
+HOST_PIDNS=""
+SANDBOX_PIDNS=""
+readlink /proc/self/ns/pid > "$PROBE_ROOT/host-ns" 2>/dev/null &&
+    HOST_PIDNS=$(ns_of < "$PROBE_ROOT/host-ns")
+# The raw form: `--json` wraps the answer, and this assertion reads the answer.
+if probe_run_raw readlink /proc/self/ns/pid > "$PROBE_ROOT/sandbox-ns" 2>/dev/null; then
+    SANDBOX_PIDNS=$(ns_of < "$PROBE_ROOT/sandbox-ns")
+fi
 if [ -z "$HOST_PIDNS" ] || [ -z "$SANDBOX_PIDNS" ]; then
     probe_bad "could not read a pid namespace to compare \
 (host '${HOST_PIDNS:-none}', sandbox '${SANDBOX_PIDNS:-none}')"
+    head -3 "$PROBE_ROOT/sandbox-ns" 2>/dev/null | sed 's/^/          /'
 elif [ "$SANDBOX_PIDNS" = "$HOST_PIDNS" ]; then
     probe_bad "the launch shares the host's pid namespace ($HOST_PIDNS): its \
 teardown would leave anything it started, a relay included"

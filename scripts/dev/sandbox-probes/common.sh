@@ -70,6 +70,15 @@ probe_run() {
     friring-cli --json sandbox exec --profile "$PROBE_PROFILE" --cwd "$PROBE_WORKSPACE" -- "$@"
 }
 
+# probe_run_raw <argv…> — the same, without `--json`, for an assertion that
+# reads the command's **own** output rather than its exit status. The JSON form
+# wraps it, and a wrapper around a refusal is still a non-empty document — which
+# is exactly how an assertion that pattern-matches output passes a launch that
+# never happened.
+probe_run_raw() {
+    friring-cli sandbox exec --profile "$PROBE_PROFILE" --cwd "$PROBE_WORKSPACE" -- "$@"
+}
+
 # probe_summary — print the tally and set the exit status.
 probe_summary() {
     printf '\n%s: %d passed, %d failed\n' "${PROBE_NAME:-probe}" "$PROBE_PASS" "$PROBE_FAIL"
