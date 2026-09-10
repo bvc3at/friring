@@ -384,9 +384,42 @@ leader_dead() {
 # shellcheck disable=SC1091
 . "$REPO_ROOT/scripts/dev/lib/harness-log.sh"
 launch_refused() { harness_spawn_refusal "$FRIRING_DATA_DIR" "$E2E_NAME"; }
+
+# Every **child's** own pane, kept as the run goes.
+#
+# friring removes a child's window when its spawn saga gives up, so by the time
+# anything below runs there is nothing left to capture — and a child that
+# started and then never reported says why in its own pane and nowhere else.
+# friring's log has only the host's half of that: "this child's own hook did not
+# report within 60s" is the symptom, never the cause. Snapshotted each poll and
+# overwritten, so what survives a vanished window is the last thing it printed.
+capture_children() {
+    tmux -L "$TBX_DEV_SOCKET" list-panes -a -F '#{pane_id} #{window_name}' 2>/dev/null \
+        | while read -r child_pane child_window; do
+        case "$child_window" in
+            # The leader has a capture of its own, below.
+            tb-conformance) continue ;;
+            tb-*) ;;
+            *) continue ;;
+        esac
+        tmux -L "$TBX_DEV_SOCKET" capture-pane -p -S -500 -t "$child_pane" \
+            > "$E2E_ARTIFACTS/child-$child_window.txt" 2>/dev/null || true
+    done
+}
+
+# Print what those captures hold. Bounded, because a child that loops prints a
+# great deal and the useful part is where it stopped.
+dump_children() {
+    for child in "$E2E_ARTIFACTS"/child-*.txt; do
+        [ -e "$child" ] || continue
+        printf -- '--- %s ---\n' "$(basename "$child")"
+        tail -40 "$child"
+    done
+}
 run_ok=0
 refused=""
 for _ in $(seq 1 900); do
+    capture_children
     if pane | grep -qE "conformance: the bridge answered every verb"; then
         run_ok=1
         break
@@ -397,6 +430,7 @@ for _ in $(seq 1 900); do
     fi
     if leader_dead; then
         sleep 1
+        capture_children
         pane | grep -qE "conformance: the bridge answered every verb" && run_ok=1
         break
     fi
@@ -416,6 +450,7 @@ if [ -n "$refused" ] && [ "$run_ok" != 1 ]; then
         printf -- '--- %s ---\n' "$dead"
         tmux -L "$TBX_DEV_SOCKET" capture-pane -p -S -200 -t "$dead" 2>&1 || true
     done
+    dump_children
     mkdir -p "$E2E_ARTIFACTS"
     pane > "$E2E_ARTIFACTS/pane.txt" || true
     find "$FRIRING_DATA_DIR" -maxdepth 1 -name 'friring.log.*' -exec cat {} + \
@@ -429,6 +464,7 @@ if [ "$run_ok" = 1 ]; then
 else
     bad "the leader never completed its conformance run"
     printf -- '--- pane ---\n%s\n------------\n' "$(pane)"
+    dump_children
 fi
 pane > "$E2E_ARTIFACTS/pane.txt"
 
