@@ -290,8 +290,9 @@ policy text*. The probes are the other half: they ask a real kernel.
   one is the documented residual — friring denies the host's sockets, not the
   concept of a socket.
 - **`just bwrap-probe`** (Linux) is the twin, with the same assertions plus the
-  two only a namespace can be asked: the wrapped process is **pid 1** inside its
-  namespace, and **no relay survives** a launch.
+  two only a namespace can be asked: the launch is in a **pid namespace of its
+  own** (compared by `/proc/self/ns/pid` against the host's), and **no relay
+  survives** a launch.
 - Both go through **`friring-cli sandbox exec --profile <name> -- <cmd>`**, which
   composes the boundary the same way a session launch does and never falls back
   to the host. Building the boundary inside the probe would have proved

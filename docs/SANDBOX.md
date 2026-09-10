@@ -972,8 +972,8 @@ inside the boundary they exist to constrain.
 The relay is `friring-cli sandbox relay --listen 127.0.0.1:8118 --socket <path>`,
 started inside the namespace beside the agent by a two-line `/bin/sh` launcher
 that takes every value as a positional parameter and then `exec`s the agent, so
-the agent is still pid 1 of the sandbox's pid namespace and the relay dies with
-it. The port is fixed because each `--unshare-net` sandbox has a private
+the agent is still the launch's own process in the sandbox's pid namespace and
+the relay dies with it. The port is fixed because each `--unshare-net` sandbox has a private
 loopback. friring's own CLI is the relay: it is resolved from the running
 binary, never from `PATH`, bound read-only into a `workspace`-scope sandbox,
 and a launch that cannot find it is refused.
@@ -1589,12 +1589,16 @@ It does three things and then disappears:
    [The launch gate](#the-launch-gate).
 
 Then it `execvp`s the agent **in place**. That is the whole reason it is an exec
-rather than a spawn: under `bwrap --unshare-pid` the program after `--` is pid 1
-of the namespace, so the agent replaces the helper *as pid 1*, the pane's
-process is the agent, and when it exits the namespace teardown takes the relay
-with it. The relay is a direct child of pid 1 — never double-forked,
-re-parented or `setsid`'d — so every helper exit (a gate timeout, `75`; an
-`execvp` failure; a relay that would not start) tears it down the same way.
+rather than a spawn: the agent *replaces* the helper in the namespace `bwrap
+--unshare-pid` created, so the pane's process is the agent, and when it exits
+the namespace teardown takes the relay with it. The relay is a direct child of
+that process — never double-forked, re-parented or `setsid`'d — so every helper
+exit (a gate timeout, `75`; an `execvp` failure; a relay that would not start)
+tears it down the same way. The pid itself is bwrap's to choose: without
+`--as-pid-1`, which friring does not pass, bwrap keeps a reaper at pid 1 and the
+program after `--` is the next one. What the invariant needs is the private
+namespace, not the number, and `just bwrap-probe` asserts it by comparing
+`/proc/self/ns/pid` inside the boundary with the host's.
 Outside a pid namespace there is no teardown to rely on, so on Linux the relay
 child also sets `PR_SET_PDEATHSIG(SIGTERM)` before it execs. A seatbelt sandbox
 never starts a relay at all — it reaches the proxy socket directly. No policy
@@ -2308,9 +2312,10 @@ documented residual, asserted rather than glossed: friring denies the **host's**
 sockets, not the concept of a socket.
 
 `just bwrap-probe` is the Linux twin, with the same assertions plus the two only
-a namespace can be asked: the wrapped process is **pid 1** inside it (which is
-what makes a relay's lifetime the launch's), and no `friring-cli sandbox relay`
-survives a launch. Both probes **skip** rather than fail where the capability is
+a namespace can be asked: the launch is in a **pid namespace of its own**,
+compared by `/proc/self/ns/pid` against the host's (which is what makes a
+relay's lifetime the launch's), and no `friring-cli sandbox relay` survives a
+launch. Both probes **skip** rather than fail where the capability is
 absent — user namespaces are off on some distributions and in most containers,
 and a probe that failed there would be reporting the machine rather than friring.
 Both run as non-blocking CI jobs.
@@ -2467,6 +2472,14 @@ masks are unchanged product behaviour (`--tmpfs /tmp` always; `/run`,
 every masked tree, masked as a file with `/dev/null`. Under `workspace` scope
 nothing outside the profile is bound at all, so the set is unreachable by
 construction rather than by a mask.
+
+A mask whose path **resolves** into one already masked is not emitted a second
+time. On every systemd distribution `/var/run` is a symlink to `/run`, and
+asking bwrap for a tmpfs over both is asking it to mount on a path inside a
+filesystem it has just replaced — which bwrap answers by failing the whole
+launch (`Can't mount tmpfs on /newroot/var/run: No such file or directory`)
+rather than by skipping the mount. Coverage is unchanged: `/var/run` resolving
+into the tmpfs at `/run` *is* that tmpfs.
 
 **Nothing broader, on purpose.** `/tmp`, `/run`, `/var/run`, `$XDG_RUNTIME_DIR`
 and `$TMPDIR` are *not* denied as wholes. The profile already decides what a

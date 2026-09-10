@@ -315,8 +315,8 @@ actually needs and to an allowlist of domains.
   child — waits for a release file in a **read-only** gate directory before the
   agent starts, so a child never runs before its session row exists. Then it
   `execvp`s in place, which is what keeps the pane's process the agent, keeps
-  the agent as pid 1 under `--unshare-pid`, and keeps the namespace teardown
-  taking the relay with it. A host with no `friring-cli` beside `friring` is
+  it inside the pid namespace `--unshare-pid` created, and keeps the namespace
+  teardown taking the relay with it. A host with no `friring-cli` beside `friring` is
   refused with the fix named, and `allow_unsandboxed_fallback` still answers
   that refusal.
 - **A filtered session's egress survives a restart** — the proxy listener lives
@@ -836,6 +836,18 @@ asks for: no product check is relaxed to fit a runner.
 `bridge-e2e` also reports a refused launch as itself. Waiting for a pane that
 was never created spent the whole budget and then read as a broken bridge; the
 refusal is in friring's log the moment the wizard is answered.
+
+Running the gates then found two things reading them could not, both the fork's
+own. `MASKED_SOCKET_DIRS` carried `/run` and `/var/run`, which on every systemd
+distribution are one directory and a symlink to it — so bwrap was asked for a
+tmpfs on a path inside a filesystem it had just replaced, and failed the whole
+launch rather than skipping the mount. A mask whose resolved path is already
+covered is no longer emitted, and coverage is unchanged. And the probe's claim
+that the wrapped process is **pid 1** was simply not true: bwrap keeps a reaper
+at pid 1 unless `--as-pid-1` is passed, which friring does not. The invariant
+never rested on the number but on the launch having a pid namespace of its own,
+so the probe compares `/proc/self/ns/pid` against the host's and the docs say
+what actually holds.
 
 #### Headless sends can't answer a dialog (July 2026)
 

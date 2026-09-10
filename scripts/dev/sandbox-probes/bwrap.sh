@@ -5,8 +5,8 @@
 # The Linux twin of `seatbelt.sh`, with the same deny-set and positive-control
 # assertions, plus the two things only a namespace can be asked:
 #
-# - the agent is **pid 1** inside its namespace, which is what makes the relay's
-#   lifetime the launch's lifetime;
+# - the agent has a **pid namespace of its own**, which is what makes the
+#   relay's lifetime the launch's lifetime;
 # - **none of this probe's own launches left a relay** on the host — a global
 #   `pgrep` for `friring-cli sandbox relay` after they have all exited. It is not
 #   a test of the two exit paths: `sandbox exec` composes no relay at all, so
@@ -120,16 +120,26 @@ probe_note "the namespace"
 
 # The agent is pid 1 inside it, which is what makes a relay's lifetime the
 # launch's: everything in the namespace goes when pid 1 does.
-PID_ONE_STATUS=0
-PID_ONE_OUT=$({ probe_run sh -c 'test "$$" = 1' >/dev/null; } 2>&1) || PID_ONE_STATUS=$?
-if [ "$PID_ONE_STATUS" -eq 0 ]; then
-    probe_ok "the wrapped process is pid 1 inside its namespace"
+# The property is that the launch is in a pid namespace **of its own**, so its
+# teardown takes everything in it — a relay included. Asserted on the
+# namespace's identity rather than on a pid number: without `--as-pid-1` bwrap
+# keeps a reaper at pid 1 and the wrapped program is the next pid, which is a
+# namespace of its own exactly as much, so a number would be testing a bwrap
+# flag friring does not pass. `/proc/self/ns/pid` is the kernel's own name for
+# the namespace — two processes in one namespace read the same inode — and the
+# boundary mounts a fresh `/proc`, so the comparison is like for like.
+HOST_PIDNS=$(readlink /proc/self/ns/pid 2>/dev/null || true)
+SANDBOX_PIDNS=$(probe_run readlink /proc/self/ns/pid 2>/dev/null |
+    tr -dc 'pid:[]0-9' || true)
+if [ -z "$HOST_PIDNS" ] || [ -z "$SANDBOX_PIDNS" ]; then
+    probe_bad "could not read a pid namespace to compare \
+(host '${HOST_PIDNS:-none}', sandbox '${SANDBOX_PIDNS:-none}')"
+elif [ "$SANDBOX_PIDNS" = "$HOST_PIDNS" ]; then
+    probe_bad "the launch shares the host's pid namespace ($HOST_PIDNS): its \
+teardown would leave anything it started, a relay included"
 else
-    # The reason matters here for the same cause as the positive controls: a
-    # launch that never ran and a launch whose pid is wrong are different
-    # findings and this exit code alone cannot tell them apart.
-    probe_bad "the wrapped process is not pid 1: a relay could outlive its launch"
-    printf '%s\n' "${PID_ONE_OUT:-(no output)}" | head -5 | sed 's/^/          /'
+    probe_ok "the launch has a pid namespace of its own \
+($SANDBOX_PIDNS, not the host's $HOST_PIDNS)"
 fi
 
 # And nothing of the launch is left on the host. `sandbox exec` composes no

@@ -633,7 +633,7 @@ pub fn build_argv_with(
     // Ends bwrap's own option parsing, so an agent flag is never read as one.
     argv.push("--".to_string());
 
-    // What runs as pid 1 of the namespace is friring's own launch helper, which
+    // What runs in the namespace is friring's own launch helper, which
     // starts the relay if there is one, waits on the gate if there is one, drops
     // the multiplexer variables and then `execvp`s the agent *in place* — so the
     // pane's process is still the agent, and when it exits the namespace

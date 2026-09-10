@@ -1492,8 +1492,11 @@ beside `sandbox relay` (ADR-29), in `cli::early`.
   socket, no new control surface. The proof and its residuals are in
   [`SANDBOX.md`](SANDBOX.md) §The launch gate.
 - *The relay lifetime invariant survives.* The helper execs and never forks the
-  agent, so under `--unshare-pid` the agent is still pid 1 and the namespace
-  teardown still takes the relay with it. Every helper exit is an exit of pid 1.
+  agent, so the agent inherits the helper's process in the launch's own pid
+  namespace and the namespace teardown still takes the relay with it. Every
+  helper exit is an exit of that process. (bwrap keeps a reaper at pid 1 unless
+  `--as-pid-1` is passed, which friring does not; the number is bwrap's, the
+  namespace is what the invariant rests on.)
 
 **Consequences**:
 
