@@ -1510,10 +1510,10 @@ in the *main* worktree therefore breaks that session's commits. That shape has
 no reason to exist — grant the checkout, which encloses its git directory.
 
 **A protected name only counts where it exists**, in two of the three backends.
-Seatbelt denies by pathname, which covers a path that is not there yet; bwrap's
-`--ro-bind-try` skips a missing source and a place mounts only what exists,
-because an engine asked to bind a missing one invents a root-owned file inside
-somebody's repository. So an absent `config.worktree` is not a protected name at
+Seatbelt denies by pathname, which covers a path that is not there yet; bwrap
+binds and a place mounts only what exists, because an engine asked to bind a
+missing one invents a root-owned file inside somebody's repository. So an absent
+`config.worktree` is not a protected name at
 all under those two — it is a name a child can *create*, and a repository with
 `extensions.worktreeConfig` already enabled (`git sparse-checkout` turns it on)
 then reads `core.fsmonitor` out of what the child wrote, the next time the host
@@ -1524,7 +1524,18 @@ friring therefore **creates the file, empty, before the grant**
 (`PROTECTED_CREATED_IF_ABSENT`, applied at S3 to every writable git root a child
 is about to get: its own metadata directory *and* each `child_shared_rw` entry),
 and **refuses the launch** when it cannot — a read-only filesystem, a permission,
-a path that is not a directory. An empty config is inert whether or not the
+a path that is not a directory. And bwrap emits a protected path **only where it
+is there**: `--ro-bind-try` tolerates a source that is absent, not one that
+cannot be resolved, and the two are different errors. A bridge child works in a
+linked worktree, where `.git` is a pointer *file*, so `<worktree>/.git/hooks`
+fails with `Not a directory` and kills the launch before the agent runs a line.
+Nothing is given up by skipping it: git resolves a worktree's hooks through the
+**common** directory, `<repo>/.git/hooks`, which a child is never granted — its
+writable metadata is `<repo>/.git/worktrees/<id>` alone, and that directory's
+three redirects are taken back. A name a child could *create* is the case the
+placeholder above covers, by making it exist rather than hoping a bind will.
+
+An empty config is inert whether or not the
 extension is on, and no protected name is left to a backend that cannot express
 it. It does mean friring adds one empty file to a repository an operator has
 already shared read-write with that owner's children, which is written down here

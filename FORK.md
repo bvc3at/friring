@@ -868,6 +868,16 @@ decided by a list rather than by the failure — `none` is what the bridge itsel
 runs under, and calling it "not asked" would let it break while a required job
 stayed green with a footnote.
 
+Running the bridge itself on Linux then found a third fork bug, and this one had
+never run anywhere: a bridge child works in a **linked worktree**, where `.git`
+is a pointer file rather than a directory, so the `<root>/.git/hooks` friring
+takes back inside every writable root does not resolve. `--ro-bind-try`
+tolerates a source that is *absent*, not one that fails with `Not a directory`,
+so bubblewrap killed the launch before the agent ran a line — reaching friring
+only as "this child's own hook did not report within 60s". bwrap now emits a
+protected path where it is there, which gives nothing up: git resolves a
+worktree's hooks through the common directory, which a child is never granted.
+
 `bridge-e2e` grew one piece of setup for the same reason. A policy backend grants
 a declared state path as it stands on the host — friring creates nothing on an
 agent's behalf, and `state_rw` is untyped, so it cannot — which means the

@@ -285,9 +285,10 @@ pub fn build_argv(
 /// path is present **on the host the sandbox runs on**; it is injected so the
 /// mount plan is a pure function of its inputs and a test never has to consult
 /// the developer's own filesystem. The secrets list, the socket masks, the
-/// database mask and the relay binary consult it — everything else either must
-/// exist (a path the user listed, which should fail loudly) or is bound with
-/// `-try`.
+/// database mask, the relay binary and the protected paths inside a writable
+/// root all consult it — everything else either must exist (a path the user
+/// listed, which should fail loudly) or is bound with `-try`, which tolerates a
+/// source that is absent and not one that cannot be resolved.
 ///
 /// `overlays` turns writable roots into [copy-on-write
 /// workspaces](OverlayWorkspace). They are emitted in the *same* sorted pass as
@@ -445,9 +446,7 @@ pub fn build_argv_with(
     }
 
     for root in launch.writable_paths() {
-        // `-try`: most writable roots are not repositories, and a missing
-        // source must not fail the launch.
-        for path in crate::sandbox::backend::protected_paths_in(&root) {
+        for path in protected_paths_present(&root, exists) {
             push(&mut argv, &["--ro-bind-try", &path, &path]);
         }
     }
@@ -592,7 +591,7 @@ pub fn build_argv_with(
     // *host* runs when friring inspects that worktree.
     for path in own_rw
         .iter()
-        .flat_map(|path| crate::sandbox::backend::protected_paths_in(path))
+        .flat_map(|path| protected_paths_present(path, exists))
     {
         push(&mut argv, &["--ro-bind-try", &path, &path]);
     }
@@ -859,6 +858,37 @@ pub fn local_relay_program() -> Option<PathBuf> {
 /// Every control-socket tree to cover, with the ones this host puts somewhere
 /// non-standard folded in and anything already covered dropped.
 ///
+/// The protected paths inside one writable root that are actually **there**.
+///
+/// [`protected_paths_in`](crate::sandbox::backend::protected_paths_in) decides
+/// on a path's shape rather than by looking at the filesystem, which is right
+/// for a rule and wrong for a mount: bubblewrap cannot take back a name with
+/// nothing behind it, and it will not start when it is asked to.
+///
+/// `--ro-bind-try` is not the answer on its own, which is what the mount plan
+/// assumed. It tolerates a source that is **absent**; it does not tolerate one
+/// that cannot be resolved, and the two are different errors. A bridge child
+/// works in a *linked worktree*, where `.git` is a pointer **file** rather than
+/// a directory — so `<root>/.git/hooks` fails to resolve with `Not a directory`,
+/// and the whole launch dies before the agent runs a line. That is a Linux-only
+/// death: seatbelt denies by pathname, which needs nothing behind it.
+///
+/// Nothing is given up by skipping it. `<root>/.git/hooks` in a linked worktree
+/// is not merely absent, it is the wrong path: git resolves a worktree's hooks
+/// through the **common** directory, `<repo>/.git/hooks`, which a child is never
+/// granted — its writable metadata is `<repo>/.git/worktrees/<id>` alone, and
+/// the three redirects that could point git elsewhere are taken back by
+/// [`PROTECTED_IN_WORKTREE_METADATA`](crate::sandbox::backend::PROTECTED_IN_WORKTREE_METADATA).
+/// A name that a *later* launch could create is the case
+/// [`PROTECTED_CREATED_IF_ABSENT`](crate::sandbox::backend::PROTECTED_CREATED_IF_ABSENT)
+/// covers, by making it exist before the launch instead of hoping a bind will.
+fn protected_paths_present(root: &str, exists: &dyn Fn(&str) -> bool) -> Vec<String> {
+    crate::sandbox::backend::protected_paths_in(root)
+        .into_iter()
+        .filter(|path| exists(path))
+        .collect()
+}
+
 /// The tmux socket root is here for friring's *own* server: `--tmpfs /tmp`
 /// covers the default location, but `$TMUX_TMPDIR` moves it, and a sandbox that
 /// can reach that socket can run a command in any pane on the host.
@@ -1671,6 +1701,44 @@ mod tests {
         );
     }
 
+    /// A protected path with nothing behind it is not bound at all.
+    ///
+    /// The launch this killed is a bridge child's. A child works in a **linked
+    /// worktree**, where `.git` is a pointer file rather than a directory, so
+    /// `<worktree>/.git/hooks` does not resolve — and `--ro-bind-try` tolerates
+    /// a source that is *absent*, not one that cannot be resolved. bubblewrap
+    /// answered `Can't find source path …: Not a directory` and the pane died
+    /// before the agent ran a line, which reached friring only as "this child's
+    /// own hook did not report within 60s".
+    ///
+    /// Driven through the existence predicate rather than a real worktree, so
+    /// the case is checked wherever the suite runs; the protected paths of a
+    /// root that *does* have them are asserted in the same pass, because a
+    /// filter that dropped everything would pass an assertion about absence.
+    #[test]
+    fn a_protected_path_that_is_not_there_is_not_bound() {
+        let worktree = "/home/u/wt";
+        let checkout = "/home/u/dev/app";
+        let missing = format!("{worktree}/.git/hooks");
+        let present = format!("{checkout}/.git/hooks");
+        let policy = policy(vec![
+            SandboxPath::workspace(checkout),
+            SandboxPath::workspace(worktree),
+        ]);
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|path| path != missing).unwrap();
+
+        assert!(
+            !argv.contains(&missing),
+            "a protected path that does not resolve was still bound, which fails the \
+             whole launch: {argv:?}"
+        );
+        assert!(
+            has_mount(&argv, "--ro-bind-try", &present, &present),
+            "the filter dropped a protected path that is there: {argv:?}"
+        );
+    }
+
     /// A read-only bind is no barrier to `connect(2)`, and `--unshare-net`
     /// isolates the network namespace rather than the filesystem — so the
     /// control-socket trees are covered rather than merely read-only.
@@ -1781,8 +1849,11 @@ mod tests {
     fn git_hooks_stay_read_only_inside_a_writable_root() {
         let policy = workspace_policy();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &nothing).unwrap();
         let hooks = "/home/u/dev/app/.git/hooks";
+        // Present, because a protected path is bound only when it is there:
+        // bubblewrap cannot take back a name with nothing behind it, and asking
+        // it to fails the launch (see `protected_paths_present`).
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|p| p == hooks).unwrap();
         assert!(has_mount(&argv, "--ro-bind-try", hooks, hooks));
     }
 
@@ -1802,7 +1873,11 @@ mod tests {
             SandboxPath::workspace(mine),
         ]);
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &nothing).unwrap();
+        // Both roots' protected names are present. That is the state the saga
+        // launches from — `ensure_protected_placeholders` creates the ones git
+        // does not, precisely because a bind cannot take back a name with
+        // nothing behind it (see `protected_paths_present`).
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|p| p.starts_with(shared)).unwrap();
 
         for name in crate::sandbox::backend::PROTECTED_IN_GIT_DIR {
             let path = format!("{shared}/{name}");
@@ -2816,7 +2891,9 @@ mod tests {
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1")
             .with_agent("claude")
             .with_friring_db(db);
-        let present = |p: &str| p == "/home/u/.ssh" || p == db;
+        // The hooks directory is in the set because a protected path is bound
+        // only when it is there — see `protected_paths_present`.
+        let present = |p: &str| p == "/home/u/.ssh" || p == db || p == "/home/u/work/.git/hooks";
         let argv = build_argv_with(
             PROGRAM,
             &launch,
