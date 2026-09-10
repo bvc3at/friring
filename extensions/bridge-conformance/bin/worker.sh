@@ -86,13 +86,27 @@ printf 'refused, as it must be\n'
 
 printf '== private state ==\n'
 # The family's state directory is in the subtract set; this child's own is not.
-if [ -r "$HOME/.friring-conformance/state" ] && [ "$CONFORMANCE_HOME" != "$HOME/.friring-conformance" ]
-then
-    die 'this child can read its family state directory: the subtract set is not holding'
+#
+# Asserted by **reading a file the harness put there**, not by testing the
+# directory: `[ -r "$dir" ]` is false for a child that is narrowed and equally
+# false for a family state directory that was never created, so against a fresh
+# HOME it would report a subtract set that had not been exercised at all. The
+# leader reads the same file first, which is what says it is there to be read.
+if [ "$CONFORMANCE_HOME" != "$HOME/.friring-conformance" ]; then
+    boundary_denied "the family's state file is unreadable from a child" \
+        cat "$HOME/.friring-conformance/state/family-secret" \
+        || die 'this child can read its family state directory: the subtract set is not holding'
+    private_state='family state refused'
+else
+    private_state='family state not asked: this child was not narrowed'
 fi
 printf 'private state directory is %s\n' "$CONFORMANCE_HOME"
 
-note verifying 80 'reporting a result'
+# The outcome travels on the **report** channel, because this pane is the child's
+# and nothing outside it is captured: `status` carries a child's latest report,
+# so the owner — whose pane the harness does read — prints what this child found.
+# Without it a skipped assertion and a passing one look identical from outside.
+note verifying 80 "$private_state; reporting a result"
 # The one finish intent. A clean worktree plus `completed` is the only path to
 # `done` — friring stops the pane and reads the worktree before deciding.
 call send --to owner --kind result \

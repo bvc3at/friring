@@ -1534,6 +1534,34 @@ The agent's own configuration is likewise not blanket-protected, because
 `state_rw` exists: an agent that cannot write its state directory dies on first
 launch. The narrow rule wins over the broad one.
 
+### State an agent declares
+
+A policy backend grants a declared state path **as it stands on the host**.
+friring creates nothing on an agent's behalf: neither `state_dir` nor `state_rw`
+is initialization, they say what to grant rather than what to make. The
+consequence is worth stating plainly, because the two backends fail differently
+for the same missing directory:
+
+- **bwrap** will not bind a source that is not there, so the launch dies before
+  the agent runs a line — `bwrap: Can't find source path <path>`, in a pane that
+  closes.
+- **seatbelt** writes a rule naming a path nothing created, so the launch
+  starts; whether the agent can then create it depends on what else the profile
+  grants.
+
+An agent's state therefore has to exist before its **first sandboxed launch**.
+For a vendor CLI that is what running it once outside a profile does; for an
+agent that has never run — a fresh machine, or a harness with a throwaway `HOME`
+— whatever installs it owns creating it, which is what
+`scripts/dev/bridge-e2e.sh` does for the conformance family.
+
+friring cannot close this by creating the missing entries itself, because
+`state_rw` is deliberately **untyped**: the list routinely holds files as well
+as directories — claude declares `~/.claude.json`, codex keeps `auth.json`
+inside its state directory — and nesting says nothing about which an absent
+entry would have been. A directory created where the agent wanted a file breaks
+it more thoroughly than the missing mount does.
+
 ## Launch integration
 
 **Policy backends** are a decorator applied where the invocation is composed

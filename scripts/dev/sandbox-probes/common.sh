@@ -12,6 +12,11 @@
 
 PROBE_PASS=0
 PROBE_FAIL=0
+PROBE_UNASKED=0
+# Newline-delimited rather than an array: these files run under whatever bash is
+# on the machine, and expanding an empty array under `set -u` is an error on the
+# 3.2 that ships with macOS.
+PROBE_UNASKED_LIST=""
 
 # probe_note <text> — a heading in the transcript.
 probe_note() { printf '\n== %s ==\n' "$*"; }
@@ -27,6 +32,29 @@ probe_ok() {
 probe_bad() {
     PROBE_FAIL=$((PROBE_FAIL + 1))
     printf '  FAILED  %s\n' "$*"
+}
+
+# probe_unexercised <what> <why> — record something this harness cannot ask.
+#
+# Neither a pass nor a fail, and deliberately not silent. Every `probe_denied` is
+# an exit status, so a launch that never starts makes all of them pass for the
+# reason the command never ran — and a tally that counted those would report a
+# boundary nothing observed. Recording it instead keeps the count honest and
+# names what is missing.
+probe_unexercised() {
+    PROBE_UNASKED=$((PROBE_UNASKED + 1))
+    PROBE_UNASKED_LIST="$PROBE_UNASKED_LIST  - $1 — $2
+"
+    printf '  NOT ASKED  %s — %s\n' "$1" "$2"
+}
+
+# probe_launches — does a launch under $PROBE_PROFILE start at all?
+#
+# The precondition for every assertion made through one. `true` because the
+# question is whether friring composes and the kernel accepts the boundary, not
+# what happens inside it.
+probe_launches() {
+    probe_run true >/dev/null 2>&1
 }
 
 # probe_denied <what> -- <argv…> — assert the command FAILS inside the boundary.
@@ -70,18 +98,17 @@ probe_run() {
     friring-cli --json sandbox exec --profile "$PROBE_PROFILE" --cwd "$PROBE_WORKSPACE" -- "$@"
 }
 
-# probe_run_raw <argv…> — the same, without `--json`, for an assertion that
-# reads the command's **own** output rather than its exit status. The JSON form
-# wraps it, and a wrapper around a refusal is still a non-empty document — which
-# is exactly how an assertion that pattern-matches output passes a launch that
-# never happened.
-probe_run_raw() {
-    friring-cli sandbox exec --profile "$PROBE_PROFILE" --cwd "$PROBE_WORKSPACE" -- "$@"
-}
-
 # probe_summary — print the tally and set the exit status.
+#
+# The "not asked" line is part of the answer, not a footnote: a run reporting
+# only passes and failures would read as a boundary fully observed while a whole
+# network mode went unexercised.
 probe_summary() {
-    printf '\n%s: %d passed, %d failed\n' "${PROBE_NAME:-probe}" "$PROBE_PASS" "$PROBE_FAIL"
+    if [ -n "$PROBE_UNASKED_LIST" ]; then
+        printf '\n%s: not asked here:\n%s' "${PROBE_NAME:-probe}" "$PROBE_UNASKED_LIST"
+    fi
+    printf '\n%s: %d passed, %d failed, %d not asked\n' \
+        "${PROBE_NAME:-probe}" "$PROBE_PASS" "$PROBE_FAIL" "$PROBE_UNASKED"
     [ "$PROBE_FAIL" -eq 0 ]
 }
 

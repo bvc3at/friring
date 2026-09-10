@@ -196,6 +196,25 @@ fcli sandbox import "$E2E_ROOT/profile.toml" --replace >/dev/null \
     || { bad "sandbox import refused the shipped profile"; exit 1; }
 ok "the bridge-conformance profile is stored"
 
+# The family's state directory, which this run's HOME is far too fresh to have.
+#
+# Both agents declare `state_rw = ["~/.friring-conformance/state"]`, and a policy
+# backend grants a declared path **as it stands on the host**: friring creates
+# nothing on an agent's behalf, so an agent's state has to exist before its first
+# sandboxed launch. The two backends then diverge on the same gap — bubblewrap
+# refuses to bind a source that is not there and the leader's pane dies on
+# `Can't find source path` before it runs a line, while seatbelt writes a rule
+# about a path nothing created and the run gets that far by luck.
+#
+# The file in it is what makes the child's claim an observation: `worker.sh`
+# asserts it cannot reach the family's state, and against an absent directory
+# that assertion passes for a narrowed child and for an un-narrowed one alike.
+E2E_FAMILY_STATE="$HOME/.friring-conformance/state"
+mkdir -p "$E2E_FAMILY_STATE"
+chmod 700 "$HOME/.friring-conformance" "$E2E_FAMILY_STATE"
+printf 'family-secret\n' > "$E2E_FAMILY_STATE/family-secret"
+ok "the family's state directory holds a file only the family may read"
+
 # The repository the leader creates its child's worktree in, handed to the
 # leader script through its own environment rather than guessed from `$PWD`.
 export CONFORMANCE_REPO="$E2E_WS"
@@ -491,6 +510,25 @@ for claim in "gate root is unreadable" "gate root is unwritable" "database is un
         bad "never observed from inside a real launch: friring's $claim"
     fi
 done
+# The agent-declared grant, from the owner's side. Without these two the child's
+# refusal below could equally be a family state directory nobody can reach.
+for claim in "state file is readable by its owner" "state directory is writable"; do
+    if grep -q "boundary ok — the family's $claim" "$E2E_ARTIFACTS/leader-pane.txt"; then
+        ok "observed from inside a real launch: the family's $claim"
+    else
+        bad "never observed from inside a real launch: the family's $claim"
+    fi
+done
+# And the child's own side of it. Only the *child's* pane holds its assertions
+# and nothing captures that, so the worker puts the outcome on the report
+# channel and the leader prints it with the rest of the child's status. The
+# exact wording matters: the worker reports a different one where it skipped the
+# assertion, so a skip cannot read as a refusal here.
+if grep -q "family state refused" "$E2E_ARTIFACTS/leader-pane.txt"; then
+    ok "the child reported that its family's state was refused to it"
+else
+    bad "the child never reported a refusal of its family's state"
+fi
 
 # The launch's **own** gate, read-only, observed the only way it can be: the
 # launch helper runs inside this boundary and cannot exec the agent until it has

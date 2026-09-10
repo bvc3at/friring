@@ -6,14 +6,18 @@
 # policy text. This is the observation: friring's own tmux server, three others
 # at the locations tmux derives socket directories under, and an outer server
 # whose socket this process inherits through `$TMUX` — each dialled from inside
-# a boundary friring composed, in all three network modes.
+# a boundary friring composed.
 #
-# The positive controls matter as much as the denials. A boundary that refused
-# everything would pass every deny assertion and be useless, so the probe also
-# proves that legitimate IPC survives: the session's own workspace is readable
-# and writable, and a tmux server started at a `-S` path under it is reachable.
-# That second one is the documented residual — friring denies the *host's*
-# sockets, not the concept of a socket.
+# The positive controls matter as much as the denials, and they run **first** in
+# each network mode because they are the precondition for it: a deny assertion
+# is an exit status, so a mode whose launches never start passes every one of
+# them for the reason nothing ran. `network_mode = allowlist` is exactly that —
+# friring refuses a filtered profile to a one-shot, correctly — so this harness
+# records it as not asked instead of counting six denials it never made. A
+# boundary that refused everything would otherwise pass the whole deny set and
+# be useless; here the workspace is readable and writable, and a tmux server
+# started at a `-S` path under it is reachable. That last one is the documented
+# residual — friring denies the *host's* sockets, not the concept of a socket.
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
@@ -96,10 +100,24 @@ printf '  inherited %s through the TMUX variable\n' "$OUTER_SOCKET"
 # The deny set is about paths and processes, not about the network, so it must
 # hold identically under all three. A mode-dependent hole is the interesting
 # kind.
+#
+# The positive controls come **first** in each mode, as a precondition rather
+# than a nicety: `probe_denied` reads an exit status, so a mode whose launches
+# never start passes the entire deny set for the reason nothing ran, and a tally
+# counting those would report a boundary nothing observed.
 for mode in full allowlist none; do
     probe_note "network_mode = $mode"
     PROBE_PROFILE="probe-$mode"
     probe_profile "$PROBE_PROFILE" "$mode"
+    if ! probe_launches; then
+        probe_unexercised "network_mode = $mode" \
+            "no one-shot launch composes in this mode, so nothing ran in it and \
+nothing about it is counted"
+        continue
+    fi
+    probe_allowed "the workspace is writable" \
+        -- sh -c "printf x > '$PROBE_WORKSPACE/probe.txt'"
+    probe_allowed "the workspace is readable" -- cat "$PROBE_WORKSPACE/probe.txt"
     for socket in "${STARTED[@]}"; do
         probe_denied "tmux at $socket" -- tmux -S "$socket" list-windows
     done
@@ -110,14 +128,27 @@ for mode in full allowlist none; do
     probe_denied 'the inherited TMUX address is gone' -- sh -c '[ -n "${TMUX:-}" ]'
 done
 
+# Why `allowlist` is the mode that goes unexercised, asserted rather than
+# asserted-about: friring refuses a **filtered** profile to a one-shot outright,
+# because the proxy that enforces one lives in a running friring and a one-shot
+# would bind that listener and take it away again. The refusal is the product's
+# and it is correct; it also means no harness here puts a filtered profile under
+# a real kernel, and `bridge-conformance` runs `none`, so nothing else covers it.
+probe_note "a one-shot under a filtered profile"
+PROBE_PROFILE="probe-allowlist"
+if probe_launches; then
+    probe_bad "a one-shot ran under a filtered profile: it would take over the \
+egress listener a running friring owns"
+else
+    probe_ok "a one-shot is refused under a filtered profile — the proxy that \
+enforces one lives in a running friring"
+fi
+
 # ── Positive controls ────────────────────────────────────────────────────
 #
 # The boundary is useful only if it still lets the session's own IPC through.
-probe_note "positive controls (network_mode = full)"
+probe_note "positive controls (a socket under the workspace)"
 PROBE_PROFILE="probe-full"
-
-probe_allowed "the workspace is writable" -- sh -c "printf x > '$PROBE_WORKSPACE/probe.txt'"
-probe_allowed "the workspace is readable" -- cat "$PROBE_WORKSPACE/probe.txt"
 
 # A tmux server under the *session's own* directory: friring denies the host's
 # sockets, not the concept of one. This is the documented residual, and a probe

@@ -331,6 +331,25 @@ boundary: it changes what the kernel grants, never what a profile asks for.
 `tests/harness_capability_gate.rs` is what keeps the two halves from drifting
 apart again.
 
+#### Nor is an assertion that never ran
+
+A deny assertion is a command's exit status, so a launch that never starts
+passes every one of them — for the reason nothing ran. Both boundary probes
+therefore make each network mode's **positive control the gate on its deny
+set**: if no launch composes in that mode, the mode is recorded as `NOT ASKED`
+and nothing in it is counted. The summary prints those beside the tally
+(`21 passed, 0 failed, 1 not asked`), because a run reporting only passes and
+failures reads as a boundary that was fully observed.
+
+The mode that goes unexercised is `network_mode = allowlist`. friring refuses a
+**filtered** profile to a one-shot — the proxy that enforces one lives in a
+running friring, and a one-shot would bind that listener and take it away again
+— so the probes assert that refusal rather than the deny set behind it. Nothing
+else covers it either: `bridge-conformance` runs `none`, and `codex-park` and
+`omx-team` both run `full`. A filtered profile's *path* deny set is therefore
+argued from the generated policy and from the two modes that do launch, not
+observed under a kernel.
+
 ### The bridge, end to end (`just bridge-e2e`)
 
 `scripts/dev/bridge-e2e.sh` is the operator-path proof for the orchestration
@@ -351,6 +370,17 @@ its own launched boundary**: friring's gate root is neither readable nor
 writable, and the database is unreadable. It also captures the leader's pane off
 friring's own tmux server, which is where a **nudge's delivery into a live pane**
 is observed rather than inferred.
+
+It also creates the conformance family's **state directory** before the run.
+Both agents declare `state_rw = ["~/.friring-conformance/state"]`, and a policy
+backend grants a declared path as it stands on the host — friring creates
+nothing on an agent's behalf, so an agent's state has to exist before its first
+sandboxed launch (see `docs/SANDBOX.md` § *State an agent declares*). The file
+the harness puts in it is what makes the child's claim an observation: the
+worker asserts it cannot read the family's state, and against an absent
+directory that assertion passes for a narrowed child and an un-narrowed one
+alike. The leader reads and writes the same file first, so a family state
+directory nobody can reach cannot be mistaken for a subtract set that holds.
 
 Before it installs anything or starts a TUI it runs the § 2.1 preflight: a
 `friring-cli config paths` whose every reported path must canonicalize inside

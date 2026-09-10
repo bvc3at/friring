@@ -45,6 +45,15 @@ if [ -n "${FRIRING_DATA_DIR:-}" ]; then
 else
     printf 'conformance: FRIRING_DATA_DIR is not set; skipping the host-tree assertions\n'
 fi
+# The one grant that comes from the **agent declaration** rather than the profile
+# (`state_rw`), and the one the child is about to be refused. Asserted from the
+# leader's side too, because a family state directory that is unreadable to
+# everyone is a subtract set that proves nothing.
+boundary_allowed "the family's state file is readable by its owner" \
+    cat "$HOME/.friring-conformance/state/family-secret"
+boundary_allowed "the family's state directory is writable" \
+    sh -c "printf x > '$HOME/.friring-conformance/state/.probe'"
+rm -f "$HOME/.friring-conformance/state/.probe" 2>/dev/null || true
 
 printf '== depth rule ==\n'
 # A child may not create children. Asserted from the leader by creating one and

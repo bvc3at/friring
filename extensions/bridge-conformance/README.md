@@ -45,9 +45,18 @@ must be refused. A child's effective grant is `{mailbox, report}` intersected
 with its owner's — never `child-lifecycle`, whatever the profile says — so a run
 where that call succeeded is a failing run, and the worker says so.
 
-**The child boundary holds.** The worker checks it cannot read the family state
-directory its own private one was seeded from. Its transcripts, and every
-sibling's, are its own.
+**The child boundary holds.** The worker reads for a file in the family state
+directory its own private one was seeded from, and must be refused. A file
+rather than the directory, because an absent directory is equally unreadable to
+a narrowed child and to an un-narrowed one; the leader reads and writes that
+same file first, so the child's refusal means the subtract set rather than an
+empty tree. Its transcripts, and every sibling's, are its own.
+
+The directory has to exist before the leader's first launch. friring grants
+`state_rw` as it stands on the host and creates nothing on an agent's behalf, so
+whatever installs this extension owns `~/.friring-conformance/state` — under
+bwrap an absent one fails the launch outright. `scripts/dev/bridge-e2e.sh`
+creates it inside its own throwaway `HOME`.
 
 **The quiesce protocol decides.** The worker sends one typed `result`. friring
 acknowledges it, stops the exact pane, reads the worktree itself and records a

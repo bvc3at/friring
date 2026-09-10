@@ -89,10 +89,26 @@ done
 STARTED+=("$OUTER_SOCKET")
 printf '  inherited %s through the TMUX variable\n' "$OUTER_SOCKET"
 
+# Every mode, and in each one the positive controls come **first** — as a
+# precondition, not as a nicety. `probe_denied` reads an exit status, so a mode
+# whose launches never start passes the whole deny set for the reason nothing
+# ran, and a tally that counted those would report a boundary nothing observed.
+# The modes really do differ here: `--unshare-net` is added for everything but
+# `full`, and its loopback setup is what a restricted kernel refuses.
+# `bridge-conformance` runs `none`, so `none` is the one that had to be covered.
 for mode in full allowlist none; do
     probe_note "network_mode = $mode"
     PROBE_PROFILE="probe-$mode"
     probe_profile "$PROBE_PROFILE" "$mode"
+    if ! probe_launches; then
+        probe_unexercised "network_mode = $mode" \
+            "no one-shot launch composes in this mode, so nothing ran in it and \
+nothing about it is counted"
+        continue
+    fi
+    probe_allowed "the workspace is writable" \
+        -- sh -c "printf x > '$PROBE_WORKSPACE/probe.txt'"
+    probe_allowed "the workspace is readable" -- cat "$PROBE_WORKSPACE/probe.txt"
     for socket in "${STARTED[@]}"; do
         probe_denied "tmux at $socket" -- tmux -S "$socket" list-windows
     done
@@ -100,25 +116,22 @@ for mode in full allowlist none; do
     probe_denied 'the inherited TMUX address is gone' -- sh -c '[ -n "${TMUX:-}" ]'
 done
 
-# One per network mode this can be asked in, not only under `full`. Every
-# `probe_denied` above passes when the launch does not run at all, so a mode
-# that cannot start is invisible in the deny set — and the modes differ in the
-# way that matters on a restricted kernel: `--unshare-net` is added for
-# everything but `full`, and its loopback setup is what such a kernel refuses.
-# `bridge-conformance` runs `none`, so `none` is the one that had to be covered.
-#
-# `allowlist` is absent because `sandbox exec` refuses a **filtered** profile
-# outright — its proxy lives in a running friring, and a one-shot would bind a
-# listener and take it away again. That refusal is the product's, it is correct,
-# and it means this harness cannot positive-control that mode at all;
-# `bridge-e2e` is where a filtered profile gets a real session.
-for mode in full none; do
-    probe_note "positive controls (network_mode = $mode)"
-    PROBE_PROFILE="probe-$mode"
-    probe_allowed "the workspace is writable" \
-        -- sh -c "printf x > '$PROBE_WORKSPACE/probe.txt'"
-    probe_allowed "the workspace is readable" -- cat "$PROBE_WORKSPACE/probe.txt"
-done
+# Why `allowlist` is the mode that goes unexercised, asserted rather than
+# asserted-about: friring refuses a **filtered** profile to a one-shot outright,
+# because the proxy that enforces it lives in a running friring and a one-shot
+# would bind that listener and take it away again. The refusal is the product's
+# and it is correct; it also means no harness here can put a filtered profile
+# under a real kernel, and `bridge-conformance` runs `none` rather than
+# `allowlist`, so nothing else covers it either.
+probe_note "a one-shot under a filtered profile"
+PROBE_PROFILE="probe-allowlist"
+if probe_launches; then
+    probe_bad "a one-shot ran under a filtered profile: it would take over the \
+egress listener a running friring owns"
+else
+    probe_ok "a one-shot is refused under a filtered profile — the proxy that \
+enforces one lives in a running friring"
+fi
 
 probe_note "positive controls (a socket under the workspace)"
 PROBE_PROFILE="probe-full"
@@ -151,21 +164,30 @@ probe_note "the namespace"
 # among junk still matches, and any non-empty string that differs from the
 # host's then reads as isolation. `x=$(grep …)` would also exit the script under
 # `set -e` on no match, before anything could report why.
+#
+# The sandbox's answer is read from a **file the launch writes**, not from its
+# stdout. `friring-cli` prints a one-line summary of the applied boundary after
+# the wrapped command's own output, and with stdout redirected — which every
+# command substitution does — that line is JSON, whatever format flags are
+# passed. So stdout always carries a trailer, and a file in the workspace this
+# profile grants holds the command's answer and nothing else.
+NS_FILE="$PROBE_WORKSPACE/pid-namespace"
+rm -f "$NS_FILE"
 HOST_RAW=""
 SANDBOX_RAW=""
 HOST_PIDNS=""
 SANDBOX_PIDNS=""
 if ! HOST_RAW=$(readlink /proc/self/ns/pid 2>/dev/null); then HOST_RAW=""; fi
-# The raw form: `--json` wraps the answer, and this assertion reads the answer.
-if ! SANDBOX_RAW=$(probe_run_raw readlink /proc/self/ns/pid 2>/dev/null); then
-    SANDBOX_RAW=""
+if probe_run sh -c "readlink /proc/self/ns/pid > '$NS_FILE'" >/dev/null 2>&1; then
+    if ! SANDBOX_RAW=$(cat "$NS_FILE" 2>/dev/null); then SANDBOX_RAW=""; fi
 fi
+rm -f "$NS_FILE"
 if [[ "$HOST_RAW" =~ ^pid:\[[0-9]+\]$ ]]; then HOST_PIDNS="$HOST_RAW"; fi
 if [[ "$SANDBOX_RAW" =~ ^pid:\[[0-9]+\]$ ]]; then SANDBOX_PIDNS="$SANDBOX_RAW"; fi
 if [ -z "$HOST_PIDNS" ] || [ -z "$SANDBOX_PIDNS" ]; then
     probe_bad "could not read one pid namespace from each side to compare"
-    printf '          host:    %s\n' "${HOST_RAW:-(nothing)}" | head -3
-    printf '          sandbox: %s\n' "${SANDBOX_RAW:-(nothing)}" | head -3
+    printf '%s' "${HOST_RAW:-(nothing)}" | head -3 | sed 's/^/          host:    /'
+    printf '%s' "${SANDBOX_RAW:-(nothing)}" | head -3 | sed 's/^/          sandbox: /'
 elif [ "$SANDBOX_PIDNS" = "$HOST_PIDNS" ]; then
     probe_bad "the launch shares the host's pid namespace ($HOST_PIDNS): its \
 teardown would leave anything it started, a relay included"

@@ -198,6 +198,120 @@ fn reading_the_log_for_a_refusal_survives_set_e_when_there_is_none() {
     std::fs::remove_dir_all(&tmp).ok();
 }
 
+/// Both boundary probes, and the network-mode loop each one makes its
+/// assertions in.
+const PROBES: [&str; 2] = [
+    "scripts/dev/sandbox-probes/seatbelt.sh",
+    "scripts/dev/sandbox-probes/bwrap.sh",
+];
+
+/// The body of `for mode in full allowlist none; do … done`.
+fn mode_loop(source: &str, script: &str) -> String {
+    let body = source
+        .split_once("for mode in full allowlist none; do")
+        .unwrap_or_else(|| panic!("{script} has no network-mode loop"))
+        .1;
+    body.split_once("\ndone")
+        .unwrap_or_else(|| panic!("{script}'s mode loop never ends"))
+        .0
+        .to_string()
+}
+
+/// A network mode whose launches never start must not be counted as observed.
+///
+/// The regression: every `probe_denied` is an exit status, and friring refuses a
+/// **filtered** profile to a one-shot before the command runs — so the whole
+/// deny set passed under `network_mode = allowlist` for the reason nothing ran,
+/// and the tally reported those six as boundary assertions. The fix is
+/// structural rather than a comment: the mode's positive control is the gate on
+/// its deny set, and a mode that cannot launch is recorded as not asked.
+#[test]
+fn no_mode_is_counted_without_a_launch_that_composed() {
+    for script in PROBES {
+        let source = read(script);
+        let loop_body = mode_loop(&source, script);
+        let launches = loop_body
+            .find("probe_launches")
+            .unwrap_or_else(|| panic!("{script} never asks whether the mode launches"));
+        let denied = loop_body
+            .find("probe_denied")
+            .unwrap_or_else(|| panic!("{script}'s mode loop makes no deny assertion"));
+        let allowed = loop_body
+            .find("probe_allowed")
+            .unwrap_or_else(|| panic!("{script}'s mode loop has no positive control"));
+        assert!(
+            launches < denied && allowed < denied,
+            "{script} counts a deny assertion before anything established that a \
+             launch in that mode starts at all"
+        );
+        assert!(
+            loop_body.contains("probe_unexercised"),
+            "{script} skips a mode it cannot launch without recording it, so the \
+             tally reads as a boundary that was fully observed"
+        );
+    }
+}
+
+/// An assertion about a launch reads a file the launch wrote, never its stdout.
+///
+/// `friring-cli` prints its own one-line summary of the applied boundary after
+/// the wrapped command's output, and with stdout redirected — every command
+/// substitution — that line is JSON whatever format flags are passed. An
+/// assertion matching *within* that stream accepts one good line among the
+/// trailer, which is how a strict check first caught it.
+#[test]
+fn nothing_asserts_on_a_launchs_stdout() {
+    let common = read("scripts/dev/sandbox-probes/common.sh");
+    assert!(
+        !common.contains("probe_run_raw"),
+        "the raw runner is back; its output still carries friring's own summary"
+    );
+    let bwrap = read("scripts/dev/sandbox-probes/bwrap.sh");
+    assert!(
+        bwrap.contains("readlink /proc/self/ns/pid > '$NS_FILE'"),
+        "the namespace assertion no longer reads the answer out of a file"
+    );
+    for script in PROBES {
+        assert!(
+            !read(script).contains("probe_run_raw"),
+            "{script} still reads a launch's stdout"
+        );
+    }
+}
+
+/// What was not asked is part of the tally, not a footnote.
+#[test]
+fn the_summary_reports_what_it_could_not_ask() {
+    let root = repo_root();
+    let script = format!(
+        "set -euo pipefail\nREPO_ROOT={root}\nPROBE_NAME=probe\n\
+         . {root}/scripts/dev/sandbox-probes/common.sh\n\
+         probe_ok 'something real'\n\
+         probe_unexercised 'network_mode = allowlist' 'a one-shot cannot own the proxy'\n\
+         probe_summary\n",
+        root = root.display()
+    );
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("bash runs");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a mode that could not be asked is not a failure: {stdout}"
+    );
+    assert!(
+        stdout.contains("probe: 1 passed, 0 failed, 1 not asked"),
+        "the tally hides what went unexercised: {stdout}"
+    );
+    assert!(
+        stdout.contains("network_mode = allowlist — a one-shot cannot own the proxy"),
+        "the summary does not say which assertions were never made: {stdout}"
+    );
+}
+
 #[test]
 fn the_ci_jobs_that_exist_for_these_assertions_require_them() {
     let workflow = read(".github/workflows/ci.yml");

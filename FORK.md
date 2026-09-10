@@ -849,6 +849,26 @@ never rested on the number but on the launch having a pid namespace of its own,
 so the probe compares `/proc/self/ns/pid` against the host's and the docs say
 what actually holds.
 
+The same reading found a third thing, this time in the probes themselves. A deny
+assertion is an exit status, and friring refuses a **filtered** profile to a
+one-shot before the command starts — so all six denials under
+`network_mode = allowlist` had been passing because nothing ran, and both probes
+counted them. Each mode's positive control is now the gate on its deny set, a
+mode that cannot launch is recorded as `NOT ASKED` and tallied separately, and
+the refusal itself is asserted where the six false passes used to be. The
+seatbelt probe's honest count is `21 passed, 0 failed, 1 not asked`, against the
+`24 passed` it used to report.
+
+`bridge-e2e` grew one piece of setup for the same reason. A policy backend grants
+a declared state path as it stands on the host — friring creates nothing on an
+agent's behalf, and `state_rw` is untyped, so it cannot — which means the
+conformance family's state directory has to exist before the leader's first
+launch, and on a throwaway `HOME` it did not. bwrap refused to bind the absent
+source and the pane died; seatbelt had been hiding it. The harness creates it and
+puts a file in it, which also turns the worker's "I cannot read my family's
+state" into an observation: against an absent directory that assertion passed for
+a narrowed child and an un-narrowed one alike.
+
 #### Headless sends can't answer a dialog (July 2026)
 
 Upstream's headless senders type their text and press Enter as two separate
