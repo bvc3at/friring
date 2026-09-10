@@ -429,6 +429,38 @@ capture_children() {
     done
 }
 
+# Replay a dead child's own mount composition, with nothing run inside it.
+#
+# A child that exits **without writing to its terminal** leaves a status and no
+# reason, and friring's log has only the host's half of that. The pane's start
+# command is the exact boundary friring composed, so everything up to the first
+# `--` — the bubblewrap options, with `/bin/true` in place of the agent — asks
+# the kernel the same question in a place where the answer is not lost. Nothing
+# of the agent runs: the separator is what divides the two, and the replacement
+# is the smallest program there is.
+#
+# A replay that *succeeds* is as useful as one that fails. It says the mounts
+# compose, which moves the question to the launch helper and off the boundary.
+replay_child_boundary() {
+    local cmd boundary replay_out replay_status=0
+    cmd=$(awk '$3 == "dead=1" && $4 != "status=0" {
+            sub(/^([^ ]+ ){4}cmd=/, "")
+            print
+            exit
+        }' "$E2E_ARTIFACTS/children.txt" 2>/dev/null) || return 0
+    [ -n "$cmd" ] || return 0
+    boundary=${cmd%% -- *}
+    [ "$boundary" != "$cmd" ] || return 0
+    printf -- '--- replaying that boundary with nothing inside it ---\n'
+    if command -v timeout >/dev/null 2>&1; then
+        replay_out=$(timeout 20 sh -c "$boundary -- /bin/true" 2>&1) || replay_status=$?
+    else
+        replay_out=$(sh -c "$boundary -- /bin/true" 2>&1) || replay_status=$?
+    fi
+    printf 'replay exit: %s\n' "$replay_status"
+    printf '%s\n' "${replay_out:-(the boundary composed and said nothing)}" | head -20
+}
+
 # Print what those captures hold. Bounded, because a child that loops prints a
 # great deal and the useful part is where it stopped.
 dump_children() {
@@ -441,6 +473,7 @@ dump_children() {
         printf -- '--- %s ---\n' "$(basename "$child")"
         tail -40 "$child"
     done
+    replay_child_boundary
 }
 run_ok=0
 refused=""
