@@ -391,9 +391,24 @@ launch_refused() { harness_spawn_refusal "$FRIRING_DATA_DIR" "$E2E_NAME"; }
 # anything below runs there is nothing left to capture — and a child that
 # started and then never reported says why in its own pane and nowhere else.
 # friring's log has only the host's half of that: "this child's own hook did not
-# report within 60s" is the symptom, never the cause. Snapshotted each poll and
-# overwritten, so what survives a vanished window is the last thing it printed.
+# report within 60s" is the symptom, never the cause.
+#
+# Snapshotted each poll, and a snapshot **replaces** the last one only when it
+# has something in it. A pane that has already died still answers `capture-pane`,
+# so overwriting unconditionally lets the run's last poll replace what the child
+# printed with the empty screen it left behind.
+#
+# The metadata line is kept beside the transcript, because the two answer
+# different questions: an empty transcript with `status=1` says the process
+# never wrote to its terminal, which is a different failure from one that
+# printed an error, and `#{pane_start_command}` is the only place the composed
+# launch appears at all. **Appended**, not overwritten — the last poll runs
+# after the window is gone, so a list written then has no line for the pane the
+# run is about. Deduped where it is printed.
 capture_children() {
+    tmux -L "$TBX_DEV_SOCKET" list-panes -a \
+        -F '#{pane_id} #{window_name} dead=#{pane_dead} status=#{pane_dead_status} cmd=#{pane_start_command}' \
+        2>/dev/null >> "$E2E_ARTIFACTS/children.txt" || true
     tmux -L "$TBX_DEV_SOCKET" list-panes -a -F '#{pane_id} #{window_name}' 2>/dev/null \
         | while read -r child_pane child_window; do
         case "$child_window" in
@@ -402,14 +417,25 @@ capture_children() {
             tb-*) ;;
             *) continue ;;
         esac
-        tmux -L "$TBX_DEV_SOCKET" capture-pane -p -S -500 -t "$child_pane" \
-            > "$E2E_ARTIFACTS/child-$child_window.txt" 2>/dev/null || true
+        child_file="$E2E_ARTIFACTS/child-$child_window.txt"
+        tmux -L "$TBX_DEV_SOCKET" capture-pane -p -J -S - -t "$child_pane" \
+            > "$child_file.new" 2>/dev/null || true
+        if [ -n "$(tr -d '[:space:]' < "$child_file.new" 2>/dev/null)" ]; then
+            mv "$child_file.new" "$child_file"
+        else
+            [ -e "$child_file" ] || mv "$child_file.new" "$child_file"
+            rm -f "$child_file.new"
+        fi
     done
 }
 
 # Print what those captures hold. Bounded, because a child that loops prints a
 # great deal and the useful part is where it stopped.
 dump_children() {
+    if [ -s "$E2E_ARTIFACTS/children.txt" ]; then
+        printf -- '--- every pane this run had, first seen first ---\n'
+        awk '!seen[$0]++' "$E2E_ARTIFACTS/children.txt"
+    fi
     for child in "$E2E_ARTIFACTS"/child-*.txt; do
         [ -e "$child" ] || continue
         printf -- '--- %s ---\n' "$(basename "$child")"
@@ -418,6 +444,10 @@ dump_children() {
 }
 run_ok=0
 refused=""
+# Started fresh: the artifacts directory survives between runs, and an appended
+# list would otherwise open with the panes of a run that is not this one.
+: > "$E2E_ARTIFACTS/children.txt"
+rm -f "$E2E_ARTIFACTS"/child-*.txt
 for _ in $(seq 1 900); do
     capture_children
     if pane | grep -qE "conformance: the bridge answered every verb"; then
