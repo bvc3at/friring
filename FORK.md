@@ -859,6 +859,12 @@ the refusal itself is asserted where the six false passes used to be. The
 seatbelt probe's honest count is `21 passed, 0 failed, 1 not asked`, against the
 `24 passed` it used to report.
 
+Neutral applies to `allowlist` alone. A supported mode that stops launching
+leaves the same empty transcript as one nothing can launch in, so the two are
+decided by a list rather than by the failure — `none` is what the bridge itself
+runs under, and calling it "not asked" would let it break while a required job
+stayed green with a footnote.
+
 `bridge-e2e` grew one piece of setup for the same reason. A policy backend grants
 a declared state path as it stands on the host — friring creates nothing on an
 agent's behalf, and `state_rw` is untyped, so it cannot — which means the

@@ -57,6 +57,34 @@ probe_launches() {
     probe_run true >/dev/null 2>&1
 }
 
+# The network modes a one-shot is **expected** to be unable to launch in, space
+# separated. Exactly one: friring refuses a *filtered* profile to a one-shot,
+# because the proxy that enforces one lives in a running friring and a one-shot
+# would bind that listener and take it away again.
+PROBE_ONESHOT_UNSUPPORTED=" allowlist "
+
+# probe_mode_unlaunchable <mode> — record a mode whose launch did not compose.
+#
+# The distinction this exists to keep: a mode nothing can launch in **by design**
+# is a scope limit, and a supported mode that stops launching is a regression
+# that takes its whole deny set with it. Both leave the same empty transcript, so
+# calling either one "not asked" would let `none` — the mode the bridge itself
+# runs under — break and still read as a clean run with a footnote.
+probe_mode_unlaunchable() {
+    local mode=$1
+    case "$PROBE_ONESHOT_UNSUPPORTED" in
+        *" $mode "*)
+            probe_unexercised "network_mode = $mode" \
+                "friring refuses a filtered profile to a one-shot, so nothing \
+ran in this mode and nothing about it is counted"
+            ;;
+        *)
+            probe_bad "network_mode = $mode: no launch composed, so every deny \
+assertion in this mode would have passed for the reason nothing ran"
+            ;;
+    esac
+}
+
 # probe_denied <what> -- <argv…> — assert the command FAILS inside the boundary.
 #
 # The deny-set assertions. A command that succeeds here is a hole, and the

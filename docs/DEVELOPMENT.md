@@ -350,6 +350,14 @@ else covers it either: `bridge-conformance` runs `none`, and `codex-park` and
 argued from the generated policy and from the two modes that do launch, not
 observed under a kernel.
 
+That is a **scope limit, and it is the only one**. A mode that cannot launch is
+neutral only when a one-shot was never able to launch in it
+(`PROBE_ONESHOT_UNSUPPORTED`, which holds `allowlist` and nothing else); any
+other mode that stops launching is a `FAILED`, because the two leave an
+identical empty transcript and `none` is what the bridge itself runs under.
+Recording that one as "not asked" would let it break while a required job stayed
+green with a footnote where its boundary checks used to be.
+
 ### The bridge, end to end (`just bridge-e2e`)
 
 `scripts/dev/bridge-e2e.sh` is the operator-path proof for the orchestration

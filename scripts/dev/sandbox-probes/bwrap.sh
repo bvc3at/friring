@@ -95,15 +95,15 @@ printf '  inherited %s through the TMUX variable\n' "$OUTER_SOCKET"
 # ran, and a tally that counted those would report a boundary nothing observed.
 # The modes really do differ here: `--unshare-net` is added for everything but
 # `full`, and its loopback setup is what a restricted kernel refuses.
-# `bridge-conformance` runs `none`, so `none` is the one that had to be covered.
+# `bridge-conformance` runs `none`, so `none` is the one that had to be covered —
+# and a mode that stops launching is a **failure** unless a one-shot was never
+# able to launch in it, which is `probe_mode_unlaunchable`'s whole job.
 for mode in full allowlist none; do
     probe_note "network_mode = $mode"
     PROBE_PROFILE="probe-$mode"
     probe_profile "$PROBE_PROFILE" "$mode"
     if ! probe_launches; then
-        probe_unexercised "network_mode = $mode" \
-            "no one-shot launch composes in this mode, so nothing ran in it and \
-nothing about it is counted"
+        probe_mode_unlaunchable "$mode"
         continue
     fi
     probe_allowed "the workspace is writable" \

@@ -245,9 +245,69 @@ fn no_mode_is_counted_without_a_launch_that_composed() {
              launch in that mode starts at all"
         );
         assert!(
-            loop_body.contains("probe_unexercised"),
-            "{script} skips a mode it cannot launch without recording it, so the \
-             tally reads as a boundary that was fully observed"
+            loop_body.contains("probe_mode_unlaunchable"),
+            "{script} skips a mode it cannot launch without deciding whether that \
+             is a scope limit or a regression"
+        );
+        assert!(
+            !loop_body.contains("probe_unexercised"),
+            "{script} calls the neutral outcome directly, so a supported mode that \
+             stopped launching would be recorded as merely not asked"
+        );
+    }
+}
+
+/// A mode nothing can launch in **by design** is a scope limit; a supported mode
+/// that stops launching is a regression that takes its whole deny set with it.
+///
+/// Both leave the same empty transcript, so the outcome cannot be read off the
+/// launch failing. `none` is the mode `bridge-conformance` itself runs under: if
+/// it broke and this recorded "not asked", a required job would stay green with
+/// a footnote where its Linux boundary checks used to be.
+#[test]
+fn a_supported_mode_that_stops_launching_is_a_failure_not_a_footnote() {
+    let root = repo_root();
+    let outcome = |mode: &str| {
+        let script = format!(
+            "set -uo pipefail\nREPO_ROOT={root}\nPROBE_NAME=probe\n\
+             . {root}/scripts/dev/sandbox-probes/common.sh\n\
+             probe_mode_unlaunchable {mode}\nprobe_summary\n",
+            root = root.display()
+        );
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("bash runs");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+
+    // The one a one-shot cannot launch in: neutral, and named in the tally.
+    let (status, stdout) = outcome("allowlist");
+    assert_eq!(status, Some(0), "a scope limit failed the probe: {stdout}");
+    assert!(
+        stdout.contains("0 passed, 0 failed, 1 not asked"),
+        "the scope limit was not recorded apart from the passes: {stdout}"
+    );
+
+    // Every mode a one-shot is supposed to launch in.
+    for mode in ["full", "none"] {
+        let (status, stdout) = outcome(mode);
+        assert_eq!(
+            status,
+            Some(1),
+            "{mode} stopped launching and the probe stayed green: {stdout}"
+        );
+        assert!(
+            stdout.contains("0 passed, 1 failed, 0 not asked"),
+            "{mode} was recorded as not asked rather than as broken: {stdout}"
+        );
+        assert!(
+            stdout.contains("would have passed for the reason nothing ran"),
+            "{mode}'s failure does not say what it costs: {stdout}"
         );
     }
 }

@@ -13,10 +13,12 @@
 # is an exit status, so a mode whose launches never start passes every one of
 # them for the reason nothing ran. `network_mode = allowlist` is exactly that —
 # friring refuses a filtered profile to a one-shot, correctly — so this harness
-# records it as not asked instead of counting six denials it never made. A
-# boundary that refused everything would otherwise pass the whole deny set and
-# be useless; here the workspace is readable and writable, and a tmux server
-# started at a `-S` path under it is reachable. That last one is the documented
+# records it as not asked instead of counting six denials it never made. Any
+# *other* mode that stops launching is a failure rather than a note: `none` is
+# what the bridge itself runs under, and "not asked" would let it break and
+# still read as a clean run. A boundary that refused everything would pass the
+# whole deny set and be useless; here the workspace is readable and writable, and
+# a tmux server started at a `-S` path under it is reachable. That is the
 # residual — friring denies the *host's* sockets, not the concept of a socket.
 set -euo pipefail
 
@@ -110,9 +112,7 @@ for mode in full allowlist none; do
     PROBE_PROFILE="probe-$mode"
     probe_profile "$PROBE_PROFILE" "$mode"
     if ! probe_launches; then
-        probe_unexercised "network_mode = $mode" \
-            "no one-shot launch composes in this mode, so nothing ran in it and \
-nothing about it is counted"
+        probe_mode_unlaunchable "$mode"
         continue
     fi
     probe_allowed "the workspace is writable" \
