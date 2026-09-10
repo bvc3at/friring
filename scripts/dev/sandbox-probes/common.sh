@@ -49,13 +49,19 @@ probe_denied() {
 # The positive controls, and they matter as much: a boundary that denied
 # everything would pass every deny assertion and be useless.
 probe_allowed() {
-    local what=$1
+    local what=$1 output status=0
     shift
     [ "$1" = "--" ] && shift
-    if probe_run "$@" >/dev/null 2>&1; then
+    output=$({ probe_run "$@" >/dev/null; } 2>&1) || status=$?
+    if [ "$status" -eq 0 ]; then
         probe_ok "$what — allowed"
     else
-        probe_bad "$what — the boundary refused it"
+        # With the reason, bounded. A failing control usually means the launch
+        # did not work at all — in which case every deny above it passed for
+        # the wrong reason, and "the boundary refused it" is the least useful
+        # half of what happened.
+        probe_bad "$what — the boundary refused it (exit $status)"
+        printf '%s\n' "${output:-(no output)}" | head -5 | sed 's/^/          /'
     fi
 }
 

@@ -120,10 +120,16 @@ probe_note "the namespace"
 
 # The agent is pid 1 inside it, which is what makes a relay's lifetime the
 # launch's: everything in the namespace goes when pid 1 does.
-if probe_run sh -c 'test "$$" = 1' >/dev/null 2>&1; then
+PID_ONE_STATUS=0
+PID_ONE_OUT=$({ probe_run sh -c 'test "$$" = 1' >/dev/null; } 2>&1) || PID_ONE_STATUS=$?
+if [ "$PID_ONE_STATUS" -eq 0 ]; then
     probe_ok "the wrapped process is pid 1 inside its namespace"
 else
+    # The reason matters here for the same cause as the positive controls: a
+    # launch that never ran and a launch whose pid is wrong are different
+    # findings and this exit code alone cannot tell them apart.
     probe_bad "the wrapped process is not pid 1: a relay could outlive its launch"
+    printf '%s\n' "${PID_ONE_OUT:-(no output)}" | head -5 | sed 's/^/          /'
 fi
 
 # And nothing of the launch is left on the host. `sandbox exec` composes no
