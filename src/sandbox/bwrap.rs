@@ -1391,6 +1391,36 @@ mod tests {
         argv.windows(2).any(|w| w[0] == flag && w[1] == value)
     }
 
+    /// Assert `dir` is covered by a tmpfs mask, and that the mask lands after
+    /// the root bind that would otherwise shadow it.
+    ///
+    /// **Covered**, not "has a mask of its own": on every systemd distribution
+    /// `/var/run` is a symlink to `/run`, so masking each separately asks bwrap
+    /// for a tmpfs on a path inside a filesystem it has already replaced and
+    /// fails the launch — see [`masked_socket_dirs`]. The deny set rests on
+    /// nothing under the tree being reachable, which a mask over the tree the
+    /// path resolves into gives just as completely. Asserting the literal
+    /// spelling made these tests pass on macOS, where `/run` does not exist and
+    /// `/var/run` is a real directory, and fail on the platform the argv is for.
+    fn assert_masked(argv: &[String], dir: &str) {
+        let resolved = std::fs::canonicalize(dir)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| dir.to_string());
+        let at = argv
+            .windows(2)
+            .position(|w| {
+                w[0] == "--tmpfs"
+                    && (dirs::encloses(&w[1], dir) || dirs::encloses(&w[1], &resolved))
+            })
+            .unwrap_or_else(|| {
+                panic!("no tmpfs mask covers {dir} (resolved {resolved}): {argv:?}")
+            });
+        assert!(
+            at > index_of(argv, "--ro-bind"),
+            "the mask covering {dir} lands before the root bind that shadows it"
+        );
+    }
+
     #[test]
     fn base_flags_isolate_without_stealing_the_terminal() {
         let policy = workspace_policy();
@@ -1650,9 +1680,7 @@ mod tests {
         let launch = SandboxLaunch::new(&host_scope, "/home/u", "s1");
         let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
         for dir in ["/run", "/var/run"] {
-            assert!(has_flag(&argv, "--tmpfs", dir), "missing mask for {dir}");
-            // After the root bind, so the mask is not shadowed by it.
-            assert!(index_of(&argv, dir) > index_of(&argv, "--ro-bind"));
+            assert_masked(&argv, dir);
         }
 
         // A path the profile lists inside a masked tree still wins: the mask is
@@ -1947,11 +1975,11 @@ mod tests {
             .with_host_mux(&host);
         let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
 
-        // The standing masks are product behaviour and stay exactly as they
-        // were.
+        // The standing coverage is product behaviour and stays exactly as it
+        // was.
         assert!(has_flag(&argv, "--tmpfs", "/tmp"));
         for dir in ["/run", "/var/run"] {
-            assert!(has_flag(&argv, "--tmpfs", dir), "{dir} lost its mask");
+            assert_masked(&argv, dir);
         }
         // `/tmp/tmux-501` needs none: `--tmpfs /tmp` already covers it, and a
         // second mask under a tmpfs would be noise.

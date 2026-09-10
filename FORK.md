@@ -842,7 +842,10 @@ own. `MASKED_SOCKET_DIRS` carried `/run` and `/var/run`, which on every systemd
 distribution are one directory and a symlink to it — so bwrap was asked for a
 tmpfs on a path inside a filesystem it had just replaced, and failed the whole
 launch rather than skipping the mount. A mask whose resolved path is already
-covered is no longer emitted, and coverage is unchanged. And the probe's claim
+covered is no longer emitted, and coverage is unchanged — which is now what the
+tests assert. Two of them named the spelling instead, so they passed on macOS,
+where `/run` does not exist and `/var/run` is a real directory, and failed on
+the only platform the argv is for. And the probe's claim
 that the wrapped process is **pid 1** was simply not true: bwrap keeps a reaper
 at pid 1 unless `--as-pid-1` is passed, which friring does not. The invariant
 never rested on the number but on the launch having a pid namespace of its own,
