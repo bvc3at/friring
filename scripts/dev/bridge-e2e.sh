@@ -393,10 +393,11 @@ launch_refused() { harness_spawn_refusal "$FRIRING_DATA_DIR" "$E2E_NAME"; }
 # friring's log has only the host's half of that: "this child's own hook did not
 # report within 60s" is the symptom, never the cause.
 #
-# Snapshotted each poll, and a snapshot **replaces** the last one only when it
-# has something in it. A pane that has already died still answers `capture-pane`,
-# so overwriting unconditionally lets the run's last poll replace what the child
-# printed with the empty screen it left behind.
+# Snapshotted each poll, and the **longest** snapshot is the one kept. A pane
+# that has died still answers `capture-pane`, and what it answers with is tmux's
+# own `Pane is dead` banner — which is not empty, so "replace when the new one
+# has something in it" still let the banner overwrite what the child printed.
+# Length is the rule that survives that: a transcript only grows.
 #
 # The metadata line is kept beside the transcript, because the two answer
 # different questions: an empty transcript with `status=1` says the process
@@ -420,13 +421,24 @@ capture_children() {
         child_file="$E2E_ARTIFACTS/child-$child_window.txt"
         tmux -L "$TBX_DEV_SOCKET" capture-pane -p -J -S - -t "$child_pane" \
             > "$child_file.new" 2>/dev/null || true
-        if [ -n "$(tr -d '[:space:]' < "$child_file.new" 2>/dev/null)" ]; then
+        if [ "$(wc -c < "$child_file.new" 2>/dev/null || echo 0)" \
+            -gt "$(wc -c < "$child_file" 2>/dev/null || echo 0)" ]; then
             mv "$child_file.new" "$child_file"
-        else
-            [ -e "$child_file" ] || mv "$child_file.new" "$child_file"
-            rm -f "$child_file.new"
         fi
+        rm -f "$child_file.new"
     done
+    # The replay, taken **now** rather than after the assertions below. friring
+    # removes a failed child's gate and scratch when its saga gives up, so a
+    # replay run later reports the tidy-up rather than the launch — which is
+    # exactly what the first one did, naming a gate directory that had been
+    # there when the child started. Once per run: the marker is the file.
+    if [ ! -e "$E2E_ARTIFACTS/child-replay.txt" ]; then
+        replay_child_boundary > "$E2E_ARTIFACTS/child-replay.txt.new" 2>&1 || true
+        if [ -s "$E2E_ARTIFACTS/child-replay.txt.new" ]; then
+            mv "$E2E_ARTIFACTS/child-replay.txt.new" "$E2E_ARTIFACTS/child-replay.txt"
+        fi
+        rm -f "$E2E_ARTIFACTS/child-replay.txt.new"
+    fi
 }
 
 # Replay a dead child's own mount composition, with nothing run inside it.
@@ -441,8 +453,13 @@ capture_children() {
 #
 # A replay that *succeeds* is as useful as one that fails. It says the mounts
 # compose, which moves the question to the launch helper and off the boundary.
+#
+# The missing-source list goes with it, because a replay is a second launch and
+# not the first: anything friring has already cleaned up reads as a cause when it
+# is only the tidy-up. A source named here as absent has to be checked against
+# when the child actually started before it means anything.
 replay_child_boundary() {
-    local cmd boundary replay_out replay_status=0
+    local cmd boundary source replay_out replay_status=0
     cmd=$(awk '$3 == "dead=1" && $4 != "status=0" {
             sub(/^([^ ]+ ){4}cmd=/, "")
             print
@@ -452,6 +469,12 @@ replay_child_boundary() {
     boundary=${cmd%% -- *}
     [ "$boundary" != "$cmd" ] || return 0
     printf -- '--- replaying that boundary with nothing inside it ---\n'
+    printf 'sources it names that are not there now:\n'
+    # `|| true`: a boundary naming no absolute path makes `grep` exit 1, and
+    # under `pipefail` that would end this function before it replayed anything.
+    printf '%s\n' "$boundary" | tr ' ' '\n' | grep '^/' | sort -u | while read -r source; do
+        [ -e "$source" ] || printf '  %s\n' "$source"
+    done || true
     if command -v timeout >/dev/null 2>&1; then
         replay_out=$(timeout 20 sh -c "$boundary -- /bin/true" 2>&1) || replay_status=$?
     else
@@ -470,10 +493,12 @@ dump_children() {
     fi
     for child in "$E2E_ARTIFACTS"/child-*.txt; do
         [ -e "$child" ] || continue
+        # The replay is printed as it was taken, not re-run: see
+        # `replay_child_boundary`, which runs while the launch's own directories
+        # are still there.
         printf -- '--- %s ---\n' "$(basename "$child")"
         tail -40 "$child"
     done
-    replay_child_boundary
 }
 run_ok=0
 refused=""
