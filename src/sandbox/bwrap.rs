@@ -879,13 +879,36 @@ fn masked_socket_dirs() -> Vec<String> {
         if !candidate.starts_with('/') {
             continue;
         }
-        if covered.iter().any(|c| dirs::encloses(c, &candidate)) {
+        // Resolved as well as written, because on every systemd distribution
+        // `/var/run` **is** `/run` — a symlink, not a second directory. Masking
+        // it separately asks bwrap to mount a tmpfs on a path that resolves
+        // into one it has already replaced, and that fails the whole launch:
+        // `Can't mount tmpfs on /newroot/var/run: No such file or directory`.
+        // A symlink into a tree that is already masked is already masked.
+        let resolved = std::fs::canonicalize(&candidate)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| candidate.clone());
+        if mask_already_covers(&covered, &candidate, &resolved) {
             continue;
         }
         covered.push(candidate.clone());
+        if resolved != candidate {
+            covered.push(resolved);
+        }
         out.push(candidate);
     }
     out
+}
+
+/// Whether a tmpfs mask over `candidate` would be redundant, given what is
+/// already masked and what `candidate` resolves to.
+///
+/// Pure so the rule can be tested on any host: the case it exists for is a
+/// Linux one, and the filesystem that produces it is not present on macOS.
+fn mask_already_covers(covered: &[String], candidate: &str, resolved: &str) -> bool {
+    covered
+        .iter()
+        .any(|c| dirs::encloses(c, candidate) || dirs::encloses(c, resolved))
 }
 
 /// The multiplexer deny-set entries [`masked_socket_dirs`] and the
@@ -1581,6 +1604,41 @@ mod tests {
         {
             assert!(!has_flag(&argv, "--tmpfs", &dir), "{dir} needs no mask");
         }
+    }
+
+    /// `/var/run` is a **symlink** to `/run` on every systemd distribution, so
+    /// masking both asks bwrap to mount a tmpfs on a path that resolves into
+    /// one it has already replaced — and bwrap fails the launch rather than
+    /// skipping it: `Can't mount tmpfs on /newroot/var/run: No such file or
+    /// directory`. Every assertion about a *denied* path still passed on such a
+    /// host, because nothing had been allowed either; the positive controls are
+    /// what caught it.
+    ///
+    /// Stated against the rule rather than the filesystem, so it is checked
+    /// wherever the suite runs and not only where that layout exists.
+    #[test]
+    fn a_socket_mask_that_resolves_into_a_masked_tree_is_not_emitted_twice() {
+        let covered = vec!["/tmp".to_string(), "/run".to_string()];
+        assert!(
+            super::mask_already_covers(&covered, "/var/run", "/run"),
+            "/var/run resolving to the already-masked /run must not be masked again"
+        );
+        // A path *inside* a masked tree needs no mask of its own either.
+        assert!(super::mask_already_covers(
+            &covered,
+            "/run/user/1000",
+            "/run/user/1000"
+        ));
+        assert!(
+            !super::mask_already_covers(&covered, "/var/lib/x", "/var/lib/x"),
+            "an unrelated tree must still be masked"
+        );
+        // And a path that cannot be resolved falls back to its own spelling
+        // rather than being treated as covered by accident.
+        assert!(
+            !super::mask_already_covers(&covered, "/nonexistent", "/nonexistent"),
+            "an unresolvable path must still be masked"
+        );
     }
 
     /// A read-only bind is no barrier to `connect(2)`, and `--unshare-net`
