@@ -100,10 +100,21 @@ for mode in full allowlist none; do
     probe_denied 'the inherited TMUX address is gone' -- sh -c '[ -n "${TMUX:-}" ]'
 done
 
-probe_note "positive controls (network_mode = full)"
+# One per network mode, not only under `full`. Every `probe_denied` above
+# passes when the launch does not run at all, so a mode that cannot start is
+# invisible in the deny set — and the modes differ in exactly the way that
+# matters here: `none` and `allowlist` add `--unshare-net`, whose loopback setup
+# is the part a restricted kernel refuses. `bridge-conformance` runs `none`.
+for mode in full allowlist none; do
+    probe_note "positive controls (network_mode = $mode)"
+    PROBE_PROFILE="probe-$mode"
+    probe_allowed "the workspace is writable" \
+        -- sh -c "printf x > '$PROBE_WORKSPACE/probe.txt'"
+    probe_allowed "the workspace is readable" -- cat "$PROBE_WORKSPACE/probe.txt"
+done
+
+probe_note "positive controls (a socket under the workspace)"
 PROBE_PROFILE="probe-full"
-probe_allowed "the workspace is writable" -- sh -c "printf x > '$PROBE_WORKSPACE/probe.txt'"
-probe_allowed "the workspace is readable" -- cat "$PROBE_WORKSPACE/probe.txt"
 if probe_tmux_server "$INNER_SOCKET"; then
     probe_allowed "a tmux server under the workspace is reachable" \
         -- tmux -S "$INNER_SOCKET" list-windows
@@ -128,9 +139,12 @@ probe_note "the namespace"
 # flag friring does not pass. `/proc/self/ns/pid` is the kernel's own name for
 # the namespace — two processes in one namespace read the same inode — and the
 # boundary mounts a fresh `/proc`, so the comparison is like for like.
-HOST_PIDNS=$(readlink /proc/self/ns/pid 2>/dev/null || true)
-SANDBOX_PIDNS=$(probe_run readlink /proc/self/ns/pid 2>/dev/null |
-    tr -dc 'pid:[]0-9' || true)
+ns_of() { grep -oE 'pid:\[[0-9]+\]' | head -1; }
+HOST_PIDNS=$(readlink /proc/self/ns/pid 2>/dev/null | ns_of || true)
+# Matched, not filtered: `sandbox exec --json` wraps the command's output, and
+# deleting every other character from the document leaves fragments of the
+# wrapper interleaved with the answer.
+SANDBOX_PIDNS=$(probe_run readlink /proc/self/ns/pid 2>/dev/null | ns_of || true)
 if [ -z "$HOST_PIDNS" ] || [ -z "$SANDBOX_PIDNS" ]; then
     probe_bad "could not read a pid namespace to compare \
 (host '${HOST_PIDNS:-none}', sandbox '${SANDBOX_PIDNS:-none}')"
