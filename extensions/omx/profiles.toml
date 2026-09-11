@@ -1,0 +1,138 @@
+# friring sandbox profiles — import with `friring-cli sandbox import`.
+#
+# A **template**, not a finished profile. Two things in it are certainly wrong
+# for your machine and must be edited before a leader will work: the repository
+# path, and the toolchain roots. Do it in the TUI (`Alt+S`), where the editor
+# validates as you type.
+#
+# Least privilege, and the parts that matter:
+#
+# - `read_scope = "workspace"` — the boundary reads the repository and what is
+#   listed below, and nothing else of the host.
+# - **One read-write path of the agents' own is listed here**: `~/.codex`, where
+#   codex keeps its SQLite state. The pinned skill cards and role prompts live
+#   under it and are taken back read-only below. OMX's own two roots (`~/.omx`,
+#   `~/.omx-runs`) are *not* here on purpose — they are the leader's alone, so
+#   they are declared in the leader agent's `state_rw`, which no worker inherits.
+#   Everything else a leader may write is what the launch adds: its own worktree,
+#   its scratch, signal and bridge directories. Adding a path here widens every
+#   session under this profile **and every bridge child of one**.
+# - `network_mode = "allowlist"` with the three OpenAI endpoints Codex needs.
+#   Everything else is refused by friring's own proxy, which asks you about a
+#   new domain the first time rather than failing silently.
+# - `child_seed_allow` is the exact list of what a worker receives out of
+#   `~/.codex`, each in the one mode it is allowed. `auth.json` is the single
+#   `link-rw` — one credential file, refreshed in place — and everything else is
+#   a copy or a read-only link. Nothing not on this list reaches a worker.
+#
+# A child's boundary is its owner's **narrowed**: a domain a worker needs must
+# be in this allowlist, and a directory a worker shares must be in
+# `child_shared_rw` *and* already read-write for the leader. See the README.
+
+[[profile]]
+name = "omx"
+backend = "auto"
+paths = [
+    # EDIT: the repository the leader works in.
+    { path = "~/dev/your-project", mode = "rw" },
+
+    # EDIT: the prefix that provides `omx`, `codex` and `node`. `~/.local/share/mise`
+    # for mise, `~/.nvm/versions/node/<v>` for nvm, `/opt/homebrew` for brew.
+    { path = "~/.local/share/mise", mode = "ro" },
+
+    # EDIT: the toolchain roots your project builds with. Remove what you do
+    # not use — each one is a directory the agent can read.
+    { path = "~/.cargo/bin", mode = "ro" },
+    { path = "~/.rustup", mode = "ro" },
+
+    # git's own configuration, read-only. A worker's job ends in a commit, and
+    # git treats an *unreadable* `~/.gitconfig` as fatal — not as absent — so
+    # without this every worker dies on `unable to access … Operation not
+    # permitted` after doing its work, with the commit lost and the worktree
+    # dirty. Read-only because nothing here should be editing it.
+    { path = "~/.gitconfig", mode = "ro" },
+
+    # `~/.omx` and `~/.omx-runs` are deliberately NOT here. They are declared in
+    # the leader agent's `state_rw` instead (`extension.toml`), because a path in
+    # this list is inherited by every bridge child — read-only, after narrowing,
+    # but inherited — and those two hold the leader's session identity, its
+    # launch lineage token, its logs and its codebase map. Nothing a worker does
+    # needs them. Moving one back here would hand all of it to every worker.
+
+    # Codex's own state directory, writable — and then the surfaces inside it
+    # that must not be, listed after it, because a nested read-only entry is
+    # denied after its writable ancestor.
+    #
+    # The directory rather than a list of files, and that is the lesson of
+    # running it: codex keeps its state in SQLite (`state_*.sqlite`,
+    # `goals_*`, `logs_*`, `memories_*`, `queue_*`), each with `-wal` and `-shm`
+    # siblings created on demand, beside a lock directory and two temp
+    # directories — and the set changes with the release. A per-file allowlist
+    # written against one codex refuses the next one with `unable to open
+    # database file` and a leader that never starts. What has to stay read-only
+    # is the pinned material, and that is exactly what the four entries below
+    # say.
+    { path = "~/.codex", mode = "rw" },
+
+    # oh-my-codex's own surfaces. Read-only: the skill cards and role prompts
+    # this extension pins by digest must not be writable by what runs under it.
+    { path = "~/.codex/skills", mode = "ro" },
+    { path = "~/.codex/prompts", mode = "ro" },
+    { path = "~/.codex/agents", mode = "ro" },
+    { path = "~/.codex/AGENTS.md", mode = "ro" },
+    { path = "~/.codex/hooks.json", mode = "ro" },
+
+    # This extension's own home, read-only. Not optional and not a convenience:
+    # `read_scope = "workspace"` grants the profile's paths plus the system
+    # directories a binary needs, and both agents here are wrapper scripts that
+    # run a Node program and read an appendix beside it. friring reads the
+    # agent's own program into every narrow scope — a policy that cannot exec its
+    # agent is never right — but what that program then opens is the profile's to
+    # grant. Without this the pane opens and the wrapper dies on its first read.
+    { path = "~/.config/friring/extensions/omx", mode = "ro" },
+]
+network_mode = "allowlist"
+network_allow = ["api.openai.com:443", "chatgpt.com:443", "auth.openai.com:443"]
+network_deny = []
+prompt_new_domains = true
+read_scope = "workspace"
+allow_unsandboxed_fallback = false
+bridge_grants = ["child-lifecycle", "mailbox", "report"]
+max_children = 3
+child_agents = ["omx-worker-codex"]
+child_shared_rw = [
+    # EDIT: the git directory of the repository above, and not optional for any
+    # worker that commits — which is every worker, since a worktree friring
+    # reads as dirty is never merged.
+    #
+    # A linked worktree is not a self-contained repository. Its index and `HEAD`
+    # are per-worktree (friring grants those itself, with the child's own
+    # directories), but the **object store and the ref store are shared by
+    # design**: `git add` writes a loose object under `.git/objects` and
+    # `git commit` moves `refs/heads/<branch>`, both in the common directory.
+    # Without this a worker gets `unable to create temporary file: Operation not
+    # permitted` after doing its work, and the run ends needing a person.
+    #
+    # Read this as what it is: **one trust domain**. Every worker under this
+    # profile, and the leader, share the object store and the ref store, so a
+    # worker can move any branch — including another worker's — and friring will
+    # verify and `integrate` will merge whatever that branch then points at. The
+    # host's verdict says what a branch pointed at and whether the worktree was
+    # clean; it does not say who wrote it. Objects are shared and deletable for
+    # the same reason.
+    #
+    # What stays separate either way: a worker cannot read another worker's
+    # worktree, its transcripts or its private state.
+    #
+    # Remove this line if one worker's work must not be forgeable by another —
+    # and then no worker can commit at all, which is the trade.
+    "~/dev/your-project/.git",
+]
+child_seed_allow = [
+    { path = "auth.json", mode = "link-rw" },
+    { path = "config.toml", mode = "copy" },
+    { path = "hooks.json", mode = "copy-rewrite" },
+    { path = "skills", mode = "symlink" },
+    { path = "prompts", mode = "symlink" },
+    { path = "AGENTS.md", mode = "symlink" },
+]

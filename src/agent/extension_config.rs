@@ -410,18 +410,36 @@ pub(crate) fn http_get_to_file(url: &str, dest: &std::path::Path) -> Result<(), 
         .map_err(|e| format!("failed to download {url} ({e})"))
 }
 
+/// Parse one `extension.toml`, reporting the keys friring did not recognise.
+///
+/// The one parse every path goes through — the installer's, and the fixture
+/// that asserts what friring hands a manifest's agents — so a manifest that
+/// parses in a test parses at install for the same reasons.
+///
+/// # Errors
+///
+/// The TOML is malformed, or a value is not the type the manifest declares,
+/// with the offending key named.
+pub fn parse_manifest_text(
+    contents: &str,
+    label: &str,
+) -> Result<(ExtensionDef, Vec<String>), String> {
+    super::agent_config::parse_toml_reporting_unknown::<ExtensionDef>(contents, label).map_err(
+        |e| {
+            format!(
+                "{label}: {}",
+                super::agent_config::compact_toml_error(&e.to_string())
+            )
+        },
+    )
+}
+
 /// Fetch + parse the `extension.toml` manifest from a source.
 pub fn load_manifest_from_source(
     source: &ExtensionSource,
 ) -> Result<(ExtensionDef, Vec<String>), String> {
     let contents = fetch_file(source, "extension.toml")?;
-    super::agent_config::parse_toml_reporting_unknown::<ExtensionDef>(&contents, "extension.toml")
-        .map_err(|e| {
-            format!(
-                "extension.toml: {}",
-                super::agent_config::compact_toml_error(&e.to_string())
-            )
-        })
+    parse_manifest_text(&contents, "extension.toml")
 }
 
 /// Register agents in `agents.toml`, appending only the ones whose names aren't
@@ -934,6 +952,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: None,
+            transcript: None,
             sandbox: None,
         };
         // claude already exists in the seeded built-ins → not re-added.
@@ -968,6 +987,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: None,
+            transcript: None,
             sandbox: None,
         };
         ensure_agents_registered(&[flow]).unwrap();
@@ -1054,6 +1074,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: Some("claude".into()),
+            transcript: None,
             sandbox: None,
         };
         ensure_agents_registered(&[fleet]).unwrap();

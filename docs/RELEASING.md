@@ -44,6 +44,27 @@ Every push to `main` automatically triggers the release workflow:
   binary. Development builds show `0.0.0-dev` when it is unset; release builds
   show the actual version.
 
+**That version string, not the cargo profile, decides the build's flavour.**
+`build.rs` sets the `dev_build` cfg from a version *containing* `-dev`, and
+`paths::app_dir_name()`, the tmux socket and the tmux group session all follow
+it. So `cargo build --release` in a working tree is still a **dev-flavoured**
+binary — `~/.config/friring-dev`, `~/.local/share/friring-dev/friring.db`,
+socket `friring-dev` — and so is one built with `FRIRING_RELEASE_VERSION` set
+to a value that itself contains `-dev`. Only a **non-dev**
+`FRIRING_RELEASE_VERSION` produces the release flavour: `~/.config/friring`,
+`~/.local/share/friring/friring.db`, socket `friring`.
+
+Those are different databases and different tmux servers, which is what makes
+installing the wrong flavour over a running instance misleading rather than
+merely wrong: it does not upgrade that installation, it starts a second, empty
+one, and the sessions appear to be gone while they are still running on the
+other socket. Anything that replaces a running binary has to preserve the
+routing the live process was started with — its launcher, and the
+`FRIRING_CONFIG_DIR`, `FRIRING_DATA_DIR`, `FRIRING_SOCKET`,
+`FRIRING_TMUX_SESSION` and `TMUX_TMPDIR` in its environment, each of which
+overrides the compiled-in flavour on its own — rather than assume the default
+for the path it is installed to.
+
 ### Release artifacts
 
 Each release includes binaries for 4 platforms plus a checksums file and a

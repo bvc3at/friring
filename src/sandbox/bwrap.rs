@@ -26,11 +26,11 @@ use std::sync::{Arc, OnceLock};
 
 use crate::sandbox::backend::{
     Argv, Availability, Caps, Egress, InnerSandboxVerdict, ProxyEndpoint, ProxyTransport,
-    SandboxBackend, SandboxError, SandboxLaunch, SandboxResult, PROTECTED_IN_WRITABLE_ROOT,
+    SandboxBackend, SandboxError, SandboxLaunch, SandboxResult,
 };
 use crate::sandbox::dirs;
 use crate::sandbox::egress::relay_addr;
-use crate::sandbox::launcher::relay_launcher_argv;
+use crate::sandbox::launcher::{launch_argv, mux_env_to_unset, LaunchHelper};
 use crate::sandbox::probe::{detect_platform, HostPlatform, LocalProbeHost, ProbeHost};
 use crate::sandbox::secrets::{secrets_for, SecretKind, SecretPlatform};
 use crate::session::{NetworkMode, ReadScope, SandboxBackendKind, SandboxShape};
@@ -285,9 +285,10 @@ pub fn build_argv(
 /// path is present **on the host the sandbox runs on**; it is injected so the
 /// mount plan is a pure function of its inputs and a test never has to consult
 /// the developer's own filesystem. The secrets list, the socket masks, the
-/// database mask and the relay binary consult it — everything else either must
-/// exist (a path the user listed, which should fail loudly) or is bound with
-/// `-try`.
+/// database mask, the relay binary and the protected paths inside a writable
+/// root all consult it — everything else either must exist (a path the user
+/// listed, which should fail loudly) or is bound with `-try`, which tolerates a
+/// source that is absent and not one that cannot be resolved.
 ///
 /// `overlays` turns writable roots into [copy-on-write
 /// workspaces](OverlayWorkspace). They are emitted in the *same* sorted pass as
@@ -315,10 +316,22 @@ pub fn build_argv_with(
     let policy = launch.policy;
     check_overlays(launch, overlays)?;
     let socket = proxy_socket(launch)?;
+    let cli = relay;
+    // A launch with a socket must have a *present* CLI to relay through it —
+    // the relay is the whole of that sandbox's egress, so a missing binary means
+    // an agent that believes it is proxied and reaches nothing. Asked here for
+    // its refusal; the program it resolves is the same `cli` below.
     let relay = match &socket {
-        Some(_) => Some(relay_program(launch, relay, exists)?),
+        Some(_) => Some(relay_program(launch, cli, exists)?),
         None => None,
     };
+    // Resolved once, before anything is mounted, from the CLI the launch path
+    // handed down rather than from the relay: the same binary does both jobs,
+    // but a launch with nothing to relay to still runs the helper, and under the
+    // narrow read scope it has to be bound in explicitly or nothing inside the
+    // boundary can exec it.
+    let helper = helper_program(launch, cli, exists)?;
+    let launch = &launch.clone().with_helper_program(&helper);
     let mut argv: Vec<String> = vec![program.to_string()];
 
     // The sandbox dies with the pane that owns it, gets its own pid/ipc/uts
@@ -368,12 +381,44 @@ pub fn build_argv_with(
                 push(&mut argv, &["--tmpfs", &dir]);
             }
         }
-    } else if let Some(relay) = relay {
+        // The entries of the closed multiplexer deny set those masks do not
+        // already cover: a `tmux-<uid>` directory under a `$TMPDIR` outside
+        // `/tmp`, or an inherited outer socket outside every masked tree
+        // (ADR-33). Masked the way a secret of the same kind is — a tmpfs over
+        // a directory, `/dev/null` over a file — and emitted here rather than
+        // after the profile's paths so a path the user listed inside one still
+        // wins, exactly like the socket-directory masks above.
+        //
+        // Under `workspace` scope there is nothing to do: the root is built out
+        // of `SYSTEM_RO_BINDS` and the profile's own paths, so a socket outside
+        // both is unreachable by construction rather than by a mask.
+        for deny in uncovered_multiplexer_denies(launch) {
+            if !exists(&deny.path) {
+                continue;
+            }
+            if deny.is_dir {
+                push(&mut argv, &["--tmpfs", &deny.path]);
+            } else {
+                push(&mut argv, &["--ro-bind", "/dev/null", &deny.path]);
+            }
+        }
+    } else {
         // The narrow scope builds a root out of the system directories instead
-        // of binding the host's, so friring's own CLI is not in there unless it
-        // lives under one of them. Before the profile's own paths, like every
-        // other default, so a path the user listed still wins.
-        push(&mut argv, &["--ro-bind", relay, relay]);
+        // of binding the host's, so two programs are not in there unless they
+        // live under one of them: friring's own CLI, which every policy launch
+        // execs as its launch helper (ADR-33), and the **agent's** program,
+        // which that helper then execs — an extension that ships its agent as a
+        // script under its own home is outside every system directory. Before
+        // the profile's own paths, like every other default, so a path the user
+        // listed still wins. `--ro-bind-try`, because a bare command name has no
+        // path to bind and a helper friring could not resolve refuses earlier.
+        for program in launch
+            .helper_program
+            .into_iter()
+            .chain(launch.agent_program)
+        {
+            push(&mut argv, &["--ro-bind-try", program, program]);
+        }
     }
 
     // One sorted pass over both sets, so a read-only path nested in a writable
@@ -401,10 +446,9 @@ pub fn build_argv_with(
     }
 
     for root in launch.writable_paths() {
-        // `-try`: most writable roots are not repositories, and a missing
-        // source must not fail the launch.
-        let path = format!("{root}/{PROTECTED_IN_WRITABLE_ROOT}");
-        push(&mut argv, &["--ro-bind-try", &path, &path]);
+        for path in protected_paths_present(&root, exists) {
+            push(&mut argv, &["--ro-bind-try", &path, &path]);
+        }
     }
 
     if policy.read_scope == ReadScope::HostMinusSecrets {
@@ -443,6 +487,14 @@ pub fn build_argv_with(
             dirs::place_root(),
             dirs::profile_dir(),
             dirs::seeds_root(),
+            // The gate tree. A release file carries the gate key its launch
+            // helper compares against, so a session that could read another
+            // session's gate would learn it — and `check_declared_paths` already
+            // refuses a profile that *names* this tree in either mode. Under
+            // this scope the read was granted anyway, which a real-kernel probe
+            // found on the seatbelt side. This launch's own gate is re-bound
+            // immediately below.
+            dirs::gate_root(),
             overlay_root(),
         ]
         .into_iter()
@@ -452,6 +504,13 @@ pub fn build_argv_with(
             if exists(&dir) {
                 push(&mut argv, &["--tmpfs", &dir]);
             }
+        }
+        // …and this launch's own gate back over that tmpfs, read-only. The
+        // helper polls it for the file the host renames in (ADR-33); every other
+        // session's gate stays behind the mask. Never `--bind`: a writable gate
+        // is a gate the agent opens for itself.
+        if let Some(gate) = launch.gate_dir {
+            push(&mut argv, &["--ro-bind-try", gate, gate]);
         }
     }
 
@@ -487,6 +546,69 @@ pub fn build_argv_with(
         }
     }
 
+    // A bridge child's subtract set, and then the seed targets re-granted over
+    // it (ADR-31). Emitted after the profile's own paths and after every mask
+    // above, because bwrap's later mount wins: a parent profile granting the
+    // whole home directory bound the family's state directory, and only a mount
+    // *over* it takes it away.
+    //
+    // A `--tmpfs` for a directory and `/dev/null` for a file — the same two
+    // shapes the secret masks use, for the same reason: an empty directory and
+    // an empty file are what a denied path should look like from inside.
+    let (subtract, seeds) = launch.subtract();
+    for entry in &subtract {
+        if !exists(&entry.path) {
+            continue;
+        }
+        if entry.is_dir {
+            push(&mut argv, &["--tmpfs", &entry.path]);
+        } else {
+            push(&mut argv, &["--ro-bind", "/dev/null", &entry.path]);
+        }
+    }
+    // The child's **own** directories, bound back over the tmpfs that the
+    // wholesale entries above just laid across friring's trees. Those entries
+    // are what cover every sibling — including one created after this child
+    // launched — so the child's worktree, scratch, signal directory, bridge
+    // queue and private state are inside them by construction. Without this bind
+    // the child cannot read its own gate, write its own workspace, report its
+    // own status or reach its own queue.
+    let (own_rw, own_ro) = launch.child_own_paths();
+    for path in &own_rw {
+        push(&mut argv, &["--bind-try", path, path]);
+    }
+    for path in &own_ro {
+        // The gate stays read-only: a writable gate is a gate the child can open
+        // for itself (ADR-33).
+        push(&mut argv, &["--ro-bind-try", path, path]);
+    }
+    // And what stays read-only *inside* one of them, re-applied after the bind
+    // that just re-opened it: a later bind over a directory shadows the earlier
+    // read-only bind of a path beneath it, so the same rule higher up in this
+    // argv is undone by the re-grant above. That is how a child's own
+    // `.git/worktrees/<id>` came back with its `gitdir` and `commondir`
+    // redirects writable, and a redirect a child can write is a program the
+    // *host* runs when friring inspects that worktree.
+    for path in own_rw
+        .iter()
+        .flat_map(|path| protected_paths_present(path, exists))
+    {
+        push(&mut argv, &["--ro-bind-try", &path, &path]);
+    }
+    for grant in &seeds {
+        // A file bind of the target *after* the tmpfs over its directory: the
+        // seed is a link into a tree that has just been masked, so without this
+        // it would be a dead link. Read-write only for the one credential mode,
+        // so write reaches exactly that file and never the state directory
+        // around it.
+        let flag = if grant.is_writable() {
+            "--bind-try"
+        } else {
+            "--ro-bind-try"
+        };
+        push(&mut argv, &[flag, &grant.target, &grant.target]);
+    }
+
     if let Some((host_path, inside_path)) = &socket {
         // Read-write, and not by oversight: `connect(2)` on a unix socket needs
         // write permission on it, so a `--ro-bind` here would leave the sandbox
@@ -510,16 +632,64 @@ pub fn build_argv_with(
     // Ends bwrap's own option parsing, so an agent flag is never read as one.
     argv.push("--".to_string());
 
-    if let (Some((_, inside_path)), Some(relay)) = (&socket, relay) {
-        // The relay is started *inside* the namespace, because that is the only
-        // place the sandbox's own loopback exists. It holds no token and makes
-        // no decision — the proxy still demands its credential at the far end —
-        // so what runs in here is a pipe, not a policy.
-        let listen = relay_addr().to_string();
-        argv.extend(relay_launcher_argv(relay, &listen, inside_path));
-    }
+    // What runs in the namespace is friring's own launch helper, which
+    // starts the relay if there is one, waits on the gate if there is one, drops
+    // the multiplexer variables and then `execvp`s the agent *in place* — so the
+    // pane's process is still the agent, and when it exits the namespace
+    // teardown takes the relay with it (ADR-33).
+    //
+    // Composed for **every** policy launch, not only the ones with something to
+    // relay or wait for. The variables it strips are set by tmux in the pane
+    // itself and point at friring's own server, so a launch that skipped the
+    // helper would hand the agent a working address for the multiplexer outside
+    // its boundary — defence in depth over the kernel deny set below, and worth
+    // nothing if it holds only on some launches.
+    let listen = relay_addr().to_string();
+    let inside = relay.and(socket.as_ref().map(|(_, inside)| inside.as_str()));
+    argv.extend(launch_argv(
+        &helper,
+        &LaunchHelper {
+            gate: launch.gate(),
+            relay: inside.map(|inside| (listen.as_str(), inside)),
+            unset: mux_env_to_unset(),
+        },
+    ));
     Ok(argv)
 }
+
+/// friring's own CLI, for the launch helper.
+///
+/// The relay's binary when this launch has one — already resolved and vetted for
+/// exactly this. Otherwise the same lookup, made here, and the same refusal when
+/// it comes up empty: the helper is what strips the multiplexer environment and
+/// holds a gated child at the door, so a launch without it is not the launch the
+/// profile describes.
+fn helper_program(
+    launch: &SandboxLaunch<'_>,
+    relay: Option<&str>,
+    exists: &dyn Fn(&str) -> bool,
+) -> SandboxResult<String> {
+    if let Some(program) = launch.helper_program.or(relay) {
+        return Ok(program.to_string());
+    }
+    let refuse = |detail: String| SandboxError::Refused {
+        profile: launch.policy.profile.clone(),
+        detail,
+    };
+    let program = local_relay_program()
+        .map(|p| p.display().to_string())
+        .ok_or_else(|| refuse(MISSING_CLI.to_string()))?;
+    if !exists(&program) {
+        return Err(refuse(format!("'{program}' does not exist. {MISSING_CLI}")));
+    }
+    Ok(program)
+}
+
+/// Why a launch needs friring's own CLI even when it has no egress to relay.
+const MISSING_CLI: &str =
+    "friring could not locate its own 'friring-cli', which every sandboxed launch runs inside \
+     the boundary to drop the host multiplexer's environment and — for a bridge child — to wait \
+     for its session row. Install friring-cli beside friring";
 
 fn push(argv: &mut Vec<String>, tokens: &[&str]) {
     argv.extend(tokens.iter().map(|t| (*t).to_string()));
@@ -688,6 +858,37 @@ pub fn local_relay_program() -> Option<PathBuf> {
 /// Every control-socket tree to cover, with the ones this host puts somewhere
 /// non-standard folded in and anything already covered dropped.
 ///
+/// The protected paths inside one writable root that are actually **there**.
+///
+/// [`protected_paths_in`](crate::sandbox::backend::protected_paths_in) decides
+/// on a path's shape rather than by looking at the filesystem, which is right
+/// for a rule and wrong for a mount: bubblewrap cannot take back a name with
+/// nothing behind it, and it will not start when it is asked to.
+///
+/// `--ro-bind-try` is not the answer on its own, which is what the mount plan
+/// assumed. It tolerates a source that is **absent**; it does not tolerate one
+/// that cannot be resolved, and the two are different errors. A bridge child
+/// works in a *linked worktree*, where `.git` is a pointer **file** rather than
+/// a directory — so `<root>/.git/hooks` fails to resolve with `Not a directory`,
+/// and the whole launch dies before the agent runs a line. That is a Linux-only
+/// death: seatbelt denies by pathname, which needs nothing behind it.
+///
+/// Nothing is given up by skipping it. `<root>/.git/hooks` in a linked worktree
+/// is not merely absent, it is the wrong path: git resolves a worktree's hooks
+/// through the **common** directory, `<repo>/.git/hooks`, which a child is never
+/// granted — its writable metadata is `<repo>/.git/worktrees/<id>` alone, and
+/// the three redirects that could point git elsewhere are taken back by
+/// [`PROTECTED_IN_WORKTREE_METADATA`](crate::sandbox::backend::PROTECTED_IN_WORKTREE_METADATA).
+/// A name that a *later* launch could create is the case
+/// [`PROTECTED_CREATED_IF_ABSENT`](crate::sandbox::backend::PROTECTED_CREATED_IF_ABSENT)
+/// covers, by making it exist before the launch instead of hoping a bind will.
+fn protected_paths_present(root: &str, exists: &dyn Fn(&str) -> bool) -> Vec<String> {
+    crate::sandbox::backend::protected_paths_in(root)
+        .into_iter()
+        .filter(|path| exists(path))
+        .collect()
+}
+
 /// The tmux socket root is here for friring's *own* server: `--tmpfs /tmp`
 /// covers the default location, but `$TMUX_TMPDIR` moves it, and a sandbox that
 /// can reach that socket can run a command in any pane on the host.
@@ -708,13 +909,58 @@ fn masked_socket_dirs() -> Vec<String> {
         if !candidate.starts_with('/') {
             continue;
         }
-        if covered.iter().any(|c| dirs::encloses(c, &candidate)) {
+        // Resolved as well as written, because on every systemd distribution
+        // `/var/run` **is** `/run` — a symlink, not a second directory. Masking
+        // it separately asks bwrap to mount a tmpfs on a path that resolves
+        // into one it has already replaced, and that fails the whole launch:
+        // `Can't mount tmpfs on /newroot/var/run: No such file or directory`.
+        // A symlink into a tree that is already masked is already masked.
+        let resolved = std::fs::canonicalize(&candidate)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| candidate.clone());
+        if mask_already_covers(&covered, &candidate, &resolved) {
             continue;
         }
         covered.push(candidate.clone());
+        if resolved != candidate {
+            covered.push(resolved);
+        }
         out.push(candidate);
     }
     out
+}
+
+/// Whether a tmpfs mask over `candidate` would be redundant, given what is
+/// already masked and what `candidate` resolves to.
+///
+/// Pure so the rule can be tested on any host: the case it exists for is a
+/// Linux one, and the filesystem that produces it is not present on macOS.
+fn mask_already_covers(covered: &[String], candidate: &str, resolved: &str) -> bool {
+    covered
+        .iter()
+        .any(|c| dirs::encloses(c, candidate) || dirs::encloses(c, resolved))
+}
+
+/// The multiplexer deny-set entries [`masked_socket_dirs`] and the
+/// unconditional `--tmpfs /tmp` do not already cover.
+///
+/// bwrap's existing masks are product behaviour this leaves alone: `/tmp` is
+/// always a private tmpfs, and under `host-minus-secrets` `/run`, `/var/run`,
+/// `$XDG_RUNTIME_DIR` and [`dirs::tmux_socket_root`] are covered too. What is
+/// left is the narrow remainder — a `tmux-<uid>` under a `$TMPDIR` that is
+/// somewhere else entirely, and an inherited outer socket outside every masked
+/// tree.
+///
+/// Both spellings of an entry survive the filter independently: a mask over the
+/// resolved path does not cover a *bind* the profile makes at the written one.
+fn uncovered_multiplexer_denies(launch: &SandboxLaunch<'_>) -> Vec<dirs::SocketDeny> {
+    let mut covered: Vec<String> = vec!["/tmp".to_string()];
+    covered.extend(masked_socket_dirs());
+    launch
+        .multiplexer_denies()
+        .into_iter()
+        .filter(|deny| !covered.iter().any(|mask| dirs::encloses(mask, &deny.path)))
+        .collect()
 }
 
 /// A hostname that says where you are, reduced to what `sethostname` accepts.
@@ -982,6 +1228,8 @@ impl SandboxBackend for BwrapBackend {
             // `--unshare-net` leaves the sandbox its own loopback and no route
             // to the host's, so only a bind-mounted socket crosses.
             proxy_transport: ProxyTransport::UnixSocket,
+            // The bridge directory is bound in like every other granted path.
+            bridge: true,
         }
     }
 
@@ -1077,7 +1325,13 @@ impl BwrapBackend {
             });
         }
         let overlays = overlay_workspaces(launch.session_key, cow_roots)?;
-        let relay = local_relay_program().map(|p| p.display().to_string());
+        // The launch's own answer first — the launch path resolves friring's
+        // CLI once and hands it down, and only a launch built by hand arrives
+        // without one.
+        let relay = launch
+            .helper_program
+            .map(str::to_string)
+            .or_else(|| local_relay_program().map(|p| p.display().to_string()));
         let mut out = build_argv_with(
             program,
             launch,
@@ -1093,7 +1347,7 @@ impl BwrapBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::launcher::{RELAY_LAUNCHER, RELAY_LAUNCHER_NAME, SHELL};
+
     use crate::sandbox::probe::{ProbeOutput, StubHost};
     use crate::session::{SandboxPath, SandboxPolicy, SandboxProfile};
 
@@ -1167,11 +1421,41 @@ mod tests {
         argv.windows(2).any(|w| w[0] == flag && w[1] == value)
     }
 
+    /// Assert `dir` is covered by a tmpfs mask, and that the mask lands after
+    /// the root bind that would otherwise shadow it.
+    ///
+    /// **Covered**, not "has a mask of its own": on every systemd distribution
+    /// `/var/run` is a symlink to `/run`, so masking each separately asks bwrap
+    /// for a tmpfs on a path inside a filesystem it has already replaced and
+    /// fails the launch — see [`masked_socket_dirs`]. The deny set rests on
+    /// nothing under the tree being reachable, which a mask over the tree the
+    /// path resolves into gives just as completely. Asserting the literal
+    /// spelling made these tests pass on macOS, where `/run` does not exist and
+    /// `/var/run` is a real directory, and fail on the platform the argv is for.
+    fn assert_masked(argv: &[String], dir: &str) {
+        let resolved = std::fs::canonicalize(dir)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| dir.to_string());
+        let at = argv
+            .windows(2)
+            .position(|w| {
+                w[0] == "--tmpfs"
+                    && (dirs::encloses(&w[1], dir) || dirs::encloses(&w[1], &resolved))
+            })
+            .unwrap_or_else(|| {
+                panic!("no tmpfs mask covers {dir} (resolved {resolved}): {argv:?}")
+            });
+        assert!(
+            at > index_of(argv, "--ro-bind"),
+            "the mask covering {dir} lands before the root bind that shadows it"
+        );
+    }
+
     #[test]
     fn base_flags_isolate_without_stealing_the_terminal() {
         let policy = workspace_policy();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(PROGRAM, &launch, None, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &nothing).unwrap();
 
         // The absolute path the probe pinned, never the bare name.
         assert_eq!(argv[0], PROGRAM);
@@ -1191,7 +1475,7 @@ mod tests {
     fn the_hostname_says_which_sandbox_you_are_in() {
         let policy = workspace_policy();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(PROGRAM, &launch, None, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &nothing).unwrap();
         let at = index_of(&argv, "--hostname");
         assert_eq!(argv[at + 1], "friring-dev");
         // sethostname accepts a narrow charset, so the profile name is filtered.
@@ -1202,7 +1486,7 @@ mod tests {
     fn host_minus_secrets_binds_the_whole_root_read_only_first() {
         let policy = workspace_policy();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(PROGRAM, &launch, None, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &nothing).unwrap();
         assert!(has_mount(&argv, "--ro-bind", "/", "/"));
         // Everything that overrides the root must come after it.
         assert!(index_of(&argv, "/srv/shared") > index_of(&argv, "--ro-bind"));
@@ -1216,7 +1500,7 @@ mod tests {
             .resolve(SandboxBackendKind::Bwrap, "/home/u")
             .unwrap();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(PROGRAM, &launch, None, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &nothing).unwrap();
 
         assert!(!has_mount(&argv, "--ro-bind", "/", "/"));
         assert!(has_mount(&argv, "--ro-bind-try", "/usr", "/usr"));
@@ -1237,7 +1521,7 @@ mod tests {
             SandboxPath::read_only("~/dev/app/.git/hooks"),
         ]);
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(PROGRAM, &launch, None, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &nothing).unwrap();
         let parent = index_of(&argv, "/home/u/dev/app");
         let child = index_of(&argv, "/home/u/dev/app/.git/hooks");
         assert!(
@@ -1260,7 +1544,7 @@ mod tests {
             .with_workspace("/home/u/work/repo")
             .with_signal_dir("/home/u/.local/share/friring/signals/s1")
             .with_tmp_dir(&scratch);
-        let argv = build_argv(PROGRAM, &launch, None, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &nothing).unwrap();
 
         for path in [
             "/home/u/work/repo",
@@ -1281,7 +1565,7 @@ mod tests {
         let policy = workspace_policy();
         let scratch = scratch();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1").with_tmp_dir(&scratch);
-        let argv = build_argv(PROGRAM, &launch, None, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &nothing).unwrap();
 
         assert!(has_flag(&argv, "--tmpfs", "/tmp"));
         for flag in ["--bind", "--ro-bind", "--ro-bind-try"] {
@@ -1318,7 +1602,7 @@ mod tests {
             .display()
             .to_string();
         let launch = SandboxLaunch::new(&host_scope, "/home/u", "s1").with_tmp_dir(&scratch);
-        let argv = build_argv(PROGRAM, &launch, None, &|_| true).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
         for dir in [dirs::place_root(), dirs::profile_dir(), dirs::seeds_root()]
             .into_iter()
             .flatten()
@@ -1349,7 +1633,7 @@ mod tests {
         let argv = build_argv_with(
             PROGRAM,
             &SandboxLaunch::new(&host_scope, "/home/u", "s1").with_tmp_dir(&scratch),
-            None,
+            Some(RELAY),
             &|_| true,
             &overlays,
         )
@@ -1369,7 +1653,7 @@ mod tests {
         let argv = build_argv(
             PROGRAM,
             &SandboxLaunch::new(&narrow, "/home/u", "s1"),
-            None,
+            Some(RELAY),
             &|_| true,
         )
         .unwrap();
@@ -1382,6 +1666,79 @@ mod tests {
         }
     }
 
+    /// `/var/run` is a **symlink** to `/run` on every systemd distribution, so
+    /// masking both asks bwrap to mount a tmpfs on a path that resolves into
+    /// one it has already replaced — and bwrap fails the launch rather than
+    /// skipping it: `Can't mount tmpfs on /newroot/var/run: No such file or
+    /// directory`. Every assertion about a *denied* path still passed on such a
+    /// host, because nothing had been allowed either; the positive controls are
+    /// what caught it.
+    ///
+    /// Stated against the rule rather than the filesystem, so it is checked
+    /// wherever the suite runs and not only where that layout exists.
+    #[test]
+    fn a_socket_mask_that_resolves_into_a_masked_tree_is_not_emitted_twice() {
+        let covered = vec!["/tmp".to_string(), "/run".to_string()];
+        assert!(
+            super::mask_already_covers(&covered, "/var/run", "/run"),
+            "/var/run resolving to the already-masked /run must not be masked again"
+        );
+        // A path *inside* a masked tree needs no mask of its own either.
+        assert!(super::mask_already_covers(
+            &covered,
+            "/run/user/1000",
+            "/run/user/1000"
+        ));
+        assert!(
+            !super::mask_already_covers(&covered, "/var/lib/x", "/var/lib/x"),
+            "an unrelated tree must still be masked"
+        );
+        // And a path that cannot be resolved falls back to its own spelling
+        // rather than being treated as covered by accident.
+        assert!(
+            !super::mask_already_covers(&covered, "/nonexistent", "/nonexistent"),
+            "an unresolvable path must still be masked"
+        );
+    }
+
+    /// A protected path with nothing behind it is not bound at all.
+    ///
+    /// The launch this killed is a bridge child's. A child works in a **linked
+    /// worktree**, where `.git` is a pointer file rather than a directory, so
+    /// `<worktree>/.git/hooks` does not resolve — and `--ro-bind-try` tolerates
+    /// a source that is *absent*, not one that cannot be resolved. bubblewrap
+    /// answered `Can't find source path …: Not a directory` and the pane died
+    /// before the agent ran a line, which reached friring only as "this child's
+    /// own hook did not report within 60s".
+    ///
+    /// Driven through the existence predicate rather than a real worktree, so
+    /// the case is checked wherever the suite runs; the protected paths of a
+    /// root that *does* have them are asserted in the same pass, because a
+    /// filter that dropped everything would pass an assertion about absence.
+    #[test]
+    fn a_protected_path_that_is_not_there_is_not_bound() {
+        let worktree = "/home/u/wt";
+        let checkout = "/home/u/dev/app";
+        let missing = format!("{worktree}/.git/hooks");
+        let present = format!("{checkout}/.git/hooks");
+        let policy = policy(vec![
+            SandboxPath::workspace(checkout),
+            SandboxPath::workspace(worktree),
+        ]);
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|path| path != missing).unwrap();
+
+        assert!(
+            !argv.contains(&missing),
+            "a protected path that does not resolve was still bound, which fails the \
+             whole launch: {argv:?}"
+        );
+        assert!(
+            has_mount(&argv, "--ro-bind-try", &present, &present),
+            "the filter dropped a protected path that is there: {argv:?}"
+        );
+    }
+
     /// A read-only bind is no barrier to `connect(2)`, and `--unshare-net`
     /// isolates the network namespace rather than the filesystem — so the
     /// control-socket trees are covered rather than merely read-only.
@@ -1389,11 +1746,9 @@ mod tests {
     fn control_socket_trees_are_masked_under_the_host_read_scope() {
         let host_scope = workspace_policy();
         let launch = SandboxLaunch::new(&host_scope, "/home/u", "s1");
-        let argv = build_argv(PROGRAM, &launch, None, &|_| true).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
         for dir in ["/run", "/var/run"] {
-            assert!(has_flag(&argv, "--tmpfs", dir), "missing mask for {dir}");
-            // After the root bind, so the mask is not shadowed by it.
-            assert!(index_of(&argv, dir) > index_of(&argv, "--ro-bind"));
+            assert_masked(&argv, dir);
         }
 
         // A path the profile lists inside a masked tree still wins: the mask is
@@ -1403,7 +1758,7 @@ mod tests {
             SandboxPath::read_only("/run/systemd/resolve"),
         ]);
         let launch = SandboxLaunch::new(&listed, "/home/u", "s1");
-        let argv = build_argv(PROGRAM, &launch, None, &|_| true).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
         assert!(
             index_of(&argv, "/run/systemd/resolve") > index_of(&argv, "/run"),
             "an explicitly listed path must be bound after the mask"
@@ -1417,7 +1772,7 @@ mod tests {
             .resolve(SandboxBackendKind::Bwrap, "/home/u")
             .unwrap();
         let launch = SandboxLaunch::new(&narrow, "/home/u", "s1");
-        let argv = build_argv(PROGRAM, &launch, None, &|_| true).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
         assert!(!has_flag(&argv, "--tmpfs", "/run"));
     }
 
@@ -1426,7 +1781,7 @@ mod tests {
         let policy = workspace_policy();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1").with_agent("claude");
         let present = |p: &str| matches!(p, "/home/u/.ssh" | "/home/u/.netrc");
-        let argv = build_argv(PROGRAM, &launch, None, &present).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &present).unwrap();
 
         // A directory is covered by an empty tmpfs, a file by /dev/null.
         assert!(has_flag(&argv, "--tmpfs", "/home/u/.ssh"));
@@ -1447,7 +1802,7 @@ mod tests {
             .unwrap();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
         // Nothing outside the listed paths is in the sandbox to begin with.
-        let argv = build_argv(PROGRAM, &launch, None, &|_| true).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
         assert!(!argv.iter().any(|a| a == "/home/u/.ssh"));
     }
 
@@ -1456,7 +1811,7 @@ mod tests {
         let policy = policy(vec![SandboxPath::workspace("~/.local/share/friring")]);
         let db = "/home/u/.local/share/friring/friring.db";
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1").with_friring_db(db);
-        let argv = build_argv(PROGRAM, &launch, None, &|p| p == db).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|p| p == db).unwrap();
         assert!(has_mount(&argv, "--ro-bind", "/dev/null", db));
         // ADR-29 wins over the writable data directory it sits inside.
         assert!(index_of(&argv, db) > index_of(&argv, "/home/u/.local/share/friring"));
@@ -1472,7 +1827,7 @@ mod tests {
         let writable = policy(vec![SandboxPath::workspace("~/.local/share/friring")]);
         let launch = SandboxLaunch::new(&writable, "/home/u", "s1").with_friring_db(db);
         // Nothing exists yet — not even the database.
-        let argv = build_argv(PROGRAM, &launch, None, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &nothing).unwrap();
         for file in [db, &format!("{db}-wal"), &format!("{db}-shm")] {
             assert!(
                 has_mount(&argv, "--ro-bind", "/dev/null", file),
@@ -1485,7 +1840,7 @@ mod tests {
         // launch rather than tighten it.
         let read_only = policy(vec![SandboxPath::read_only("~/.local/share/friring")]);
         let launch = SandboxLaunch::new(&read_only, "/home/u", "s1").with_friring_db(db);
-        let argv = build_argv(PROGRAM, &launch, None, &|p| p == db).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|p| p == db).unwrap();
         assert!(has_mount(&argv, "--ro-bind", "/dev/null", db));
         assert!(!argv.iter().any(|a| a == &format!("{db}-wal")));
     }
@@ -1494,9 +1849,62 @@ mod tests {
     fn git_hooks_stay_read_only_inside_a_writable_root() {
         let policy = workspace_policy();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(PROGRAM, &launch, None, &nothing).unwrap();
         let hooks = "/home/u/dev/app/.git/hooks";
+        // Present, because a protected path is bound only when it is there:
+        // bubblewrap cannot take back a name with nothing behind it, and asking
+        // it to fails the launch (see `protected_paths_present`).
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|p| p == hooks).unwrap();
         assert!(has_mount(&argv, "--ro-bind-try", hooks, hooks));
+    }
+
+    /// The two shapes a bridge child's git grant takes, under bwrap.
+    ///
+    /// A shared `<repo>/.git` keeps the operator's hooks, config and main
+    /// worktree state read-only; a child's own
+    /// `<repo>/.git/worktrees/<id>` keeps its redirects read-only. Both are
+    /// `--ro-bind-try` over paths the child otherwise writes, and both leave
+    /// what a commit needs alone.
+    #[test]
+    fn a_shared_git_directory_and_a_childs_metadata_keep_their_redirects_read_only() {
+        let shared = "/home/u/dev/app/.git";
+        let mine = "/home/u/dev/app/.git/worktrees/child-a";
+        let policy = policy(vec![
+            SandboxPath::workspace(shared),
+            SandboxPath::workspace(mine),
+        ]);
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
+        // Both roots' protected names are present. That is the state the saga
+        // launches from — `ensure_protected_placeholders` creates the ones git
+        // does not, precisely because a bind cannot take back a name with
+        // nothing behind it (see `protected_paths_present`).
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|p| p.starts_with(shared)).unwrap();
+
+        for name in crate::sandbox::backend::PROTECTED_IN_GIT_DIR {
+            let path = format!("{shared}/{name}");
+            assert!(
+                has_mount(&argv, "--ro-bind-try", &path, &path),
+                "a shared git directory left '{name}' writable"
+            );
+        }
+        for name in crate::sandbox::backend::PROTECTED_IN_WORKTREE_METADATA {
+            let path = format!("{mine}/{name}");
+            assert!(
+                has_mount(&argv, "--ro-bind-try", &path, &path),
+                "a child's metadata directory left '{name}' writable"
+            );
+        }
+        // What a commit writes stays writable in both.
+        for path in [
+            format!("{shared}/objects"),
+            format!("{shared}/refs"),
+            format!("{mine}/HEAD"),
+            format!("{mine}/index"),
+        ] {
+            assert!(
+                !has_mount(&argv, "--ro-bind-try", &path, &path),
+                "'{path}' was taken back, so no child can commit"
+            );
+        }
     }
 
     /// Only a `full` profile with nothing to take back keeps the host's network
@@ -1511,7 +1919,7 @@ mod tests {
                 .resolve(SandboxBackendKind::Bwrap, "/home/u")
                 .unwrap();
             let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-            let argv = build_argv(PROGRAM, &launch, None, &nothing).unwrap();
+            let argv = build_argv(PROGRAM, &launch, Some(RELAY), &nothing).unwrap();
             assert!(
                 argv.contains(&"--unshare-net".to_string()),
                 "{mode} must have no direct egress"
@@ -1522,7 +1930,7 @@ mod tests {
             .resolve(SandboxBackendKind::Bwrap, "/home/u")
             .unwrap();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(PROGRAM, &launch, None, &nothing).unwrap();
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &nothing).unwrap();
         assert!(!argv.contains(&"--unshare-net".to_string()));
 
         profile.network_deny = vec!["evil.example".into()];
@@ -1563,23 +1971,27 @@ mod tests {
         // The namespace still has no route out except that socket.
         assert!(argv.contains(&"--unshare-net".to_string()));
 
-        // The relay is started inside the namespace, before the agent, with
-        // every value as its own argument: nothing here is re-parsed by a
-        // shell, so a path with a space or a quote in it survives.
+        // The relay is started inside the namespace, before the agent, by
+        // friring's own launch helper — with every value as its own argument,
+        // so nothing is re-parsed by a shell and a path with a space or a quote
+        // in it survives.
         let listen = relay_addr().to_string();
         let end = index_of(&argv, "--");
-        assert_eq!(
-            &argv[end + 1..],
-            [
-                SHELL,
-                "-c",
-                RELAY_LAUNCHER,
-                RELAY_LAUNCHER_NAME,
-                RELAY,
-                listen.as_str(),
-                socket.as_str(),
-            ]
-        );
+        let mut expected = vec![
+            RELAY.to_string(),
+            "sandbox".to_string(),
+            "launch".to_string(),
+            "--relay-listen".to_string(),
+            listen.clone(),
+            "--relay-socket".to_string(),
+            socket.clone(),
+        ];
+        for var in crate::sandbox::launcher::mux_env_to_unset() {
+            expected.push("--unset".to_string());
+            expected.push((*var).to_string());
+        }
+        expected.push("--".to_string());
+        assert_eq!(&argv[end + 1..], expected.as_slice());
         // The relay listens on the sandbox's *own* loopback.
         assert!(relay_addr().ip().is_loopback());
 
@@ -1587,37 +1999,6 @@ mod tests {
             .with_proxy(ProxyEndpoint::Loopback { port: 8123 });
         let err = build_argv(PROGRAM, &loopback, Some(RELAY), &|_| true).unwrap_err();
         assert!(err.to_string().contains("no route to host loopback"));
-    }
-
-    /// The launcher's `shift` has to land exactly on the agent, so this **runs**
-    /// the script instead of reading it, over the positionals `build_argv`
-    /// actually emitted. A miscount leaves the sandbox executing a socket path
-    /// or losing the agent's first argument, and both are silent in an argv
-    /// assertion.
-    ///
-    /// Nothing starts and nothing leaves the machine: the relay's place is taken
-    /// by a path that does not exist (its failure goes to `/dev/null`, which is
-    /// the design), and the agent's place by `echo`.
-    #[cfg(unix)]
-    #[test]
-    fn the_launcher_shifts_past_the_relay_and_becomes_the_agent() {
-        let policy = workspace_policy();
-        let launch = SandboxLaunch::new(&policy, "/home/u", "s1").with_proxy(socket_endpoint());
-        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
-        let launcher = &argv[index_of(&argv, "--") + 1..];
-
-        let output = std::process::Command::new(&launcher[0])
-            .args(&launcher[1..])
-            // What `wrap` appends: the agent's own argv, unchanged.
-            .args(["/bin/echo", "the-agent", "--resume=abc"])
-            .output()
-            .expect("the launcher runs");
-
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            "the-agent --resume=abc",
-            "the launcher exec'd the wrong thing: {output:?}"
-        );
     }
 
     /// Without the relay there is no egress at all, so a launch that cannot
@@ -1633,10 +2014,364 @@ mod tests {
             assert!(matches!(err, SandboxError::Refused { .. }), "{err}");
             assert!(err.to_string().contains("friring-cli"), "{err}");
         }
-        // A launch with nothing to relay to needs none.
+        // A launch with nothing to relay to still runs the helper, which is
+        // what strips the multiplexer environment — but it needs no *relay*, so
+        // it composes no relay flags.
         let closed = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv = build_argv(PROGRAM, &closed, None, &nothing).unwrap();
-        assert!(!argv.contains(&SHELL.to_string()));
+        let argv = build_argv(PROGRAM, &closed, Some(RELAY), &nothing).unwrap();
+        assert_eq!(argv.last().map(String::as_str), Some("--"));
+        assert!(!argv.contains(&"--relay-socket".to_string()));
+        assert!(argv.contains(&"--unset".to_string()));
+    }
+
+    /// The host's multiplexer sockets, with an outer socket and a `$TMPDIR`
+    /// socket directory that bwrap's standing masks do not reach.
+    fn host_mux() -> crate::session::HostMuxSockets {
+        crate::session::HostMuxSockets {
+            own_socket: PathBuf::from("/tmp/tmux-501/friring"),
+            outer_socket: Some(PathBuf::from("/home/u/.cache/outer-tmux/default")),
+            uid: 501,
+        }
+    }
+
+    /// Under the host read scope, every deny-set entry is either already inside
+    /// one of bwrap's standing masks or gets a mask of its own — and the
+    /// standing masks are untouched.
+    #[test]
+    fn the_host_scope_masks_every_uncovered_multiplexer_entry() {
+        let host = host_mux();
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.network_mode = NetworkMode::None;
+        let policy = profile
+            .resolve(SandboxBackendKind::Bwrap, "/home/u")
+            .unwrap();
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1")
+            .with_helper_program(RELAY)
+            .with_host_mux(&host);
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
+
+        // The standing coverage is product behaviour and stays exactly as it
+        // was.
+        assert!(has_flag(&argv, "--tmpfs", "/tmp"));
+        for dir in ["/run", "/var/run"] {
+            assert_masked(&argv, dir);
+        }
+        // `/tmp/tmux-501` needs none: `--tmpfs /tmp` already covers it, and a
+        // second mask under a tmpfs would be noise.
+        assert!(!has_flag(&argv, "--tmpfs", "/tmp/tmux-501"));
+        // The outer socket is outside every masked tree, so it is masked as a
+        // file — the way a secret file is.
+        assert!(has_mount(
+            &argv,
+            "--ro-bind",
+            "/dev/null",
+            "/home/u/.cache/outer-tmux/default"
+        ));
+    }
+
+    /// Under the narrow scope the root is built out of the system directories
+    /// and the profile's own paths, so a socket outside both is unreachable by
+    /// construction rather than by a mask — and adding masks there would be
+    /// mounting over paths that are not bound at all.
+    #[test]
+    fn the_workspace_scope_masks_no_multiplexer_entry() {
+        let host = host_mux();
+        let mut profile = SandboxProfile::new("dev", vec![SandboxPath::workspace("~/dev/app")]);
+        profile.network_mode = NetworkMode::None;
+        profile.read_scope = ReadScope::Workspace;
+        let policy = profile
+            .resolve(SandboxBackendKind::Bwrap, "/home/u")
+            .unwrap();
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1")
+            .with_helper_program(RELAY)
+            .with_host_mux(&host);
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
+
+        assert!(!argv
+            .iter()
+            .any(|a| a == "/home/u/.cache/outer-tmux/default"));
+        assert!(!has_flag(&argv, "--tmpfs", "/run"));
+        // Nothing outside the profile and the system binds is mounted at all.
+        assert!(!argv.iter().any(|a| a == "/tmp/tmux-501"));
+    }
+
+    /// The bwrap half of ADR-31: the subtract set is mounted **over** what the
+    /// profile bound, and the seed targets are bound back over that.
+    #[test]
+    fn a_childs_subtract_set_is_mounted_over_the_grant_it_lands_in() {
+        let policy = closed_policy(vec![SandboxPath::workspace("~")]);
+        let overlay = crate::session::SandboxOverlay {
+            worktree: Some("/data/worktrees/child".into()),
+            seed: vec![
+                crate::session::SeedGrant {
+                    target: "/home/u/.codex/auth.json".into(),
+                    mode: crate::session::SeedMode::LinkRw,
+                },
+                crate::session::SeedGrant {
+                    target: "/home/u/.codex/skills".into(),
+                    mode: crate::session::SeedMode::Symlink,
+                },
+            ],
+            subtract: vec![
+                crate::session::SubtractPath {
+                    path: "/home/u/.codex".into(),
+                    is_dir: true,
+                },
+                crate::session::SubtractPath {
+                    path: "/home/u/.codex/history.jsonl".into(),
+                    is_dir: false,
+                },
+            ],
+            ..crate::session::SandboxOverlay::default()
+        };
+        let launch = SandboxLaunch::new(&policy, "/home/u", "child")
+            .with_helper_program(RELAY)
+            .with_narrowing(&overlay);
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
+
+        // A directory is masked with an empty tmpfs, a file with `/dev/null` —
+        // the two shapes the secret masks use, because an empty directory and an
+        // empty file are what a denied path should look like from inside.
+        assert!(has_flag(&argv, "--tmpfs", "/home/u/.codex"), "{argv:?}");
+        assert!(
+            has_mount(
+                &argv,
+                "--ro-bind",
+                "/dev/null",
+                "/home/u/.codex/history.jsonl"
+            ),
+            "{argv:?}"
+        );
+        // The mask comes after the grant it lands in: bwrap's later mount wins,
+        // so only a mount *over* the home bind takes the state directory away.
+        assert!(index_of(&argv, "/home/u/.codex") > index_of(&argv, "/home/u"));
+
+        // The seed targets are bound back over the mask, and only the credential
+        // one is writable.
+        assert!(
+            has_mount(
+                &argv,
+                "--bind-try",
+                "/home/u/.codex/auth.json",
+                "/home/u/.codex/auth.json"
+            ),
+            "{argv:?}"
+        );
+        assert!(
+            has_mount(
+                &argv,
+                "--ro-bind-try",
+                "/home/u/.codex/skills",
+                "/home/u/.codex/skills"
+            ),
+            "{argv:?}"
+        );
+        let mask = index_of(&argv, "/home/u/.codex");
+        let credential = argv
+            .iter()
+            .rposition(|a| a == "/home/u/.codex/auth.json")
+            .expect("the credential is bound");
+        assert!(credential > mask, "the seed must come after the mask");
+    }
+
+    /// friring's data root as a child's own directories are minted under it.
+    const CHILD_DATA: &str = "/home/u/.local/share/friring";
+
+    /// A child's overlay whose own directories are **inside** the trees its
+    /// subtract set denies wholesale, which is what a real one always looks
+    /// like: `subtract_set` denies `<data>/{sandbox,signals,gates,worktrees}` to
+    /// cover every sibling, and friring mints the child's own directories under
+    /// exactly those roots. The bwrap twin of seatbelt's `child_narrowing`.
+    fn child_narrowing() -> crate::session::SandboxOverlay {
+        crate::session::SandboxOverlay {
+            worktree: Some(format!("{CHILD_DATA}/worktrees/repo/child")),
+            own_dirs: vec![
+                format!("{CHILD_DATA}/sandbox/tmp/child"),
+                format!("{CHILD_DATA}/signals/child"),
+                format!("{CHILD_DATA}/signals/child/bridge"),
+            ],
+            gate_dir: Some(format!("{CHILD_DATA}/gates/child")),
+            state_dir: Some(format!("{CHILD_DATA}/sandbox/state/child")),
+            seed: vec![],
+            subtract: ["sandbox", "signals", "gates", "worktrees"]
+                .into_iter()
+                .map(|tree| crate::session::SubtractPath {
+                    path: format!("{CHILD_DATA}/{tree}"),
+                    is_dir: true,
+                })
+                .collect(),
+            ..crate::session::SandboxOverlay::default()
+        }
+    }
+
+    /// The bind that re-grants a child's own directory must not re-open what is
+    /// protected inside it. bwrap's later mount wins, so binding
+    /// `.git/worktrees/<id>` read-write after the read-only bind of its `gitdir`
+    /// shadows that bind — and a redirect a child can write is a program the
+    /// *host* runs when friring inspects the worktree. The seatbelt twin is
+    /// `a_childs_own_git_metadata_keeps_its_redirects_after_the_re_grant`.
+    #[test]
+    fn a_childs_own_git_metadata_keeps_its_redirects_after_the_re_grant() {
+        const MINE: &str = "/home/u/dev/app/.git/worktrees/child";
+        let policy = closed_policy(vec![SandboxPath::workspace("~")]);
+        let mut overlay = child_narrowing();
+        overlay.own_dirs.push(MINE.to_string());
+        let launch = SandboxLaunch::new(&policy, "/home/u", "child")
+            .with_helper_program(RELAY)
+            .with_narrowing(&overlay);
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
+
+        let mount_at = |flag: &str, path: &str| {
+            argv.windows(3)
+                .position(|w| w[0] == flag && w[1] == path && w[2] == path)
+        };
+        let at_bind = mount_at("--bind-try", MINE)
+            .unwrap_or_else(|| panic!("the child's own git directory is not re-granted: {argv:?}"));
+        for name in crate::sandbox::backend::PROTECTED_IN_WORKTREE_METADATA {
+            let path = format!("{MINE}/{name}");
+            let at_protect = mount_at("--ro-bind-try", &path)
+                .unwrap_or_else(|| panic!("'{name}' is never taken back: {argv:?}"));
+            assert!(
+                at_protect > at_bind,
+                "the re-grant of the child's own directory re-opens '{name}'"
+            );
+        }
+        for name in ["HEAD", "index"] {
+            assert!(
+                mount_at("--ro-bind-try", &format!("{MINE}/{name}")).is_none(),
+                "a child cannot commit: {argv:?}"
+            );
+        }
+    }
+
+    /// The subtract set denies friring's trees wholesale and the child's own
+    /// directories are inside them — so a renderer that stopped at the masks
+    /// would build a boundary in which the child cannot write its own worktree
+    /// or scratch, report its own status, reach its own bridge queue or read its
+    /// own gate. The seatbelt twin is
+    /// `a_childs_own_directories_are_re_granted_after_the_subtract_set`.
+    #[test]
+    fn a_childs_own_directories_are_bound_back_over_the_subtract_set() {
+        let policy = closed_policy(vec![SandboxPath::workspace("~")]);
+        let overlay = child_narrowing();
+        let launch = SandboxLaunch::new(&policy, "/home/u", "child")
+            .with_helper_program(RELAY)
+            .with_narrowing(&overlay);
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
+
+        let mount_at = |flag: &str, src: &str, dst: &str| {
+            argv.windows(3)
+                .position(|w| w[0] == flag && w[1] == src && w[2] == dst)
+        };
+        let flag_at =
+            |flag: &str, value: &str| argv.windows(2).position(|w| w[0] == flag && w[1] == value);
+
+        for own in overlay
+            .worktree
+            .iter()
+            .chain(overlay.own_dirs.iter())
+            .chain(overlay.state_dir.iter())
+        {
+            let grant = mount_at("--bind-try", own, own)
+                .unwrap_or_else(|| panic!("no re-grant for the child's own '{own}': {argv:?}"));
+            // bwrap's later mount wins, so the position is the whole assertion:
+            // a bind before the tmpfs that covers it grants nothing.
+            for entry in &overlay.subtract {
+                if !crate::sandbox::dirs::encloses(&entry.path, own) {
+                    continue;
+                }
+                let mask = flag_at("--tmpfs", &entry.path)
+                    .unwrap_or_else(|| panic!("'{}' is not masked: {argv:?}", entry.path));
+                assert!(
+                    grant > mask,
+                    "'{own}' is bound before the mask of '{}'",
+                    entry.path
+                );
+            }
+        }
+
+        let gate = overlay.gate_dir.as_deref().unwrap();
+        let gate_at = mount_at("--ro-bind-try", gate, gate)
+            .unwrap_or_else(|| panic!("no read-only re-grant for the gate: {argv:?}"));
+        assert!(
+            gate_at > flag_at("--tmpfs", &format!("{CHILD_DATA}/gates")).unwrap(),
+            "the gate is bound before the mask that covers it"
+        );
+        // A writable gate is a gate the child opens for itself (ADR-33).
+        assert!(
+            mount_at("--bind-try", gate, gate).is_none()
+                && mount_at("--bind", gate, gate).is_none(),
+            "the gate was bound writable: {argv:?}"
+        );
+
+        // A sibling under the same roots is what the wholesale masks are for:
+        // it is never named, so it is covered by the tmpfs and stays covered.
+        for sibling in [
+            format!("{CHILD_DATA}/worktrees/repo/other"),
+            format!("{CHILD_DATA}/signals/other"),
+            format!("{CHILD_DATA}/gates/other"),
+        ] {
+            assert!(
+                !argv.iter().any(|a| a == &sibling),
+                "a sibling's directory is named in the argv: {argv:?}"
+            );
+        }
+    }
+
+    /// An ordinary launch carries no subtract set: nothing about the argv
+    /// changes for a session that is not a bridge child.
+    #[test]
+    fn an_ordinary_launch_masks_no_child_paths() {
+        let policy = closed_policy(vec![SandboxPath::workspace("~/dev/app")]);
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1").with_helper_program(RELAY);
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
+        // `--bind-try` is the seed shape and appears for no other reason, so
+        // its absence is the assertion. (`--ro-bind-try` is the ordinary
+        // `.git/hooks` protection every writable root gets.)
+        assert!(!argv.iter().any(|a| a == "--bind-try"), "{argv:?}");
+    }
+
+    /// No launch path composes a shell string any more (ADR-33): the helper is
+    /// argv the whole way down, so a socket path or an agent argument
+    /// containing a space, a quote or a `;` cannot be re-split.
+    #[test]
+    fn no_launch_path_composes_a_shell_string() {
+        let policy = workspace_policy();
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1").with_proxy(socket_endpoint());
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
+        assert!(!argv.iter().any(|a| a == crate::sandbox::launcher::SHELL));
+        assert!(!argv.iter().any(|a| a == "-c"));
+    }
+
+    /// A gated launch runs the helper even with no relay to start, and passes
+    /// the gate through as its own argv elements.
+    #[test]
+    fn a_gated_launch_waits_on_the_helper() {
+        let policy = closed_policy(vec![SandboxPath::workspace("~/dev/app")]);
+        let launch =
+            SandboxLaunch::new(&policy, "/home/u", "s1").with_gate("/data/gates/c1", "k-1");
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
+        let tail = &argv[index_of(&argv, "--") + 1..];
+        assert_eq!(tail[0], RELAY);
+        assert_eq!(&tail[1..3], ["sandbox", "launch"]);
+        assert!(tail.contains(&"--gate".to_string()));
+        assert!(tail.contains(&"/data/gates/c1".to_string()));
+        assert!(tail.contains(&"k-1".to_string()));
+        // No relay flags: this launch has no proxy to front.
+        assert!(!tail.contains(&"--relay-socket".to_string()));
+        // The gate is bound read-only and never read-write.
+        assert!(has_mount(
+            &argv,
+            "--ro-bind",
+            "/data/gates/c1",
+            "/data/gates/c1"
+        ));
+        assert!(!has_mount(
+            &argv,
+            "--bind",
+            "/data/gates/c1",
+            "/data/gates/c1"
+        ));
     }
 
     /// The narrow read scope builds its root out of the system directories, so
@@ -1651,15 +2386,28 @@ mod tests {
             .unwrap();
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1").with_proxy(socket_endpoint());
         let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
-        assert!(has_mount(&argv, "--ro-bind", RELAY, RELAY));
+        assert!(has_mount(&argv, "--ro-bind-try", RELAY, RELAY));
         assert!(index_of(&argv, RELAY) < index_of(&argv, "/home/u/dev/app"));
 
-        // The host read scope already carries it, at its own path, so binding
-        // it again would only narrow what the profile granted.
-        let host_scope = workspace_policy();
-        let launch = SandboxLaunch::new(&host_scope, "/home/u", "s1").with_proxy(socket_endpoint());
+        // The agent's own program too, and for the same reason: an extension
+        // ships its agent as a script under its own home, which is under no
+        // system directory the narrow root is built from.
+        const AGENT: &str = "/home/u/.config/friring/extensions/x/bin/run.sh";
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1")
+            .with_proxy(socket_endpoint())
+            .with_agent_program(AGENT);
         let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
-        assert!(!has_mount(&argv, "--ro-bind", RELAY, RELAY));
+        assert!(has_mount(&argv, "--ro-bind-try", AGENT, AGENT));
+
+        // The host read scope already carries both, at their own paths, so
+        // binding them again would only narrow what the profile granted.
+        let host_scope = workspace_policy();
+        let launch = SandboxLaunch::new(&host_scope, "/home/u", "s1")
+            .with_proxy(socket_endpoint())
+            .with_agent_program(AGENT);
+        let argv = build_argv(PROGRAM, &launch, Some(RELAY), &|_| true).unwrap();
+        assert!(!has_mount(&argv, "--ro-bind-try", RELAY, RELAY));
+        assert!(!has_mount(&argv, "--ro-bind-try", AGENT, AGENT));
     }
 
     #[test]
@@ -1671,7 +2419,7 @@ mod tests {
         let policy = profile
             .resolve(SandboxBackendKind::Bwrap, "/home/u")
             .unwrap();
-        let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1").with_helper_program(RELAY);
         let backend = BwrapBackend::new(Arc::new(StubHost::linux_with_bwrap("0.11.0")));
         let argv = backend
             .wrap(
@@ -1679,7 +2427,9 @@ mod tests {
                 &launch,
             )
             .unwrap();
-        let end = index_of(&argv, "--");
+        // After the *helper's* separator: friring's own launch helper sits
+        // between bwrap and the agent (ADR-33).
+        let end = argv.iter().rposition(|a| a == "--").expect("a handover");
         assert_eq!(&argv[end + 1..], ["claude", "--resume", "abc"]);
     }
 
@@ -1919,7 +2669,7 @@ mod tests {
         let system = BwrapBackend::new(Arc::new(StubHost::linux_with_bwrap("0.11.0")));
         assert_eq!(system.details().program.as_deref(), Some(PROGRAM));
         let policy = closed_policy(vec![SandboxPath::workspace("~/dev/app")]);
-        let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
+        let launch = SandboxLaunch::new(&policy, "/home/u", "s1").with_helper_program(RELAY);
         let argv = system.wrap(vec!["claude".into()], &launch).unwrap();
         assert_eq!(argv[0], PROGRAM);
     }
@@ -2018,8 +2768,14 @@ mod tests {
         let policy = closed_policy(vec![SandboxPath::workspace("~/dev/app")]);
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
         let ws = workspace_at("/home/u/dev/app");
-        let argv =
-            build_argv_with(PROGRAM, &launch, None, &nothing, std::slice::from_ref(&ws)).unwrap();
+        let argv = build_argv_with(
+            PROGRAM,
+            &launch,
+            Some(RELAY),
+            &nothing,
+            std::slice::from_ref(&ws),
+        )
+        .unwrap();
 
         // `--overlay-src` is consumed by the option that follows it, so the two
         // are adjacent: a mount emitted between them would take the lower layer.
@@ -2050,8 +2806,14 @@ mod tests {
             SandboxPath::read_only("/repo/vendor"),
         ]);
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let argv =
-            build_argv_with(PROGRAM, &launch, None, &nothing, &[workspace_at("/repo")]).unwrap();
+        let argv = build_argv_with(
+            PROGRAM,
+            &launch,
+            Some(RELAY),
+            &nothing,
+            &[workspace_at("/repo")],
+        )
+        .unwrap();
 
         assert!(index_of(&argv, "/repo/vendor") > index_of(&argv, "--overlay"));
         assert!(has_mount(
@@ -2076,8 +2838,14 @@ mod tests {
             SandboxPath::workspace("/repo/sub"),
         ]);
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1");
-        let err = build_argv_with(PROGRAM, &launch, None, &nothing, &[workspace_at("/repo")])
-            .unwrap_err();
+        let err = build_argv_with(
+            PROGRAM,
+            &launch,
+            Some(RELAY),
+            &nothing,
+            &[workspace_at("/repo")],
+        )
+        .unwrap_err();
         assert!(matches!(err, SandboxError::Refused { .. }), "{err}");
         let text = err.to_string();
         assert!(text.contains("/repo/sub"), "{text}");
@@ -2093,7 +2861,7 @@ mod tests {
         let err = build_argv_with(
             PROGRAM,
             &nested_workspace,
-            None,
+            Some(RELAY),
             &nothing,
             &[workspace_at("/repo")],
         )
@@ -2105,7 +2873,7 @@ mod tests {
         assert!(build_argv_with(
             PROGRAM,
             &SandboxLaunch::new(&single, "/home/u", "s1"),
-            None,
+            Some(RELAY),
             &nothing,
             &[workspace_at("/repo")],
         )
@@ -2123,11 +2891,13 @@ mod tests {
         let launch = SandboxLaunch::new(&policy, "/home/u", "s1")
             .with_agent("claude")
             .with_friring_db(db);
-        let present = |p: &str| p == "/home/u/.ssh" || p == db;
+        // The hooks directory is in the set because a protected path is bound
+        // only when it is there — see `protected_paths_present`.
+        let present = |p: &str| p == "/home/u/.ssh" || p == db || p == "/home/u/work/.git/hooks";
         let argv = build_argv_with(
             PROGRAM,
             &launch,
-            None,
+            Some(RELAY),
             &present,
             &[workspace_at("/home/u/work")],
         )
@@ -2159,7 +2929,7 @@ mod tests {
         let err = build_argv_with(
             PROGRAM,
             &launch,
-            None,
+            Some(RELAY),
             &nothing,
             &[workspace_at("/home/u/secrets")],
         )
@@ -2177,7 +2947,7 @@ mod tests {
         let err = build_argv_with(
             PROGRAM,
             &launch,
-            None,
+            Some(RELAY),
             &nothing,
             &[workspace_at("/repo"), workspace_at("/repo/sub")],
         )

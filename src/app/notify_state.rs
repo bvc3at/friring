@@ -163,6 +163,30 @@ impl NotificationState {
         }
     }
 
+    /// The notification a **bridge child's** state change fires (ADR-32).
+    ///
+    /// Built from host-known fields only: two session names and one state word
+    /// friring itself decided. Nothing a child wrote reaches it — not its
+    /// `result` summary, not a report, not a `blocked` question. A notification
+    /// is the one surface with no room for a `child-authored` label and no way
+    /// for a reader to check provenance, so a sandboxed session that could put
+    /// text in one would be putting chosen words on the operator's screen with
+    /// friring's name on them.
+    pub fn child_notification(
+        id: SessionId,
+        owner_name: &str,
+        child_name: &str,
+        state: crate::session::ChildState,
+        sound: bool,
+    ) -> Notification {
+        Notification {
+            session_id: id,
+            title: format!("{owner_name} · {child_name}"),
+            body: format!("child {state}"),
+            sound,
+        }
+    }
+
     pub fn send(&self, n: Notification) {
         self.sender.send(n);
     }
@@ -414,6 +438,27 @@ mod tests {
         let n = NotificationState::build_notification(id, "demo", "claude", Some(&exact), true);
         assert_eq!(n.body, exact);
         assert!(!n.body.ends_with('…'));
+    }
+
+    /// A notification has no room for a `child-authored` label and no way for a
+    /// reader to check provenance, so nothing a child wrote may reach one.
+    #[test]
+    fn a_child_notification_carries_no_child_authored_text() {
+        let id = SessionId::default();
+        let n = NotificationState::child_notification(
+            id,
+            "lead",
+            "lead-abc12345",
+            crate::session::ChildState::Dirty,
+            true,
+        );
+        assert_eq!(n.title, "lead · lead-abc12345");
+        assert_eq!(n.body, "child dirty");
+        // The body is a fixed template over one state word: there is nowhere in
+        // it for a summary to land.
+        assert!(crate::session::ChildState::ALL
+            .iter()
+            .any(|s| n.body == format!("child {s}")));
     }
 
     #[test]

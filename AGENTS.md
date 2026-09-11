@@ -57,9 +57,11 @@ Two rules matter when working here:
 
 ```bash
 just build                           # build friring + friring-cli
-just test                            # cargo nextest run --all
+just test                            # full suite, under scripts/dev/sacrificial-env.sh
+just test-one NAME                   # run a single test by name, same wrapper
+just test-unprotected                # the suite against your real HOME (escape hatch)
+just bridge-e2e                      # the bridge conformance run against a real TUI
 just lint                            # fmt-check + clippy + deny + rumdl + shellcheck
-cargo nextest run -E 'test(name)'    # run a single test by name
 cargo check --all                    # type check (bare cargo still works)
 
 cargo fmt --all                      # format (rustfmt, 100-col max)
@@ -85,6 +87,7 @@ session  ← pure data types, no crate-internal references
 agent    ← session + sandbox (+ paths/shell utils; NEVER ui, git, app)
 sandbox  ← session + proxy + paths + shell (NEVER ui, git, app)
 proxy    ← leaf: no crate-internal references
+paths    ← session (bridge request keys and byte caps only; ADR-30)
 ui       ← session + app model/view state (+ fuzzy/paths; NEVER agent or git)
 app      ← coordinator, imports all modules
 ```
@@ -144,6 +147,7 @@ Detail is read on demand — jump to the doc for what you're touching:
 | A user-facing feature — sessions, code review, automations, tasks, global search, notifications, status, remote/WSL, extensions, keybindings | `docs/FEATURES.md` |
 | Render-loop performance, perf counters, redraw throttling | `docs/PERFORMANCE.md` |
 | Sandboxed agents — profiles, backends (seatbelt/bwrap/docker/…), egress proxy, credentials | `docs/SANDBOX.md` |
+| The orchestration bridge — a sandboxed agent asking friring to run child agents: verbs, grants, the spawn saga, quiesce | `docs/SANDBOX.md` + ADR-30…33 in `docs/ARCHITECTURE.md` |
 | The headless CLI (`friring-cli`) | `docs/CLI.md` |
 | Real-agent e2e tests, the model stub, scenario-driven demos | `docs/E2E.md` |
 | Cutting a release, versioning, installers, packaging | `docs/RELEASING.md` |

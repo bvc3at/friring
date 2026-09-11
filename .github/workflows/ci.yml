@@ -45,6 +45,8 @@ jobs:
       install_ps: ${{ steps.filter.outputs.install_ps || steps.all.outputs.all }}
       media: ${{ steps.filter.outputs.media || steps.all.outputs.all }}
       agent_e2e: ${{ steps.filter.outputs.agent_e2e || steps.all.outputs.all }}
+      sandbox_probe: ${{ steps.filter.outputs.sandbox_probe || steps.all.outputs.all }}
+      omx: ${{ steps.filter.outputs.omx || steps.all.outputs.all }}
     steps:
       # A merge queue entry already contains exactly the PR's changes; validate
       # the whole suite against it rather than diffing (paths-filter has no PR
@@ -104,6 +106,28 @@ jobs:
               - 'extensions/hooks/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+            sandbox_probe:
+              - 'scripts/dev/sandbox-probes/**'
+              - 'scripts/ci/allow-user-namespaces.sh'
+              - 'scripts/dev/bridge-e2e.sh'
+              - 'scripts/dev/codex-park-e2e.sh'
+              - 'scripts/dev/omx-team-e2e.sh'
+              - 'scripts/dev/lib/**'
+              - 'src/sandbox/**'
+              - 'src/agent/sandboxing.rs'
+              - 'src/app/bridge*.rs'
+              - 'src/cli/sandbox.rs'
+              - 'src/cli/early.rs'
+              - 'tests/harness_capability_gate.rs'
+              - 'tests/sandbox_launch_helper.rs'
+              - 'tests/bridge_cli_boundary.rs'
+              - 'extensions/bridge-conformance/**'
+              - '.github/workflows/ci.yml'
+            omx:
+              - 'extensions/omx/**'
+              - 'extensions/bridge-conformance/**'
+              - 'tests/omx_manifest_invocation.rs'
               - '.github/workflows/ci.yml'
 
   check:
@@ -249,6 +273,103 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y tmux
       - name: Black-box TUI smoke test
         run: scripts/dev/smoke/tui-smoke.sh
+
+  # Observe the deny set against a real kernel rather than against generated
+  # policy text. Both probes are blocking, and both are required to make their
+  # assertions rather than skip them: a green that meant "asserted nothing" is
+  # what let the Linux boundary go unexercised for the whole of this feature's
+  # development.
+  seatbelt-probe:
+    name: Seatbelt Boundary Probe (macOS)
+    needs: changes
+    if: needs.changes.outputs.sandbox_probe == 'true'
+    runs-on: macos-latest
+    env:
+      FRIRING_E2E_REQUIRE_BRIDGE: "1"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install tmux
+        run: brew install tmux
+      - name: Observe the seatbelt boundary
+        run: scripts/dev/sacrificial-env.sh scripts/dev/sandbox-probes/seatbelt.sh
+
+  bwrap-probe:
+    name: Bubblewrap Boundary Probe (Linux)
+    needs: changes
+    if: needs.changes.outputs.sandbox_probe == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # This job exists to make these assertions, so it may not report success
+      # for having skipped them. See `scripts/dev/lib/bridge-backend.sh`.
+      FRIRING_E2E_REQUIRE_BRIDGE: "1"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install tmux and bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y tmux bubblewrap
+      - name: Grant unprivileged user namespaces on this disposable runner
+        env:
+          # Positively identified, not inferred: `CI` and `GITHUB_ACTIONS` are
+          # equally true on a self-hosted runner, which the helper must refuse.
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/allow-user-namespaces.sh
+      - name: Observe the bubblewrap boundary
+        run: scripts/dev/sacrificial-env.sh scripts/dev/sandbox-probes/bwrap.sh
+
+  # The orchestration bridge, end to end against a real TUI: a leader created
+  # through the wizard, a child through the saga, a verdict friring reached by
+  # reading a worktree. Blocking, and required to make its assertions
+  # rather than skip them: `scripts/ci/allow-user-namespaces.sh` gives the
+  # runner a usable namespace first, and `FRIRING_E2E_REQUIRE_BRIDGE` turns
+  # "this host cannot" into a failure instead of a green run that asserted
+  # nothing.
+  # Run through `sacrificial-env.sh`, which mints a throwaway outer HOME whose
+  # friring fallback paths are canaries, and fails the job if anything writes to
+  # one. A runner's HOME is disposable, so this buys little here; it is the same
+  # command a developer runs locally, where it buys a great deal.
+  bridge-e2e:
+    name: Bridge Conformance E2E (Linux)
+    needs: changes
+    if: needs.changes.outputs.sandbox_probe == 'true'
+    runs-on: ubuntu-latest
+    env:
+      FRIRING_E2E_REQUIRE_BRIDGE: "1"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install tmux, bubblewrap and jq
+        run: sudo apt-get update && sudo apt-get install -y tmux bubblewrap jq
+      - name: Grant unprivileged user namespaces on this disposable runner
+        env:
+          # Positively identified, not inferred: `CI` and `GITHUB_ACTIONS` are
+          # equally true on a self-hosted runner, which the helper must refuse.
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: scripts/ci/allow-user-namespaces.sh
+      - name: Run the conformance extension end to end
+        run: scripts/dev/sacrificial-env.sh scripts/dev/bridge-e2e.sh
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bridge-e2e
+          path: target/bridge-e2e/
+          if-no-files-found: ignore
+
+  # The omx extension's own program tests. Node is on every hosted runner, so
+  # this is an ordinary blocking job rather than a skip-if-absent one.
+  omx-tests:
+    name: OMX Extension Tests
+    needs: changes
+    if: needs.changes.outputs.omx == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Run the extension's program tests
+        run: node --test "extensions/omx/lib/*.test.mjs"
 
   acceptance:
     name: Acceptance Tests
@@ -547,6 +668,12 @@ jobs:
       - shellcheck
       - website-lint
       - sonarqube
+      # The dedicated boundary and bridge gates. Blocking now that they cannot
+      # pass by skipping: a green that meant "made no assertions" is what let a
+      # Linux run go unexercised for the whole of this feature's development.
+      - seatbelt-probe
+      - bwrap-probe
+      - bridge-e2e
     runs-on: ubuntu-latest
     steps:
       - name: Verify all checks passed

@@ -77,6 +77,15 @@ copy_in = [
   "~/.claude/settings.json",
 ]
 
+# Where this CLI keeps a conversation, so friring can tell a resume that will
+# reach one from a resume that would silently start a new conversation with the
+# same id. The transcript is `projects/<encoded cwd>/<id>.jsonl`, so the file
+# NAME is the id friring resumes by.
+[agents.transcript]
+dir = "projects"
+suffix = ".jsonl"
+name_has_id = true
+
 # codex can't pin or report its session id, so resume/fork target the most
 # recent session in the launch directory. friring keeps that directory stable
 # across restart (same cwd) and single-repo fork (child reuses the parent cwd).
@@ -98,6 +107,14 @@ writeback = true
 state_rw = ["~/.codex"]
 bypass = ["--dangerously-bypass-approvals-and-sandbox"]
 copy_in = ["~/.codex/AGENTS.md", "~/.codex/prompts"]
+
+# Rollouts are `sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl`, and the id in that
+# name is codex's own rather than friring's — so `name_has_id` is false and the
+# check is "is there a conversation for `resume --last` to resolve to at all?".
+# Exact for a bridge child, whose CODEX_HOME is private and holds only its own.
+[agents.transcript]
+dir = "sessions"
+suffix = ".jsonl"
 
 # friring's highest-precedence layer inside the boundary, merged over whatever
 # projected to the same path. A place is always a fresh home, so the workspace
@@ -172,6 +189,17 @@ command = "vibe"
 #                               #   A rebranded-claude CLI sets "claude" to get
 #                               #   claude's --settings hook wiring under its own
 #                               #   name. Omit if the agent has no known family.
+#
+# [agents.transcript]           # OPTIONAL: where this CLI stores a conversation,
+# dir = "sessions"              #   relative to `state_dir` below, searched
+# suffix = ".jsonl"             #   recursively. friring uses it to check that a
+# name_has_id = false           #   conversation still EXISTS before resuming it:
+#                               #   without it a "resume" can silently start a
+#                               #   new one. Set name_has_id = true when the file
+#                               #   is named for the {id} friring resumes by.
+#                               #   REQUIRED for an agent used as a bridge child
+#                               #   with `resume_latest = true`: a child's resume
+#                               #   is refused rather than started blank.
 #
 # [agents.sandbox]              # OPTIONAL: what this CLI needs inside a sandbox
 # auth = "auto"                 #   auto | host-passthrough | env-token

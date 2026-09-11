@@ -12,8 +12,10 @@
 #                           (+ TMUX_TMPDIR), leaving HOME/XDG real so your real,
 #                           authenticated agent CLIs (claude/codex/antigravity/…) work.
 #   tbx_sandbox_init_full — *full* isolation: also overrides HOME + XDG_* under
-#                           the sandbox (hermetic; agents boot with no creds).
-#                           Used by the demo recorder + TUI smoke test.
+#                           the sandbox (hermetic; agents boot with no creds),
+#                           and pins FRIRING_*_DIR explicitly so no process can
+#                           fall back to the real $HOME. Used by the demo
+#                           recorder, the TUI smoke test and bridge-e2e.
 #
 # Source it (don't execute) AFTER setting REPO_ROOT (or TBX_REPO_ROOT). Written
 # in POSIX sh so both bash callers (sandbox.sh, smoke/tui-smoke.sh) and the
@@ -71,7 +73,13 @@ _tbx_resolve_root() {
             # folder-trust entry seeded under the symlinked path silently misses
             # and the agent boots into a "trust this folder?" dialog instead of
             # a usable UI.
-            TBX_SANDBOX_ROOT="$(cd "$(mktemp -d /tmp/friring-sandbox.XXXXXX)" && pwd -P)"
+            # The name is short for the same reason the tmux dir below is: the
+            # **egress proxy's** socket lives at
+            # `<root>/data/friring-dev/sandbox/tmp/<uuid>/proxy.sock`, whose
+            # fixed part is 77 bytes, so a root longer than 26 overflows the
+            # 103-byte AF_UNIX limit and friring correctly refuses every
+            # filtered profile. `friring-sandbox.XXXXXX` was 27.
+            TBX_SANDBOX_ROOT="$(cd "$(mktemp -d /tmp/friring-e2e.XXXXXX)" && pwd -P)"
             TBX_SANDBOX_FRESH=1
             # NOT under the root: AF_UNIX socket paths are ~104-byte limited,
             # and <root>/tmux/tmux-<uid>/friring-dev would overflow it under any
@@ -110,23 +118,68 @@ tbx_sandbox_init() {
     mkdir -p "$FRIRING_CONFIG_DIR" "$FRIRING_DATA_DIR"
 }
 
+# The app-dir segment paths.rs appends under an XDG root for a dev build. Every
+# harness here runs `0.0.0-dev` binaries, and several scenarios name this
+# directory directly ($XDG_CONFIG_HOME/friring-dev/settings.toml and friends);
+# `tbx_sandbox_init_full` pins the FRIRING_*_DIR overrides to exactly the paths
+# those scenarios already assume, so the explicit override changes *how* the
+# directory is decided, never which directory it is.
+export TBX_APP_DIR_NAME="friring-dev"
+
 # tbx_sandbox_init_full <fresh|persistent> [profile] — FULL isolation.
 # Overrides HOME + XDG_* under the sandbox too (hermetic; agents boot fresh with
-# no creds). For the demo recorder + smoke test. Uses the dev_build `friring-dev`
-# XDG subdir (no FRIRING_*_DIR override needed).
+# no creds). For the demo recorder + smoke test.
+#
+# It also sets FRIRING_CONFIG_DIR / FRIRING_DATA_DIR **explicitly**, rather than
+# unsetting them and relying on the XDG fallback. Both spellings resolve to the
+# same directory, but the fallback is a chain — override, then XDG root, then
+# $HOME — and only its last link is a path every process has. A process that
+# reaches this environment with the XDG variables missing (a tmux server that
+# captured an older environment, a login shell re-exec, anything that filters
+# what it passes on) silently resolves against $HOME instead, and $HOME on a
+# developer's machine holds the real friring database. The explicit override is
+# the first link of the chain: if it survives, nothing further down can be
+# consulted; if it does not, `friring-cli config paths` reports `HOME` as the
+# source and a caller can refuse before touching storage.
 tbx_sandbox_init_full() {
     _tbx_resolve_root "$@" || return $?
-    # Hermetic: drop any inherited FRIRING_*_DIR overrides — paths.rs honors them
-    # ahead of XDG, so an inherited one would silently defeat the isolation.
-    unset FRIRING_CONFIG_DIR FRIRING_DATA_DIR
     HOME="$TBX_SANDBOX_ROOT/home"
     XDG_CONFIG_HOME="$TBX_SANDBOX_ROOT/config"
     XDG_DATA_HOME="$TBX_SANDBOX_ROOT/data"
     XDG_STATE_HOME="$TBX_SANDBOX_ROOT/state"
     XDG_CACHE_HOME="$TBX_SANDBOX_ROOT/cache"
+    FRIRING_CONFIG_DIR="$XDG_CONFIG_HOME/$TBX_APP_DIR_NAME"
+    FRIRING_DATA_DIR="$XDG_DATA_HOME/$TBX_APP_DIR_NAME"
     export HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME
+    export FRIRING_CONFIG_DIR FRIRING_DATA_DIR
     mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" \
-        "$XDG_CACHE_HOME"
+        "$XDG_CACHE_HOME" "$FRIRING_CONFIG_DIR" "$FRIRING_DATA_DIR"
+}
+
+# tbx_sandbox_env_args — print this sandbox's path variables as `NAME=value`
+# words, one per line, for `env`.
+#
+# Inheritance is not enough where a process is started *through* something that
+# supplies its own environment. `tmux new-session` hands a new pane the server's
+# environment, which for a server that already existed is whatever was current
+# when it started — so a harness that exports correctly and then launches
+# through tmux can still get a pane with the operator's own HOME. Passing these
+# words to `env` in front of the command makes the caller's environment the one
+# that applies, whatever the intermediary had.
+#
+# Word-split by the caller on newlines, so no value here may contain one; every
+# value is a path this library composed under a mktemp root.
+tbx_sandbox_env_args() {
+    printf '%s\n' \
+        "HOME=$HOME" \
+        "XDG_CONFIG_HOME=$XDG_CONFIG_HOME" \
+        "XDG_DATA_HOME=$XDG_DATA_HOME" \
+        "XDG_STATE_HOME=$XDG_STATE_HOME" \
+        "XDG_CACHE_HOME=$XDG_CACHE_HOME" \
+        "FRIRING_CONFIG_DIR=$FRIRING_CONFIG_DIR" \
+        "FRIRING_DATA_DIR=$FRIRING_DATA_DIR" \
+        "TMUX_TMPDIR=$TMUX_TMPDIR" \
+        "PATH=$PATH"
 }
 
 # tbx_sandbox_teardown — kill the sandbox's tmux server (safe: private

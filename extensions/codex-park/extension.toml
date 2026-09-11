@@ -1,0 +1,121 @@
+name = "codex-park"
+description = "Park and resume a real interactive Codex worker, against a local model stub"
+config_version = 1
+version = "1.0.0"
+# The soft compatibility gate. The hard one is the bridge capability below.
+min_thurbox_version = "0.20.0"
+home = "~/.config/friring/extensions/codex-park"
+
+# ── What it needs ────────────────────────────────────────────────────────
+
+[[requires]]
+kind = "binary-capability"
+name = "bridge"
+version = 1
+
+[[requires]]
+kind = "binary-capability"
+name = "extension_requires"
+version = 1
+
+# Presence, not a version: this extension is about friring's lifecycle, and it
+# reads nothing of Codex's that a version pin would protect. The real bound is
+# the wire dialect the stub speaks, which every Codex since 0.144 has.
+[[requires]]
+kind = "tool-version"
+command = "codex"
+args = ["--version"]
+pattern = "codex"
+
+# ── The two agents ───────────────────────────────────────────────────────
+#
+# The leader is a `/bin/sh` script, because what it drives is friring's own
+# verbs. The **worker is the vendor CLI**, and that is the whole point: parking
+# is about what survives a process going away, and only a real agent has a
+# conversation to survive it.
+
+[[agents]]
+name = "codex-park-leader"
+command = "{home}/bin/park-leader.sh"
+args = []
+hook_schema = "none"
+
+[agents.sandbox]
+config_dir_env = "CODEX_PARK_HOME"
+state_dir = "~/.friring-codex-park"
+state_rw = ["~/.friring-codex-park/state"]
+bridge_requires = ["child-lifecycle", "mailbox", "report"]
+
+[[agents]]
+name = "codex-park-worker"
+command = "{home}/bin/codex-worker.sh"
+args = []
+# Codex's own status hooks, seeded into the child's private CODEX_HOME below.
+# They are what S9 accepts as proof the child is up: a live pane shows something
+# is running, not that it is running from the state friring seeded.
+hook_schema = "codex"
+# `resume --last` and not a pinned id: friring cannot pin or read back a Codex
+# thread id, so a relaunch uses the CLI's own "most recent session in this
+# directory" resolution — and the directory is the child's preserved worktree,
+# under the private `CODEX_HOME` friring kept, where the last conversation is
+# this child's and there is no other. `app::bridge_saga::child_resume_identity`
+# is what emits this group for a bridge child, and the harness is what observes
+# that the thread really comes back.
+resume_args = ["resume", "--last"]
+resume_latest = true
+
+# What makes that resume provable rather than hopeful. `resume --last` in an
+# empty directory is not a resume, and friring refuses a bridge child's resume
+# it cannot prove — so this names where a Codex conversation lands
+# (`$CODEX_HOME/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl`). The id in that
+# filename is Codex's own, not friring's, so the check is "is there a
+# conversation here at all?" — exact for a child, whose CODEX_HOME is private
+# and holds only its own.
+[agents.transcript]
+dir = "sessions"
+suffix = ".jsonl"
+
+[agents.sandbox]
+config_dir_env = "CODEX_HOME"
+state_dir = "~/.codex"
+# The child's own thread lives here, and it is the thing a resume has to find
+# again. Never shared with the family: ADR-31.
+state_rw = ["~/.codex/sessions"]
+bridge_requires = ["mailbox", "report"]
+
+# The provider block that points Codex at the stub. `copy`, so the child gets a
+# file of its own that its own TUI may rewrite on startup.
+[[agents.sandbox.child_state_seed]]
+src = "config.toml"
+mode = "copy"
+required = true
+
+# The status hooks, `copy-rewrite` so every mention of the family's CODEX_HOME
+# becomes the child's private one — the seed mode ADR-31 exists for, and the one
+# `tests/codex_private_state.rs` proves Codex actually fires from.
+[[agents.sandbox.child_state_seed]]
+src = "hooks.json"
+mode = "copy-rewrite"
+required = true
+
+[[files]]
+path = "bin/park-leader.sh"
+executable = true
+
+[[files]]
+path = "bin/codex-worker.sh"
+executable = true
+
+# Not an agent: what the child's Codex runs through its shell tool on each turn.
+[[files]]
+path = "bin/park-turn.sh"
+executable = true
+
+[[files]]
+path = "lib/park.sh"
+
+[[files]]
+path = "profiles.toml"
+
+[[files]]
+path = "README.md"

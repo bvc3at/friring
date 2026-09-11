@@ -1279,6 +1279,20 @@ fn push_prefix_marks(
             ("\u{26e8} ", Theme::tool_disallowed)
         };
         spans.push(Span::styled(glyph, mark_style(is_dimmed, color)));
+        // A filtered session whose proxy could not be rebound is *shielded and
+        // not filtered*: the shield above is still true — the path and process
+        // policy are enforced by the kernel — but the allowlist is not, and the
+        // shield alone would say otherwise. Its own mark, beside the shield,
+        // because that is the gap it names.
+        if matches!(
+            info.egress_state,
+            crate::session::EgressState::Unrestorable(_)
+        ) {
+            spans.push(Span::styled(
+                "\u{29b8} ",
+                mark_style(is_dimmed, Theme::danger),
+            ));
+        }
     }
 
     // Worktree sessions get a dedicated mark, subordinate to the status dot.

@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+#
+# Observe the bubblewrap boundary against a real kernel — `just bwrap-probe`.
+#
+# The Linux twin of `seatbelt.sh`, with the same deny-set and positive-control
+# assertions, plus the two things only a namespace can be asked:
+#
+# - the agent has a **pid namespace of its own**, which is what makes the
+#   relay's lifetime the launch's lifetime;
+# - **none of this probe's own launches left a relay** on the host — a global
+#   `pgrep` for `friring-cli sandbox relay` after they have all exited. It is not
+#   a test of the two exit paths: `sandbox exec` composes no relay at all, so
+#   there is never one here to outlive anything. The lifetimes themselves — after
+#   the agent argv exits, and after a gate timeout — are covered as real
+#   processes by `tests/sandbox_launch_helper.rs::no_relay_survives_the_helper`
+#   (Linux).
+#
+# Skips rather than fails where the capability is absent: user namespaces are
+# off on some distributions and in most containers, and a probe that failed
+# there would be reporting the machine rather than friring.
+set -euo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
+export REPO_ROOT
+PROBE_NAME="bwrap-probe"
+
+if [ "$(uname -s)" != "Linux" ]; then
+    echo "$PROBE_NAME: bubblewrap is Linux only; skipping on $(uname -s)" >&2
+    exit 0
+fi
+# The capability check this file already made, moved into the gate the bridge
+# harnesses now share — the drift between the two is what let a job report
+# success for assertions it never reached. Its `FRIRING_E2E_REQUIRE_BRIDGE`
+# contract comes with it, which is what a dedicated CI job sets.
+# shellcheck source=scripts/dev/lib/bridge-backend.sh
+# shellcheck disable=SC1091
+. "$REPO_ROOT/scripts/dev/lib/bridge-backend.sh"
+bridge_backend_or_skip "$PROBE_NAME"
+
+# shellcheck source=scripts/dev/lib/sandbox-env.sh
+# shellcheck disable=SC1091
+. "$REPO_ROOT/scripts/dev/lib/sandbox-env.sh"
+# shellcheck source=scripts/dev/sandbox-probes/common.sh
+# shellcheck disable=SC1091
+. "$REPO_ROOT/scripts/dev/sandbox-probes/common.sh"
+
+cargo build --bin friring --bin friring-cli >/dev/null
+
+OUTER_DIR=$(mktemp -d /tmp/friring-probe-outer.XXXXXX)
+OUTER_SOCKET="$OUTER_DIR/outer"
+if ! probe_tmux_server "$OUTER_SOCKET"; then
+    bridge_require_or_skip "$PROBE_NAME" "could not start the outer tmux server"
+fi
+export TMUX="$OUTER_SOCKET,1,0"
+
+tbx_sandbox_init_full fresh
+PROBE_ROOT="$TBX_SANDBOX_ROOT"
+PROBE_WORKSPACE="$PROBE_ROOT/ws"
+mkdir -p "$PROBE_WORKSPACE"
+
+UID_NOW=$(id -u)
+FRIRING_SOCKET="$TMUX_TMPDIR/tmux-$UID_NOW/$TBX_DEV_SOCKET"
+TMP_SOCKET="/tmp/tmux-$UID_NOW/probe-other"
+TMUX_TMPDIR_SOCKET="$TMUX_TMPDIR/tmux-$UID_NOW/probe-x"
+TMPDIR_SOCKET="${TMPDIR:-/tmp}/tmux-$UID_NOW/probe-y"
+INNER_SOCKET="$PROBE_WORKSPACE/inner.sock"
+
+cleanup() {
+    for socket in "$FRIRING_SOCKET" "$TMP_SOCKET" "$TMUX_TMPDIR_SOCKET" \
+        "$TMPDIR_SOCKET" "$OUTER_SOCKET" "$INNER_SOCKET"; do
+        probe_kill_server "$socket"
+    done
+    rm -r -f -- "$OUTER_DIR"
+    tbx_sandbox_teardown
+    return 0
+}
+trap cleanup EXIT
+
+probe_note "servers"
+STARTED=()
+for socket in "$FRIRING_SOCKET" "$TMP_SOCKET" "$TMUX_TMPDIR_SOCKET" "$TMPDIR_SOCKET"; do
+    if probe_tmux_server "$socket"; then
+        STARTED+=("$socket")
+        printf '  started %s\n' "$socket"
+    else
+        printf '  SKIPPED %s (could not start)\n' "$socket"
+    fi
+done
+STARTED+=("$OUTER_SOCKET")
+printf '  inherited %s through the TMUX variable\n' "$OUTER_SOCKET"
+
+# Every mode, and in each one the positive controls come **first** — as a
+# precondition, not as a nicety. `probe_denied` reads an exit status, so a mode
+# whose launches never start passes the whole deny set for the reason nothing
+# ran, and a tally that counted those would report a boundary nothing observed.
+# The modes really do differ here: `--unshare-net` is added for everything but
+# `full`, and its loopback setup is what a restricted kernel refuses.
+# `bridge-conformance` runs `none`, so `none` is the one that had to be covered —
+# and a mode that stops launching is a **failure** unless a one-shot was never
+# able to launch in it, which is `probe_mode_unlaunchable`'s whole job.
+for mode in full allowlist none; do
+    probe_note "network_mode = $mode"
+    PROBE_PROFILE="probe-$mode"
+    probe_profile "$PROBE_PROFILE" "$mode"
+    if ! probe_launches; then
+        probe_mode_unlaunchable "$mode"
+        continue
+    fi
+    probe_allowed "the workspace is writable" \
+        -- sh -c "printf x > '$PROBE_WORKSPACE/probe.txt'"
+    probe_allowed "the workspace is readable" -- cat "$PROBE_WORKSPACE/probe.txt"
+    for socket in "${STARTED[@]}"; do
+        probe_denied "tmux at $socket" -- tmux -S "$socket" list-windows
+    done
+    # shellcheck disable=SC2016  # the inner shell is meant to expand it, not this one
+    probe_denied 'the inherited TMUX address is gone' -- sh -c '[ -n "${TMUX:-}" ]'
+done
+
+# Why `allowlist` is the mode that goes unexercised, asserted rather than
+# asserted-about: friring refuses a **filtered** profile to a one-shot outright,
+# because the proxy that enforces it lives in a running friring and a one-shot
+# would bind that listener and take it away again. The refusal is the product's
+# and it is correct; it also means no harness here can put a filtered profile
+# under a real kernel, and `bridge-conformance` runs `none` rather than
+# `allowlist`, so nothing else covers it either.
+probe_note "a one-shot under a filtered profile"
+PROBE_PROFILE="probe-allowlist"
+if probe_launches; then
+    probe_bad "a one-shot ran under a filtered profile: it would take over the \
+egress listener a running friring owns"
+else
+    probe_ok "a one-shot is refused under a filtered profile — the proxy that \
+enforces one lives in a running friring"
+fi
+
+probe_note "positive controls (a socket under the workspace)"
+PROBE_PROFILE="probe-full"
+if probe_tmux_server "$INNER_SOCKET"; then
+    probe_allowed "a tmux server under the workspace is reachable" \
+        -- tmux -S "$INNER_SOCKET" list-windows
+else
+    printf '  SKIPPED  a tmux server under the workspace (could not start)\n'
+fi
+
+# ── The namespace's own two properties ───────────────────────────────────
+
+probe_note "friring's own trees"
+probe_other_gate
+
+probe_note "the namespace"
+
+# The property is that the launch is in a pid namespace **of its own**, so its
+# teardown takes everything in it — a relay included. Asserted on the
+# namespace's identity rather than on a pid number: without `--as-pid-1` bwrap
+# keeps a reaper at pid 1 and the wrapped program is the next pid, which is a
+# namespace of its own exactly as much, so a number would be testing a bwrap
+# flag friring does not pass. `/proc/self/ns/pid` is the kernel's own name for
+# the namespace — two processes in one namespace read the same inode — and the
+# boundary mounts a fresh `/proc`, so the comparison is like for like.
+#
+# Both readings must **succeed**, and each whole answer must be exactly one
+# `pid:[<digits>]`, before they are compared. Searching instead of validating is
+# how a failed launch passes this: a refusal is still output, one good line
+# among junk still matches, and any non-empty string that differs from the
+# host's then reads as isolation. `x=$(grep …)` would also exit the script under
+# `set -e` on no match, before anything could report why.
+#
+# The sandbox's answer is read from a **file the launch writes**, not from its
+# stdout. `friring-cli` prints a one-line summary of the applied boundary after
+# the wrapped command's own output, and with stdout redirected — which every
+# command substitution does — that line is JSON, whatever format flags are
+# passed. So stdout always carries a trailer, and a file in the workspace this
+# profile grants holds the command's answer and nothing else.
+NS_FILE="$PROBE_WORKSPACE/pid-namespace"
+rm -f "$NS_FILE"
+HOST_RAW=""
+SANDBOX_RAW=""
+HOST_PIDNS=""
+SANDBOX_PIDNS=""
+if ! HOST_RAW=$(readlink /proc/self/ns/pid 2>/dev/null); then HOST_RAW=""; fi
+if probe_run sh -c "readlink /proc/self/ns/pid > '$NS_FILE'" >/dev/null 2>&1; then
+    if ! SANDBOX_RAW=$(cat "$NS_FILE" 2>/dev/null); then SANDBOX_RAW=""; fi
+fi
+rm -f "$NS_FILE"
+if [[ "$HOST_RAW" =~ ^pid:\[[0-9]+\]$ ]]; then HOST_PIDNS="$HOST_RAW"; fi
+if [[ "$SANDBOX_RAW" =~ ^pid:\[[0-9]+\]$ ]]; then SANDBOX_PIDNS="$SANDBOX_RAW"; fi
+if [ -z "$HOST_PIDNS" ] || [ -z "$SANDBOX_PIDNS" ]; then
+    probe_bad "could not read one pid namespace from each side to compare"
+    printf '%s' "${HOST_RAW:-(nothing)}" | head -3 | sed 's/^/          host:    /'
+    printf '%s' "${SANDBOX_RAW:-(nothing)}" | head -3 | sed 's/^/          sandbox: /'
+elif [ "$SANDBOX_PIDNS" = "$HOST_PIDNS" ]; then
+    probe_bad "the launch shares the host's pid namespace ($HOST_PIDNS): its \
+teardown would leave anything it started, a relay included"
+else
+    probe_ok "the launch has a pid namespace of its own \
+($SANDBOX_PIDNS, not the host's $HOST_PIDNS)"
+fi
+
+# And nothing of the launch is left on the host. `sandbox exec` composes no
+# relay (it refuses a filtered profile — a one-shot cannot own a proxy), so what
+# this asserts is the stronger statement: the probe's own launches left none.
+RELAYS=$(pgrep -fa 'friring-cli sandbox relay' 2>/dev/null || true)
+if [ -z "$RELAYS" ]; then
+    probe_ok "no sandbox relay survived a launch"
+else
+    probe_bad "a sandbox relay is still running: $RELAYS"
+fi
+
+probe_summary

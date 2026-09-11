@@ -63,6 +63,11 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # System metrics
 sysinfo = "0.39"
 
+# Content digests for extension `[[requires]]` file-digest checks. Already in
+# the tree transitively; declared directly so the check uses a version this
+# crate pins rather than whatever a dependency happens to resolve.
+sha2 = "0.10"
+
 # Error handling
 anyhow = "1.0"
 
@@ -94,9 +99,14 @@ serde_ignored = "0.1.14"
 # (WSL toast) shells out to `powershell.exe`, also no notify-rust.
 [target.'cfg(target_os = "linux")'.dependencies]
 notify-rust = "4"
+
 # `sysconf(_SC_PAGESIZE)` — the page size /proc/<pid>/statm counts sessions'
 # resident memory in. Already in the tree transitively; declared so the direct
 # use is honest. aarch64 Linux ships 16K/64K pages, so it can't be assumed.
+# `getuid` names the `tmux-<uid>` socket directory a sandbox policy denies, and
+# `open`/`fcntl` are how the gated launch helper opens the release file without
+# following a symlink — both on macOS as well as Linux, so this is `cfg(unix)`.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [[bin]]

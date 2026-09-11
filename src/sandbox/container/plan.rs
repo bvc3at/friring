@@ -29,7 +29,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::sandbox::backend::{SandboxError, SandboxResult, PROTECTED_IN_WRITABLE_ROOT};
+use crate::sandbox::backend::{SandboxError, SandboxResult};
 use crate::sandbox::dirs;
 use crate::session::{NetworkMode, SandboxPolicy};
 
@@ -219,9 +219,10 @@ pub fn plan_instance(input: PlanInput<'_>) -> SandboxResult<InstancePlan> {
     // bind a missing source either fails the create or invents a root-owned
     // directory inside somebody's repository.
     for root in &policy.rw_paths {
-        let hooks = format!("{root}/{PROTECTED_IN_WRITABLE_ROOT}");
-        if (input.check.exists)(&hooks) {
-            mounts.push(Mount::identical(&hooks, false));
+        for hooks in crate::sandbox::backend::protected_paths_in(root) {
+            if (input.check.exists)(&hooks) {
+                mounts.push(Mount::identical(&hooks, false));
+            }
         }
     }
 
@@ -711,6 +712,44 @@ mod tests {
         assert!(!hooks.writable);
     }
 
+    /// The two git shapes a bridge child is granted, mounted read-only inside
+    /// the writable roots that carry them.
+    ///
+    /// A place mounts only what exists — an engine asked to bind a missing
+    /// source invents a root-owned file inside somebody's repository — so this
+    /// asserts against `exists: &everything`, which is the state a real
+    /// repository is in for every one of these: git writes `config`, `HEAD`,
+    /// `index`, `gitdir` and `commondir` when it creates them. `config.worktree`
+    /// is the exception and is inert without `extensions.worktreeConfig`, which
+    /// lives in the `config` this protects.
+    #[test]
+    fn a_shared_git_directory_and_a_childs_metadata_mount_their_redirects_read_only() {
+        let shared = "/repo/.git";
+        let mine = "/repo/.git/worktrees/child-a";
+        let policy = resolved(SandboxProfile::new(
+            "child",
+            vec![SandboxPath::workspace(shared), SandboxPath::workspace(mine)],
+        ));
+        let plan = plan_for(&policy).unwrap();
+        let read_only = |path: &str| {
+            !plan
+                .mounts
+                .iter()
+                .find(|m| m.source == path)
+                .unwrap_or_else(|| panic!("{path} is not mounted at all"))
+                .writable
+        };
+        for name in crate::sandbox::backend::PROTECTED_IN_GIT_DIR {
+            assert!(read_only(&format!("{shared}/{name}")), "{name} is writable");
+        }
+        for name in crate::sandbox::backend::PROTECTED_IN_WORKTREE_METADATA {
+            assert!(read_only(&format!("{mine}/{name}")), "{name} is writable");
+        }
+        // Both roots stay writable, which is what lets a child commit.
+        assert!(plan.mounts.iter().any(|m| m.source == shared && m.writable));
+        assert!(plan.mounts.iter().any(|m| m.source == mine && m.writable));
+    }
+
     /// ADR-29 is absolute, and a container makes the read-only half matter: a
     /// read-only bind of the data directory would still carry the automation
     /// commands the *host* executes.
@@ -956,7 +995,11 @@ mod tests {
         for mount in &planned.mounts {
             let known = declared.iter().chain(&minted).any(|path| {
                 mount.source == *path
-                    || mount.source == format!("{path}/{PROTECTED_IN_WRITABLE_ROOT}")
+                    || mount.source
+                        == format!(
+                            "{path}/{}",
+                            crate::sandbox::backend::PROTECTED_IN_WRITABLE_ROOT
+                        )
             });
             assert!(known, "unexpected mount source {}", mount.source);
         }

@@ -172,6 +172,13 @@ pub struct ProxyGrant {
     /// instance's token inside the proxy URLs, which is why `Debug` prints the
     /// variable names and not their values.
     pub env: BTreeMap<String, String>,
+    /// The credential this instance demands, for the launch to persist so a
+    /// restart can rebind the same one.
+    ///
+    /// Handed over here rather than parsed back out of a proxy URL: a value that
+    /// has to be re-extracted from a string is a value two pieces of code can
+    /// disagree about. Withheld from `Debug` for the reason the URLs are.
+    pub token: String,
 }
 
 impl fmt::Debug for ProxyGrant {
@@ -185,6 +192,7 @@ impl fmt::Debug for ProxyGrant {
         f.debug_struct("ProxyGrant")
             .field("endpoint", &self.endpoint)
             .field("env", &self.env.keys().collect::<Vec<_>>())
+            .field("token", &"<redacted>")
             .finish()
     }
 }
@@ -509,6 +517,7 @@ pub fn prepare_at(
         grant: ProxyGrant {
             endpoint,
             env: bound.env,
+            token: bound.token,
         },
         pending,
     })
@@ -530,6 +539,153 @@ pub fn establish(
     let prepared = prepare(session_key, policy, transport, scratch)?;
     prepared.pending.commit();
     Ok(prepared.grant)
+}
+
+/// Bring a session's proxy back at the **exact** endpoint and token it had.
+///
+/// The restart story. A filtered session's listener lives in the friring
+/// process, so a restart leaves an agent that is still running holding proxy
+/// URLs naming a port and a credential nothing answers on any more. Rebinding
+/// the same pair is the only thing that puts it back — which is why nothing
+/// here is allowed to drift:
+///
+/// - **The port is the persisted one**, and on both loopback families. `::1` and
+///   `127.0.0.1` are two addresses and an agent's client may resolve `localhost`
+///   to either, so a rebind that took only one would work for some agents and
+///   not others.
+/// - **The token is the persisted one.** Minting a fresh one would leave the
+///   running agent presenting a credential the new listener refuses — a sandbox
+///   that looks filtered and reaches nothing, which is the failure nobody
+///   diagnoses.
+/// - **The policy is re-read**, because the profile may have been edited between
+///   the two runs and the boundary that comes back must be the one written down
+///   now. That is the one thing that deliberately *does* change.
+///
+/// The endpoint is the persisted `tcp:<port>` / `unix:<path>` string.
+///
+/// # Errors
+///
+/// The endpoint could not be parsed, the port or the socket path is taken, or
+/// the policy carries a rule the proxy will not load. Every one fails **closed**:
+/// the caller records [`EgressState::Unrestorable`] and leaves the token alone,
+/// so the agent stays kernel-closed rather than being handed a listener it
+/// cannot authenticate to.
+///
+/// [`EgressState::Unrestorable`]: crate::session::EgressState::Unrestorable
+pub fn establish_at(
+    session_key: &str,
+    policy: &SandboxPolicy,
+    transport: ProxyTransport,
+    endpoint: &str,
+    token: &str,
+) -> SandboxResult<ProxyGrant> {
+    let refuse = |detail: String| SandboxError::Refused {
+        profile: policy.profile.clone(),
+        detail,
+    };
+    let rules = proxy_policy(policy).map_err(|error| {
+        refuse(format!(
+            "the egress proxy refused this profile's domain rules: {error:#}"
+        ))
+    })?;
+    let bind = match (transport, PersistedEndpoint::parse(endpoint)) {
+        (ProxyTransport::Loopback, Some(PersistedEndpoint::Port(port))) => {
+            StartBind::LoopbackPort(port)
+        }
+        (ProxyTransport::UnixSocket, Some(PersistedEndpoint::Socket(path))) => {
+            StartBind::UnixSocketAt {
+                path,
+                relay: relay_addr(),
+            }
+        }
+        // A backend whose transport changed under a session — a profile edited
+        // from a policy backend to a place, or the reverse — has no endpoint to
+        // restore, because the one recorded is not one it can reach. Refused
+        // rather than silently rebound somewhere else: the running agent's URLs
+        // name the old one either way.
+        (_, Some(_)) => {
+            return Err(refuse(format!(
+                "the recorded egress endpoint '{endpoint}' is not one this session's backend can \
+                 reach, so restoring it would hand the agent an address it cannot dial"
+            )))
+        }
+        (_, None) => {
+            return Err(refuse(format!(
+                "the recorded egress endpoint '{endpoint}' is not a 'tcp:<port>' or \
+                 'unix:<path>' value friring wrote"
+            )))
+        }
+    };
+    let bound = supervisor()
+        .start_with_token(session_key, rules, bind, Some(token.to_string()))
+        .map_err(|error| {
+            refuse(format!(
+                "the egress proxy could not be restored at '{endpoint}': {error}"
+            ))
+        })?;
+    let pending = PendingEgress {
+        key: session_key.to_string(),
+        outcome: Outcome::Take(bound.id),
+    };
+    let restored = match (bound.unix.clone(), bound.tcp) {
+        (Some(socket), _) => ProxyEndpoint::UnixSocket {
+            host_path: socket.clone(),
+            inside_path: socket,
+        },
+        (None, Some(addr)) => ProxyEndpoint::Loopback { port: addr.port() },
+        (None, None) => {
+            return Err(refuse(
+                "the restored egress proxy has no listener to hand the sandbox".to_string(),
+            ))
+        }
+    };
+    let grant = ProxyGrant {
+        endpoint: restored,
+        env: bound.env,
+        token: bound.token,
+    };
+    pending.commit();
+    Ok(grant)
+}
+
+/// A persisted `egress_endpoint` value, parsed back.
+///
+/// Two spellings, one per transport, so the stored string says which kind of
+/// listener it names rather than being guessed at from its shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistedEndpoint {
+    /// `tcp:<port>` — a seatbelt sandbox's host loopback listener.
+    Port(u16),
+    /// `unix:<path>` — a namespaced sandbox's bind-mounted socket.
+    Socket(String),
+}
+
+impl PersistedEndpoint {
+    /// The stored spelling of a live endpoint.
+    pub fn of(endpoint: &ProxyEndpoint) -> Self {
+        match endpoint {
+            ProxyEndpoint::Loopback { port } => Self::Port(*port),
+            ProxyEndpoint::UnixSocket { host_path, .. } => Self::Socket(host_path.clone()),
+        }
+    }
+
+    /// Read one back. `None` for anything friring did not write.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.split_once(':') {
+            Some(("tcp", port)) => port.parse().ok().map(Self::Port),
+            Some(("unix", path)) if !path.is_empty() => Some(Self::Socket(path.to_string())),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for PersistedEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Port(port) => write!(f, "tcp:{port}"),
+            Self::Socket(path) => write!(f, "unix:{path}"),
+        }
+    }
 }
 
 /// Stop the proxy a session was given, if it has one — and release a prepared
@@ -690,6 +846,9 @@ struct Bound {
     /// The socket path the supervisor chose. See [`StartBind::UnixSocket`].
     unix: Option<String>,
     env: BTreeMap<String, String>,
+    /// The credential this instance demands. Never rendered — see [`Bound`]'s
+    /// own `Debug`.
+    token: String,
 }
 
 impl fmt::Debug for Bound {
@@ -699,6 +858,7 @@ impl fmt::Debug for Bound {
             .field("tcp", &self.tcp)
             .field("unix", &self.unix)
             .field("env", &self.env.keys().collect::<Vec<_>>())
+            .field("token", &"<redacted>")
             .finish()
     }
 }
@@ -723,6 +883,18 @@ enum StartBind {
         alternate: String,
         relay: SocketAddr,
     },
+    /// **Exactly** this host loopback port, on both families — what a restart
+    /// rebinds a seatbelt session's proxy at.
+    ///
+    /// An ephemeral port would be a different address from the one the agent
+    /// that is still running was told about, which is the whole reason this
+    /// variant exists. Both `127.0.0.1` and `::1`, because `localhost` resolves
+    /// to either depending on the client and a rebind that took one would work
+    /// for some agents and not others.
+    LoopbackPort(u16),
+    /// **Exactly** this socket path — what a restart rebinds a namespaced
+    /// session's proxy at, at the path already bind-mounted into its boundary.
+    UnixSocketAt { path: String, relay: SocketAddr },
 }
 
 /// One instruction for the supervisor thread.
@@ -732,6 +904,9 @@ enum Command {
         /// Boxed to keep every variant the size of the smallest one.
         policy: Box<Policy>,
         bind: StartBind,
+        /// The credential this instance must demand, or `None` to mint one.
+        /// Only a restore supplies it — see `Supervisor::start_with_token`.
+        token: Option<String>,
         reply: std::sync::mpsc::Sender<Result<Bound, String>>,
     },
     /// Give a prepared instance to its session, retiring the one it replaces.
@@ -764,7 +939,10 @@ enum Command {
     /// would still pass. The wire-level half of the same claim — a live policy
     /// change turning a refusal into a tunnel — is
     /// `proxy::tests::a_policy_update_takes_effect_without_a_restart`.
-    #[cfg(test)]
+    ///
+    /// Also the supervisor's **acknowledgement**: an answer means it holds this
+    /// session's committed instance, which is what turns a launch's
+    /// `EgressState::Preparing` into `Active` (see [`acknowledged`]).
     Rules {
         key: String,
         reply: std::sync::mpsc::Sender<Option<Vec<String>>>,
@@ -818,11 +996,27 @@ impl Supervisor {
     }
 
     fn start(&self, key: &str, policy: Policy, bind: StartBind) -> Result<Bound, String> {
+        self.start_with_token(key, policy, bind, None)
+    }
+
+    /// [`start`](Self::start), with the token the instance must demand.
+    ///
+    /// `None` mints a fresh one, which is what every ordinary launch does.
+    /// `Some` is the restore path and only the restore path: the agent that is
+    /// still running holds proxy URLs carrying that exact value.
+    fn start_with_token(
+        &self,
+        key: &str,
+        policy: Policy,
+        bind: StartBind,
+        token: Option<String>,
+    ) -> Result<Bound, String> {
         let (reply, answer) = std::sync::mpsc::channel();
         self.send(Command::Start {
             key: key.to_string(),
             policy: Box::new(policy),
             bind,
+            token,
             reply,
         });
         // A plain blocking receive, not `tokio::sync`: this runs on whatever
@@ -852,6 +1046,7 @@ async fn serve(mut commands: mpsc::UnboundedReceiver<Command>) {
                 key,
                 policy,
                 bind,
+                token,
                 reply,
             } => {
                 // A composition nobody launched has no claim on a listener —
@@ -859,8 +1054,9 @@ async fn serve(mut commands: mpsc::UnboundedReceiver<Command>) {
                 if let Some((_, superseded)) = pending.remove(&key) {
                     superseded.shutdown().await;
                 }
-                let (socket, relay) = match &bind {
-                    StartBind::Loopback => (None, None),
+                let (socket, relay, pinned_port) = match &bind {
+                    StartBind::Loopback => (None, None, None),
+                    StartBind::LoopbackPort(port) => (None, None, Some(*port)),
                     StartBind::UnixSocket {
                         primary,
                         alternate,
@@ -872,14 +1068,29 @@ async fn serve(mut commands: mpsc::UnboundedReceiver<Command>) {
                         } else {
                             primary.clone()
                         };
-                        (Some(path), Some(*relay))
+                        (Some(path), Some(*relay), None)
+                    }
+                    // No alternate: a restore rebinds the path already
+                    // bind-mounted into a running boundary, and any other path
+                    // is unreachable from inside it.
+                    StartBind::UnixSocketAt { path, relay } => {
+                        (Some(path.clone()), Some(*relay), None)
                     }
                 };
                 let config = ProxyConfig {
-                    bind: match &socket {
-                        Some(path) => ProxyBind::unix(path),
-                        None => ProxyBind::tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+                    // A pinned port rather than an ephemeral one is the whole
+                    // of a restore: `Proxy::start` already claims the *same*
+                    // port on both loopback families, because a client
+                    // resolving `localhost` may pick either and the seatbelt
+                    // rule cannot tell them apart.
+                    bind: match (&socket, pinned_port) {
+                        (Some(path), _) => ProxyBind::unix(path),
+                        (None, port) => ProxyBind::tcp(SocketAddr::from((
+                            Ipv4Addr::LOCALHOST,
+                            port.unwrap_or(0),
+                        ))),
                     },
+                    token,
                     ..ProxyConfig::new(*policy)
                 };
                 let started = match Proxy::start(config).await {
@@ -901,6 +1112,7 @@ async fn serve(mut commands: mpsc::UnboundedReceiver<Command>) {
                     id: next_id,
                     tcp: proxy.tcp_addr(),
                     unix: socket,
+                    token: proxy.token().to_string(),
                     env: match endpoint {
                         Some(addr) => proxy_env(
                             &proxy.http_proxy_url_at(addr),
@@ -958,7 +1170,6 @@ async fn serve(mut commands: mpsc::UnboundedReceiver<Command>) {
                 }
                 let _ = reply.send(running.is_some());
             }
-            #[cfg(test)]
             Command::Rules { key, reply } => {
                 let rules = proxies.get(&key).map(|proxy| {
                     proxy
@@ -978,6 +1189,23 @@ async fn serve(mut commands: mpsc::UnboundedReceiver<Command>) {
     for (_, proxy) in proxies.drain() {
         proxy.shutdown().await;
     }
+}
+
+/// Whether the supervisor has this session's committed instance — the
+/// acknowledgement that turns [`EgressState::Preparing`] into
+/// [`EgressState::Active`].
+///
+/// Asked of the supervisor rather than assumed from a successful
+/// [`PendingEgress::commit`], because a commit is a *message*: it is sent to the
+/// supervisor thread and returns immediately, so a caller that inferred "active"
+/// from it would be recording that a boundary is filtered before anything had
+/// agreed to filter it. A silent supervisor answers `false`, and Stage F's saga
+/// treats that as a failure rather than releasing the child's gate.
+///
+/// [`EgressState::Preparing`]: crate::session::EgressState::Preparing
+/// [`EgressState::Active`]: crate::session::EgressState::Active
+pub fn acknowledged(session_key: &str) -> bool {
+    running_allow_rules(session_key).is_some()
 }
 
 /// Buffer one session's refusals until the TUI drains them. Ends when the proxy
@@ -1023,7 +1251,9 @@ pub(crate) fn record_denial_for_test(denial: SessionDenial) {
 
 /// The allow rules a session's running proxy is enforcing, in the proxy's own
 /// canonical spelling — `None` when nothing is running for that key.
-#[cfg(test)]
+///
+/// Also the acknowledgement [`acknowledged`] asks for: a supervisor that answers
+/// with the rules is a supervisor that holds this session's committed instance.
 pub(crate) fn running_allow_rules(session_key: &str) -> Option<Vec<String>> {
     let (reply, answer) = std::sync::mpsc::channel();
     SUPERVISOR.get()?.send(Command::Rules {
@@ -1150,6 +1380,7 @@ mod tests {
                 "http://friring:s3cr3t@127.0.0.1:9",
                 "socks5h://friring:s3cr3t@127.0.0.1:9",
             ),
+            token: "s3cr3t".to_string(),
         };
         let printed = format!("{grant:?}");
         assert!(!printed.contains("s3cr3t"), "{printed}");
@@ -1232,6 +1463,141 @@ mod tests {
             "a relaunch must mint a fresh credential, not just a fresh port"
         );
         stop("egress-loopback");
+    }
+
+    /// The restart story: the same port, the same credential, and the policy as
+    /// it stands **now**.
+    ///
+    /// The agent that is still running holds proxy URLs naming both, so a
+    /// rebind that changed either would leave it dialling a port nothing answers
+    /// on or presenting a credential the new listener refuses — a sandbox that
+    /// looks filtered and reaches nothing.
+    #[test]
+    fn a_restore_rebinds_the_same_port_with_the_same_credential() {
+        let original = policy(NetworkMode::Allowlist, &["github.com"], &[]);
+        let scratch = test_scratch("restore-loopback");
+        let grant = establish(
+            "egress-restore",
+            &original,
+            ProxyTransport::Loopback,
+            &scratch,
+        )
+        .expect("the proxy binds a loopback port");
+        let ProxyEndpoint::Loopback { port } = grant.endpoint else {
+            panic!("expected a loopback endpoint");
+        };
+        let token = grant.token.clone();
+        let endpoint = PersistedEndpoint::Port(port).to_string();
+        assert_eq!(endpoint, format!("tcp:{port}"));
+
+        // The friring that owned it is gone; nothing is listening any more.
+        stop("egress-restore");
+
+        // A profile edited between the two runs: the boundary that comes back
+        // is the one written down now, which is the one thing that changes.
+        let edited = policy(NetworkMode::Allowlist, &["github.com", "crates.io"], &[]);
+        let restored = establish_at(
+            "egress-restore",
+            &edited,
+            ProxyTransport::Loopback,
+            &endpoint,
+            &token,
+        )
+        .expect("the proxy comes back at the same endpoint");
+
+        assert_eq!(restored.endpoint, ProxyEndpoint::Loopback { port });
+        assert_eq!(restored.token, token, "a restore must not rotate the token");
+        let http = restored.env.get("HTTP_PROXY").expect("HTTP_PROXY is set");
+        assert!(http.contains(&token), "the URLs carry the restored token");
+        assert!(http.ends_with(&format!("@127.0.0.1:{port}")), "{http}");
+        // The supervisor holds it, which is what turns `Preparing` into
+        // `Active`.
+        assert!(acknowledged("egress-restore"));
+        let rules = running_allow_rules("egress-restore").expect("the restored proxy is running");
+        assert!(
+            rules.iter().any(|r| r.contains("crates.io")),
+            "the re-read policy takes effect: {rules:?}"
+        );
+        stop("egress-restore");
+    }
+
+    /// A port something else holds is a refusal, not a fresh port: the running
+    /// agent's URLs name the old one, so a listener anywhere else is no use to
+    /// it and would only hide the problem.
+    #[test]
+    fn a_taken_port_refuses_the_restore_rather_than_moving() {
+        let policy = policy(NetworkMode::Allowlist, &["github.com"], &[]);
+        let scratch = test_scratch("restore-taken");
+        let grant = establish("egress-taken", &policy, ProxyTransport::Loopback, &scratch)
+            .expect("the proxy binds");
+        let ProxyEndpoint::Loopback { port } = grant.endpoint else {
+            panic!("expected a loopback endpoint");
+        };
+        // Still listening under one key; restoring the *same* port under
+        // another is the collision a second friring, or a stray process, makes.
+        let error = establish_at(
+            "egress-taken-other",
+            &policy,
+            ProxyTransport::Loopback,
+            &format!("tcp:{port}"),
+            &grant.token,
+        )
+        .expect_err("a port in use cannot be restored");
+        assert!(
+            error.to_string().contains("could not be restored"),
+            "{error}"
+        );
+        assert!(!acknowledged("egress-taken-other"));
+        stop("egress-taken");
+    }
+
+    /// A stored value friring did not write names nothing, so it is refused
+    /// rather than guessed at.
+    #[test]
+    fn a_malformed_endpoint_is_refused() {
+        assert_eq!(
+            PersistedEndpoint::parse("tcp:8123"),
+            Some(PersistedEndpoint::Port(8123))
+        );
+        assert_eq!(
+            PersistedEndpoint::parse("unix:/s/p.sock"),
+            Some(PersistedEndpoint::Socket("/s/p.sock".to_string()))
+        );
+        for raw in ["", "8123", "tcp:", "unix:", "http://x", "tcp:not-a-port"] {
+            assert_eq!(PersistedEndpoint::parse(raw), None, "{raw:?}");
+        }
+
+        let policy = policy(NetworkMode::Allowlist, &["github.com"], &[]);
+        let error = establish_at(
+            "egress-malformed",
+            &policy,
+            ProxyTransport::Loopback,
+            "not-an-endpoint",
+            "tok",
+        )
+        .expect_err("a value friring did not write names nothing");
+        assert!(error.to_string().contains("not a 'tcp:<port>'"), "{error}");
+    }
+
+    /// A profile edited from one backend shape to the other has no endpoint to
+    /// restore: the recorded one is not an address the new transport can reach.
+    #[test]
+    fn an_endpoint_the_transport_cannot_reach_is_refused() {
+        let policy = policy(NetworkMode::Allowlist, &["github.com"], &[]);
+        let error = establish_at(
+            "egress-mismatch",
+            &policy,
+            ProxyTransport::UnixSocket,
+            "tcp:8123",
+            "tok",
+        )
+        .expect_err("a loopback endpoint is unreachable from a namespaced sandbox");
+        assert!(
+            error
+                .to_string()
+                .contains("is not one this session's backend can reach"),
+            "{error}"
+        );
     }
 
     /// The bwrap shape: a socket in the session's scratch directory, and an

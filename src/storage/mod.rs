@@ -12,6 +12,7 @@
 
 pub mod audit;
 pub mod automations;
+pub mod bridge;
 pub mod keybindings;
 pub mod messages;
 pub mod repo_bookmarks;

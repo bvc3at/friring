@@ -307,6 +307,21 @@ fn first_line(body: &str) -> String {
     }
 }
 
+/// The **one exact literal** friring types into a bridge child's pane when it
+/// has mail (ADR-30).
+///
+/// Nothing is formatted into it, and that is the whole point. A nudge is typed
+/// into a live agent's prompt, so any part of it that came from a *message*
+/// would be a way for one sandboxed session to put chosen text in front of
+/// another agent — the shape of every prompt-injection this design exists to
+/// close. The mail itself is read through `friring-cli bridge inbox`, where it
+/// arrives as data the agent parses rather than as words it was told.
+///
+/// A test asserts this constant carries no placeholder and that no code path
+/// formats into it.
+pub const BRIDGE_NUDGE: &str =
+    "friring: you have new mail. Read it with `friring-cli bridge inbox --claim --json`.";
+
 /// What one wake attempt did.
 pub(crate) enum Wake {
     /// The nudge was typed into the recipient's pane.
@@ -491,6 +506,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         };
         db.upsert_session(&shared).unwrap();
         id

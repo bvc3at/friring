@@ -23,6 +23,12 @@ use super::Database;
 /// Hard cap on the number of *unread* messages a single recipient may hold.
 /// Enqueue is rejected past this, so one sender plus a stuck (never-draining)
 /// recipient can't grow the table without bound — backpressure, not silent loss.
+///
+/// The ceiling for an ordinary mailbox. A caller that knows its recipient
+/// deserves a tighter bound passes it to
+/// [`enqueue_message_capped`](Database::enqueue_message_capped); the bridge
+/// does, because a sandboxed agent chooses both how much it sends and when it
+/// drains (see [`crate::session::bridge::MAX_UNREAD_PER_CHILD`]).
 pub const MAX_UNREAD_PER_RECIPIENT: usize = 500;
 
 /// Default cap on how many messages a single `list`/`claim` returns when the
@@ -83,17 +89,38 @@ impl Database {
     ///
     /// Validates `kind`/`body` (see
     /// [`MAX_KIND_LEN`](crate::session::message::MAX_KIND_LEN) /
-    /// [`MAX_BODY_LEN`](crate::session::message::MAX_BODY_LEN)) and enforces the
-    /// per-recipient unread cap atomically as part of the insert.
+    /// [`MAX_BODY_LEN`](crate::session::message::MAX_BODY_LEN)) and enforces
+    /// [`MAX_UNREAD_PER_RECIPIENT`] atomically as part of the insert.
+    pub fn enqueue_message(&self, new: &NewMessage) -> Result<i64, EnqueueError> {
+        self.enqueue_message_capped(new, MAX_UNREAD_PER_RECIPIENT)
+    }
+
+    /// [`enqueue_message`](Self::enqueue_message) under a caller-chosen unread
+    /// cap.
+    ///
+    /// The cap is the caller's because only the caller knows what the recipient
+    /// is. A bridge child's inbox is filled by its owner and drained by an agent
+    /// inside a sandbox, so it is held to
+    /// [`MAX_UNREAD_PER_CHILD`](crate::session::bridge::MAX_UNREAD_PER_CHILD)
+    /// rather than to the generic ceiling — at the bridge's 64 KiB body bound
+    /// the difference is ~3 MiB of undrained mail per recipient instead of ~32.
+    ///
+    /// `cap` above [`MAX_UNREAD_PER_RECIPIENT`] is clamped down to it: this
+    /// tightens a mailbox, it never widens one.
     ///
     /// The cap check and the insert are a **single** `INSERT … SELECT … WHERE`
     /// statement: the row is written only if the recipient's unread count is
-    /// still below [`MAX_UNREAD_PER_RECIPIENT`] *at insert time*. SQLite
-    /// serializes writers, so two concurrent senders can't both pass the cap and
-    /// both insert (the TOCTOU a separate count-then-insert would allow). A zero
-    /// row-count means the guard rejected it → [`EnqueueError::InboxFull`].
-    pub fn enqueue_message(&self, new: &NewMessage) -> Result<i64, EnqueueError> {
+    /// still below `cap` *at insert time*. SQLite serializes writers, so two
+    /// concurrent senders can't both pass the cap and both insert (the TOCTOU a
+    /// separate count-then-insert would allow). A zero row-count means the guard
+    /// rejected it → [`EnqueueError::InboxFull`].
+    pub fn enqueue_message_capped(
+        &self,
+        new: &NewMessage,
+        cap: usize,
+    ) -> Result<i64, EnqueueError> {
         validate_kind_body(&new.kind, &new.body).map_err(EnqueueError::Invalid)?;
+        let cap = cap.min(MAX_UNREAD_PER_RECIPIENT);
 
         let now = current_time_millis() as i64;
         let inserted = self.conn.execute(
@@ -112,14 +139,12 @@ impl Database {
                 new.kind,
                 new.body,
                 now,
-                MAX_UNREAD_PER_RECIPIENT as i64,
+                cap as i64,
                 new.in_reply_to,
             ],
         )?;
         if inserted == 0 {
-            return Err(EnqueueError::InboxFull {
-                cap: MAX_UNREAD_PER_RECIPIENT,
-            });
+            return Err(EnqueueError::InboxFull { cap });
         }
         Ok(self.conn.last_insert_rowid())
     }
@@ -182,6 +207,58 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(n as usize)
+    }
+
+    /// Which of `recipients` have unread mail of one of `kinds`.
+    ///
+    /// One statement for the whole set, rather than a
+    /// [`Self::count_unread_messages`] per session: the bridge's broker asks
+    /// this about every session it serves, on a repeating pass. Served by the
+    /// partial index `idx_session_messages_unread`, which is exactly the
+    /// unread half of this predicate.
+    ///
+    /// `kinds` is what keeps it a question about the bridge. This mailbox is
+    /// shared with `friring-cli message send`, which has a `--no-wake` for
+    /// "deliver this without interrupting them" — and a recipient that also
+    /// happens to be a bridge session would be typed at anyway if every unread
+    /// row counted.
+    pub fn sessions_with_unread_messages(
+        &self,
+        recipients: &[SessionId],
+        kinds: &[&str],
+    ) -> rusqlite::Result<Vec<SessionId>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One bound parameter per recipient, and SQLite has a ceiling on those
+        // (999 on an older build). A caller with more sessions than that would
+        // otherwise get an error rather than an answer, and its caller treats an
+        // error as "nothing to do" — so the feature would switch itself off on
+        // exactly the large fleet it matters on.
+        const CHUNK: usize = 500;
+        let kind_slots = vec!["?"; kinds.len()].join(", ");
+        let mut out = Vec::new();
+        for chunk in recipients.chunks(CHUNK) {
+            let slots = vec!["?"; chunk.len()].join(", ");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT DISTINCT to_session_id FROM session_messages \
+                 WHERE read_at IS NULL AND to_session_id IN ({slots}) AND kind IN ({kind_slots})"
+            ))?;
+            let params: Vec<String> = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .chain(kinds.iter().map(|k| (*k).to_string()))
+                .collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, String>(0)
+            })?;
+            for row in rows {
+                if let Ok(id) = row?.parse::<SessionId>() {
+                    out.push(id);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Peek at a recipient's inbox **without** marking anything read. Oldest
@@ -308,6 +385,76 @@ mod tests {
             body: body.into(),
             in_reply_to: None,
         }
+    }
+
+    /// The bridge's owed-nudge reconciliation asks about every session it
+    /// serves at once, and one bound parameter per session runs into SQLite's
+    /// ceiling on a fleet that is exactly the size this exists for. Its caller
+    /// reads an error as "nothing owed", so past the ceiling the feature would
+    /// switch itself off silently.
+    ///
+    /// More recipients than the chunk, with unread mail on both sides of the
+    /// boundary and controls that must not be returned.
+    #[test]
+    fn unread_recipients_are_asked_for_across_chunk_boundaries() {
+        let db = Database::open_in_memory().unwrap();
+        let recipients: Vec<SessionId> = (0..1200).map(|_| SessionId::default()).collect();
+        // First, last, and one either side of the 500-boundary.
+        let with_mail = [0usize, 499, 500, 501, 999, 1000, 1199];
+        for &n in &with_mail {
+            db.enqueue_message(&new_msg(recipients[n], "task", "do it"))
+                .unwrap();
+        }
+        // Read mail is not mail it has not taken delivery of.
+        let read_at = recipients[7];
+        db.enqueue_message(&new_msg(read_at, "task", "old"))
+            .unwrap();
+        db.claim_messages(read_at, None).unwrap();
+        // Nor is a kind the bridge did not send.
+        db.enqueue_message(&new_msg(recipients[8], "questions", "q?"))
+            .unwrap();
+
+        let found = db
+            .sessions_with_unread_messages(&recipients, &["task", "report"])
+            .unwrap();
+
+        // Compared as strings: `SessionId` is a uuid newtype with no ordering,
+        // and the query's `DISTINCT` gives no order to rely on.
+        let mut expected: Vec<String> = with_mail
+            .iter()
+            .map(|&n| recipients[n].to_string())
+            .collect();
+        let mut found: Vec<String> = found.iter().map(SessionId::to_string).collect();
+        expected.sort();
+        found.sort();
+        assert_eq!(found, expected);
+    }
+
+    /// The bridge's nudge is about the bridge's own mail. This mailbox is
+    /// shared with `friring-cli message send`, whose `--no-wake` means "do not
+    /// interrupt them" — so a recipient that also happens to be a bridge
+    /// session must not be typed at because of one.
+    #[test]
+    fn unread_recipients_are_scoped_to_the_kinds_asked_for() {
+        let db = Database::open_in_memory().unwrap();
+        let quiet = SessionId::default();
+        db.enqueue_message(&new_msg(quiet, "questions", "no wake"))
+            .unwrap();
+
+        assert!(db
+            .sessions_with_unread_messages(&[quiet], &["task", "report"])
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.sessions_with_unread_messages(&[quiet], &["questions"])
+                .unwrap(),
+            vec![quiet]
+        );
+        // No kinds is no question, not every kind.
+        assert!(db
+            .sessions_with_unread_messages(&[quiet], &[])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

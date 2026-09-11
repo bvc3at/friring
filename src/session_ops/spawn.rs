@@ -312,6 +312,15 @@ fn spawn_session_with(
         display_order: None,
         tombstone: false,
         tombstone_at: None,
+        // A headless spawn reaches tmux through the one-shot helpers rather than
+        // over control mode, so it gets the pane id and no window id or pane
+        // pid. Nothing recorded, which
+        // `MuxIdentity::is_recorded` reads as "friring cannot prove which pane
+        // this is" — the honest answer, and the reason a bridge child is only
+        // ever created from a running TUI.
+        mux: crate::session::MuxIdentity::default(),
+        egress: invocation.egress.clone(),
+        sandbox_overlay: None,
     };
     // The tmux window is already live. If the DB upsert fails now, no row exists
     // for the TUI to adopt and the window would be orphaned — untrackable and
@@ -343,6 +352,18 @@ fn spawn_session_with(
     // The window is live and the row that owns it is committed: this session
     // exists, so its boundary is the session's now.
     egress.commit();
+    // …and `Preparing` becomes `Active` only once the supervisor says it holds
+    // the instance. A commit is a message, so asking is what makes the recorded
+    // state mean the boundary is really filtering.
+    if invocation.egress.state == crate::session::EgressState::Preparing
+        && crate::agent::sandboxing::egress_acknowledged(&session_id.to_string())
+    {
+        if let Err(e) =
+            db.set_session_egress_state(session_id, &crate::session::EgressState::Active)
+        {
+            tracing::warn!("Failed to record the session's egress state: {e}");
+        }
+    }
     if let Some(instance) = &invocation.instance {
         super::record_sandbox_instance(db, instance);
     }
@@ -874,6 +895,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         };
         db.upsert_session(&parent).unwrap();
         assert!(validate_parent_session(&db, Some(parent.id)).is_ok());
@@ -900,6 +924,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
             sandbox_profile: None,
             sandbox_enforcement: crate::session::SandboxEnforcement::default(),
         };

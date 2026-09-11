@@ -1,0 +1,55 @@
+# friring sandbox profile for the codex-park harness.
+#
+# A **fixture**, not a template for real work. `scripts/dev/codex-park-e2e.sh`
+# substitutes the two placeholder paths for the run's own throwaway repository
+# and the directory the `codex` binary lives in, then imports it.
+#
+# One deliberate difference from every other bridge profile here, and it is the
+# one thing this profile is *not* proving: `network_mode = "full"`. The child is
+# a real Codex CLI and it has to reach the model, and the model is a Node stub on
+# loopback with no credential and no account behind it. `allowlist` routes egress
+# through friring's own proxy, which resolves names for the endpoints a profile
+# lists — a dynamically-numbered loopback port is not that shape. What the
+# boundary allows is proven by `bridge-conformance`, which runs the whole bridge
+# with `network_mode = "none"`, and by `just seatbelt-probe` against a real
+# kernel. This harness is about the **lifecycle**.
+
+[[profile]]
+name = "codex-park"
+backend = "auto"
+paths = [
+    # EDIT: the repository the leader and its children work in.
+    { path = "~/dev/scratch", mode = "rw" },
+    # EDIT: the directory the `codex` **binary itself** lives in, after symlinks
+    # are resolved. `read_scope = "workspace"` grants the profile's paths plus
+    # the system directories a binary needs; friring reads the agent's own
+    # program into every narrow scope, but this agent's program is a wrapper
+    # that execs a *second* binary, and that one is the profile's to grant.
+    # Resolved rather than as-installed because a package manager usually puts a
+    # symlink on `PATH` and the real file somewhere else entirely — on macOS,
+    # `/usr/local/bin/codex` into a Homebrew cask.
+    { path = "/usr/local/bin", mode = "ro" },
+    # This extension's own home, read-only: both agents are scripts that source
+    # a library beside them.
+    { path = "~/.config/friring/extensions/codex-park", mode = "ro" },
+]
+network_mode = "full"
+network_allow = []
+network_deny = []
+prompt_new_domains = false
+read_scope = "workspace"
+allow_unsandboxed_fallback = false
+bridge_grants = ["child-lifecycle", "mailbox", "report"]
+# One. The exhaustion half of the lifecycle needs a full fan-out, and one child
+# plus one filler is the cheapest way to have one — each of these is a real
+# Codex process.
+max_children = 1
+child_agents = ["codex-park-worker"]
+child_shared_rw = []
+# Exactly what a worker receives out of `~/.codex`, each in the one mode it is
+# allowed. No credential: this harness has none and needs none, which is what
+# makes it runnable anywhere.
+child_seed_allow = [
+    { path = "config.toml", mode = "copy" },
+    { path = "hooks.json", mode = "copy-rewrite" },
+]

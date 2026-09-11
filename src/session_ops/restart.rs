@@ -203,6 +203,36 @@ fn restart_session_with(
         ));
     }
 
+    // A **bridge child** is refused here for the same reason the TUI's `Ctrl+R`
+    // and startup restore refuse it (ADR-32): what makes a child a child — the
+    // narrowing, the launch gate and the private agent state — lives on
+    // `sessions.sandbox_overlay`, and `build_restart_plan` composes from
+    // `sandbox_profile` alone. Relaunching here would put the child's agent back
+    // in its worktree under its **owner's un-narrowed profile**: the owner's
+    // transcripts, every sibling's worktree and control directories, and no
+    // gate — and it would look like an ordinary successful restart.
+    //
+    // Not an escape hatch worth keeping: the owner's `resume` verb rebuilds the
+    // overlay, and `session delete --force` stops a wedged child. A relaunch
+    // that silently drops the boundary is not a way out of a stuck state, it is
+    // a way out of the sandbox.
+    //
+    // The lookup's own failure is an error rather than a `false`: a read this
+    // cannot answer is not evidence that the session is ordinary, and the whole
+    // point of the refusal is that guessing wrong here drops a boundary.
+    if db
+        .bridge_child(&session_id.to_string())
+        .map_err(|e| format!("Failed to check bridge ownership: {e}"))?
+        .is_some()
+    {
+        return Err(format!(
+            "Session '{}' is a bridge child, so friring will not restart it here: its boundary \
+             is its owner's narrowed, with a launch gate and a private agent state directory \
+             that only the spawn saga rebuilds. Ask its owner to resume it",
+            session.name
+        ));
+    }
+
     let sandbox = super::load_sandbox_profile(db, session.sandbox_profile.as_deref())?;
     let plan = build_restart_plan(&session, sandbox)?;
 
@@ -247,11 +277,86 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         }
     }
 
     /// A place-backed session's tmux is inside the container, so the local
     /// kill/spawn pair would find nothing to kill and would put an
+    /// A bridge child's boundary is its owner's **narrowed**, with a launch gate
+    /// and a private state directory — all of it on `sandbox_overlay`, which
+    /// this path never reads. Relaunching one here would put its agent back in
+    /// its worktree under the owner's un-narrowed profile, and look like an
+    /// ordinary successful restart. The TUI and startup restore already refuse;
+    /// this is the third relaunch path.
+    #[test]
+    fn a_headless_restart_refuses_a_bridge_child() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let db = Database::open_in_memory().unwrap();
+        let sess = session(Some("agent-conv-uuid"), Some(PathBuf::from("/tmp/repo")));
+        db.upsert_session(&sess).unwrap();
+
+        // Without the ownership row it is an ordinary session and restarts.
+        restart_session_with(
+            &db,
+            sess.id,
+            &WindowOps {
+                kill: &|_| Ok(()),
+                spawn: &|_| Ok(()),
+            },
+        )
+        .expect("an ordinary session restarts");
+
+        // The row is the whole difference: authority is asked of
+        // `bridge_children`, never of `sessions.parent_session_id`.
+        db.insert_bridge_child(&sess.id.to_string(), "an-owner", "create-0001")
+            .unwrap();
+        let err = restart_session_with(
+            &db,
+            sess.id,
+            &WindowOps {
+                kill: &|_| panic!("a bridge child must be refused before anything is killed"),
+                spawn: &|_| panic!("a bridge child must never be relaunched here"),
+            },
+        )
+        .expect_err("a bridge child is refused");
+        assert!(err.contains("bridge child"), "{err}");
+        assert!(err.contains("resume"), "{err}");
+    }
+
+    /// A classification friring cannot make is not a `false`.
+    ///
+    /// The refusal above is the boundary: reading "no ownership row" out of a
+    /// failed lookup would relaunch a child under its owner's un-narrowed
+    /// profile, silently, and look like an ordinary restart. So the read
+    /// propagates and the kill/spawn pair never runs.
+    #[test]
+    fn a_headless_restart_refuses_when_it_cannot_tell_whether_a_session_is_a_child() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = crate::paths::TestPathGuard::new(temp.path());
+        let db = Database::open_in_memory().unwrap();
+        let sess = session(Some("agent-conv-uuid"), Some(PathBuf::from("/tmp/repo")));
+        db.upsert_session(&sess).unwrap();
+        // The one seam that fails the ownership lookup and nothing else.
+        db.conn_ref()
+            .execute("DROP TABLE bridge_children", [])
+            .unwrap();
+
+        let err = restart_session_with(
+            &db,
+            sess.id,
+            &WindowOps {
+                kill: &|_| panic!("nothing may be killed before the classification is known"),
+                spawn: &|_| panic!("nothing may be relaunched before the classification is known"),
+            },
+        )
+        .expect_err("an unreadable ownership table is not an ordinary session");
+        assert!(err.contains("bridge ownership"), "{err}");
+    }
+
     /// **unsandboxed** agent on the host under a profile that says otherwise.
     #[test]
     fn a_headless_restart_refuses_an_offhost_session_of_either_shape() {

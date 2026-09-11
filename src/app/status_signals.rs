@@ -25,10 +25,8 @@
 //! dropped and the next one is read normally, because the poll it would
 //! otherwise stall is the same poll every session's status is derived from.
 
-use std::collections::HashMap;
-
 use crate::session::{parse_status_signal, SessionId, SignalState};
-use crate::storage::{Database, HookRow};
+use crate::storage::Database;
 
 use super::App;
 
@@ -62,7 +60,7 @@ impl App {
         if sandboxed.is_empty() {
             return;
         }
-        if !apply_status_signals(&self.db, &sandboxed, &self.cached_hook_states).is_empty() {
+        if !apply_status_signals(&self.db, &sandboxed).is_empty() {
             // Our own connection's write does not move `data_version`, so the
             // version gate would not notice it — force the reload that makes
             // this tick's derivation see the row.
@@ -76,15 +74,25 @@ impl App {
 /// Returns what was written, newest value per session, so a caller (and a test)
 /// can tell a quiet sweep from one that moved something.
 ///
-/// `current` is the hook state already on record. A file repeating it is
-/// dropped rather than re-stamped: `state_at` is what decides whether a `done`
-/// has been acknowledged, so re-writing an unchanged `done` would resurrect it
-/// as unseen and fire its notification again. This is the same rule the remote
+/// A file repeating the state already on record is dropped rather than
+/// re-stamped: `state_at` is what decides whether a `done` has been
+/// acknowledged, so re-writing an unchanged `done` would resurrect it as unseen
+/// and fire its notification again. This is the same rule the remote
 /// pane-option channel applies, for the same reason.
+///
+/// **What "on record" means is the database, not this process's cache.** friring
+/// supports several instances against one database (ADR-7b), and the bridge
+/// depends on this dedupe in a way nothing else does: S8 clears a relaunching
+/// child's hook row precisely so that only its *new* agent's report can satisfy
+/// S9. Asked of a cache, a peer instance that had not reloaded since the clear
+/// would see the previous life's state, call the first report a repeat, drop
+/// it — and the relaunch would die at its readiness timeout with a healthy agent
+/// running. The row is read only for a session that actually produced a signal
+/// this sweep, so the cost is one indexed lookup per state change rather than
+/// per tick.
 pub(crate) fn apply_status_signals(
     db: &Database,
     sandboxed: &[SessionId],
-    current: &HashMap<SessionId, HookRow>,
 ) -> Vec<(SessionId, SignalState)> {
     let mut applied = Vec::new();
     for &id in sandboxed {
@@ -96,8 +104,11 @@ pub(crate) fn apply_status_signals(
         else {
             continue;
         };
-        let on_record = current.get(&id).and_then(|hook| hook.state.as_deref());
-        if on_record == Some(state.as_str()) {
+        // A row friring cannot read is not evidence of a repeat, so the report
+        // is written: a state written twice costs a redundant notification,
+        // where one dropped costs a launch.
+        let on_record = db.hook_state_of(id).ok().flatten();
+        if on_record.as_deref() == Some(state.as_str()) {
             continue;
         }
         // `state.as_str()` and nothing else: the file's own bytes never reach
@@ -148,12 +159,14 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         }
     }
 
-    /// What the poll would see for `id`: the persisted hook state, in the shape
-    /// [`apply_status_signals`] dedupes against.
-    fn hooks(db: &Database) -> HashMap<SessionId, HookRow> {
+    /// The persisted hook rows, for asserting what a sweep wrote.
+    fn hooks(db: &Database) -> std::collections::HashMap<SessionId, crate::storage::HookRow> {
         db.load_hook_states().unwrap()
     }
 
@@ -167,7 +180,7 @@ mod tests {
     fn a_well_formed_file_drives_the_status_transition() {
         let (_tmp, _guard, db, id) = fixture("transition");
         create_session_signal_dir(&id.to_string()).unwrap();
-        assert!(apply_status_signals(&db, &[id], &hooks(&db)).is_empty());
+        assert!(apply_status_signals(&db, &[id]).is_empty());
 
         for state in [
             SignalState::Idle,
@@ -176,7 +189,7 @@ mod tests {
             SignalState::Done,
         ] {
             write_signal(id, format!("{}\n", state.as_str()).as_bytes());
-            assert_eq!(apply_status_signals(&db, &[id], &hooks(&db)), [(id, state)]);
+            assert_eq!(apply_status_signals(&db, &[id]), [(id, state)]);
             assert_eq!(
                 hooks(&db)[&id].state.as_deref(),
                 Some(state.as_str()),
@@ -188,14 +201,63 @@ mod tests {
         // ones before it are history.
         write_signal(id, b"working\nblocked\nworking\n");
         assert_eq!(
-            apply_status_signals(&db, &[id], &hooks(&db)),
+            apply_status_signals(&db, &[id]),
             [(id, SignalState::Working)]
         );
 
         // A file repeating what is already on record is dropped: re-stamping a
         // `done` would resurrect it as unseen and re-fire its notification.
         write_signal(id, b"working\n");
-        assert!(apply_status_signals(&db, &[id], &hooks(&db)).is_empty());
+        assert!(apply_status_signals(&db, &[id]).is_empty());
+    }
+
+    /// The dedupe asks the **database**, so a hook row another instance cleared
+    /// is seen as cleared.
+    ///
+    /// S8 clears a relaunching child's hook row precisely so only its new
+    /// agent's report can satisfy S9. Any friring on the same database may be
+    /// the one that picks that report up (ADR-7b), and a peer that dedupes
+    /// against its own cache would compare the first report of the new agent
+    /// against the *previous life's* state, call it a repeat and drop it. The
+    /// relaunch then dies at its readiness timeout with a healthy agent running.
+    #[test]
+    fn a_report_after_a_cleared_row_is_written_even_when_it_repeats_the_old_state() {
+        let (_tmp, _guard, db, id) = fixture("relaunch");
+        create_session_signal_dir(&id.to_string()).unwrap();
+
+        write_signal(id, b"working\n");
+        assert_eq!(
+            apply_status_signals(&db, &[id]),
+            [(id, SignalState::Working)]
+        );
+
+        // What S8 does at the gate release of a relaunch: clear the row, then
+        // take the moment S9 will compare every later stamp against.
+        db.clear_hook_state(id).unwrap();
+        let opened_at = crate::sync::current_time_millis() as i64;
+
+        // The new agent's first report happens to say the same word its previous
+        // life ended on. It is the *new* one, and it must land.
+        write_signal(id, b"working\n");
+        assert_eq!(
+            apply_status_signals(&db, &[id]),
+            [(id, SignalState::Working)],
+            "a report after a cleared row was dropped as a repeat"
+        );
+
+        // S9's own predicate, not a stricter one. `state_at` is milliseconds, so
+        // two writes inside one tick are equal and a `>` here would fail on a
+        // fast machine while the thing it is checking held perfectly. The clear
+        // above set the column to NULL, so a dropped report leaves `None` and
+        // this still catches it.
+        let stamped = hooks(&db)[&id]
+            .state_at
+            .expect("the report must leave a stamp; the clear left none");
+        assert!(
+            stamped >= opened_at,
+            "the report was written without a stamp this launch could claim, \
+             which is the whole of S9's proof"
+        );
     }
 
     /// Every shape of hostile file, one after another through the *same* poll:
@@ -209,7 +271,7 @@ mod tests {
         let status = session_signal_file(&id.to_string()).unwrap();
         let refuse = |what: &str| {
             assert!(
-                apply_status_signals(&db, &[id], &hooks(&db)).is_empty(),
+                apply_status_signals(&db, &[id]).is_empty(),
                 "the poll accepted {what}"
             );
             assert_eq!(hooks(&db)[&id].state, None, "{what} wrote a state");
@@ -249,10 +311,7 @@ mod tests {
 
         // The channel still works after every one of them.
         write_signal(id, b"done\n");
-        assert_eq!(
-            apply_status_signals(&db, &[id], &hooks(&db)),
-            [(id, SignalState::Done)]
-        );
+        assert_eq!(apply_status_signals(&db, &[id]), [(id, SignalState::Done)]);
     }
 
     /// A session with no profile has no signal directory, so nothing about it
@@ -267,7 +326,7 @@ mod tests {
         // Even with a file sitting exactly where the poll would look, a session
         // the poll is never handed is never read.
         write_signal(plain.id, b"done\n");
-        assert!(apply_status_signals(&db, &[sandboxed], &hooks(&db)).is_empty());
+        assert!(apply_status_signals(&db, &[sandboxed]).is_empty());
         assert_eq!(hooks(&db)[&plain.id].state, None);
         // The file is still there: nothing consumed it either.
         let planted = session_signal_file(&plain.id.to_string()).unwrap();
@@ -345,7 +404,7 @@ mod tests {
 
             // The assertion runs the whole way through: file → poll → database.
             assert_eq!(
-                apply_status_signals(&db, &[id], &hooks(&db)),
+                apply_status_signals(&db, &[id]),
                 [(id, expected)],
                 "the {event} hook did not report {expected:?}"
             );

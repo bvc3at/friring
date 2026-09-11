@@ -89,12 +89,26 @@ back to the built-ins.
 Check everything from the command line:
 
 ```bash
+friring-cli config paths      # resolved config/data/database paths; opens nothing
 friring-cli config validate   # strict parse of every file; exit 1 on problems
 friring-cli config show       # effective config + where each value came from
 ```
 
 `validate` fails on unknown keys (they are typos or leftovers either
 way), making it usable as a dotfiles CI gate.
+
+`paths` answers **before the database is opened**, and reports which
+environment variable decided each directory. The two chains are
+separate: `config_source` is `FRIRING_CONFIG_DIR`, then
+`XDG_CONFIG_HOME`, then the platform fallback (`HOME` on Unix,
+`APPDATA` on Windows); `data_source` is `FRIRING_DATA_DIR`, then
+`XDG_DATA_HOME`, then the platform fallback (`HOME` on Unix,
+`LOCALAPPDATA` on Windows). `database` follows `data_source`. That
+ordering is the point: it lets a script
+check that the environment it composed is the one the binary resolved
+*before* letting it touch storage, which is otherwise unobservable
+(`Database::open` is already the write, and a schema migration is
+one-way). `friring-cli --json config paths` is the machine form.
 
 ## agents.toml
 
@@ -121,6 +135,12 @@ resume_latest = false       # true = id-less "resume last session in cwd"
                             #   the built-in hooks extension wires its status
                             #   hooks under this custom agent's name too
 
+[agents.transcript]         # optional: where this CLI stores a conversation, so
+dir = "projects"            #   friring can check one still EXISTS before
+suffix = ".jsonl"           #   resuming it. Relative to state_dir, searched
+name_has_id = true          #   recursively. REQUIRED for a bridge child agent
+                            #   that can resume at all — either style
+
 [agents.sandbox]            # optional: what this CLI needs inside a sandbox
 auth = "auto"               # auto | host-passthrough | env-token | volume-login
                             #   | seed-file. A request, not a verdict: a policy
@@ -144,6 +164,15 @@ copy_in = ["~/.claude/skills"]   # config safe to project into a container,
 # seed_file_supported = false  # true ONLY where the vendor documents copying it
 # writeback = true          # a refreshed credential must survive the sandbox
 # login_fallback = "/login" # what to type in the pane when the state is empty
+# bridge_requires = ["mailbox", "report"]  # orchestration-bridge capabilities
+                            #   this CLI will not work without. A *requirement*,
+                            #   never a grant: the profile grants, and a launch
+                            #   whose profile does not cover the list is refused
+
+# [[agents.sandbox.child_state_seed]]  # what a bridge CHILD needs in its own
+# src = "auth.json"         #   private state dir, relative to `state_dir`
+# mode = "link-rw"          #   symlink | copy | copy-rewrite | link-rw
+# required = true           #   false = seed it if it exists, don't refuse
 
 [[agents.sandbox.enforced]]  # friring's highest-precedence layer inside a container
 path = "~/.codex/config.toml"  # `~`-anchored: a container's only writable
@@ -196,8 +225,9 @@ itself:
 This works because restart reuses the session's cwd and a single-repo
 fork reuses the parent's cwd. `resume_latest` only changes *when* the
 resume group fires (`session_ops::resume_trigger_for`): for the id-less
-agents restart always triggers resume, while claude still defers to an
-on-disk transcript check. Caveats: an agent with no `fork_args`
+agents restart triggers resume whenever a conversation is there to resume,
+which is what `[agents.<name>.transcript]` below answers, and claude
+defers to the same check. Caveats: an agent with no `fork_args`
 (`antigravity`, `aider`, `copilot` — none of these CLIs fork) starts
 fresh on `Ctrl+F`; and a multi-repo fork of a cwd-scoped agent lands in a
 fresh symlink workspace, so `--last`/`--continue` finds no parent session
@@ -221,6 +251,69 @@ host. It names the *family* to imitate, not a boolean; today the useful value is
 antigravity/vibe/copilot are wired through their own config dir, so a rebrand
 sharing that dir already reports status).
 
+`[agents.<name>.transcript]` is optional, and says where this CLI stores the
+conversations it can resume — the one thing a resume contract cannot answer from
+argv. Three keys, all relative to the agent's `state_dir`.
+
+The block belongs to the `[[agents]]` entry above it — `agents` is an array of
+tables, so it is spelled `[agents.transcript]` in the file and referred to as
+`[agents.<name>.transcript]` in prose. `state_dir` is declared in the sibling
+`[agents.sandbox]` block, and without one the check has nothing to resolve
+against and answers "no conversation", so both belong to any entry that wants
+this:
+
+```toml
+[[agents]]
+name = "codex"
+command = "codex"
+resume_args = ["resume", "--last"]
+resume_latest = true
+
+[agents.sandbox]
+state_dir = "~/.codex"  # what `dir` below is relative to
+config_dir_env = "CODEX_HOME"   # and what relocates it for a bridge child
+
+[agents.transcript]
+dir = "sessions"        # searched recursively, under state_dir
+suffix = ".jsonl"       # what one stored conversation is named; "" = any file
+name_has_id = false     # true when the file NAME is the {id} friring resumes by
+```
+
+Declared, never known: friring bakes in no agent knowledge here either. With it,
+a restart resumes only when the conversation is actually on disk and starts fresh
+otherwise, instead of passing a resume flag that resolves to nothing. Set
+`name_has_id = true` for an agent that resumes by id (claude writes
+`projects/<project>/<id>.jsonl`), so the check is about *this* conversation; leave
+it false for an agent that resumes "the latest in this directory", whose stored id
+is its own and not friring's.
+
+With `name_has_id = false` the check proves that the directory holds *a*
+conversation, not that it holds the same one — saying more would mean parsing a
+vendor's transcript format, which is the agent knowledge the core does not hold.
+For a bridge child that distinction is empty, because its state directory is
+private and holds only its own conversations. Symlinks are not followed and a
+dangling one is not a conversation: the check runs on the host, where a link out
+of a child's private state would resolve to somebody else's.
+
+It is **required** for an agent used as a bridge child that can resume at all —
+both styles, `resume_latest = true` and a `resume_args` carrying `{id}`. A
+bridge `resume` that friring cannot prove will reach the child's own
+conversation is refused rather than started blank (`docs/SANDBOX.md` §The child
+lifecycle), and without this block there is nothing to prove it with. The
+directory checked is the child's *private* state directory, so the answer is
+about the child and never about your own conversations. An agent that declares
+no resume group at all is unaffected: a worker with no thread has none to lose.
+
+**Upgrading an `agents.toml` written before this block existed.** It has none,
+so a bridge child of an agent that *can* resume is refused rather than resumed
+blank — by design, with the message naming the block to add. The built-ins as
+shipped declare it (`claude`, `codex`). Any **existing** definition that lacks
+it needs the keys added before a bridge resume works again, whether it was
+hand-written or installed by an extension, including a custom Claude or Codex
+one; an extension published since can declare the block itself. Nothing else
+changes: an ordinary session's restart still falls back to the agent's own
+resume flag.
+
 `[agents.<name>.sandbox]` is optional and every field inside it is too. It is
 how friring stays agent-neutral about sandboxing: the flags that turn an agent's
 *own* sandbox off (nesting is denied outright under seatbelt), the state
@@ -234,6 +327,48 @@ before sandboxing existed loads unchanged. Full semantics:
 agent sandboxes. Sandbox *profiles* themselves are UI-edited and live in SQLite,
 not here — `friring-cli sandbox export|import` is how one moves between machines
 ([`docs/CLI.md`](CLI.md#sandboxes)).
+
+### The orchestration bridge: the agent declares, the profile authorizes
+
+Two of the keys above are the agent's half of the orchestration bridge, and
+neither one grants anything:
+
+- **`bridge_requires`** names the capabilities (`child-lifecycle`, `mailbox`,
+  `report`) the CLI needs to work at all. A launch whose profile does not cover
+  the list is refused with `grant_missing`, rather than started to fail later in
+  a way nobody can attribute. It is never quietly unsandboxed.
+- **`[[agents.sandbox.child_state_seed]]`** says what a **bridge child** running
+  this agent needs in its own private state directory, since a child never runs
+  from the family's shared state. Each entry is a `src` relative to `state_dir`
+  plus the `mode` it needs: `symlink` (read-only material), `copy` (a copy that
+  diverges), `copy-rewrite` (a UTF-8 text file ≤ 1 MiB whose occurrences of the
+  parent's state directory are repointed at the private one — how a path-keyed
+  hook configuration survives relocation), and `link-rw` (the credential mode:
+  one shared file, so no second copy of a rotating token exists — ADR-28).
+  `required = true` makes a missing, wrong-kind or unauthorized entry refuse the
+  launch with `state_unrelocatable`.
+
+The **authorizing** half is on the sandbox profile, which is UI-edited and lives
+in SQLite (`Alt+S`, or `friring-cli sandbox export|import`). Five fields, all
+closed by default:
+
+| Profile field | Meaning |
+|---|---|
+| `bridge_grants` | which capabilities this profile hands a session. Empty = no bridge at all, which is every profile until someone writes it down |
+| `max_children` | how many **live** children one session may have. A terminal child releases its slot; a dirty or unstoppable one does not |
+| `child_agents` | which agents a child may be, by registry name. Empty = none, so granting `child-lifecycle` alone creates nothing |
+| `child_shared_rw` | which of this profile's read-write paths a child shares with its owner — the build caches a real project needs. Intersected with the parent's own set at every launch, so listing one the parent lacks grants nothing |
+| `child_seed_allow` | `path` + `mode` pairs a child may be seeded with. An agent's `child_state_seed` entry reaches a child only when this names that **exact** path in that **exact** mode |
+
+The split is the point: an agent registry can say what its CLI needs, and only a
+profile an operator edited can say what it gets. The editor offers `bridge_grants`
+as three presets rather than eight combinations — **none**, **worker**
+(`mailbox`, `report`) and **leader** (`child-lifecycle`, `mailbox`, `report`) —
+and only for a backend that can carry the bridge. A stored set that is none of
+the three (hand-edited, or written by a later friring) reads back as the
+**narrowest** preset covering it, so opening and saving a profile never widens
+what it grants. See
+[`docs/FEATURES.md`](FEATURES.md#sandboxed-orchestration).
 
 The seeded file also ships two commented, copy-pasteable templates
 below the built-ins — **Add your own agent** (every field annotated)
@@ -1056,6 +1191,107 @@ Self-heal while the TUI is closed depends on the automation heartbeat
 (`[features] automations = true`); with automations off, healing happens
 at the next TUI startup only.
 
+### `[[requires]]` — hard gates
+
+`min_thurbox_version` is soft, and deliberately so. `[[requires]]` is not: a
+failed requirement **refuses** install, activate and self-heal, and the refusal
+names the entry that failed. An extension whose declared preconditions do not
+hold is one whose behaviour nobody has reasoned about, and "installed but not
+working" costs more than a refusal does.
+
+Five kinds:
+
+```toml
+# A capability of the friring binary, from the same constants
+# `friring-cli capabilities` prints.
+[[requires]]
+kind = "binary-capability"
+name = "bridge"        # or "extension_requires"
+version = 1
+
+# A tool on the operator's PATH. Run argv-only — never through a shell.
+[[requires]]
+kind = "tool-version"
+command = "node"
+args = ["--version"]
+pattern = "v20."       # literal, matched on a version boundary (below)
+
+# A file whose exact contents matter.
+[[requires]]
+kind = "file-digest"
+path = "{home}/lib/hook.mjs"
+sha256 = "…"
+
+[[requires]]
+kind = "file-exists"
+path = "~/.codex/config.toml"
+
+[[requires]]
+kind = "file-contains"
+path = "~/.codex/config.toml"
+needle = "notify"
+```
+
+**`tool-version` `pattern` is still literal** — never a regular expression — but
+it only matches on a **version-token boundary**, so a pin cannot be satisfied by
+a different release that happens to contain its digits. `0.21.0` does not match
+`10.21.0`, `0.21.0-beta.1`, `0.21.01`, `foo0.21.0` or `_0.21.0`. The one thing
+the left-hand bound steps over is a conventional `v` prefix, because tools print
+one (`oh-my-codex v0.21.0`) while a manifest pins the number — and only when the
+`v` is itself at a boundary, so `10v0.21.0` and `rev0.21.0` are still refused.
+The right-hand bound applies only when
+the pattern *ends in a digit*, which is what leaves the other two shapes usable:
+a pattern ending in `.` is a deliberate prefix (`v20.` matches `v20.11.0` and not
+`v120.11.0`), and one ending in a letter has no right-hand bound at all (`v`
+means "prints a `v`-prefixed version"). The rule cannot express "20 or newer" —
+it asks for a spelling, and friring does not parse a vendor's version grammar —
+so an extension needing a real lower bound checks it in its own program and uses
+the manifest gate for presence.
+
+A `kind` this friring does not recognise is a **refusal**, not an ignored line:
+an extension that declared it meant something by it.
+`friring-cli capabilities` prints `extension_requires`, the version of this
+vocabulary, so an extension can gate on the vocabulary itself.
+
+**The `tool-version` trust boundary.** The command runs as
+`Command::new(command).args(args)` — argv-only, resolved through `PATH` as the
+operator's shell would, with a 10 s timeout and 64 KiB of output. friring runs
+the operator's installed tool and trusts it exactly as much as the operator
+does; a hostile binary on `PATH` already owns the account, so this adds no
+exposure. What it must never do is *introduce* an interpreter, which is why
+`command` is one argv element: a value containing a space simply fails to
+resolve rather than being split into a command line. A passing result is cached
+against the **resolved binary path and its mtime**, so a tool replaced by a
+version manager is re-probed at once; the one-hour ceiling is a backstop, not
+the invalidation. File checks are never cached — they are a read, and a file can
+be edited between one tick and the next.
+
+`{home}` is resolved in a requirement's `path`, and also in an extension's own
+`[[agents]]` `command`, `args`, `resume_args`, `new_session_args` and
+`sandbox.env` — everywhere the extension's own tree is named.
+
+### `[[external_files]] on_conflict`
+
+An external file's destination is outside the extension's home, in an agent's
+own config directory, so it can already exist. `on_conflict` says what to do:
+
+| Value | Behaviour |
+|-------|-----------|
+| `skip` (default) | leave the destination alone — what friring has always done |
+| `refuse` | fail the install when the destination exists **without** friring's managed marker |
+
+`refuse` is for a file whose exact content the extension depends on — a hook
+script a worker's private state directory is rewritten to point at, say.
+Skipping there would install an extension that then behaves as somebody else's
+file says. A destination that *does* carry the marker is friring's own and is
+restored to the manifest's content, because a managed file that drifted is one
+that needs putting back.
+
+Uninstall removes **marker-managed files only**, and the directory around one
+only when it is empty afterwards: a file the user has since taken over is
+theirs, and friring having once written to that path is not a licence to delete
+what is there now.
+
 ### Versioning + the update lifecycle
 
 Extensions carry two version markers, and the installer stamps two more
@@ -1150,6 +1386,7 @@ these to prove its own identity without scraping panes or names:
 | `FRIRING_METRICS_DIR` | metrics output dir |
 | `FRIRING_CONFIG_DIR` / `FRIRING_DATA_DIR` | the resolved config/data dirs, so the agent's `friring-cli` (its status hook) targets the same DB the TUI reads — independent of XDG, which `friring-cli` is on PATH, or a stale tmux-server env. Also honored if you set them yourself to relocate friring's state. |
 | `FRIRING_SIGNAL_FILE` | **sandboxed sessions only.** The one file a policy boundary may write status into: the bundled hooks append a state word here instead of calling `friring-cli session signal`, because the database is denied inside every sandbox (see [`docs/SANDBOX.md`](SANDBOX.md) §Status signals). Unset for every unsandboxed session, which is what makes those hooks byte-identical to before. |
+| `FRIRING_BRIDGE_DIR` | **sessions granted the orchestration bridge only.** The one directory `friring-cli bridge` writes requests into and reads answers from. Which directory a request lands in *is* the caller's identity, so this is inserted on the sandbox **policy** — the launch's last word — and an agent that declares the same variable in `agents.toml` cannot point the channel elsewhere. Unset for every session with no `bridge_grants`. |
 
 The three *path* variables (`FRIRING_METRICS_DIR`, `FRIRING_CONFIG_DIR`,
 `FRIRING_DATA_DIR`) are set only for a session running on **this** machine's

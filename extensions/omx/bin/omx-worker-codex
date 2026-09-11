@@ -1,0 +1,2 @@
+#!/bin/sh
+exec node "${0%/*}/../lib/friring-omx.mjs" worker "$@"

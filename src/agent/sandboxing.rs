@@ -23,6 +23,104 @@ use crate::session::{AgentDef, SessionConfig};
 /// name the handle they hold across a kill and a spawn.
 pub use crate::sandbox::PendingEgress;
 
+/// What a launch is *for*, when it is not an ordinary session.
+///
+/// Carried into [`apply`] rather than inferred, because every refusal below
+/// depends on it and inferring one would mean guessing at a boundary. `None` is
+/// an ordinary session, which is the overwhelmingly common case.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BridgeLaunch {
+    /// The narrowing this child runs under (ADR-31).
+    pub overlay: crate::session::SandboxOverlay,
+    /// The gate this child waits on and the key that opens it (ADR-33).
+    pub gate: Option<(String, String)>,
+    /// The child's own bridge directory, for `FRIRING_BRIDGE_DIR`.
+    pub bridge_dir: Option<String>,
+    /// The private state directory the agent is pointed at, and the plan that
+    /// filled it.
+    pub state_dir: Option<String>,
+}
+
+/// Whether a launch may carry the bridge at all, and why not when it may not.
+///
+/// Every one of these is a **refusal**, never a degraded launch, and every one
+/// is `integrity: true` so a profile's `allow_unsandboxed_fallback` cannot
+/// answer it. The switch means "this host cannot apply this profile, run on the
+/// host instead"; a bridge-required agent started on the host has no boundary
+/// *and* a channel nobody is serving, which is strictly worse than not starting.
+pub fn bridge_refusal(
+    def: Option<&AgentDef>,
+    config: &SessionConfig,
+    caps: Option<&crate::sandbox::Caps>,
+    from_tui: bool,
+) -> Option<Refusal> {
+    let required: Vec<crate::session::BridgeCapability> = def
+        .and_then(|d| d.sandbox.as_ref())
+        .map(|s| s.bridge_requires.clone())
+        .unwrap_or_default();
+    if required.is_empty() {
+        return None;
+    }
+    let integrity = |reason: String| {
+        Some(Refusal {
+            reason,
+            integrity: true,
+        })
+    };
+    let Some(profile) = config.sandbox.as_ref() else {
+        return integrity(format!(
+            "agent '{}' requires the orchestration bridge, which is granted by a sandbox \
+             profile — and this session has none. A bridge-required agent is never started \
+             as a plain session",
+            config.agent
+        ));
+    };
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|cap| !profile.bridge_grants.contains(cap))
+        .map(|cap| cap.to_string())
+        .collect();
+    if !missing.is_empty() {
+        return integrity(format!(
+            "grant_missing: agent '{}' requires the bridge capabilities [{}], which sandbox \
+             profile '{}' does not grant",
+            config.agent,
+            missing.join(", "),
+            profile.name
+        ));
+    }
+    if caps.is_some_and(|caps| !caps.bridge) {
+        return integrity(format!(
+            "sandbox profile '{}' resolves to a backend that cannot carry the orchestration \
+             bridge: the bridge is a directory friring mints on the host and exposes inside \
+             the boundary, and a place or a remote host has neither at that path",
+            profile.name
+        ));
+    }
+    if config
+        .backend
+        .as_deref()
+        .is_some_and(crate::session::is_remote_backend)
+    {
+        return integrity(format!(
+            "agent '{}' requires the orchestration bridge, and this session runs on a remote \
+             host: friring builds the boundary — and mints the bridge directory — on the \
+             machine it runs on",
+            config.agent
+        ));
+    }
+    if !from_tui {
+        return integrity(format!(
+            "bridge_requires_tui: agent '{}' requires the orchestration bridge, which is \
+             served by a running friring TUI. A headless `friring-cli session create` exits \
+             after spawning, so nothing would own this session's egress proxy or answer its \
+             requests. Create it from the TUI instead",
+            config.agent
+        ));
+    }
+    None
+}
+
 /// A launch with its sandbox profile applied.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SandboxedInvocation {
@@ -70,6 +168,19 @@ pub struct SandboxedInvocation {
     /// can find a container this launch created. `None` for a policy backend,
     /// which creates nothing that outlives the process.
     pub instance: Option<crate::sandbox::SandboxInstance>,
+    /// Where this launch's egress proxy listens and the credential it demands,
+    /// for the launch path to persist (`sessions.egress_*`).
+    ///
+    /// A restart has to rebind the **same** pair or the agent that is still
+    /// running holds proxy URLs naming a port and a credential nothing answers
+    /// on. Carried on the invocation rather than looked up afterwards because
+    /// this is the one place that knows both, and its `state` is
+    /// [`Preparing`](crate::session::EgressState::Preparing) until the launch
+    /// commits.
+    ///
+    /// The token never reaches [`Debug`], which is why the record has one of its
+    /// own.
+    pub egress: crate::session::EgressRecord,
     /// What the user has to type in the pane to sign this agent in, when the
     /// boundary starts it signed out — for
     /// [`SessionInfo::sandbox_login`](crate::session::SessionInfo::sandbox_login).
@@ -121,6 +232,7 @@ impl std::fmt::Debug for SandboxedInvocation {
             .field("state", &self.state)
             .field("place", &self.place)
             .field("instance", &self.instance)
+            .field("egress", &self.egress)
             .field("login", &self.login)
             .finish()
     }
@@ -172,6 +284,44 @@ pub fn apply(
     command: &str,
     args: &[String],
 ) -> Result<SandboxDecision, String> {
+    apply_for(def, config, command, args, None, true)
+}
+
+/// [`apply`], told what this launch is for.
+///
+/// `bridge` is the child narrowing when this launch is a bridge child's, and
+/// `from_tui` is whether a running TUI will own the session's egress proxy and
+/// answer its bridge requests. Both default the ordinary way in [`apply`]; the
+/// headless path passes `from_tui = false`, which is what refuses a
+/// bridge-required agent there rather than starting one whose channel nobody
+/// serves.
+///
+/// # Errors
+///
+/// As [`apply`], plus every [`bridge_refusal`] — each of which is an integrity
+/// refusal a profile's `allow_unsandboxed_fallback` may not answer.
+pub fn apply_for(
+    def: Option<&AgentDef>,
+    config: &SessionConfig,
+    command: &str,
+    args: &[String],
+    bridge: Option<&BridgeLaunch>,
+    from_tui: bool,
+) -> Result<SandboxDecision, String> {
+    // Asked before anything is minted or bound: a refusal here costs nothing,
+    // and a bridge-required agent must never reach a launch path that would
+    // start it without one.
+    let caps = config.sandbox.as_ref().and_then(|profile| {
+        with_host(|host| {
+            host.select(profile.backend)
+                .backend()
+                .ok()
+                .and_then(|backend| host.backend(backend).map(|b| b.capabilities()))
+        })
+    });
+    if let Some(refusal) = bridge_refusal(def, config, caps.as_ref(), from_tui) {
+        return Err(refusal.reason);
+    }
     let Some(profile) = config.sandbox.as_ref() else {
         // A session whose profile was cleared keeps nothing running — but not
         // before this launch happens, because until then the agent still
@@ -180,7 +330,18 @@ pub fn apply(
         PendingEgress::clearing(&session_key(config)).park();
         return Ok(SandboxDecision::Unsandboxed);
     };
-    let fallback = profile.allow_unsandboxed_fallback;
+    // A bridge launch has no fallback, whatever the profile says: an agent that
+    // can leave its boundary by breaking it is not sandboxed, and the bridge is
+    // the one channel that would then be answered for a process running on the
+    // host. `SandboxPolicy::narrow` already refuses it for a child; this is the
+    // same rule for the launch the profile itself asks for, and it covers the
+    // composition failures `bridge_refusal` cannot see — no backend probe
+    // resolved, so `caps` is `None` and the capability check above is vacuous.
+    let bridge_launch = bridge.is_some()
+        || def
+            .and_then(|d| d.sandbox.as_ref())
+            .is_some_and(|s| !s.bridge_requires.is_empty());
+    let fallback = profile.allow_unsandboxed_fallback && !bridge_launch;
     let home = match crate::paths::home_dir() {
         Some(home) => match representable("the home directory", &home) {
             Ok(home) => home,
@@ -194,7 +355,7 @@ pub fn apply(
         }
         None => return Err(NO_HOME.to_string()),
     };
-    match with_host(|host| build(host, &home, def, config, command, args)) {
+    match with_host(|host| build(host, &home, def, config, command, args, bridge)) {
         Ok(invocation) => Ok(SandboxDecision::Wrapped(Box::new(invocation))),
         // The switch's meaning is "this host cannot apply this profile" — not
         // "the boundary's own state is wrong, so run outside it". A launch
@@ -253,6 +414,15 @@ impl From<crate::sandbox::SandboxError> for Refusal {
     }
 }
 
+/// Whether the supervisor holds this session's committed egress instance.
+///
+/// Re-exported here because `session_ops` may not reference
+/// [`crate::sandbox`] at all (`tests/architecture_rules.rs`), and the headless
+/// launch path has to ask the same question the TUI's does.
+pub fn egress_acknowledged(session_key: &str) -> bool {
+    crate::sandbox::egress::acknowledged(session_key)
+}
+
 /// Take the egress instance the composition for this session prepared, so the
 /// launch that is about to happen owns it.
 ///
@@ -265,9 +435,41 @@ pub fn pending_egress(config: &SessionConfig) -> PendingEgress {
     crate::sandbox::egress::claim(&session_key(config))
 }
 
+/// friring's own CLI, which every policy launch runs inside the boundary as its
+/// launch helper (ADR-33).
+///
+/// Resolved from the running binary, never from `PATH`, for the reason the relay
+/// is: the program that applies a launch's last boundary steps must be *this*
+/// friring's. `None` refuses the launch in whichever backend composes it.
+///
+/// A test binary lives in `target/debug/deps` with no `friring-cli` beside it,
+/// so under `cfg(test)` this answers a fixed path instead. That keeps every
+/// composition test about what it is about; the refusal itself is asserted
+/// directly against the backends, where the launch is built by hand.
+fn local_helper_program() -> Option<String> {
+    #[cfg(test)]
+    {
+        Some(TEST_HELPER_PROGRAM.to_string())
+    }
+    #[cfg(not(test))]
+    {
+        crate::sandbox::bwrap::local_relay_program().map(|p| p.display().to_string())
+    }
+}
+
+/// The launch helper a composition test sees — see [`local_helper_program`].
+#[cfg(test)]
+pub(crate) const TEST_HELPER_PROGRAM: &str = "/usr/local/bin/friring-cli";
+
 /// Run `wrap` against the host friring itself runs on — or, in a test, the one
 /// it installed.
-fn with_host<R>(wrap: impl FnOnce(&SandboxHost) -> R) -> R {
+///
+/// Every path that resolves a backend goes through here rather than reaching
+/// for [`SandboxHost::local_shared`] itself, and the reason is the one
+/// [`TestSandboxHost`] gives: a path that does not asserts something different
+/// depending on whether the machine running the test happens to have seatbelt
+/// or bubblewrap. Egress restoration is such a path, in `app::sandbox`.
+pub(crate) fn with_host<R>(wrap: impl FnOnce(&SandboxHost) -> R) -> R {
     #[cfg(test)]
     if let Some(host) = TEST_HOST.with(|installed| installed.borrow().clone()) {
         return wrap(&host);
@@ -297,9 +499,24 @@ pub(crate) struct TestSandboxHost;
 #[cfg(test)]
 impl TestSandboxHost {
     pub(crate) fn new(host: SandboxHost) -> Self {
-        let host = std::sync::Arc::new(host);
+        Self::install(std::sync::Arc::new(host))
+    }
+
+    /// Install an already-shared host, so a worker thread can be given the one
+    /// the test installed.
+    ///
+    /// The override is thread-local — see [`crate::paths::test_dir_override`]
+    /// for why — so a blocking task that composes a launch would otherwise
+    /// resolve the *machine's* backends and make every such test depend on
+    /// whether seatbelt or bubblewrap happened to be installed.
+    pub(crate) fn install(host: std::sync::Arc<SandboxHost>) -> Self {
         TEST_HOST.with(|installed| *installed.borrow_mut() = Some(host));
         Self
+    }
+
+    /// The host installed on this thread, for handing to a worker.
+    pub(crate) fn installed() -> Option<std::sync::Arc<SandboxHost>> {
+        TEST_HOST.with(|installed| installed.borrow().clone())
     }
 
     /// A host offering seatbelt, whatever this machine is.
@@ -416,6 +633,7 @@ fn build(
     config: &SessionConfig,
     command: &str,
     args: &[String],
+    bridge: Option<&BridgeLaunch>,
 ) -> Result<SandboxedInvocation, Refusal> {
     let profile = config
         .sandbox
@@ -453,6 +671,25 @@ fn build(
     let agent_sandbox = def.and_then(|d| d.sandbox.as_ref());
     let mut policy = profile.resolve(backend, home).map_err(|e| e.to_string())?;
     crate::sandbox::apply_agent_requirements(&mut policy, agent_sandbox, home);
+    // A bridge child's policy is its owner's, narrowed (ADR-31) — and narrowed
+    // **here**, at every launch, against the parent's profile as it stands now.
+    // A relaunch of a child whose owner's profile was narrowed in between is
+    // therefore narrowed to match, or refused; it is never wider than its owner.
+    //
+    // The agent's own `state_rw` host paths, which `apply_agent_requirements`
+    // just folded into the writable set, are taken back out by the narrowing:
+    // a bridge child's state is the private directory, not the family's.
+    if let Some(bridge) = bridge {
+        policy = policy
+            .narrow(&bridge.overlay)
+            .map_err(|violation| Refusal {
+                reason: format!("overlay_violation: {violation}"),
+                // An overlay that would widen is not a host that cannot apply a
+                // profile: it is a request for a boundary friring will not build,
+                // and running on the host instead would be wider still.
+                integrity: true,
+            })?;
+    }
 
     let plan = host
         .inner_sandbox(backend, &policy, agent_sandbox)
@@ -504,6 +741,13 @@ fn build(
     .map_err(Refusal::from)
     .and_then(|dir| representable("the sandbox scratch directory", &dir).map_err(Refusal::from))?;
 
+    // The private directory is useful only when programs can discover it.
+    // Override inherited host temp variables after applying the agent's static
+    // environment so every tool lands in this launch's boundary-owned scratch.
+    for key in ["TMPDIR", "TMP", "TEMP"] {
+        policy.insert_env(key, tmp_dir.clone());
+    }
+
     // The one channel out of a policy boundary (ADR-29): the agent's hooks
     // append a state word to a file here and the status poll takes it, because
     // the database `friring-cli session signal` writes is what a sandbox may
@@ -528,6 +772,45 @@ fn build(
         // so an agent that declares `FRIRING_SIGNAL_FILE` in the registry cannot
         // point the channel somewhere friring does not read.
         policy.insert_env(crate::paths::SIGNAL_FILE_ENV, file);
+    }
+
+    // The bridge channel. A **leader** is an ordinary session — the operator
+    // creates it from the TUI, not the child saga — so minting only on the child
+    // path would leave every leader holding capabilities it has no channel to
+    // use. The rule is therefore the profile's, not the launch's: any
+    // policy-sandboxed session whose profile grants a capability gets a queue,
+    // which is the contract `docs/CONFIG.md` states.
+    //
+    // A child already carries its own directory on the `BridgeLaunch` (minted at
+    // S3 with the rest of its private dirs, before this launch is composed), so
+    // that one wins and the child path is untouched. A place gets none: no place
+    // backend advertises the capability, and a host path inside a container names
+    // nothing.
+    let bridge_dir = match bridge.and_then(|b| b.bridge_dir.clone()) {
+        Some(dir) => Some(dir),
+        None if ensured.is_none() && !profile.bridge_grants.is_empty() => {
+            let dir = crate::paths::create_session_bridge_dirs(&session_key)
+                .map_err(|e| format!("Cannot apply a sandbox profile: {e}"))?;
+            Some(representable("the bridge directory", &dir)?)
+        }
+        None => None,
+    };
+    // On the **policy**, whose environment is the launch's last word, so an
+    // agent that declares either variable in the registry cannot point the
+    // channel or the state somewhere friring does not own — the same rule the
+    // signal file follows.
+    if let Some(dir) = &bridge_dir {
+        policy.insert_env(crate::session::bridge::BRIDGE_DIR_ENV, dir.clone());
+    }
+    // The private state directory that makes a child a child stays child-only:
+    // a leader runs from the family's own state, which is what it is for.
+    if let Some(bridge) = bridge {
+        if let (Some(state), Some(variable)) = (
+            &bridge.state_dir,
+            agent_sandbox.and_then(|s| s.config_dir_env.as_deref()),
+        ) {
+            policy.insert_env(variable, state.clone());
+        }
     }
 
     let database = crate::paths::database_file()
@@ -590,7 +873,11 @@ fn build(
         for (key, value) in prepared.grant.env {
             policy.insert_env(key, value);
         }
-        (Some(prepared.grant.endpoint), relay, prepared.pending)
+        (
+            Some((prepared.grant.endpoint, prepared.grant.token)),
+            relay,
+            prepared.pending,
+        )
     } else {
         // A profile edited from `allowlist` to `full` or `none` must not leave
         // the previous launch's listener behind — once this launch is the one
@@ -630,12 +917,52 @@ fn build(
         policy.insert_env(key.clone(), value.clone());
     }
 
-    let mut launch = SandboxLaunch::new(&policy, home, &session_key).with_tmp_dir(&tmp_dir);
-    if let Some(endpoint) = proxy {
+    // The host's own multiplexer sockets, so the generated policy denies them
+    // (ADR-33). Every policy launch gets them: friring's tmux server runs
+    // commands in host panes, and a sandbox that can dial its socket is outside
+    // the boundary whatever the profile says.
+    //
+    // The launch helper is resolved here, once, for the same reason the relay is
+    // a launch input rather than a backend lookup: it is *this* friring's CLI,
+    // and a backend that resolved it itself could not be composed against a host
+    // that has no such binary beside it. A policy backend refuses the launch
+    // when it is missing.
+    let helper = local_helper_program();
+    let mut launch = SandboxLaunch::new(&policy, home, &session_key)
+        .with_tmp_dir(&tmp_dir)
+        .with_agent_program(command)
+        .with_host_mux(crate::agent::tmux::host_mux_sockets());
+    if let Some(helper) = helper.as_deref() {
+        launch = launch.with_helper_program(helper);
+    }
+    if let Some(bridge) = bridge {
+        launch = launch.with_narrowing(&bridge.overlay);
+        if let Some((dir, key)) = &bridge.gate {
+            launch = launch.with_gate(dir, key);
+        }
+    }
+    // Recorded before the launch is composed against it, so the row a restart
+    // rebinds from names the very endpoint the agent's own environment names.
+    // `Preparing` until the supervisor acknowledges the commit: a listener that
+    // is bound and not yet anybody's is not a boundary anything is using.
+    let egress = crate::session::EgressRecord {
+        endpoint: proxy.as_ref().map(|(endpoint, _)| {
+            crate::sandbox::egress::PersistedEndpoint::of(endpoint).to_string()
+        }),
+        token: proxy.as_ref().map(|(_, token)| token.clone()),
+        state: match &proxy {
+            Some(_) => crate::session::EgressState::Preparing,
+            None => crate::session::EgressState::None,
+        },
+    };
+    if let Some((endpoint, _)) = proxy {
         launch = launch.with_proxy(endpoint);
     }
     if let Some(dir) = signal_dir.as_deref() {
         launch = launch.with_signal_dir(dir);
+    }
+    if let Some(dir) = bridge_dir.as_deref() {
+        launch = launch.with_bridge_dir(dir);
     }
     if let Some(place) = &ensured {
         // A relay exactly when the launch is proxied. `ensure_place` refuses a
@@ -782,6 +1109,7 @@ fn build(
         label: format!("{}{note}", plan.label),
         place,
         instance: ensured.map(|ensured| ensured.instance),
+        egress,
         // Only where there is something to do. An agent whose state friring
         // cannot inspect (`LoginState::Unknown`) is *not* a prompt: telling a
         // user to sign in every launch when they may already be signed in is
@@ -1042,6 +1370,271 @@ fn session_key(config: &SessionConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Bridge launch refusals (ADR-31) ──────────────────────────────────
+
+    /// An agent that requires the bridge, for the refusal tests.
+    fn bridge_agent() -> AgentDef {
+        let mut def = agent_def();
+        def.sandbox = Some(crate::session::AgentSandboxDef {
+            bridge_requires: vec![
+                crate::session::BridgeCapability::ChildLifecycle,
+                crate::session::BridgeCapability::Mailbox,
+            ],
+            config_dir_env: Some("CODEX_HOME".to_string()),
+            state_dir: Some("~/.codex".to_string()),
+            ..def.sandbox.unwrap_or_default()
+        });
+        def
+    }
+
+    /// A profile granting everything the agent above requires.
+    fn granting_profile() -> crate::session::SandboxProfile {
+        let mut profile = crate::session::SandboxProfile::new(
+            "orchestrator",
+            vec![crate::session::SandboxPath::workspace("~/dev/app")],
+        );
+        profile.network_mode = crate::session::NetworkMode::None;
+        profile.bridge_grants = vec![
+            crate::session::BridgeCapability::ChildLifecycle,
+            crate::session::BridgeCapability::Mailbox,
+        ];
+        profile
+    }
+
+    /// A **leader** is an ordinary session: the operator creates it from the
+    /// TUI, and nothing about its launch goes through the child saga. So the
+    /// queue has to be minted by the *profile's* grant rather than by the child
+    /// path, or every leader holds capabilities with no channel to use them
+    /// through — which is what `docs/CONFIG.md` promises and what both shipped
+    /// extensions' leaders die on the first line without.
+    #[test]
+    fn a_session_whose_profile_grants_the_bridge_is_minted_a_queue() {
+        let _guard = fabricated_data_dir("leader-queue");
+        let _host = TestSandboxHost::new(stub_host());
+
+        let mut config = config_with(Some(granting_profile()));
+        config.agent_session_id = Some("leader-queue".into());
+        let invocation = build(
+            &stub_host(),
+            "/fabricated/home",
+            Some(&agent_def()),
+            &config,
+            "claude",
+            &[],
+            // No `BridgeLaunch`: this is a leader, not a child.
+            None,
+        )
+        .expect("a granting profile composes");
+
+        let dir = invocation
+            .env
+            .get(crate::session::bridge::BRIDGE_DIR_ENV)
+            .cloned()
+            .expect("a granting profile mints a bridge queue");
+        assert_eq!(
+            dir,
+            crate::paths::session_bridge_dir("leader-queue")
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        // The channel is the agent writing a request and reading an answer, so
+        // the directory has to be **writable** inside the boundary. Read off the
+        // generated argv, which is the boundary the kernel is handed: the stub
+        // host is bwrap, which spells a writable root `--bind src dst`. Merely
+        // finding the path in the argv would accept a read-only mount — a leader
+        // that can read answers and never submit a request.
+        assert!(
+            invocation
+                .args
+                .windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == dir && w[2] == dir),
+            "the bridge queue is not bound read-write into the boundary: {:?}",
+            invocation.args
+        );
+        assert!(
+            !invocation
+                .args
+                .windows(3)
+                .any(|w| (w[0] == "--ro-bind" || w[0] == "--ro-bind-try") && w[2] == dir),
+            "the bridge queue is mounted read-only: {:?}",
+            invocation.args
+        );
+        cleanup(&config);
+
+        // And a profile that grants nothing gets none: the variable's presence
+        // is what tells `friring-cli bridge` it has authority to spend.
+        let mut plain = config_with(Some(closed_profile()));
+        plain.agent_session_id = Some("leader-none".into());
+        let invocation = build(
+            &stub_host(),
+            "/fabricated/home",
+            Some(&agent_def()),
+            &plain,
+            "claude",
+            &[],
+            None,
+        )
+        .expect("an ordinary profile composes");
+        assert!(
+            !invocation
+                .env
+                .contains_key(crate::session::bridge::BRIDGE_DIR_ENV),
+            "a profile granting nothing was still given a queue"
+        );
+        cleanup(&plain);
+    }
+
+    /// A refusal is read by a person, so it must not carry the indentation of
+    /// the source it was wrapped in.
+    ///
+    /// A multi-line string literal without a `\` continuation keeps every
+    /// continuation line's leading spaces, and rustfmt does not touch string
+    /// contents — so the mistake is invisible in the source and obvious on a
+    /// terminal. This asserts it over every refusal this function can produce.
+    #[test]
+    fn no_refusal_carries_the_indentation_it_was_wrapped_in() {
+        let def = bridge_agent();
+        let caps = crate::sandbox::backend::Caps {
+            shape: crate::session::SandboxShape::Place,
+            limits: true,
+            network_modes: crate::session::NetworkMode::ALL,
+            read_scopes: crate::session::ReadScope::ALL,
+            persistent: true,
+            host_credentials: false,
+            inner_agent_sandbox: crate::sandbox::backend::InnerSandboxVerdict::Redundant,
+            proxy_transport: crate::sandbox::backend::ProxyTransport::UnixSocket,
+            bridge: false,
+        };
+        let mut short = config_with(Some(granting_profile()));
+        short.sandbox.as_mut().unwrap().bridge_grants = Vec::new();
+        let mut remote = config_with(Some(granting_profile()));
+        remote.backend = Some("ssh:devbox".to_string());
+
+        let refusals = [
+            bridge_refusal(Some(&def), &config_with(None), None, true),
+            bridge_refusal(Some(&def), &short, None, true),
+            bridge_refusal(
+                Some(&def),
+                &config_with(Some(granting_profile())),
+                Some(&caps),
+                true,
+            ),
+            bridge_refusal(Some(&def), &remote, None, true),
+            bridge_refusal(
+                Some(&def),
+                &config_with(Some(granting_profile())),
+                None,
+                false,
+            ),
+        ];
+        for refusal in refusals {
+            let reason = refusal.expect("each of these is a refusal").reason;
+            assert!(
+                !reason.contains("  "),
+                "a refusal carries wrapped-source indentation: {reason:?}"
+            );
+        }
+    }
+
+    /// Every way a bridge-required agent must **not** start, each an integrity
+    /// refusal a profile's `allow_unsandboxed_fallback` may not answer.
+    ///
+    /// The common failure this closes is subtle: a bridge-required agent that
+    /// fell back to the host would have no boundary *and* a channel nobody is
+    /// serving — strictly worse than not starting, and much harder to diagnose.
+    #[test]
+    fn a_bridge_required_agent_is_refused_wherever_it_cannot_be_served() {
+        let def = bridge_agent();
+        let with_bridge = crate::sandbox::Caps {
+            bridge: true,
+            ..crate::sandbox::backend::Caps {
+                shape: crate::session::SandboxShape::Policy,
+                limits: false,
+                network_modes: crate::session::NetworkMode::ALL,
+                read_scopes: crate::session::ReadScope::ALL,
+                persistent: false,
+                host_credentials: true,
+                inner_agent_sandbox: crate::sandbox::backend::InnerSandboxVerdict::Redundant,
+                proxy_transport: crate::sandbox::backend::ProxyTransport::Loopback,
+                bridge: true,
+            }
+        };
+        let without_bridge = crate::sandbox::Caps {
+            bridge: false,
+            ..with_bridge.clone()
+        };
+
+        // No profile at all: the bridge is granted by a profile, so an agent
+        // that needs one is never started as a plain session.
+        let plain = config_with(None);
+        let refusal = bridge_refusal(Some(&def), &plain, Some(&with_bridge), true)
+            .expect("a bridge agent with no profile is refused");
+        assert!(refusal.integrity, "the fallback must not answer this");
+        assert!(refusal.reason.contains("has none"), "{}", refusal.reason);
+
+        // A profile that grants less than the agent needs.
+        let mut profile = granting_profile();
+        profile.bridge_grants = vec![crate::session::BridgeCapability::Mailbox];
+        let short = config_with(Some(profile));
+        let refusal = bridge_refusal(Some(&def), &short, Some(&with_bridge), true)
+            .expect("a missing grant is refused");
+        assert!(
+            refusal.reason.contains("grant_missing"),
+            "{}",
+            refusal.reason
+        );
+        assert!(
+            refusal.reason.contains("child-lifecycle"),
+            "{}",
+            refusal.reason
+        );
+
+        // A backend that cannot carry the channel.
+        let placed = config_with(Some(granting_profile()));
+        let refusal = bridge_refusal(Some(&def), &placed, Some(&without_bridge), true)
+            .expect("a place cannot carry the bridge");
+        assert!(
+            refusal.reason.contains("cannot carry"),
+            "{}",
+            refusal.reason
+        );
+
+        // A remote session: friring mints the bridge directory on the machine it
+        // runs on.
+        let mut remote = config_with(Some(granting_profile()));
+        remote.backend = Some("ssh:devbox".to_string());
+        let refusal = bridge_refusal(Some(&def), &remote, Some(&with_bridge), true)
+            .expect("a remote session cannot carry the bridge");
+        assert!(refusal.reason.contains("remote"), "{}", refusal.reason);
+
+        // The headless path: nothing would own the proxy or answer the requests.
+        let headless = config_with(Some(granting_profile()));
+        let refusal = bridge_refusal(Some(&def), &headless, Some(&with_bridge), false)
+            .expect("a headless create is refused");
+        assert!(
+            refusal.reason.contains("bridge_requires_tui"),
+            "{}",
+            refusal.reason
+        );
+
+        // …and the one shape that is allowed: a granting profile, a capable
+        // backend, from a running TUI.
+        let ok = config_with(Some(granting_profile()));
+        assert!(bridge_refusal(Some(&def), &ok, Some(&with_bridge), true).is_none());
+    }
+
+    /// An agent that requires nothing is unaffected by any of it — which is
+    /// every agent in the registry today.
+    #[test]
+    fn an_agent_that_requires_nothing_is_never_refused_for_the_bridge() {
+        let def = agent_def();
+        let config = config_with(None);
+        assert!(bridge_refusal(Some(&def), &config, None, false).is_none());
+        assert!(bridge_refusal(None, &config, None, false).is_none());
+    }
+
     use crate::session::{AgentSandboxDef, SandboxBackendKind, SandboxPath, SandboxProfile};
 
     fn agent_def() -> AgentDef {
@@ -1054,6 +1647,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: None,
+            transcript: None,
             sandbox: Some(AgentSandboxDef {
                 bypass: vec!["--dangerously-skip-permissions".into()],
                 env: [("DISABLE_AUTOUPDATER".to_string(), "1".to_string())]
@@ -1302,7 +1896,12 @@ mod tests {
         let profile = closed_profile();
         let mut config = config_with(Some(profile));
         config.cwd = Some("/fabricated/home/dev/app".into());
-        let def = agent_def();
+        let mut def = agent_def();
+        def.sandbox
+            .as_mut()
+            .unwrap()
+            .env
+            .insert("TMPDIR".into(), "/host/temp".into());
 
         let wrapped = build(
             &stub_host(),
@@ -1311,21 +1910,25 @@ mod tests {
             &config,
             "claude",
             &["--resume".into(), "abc".into()],
+            None,
         )
         .unwrap();
 
         assert_eq!(wrapped.command, STUB_BWRAP);
-        // The agent's own command line is last, after the backend's `--`, with
+        // The agent's own command line is last, after the *helper's* `--`, with
         // the bypass flags appended to *its* arguments rather than the
-        // wrapper's.
+        // wrapper's. friring's own launch helper sits between the two, which is
+        // what drops the host multiplexer's environment (ADR-33).
         let tail: Vec<&str> = wrapped
             .args
             .iter()
             .skip_while(|a| *a != "--")
             .map(String::as_str)
             .collect();
+        assert_eq!(&tail[..4], ["--", TEST_HELPER_PROGRAM, "sandbox", "launch"]);
+        let handover = tail.iter().rposition(|a| *a == "--").expect("a handover");
         assert_eq!(
-            tail,
+            &tail[handover..],
             [
                 "--",
                 "claude",
@@ -1362,6 +1965,7 @@ mod tests {
             &config,
             "claude",
             &[],
+            None,
         )
         .unwrap();
 
@@ -1408,6 +2012,7 @@ mod tests {
             &config,
             "aider",
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(wrapped.command, STUB_BWRAP);
@@ -1436,6 +2041,7 @@ mod tests {
             &config,
             "claude",
             &[],
+            None,
         )
         .unwrap_err();
         assert!(err.reason.contains("not valid UTF-8"), "{err}");
@@ -1458,6 +2064,7 @@ mod tests {
             &config,
             "claude",
             &[],
+            None,
         )
         .unwrap();
 
@@ -1467,6 +2074,14 @@ mod tests {
             "the scratch directory must exist by launch"
         );
         let scratch = scratch.display().to_string();
+        for key in ["TMPDIR", "TMP", "TEMP"] {
+            assert_eq!(
+                wrapped.env.get(key).map(String::as_str),
+                Some(scratch.as_str()),
+                "{key} must name the launch's private scratch directory, even when the agent's \
+                 static environment points elsewhere"
+            );
+        }
         assert!(
             wrapped.args.contains(&scratch),
             "the sandbox was not given its scratch directory: {:?}",
@@ -1547,6 +2162,7 @@ mod tests {
             &config,
             "claude",
             &[],
+            None,
         )
         .expect_err("an unidentifiable boundary must not be composed");
         assert!(refusal.reason.contains("no session id"), "{refusal}");
@@ -1567,6 +2183,7 @@ mod tests {
             &identified,
             "claude",
             &[],
+            None,
         )
         .expect("an identified launch composes");
         cleanup(&identified);
@@ -1592,6 +2209,7 @@ mod tests {
             &config,
             "claude",
             &[],
+            None,
         )
         .unwrap();
         let port = proxy_port(&wrapped);
@@ -1636,6 +2254,7 @@ mod tests {
             &config,
             "claude",
             &[],
+            None,
         )
         .unwrap();
         let port = proxy_port(&wrapped);
@@ -1668,6 +2287,7 @@ mod tests {
                 &config,
                 "claude",
                 &[],
+                None,
             )
             .expect("the boundary composes");
             (config, wrapped)
@@ -1736,6 +2356,7 @@ mod tests {
             &config,
             "claude",
             &[],
+            None,
         )
         .unwrap();
 
@@ -1814,6 +2435,7 @@ mod tests {
             &config,
             "claude",
             &[],
+            None,
         )
         .unwrap_err();
         assert!(err.reason.contains("egress proxy"), "{err}");
@@ -2129,6 +2751,7 @@ mod tests {
             &config,
             "claude",
             &["--resume".into()],
+            None,
         )
         .expect("a place composes");
 
@@ -2165,6 +2788,7 @@ mod tests {
             &config_with(Some(closed_profile())),
             "claude",
             &[],
+            None,
         )
         .unwrap();
         assert!(wrapped.place.is_none());
@@ -2192,6 +2816,7 @@ mod tests {
                 &config,
                 "claude",
                 &[],
+                None,
             )
             .expect_err("a boundary friring builds here cannot hold a session over there");
             assert!(err.reason.contains("remote host"), "{err}");
@@ -2216,6 +2841,7 @@ mod tests {
             &config,
             "claude",
             &[],
+            None,
         )
         .expect("a place-backed session relaunches into its place");
     }
@@ -2265,6 +2891,7 @@ mod tests {
             &config,
             "claude",
             &["--settings".into(), config_arg.clone(), "--verbose".into()],
+            None,
         )
         .unwrap();
 
@@ -2327,6 +2954,7 @@ mod tests {
             &config_with(Some(closed_profile())),
             "claude",
             &["--settings".into(), config_arg.clone()],
+            None,
         )
         .unwrap();
         assert!(policy.args.contains(&config_arg));
@@ -2409,6 +3037,7 @@ mod tests {
             &config,
             "claude",
             &[],
+            None,
         )
         .unwrap();
 
@@ -2476,6 +3105,7 @@ mod tests {
                 &config,
                 "claude",
                 args,
+                None,
             )
             .unwrap()
         };
@@ -2542,6 +3172,7 @@ mod tests {
             &config_with(Some(closed_profile())),
             "claude",
             &[],
+            None,
         )
         .unwrap();
 
@@ -2576,6 +3207,7 @@ mod tests {
             &config,
             "claude",
             &[],
+            None,
         )
         .unwrap();
 
@@ -2607,8 +3239,16 @@ mod tests {
                 p.network_allow = vec!["api.anthropic.com".into()];
             })));
             config.agent_session_id = Some(key.to_string());
-            let wrapped = build(&host, "/fabricated/home", None, &config, "claude", &[])
-                .expect("a filtered place composes");
+            let wrapped = build(
+                &host,
+                "/fabricated/home",
+                None,
+                &config,
+                "claude",
+                &[],
+                None,
+            )
+            .expect("a filtered place composes");
             pending_egress(&config).commit();
             (config, wrapped)
         };
@@ -2634,9 +3274,10 @@ mod tests {
         let (_, again) = compose("place-egress-a");
         assert_eq!(address(&first), address(&again));
 
-        // The relay runs beside the agent, inside the place.
-        assert_eq!(first.command, "/bin/sh");
-        assert!(first.args.iter().any(|a| a == "/usr/local/bin/friring-cli"));
+        // The relay runs beside the agent, inside the place — started by
+        // friring's own launch helper, which is the place's copy of the CLI.
+        assert_eq!(first.command, "/usr/local/bin/friring-cli");
+        assert_eq!(&first.args[..2], ["sandbox", "launch"]);
 
         cleanup(&first_config);
         cleanup(&second_config);
@@ -2663,8 +3304,16 @@ mod tests {
         })));
         config.agent_session_id = Some("place-unprovable".into());
 
-        let err = build(&host, "/fabricated/home", None, &config, "claude", &[])
-            .expect_err("a place that cannot be shown to reach the proxy must not compose");
+        let err = build(
+            &host,
+            "/fabricated/home",
+            None,
+            &config,
+            "claude",
+            &[],
+            None,
+        )
+        .expect_err("a place that cannot be shown to reach the proxy must not compose");
         assert!(
             err.reason.contains("could not prove this place can dial"),
             "{err}"
@@ -2709,11 +3358,20 @@ mod tests {
             state: String::new(),
             place: None,
             instance: None,
+            // The egress record is the second place a credential lives on this
+            // type, and its own `Debug` has to withhold it too.
+            egress: crate::session::EgressRecord {
+                endpoint: Some("tcp:8118".to_string()),
+                token: Some(FAKE.to_string()),
+                state: crate::session::EgressState::Preparing,
+            },
             login: None,
         };
 
         let rendered = format!("{wrapped:?}");
         assert!(!rendered.contains(FAKE), "{rendered}");
+        // The endpoint is not a credential and stays legible.
+        assert!(rendered.contains("tcp:8118"), "{rendered}");
         // The names are the diagnostic and stay, and so does everything that is
         // not a credential.
         for name in ["HTTP_PROXY", "ALL_PROXY", "ANTHROPIC_API_KEY"] {

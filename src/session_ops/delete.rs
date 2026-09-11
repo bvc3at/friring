@@ -19,6 +19,92 @@ pub struct ForceDeleteReport {
     /// unreachable host is expected (that's often *why* someone force-deletes),
     /// so this is recorded rather than aborting the delete.
     pub remote_teardown_error: Option<String>,
+    /// The bridge children this delete stopped first (ADR-32).
+    pub stopped_children: Vec<String>,
+}
+
+/// Stop every live bridge child of a session being force-deleted.
+///
+/// The owner is going away, so there is nobody left to receive a `result`, and
+/// the grace period a `stop` verb grants exists precisely so a child can send
+/// one. Each child's runtime is torn down and its state recorded.
+///
+/// **The recorded state is what the teardown achieved**, never what it
+/// attempted. A pane that refused to die is `stop_failed` — which
+/// [`ChildState::is_live`](crate::session::ChildState::is_live) still counts as
+/// live, so the child keeps its fan-out slot and an operator is told to look —
+/// and only a teardown that reported nothing wrong is `stopped`. Recording a
+/// terminal state friring did not verify is the one outcome that corrupts every
+/// later decision: integration reads it, `status` reports it, and the slot is
+/// released for a child that may still be writing its worktree. A child whose
+/// session row cannot be read is `stop_failed` for the same reason: nothing was
+/// torn down, so nothing was verified dead.
+///
+/// **Not deleted.** The child's worktree, branch and rows survive: a
+/// force-deleted owner is a reason to stop its workers, not a licence to throw
+/// away what they wrote.
+///
+/// **An unreadable row aborts the delete.** The cascade is the only thing that
+/// stops this owner's workers, and a read that failed is not the same answer as
+/// "there are none": `unwrap_or_default()` here would delete the owner with its
+/// children still running, holding worktrees nothing can now find. So the whole
+/// force-delete is refused and the operator is told which read failed — the
+/// escape hatch is narrower than it was, and it is still there, because a
+/// child's own row can be force-deleted directly.
+fn stop_owned_children(db: &Database, owner: SessionId) -> Result<Vec<String>, String> {
+    let mut stopped = Vec::new();
+    let children = db.bridge_children_of(&owner.to_string()).map_err(|e| {
+        format!(
+            "Session {owner} owns bridge children and friring could not read them ({e}), so it \
+             will not delete the one session that could stop them. Repair the database, or \
+             force-delete each child by id first"
+        )
+    })?;
+    for child in children {
+        // Fail closed on a read error, exactly as the cascade above does: an
+        // unreadable state is not evidence that a child is finished, and
+        // skipping it would leave an agent running for an owner that is gone.
+        let live = match db.bridge_child_state(&child.child_id) {
+            Ok(row) => row.is_some_and(|row| row.state.is_live()),
+            Err(e) => {
+                return Err(format!(
+                    "friring could not read the state of child '{}' ({e}), so it cannot tell \
+                     whether stopping it is still needed and will not delete its owner",
+                    child.child_id
+                ))
+            }
+        };
+        if !live {
+            continue;
+        }
+        let Ok(id) = child.child_id.parse::<SessionId>() else {
+            continue;
+        };
+        // `false` until a teardown says otherwise: a session row that cannot be
+        // read, or is not there, is a child friring never tried to stop and
+        // certainly did not verify dead. It keeps its slot and an operator is
+        // told to look, which is the whole rule above.
+        let mut torn_down = false;
+        if let Ok(Some(row)) = db.get_session_by_id(id) {
+            let recorded = recorded_places(db, &row.backend_type);
+            let mut child_report = ForceDeleteReport::default();
+            teardown_runtime_resources(&row, &recorded, &mut child_report);
+            // A window friring could not kill, or a remote host it could not
+            // reach: either way the child's agent may still be running.
+            torn_down = child_report.remote_teardown_error.is_none()
+                && (child_report.killed_window || row.backend_id.is_empty());
+        }
+        let state = if torn_down {
+            crate::session::ChildState::Stopped
+        } else {
+            crate::session::ChildState::StopFailed
+        };
+        let _ = db.set_bridge_child_state(&child.child_id, state);
+        if torn_down {
+            stopped.push(child.child_id);
+        }
+    }
+    Ok(stopped)
 }
 
 /// Soft-delete a session and (when `force`) also tear down its runtime
@@ -41,12 +127,62 @@ pub fn delete_session_headless(
 
     let mut report = ForceDeleteReport::default();
 
+    // A **live** bridge child is not soft-deletable. Without `force` there is no
+    // runtime teardown at all, so the row would be stamped force-deleted and its
+    // owner told the child is gone while its agent kept writing the worktree a
+    // later verdict reads. The owner's own `stop` verb is the path that stops a
+    // child and has the host verify it; `--force` is the operator's override,
+    // and it does tear the runtime down.
+    if !force {
+        let live = db
+            .bridge_child_state(&session_id.to_string())
+            .ok()
+            .flatten()
+            .is_some_and(|row| row.state.is_live());
+        if live {
+            return Err(format!(
+                "Session {session_id} is a running bridge child. Its owner's 'stop' is what \
+                 stops one, so friring can verify the pane died before anything reads its \
+                 worktree — or pass --force to take it away anyway"
+            ));
+        }
+    }
+
     if force {
+        // The owner's children first (ADR-32). A force-delete takes away the
+        // one session that could ever answer a child's `blocked`, read its
+        // `result` or integrate its branch, so leaving them running would leave
+        // agents working for nobody — and holding worktrees an operator has no
+        // way left to find.
+        // Before anything of the owner's own runtime is touched: a refusal here
+        // must leave the session exactly as it was, not half torn down.
+        report.stopped_children = stop_owned_children(db, session_id)?;
         let recorded = recorded_places(db, &session.backend_type);
         teardown_runtime_resources(&session, &recorded, &mut report);
         report.disabled_automations = db
             .disable_send_automations_for_session(session_id)
             .map_err(|e| format!("disable_send_automations_for_session: {e}"))?;
+    }
+    // An operator took a child away. Its owner is told in friring's own words,
+    // because a leader polling `status` would otherwise see a child that simply
+    // stopped existing.
+    if let Ok(Some(row)) = db.bridge_child(&session_id.to_string()) {
+        let _ = db.mark_bridge_child_force_deleted(&session_id.to_string());
+        if let Ok(owner) = row.owner_id.parse::<SessionId>() {
+            let _ = db.enqueue_message_capped(
+                &crate::storage::messages::NewMessage {
+                    to_session_id: owner,
+                    from_session_id: None,
+                    from_task_id: None,
+                    kind: crate::session::bridge::MailKind::ChildRemovedByOperator
+                        .as_str()
+                        .to_string(),
+                    body: serde_json::json!({ "child": session_id.to_string() }).to_string(),
+                    in_reply_to: None,
+                },
+                crate::session::bridge::MAX_UNREAD_PER_OWNER,
+            );
+        }
     }
 
     db.soft_delete_session(session_id)
@@ -366,6 +502,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         };
         db.upsert_session(&shared).unwrap();
         id
@@ -514,6 +653,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         };
 
         let mut report = ForceDeleteReport::default();
@@ -570,6 +712,9 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         };
 
         let mut report = ForceDeleteReport::default();
@@ -584,6 +729,96 @@ mod tests {
         // session that never asked for a boundary is not touched.
         assert!(scratch_root.join(plain.to_string()).exists());
         let _ = std::fs::remove_dir_all(scratch_root.join(plain.to_string()));
+    }
+
+    /// A child whose session row is gone was never torn down, so it is not
+    /// `stopped`.
+    ///
+    /// `stopped` releases the owner's fan-out slot and tells `status` and
+    /// integration the pane is dead. Recording it for a child friring never
+    /// looked at — no window killed, no host reached, nothing verified — is the
+    /// one outcome that corrupts every later decision, and a row that will not
+    /// read is exactly that case.
+    #[test]
+    fn a_child_whose_session_row_is_missing_is_recorded_stop_failed() {
+        let db = Database::open_in_memory().unwrap();
+        let owner = insert_session(&db, "owner");
+        // Owned and live, but with no session row of its own: the arm that would
+        // have torn something down cannot run.
+        let child = SessionId::default().to_string();
+        db.insert_bridge_child(&child, &owner.to_string(), "create-0001")
+            .unwrap();
+        db.set_bridge_child_state(&child, crate::session::ChildState::Working)
+            .unwrap();
+
+        let report = delete_session_headless(&db, owner, true).unwrap();
+
+        assert!(
+            report.stopped_children.is_empty(),
+            "a child friring never touched was reported stopped: {:?}",
+            report.stopped_children
+        );
+        assert_eq!(
+            db.bridge_child_state(&child).unwrap().map(|row| row.state),
+            Some(crate::session::ChildState::StopFailed),
+            "an unverified child must keep its slot and be flagged for a person"
+        );
+    }
+
+    /// A force-delete whose ownership cascade cannot be read is refused, and
+    /// leaves the owner exactly as it was.
+    ///
+    /// `unwrap_or_default()` on that read is an empty cascade, which is
+    /// indistinguishable from "this session owns nothing" — so the one session
+    /// that could ever stop these children is deleted while they keep running,
+    /// holding worktrees nothing can now find. The escape hatch survives: a
+    /// child's own row can still be force-deleted by id.
+    #[test]
+    fn an_owner_whose_children_cannot_be_read_is_not_force_deleted() {
+        let db = Database::open_in_memory().unwrap();
+        let owner = insert_session(&db, "owner");
+        // A read that genuinely fails, rather than a seam: the cascade's own
+        // SELECT has no table to run against.
+        db.conn_ref()
+            .execute("DROP TABLE bridge_children", [])
+            .unwrap();
+
+        let err = delete_session_headless(&db, owner, true).unwrap_err();
+        assert!(err.contains("bridge children"), "got {err}");
+        assert!(
+            db.get_session_by_id(owner).unwrap().is_some(),
+            "the owner was deleted after the cascade was refused"
+        );
+        // Untouched, not merely still present: a refusal that had already
+        // stamped or soft-deleted the row would be a half-done delete.
+        let (deleted, forced): (Option<i64>, i64) = db
+            .conn_ref()
+            .query_row(
+                "SELECT deleted_at, force_deleted FROM sessions WHERE id = ?1",
+                rusqlite::params![owner.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(deleted, None, "the owner was soft-deleted anyway");
+        assert_eq!(forced, 0, "the owner was stamped force-deleted anyway");
+    }
+
+    /// The same rule one level down: a child whose *state* cannot be read is not
+    /// evidence that stopping it is unnecessary.
+    #[test]
+    fn an_owner_whose_child_state_cannot_be_read_is_not_force_deleted() {
+        let db = Database::open_in_memory().unwrap();
+        let owner = insert_session(&db, "owner");
+        let child = SessionId::default().to_string();
+        db.insert_bridge_child(&child, &owner.to_string(), "create-0001")
+            .unwrap();
+        db.conn_ref()
+            .execute("DROP TABLE bridge_child_state", [])
+            .unwrap();
+
+        let err = delete_session_headless(&db, owner, true).unwrap_err();
+        assert!(err.contains(&child), "got {err}");
+        assert!(db.get_session_by_id(owner).unwrap().is_some());
     }
 
     #[test]

@@ -217,6 +217,11 @@ pub struct DiscoveredSession {
 pub struct SpawnedSession {
     /// Backend-specific session identifier.
     pub backend_id: String,
+    /// The exact window this spawn landed in, for the row every destructive
+    /// action revalidates against (ADR-32). Empty for a backend with no such
+    /// notion; [`MuxIdentity::is_recorded`](crate::session::MuxIdentity::is_recorded)
+    /// is what reads that as "nothing to compare" rather than as a match.
+    pub identity: crate::session::MuxIdentity,
     /// Streaming output bytes from the session.
     pub output: Box<dyn Read + Send>,
     /// Input write handle to send bytes to the session.
@@ -300,6 +305,36 @@ pub trait SessionBackend: Send + Sync {
     /// Default: an empty seed, like [`Self::capture_history`].
     fn capture_visible(&self, _backend_id: &str) -> Result<Vec<u8>> {
         Ok(Vec::new())
+    }
+
+    /// What the multiplexer server this backend talks to says about itself
+    /// (ADR-32).
+    ///
+    /// The identity a launch is checked against: `socket_path` must be the
+    /// socket the policy denied, and `marker` is friring's own uuid for the
+    /// server, set once on first connection. `None` for a backend with no such
+    /// notion — which is every backend that is not a real multiplexer, and where
+    /// no bridge child is ever launched.
+    fn server_identity(&self) -> Option<crate::session::MuxServerIdentity> {
+        None
+    }
+
+    /// The exact window, pane and pane pid `backend_id` names right now, plus
+    /// friring's own pane marker.
+    ///
+    /// Read fresh from the server every time, because that is the point: it is
+    /// compared against what friring recorded, and a cached answer would agree
+    /// with itself. Default: nothing recorded — which
+    /// [`MuxIdentity::is_recorded`](crate::session::MuxIdentity::is_recorded)
+    /// reads as "no comparison possible", never as a match.
+    fn pane_identity(&self, _backend_id: &str) -> Result<crate::session::MuxIdentity> {
+        Ok(crate::session::MuxIdentity::default())
+    }
+
+    /// Stamp friring's own marker on a pane, so a later revalidation has
+    /// something the pane cannot have acquired by accident.
+    fn set_pane_marker(&self, _backend_id: &str, _value: &str) -> Result<()> {
+        Ok(())
     }
 
     /// Discover existing sessions managed by this backend.
@@ -537,6 +572,185 @@ struct Sandboxed {
     /// What the user types in the pane to sign the agent in, when the boundary
     /// starts it signed out. For `SessionInfo::sandbox_login`.
     login: Option<String>,
+    /// Where the proxy above listens and the credential it demands, for
+    /// `sessions.egress_*` — what a restart rebinds from. Empty for a launch
+    /// that needs no proxy. Never rendered: the record's own `Debug` withholds
+    /// the token.
+    egress_record: crate::session::EgressRecord,
+}
+
+/// A spawned pane whose egress claim has not been committed yet.
+///
+/// Returned by [`Session::spawn_gated`] and, internally, by the shared launch
+/// both spawn paths use. Dropping it without committing releases the prepared
+/// proxy instance and leaves whatever the session was using alone — which is the
+/// behaviour every failure between S5 and S7 depends on.
+pub struct GatedSession {
+    pub session: Session,
+    /// Commit once the child's rows exist (S6) and before the gate is released.
+    pub egress: PendingEgress,
+}
+
+impl Session {
+    /// The credential this session's egress proxy demands, for the one caller
+    /// that persists it. Never rendered, never logged.
+    pub fn egress_token(&self) -> Option<&str> {
+        self.egress_token.as_deref()
+    }
+
+    /// Prove the pane friring is about to act on is the pane it recorded
+    /// (ADR-32).
+    ///
+    /// **Every destructive multiplexer action calls this first**: a kill, a
+    /// nudge, a gate release. The window name is the adoption key and always
+    /// will be, but a name is not evidence — a window can be created by anything
+    /// holding the socket, and a pane id is reused after a server restart. So
+    /// the whole recorded identity is re-read from the server and compared, and
+    /// a mismatch in **any** field is a refusal rather than an action on
+    /// whatever now answers.
+    ///
+    /// A session with nothing recorded (spawned before schema v49, or adopted
+    /// without a launch) is refused too, and that is deliberate: "no identity to
+    /// compare" must not read as "the identity matched". The caller decides what
+    /// to do about it — an ordinary kill has always worked by pane id and still
+    /// may; a bridge child's does not.
+    ///
+    /// # Errors
+    ///
+    /// Nothing was recorded, the server would not answer, or a field differs —
+    /// with the field named, because that is what tells an operator whether they
+    /// are looking at a recycled pane or at something that created a decoy.
+    pub fn revalidate_identity(&self) -> Result<()> {
+        let expected = &self.info.mux;
+        if !expected.is_recorded() {
+            bail!(
+                "session '{}' has no recorded multiplexer identity, so friring cannot prove \
+                 which pane this is; relaunch it to record one",
+                self.info.name
+            );
+        }
+        let live = self.backend.pane_identity(&self.backend_id)?;
+        compare_identity(expected, &live).map_err(|difference| {
+            anyhow::anyhow!(
+                "the pane friring recorded for session '{}' is not the pane that answers to \
+                 it now ({difference}), so this action was refused rather than aimed at \
+                 whatever took its place",
+                self.info.name
+            )
+        })
+    }
+}
+
+/// Kill a pane friring recorded, and only if it is still that pane (ADR-32).
+///
+/// The recovery twin of [`Session::revalidate_identity`], for a pane whose
+/// session was never wired: after a crash the saga row names a window, a pane
+/// and a pid, and there is no [`Session`] to ask. The identity is re-read from
+/// the server and compared before anything is killed, because a pane id is
+/// reused after a server restart — so a kill by id alone would eventually be
+/// aimed at somebody else's window.
+///
+/// A pane the server no longer knows is not an error: it is already gone, which
+/// is the outcome the caller wanted.
+///
+/// # Errors
+///
+/// The recorded identity has no pane id to aim at, a field differs, or the
+/// server refused the kill.
+pub fn kill_recorded_pane(
+    backend: &Arc<dyn SessionBackend>,
+    expected: &crate::session::MuxIdentity,
+) -> Result<()> {
+    let Some(pane) = expected.pane_id.as_deref() else {
+        bail!("nothing was recorded about this pane, so friring will not kill one");
+    };
+    let live = match backend.pane_identity(pane) {
+        Ok(live) => live,
+        // The server does not know it. Already gone.
+        Err(_) => return Ok(()),
+    };
+    compare_identity(expected, &live).map_err(|difference| {
+        anyhow::anyhow!(
+            "the pane friring recorded ({pane}) is not the pane that answers to it now \
+             ({difference}), so it was left alone"
+        )
+    })?;
+    backend.kill(pane)
+}
+
+/// Which recorded field the live pane disagrees with, or `Ok(())`.
+///
+/// Only fields friring **recorded** are compared: a server that did not report
+/// `#{pane_pid}` left `None`, and comparing that against a live value would
+/// refuse every action on an older tmux. What is recorded must match exactly;
+/// what is not recorded is a cross-check friring never had.
+fn compare_identity(
+    expected: &crate::session::MuxIdentity,
+    live: &crate::session::MuxIdentity,
+) -> std::result::Result<(), String> {
+    let checks: [(&str, Option<String>, Option<String>); 4] = [
+        (
+            "window id",
+            expected.window_id.clone(),
+            live.window_id.clone(),
+        ),
+        ("pane id", expected.pane_id.clone(), live.pane_id.clone()),
+        (
+            "pane pid",
+            expected.pane_pid.map(|pid| pid.to_string()),
+            live.pane_pid.map(|pid| pid.to_string()),
+        ),
+        (
+            "friring's pane marker",
+            expected.launch_key.clone(),
+            live.launch_key.clone(),
+        ),
+    ];
+    for (what, recorded, found) in checks {
+        let Some(recorded) = recorded else { continue };
+        if found.as_deref() != Some(recorded.as_str()) {
+            return Err(format!(
+                "{what} is {} and friring recorded {recorded}",
+                found.unwrap_or_else(|| "absent".to_string())
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Turn a `Preparing` record into `Active` once the supervisor says it holds the
+/// committed instance.
+///
+/// A commit is a message to the supervisor thread, so it returns before anything
+/// has agreed to filter. Asking afterwards is what makes `Active` mean the
+/// boundary is really enforcing rather than that friring asked for it — and a
+/// silent supervisor leaves the record `Preparing`, which is the honest answer
+/// and the one Stage F's saga refuses to release a gate on.
+fn acknowledged_egress(
+    record: crate::session::EgressRecord,
+    session_id: Option<crate::session::SessionId>,
+) -> crate::session::EgressRecord {
+    if record.state != crate::session::EgressState::Preparing {
+        return record;
+    }
+    let Some(id) = session_id else { return record };
+    if crate::sandbox::egress::acknowledged(&id.to_string()) {
+        return crate::session::EgressRecord {
+            state: crate::session::EgressState::Active,
+            ..record
+        };
+    }
+    record
+}
+
+/// A fresh key for one launch, stamped into the pane's `@friring_pane` marker.
+///
+/// Per **launch**, not per session: a relaunch of the same session gets a new
+/// one, so a marker left on a pane a previous launch created never matches the
+/// current row. That is what makes the marker evidence rather than a label — a
+/// pane can only be carrying this launch's key if this launch put it there.
+fn launch_key() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// Bring a place's own tmux up before spawning into it.
@@ -671,10 +885,29 @@ fn sandboxed_invocation(
     config: &SessionConfig,
     provider: &Arc<dyn AgentProvider>,
 ) -> Result<Sandboxed> {
+    sandboxed_invocation_for(config, provider, None)
+}
+
+/// [`sandboxed_invocation`], told when the launch is a bridge child's.
+///
+/// `bridge` carries the narrowing, the gate and the private state directory
+/// (ADR-31, ADR-33). `None` is every ordinary launch.
+fn sandboxed_invocation_for(
+    config: &SessionConfig,
+    provider: &Arc<dyn AgentProvider>,
+    bridge: Option<&crate::agent::sandboxing::BridgeLaunch>,
+) -> Result<Sandboxed> {
     let command = provider.command().to_string();
     let args = provider.build_args(config);
-    let decision = crate::agent::sandboxing::apply(provider.agent_def(), config, &command, &args)
-        .map_err(anyhow::Error::msg)?;
+    let decision = crate::agent::sandboxing::apply_for(
+        provider.agent_def(),
+        config,
+        &command,
+        &args,
+        bridge,
+        true,
+    )
+    .map_err(anyhow::Error::msg)?;
     let plain = Sandboxed {
         command,
         args,
@@ -686,6 +919,7 @@ fn sandboxed_invocation(
         place: None,
         instance: None,
         login: None,
+        egress_record: crate::session::EgressRecord::default(),
         // Claimed here rather than left parked so the invocation and the
         // boundary it names travel together: whatever happens to one of them
         // from now on happens to both.
@@ -736,6 +970,7 @@ fn sandboxed_invocation(
                 place: wrapped.place,
                 instance: wrapped.instance,
                 login: wrapped.login,
+                egress_record: wrapped.egress,
             })
         }
     }
@@ -773,6 +1008,15 @@ pub struct Session {
     /// `attention_at > attention_ack_at`.
     attention_ack_at: u64,
     pub shell_pane: Option<ShellPane>,
+    /// The credential this session's egress proxy demands, so a restart can
+    /// rebind the same one.
+    ///
+    /// Deliberately here and **not** on
+    /// [`SessionInfo`](crate::session::SessionInfo): that type is rendered,
+    /// serialized, logged and snapshotted all over the app, and the safest
+    /// redaction is the value never being in it. The app reads this once, where
+    /// it builds the row to persist.
+    egress_token: Option<String>,
     /// Session environment variables, passed to shell pane spawns.
     env: HashMap<String, String>,
     /// True for a **placeholder** session: no live backend pane / reader /
@@ -815,6 +1059,61 @@ impl Session {
         backend: &Arc<dyn SessionBackend>,
         provider: &Arc<dyn AgentProvider>,
     ) -> Result<Self> {
+        let spawned = Self::spawn_inner(name, rows, cols, config, backend, provider, None)?;
+        // There is a pane now, so the boundary composed above has something to
+        // be the boundary *of*. A spawn that failed dropped it instead.
+        spawned.egress.commit();
+        Ok(spawned.session)
+    }
+
+    /// Spawn a **bridge child**: a pane that is running the launch helper and
+    /// waiting on its gate (ADR-32 S5, ADR-33).
+    ///
+    /// The difference from [`spawn`](Self::spawn) is entirely in what the caller
+    /// is handed back rather than in what the pane does. The child's agent has
+    /// not started and cannot start until the host writes the release file, so
+    /// the saga still has every step between here and S8 to fail in — and each
+    /// one has to be able to fail *without* the agent ever having run.
+    ///
+    /// That is why the egress instance comes back uncommitted: committing it
+    /// would make it the session's before the session's own row exists (S6), and
+    /// a saga that then rolled back would have retired the boundary of a session
+    /// nothing created. Dropping the returned [`GatedSession`] releases it.
+    ///
+    /// # Errors
+    ///
+    /// Composition refused the launch (every [`crate::agent::sandboxing::bridge_refusal`],
+    /// the narrowing, the seeding), or the backend would not open a window.
+    pub fn spawn_gated(
+        name: String,
+        rows: u16,
+        cols: u16,
+        config: &SessionConfig,
+        backend: &Arc<dyn SessionBackend>,
+        provider: &Arc<dyn AgentProvider>,
+        bridge: &crate::agent::sandboxing::BridgeLaunch,
+    ) -> Result<GatedSession> {
+        Self::spawn_inner(name, rows, cols, config, backend, provider, Some(bridge))
+    }
+
+    /// The launch both spawn paths share.
+    ///
+    /// Returns the egress claim rather than committing it, so the caller decides
+    /// when the pane counts as the boundary's — immediately for an ordinary
+    /// spawn, and at S7 for a gated one.
+    fn spawn_inner(
+        name: String,
+        rows: u16,
+        cols: u16,
+        config: &SessionConfig,
+        backend: &Arc<dyn SessionBackend>,
+        provider: &Arc<dyn AgentProvider>,
+        bridge: Option<&crate::agent::sandboxing::BridgeLaunch>,
+    ) -> Result<GatedSession> {
+        // The clamp belongs to the shared launch rather than to `spawn`, so a
+        // gated child gets it too: a zero dimension panics the vt100 grid, and
+        // a bridge child is spawned from whatever geometry the broker's tick
+        // happened to see.
         let (rows, cols) = (rows.max(1), cols.max(1));
         let window_name = crate::agent::tmux::agent_window_name(&name);
         let Sandboxed {
@@ -827,7 +1126,8 @@ impl Session {
             place,
             instance,
             login,
-        } = sandboxed_invocation(config, provider)?;
+            egress_record,
+        } = sandboxed_invocation_for(config, provider, bridge)?;
 
         // A place is a transport, so a place-backed launch spawns *into* the
         // place rather than onto the backend the caller resolved from
@@ -844,6 +1144,25 @@ impl Session {
             ready_place(backend)?;
         }
 
+        // ADR-33's claim, checked rather than asserted. The multiplexer deny set
+        // is computed from the socket path tmux *derives* from `-L <name>`, and
+        // this is what proves the derivation named the server friring is
+        // actually talking to. A server reporting a different `#{socket_path}`
+        // is one the generated policy says nothing about, so a policy launch
+        // onto it would be unconstrained in exactly the dimension that deny set
+        // exists for.
+        //
+        // A **policy** launch only — a place's tmux is inside the place and has
+        // no host deny set to disagree with, and an unsandboxed launch has no
+        // policy at all — and before the pane exists, where a refusal costs
+        // nothing. A tmux that does not report the variable degrades to `Ok`
+        // inside the check rather than losing the feature here.
+        if profile.is_some() && in_place.is_none() {
+            if let Some(identity) = backend.server_identity() {
+                crate::agent::tmux::socket_matches_policy(&identity)?;
+            }
+        }
+
         let spawned = backend.spawn(
             &window_name,
             &command,
@@ -853,11 +1172,22 @@ impl Session {
             rows,
             cols,
         )?;
-        // There is a pane now, so the boundary composed above has something to
-        // be the boundary *of*. A spawn that failed dropped it instead.
-        egress.commit();
+        // A gated launch's supervisor has nothing to acknowledge yet — the claim
+        // is still the caller's — so the record stays `Preparing` until S7 asks.
+        let egress_record = match bridge {
+            Some(_) => egress_record,
+            None => acknowledged_egress(egress_record, config.session_id),
+        };
 
         let mut info = SessionInfo::new(name);
+        // The exact window this launch landed in, stamped with friring's own
+        // marker so a later revalidation has something a decoy pane cannot have
+        // acquired (ADR-32). Best effort on the stamp: a server that will not
+        // take a pane option leaves a weaker identity — window, pane and pane
+        // pid — rather than failing a launch that has already succeeded.
+        info.mux = spawned.identity.clone();
+        info.egress_endpoint = egress_record.endpoint.clone();
+        info.egress_state = egress_record.state.clone();
         // Reuse the caller-supplied id when present (stable identity across a
         // respawn; matches the `FRIRING_SESSION` env injected before launch).
         if let Some(id) = config.session_id {
@@ -873,6 +1203,13 @@ impl Session {
         info.sandbox_profile = profile;
         info.sandbox_state = state;
         info.sandbox_login = login;
+        let marker =
+            crate::session::MuxIdentity::launch_marker(&info.id.to_string(), &launch_key());
+        if let Err(e) = backend.set_pane_marker(&spawned.backend_id, &marker) {
+            warn!(session_id = %info.id, "Could not mark the agent pane: {e:#}");
+        } else {
+            info.mux.launch_key = Some(marker);
+        }
         debug!(session_id = %info.id, backend_id = %spawned.backend_id, "Spawned session via backend");
 
         let mut session = Self::wire_io(
@@ -890,7 +1227,8 @@ impl Session {
             env,
         );
         session.place_instance = instance;
-        Ok(session)
+        session.egress_token = egress_record.token;
+        Ok(GatedSession { session, egress })
     }
 
     /// Reconnect to an existing backend session. `seed` is optional
@@ -1021,6 +1359,7 @@ impl Session {
             last_drained_osc52_gen: 0,
             attention_ack_at: 0,
             shell_pane: None,
+            egress_token: None,
             env,
             placeholder: false,
             ghost: false,
@@ -1098,6 +1437,7 @@ impl Session {
             last_drained_osc52_gen: 0,
             attention_ack_at: 0,
             shell_pane: None,
+            egress_token: None,
             env,
             placeholder: true,
             ghost: false,
@@ -1506,6 +1846,7 @@ impl Session {
             place,
             instance,
             login,
+            egress_record,
         } = sandboxed_invocation(config, &self.provider)?;
 
         // A relaunch re-reads the profile, so an edited one asks for a *new*
@@ -1569,7 +1910,9 @@ impl Session {
         // one the retired pane was using, and that one is shut down. Every
         // failure above dropped it instead, leaving the session's own alone.
         egress.commit();
+        let egress_record = acknowledged_egress(egress_record, Some(self.info.id));
 
+        let identity = spawned.identity.clone();
         let (state, backend_id) = Self::wire_up(
             rows,
             cols,
@@ -1611,6 +1954,20 @@ impl Session {
         }
         self.place_instance = instance;
         self.info.backend_id = Some(self.backend_id.clone());
+        // A relaunch is a *new* window, so the recorded identity is replaced
+        // rather than merged: keeping the retired pane's would aim every later
+        // revalidation at a pane that no longer exists (ADR-32).
+        self.info.mux = identity;
+        let marker =
+            crate::session::MuxIdentity::launch_marker(&self.info.id.to_string(), &launch_key());
+        if let Err(e) = self.backend.set_pane_marker(&self.backend_id, &marker) {
+            warn!(session_id = %self.info.id, "Could not mark the agent pane: {e:#}");
+        } else {
+            self.info.mux.launch_key = Some(marker);
+        }
+        self.info.egress_endpoint = egress_record.endpoint.clone();
+        self.info.egress_state = egress_record.state.clone();
+        self.egress_token = egress_record.token;
         self.info.sandbox_profile = profile;
         self.info.sandbox_state = sandbox_state;
         // Overwritten rather than merged: a relaunch re-reads the profile, so a
@@ -1850,6 +2207,7 @@ impl Session {
             last_drained_osc52_gen: 0,
             attention_ack_at: 0,
             shell_pane: None,
+            egress_token: None,
             env: HashMap::new(),
             placeholder: false,
             ghost: false,
@@ -1885,6 +2243,100 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recorded identity with every field filled: the shape a control-mode
+    /// launch on a modern tmux produces.
+    fn recorded() -> crate::session::MuxIdentity {
+        crate::session::MuxIdentity {
+            server: Some("server-uuid".to_string()),
+            window_id: Some("@7".to_string()),
+            pane_id: Some("%12".to_string()),
+            pane_pid: Some(4242),
+            launch_key: Some("sess-1:launch-1".to_string()),
+        }
+    }
+
+    /// Every recorded field has to match. A comparison that let any one of them
+    /// slide is a kill aimed at whatever now answers to a pane id — a decoy
+    /// window an agent created, or a pane recycled after a server restart.
+    #[test]
+    fn a_mismatch_in_any_recorded_field_refuses() {
+        let expected = recorded();
+        assert!(compare_identity(&expected, &expected).is_ok());
+
+        let cases: [(&str, crate::session::MuxIdentity); 4] = [
+            (
+                "window id",
+                crate::session::MuxIdentity {
+                    window_id: Some("@9".to_string()),
+                    ..recorded()
+                },
+            ),
+            (
+                "pane id",
+                crate::session::MuxIdentity {
+                    pane_id: Some("%13".to_string()),
+                    ..recorded()
+                },
+            ),
+            (
+                "pane pid",
+                crate::session::MuxIdentity {
+                    pane_pid: Some(4243),
+                    ..recorded()
+                },
+            ),
+            (
+                "friring's pane marker",
+                crate::session::MuxIdentity {
+                    launch_key: Some("sess-1:launch-2".to_string()),
+                    ..recorded()
+                },
+            ),
+        ];
+        for (field, live) in cases {
+            let difference =
+                compare_identity(&expected, &live).expect_err("{field} must be compared");
+            assert!(difference.contains(field), "{difference}");
+        }
+
+        // A field the live pane no longer reports is a mismatch too: the
+        // recorded value is evidence, and its absence is not agreement.
+        let gone = crate::session::MuxIdentity {
+            launch_key: None,
+            ..recorded()
+        };
+        assert!(compare_identity(&expected, &gone).is_err());
+    }
+
+    /// A field friring never recorded is a cross-check it never had — an older
+    /// tmux that does not report `#{pane_pid}`, say — and comparing it would
+    /// refuse every action rather than the wrong ones.
+    #[test]
+    fn an_unrecorded_field_is_not_compared() {
+        let expected = crate::session::MuxIdentity {
+            pane_id: Some("%12".to_string()),
+            launch_key: Some("sess-1:launch-1".to_string()),
+            ..crate::session::MuxIdentity::default()
+        };
+        let live = recorded();
+        assert!(compare_identity(&expected, &live).is_ok());
+    }
+
+    /// Nothing recorded must never read as "the identity matched": a session
+    /// from before the identity existed has to be refused, not waved through.
+    #[test]
+    fn nothing_recorded_is_not_a_match() {
+        let nothing = crate::session::MuxIdentity::default();
+        assert!(!nothing.is_recorded());
+        // A pane id alone is not enough either — a pane id is reused.
+        assert!(!crate::session::MuxIdentity {
+            pane_id: Some("%12".to_string()),
+            ..crate::session::MuxIdentity::default()
+        }
+        .is_recorded());
+        assert!(recorded().is_recorded());
+    }
 
     /// A backend scripted for one outcome, counting `kill` and recording the
     /// environment a `spawn` was handed.
@@ -1941,6 +2393,7 @@ mod tests {
                 anyhow::bail!("stub backend does not spawn");
             }
             Ok(SpawnedSession {
+                identity: crate::session::MuxIdentity::default(),
                 backend_id: "%scripted".to_string(),
                 output: Box::new(std::io::empty()),
                 input: Box::new(std::io::sink()),

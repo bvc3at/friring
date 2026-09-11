@@ -1,0 +1,78 @@
+name = "bridge-conformance"
+description = "Prove the orchestration bridge end to end with no vendor agent involved"
+config_version = 1
+version = "1.0.0"
+# The soft compatibility gate, and deliberately not the real one: the bridge
+# this extension needs is gated hard by `[[requires]] binary-capability bridge`
+# below, which refuses rather than warns. A floor above the fork's newest
+# release would warn on every install for a check the hard gate already makes.
+min_thurbox_version = "0.20.0"
+home = "~/.config/friring/extensions/bridge-conformance"
+
+# The one thing it needs, and the reason it exists: an extension author has to
+# be able to state which bridge protocol they wrote against.
+[[requires]]
+kind = "binary-capability"
+name = "bridge"
+version = 1
+
+# The `[[requires]]` vocabulary itself, so an author can gate on the gate.
+[[requires]]
+kind = "binary-capability"
+name = "extension_requires"
+version = 1
+
+# ── The two agents ───────────────────────────────────────────────────────
+#
+# Both are `/bin/sh` scripts. That is the point: an agent that is a shell script
+# has no vendor, no login, no model and no network, so what these prove is the
+# **bridge**, not an integration with anything.
+
+[[agents]]
+name = "conformance-leader"
+command = "{home}/bin/leader.sh"
+args = []
+hook_schema = "none"
+
+[agents.sandbox]
+config_dir_env = "CONFORMANCE_HOME"
+state_dir = "~/.friring-conformance"
+state_rw = ["~/.friring-conformance/state"]
+bridge_requires = ["child-lifecycle", "mailbox", "report"]
+
+[[agents]]
+name = "conformance-worker"
+command = "{home}/bin/worker.sh"
+args = []
+hook_schema = "none"
+
+[agents.sandbox]
+config_dir_env = "CONFORMANCE_HOME"
+state_dir = "~/.friring-conformance"
+state_rw = ["~/.friring-conformance/state"]
+bridge_requires = ["mailbox", "report"]
+
+# One seed, in the one mode that copies. A conformance worker needs no
+# credential, so it asks for none — which is what makes this the minimal
+# demonstration that private state works at all.
+[[agents.sandbox.child_state_seed]]
+src = "settings.json"
+mode = "copy"
+required = false
+
+[[files]]
+path = "bin/leader.sh"
+executable = true
+
+[[files]]
+path = "bin/worker.sh"
+executable = true
+
+[[files]]
+path = "lib/conformance.sh"
+
+[[files]]
+path = "profiles.toml"
+
+[[files]]
+path = "README.md"

@@ -477,9 +477,32 @@ themes, switched live with `Ctrl+Y` (or `F4`) and persisted across restarts.
   signs in once per profile inside its own pane, because a rotating credential
   copied into two places invalidates itself. `friring-cli sandbox` manages the
   same profiles and places without a TUI, and exports them as TOML you can
-  commit. It is the newest thing here and the least exercised — its tests check
-  what friring generates rather than watching a kernel refuse something — so
-  treat it as defence in depth, expect rough edges, and please report them.
+  commit. It is the newest thing here and the least exercised — most of its
+  tests check what friring generates, and the one part now observed rather than
+  argued is the multiplexer deny set, which `just seatbelt-probe` has watched a
+  real macOS kernel refuse, positive controls included; its Linux twin `just
+  bwrap-probe` is written and runs in CI but has not been run on a Linux host —
+  so treat it as defence in depth, expect rough edges, and please report them.
+- **[Sandboxed orchestration](docs/FEATURES.md#sandboxed-orchestration)**
+  *(Friring — fork-only, experimental)* — a sandboxed agent can ask friring to
+  run **other** sandboxed agents. Seven verbs, each acting on the caller's own
+  session or on a child it owns, each refused unless the session's profile
+  granted it: the caller's identity is *which directory the request file arrived
+  in*, never a field in the request. A child gets its own worktree, its own
+  pane, its own private agent state, and a boundary that is its owner's narrowed
+  — minus the owner's and every sibling's transcripts, control directories and
+  worktrees. Its agent does not start until friring has committed its row and
+  opened a gate only the host can open, and `done` is reachable only after
+  friring kills that exact pane and reads the worktree itself: a worker's claim
+  about its own work is never what gets merged. Two extensions use it —
+  [`bridge-conformance`](extensions/bridge-conformance/), whose two `/bin/sh`
+  agents prove the contract with no vendor involved, and
+  [`omx`](extensions/omx/), which runs oh-my-codex 0.21.0 as a leader with every
+  Team node as a child (it needs the Codex CLI, `oh-my-codex@0.21.0` and
+  Node.js 20 or newer). Carried by the two policy backends only, and the
+  end-to-end run against a real oh-my-codex has not been exercised — see
+  [`docs/E2E.md`](docs/E2E.md#sandboxed-orchestration-what-covers-it-and-what-does-not)
+  for exactly what is and is not covered.
 - **[Leader key](#leader-key)** *(Friring — fork-only)* — `Ctrl+F` arms a
   tmux-style prefix and paints a which-key overlay naming everything reachable;
   the next key runs it. Every global command is on it, plus jump-to-session by
@@ -978,6 +1001,22 @@ recorded in the JSON report (`killed_window`, `removed_worktrees`,
 delete. The DB row is always soft-deleted last, so even a forced
 delete remains restorable (it just re-spawns from a clean slate).
 
+A **bridge child** is the exception: deleting a live one without
+`--force` is refused (its owner's `friring-cli bridge stop <child>`
+is the path that stops one, verified), and `--force` on an *owner*
+first stops its live children — reported as `stopped_children`,
+with a child friring could not verify dead recorded `stop_failed`
+and keeping its slot. The children's rows, branches and worktrees
+are preserved. See
+[`docs/CLI.md`](docs/CLI.md#delete-and-restore-semantics).
+
+`session restart` refuses a bridge child for the same reason: the
+generic path composes a boundary from `sandbox_profile` alone and
+cannot rebuild the child's narrowed one, its launch gate or its
+private agent state, so its owner's `friring-cli bridge resume
+<child>` is the only relaunch. See
+[`docs/CLI.md`](docs/CLI.md#delete-and-restore-semantics).
+
 ### Agent metrics
 
 What an agent is costing, in the four shapes friring collects.
@@ -1113,6 +1152,7 @@ appended as the final argument.
 ### Config
 
 ```bash
+friring-cli config paths                 # resolved config/data/database paths (opens nothing)
 friring-cli config validate              # strict-parse every config file (exit 1 on a problem)
 friring-cli config show                  # print the effective resolved config
 ```

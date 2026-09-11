@@ -422,10 +422,133 @@ pub(crate) fn resume_trigger_for(
     agent_session_id: &str,
     env: &HashMap<String, String>,
 ) -> Option<String> {
-    if def.resumes_latest() {
-        return Some(agent_session_id.to_string());
+    match conversation_exists(def, agent_session_id, env) {
+        // A declared contract decides, in both directions: an agent whose
+        // conversation is gone starts fresh rather than being handed a resume
+        // group that resolves to nothing or to somebody else's thread.
+        Some(true) => Some(agent_session_id.to_string()),
+        Some(false) => None,
+        None if def.resumes_latest() => Some(agent_session_id.to_string()),
+        None => resume_id_if_transcript_exists(agent_session_id, env),
     }
-    resume_id_if_transcript_exists(agent_session_id, env)
+}
+
+/// How deep [`conversation_exists`] walks, and how many entries it will look at.
+///
+/// Both bound one launch-time question against a directory friring does not
+/// own. The depth covers every layout seen in the wild with room to spare
+/// (`sessions/YYYY/MM/DD/<file>` is four); the entry budget is what stops a
+/// state directory somebody pointed at their home from stalling a launch.
+/// Exhausting either answers "not found", which refuses a bridge resume and
+/// starts a TUI restart fresh — the safe direction in both.
+const TRANSCRIPT_MAX_DEPTH: usize = 6;
+const TRANSCRIPT_MAX_ENTRIES: usize = 20_000;
+
+/// Whether the conversation `agent_session_id` names is still on disk, according
+/// to the agent's **own declaration** (`[agents.<name>.transcript]`).
+///
+/// `None` is not "no": it is *friring cannot tell*, because this agent declares
+/// no transcript contract. The two callers treat that differently, and the
+/// difference is the point:
+///
+/// - [`resume_trigger_for`] keeps the historical behaviour, so a TUI restart of
+///   an agent nobody has declared a contract for resumes exactly as it always
+///   has;
+/// - `App::child_resume_identity` **refuses**, because a bridge child that comes
+///   back to a blank conversation looks identical to one that came back to its
+///   own — it answers its mail, has forgotten its task, and nothing says so.
+///
+/// The directory searched is the agent's state directory as *this launch* sees
+/// it: `config_dir_env` from `env` when set, which for a bridge child is its own
+/// private directory (ADR-31), and the declared `state_dir` under the host's
+/// home otherwise. Asking the default location about a child would be asking
+/// about the operator's conversations.
+pub(crate) fn conversation_exists(
+    def: &crate::session::AgentDef,
+    agent_session_id: &str,
+    env: &HashMap<String, String>,
+) -> Option<bool> {
+    let contract = def.transcript.as_ref()?;
+    let Some(root) = transcript_root(def, env) else {
+        // Declared but unresolvable — no `state_dir` to hang it on, or no home.
+        // Fail closed rather than falling back to "cannot tell".
+        return Some(false);
+    };
+    let want = format!("{agent_session_id}{}", contract.suffix);
+    let mut stack = vec![(root.join(&contract.dir), 0usize)];
+    let mut budget = TRANSCRIPT_MAX_ENTRIES;
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                return Some(false);
+            }
+            budget -= 1;
+            // The kind **without** following a link, so a symlink is neither
+            // descended into nor counted. A dangling one named for the wanted
+            // conversation would otherwise answer yes for a transcript that does
+            // not exist, and one pointing out of the child's private state would
+            // answer yes with the *operator's* — and this check runs on the
+            // host, where both resolve.
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if depth + 1 < TRANSCRIPT_MAX_DEPTH {
+                    stack.push((entry.path(), depth + 1));
+                }
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let matches = if contract.name_has_id {
+                name == want.as_str()
+            } else {
+                name.ends_with(&contract.suffix)
+            };
+            if matches {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// The directory an agent's transcript contract is relative to: its state
+/// directory as this launch sees it.
+fn transcript_root(
+    def: &crate::session::AgentDef,
+    env: &HashMap<String, String>,
+) -> Option<std::path::PathBuf> {
+    let sandbox = def.sandbox.as_ref()?;
+    // The launch's own environment first, then friring's — the same order
+    // `crate::paths::claude_projects_dir` resolves in, so a relocated state
+    // directory means the same thing to both. For a bridge child the first one
+    // always answers, and it names the private directory ADR-31 gave it.
+    if let Some(dir) = sandbox.config_dir_env.as_ref().and_then(|var| {
+        env.get(var)
+            .cloned()
+            .or_else(|| std::env::var(var).ok())
+            .filter(|dir| !dir.is_empty())
+    }) {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    // The launch's home before friring's, for the same reason: a launch that
+    // relocates `HOME` keeps its state under *that* home, and asking friring's
+    // would answer about a directory the agent will not use.
+    let home = match env.get("HOME").filter(|home| !home.is_empty()) {
+        Some(home) => home.clone(),
+        None => crate::paths::home_dir()?.to_string_lossy().into_owned(),
+    };
+    let state = sandbox.state_dir.as_ref()?;
+    Some(std::path::PathBuf::from(crate::session::expand_tilde(
+        state, &home,
+    )))
 }
 
 /// Resolve the [`AgentDef`](crate::session::AgentDef) for a requested agent name
@@ -513,6 +636,10 @@ pub(crate) struct AgentInvocation {
     /// What the user types in the session's pane to sign the agent in, when the
     /// boundary starts it signed out. `None` when there is nothing to do.
     pub login: Option<String>,
+    /// Where this launch's proxy listens and the credential it demands, for
+    /// `sessions.egress_*` — what a restart rebinds from. Empty for a launch
+    /// with no proxy; the token is never rendered.
+    pub egress: crate::session::EgressRecord,
 }
 
 /// Build the invocation for an already-resolved [`AgentDef`], with the
@@ -547,8 +674,14 @@ fn build_agent_invocation(
         &provider, config,
     );
 
-    match crate::agent::sandboxing::apply(Some(def), config, &command, &args)? {
+    // `from_tui = false`: this is the headless path. A bridge-required agent is
+    // refused here rather than started, because a `friring-cli session create`
+    // exits after spawning — nothing would own the session's egress proxy or
+    // answer its bridge requests, so the channel would be there and dead
+    // (ADR-31).
+    match crate::agent::sandboxing::apply_for(Some(def), config, &command, &args, None, false)? {
         crate::agent::sandboxing::SandboxDecision::Unsandboxed => Ok(AgentInvocation {
+            egress: crate::session::EgressRecord::default(),
             command,
             args,
             secret_env: Vec::new(),
@@ -571,6 +704,7 @@ fn build_agent_invocation(
                 place: None,
                 instance: None,
                 login: None,
+                egress: crate::session::EgressRecord::default(),
             })
         }
         crate::agent::sandboxing::SandboxDecision::Wrapped(wrapped) => {
@@ -595,6 +729,7 @@ fn build_agent_invocation(
                 place: wrapped.place,
                 instance: wrapped.instance,
                 login: wrapped.login,
+                egress: wrapped.egress,
             })
         }
     }
@@ -736,6 +871,197 @@ mod tests {
         assert!(err.contains("'broken'"), "{err}");
         assert!(err.contains("read_scope = 'everything'"), "{err}");
         assert!(err.contains("network_deny = '[oops'"), "{err}");
+    }
+
+    /// One agent definition with a transcript contract, and the environment
+    /// that points it at a directory this test owns.
+    fn agent_with_transcript(
+        contract: crate::session::TranscriptDef,
+        state: &std::path::Path,
+    ) -> (crate::session::AgentDef, HashMap<String, String>) {
+        let def = crate::session::AgentDef {
+            name: "worker".into(),
+            command: "worker".into(),
+            args: vec![],
+            resume_args: vec!["resume".into(), "--last".into()],
+            fork_args: vec![],
+            new_session_args: vec![],
+            resume_latest: true,
+            hook_schema: None,
+            sandbox: Some(crate::session::AgentSandboxDef {
+                config_dir_env: Some("WORKER_HOME".into()),
+                state_dir: Some("~/.worker".into()),
+                ..Default::default()
+            }),
+            transcript: Some(contract),
+        };
+        let env = [("WORKER_HOME".to_string(), state.display().to_string())]
+            .into_iter()
+            .collect();
+        (def, env)
+    }
+
+    /// The check is about the conversation, and it is about *this* one.
+    ///
+    /// `name_has_id` is the difference between "the agent has a conversation
+    /// here" (an agent that resumes the latest in a directory, whose stored id
+    /// is its own) and "the conversation friring is resuming is here" (an agent
+    /// that resumes by id). Getting the second wrong resumes into a stranger's
+    /// thread, so a neighbouring transcript must not answer for a missing one.
+    #[test]
+    fn a_declared_transcript_decides_whether_a_conversation_can_be_resumed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let by_id = crate::session::TranscriptDef {
+            dir: "projects".into(),
+            suffix: ".jsonl".into(),
+            name_has_id: true,
+        };
+        let (mut def, env) = agent_with_transcript(by_id, tmp.path());
+        def.resume_args = vec!["--resume".into(), "{id}".into()];
+        def.resume_latest = false;
+
+        // Nothing there at all.
+        assert_eq!(conversation_exists(&def, "wanted", &env), Some(false));
+        assert_eq!(resume_trigger_for(&def, "wanted", &env), None);
+
+        // Somebody else's conversation, sharded the way agents shard.
+        let sharded = tmp.path().join("projects/-home-u-repo");
+        std::fs::create_dir_all(&sharded).unwrap();
+        std::fs::write(sharded.join("other.jsonl"), "{}\n").unwrap();
+        assert_eq!(
+            conversation_exists(&def, "wanted", &env),
+            Some(false),
+            "a neighbour's transcript answered for a missing one"
+        );
+
+        // And this one, several directories down.
+        std::fs::write(sharded.join("wanted.jsonl"), "{}\n").unwrap();
+        assert_eq!(conversation_exists(&def, "wanted", &env), Some(true));
+        assert_eq!(
+            resume_trigger_for(&def, "wanted", &env).as_deref(),
+            Some("wanted")
+        );
+    }
+
+    /// An agent that resumes "the latest in this directory" asks the only
+    /// question that means anything for it — and a suffix that does not match is
+    /// not a conversation.
+    #[test]
+    fn a_latest_style_transcript_asks_whether_the_directory_holds_a_conversation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (def, env) = agent_with_transcript(
+            crate::session::TranscriptDef {
+                dir: "sessions".into(),
+                suffix: ".jsonl".into(),
+                name_has_id: false,
+            },
+            tmp.path(),
+        );
+        assert_eq!(conversation_exists(&def, "ignored", &env), Some(false));
+
+        // The lock file and the temp directory codex leaves beside its rollouts
+        // are not conversations.
+        let day = tmp.path().join("sessions/2026/09/09");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("rollout.tmp"), "").unwrap();
+        assert_eq!(conversation_exists(&def, "ignored", &env), Some(false));
+
+        std::fs::write(day.join("rollout-abc.jsonl"), "{}\n").unwrap();
+        assert_eq!(conversation_exists(&def, "ignored", &env), Some(true));
+    }
+
+    /// A link is not a conversation.
+    ///
+    /// The check runs on the **host**, where a link out of the child's private
+    /// state resolves — so following one would answer about a transcript the
+    /// child cannot reach, or, dangling, about one that does not exist at all.
+    /// Both would let an unprovable resume through preflight and kill a stalled
+    /// child's live pane on the way to failing.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_transcript_is_not_a_conversation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (def, env) = agent_with_transcript(
+            crate::session::TranscriptDef {
+                dir: "sessions".into(),
+                suffix: ".jsonl".into(),
+                name_has_id: false,
+            },
+            tmp.path(),
+        );
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        // Dangling, and named exactly like the real thing.
+        std::os::unix::fs::symlink(
+            tmp.path().join("gone/rollout.jsonl"),
+            sessions.join("rollout.jsonl"),
+        )
+        .unwrap();
+        assert_eq!(conversation_exists(&def, "id", &env), Some(false));
+
+        // And a link to somebody else's directory full of real transcripts.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("other.jsonl"), "{}\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, sessions.join("linked")).unwrap();
+        assert_eq!(
+            conversation_exists(&def, "id", &env),
+            Some(false),
+            "a link out of the child's own state answered for it"
+        );
+
+        // The real thing still counts.
+        std::fs::write(sessions.join("real.jsonl"), "{}\n").unwrap();
+        assert_eq!(conversation_exists(&def, "id", &env), Some(true));
+    }
+
+    /// A launch that relocates `HOME` keeps its state under *that* home.
+    #[test]
+    fn the_launchs_own_home_decides_where_the_transcript_is_looked_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut def, mut env) = agent_with_transcript(
+            crate::session::TranscriptDef {
+                dir: "sessions".into(),
+                suffix: ".jsonl".into(),
+                name_has_id: false,
+            },
+            tmp.path(),
+        );
+        // No `config_dir_env` override, so the state directory is `~/.worker`
+        // under whichever home this launch has.
+        env.remove("WORKER_HOME");
+        def.sandbox.as_mut().unwrap().config_dir_env = None;
+        env.insert("HOME".into(), tmp.path().display().to_string());
+
+        assert_eq!(conversation_exists(&def, "id", &env), Some(false));
+        let sessions = tmp.path().join(".worker/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("rollout.jsonl"), "{}\n").unwrap();
+        assert_eq!(conversation_exists(&def, "id", &env), Some(true));
+    }
+
+    /// An agent that declares nothing is "friring cannot tell", which is not
+    /// "no": the TUI restart path keeps its historical behaviour, and only the
+    /// bridge turns the same answer into a refusal.
+    #[test]
+    fn an_agent_with_no_transcript_block_is_unknown_rather_than_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut def, env) = agent_with_transcript(
+            crate::session::TranscriptDef {
+                dir: "sessions".into(),
+                suffix: ".jsonl".into(),
+                name_has_id: false,
+            },
+            tmp.path(),
+        );
+        def.transcript = None;
+        assert_eq!(conversation_exists(&def, "id", &env), None);
+        assert_eq!(
+            resume_trigger_for(&def, "id", &env).as_deref(),
+            Some("id"),
+            "a latest-style agent that declares nothing must resume as it always has"
+        );
     }
 
     /// The same path must not become paranoid: a profile that decoded
@@ -1139,15 +1465,26 @@ mod tests {
     }
 
     #[test]
-    fn resume_trigger_latest_agent_always_triggers() {
-        // A resume_latest agent (codex) triggers resume regardless of any
-        // on-disk claude transcript; the returned id is just the trigger.
+    fn resume_trigger_latest_agent_triggers_when_a_conversation_is_there() {
+        // A `resume_latest` agent's returned id is only a trigger — its resume
+        // group carries no `{id}` — but *whether* it is emitted now depends on
+        // the agent's own declaration rather than on nothing at all. `resume
+        // --last` in an empty state directory is not a resume, and the
+        // historical "always" made a restart pass a flag that resolves to
+        // nothing.
         let codex = crate::agent::agent_config::builtin_registry()
             .get("codex")
             .unwrap()
             .clone();
         assert!(codex.resumes_latest());
-        let env = HashMap::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = HashMap::new();
+        env.insert("CODEX_HOME".into(), tmp.path().display().to_string());
+        assert_eq!(resume_trigger_for(&codex, "friring-uuid", &env), None);
+
+        let day = tmp.path().join("sessions/2026/09/09");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("rollout-abc.jsonl"), b"{}\n").unwrap();
         assert_eq!(
             resume_trigger_for(&codex, "friring-uuid", &env),
             Some("friring-uuid".to_string())

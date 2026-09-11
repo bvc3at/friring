@@ -61,7 +61,7 @@ scenario_steps() {
     step_type "2"
     # Timeline rows print the Write's *absolute* file_path, truncated to the
     # central pane. It fits the default 120-column pane with ~6 columns to
-    # spare only because the sandbox root is /tmp/friring-sandbox.XXXXXX and
+    # spare only because the sandbox root is /tmp/friring-e2e.XXXXXX and
     # the file name is short; lengthening either costs the greppable tail and
     # the scenario needs SCENARIO_COLS back — which the demo then records at,
     # so it buys a wider clip, not just a wider test.

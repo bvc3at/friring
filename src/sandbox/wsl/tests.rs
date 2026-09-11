@@ -21,6 +21,11 @@ const WSL_EXE: &str = "C:/Windows/System32/wsl.exe";
 const TEMPLATE: &str = "Ubuntu-24.04";
 const DISTRO: &str = "friring-sbx-dev";
 
+/// friring's own CLI *inside* the distro, which every policy launch runs as its
+/// launch helper (ADR-33). A launch input, so the composition is assertable on
+/// a machine that has no such binary.
+const DISTRO_CLI: &str = "/usr/local/bin/friring-cli";
+
 /// `wsl --list --verbose` on a host with a template and no friring distro.
 const LIST: &str = "  NAME             STATE           VERSION\n\
                     * Ubuntu-24.04     Running         2\n";
@@ -591,6 +596,7 @@ fn the_in_distro_command_is_bubblewrap_around_the_agent() {
     let policy = policy_for(&profile);
     let launch = SandboxLaunch::new(&policy, "/root", "s1")
         .with_workspace("/root/dev/app")
+        .with_helper_program(DISTRO_CLI)
         .with_place(PlaceLaunch { relay: None });
     let argv = backend
         .wrap(vec!["claude".into(), "--resume".into()], &launch)
@@ -605,9 +611,12 @@ fn the_in_distro_command_is_bubblewrap_around_the_agent() {
         .any(|w| w[0] == "--bind" && w[1] == "/root/dev/app" && w[2] == "/root/dev/app"));
     // `none` is enforced by the namespace, not by the distro.
     assert!(argv.contains(&"--unshare-net".to_string()));
-    // The agent's own argv is appended after bubblewrap's separator, unchanged.
+    // friring's own launch helper runs after bubblewrap's separator and hands
+    // over to the agent at its own (ADR-33), whose argv is unchanged.
     let end = argv.iter().position(|a| a == "--").unwrap();
-    assert_eq!(&argv[end + 1..], ["claude", "--resume"]);
+    assert_eq!(&argv[end + 1..end + 4], [DISTRO_CLI, "sandbox", "launch"]);
+    let handover = argv.iter().rposition(|a| a == "--").unwrap();
+    assert_eq!(&argv[handover + 1..], ["claude", "--resume"]);
     // Nothing here names wsl.exe: reaching the distro is the transport's job.
     assert!(!argv.iter().any(|token| token.contains("wsl.exe")));
     cleanup();
@@ -656,6 +665,7 @@ fn the_database_cannot_be_reached_from_a_distro_friring_registered() {
     let db = "C:/Users/me/AppData/Local/friring/friring.db";
     let launch = SandboxLaunch::new(&policy, "/root", "s1")
         .with_friring_db(db)
+        .with_helper_program(DISTRO_CLI)
         .with_place(PlaceLaunch { relay: None });
     let argv = backend.wrap(vec!["claude".into()], &launch).unwrap();
 

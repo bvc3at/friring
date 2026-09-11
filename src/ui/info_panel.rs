@@ -15,6 +15,92 @@ pub struct AutomationEntry {
     pub countdown: String,
 }
 
+/// Where a session sits in an orchestration (ADR-32), resolved by the app.
+///
+/// Resolved rather than derived here for the reason every other row on this
+/// panel is: the view probes nothing. Ownership lives in `bridge_children`,
+/// which is authority, and a view that read it would be a view that could be
+/// wrong about who may act on what.
+pub struct BridgeRow {
+    /// The session's own lifecycle state, when it is somebody's child.
+    pub child_state: Option<String>,
+    /// Its owner's name, when it is somebody's child.
+    pub owner: Option<String>,
+    /// Live children and the cap, when it has any.
+    pub children: Option<(usize, u32)>,
+    /// Whether something here needs a person: a dirty or unstoppable child, or
+    /// a child that says it is blocked.
+    pub needs_operator: bool,
+}
+
+impl BridgeRow {
+    /// The one line this row renders.
+    ///
+    /// Two facts and no more: what this session *is* in the orchestration, and
+    /// what it is responsible for. Both are host-known — a name friring
+    /// resolved and a count it made — so nothing a sandboxed agent wrote reaches
+    /// the panel through here.
+    pub fn detail(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let (Some(owner), Some(state)) = (self.owner.as_deref(), self.child_state.as_deref()) {
+            parts.push(format!("child of {owner} \u{b7} {state}"));
+        }
+        if let Some((live, cap)) = self.children {
+            parts.push(format!("{live}/{cap} children"));
+        }
+        if self.needs_operator {
+            parts.push("needs you".to_string());
+        }
+        parts.join(" \u{b7} ")
+    }
+}
+
+/// What the `Egress:` row says, and in which colour.
+///
+/// `None` for the sessions that have no filter at all, which is most of them:
+/// a profile whose network mode the kernel enforces on its own binds no proxy
+/// and has nothing to report.
+///
+/// The row exists because the shield does not answer this question. A profile
+/// can be **applied** — its path and process policy enforced by the kernel — and
+/// its *allowlist* still be down, because the allowlist lives in a listener
+/// inside the friring process and a restart has to rebind it. An operator
+/// looking at a shield and assuming the domain filter is live would be wrong in
+/// exactly the case that matters.
+fn egress_detail(info: &SessionInfo) -> Option<(String, ratatui::style::Color)> {
+    use crate::session::EgressState;
+    match &info.egress_state {
+        EgressState::None => None,
+        EgressState::Preparing => Some(("binding \u{2026}".to_string(), Theme::status_working())),
+        EgressState::Active => Some(("\u{2713} filtered".to_string(), Theme::tool_disallowed())),
+        EgressState::Restoring => Some((
+            "rebinding after a restart \u{2026}".to_string(),
+            Theme::status_working(),
+        )),
+        // The one that has to be loud: the boundary is on and the filter is not.
+        EgressState::Unrestorable(reason) => {
+            Some((format!("\u{29b8} NOT FILTERED: {reason}"), Theme::danger()))
+        }
+    }
+}
+
+/// The fields the **app** resolved for this panel, rather than the session
+/// carrying them.
+///
+/// Both are lookups into state the view may not do itself: a name from the
+/// session list, and a place in an orchestration from rows that are authority.
+/// Grouped so the panel's signature says "here is what was resolved" once
+/// instead of growing an argument per lookup.
+#[derive(Default)]
+pub struct Resolved<'a> {
+    /// The parent session's name (lead/worker linkage), or `None` for a
+    /// top-level session.
+    pub parent_name: Option<&'a str>,
+    /// Where this session sits in an orchestration, or `None` for the
+    /// overwhelming majority, which are in none.
+    pub bridge: Option<&'a BridgeRow>,
+}
+
 /// System-wide and active-session resource metrics.
 pub struct SystemMetrics {
     /// Overall CPU usage 0-100.
@@ -34,7 +120,7 @@ pub fn render_info_panel(
     metrics: Option<&SystemMetrics>,
     automations: &[AutomationEntry],
     usage: Option<&crate::session::AgentUsage>,
-    parent_name: Option<&str>,
+    resolved: &Resolved<'_>,
 ) {
     let block = Block::default()
         .title(" Info ")
@@ -42,7 +128,7 @@ pub fn render_info_panel(
         .border_style(Style::default().fg(Theme::border_unfocused()));
 
     let inner_width = area.width.saturating_sub(2) as usize;
-    let lines = build_lines(info, metrics, automations, usage, parent_name, inner_width);
+    let lines = build_lines(info, metrics, automations, usage, resolved, inner_width);
 
     let paragraph = Paragraph::new(lines)
         .block(block)
@@ -64,16 +150,9 @@ pub fn content_rows(
     metrics: Option<&SystemMetrics>,
     automations: &[AutomationEntry],
     usage: Option<&crate::session::AgentUsage>,
-    parent_name: Option<&str>,
+    resolved: &Resolved<'_>,
 ) -> u16 {
-    let lines = build_lines(
-        info,
-        metrics,
-        automations,
-        usage,
-        parent_name,
-        MEASURE_WIDTH,
-    );
+    let lines = build_lines(info, metrics, automations, usage, resolved, MEASURE_WIDTH);
     (lines.len() as u16).saturating_add(2)
 }
 
@@ -84,12 +163,12 @@ fn build_lines<'a>(
     metrics: Option<&SystemMetrics>,
     automations: &'a [AutomationEntry],
     usage: Option<&crate::session::AgentUsage>,
-    parent_name: Option<&str>,
+    resolved: &Resolved<'_>,
     inner_width: usize,
 ) -> Vec<Line<'a>> {
     let mut lines = Vec::new();
 
-    append_session_section(&mut lines, info, parent_name);
+    append_session_section(&mut lines, info, resolved);
     append_repos_section(&mut lines, info);
 
     if let Some(ref git) = info.git_stats {
@@ -126,7 +205,7 @@ fn build_lines<'a>(
 fn append_session_section<'a>(
     lines: &mut Vec<Line<'a>>,
     info: &'a SessionInfo,
-    parent_name: Option<&str>,
+    resolved: &Resolved<'_>,
 ) {
     lines.push(Line::from(vec![
         Span::styled("Name: ", Theme::label()),
@@ -151,7 +230,7 @@ fn append_session_section<'a>(
         ),
     ]));
     // Parent session (lead/worker linkage); omitted for top-level sessions.
-    if let Some(parent) = parent_name {
+    if let Some(parent) = resolved.parent_name {
         lines.push(Line::from(vec![
             Span::styled("Parent: ", Theme::label()),
             Span::styled(
@@ -193,6 +272,16 @@ fn append_session_section<'a>(
             Span::styled("Sandbox: ", Theme::label()),
             Span::styled(detail, Style::default().fg(color)),
         ]));
+        // Whether the egress *filter* is live, which the shield above does not
+        // say. A profile can be applied — paths and processes enforced by the
+        // kernel — while its allowlist is not, and the two failing separately is
+        // exactly the case an operator has to be able to see.
+        if let Some(egress) = egress_detail(info) {
+            lines.push(Line::from(vec![
+                Span::styled("Egress:  ", Theme::label()),
+                Span::styled(egress.0, Style::default().fg(egress.1)),
+            ]));
+        }
         // A boundary the agent has no credential in is a session that looks
         // broken until you know it is only signed out. Its own row, because it
         // is the one thing on this panel the user has to *act* on, and the
@@ -206,6 +295,21 @@ fn append_session_section<'a>(
                 ),
             ]));
         }
+    }
+    // Where this session sits in an orchestration (ADR-32). Omitted entirely
+    // for the overwhelming majority of sessions, which are in none.
+    if let Some(row) = resolved.bridge {
+        lines.push(Line::from(vec![
+            Span::styled("Bridge:  ", Theme::label()),
+            Span::styled(
+                row.detail(),
+                Style::default().fg(if row.needs_operator {
+                    Theme::danger()
+                } else {
+                    Theme::accent()
+                }),
+            ),
+        ]));
     }
     // Live activity from the agent-emitted OSC terminal title.
     if let Some(activity) = info.agent_activity.as_deref() {
@@ -743,7 +847,7 @@ mod tests {
         info.sandbox_profile = profile.map(str::to_string);
         info.sandbox_state = state;
         let mut lines = Vec::new();
-        append_session_section(&mut lines, &info, None);
+        append_session_section(&mut lines, &info, &Resolved::default());
         lines
             .iter()
             .map(|l| {
@@ -801,7 +905,7 @@ mod tests {
         ));
         info.sandbox_login = Some("sign in inside this pane: /login".to_string());
         let mut lines = Vec::new();
-        append_session_section(&mut lines, &info, None);
+        append_session_section(&mut lines, &info, &Resolved::default());
         let text: Vec<String> = lines
             .iter()
             .map(|l| {
@@ -821,7 +925,7 @@ mod tests {
         // sign in, and neither must one friring never launched.
         info.sandbox_login = None;
         let mut lines = Vec::new();
-        append_session_section(&mut lines, &info, None);
+        append_session_section(&mut lines, &info, &Resolved::default());
         assert!(!lines.iter().any(|l| l
             .spans
             .first()

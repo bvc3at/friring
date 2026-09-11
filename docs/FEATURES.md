@@ -1059,6 +1059,15 @@ reusing the session's stored agent. Agents that define no
 - The session's `SessionInfo` (ID, name, agent, repos)
   stays intact — only the backend pane and I/O are replaced.
 
+**A bridge child is the exception.** `Ctrl+R` on one is refused, and it points
+at the owner instead. A child's boundary is its owner's *narrowed*, with a
+launch gate only the host can open and a private agent-state directory friring
+seeds — none of which the generic restart path rebuilds, so a session relaunched
+by it would be an agent running with the wrong boundary under a child's id. The
+one relaunch that rebuilds all of it is the owner's `friring-cli bridge resume
+<child>`. See
+[`docs/SANDBOX.md`](SANDBOX.md#the-child-lifecycle).
+
 ### Why UUID v4?
 
 Sessions need unique identifiers for the lifetime of the process.
@@ -2978,11 +2987,16 @@ whatever reach the user's shell has. Full design contract, per-backend detail
 and every ADR: [`docs/SANDBOX.md`](SANDBOX.md).
 
 **Experimental.** This is the newest and least-exercised feature in the fork.
-Its tests cover what friring generates — profile text, argv, mount plans,
-refusals — but none of them runs a real boundary and watches the kernel deny
-something, none starts a container, `apple-container` is unverified against
-real hardware, and `wsl-distro` has no caller. The screens say so where a
-profile is authored and where one is picked, both titled *experimental*.
+Most of its tests cover what friring generates — profile text, argv, mount
+plans, refusals. The **multiplexer deny set** is the one part now observed
+rather than argued: `just seatbelt-probe` dials five real tmux servers from
+inside a real boundary and watches the kernel refuse each one, and `just
+bwrap-probe` is its Linux twin (see
+[`docs/SANDBOX.md`](SANDBOX.md#conformance-what-has-been-observed) for exactly
+what has been run and what has not). Everything else stands where it did: no
+test starts a container, `apple-container` is unverified against real hardware,
+and `wsl-distro` has no caller. The screens say so where a profile is authored
+and where one is picked, both titled *experimental*.
 
 A **sandbox profile** scopes what an agent can touch — a set of paths with
 per-path read-only / read-write intent, a network mode, and a read scope — and a
@@ -3178,6 +3192,113 @@ profile name, while the rename is a database transaction.
 
 ---
 
+## Sandboxed orchestration
+
+**Friring — fork-only.** Upstream ships no orchestration of any kind. The wire
+protocol, the ownership model and the spawn saga are ADR-30 through ADR-33 in
+[`docs/ARCHITECTURE.md`](ARCHITECTURE.md); the boundary they rest on is
+[`docs/SANDBOX.md`](SANDBOX.md).
+
+**Experimental, and narrower than the sandbox around it.** Bridge children are
+carried by `seatbelt` and `bwrap` only, the `omx-friring-team` end-to-end
+scenario is not built, and two of the `omx` extension's ship gates need a
+toolchain this work cannot install — all of it itemised in
+[`docs/E2E.md`](E2E.md#sandboxed-orchestration-what-covers-it-and-what-does-not).
+
+A sandboxed agent can ask friring to run **other** sandboxed agents. Nothing
+about that is a general remote-control channel: the whole surface is seven
+verbs, every one of them acting on the caller's own session or on a child the
+caller owns, and each one is refused unless the caller was granted it.
+
+**Why a file queue and not an API.** Friring's database is denied inside every
+boundary, because writing it is arbitrary host command execution (ADR-29). So
+the bridge reuses the shape that already works for status: friring mints one
+directory per session, exposes only that, and `friring-cli bridge` — which is
+also the agent's own binary, run inside the boundary — writes a request file
+into it. The host takes each file with one atomic rename into a directory no
+sandbox can see, and answers on the TUI's tick, a bounded amount per pass.
+There is no socket to reach and no daemon to confuse.
+
+**Authority is the directory the request landed in.** The caller's identity is
+never read out of a request; it is the session whose bridge directory the file
+arrived in. A request that names another session is refused, not honoured, and
+so is one whose grant is missing, whose key has been reused, or whose child
+belongs to someone else. Every refusal names its reason
+(`not-owner`, `grant-missing`, `depth-exceeded`, `repo-not-owned`, …) so the
+agent can act on it instead of retrying blind.
+
+**The seven verbs.** `create`, `stop` and `resume` need the
+`child-lifecycle` grant; `inbox`, `send` and `status` need `mailbox`; `report`
+needs `report`. There is no eighth. A child is never given `child-lifecycle`,
+which is what makes orchestration exactly one level deep — a structural fact
+rather than a counter that could be miscounted. The profile editor offers three
+presets rather than eight combinations: **none**, **worker** (mailbox, report)
+and **leader** (child-lifecycle, mailbox, report).
+
+**A child is a full session, narrower than its owner.** It gets its own
+worktree on its own branch, its own pane, its own private agent-state directory,
+and a boundary computed as its owner's policy **narrowed** — never widened. On
+top of that friring subtracts the owner's and every sibling's transcripts,
+control directories, scratch and bridge channels, so children of one leader
+cannot read each other. A child that cannot be given private agent state is
+refused rather than started on shared state.
+
+**The agent does not start until friring has recorded the child.** The launch
+runs a gated helper: the pane exists, and the agent binary is only executed once
+friring has written the child's row and released a gate file by renaming it into
+a directory the boundary sees read-only. If friring dies in between, the child
+never runs its agent, and reconciliation on the next start acts only on
+identities friring itself recorded — the exact pane, the exact worktree, the
+exact branch. It never kills or deletes something it merely inferred.
+
+**A finished child is judged by friring, not believed.** `done` and `failed`
+are reachable only through the quiesce protocol. The child files a typed
+`result`; friring acknowledges it, kills that exact pane, and *then* reads the
+worktree itself with four read-only git commands — branch, head, dirty, commits
+ahead of base. A worktree that is dirty, unreadable, or whose pane would not
+die is marked for the operator instead of being integrated. The child's own
+claim about what it did is never the thing that is merged.
+
+**Nudges are one exact literal.** When mail is waiting, friring types this into
+the recipient's pane:
+
+```text
+friring: you have new mail. Read it with `friring-cli bridge inbox --claim --json`.
+```
+
+The same sentence every time, with nothing formatted into it, at most one pane
+per tick and no more than once a minute per recipient. A nudge interrupts a live
+agent's turn, so it is rate limited; and because no data is ever interpolated
+into it, nothing a child writes can become instructions to its owner. A
+recipient nudged repeatedly with no bridge call in return is marked `stalled`
+rather than nudged forever.
+
+**Where you see it.** The info panel (`F2`) grows a `Bridge:` row — the
+session's role, its grants, its children and their states, and whether any of
+them is waiting on you — and an `Egress:` row for a filtered session's proxy
+state. The session list marks a session whose egress could not be restored.
+`friring-cli session get|list` carry a `bridge` object built from host-known
+fields only, and `friring-cli bridge --human` renders an answer for a person
+while the JSON stays the machine contract. See
+[`docs/CLI.md`](CLI.md#the-bridge-inside-a-sandbox).
+
+**What it is not.** No verb reaches SQL, the host multiplexer, another
+session's pane, raw screen capture, or arbitrary execution. Bridge children are
+carried by the two policy backends (`seatbelt`, `bwrap`) only: no place backend
+and no `wsl-distro` profile advertises the capability, and a bridge-required
+agent is refused — never quietly unsandboxed — wherever it cannot be served.
+Headless creation of a bridge-required agent is refused too, because a
+one-shot process cannot own a proxy or answer a broker.
+
+**Setting one up is an operator job, deliberately.** Installing an
+orchestration extension, importing its profile template, editing the repository
+and toolchain paths, and creating the leader are steps friring never takes for
+you — see [`extensions/omx/README.md`](../extensions/omx/README.md) for the one
+worked example, and `extensions/bridge-conformance` for the same contract with
+no vendor agent in it at all.
+
+---
+
 ## Session Persistence
 
 Sessions run inside a dedicated tmux server (`tmux -L friring`)
@@ -3254,6 +3375,16 @@ window name; if a loaded session already owns it, the load is refused and the
 row remains a ghost instead of creating an ambiguous duplicate window.
 `Alt+N` / `Alt+P` (`<leader> c` / `<leader> C`) cycle among loaded sessions
 only, skipping ghosts.
+
+A **bridge child** is never *relaunched* by a generic path. Its still-running
+pane is adopted at startup exactly like any other session's — nothing is
+respawned, so nothing loses its boundary. What is refused is every path that
+would start its agent afresh: a child whose pane is gone restores as a ghost
+rather than being respawned, and `Ctrl+R` and `friring-cli session restart`
+both decline. None of those rebuilds its narrowed boundary, its launch gate or
+its private agent state, so the only relaunch that does is its owner's
+`friring-cli bridge resume <child>`. See
+[`docs/SANDBOX.md`](SANDBOX.md#the-child-lifecycle).
 
 **Frames.** The saved frame is the pane's **visible screen** as SGR-styled
 lines (the same byte shape as the adopt seed), captured at unload and
@@ -3342,7 +3473,16 @@ source session as the fork's parent, and the info panel (`F2`) shows a
 
 ### Why informational-only (no cascade)
 
-The link is metadata, not a lifecycle contract. Deleting a parent
+The link is metadata, not a lifecycle contract, and it stays that way now that a
+real one exists. [Sandboxed orchestration](#sandboxed-orchestration) keeps its
+own ownership rows (`bridge_children`, insert-only), and neither reads nor
+writes `parent_session_id` — a bridge child renders as a top-level session, and
+its owner is shown on the info panel's `Bridge:` row instead. The two are kept
+apart on purpose: this column is set by a script or by `Ctrl+F` and can dangle
+harmlessly, while bridge ownership decides what a verb is allowed to do and must
+never be something a writer outside the bridge can produce.
+
+Deleting a parent
 does **not** delete or orphan-block its children — workers routinely
 outlive the lead that spawned them (the lead finishes orchestrating
 while workers keep coding). A dangling parent id is harmless: the

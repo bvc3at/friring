@@ -2195,6 +2195,9 @@ mod tests {
                 display_order: None,
                 tombstone: false,
                 tombstone_at: None,
+                mux: crate::session::MuxIdentity::default(),
+                egress: crate::session::EgressRecord::default(),
+                sandbox_overlay: None,
             };
             db.upsert_session(&shared).unwrap();
         }

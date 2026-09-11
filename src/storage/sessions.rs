@@ -82,6 +82,13 @@ impl Database {
     /// a write that clears `sandbox_profile`: the warning goes with the
     /// boundary it was about, because a session that asks for nothing cannot be
     /// failing to get it.
+    ///
+    /// The **multiplexer identity** and the **egress record** follow the same
+    /// rule for the same reason: a writer that recorded neither leaves the
+    /// stored values alone. A row rebuilt from storage and written back would
+    /// otherwise erase the exact pane every destructive action revalidates
+    /// against, and the endpoint and token a restart rebinds from — turning a
+    /// guard into "no identity recorded, so nothing to compare".
     pub fn upsert_session(&self, session: &SharedSession) -> rusqlite::Result<()> {
         let now = current_time_millis() as i64;
         let id_str = session.id.to_string();
@@ -104,12 +111,22 @@ impl Database {
                 (Some(_), SandboxEnforcement::Unenforced(reason)) => (true, Some(reason.as_str())),
             };
 
+        // Recorded exactly when the writer has something to record. A launch
+        // that spawned a pane knows the identity; a row read back from storage
+        // and written again does not, and must not clear it.
+        let records_mux = session.mux.is_recorded();
+        let records_egress = session.egress.endpoint.is_some();
+
         self.conn.execute(
             "INSERT INTO sessions (id, name, agent, backend_id, backend_type, \
              agent_session_id, cwd, additional_dirs, workspace_dir, \
              shell_backend_id, parent_session_id, display_order, \
-             sandbox_profile, sandbox_unenforced, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15) \
+             sandbox_profile, sandbox_unenforced, \
+             mux_server, mux_window_id, mux_pane_id, mux_pane_pid, mux_launch_key, \
+             egress_endpoint, egress_token, egress_state, sandbox_overlay, \
+             created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?15, ?15) \
              ON CONFLICT(id) DO UPDATE SET \
                  name = excluded.name, agent = excluded.agent, \
                  backend_id = excluded.backend_id, \
@@ -123,6 +140,23 @@ impl Database {
                  sandbox_profile = excluded.sandbox_profile, \
                  sandbox_unenforced = CASE WHEN ?16 THEN excluded.sandbox_unenforced \
                                            ELSE sessions.sandbox_unenforced END, \
+                 mux_server = CASE WHEN ?26 THEN excluded.mux_server \
+                                   ELSE sessions.mux_server END, \
+                 mux_window_id = CASE WHEN ?26 THEN excluded.mux_window_id \
+                                      ELSE sessions.mux_window_id END, \
+                 mux_pane_id = CASE WHEN ?26 THEN excluded.mux_pane_id \
+                                    ELSE sessions.mux_pane_id END, \
+                 mux_pane_pid = CASE WHEN ?26 THEN excluded.mux_pane_pid \
+                                     ELSE sessions.mux_pane_pid END, \
+                 mux_launch_key = CASE WHEN ?26 THEN excluded.mux_launch_key \
+                                       ELSE sessions.mux_launch_key END, \
+                 egress_endpoint = CASE WHEN ?27 THEN excluded.egress_endpoint \
+                                        ELSE sessions.egress_endpoint END, \
+                 egress_token = CASE WHEN ?27 THEN excluded.egress_token \
+                                     ELSE sessions.egress_token END, \
+                 egress_state = CASE WHEN ?27 THEN excluded.egress_state \
+                                     ELSE sessions.egress_state END, \
+                 sandbox_overlay = excluded.sandbox_overlay, \
                  updated_at = excluded.updated_at, deleted_at = NULL",
             params![
                 id_str,
@@ -147,6 +181,17 @@ impl Database {
                 unenforced,
                 now,
                 records_launch,
+                session.mux.server,
+                session.mux.window_id,
+                session.mux.pane_id,
+                session.mux.pane_pid.map(i64::from),
+                session.mux.launch_key,
+                session.egress.endpoint,
+                session.egress.token,
+                session.egress.state.to_storage(),
+                session.sandbox_overlay,
+                records_mux,
+                records_egress,
             ],
         )?;
 
@@ -330,6 +375,9 @@ impl Database {
              s.agent_session_id, s.cwd, s.additional_dirs, s.workspace_dir, \
              s.shell_backend_id, s.parent_session_id, s.display_order, \
              s.sandbox_profile, s.sandbox_unenforced, \
+             s.mux_server, s.mux_window_id, s.mux_pane_id, s.mux_pane_pid, \
+             s.mux_launch_key, s.egress_endpoint, s.egress_token, s.egress_state, \
+             s.sandbox_overlay, \
              w.repo_path, w.worktree_path, w.branch \
              FROM sessions s \
              LEFT JOIN worktrees w ON s.id = w.session_id AND w.deleted_at IS NULL \
@@ -532,13 +580,133 @@ impl Database {
     /// [`upsert_session`](Self::upsert_session) must never list them, so the
     /// TUI's full-row write-back can't clobber a state a headless hook just set.
     pub fn set_hook_state(&self, id: SessionId, state: &str) -> rusqlite::Result<()> {
-        let now = current_time_millis() as i64;
+        self.set_hook_state_at(id, state, current_time_millis() as i64)
+    }
+
+    /// [`set_hook_state`](Self::set_hook_state) with the stamp chosen.
+    ///
+    /// For the rules that compare `hook_state_at` against a moment of their own.
+    /// The bridge saga's S9 accepts a report only if it is at or after the gate
+    /// it opened (`app::bridge_spawn::hook_reported_since`), and a
+    /// **stale** report — one left by a previous life of the same session id,
+    /// which a `resume` produces — is exactly the case that rule exists for, so
+    /// a test has to be able to write one.
+    pub fn set_hook_state_at(&self, id: SessionId, state: &str, at: i64) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE sessions SET hook_state = ?1, hook_state_at = ?2 \
              WHERE id = ?3 AND deleted_at IS NULL",
-            params![state, now, id.to_string()],
+            params![state, at, id.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Record the exact multiplexer window a launch put a session's agent in.
+    ///
+    /// A targeted UPDATE for the relaunch paths that do not rewrite the row, the
+    /// same pattern the sandbox verdict uses — and for a sharper reason. This is
+    /// what every destructive action revalidates against, so a stale identity is
+    /// not merely wrong: it is a kill aimed at whatever now answers to a pane id
+    /// that has been recycled. A caller with nothing recorded
+    /// ([`MuxIdentity::is_recorded`](crate::session::MuxIdentity::is_recorded)
+    /// false) writes nothing rather than clearing it.
+    pub fn set_session_mux_identity(
+        &self,
+        id: SessionId,
+        mux: &crate::session::MuxIdentity,
+    ) -> rusqlite::Result<()> {
+        if !mux.is_recorded() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "UPDATE sessions SET mux_server = ?1, mux_window_id = ?2, mux_pane_id = ?3, \
+             mux_pane_pid = ?4, mux_launch_key = ?5, updated_at = ?6 WHERE id = ?7",
+            params![
+                mux.server,
+                mux.window_id,
+                mux.pane_id,
+                mux.pane_pid.map(i64::from),
+                mux.launch_key,
+                current_time_millis() as i64,
+                id.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record where a session's egress proxy listens, what it demands, and what
+    /// became of it.
+    ///
+    /// A targeted UPDATE, so a restore that only rebinds a listener does not
+    /// have to rewrite a whole session row to say so. The token is written here
+    /// and read back only by the restore path — nothing renders it.
+    pub fn set_session_egress(
+        &self,
+        id: SessionId,
+        egress: &crate::session::EgressRecord,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET egress_endpoint = ?1, egress_token = ?2, egress_state = ?3, \
+             updated_at = ?4 WHERE id = ?5",
+            params![
+                egress.endpoint,
+                egress.token,
+                egress.state.to_storage(),
+                current_time_millis() as i64,
+                id.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Move a session's egress **state** without touching its endpoint or its
+    /// token.
+    ///
+    /// The failed-restore path's whole point: an endpoint that could not be
+    /// rebound is recorded as `Unrestorable` and the token is left exactly as it
+    /// was. Rotating it there would silently invalidate the proxy URLs the agent
+    /// that is *still running* already holds, taking its network away for a
+    /// reason nothing would explain.
+    pub fn set_session_egress_state(
+        &self,
+        id: SessionId,
+        state: &crate::session::EgressState,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET egress_state = ?1, updated_at = ?2 WHERE id = ?3",
+            params![
+                state.to_storage(),
+                current_time_millis() as i64,
+                id.to_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// One session's egress record, token included — the restore path's input.
+    ///
+    /// The only reader of the token, and deliberately a separate call rather
+    /// than a field on every listing: a value that is not fetched cannot be
+    /// logged.
+    pub fn session_egress(
+        &self,
+        id: SessionId,
+    ) -> rusqlite::Result<Option<crate::session::EgressRecord>> {
+        self.conn
+            .query_row(
+                "SELECT egress_endpoint, egress_token, egress_state FROM sessions WHERE id = ?1",
+                params![id.to_string()],
+                |row| {
+                    Ok(crate::session::EgressRecord {
+                        endpoint: row.get(0)?,
+                        token: row.get(1)?,
+                        state: row
+                            .get::<_, Option<String>>(2)?
+                            .map(|raw| crate::session::EgressState::from_storage(&raw))
+                            .unwrap_or_default(),
+                    })
+                },
+            )
+            .optional()
     }
 
     /// Record the base branch a session's worktree was forked from. A targeted
@@ -733,9 +901,27 @@ fn row_to_shared_session(
     let display_order: Option<i64> = row.get(11)?;
     let sandbox_profile: Option<String> = row.get(12)?;
     let sandbox_unenforced: Option<String> = row.get(13)?;
-    let wt_repo: Option<String> = row.get(14)?;
-    let wt_path: Option<String> = row.get(15)?;
-    let wt_branch: Option<String> = row.get(16)?;
+    let mux = crate::session::MuxIdentity {
+        server: row.get(14)?,
+        window_id: row.get(15)?,
+        pane_id: row.get(16)?,
+        pane_pid: row
+            .get::<_, Option<i64>>(17)?
+            .and_then(|pid| u32::try_from(pid).ok()),
+        launch_key: row.get(18)?,
+    };
+    let egress = crate::session::EgressRecord {
+        endpoint: row.get(19)?,
+        token: row.get(20)?,
+        state: row
+            .get::<_, Option<String>>(21)?
+            .map(|raw| crate::session::EgressState::from_storage(&raw))
+            .unwrap_or_default(),
+    };
+    let sandbox_overlay: Option<String> = row.get(22)?;
+    let wt_repo: Option<String> = row.get(23)?;
+    let wt_path: Option<String> = row.get(24)?;
+    let wt_branch: Option<String> = row.get(25)?;
 
     let additional_dirs = additional_dirs_from_db(&dirs_str);
 
@@ -760,6 +946,9 @@ fn row_to_shared_session(
             display_order,
             tombstone: false,
             tombstone_at: None,
+            mux,
+            egress,
+            sandbox_overlay,
         },
         worktree,
     ))
@@ -788,7 +977,120 @@ mod tests {
             display_order: None,
             tombstone: false,
             tombstone_at: None,
+            mux: crate::session::MuxIdentity::default(),
+            egress: crate::session::EgressRecord::default(),
+            sandbox_overlay: None,
         }
+    }
+
+    /// The endpoint and the token round-trip whole, and the token never appears
+    /// in a rendering of anything that carries it.
+    #[test]
+    fn an_egress_record_round_trips_with_the_token_redacted() {
+        let db = Database::open_in_memory().unwrap();
+        let mut session = make_session("filtered");
+        session.egress = crate::session::EgressRecord {
+            endpoint: Some("tcp:8123".to_string()),
+            token: Some("s3cr3t-egress-token".to_string()),
+            state: crate::session::EgressState::Active,
+        };
+        db.upsert_session(&session).unwrap();
+
+        let read = db.session_egress(session.id).unwrap().unwrap();
+        assert_eq!(read.endpoint.as_deref(), Some("tcp:8123"));
+        assert_eq!(read.token.as_deref(), Some("s3cr3t-egress-token"));
+        assert_eq!(read.state, crate::session::EgressState::Active);
+
+        // Neither the record nor the session that holds it prints the value.
+        for rendered in [format!("{read:?}"), format!("{session:?}")] {
+            assert!(!rendered.contains("s3cr3t"), "{rendered}");
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+        }
+
+        // A listing carries the endpoint and the state and never the token.
+        let listed = db.list_active_sessions().unwrap();
+        let row = listed.iter().find(|s| s.id == session.id).unwrap();
+        assert_eq!(row.egress.endpoint.as_deref(), Some("tcp:8123"));
+        assert_eq!(row.egress.state, crate::session::EgressState::Active);
+    }
+
+    /// A failed restore records the reason and leaves the token exactly as it
+    /// was. Rotating it there would invalidate the proxy URLs the agent that is
+    /// **still running** already holds.
+    #[test]
+    fn an_unrestorable_egress_keeps_its_token() {
+        let db = Database::open_in_memory().unwrap();
+        let mut session = make_session("filtered");
+        session.egress = crate::session::EgressRecord {
+            endpoint: Some("tcp:8123".to_string()),
+            token: Some("s3cr3t-egress-token".to_string()),
+            state: crate::session::EgressState::Active,
+        };
+        db.upsert_session(&session).unwrap();
+
+        let reason = "port 8123 is in use by another process";
+        db.set_session_egress_state(
+            session.id,
+            &crate::session::EgressState::Unrestorable(reason.to_string()),
+        )
+        .unwrap();
+
+        let read = db.session_egress(session.id).unwrap().unwrap();
+        assert_eq!(read.token.as_deref(), Some("s3cr3t-egress-token"));
+        assert_eq!(read.endpoint.as_deref(), Some("tcp:8123"));
+        assert_eq!(read.state.reason(), Some(reason));
+        assert!(read.state.needs_attention());
+
+        // And the boundary itself is untouched: an enforced sandbox with a dead
+        // proxy is still enforced, so `sandbox_unenforced` stays clear.
+        let row = db
+            .list_active_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == session.id)
+            .unwrap();
+        assert_eq!(row.sandbox_enforcement.unenforced_reason(), None);
+    }
+
+    /// The identity is what every destructive action revalidates against, so a
+    /// writer with nothing recorded must leave the stored one alone rather than
+    /// turning the guard into "nothing to compare".
+    #[test]
+    fn a_writer_with_no_identity_does_not_erase_the_recorded_one() {
+        let db = Database::open_in_memory().unwrap();
+        let mut session = make_session("worker");
+        session.mux = crate::session::MuxIdentity {
+            server: Some("server-uuid".to_string()),
+            window_id: Some("@7".to_string()),
+            pane_id: Some("%12".to_string()),
+            pane_pid: Some(4242),
+            launch_key: Some("sess:launch".to_string()),
+        };
+        session.egress = crate::session::EgressRecord {
+            endpoint: Some("unix:/s/p.sock".to_string()),
+            token: Some("tok".to_string()),
+            state: crate::session::EgressState::Active,
+        };
+        db.upsert_session(&session).unwrap();
+
+        // A row rebuilt from storage and written back — the periodic write-back
+        // shape — carries neither.
+        let mut blank = make_session("worker");
+        blank.id = session.id;
+        db.upsert_session(&blank).unwrap();
+
+        let read = db
+            .list_active_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == session.id)
+            .unwrap();
+        assert_eq!(read.mux, session.mux);
+        assert_eq!(read.egress.endpoint.as_deref(), Some("unix:/s/p.sock"));
+        assert_eq!(
+            db.session_egress(session.id).unwrap().unwrap().token,
+            Some("tok".to_string())
+        );
     }
 
     /// A session under profile `dev` whose launch reported `enforcement`.
