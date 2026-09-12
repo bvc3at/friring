@@ -284,9 +284,13 @@ session ids, resume/fork behavior and every state-directory env override are
 untouched. It is independent of `hook_schema` in both directions: that one
 names the hook family the CLI speaks, this one the records it leaves behind,
 and an agent may need either, both, or neither. Editing it takes effect on the
-next `agents.toml` reload — a session whose provider changes drops the activity
-it had accumulated under the old one and rebuilds from the new provider's own
-sources.
+next `agents.toml` reload — a session whose provider changes drops the event
+stream it had accumulated under the old one and rebuilds from the new
+provider's own sources. Two things lag that, both pre-dating this field and
+equally reachable by editing an entry's `command`: a **shelved** session keeps
+the accumulator it was shelved with until it loads again, and F9's **Agents**
+section (the Claude workflow/subagent tree, a separate scan) keeps the tree it
+last indexed. Neither affects a session whose provider never changes.
 
 Distinct from the sibling `[agents.<name>.transcript]` block below,
 despite the shared word: that one says *where* this CLI stores a
