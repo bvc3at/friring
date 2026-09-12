@@ -888,6 +888,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: true,
             hook_schema: None,
+            activity_provider: None,
             sandbox: Some(crate::session::AgentSandboxDef {
                 config_dir_env: Some("WORKER_HOME".into()),
                 state_dir: Some("~/.worker".into()),

@@ -27,6 +27,118 @@ pub mod opencode;
 pub mod qwen;
 pub mod vibe;
 
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+/// Which provider reads a session's on-disk records — one variant per
+/// supported transcript format.
+///
+/// Resolution is the registry entry's explicit
+/// [`AgentDef::activity_provider`](crate::session::AgentDef::activity_provider)
+/// when it declares one, else the **command basename**
+/// ([`Self::for_command`]), so a custom registry name wrapping a known CLI
+/// (`claude-opus` → `claude`) resolves without an allowlist of names.
+///
+/// Lives in the pure layer rather than beside the scan (`crate::activity`)
+/// because an `agents.toml` entry names one, and `session` is the dependency
+/// sink an [`AgentDef`](crate::session::AgentDef) can embed a type from.
+///
+/// The serde names are [`Self::id`] verbatim: what a config file writes is
+/// what `friring-cli session activity` and the F9 identity line report back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderKind {
+    #[serde(rename = "claude-code")]
+    Claude,
+    #[serde(rename = "vibe")]
+    Vibe,
+    #[serde(rename = "qwen-code")]
+    Qwen,
+    #[serde(rename = "cursor-agent")]
+    Cursor,
+    #[serde(rename = "gemini-cli")]
+    Gemini,
+    #[serde(rename = "crush")]
+    Crush,
+    #[serde(rename = "copilot")]
+    Copilot,
+    #[serde(rename = "aider")]
+    Aider,
+    #[serde(rename = "goose")]
+    Goose,
+    #[serde(rename = "opencode")]
+    Opencode,
+    #[serde(rename = "codex")]
+    Codex,
+    #[serde(rename = "cline")]
+    Cline,
+}
+
+impl ProviderKind {
+    /// Every variant, in the order the config documentation lists them.
+    /// Exhaustiveness is held by [`Self::id`]'s `match`, which fails to
+    /// compile when a variant is added without an id.
+    pub const ALL: [Self; 12] = [
+        Self::Claude,
+        Self::Vibe,
+        Self::Qwen,
+        Self::Cursor,
+        Self::Gemini,
+        Self::Crush,
+        Self::Copilot,
+        Self::Aider,
+        Self::Goose,
+        Self::Opencode,
+        Self::Codex,
+        Self::Cline,
+    ];
+
+    /// The provider a bare command implies, by basename — the fallback when an
+    /// entry declares no [`ProviderKind`] of its own. `None` for a command
+    /// friring has no parser for, which is not the same as one it has decided
+    /// it cannot read (`activity::unsupported_reason` names those).
+    pub fn for_command(command: &str) -> Option<Self> {
+        let base = Path::new(command)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(command);
+        match base {
+            "claude" => Some(Self::Claude),
+            "vibe" => Some(Self::Vibe),
+            "qwen" => Some(Self::Qwen),
+            "cursor-agent" => Some(Self::Cursor),
+            "gemini" => Some(Self::Gemini),
+            "crush" => Some(Self::Crush),
+            "copilot" => Some(Self::Copilot),
+            "aider" => Some(Self::Aider),
+            "goose" => Some(Self::Goose),
+            "opencode" => Some(Self::Opencode),
+            "codex" => Some(Self::Codex),
+            "cline" => Some(Self::Cline),
+            _ => None,
+        }
+    }
+
+    /// Stable identifier: the config-file spelling, the `provider` field of
+    /// `friring-cli session activity --json`, and the Overview identity line.
+    pub fn id(self) -> &'static str {
+        match self {
+            ProviderKind::Claude => "claude-code",
+            ProviderKind::Vibe => "vibe",
+            ProviderKind::Qwen => "qwen-code",
+            ProviderKind::Cursor => "cursor-agent",
+            ProviderKind::Gemini => "gemini-cli",
+            ProviderKind::Crush => "crush",
+            ProviderKind::Copilot => "copilot",
+            ProviderKind::Aider => "aider",
+            ProviderKind::Goose => "goose",
+            ProviderKind::Opencode => "opencode",
+            ProviderKind::Codex => "codex",
+            ProviderKind::Cline => "cline",
+        }
+    }
+}
+
 /// What kind of action an [`ActivityEvent`] records, normalized across
 /// agents. `Other` carries actions worth showing on the timeline that fit no
 /// dedicated category (its tool name goes in [`ActivityEvent::detail`]).
@@ -392,6 +504,72 @@ mod tests {
         // `/first.rs` was touched last (the read) → most recent.
         assert_eq!(files[0].path, "/first.rs");
         assert_eq!(files[1].path, "/second.rs");
+    }
+
+    /// The config vocabulary and the reported vocabulary are one vocabulary:
+    /// every variant's serde name is its [`ProviderKind::id`], so a value read
+    /// out of `session activity --json` can be pasted straight into
+    /// `agents.toml`. A derive that drifts from `id()` fails here.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct ProviderWrapper {
+        provider: ProviderKind,
+    }
+
+    #[test]
+    fn every_provider_round_trips_through_its_id() {
+        for kind in ProviderKind::ALL {
+            let doc = format!("provider = \"{}\"\n", kind.id());
+            let parsed: ProviderWrapper = toml::from_str(&doc)
+                .unwrap_or_else(|e| panic!("{:?} does not deserialize from its own id: {e}", kind));
+            assert_eq!(parsed.provider, kind);
+            assert_eq!(
+                toml::to_string(&ProviderWrapper { provider: kind }).unwrap(),
+                doc,
+                "{kind:?} serializes to something other than its id"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_ids_are_unique_and_all_lists_every_variant() {
+        let mut ids: Vec<&str> = ProviderKind::ALL.iter().map(|k| k.id()).collect();
+        let count = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "two providers share an id");
+        // Every basename-inferred provider is reachable from ALL — a variant
+        // omitted there would be undocumentable and unwritable in a config.
+        for command in [
+            "claude",
+            "vibe",
+            "qwen",
+            "cursor-agent",
+            "gemini",
+            "crush",
+            "copilot",
+            "aider",
+            "goose",
+            "opencode",
+            "codex",
+            "cline",
+        ] {
+            let kind = ProviderKind::for_command(command)
+                .unwrap_or_else(|| panic!("'{command}' resolves to no provider"));
+            assert!(ProviderKind::ALL.contains(&kind), "{kind:?} missing in ALL");
+        }
+    }
+
+    #[test]
+    fn an_unknown_provider_name_names_the_valid_ones() {
+        // The diagnostic `friring-cli config validate` shows: serde's
+        // unknown-variant error enumerates what the user could have written.
+        let err = toml::from_str::<ProviderWrapper>("provider = \"claude\"\n")
+            .expect_err("'claude' is not a provider id");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("claude-code"),
+            "error must list the ids: {msg}"
+        );
     }
 
     #[test]

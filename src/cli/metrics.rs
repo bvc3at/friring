@@ -269,13 +269,6 @@ pub fn run_activity(target: TargetArgs, db: &Database) -> Result<CommandOutput, 
 fn activity_row(s: &SharedSession, agents: &crate::session::AgentRegistry) -> Value {
     use crate::session::activity::ActivityCounts;
 
-    // The provider keys off the registry entry's *command* basename, so a
-    // custom agent name wrapping a known CLI still resolves.
-    let command = agents
-        .get(&s.agent)
-        .map(|a| a.command.clone())
-        .unwrap_or_else(|| s.agent.clone());
-
     // An unmeasured row still carries every key, explicitly null: absent is not
     // zero, and a jq pipeline sees one stable shape across both outcomes.
     if is_remote(s) {
@@ -284,7 +277,13 @@ fn activity_row(s: &SharedSession, agents: &crate::session::AgentRegistry) -> Va
             "off-host session: its transcripts are not on this machine".into(),
         );
     }
-    let Some(provider) = crate::activity::ProviderKind::for_command(&command) else {
+
+    // The same resolution the TUI's F9 view uses — the entry's declared
+    // `activity_provider`, else its command basename — so this command and the
+    // view can never disagree about a session.
+    let choice = crate::activity::resolve_provider(agents, &s.agent);
+    let Some(provider) = choice.provider else {
+        let command = choice.command;
         let note = crate::activity::unsupported_reason(&command)
             .map(str::to_string)
             .unwrap_or_else(|| format!("no activity provider for '{command}'"));

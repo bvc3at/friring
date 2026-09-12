@@ -7,13 +7,16 @@
 //! seeded with built-ins on first run, so users can register custom agents
 //! without recompiling.
 //!
-//! This module is pure data + pure logic (no filesystem, no local imports
-//! beyond serde/std) to satisfy the `session/` architecture rule. The TOML
-//! loading and the `AgentProvider` bridge live in `crate::agent`.
+//! This module is pure data + pure logic (no filesystem, and no imports beyond
+//! serde/std and its sibling `session` types) to satisfy the `session/`
+//! architecture rule. The TOML loading and the `AgentProvider` bridge live in
+//! `crate::agent`.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+use super::activity::ProviderKind;
 
 /// Placeholder substituted with a session id in resume/fork/new-session groups.
 const ID_PLACEHOLDER: &str = "{id}";
@@ -68,6 +71,23 @@ pub struct AgentDef {
     /// (`apply_agent_patches`) and `extensions/hooks/`.
     #[serde(default)]
     pub hook_schema: Option<String>,
+    /// Which transcript format this CLI **writes**, for activity reporting
+    /// (the F9 view and `friring-cli session activity`).
+    ///
+    /// Absent, the provider is inferred from the command basename
+    /// ([`ProviderKind::for_command`]) — which is all a custom entry ever had,
+    /// and why an executable named anything else reported nothing. Declaring
+    /// one here says "whatever this command is called, it records like
+    /// *that*", and takes precedence over the basename. friring bakes in no
+    /// agent knowledge: the *user* asserts the format, exactly as with
+    /// [`hook_schema`](Self::hook_schema).
+    ///
+    /// Deliberately **independent** of `hook_schema`. They answer different
+    /// questions — which hook family the CLI speaks, versus which records it
+    /// leaves behind — and an agent can need one, the other, both, or neither
+    /// (a CLI with no hooks still has a transcript to read).
+    #[serde(default)]
+    pub activity_provider: Option<ProviderKind>,
     /// What this CLI needs in order to survive being sandboxed
     /// (`[agents.<name>.sandbox]`). Absent for an agent nobody has sandboxed
     /// yet: it still launches, it just gets no help — which the editor says
@@ -349,6 +369,18 @@ impl AgentDef {
     pub fn resumes_by_id(&self) -> bool {
         !self.resume_latest && self.resume_args.iter().any(|t| t.contains(ID_PLACEHOLDER))
     }
+
+    /// The activity provider for this entry: its explicit
+    /// [`activity_provider`](Self::activity_provider), else whatever its
+    /// command basename implies.
+    ///
+    /// Named apart from the field so a call site reads as the *resolution* it
+    /// is. Both activity callers go through `crate::activity::resolve_provider`
+    /// rather than here directly — it also answers the "entry is gone" case.
+    pub fn resolved_activity_provider(&self) -> Option<ProviderKind> {
+        self.activity_provider
+            .or_else(|| ProviderKind::for_command(&self.command))
+    }
 }
 
 /// Substitute `{id}` — and `{name}`, when the launch has a non-empty session
@@ -460,6 +492,7 @@ mod tests {
             ],
             resume_latest: false,
             hook_schema: None,
+            activity_provider: None,
             transcript: None,
             sandbox: None,
         }
@@ -602,6 +635,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: None,
+            activity_provider: None,
             transcript: None,
             sandbox: None,
         };
@@ -622,6 +656,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: true,
             hook_schema: None,
+            activity_provider: None,
             transcript: None,
             sandbox: None,
         };
@@ -660,6 +695,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: true,
             hook_schema: None,
+            activity_provider: None,
             transcript: None,
             sandbox: None,
         };
@@ -687,6 +723,7 @@ mod tests {
                     new_session_args: vec![],
                     resume_latest: false,
                     hook_schema: None,
+                    activity_provider: None,
                     transcript: None,
                     sandbox: None,
                 },

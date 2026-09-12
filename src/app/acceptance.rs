@@ -6086,6 +6086,7 @@ fn worker_agent() -> crate::session::AgentDef {
         new_session_args: vec![],
         resume_latest: false,
         hook_schema: None,
+        activity_provider: None,
         transcript: None,
         sandbox: Some(crate::session::AgentSandboxDef {
             config_dir_env: Some("WORKER_HOME".into()),

@@ -1826,6 +1826,7 @@ mod tests {
             new_session_args: Vec::new(),
             resume_latest: false,
             hook_schema: None,
+            activity_provider: None,
             transcript: None,
             sandbox: Some(AgentSandboxDef {
                 secret_env: secret_env.iter().map(|s| (*s).to_string()).collect(),

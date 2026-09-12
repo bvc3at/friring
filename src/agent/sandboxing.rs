@@ -1647,6 +1647,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: None,
+            activity_provider: None,
             transcript: None,
             sandbox: Some(AgentSandboxDef {
                 bypass: vec!["--dangerously-skip-permissions".into()],

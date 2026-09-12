@@ -14,7 +14,8 @@
 use std::path::PathBuf;
 
 use crate::activity::{
-    claude_sub_sources, collect_activity, unsupported_reason, ActivityInput, ScanRoots,
+    claude_sub_sources, collect_activity, resolve_provider, unsupported_reason, ActivityInput,
+    ScanRoots,
 };
 pub(crate) use crate::activity::{ActivityRefresh, ProviderKind, SessionActivity};
 use crate::session::activity::{
@@ -63,18 +64,16 @@ impl Section {
 
 impl App {
     /// The CLI command behind a session's agent (the registry name itself
-    /// when the entry is gone) — the provider-dispatch key.
+    /// when the entry is gone) — what the Overview's unsupported line names.
     pub(super) fn session_command(&self, info: &SessionInfo) -> String {
-        self.agents
-            .get(&info.agent)
-            .map(|a| a.command.clone())
-            .unwrap_or_else(|| info.agent.clone())
+        resolve_provider(&self.agents, &info.agent).command
     }
 
-    /// The activity provider for a session, from its registry entry's command
-    /// basename.
+    /// The activity provider for a session: its registry entry's explicit
+    /// `activity_provider`, else the command basename. Shared with
+    /// `friring-cli session activity` (see [`resolve_provider`]).
     pub(crate) fn session_provider(&self, info: &SessionInfo) -> Option<ProviderKind> {
-        ProviderKind::for_command(&self.session_command(info))
+        resolve_provider(&self.agents, &info.agent).provider
     }
 
     /// Kick off a background event scan for every **loaded** local session with
@@ -141,7 +140,12 @@ impl App {
                     .activity
                     .remove(&id)
                     // An agents.toml edit can repoint a session's provider —
-                    // stale accumulators must not survive that.
+                    // by changing the entry's command, or by declaring a
+                    // different `activity_provider` outright — and the reload
+                    // is live. A stale accumulator holds another format's
+                    // parser, its byte offsets and its already-parsed events,
+                    // so it must not survive the change: drop it and rebuild
+                    // from the new provider's own sources.
                     .filter(|a| a.provider == provider)
                     .unwrap_or_else(|| SessionActivity::new(provider));
                 ActivityInput {

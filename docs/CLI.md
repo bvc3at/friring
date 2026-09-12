@@ -339,6 +339,14 @@ it reads credentials wherever they are, so `--host <name>` queries a host from
 transcripts into its counts from the TUI's cc tree scan, which is TUI state, so
 delegated work is absent from the CLI's counts, files and tokens.
 
+Which parser `session activity` uses is resolved from the session's
+`agents.toml` entry by the same code the F9 view calls, so the two can never
+disagree: the entry's `activity_provider` when it declares one, else its
+command basename. The `provider` field in the output is that provider's id —
+the same spelling you would write in the config. A session friring cannot
+place reports `provider: null` with a `note` naming the command, exactly as an
+off-host one does. See [`docs/CONFIG.md`](CONFIG.md#agentstoml).
+
 Cost varies by three orders of magnitude, which is why these are separate
 commands rather than one: `metrics` is a file read, `resources` is one process
 sweep plus one tmux call for any number of sessions, `activity` parses the

@@ -1095,9 +1095,13 @@ sessions only.
   TaskOutput, …) are kept as dim **minor** rows instead of being dropped.
 - **Providers.** Every supported CLI gets a provider: pure record→event
   parsers in `session::activity::<provider>` plus discovery/tailing glue in
-  `app::activity::<provider>`, dispatched by the **command basename** of the
-  session's `agents.toml` entry (so wrapper entries like `claude-opus`
-  resolve). Sources are stat-signature-gated, append-only files tail
+  `app::activity::<provider>`. Which one reads a session is resolved once,
+  from its `agents.toml` entry, by `activity::resolve_provider` — shared by
+  this view and `friring-cli session activity` so the two can never disagree.
+  The default is the entry's **command basename** (so wrapper entries like
+  `claude-opus` resolve for free); an entry may instead **declare** its format
+  with `activity_provider` (below). Sources are stat-signature-gated,
+  append-only files tail
   incrementally by byte offset, SQLite stores are read read-only (WAL-aware),
   and nothing is persisted. Formats were reverse-engineered from each CLI's
   source/docs (July 2026) and every parser degrades to skipped records on
@@ -1111,6 +1115,30 @@ sessions only.
   `GOOSE_PATH_ROOT`; `CLINE_DIR` / `CLINE_DATA_DIR` /
   `CLINE_SESSION_DATA_DIR`; `AIDER_CHAT_HISTORY_FILE`; `OPENCODE_DB`;
   `XDG_DATA_HOME` for opencode and goose).
+- **Explicit provider selection (`activity_provider` in `agents.toml`).**
+  Basename inference is a guess about a name, and it is the *only* thing a
+  custom entry had: an executable friring cannot recognize — a wrapper script,
+  a rebranded binary, `command = "/opt/ring/bin/ringwriter"` — reported nothing
+  at all, however ordinary the transcripts it wrote. An entry can now name the
+  format it produces (`activity_provider = "claude-code"`, one of the twelve
+  provider ids), and that declaration **wins** over the basename, including
+  against a misleading one. Omitted, resolution is byte-for-byte what it was,
+  so every existing `agents.toml` is unaffected. The field is `AgentDef`'s, so
+  `ProviderKind` moved down into the pure `session::activity` layer (`session`
+  is the dependency sink an `AgentDef` can embed a type from) and its serde
+  names are its `id()` verbatim — what `session activity --json` reports is
+  what you paste into the config. Deliberately **orthogonal to `hook_schema`**
+  in both directions: hooks are what a CLI *speaks*, a provider is what it
+  *writes*, and an agent may need either, both, or neither. An invalid value is
+  an ordinary malformed entry — skipped with a warning that enumerates the
+  valid ids, siblings unaffected, and `friring-cli config validate` fails the
+  file. Nothing about the launch changes (argv, session ids, resume/fork,
+  state-dir env overrides are untouched); on a live `agents.toml` reload a
+  session whose provider changed drops its accumulator — another format's
+  parser, offsets and events — and rebuilds. Covered by the
+  `custom-activity-provider` agent-e2e scenario, which registers a synthetic
+  executable under an arbitrary basename and asserts the same turn through both
+  F9 and the CLI.
 - **Known-unsupported agents** show *why* in the Overview (e.g. `agy`
   encrypts its trajectory store; `amp` keeps threads server-side).
 - **The Claude workflow/subagent tree** (the original v1 feature) lives on
@@ -1431,7 +1459,7 @@ faking a login. A missing *or unresponsive* agent binary skips only that
 agent's tests, so any subset of the CLIs stays green.
 
 The suite has since grown from agent smoke tests into a **core-feature e2e
-suite** (31 scenarios, 43 bats tests): tmux-persistence re-adoption, the real
+suite** (46 scenarios, 50 bats tests): tmux-persistence re-adoption, the real
 permission→blocked hook path, restart-resume / fork / conversation import
 (riding claude's `--session-id {id}` pinning — the harness `agents.toml`
 entry now mirrors the production templates), worktree sessions and `Ctrl+S`
@@ -1439,12 +1467,16 @@ sync incl. the conflict handoff to the agent, code-review export, automations,
 tasks, inter-session messages, extension lifecycle with offline issue-sync,
 global search, the F9 activity view, both wizard flows, and the polish surface
 (themes, settings live-reload, keybinding editor, shell pane, soft delete,
-attention navigation). Two harness additions keep that hermetic: a
+attention navigation). Three harness additions keep that hermetic: a
 **`scripted` agent profile** — a bash script registered through the ordinary
 `agents.toml` machinery (living proof of the agent-neutral registry) that
-echoes stdin back, giving fast model-free scenarios that never skip — and a
-seeded sandbox `settings.toml` (`[features] notifications = false`) so
-blocked-state tests can never fire a real desktop banner. See `docs/E2E.md`.
+echoes stdin back, giving fast model-free scenarios that never skip; a
+**`ringwriter` profile**, a second script agent under a basename no provider
+inference resolves, which replays a claude-code-format fixture transcript into
+a relocated `CLAUDE_CONFIG_DIR` so `activity_provider` can be asserted with
+nothing recognizable in the loop; and a seeded sandbox `settings.toml`
+(`[features] notifications = false`) so blocked-state tests can never fire a
+real desktop banner. See `docs/E2E.md`.
 
 **The demo half of that promise was mostly untested** — one scenario
 description, two outputs only holds if the second output is exercised, and

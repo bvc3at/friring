@@ -1530,12 +1530,20 @@ Keys mirror the code-review view — `j`/`k`, PageUp/Down, `Ctrl+D`/`Ctrl+U`,
 expand a row's note and result head. The view is mutually exclusive with the
 code-review overlay, since both own the central pane.
 
-**Twelve agents are supported**, dispatched by the command basename of the
-session's `agents.toml` entry (so a wrapper entry like `claude-opus` resolves):
-claude, codex, gemini, qwen, copilot, vibe, cursor-agent, opencode, goose,
-crush, aider, cline. Each honors its CLI's own state-dir env overrides. An agent
-whose store can't be read says **why** in the Overview rather than rendering
-empty — `agy` encrypts its trajectory store, `amp` keeps threads server-side.
+**Twelve agents are supported**: claude, codex, gemini, qwen, copilot, vibe,
+cursor-agent, opencode, goose, crush, aider, cline. Each honors its CLI's own
+state-dir env overrides. An agent whose store can't be read says **why** in the
+Overview rather than rendering empty — `agy` encrypts its trajectory store,
+`amp` keeps threads server-side.
+
+Which one reads a session is resolved from its `agents.toml` entry, once, for
+both this view and `friring-cli session activity`. By default it is the entry's
+command **basename**, so a wrapper entry like `claude-opus` resolves for free.
+A command friring cannot recognize by name — a wrapper script, a rebranded
+binary — declares the format it writes with
+[`activity_provider`](CONFIG.md#agentstoml), which takes precedence over the
+basename; see that section for the valid values and how it differs from
+`hook_schema`.
 
 **What this costs, and what it can't promise.** Sources are stat-signature
 gated and append-only files tail by byte offset, so a pass that finds nothing
