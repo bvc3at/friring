@@ -196,7 +196,7 @@ scenario_assert_effects() {
         || e2e_die "no transcript under CLAUDE_CONFIG_DIR for $aid" || return 1
     [ ! -d "$HOME/.claude/projects" ] \
         || e2e_die "the state-dir override was ignored: ~/.claude/projects exists" || return 1
-    assert_ws_file_eq drift.md "capture ring clamped to 92%"
+    assert_ws_file_eq drift.md "capture ring clamped to 92%" || return 1
 
     # --- the declaring entry, headlessly ----------------------------------
     # The same provider the TUI showed, from the same resolution — and the
@@ -228,7 +228,7 @@ scenario_assert_effects() {
     # the before-picture of the entry above, and the proof that hook wiring
     # implies nothing about transcripts.
     cap_wait_activity "$CAP_BARE_SESSION" \
-        '.provider == null and (.note | test("no activity provider"))'
+        '.provider == null and (.note | test("no activity provider"))' || return 1
     local bare
     bare="$(friring-cli --json session activity "$CAP_BARE_SESSION")"
     printf '%s' "$bare" | jq -e '.counts == null and .tokens == null' >/dev/null \
@@ -237,7 +237,7 @@ scenario_assert_effects() {
     # No `activity_provider` either, but a basename friring knows: inference,
     # unchanged. Every agents.toml written before the field keeps working.
     cap_wait_activity "$CAP_LEGACY_SESSION" \
-        '.provider == "claude-code" and .counts.edits == 1'
+        '.provider == "claude-code" and .counts.edits == 1' || return 1
 
     # --- the invalid entry ------------------------------------------------
     # `config validate` fails the file and names what could have been written.
