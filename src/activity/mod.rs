@@ -33,7 +33,11 @@ use std::path::{Path, PathBuf};
 
 use crate::session::activity::vibe::{parse_meta as parse_vibe_meta, VibeMeta, VibeScan};
 use crate::session::activity::{claude::ClaudeScan, ActionKind, ActivityEvent, ActivityMeta};
-use crate::session::{SessionId, SessionInfo};
+// Re-exported so this module reads as the provider's home even though the type
+// itself is pure data: an `agents.toml` entry names a provider, so it has to
+// live where an `AgentDef` can embed it (arch rule `session` ← nothing).
+pub(crate) use crate::session::activity::ProviderKind;
+use crate::session::{AgentRegistry, SessionId, SessionInfo};
 
 /// Per-pass ingest budget for an append-only source. History is never
 /// clipped: a months-old transcript is ingested front-to-back across
@@ -49,64 +53,38 @@ const INGEST_CHUNK: u64 = 8 * 1024 * 1024;
 /// [`SessionActivity::truncated`].
 const SNAPSHOT_INGEST_MAX: u64 = 32 * 1024 * 1024;
 
-/// Which activity provider reads a session's on-disk records, resolved from
-/// the **command basename** of the session's registry entry — so custom
-/// registry names wrapping the same CLI (`claude-opus` → `claude`) resolve
-/// without an allowlist of names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProviderKind {
-    Claude,
-    Vibe,
-    Qwen,
-    Cursor,
-    Gemini,
-    Crush,
-    Copilot,
-    Aider,
-    Goose,
-    Opencode,
-    Codex,
-    Cline,
+/// A session's activity provider plus the command it was resolved against.
+/// Built by [`resolve_provider`].
+pub(crate) struct ProviderChoice {
+    /// The registry entry's command, or the agent *name* when that entry is
+    /// gone — what [`unsupported_reason`] and the Overview's fallback line
+    /// have left to name.
+    pub(crate) command: String,
+    /// `None` when neither an explicit declaration nor the basename resolves.
+    pub(crate) provider: Option<ProviderKind>,
 }
 
-impl ProviderKind {
-    pub(crate) fn for_command(command: &str) -> Option<Self> {
-        let base = Path::new(command)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(command);
-        match base {
-            "claude" => Some(Self::Claude),
-            "vibe" => Some(Self::Vibe),
-            "qwen" => Some(Self::Qwen),
-            "cursor-agent" => Some(Self::Cursor),
-            "gemini" => Some(Self::Gemini),
-            "crush" => Some(Self::Crush),
-            "copilot" => Some(Self::Copilot),
-            "aider" => Some(Self::Aider),
-            "goose" => Some(Self::Goose),
-            "opencode" => Some(Self::Opencode),
-            "codex" => Some(Self::Codex),
-            "cline" => Some(Self::Cline),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn id(self) -> &'static str {
-        match self {
-            ProviderKind::Claude => "claude-code",
-            ProviderKind::Vibe => "vibe",
-            ProviderKind::Qwen => "qwen-code",
-            ProviderKind::Cursor => "cursor-agent",
-            ProviderKind::Gemini => "gemini-cli",
-            ProviderKind::Crush => "crush",
-            ProviderKind::Copilot => "copilot",
-            ProviderKind::Aider => "aider",
-            ProviderKind::Goose => "goose",
-            ProviderKind::Opencode => "opencode",
-            ProviderKind::Codex => "codex",
-            ProviderKind::Cline => "cline",
-        }
+/// Resolve a session's activity provider from the agent registry.
+///
+/// The **one** resolution both callers use — the F9 view and `friring-cli
+/// session activity` — so a registry entry can never report one provider in
+/// the TUI and a different one headlessly.
+///
+/// An entry's explicit `activity_provider` wins; with none, its command
+/// basename decides, which is what keeps every `agents.toml` written before
+/// that field existed behaving exactly as it did. A session whose entry has
+/// been deleted falls back to inferring from the agent name, the only thing
+/// left of it.
+pub(crate) fn resolve_provider(agents: &AgentRegistry, agent: &str) -> ProviderChoice {
+    match agents.get(agent) {
+        Some(def) => ProviderChoice {
+            command: def.command.clone(),
+            provider: def.resolved_activity_provider(),
+        },
+        None => ProviderChoice {
+            command: agent.to_string(),
+            provider: ProviderKind::for_command(agent),
+        },
     }
 }
 
@@ -974,6 +952,103 @@ mod tests {
         assert!(unsupported_reason("agy").is_some());
         assert!(unsupported_reason("amp").is_some());
         assert_eq!(unsupported_reason("my-agent-cli"), None);
+    }
+
+    /// A registry holding one entry, for the resolution tests below.
+    fn registry_of(def: crate::session::AgentDef) -> AgentRegistry {
+        AgentRegistry {
+            config_version: None,
+            default: def.name.clone(),
+            agents: vec![def],
+        }
+    }
+
+    fn custom_agent(command: &str) -> crate::session::AgentDef {
+        crate::session::AgentDef {
+            name: "ringwriter".into(),
+            command: command.into(),
+            args: vec![],
+            resume_args: vec![],
+            fork_args: vec![],
+            new_session_args: vec![],
+            resume_latest: false,
+            hook_schema: None,
+            activity_provider: None,
+            sandbox: None,
+            transcript: None,
+        }
+    }
+
+    #[test]
+    fn an_explicit_provider_beats_the_basename() {
+        // The whole point: a command friring has never heard of still reports
+        // activity, because the entry declares the format it writes.
+        let mut def = custom_agent("/opt/ring/bin/ringwriter");
+        assert_eq!(
+            resolve_provider(&registry_of(def.clone()), "ringwriter").provider,
+            None
+        );
+
+        def.activity_provider = Some(ProviderKind::Claude);
+        let choice = resolve_provider(&registry_of(def.clone()), "ringwriter");
+        assert_eq!(choice.provider, Some(ProviderKind::Claude));
+        // The command is still what the unsupported note would name.
+        assert_eq!(choice.command, "/opt/ring/bin/ringwriter");
+
+        // It also *overrides* an inference, rather than merely filling a gap:
+        // a wrapper named `codex` that actually emits claude transcripts.
+        def.command = "codex".into();
+        assert_eq!(
+            resolve_provider(&registry_of(def), "ringwriter").provider,
+            Some(ProviderKind::Claude)
+        );
+    }
+
+    #[test]
+    fn an_undeclared_entry_still_infers_from_its_command() {
+        // Backward compatibility: every agents.toml written before the field
+        // existed resolves exactly as it did.
+        let def = custom_agent("/usr/local/bin/claude");
+        assert_eq!(
+            resolve_provider(&registry_of(def), "ringwriter").provider,
+            Some(ProviderKind::Claude)
+        );
+    }
+
+    #[test]
+    fn a_deleted_entry_falls_back_to_the_agent_name() {
+        let agents = registry_of(custom_agent("claude"));
+        // Nothing named "gemini" is registered; the name is all that is left
+        // to infer from, and it resolves.
+        let choice = resolve_provider(&agents, "gemini");
+        assert_eq!(choice.provider, Some(ProviderKind::Gemini));
+        assert_eq!(choice.command, "gemini");
+    }
+
+    #[test]
+    fn the_declared_provider_is_independent_of_hook_schema() {
+        // Two orthogonal declarations: `hook_schema` names the hook family the
+        // CLI speaks, `activity_provider` the transcript format it writes.
+        // Setting either must not move the other.
+        let mut def = custom_agent("ringwriter");
+        def.hook_schema = Some("claude".into());
+        assert_eq!(
+            resolve_provider(&registry_of(def.clone()), "ringwriter").provider,
+            None,
+            "hook wiring must not imply a transcript format"
+        );
+
+        def.hook_schema = None;
+        def.activity_provider = Some(ProviderKind::Codex);
+        let def = def;
+        assert_eq!(
+            resolve_provider(&registry_of(def.clone()), "ringwriter").provider,
+            Some(ProviderKind::Codex)
+        );
+        assert_eq!(
+            def.hook_schema, None,
+            "a transcript format must not imply hook wiring"
+        );
     }
 
     #[test]

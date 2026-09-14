@@ -189,6 +189,20 @@ command = "vibe"
 #                               #   A rebranded-claude CLI sets "claude" to get
 #                               #   claude's --settings hook wiring under its own
 #                               #   name. Omit if the agent has no known family.
+# activity_provider = "claude-code"
+#                               # OPTIONAL: name the TRANSCRIPT FORMAT this CLI
+#                               #   writes, so the F9 activity view and
+#                               #   `friring-cli session activity` can read it.
+#                               #   Omitted, the format is guessed from the
+#                               #   command's basename — so a wrapper script or
+#                               #   a rebranded binary under any other name
+#                               #   reports nothing until you declare one here.
+#                               #   Independent of hook_schema: that is the
+#                               #   hooks this CLI speaks, this is the records
+#                               #   it leaves. One of:
+#                               #     claude-code  vibe    qwen-code  cursor-agent
+#                               #     gemini-cli   crush   copilot    aider
+#                               #     goose        opencode codex     cline
 #
 # [agents.transcript]           # OPTIONAL: where this CLI stores a conversation,
 # dir = "sessions"              #   relative to `state_dir` below, searched
@@ -777,6 +791,91 @@ args = ["--model", "claude-haiku-4-5"]
         assert!(
             warnings[0].contains("claude-bypass") && warnings[0].contains("skipped"),
             "warning must name the skipped agent: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn activity_provider_is_optional_explicit_and_orthogonal_to_hook_schema() {
+        use crate::session::activity::ProviderKind;
+
+        let toml = r#"
+default = "ringwriter"
+
+[[agents]]
+name = "ringwriter"
+command = "/opt/ring/bin/ringwriter"
+activity_provider = "claude-code"
+
+[[agents]]
+name = "hooked"
+command = "rebrand"
+hook_schema = "claude"
+
+[[agents]]
+name = "legacy"
+command = "claude"
+"#;
+        let (reg, warnings) = parse_agents_toml(toml);
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+
+        // Declared: the provider is the entry's, whatever the command is named.
+        let ring = reg.get("ringwriter").expect("declared entry loads");
+        assert_eq!(ring.activity_provider, Some(ProviderKind::Claude));
+        assert_eq!(
+            ring.resolved_activity_provider(),
+            Some(ProviderKind::Claude)
+        );
+
+        // hook_schema alone declares nothing about the transcript format.
+        let hooked = reg.get("hooked").expect("entry loads");
+        assert_eq!(hooked.activity_provider, None);
+        assert_eq!(hooked.resolved_activity_provider(), None);
+
+        // Omitted: the pre-existing basename inference, unchanged.
+        let legacy = reg.get("legacy").expect("entry loads");
+        assert_eq!(legacy.activity_provider, None);
+        assert_eq!(
+            legacy.resolved_activity_provider(),
+            Some(ProviderKind::Claude)
+        );
+    }
+
+    #[test]
+    fn an_invalid_activity_provider_is_diagnosed_and_siblings_survive() {
+        // Same contract every malformed entry gets: the bad one is named and
+        // skipped, the rest of the file still loads. `friring-cli config
+        // validate` strict-parses the same document and fails on it there.
+        let toml = r#"
+default = "claude"
+
+[[agents]]
+name = "claude"
+command = "claude"
+
+[[agents]]
+name = "ringwriter"
+command = "ringwriter"
+activity_provider = "ringwriter-format"
+
+[[agents]]
+name = "shepherd"
+command = "codex"
+"#;
+        let (reg, warnings) = parse_agents_toml(toml);
+
+        assert_eq!(reg.names(), vec!["claude", "shepherd"]);
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(
+            warnings[0].contains("ringwriter") && warnings[0].contains("skipped"),
+            "warning must name the skipped agent: {}",
+            warnings[0]
+        );
+        // The diagnostic tells the user what they could have written, rather
+        // than only that they were wrong.
+        assert!(
+            warnings[0].contains("claude-code"),
+            "warning must enumerate the valid providers: {}",
             warnings[0]
         );
     }

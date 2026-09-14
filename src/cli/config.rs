@@ -387,6 +387,44 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_an_unknown_activity_provider_and_names_the_valid_ones() {
+        // The diagnostic route for a mistyped `activity_provider`: the strict
+        // parse fails the file and the problem text enumerates what could have
+        // been written. (The *load* is more forgiving — it skips just that
+        // entry; see agent_config::an_invalid_activity_provider_is_diagnosed…)
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = TestPathGuard::new(tmp.path());
+        let path = crate::agent::agent_config::agents_config_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "default = \"ringwriter\"\n\n\
+             [[agents]]\nname = \"ringwriter\"\ncommand = \"ringwriter\"\n\
+             activity_provider = \"ringwriter-format\"\n",
+        )
+        .unwrap();
+
+        let (report, failed) = validate();
+        assert!(failed.iter().any(|f| f == "agents.toml"), "got: {failed:?}");
+        let problems = report["agents_toml"]["problems"].to_string();
+        assert!(
+            problems.contains("claude-code"),
+            "problem must list the valid provider ids: {problems}"
+        );
+
+        // A valid value passes the same gate.
+        std::fs::write(
+            &path,
+            "default = \"ringwriter\"\n\n\
+             [[agents]]\nname = \"ringwriter\"\ncommand = \"ringwriter\"\n\
+             activity_provider = \"claude-code\"\n",
+        )
+        .unwrap();
+        let (_, failed) = validate();
+        assert!(failed.is_empty(), "got failures: {failed:?}");
+    }
+
+    #[test]
     fn validate_reports_keybinding_conflicts() {
         let tmp = tempfile::tempdir().unwrap();
         let _g = TestPathGuard::new(tmp.path());

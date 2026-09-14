@@ -23,7 +23,9 @@ hook-driven status incl. the real permission→blocked path and the modal guard 
 keeps a headless send from answering it, restart-resume / fork /
 conversation import (all riding claude's `--session-id {id}` pinning), worktree sessions and
 `Ctrl+S` sync incl. the conflict handoff, code-review export, automations, tasks, messages,
-extensions, global search, the F9 activity view, the four headless agent-metrics commands
+extensions, global search, the F9 activity view (including `activity_provider`: a synthetic
+command under an unrecognizable basename declaring the transcript format it writes), the four
+headless agent-metrics commands
 (statusline / process tree / transcripts / account usage), both wizard flows, and the polish surface
 (themes, settings live-reload, keybinding editor, shell pane, clipboard — in-pane OSC 52
 copies asserted against a sandboxed outer clipboard, plus raw kitty-protocol Cmd+C
@@ -269,6 +271,21 @@ agent". It declares the `anthropic` dialect with an empty `{"responses": []}` fi
 the strict-offline invariant doubles as proof the agent made zero model calls; `require_agent
 scripted` never skips (bash is always present), keeping the pure-UI scenarios green on any
 machine and in CI.
+
+The `ringwriter` profile is the second script agent, and it exists for one thing `scripted`
+structurally cannot show: **`activity_provider`** in `agents.toml`. Its "binary" lives at
+`$HOME/ringwriter` — a basename no provider inference resolves — and at launch it replays
+`agents/ringwriter/transcript.jsonl` (a claude-code-format fixture, `{{ID}}`/`{{WS}}`
+substituted) into `$CLAUDE_CONFIG_DIR/projects/<slug>/<id>.jsonl`. Its entry declares
+`activity_provider = "claude-code"` and *nothing else* about the format, so every tool event
+`custom-activity-provider` reads back through F9 and `friring-cli session activity` is
+attributable to that one line. Three further properties are load-bearing rather than
+incidental: `CLAUDE_CONFIG_DIR` is relocated into the sandbox (so the scenario proves a
+declared provider still honours its CLI's state-dir override, not that a default path
+happened to work), `hook_schema` is deliberately unset and the script signals its own
+lifecycle with `friring-cli session signal` (so the two optional family fields are visibly
+independent), and `AGENT_HAS_STATUS_HOOKS=0` stays truthful — the scenario polls `hook_state`
+itself rather than claiming a capability the hooks extension does not provide.
 
 That `GOT:` echo is what makes the keyboard scenarios meaningful rather than decorative. The
 leader-key scenario (`scripted-leader-key`) uses it to assert a *negative*: after a mistyped

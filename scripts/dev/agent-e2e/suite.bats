@@ -140,6 +140,11 @@ teardown() {
     e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-registry-terminal"
 }
 
+@test "e2e: agents.toml activity_provider selects the transcript parser for an unrecognizable command" {
+    require_agent ringwriter
+    e2e_scenario "$AGENT_E2E_DIR/scenarios/custom-activity-provider"
+}
+
 @test "e2e: multi-session switching (Alt+N, Ctrl+6) with CLI send/capture/focus staying in sync" {
     require_agent scripted
     e2e_scenario "$AGENT_E2E_DIR/scenarios/scripted-multi-nav"

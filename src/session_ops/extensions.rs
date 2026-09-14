@@ -3476,6 +3476,7 @@ mod requirement_tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: None,
+            activity_provider: None,
             transcript: None,
             sandbox: Some(crate::session::AgentSandboxDef {
                 env: [("OMX_ROOT".to_string(), "{home}/lib".to_string())]

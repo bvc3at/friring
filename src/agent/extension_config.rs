@@ -952,6 +952,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: None,
+            activity_provider: None,
             transcript: None,
             sandbox: None,
         };
@@ -987,6 +988,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: None,
+            activity_provider: None,
             transcript: None,
             sandbox: None,
         };
@@ -1074,6 +1076,7 @@ mod tests {
             new_session_args: vec![],
             resume_latest: false,
             hook_schema: Some("claude".into()),
+            activity_provider: None,
             transcript: None,
             sandbox: None,
         };

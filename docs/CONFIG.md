@@ -134,6 +134,10 @@ resume_latest = false       # true = id-less "resume last session in cwd"
 # hook_schema = "claude"    # optional: name the hook FAMILY this CLI speaks so
                             #   the built-in hooks extension wires its status
                             #   hooks under this custom agent's name too
+# activity_provider = "claude-code"  # optional: name the TRANSCRIPT FORMAT this
+                            #   CLI writes, so F9 / `session activity` can read
+                            #   it. Omitted, the format is inferred from the
+                            #   command basename
 
 [agents.transcript]         # optional: where this CLI stores a conversation, so
 dir = "projects"            #   friring can check one still EXISTS before
@@ -250,6 +254,48 @@ host. It names the *family* to imitate, not a boolean; today the useful value is
 `"claude"` (the only family wired via a per-agent arg patch — codex/opencode/
 antigravity/vibe/copilot are wired through their own config dir, so a rebrand
 sharing that dir already reports status).
+
+`activity_provider` is optional and names the **transcript format** this CLI
+writes, for the F9 activity view and `friring-cli session activity`. Omit it
+and the format is inferred from the command basename, which is what every
+entry did before this field existed — `command = "claude"` reads as
+`claude-code` whatever the entry is *named*. That inference is all a custom
+entry ever had, so an executable called anything else (a wrapper script, a
+rebranded binary, `command = "/opt/ring/bin/ringwriter"`) reported nothing at
+all. Declaring a provider says "whatever this command is called, it records
+like *that*", and takes precedence over the basename — including *against* it,
+so a wrapper that happens to be named `codex` but emits Claude Code transcripts
+can say so. One resolution serves both the view and the CLI, so the two can
+never disagree about a session. The valid values are the provider ids
+`friring-cli session activity --json` reports back:
+
+| | | | |
+|---|---|---|---|
+| `claude-code` | `vibe` | `qwen-code` | `cursor-agent` |
+| `gemini-cli` | `crush` | `copilot` | `aider` |
+| `goose` | `opencode` | `codex` | `cline` |
+
+Anything else is a malformed entry: the load skips it (naming it, and listing
+what you could have written instead) while its siblings stay in effect, and
+`friring-cli config validate` fails on the file. Declaring a provider does not
+make friring launch or configure the agent any differently — it only says how
+to *read* what the agent already wrote, so the command, its argument groups,
+session ids, resume/fork behavior and every state-directory env override are
+untouched. It is independent of `hook_schema` in both directions: that one
+names the hook family the CLI speaks, this one the records it leaves behind,
+and an agent may need either, both, or neither. Editing it takes effect on the
+next `agents.toml` reload — a session whose provider changes drops the event
+stream it had accumulated under the old one and rebuilds from the new
+provider's own sources. Two things lag that, both pre-dating this field and
+equally reachable by editing an entry's `command`: a **shelved** session keeps
+the accumulator it was shelved with until it loads again, and F9's **Agents**
+section (the Claude workflow/subagent tree, a separate scan) keeps the tree it
+last indexed. Neither affects a session whose provider never changes.
+
+Distinct from the sibling `[agents.<name>.transcript]` block below,
+despite the shared word: that one says *where* this CLI stores a
+conversation, so a resume can be proved to reach one; this one says what
+*format* the records it leaves are in, so they can be read back.
 
 `[agents.<name>.transcript]` is optional, and says where this CLI stores the
 conversations it can resume — the one thing a resume contract cannot answer from
