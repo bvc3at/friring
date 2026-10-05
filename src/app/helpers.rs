@@ -71,12 +71,21 @@ pub(super) fn drawn_label_cells(
 /// *same* styles, so nothing changes visually; only the terminal's hyperlink
 /// state is added. Writes go to `stdout` after the backend's flush, so they
 /// cannot interleave with the frame.
+///
+/// Bracketed in DECSC/DECRC, because the frame has already placed the caret and
+/// this walks it away. `draw` positions the caret last and leaves it *shown*,
+/// so without the restore a focused pane's caret sat wherever the final run
+/// ended — and since the loop repaints on the forced-redraw floor, it jumped
+/// back and away again several times a second. Restoring here rather than
+/// leaving it to the next `draw` keeps the two independent: any number of
+/// frames may pass before the next one.
 pub(super) fn paint_hyperlinks(paints: &[HyperlinkPaint]) -> std::io::Result<()> {
-    use crossterm::cursor::MoveTo;
+    use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
     use crossterm::queue;
     use crossterm::style::{Print, PrintStyledContent, ResetColor};
 
     let mut out = std::io::stdout();
+    queue!(out, SavePosition)?;
     for paint in paints {
         queue!(
             out,
@@ -89,6 +98,7 @@ pub(super) fn paint_hyperlinks(paints: &[HyperlinkPaint]) -> std::io::Result<()>
         }
         queue!(out, Print(hyperlink::OSC8_CLOSE), ResetColor)?;
     }
+    queue!(out, RestorePosition)?;
     out.flush()
 }
 
