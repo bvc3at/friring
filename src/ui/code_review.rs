@@ -75,7 +75,7 @@ pub(crate) fn render(
         format!(" · U{}", state.context)
     };
     let title = format!(" Code review · {target}{ctx}  +{add} -{del} ");
-    // Right-aligned so the app-layer central-pane tab strip (Agent/Shell/Review)
+    // Right-aligned so the app-layer central-pane tab strip (Agent/Review/Shell/Activity)
     // overlaid on the left of this top border has room; truncated to the space
     // the tabs leave so it can't overlap the pills.
     let title = crate::ui::fit_right_title(&title, area.width, tabs_width);

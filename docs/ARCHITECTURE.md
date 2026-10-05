@@ -190,13 +190,16 @@ a clickable tab strip painted on the pane's top border by
 `App::draw_central_tabs` (each tab a `ui::render_pill`; the active view is
 the accent-filled "primary" pill). `central_tab_cells` lays out the
 on-border hitboxes, recorded as
-`ClickAction::CentralTab(CentralTab::{Agent,Shell,Review})` **before** the
+`ClickAction::CentralTab(CentralTab::{Agent,Review,Shell,CcActivity})` **before** the
 pane's whole-rect focus fallback so a tab click wins; a click runs
 `App::select_central_tab`, which *selects* a view (distinct from the
 keyboard `Ctrl+T`/`Ctrl+X` *toggles*). Each tab shows its toggle's F-key
 hint, because a focused terminal passes `Ctrl+<letter>` chords through to
-the CLI while the F-key dispatches in every pane; Shell/Review tabs are
-feature-gated.
+the CLI while the F-key dispatches in every pane; Review/Shell/Activity tabs
+are feature-gated. On a narrow pane `trim_central_tabs` strips the F-key hints
+first, then sheds whole tabs (Activity, then Shell, then Review), never Agent or
+the active view; each view's right-aligned title fits into what the strip
+leaves (`central_tabs_width`).
 
 **Enforcement.** `tests/architecture_rules.rs` is an **allowlist** (the
 dependency table itself lives in `AGENTS.md`): every module under `src/`

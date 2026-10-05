@@ -1344,15 +1344,18 @@ column back.
 **The chevron is expand-only.** Upstream draws a `◀`/`▶` affordance in both
 states; here it appears only while the list is collapsed. The fork's central
 pane packs four tab pills (Agent · Review · F7 · Shell · F8 · Activity · F9)
-into ~40 columns and `break`s when it runs out of room — a permanent ~9-cell
-chevron would, on a 120-column terminal with tasks + the file viewer open,
-silently drop the Activity tab. Upstream's two refinements ([`b951991`]) are
+into ~40 columns and, once out of room, strips their F-key hints and then sheds
+whole tabs, Activity first (upstream's narrow-pane trim, [`365625ef`], extended
+to the fork's fourth tab) — a permanent ~9-cell chevron would, on a 120-column
+terminal with tasks + the file viewer open, cost the hints or the Activity tab.
+Upstream's two refinements ([`b951991`]) are
 kept: the one-cell gap before the tab strip, and the hover carve-out that keeps
 the chevron a subtle band rather than a filled pill.
 
 [`86ab3dc`]: https://github.com/Thurbeen/thurbox/commit/86ab3dc728f5ab307822c442c959ae8cabc1e68d
 [`4e19147`]: https://github.com/Thurbeen/thurbox/commit/4e191473dffa01a20b028cbcc456d25665451972
 [`b951991`]: https://github.com/Thurbeen/thurbox/commit/b951991a458ae9ca11f2d92aca9ec36b84df6b13
+[`365625ef`]: https://github.com/Thurbeen/thurbox/commit/365625ef829c862d7e8e47263a6d0bf73bdafc45
 
 #### Global search: centered popup + double-`Shift` opener
 
@@ -2375,7 +2378,12 @@ real Claude turn and the stub's usage route.
   against a worst-case `[Unreachable]`, so a short status hands its columns back
   to the branch; over budget, the branch truncates (`[fix/displa…]`), then the
   agent sheds, then the branch drops — status and the scrollback marker are
-  never dropped.
+  never dropped. Upstream later fixed the same collision by cutting the title
+  with an ellipsis (`ui::fit_right_title`,
+  [`365625ef`](https://github.com/Thurbeen/thurbox/commit/365625ef), by LeTuR).
+  The terminal title keeps the per-part fit above; the code-review and
+  Activity titles, which had no budget at all, use upstream's helper against
+  the same `central_tabs_width`.
 
 - **The footer's text no longer runs under its buttons.** Upstream paints the
   left-hand text (focus label, session/automation counts, key hints) across the
