@@ -39,12 +39,73 @@ divergent on purpose:
 - **`86ab3dc` / `4e19147` / `b951991` F9 session-list collapse** — `F9` is the
   fork's activity view.
 - **`1dd5edb` / `2c07e3a` demo regeneration** and the **visual identity** half of
-  upstream's website work — the fork records its own demos and ships its own
-  site, so upstream's Doom-inspired game-UI redesign, its restyled dividers and
-  chrome, and its `iddqd` easter egg stay unadopted. The **bug-fix and
-  load-cost** half of that work does apply to the fork's site, which was
-  upstream's pre-redesign CSS rebranded, and is adopted separately (see "Own
-  website" below).
+  upstream's website work (`f5bc0e7d`) — the fork records its own demos and
+  ships its own site, so upstream's Doom-inspired game-UI redesign, its restyled
+  dividers and chrome, and its `iddqd` easter egg stay unadopted. The **bug-fix
+  and load-cost** half of that work, `d1ab8779`'s mobile-overflow fix included,
+  does apply to the fork's site, which was upstream's pre-redesign CSS
+  rebranded, and is adopted separately (see "Own website" below).
+- **`0a507124` the v2 plugin kernel, and the v2 line built on it** — upstream
+  replaced its v1 `src/app` / `src/ui` with a Lua plugin kernel, and every fork
+  feature lives in the v1 architecture. Fixes from the v2 line that also apply
+  here are ported one at a time as credited fork commits (for example
+  `ae1a0b46`'s cursor save/restore around OSC 8 link painting); see "Pending
+  ports" below.
+- **`0f5da348` / `71858d29` Exec off the TUI thread** — the fork already runs
+  Exec off the tick thread. Two blind judges preferred the fork's runner; its
+  overlap guard and null stdin were ported from upstream's (see "Exec off the
+  tick thread, with a process-tree deadline").
+- **`a6fb941a` dropping the repo-group rollup dot** — a collapsed group shows
+  only its header line, and the rolled-up dot is how that line still reports a
+  blocked or working member (see "Label jump (`Alt+G`), collapsible groups, and
+  the ghost shelf").
+- **`ab865fae` the `Shift+Tab` back-to-list hint** — the fork's repo palette has
+  one input and no list/input focus zones (see "New-session wizard redesign").
+- **`462a1251`** — a style-only one-liner in `act_toggle_session_list`, which
+  the fork keeps as its `Alt+L` collapse; it does not apply cleanly here and
+  changes no behavior.
+- **`c5fc4452` / `344d3e2f` / `25f95271` winget and Chocolatey** — those
+  channels are deleted here (see "Own install surface").
+- **`327a792a` OpenSpec skills** (upstream removed them again in `7d76c580`),
+  **`6b016e88` / `4b249e2e`** upstream's own pi / opencode repo tooling, and
+  **`56659c98`** its `CLAUDE.md` trim — this repo keeps its own brief
+  (`AGENTS.md`) and tooling.
+- **`aacfeabb` built-in agents docs** — it adds `docs/AGENTS.md`, and `AGENTS.md`
+  is the agent-instruction file name this repo already uses for its brief, so
+  agents that load nested `AGENTS.md` files would read it as instructions for
+  `docs/`. The fork documents its built-ins in `docs/CONFIG.md` and on its site.
+- **`a90c594a`** pre-1.0 framing, **`b2e58e14`** the control-plane
+  orchestration doc (the fork's orchestration is the sandboxed bridge,
+  ADR-30…33), **`a2297987`** upstream's runtime performance report,
+  **`34250016`** its demo-recorder fix, and **`7b9dc65d` / `2de571f7` /
+  `d2c0222a`** its v1.x maintenance CI — upstream's own release line, docs and
+  measurements.
+
+### Pending ports
+
+Upstream changes this fork wants but has not landed. Each needs a rewrite
+rather than a cherry-pick, and the first plan for each failed an adversarial
+review, so these notes record what a port has to respect:
+
+- **`c1ab2853` / `1e103991` new-session progress row** — a blind duel preferred
+  upstream's persistent "creating…" row in the session list over the fork's
+  5-second status toast, which is gone long before a worktree create or an SSH
+  spawn finishes. A port should derive the row from the two pending-spawn
+  continuations instead of a slot cleared by hand at every exit, must not keep
+  the status row carved for the whole spawn (panes are not resized for that
+  row, so their bottom line would go undrawn), and must place the row correctly
+  when a fork's parent is hidden. The re-entry guard from `c1ab2853` is already
+  ported (see "New-session wizard redesign").
+- **`457819b6` browsable remote repo paths** — a blind duel preferred upstream.
+  The fork's palette lists a remote directory and expands `~` synchronously on
+  `Tab` / `Enter`, refuses a remote parent import, and never checks whether a
+  remote candidate is a git repo. A port takes upstream's worker and
+  generation-stamp design under the fork's palette with schema v50, keeps
+  `Ctrl+T` instant on rows whose git-ness is unknown, clears a pending check on
+  every input edit, and follows upstream's own `fb722adf`, which replaced the
+  persisted-children design `457819b6` introduced.
+- **Fixes from upstream's v2 line** — written against the plugin kernel, so
+  each one is ported by hand as a credited fork commit.
 
 ## Renamed to friring (July 2026)
 
@@ -258,7 +319,10 @@ actually needs and to an allowlist of domains.
   write access equivalent to arbitrary host command execution: the launch mints
   `<data dir>/signals/<session>/`, exposes that one directory read-write, and the
   bundled hooks append a state word there when `FRIRING_SIGNAL_FILE` is set
-  (unsandboxed sessions run the CLI exactly as before). The host **takes** the
+  (unsandboxed sessions run the CLI exactly as before). That covers the pi and
+  omp TypeScript extensions too, whose upstream versions only know the CLI;
+  `every_shipped_payload_honours_the_sandbox_signal_file` holds every bundled
+  payload to it. The host **takes** the
   file with a `rename(2)` into a directory no sandbox is granted before reading
   it, refuses anything that is not a regular file under 4 KiB of UTF-8, and
   writes only a matched constant from a closed vocabulary — never the file's own
@@ -447,7 +511,7 @@ actually needs and to an allowlist of domains.
   keystrokes, because a bridge-requiring agent is refused a headless create.
   Its first real run showed that **neither** bridge-backed extension could have
   started: `extension install` registered agents in `agents.toml` before
-  resolving `{home}`, so the launcher — which expands no tokens — was handed
+  resolving `{home}`, so the launcher — which then expanded no tokens — was handed
   `cannot run '{home}/bin/leader.sh'`; a `workspace` read scope did not read the
   agent's own program, so the pane died before the agent started; the shipped
   profiles did not grant the extension home, so a script agent could not source
@@ -485,7 +549,10 @@ actually needs and to an allowlist of domains.
   evaluated against the private state directory *that* launch uses. An agent
   that declares a resume contract and no way to check it is refused rather than
   guessed at, which is a behaviour change for an `agents.toml` written before the
-  key existed. Building it also
+  key existed. Upstream's omp support
+  ([`14991509`](https://github.com/Thurbeen/thurbox/commit/14991509)) resumes by
+  checking the session file it pins at launch; here that check runs only for an
+  agent with no declared contract, so a `transcript` block still decides first. Building it also
   found that the openai stub read
   `hasToolResult` across the whole transcript rather than the turn being
   answered, so a two-fixture tool loop stopped firing from the second turn
