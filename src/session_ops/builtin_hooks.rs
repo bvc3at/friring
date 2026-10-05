@@ -389,6 +389,31 @@ mod tests {
         assert_eq!(rewrite_hook_signals_for_remote(unrelated), unrelated);
     }
 
+    /// Every bundled payload must also report from inside a sandbox, where
+    /// `friring-cli` need not exist and the database is out of reach
+    /// (docs/SANDBOX.md §Status signals). A payload that only runs the CLI
+    /// leaves a sandboxed session idle forever, and nothing else notices.
+    #[test]
+    fn every_shipped_payload_honours_the_sandbox_signal_file() {
+        for (name, asset) in [
+            ("claude.json", CLAUDE_SETTINGS),
+            ("opencode-status.js", OPENCODE_PLUGIN),
+            ("antigravity-hooks.json", ANTIGRAVITY_HOOKS),
+            ("codex-hooks.json", CODEX_HOOKS),
+            ("vibe-hooks.toml", VIBE_HOOKS),
+            ("copilot-hooks.json", COPILOT_HOOKS),
+            ("pi-status.ts", PI_STATUS),
+            ("omp-status.ts", OMP_STATUS),
+            ("extension.toml", MANIFEST), // aider's literal --notifications-command arg
+        ] {
+            assert!(
+                asset.contains(crate::paths::SIGNAL_FILE_ENV),
+                "{name} never checks ${}, so it cannot report from a sandbox",
+                crate::paths::SIGNAL_FILE_ENV
+            );
+        }
+    }
+
     #[test]
     fn signal_marker_matches_shipped_hook_commands() {
         // Guard: a future edit to a hook asset that drifts from the marker
