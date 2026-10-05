@@ -2,7 +2,7 @@
 
 > Friring is a multi-session TUI orchestrator that runs any coding-agent CLI
 > — Claude Code, Codex, Antigravity, opencode, aider, GitHub Copilot CLI, Vibe,
-> or any CLI you define — inside persistent tmux panes. Sessions, agents, and
+> pi, Oh My Pi, or any CLI you define — inside persistent tmux panes. Sessions, agents, and
 > git worktrees
 > are first-class citizens, and sessions survive crashes, restarts, and
 > reboots because tmux keeps the agent processes alive. It is written in Rust,
